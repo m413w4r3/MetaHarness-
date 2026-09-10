@@ -1,1 +1,7 @@
 /.env.models
+
+# Local credentials and persistent WebAI state.
+/.env
+/WebAI-to-API/.env
+/WebAI-to-API/config.conf
+/WebAI-to-API/runtime/

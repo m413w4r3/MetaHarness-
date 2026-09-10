@@ -5,12 +5,12 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Path as FastAPIPath
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from jsonschema import Draft202012Validator
 from pydantic import BaseModel, Field
 
 
@@ -35,7 +35,6 @@ class SendRequest(BaseModel):
     surface: Surface
     payload: dict[str, Any]
     idempotency_key: str | None = Field(default=None, max_length=255)
-    schema_: dict[str, Any] | None = Field(default=None, alias="schema")
 
 
 def _provider_base(provider: Provider) -> str:
@@ -142,52 +141,65 @@ def _extract_sse_text(raw: str) -> str:
     return "".join(pieces)
 
 
-def _parse_diagnostics(text: str | None, schema: dict[str, Any] | None) -> dict[str, Any]:
-    if text is None:
-        return {
-            "has_text": False,
-            "strict_json": False,
-            "schema_valid": None,
-            "fenced": False,
-            "error": "Aucun texte assistant extrait.",
-        }
+def _sse_diagnostics(raw: str) -> dict[str, Any]:
+    """Summarize buffered SSE without pretending it was rendered live."""
+    frame_count = 0
+    event_types: list[str] = []
+    last_event: str | None = None
+    pending_event: str | None = None
 
-    result: dict[str, Any] = {
-        "has_text": True,
-        "chars": len(text),
-        "fenced": "```" in text,
-        "strict_json": False,
-        "schema_valid": None,
-        "json": None,
-        "error": None,
+    for line in raw.splitlines():
+        if line.startswith("event:"):
+            pending_event = line[6:].strip() or None
+            continue
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data:
+            continue
+        frame_count += 1
+        event_type = pending_event
+        pending_event = None
+        if event_type is None and data != "[DONE]":
+            try:
+                decoded = json.loads(data)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, dict):
+                event_type = str(decoded.get("type") or "chat.completion.chunk")
+        if data == "[DONE]":
+            event_type = event_type or "done"
+        if event_type:
+            last_event = event_type
+            if event_type not in event_types:
+                event_types.append(event_type)
+
+    return {
+        "frame_count": frame_count,
+        "event_types": event_types,
+        "last_event": last_event,
+        "text_reconstructed": True,
     }
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError as exc:
-        result["error"] = f"JSON strict invalide: {exc.msg} (ligne {exc.lineno}, colonne {exc.colno})"
-        return result
 
-    result["strict_json"] = True
-    result["json"] = value
 
-    if schema is not None:
-        errors = sorted(
-            Draft202012Validator(schema).iter_errors(value),
-            key=lambda error: list(error.absolute_path),
-        )
-        if errors:
-            result["schema_valid"] = False
-            result["schema_errors"] = [
-                {
-                    "path": list(error.absolute_path),
-                    "message": error.message,
-                    "validator": error.validator,
-                }
-                for error in errors[:25]
-            ]
-        else:
-            result["schema_valid"] = True
-    return result
+def _provider_metadata(raw: Any) -> dict[str, Any]:
+    """Keep useful provider fields visible without duplicating the raw body."""
+    if not isinstance(raw, dict):
+        return {}
+    keys = (
+        "id", "object", "status", "model", "created", "created_at", "usage",
+        "service_tier", "system_fingerprint", "metadata", "error",
+    )
+    return {key: raw[key] for key in keys if key in raw}
+
+
+def _auth_state(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    status = body.get("gemini_webapi")
+    if isinstance(status, dict):
+        status = status.get("status")
+    return str(status) if status is not None else None
 
 
 async def _get_json(provider: Provider, path: str) -> dict[str, Any]:
@@ -224,18 +236,55 @@ async def index() -> FileResponse:
 
 @app.get("/api/status/{provider}")
 async def provider_status(provider: Provider) -> dict[str, Any]:
-    paths = ["/health", "/ready", "/v1/models"]
+    paths = ["/health", "/v1/models"]
     if provider == "bridge":
-        paths.append("/v1/bridge/capabilities")
+        paths.extend(["/ready", "/v1/bridge/capabilities"])
     else:
-        paths.extend(["/v1/auth/status", "/v1/runtime/status"])
+        # WebAI's readiness is BrowserEngine/Playwright readiness. It is not a
+        # readiness signal for the Gemini WebAPI transport itself.
+        paths.extend(["/v1/auth/status", "/v1/runtime/status", "/ready"])
     results = {path: await _get_json(provider, path) for path in paths}
-    return {"provider": provider, "base_url": _provider_base(provider), "checks": results}
+    if provider == "webai":
+        process_ok = bool(results["/health"].get("ok"))
+        auth_state = _auth_state(results["/v1/auth/status"].get("body"))
+        webapi_ok = process_ok and auth_state == "AUTHENTICATED"
+        summary = {
+            "label": "opérationnel WebAPI" if webapi_ok else "joignable" if process_ok else "hors ligne",
+            "ok": webapi_ok,
+            "reachable": process_ok,
+            "process": "OK" if process_ok else "ERR",
+            "gemini_webapi_auth": auth_state or "UNKNOWN",
+            "browser_readiness": "READY" if results["/ready"].get("ok") else "NOT READY / N/A pour webapi",
+        }
+    else:
+        summary = {
+            "label": "opérationnel" if results["/health"].get("ok") else "hors ligne",
+            "ok": bool(results["/health"].get("ok")),
+        }
+    return {"provider": provider, "base_url": _provider_base(provider), "checks": results, "summary": summary}
 
 
 @app.get("/api/models/{provider}")
 async def models(provider: Provider) -> dict[str, Any]:
     return await _get_json(provider, "/v1/models")
+
+
+@app.get("/api/poll/responses/{response_id}")
+async def poll_response(
+    response_id: str = FastAPIPath(..., min_length=1, max_length=255, pattern=r"^[A-Za-z0-9._:-]+$")
+) -> dict[str, Any]:
+    """Retrieve one background Responses result; never resubmits the POST."""
+    path = f"/v1/responses/{quote(response_id, safe='')}"
+    result = await _get_json("bridge", path)
+    raw = result.get("body")
+    result.update({
+        "provider": "bridge",
+        "surface": "responses",
+        "path": path,
+        "extracted_text": _extract_response_text(raw),
+        "provider_metadata": _provider_metadata(raw),
+    })
+    return result
 
 
 @app.post("/api/send")
@@ -252,6 +301,7 @@ async def send(request: SendRequest) -> dict[str, Any]:
     try:
         timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=3.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
+            response_parse_error: str | None = None
             if stream:
                 chunks: list[bytes] = []
                 size = 0
@@ -275,8 +325,9 @@ async def send(request: SendRequest) -> dict[str, Any]:
                     raise HTTPException(status_code=413, detail="Réponse trop volumineuse.")
                 try:
                     raw = response.json()
-                except ValueError:
+                except ValueError as exc:
                     raw = response.text
+                    response_parse_error = f"Réponse non JSON ({type(exc).__name__})."
                 extracted = _extract_response_text(raw)
     except HTTPException:
         raise
@@ -294,5 +345,7 @@ async def send(request: SendRequest) -> dict[str, Any]:
         "stream": stream,
         "raw": raw,
         "extracted_text": extracted,
-        "parse": _parse_diagnostics(extracted, request.schema_),
+        "provider_metadata": _provider_metadata(raw),
+        "response_parse_error": response_parse_error,
+        "sse": _sse_diagnostics(raw) if stream else None,
     }

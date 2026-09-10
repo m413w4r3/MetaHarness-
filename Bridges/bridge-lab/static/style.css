@@ -19,7 +19,7 @@ p { color: #9da7b3; margin: 6px 0; }
 .badge { padding: 4px 9px; border-radius: 999px; background: #30363d; font-size: 12px; }
 .badge.ok { background: #173b25; }
 .badge.bad { background: #4a2023; }
-.toolbar { display: grid; grid-template-columns: repeat(4, minmax(150px,1fr)); gap: 12px; margin-bottom: 14px; }
+.toolbar { display: grid; grid-template-columns: repeat(4, minmax(150px,1fr)); gap: 12px; margin-bottom: 8px; }
 label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: #9da7b3; }
 input, select, textarea, button {
   border: 1px solid #30363d; border-radius: 8px; background: #0d1117; color: #e6edf3;
@@ -27,7 +27,9 @@ input, select, textarea, button {
 }
 input, select { height: 38px; padding: 0 10px; }
 textarea { min-height: 240px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; resize: vertical; }
-#schema { min-height: 110px; }
+.hint { font-size: 12px; margin: 10px 0 14px; }
+small { color: #8b949e; font-size: 11px; font-weight: 400; }
+label[hidden], button[hidden] { display: none; }
 button { padding: 9px 13px; cursor: pointer; }
 button:hover { border-color: #8b949e; }
 button.primary { font-weight: 700; }

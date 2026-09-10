@@ -12,7 +12,7 @@
       <div>
         <p class="eyebrow">MetaHarness / Bridges</p>
         <h1>Bridge Lab</h1>
-        <p>Tester ChatGPT Bridge et WebAI, comparer le brut, le texte extrait et le parsing strict.</p>
+        <p>Diagnostiquer les transports, surfaces API, réponses brutes et métadonnées provider.</p>
       </div>
       <button id="refreshStatus">Actualiser les statuts</button>
     </header>
@@ -39,33 +39,35 @@
         <label>Surface
           <select id="surface"></select>
         </label>
-        <label>Modèle
-          <select id="model"></select>
+        <label id="modelLabel">API model label
+          <input id="model" list="modelSuggestions" autocomplete="off" spellcheck="false">
+          <datalist id="modelSuggestions"></datalist>
+          <small id="modelNote"></small>
+        </label>
+        <label id="uiModelField">UI model (optionnel)
+          <input id="uiModel" autocomplete="off" spellcheck="false" placeholder="laissé inchangé">
         </label>
         <label>Idempotency key
           <input id="idem" placeholder="optionnel">
         </label>
       </div>
 
+      <p id="surfaceHint" class="hint"></p>
+
       <div class="presets">
-        <button data-preset="text">Texte</button>
-        <button data-preset="json">JSON strict</button>
-        <button data-preset="nested">JSON imbriqué</button>
-        <button data-preset="stream">Streaming</button>
-        <button data-preset="background">Responses background</button>
-        <button data-preset="native">Bridge natif</button>
+        <button data-preset="text">Requête texte</button>
+        <button data-preset="stream">SSE buffered</button>
+        <button data-preset="background" data-bridge-only>Responses background</button>
+        <button data-preset="native" data-bridge-only>Bridge natif /runs</button>
       </div>
 
-      <label class="block">Payload JSON
+      <label class="block">Payload API
         <textarea id="payload" spellcheck="false"></textarea>
-      </label>
-
-      <label class="block">JSON Schema à valider (optionnel)
-        <textarea id="schema" spellcheck="false" placeholder='{"type":"object","required":["ok"],"properties":{"ok":{"type":"boolean"}}}'></textarea>
       </label>
 
       <div class="actions">
         <button id="send" class="primary">Envoyer</button>
+        <button id="stopPolling" disabled>Stop polling</button>
         <span id="requestState"></span>
       </div>
     </section>
