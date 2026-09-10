@@ -4,7 +4,7 @@
 
 [submodule "WebAI-to-API"]
 	path = WebAI-to-API
-	url = https://github.com/m413w4r3/bridge
+	url = https://github.com/Amm1rr/WebAI-to-API
 
 [submodule "chatgpt-bridge"]
 	path = chatgpt-bridge
