@@ -7,19 +7,23 @@ interpreted as a command.
 
 from __future__ import annotations
 
-import hashlib
 import re
-import subprocess
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .gitops import current_head, status_porcelain
+from .gitops import GitError, candidate_tree_sha, current_head, symbolic_head
 from .models import CheckConfig, HarnessConfig
+from .procutil import read_capped, run_bounded
+from .redaction import redact_file
 
 
 DEFAULT_TAIL_BYTES = 4_096
+# Full logs always stay on disk; only this much is kept in memory.
+_IN_MEMORY_LOG_BYTES = 8 * 1024 * 1024
+_CHECK_GRACE_SECONDS = 5.0
 
 
 class ValidationError(RuntimeError):
@@ -43,11 +47,11 @@ class CheckResult:
 
 @dataclass(frozen=True)
 class _GitSnapshot:
-    """The content that a subsequent ``git add -A`` would submit."""
+    """The candidate that a subsequent ``git add -A`` would submit."""
 
     head: str
-    tracked_diff: str
-    untracked: tuple[tuple[str, str], ...]
+    head_ref: str | None
+    candidate_tree: str
 
 
 def bounded_tail(value: str, max_bytes: int = DEFAULT_TAIL_BYTES) -> str:
@@ -61,73 +65,15 @@ def bounded_tail(value: str, max_bytes: int = DEFAULT_TAIL_BYTES) -> str:
     return encoded[-max_bytes:].decode("utf-8", errors="ignore") if max_bytes else ""
 
 
-def _decode_output(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)
-
-
-def _file_fingerprint(path: Path) -> str:
-    """Fingerprint one untracked path without following a final symlink."""
-
-    try:
-        stat = path.lstat()
-        digest = hashlib.sha256()
-        digest.update(str(stat.st_mode & 0o7777).encode("ascii"))
-        if path.is_symlink():
-            digest.update(b"symlink:")
-            digest.update(path.readlink().as_posix().encode("utf-8", errors="surrogateescape"))
-        elif path.is_file():
-            with path.open("rb") as file:
-                for chunk in iter(lambda: file.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        else:
-            digest.update(b"special-or-directory")
-        return digest.hexdigest()
-    except (OSError, ValueError):
-        return "<unreadable>"
-
-
-def _untracked_snapshot(worktree: Path, status: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
-    entries: list[tuple[str, str]] = []
-    for line in status:
-        if not line.startswith("?? "):
-            continue
-        relative = line[3:]
-        # Git quotes unusual paths in the non -z porcelain format.  Such a
-        # path is still safely represented by the status line; normal paths,
-        # including spaces, retain their exact spelling here.
-        if relative.startswith('"') and relative.endswith('"'):
-            relative = relative[1:-1]
-        entries.append((relative, _file_fingerprint(worktree / relative)))
-    return tuple(sorted(entries))
-
-
-def _tracked_diff(worktree: Path) -> str:
-    """Return the complete tracked working-tree delta from HEAD."""
-
-    result = subprocess.run(
-        ["git", "-C", str(worktree), "diff", "--no-ext-diff", "--binary", "HEAD", "--"],
-        text=True,
-        capture_output=True,
-        check=False,
-        shell=False,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise ValidationError(f"could not snapshot Git diff: {detail}")
-    return result.stdout
-
-
 def _git_snapshot(worktree: Path) -> _GitSnapshot:
-    status = status_porcelain(worktree)
-    return _GitSnapshot(
-        head=current_head(worktree),
-        tracked_diff=_tracked_diff(worktree),
-        untracked=_untracked_snapshot(worktree, status),
-    )
+    try:
+        return _GitSnapshot(
+            head=current_head(worktree),
+            head_ref=symbolic_head(worktree),
+            candidate_tree=candidate_tree_sha(worktree),
+        )
+    except GitError as exc:
+        raise ValidationError(f"could not snapshot the candidate worktree: {exc}") from exc
 
 
 def resolve_check_cwd(worktree: str | Path, check: CheckConfig) -> Path:
@@ -142,8 +88,12 @@ def resolve_check_cwd(worktree: str | Path, check: CheckConfig) -> Path:
         raise ValidationError(f"worktree is not a directory: {root}")
     if "\x00" in check.cwd:
         raise ValidationError(f"check cwd contains NUL: {check.name}")
+    if Path(check.cwd).is_absolute():
+        raise ValidationError(
+            f"check cwd must be relative to the worktree: {check.name!r} -> {check.cwd!r}"
+        )
     try:
-        candidate = (Path(worktree).expanduser() / check.cwd).resolve()
+        candidate = (root / check.cwd).resolve()
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValidationError(f"invalid cwd for check {check.name!r}: {exc}") from exc
     try:
@@ -168,24 +118,21 @@ def _safe_log_stem(name: str, used: set[str]) -> str:
     return candidate
 
 
-def _persist_logs(
-    logs_dir: Path,
-    result: CheckResult,
-    stem: str,
-) -> None:
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    (logs_dir / f"{stem}.stdout.log").write_text(result.stdout_log, encoding="utf-8")
-    (logs_dir / f"{stem}.stderr.log").write_text(result.stderr_log, encoding="utf-8")
-
-
 def run_checks(
     worktree: str | Path,
     config: HarnessConfig,
     *,
     logs_dir: str | Path | None = None,
     tail_bytes: int = DEFAULT_TAIL_BYTES,
+    secrets: tuple[str, ...] = (),
 ) -> tuple[CheckResult, ...]:
-    """Run every configured check, continuing after failures and timeouts."""
+    """Run every configured check, continuing after failures and timeouts.
+
+    Each check runs in its own process group with stdin closed and outputs
+    written to log files; its whole group is terminated at the deadline and
+    after it exits.  The candidate tree is snapshotted before and after each
+    check to detect any mutation of the submitted code.
+    """
 
     if not isinstance(config, HarnessConfig):
         raise TypeError("config must be a HarnessConfig")
@@ -198,56 +145,60 @@ def run_checks(
             pass
         else:
             raise ValidationError("logs_dir must be outside the worktree")
+    # Every cwd is validated before any command runs.
+    cwds = [resolve_check_cwd(root, check) for check in config.checks]
     used_log_stems: set[str] = set()
     results: list[CheckResult] = []
 
-    for check in config.checks:
-        cwd = resolve_check_cwd(root, check)
-        before = _git_snapshot(root)
-        started = time.monotonic()
-        stdout = ""
-        stderr = ""
-        exit_code = -1
-        timed_out = False
-        try:
-            completed = subprocess.run(
-                list(check.argv),
-                cwd=cwd,
-                text=True,
-                capture_output=True,
-                timeout=check.timeout_seconds,
-                check=False,
-                shell=False,
+    with tempfile.TemporaryDirectory(prefix="metaharness-checks-") as scratch:
+        log_root = output_dir if output_dir is not None else Path(scratch)
+        log_root.mkdir(parents=True, exist_ok=True)
+        for check, cwd in zip(config.checks, cwds):
+            stem = _safe_log_stem(check.name, used_log_stems)
+            stdout_path = log_root / f"{stem}.stdout.log"
+            stderr_path = log_root / f"{stem}.stderr.log"
+            before = _git_snapshot(root)
+            started = time.monotonic()
+            exit_code = -1
+            timed_out = False
+            with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+                try:
+                    exit_code, timed_out = run_bounded(
+                        check.argv,
+                        cwd=cwd,
+                        timeout_seconds=check.timeout_seconds,
+                        stdout=stdout,
+                        stderr=stderr,
+                        grace_seconds=_CHECK_GRACE_SECONDS,
+                    )
+                except (OSError, ValueError) as exc:
+                    stderr.write(f"could not start check: {exc}\n".encode("utf-8", "replace"))
+                if timed_out:
+                    exit_code = 124
+                    stderr.write(
+                        f"\ncheck timed out after {check.timeout_seconds}s\n".encode("utf-8")
+                    )
+            duration = time.monotonic() - started
+            after = _git_snapshot(root)
+            redact_file(stdout_path, secrets)
+            redact_file(stderr_path, secrets)
+            stdout_text, _ = read_capped(stdout_path, _IN_MEMORY_LOG_BYTES)
+            stderr_text, _ = read_capped(stderr_path, _IN_MEMORY_LOG_BYTES)
+            results.append(
+                CheckResult(
+                    name=check.name,
+                    argv=tuple(check.argv),
+                    cwd=str(cwd),
+                    exit_code=exit_code,
+                    timed_out=timed_out,
+                    duration_seconds=duration,
+                    stdout_log=stdout_text,
+                    stderr_log=stderr_text,
+                    stdout_tail=bounded_tail(stdout_text, tail_bytes),
+                    stderr_tail=bounded_tail(stderr_text, tail_bytes),
+                    workspace_mutated=before != after,
+                )
             )
-            stdout = _decode_output(completed.stdout)
-            stderr = _decode_output(completed.stderr)
-            exit_code = completed.returncode
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            exit_code = 124
-            stdout = _decode_output(exc.stdout)
-            stderr = _decode_output(exc.stderr)
-            stderr = f"{stderr}\ncheck timed out after {check.timeout_seconds}s".lstrip()
-        except (OSError, ValueError) as exc:
-            stderr = f"could not start check: {exc}"
-        duration = time.monotonic() - started
-        after = _git_snapshot(root)
-        result = CheckResult(
-            name=check.name,
-            argv=tuple(check.argv),
-            cwd=str(cwd),
-            exit_code=exit_code,
-            timed_out=timed_out,
-            duration_seconds=duration,
-            stdout_log=stdout,
-            stderr_log=stderr,
-            stdout_tail=bounded_tail(stdout, tail_bytes),
-            stderr_tail=bounded_tail(stderr, tail_bytes),
-            workspace_mutated=before != after,
-        )
-        results.append(result)
-        if output_dir is not None:
-            _persist_logs(output_dir, result, _safe_log_stem(check.name, used_log_stems))
 
     return tuple(results)
 

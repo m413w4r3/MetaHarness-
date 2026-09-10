@@ -74,6 +74,17 @@ For every material finding:
 - state the required behavior;
 - identify a missing test scenario when applicable.
 
+Write one finding per line, starting with its severity:
+- BLOCKER | area | evidence | required behavior
+- MAJOR | area | evidence | required behavior
+- MINOR | area | evidence | suggestion
+- NIT | area | evidence | suggestion
+Write NONE when there is no finding.
+
+PASS is only valid with ROUTE: NONE, no BLOCKER or MAJOR finding, and
+REQUIRED FIXES: NONE. Any required change means REVISE.
+The VERDICT and ROUTE lines must contain exactly one value each.
+
 Prefer compact, concrete findings over long general commentary.
 
 Use this approximate output shape:

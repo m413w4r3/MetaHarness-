@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, Callable
 
 from .gitops import GitError, current_head, git_root, read_file_at_commit, resolve_commit
 from .models import ContextConfig
+from .procutil import run_bounded
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,9 @@ class ContextBundle:
 
 _INSTRUCTION_NAMES = frozenset({"AGENTS.md", "CLAUDE.md"})
 _MAX_EXCERPT_LINES = 200
+_MAX_LOCATOR_OUTPUT_BYTES = 16 * 1024 * 1024
+_MAX_SYMBOL_CHARS = 200
+_LOCATOR_GRACE_SECONDS = 2.0
 
 
 def _read_optional(repo: Path, base_sha: str, path: str) -> str | None:
@@ -114,36 +119,54 @@ def _locator_command(config: ContextConfig, spec: str) -> list[str]:
 def _run_locator(
     repo: Path, spec: str, config: ContextConfig
 ) -> tuple[bool, list[dict[str, Any]], list[str]]:
-    """Run the locator and return (was_started, hits, warnings)."""
+    """Run the locator and return (was_started, hits, warnings).
+
+    The locator runs in its own process group with a hard deadline; its JSON
+    output only supplies locations.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="metaharness-locator-") as scratch:
+        stdout_path = Path(scratch) / "stdout"
+        try:
+            with stdout_path.open("wb") as stdout, open(os.devnull, "wb") as stderr:
+                exit_code, timed_out = run_bounded(
+                    _locator_command(config, spec),
+                    cwd=repo,
+                    timeout_seconds=config.locator_timeout_seconds,
+                    stdout=stdout,
+                    stderr=stderr,
+                    grace_seconds=_LOCATOR_GRACE_SECONDS,
+                )
+        except (OSError, ValueError):
+            return True, [], ["locator could not be started"]
+        if timed_out:
+            return True, [], ["locator timed out"]
+        if exit_code != 0:
+            return True, [], [f"locator failed (exit status {exit_code})"]
+        if stdout_path.stat().st_size > _MAX_LOCATOR_OUTPUT_BYTES:
+            return True, [], ["locator output is too large"]
+        output = stdout_path.read_text(encoding="utf-8", errors="replace")
 
     try:
-        result = subprocess.run(
-            _locator_command(config, spec),
-            cwd=repo,
-            text=True,
-            capture_output=True,
-            timeout=config.locator_timeout_seconds,
-            shell=False,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return True, [], ["locator timed out"]
-    except (OSError, ValueError):
-        return True, [], ["locator could not be started"]
-
-    if result.returncode != 0:
-        return True, [], [f"locator failed (exit status {result.returncode})"]
-    try:
-        payload = json.loads(result.stdout)
-    except (json.JSONDecodeError, TypeError):
+        payload = json.loads(output)
+    except json.JSONDecodeError:
         return True, [], ["locator returned invalid JSON"]
     if not isinstance(payload, list):
         return True, [], ["locator JSON must be an array"]
     return True, [item for item in payload if isinstance(item, dict)], []
 
 
+def _clean_symbol(value: Any) -> str | None:
+    """A locator symbol is a label: one bounded line without control chars."""
+
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join("".join(ch if ch.isprintable() else " " for ch in value).split())
+    return cleaned[:_MAX_SYMBOL_CHARS] or None
+
+
 def _excerpt_from_hit(
-    repo: Path, base_sha: str, hit: dict[str, Any]
+    hit: dict[str, Any], lines_for: Callable[[str], list[str] | None]
 ) -> tuple[ContextExcerpt | None, str | None]:
     path = _safe_locator_path(hit.get("path"))
     if path is None:
@@ -153,26 +176,47 @@ def _excerpt_from_hit(
     if not _valid_line_range(start, end):
         return None, f"locator returned an invalid range for {path}"
 
-    content = _read_optional(repo, base_sha, path)
-    if content is None:
+    # Only the location is trusted from the locator; the text is always the
+    # blob at the recorded base commit (any cached body is ignored).
+    lines = lines_for(path)
+    if lines is None:
         return None, f"locator path does not exist at base commit: {path}"
-    lines = content.splitlines(keepends=True)
     if start > len(lines) or end > len(lines):
         return None, f"locator range is outside file at base commit: {path}"
 
-    symbol = hit.get("symbol")
-    if symbol is not None and not isinstance(symbol, str):
-        symbol = None
     return (
         ContextExcerpt(
             path=path,
             start_line=start,
             end_line=end,
-            symbol=symbol,
+            symbol=_clean_symbol(hit.get("symbol")),
             content="".join(lines[start - 1 : end]),
         ),
         None,
     )
+
+
+def _merge_excerpt(
+    excerpts: list[ContextExcerpt], new: ContextExcerpt, lines: list[str]
+) -> bool:
+    """Merge *new* into an overlapping/adjacent excerpt of the same file."""
+
+    for index, existing in enumerate(excerpts):
+        if existing.path != new.path:
+            continue
+        if new.start_line > existing.end_line + 1 or new.end_line < existing.start_line - 1:
+            continue
+        start = min(existing.start_line, new.start_line)
+        end = max(existing.end_line, new.end_line)
+        excerpts[index] = ContextExcerpt(
+            path=existing.path,
+            start_line=start,
+            end_line=end,
+            symbol=existing.symbol or new.symbol,
+            content="".join(lines[start - 1 : end]),
+        )
+        return True
+    return False
 
 
 def build_context(
@@ -268,17 +312,32 @@ def build_context(
             locator_used, raw_hits, locator_warnings = _run_locator(repo, spec, config)
             warnings.extend(locator_warnings)
 
+    file_lines: dict[str, list[str] | None] = {}
+
+    def lines_for(path: str) -> list[str] | None:
+        if path not in file_lines:
+            content = _read_optional(repo, base_sha, path)
+            file_lines[path] = None if content is None else content.splitlines(keepends=True)
+        return file_lines[path]
+
     valid_excerpts: list[ContextExcerpt] = []
-    for hit in raw_hits[: config.max_hits]:
-        excerpt, warning = _excerpt_from_hit(repo, base_sha, hit)
-        if excerpt is not None:
-            valid_excerpts.append(excerpt)
-            for instruction_path in _applicable_instruction_paths(
-                excerpt.path, instruction_names
-            ):
-                add_instruction(instruction_path)
+    for hit in raw_hits:
+        excerpt, warning = _excerpt_from_hit(hit, lines_for)
         if warning is not None:
             warnings.append(warning)
+        if excerpt is None:
+            continue
+        # Duplicate and overlapping hits collapse into one excerpt; max_hits
+        # counts distinct valid excerpts, not rejected or duplicate entries.
+        if _merge_excerpt(valid_excerpts, excerpt, lines_for(excerpt.path) or []):
+            continue
+        if len(valid_excerpts) >= config.max_hits:
+            break
+        valid_excerpts.append(excerpt)
+        for instruction_path in _applicable_instruction_paths(
+            excerpt.path, instruction_names
+        ):
+            add_instruction(instruction_path)
 
     for path, content in direct_instructions:
         if path not in seen_instruction_paths:

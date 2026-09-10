@@ -9,13 +9,14 @@ from pathlib import Path
 
 from .config import ConfigError, load_config
 from .gitops import GitError, assert_clean, git_root, resolve_commit
+from .llm.chat import validate_endpoint
 from .models import RunStatus
 from .orchestrator import OrchestrationError, run_orchestrator
 from .state import RunStateStore
 
 
 def _endpoint(base_url: str, endpoint_path: str) -> str:
-    return f"{base_url.rstrip('/')}/{endpoint_path.lstrip('/')}"
+    return validate_endpoint(base_url, endpoint_path)
 
 
 def _config_check(config_path: Path) -> int:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import uuid
@@ -11,28 +12,33 @@ from pathlib import Path
 from typing import Any
 
 from .agent.base import AgentError, AgentResult
-from .agent.codex import CodexAgent
+from .agent.codex import AgentCommittedError, CodexAgent
 from .config import load_config
 from .context import build_context, render_context
-from .evidence import DIFF_TOO_LARGE, EvidenceBundle, collect_evidence
+from .evidence import DIFF_TOO_LARGE, SECRET_IN_DIFF, EvidenceBundle, collect_evidence
 from .gitops import (
     GitError,
     assert_clean,
-    commit_staged,
+    candidate_tree_sha,
+    commit_reviewed_tree,
     create_run_worktree,
     current_head,
     git_root,
     index_tree_sha,
+    local_branches,
+    registered_worktrees,
     resolve_commit,
     status_porcelain,
+    symbolic_head,
 )
-from .llm.chat import OpenAIChatTextClient
+from .llm.chat import LLMError, OpenAIChatTextClient
 from .models import HarnessConfig, ReviewRoute, ReviewVerdict, RunStatus
-from .planning import PlanDecision, Planner, TaskPlan
+from .planning import PlanDecision, Planner, PlanParseError, TaskPlan
+from .redaction import config_secret_values, redact, redact_file
 from .result import RunResult, write_repair_task
-from .review import Reviewer, ReviewResult
+from .review import Reviewer, ReviewParseError, ReviewResult, blocking_finding_lines, parse_review
 from .state import RunStateStore
-from .validation import check_result_json
+from .validation import ValidationError, check_result_json
 
 
 class OrchestrationError(RuntimeError):
@@ -40,7 +46,20 @@ class OrchestrationError(RuntimeError):
 
 
 class CommitBoundaryError(OrchestrationError):
-    """The reviewed index or worktree changed before the commit."""
+    """A commit precondition does not hold immediately before the commit."""
+
+
+# Gate failures for which a semantic review is pointless or unsafe: the
+# candidate is empty, unreviewable, not the agent's output, or leaks a secret.
+_DIRECT_FAILURES = frozenset({"EMPTY_DIFF", DIFF_TOO_LARGE, "HEAD_MISMATCH", SECRET_IN_DIFF})
+_COMMIT_SUBJECT_LIMIT = 72
+_MAX_AGENT_REPORT_BYTES = 32_000
+_AGENT_ARTIFACTS = (
+    "agent.events.jsonl",
+    "agent.stderr.log",
+    "agent.final.md",
+    "agent.result.json",
+)
 
 
 def _generated_run_id() -> str:
@@ -56,12 +75,36 @@ def _safe_run_id(value: str) -> str:
         raise OrchestrationError("run_id must be one safe path component")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
         raise OrchestrationError("run_id contains unsupported characters")
+    # The run id is also the last component of the run branch name.
+    if ".." in value or value.endswith(".") or value.endswith(".lock"):
+        raise OrchestrationError("run_id must be a valid Git ref component")
     return value
 
 
 def _slug(value: str) -> str:
     candidate = re.sub(r"[^A-Za-z0-9]+", "-", value.casefold()).strip("-")
     return (candidate[:60] or "task")
+
+
+def _commit_subject(title: str) -> str:
+    """One Git subject line of at most 72 characters from the plan title."""
+
+    first = next((line for line in title.splitlines() if line.strip()), "")
+    subject = " ".join(first.split()).strip("#*_` ") or "MetaHarness change"
+    if len(subject) > _COMMIT_SUBJECT_LIMIT:
+        subject = subject[: _COMMIT_SUBJECT_LIMIT - 3].rstrip() + "..."
+    return subject
+
+
+def _bounded_report(text: str) -> str:
+    """Bound the non-authoritative agent report sent to the reviewer."""
+
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= _MAX_AGENT_REPORT_BYTES:
+        return text
+    head = encoded[:_MAX_AGENT_REPORT_BYTES].decode("utf-8", errors="ignore")
+    omitted = len(encoded) - _MAX_AGENT_REPORT_BYTES
+    return f"{head}\n[... {omitted} bytes truncated; full report in agent.final.md ...]"
 
 
 def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
@@ -101,6 +144,101 @@ def _status_has_unstaged_or_untracked(status: tuple[str, ...]) -> list[str]:
     return problems
 
 
+@dataclasses.dataclass(frozen=True)
+class _GitOwnership:
+    """Git state the implementation agent is not allowed to change."""
+
+    head_ref: str | None
+    head: str
+    branches: frozenset[str]
+    worktrees: frozenset[str]
+
+
+def _git_ownership(repo: Path, worktree: Path) -> _GitOwnership:
+    return _GitOwnership(
+        head_ref=symbolic_head(worktree),
+        head=current_head(worktree),
+        branches=local_branches(repo),
+        worktrees=registered_worktrees(repo),
+    )
+
+
+def _ownership_violations(
+    before: _GitOwnership, after: _GitOwnership, *, branch_ref: str, base_sha: str
+) -> list[str]:
+    problems: list[str] = []
+    if after.head_ref != branch_ref:
+        problems.append(
+            f"worktree HEAD switched from {branch_ref} to {after.head_ref or 'a detached HEAD'}"
+        )
+    if after.head != base_sha:
+        problems.append("worktree HEAD commit changed (commit, merge, reset or rewrite)")
+    created = sorted(after.branches - before.branches)
+    if created:
+        problems.append("branch(es) created: " + ", ".join(created))
+    deleted = sorted(before.branches - after.branches)
+    if deleted:
+        problems.append("branch(es) deleted: " + ", ".join(deleted))
+    added_worktrees = sorted(after.worktrees - before.worktrees)
+    if added_worktrees:
+        problems.append("worktree(s) created: " + ", ".join(added_worktrees))
+    removed_worktrees = sorted(before.worktrees - after.worktrees)
+    if removed_worktrees:
+        problems.append("worktree(s) removed: " + ", ".join(removed_worktrees))
+    return problems
+
+
+def authorize_commit(
+    *,
+    plan: TaskPlan,
+    agent_result: AgentResult,
+    evidence: EvidenceBundle,
+    review: ReviewResult,
+    worktree: Path,
+    base_sha: str,
+    branch_ref: str,
+) -> str:
+    """Single gate in front of the only commit call; return the tree to commit.
+
+    Every precondition is re-derived here, from primary evidence where
+    possible (the reviewer's raw answer is parsed again), immediately before
+    committing.  Any failure raises :class:`CommitBoundaryError`.
+    """
+
+    if plan.decision is not PlanDecision.READY:
+        raise CommitBoundaryError("planner decision is not READY")
+    if agent_result.timed_out or agent_result.exit_code != 0:
+        raise CommitBoundaryError("implementation agent did not exit successfully")
+    if not evidence.deterministic_passed or evidence.failures:
+        raise CommitBoundaryError("deterministic gate did not pass")
+    approved_tree = evidence.staged_tree_sha
+    if not approved_tree:
+        raise CommitBoundaryError("no reviewed tree identity was recorded")
+    try:
+        reparsed = parse_review(review.raw, deterministic_passed=True)
+    except ReviewParseError as exc:
+        raise CommitBoundaryError(f"reviewer answer does not authorize a commit: {exc}") from exc
+    if review.verdict is not ReviewVerdict.PASS or reparsed.verdict is not ReviewVerdict.PASS:
+        raise CommitBoundaryError("reviewer verdict is not PASS")
+    if review.route is not ReviewRoute.NONE or reparsed.route is not ReviewRoute.NONE:
+        raise CommitBoundaryError("reviewer route is not NONE")
+    if blocking_finding_lines(review.raw):
+        raise CommitBoundaryError("reviewer reported a MAJOR or BLOCKER finding")
+
+    if symbolic_head(worktree) != branch_ref:
+        raise CommitBoundaryError("worktree HEAD no longer points to the run branch")
+    if current_head(worktree) != base_sha:
+        raise CommitBoundaryError("HEAD changed after review")
+    if index_tree_sha(worktree) != approved_tree:
+        raise CommitBoundaryError("index changed after review")
+    problems = _status_has_unstaged_or_untracked(status_porcelain(worktree))
+    if problems:
+        raise CommitBoundaryError("; ".join(problems))
+    if candidate_tree_sha(worktree) != approved_tree:
+        raise CommitBoundaryError("working tree differs from the reviewed tree")
+    return approved_tree
+
+
 class Orchestrator:
     """Execute exactly one planner, one implementation agent and one review."""
 
@@ -124,6 +262,7 @@ class Orchestrator:
             allow_format_repair=False,
         )
         self.agent = agent or CodexAgent(config.agent)
+        self._secrets: tuple[str, ...] = ()
 
     def run(self, spec: str | Path, *, run_id: str | None = None) -> RunResult:
         """Run one SPEC and return its durable final state.
@@ -145,6 +284,7 @@ class Orchestrator:
         run_dir = (self.config.runs_root / selected_run_id).expanduser().resolve()
         if run_dir.exists():
             raise OrchestrationError(f"run directory already exists: {run_dir}")
+        self._secrets = config_secret_values(self.config)
 
         store: RunStateStore | None = None
         try:
@@ -172,7 +312,9 @@ class Orchestrator:
         except Exception as exc:
             if store is None:
                 raise
-            state = store.record_failure(_failure_reason(exc), str(exc))
+            state = store.record_failure(
+                _failure_reason(exc), redact(str(exc), self._secrets)
+            )
             return RunResult(run_dir, RunStatus.FAILED, state)
 
     execute = run
@@ -203,6 +345,8 @@ class Orchestrator:
             },
         )
 
+        # The planner receives the SPEC; the implementation agent below only
+        # receives the planner's raw plan.
         plan = self.planner.plan(spec, context, artifacts_dir=run_dir)
         store.update(
             status=RunStatus.PLANNING,
@@ -228,6 +372,7 @@ class Orchestrator:
             worktree_path=worktree_path,
             require_clean_base=self.config.require_clean_base,
         )
+        branch_ref = f"refs/heads/{info.branch}"
         store.update(
             status=RunStatus.WORKTREE_READY,
             branch=info.branch,
@@ -235,14 +380,36 @@ class Orchestrator:
             base_sha=info.base_sha,
         )
 
+        ownership_before = _git_ownership(repo, info.worktree)
         store.update(status=RunStatus.IMPLEMENTING)
-        agent_result = self.agent.run(
-            plan.raw,
-            info.worktree,
-            run_dir,
-            base_sha=base_sha,
+        try:
+            agent_result = self.agent.run(
+                plan.raw,
+                info.worktree,
+                run_dir,
+                base_sha=base_sha,
+            )
+        except AgentCommittedError as exc:
+            # Detected, recorded and preserved: the worktree is never reset.
+            self._redact_agent_artifacts(run_dir)
+            state = store.record_failure("AGENT_COMMITTED", redact(str(exc), self._secrets))
+            return RunResult(run_dir, RunStatus.FAILED, state)
+        self._redact_agent_artifacts(run_dir)
+        agent_result = dataclasses.replace(
+            agent_result,
+            final_message=redact(agent_result.final_message, self._secrets),
+            stderr_tail=redact(agent_result.stderr_tail, self._secrets),
         )
         store.update(status=RunStatus.IMPLEMENTING, agent=_agent_payload(agent_result))
+        violations = _ownership_violations(
+            ownership_before,
+            _git_ownership(repo, info.worktree),
+            branch_ref=branch_ref,
+            base_sha=base_sha,
+        )
+        if violations:
+            state = store.record_failure("AGENT_GIT_VIOLATION", violations)
+            return RunResult(run_dir, RunStatus.FAILED, state)
         if agent_result.timed_out:
             state = store.record_failure("AGENT_TIMEOUT")
             return RunResult(run_dir, RunStatus.FAILED, state)
@@ -258,6 +425,7 @@ class Orchestrator:
             base_sha,
             self.config,
             evidence_dir=run_dir,
+            secrets=self._secrets,
         )
         store.update(
             status=RunStatus.VALIDATING,
@@ -270,12 +438,14 @@ class Orchestrator:
             },
         )
 
-        direct_failures = {"EMPTY_DIFF", DIFF_TOO_LARGE, "HEAD_MISMATCH", "CHECK_MUTATED"}
-        integrity_failures = [item for item in evidence.failures if item in direct_failures]
+        integrity_failures = [
+            item
+            for item in evidence.failures
+            if item in _DIRECT_FAILURES or item.startswith("CHECK_MUTATED:")
+        ]
         if integrity_failures:
-            state = store.record_failure(
-                integrity_failures[0], ", ".join(integrity_failures)
-            )
+            reason = integrity_failures[0].split(":", 1)[0]
+            state = store.record_failure(reason, ", ".join(integrity_failures))
             return RunResult(run_dir, RunStatus.FAILED, state)
 
         gate = _json_text(
@@ -287,6 +457,8 @@ class Orchestrator:
         )
         checks_text = _json_text(_check_payload(evidence))
         store.update(status=RunStatus.REVIEWING)
+        # The reviewer receives SPEC and PLAN so it can route a defect to
+        # IMPLEMENTATION or REPLAN.  Diff, checks and report are review data.
         review = self.reviewer.review(
             spec,
             plan.raw,
@@ -295,7 +467,7 @@ class Orchestrator:
             "\n".join(evidence.changed_files),
             evidence.diff,
             checks_text,
-            agent_result.final_message,
+            _bounded_report(agent_result.final_message),
             # The deterministic gate is evaluated cumulatively below.  Passing
             # it here allows a reviewer PASS to remain a useful diagnostic on
             # a failed check, as required by V0.
@@ -305,6 +477,8 @@ class Orchestrator:
         store.update(status=RunStatus.REVIEWING, review=_review_payload(review))
 
         if review.verdict is ReviewVerdict.REVISE:
+            # V0 never re-implements automatically: REVISE produces an
+            # inspectable repair task and ends the run.
             write_repair_task(
                 run_dir,
                 fields={
@@ -332,29 +506,34 @@ class Orchestrator:
             status=RunStatus.APPROVED,
             approved_tree_sha=evidence.staged_tree_sha,
         )
-        self._assert_commit_boundary(info.worktree, base_sha, evidence)
-        body = self._commit_body(run_id, base_sha, plan, evidence)
-        commit_sha = commit_staged(info.worktree, subject=plan.title, body=body)
+        approved_tree = authorize_commit(
+            plan=plan,
+            agent_result=agent_result,
+            evidence=evidence,
+            review=review,
+            worktree=info.worktree,
+            base_sha=base_sha,
+            branch_ref=branch_ref,
+        )
+        commit_sha = commit_reviewed_tree(
+            info.worktree,
+            tree_sha=approved_tree,
+            parent_sha=base_sha,
+            subject=_commit_subject(plan.title),
+            body=self._commit_body(run_id, base_sha, approved_tree, evidence),
+        )
         state = store.update(status=RunStatus.COMMITTED, commit_sha=commit_sha)
         return RunResult(run_dir, RunStatus.COMMITTED, state)
 
-    @staticmethod
-    def _assert_commit_boundary(
-        worktree: Path, base_sha: str, evidence: EvidenceBundle
-    ) -> None:
-        if current_head(worktree) != base_sha:
-            raise CommitBoundaryError("HEAD changed after review")
-        if index_tree_sha(worktree) != evidence.staged_tree_sha:
-            raise CommitBoundaryError("index changed after review")
-        problems = _status_has_unstaged_or_untracked(status_porcelain(worktree))
-        if problems:
-            raise CommitBoundaryError("; ".join(problems))
+    def _redact_agent_artifacts(self, run_dir: Path) -> None:
+        for name in _AGENT_ARTIFACTS:
+            redact_file(run_dir / name, self._secrets)
 
     def _commit_body(
         self,
         run_id: str,
         base_sha: str,
-        plan: TaskPlan,
+        tree_sha: str,
         evidence: EvidenceBundle,
     ) -> str:
         checks = self.config.checks
@@ -372,6 +551,7 @@ class Orchestrator:
                 "",
                 f"Run: {run_id}",
                 f"Base: {base_sha}",
+                f"Reviewed tree: {tree_sha}",
                 f"Planner: {self.config.planner.model}",
                 f"Implementer: {self.config.agent.model} / {self.config.agent.effort}",
                 f"Reviewer: {self.config.reviewer.model}",
@@ -383,12 +563,20 @@ class Orchestrator:
 
 
 def _failure_reason(exc: Exception) -> str:
+    if isinstance(exc, CommitBoundaryError):
+        return "TOCTOU_FAILURE"
     if isinstance(exc, GitError):
         return "GIT_FAILURE"
     if isinstance(exc, AgentError):
         return getattr(exc, "code", "AGENT_FAILURE")
-    if isinstance(exc, CommitBoundaryError):
-        return "TOCTOU_FAILURE"
+    if isinstance(exc, PlanParseError):
+        return "PLANNER_OUTPUT_INVALID"
+    if isinstance(exc, ReviewParseError):
+        return "REVIEWER_OUTPUT_INVALID"
+    if isinstance(exc, LLMError):
+        return "LLM_FAILURE"
+    if isinstance(exc, ValidationError):
+        return "CHECK_SETUP_INVALID"
     return exc.__class__.__name__.upper()
 
 
@@ -408,5 +596,6 @@ __all__ = [
     "CommitBoundaryError",
     "OrchestrationError",
     "Orchestrator",
+    "authorize_commit",
     "run_orchestrator",
 ]

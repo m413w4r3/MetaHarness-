@@ -8,6 +8,7 @@ import tomllib
 from pathlib import Path
 from typing import Any, Mapping
 
+from .llm.chat import PROTECTED_BODY_KEYS, LLMProtocolError, validate_endpoint
 from .models import (
     AgentConfig,
     CheckConfig,
@@ -31,30 +32,19 @@ _KNOWN_SANDBOXES = frozenset({
 
 
 def _expand_string(value: str) -> str:
-    """Expand environment variables, including variables referring to others."""
+    """Expand ``${NAME}`` references in one non-recursive pass.
 
-    current = value
-    seen: set[str] = set()
-    while True:
-        matches = tuple(_ENV_VAR.finditer(current))
-        if not matches:
-            return current
-        if current in seen:
-            raise ConfigError(f"cyclic environment expansion involving {value!r}")
-        seen.add(current)
+    A value taken from the environment is inserted literally: a ``${...}``
+    sequence inside it is never expanded again.
+    """
 
-        def replace(match: re.Match[str]) -> str:
-            name = match.group(1)
-            if name not in os.environ:
-                raise ConfigError(
-                    f"environment variable {name!r} is not set"
-                )
-            return os.environ[name]
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in os.environ:
+            raise ConfigError(f"environment variable {name!r} is not set")
+        return os.environ[name]
 
-        expanded = _ENV_VAR.sub(replace, current)
-        if expanded == current:
-            raise ConfigError(f"cyclic environment expansion involving {value!r}")
-        current = expanded
+    return _ENV_VAR.sub(replace, value)
 
 
 def _expand(value: Any) -> Any:
@@ -165,9 +155,19 @@ def _endpoint(data: Mapping[str, Any], name: str) -> LLMEndpointConfig:
     api_key_env = _optional_env_name(data, "api_key_env", None, name)
     timeout_seconds = _positive_int(data, "timeout_seconds", 300, name)
     retries = _nonnegative_int(data, "retries", 2, name)
+    try:
+        validate_endpoint(base_url, endpoint_path)
+    except LLMProtocolError as exc:
+        raise ConfigError(f"{name}: {exc}") from None
     extra_body = data.get("extra_body", {})
     if not isinstance(extra_body, dict):
         raise ConfigError(f"{name}.extra_body must be a table")
+    protected = PROTECTED_BODY_KEYS.intersection(extra_body)
+    if protected:
+        raise ConfigError(
+            f"{name}.extra_body cannot override protected request keys: "
+            + ", ".join(sorted(protected))
+        )
     return LLMEndpointConfig(
         base_url=base_url,
         endpoint_path=endpoint_path,

@@ -133,6 +133,35 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "locator_argv must be an array"):
                 load_config(self.write_config(Path(directory_name), contents))
 
+    def test_environment_expansion_is_not_recursive(self) -> None:
+        os.environ["META_PLANNER_MODEL"] = "model-${META_NESTED}"
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name)))
+        self.assertEqual(config.planner.model, "model-${META_NESTED}")
+
+    def test_endpoint_urls_are_validated_at_load(self) -> None:
+        for base_url, endpoint_path, message in (
+            ("file:///etc", "/v1/chat", "http"),
+            ("https://user:secret@planner.example", "/v1/chat", "credentials"),
+            ("https://planner.example", "https://evil.example/v1", "path"),
+            ("https://planner.example", "/v1/../admin", r"\.\."),
+        ):
+            os.environ["META_PLANNER_BASE_URL"] = base_url
+            os.environ["META_PLANNER_ENDPOINT"] = endpoint_path
+            with self.subTest(base_url=base_url, endpoint_path=endpoint_path):
+                with tempfile.TemporaryDirectory() as directory_name:
+                    with self.assertRaisesRegex(ConfigError, message) as raised:
+                        load_config(self.write_config(Path(directory_name)))
+                self.assertNotIn("secret", str(raised.exception))
+
+    def test_extra_body_cannot_override_the_wire_contract(self) -> None:
+        for key in ("messages", "response_format", "stream", "tools"):
+            contents = VALID_CONFIG.replace("new_chat = true", f"{key} = true")
+            with self.subTest(key=key):
+                with tempfile.TemporaryDirectory() as directory_name:
+                    with self.assertRaisesRegex(ConfigError, "protected"):
+                        load_config(self.write_config(Path(directory_name), contents))
+
     def test_empty_limits_and_unknown_sandbox_are_rejected(self) -> None:
         for replacement, message in (
             ('max_hits = 8', 'max_hits must be greater'),

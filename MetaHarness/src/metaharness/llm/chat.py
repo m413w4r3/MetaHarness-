@@ -1,12 +1,21 @@
-"""Transport HTTP minimal pour les endpoints OpenAI-compatible texte."""
+"""Transport HTTP minimal pour les endpoints OpenAI-compatible texte.
+
+Contrat : ``POST`` sur un endpoint configurable, exactement un message
+``user``, ``stream=false``, réponse lue dans ``choices[0].message.content``.
+Aucun message système, aucun ``response_format``, aucune sortie JSON exigée
+du modèle.  La clé API n'apparaît jamais dans une exception, un état ou un
+artefact.
+"""
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
@@ -35,11 +44,40 @@ class TextLLMResult:
 
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
-_PROTECTED_BODY_KEYS = frozenset(
-    {"messages", "stream", "model", "response_format"}
+# Keys that would change the wire contract (message list, streaming, model,
+# structured or tool output) cannot come from static extra_body.
+PROTECTED_BODY_KEYS = frozenset(
+    {
+        "messages",
+        "stream",
+        "stream_options",
+        "model",
+        "response_format",
+        "tools",
+        "tool_choice",
+        "functions",
+        "function_call",
+    }
 )
+_PROTECTED_BODY_KEYS = PROTECTED_BODY_KEYS
 _MAX_BACKOFF_SECONDS = 1.0
 _INITIAL_BACKOFF_SECONDS = 0.05
+_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "content_filter"})
+_TEXT_PART_TYPES = frozenset({"text", "output_text"})
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: a POST must not be replayed elsewhere, and the
+    Authorization header must never be forwarded to another location."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_NoRedirect)
 
 
 class OpenAIChatTextClient:
@@ -48,41 +86,35 @@ class OpenAIChatTextClient:
     def __init__(self, config: LLMEndpointConfig):
         self.config = config
         self._url = _join_url(config.base_url, config.endpoint_path)
-        conflicting_keys = _PROTECTED_BODY_KEYS.intersection(config.extra_body)
+        conflicting_keys = PROTECTED_BODY_KEYS.intersection(config.extra_body)
         if conflicting_keys:
             keys = ", ".join(sorted(conflicting_keys))
             raise LLMProtocolError(
                 f"extra_body cannot override protected request keys: {keys}"
             )
+        self._opener = _opener()
 
     def complete(self, prompt: str) -> TextLLMResult:
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
 
-        payload: dict[str, Any] = {
-            "model": self.config.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            "stream": False,
-        }
-        payload.update(self.config.extra_body)
+        payload: dict[str, Any] = dict(self.config.extra_body)
+        # Protected keys are written last: even a mutated extra_body cannot
+        # replace the single user message or the non-streaming contract.
+        payload.update(
+            {
+                "model": self.config.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            }
+        )
 
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
         if self.config.api_key_env is not None:
-            try:
-                api_key = os.environ[self.config.api_key_env]
-            except KeyError as exc:
-                raise LLMError(
-                    f"API key environment variable {self.config.api_key_env!r} is not set"
-                ) from exc
-            headers["Authorization"] = f"Bearer {api_key}"
+            headers["Authorization"] = f"Bearer {_api_key(self.config.api_key_env)}"
 
         request = urllib.request.Request(
             self._url,
@@ -97,10 +129,11 @@ class OpenAIChatTextClient:
         attempts = self.config.retries + 1
         for attempt in range(attempts):
             try:
-                with urllib.request.urlopen(
+                deadline = time.monotonic() + self.config.timeout_seconds
+                with self._opener.open(
                     request, timeout=self.config.timeout_seconds
                 ) as response:
-                    body = response.read()
+                    body = _read_bounded(response, deadline)
             except urllib.error.HTTPError as exc:
                 status = exc.code
                 try:
@@ -113,12 +146,24 @@ class OpenAIChatTextClient:
                 raise LLMHTTPError(
                     f"LLM endpoint returned HTTP {status} after {attempt + 1} attempt(s)"
                 ) from None
+            except LLMError:
+                raise
             except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
                 if _is_timeout_error(exc):
                     message = "LLM request timed out"
                 else:
-                    message = "LLM request failed before receiving an HTTP response"
+                    reason = getattr(exc, "reason", exc)
+                    message = (
+                        "LLM request failed before receiving an HTTP response "
+                        f"({type(reason).__name__})"
+                    )
                 raise LLMHTTPError(message) from None
+            except (http.client.HTTPException, ValueError) as exc:
+                # http.client errors (and invalid header values) can embed
+                # request data; only the class name is reported.
+                raise LLMHTTPError(
+                    f"LLM request failed ({type(exc).__name__})"
+                ) from None
 
             try:
                 decoded = json.loads(body.decode("utf-8"))
@@ -133,9 +178,69 @@ class OpenAIChatTextClient:
         raise LLMHTTPError("LLM endpoint request failed")  # pragma: no cover
 
 
+def _api_key(env_name: str) -> str:
+    try:
+        api_key = os.environ[env_name]
+    except KeyError:
+        raise LLMError(
+            f"API key environment variable {env_name!r} is not set"
+        ) from None
+    # A control character or space would make http.client raise an error that
+    # quotes the header value; reject it here without echoing the value.
+    if not api_key or any(not 0x21 <= ord(character) <= 0x7E for character in api_key):
+        raise LLMError(
+            f"API key environment variable {env_name!r} contains an invalid value"
+        )
+    return api_key
+
+
+def _read_bounded(response: Any, deadline: float) -> bytes:
+    """Read a response body under a total deadline and a size bound."""
+
+    # ``read1`` returns after one underlying read, so the deadline is checked
+    # even when a server trickles bytes; ``read(n)`` would wait for n bytes.
+    read = getattr(response, "read1", response.read)
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        if time.monotonic() > deadline:
+            raise LLMHTTPError("LLM request timed out")
+        chunk = read(_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > _MAX_RESPONSE_BYTES:
+            raise LLMProtocolError("LLM endpoint response is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def validate_endpoint(base_url: str, endpoint_path: str) -> str:
+    """Return the joined request URL or raise :class:`LLMProtocolError`."""
+
+    return _join_url(base_url, endpoint_path)
+
+
 def _join_url(base_url: str, endpoint_path: str) -> str:
     if not isinstance(base_url, str) or not isinstance(endpoint_path, str):
         raise TypeError("base_url and endpoint_path must be strings")
+    for label, value in (("base_url", base_url), ("endpoint_path", endpoint_path)):
+        if any(ord(character) < 0x21 or ord(character) == 0x7F for character in value):
+            raise LLMProtocolError(f"{label} must not contain whitespace or control characters")
+    base = urllib.parse.urlsplit(base_url)
+    if base.scheme not in {"http", "https"} or not base.hostname:
+        raise LLMProtocolError("base_url must be an absolute http(s) URL")
+    if base.username is not None or base.password is not None:
+        raise LLMProtocolError("base_url must not embed credentials; use api_key_env")
+    if base.query or base.fragment:
+        raise LLMProtocolError("base_url must not contain a query or fragment")
+    endpoint = urllib.parse.urlsplit(endpoint_path)
+    if endpoint.scheme or endpoint.netloc or endpoint_path.startswith("//"):
+        raise LLMProtocolError("endpoint_path must be a path, not a URL")
+    if endpoint.fragment:
+        raise LLMProtocolError("endpoint_path must not contain a fragment")
+    if any(segment in {".", ".."} for segment in endpoint.path.split("/")):
+        raise LLMProtocolError("endpoint_path must not contain . or .. segments")
     return f"{base_url.rstrip('/')}/{endpoint_path.lstrip('/')}"
 
 
@@ -161,6 +266,12 @@ def _parse_completion_response(response: dict[str, Any]) -> TextLLMResult:
     first_choice = choices[0]
     if not isinstance(first_choice, dict):
         raise LLMProtocolError("LLM response first choice must be an object")
+    finish_reason = first_choice.get("finish_reason")
+    if isinstance(finish_reason, str) and finish_reason in _TRUNCATED_FINISH_REASONS:
+        # A truncated plan or review may still look well formed; never use it.
+        raise LLMProtocolError(
+            f"LLM response is incomplete (finish_reason={finish_reason})"
+        )
     message = first_choice.get("message")
     if not isinstance(message, dict):
         raise LLMProtocolError("LLM response choice is missing a message object")
@@ -168,9 +279,11 @@ def _parse_completion_response(response: dict[str, Any]) -> TextLLMResult:
         raise LLMProtocolError("LLM response message is missing content")
     text = _extract_text_content(message["content"])
 
+    # Model and usage are informational: a provider-specific shape must not
+    # make an otherwise valid text answer unusable.
     model = response.get("model")
-    if model is not None and not isinstance(model, str):
-        raise LLMProtocolError("LLM response model must be a string or null")
+    if not isinstance(model, str):
+        model = None
 
     return TextLLMResult(
         text=text,
@@ -185,6 +298,8 @@ def _extract_text_content(content: Any) -> str:
         if not content.strip():
             raise LLMProtocolError("LLM response content contains no usable text")
         return content
+    if content is None:
+        raise LLMProtocolError("LLM response content is null (no text answer)")
     if not isinstance(content, list):
         raise LLMProtocolError("LLM response content must be text or text parts")
     if not content:
@@ -192,7 +307,7 @@ def _extract_text_content(content: Any) -> str:
 
     parts: list[str] = []
     for index, part in enumerate(content):
-        if not isinstance(part, dict) or part.get("type") != "text":
+        if not isinstance(part, dict) or part.get("type") not in _TEXT_PART_TYPES:
             raise LLMProtocolError(
                 f"LLM response content part {index} is not a standard text part"
             )
@@ -209,10 +324,8 @@ def _extract_text_content(content: Any) -> str:
 
 
 def _normalize_usage(value: Any) -> dict[str, int]:
-    if value is None:
-        return {}
     if not isinstance(value, dict):
-        raise LLMProtocolError("LLM response usage must be an object")
+        return {}
 
     usage: dict[str, int] = {}
     for canonical, aliases in (
@@ -221,12 +334,8 @@ def _normalize_usage(value: Any) -> dict[str, int]:
         ("total_tokens", ("total_tokens",)),
     ):
         for alias in aliases:
-            if alias in value:
-                number = value[alias]
-                if isinstance(number, bool) or not isinstance(number, int):
-                    raise LLMProtocolError(
-                        f"LLM response usage field {alias!r} must be an integer"
-                    )
+            number = value.get(alias)
+            if isinstance(number, int) and not isinstance(number, bool):
                 usage[canonical] = number
                 break
     return usage

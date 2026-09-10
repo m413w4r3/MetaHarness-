@@ -4,17 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import signal
 import subprocess
-import threading
-import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
 from ..gitops import GitError, current_head
 from ..models import AgentConfig
+from ..procutil import run_bounded
 from .base import AgentError, AgentResult
 from .events import extract_final, extract_usage, parse_event
 
@@ -30,9 +27,9 @@ class AgentCommittedError(AgentError):
         self.actual = actual
 
 
-_END = object()
-_POLL_SECONDS = 0.2
 _DEFAULT_TAIL_BYTES = 16_384
+# Longer JSONL lines are kept in the artifact but not parsed in memory.
+_MAX_EVENT_LINE_BYTES = 8 * 1024 * 1024
 
 
 def _template_path() -> Path:
@@ -61,25 +58,34 @@ def _tail(path: Path, limit: int) -> str:
         return stream.read(limit).decode("utf-8", errors="replace")
 
 
-def _kill_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
-    try:
-        os.killpg(process.pid, sig)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        # The process may have exited between poll() and killpg().
-        if process.poll() is None:
-            raise
+def _scan_events(path: Path) -> tuple[dict[str, int], str | None]:
+    """Extract usage and final message from a JSONL file with bounded memory."""
 
-
-def _read_stdout(stream: Any, output: queue.Queue[object]) -> None:
-    try:
-        for line in stream:
-            output.put(line)
-    except (OSError, ValueError):
-        pass
-    finally:
-        output.put(_END)
+    usage: dict[str, int] = {}
+    final: str | None = None
+    if not path.exists():
+        return usage, final
+    with path.open("rb") as stream:
+        skipping = False
+        while True:
+            chunk = stream.readline(_MAX_EVENT_LINE_BYTES)
+            if not chunk:
+                break
+            complete = chunk.endswith(b"\n")
+            if skipping or (not complete and len(chunk) >= _MAX_EVENT_LINE_BYTES):
+                # Remainder (or head) of an oversized line: not parseable.
+                skipping = not complete
+                continue
+            event = parse_event(chunk.decode("utf-8", errors="replace"))
+            if event is None:
+                continue
+            found_usage = extract_usage(event)
+            if found_usage is not None:
+                usage = found_usage
+            found_final = extract_final(event)
+            if found_final is not None:
+                final = found_final
+    return usage, final
 
 
 class CodexAgent:
@@ -146,6 +152,7 @@ class CodexAgent:
                 [self.executable, "exec", "--help"],
                 capture_output=True,
                 text=True,
+                stdin=subprocess.DEVNULL,
                 timeout=20,
                 shell=False,
                 check=False,
@@ -187,13 +194,10 @@ class CodexAgent:
             raise AgentError("worktree HEAD does not match the agent base SHA")
 
         argv = self.build_argv(worktree_path, final_path)
-        exit_code, timed_out, usage, event_final = self._execute(
-            argv,
-            prompt,
-            worktree_path,
-            events_path,
-            stderr_path,
+        exit_code, timed_out = self._execute(
+            argv, prompt_path, worktree_path, events_path, stderr_path
         )
+        usage, event_final = _scan_events(events_path)
 
         actual_head = self._head(worktree_path)
         if actual_head != expected_head:
@@ -230,120 +234,37 @@ class CodexAgent:
     def _execute(
         self,
         argv: list[str],
-        prompt: str,
+        prompt_path: Path,
         worktree: Path,
         events_path: Path,
         stderr_path: Path,
-    ) -> tuple[int, bool, dict[str, int], str | None]:
+    ) -> tuple[int, bool]:
+        """Run Codex with file-backed stdin/stdout/stderr and a hard deadline.
+
+        Nothing here blocks on a pipe: the prompt is read from a file, events
+        are written to a file, and the deadline is enforced by polling the
+        process.  On timeout the process group receives SIGINT, then SIGKILL
+        after the grace period; leftover background processes are always
+        terminated once Codex exits.
+        """
+
         events_path.parent.mkdir(parents=True, exist_ok=True)
-        output: queue.Queue[object] = queue.Queue()
-        usage: dict[str, int] = {}
-        event_final: str | None = None
-        timed_out = False
-        process: subprocess.Popen[str] | None = None
-
-        with stderr_path.open("w", encoding="utf-8", errors="replace") as stderr_file:
-            try:
-                process = subprocess.Popen(
+        try:
+            with prompt_path.open("rb") as stdin, events_path.open(
+                "wb"
+            ) as stdout, stderr_path.open("wb") as stderr:
+                return run_bounded(
                     argv,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=stderr_file,
-                    cwd=str(worktree),
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    start_new_session=True,
+                    cwd=worktree,
+                    timeout_seconds=self.config.timeout_seconds,
+                    stdin=stdin,
+                    stdout=stdout,
+                    stderr=stderr,
+                    interrupt_signal=signal.SIGINT,
+                    grace_seconds=self.interrupt_grace_seconds,
                 )
-            except (OSError, ValueError) as exc:
-                raise AgentError(f"could not start Codex: {exc}") from exc
-
-            assert process.stdin is not None
-            assert process.stdout is not None
-            reader = threading.Thread(
-                target=_read_stdout, args=(process.stdout, output), daemon=True
-            )
-            reader.start()
-            try:
-                try:
-                    process.stdin.write(prompt)
-                    process.stdin.close()
-                except (BrokenPipeError, OSError, ValueError):
-                    # The exit code and stderr remain the authoritative failure.
-                    try:
-                        process.stdin.close()
-                    except (OSError, ValueError):
-                        pass
-
-                with events_path.open("w", encoding="utf-8") as events_file:
-                    eof = False
-                    deadline = time.monotonic() + self.config.timeout_seconds
-                    grace_deadline: float | None = None
-                    while True:
-                        now = time.monotonic()
-                        if not timed_out and now >= deadline:
-                            timed_out = True
-                            grace_deadline = now + self.interrupt_grace_seconds
-                            _kill_process_group(process, signal.SIGINT)
-
-                        if (
-                            timed_out
-                            and grace_deadline is not None
-                            and now >= grace_deadline
-                        ):
-                            _kill_process_group(process, signal.SIGKILL)
-                            grace_deadline = None
-
-                        wait = _POLL_SECONDS
-                        if not timed_out:
-                            wait = min(wait, max(0.0, deadline - now))
-                        elif grace_deadline is not None:
-                            wait = min(wait, max(0.0, grace_deadline - now))
-                        try:
-                            item = output.get(timeout=wait)
-                        except queue.Empty:
-                            item = None
-
-                        if item is not None:
-                            if item is _END:
-                                eof = True
-                            else:
-                                line = str(item)
-                                events_file.write(line)
-                                events_file.flush()
-                                event = parse_event(line)
-                                if event is not None:
-                                    found_usage = extract_usage(event)
-                                    if found_usage is not None:
-                                        usage = found_usage
-                                    found_final = extract_final(event)
-                                    if found_final is not None:
-                                        event_final = found_final
-
-                        if process.poll() is not None and output.empty() and (
-                            eof or not timed_out
-                        ):
-                            if not eof:
-                                # A child that inherited stdout can otherwise
-                                # keep the reader blocked after the CLI exits.
-                                try:
-                                    process.stdout.close()
-                                except (OSError, ValueError):
-                                    pass
-                            break
-
-                    exit_code = process.wait()
-            finally:
-                if process.poll() is None:
-                    _kill_process_group(process, signal.SIGKILL)
-                reader.join(timeout=1.0)
-                try:
-                    process.stdout.close()
-                except (OSError, ValueError):
-                    pass
-
-        return exit_code, timed_out, usage, event_final
+        except (OSError, ValueError) as exc:
+            raise AgentError(f"could not start Codex: {exc}") from exc
 
 
 def run_codex(

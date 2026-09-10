@@ -22,9 +22,25 @@ choices[0].message.content
 ```
 
 V0 deliberately does not require JSON output, a `system` role, or a
-`response_format` field; `response_format` is rejected if supplied through
-`extra_body` as well. Structured Outputs are intentionally unused so the
+`response_format` field. Structured Outputs are intentionally unused so the
 planner and reviewer have the same wire contract on every backend.
+
+Transport rules:
+
+- `extra_body` is static and validated at config load; it cannot set
+  `messages`, `stream`, `stream_options`, `model`, `response_format`,
+  `tools`, `tool_choice`, `functions` or `function_call`.
+- `base_url` must be an absolute `http(s)` URL without credentials, query or
+  fragment; `endpoint_path` must be a path without `.`/`..` segments.
+- Text is read from `choices[0].message.content` as a string or a list of
+  `text`/`output_text` parts. Missing, null or non-text content, and
+  `finish_reason` `length`/`content_filter`, are protocol errors. `model` and
+  `usage` are informational and tolerated in any shape.
+- Redirects are never followed (the key is never forwarded elsewhere).
+- `timeout_seconds` bounds each attempt, including a slowly trickled body;
+  responses above 32 MiB are rejected.
+- Only HTTP 408, 429, 500, 502, 503 and 504 are retried, at most `retries`
+  times; 401/403 and network failures are not retried.
 
 ## ChatGPT bridge
 

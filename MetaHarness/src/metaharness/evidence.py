@@ -11,6 +11,7 @@ from typing import Any
 
 from .gitops import current_head, index_tree_sha, stage_all, staged_changed_files, staged_diff
 from .models import HarnessConfig
+from .redaction import contains_secret, redact
 from .validation import (
     DEFAULT_TAIL_BYTES,
     CheckResult,
@@ -20,6 +21,7 @@ from .validation import (
 
 
 DIFF_TOO_LARGE = "DIFF_TOO_LARGE"
+SECRET_IN_DIFF = "SECRET_IN_DIFF"
 
 
 @dataclass(frozen=True)
@@ -86,27 +88,40 @@ def _log_stems(checks: tuple[CheckResult, ...]) -> tuple[str, ...]:
     return tuple(stems)
 
 
-def persist_evidence(bundle: EvidenceBundle, evidence_dir: str | Path) -> None:
-    """Persist full diff/log artifacts and reviewer-safe JSON metadata."""
+def persist_evidence(
+    bundle: EvidenceBundle,
+    evidence_dir: str | Path,
+    *,
+    write_logs: bool = True,
+    secrets: tuple[str, ...] = (),
+) -> None:
+    """Persist full diff/log artifacts and reviewer-safe JSON metadata.
+
+    ``write_logs=False`` keeps the complete log files already written by
+    :func:`run_checks` instead of replacing them with in-memory copies.
+    """
 
     directory = Path(evidence_dir).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
     stems = _log_stems(bundle.checks)
     checks_dir = directory / "checks"
     checks_dir.mkdir(parents=True, exist_ok=True)
-    for check, stem in zip(bundle.checks, stems):
-        _write_atomic(checks_dir / f"{stem}.stdout.log", check.stdout_log)
-        _write_atomic(checks_dir / f"{stem}.stderr.log", check.stderr_log)
+    if write_logs:
+        for check, stem in zip(bundle.checks, stems):
+            _write_atomic(checks_dir / f"{stem}.stdout.log", redact(check.stdout_log, secrets))
+            _write_atomic(checks_dir / f"{stem}.stderr.log", redact(check.stderr_log, secrets))
 
     checks_payload = [
         check_result_json(check, log_stem=stem)
         for check, stem in zip(bundle.checks, stems)
     ]
     _write_atomic(directory / "checks.json", _json_text(checks_payload))
-    _write_atomic(directory / "diff.patch", bundle.diff)
+    diff = redact(bundle.diff, secrets)
+    _write_atomic(directory / "diff.patch", diff)
     changed_files = "".join(f"{path}\n" for path in bundle.changed_files)
     _write_atomic(directory / "changed-files.txt", changed_files)
     evidence_payload = asdict(bundle)
+    evidence_payload["diff"] = diff
     evidence_payload["changed_files"] = list(bundle.changed_files)
     evidence_payload["checks"] = checks_payload
     evidence_payload["failures"] = list(bundle.failures)
@@ -137,6 +152,7 @@ def collect_evidence(
     *,
     evidence_dir: str | Path | None = None,
     tail_bytes: int = DEFAULT_TAIL_BYTES,
+    secrets: tuple[str, ...] = (),
 ) -> EvidenceBundle:
     """Run all configured checks, then stage and freeze the submitted tree."""
 
@@ -156,7 +172,9 @@ def collect_evidence(
         else:
             raise EvidenceError("evidence_dir must be outside the worktree")
         logs_dir = evidence_path / "checks"
-    checks = run_checks(root, config, logs_dir=logs_dir, tail_bytes=tail_bytes)
+    checks = run_checks(
+        root, config, logs_dir=logs_dir, tail_bytes=tail_bytes, secrets=secrets
+    )
 
     head_matches = current_head(root) == base_sha
     # This is intentionally after every check, including failed checks, so the
@@ -172,15 +190,20 @@ def collect_evidence(
         changed_files=changed_files,
         max_diff_bytes=config.max_diff_bytes,
     )
+    if contains_secret(diff, secrets):
+        # The diff would be sent to the reviewer endpoint and persisted.
+        failures.append(SECRET_IN_DIFF)
     for check, check_config in zip(checks, config.checks):
+        # A mutation changes the code that is reviewed, whatever the check's
+        # importance: it always closes the gate.
+        if check.workspace_mutated:
+            failures.append(f"CHECK_MUTATED:{check.name}")
         if not check_config.required:
             continue
         if check.timed_out:
             failures.append(f"CHECK_TIMEOUT:{check.name}")
         elif check.exit_code != 0:
             failures.append(f"CHECK_FAILED:{check.name}")
-        if check.workspace_mutated:
-            failures.append(f"CHECK_MUTATED:{check.name}")
 
     bundle = EvidenceBundle(
         base_sha=base_sha,
@@ -192,7 +215,7 @@ def collect_evidence(
         failures=tuple(failures),
     )
     if evidence_dir is not None:
-        persist_evidence(bundle, evidence_dir)
+        persist_evidence(bundle, evidence_dir, write_logs=False, secrets=secrets)
     return bundle
 
 

@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .llm.chat import TextLLMResult
-from .llm.wire import AmbiguousFieldError, WireParseError, parse_labeled_document
+from .llm.wire import (
+    AmbiguousFieldError,
+    WireParseError,
+    control_tokens,
+    fence_lines,
+    parse_labeled_document,
+)
 from .models import ReviewRoute, ReviewVerdict
 
 
@@ -57,8 +63,9 @@ _FIELD_ALIASES = {
 _SECTION_ALIASES = _FIELD_ALIASES
 _KNOWN_VERDICTS = frozenset(item.value for item in ReviewVerdict)
 _KNOWN_ROUTES = frozenset(item.value for item in ReviewRoute)
-_EMPTY_VALUES = frozenset({"", "none", "n/a", "na", "-", "—"})
+_EMPTY_VALUES = frozenset({"", "none", "n/a", "na", "-", "—", "nil"})
 _END_MARKER = "end meta review"
+_CONTROL_FIELDS = frozenset({"verdict", "route"})
 
 
 def _prompt_template_path() -> Path:
@@ -120,74 +127,20 @@ def _normalise_scalar(value: str) -> str:
     return " ".join(value.strip().split()).casefold()
 
 
-def _fence_opening(line: str) -> tuple[str, int] | None:
-    match = re.match(r"^\s*(`{3,}|~{3,})(?P<info>[^`]*)$", line)
-    if match is None:
-        return None
-    return match.group(1)[0], len(match.group(1))
+def _control_value(document: Any, name: str, known: frozenset[str]) -> str:
+    """Return the one explicit control token for *name* or fail closed."""
 
-
-def _fence_closing(line: str, fence: tuple[str, int]) -> bool:
-    character, length = fence
-    return re.match(rf"^\s*{re.escape(character)}{{{length},}}\s*$", line) is not None
-
-
-def _bare_section_labels(text: str) -> str:
-    """Make the prompt's bare section labels visible to the wire parser."""
-
-    labels = {
-        alias.strip().casefold()
-        for aliases in _SECTION_ALIASES.values()
-        for alias in aliases
-    }
-    lines = text.splitlines()
-    nonempty = [index for index, line in enumerate(lines) if line.strip()]
-    wrapper: tuple[int, int] | None = None
-    if len(nonempty) >= 2:
-        first, last = nonempty[0], nonempty[-1]
-        opening = _fence_opening(lines[first])
-        if opening is not None and _fence_closing(lines[last], opening):
-            info = lines[first].strip()[len("`" * opening[1]) :].strip().casefold()
-            if info in {"", "markdown", "md", "text", "txt"}:
-                wrapper = (first, last)
-
-    transformed: list[str] = []
-    fence: tuple[str, int] | None = None
-    for index, line in enumerate(lines):
-        if wrapper and index in wrapper:
-            transformed.append(line)
-            continue
-        if fence is not None:
-            transformed.append(line)
-            if _fence_closing(line, fence):
-                fence = None
-            continue
-        opening = _fence_opening(line)
-        if opening is not None:
-            transformed.append(line)
-            fence = opening
-            continue
-        candidate = re.sub(r"^[-*+]\s+", "", line.strip())
-        if candidate.casefold() in labels:
-            transformed.append(f"## {candidate}")
-        else:
-            transformed.append(line)
-    return "\n".join(transformed)
-
-
-def _enum_values(value: str, known: frozenset[str]) -> tuple[str, ...]:
-    """Return explicit enum tokens found in a labeled value."""
-
-    values: list[str] = []
-    for line in value.splitlines() or [value]:
-        candidate = line.strip()
-        candidate = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", candidate)
-        candidate = candidate.strip("`*_[]() ")
-        tokens = re.findall(r"\b(?:PASS|REVISE|FAIL|NONE|IMPLEMENTATION|REPLAN|HUMAN)\b", candidate.upper())
-        for token in tokens:
-            if token in known and token not in values:
-                values.append(token)
-    return tuple(values)
+    try:
+        candidates = list(control_tokens(document.fields.get(name, ""), known))
+        candidates.extend(control_tokens(document.sections.get(name, ""), known))
+    except WireParseError as exc:
+        raise ReviewParseError(f"invalid {name.upper()}: {exc}") from exc
+    unique = tuple(dict.fromkeys(candidates))
+    if not unique:
+        raise ReviewParseError(f"missing {name.upper()}")
+    if len(unique) != 1:
+        raise ReviewParseError(f"conflicting {name.upper()} values")
+    return unique[0]
 
 
 def _field_or_section(
@@ -204,30 +157,75 @@ def _field_or_section(
     ).strip()
 
 
-def _structured_major_or_blocker(findings: str) -> bool:
-    """Detect severity-prefixed finding records, not prose mentions."""
+_BLOCKING_TAGS = (
+    # "Severity: MAJOR", "severity = **blocker**"
+    re.compile(
+        r"\bseverity\s*[*_`]*\s*[:=]\s*[*_`\[(]*\s*(?:major|blocker|critical|high)\b[*_`\])]*",
+        re.IGNORECASE,
+    ),
+    # "[MAJOR]", "(BLOCKER)"
+    re.compile(r"[\[(]\s*(?:major|blocker|critical)\s*[\])]", re.IGNORECASE),
+    # "**MAJOR**", "__BLOCKER:__"
+    re.compile(r"(\*\*|__)\s*(?:major|blocker|critical)\s*:?\s*\1", re.IGNORECASE),
+    # "MAJOR | area | ...", "BLOCKER: ...", "MAJOR — ...", bare "MAJOR"
+    re.compile(
+        r"^[*_`]*(?:major|blocker|critical)[*_`]*(?=\s*(?:[|:\-–—]|$))",
+        re.IGNORECASE,
+    ),
+)
+_NEGATED_REST = re.compile(r"^(?:none\b|no\b|n/?a\b|nil\b|0\b)", re.IGNORECASE)
+# "FINDINGS: MAJOR | ..." carries its first record on the label line itself.
+_LABEL_PREFIX = re.compile(
+    r"^[*_`]*(?:"
+    + "|".join(
+        re.escape(alias) for aliases in _FIELD_ALIASES.values() for alias in aliases
+    )
+    + r")[*_`]*\s*[:=]\s*[*_`]*\s*",
+    re.IGNORECASE,
+)
 
-    for line in findings.splitlines():
-        candidate = line.strip()
-        candidate = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", candidate)
-        candidate = re.sub(
-            r"^(?:\[\s*)?(?:[*_`]*)(MAJOR|BLOCKER)(?:[*_`]*)(?:\s*\])?",
-            r"\1",
-            candidate,
-            flags=re.IGNORECASE,
-        )
-        if re.match(
-            r"^(?:MAJOR|BLOCKER)(?=\s*(?:\||:|-|$))",
-            candidate,
-            re.IGNORECASE,
-        ):
+
+def _has_blocking_tag(candidate: str) -> bool:
+    for pattern in _BLOCKING_TAGS:
+        match = pattern.search(candidate)
+        if match is None:
+            continue
+        rest = candidate[match.end() :].lstrip(" \t|:-–—*_`")
+        if not _NEGATED_REST.match(rest):
             return True
     return False
 
 
+def _is_blocking_record(line: str) -> bool:
+    bullets = r"^(?:>\s*)?(?:[-*+]\s+|\d+[.)]\s+|\|\s*)*"
+    candidate = re.sub(bullets, "", line.strip())
+    if _has_blocking_tag(candidate):
+        return True
+    unlabeled = _LABEL_PREFIX.sub("", candidate, count=1)
+    if unlabeled != candidate:
+        return _has_blocking_tag(re.sub(bullets, "", unlabeled))
+    return False
+
+
+def blocking_finding_lines(raw: str) -> tuple[str, ...]:
+    """Return severity-tagged MAJOR/BLOCKER records found in a review.
+
+    The whole answer is scanned (outside code fences), not only the FINDINGS
+    section: a mislabeled or merged section must not hide a blocking finding
+    from the PASS gate.  Prose such as "no MAJOR or BLOCKER findings" is not a
+    severity-tagged record.
+    """
+
+    return tuple(
+        line.strip()
+        for line, in_fence in fence_lines(raw)
+        if not in_fence and _is_blocking_record(line)
+    )
+
+
 def _is_explicitly_empty(value: str) -> bool:
     normalized_lines = [
-        line.strip().strip("`*_ ").casefold()
+        re.sub(r"^[-*+]\s+", "", line.strip()).strip("`*_ ").rstrip(".").casefold()
         for line in value.splitlines()
         if line.strip()
     ]
@@ -253,9 +251,11 @@ def parse_review(raw: str, *, deterministic_passed: bool = True) -> ReviewResult
 
     try:
         document = parse_labeled_document(
-            _bare_section_labels(raw),
+            raw,
             field_aliases=_FIELD_ALIASES,
             section_aliases=_SECTION_ALIASES,
+            bare_labels=True,
+            control_fields=_CONTROL_FIELDS,
         )
     except (AmbiguousFieldError, WireParseError, ValueError) as exc:
         raise ReviewParseError(f"wire parsing failed: {exc}") from exc
@@ -264,24 +264,17 @@ def parse_review(raw: str, *, deterministic_passed: bool = True) -> ReviewResult
         name: _field_or_section(document.fields, document.sections, name)
         for name in _FIELD_ALIASES
     }
-    verdict_candidates = list(_enum_values(values["verdict"], _KNOWN_VERDICTS))
-    route_candidates = list(_enum_values(values["route"], _KNOWN_ROUTES))
-    if len(verdict_candidates) != 1:
-        reason = "missing VERDICT" if not verdict_candidates else "conflicting VERDICT values"
-        raise ReviewParseError(reason)
-    if len(route_candidates) != 1:
-        reason = "missing ROUTE" if not route_candidates else "conflicting ROUTE values"
-        raise ReviewParseError(reason)
-
-    verdict = ReviewVerdict(verdict_candidates[0])
-    route = ReviewRoute(route_candidates[0])
+    verdict = ReviewVerdict(_control_value(document, "verdict", _KNOWN_VERDICTS))
+    route = ReviewRoute(_control_value(document, "route", _KNOWN_ROUTES))
     if verdict is ReviewVerdict.PASS:
         if not deterministic_passed:
             raise ReviewParseError("PASS is forbidden when deterministic gate did not pass")
         if route is not ReviewRoute.NONE:
             raise ReviewParseError("PASS requires ROUTE: NONE")
-        if _structured_major_or_blocker(values["findings"]):
+        if blocking_finding_lines(raw):
             raise ReviewParseError("PASS cannot contain a structured MAJOR or BLOCKER finding")
+        if "required_fixes" not in document.fields and "required_fixes" not in document.sections:
+            raise ReviewParseError("PASS requires an explicit REQUIRED FIXES: NONE")
         if not _is_explicitly_empty(values["required_fixes"]):
             raise ReviewParseError("PASS requires empty or explicitly NONE/N/A REQUIRED FIXES")
     elif verdict is ReviewVerdict.REVISE:
@@ -433,14 +426,25 @@ class Reviewer:
             agent_report,
             template=self.template,
         )
+        target = Path(artifacts_dir) if artifacts_dir is not None else None
+        # Persist the exchange before parsing: an unparseable or rejected
+        # review must remain inspectable.
+        if target is not None:
+            _atomic_write_text(target / "reviewer.request.txt", request)
         first_raw = _completion_text(self.client.complete(request))
+        if target is not None:
+            _atomic_write_text(target / "reviewer.raw.md", first_raw)
         try:
             review = parse_review(first_raw, deterministic_passed=deterministic_passed)
         except ReviewParseError as first_error:
             if not self.allow_format_repair:
                 raise
             repair_request = build_review_repair_prompt(first_raw, first_error)
+            if target is not None:
+                _atomic_write_text(target / "reviewer.repair.request.txt", repair_request)
             repaired_raw = _completion_text(self.client.complete(repair_request))
+            if target is not None:
+                _atomic_write_text(target / "reviewer.repair.raw.md", repaired_raw)
             try:
                 review = parse_review(
                     repaired_raw, deterministic_passed=deterministic_passed

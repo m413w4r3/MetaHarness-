@@ -49,7 +49,13 @@ python -m metaharness.cli show --run ../MetaHarness-runs/example-001
 ## Failure handling
 
 `BLOCKED`, `REVISE`, `FAIL`, check failures, timeouts, mutations, stale HEAD,
-empty/oversized diffs, and review-boundary changes do not commit. V0 stops and
+empty/oversized diffs, and review-boundary changes do not commit. Common
+failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,
+`REVIEWER_OUTPUT_INVALID`, `LLM_FAILURE`, `AGENT_TIMEOUT`, `AGENT_FAILED`,
+`AGENT_COMMITTED`, `AGENT_GIT_VIOLATION`, `CHECK_SETUP_INVALID`,
+`CHECK_MUTATED`, `EMPTY_DIFF`, `DIFF_TOO_LARGE`, `SECRET_IN_DIFF`,
+`DETERMINISTIC_GATE_FAILED`, `REVIEW_REVISE`, `REVIEW_FAIL`,
+`TOCTOU_FAILURE`, `GIT_FAILURE`. V0 stops and
 leaves the run directory and worktree available for inspection; it does not
 automatically repair or retry implementation work. Resolve the issue as an
 operator, then start a new run ID. Remove an obsolete worktree only through

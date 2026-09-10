@@ -11,17 +11,20 @@ from metaharness.gitops import (  # noqa: E402
     assert_agent_did_not_commit,
     assert_clean,
     branch_exists,
-    commit_staged,
+    candidate_tree_sha,
+    commit_reviewed_tree,
     create_run_worktree,
     current_head,
     git_root,
     index_tree_sha,
+    local_branches,
     read_file_at_commit,
     resolve_commit,
     stage_all,
     staged_changed_files,
     staged_diff,
     status_porcelain,
+    symbolic_head,
 )
 
 
@@ -150,8 +153,10 @@ class GitOpsTests(unittest.TestCase):
 
         tree_sha = index_tree_sha(worktree)
         self.assertEqual(tree_sha, index_tree_sha(worktree))
-        commit_sha = commit_staged(
+        commit_sha = commit_reviewed_tree(
             worktree,
+            tree_sha=tree_sha,
+            parent_sha=info.base_sha,
             subject="  harness commit  ",
             body="The harness owns this commit.",
         )
@@ -163,24 +168,128 @@ class GitOpsTests(unittest.TestCase):
         )
         self.assertEqual(status_porcelain(worktree), ())
 
-    def test_commit_staged_rejects_empty_and_long_subjects(self) -> None:
+    def test_commit_reviewed_tree_rejects_empty_tree_and_bad_subjects(self) -> None:
         worktree = self.root / "run empty commit"
-        create_run_worktree(
+        info = create_run_worktree(
             self.repo,
             base_ref=self.initial_sha,
             branch="metaharness/run-empty",
             worktree_path=worktree,
             require_clean_base=True,
         )
-        with self.assertRaises(GitError):
-            commit_staged(worktree, subject="subject", body="body")
+        base_tree = index_tree_sha(worktree)
+        with self.assertRaisesRegex(GitError, "no changes"):
+            commit_reviewed_tree(
+                worktree, tree_sha=base_tree, parent_sha=info.base_sha, subject="s", body=""
+            )
 
         (worktree / "README.md").write_text("change\n", encoding="utf-8")
         stage_all(worktree)
+        tree = index_tree_sha(worktree)
+        for subject in ("x" * 73, "   ", "two\nlines"):
+            with self.subTest(subject=subject):
+                with self.assertRaises(GitError):
+                    commit_reviewed_tree(
+                        worktree, tree_sha=tree, parent_sha=info.base_sha, subject=subject, body=""
+                    )
         with self.assertRaises(GitError):
-            commit_staged(worktree, subject="x" * 73, body="")
+            commit_reviewed_tree(
+                worktree, tree_sha="HEAD", parent_sha=info.base_sha, subject="s", body=""
+            )
+        self.assertEqual(current_head(worktree), info.base_sha)
+
+    def _staged_worktree(self, name: str):
+        worktree = self.root / name
+        info = create_run_worktree(
+            self.repo,
+            base_ref=self.initial_sha,
+            branch=f"metaharness/{name.replace(' ', '-')}",
+            worktree_path=worktree,
+            require_clean_base=True,
+        )
+        (worktree / "README.md").write_text("reviewed\n", encoding="utf-8")
+        stage_all(worktree)
+        return worktree, info, index_tree_sha(worktree)
+
+    def test_commit_reviewed_tree_commits_the_reviewed_tree_not_the_index(self) -> None:
+        worktree, info, reviewed_tree = self._staged_worktree("exact tree")
+        (worktree / "README.md").write_text("tampered after review\n", encoding="utf-8")
+        stage_all(worktree)
+        self.assertNotEqual(index_tree_sha(worktree), reviewed_tree)
+
+        commit_sha = commit_reviewed_tree(
+            worktree, tree_sha=reviewed_tree, parent_sha=info.base_sha, subject="s", body=""
+        )
+
+        self.assertEqual(
+            run_git(worktree, "rev-parse", f"{commit_sha}^{{tree}}").stdout.strip(), reviewed_tree
+        )
+        self.assertEqual(
+            run_git(worktree, "show", f"{commit_sha}:README.md").stdout, "reviewed\n"
+        )
+
+    def test_commit_reviewed_tree_refuses_when_head_moved(self) -> None:
+        worktree, info, reviewed_tree = self._staged_worktree("moved head")
+        run_git(worktree, "commit", "-qm", "someone else")
+        moved = current_head(worktree)
+
         with self.assertRaises(GitError):
-            commit_staged(worktree, subject="   ", body="")
+            commit_reviewed_tree(
+                worktree, tree_sha=reviewed_tree, parent_sha=info.base_sha, subject="s", body=""
+            )
+        self.assertEqual(current_head(worktree), moved)
+
+    def test_commit_reviewed_tree_runs_no_commit_hooks(self) -> None:
+        worktree, info, reviewed_tree = self._staged_worktree("hooks")
+        marker = self.root / "hook-ran"
+        hooks = self.repo / ".git" / "hooks"
+        for name in ("pre-commit", "commit-msg", "prepare-commit-msg"):
+            hook = hooks / name
+            hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n", encoding="utf-8")
+            hook.chmod(0o755)
+
+        commit_sha = commit_reviewed_tree(
+            worktree, tree_sha=reviewed_tree, parent_sha=info.base_sha, subject="s", body="b"
+        )
+
+        self.assertEqual(current_head(worktree), commit_sha)
+        self.assertFalse(marker.exists())
+
+    def test_candidate_tree_matches_add_all_without_touching_the_index(self) -> None:
+        worktree = self.root / "candidate"
+        create_run_worktree(
+            self.repo,
+            base_ref=self.initial_sha,
+            branch="metaharness/candidate",
+            worktree_path=worktree,
+            require_clean_base=True,
+        )
+        base_tree = index_tree_sha(worktree)
+        (worktree / "README.md").write_text("modified\n", encoding="utf-8")
+        (worktree / "untracked file.txt").write_text("new\n", encoding="utf-8")
+        (worktree / "delete me.txt").unlink()
+
+        candidate = candidate_tree_sha(worktree)
+
+        self.assertEqual(index_tree_sha(worktree), base_tree)
+        stage_all(worktree)
+        self.assertEqual(index_tree_sha(worktree), candidate)
+
+    def test_ref_snapshots_and_option_like_refs(self) -> None:
+        worktree = self.root / "refs"
+        create_run_worktree(
+            self.repo,
+            base_ref=self.initial_sha,
+            branch="metaharness/refs",
+            worktree_path=worktree,
+            require_clean_base=True,
+        )
+        self.assertEqual(symbolic_head(worktree), "refs/heads/metaharness/refs")
+        self.assertIn("refs/heads/metaharness/refs", local_branches(self.repo))
+        run_git(worktree, "switch", "-q", "--detach")
+        self.assertIsNone(symbolic_head(worktree))
+        with self.assertRaises(GitError):
+            resolve_commit(self.repo, "--all")
 
     def test_agent_commit_is_detected(self) -> None:
         worktree = self.root / "run agent commit"
@@ -229,6 +338,14 @@ class GitOpsTests(unittest.TestCase):
                 self.repo,
                 commit_sha=self.initial_sha,
                 relative_path="safe\x00path",
+            )
+        (self.repo / "dir").mkdir()
+        (self.repo / "dir" / "file.txt").write_text("x\n", encoding="utf-8")
+        run_git(self.repo, "add", "--all")
+        run_git(self.repo, "commit", "-qm", "dir")
+        with self.assertRaises(GitError):
+            read_file_at_commit(
+                self.repo, commit_sha=current_head(self.repo), relative_path="dir"
             )
 
 

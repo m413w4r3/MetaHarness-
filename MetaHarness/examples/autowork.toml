@@ -16,15 +16,17 @@ timeout_seconds = 5400
 
 [context]
 always_files = ["AGENTS.md", "CLAUDE.md", "README.md"]
+# "--" keeps a SPEC starting with "-" from being parsed as a ctx.py option.
 locator_argv = [
     "uv",
     "run",
     "scripts/ctx/ctx.py",
     "query",
-    "{query}",
     "-k",
     "8",
-    "--json"
+    "--json",
+    "--",
+    "{query}"
 ]
 locator_timeout_seconds = 180
 max_hits = 8

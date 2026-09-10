@@ -29,12 +29,39 @@ second implementation specification.
    base SHA. Applicable nested `AGENTS.md`/`CLAUDE.md` files are loaded.
 3. Ask the planner for one labeled text plan. A BLOCKED plan stops the run.
 4. Create one worktree at the resolved base SHA and give Codex the plan only.
-5. Run configured checks, snapshot mutations, stage once, and freeze the full
-   diff plus the index tree SHA as evidence.
+   After Codex exits, any commit, branch switch, branch creation/deletion or
+   worktree creation/removal fails the run (`AGENT_COMMITTED` or
+   `AGENT_GIT_VIOLATION`); the worktree is preserved, never reset.
+5. Run configured checks, snapshot the candidate tree before and after each
+   check, stage once, and freeze the full diff plus the index tree SHA as
+   evidence. A check that mutates the candidate (required or not) fails the
+   run before review; an empty, oversized or secret-bearing diff too.
 6. Give the reviewer the original SPEC, raw PLAN, context, diff, checks, and
    implementer report. The reviewer must return a coherent labeled verdict.
-7. On `PASS` with a green deterministic gate, recheck HEAD, index tree SHA, and
-   unstaged/untracked state, then create the single harness commit.
+7. On `PASS` with a green deterministic gate, `authorize_commit` re-derives
+   every precondition (READY plan, agent exit 0, gate, reviewer answer parsed
+   again, HEAD and branch, index tree, unstaged/untracked state, candidate
+   tree) and `commit_reviewed_tree` creates the single harness commit.
+
+Codex, checks and the locator run through `procutil.run_bounded`: no shell,
+own process group, file-backed stdin/stdout/stderr, hard deadline, and
+termination of the whole group at the deadline and after exit, so a
+background child cannot modify the candidate after its snapshot. A
+descendant that creates its own session escapes this cleanup (no cgroups in
+V0).
+
+The commit is built from the reviewed tree object (`git commit-tree`), not
+from the index, and the branch is advanced with a compare-and-swap
+`git update-ref HEAD <new> <base>`. Commit hooks therefore cannot restage
+content, and a moved HEAD makes the update fail.
+
+Planner and reviewer answers are free Markdown. The parser is tolerant on
+presentation (headings, bold labels, bracket/colon markers, one whole-answer
+fence) but strict on control values: `STATUS`, `VERDICT` and `ROUTE` lines
+must be exactly one known token, content of code fences is never metadata,
+and duplicated or contradictory control values fail closed. A `PASS` also
+requires `ROUTE: NONE`, an explicit empty `REQUIRED FIXES`, and no
+severity-tagged MAJOR/BLOCKER record anywhere outside code fences.
 
 The implementer does not receive the original SPEC. This makes the planner's
 raw plan the implementation authority, prevents an executor from silently

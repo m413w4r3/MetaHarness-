@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .llm.chat import TextLLMResult
-from .llm.wire import AmbiguousFieldError, WireParseError, parse_labeled_document
+from .llm.wire import (
+    AmbiguousFieldError,
+    WireParseError,
+    control_tokens,
+    parse_labeled_document,
+)
 
 
 class PlanDecision(StrEnum):
@@ -70,83 +75,10 @@ _FIELD_ALIASES = {
 _SECTION_ALIASES = _FIELD_ALIASES
 _REQUIRED_READY = ("decision", "title", "objective", "implementation", "acceptance", "tests")
 _KNOWN_DECISIONS = frozenset(item.value for item in PlanDecision)
-_EMPTY_BLOCKER_VALUES = frozenset({"", "none", "n/a", "na", "-", "—"})
-
-
-def _fence_opening(line: str) -> tuple[str, int] | None:
-    match = re.match(r"^\s*(`{3,}|~{3,})(?P<info>[^`]*)$", line)
-    if match is None:
-        return None
-    return match.group(1)[0], len(match.group(1))
-
-
-def _fence_closing(line: str, fence: tuple[str, int]) -> bool:
-    character, length = fence
-    return re.match(rf"^\s*{re.escape(character)}{{{length},}}\s*$", line) is not None
-
-
-def _bare_section_labels(text: str) -> str:
-    """Make bare ``OBJECTIVE`` labels visible to the generic wire parser.
-
-    The wire parser deliberately requires an explicit marker for a section.
-    Planner output in the requested compact shape also permits a bare label on
-    its own line, so add Markdown heading markers only outside code fences.
-    The original response remains untouched in ``TaskPlan.raw``.
-    """
-
-    labels = {
-        alias.strip().casefold()
-        for aliases in _SECTION_ALIASES.values()
-        for alias in aliases
-    }
-    lines = text.splitlines()
-    nonempty = [index for index, line in enumerate(lines) if line.strip()]
-    wrapper: tuple[int, int] | None = None
-    if len(nonempty) >= 2:
-        first, last = nonempty[0], nonempty[-1]
-        opening = _fence_opening(lines[first])
-        if opening is not None and lines[last] != lines[first] and _fence_closing(lines[last], opening):
-            opening_match = re.match(r"^\s*(?:`{3,}|~{3,})(?P<info>[^`]*)$", lines[first])
-            info = opening_match.group("info").strip().casefold() if opening_match else ""
-            # A whole-response Markdown fence is unwrapped by wire.py.  Treat
-            # its two delimiters as transparent while scanning bare labels.
-            if info in {"", "markdown", "md", "text", "txt"}:
-                wrapper = (first, last)
-
-    transformed: list[str] = []
-    fence: tuple[str, int] | None = None
-    for index, line in enumerate(lines):
-        if wrapper and index in wrapper:
-            transformed.append(line)
-            continue
-        if fence is not None:
-            transformed.append(line)
-            if _fence_closing(line, fence):
-                fence = None
-            continue
-        opening = _fence_opening(line)
-        if opening is not None:
-            transformed.append(line)
-            fence = opening
-            continue
-        heading_inline = re.match(
-            r"^\s*#{1,6}\s+(?P<label>[^:=]+?)\s*[:=]\s*(?P<value>.+?)\s*#*\s*$",
-            line,
-        )
-        if heading_inline is not None:
-            label = heading_inline.group("label").strip()
-            if label.casefold() in labels:
-                transformed.append(
-                    f"{label}: {heading_inline.group('value').strip()}"
-                )
-                continue
-        candidate = line.strip()
-        candidate = re.sub(r"^[-*+]\s+", "", candidate)
-        if candidate.casefold() in labels:
-            transformed.append(f"## {candidate}")
-        else:
-            transformed.append(line)
-    return "\n".join(transformed)
+_EMPTY_BLOCKER_VALUES = frozenset({"", "none", "n/a", "na", "-", "—", "nil", "tbd"})
+# One-line metadata: ``## Status: READY`` must not open a section whose prose
+# could later be read as a control value.
+_CONTROL_FIELDS = frozenset({"decision", "title"})
 
 
 def _prompt_template_path() -> Path:
@@ -181,14 +113,15 @@ def _normalise_scalar(value: str) -> str:
     return " ".join(value.strip().split()).casefold()
 
 
-def _status_values(value: str) -> tuple[str, ...]:
-    values: list[str] = []
-    for line in value.splitlines():
-        candidate = line.strip().strip("`*_ ").upper()
-        candidate = re.sub(r"^[-*+]\s+", "", candidate)
-        if candidate in _KNOWN_DECISIONS and candidate not in values:
-            values.append(candidate)
-    return tuple(values)
+def _placeholder(value: str) -> bool:
+    """Whether a section only says NONE/N/A (optionally bulleted/emphasized)."""
+
+    lines = [
+        re.sub(r"^[-*+]\s+", "", line.strip()).strip("`*_ ").rstrip(".").casefold()
+        for line in value.splitlines()
+        if line.strip()
+    ]
+    return not lines or (len(lines) == 1 and lines[0] in _EMPTY_BLOCKER_VALUES)
 
 
 def _field_or_section(fields: dict[str, str], sections: dict[str, str], name: str) -> str:
@@ -223,17 +156,28 @@ def parse_task_plan(raw: str) -> TaskPlan:
 
     try:
         document = parse_labeled_document(
-            _bare_section_labels(raw),
+            raw,
             field_aliases=_FIELD_ALIASES,
             section_aliases=_SECTION_ALIASES,
+            bare_labels=True,
+            control_fields=_CONTROL_FIELDS,
         )
     except (WireParseError, ValueError) as exc:
         if isinstance(exc, AmbiguousFieldError) and "decision" in str(exc):
             raise PlanParseError("contradictory STATUS/DECISION values") from exc
         raise PlanParseError(f"wire parsing failed: {exc}") from exc
 
-    decision_candidates = list(_status_values(document.fields.get("decision", "")))
-    decision_candidates.extend(_status_values(document.sections.get("decision", "")))
+    # The control value is read strictly: each STATUS line must be exactly
+    # READY or BLOCKED.  Prose, alternatives or a second value fail closed.
+    try:
+        decision_candidates = list(
+            control_tokens(document.fields.get("decision", ""), _KNOWN_DECISIONS)
+        )
+        decision_candidates.extend(
+            control_tokens(document.sections.get("decision", ""), _KNOWN_DECISIONS)
+        )
+    except WireParseError as exc:
+        raise PlanParseError(f"invalid STATUS/DECISION: {exc}") from exc
     unique_decisions = tuple(dict.fromkeys(decision_candidates))
     if len(unique_decisions) != 1:
         if not unique_decisions:
@@ -248,10 +192,10 @@ def parse_task_plan(raw: str) -> TaskPlan:
     values["decision"] = decision.value
 
     if decision is PlanDecision.BLOCKED:
-        if _normalise_scalar(values["blockers"]) in _EMPTY_BLOCKER_VALUES:
+        if _placeholder(values["blockers"]):
             raise PlanParseError("BLOCKED plan requires non-empty BLOCKERS")
     else:
-        missing = [name for name in _REQUIRED_READY if not values[name].strip()]
+        missing = [name for name in _REQUIRED_READY if _placeholder(values[name])]
         if missing:
             raise PlanParseError(
                 "READY plan is missing required section(s): " + ", ".join(missing)
@@ -399,14 +343,25 @@ class Planner:
         artifacts_dir: str | Path | None = None,
     ) -> TaskPlan:
         request = build_planner_prompt(spec, context, template=self.template)
+        target = Path(artifacts_dir) if artifacts_dir is not None else None
+        # The exchange is persisted as it happens, so an unparseable answer or
+        # a transport failure still leaves the exact request/response behind.
+        if target is not None:
+            _atomic_write_text(target / "planner.request.txt", request)
         first_raw = _completion_text(self.client.complete(request))
+        if target is not None:
+            _atomic_write_text(target / "planner.raw.md", first_raw)
         try:
             plan = parse_task_plan(first_raw)
         except PlanParseError as first_error:
             if not self.allow_format_repair:
                 raise
             repair_request = build_repair_prompt(first_raw, first_error)
+            if target is not None:
+                _atomic_write_text(target / "planner.repair.request.txt", repair_request)
             repaired_raw = _completion_text(self.client.complete(repair_request))
+            if target is not None:
+                _atomic_write_text(target / "planner.repair.raw.md", repaired_raw)
             try:
                 plan = parse_task_plan(repaired_raw)
             except PlanParseError as repair_error:
