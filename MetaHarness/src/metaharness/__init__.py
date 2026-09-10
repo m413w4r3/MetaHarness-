@@ -20,7 +20,9 @@ from .models import (
     ReviewVerdict,
     RunStatus,
 )
+from .orchestrator import Orchestrator, run_orchestrator
 from .review import Reviewer, ReviewParseError, ReviewResult, parse_review
+from .result import RunResult
 from .state import RunStateStore
 from .validation import CheckResult, ValidationError, run_checks
 
@@ -43,7 +45,9 @@ __all__ = [
     "ReviewVerdict",
     "Reviewer",
     "RunStateStore",
+    "RunResult",
     "RunStatus",
+    "Orchestrator",
     "ValidationError",
     "build_context",
     "build_context_bundle",
@@ -51,5 +55,6 @@ __all__ = [
     "load_config",
     "parse_review",
     "render_context",
+    "run_orchestrator",
     "run_checks",
 ]

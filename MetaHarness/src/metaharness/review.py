@@ -390,11 +390,23 @@ def persist_review_artifacts(
 
 
 class Reviewer:
-    """Run one reviewer request, with at most one format-only repair."""
+    """Run one reviewer request.
 
-    def __init__(self, client: TextCompletionClient, *, template: str | None = None):
+    The optional format repair is retained for the standalone API.  The V0
+    orchestrator turns it off because it must not create an automatic repair
+    loop.
+    """
+
+    def __init__(
+        self,
+        client: TextCompletionClient,
+        *,
+        template: str | None = None,
+        allow_format_repair: bool = True,
+    ):
         self.client = client
         self.template = template
+        self.allow_format_repair = allow_format_repair
 
     def review(
         self,
@@ -425,6 +437,8 @@ class Reviewer:
         try:
             review = parse_review(first_raw, deterministic_passed=deterministic_passed)
         except ReviewParseError as first_error:
+            if not self.allow_format_repair:
+                raise
             repair_request = build_review_repair_prompt(first_raw, first_error)
             repaired_raw = _completion_text(self.client.complete(repair_request))
             try:

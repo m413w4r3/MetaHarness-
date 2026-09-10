@@ -373,11 +373,23 @@ def persist_planning_artifacts(
 
 
 class Planner:
-    """Run one planner request, with at most one format-only repair request."""
+    """Run one planner request.
 
-    def __init__(self, client: TextCompletionClient, *, template: str | None = None):
+    Format repair remains available to callers that explicitly opt into the
+    legacy behavior.  The V0 orchestrator disables it: a run must have one
+    planner task and one planner request.
+    """
+
+    def __init__(
+        self,
+        client: TextCompletionClient,
+        *,
+        template: str | None = None,
+        allow_format_repair: bool = True,
+    ):
         self.client = client
         self.template = template
+        self.allow_format_repair = allow_format_repair
 
     def plan(
         self,
@@ -391,6 +403,8 @@ class Planner:
         try:
             plan = parse_task_plan(first_raw)
         except PlanParseError as first_error:
+            if not self.allow_format_repair:
+                raise
             repair_request = build_repair_prompt(first_raw, first_error)
             repaired_raw = _completion_text(self.client.complete(repair_request))
             try:
