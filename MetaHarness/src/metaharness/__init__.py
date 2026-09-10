@@ -1,5 +1,6 @@
 """Fondations de MetaHarness V0."""
 
+from .agent import AgentResult, CodexAgent
 from .config import ConfigError, load_config
 from .context import (
     ContextBundle,
@@ -22,11 +23,13 @@ from .state import RunStateStore
 
 __all__ = [
     "AgentConfig",
+    "AgentResult",
     "CheckConfig",
+    "CodexAgent",
     "ConfigError",
     "ContextBundle",
-    "ContextExcerpt",
     "ContextConfig",
+    "ContextExcerpt",
     "HarnessConfig",
     "LLMEndpointConfig",
     "ReviewRoute",
