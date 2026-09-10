@@ -20,6 +20,8 @@ from .models import (
     RunStatus,
 )
 from .state import RunStateStore
+from .evidence import EvidenceBundle, collect_evidence
+from .validation import CheckResult, ValidationError, run_checks
 
 __all__ = [
     "AgentConfig",
@@ -30,14 +32,19 @@ __all__ = [
     "ContextBundle",
     "ContextConfig",
     "ContextExcerpt",
+    "CheckResult",
+    "EvidenceBundle",
     "HarnessConfig",
     "LLMEndpointConfig",
     "ReviewRoute",
     "ReviewVerdict",
     "RunStateStore",
     "RunStatus",
+    "ValidationError",
     "build_context",
     "build_context_bundle",
+    "collect_evidence",
     "load_config",
     "render_context",
+    "run_checks",
 ]
