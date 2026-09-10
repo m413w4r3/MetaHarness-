@@ -3,10 +3,10 @@
 	url = https://github.com/m413w4r3/AutoWork
 
 [submodule "WebAI-to-API"]
-	path = WebAI-to-API
+	path = Bridges/WebAI-to-API
 	url = https://github.com/Amm1rr/WebAI-to-API
 
 [submodule "chatgpt-bridge"]
-	path = chatgpt-bridge
+	path = Bridges/chatgpt-bridge
 	url = https://github.com/m413w4r3/bridge
 

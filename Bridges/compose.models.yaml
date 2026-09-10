@@ -1,0 +1,94 @@
+services:
+  chatgpt-bridge:
+    build:
+      context: ./chatgpt-bridge
+      dockerfile: Dockerfile
+
+    environment:
+      BRIDGE_HOST: 0.0.0.0
+      BRIDGE_PORT: 8001
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY:?BRIDGE_API_KEY is required}
+      BRIDGE_WS_TOKEN: ${BRIDGE_WS_TOKEN:?BRIDGE_WS_TOKEN is required}
+      BRIDGE_RUN_DB: /data/bridge-runs.sqlite3
+      BRIDGE_TOTAL_TIMEOUT: ${BRIDGE_TOTAL_TIMEOUT:-3600}
+      BRIDGE_IDLE_TIMEOUT: ${BRIDGE_IDLE_TIMEOUT:-300}
+      BRIDGE_UI_TIMEOUT: ${BRIDGE_UI_TIMEOUT:-30}
+      BRIDGE_UI_PROBE_TTL: ${BRIDGE_UI_PROBE_TTL:-60}
+      BRIDGE_SHUTDOWN_GRACE_SECONDS: ${BRIDGE_SHUTDOWN_GRACE_SECONDS:-20}
+
+    ports:
+      - "127.0.0.1:${BRIDGE_PORT:-8001}:8001"
+
+    volumes:
+      - bridge_data:/data
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+
+    networks:
+      - models
+
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  web_ai:
+    build:
+      context: ./WebAI-to-API
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+
+    image: cornatul/webai.ai
+
+    env_file:
+      - ./WebAI-to-API/.env
+
+    environment:
+      PYTHONPATH: /app/src
+      PLAYWRIGHT_HEADLESS: "true"
+      RUNTIME_DIR: /app/runtime
+      AUTH_STATE_DIR: /app/runtime/auth
+      CONVERSATION_SNAPSHOT_DB: /app/runtime/conversations/conversation_snapshots.db
+      LOG_LEVEL: ${WEBAI_LOG_LEVEL:-}
+      DISABLE_ACCESS_LOGS: ${WEBAI_DISABLE_ACCESS_LOGS:-false}
+
+    ports:
+      - "127.0.0.1:${WEBAI_PORT:-6969}:6969"
+
+    volumes:
+      - type: bind
+        source: ./WebAI-to-API/config.conf
+        target: /app/config.conf
+        read_only: true
+        bind:
+          create_host_path: false
+
+      - type: bind
+        source: ${WEBAI_RUNTIME_DIR:-./WebAI-to-API/runtime}
+        target: /app/runtime
+        bind:
+          create_host_path: false
+
+    networks:
+      - models
+
+    restart: unless-stopped
+
+volumes:
+  bridge_data:
+    name: chatgpt-bridge_bridge_data
+
+networks:
+  models:
+    name: metaharness-models
