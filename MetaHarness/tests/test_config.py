@@ -108,6 +108,19 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "argv must be an array"):
                 load_config(self.write_config(Path(directory_name), contents))
 
+    def test_api_key_env_must_be_a_name_without_echoing_the_value(self) -> None:
+        secret = "sk-test-secret-value"
+        contents = VALID_CONFIG.replace(
+            'api_key_env = "META_PLANNER_API_KEY"',
+            f'api_key_env = "{secret}"',
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(
+                ConfigError, "environment variable name"
+            ) as raised:
+                load_config(self.write_config(Path(directory_name), contents))
+        self.assertNotIn(secret, str(raised.exception))
+
     def test_locator_argv_array_is_accepted_and_string_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name)))

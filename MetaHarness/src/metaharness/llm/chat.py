@@ -35,7 +35,9 @@ class TextLLMResult:
 
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
-_PROTECTED_BODY_KEYS = frozenset({"messages", "stream", "model"})
+_PROTECTED_BODY_KEYS = frozenset(
+    {"messages", "stream", "model", "response_format"}
+)
 _MAX_BACKOFF_SECONDS = 1.0
 _INITIAL_BACKOFF_SECONDS = 0.05
 

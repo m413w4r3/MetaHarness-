@@ -132,7 +132,7 @@ class ChatClientTests(unittest.TestCase):
             ).complete("prompt")
             self.assertTrue(server.requests[0]["payload"]["new_chat"])
             self.assertEqual(server.requests[0]["payload"]["temperature"], 0.2)
-            for protected in ("messages", "stream", "model"):
+            for protected in ("messages", "stream", "model", "response_format"):
                 with self.assertRaises(LLMProtocolError):
                     OpenAIChatTextClient(config(server, extra_body={protected: "bad"}))
 

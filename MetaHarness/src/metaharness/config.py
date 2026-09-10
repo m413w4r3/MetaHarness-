@@ -22,6 +22,7 @@ class ConfigError(ValueError):
 
 
 _ENV_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _KNOWN_SANDBOXES = frozenset({
     "read-only",
     "workspace-write",
@@ -97,6 +98,17 @@ def _optional_string(
     return value
 
 
+def _optional_env_name(
+    data: Mapping[str, Any], key: str, default: str | None, where: str
+) -> str | None:
+    value = _optional_string(data, key, default, where)
+    if value is not None and _ENV_NAME.fullmatch(value) is None:
+        # Do not include the value: this field is intended to contain a name,
+        # and an invalid value could itself be an API key.
+        raise ConfigError(f"{where}.{key} must be an environment variable name")
+    return value
+
+
 def _positive_int(data: Mapping[str, Any], key: str, default: int, where: str) -> int:
     value = data.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -150,7 +162,7 @@ def _endpoint(data: Mapping[str, Any], name: str) -> LLMEndpointConfig:
     base_url = _required_string(data, "base_url", name)
     endpoint_path = _required_string(data, "endpoint_path", name)
     model = _required_string(data, "model", name)
-    api_key_env = _optional_string(data, "api_key_env", None, name)
+    api_key_env = _optional_env_name(data, "api_key_env", None, name)
     timeout_seconds = _positive_int(data, "timeout_seconds", 300, name)
     retries = _nonnegative_int(data, "retries", 2, name)
     extra_body = data.get("extra_body", {})
