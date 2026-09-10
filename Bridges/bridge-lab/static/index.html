@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Bridge Lab</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">MetaHarness / Bridges</p>
+        <h1>Bridge Lab</h1>
+        <p>Tester ChatGPT Bridge et WebAI, comparer le brut, le texte extrait et le parsing strict.</p>
+      </div>
+      <button id="refreshStatus">Actualiser les statuts</button>
+    </header>
+
+    <section class="status-grid">
+      <article class="card">
+        <div class="card-head"><h2>ChatGPT Bridge</h2><span id="bridgeBadge" class="badge">…</span></div>
+        <pre id="bridgeStatus">Chargement…</pre>
+      </article>
+      <article class="card">
+        <div class="card-head"><h2>WebAI-to-API</h2><span id="webaiBadge" class="badge">…</span></div>
+        <pre id="webaiStatus">Chargement…</pre>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="toolbar">
+        <label>Provider
+          <select id="provider">
+            <option value="bridge">ChatGPT Bridge</option>
+            <option value="webai">WebAI-to-API</option>
+          </select>
+        </label>
+        <label>Surface
+          <select id="surface"></select>
+        </label>
+        <label>Modèle
+          <select id="model"></select>
+        </label>
+        <label>Idempotency key
+          <input id="idem" placeholder="optionnel">
+        </label>
+      </div>
+
+      <div class="presets">
+        <button data-preset="text">Texte</button>
+        <button data-preset="json">JSON strict</button>
+        <button data-preset="nested">JSON imbriqué</button>
+        <button data-preset="stream">Streaming</button>
+        <button data-preset="background">Responses background</button>
+        <button data-preset="native">Bridge natif</button>
+      </div>
+
+      <label class="block">Payload JSON
+        <textarea id="payload" spellcheck="false"></textarea>
+      </label>
+
+      <label class="block">JSON Schema à valider (optionnel)
+        <textarea id="schema" spellcheck="false" placeholder='{"type":"object","required":["ok"],"properties":{"ok":{"type":"boolean"}}}'></textarea>
+      </label>
+
+      <div class="actions">
+        <button id="send" class="primary">Envoyer</button>
+        <span id="requestState"></span>
+      </div>
+    </section>
+
+    <section class="result-grid">
+      <article class="card">
+        <h2>Diagnostic</h2>
+        <div id="diagnostic" class="diagnostic empty">Aucun test.</div>
+      </article>
+      <article class="card">
+        <h2>Texte extrait</h2>
+        <pre id="extracted">—</pre>
+      </article>
+    </section>
+
+    <section class="card">
+      <h2>Réponse brute</h2>
+      <pre id="raw">—</pre>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

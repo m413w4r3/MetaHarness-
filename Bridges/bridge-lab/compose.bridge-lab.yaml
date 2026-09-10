@@ -1,0 +1,21 @@
+services:
+  bridge-lab:
+    build:
+      context: ./bridge-lab
+      dockerfile: Dockerfile
+    environment:
+      BRIDGE_BASE_URL: http://chatgpt-bridge:8001
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY}
+      WEBAI_BASE_URL: http://web_ai:6969
+      LAB_REQUEST_TIMEOUT_SECONDS: ${LAB_REQUEST_TIMEOUT_SECONDS:-300}
+      LAB_MAX_REQUEST_BYTES: ${LAB_MAX_REQUEST_BYTES:-1048576}
+      LAB_MAX_RESPONSE_BYTES: ${LAB_MAX_RESPONSE_BYTES:-4194304}
+    ports:
+      - "127.0.0.1:${BRIDGE_LAB_PORT:-7070}:7070"
+    networks:
+      - models
+    restart: unless-stopped
+
+networks:
+  models:
+    name: metaharness-models

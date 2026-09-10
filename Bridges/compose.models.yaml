@@ -87,6 +87,7 @@ services:
 
 volumes:
   bridge_data:
+    external: true
     name: chatgpt-bridge_bridge_data
 
 networks:
