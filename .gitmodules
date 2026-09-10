@@ -8,5 +8,5 @@
 
 [submodule "chatgpt-bridge"]
 	path = chatgpt-bridge
-	url = https://github.com/votre-nom/chatgpt-bridge.git
+	url = https://github.com/m413w4r3/bridge
 
