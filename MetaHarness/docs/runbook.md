@@ -71,6 +71,25 @@ python -m metaharness.cli status --run ../MetaHarness-runs/example-001
 python -m metaharness.cli show --run ../MetaHarness-runs/example-001
 ```
 
+## Local web UI
+
+Start the local observation and plan-approval UI in Terminal A:
+
+```sh
+metaharness web --config autowork.local.toml --port 8765
+```
+
+Run a SPEC in Terminal B:
+
+```sh
+metaharness run --config autowork.local.toml --spec my-spec.md
+```
+
+Open `http://127.0.0.1:8765/`, open the run, read the canonical plan, then
+approve or reject it and observe Codex progress, checks and review. The UI is
+read-only apart from the two plan-decision buttons: it never runs Codex or
+checks, changes a plan or worktree, commits, or writes `state.json` directly.
+
 ## Failure handling
 
 `BLOCKED`, `PLAN_REJECTED`, `REVISE`, `FAIL`, check failures, timeouts, mutations, stale HEAD,
