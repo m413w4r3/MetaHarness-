@@ -27,6 +27,15 @@ class WorktreeInfo:
     base_sha: str
 
 
+@dataclass(frozen=True)
+class StagedBlob:
+    """One regular blob currently present in the staged tree."""
+
+    path: str
+    object_id: str
+    size: int
+
+
 def _git(
     repo: Path,
     *args: str,
@@ -56,6 +65,113 @@ def _git(
         suffix = f": {detail}" if detail else ""
         raise GitError(f"git command exited with {result.returncode}{suffix}")
     return result
+
+
+def _git_bytes(repo: Path, *args: str, timeout: int = 60) -> bytes:
+    """Run Git and return stdout without decoding blob contents."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise GitError(f"git command failed: {exc}") from exc
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode("utf-8", errors="replace").strip()
+        suffix = f": {detail}" if detail else ""
+        raise GitError(f"git command exited with {result.returncode}{suffix}")
+    return result.stdout
+
+
+def _staged_index_entries(worktree: Path) -> tuple[tuple[str, str, str], ...]:
+    """Return ``(mode, object_id, path)`` entries from the current index."""
+
+    output = _git(
+        worktree, "ls-files", "--stage", "-z", errors="surrogateescape"
+    ).stdout
+    entries: list[tuple[str, str, str]] = []
+    for record in output.split("\0"):
+        if not record:
+            continue
+        metadata, separator, path = record.partition("\t")
+        if not separator:
+            raise GitError("git ls-files returned a malformed staged entry")
+        fields = metadata.split()
+        if len(fields) != 3:
+            raise GitError("git ls-files returned malformed staged metadata")
+        mode, object_id, stage = fields
+        if stage != "0" or _OBJECT_ID.fullmatch(object_id) is None:
+            # Unmerged entries cannot form a tree and are not readable staged
+            # blobs for this gate.
+            continue
+        entries.append((mode, object_id, path))
+    return tuple(entries)
+
+
+def staged_submodule_paths(worktree: Path) -> frozenset[str]:
+    """Return staged gitlink paths, whose object IDs are commits, not blobs."""
+
+    return frozenset(
+        path for mode, _object_id, path in _staged_index_entries(worktree) if mode == "160000"
+    )
+
+
+def staged_blobs(worktree: Path) -> tuple[StagedBlob, ...]:
+    """Describe regular blobs in the current index without reading contents."""
+
+    blobs: list[StagedBlob] = []
+    for mode, object_id, path in _staged_index_entries(worktree):
+        if mode == "160000":
+            continue
+        size_text = _git(worktree, "cat-file", "-s", object_id).stdout.strip()
+        try:
+            size = int(size_text)
+        except ValueError as exc:
+            raise GitError("git cat-file returned an invalid blob size") from exc
+        if size < 0:
+            raise GitError("git cat-file returned a negative blob size")
+        blobs.append(StagedBlob(path=path, object_id=object_id, size=size))
+    return tuple(blobs)
+
+
+def read_staged_blob(worktree: Path, object_id: str) -> bytes:
+    """Read one validated Git blob as raw bytes."""
+
+    if _OBJECT_ID.fullmatch(object_id) is None:
+        raise GitError("staged blob object ID is invalid")
+    return _git_bytes(worktree, "cat-file", "blob", object_id, timeout=600)
+
+
+def staged_binary_files(worktree: Path) -> frozenset[str]:
+    """Return staged paths represented as binary by Git's diff machinery."""
+
+    output = _git(
+        worktree,
+        "diff",
+        "--cached",
+        "--numstat",
+        "--no-renames",
+        "-z",
+        errors="surrogateescape",
+    ).stdout
+    paths: set[str] = set()
+    for record in output.split("\0"):
+        if not record:
+            continue
+        added, separator, rest = record.partition("\t")
+        if not separator:
+            raise GitError("git diff returned malformed numstat output")
+        deleted, separator2, path = rest.partition("\t")
+        if not separator2:
+            raise GitError("git diff returned malformed numstat output")
+        if added == "-" and deleted == "-":
+            paths.add(path)
+    return frozenset(paths)
 
 
 def git_root(path: Path) -> Path:

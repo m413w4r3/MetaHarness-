@@ -153,6 +153,63 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(bundle.deterministic_passed)
         self.assertIn("HEAD_MISMATCH", bundle.failures)
 
+    def test_secret_in_diff_suppressed_by_gitattributes_is_found_in_staged_blob(self) -> None:
+        secret = "sk-staged-secret-012345"
+        (self.repo / ".gitattributes").write_text("*.py -diff\n", encoding="utf-8")
+        (self.repo / "secret.py").write_text(f"TOKEN = {secret!r}\n", encoding="utf-8")
+
+        bundle = collect_evidence(
+            self.repo,
+            self.base_sha,
+            self.config(),
+            secrets=(secret,),
+        )
+
+        self.assertNotIn(secret, bundle.diff)
+        self.assertFalse(bundle.deterministic_passed)
+        self.assertIn("SECRET_IN_STAGED_BLOB:secret.py", bundle.failures)
+
+    def test_normal_text_blob_secret_and_clean_blob(self) -> None:
+        secret = "sk-normal-secret-012345"
+        (self.repo / "secret.txt").write_text(secret, encoding="utf-8")
+        secret_bundle = collect_evidence(
+            self.repo, self.base_sha, self.config(), secrets=(secret,)
+        )
+        self.assertIn("SECRET_IN_STAGED_BLOB:secret.txt", secret_bundle.failures)
+
+        clean = self.repo / "secret.txt"
+        clean.write_text("safe\n", encoding="utf-8")
+        clean_bundle = collect_evidence(
+            self.repo, self.base_sha, self.config(), secrets=(secret,)
+        )
+        self.assertTrue(clean_bundle.deterministic_passed)
+
+    def test_large_changed_blob_fails_closed_without_reading_secret(self) -> None:
+        from unittest.mock import patch
+
+        (self.repo / "large.txt").write_text("0123456789", encoding="utf-8")
+        with patch("metaharness.evidence.MAX_SECRET_SCAN_BLOB_BYTES", 4):
+            bundle = collect_evidence(self.repo, self.base_sha, self.config())
+
+        self.assertFalse(bundle.deterministic_passed)
+        self.assertIn("UNSCANNABLE_STAGED_BLOB:large.txt", bundle.failures)
+
+    def test_binary_only_source_diff_is_not_reviewable_but_binary_asset_is_allowed(self) -> None:
+        (self.repo / ".gitattributes").write_text("*.py -diff\n", encoding="utf-8")
+        (self.repo / "source.py").write_text("print('changed')\n", encoding="utf-8")
+        (self.repo / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x01")
+
+        bundle = collect_evidence(self.repo, self.base_sha, self.config())
+
+        self.assertFalse(bundle.deterministic_passed)
+        self.assertIn("UNREVIEWABLE_TEXT_DIFF:source.py", bundle.failures)
+        self.assertNotIn("UNREVIEWABLE_TEXT_DIFF:image.png", bundle.failures)
+
+    def test_deleted_file_does_not_trigger_blob_read(self) -> None:
+        (self.repo / "delete.txt").unlink()
+        bundle = collect_evidence(self.repo, self.base_sha, self.config(), secrets=("unused-secret",))
+        self.assertTrue(bundle.deterministic_passed)
+
 
 if __name__ == "__main__":
     unittest.main()

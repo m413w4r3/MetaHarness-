@@ -139,6 +139,15 @@ def _string_array(data: Mapping[str, Any], key: str, default: tuple[str, ...], w
     return result
 
 
+def _env_name_array(
+    data: Mapping[str, Any], key: str, default: tuple[str, ...], where: str
+) -> tuple[str, ...]:
+    result = _string_array(data, key, default, where)
+    if any(_ENV_NAME.fullmatch(name) is None for name in result):
+        raise ConfigError(f"{where}.{key} must contain environment variable names")
+    return result
+
+
 def _path(value: Any, key: str, config_dir: Path) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{key} must be a non-empty path string")
@@ -244,6 +253,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         effort=effort,
         sandbox=sandbox,
         timeout_seconds=_positive_int(agent_data, "timeout_seconds", 5400, "agent"),
+        env_allowlist=_env_name_array(
+            agent_data, "env_allowlist", AgentConfig.env_allowlist, "agent"
+        ),
     )
 
     planner = _endpoint(_table(expanded, "planner"), "planner")

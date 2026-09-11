@@ -21,6 +21,7 @@ from metaharness.gitops import (  # noqa: E402
     read_file_at_commit,
     resolve_commit,
     stage_all,
+    staged_blobs,
     staged_changed_files,
     staged_diff,
     status_porcelain,
@@ -274,6 +275,32 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(index_tree_sha(worktree), base_tree)
         stage_all(worktree)
         self.assertEqual(index_tree_sha(worktree), candidate)
+
+    def test_staged_blobs_preserve_paths_and_skip_gitlinks(self) -> None:
+        (self.repo / "unicode file.txt").write_text("blob\n", encoding="utf-8")
+        stage_all(self.repo)
+        blobs = staged_blobs(self.repo)
+        blob = next(item for item in blobs if item.path == "unicode file.txt")
+        self.assertEqual(blob.size, len("blob\n".encode()))
+
+        nested = self.root / "nested"
+        nested.mkdir()
+        run_git(nested, "init", "-q")
+        run_git(nested, "config", "user.name", "MetaHarness Tests")
+        run_git(nested, "config", "user.email", "tests@example.invalid")
+        (nested / "README.md").write_text("nested\n", encoding="utf-8")
+        run_git(nested, "add", "README.md")
+        run_git(nested, "commit", "-m", "nested")
+        nested_sha = run_git(nested, "rev-parse", "HEAD").stdout.strip()
+        run_git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{nested_sha},submodule.py",
+        )
+        stage_all(self.repo)
+        self.assertNotIn("submodule.py", {item.path for item in staged_blobs(self.repo)})
 
     def test_ref_snapshots_and_option_like_refs(self) -> None:
         worktree = self.root / "refs"

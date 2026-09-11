@@ -65,6 +65,17 @@ class AgentConfig:
     effort: str = "high"
     sandbox: str = "workspace-write"
     timeout_seconds: int = 5400
+    env_allowlist: tuple[str, ...] = (
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "CODEX_HOME",
+    )
 
 
 @dataclass(frozen=True)

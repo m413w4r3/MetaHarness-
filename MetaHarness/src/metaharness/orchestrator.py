@@ -12,10 +12,18 @@ from pathlib import Path
 from typing import Any
 
 from .agent.base import AgentError, AgentResult
-from .agent.codex import AgentCommittedError, CodexAgent
+from .agent.codex import AgentCommittedError, CodexAgent, build_agent_environment
 from .config import load_config
 from .context import build_context, render_context
-from .evidence import DIFF_TOO_LARGE, SECRET_IN_DIFF, EvidenceBundle, collect_evidence
+from .evidence import (
+    DIFF_TOO_LARGE,
+    SECRET_IN_DIFF,
+    SECRET_IN_STAGED_BLOB,
+    UNSCANNABLE_STAGED_BLOB,
+    UNREVIEWABLE_TEXT_DIFF,
+    EvidenceBundle,
+    collect_evidence,
+)
 from .gitops import (
     GitError,
     assert_clean,
@@ -57,7 +65,17 @@ class CommitBoundaryError(OrchestrationError):
 
 # Gate failures for which a semantic review is pointless or unsafe: the
 # candidate is empty, unreviewable, not the agent's output, or leaks a secret.
-_DIRECT_FAILURES = frozenset({"EMPTY_DIFF", DIFF_TOO_LARGE, "HEAD_MISMATCH", SECRET_IN_DIFF})
+_DIRECT_FAILURES = frozenset(
+    {
+        "EMPTY_DIFF",
+        DIFF_TOO_LARGE,
+        "HEAD_MISMATCH",
+        SECRET_IN_DIFF,
+        SECRET_IN_STAGED_BLOB,
+        UNSCANNABLE_STAGED_BLOB,
+        UNREVIEWABLE_TEXT_DIFF,
+    }
+)
 _COMMIT_SUBJECT_LIMIT = 72
 _MAX_AGENT_REPORT_BYTES = 32_000
 _AGENT_ARTIFACTS = (
@@ -390,11 +408,19 @@ class Orchestrator:
         store.update(status=RunStatus.IMPLEMENTING)
         implementation_contract = render_implementation_contract(plan)
         try:
+            agent_environment = build_agent_environment(
+                self.config.agent,
+                forbidden_names=(
+                    self.config.planner.api_key_env,
+                    self.config.reviewer.api_key_env,
+                ),
+            )
             agent_result = self.agent.run(
                 implementation_contract,
                 info.worktree,
                 run_dir,
                 base_sha=base_sha,
+                env=agent_environment,
             )
         except AgentCommittedError as exc:
             # Detected, recorded and preserved: the worktree is never reset.
@@ -448,7 +474,11 @@ class Orchestrator:
         integrity_failures = [
             item
             for item in evidence.failures
-            if item in _DIRECT_FAILURES or item.startswith("CHECK_MUTATED:")
+            if (
+                item in _DIRECT_FAILURES
+                or any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES)
+                or item.startswith("CHECK_MUTATED:")
+            )
         ]
         if integrity_failures:
             reason = integrity_failures[0].split(":", 1)[0]

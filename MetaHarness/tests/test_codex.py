@@ -1,4 +1,5 @@
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.agent.base import AgentResult
-from metaharness.agent.codex import AgentCommittedError, CodexAgent
+from metaharness.agent.codex import AgentCommittedError, CodexAgent, build_agent_environment
 from metaharness.models import AgentConfig
 
 
@@ -89,6 +90,30 @@ class CodexTests(unittest.TestCase):
         self.assertEqual((artifacts / "agent.events.jsonl").read_text().splitlines()[0], "not an event")
         saved = json.loads((artifacts / "agent.result.json").read_text())
         self.assertEqual(saved["exit_code"], 0)
+
+    def test_agent_environment_is_allowlisted_and_forbids_endpoint_keys(self) -> None:
+        old = {name: os.environ.get(name) for name in ("PATH", "HOME", "META_PLANNER_KEY", "META_REVIEWER_KEY", "META_UNLISTED")}
+        try:
+            os.environ.update({
+                "PATH": "/test/path",
+                "HOME": "/test/home",
+                "META_PLANNER_KEY": "planner-secret",
+                "META_REVIEWER_KEY": "reviewer-secret",
+                "META_UNLISTED": "not-forwarded",
+            })
+            config = AgentConfig(env_allowlist=("PATH", "HOME", "META_PLANNER_KEY", "META_REVIEWER_KEY"))
+            environment = build_agent_environment(
+                config,
+                forbidden_names=("META_PLANNER_KEY", "META_REVIEWER_KEY"),
+            )
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.assertEqual(environment, {"PATH": "/test/path", "HOME": "/test/home"})
 
     def test_exit_one_is_reported(self) -> None:
         executable = self.executable(

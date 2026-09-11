@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
+from typing import Iterable
 
 from ..gitops import GitError, current_head
 from ..models import AgentConfig
@@ -30,6 +32,27 @@ class AgentCommittedError(AgentError):
 _DEFAULT_TAIL_BYTES = 16_384
 # Longer JSONL lines are kept in the artifact but not parsed in memory.
 _MAX_EVENT_LINE_BYTES = 8 * 1024 * 1024
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def build_agent_environment(
+    config: AgentConfig,
+    *,
+    forbidden_names: Iterable[str] = (),
+) -> dict[str, str]:
+    """Build the explicit, minimal environment passed to Codex."""
+
+    if not isinstance(config, AgentConfig):
+        raise TypeError("config must be an AgentConfig")
+    names = tuple(config.env_allowlist)
+    if any(_ENV_NAME.fullmatch(name) is None for name in names):
+        raise ValueError("agent environment allowlist contains an invalid name")
+    forbidden = frozenset(name for name in forbidden_names if name)
+    return {
+        name: os.environ[name]
+        for name in names
+        if name not in forbidden and name in os.environ
+    }
 
 
 def _template_path() -> Path:
@@ -173,6 +196,7 @@ class CodexAgent:
         artifacts_dir: str | Path,
         *,
         base_sha: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> AgentResult:
         """Execute *plan* and persist the five run artifacts."""
 
@@ -194,8 +218,11 @@ class CodexAgent:
             raise AgentError("worktree HEAD does not match the agent base SHA")
 
         argv = self.build_argv(worktree_path, final_path)
+        agent_environment = (
+            build_agent_environment(self.config) if env is None else dict(env)
+        )
         exit_code, timed_out = self._execute(
-            argv, prompt_path, worktree_path, events_path, stderr_path
+            argv, prompt_path, worktree_path, events_path, stderr_path, agent_environment
         )
         usage, event_final = _scan_events(events_path)
 
@@ -238,6 +265,7 @@ class CodexAgent:
         worktree: Path,
         events_path: Path,
         stderr_path: Path,
+        env: dict[str, str],
     ) -> tuple[int, bool]:
         """Run Codex with file-backed stdin/stdout/stderr and a hard deadline.
 
@@ -262,6 +290,7 @@ class CodexAgent:
                     stderr=stderr,
                     interrupt_signal=signal.SIGINT,
                     grace_seconds=self.interrupt_grace_seconds,
+                    env=env,
                 )
         except (OSError, ValueError) as exc:
             raise AgentError(f"could not start Codex: {exc}") from exc
@@ -274,15 +303,17 @@ def run_codex(
     *,
     config: AgentConfig | None = None,
     base_sha: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> AgentResult:
     """Functional convenience wrapper for one Codex execution."""
 
-    return CodexAgent(config).run(plan, worktree, artifacts_dir, base_sha=base_sha)
+    return CodexAgent(config).run(plan, worktree, artifacts_dir, base_sha=base_sha, env=env)
 
 
 __all__ = [
     "AgentCommittedError",
     "CodexAgent",
+    "build_agent_environment",
     "build_implementer_prompt",
     "run_codex",
 ]

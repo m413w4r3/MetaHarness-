@@ -95,6 +95,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.context.locator_argv[0], "ctx")
         self.assertEqual(config.checks[0].argv, ("make", "test"))
         self.assertEqual(config.planner.api_key_env, "META_PLANNER_API_KEY")
+        self.assertEqual(config.agent.env_allowlist, (
+            "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR",
+            "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME",
+        ))
+
+    def test_agent_environment_allowlist_is_configurable_and_validated(self) -> None:
+        contents = VALID_CONFIG.replace(
+            'timeout_seconds = 5400\n\n[planner]',
+            'timeout_seconds = 5400\nenv_allowlist = ["PATH", "CUSTOM_VALUE"]\n\n[planner]',
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), contents))
+        self.assertEqual(config.agent.env_allowlist, ("PATH", "CUSTOM_VALUE"))
+
+        invalid = contents.replace('"CUSTOM_VALUE"', '"not-valid-name"')
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, "environment variable names"):
+                load_config(self.write_config(Path(directory_name), invalid))
 
     def test_missing_environment_variable_is_explicit_error(self) -> None:
         os.environ.pop("META_PLANNER_MODEL")

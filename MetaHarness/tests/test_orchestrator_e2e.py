@@ -205,6 +205,9 @@ class OrchestratorE2ETests(unittest.TestCase):
                     subprocess.Popen(['sh', '-c', 'sleep 1; echo late > feature.txt'], cwd=worktree)
                 elif behavior == 'secret':
                     target.write_text(os.environ['META_E2E_KEY'] + '\\n')
+                elif behavior == 'staged-secret':
+                    (worktree / '.gitattributes').write_text('*.py -diff\\n')
+                    (worktree / 'secret.py').write_text(os.environ['FAKE_STAGED_SECRET'] + '\\n')
                 final = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])
                 final.write_text(os.environ.get('FAKE_FINAL', 'fake codex completed\\n'))
                 if behavior == 'fail':
@@ -250,7 +253,11 @@ class OrchestratorE2ETests(unittest.TestCase):
                 f"[planner]\nbase_url = {llm.base_url!r}\nendpoint_path = \"/planner\"\nmodel = \"fake-planner\"\nretries = 0{key_line}",
                 f"[reviewer]\nbase_url = {llm.base_url!r}\nendpoint_path = \"/reviewer\"\nmodel = \"fake-reviewer\"\nretries = 0",
                 "[context]\nalways_files = []",
-                "[agent]\nmodel = \"gpt-5.6-luna\"\neffort = \"high\"\ntimeout_seconds = 3",
+                "[agent]\nmodel = \"gpt-5.6-luna\"\neffort = \"high\"\ntimeout_seconds = 3\n"
+                "env_allowlist = [\"PATH\", \"HOME\", \"LANG\", \"LC_ALL\", \"TERM\", "
+                "\"TMPDIR\", \"XDG_CONFIG_HOME\", \"XDG_CACHE_HOME\", \"CODEX_HOME\", "
+                "\"FAKE_CODEX_BEHAVIOR\", \"FAKE_WORKTREE\", \"FAKE_PROMPT\", \"FAKE_FINAL\", "
+                "\"FAKE_CHECK\", \"FAKE_STAGED_SECRET\"]",
                 f"[[checks]]\nname = \"test\"\nargv = [{str(sys.executable)!r}, {str(self.check)!r}]\ntimeout_seconds = 3\ncwd = {check_cwd!r}",
             ]) + "\n",
             encoding="utf-8",
@@ -525,11 +532,20 @@ class OrchestratorE2ETests(unittest.TestCase):
         _, llm, state = self.run_case(
             codex_behavior="secret", key_env="META_E2E_KEY", env={"META_E2E_KEY": secret}, run_id="secret-diff"
         )
-        self.assertEqual(state["failure"]["reason"], "SECRET_IN_DIFF")
+        self.assertEqual(state["failure"]["reason"], "AGENT_FAILED")
         self.assertEqual(llm.reviewer_calls, 0)
         for path in (self.root / "runs" / "secret-diff").rglob("*"):
             if path.is_file():
                 self.assertNotIn(secret, path.read_text(errors="replace"), path)
+
+        _, llm, state = self.run_case(
+            codex_behavior="staged-secret",
+            key_env="META_E2E_KEY",
+            env={"META_E2E_KEY": secret, "FAKE_STAGED_SECRET": secret},
+            run_id="staged-secret",
+        )
+        self.assertEqual(state["failure"]["reason"], "SECRET_IN_STAGED_BLOB")
+        self.assertEqual(llm.reviewer_calls, 0)
 
     def test_revise_writes_a_complete_repair_task_and_no_commit(self) -> None:
         _, llm, _ = self.run_case(review=REVISE_REVIEW, run_id="repair")
