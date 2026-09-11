@@ -75,7 +75,11 @@ _FIELD_ALIASES = {
 _SECTION_ALIASES = _FIELD_ALIASES
 _REQUIRED_READY = ("decision", "title", "objective", "implementation", "acceptance", "tests")
 _KNOWN_DECISIONS = frozenset(item.value for item in PlanDecision)
-_EMPTY_BLOCKER_VALUES = frozenset({"", "none", "n/a", "na", "-", "—", "nil", "tbd"})
+# A required READY section saying only "TBD" is still missing content.
+_EMPTY_SECTION_VALUES = frozenset({"", "none", "n/a", "na", "-", "—", "nil", "tbd"})
+# For BLOCKERS, "TBD" means a decision is still open: it is a real blocker,
+# so it cannot make a READY plan pass nor leave a BLOCKED plan empty.
+_EMPTY_BLOCKER_VALUES = _EMPTY_SECTION_VALUES - {"tbd"}
 # One-line metadata: ``## Status: READY`` must not open a section whose prose
 # could later be read as a control value.
 _CONTROL_FIELDS = frozenset({"decision", "title"})
@@ -113,7 +117,7 @@ def _normalise_scalar(value: str) -> str:
     return " ".join(value.strip().split()).casefold()
 
 
-def _placeholder(value: str) -> bool:
+def _placeholder(value: str, empty_values: frozenset[str] = _EMPTY_SECTION_VALUES) -> bool:
     """Whether a section only says NONE/N/A (optionally bulleted/emphasized)."""
 
     lines = [
@@ -121,7 +125,11 @@ def _placeholder(value: str) -> bool:
         for line in value.splitlines()
         if line.strip()
     ]
-    return not lines or (len(lines) == 1 and lines[0] in _EMPTY_BLOCKER_VALUES)
+    return not lines or (len(lines) == 1 and lines[0] in empty_values)
+
+
+def _empty_blockers(value: str) -> bool:
+    return _placeholder(value, _EMPTY_BLOCKER_VALUES)
 
 
 def _field_or_section(fields: dict[str, str], sections: dict[str, str], name: str) -> str:
@@ -192,7 +200,7 @@ def parse_task_plan(raw: str) -> TaskPlan:
     values["decision"] = decision.value
 
     if decision is PlanDecision.BLOCKED:
-        if _placeholder(values["blockers"]):
+        if _empty_blockers(values["blockers"]):
             raise PlanParseError("BLOCKED plan requires non-empty BLOCKERS")
     else:
         missing = [name for name in _REQUIRED_READY if _placeholder(values[name])]
@@ -200,7 +208,7 @@ def parse_task_plan(raw: str) -> TaskPlan:
             raise PlanParseError(
                 "READY plan is missing required section(s): " + ", ".join(missing)
             )
-        if not _placeholder(values["blockers"]):
+        if not _empty_blockers(values["blockers"]):
             raise PlanParseError("READY plan cannot contain real BLOCKERS")
 
     return TaskPlan(

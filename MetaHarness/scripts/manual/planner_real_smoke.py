@@ -13,8 +13,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
+import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +46,10 @@ API_KEY_ENV_BY_PROVIDER = {
     "chatgpt": "META_SMOKE_GPT_API_KEY",
     "gemini": "META_SMOKE_GEMINI_API_KEY",
 }
+# Non-generative catalogue endpoint of WebAI-to-API used by ``preflight``.
+GEMINI_MODELS_PATH = "/v1/stateless/models"
+PREFLIGHT_TIMEOUT_SECONDS = 15
+PREFLIGHT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 class SmokeConfigurationError(ValueError):
@@ -115,8 +121,18 @@ def validate_repeat(value: str | int) -> int:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("provider", choices=("chatgpt", "gemini", "matrix"))
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "provider",
+        choices=("chatgpt", "gemini", "matrix", "preflight"),
+        help=(
+            "provider to exercise; 'preflight' only checks variables, URLs, "
+            "fixtures and the Gemini model catalogue, without generating any plan"
+        ),
+    )
     parser.add_argument(
         "--repeat",
         type=validate_repeat,
@@ -163,14 +179,28 @@ def _write_json(path: Path, value: object) -> None:
     _write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
+_SENSITIVE_TEXT = (
+    re.compile(r"(?i)\b(?:proxy-)?authorization\s*[:=]\s*[^\r\n,;]*"),
+    re.compile(r"(?i)\b(?:set-)?cookie\s*[:=]\s*[^\r\n]*"),
+    re.compile(r"(?i)\bbearer\s+\S+"),
+)
+
+
 def _safe_error_text(error: BaseException) -> str:
-    """Keep parser diagnostics useful while never copying an API key."""
+    """Return a bounded one-line diagnostic that never copies a credential.
+
+    Only ``str(error)`` is used (never a traceback).  Configured API key
+    values, Authorization/Cookie headers and bearer tokens are redacted
+    before the text is truncated, so a cut can never expose a key prefix.
+    """
 
     message = str(error)
     for env_name in API_KEY_ENV_BY_PROVIDER.values():
         secret = os.environ.get(env_name)
         if secret:
             message = message.replace(secret, "[REDACTED]")
+    for pattern in _SENSITIVE_TEXT:
+        message = pattern.sub("[REDACTED]", message)
     return " ".join(message.split())[:1000]
 
 
@@ -235,6 +265,9 @@ def run_provider(
                     "attempt": attempt_number,
                     "status": "TRANSPORT_FAILED",
                     "error_type": type(exc).__name__,
+                    # Distinguishes 401, connection refused, timeout, bridge
+                    # errors...; redacted and bounded, never a traceback.
+                    "error": _safe_error_text(exc),
                 },
             )
             continue
@@ -252,6 +285,7 @@ def run_provider(
                     "attempt": attempt_number,
                     "status": "TRANSPORT_FAILED",
                     "error_type": "InvalidClientResult",
+                    "error": "client result has no text",
                 },
             )
             continue
@@ -365,8 +399,132 @@ def _print_summary(summary: dict[str, object], run_dir: Path) -> None:
     print(f"Artifacts: {run_dir}")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never forward the optional Authorization header to another location."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _api_key_header(env_name: str | None) -> dict[str, str]:
+    if env_name is None:
+        return {}
+    value = os.environ.get(env_name, "")
+    # Same rule as the chat client: a key http.client would reject (and quote
+    # in its error) is a configuration error reported by name only.
+    if not value or any(not 0x21 <= ord(character) <= 0x7E for character in value):
+        raise SmokeConfigurationError(f"{env_name} contains an invalid value")
+    return {"Authorization": f"Bearer {value}"}
+
+
+def fetch_gemini_models(config: LLMEndpointConfig) -> list[str]:
+    """Return the model IDs of the WebAI-to-API stateless catalogue (GET only)."""
+
+    url = validate_endpoint(config.base_url, GEMINI_MODELS_PATH)
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", **_api_key_header(config.api_key_env)},
+        method="GET",
+    )
+    opener = urllib.request.build_opener(_NoRedirect)
+    with opener.open(request, timeout=PREFLIGHT_TIMEOUT_SECONDS) as response:
+        body = response.read(PREFLIGHT_MAX_RESPONSE_BYTES + 1)
+    if len(body) > PREFLIGHT_MAX_RESPONSE_BYTES:
+        raise ValueError("model catalogue response is too large")
+    payload = json.loads(body.decode("utf-8"))
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise ValueError("model catalogue has no data array")
+    return [item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
+
+
+ModelCatalogFetcher = Callable[[LLMEndpointConfig], list[str]]
+
+
+def run_preflight(
+    *,
+    fixtures: Sequence[Path] = (SPEC_PATH, CONTEXT_PATH),
+    fetch_models: ModelCatalogFetcher = fetch_gemini_models,
+) -> tuple[int, list[str]]:
+    """Check the local smoke configuration without generating any plan.
+
+    Return ``(exit_code, report_lines)``: 0 when ready, 2 for an invalid
+    local configuration, 1 when the Gemini catalogue probe fails or does not
+    list ``META_SMOKE_GEMINI_MODEL``.  Credentials are reported by variable
+    name only.
+    """
+
+    lines: list[str] = []
+    configuration_ok = True
+    probe_ok = True
+
+    for path in fixtures:
+        try:
+            path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            configuration_ok = False
+            lines.append(f"FAIL fixture {path}: unreadable ({type(exc).__name__})")
+        else:
+            lines.append(f"OK   fixture {path}")
+
+    providers: dict[str, ProviderRun] = {}
+    for name in ("chatgpt", "gemini"):
+        try:
+            provider = provider_run(name)
+            validate_endpoint(provider.config.base_url, provider.config.endpoint_path)
+            _api_key_header(provider.config.api_key_env)
+        except SmokeConfigurationError as exc:
+            configuration_ok = False
+            lines.append(f"FAIL {name}: {exc}")
+            continue
+        except Exception as exc:
+            configuration_ok = False
+            lines.append(f"FAIL {name}: endpoint configuration is invalid ({_safe_error_text(exc)})")
+            continue
+        providers[name] = provider
+        key_env = provider.config.api_key_env
+        credential = f"{key_env} set" if key_env else f"{API_KEY_ENV_BY_PROVIDER[name]} not set"
+        lines.append(
+            f"OK   {name}: {provider.config.base_url}{provider.config.endpoint_path} "
+            f"model={provider.config.model} ({credential})"
+        )
+
+    if "chatgpt" in providers:
+        lines.append(
+            "INFO chatgpt: no network probe; select the model manually in the "
+            "ChatGPT UI before running the smoke test"
+        )
+    gemini = providers.get("gemini")
+    if gemini is not None:
+        try:
+            models = fetch_models(gemini.config)
+        except Exception as exc:
+            probe_ok = False
+            lines.append(f"FAIL gemini catalogue {GEMINI_MODELS_PATH}: {_safe_error_text(exc)}")
+        else:
+            if gemini.config.model in models:
+                lines.append(f"OK   gemini catalogue lists {gemini.config.model}")
+            else:
+                probe_ok = False
+                listed = ", ".join(models[:20]) or "none"
+                lines.append(
+                    f"FAIL gemini catalogue does not list {gemini.config.model} "
+                    f"(available: {_safe_error_text(ValueError(listed))})"
+                )
+
+    if not configuration_ok:
+        return 2, lines
+    return (0 if probe_ok else 1), lines
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.provider == "preflight":
+        code, lines = run_preflight()
+        for line in lines:
+            print(line)
+        print("Preflight: " + {0: "ready", 1: "provider probe failed", 2: "configuration invalid"}[code])
+        return code
     provider_names = ("chatgpt", "gemini") if args.provider == "matrix" else (args.provider,)
     try:
         run_dir, summary = run_smoke(

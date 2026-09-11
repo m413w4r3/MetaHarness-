@@ -57,6 +57,23 @@ Lancer :
 python scripts/manual/planner_real_smoke.py gemini --repeat 3
 ```
 
+## Preflight
+
+Avant toute génération, vérifier la configuration locale :
+
+```sh
+python scripts/manual/planner_real_smoke.py preflight
+```
+
+Le preflight ne génère aucun plan. Il vérifie les variables des deux
+providers, la syntaxe des URLs, la validité des clés (par nom de variable,
+jamais par valeur) et la lisibilité des fixtures. Pour Gemini, il interroge
+uniquement `GET /v1/stateless/models` et confirme que
+`META_SMOKE_GEMINI_MODEL` figure dans le catalogue. Pour ChatGPT UI, aucun
+probe réseau n'est fait et le modèle n'est jamais sélectionné : il reste
+choisi manuellement dans l'UI. Code retour : `0` prêt, `1` probe Gemini en
+échec ou modèle absent, `2` configuration invalide.
+
 ## Matrice
 
 Une fois les deux services prêts et leurs variables exportées :
@@ -69,8 +86,11 @@ Les artefacts sont écrits sous `manual-results/planner-smoke-<timestamp>/`
 (ou sous le répertoire donné par `--output`). Chaque tentative contient la
 requête exacte, la réponse Markdown exacte lorsqu'elle a été reçue, le plan
 normalisé en cas de succès, et le résultat de la tentative. Une erreur de
-parsing est écrite dans `parse-error.txt` ; une erreur de transport conserve
-uniquement son type dans `result.json`.
+parsing est écrite dans `parse-error.txt`. Une erreur de transport écrit dans
+`result.json` son type (`error_type`) et un message `error` borné à 1000
+caractères (HTTP 401, connexion refusée, timeout...), dont les valeurs de clés
+configurées, en-têtes `Authorization`/`Cookie` et jetons bearer sont
+masqués ; aucune traceback n'est persistée.
 
 Le code retour vaut `0` si toutes les réponses reçues sont parsées et qu'il
 n'y a aucun échec de transport, `1` sinon, et `2` si la configuration ou les

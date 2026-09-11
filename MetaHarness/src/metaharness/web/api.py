@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import unquote
 
 from ..agent.events import parse_event, summarize_event
@@ -32,7 +33,15 @@ ARTIFACT_ALLOWLIST = frozenset(
         "repair_task.md",
     }
 )
+# Window of complete JSONL lines returned by one progress request.
 PROGRESS_MAX_BYTES = 256 * 1024
+# A longer single event is omitted from the UI (the artifact keeps it; the
+# Codex adapter parses lines up to 8 MiB for usage/final message).
+PROGRESS_MAX_EVENT_BYTES = 1 * 1024 * 1024
+# Bytes of an oversized line skipped per request without being stored.
+PROGRESS_MAX_SKIP_BYTES = 8 * 1024 * 1024
+_PROGRESS_SCAN_CHUNK_BYTES = 64 * 1024
+OVERSIZED_EVENT = "[oversized Codex event omitted]"
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
@@ -169,6 +178,10 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
     state = _load_state(directory)
     raw_plan = _load_text(_artifact_path(directory, "planner.raw.md"))
     contract = _load_text(_artifact_path(directory, "implementation_contract.md"))
+    reviewer_raw = _load_text(_artifact_path(directory, "reviewer.raw.md"))
+    # This shape is polled by the run page every STATE_POLL_MS: status,
+    # updated_at, state.{base_sha,branch,worktree,commit_sha,failure}, plan,
+    # checks, review and reviewer_raw(_available) must stay stable.
     return {
         **_state_summary(safe_id, state),
         "state": state,
@@ -182,10 +195,83 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
         "implementation_contract": contract,
         "checks": _load_json(_artifact_path(directory, "checks.json")),
         "review": _load_json(_artifact_path(directory, "review.json")),
-        "reviewer_raw": _load_text(_artifact_path(directory, "reviewer.raw.md")),
+        "reviewer_raw": reviewer_raw,
+        "reviewer_raw_available": reviewer_raw is not None,
         "repair_task": _load_text(_artifact_path(directory, "repair_task.md")),
         "failure": state.get("failure"),
     }
+
+
+def _summaries(complete_lines: bytes) -> list[str]:
+    events: list[str] = []
+    for line in complete_lines.splitlines():
+        event = parse_event(line.decode("utf-8", errors="replace"))
+        if event is None:
+            continue
+        summary = summarize_event(event)
+        if summary:
+            events.append(summary)
+    return events
+
+
+def _skip_past_newline(stream: BinaryIO, start: int, limit: int) -> tuple[int, bool]:
+    """Scan at most *limit* bytes from *start* without keeping them.
+
+    Return the position just after the next newline and ``True``, or the
+    position where scanning stopped (limit or end of file) and ``False``.
+    """
+
+    stream.seek(start)
+    position = start
+    remaining = limit
+    while remaining > 0:
+        chunk = stream.read(min(_PROGRESS_SCAN_CHUNK_BYTES, remaining))
+        if not chunk:
+            break
+        newline = chunk.find(b"\n")
+        if newline >= 0:
+            return position + newline + 1, True
+        position += len(chunk)
+        remaining -= len(chunk)
+    return position, False
+
+
+def _read_progress(stream: BinaryIO, offset: int) -> dict[str, Any]:
+    if offset > 0:
+        stream.seek(offset - 1)
+        if stream.read(1) != b"\n":
+            # The offset is inside a line already reported as oversized (or
+            # was supplied mid-line): drop the rest of that line first.
+            position, found = _skip_past_newline(stream, offset, PROGRESS_MAX_SKIP_BYTES)
+            if not found:
+                return {"next_offset": position, "events": []}
+            offset = position
+
+    stream.seek(offset)
+    data = stream.read(PROGRESS_MAX_BYTES)
+    complete_length = data.rfind(b"\n") + 1
+    if complete_length:
+        return {"next_offset": offset + complete_length, "events": _summaries(data[:complete_length])}
+    if len(data) < PROGRESS_MAX_BYTES:
+        # A partial final line that is still being written.
+        return {"next_offset": offset, "events": []}
+
+    # One line is longer than the window: it is read whole only up to the
+    # event limit, so memory stays bounded whatever the line length.
+    line = data + stream.read(max(0, PROGRESS_MAX_EVENT_BYTES - len(data)))
+    newline = line.find(b"\n")
+    if newline >= 0:
+        return {"next_offset": offset + newline + 1, "events": _summaries(line[: newline + 1])}
+    if len(line) < PROGRESS_MAX_EVENT_BYTES:
+        # Still being written and may end under the limit.
+        return {"next_offset": offset, "events": []}
+    # Oversized: never parsed.  The offset always moves forward (after the
+    # newline when found in the bounded scan, otherwise mid-line where the
+    # next request resumes skipping), so the same range is never re-read.
+    position, _found = _skip_past_newline(
+        stream, offset + len(line), PROGRESS_MAX_SKIP_BYTES
+    )
+    return {"next_offset": position, "events": [OVERSIZED_EVENT]}
 
 
 def progress(runs_root: Path, run_id: str, offset: int) -> dict[str, Any]:
@@ -194,27 +280,13 @@ def progress(runs_root: Path, run_id: str, offset: int) -> dict[str, Any]:
     directory = _run_dir(runs_root, run_id)
     path = _artifact_path(directory, "agent.events.jsonl")
     try:
-        size = path.stat().st_size
-        offset = min(offset, size)
         with path.open("rb") as stream:
-            stream.seek(offset)
-            data = stream.read(PROGRESS_MAX_BYTES)
+            size = os.fstat(stream.fileno()).st_size
+            return _read_progress(stream, min(offset, size))
     except FileNotFoundError:
         return {"next_offset": 0, "events": []}
     except OSError as exc:
         raise WebAPIError(503, "progress is temporarily unavailable") from exc
-
-    complete_length = data.rfind(b"\n") + 1
-    complete = data[:complete_length]
-    events: list[str] = []
-    for line in complete.splitlines():
-        event = parse_event(line.decode("utf-8", errors="replace"))
-        if event is None:
-            continue
-        summary = summarize_event(event)
-        if summary:
-            events.append(summary)
-    return {"next_offset": offset + complete_length, "events": events}
 
 
 def approve_run(runs_root: Path, run_id: str, decision: str) -> dict[str, Any]:
@@ -255,7 +327,10 @@ def approve_run(runs_root: Path, run_id: str, decision: str) -> dict[str, Any]:
 
 __all__ = [
     "ARTIFACT_ALLOWLIST",
+    "OVERSIZED_EVENT",
     "PROGRESS_MAX_BYTES",
+    "PROGRESS_MAX_EVENT_BYTES",
+    "PROGRESS_MAX_SKIP_BYTES",
     "WebAPIError",
     "approve_run",
     "get_run",

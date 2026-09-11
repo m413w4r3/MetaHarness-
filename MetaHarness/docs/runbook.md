@@ -90,6 +90,22 @@ approve or reject it and observe Codex progress, checks and review. The UI is
 read-only apart from the two plan-decision buttons: it never runs Codex or
 checks, changes a plan or worktree, commits, or writes `state.json` directly.
 
+The run page polls `GET /api/runs/<run_id>` every 2 seconds (status,
+timeline, header, failure, approval buttons, plan, checks, review, reviewer
+raw) and the Codex progress JSONL every second, so transitions appear without
+a manual refresh. A JSONL event longer than 1 MiB is shown as
+`[oversized Codex event omitted]`; the progress offset always moves forward.
+
+Local security invariants: the server binds `127.0.0.1` only; every request
+must carry `Host: 127.0.0.1:<port>` or `Host: localhost:<port>` exactly
+(403 otherwise, against DNS rebinding); an approval `POST` needs the
+in-memory token and, when an `Origin` header is present, the exact local
+origin. The token is embedded only in a run page awaiting plan approval,
+never in the run list. HTML responses carry a nonce-based CSP (no external
+script, object, `<base>`, form target or framing), `X-Frame-Options: DENY`,
+`Referrer-Policy: no-referrer` and `nosniff`. Artifact text is escaped
+server-side and written with `textContent` client-side, never as HTML.
+
 ## Failure handling
 
 `BLOCKED`, `PLAN_REJECTED`, `REVISE`, `FAIL`, check failures, timeouts, mutations, stale HEAD,

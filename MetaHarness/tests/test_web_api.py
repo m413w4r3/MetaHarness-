@@ -10,6 +10,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from unittest.mock import patch
+
 from metaharness.approval import compute_plan_identity
 from metaharness.models import (
     AgentConfig,
@@ -18,6 +20,8 @@ from metaharness.models import (
     LLMEndpointConfig,
 )
 from metaharness.state import RunStateStore
+from metaharness.web import api
+from metaharness.web.pages import RUN_PAGE_DYNAMIC_IDS, STATE_POLL_MS
 from metaharness.web.server import create_server
 
 
@@ -163,6 +167,218 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertLessEqual(payload["next_offset"], 256 * 1024)
         self.assertGreater(len(payload["events"]), 0)
+
+    def get_html(self, path: str) -> str:
+        connection = HTTPConnection("127.0.0.1", self.server.server_port)
+        connection.request("GET", path)
+        response = connection.getresponse()
+        content = response.read().decode("utf-8")
+        connection.close()
+        self.assertEqual(response.status, 200)
+        return content
+
+    def assert_poll_shape(self, payload: dict) -> None:
+        # Fields read by the run-page polling script.
+        for key in (
+            "run_id",
+            "status",
+            "updated_at",
+            "state",
+            "plan",
+            "checks",
+            "review",
+            "reviewer_raw",
+            "reviewer_raw_available",
+            "failure",
+            "commit_sha",
+        ):
+            self.assertIn(key, payload)
+        for key in ("status", "base_sha", "branch", "worktree", "commit_sha", "failure"):
+            self.assertIn(key, payload["state"])
+        self.assertIn("raw", payload["plan"])
+        self.assertIn("contract", payload["plan"])
+        self.assertEqual(payload["status"], payload["state"]["status"])
+
+    def test_run_page_observes_transitions_without_manual_reload(self) -> None:
+        run_dir = self.runs / "live"
+        store = RunStateStore(run_dir / "state.json")
+        store.initialize("live", base_sha="b" * 40, branch="metaharness/live", worktree="/tmp/wt live")
+        store.update(status="implementing")
+
+        page = self.get_html("/runs/live")
+        self.assertIn('id="run-page"', page)
+        self.assertIn('data-run-id="live"', page)
+        self.assertIn('data-status="implementing"', page)
+        self.assertIn("data-updated-at=", page)
+        script = page[page.index("<script"):page.index("</script>")]
+        for element_id in RUN_PAGE_DYNAMIC_IDS:
+            with self.subTest(element_id=element_id):
+                self.assertIn(f'id="{element_id}"', page)
+                self.assertIn(f"'{element_id}'", script)
+        self.assertIn("fetch('/api/runs/' + encodeURIComponent(RUN_ID), ", script)
+        self.assertIn("setInterval(pollRun, STATE_POLL_MS)", script)
+        self.assertIn("setInterval(pollProgress, 1000)", script)
+        self.assertIn(f"const STATE_POLL_MS = {STATE_POLL_MS};", script)
+        self.assertTrue(1000 <= STATE_POLL_MS <= 2000)
+        self.assertNotIn("innerHTML", page)
+
+        status, payload, _ = self.request("GET", "/api/runs/live")
+        self.assertEqual(status, 200)
+        self.assert_poll_shape(payload)
+        self.assertEqual(payload["status"], "implementing")
+        self.assertEqual(payload["state"]["worktree"], "/tmp/wt live")
+
+        checks = [{"name": "unit", "exit_code": 0, "timed_out": False, "stdout_tail": "<b>ok</b>"}]
+        (run_dir / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
+        store.update(status="validating")
+        status, payload, _ = self.request("GET", "/api/runs/live")
+        self.assert_poll_shape(payload)
+        self.assertEqual(payload["status"], "validating")
+        self.assertEqual(payload["checks"], checks)
+        self.assertFalse(payload["reviewer_raw_available"])
+
+        (run_dir / "review.json").write_text(
+            json.dumps({"verdict": "PASS", "route": "NONE", "summary": "ok"}), encoding="utf-8"
+        )
+        (run_dir / "reviewer.raw.md").write_text("VERDICT: PASS\n", encoding="utf-8")
+        store.update(status="reviewing")
+        status, payload, _ = self.request("GET", "/api/runs/live")
+        self.assert_poll_shape(payload)
+        self.assertEqual(payload["status"], "reviewing")
+        self.assertEqual(payload["review"]["verdict"], "PASS")
+        self.assertTrue(payload["reviewer_raw_available"])
+        self.assertEqual(payload["reviewer_raw"], "VERDICT: PASS\n")
+
+        store.update(status="committed", commit_sha="c" * 40)
+        status, payload, _ = self.request("GET", "/api/runs/live")
+        self.assert_poll_shape(payload)
+        self.assertEqual(payload["status"], "committed")
+        self.assertEqual(payload["state"]["commit_sha"], "c" * 40)
+        self.assertIsNone(payload["failure"])
+
+        failed = self.create_run("broken", "implementing")
+        RunStateStore(failed / "state.json").record_failure("CHECK_FAILED", "unit")
+        status, payload, _ = self.request("GET", "/api/runs/broken")
+        self.assert_poll_shape(payload)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["state"]["failure"], {"reason": "CHECK_FAILED", "detail": "unit"})
+
+    def test_approval_controls_follow_status(self) -> None:
+        self.create_run("before", "planning")
+        page = self.get_html("/runs/before")
+        self.assertIn('<div id="approval-actions" hidden>', page)
+        self.assertIn('<button id="approve" type="button" disabled>', page)
+        self.assertIn("const META_TOKEN = null;", page)
+        # A page rendered before the gate reloads itself once to obtain
+        # the controls when polling observes awaiting_plan_approval.
+        self.assertIn("window.location.reload()", page)
+
+        self.create_run("gate", "awaiting_plan_approval")
+        page = self.get_html("/runs/gate")
+        self.assertIn('<div id="approval-actions">', page)
+        self.assertIn('<button id="approve" type="button">', page)
+        self.assertIn('<button id="reject" type="button">', page)
+
+
+class ProgressOffsetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.runs = Path(self.temp.name)
+        (self.runs / "p").mkdir()
+        self.path = self.runs / "p" / "agent.events.jsonl"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def write(self, data: bytes, mode: str = "wb") -> None:
+        with self.path.open(mode) as stream:
+            stream.write(data)
+
+    def poll(self, offset: int) -> dict:
+        return api.progress(self.runs, "p", offset)
+
+    def drain(self, offset: int = 0, max_requests: int = 200) -> tuple[int, list[str]]:
+        """Poll like the browser until the offset stops, checking progress."""
+
+        events: list[str] = []
+        for _ in range(max_requests):
+            payload = self.poll(offset)
+            events.extend(payload["events"])
+            if payload["next_offset"] == offset:
+                return offset, events
+            self.assertGreater(payload["next_offset"], offset)
+            offset = payload["next_offset"]
+        self.fail("progress offset did not settle")
+
+    @staticmethod
+    def event(kind: str) -> bytes:
+        return json.dumps({"type": kind}).encode() + b"\n"
+
+    def test_normal_lines_advance_normally(self) -> None:
+        data = self.event("one") + self.event("two") + self.event("three")
+        self.write(data)
+        payload = self.poll(0)
+        self.assertEqual(payload, {"next_offset": len(data), "events": ["one", "two", "three"]})
+        self.assertEqual(self.poll(len(data)), {"next_offset": len(data), "events": []})
+
+    def test_partial_final_line_waits_correctly(self) -> None:
+        first = self.event("first")
+        self.write(first + b'{"type": "sec')
+        payload = self.poll(0)
+        self.assertEqual(payload, {"next_offset": len(first), "events": ["first"]})
+        self.assertEqual(self.poll(len(first)), {"next_offset": len(first), "events": []})
+        self.write(b'ond"}\n', "ab")
+        self.assertEqual(self.poll(len(first))["events"], ["second"])
+
+    def test_line_longer_than_window_eventually_advances(self) -> None:
+        big = json.dumps({"type": "big", "pad": "x" * (300 * 1024)}).encode() + b"\n"
+        data = self.event("before") + big + b"not json\n" + self.event("after")
+        self.write(data)
+        offset, events = self.drain()
+        self.assertEqual(offset, len(data))
+        self.assertEqual(events, ["before", "big", "after"])
+
+    def test_oversized_line_is_omitted_and_never_repeats_offset(self) -> None:
+        oversized = b'{"type": "huge", "pad": "' + b"y" * (api.PROGRESS_MAX_EVENT_BYTES + 4096) + b'"}\n'
+        data = self.event("before") + oversized + b"{malformed\n" + self.event("after")
+        self.write(data)
+        offset, events = self.drain()
+        self.assertEqual(offset, len(data))
+        self.assertEqual(events, ["before", api.OVERSIZED_EVENT, "after"])
+
+    def test_oversized_line_is_skipped_across_bounded_requests(self) -> None:
+        with patch.multiple(
+            api,
+            PROGRESS_MAX_BYTES=64,
+            PROGRESS_MAX_EVENT_BYTES=128,
+            PROGRESS_MAX_SKIP_BYTES=100,
+            _PROGRESS_SCAN_CHUNK_BYTES=16,
+        ):
+            data = b"z" * 1000 + b"\n" + b"[1, 2]\n" + b"not json\n" + self.event("after")
+            self.write(data)
+            offset, events = self.drain()
+        self.assertEqual(offset, len(data))
+        self.assertEqual(events, [api.OVERSIZED_EVENT, "after"])
+
+    def test_oversized_line_still_being_written_advances(self) -> None:
+        with patch.multiple(
+            api,
+            PROGRESS_MAX_BYTES=64,
+            PROGRESS_MAX_EVENT_BYTES=128,
+            PROGRESS_MAX_SKIP_BYTES=100,
+            _PROGRESS_SCAN_CHUNK_BYTES=16,
+        ):
+            self.write(b"q" * 500)
+            first = self.poll(0)
+            self.assertGreater(first["next_offset"], 0)
+            self.assertEqual(first["events"], [api.OVERSIZED_EVENT])
+            offset, events = self.drain(first["next_offset"])
+            self.assertEqual(offset, 500)
+            self.assertEqual(events, [])
+            self.write(b"q" * 50 + b"\n" + self.event("after"), "ab")
+            offset, events = self.drain(offset)
+            self.assertEqual(offset, self.path.stat().st_size)
+            self.assertEqual(events, ["after"])
 
 
 if __name__ == "__main__":

@@ -21,8 +21,9 @@ from metaharness.gitops import (  # noqa: E402
     read_file_at_commit,
     resolve_commit,
     stage_all,
-    staged_blobs,
+    staged_changed_blobs,
     staged_changed_files,
+    staged_changes,
     staged_diff,
     status_porcelain,
     symbolic_head,
@@ -277,10 +278,10 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(index_tree_sha(worktree), candidate)
 
     def test_staged_blobs_preserve_paths_and_skip_gitlinks(self) -> None:
-        (self.repo / "unicode file.txt").write_text("blob\n", encoding="utf-8")
+        (self.repo / "unicode file é.txt").write_text("blob\n", encoding="utf-8")
         stage_all(self.repo)
-        blobs = staged_blobs(self.repo)
-        blob = next(item for item in blobs if item.path == "unicode file.txt")
+        blobs = staged_changed_blobs(self.repo)
+        blob = next(item for item in blobs if item.path == "unicode file é.txt")
         self.assertEqual(blob.size, len("blob\n".encode()))
 
         nested = self.root / "nested"
@@ -299,8 +300,40 @@ class GitOpsTests(unittest.TestCase):
             "--cacheinfo",
             f"160000,{nested_sha},submodule.py",
         )
+        changes = {change.path: change for change in staged_changes(self.repo)}
+        self.assertTrue(changes["submodule.py"].is_gitlink)
+        self.assertNotIn("submodule.py", {item.path for item in staged_changed_blobs(self.repo)})
+
+    def test_changed_blob_selection_ignores_unmodified_files(self) -> None:
+        for index in range(300):
+            (self.repo / f"untouched {index:03d}.txt").write_text(f"{index}\n", encoding="utf-8")
+        (self.repo / "link.txt").symlink_to("README.md")
+        run_git(self.repo, "add", "--all")
+        run_git(self.repo, "commit", "-qm", "many files")
+
+        (self.repo / "README.md").write_text("modified\n", encoding="utf-8")
+        (self.repo / "delete me.txt").unlink()
+        (self.repo / "nouveau é.txt").write_text("unicode\n", encoding="utf-8")
+        (self.repo / "data file.bin").write_bytes(b"\x00\x01\xff binary")
+        (self.repo / "link.txt").unlink()
+        (self.repo / "link.txt").symlink_to("rename me.txt")
+        (self.repo / "new link").symlink_to("README.md")
         stage_all(self.repo)
-        self.assertNotIn("submodule.py", {item.path for item in staged_blobs(self.repo)})
+
+        changes = staged_changes(self.repo)
+        self.assertEqual(
+            {change.path for change in changes},
+            set(staged_changed_files(self.repo)),
+        )
+        self.assertTrue(next(c for c in changes if c.path == "delete me.txt").deleted)
+        blobs = {blob.path: blob for blob in staged_changed_blobs(self.repo)}
+        self.assertEqual(
+            set(blobs),
+            {"README.md", "nouveau é.txt", "data file.bin", "link.txt", "new link"},
+        )
+        self.assertEqual(blobs["data file.bin"].size, len(b"\x00\x01\xff binary"))
+        self.assertEqual(blobs["link.txt"].size, len("rename me.txt"))
+        self.assertFalse(any(path.startswith("untouched") for path in blobs))
 
     def test_ref_snapshots_and_option_like_refs(self) -> None:
         worktree = self.root / "refs"

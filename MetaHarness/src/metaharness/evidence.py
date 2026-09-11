@@ -10,15 +10,16 @@ from pathlib import Path
 from typing import Any
 
 from .gitops import (
+    StagedChange,
     current_head,
     index_tree_sha,
     read_staged_blob,
     stage_all,
     staged_binary_files,
-    staged_blobs,
+    staged_changed_blobs,
     staged_changed_files,
+    staged_changes,
     staged_diff,
-    staged_submodule_paths,
 )
 from .models import HarnessConfig
 from .redaction import contains_secret, redact
@@ -193,37 +194,44 @@ def _gate_failures(
 def _staged_blob_failures(
     root: Path,
     changed_files: tuple[str, ...],
+    changes: tuple[StagedChange, ...],
     secrets: tuple[str, ...],
 ) -> list[str]:
-    """Scan changed index blobs without loading oversized blobs."""
+    """Scan the changed index blobs without loading oversized blobs.
 
-    blobs = {blob.path: blob for blob in staged_blobs(root)}
-    encoded_secrets = tuple(secret.encode("utf-8") for secret in secrets if secret)
+    Only changed paths are described (one diff and one batched cat-file
+    call), so the cost follows the change, not the repository size.
+    """
+
     failures: list[str] = []
+    described = {change.path for change in changes}
+    # Both lists come from the same index; a path the raw diff cannot
+    # describe is never silently treated as a deletion.
     for path in changed_files:
-        blob = blobs.get(path)
-        if blob is None:
-            # Deletions and gitlinks do not have a staged blob to scan.
-            continue
-        if blob.size > MAX_SECRET_SCAN_BLOB_BYTES:
+        if path not in described:
             failures.append(f"{UNSCANNABLE_STAGED_BLOB}:{path}")
+    encoded_secrets = tuple(secret.encode("utf-8") for secret in secrets if secret)
+    for blob in staged_changed_blobs(root, changes):
+        if blob.size > MAX_SECRET_SCAN_BLOB_BYTES:
+            failures.append(f"{UNSCANNABLE_STAGED_BLOB}:{blob.path}")
             continue
         if not encoded_secrets:
             continue
         content = read_staged_blob(root, blob.object_id)
         if any(secret in content for secret in encoded_secrets):
-            failures.append(f"{SECRET_IN_STAGED_BLOB}:{path}")
+            failures.append(f"{SECRET_IN_STAGED_BLOB}:{blob.path}")
     return failures
 
 
 def _unreviewable_text_diff_failures(
     root: Path,
     changed_files: tuple[str, ...],
+    changes: tuple[StagedChange, ...],
 ) -> list[str]:
     """Reject source-like paths whose staged diff is binary-only."""
 
     binary_paths = staged_binary_files(root)
-    submodule_paths = staged_submodule_paths(root)
+    submodule_paths = frozenset(change.path for change in changes if change.is_gitlink)
     return [
         f"{UNREVIEWABLE_TEXT_DIFF}:{path}"
         for path in changed_files
@@ -269,6 +277,7 @@ def collect_evidence(
     # tree written below is the exact tree offered to the reviewer.
     stage_all(root)
     changed_files = staged_changed_files(root)
+    changes = staged_changes(root)
     diff = staged_diff(root)
     tree_sha = index_tree_sha(root)
 
@@ -278,8 +287,8 @@ def collect_evidence(
         changed_files=changed_files,
         max_diff_bytes=config.max_diff_bytes,
     )
-    failures.extend(_staged_blob_failures(root, changed_files, secrets))
-    failures.extend(_unreviewable_text_diff_failures(root, changed_files))
+    failures.extend(_staged_blob_failures(root, changed_files, changes, secrets))
+    failures.extend(_unreviewable_text_diff_failures(root, changed_files, changes))
     if contains_secret(diff, secrets):
         # The diff would be sent to the reviewer endpoint and persisted.
         failures.append(SECRET_IN_DIFF)

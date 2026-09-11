@@ -42,9 +42,13 @@ def _git(
     timeout: int = 60,
     env: dict[str, str] | None = None,
     errors: str = "strict",
+    input: str | None = None,
 ) -> CompletedProcess[str]:
     """Run one Git command without invoking a shell."""
 
+    stdin_kwargs: dict[str, object] = (
+        {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+    )
     try:
         result = subprocess.run(
             ["git", "-C", str(repo), *args],
@@ -52,10 +56,10 @@ def _git(
             encoding="utf-8",
             errors=errors,
             capture_output=True,
-            stdin=subprocess.DEVNULL,
             timeout=timeout,
             shell=False,
             env=env,
+            **stdin_kwargs,
         )
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         raise GitError(f"git command failed: {exc}") from exc
@@ -88,55 +92,135 @@ def _git_bytes(repo: Path, *args: str, timeout: int = 60) -> bytes:
     return result.stdout
 
 
-def _staged_index_entries(worktree: Path) -> tuple[tuple[str, str, str], ...]:
-    """Return ``(mode, object_id, path)`` entries from the current index."""
+@dataclass(frozen=True)
+class StagedChange:
+    """One path changed between HEAD and the index (``git diff --cached``).
+
+    ``path`` is decoded exactly like :func:`staged_changed_files`.  ``mode``
+    and ``object_id`` describe the staged (new) side; a deletion has
+    ``deleted=True`` and no staged object.
+    """
+
+    path: str
+    mode: str
+    object_id: str | None
+    deleted: bool
+
+    @property
+    def is_gitlink(self) -> bool:
+        return self.mode == "160000"
+
+
+_ZERO_OBJECT_ID = re.compile(r"0{40}|0{64}")
+
+
+def staged_changes(worktree: Path) -> tuple[StagedChange, ...]:
+    """Return the staged changes vs HEAD with their new index mode and object.
+
+    One ``git diff --cached --raw`` call: the cost is proportional to the
+    number of changed paths, not to the size of the index.  ``-z`` keeps
+    spaces, quotes and non-ASCII names verbatim; renames are split into a
+    deletion and an addition like :func:`staged_changed_files`.
+    """
 
     output = _git(
-        worktree, "ls-files", "--stage", "-z", errors="surrogateescape"
+        worktree,
+        "diff",
+        "--cached",
+        "--raw",
+        "-z",
+        "--no-renames",
+        "--no-abbrev",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        timeout=600,
+        errors="replace",
     ).stdout
-    entries: list[tuple[str, str, str]] = []
-    for record in output.split("\0"):
-        if not record:
+    records = output.split("\0")
+    if records and records[-1] == "":
+        records.pop()
+    if len(records) % 2:
+        raise GitError("git diff returned malformed raw output")
+    changes: list[StagedChange] = []
+    for metadata, path in zip(records[0::2], records[1::2]):
+        fields = metadata.split(" ")
+        if len(fields) != 5 or not fields[0].startswith(":") or not path:
+            raise GitError("git diff returned malformed raw metadata")
+        _old_mode, new_mode, _old_id, new_id, status = fields
+        if _OBJECT_ID.fullmatch(new_id) is None:
+            raise GitError("git diff returned an invalid object ID")
+        if status == "D":
+            changes.append(StagedChange(path=path, mode=new_mode, object_id=None, deleted=True))
             continue
-        metadata, separator, path = record.partition("\t")
-        if not separator:
-            raise GitError("git ls-files returned a malformed staged entry")
-        fields = metadata.split()
-        if len(fields) != 3:
-            raise GitError("git ls-files returned malformed staged metadata")
-        mode, object_id, stage = fields
-        if stage != "0" or _OBJECT_ID.fullmatch(object_id) is None:
-            # Unmerged entries cannot form a tree and are not readable staged
-            # blobs for this gate.
-            continue
-        entries.append((mode, object_id, path))
-    return tuple(entries)
+        if _ZERO_OBJECT_ID.fullmatch(new_id) is not None:
+            # Unmerged or otherwise unstaged content has no scannable object.
+            raise GitError(f"staged path has no object: {path}")
+        changes.append(StagedChange(path=path, mode=new_mode, object_id=new_id, deleted=False))
+    return tuple(changes)
 
 
 def staged_submodule_paths(worktree: Path) -> frozenset[str]:
-    """Return staged gitlink paths, whose object IDs are commits, not blobs."""
+    """Return changed staged gitlink paths, whose objects are commits, not blobs."""
 
-    return frozenset(
-        path for mode, _object_id, path in _staged_index_entries(worktree) if mode == "160000"
-    )
+    return frozenset(change.path for change in staged_changes(worktree) if change.is_gitlink)
 
 
-def staged_blobs(worktree: Path) -> tuple[StagedBlob, ...]:
-    """Describe regular blobs in the current index without reading contents."""
+def _blob_sizes(worktree: Path, object_ids: tuple[str, ...]) -> dict[str, int]:
+    """Size every object with one ``git cat-file --batch-check`` process."""
 
-    blobs: list[StagedBlob] = []
-    for mode, object_id, path in _staged_index_entries(worktree):
-        if mode == "160000":
-            continue
-        size_text = _git(worktree, "cat-file", "-s", object_id).stdout.strip()
+    if not object_ids:
+        return {}
+    unique = tuple(dict.fromkeys(object_ids))
+    output = _git(
+        worktree,
+        "cat-file",
+        "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        input="".join(f"{object_id}\n" for object_id in unique),
+        timeout=600,
+    ).stdout
+    lines = output.splitlines()
+    if len(lines) != len(unique):
+        raise GitError("git cat-file returned an unexpected number of records")
+    sizes: dict[str, int] = {}
+    for expected, line in zip(unique, lines):
+        fields = line.split(" ")
+        if len(fields) != 3 or fields[0] != expected:
+            raise GitError("staged blob object is missing or malformed")
+        _object_id, object_type, size_text = fields
+        if object_type != "blob":
+            raise GitError("staged object is not a blob")
         try:
             size = int(size_text)
         except ValueError as exc:
             raise GitError("git cat-file returned an invalid blob size") from exc
         if size < 0:
             raise GitError("git cat-file returned a negative blob size")
-        blobs.append(StagedBlob(path=path, object_id=object_id, size=size))
-    return tuple(blobs)
+        sizes[expected] = size
+    return sizes
+
+
+def staged_changed_blobs(
+    worktree: Path, changes: tuple[StagedChange, ...] | None = None
+) -> tuple[StagedBlob, ...]:
+    """Describe the staged blobs of changed paths only, without reading them.
+
+    Deletions and gitlinks have no staged blob.  Regular files, executables
+    and symlinks (whose blob is the link target) are all returned.
+    """
+
+    if changes is None:
+        changes = staged_changes(worktree)
+    candidates = [
+        change
+        for change in changes
+        if not change.deleted and not change.is_gitlink and change.object_id is not None
+    ]
+    sizes = _blob_sizes(worktree, tuple(change.object_id for change in candidates))
+    return tuple(
+        StagedBlob(path=change.path, object_id=change.object_id, size=sizes[change.object_id])
+        for change in candidates
+    )
 
 
 def read_staged_blob(worktree: Path, object_id: str) -> bytes:
