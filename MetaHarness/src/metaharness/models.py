@@ -84,6 +84,10 @@ class ImplementationStep:
     instructions: str
     verify: str
     forbidden: str
+    # New paths the step may create, existing paths it may delete.  Older
+    # META PLAN v2 answers without these sections parse to empty tuples.
+    create_set: tuple[str, ...] = ()
+    delete_set: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

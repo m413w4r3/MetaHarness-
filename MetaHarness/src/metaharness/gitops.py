@@ -479,6 +479,73 @@ def candidate_tree_sha(worktree: Path) -> str:
     return tree_sha
 
 
+def _require_object_id(value: str, label: str) -> str:
+    if not isinstance(value, str) or _OBJECT_ID.fullmatch(value) is None:
+        raise GitError(f"{label} must be a complete object ID")
+    return value
+
+
+def path_exists_in_tree(repo: Path, tree_sha: str, path: str) -> bool:
+    """Return whether *path* names an entry of the tree object *tree_sha*.
+
+    One ``git ls-tree`` restricted to that literal path: the repository is
+    never walked and the working tree is never consulted.
+    """
+
+    tree = _require_object_id(tree_sha, "tree_sha")
+    relative = _validate_relative_path(path)
+    output = _git(
+        repo,
+        "--literal-pathspecs",
+        "ls-tree",
+        "-z",
+        "--full-tree",
+        tree,
+        "--",
+        relative,
+        errors="surrogateescape",
+    ).stdout
+    for record in output.split("\0"):
+        if not record:
+            continue
+        _metadata, separator, entry_path = record.partition("\t")
+        if not separator:
+            raise GitError("git ls-tree returned malformed output")
+        if entry_path == relative:
+            return True
+    return False
+
+
+def changed_paths_between_trees(
+    repo: Path, before_tree: str, after_tree: str
+) -> tuple[str, ...]:
+    """Return every path that differs between two tree objects, sorted.
+
+    Renames are split into a deletion and an addition, so both sides are
+    reported.  Undecodable bytes are kept as surrogates: such a path can
+    never equal an authorized path.
+    """
+
+    before = _require_object_id(before_tree, "before_tree")
+    after = _require_object_id(after_tree, "after_tree")
+    output = _git(
+        repo,
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        before,
+        after,
+        "--",
+        timeout=600,
+        errors="surrogateescape",
+    ).stdout
+    return tuple(sorted({path for path in output.split("\0") if path}))
+
+
 def commit_reviewed_tree(
     worktree: Path,
     *,

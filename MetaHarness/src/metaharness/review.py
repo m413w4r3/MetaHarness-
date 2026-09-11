@@ -24,6 +24,13 @@ from .llm.wire import (
     parse_labeled_document,
 )
 from .models import ReviewRoute, ReviewVerdict
+from .usage import (
+    REVIEWER_USAGE_ARTIFACT,
+    add_usage,
+    completion_usage,
+    normalize_usage,
+    write_usage_artifact,
+)
 
 
 class ReviewError(ValueError):
@@ -481,9 +488,12 @@ class Reviewer:
         # review must remain inspectable.
         if target is not None:
             _atomic_write_text(target / "reviewer.request.txt", request)
-        first_raw = _completion_text(self.client.complete(request))
+        first_result = self.client.complete(request)
+        first_raw = _completion_text(first_result)
+        usages = [normalize_usage(completion_usage(first_result))]
         if target is not None:
             _atomic_write_text(target / "reviewer.raw.md", first_raw)
+            write_usage_artifact(target / REVIEWER_USAGE_ARTIFACT, add_usage(usages))
         try:
             review = parse_review(first_raw, deterministic_passed=deterministic_passed)
         except ReviewParseError as first_error:
@@ -492,9 +502,12 @@ class Reviewer:
             repair_request = build_review_repair_prompt(first_raw, first_error)
             if target is not None:
                 _atomic_write_text(target / "reviewer.repair.request.txt", repair_request)
-            repaired_raw = _completion_text(self.client.complete(repair_request))
+            repaired_result = self.client.complete(repair_request)
+            repaired_raw = _completion_text(repaired_result)
+            usages.append(normalize_usage(completion_usage(repaired_result)))
             if target is not None:
                 _atomic_write_text(target / "reviewer.repair.raw.md", repaired_raw)
+                write_usage_artifact(target / REVIEWER_USAGE_ARTIFACT, add_usage(usages))
             try:
                 review = parse_review(
                     repaired_raw, deterministic_passed=deterministic_passed

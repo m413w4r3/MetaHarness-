@@ -9,9 +9,9 @@
 - Any API key supplied through the environment variable named by
   `api_key_env`; never put the key itself in TOML.
 
-For the AutoWork profile, copy this example to the MetaHarness checkout root
-(or adjust its paths) before running it. The endpoint configuration is
-explicit; secrets are loaded from the configured environment file.
+`examples/autowork.toml` is usable in place: its relative paths are resolved
+from `examples/`. The endpoint configuration is explicit; the secret is
+loaded only from `Bridges/.env.models`. No `export` is needed.
 
 ## Local checks
 
@@ -28,14 +28,19 @@ executable for a complete no-network orchestration path.
 ## Configure and run
 
 ```sh
-cp examples/autowork.toml autowork.local.toml
-python -m metaharness.cli config-check --config autowork.local.toml
-python -m metaharness.cli doctor --config autowork.local.toml
-python -m metaharness.cli run \
-  --config autowork.local.toml \
+metaharness config-check --config examples/autowork.toml
+metaharness doctor --config examples/autowork.toml
+metaharness run \
+  --config examples/autowork.toml \
   --spec examples/spec-example.md \
   --run-id example-001
 ```
+
+`doctor` never contacts a model. Besides local files, Git and executables it
+runs `codex sandbox -- /bin/true` with the managed `CODEX_HOME` (this detects
+bubblewrap/AppArmor refusals) and, for OpenAI-chat profiles on `127.0.0.1` or
+`localhost` only, an unauthenticated `GET <base_url>/health` expecting
+`{"status": "ok"}`.
 
 On first use, authenticate the managed Codex runtime once:
 
@@ -83,7 +88,7 @@ python -m metaharness.cli show --run ../MetaHarness-runs/example-001
 Start the local run UI:
 
 ```sh
-metaharness web --config autowork.local.toml --port 8765
+metaharness web --config examples/autowork.toml --port 8765
 ```
 
 Open `http://127.0.0.1:8765/`, click `NEW RUN`, enter the SPEC and click
@@ -98,8 +103,16 @@ NEW RUN → SPEC → CREATE RUN → planner → APPROVE → Codex → checks →
 The CLI remains available for automation and file-based runs:
 
 ```sh
-metaharness run --config autowork.local.toml --spec my-spec.md
+metaharness run --config examples/autowork.toml --spec my-spec.md
 ```
+
+With `[planning] protocol = "v2"`, the approval card shows the execution mode,
+the step count and, for every step, the recommended implementer, a profile
+dropdown and the exact `steps/Sxx/contract.md` bytes hashed in
+`implementation_bundle.json` — the same bytes each fresh Codex process
+receives. After approval each step card shows its status (✓ ✗ ▶ …), recent
+events (messages and tool names, never tool arguments) and token usage; the
+TOKEN USAGE table sums planner, Luna and reviewer tokens.
 
 Open the created run, read the canonical plan, then approve or reject it and
 observe Codex progress, checks and review. The UI never runs Codex or checks,
@@ -131,7 +144,11 @@ failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,
 `CHECK_MUTATED`, `EMPTY_DIFF`, `DIFF_TOO_LARGE`, `SECRET_IN_DIFF`,
 `DETERMINISTIC_GATE_FAILED`, `REVIEW_REVISE`, `REVIEW_FAIL`,
 `PLAN_APPROVAL_INVALID`, `WORKSPACE_SETUP_FAILED`, `WORKSPACE_SETUP_TIMEOUT`,
-`WORKSPACE_SETUP_MUTATED`, `AGENT_NO_CHANGE`, `TOCTOU_FAILURE`, `GIT_FAILURE`.
+`WORKSPACE_SETUP_MUTATED`, `AGENT_NO_CHANGE`, `TOCTOU_FAILURE`, `GIT_FAILURE`,
+`STEP_CONTRACT_DRIFT` (a step's READ/WRITE/DELETE path is missing or a CREATE
+path already exists in the tree before Codex), `STEP_WRITE_SET_VIOLATION`
+(Git shows a changed path outside the step's WRITE ∪ CREATE ∪ DELETE sets).
+A v2 failure detail always starts with `step=Sxx` when a step failed.
 V0 stops and
 leaves the run directory and worktree available for inspection; it does not
 automatically repair or retry implementation work. Resolve the issue as an

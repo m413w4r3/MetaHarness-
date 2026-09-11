@@ -24,6 +24,13 @@ from .llm.wire import (
     parse_labeled_document,
 )
 from .models import PlanDecision
+from .usage import (
+    PLANNER_USAGE_ARTIFACT,
+    add_usage,
+    completion_usage,
+    normalize_usage,
+    write_usage_artifact,
+)
 
 
 @dataclass(frozen=True)
@@ -384,9 +391,12 @@ class Planner:
         # a transport failure still leaves the exact request/response behind.
         if target is not None:
             _atomic_write_text(target / "planner.request.txt", request)
-        first_raw = _completion_text(self.client.complete(request))
+        first_result = self.client.complete(request)
+        first_raw = _completion_text(first_result)
+        usages = [normalize_usage(completion_usage(first_result))]
         if target is not None:
             _atomic_write_text(target / "planner.raw.md", first_raw)
+            write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, add_usage(usages))
         try:
             plan = parse_task_plan(first_raw)
         except PlanParseError as first_error:
@@ -395,9 +405,12 @@ class Planner:
             repair_request = build_repair_prompt(first_raw, first_error)
             if target is not None:
                 _atomic_write_text(target / "planner.repair.request.txt", repair_request)
-            repaired_raw = _completion_text(self.client.complete(repair_request))
+            repaired_result = self.client.complete(repair_request)
+            repaired_raw = _completion_text(repaired_result)
+            usages.append(normalize_usage(completion_usage(repaired_result)))
             if target is not None:
                 _atomic_write_text(target / "planner.repair.raw.md", repaired_raw)
+                write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, add_usage(usages))
             try:
                 plan = parse_task_plan(repaired_raw)
             except PlanParseError as repair_error:

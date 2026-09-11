@@ -52,7 +52,10 @@ def _integer_fields(value: Any) -> dict[str, int] | None:
     }
     wanted = {
         "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
         "output_tokens",
+        "reasoning_output_tokens",
         "total_tokens",
         "prompt_tokens",
         "completion_tokens",
@@ -157,4 +160,72 @@ def summarize_event(event: dict[str, Any]) -> str | None:
     return None
 
 
-__all__ = ["extract_final", "extract_usage", "iter_events", "parse_event", "summarize_event"]
+def _one_line(value: Any, limit: int = 110) -> str:
+    return " ".join(str(value).split())[:limit]
+
+
+def _program_name(command: Any) -> str:
+    """Only the program of a command, never its arguments."""
+
+    if isinstance(command, (list, tuple)):
+        first = next((part for part in command if isinstance(part, str) and part), "")
+    elif isinstance(command, str):
+        parts = command.split()
+        first = parts[0] if parts else ""
+    else:
+        first = ""
+    return first.rsplit("/", 1)[-1][:40] or "?"
+
+
+def summarize_step_event(event: dict[str, Any]) -> str | None:
+    """Compact per-step progress line: messages and tool names only.
+
+    Tool arguments (command lines, MCP arguments, patch bodies) are never
+    rendered; a command is reduced to its program name.
+    """
+
+    msg = event.get("msg") if isinstance(event.get("msg"), dict) else {}
+    event_type = str(event.get("type") or msg.get("type") or "")
+    item = event.get("item") or msg.get("item")
+    if isinstance(item, dict):
+        item_type = str(item.get("type") or "")
+        if event_type == "item.updated":
+            return None
+        if item_type in {"agent_message", "assistant_message"}:
+            if event_type == "item.started":
+                return None
+            text = item.get("text") or item.get("content")
+            return f"message: {_one_line(text)}" if isinstance(text, str) and text.strip() else None
+        if item_type == "command_execution" or "command" in item:
+            if event_type == "item.completed":
+                return None
+            return f"tool: command {_program_name(item.get('command'))}"
+        if item_type in {"file_change", "patch_apply", "apply_patch"}:
+            if event_type == "item.started":
+                return None
+            changes = item.get("changes") or item.get("paths") or item.get("files") or []
+            paths = [
+                str(change.get("path")) if isinstance(change, dict) else str(change)
+                for change in changes if isinstance(changes, list)
+            ][:3]
+            return "tool: file_change" + (f" {_one_line(', '.join(paths), 90)}" if paths else "")
+        tool = item.get("tool_name") or item.get("tool") or item.get("name")
+        if item_type == "mcp_tool_call" or isinstance(tool, str):
+            if event_type == "item.completed":
+                return None
+            return f"tool: {_one_line(tool or item_type, 60)}"
+        if item_type:
+            return None if event_type in {"item.started", "item.completed"} else item_type
+    if msg.get("type") in {"agent_message", "assistant_message"} and isinstance(msg.get("message"), str):
+        return f"message: {_one_line(msg['message'])}"
+    return event_type or None
+
+
+__all__ = [
+    "extract_final",
+    "extract_usage",
+    "iter_events",
+    "parse_event",
+    "summarize_event",
+    "summarize_step_event",
+]

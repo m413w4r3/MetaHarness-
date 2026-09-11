@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -9,10 +10,10 @@ import time
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping
+from typing import Any, BinaryIO, Callable, Mapping
 from urllib.parse import unquote
 
-from ..agent.events import parse_event, summarize_event
+from ..agent.events import parse_event, summarize_event, summarize_step_event
 from ..approval import (
     ApprovalDecision,
     ApprovalError,
@@ -33,9 +34,17 @@ from ..execution_selection import (
     validate_execution_selection_v3,
 )
 from ..models import ExecutionRole, ExecutionSelection, HarnessConfig, RunStatus
-from ..planning_v2 import V2PlanParseError, validate_implementation_bundle
+from ..planning_v2 import V2PlanParseError, step_contract_path, validate_implementation_bundle
 from ..profiles import ProfileError, profile_for_role, profiles_for_config, safe_profile_metadata
 from ..state import RunStateStore
+from ..usage import (
+    PLANNER_USAGE_ARTIFACT,
+    REVIEWER_USAGE_ARTIFACT,
+    add_usage,
+    empty_usage,
+    normalize_usage,
+    read_usage_artifact,
+)
 from .run_manager import RunCapacityError, RunCollisionError, RunManager, RunManagerError
 
 ARTIFACT_ALLOWLIST = frozenset(
@@ -64,8 +73,16 @@ ARTIFACT_ALLOWLIST = frozenset(
         "diff.patch",
         "plan_approval.json",
         "setup/results.json",
+        PLANNER_USAGE_ARTIFACT,
+        REVIEWER_USAGE_ARTIFACT,
     }
 )
+# A step contract is at most 8000 characters; anything larger is not shown.
+MAX_STEP_CONTRACT_BYTES = 64 * 1024
+STEP_EVENTS_MAX = 30
+# Worker input above this many tokens is flagged (advisory only).
+HIGH_WORKER_INPUT_TOKENS = 100_000
+_STEP_ID = re.compile(r"S0[1-6]\Z")
 # Window of complete JSONL lines returned by one progress request.
 PROGRESS_MAX_BYTES = 256 * 1024
 # A longer single event is omitted from the UI (the artifact keeps it; the
@@ -305,19 +322,40 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
     workspace_setup = _load_json(_artifact_path(directory, "setup/results.json"))
     if not isinstance(workspace_setup, list):
         workspace_setup = state.get("workspace_setup", [])
+    bundle = _load_json(_artifact_path(directory, "implementation_bundle.json"), max_bytes=MAX_RESULT_BYTES)
+    declared_hashes = {
+        entry.get("id"): entry.get("contract_sha256")
+        for entry in (bundle.get("steps") if isinstance(bundle, dict) and isinstance(bundle.get("steps"), list) else [])
+        if isinstance(entry, dict)
+    }
     step_artifacts: list[dict[str, Any]] = []
     raw_steps = state.get("steps") if isinstance(state.get("steps"), list) else []
     for item in raw_steps:
-        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or re.fullmatch(r"S0[1-6]", item["id"]) is None:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or _STEP_ID.fullmatch(item["id"]) is None:
             continue
         step_id = item["id"]
         step_dir = directory / "steps" / step_id
+        contract = _step_contract(directory, step_id, declared_hashes.get(step_id))
+        step_json = _load_json(step_dir / "step.json", max_bytes=MAX_RESULT_BYTES)
+        step_usage = (
+            normalize_usage(step_json.get("usage"))
+            if isinstance(step_json, dict) and isinstance(step_json.get("usage"), dict)
+            else None
+        )
         step_artifacts.append({
             **item,
-            "contract": _tail_text(step_dir / "contract.md", 16 * 1024),
+            "contract": contract["text"],
+            "contract_sha256": contract["sha256"],
+            "contract_matches_bundle": contract["matches"],
+            "contract_layout": contract["layout"],
             "final": _tail_text(step_dir / "agent.final.md", 8 * 1024),
             "stderr": _tail_text(step_dir / "agent.stderr.log", 8 * 1024),
             "result": _load_json(step_dir / "agent.result.json", max_bytes=MAX_RESULT_BYTES),
+            "events": step_progress_tail(directory, step_id, max_events=STEP_EVENTS_MAX),
+            "usage": step_usage,
+            "high_context": bool(
+                step_usage and step_usage["input_tokens"] > HIGH_WORKER_INPUT_TOKENS
+            ),
         })
     changed_files = _bounded_changed_files(
         _artifact_path(directory, "changed-files.txt")
@@ -357,16 +395,79 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
         "candidate": {"changed_files": changed_files, "diff_tail": diff_tail},
         "workspace_setup": workspace_setup,
         "step_artifacts": step_artifacts,
+        "usage": _usage_summary(directory, step_artifacts, raw_usage),
     }
 
 
-def _summaries(complete_lines: bytes) -> list[str]:
+def _step_contract(
+    directory: Path, step_id: str, declared_sha256: Any
+) -> dict[str, Any]:
+    """Read one step contract exactly as stored, never re-rendered.
+
+    ``matches`` tells whether these bytes are the ones hashed in
+    ``implementation_bundle.json``.  Historic P20 runs stored contracts as
+    ``steps/Sxx.contract.md``; that layout is shown read-only.
+    """
+
+    for layout, path in (
+        ("canonical", step_contract_path(directory, step_id)),
+        ("legacy", directory / "steps" / f"{step_id}.contract.md"),
+    ):
+        try:
+            with path.open("rb") as stream:
+                data = stream.read(MAX_STEP_CONTRACT_BYTES + 1)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            break
+        if len(data) > MAX_STEP_CONTRACT_BYTES:
+            return {"text": None, "sha256": None, "matches": False, "layout": layout}
+        digest = hashlib.sha256(data).hexdigest()
+        return {
+            "text": data.decode("utf-8", errors="replace"),
+            "sha256": digest,
+            "matches": isinstance(declared_sha256, str) and digest == declared_sha256,
+            "layout": layout,
+        }
+    return {"text": None, "sha256": None, "matches": False, "layout": None}
+
+
+def _usage_summary(
+    directory: Path, step_artifacts: list[dict[str, Any]], v1_agent_usage: Any
+) -> dict[str, Any]:
+    """Aggregate persisted token usage per phase; no pricing is derived."""
+
+    planner = read_usage_artifact(directory / PLANNER_USAGE_ARTIFACT) or empty_usage()
+    reviewer = read_usage_artifact(directory / REVIEWER_USAGE_ARTIFACT) or empty_usage()
+    steps = [
+        {"id": item["id"], "usage": item["usage"]}
+        for item in step_artifacts
+        if isinstance(item.get("usage"), dict)
+    ]
+    if steps:
+        implementer = add_usage(step["usage"] for step in steps)
+    elif isinstance(v1_agent_usage, dict) and v1_agent_usage:
+        implementer = normalize_usage(v1_agent_usage)
+    else:
+        implementer = empty_usage()
+    return {
+        "planner": planner,
+        "implementer": {"total": implementer, "steps": steps},
+        "reviewer": reviewer,
+        "grand_total": add_usage((planner, implementer, reviewer)),
+    }
+
+
+def _summaries(
+    complete_lines: bytes,
+    summarize: Callable[[dict[str, Any]], str | None] = summarize_event,
+) -> list[str]:
     events: list[str] = []
     for line in complete_lines.splitlines():
         event = parse_event(line.decode("utf-8", errors="replace"))
         if event is None:
             continue
-        summary = summarize_event(event)
+        summary = summarize(event)
         if summary:
             events.append(summary)
     return events
@@ -394,7 +495,11 @@ def _skip_past_newline(stream: BinaryIO, start: int, limit: int) -> tuple[int, b
     return position, False
 
 
-def _read_progress(stream: BinaryIO, offset: int) -> dict[str, Any]:
+def _read_progress(
+    stream: BinaryIO,
+    offset: int,
+    summarize: Callable[[dict[str, Any]], str | None] = summarize_event,
+) -> dict[str, Any]:
     if offset > 0:
         stream.seek(offset - 1)
         if stream.read(1) != b"\n":
@@ -409,7 +514,7 @@ def _read_progress(stream: BinaryIO, offset: int) -> dict[str, Any]:
     data = stream.read(PROGRESS_MAX_BYTES)
     complete_length = data.rfind(b"\n") + 1
     if complete_length:
-        return {"next_offset": offset + complete_length, "events": _summaries(data[:complete_length])}
+        return {"next_offset": offset + complete_length, "events": _summaries(data[:complete_length], summarize)}
     if len(data) < PROGRESS_MAX_BYTES:
         # A partial final line that is still being written.
         return {"next_offset": offset, "events": []}
@@ -419,7 +524,7 @@ def _read_progress(stream: BinaryIO, offset: int) -> dict[str, Any]:
     line = data + stream.read(max(0, PROGRESS_MAX_EVENT_BYTES - len(data)))
     newline = line.find(b"\n")
     if newline >= 0:
-        return {"next_offset": offset + newline + 1, "events": _summaries(line[: newline + 1])}
+        return {"next_offset": offset + newline + 1, "events": _summaries(line[: newline + 1], summarize)}
     if len(line) < PROGRESS_MAX_EVENT_BYTES:
         # Still being written and may end under the limit.
         return {"next_offset": offset, "events": []}
@@ -459,14 +564,23 @@ def progress_tail(runs_root: Path, run_id: str, max_events: int = 50) -> list[st
     if max_events == 0:
         return []
     directory = _run_dir(runs_root, run_id)
-    path = _artifact_path(directory, "agent.events.jsonl")
+    return _tail_events(_artifact_path(directory, "agent.events.jsonl"), max_events)
+
+
+def _tail_events(
+    path: Path,
+    max_events: int,
+    summarize: Callable[[dict[str, Any]], str | None] = summarize_event,
+) -> list[str]:
+    """Latest summaries of a JSONL file, read through the bounded window."""
+
     events: deque[str] = deque(maxlen=max_events)
     offset = 0
     try:
         with path.open("rb") as stream:
             size = os.fstat(stream.fileno()).st_size
             while offset < size:
-                payload = _read_progress(stream, offset)
+                payload = _read_progress(stream, offset, summarize)
                 next_offset = int(payload["next_offset"])
                 if next_offset <= offset:
                     break
@@ -477,6 +591,28 @@ def progress_tail(runs_root: Path, run_id: str, max_events: int = 50) -> list[st
     except OSError as exc:
         raise WebAPIError(503, "progress is temporarily unavailable") from exc
     return list(events)
+
+
+def step_progress_tail(
+    run_dir: Path,
+    step_id: str,
+    *,
+    max_events: int = STEP_EVENTS_MAX,
+) -> list[str]:
+    """Latest compact events of one v2 step (``steps/Sxx/agent.events.jsonl``).
+
+    Uses the same bounded JSONL window as :func:`progress_tail`; tool
+    arguments are never rendered.
+    """
+
+    if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events < 0:
+        raise WebAPIError(400, "max_events must be a non-negative integer")
+    if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None:
+        raise WebAPIError(400, "invalid step id")
+    if max_events == 0:
+        return []
+    path = Path(run_dir) / "steps" / step_id / "agent.events.jsonl"
+    return _tail_events(path, max_events, summarize_step_event)
 
 
 def approve_run(
@@ -579,10 +715,13 @@ def approve_run(
             bundle_sha256=expected.bundle_sha256,
         )
         _publish_decision(directory, selected, identity)
-        store = RunStateStore(directory / "state.json")
-        if store.load().get("status") == RunStatus.AWAITING_PLAN_APPROVAL.value:
-            store.update(status=RunStatus.AWAITING_PLAN_APPROVAL,
-                         plan_identity=asdict(identity), execution=_execution_state_v3(durable))
+        # Compare-and-set: once the orchestrator has left the gate it owns the
+        # state, and this write must not resurrect the approval status.
+        RunStateStore(directory / "state.json").update_if_status(
+            RunStatus.AWAITING_PLAN_APPROVAL,
+            plan_identity=asdict(identity),
+            execution=_execution_state_v3(durable),
+        )
         return {"ok": True, "decision": selected.value}
 
     if not (selected is ApprovalDecision.APPROVE and profile_aware):
@@ -623,14 +762,13 @@ def approve_run(
     )
     _publish_decision(directory, selected, identity)
     # 9. Only now reflect the approved choice in state.json.  The orchestrator
-    # may already have left the gate, in which case it owns the state.
-    store = RunStateStore(directory / "state.json")
-    if store.load().get("status") == RunStatus.AWAITING_PLAN_APPROVAL.value:
-        store.update(
-            status=RunStatus.AWAITING_PLAN_APPROVAL,
-            plan_identity=asdict(identity),
-            execution=_execution_state(durable),
-        )
+    # may already have left the gate, in which case it owns the state: the
+    # compare-and-set writes nothing then.
+    RunStateStore(directory / "state.json").update_if_status(
+        RunStatus.AWAITING_PLAN_APPROVAL,
+        plan_identity=asdict(identity),
+        execution=_execution_state(durable),
+    )
     return {"ok": True, "decision": selected.value}
 
 
@@ -737,7 +875,9 @@ def create_run(
 
 __all__ = [
     "ARTIFACT_ALLOWLIST",
+    "HIGH_WORKER_INPUT_TOKENS",
     "MAX_SPEC_BYTES",
+    "MAX_STEP_CONTRACT_BYTES",
     "MAX_DIAGNOSTIC_TAIL_BYTES",
     "MAX_DIFF_BYTES",
     "OVERSIZED_EVENT",
@@ -752,6 +892,7 @@ __all__ = [
     "list_runs",
     "progress",
     "progress_tail",
+    "step_progress_tail",
     "validate_run_id",
     "validate_spec",
 ]

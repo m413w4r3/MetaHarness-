@@ -18,11 +18,19 @@ from .llm.chat import TextLLMResult
 from .models import ExecutionMode, ImplementationStep, ModelProfile, TaskPlanV2
 from .planning import PlanDecision, PlanParseError
 from .result import atomic_write_text
+from .usage import PLANNER_USAGE_ARTIFACT, completion_usage, write_usage_artifact
 
 
 MAX_STEPS = 6
 MAX_STEP_CONTRACT_CHARS = 8_000
 MAX_TOTAL_STEP_CONTRACT_CHARS = 32_000
+MAX_READ_SET = 8
+MAX_WRITE_SET = 6
+MAX_CREATE_SET = 6
+MAX_DELETE_SET = 6
+# Canonical layout of the approved step contracts, written at planning time
+# and executed byte-for-byte: ``steps/<STEP>/contract.md``.
+STEP_CONTRACT_NAME = "contract.md"
 
 _HEADER = "META PLAN v2"
 _END = "END META PLAN"
@@ -33,12 +41,12 @@ _INLINE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*:\s*(.*)$")
 _PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 _TEXT_SECTIONS = frozenset(
-    {"OBJECTIVE", "CONSTRAINTS", "READ_SET", "WRITE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS"}
+    {"OBJECTIVE", "CONSTRAINTS", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS"}
 )
 _ENVELOPE_INLINE = frozenset({"STATUS", "TITLE", "EXECUTION_MODE", "STEP_COUNT", "REVIEWER_PROFILE"})
 _ENVELOPE_SECTIONS = frozenset({"OBJECTIVE", "CONSTRAINTS", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS"})
 _STEP_INLINE = frozenset({"TITLE", "IMPLEMENTER_PROFILE", "DEPENDS_ON"})
-_STEP_SECTIONS = frozenset({"OBJECTIVE", "READ_SET", "WRITE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN"})
+_STEP_SECTIONS = frozenset({"OBJECTIVE", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN"})
 
 
 class V2PlanParseError(PlanParseError):
@@ -190,32 +198,77 @@ def _read_set(value: str) -> tuple[str, ...]:
         result.append(path + " :: " + anchor)
     if not result:
         raise V2PlanParseError("READ_SET is missing")
-    if len(result) > 8:
-        raise V2PlanParseError("READ_SET may contain at most 8 paths")
+    if len(result) > MAX_READ_SET:
+        raise V2PlanParseError(f"READ_SET may contain at most {MAX_READ_SET} paths")
     return tuple(result)
 
 
-def _write_set(value: str, read_set: tuple[str, ...]) -> tuple[str, ...]:
+def read_set_paths(read_set: Sequence[str]) -> tuple[str, ...]:
+    """The repo-relative paths of ``'path :: anchor'`` READ_SET entries."""
+
+    return tuple(item.split(" :: ", 1)[0] for item in read_set)
+
+
+def _path_set(value: str, *, name: str, limit: int) -> tuple[str, ...]:
+    """Parse a ``- path`` list; exactly ``NONE`` is the explicit empty set."""
+
     if not value.strip():
-        raise V2PlanParseError("WRITE_SET is missing")
-    reads = {item.split(" :: ", 1)[0] for item in read_set}
+        raise V2PlanParseError(f"{name} is missing")
+    if value.strip() == "NONE":
+        return ()
     result: list[str] = []
     for line in value.splitlines():
         if not line.strip():
             continue
         if not line.startswith("- ") or " :: " in line:
-            raise V2PlanParseError("each WRITE_SET line must be '- path'")
-        path = _repo_path(line[2:].strip(), kind="WRITE_SET")
+            raise V2PlanParseError(f"each {name} line must be '- path'")
+        path = _repo_path(line[2:].strip(), kind=name)
         if path in result:
-            raise V2PlanParseError("duplicate WRITE_SET path")
-        if path not in reads:
-            raise V2PlanParseError("every WRITE_SET path must also appear in READ_SET")
+            raise V2PlanParseError(f"duplicate {name} path")
         result.append(path)
     if not result:
-        raise V2PlanParseError("WRITE_SET is missing")
-    if len(result) > 6:
-        raise V2PlanParseError("WRITE_SET may contain at most 6 paths")
+        raise V2PlanParseError(f"{name} is missing")
+    if len(result) > limit:
+        raise V2PlanParseError(f"{name} may contain at most {limit} paths")
     return tuple(result)
+
+
+def _change_sets(
+    values: dict[str, str], read_set: tuple[str, ...]
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Validate WRITE/CREATE/DELETE sets against READ_SET and each other."""
+
+    reads = set(read_set_paths(read_set))
+    write_set = _path_set(values["WRITE_SET"], name="WRITE_SET", limit=MAX_WRITE_SET)
+    # Plans emitted before CREATE_SET/DELETE_SET existed omit both sections.
+    create_set = (
+        _path_set(values["CREATE_SET"], name="CREATE_SET", limit=MAX_CREATE_SET)
+        if "CREATE_SET" in values
+        else ()
+    )
+    delete_set = (
+        _path_set(values["DELETE_SET"], name="DELETE_SET", limit=MAX_DELETE_SET)
+        if "DELETE_SET" in values
+        else ()
+    )
+    if any(path not in reads for path in write_set):
+        raise V2PlanParseError("every WRITE_SET path must also appear in READ_SET")
+    if any(path not in reads for path in delete_set):
+        raise V2PlanParseError("every DELETE_SET path must also appear in READ_SET")
+    if any(path in reads for path in create_set):
+        # A READ_SET path must exist and a CREATE_SET path must not.
+        raise V2PlanParseError("a CREATE_SET path cannot appear in READ_SET")
+    if (
+        set(write_set) & set(create_set)
+        or set(write_set) & set(delete_set)
+        or set(create_set) & set(delete_set)
+    ):
+        raise V2PlanParseError(
+            "a path may appear in only one of WRITE_SET, CREATE_SET and DELETE_SET"
+        )
+    if not (write_set or create_set or delete_set):
+        raise V2PlanParseError("a step must write, create or delete at least one path")
+    return write_set, create_set, delete_set
 
 
 def _parse_step(step_id: str, body: Sequence[str], implementer_ids: frozenset[str], prior_ids: frozenset[str]) -> ImplementationStep:
@@ -225,6 +278,9 @@ def _parse_step(step_id: str, body: Sequence[str], implementer_ids: frozenset[st
     for name in ("TITLE", "IMPLEMENTER_PROFILE", "DEPENDS_ON", "OBJECTIVE", "READ_SET", "WRITE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN"):
         if not values.get(name, "").strip():
             raise V2PlanParseError(f"step {step_id} is missing {name}")
+    for name in ("CREATE_SET", "DELETE_SET"):
+        if name in values and not values[name].strip():
+            raise V2PlanParseError(f"step {step_id} has an empty {name}; use NONE")
     title = _nonempty(values["TITLE"], f"step {step_id} TITLE")
     profile = values["IMPLEMENTER_PROFILE"]
     if not _PROFILE.fullmatch(profile) or profile not in implementer_ids:
@@ -235,16 +291,20 @@ def _parse_step(step_id: str, body: Sequence[str], implementer_ids: frozenset[st
             raise V2PlanParseError(f"invalid or future dependency in {step_id}")
     objective = _nonempty(values["OBJECTIVE"], f"step {step_id} OBJECTIVE")
     read_set = _read_set(values["READ_SET"])
-    write_set = _write_set(values["WRITE_SET"], read_set)
+    write_set, create_set, delete_set = _change_sets(values, read_set)
     instructions = _nonempty(values["INSTRUCTIONS"], f"step {step_id} INSTRUCTIONS")
     verify = _nonempty(values["VERIFY"], f"step {step_id} VERIFY")
     forbidden = _nonempty(values["FORBIDDEN"], f"step {step_id} FORBIDDEN")
-    return ImplementationStep(step_id, title, profile, None if dependency == "NONE" else dependency, objective, read_set, write_set, instructions, verify, forbidden)
+    return ImplementationStep(
+        step_id, title, profile, None if dependency == "NONE" else dependency,
+        objective, read_set, write_set, instructions, verify, forbidden,
+        create_set=create_set, delete_set=delete_set,
+    )
 
 
 def _render_step_contract_unchecked(plan: TaskPlanV2, step: ImplementationStep) -> str:
     def lines(items: tuple[str, ...]) -> str:
-        return "\n".join(f"- {item}" for item in items)
+        return "\n".join(f"- {item}" for item in items) if items else "NONE"
 
     return "\n\n".join(
         (
@@ -255,6 +315,8 @@ def _render_step_contract_unchecked(plan: TaskPlanV2, step: ImplementationStep) 
             "OBJECTIVE\n" + step.objective,
             "READ SET\n" + lines(step.read_set),
             "WRITE SET\n" + lines(step.write_set),
+            "CREATE SET\n" + lines(step.create_set),
+            "DELETE SET\n" + lines(step.delete_set),
             "INSTRUCTIONS\n" + step.instructions,
             "VERIFY\n" + step.verify,
             "FORBIDDEN\n" + step.forbidden,
@@ -462,7 +524,9 @@ def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict
     }
     atomic_write_text(target / "implementation_contract.md", render_plan_summary_v2(plan))
     for step in plan.steps:
-        atomic_write_text(target / "steps" / f"{step.id}.contract.md", contracts[step.id])
+        # The only copy of each contract: approval hashes and runtime reads
+        # these exact bytes; nothing re-renders them after this point.
+        atomic_write_text(step_contract_path(target, step.id), contracts[step.id])
     atomic_write_text(target / "implementation_bundle.json", json.dumps(bundle, ensure_ascii=False, indent=2) + "\n")
     # ``task_plan.json`` is the stable v2 artifact name approved by the human.
     # Keep the older suffixed name as a compatibility alias for existing tools.
@@ -477,8 +541,57 @@ def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict
     return bundle
 
 
-def validate_implementation_bundle(directory: str | Path) -> tuple[dict[str, Any], str]:
-    """Validate the immutable v2 bundle and every contract hash it declares."""
+def step_contract_path(directory: str | Path, step_id: str) -> Path:
+    """Canonical path of one step contract: ``steps/<STEP>/contract.md``."""
+
+    if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None:
+        raise V2PlanParseError("step ID must be exactly S01 through S06")
+    return Path(directory) / "steps" / step_id / STEP_CONTRACT_NAME
+
+
+def read_approved_step_contract(
+    directory: str | Path, bundle: dict[str, Any], step_id: str
+) -> str:
+    """Read the exact contract bytes declared by a validated bundle.
+
+    The bytes are hashed again at read time, so the text handed to the worker
+    is exactly the file whose hash the approval bound.
+    """
+
+    entries = bundle.get("steps") if isinstance(bundle, dict) else None
+    entry = next(
+        (item for item in entries or () if isinstance(item, dict) and item.get("id") == step_id),
+        None,
+    )
+    if entry is None:
+        raise V2PlanParseError(f"implementation bundle has no step {step_id}")
+    path = step_contract_path(Path(directory).expanduser().resolve(), step_id)
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise V2PlanParseError(f"missing contract for {step_id}") from exc
+    if hashlib.sha256(data).hexdigest() != entry.get("contract_sha256"):
+        raise V2PlanParseError(f"contract hash mismatch for {step_id}")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeError as exc:
+        raise V2PlanParseError(f"contract for {step_id} is not UTF-8") from exc
+    if len(text) > MAX_STEP_CONTRACT_CHARS:
+        raise V2PlanParseError("step contract exceeds MAX_STEP_CONTRACT_CHARS")
+    return text
+
+
+def validate_implementation_bundle(
+    directory: str | Path,
+    *,
+    expected_step_ids: Sequence[str] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Validate the immutable v2 bundle and every contract hash it declares.
+
+    With *expected_step_ids*, the bundle must declare exactly those steps in
+    that order.  Contracts are read from the canonical per-step layout only;
+    the P20 ``steps/Sxx.contract.md`` layout is never executed.
+    """
 
     target = Path(directory).expanduser().resolve()
     bundle_path = target / "implementation_bundle.json"
@@ -504,7 +617,9 @@ def validate_implementation_bundle(directory: str | Path) -> tuple[dict[str, Any
         declared = entry.get("contract_sha256")
         if not isinstance(declared, str) or re.fullmatch(r"[0-9a-f]{64}", declared) is None:
             raise V2PlanParseError("implementation bundle contract hash is invalid")
-        contract_path = target / "steps" / f"{step_id}.contract.md"
+        if _STEP_ID.fullmatch(step_id) is None:
+            raise V2PlanParseError("implementation bundle step ID is invalid")
+        contract_path = step_contract_path(target, step_id)
         try:
             actual = hashlib.sha256(contract_path.read_bytes()).hexdigest()
         except OSError as exc:
@@ -513,6 +628,8 @@ def validate_implementation_bundle(directory: str | Path) -> tuple[dict[str, Any
             raise V2PlanParseError(f"contract hash mismatch for {step_id}")
     if actual_ids != expected_ids:
         raise V2PlanParseError("implementation bundle step IDs are not contiguous")
+    if expected_step_ids is not None and list(expected_step_ids) != actual_ids:
+        raise V2PlanParseError("implementation bundle steps do not match the plan")
     return payload, hashlib.sha256(bundle_bytes).hexdigest()
 
 
@@ -580,10 +697,18 @@ class PlannerV2:
 
     def plan(self, spec: str, context: str, *, artifacts_dir: str | Path | None = None) -> TaskPlanV2:
         request = build_planner_prompt_v2(spec, context, implementer_profiles=self.implementer_profiles, reviewer_profiles=self.reviewer_profiles, template=self.template)
+        target = Path(artifacts_dir) if artifacts_dir is not None else None
+        if target is not None:
+            atomic_write_text(target / "planner.request.txt", request)
         result = self.client.complete(request)
         raw = result if isinstance(result, str) else getattr(result, "text", None)
+        if target is not None:
+            # Tokens were consumed whether or not the answer parses.
+            write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, completion_usage(result))
         if not isinstance(raw, str):
             raise V2PlanParseError("planner client did not return text")
+        if target is not None:
+            atomic_write_text(target / "planner.raw.md", raw)
         plan = parse_task_plan_v2(raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids)
         if artifacts_dir is not None:
             persist_planning_v2_artifacts(
@@ -619,11 +744,13 @@ def run_planner_v2(
 
 
 __all__ = [
-    "ExecutionMode", "ImplementationStep", "MAX_STEPS", "MAX_STEP_CONTRACT_CHARS",
-    "MAX_TOTAL_STEP_CONTRACT_CHARS", "PlannerV2", "TaskPlanV2", "V2PlanParseError",
+    "ExecutionMode", "ImplementationStep", "MAX_CREATE_SET", "MAX_DELETE_SET", "MAX_READ_SET",
+    "MAX_STEPS", "MAX_STEP_CONTRACT_CHARS", "MAX_TOTAL_STEP_CONTRACT_CHARS", "MAX_WRITE_SET",
+    "PlannerV2", "STEP_CONTRACT_NAME", "TaskPlanV2", "V2PlanParseError",
     "PlanDecision", "PlanParseError",
     "build_planner_prompt_v2", "parse_task_plan_v2", "persist_implementation_bundle",
     "persist_planning_artifacts_v2", "persist_planning_v2_artifacts",
+    "read_approved_step_contract", "read_set_paths",
     "render_plan_summary_v2", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract",
-    "run_planner_v2", "validate_implementation_bundle", "write_implementation_bundle",
+    "run_planner_v2", "step_contract_path", "validate_implementation_bundle", "write_implementation_bundle",
 ]

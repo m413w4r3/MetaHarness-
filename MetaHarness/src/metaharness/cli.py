@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import shutil
+import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
+from typing import Iterable, Mapping
 
 from .approval import (
     ApprovalDecision,
@@ -16,13 +22,23 @@ from .approval import (
     write_plan_approval,
 )
 from .config import ConfigError, load_config
+from .agent.codex import build_agent_environment
 from .agent.runtime import CodexRuntimeError, prepare_codex_home
 from .execution_selection import is_profile_aware_run
 from .gitops import GitError, assert_clean, git_root, resolve_commit
 from .llm.chat import validate_endpoint
-from .models import RunStatus
+from .models import HarnessConfig, ProfileDriver, RunStatus
 from .orchestrator import OrchestrationError, run_orchestrator
-from .state import RunStateStore
+from .profiles import profiles_for_config
+from .redaction import config_secret_values, redact
+from .state import STATE_LOCK_NAME, RunStateStore
+
+_SANDBOX_PROBE_ARGV = ("sandbox", "--", "/bin/true")
+_SANDBOX_PROBE_TIMEOUT_SECONDS = 20
+_BRIDGE_HEALTH_TIMEOUT_SECONDS = 2
+_BRIDGE_HEALTH_MAX_BYTES = 64 * 1024
+_LOCAL_BRIDGE_HOSTS = frozenset({"127.0.0.1", "localhost"})
+_DOCTOR_DETAIL_CHARS = 300
 
 
 def _endpoint(base_url: str, endpoint_path: str) -> str:
@@ -118,7 +134,7 @@ def _show(run_dir: Path) -> int:
         "artifacts": sorted(
             str(path.relative_to(directory))
             for path in directory.rglob("*")
-            if path.is_file() and path.name != "state.json"
+            if path.is_file() and path.name not in {"state.json", STATE_LOCK_NAME}
         ),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
@@ -173,8 +189,111 @@ def _write_plan_decision(run_dir: Path, decision: ApprovalDecision) -> int:
     return 0
 
 
+def _usable_secret_value(value: object) -> bool:
+    """Same acceptance rule as the HTTP client for an ``Authorization`` key.
+
+    A non-empty ``str`` whose characters are all printable ASCII without
+    space (0x21..0x7e).  The value itself is never displayed.
+    """
+
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and all(0x21 <= ord(character) <= 0x7E for character in value)
+    )
+
+
+def _bounded_detail(text: str, secrets: Iterable[str]) -> str:
+    return redact(" ".join(text.split()), secrets)[:_DOCTOR_DETAIL_CHARS]
+
+
+def _probe_codex_sandbox(
+    codex: str,
+    environment: Mapping[str, str],
+    codex_home: Path,
+    secrets: tuple[str, ...],
+) -> str | None:
+    """Run ``codex sandbox -- /bin/true``; return None or a redacted detail.
+
+    No model is contacted and nothing is persisted: the output is only used
+    for one bounded diagnostic line.
+    """
+
+    try:
+        result = subprocess.run(
+            [codex, *_SANDBOX_PROBE_ARGV],
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=_SANDBOX_PROBE_TIMEOUT_SECONDS,
+            env=dict(environment),
+            cwd=codex_home,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"timed out after {_SANDBOX_PROBE_TIMEOUT_SECONDS}s"
+    except (OSError, ValueError) as exc:
+        return _bounded_detail(f"could not start: {type(exc).__name__}", secrets)
+    if result.returncode != 0:
+        output = (result.stderr or "") + " " + (result.stdout or "")
+        return _bounded_detail(f"exit {result.returncode}: {output}", secrets)
+    return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _probe_bridge_health(base_url: str) -> bool:
+    """``GET <base_url>/health`` without credentials; expect ``{"status": "ok"}``."""
+
+    url = f"{base_url.rstrip('/')}/health"
+    request = urllib.request.Request(url, method="GET", headers={"Accept": "application/json"})
+    # No proxy, no redirect: the probe must reach exactly the local bridge.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    try:
+        with opener.open(request, timeout=_BRIDGE_HEALTH_TIMEOUT_SECONDS) as response:
+            if response.status != 200:
+                return False
+            body = response.read(_BRIDGE_HEALTH_MAX_BYTES + 1)
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+        return False
+    if len(body) > _BRIDGE_HEALTH_MAX_BYTES:
+        return False
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("status") == "ok"
+
+
+def _local_bridge_urls(config: HarnessConfig) -> list[str]:
+    """Base URLs of OpenAI-chat profiles served on this machine only."""
+
+    urls: list[str] = []
+    for profile in profiles_for_config(config).values():
+        if profile.driver is not ProfileDriver.OPENAI_CHAT or not profile.base_url:
+            continue
+        try:
+            hostname = urllib.parse.urlsplit(profile.base_url).hostname
+        except ValueError:
+            continue
+        if hostname in _LOCAL_BRIDGE_HOSTS:
+            normalized = profile.base_url.rstrip("/")
+            if normalized not in urls:
+                urls.append(normalized)
+    return urls
+
+
 def _doctor(config_path: Path) -> int:
-    """Check local prerequisites only; this function never constructs an LLM client."""
+    """Check local prerequisites only; this function never contacts a model.
+
+    The only network access is an unauthenticated ``GET /health`` to a
+    bridge configured on 127.0.0.1 or localhost.
+    """
 
     try:
         config = load_config(config_path)
@@ -183,6 +302,7 @@ def _doctor(config_path: Path) -> int:
         return 2
 
     problems: list[str] = []
+    secrets = config_secret_values(config, config.runtime_environment)
     config_dir = config_path.expanduser().resolve().parent
     print(f"config: {config_path.expanduser().resolve()}")
     for env_file in config.environment.files:
@@ -202,10 +322,10 @@ def _doctor(config_path: Path) -> int:
         if profile.api_key_env
     )
     for name in sorted(required_env_names):
-        if name in config.runtime_environment:
-            print(f"OK env {name}: set")
+        if _usable_secret_value(config.runtime_environment.get(name)):
+            print(f"OK env {name}: usable")
         else:
-            problems.append(f"required env {name} is not set")
+            problems.append(f"required env {name} is missing or invalid")
     if not config.repo.is_dir():
         problems.append(f"repo does not exist: {config.repo}")
     else:
@@ -225,16 +345,32 @@ def _doctor(config_path: Path) -> int:
         else:
             print(f"{label}: {path}")
     path_value = config.runtime_environment.get("PATH", "")
-    if shutil.which("codex", path=path_value):
+    codex = shutil.which("codex", path=path_value)
+    if codex:
         print("OK codex binary: present")
     else:
         problems.append("codex binary is not resolvable")
+    codex_home: Path | None = None
     try:
         codex_home = prepare_codex_home(config)
         print(f"OK codex home: {codex_home}")
         print("OK codex MCP isolation: none configured")
     except CodexRuntimeError as exc:
         problems.append(str(exc))
+    if codex and codex_home is not None:
+        # The environment Codex really receives: the agent allowlist taken
+        # from the runtime mapping, API keys excluded, CODEX_HOME forced.
+        probe_environment = build_agent_environment(
+            config.agent,
+            source_environment=config.runtime_environment,
+            codex_home=codex_home,
+            forbidden_names=required_env_names,
+        )
+        detail = _probe_codex_sandbox(codex, probe_environment, codex_home, secrets)
+        if detail is None:
+            print("OK codex sandbox: usable")
+        else:
+            problems.append(f"codex sandbox probe failed\n  detail: {detail}")
     for label, commands in (
         ("workspace setup", config.workspace_setup),
         ("check", config.checks),
@@ -245,6 +381,11 @@ def _doctor(config_path: Path) -> int:
                 print(f"OK {label} executable {command.name}: resolvable")
             else:
                 problems.append(f"{label} executable {command.name} is not resolvable")
+    for base_url in _local_bridge_urls(config):
+        if _probe_bridge_health(base_url):
+            print("OK planner bridge: healthy")
+        else:
+            problems.append(f"planner bridge is not healthy: GET {base_url}/health")
     if problems:
         for problem in problems:
             print(f"error: {problem}", file=sys.stderr)

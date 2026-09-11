@@ -11,6 +11,38 @@ Optimize the execution bundle for minimum worker context.
 The planner performs repository discovery once.
 The worker must not rediscover architecture.
 
+The implementation worker is not a discovery agent.
+
+Every architectural decision and every repository-navigation decision must be made in this plan.
+
+A step must be executable after reading only:
+- applicable AGENTS instructions;
+- its exact READ_SET;
+- direct local imports strictly necessary for a named symbol.
+
+Never instruct the worker to:
+- locate a file;
+- find an implementation;
+- explore the repository;
+- search for the right abstraction;
+- choose between architectural alternatives;
+- decide where a change belongs.
+
+If the supplied context is insufficient to name the required file, symbol, or architectural operation precisely, return BLOCKED instead of delegating discovery to the worker.
+
+Instructions must say exactly what to change, where to change it, and what invariant must remain true.
+
+VERIFY must contain concrete narrow commands or concrete observable checks. Do not use placeholders such as "run relevant tests".
+
+Optimize for the minimum worker-context footprint, not for the minimum planner output.
+
+Prefer one complete mechanical step over multiple artificial steps.
+
+Use STAGED only when separating the steps materially reduces context or architectural ambiguity.
+
+Normal target: keep each step contract under approximately 4000 characters.
+Hard parser limit remains 8000 characters.
+
 For every step:
 - include only files actually needed;
 - use exact paths from supplied context;
@@ -30,13 +62,26 @@ a new protocol plus consumers, dependent components, or an ordered structural
 refactor. STAGED has 2 to 6 steps. SINGLE has exactly 1 step. Never split a
 micro-feature's implementation and tests into artificial steps.
 
+Each step declares four path sets:
+- READ_SET: existing files needed to understand the step.
+- WRITE_SET: existing files the worker may modify.
+- CREATE_SET: new paths the worker may create; they must not exist yet.
+- DELETE_SET: existing files the worker may delete.
+
 Every READ_SET line must be exactly:
 - repo/relative/path.py :: exact symbol or anchor
-Every WRITE_SET line must be exactly:
+Every WRITE_SET, CREATE_SET and DELETE_SET line must be exactly:
 - repo/relative/path.py
-Use at most 8 READ_SET paths and 6 WRITE_SET paths. Every write path must also
-be read. Paths must be exact, repo-relative, non-wildcard paths. Step IDs are
-contiguous S01 through S06; a step may depend only on NONE or an earlier step.
+Always emit all four sections. Write NONE for an empty WRITE_SET, CREATE_SET
+or DELETE_SET; READ_SET is never empty.
+Use at most 8 READ_SET paths, 6 WRITE_SET paths, 6 CREATE_SET paths and 6
+DELETE_SET paths. Every WRITE_SET and DELETE_SET path must also appear in
+READ_SET. A CREATE_SET path must not appear in READ_SET. A path may appear in
+only one of WRITE_SET, CREATE_SET and DELETE_SET, and each step must write,
+create or delete at least one path. Changing any other path fails the step
+deterministically. Paths must be exact, repo-relative, non-wildcard paths.
+Step IDs are contiguous S01 through S06; a step may depend only on NONE or an
+earlier step.
 
 Profiles are recommendations, not human authority. Choose exact IDs from the
 catalogues supplied below. Never output endpoint URLs, API-key environment
@@ -74,6 +119,12 @@ READ_SET
 
 WRITE_SET
 - relative/path.py
+
+CREATE_SET
+NONE
+
+DELETE_SET
+NONE
 
 INSTRUCTIONS
 1. exact operation

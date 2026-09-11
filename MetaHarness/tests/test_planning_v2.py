@@ -167,7 +167,8 @@ END META PLAN
         plan = _parse(_plan())
         with tempfile.TemporaryDirectory() as directory:
             bundle = write_implementation_bundle(directory, plan)
-            contract_path = Path(directory) / "steps/S01.contract.md"
+            contract_path = Path(directory) / "steps/S01/contract.md"
+            self.assertFalse((Path(directory) / "steps/S01.contract.md").exists())
             self.assertEqual(bundle["steps"][0]["contract_sha256"], hashlib.sha256(contract_path.read_bytes()).hexdigest())
             self.assertEqual(json.loads((Path(directory) / "implementation_bundle.json").read_text())["schema_version"], 1)
             self.assertIn("ordered steps", (Path(directory) / "implementation_contract.md").read_text().lower())
@@ -189,6 +190,110 @@ END META PLAN
         worker = build_implementer_step_prompt("contract")
         self.assertIn("contract", worker)
         self.assertNotIn("{{STEP_CONTRACT}}", worker)
+
+
+def _change_step(sets: str) -> str:
+    return _step(1).replace(
+        "READ_SET\n- src/example.py :: function example()\n\nWRITE_SET\n- src/example.py\n", sets
+    )
+
+
+class ChangeSetTests(unittest.TestCase):
+    def test_create_and_delete_sets_are_parsed_and_rendered(self) -> None:
+        sets = (
+            "READ_SET\n- src/example.py :: function example()\n- src/old.py :: module\n\n"
+            "WRITE_SET\n- src/example.py\n\n"
+            "CREATE_SET\n- src/new.py\n\n"
+            "DELETE_SET\n- src/old.py\n"
+        )
+        plan = _parse(_plan(steps=_change_step(sets)))
+        step = plan.steps[0]
+        self.assertEqual(step.write_set, ("src/example.py",))
+        self.assertEqual(step.create_set, ("src/new.py",))
+        self.assertEqual(step.delete_set, ("src/old.py",))
+        contract = render_step_contract(plan, step)
+        order = [contract.index(name) for name in (
+            "OBJECTIVE", "READ SET", "WRITE SET", "CREATE SET", "DELETE SET",
+            "INSTRUCTIONS", "VERIFY", "FORBIDDEN", "END META IMPLEMENTATION STEP",
+        )]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("CREATE SET\n- src/new.py", contract)
+        self.assertIn("DELETE SET\n- src/old.py", contract)
+
+    def test_legacy_plan_without_sections_has_empty_sets(self) -> None:
+        plan = _parse(_plan())
+        self.assertEqual((plan.steps[0].create_set, plan.steps[0].delete_set), ((), ()))
+        contract = render_step_contract(plan, plan.steps[0])
+        self.assertIn("CREATE SET\nNONE", contract)
+        self.assertIn("DELETE SET\nNONE", contract)
+
+    def test_create_only_step_may_have_no_write_set(self) -> None:
+        sets = (
+            "READ_SET\n- src/example.py :: function example()\n\n"
+            "WRITE_SET\nNONE\n\nCREATE_SET\n- src/new.py\n\nDELETE_SET\nNONE\n"
+        )
+        step = _parse(_plan(steps=_change_step(sets))).steps[0]
+        self.assertEqual((step.write_set, step.create_set, step.delete_set), ((), ("src/new.py",), ()))
+
+    def test_invalid_change_sets_are_rejected(self) -> None:
+        read = "READ_SET\n- src/example.py :: function example()\n\n"
+        cases = {
+            "delete not read": read + "WRITE_SET\nNONE\n\nCREATE_SET\nNONE\n\nDELETE_SET\n- src/other.py\n",
+            "create in read": read + "WRITE_SET\nNONE\n\nCREATE_SET\n- src/example.py\n\nDELETE_SET\nNONE\n",
+            "write and delete overlap": read + "WRITE_SET\n- src/example.py\n\nCREATE_SET\nNONE\n\nDELETE_SET\n- src/example.py\n",
+            "create twice": read + "WRITE_SET\nNONE\n\nCREATE_SET\n- a.py\n- a.py\n\nDELETE_SET\nNONE\n",
+            "empty union": read + "WRITE_SET\nNONE\n\nCREATE_SET\nNONE\n\nDELETE_SET\nNONE\n",
+            "blank create": read + "WRITE_SET\n- src/example.py\n\nCREATE_SET\n\nDELETE_SET\nNONE\n",
+            "create wildcard": read + "WRITE_SET\nNONE\n\nCREATE_SET\n- src/*.py\n\nDELETE_SET\nNONE\n",
+            "create traversal": read + "WRITE_SET\nNONE\n\nCREATE_SET\n- ../escape.py\n\nDELETE_SET\nNONE\n",
+            "create anchor": read + "WRITE_SET\nNONE\n\nCREATE_SET\n- src/new.py :: anchor\n\nDELETE_SET\nNONE\n",
+            "too many creates": read + "WRITE_SET\nNONE\n\nCREATE_SET\n"
+            + "".join(f"- src/n{index}.py\n" for index in range(7)) + "\nDELETE_SET\nNONE\n",
+        }
+        for name, sets in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(V2PlanParseError):
+                    _parse(_plan(steps=_change_step(sets)))
+
+    def test_bundle_validation_binds_step_ids_and_contract_bytes(self) -> None:
+        from metaharness.planning_v2 import read_approved_step_contract, validate_implementation_bundle
+
+        plan = _parse(_plan("STAGED", 2, steps=_step(1) + "\n\n" + _step(2)))
+        with tempfile.TemporaryDirectory() as directory:
+            write_implementation_bundle(directory, plan)
+            bundle, _sha = validate_implementation_bundle(directory, expected_step_ids=["S01", "S02"])
+            self.assertEqual(
+                read_approved_step_contract(directory, bundle, "S02"),
+                (Path(directory) / "steps/S02/contract.md").read_text(),
+            )
+            with self.assertRaises(V2PlanParseError):
+                validate_implementation_bundle(directory, expected_step_ids=["S01"])
+            path = Path(directory) / "steps/S02/contract.md"
+            path.write_bytes(path.read_bytes().replace(b"Step 2", b"Step X", 1))
+            with self.assertRaises(V2PlanParseError):
+                read_approved_step_contract(directory, bundle, "S02")
+            with self.assertRaises(V2PlanParseError):
+                validate_implementation_bundle(directory)
+
+    def test_prompts_carry_the_worker_restrictions(self) -> None:
+        planner = build_planner_prompt_v2("spec", "context")
+        for sentence in (
+            "The implementation worker is not a discovery agent.",
+            "If the supplied context is insufficient to name the required file, symbol, or architectural operation precisely, return BLOCKED instead of delegating discovery to the worker.",
+            "Normal target: keep each step contract under approximately 4000 characters.",
+            "Hard parser limit remains 8000 characters.",
+            "CREATE_SET\nNONE",
+            "DELETE_SET\nNONE",
+        ):
+            self.assertIn(sentence, planner)
+        worker = build_implementer_step_prompt("CONTRACT")
+        for sentence in (
+            "Do not run repository-wide discovery commands.",
+            "- repo-wide grep/git-grep/rg.",
+            "Do not inspect other step contracts.",
+            "All design decisions are already final.",
+        ):
+            self.assertIn(sentence, worker)
 
 
 if __name__ == "__main__":

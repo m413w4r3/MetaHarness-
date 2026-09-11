@@ -37,12 +37,14 @@ from .gitops import (
     GitError,
     assert_clean,
     candidate_tree_sha,
+    changed_paths_between_trees,
     commit_reviewed_tree,
     create_run_worktree,
     current_head,
     git_root,
     index_tree_sha,
     local_branches,
+    path_exists_in_tree,
     registered_worktrees,
     resolve_commit,
     resolve_tree,
@@ -68,7 +70,15 @@ from .execution_selection import (
     read_execution_selection_v3_with_sha256,
     validate_execution_selection_v3,
 )
-from .models import ExecutionRole, ExecutionSelectionV3, HarnessConfig, ReviewRoute, ReviewVerdict, RunStatus
+from .models import (
+    ExecutionRole,
+    ExecutionSelectionV3,
+    HarnessConfig,
+    ImplementationStep,
+    ReviewRoute,
+    ReviewVerdict,
+    RunStatus,
+)
 from .planning import (
     PlanDecision,
     Planner,
@@ -80,9 +90,11 @@ from .planning_v2 import (
     PlannerV2,
     TaskPlanV2,
     V2PlanParseError,
-    render_step_contract,
+    read_approved_step_contract,
+    read_set_paths,
     validate_implementation_bundle,
 )
+from .usage import add_usage, empty_usage, normalize_usage
 from .redaction import config_secret_values, redact, redact_file
 from .profiles import (
     build_agent_config,
@@ -258,6 +270,46 @@ def _agent_payload(result: AgentResult) -> dict[str, Any]:
         "usage": dict(result.usage),
         "stderr_tail": result.stderr_tail,
     }
+
+
+_MAX_REPORTED_PATHS = 20
+
+
+def _safe_path_label(path: str) -> str:
+    """A printable rendering of one repository path for failure details."""
+
+    return "".join(
+        character if character.isprintable() else f"\\x{ord(character) & 0xFF:02x}"
+        for character in path
+    )[:300]
+
+
+def _paths_detail(paths: list[str]) -> str:
+    shown = [_safe_path_label(path) for path in paths[:_MAX_REPORTED_PATHS]]
+    extra = len(paths) - len(shown)
+    return ",".join(shown) + (f" (+{extra} more)" if extra > 0 else "")
+
+
+def _terminal_step_fields(
+    state: Mapping[str, Any], failed_step: str | None, terminal: str = "failed"
+) -> dict[str, Any]:
+    """State fields that close every step when a run becomes terminal.
+
+    The failed step and any step still marked ``running`` take *terminal*;
+    later steps stay ``waiting``; ``current_step`` is cleared.
+    """
+
+    steps = state.get("steps") if isinstance(state, Mapping) else None
+    if not isinstance(steps, list):
+        return {"current_step": None}
+    closed: list[Any] = []
+    for item in steps:
+        if isinstance(item, dict) and (
+            item.get("id") == failed_step or item.get("status") == "running"
+        ):
+            item = {**item, "status": terminal}
+        closed.append(item)
+    return {"steps": closed, "current_step": None}
 
 
 def _status_has_unstaged_or_untracked(status: tuple[str, ...]) -> list[str]:
@@ -566,15 +618,25 @@ class Orchestrator:
             state = store.update(
                 status=RunStatus.INTERRUPTED,
                 failure={"reason": "INTERRUPTED"},
+                **self._closing_step_fields(store, "interrupted"),
             )
             return RunResult(run_dir, RunStatus.INTERRUPTED, state)
         except Exception as exc:
             if store is None:
                 raise
             state = store.record_failure(
-                _failure_reason(exc), redact(str(exc), self._secrets)
+                _failure_reason(exc),
+                redact(str(exc), self._secrets),
+                **self._closing_step_fields(store, "failed"),
             )
             return RunResult(run_dir, RunStatus.FAILED, state)
+
+    @staticmethod
+    def _closing_step_fields(store: RunStateStore, terminal: str) -> dict[str, Any]:
+        try:
+            return _terminal_step_fields(store.load(), None, terminal)
+        except (OSError, ValueError):
+            return {}
 
     execute = run
 
@@ -1047,11 +1109,16 @@ class Orchestrator:
 
         # Re-read the complete manifest after the approval transaction.  The
         # first validation protects the approval surface; this one closes the
-        # race between approval and worktree creation.
+        # race between approval and worktree creation.  The bundle bytes must
+        # still be the ones hashed at planning time and bound by the approval.
         try:
-            validate_implementation_bundle(run_dir)
+            bundle, bundle_sha = validate_implementation_bundle(
+                run_dir, expected_step_ids=[step.id for step in plan.steps]
+            )
         except (V2PlanParseError, OSError, UnicodeError) as exc:
             raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
+        if bundle_sha != plan_identity.bundle_sha256:
+            raise ApprovalError("PLAN_APPROVAL_INVALID: implementation bundle changed after planning")
 
         if selection.planner.profile_id != planner_profile_id:
             raise ExecutionSelectionError("execution selection planner is not the run planner")
@@ -1108,9 +1175,10 @@ class Orchestrator:
              "profile_id": step_items[step.id].implementer.profile_id}
             for step in plan.steps
         ]
-        total_input = 0
-        total_output = 0
         self._last_v2_step_results: list[dict[str, Any]] = []
+        self._v2_usage_rows: list[dict[str, Any]] = []
+        # Tree every step must start from: the base, then each frozen step.
+        expected_tree = candidate_tree
         for step in plan.steps:
             selected_step = step_items.get(step.id)
             if selected_step is None:
@@ -1118,9 +1186,17 @@ class Orchestrator:
             profile = profile_for_role(self.config, selected_step.implementer.profile_id, ExecutionRole.IMPLEMENTER)
             step_dir = run_dir / "steps" / step.id
             step_dir.mkdir(parents=True, exist_ok=True)
-            contract = render_step_contract(plan, step)
-            atomic_write_text(step_dir / "contract.md", contract)
+            # The approved file is the executed file: its bytes are re-hashed
+            # against the validated bundle and never re-rendered or rewritten.
+            try:
+                contract = read_approved_step_contract(run_dir, bundle, step.id)
+            except (V2PlanParseError, OSError, UnicodeError) as exc:
+                raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
             before_tree = candidate_tree_sha(info.worktree)
+            drift = self._step_contract_drift(repo, before_tree, expected_tree, step)
+            if drift:
+                return self._v2_failed(store, run_dir, "STEP_CONTRACT_DRIFT", step.id, drift,
+                                       profile_id=profile.id, tree_before=before_tree)
             store.update(status=RunStatus.IMPLEMENTING, current_step=step.id,
                          steps=[{**item, "status": "running" if item["id"] == step.id else item["status"]}
                                 for item in state_steps])
@@ -1144,50 +1220,62 @@ class Orchestrator:
                                        step_dir, base_sha=base_sha, env=agent_environment)
             except AgentCommittedError as exc:
                 self._redact_step_artifacts(step_dir)
-                state = store.record_failure("AGENT_COMMITTED", f"step={step.id} {redact(str(exc), self._secrets)}")
-                return RunResult(run_dir, RunStatus.FAILED, state)
+                return self._v2_failed(store, run_dir, "AGENT_COMMITTED", step.id,
+                                       redact(str(exc), self._secrets),
+                                       profile_id=profile.id, tree_before=before_tree)
             self._redact_step_artifacts(step_dir)
             result = dataclasses.replace(result,
                                          final_message=redact(result.final_message, self._secrets),
                                          stderr_tail=redact(result.stderr_tail, self._secrets))
+            usage = normalize_usage(result.usage)
+            self._v2_usage_rows.append({"id": step.id, **usage})
+            failed_step = {"usage": usage, "profile_id": profile.id, "tree_before": before_tree}
             ownership_after = _git_ownership(repo, info.worktree)
             if ownership_after.head != base_sha:
                 return self._v2_failed(store, run_dir, "AGENT_COMMITTED", step.id,
-                                       "worktree HEAD changed")
+                                       "worktree HEAD changed", **failed_step)
             violations = _ownership_violations(ownership_before, ownership_after,
                                                 branch_ref=branch_ref, base_sha=base_sha)
             if violations:
-                return self._v2_failed(store, run_dir, "AGENT_GIT_VIOLATION", step.id, violations)
+                return self._v2_failed(store, run_dir, "AGENT_GIT_VIOLATION", step.id, violations,
+                                       **failed_step)
             if result.timed_out:
-                return self._v2_failed(store, run_dir, "AGENT_TIMEOUT", step.id)
+                return self._v2_failed(store, run_dir, "AGENT_TIMEOUT", step.id, **failed_step)
             if result.exit_code != 0:
                 return self._v2_failed(store, run_dir, "AGENT_FAILED", step.id,
-                                        f"exit status {result.exit_code}")
-            after_tree = candidate_tree_sha(info.worktree)
-            if after_tree == before_tree:
-                return self._v2_failed(store, run_dir, "AGENT_NO_CHANGE", step.id)
+                                        f"exit status {result.exit_code}", **failed_step)
             stage_all(info.worktree)
             frozen_tree = index_tree_sha(info.worktree)
-            usage = {key: value for key, value in result.usage.items()
-                     if key in {"input_tokens", "output_tokens"} and isinstance(value, int)}
-            total_input += usage.get("input_tokens", 0)
-            total_output += usage.get("output_tokens", 0)
+            if frozen_tree == before_tree:
+                return self._v2_failed(store, run_dir, "AGENT_NO_CHANGE", step.id, **failed_step)
+            # Git, not the prompt, is the scope barrier: every changed path
+            # must be authorized by this step's WRITE, CREATE or DELETE set.
+            changed_paths = changed_paths_between_trees(repo, before_tree, frozen_tree)
+            allowed = {*step.write_set, *step.create_set, *step.delete_set}
+            unexpected = [path for path in changed_paths if path not in allowed]
+            if unexpected:
+                return self._v2_failed(
+                    store, run_dir, "STEP_WRITE_SET_VIOLATION", step.id,
+                    f"unexpected={_paths_detail(unexpected)}",
+                    **failed_step, tree_after=frozen_tree,
+                )
+            expected_tree = frozen_tree
             step_result = {
                 "id": step.id, "status": "COMPLETED", "profile_id": profile.id,
                 "tree_before": before_tree, "tree_after": frozen_tree,
-                "usage": {"input_tokens": usage.get("input_tokens", 0),
-                          "output_tokens": usage.get("output_tokens", 0)},
+                "changed_paths": list(changed_paths),
+                "usage": usage,
             }
             atomic_write_text(step_dir / "step.json", _json_text(step_result))
             self._last_v2_step_results.append({**step_result, "final": _bounded_v2_report(result.final_message)})
-            state_steps = [{**item, "status": "completed" if item["id"] == step.id else item["status"],
-                            "input_tokens": usage.get("input_tokens", 0) if item["id"] == step.id else item.get("input_tokens", 0),
-                            "output_tokens": usage.get("output_tokens", 0) if item["id"] == step.id else item.get("output_tokens", 0)}
-                           for item in state_steps]
+            state_steps = [
+                {**item, "status": "completed", "usage": usage,
+                 "input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}
+                if item["id"] == step.id else item
+                for item in state_steps
+            ]
             store.update(status=RunStatus.IMPLEMENTING, current_step=None, steps=state_steps,
-                         agent_usage={"total_input_tokens": total_input,
-                                      "total_output_tokens": total_output,
-                                      "steps": [{"id": x["id"], **x["usage"]} for x in self._last_v2_step_results]})
+                         agent_usage=self._v2_agent_usage())
 
         store.update(status=RunStatus.VALIDATING, current_step=None)
         evidence = collect_evidence(info.worktree, base_sha, self.config,
@@ -1238,27 +1326,85 @@ class Orchestrator:
         for name in _AGENT_ARTIFACTS:
             redact_file(step_dir / name, self._secrets)
 
+    def _v2_agent_usage(self) -> dict[str, Any]:
+        rows = getattr(self, "_v2_usage_rows", [])
+        total = add_usage(rows)
+        return {
+            "total_input_tokens": total["input_tokens"],
+            "total_output_tokens": total["output_tokens"],
+            "total": total,
+            "steps": [dict(row) for row in rows],
+        }
+
+    def _step_contract_drift(
+        self, repo: Path, before_tree: str, expected_tree: str, step: ImplementationStep,
+    ) -> str | None:
+        """Check the step's Git preconditions on the tree Codex will receive.
+
+        Every READ/WRITE/DELETE path must exist in *before_tree* and no CREATE
+        path may exist.  The tree must also be exactly the base or the tree
+        frozen after the previous step.
+        """
+
+        if before_tree != expected_tree:
+            return "worktree changed outside a step"
+        problems: list[str] = []
+        for label, paths, must_exist in (
+            ("read_missing", read_set_paths(step.read_set), True),
+            ("write_missing", step.write_set, True),
+            ("delete_missing", step.delete_set, True),
+            ("create_exists", step.create_set, False),
+        ):
+            wrong = [path for path in paths
+                     if path_exists_in_tree(repo, before_tree, path) is not must_exist]
+            if wrong:
+                problems.append(f"{label}={_paths_detail(wrong)}")
+        return " ".join(problems) or None
+
     def _v2_failed(
         self, store: RunStateStore, run_dir: Path, reason: str,
-        step_id: str | None, detail: Any = None,
+        step_id: str | None, detail: Any = None, *,
+        usage: Mapping[str, int] | None = None,
+        profile_id: str | None = None,
+        tree_before: str | None = None,
+        tree_after: str | None = None,
     ) -> RunResult:
+        state = store.load()
+        fields = _terminal_step_fields(state, step_id)
         if step_id is not None:
             detail = f"step={step_id}" + (f" {detail}" if detail is not None else "")
+            step_usage = normalize_usage(usage) if usage is not None else empty_usage()
+            if isinstance(fields.get("steps"), list):
+                fields["steps"] = [
+                    {**item, "usage": step_usage,
+                     "input_tokens": step_usage["input_tokens"],
+                     "output_tokens": step_usage["output_tokens"]}
+                    if isinstance(item, dict) and item.get("id") == step_id else item
+                    for item in fields["steps"]
+                ]
+            if hasattr(self, "_v2_usage_rows"):
+                fields["agent_usage"] = self._v2_agent_usage()
             step_dir = run_dir / "steps" / step_id
             if not (step_dir / "step.json").exists():
-                state_steps = store.load().get("steps")
-                profile_id = next(
-                    (item.get("profile_id") for item in state_steps
-                     if isinstance(item, dict) and item.get("id") == step_id),
-                    None,
-                ) if isinstance(state_steps, list) else None
+                if profile_id is None:
+                    state_steps = state.get("steps")
+                    profile_id = next(
+                        (item.get("profile_id") for item in state_steps
+                         if isinstance(item, dict) and item.get("id") == step_id),
+                        None,
+                    ) if isinstance(state_steps, list) else None
                 atomic_write_text(step_dir / "step.json", _json_text({
-                    "id": step_id, "status": "FAILED", "profile_id": profile_id,
-                    "tree_before": None, "tree_after": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                    "id": step_id, "status": "FAILED", "reason": reason,
+                    "profile_id": profile_id,
+                    "tree_before": tree_before, "tree_after": tree_after,
+                    "usage": step_usage,
                 }))
         return RunResult(run_dir, RunStatus.FAILED,
-                         store.record_failure(reason, redact(detail, self._secrets) if detail is not None else None))
+                         store.record_failure(
+                             reason,
+                             redact(detail, self._secrets) if detail is not None else None,
+                             **fields,
+                         ))
 
     def _authorize_v2_commit(
         self, plan: TaskPlanV2, review: ReviewResult, evidence: EvidenceBundle,

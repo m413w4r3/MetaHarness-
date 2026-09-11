@@ -225,11 +225,39 @@ def _profile_options(config: HarnessConfig | None, role: str, selected: Any) -> 
     return "".join(result)
 
 
+_HIGH_WORKER_INPUT_TOKENS = 100_000
+_HIGH_CONTEXT_WARNING = '<span class="danger">High worker context usage</span>'
+_STEP_ICONS = {"completed": "✓", "failed": "✗", "interrupted": "✗", "running": "▶"}
+
+
+def _artifact_map(artifacts: Any) -> dict[Any, dict[str, Any]]:
+    if not isinstance(artifacts, list):
+        return {}
+    return {item.get("id"): item for item in artifacts if isinstance(item, dict)}
+
+
+def _contract_block(artifact: dict[str, Any]) -> str:
+    """The exact stored contract bytes, flagged if they are not the hashed ones."""
+
+    contract = artifact.get("contract")
+    if contract is None:
+        return '<p class="danger">Contract artifact is missing.</p>'
+    warning = "" if artifact.get("contract_matches_bundle") else (
+        '<p class="danger">This contract does not match implementation_bundle.json.</p>'
+    )
+    return (
+        f'<details open><summary>Exact implementation contract</summary>{warning}'
+        f'<pre class="contract">{_e(contract)}</pre></details>'
+    )
+
+
 def _v2_approval_form(
     run_id: Any, token: str, state: dict[str, Any], config: HarnessConfig | None,
+    artifacts: Any = None,
 ) -> str:
     planner = state.get("planner") if isinstance(state.get("planner"), dict) else {}
     steps = planner.get("steps") if isinstance(planner.get("steps"), list) else state.get("steps", [])
+    artifact_map = _artifact_map(artifacts)
     rows: list[str] = []
     for item in steps:
         if not isinstance(item, dict) or not isinstance(item.get("id"), str):
@@ -238,14 +266,16 @@ def _v2_approval_form(
         selected = item.get("recommended_profile") or item.get("profile_id")
         rows.append(
             f'<section class="card"><h3>{_e(step_id)} — {_e(item.get("title"))}</h3>'
-            f'<p>Recommended: <span class="mono">{_e(selected)}</span></p>'
+            f'<p>Recommended implementer: <span class="mono">{_e(selected)}</span></p>'
             f'<label for="step-profile-{_e(step_id)}">Implementer</label>'
             f'<select id="step-profile-{_e(step_id)}" name="step_profile__{_e(step_id)}" required>'
-            f'{_profile_options(config, "implementer", selected)}</select></section>'
+            f'{_profile_options(config, "implementer", selected)}</select>'
+            f'{_contract_block(artifact_map.get(step_id, {}))}</section>'
         )
     reviewer = planner.get("reviewer_recommendation")
     return f'''<section class="card"><h2>Execution plan</h2>
-<p>Execution strategy: <strong>{_e(planner.get("execution_mode"))}</strong> · {_e(len(rows))} steps</p>
+<p>Execution mode: <strong>{_e(planner.get("execution_mode"))}</strong></p>
+<p>Steps: {_e(len(rows))}</p>
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE">
 {"".join(rows)}<label for="reviewer-profile">Reviewer</label><select id="reviewer-profile" name="reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select><br><button class="approve" type="submit">APPROVE PLAN</button></form>
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT PLAN</button></form></section>'''
@@ -256,24 +286,140 @@ def _v2_steps(state: dict[str, Any], artifacts: Any = None) -> str:
     if not steps:
         return '<p class="muted">No staged steps.</p>'
     cards: list[str] = []
-    artifact_map = {item.get("id"): item for item in artifacts if isinstance(item, dict)} if isinstance(artifacts, list) else {}
+    artifact_map = _artifact_map(artifacts)
     for item in steps:
         if not isinstance(item, dict):
             continue
         status = str(item.get("status", "waiting"))
-        icon = "✓" if status == "completed" else "▶" if status == "running" else "…"
+        icon = _STEP_ICONS.get(status, "…")
+        artifact = artifact_map.get(item.get("id"), {})
+        usage = artifact.get("usage") if isinstance(artifact.get("usage"), dict) else item.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        warning = f" · {_HIGH_CONTEXT_WARNING}" if artifact.get("high_context") else ""
+        events = artifact.get("events") if isinstance(artifact.get("events"), list) else []
+        event_items = "".join(f"<li>{_e(event)}</li>" for event in events) or '<li class="muted">No event yet.</li>'
         cards.append(
-            f'<details class="card"{" open" if status == "running" else ""}>'
+            f'<details class="card step {_e(status)}"{" open" if status in {"running", "failed"} else ""}>'
             f'<summary>{_e(item.get("id"))} {icon} — {_e(item.get("title"))} · '
-            f'{_e(item.get("input_tokens", 0))} in / {_e(item.get("output_tokens", 0))} out</summary>'
+            f'{_e(usage.get("input_tokens", 0))} input / {_e(usage.get("output_tokens", 0))} output{warning}</summary>'
             f'<p>profile: <span class="mono">{_e(item.get("profile_id"))}</span></p>'
             f'<p>status: {_e(status)}</p>'
-            f'<details><summary>contract</summary><pre>{_e(artifact_map.get(item.get("id"), {}).get("contract"))}</pre></details>'
-            f'<details><summary>final report</summary><pre>{_e(artifact_map.get(item.get("id"), {}).get("final"))}</pre></details>'
-            f'<details><summary>stderr</summary><pre>{_e(artifact_map.get(item.get("id"), {}).get("stderr"))}</pre></details></details>'
+            f'<h4>Recent events</h4><ul class="events">{event_items}</ul>'
+            f'<details><summary>contract</summary><pre>{_e(artifact.get("contract"))}</pre></details>'
+            f'<details><summary>final report</summary><pre>{_e(artifact.get("final"))}</pre></details>'
+            f'<details><summary>stderr</summary><pre>{_e(artifact.get("stderr"))}</pre></details></details>'
         )
-    usage = state.get("agent_usage") if isinstance(state.get("agent_usage"), dict) else {}
-    return f'<p><strong>Total Luna tokens:</strong> {_e(usage.get("total_input_tokens", 0))} in / {_e(usage.get("total_output_tokens", 0))} out</p>' + "".join(cards)
+    return "".join(cards)
+
+
+def _usage_pair(usage: Any) -> str:
+    usage = usage if isinstance(usage, dict) else {}
+    return f'{_e(usage.get("input_tokens", 0))} input / {_e(usage.get("output_tokens", 0))} output'
+
+
+def _usage_detail(usage: Any) -> str:
+    usage = usage if isinstance(usage, dict) else {}
+    return (
+        f'cached input {_e(usage.get("cached_input_tokens", 0))} · '
+        f'cache write {_e(usage.get("cache_write_input_tokens", 0))} · '
+        f'reasoning {_e(usage.get("reasoning_output_tokens", 0))} · '
+        f'total {_e(usage.get("total_tokens", 0))}'
+    )
+
+
+def _usage_section(run: dict[str, Any]) -> str:
+    """Token counters per phase, as persisted; no cost is derived."""
+
+    usage = run.get("usage") if isinstance(run.get("usage"), dict) else {}
+    implementer = usage.get("implementer") if isinstance(usage.get("implementer"), dict) else {}
+    rows = "".join(
+        f'<tr><th>{label}</th><td>{_usage_pair(value)}</td><td class="muted">{_usage_detail(value)}</td></tr>'
+        for label, value in (
+            ("Planner", usage.get("planner")),
+            ("Luna", implementer.get("total")),
+            ("Reviewer", usage.get("reviewer")),
+        )
+    )
+    step_rows = []
+    for step in implementer.get("steps") if isinstance(implementer.get("steps"), list) else []:
+        if not isinstance(step, dict):
+            continue
+        step_usage = step.get("usage") if isinstance(step.get("usage"), dict) else {}
+        high = isinstance(step_usage.get("input_tokens"), int) and step_usage["input_tokens"] > _HIGH_WORKER_INPUT_TOKENS
+        step_rows.append(
+            f'<tr><td class="mono">{_e(step.get("id"))}</td><td>{_usage_pair(step_usage)}</td>'
+            f'<td class="muted">{_usage_detail(step_usage)}{" · " + _HIGH_CONTEXT_WARNING if high else ""}</td></tr>'
+        )
+    steps_table = (
+        '<table class="usage-steps"><thead><tr><th>Luna step</th><th>tokens</th><th>detail</th></tr></thead>'
+        f'<tbody>{"".join(step_rows)}</tbody></table>'
+        if step_rows else ""
+    )
+    return (
+        '<section class="usage"><h2>TOKEN USAGE</h2>'
+        f'<table class="usage-phases"><tbody>{rows}</tbody></table>{steps_table}</section>'
+    )
+
+
+def _profile_triplet(profile_id: Any, model: Any, effort: Any) -> str:
+    if not profile_id:
+        return '<span class="muted">—</span>'
+    return f'<span class="mono">{_e(profile_id)} / {_e(model or "—")} / {_e(effort or "—")}</span>'
+
+
+def _execution_card_v2(
+    state: dict[str, Any], run: dict[str, Any], config: HarnessConfig | None,
+) -> str:
+    """Planner, reviewer and per-step implementers; recommended vs approved."""
+
+    metadata: dict[str, Any] = {}
+    if config is not None:
+        metadata = {profile.id: safe_profile_metadata(profile) for profile in profiles_for_config(config).values()}
+    execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
+    planner_state = state.get("planner") if isinstance(state.get("planner"), dict) else {}
+    selection = run.get("execution_selection")
+    approved = selection if isinstance(selection, dict) and selection.get("schema_version") == 3 else {}
+    planner = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
+    planner_mode = planner.get("selection_mode")
+    planner_warning = '<p class="danger">external-ui: le modèle est sélectionné dans le fournisseur externe.</p>' if planner_mode == "external-ui" else ""
+    planner_card = (
+        f'<article class="card"><h3>Planner</h3><dl><dt>profile</dt><dd>{_e(planner.get("profile_id") or "—")}</dd>'
+        f'<dt>model</dt><dd>{_e(planner.get("model") or "—")}</dd><dt>selection mode</dt><dd>{_e(planner_mode or "—")}</dd></dl>{planner_warning}</article>'
+    )
+    reviewer_recommended = planner_state.get("reviewer_recommendation")
+    reviewer_approved = approved.get("reviewer") if isinstance(approved.get("reviewer"), dict) else {}
+    recommended_meta = metadata.get(reviewer_recommended, {})
+    reviewer_card = (
+        f'<article class="card"><h3>Reviewer</h3><dl>'
+        f'<dt>recommended</dt><dd>{_profile_triplet(reviewer_recommended, recommended_meta.get("model_label"), recommended_meta.get("selection_mode"))}</dd>'
+        f'<dt>approved</dt><dd>{_profile_triplet(reviewer_approved.get("profile_id"), reviewer_approved.get("model"), reviewer_approved.get("selection_mode")) if reviewer_approved else "<span class=muted>pending approval</span>"}</dd>'
+        f'</dl></article>'
+    )
+    approved_steps = {
+        item.get("step_id"): item.get("implementer")
+        for item in (approved.get("steps") if isinstance(approved.get("steps"), list) else [])
+        if isinstance(item, dict) and isinstance(item.get("implementer"), dict)
+    }
+    recommended_steps = planner_state.get("steps") if isinstance(planner_state.get("steps"), list) else []
+    rows = []
+    for item in recommended_steps:
+        if not isinstance(item, dict):
+            continue
+        step_id = item.get("id")
+        recommended = item.get("recommended_profile")
+        meta = metadata.get(recommended, {})
+        chosen = approved_steps.get(step_id)
+        rows.append(
+            f'<tr><td class="mono">{_e(step_id)}</td>'
+            f'<td>recommended {_profile_triplet(recommended, meta.get("model_label"), meta.get("effort"))}</td>'
+            f'<td>approved {_profile_triplet(chosen.get("profile_id"), chosen.get("model"), chosen.get("effort")) if chosen else "<span class=muted>pending approval</span>"}</td></tr>'
+        )
+    steps_table = (
+        '<h3>Step implementers</h3><table class="step-implementers"><tbody>'
+        + ("".join(rows) or '<tr><td class="muted">No step.</td></tr>')
+        + "</tbody></table>"
+    )
+    return f'<div class="grid">{planner_card}{reviewer_card}</div>{steps_table}'
 
 
 def render_run(run: dict[str, Any], token: str | None = None, *, config: HarnessConfig | None = None, nonce: str | None = None, refresh_seconds: int | None = None) -> str:
@@ -293,7 +439,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
     approval_forms = ""
     is_v2 = state.get("planning_protocol") == "v2"
     if can_decide and is_v2:
-        approval_forms = _v2_approval_form(run_id, token or "", state, config)
+        approval_forms = _v2_approval_form(run_id, token or "", state, config, run.get("step_artifacts"))
     elif can_decide:
         approval_forms = f'''<section class="card"><h2>Plan approval</h2>
 {recommendation_note}
@@ -307,9 +453,10 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
     failure_top = f'<p class="danger"><strong>FAILED: {_e(failure.get("reason") if isinstance(failure, dict) else failure)}</strong><br>{_e(failure.get("detail") if isinstance(failure, dict) else "")}</p>' if status == "failed" and failure else ""
     body = f'''<main><p><a href="/">← Tous les runs</a></p>
 <header class="sticky"><h1>Run <span class="mono">{_e(run_id)}</span></h1><p>{_status_badge(status)} · updated_at <span class="mono">{_e(run.get("updated_at"))}</span></p>{failure_top}</header>
+{_usage_section(run)}
 {approval_forms}
 <section><h2>PLAN</h2><details open{_section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER"))}><summary>Canonical implementation contract</summary><pre>{_e(plan.get("contract"))}</pre></details><details><summary>planner.raw.md</summary><pre>{_e(plan.get("raw"))}</pre></details><details><summary>SPEC</summary><pre>{_e(run.get("spec"))}</pre></details></section>
-<section><h2>EXECUTION</h2>{_execution_card(state, config)}</section>
+<section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config) if is_v2 else _execution_card(state, config)}</section>
 <section><h2>AGENT</h2>{_v2_steps(state, run.get("step_artifacts")) if is_v2 else f'<details open{_section_open(run, ("AGENT_",))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'}</section>
 <section><h2>CHECKS</h2><details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
 <section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details><details><summary>reviewer.raw.md</summary><pre>{_e(run.get("reviewer_raw"))}</pre></details></section>

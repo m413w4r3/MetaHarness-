@@ -24,6 +24,14 @@ interrupted worktrees are intentionally retained for inspection.
 | `reviewer.raw.md` / `review.json` | Raw review (written before parsing) and normalized verdict |
 | `repair_task.md` / `repair_task.json` | REVISE only: route, summary, findings, required fixes, missing tests, branch, worktree, run id |
 | `state.json` | Atomic run state and status transitions |
+| `state.lock` | Internal `flock` file serializing every state write; never served |
+| `planner.usage.json` / `reviewer.usage.json` | Token counters: `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens` (absent counters are 0) |
+| `implementation_bundle.json` | v2 only: step IDs, recommended profiles and the SHA-256 of every step contract |
+| `steps/Sxx/contract.md` | v2 only: the single authoritative step contract, written at planning, approved and executed byte-for-byte |
+| `steps/Sxx/agent.*` / `steps/Sxx/step.json` | v2 only: per-step Codex prompt, events, report, trees, changed paths and usage |
+
+Historic P20 runs stored contracts as `steps/Sxx.contract.md`; the UI can
+still display them, but new runs never write and never execute that layout.
 
 The state records references and bounded metadata, not API key values. The
 values of the variables named by `api_key_env` are redacted from check logs,

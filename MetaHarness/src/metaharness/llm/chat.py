@@ -347,4 +347,33 @@ def _normalize_usage(value: Any) -> dict[str, int]:
             if isinstance(number, int) and not isinstance(number, bool):
                 usage[canonical] = number
                 break
+    # Cache and reasoning counters are kept only when the provider supplies
+    # them, flat or in OpenAI-style ``*_details`` objects.
+    for canonical, aliases, nested in (
+        (
+            "cached_input_tokens",
+            ("cached_input_tokens", "cache_read_input_tokens"),
+            (("prompt_tokens_details", "cached_tokens"), ("input_tokens_details", "cached_tokens")),
+        ),
+        (
+            "cache_write_input_tokens",
+            ("cache_write_input_tokens", "cache_creation_input_tokens"),
+            (("prompt_tokens_details", "cache_write_tokens"), ("input_tokens_details", "cache_write_tokens")),
+        ),
+        (
+            "reasoning_output_tokens",
+            ("reasoning_output_tokens",),
+            (("completion_tokens_details", "reasoning_tokens"), ("output_tokens_details", "reasoning_tokens")),
+        ),
+    ):
+        candidates = [value.get(alias) for alias in aliases]
+        candidates.extend(
+            value[container].get(key)
+            for container, key in nested
+            if isinstance(value.get(container), dict)
+        )
+        for number in candidates:
+            if isinstance(number, int) and not isinstance(number, bool):
+                usage[canonical] = number
+                break
     return usage

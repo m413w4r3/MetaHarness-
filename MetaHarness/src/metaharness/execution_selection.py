@@ -115,6 +115,35 @@ def resolve_execution_selection(
     return ExecutionSelection(schema_version=SCHEMA_VERSION, **selected)
 
 
+_MAX_V3_STEPS = 6
+
+
+def _canonical_step_items(step_profile_ids: Mapping[str, str]) -> list[tuple[str, str]]:
+    """Return ``(step_id, profile_id)`` in canonical S01..SNN order.
+
+    The order never depends on the insertion order of the request mapping:
+    IDs are validated, sorted numerically, and must then be unique,
+    contiguous from S01, and at most six.
+    """
+
+    if not isinstance(step_profile_ids, Mapping) or not step_profile_ids:
+        raise ExecutionSelectionError("v3 selection must contain steps")
+    items: list[tuple[str, str]] = []
+    for step_id, profile_id in step_profile_ids.items():
+        if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None or not isinstance(profile_id, str):
+            raise ExecutionSelectionError("v3 step selection is invalid")
+        items.append((step_id, profile_id))
+    if len(items) > _MAX_V3_STEPS:
+        raise ExecutionSelectionError("v3 selection may contain at most six steps")
+    ordered = sorted(items, key=lambda item: int(item[0][1:]))
+    ids = [step_id for step_id, _profile_id in ordered]
+    if len(set(ids)) != len(ids):
+        raise ExecutionSelectionError("v3 step IDs must be unique")
+    if ids != [f"S{index:02d}" for index in range(1, len(ids) + 1)]:
+        raise ExecutionSelectionError("v3 step IDs must be contiguous from S01")
+    return ordered
+
+
 def resolve_execution_selection_v3(
     config: HarnessConfig,
     *,
@@ -132,12 +161,8 @@ def resolve_execution_selection_v3(
         profile_for_role(config, reviewer_profile_id, ExecutionRole.REVIEWER),
         agent_env_allowlist=_env_allowlist(config, ExecutionRole.REVIEWER),
     )
-    if not isinstance(step_profile_ids, Mapping) or not step_profile_ids:
-        raise ExecutionSelectionError("v3 selection must contain steps")
     steps: list[StepExecutionSelection] = []
-    for step_id, profile_id in step_profile_ids.items():
-        if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None or not isinstance(profile_id, str):
-            raise ExecutionSelectionError("v3 step selection is invalid")
+    for step_id, profile_id in _canonical_step_items(step_profile_ids):
         profile = profile_for_role(config, profile_id, ExecutionRole.IMPLEMENTER)
         steps.append(
             StepExecutionSelection(

@@ -2,25 +2,58 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .models import RunStatus
+
+# Lock file serializing every read/modify/write of ``state.json``.  It is an
+# internal coordination file: it never contains state and is never served.
+STATE_LOCK_NAME = "state.lock"
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+@contextmanager
+def _exclusive_state_lock(lock_path: Path) -> Iterator[None]:
+    """Hold an exclusive ``flock`` on *lock_path* (Linux).
+
+    ``flock`` locks belong to the open file description, so two threads of one
+    process opening the file independently exclude each other exactly like two
+    processes (web server and orchestrator) do.
+    """
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 class RunStateStore:
-    """Store one run state in a JSON file, using atomic replacements."""
+    """Store one run state in a JSON file, using atomic replacements.
+
+    Every mutation reads, merges and replaces the file under one exclusive
+    lock, so concurrent writers (orchestrator thread, web approval) can never
+    lose each other's fields or resurrect an older status.
+    """
 
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser().resolve()
+        self.lock_path = self.path.parent / STATE_LOCK_NAME
 
     def initialize(
         self,
@@ -64,30 +97,63 @@ class RunStateStore:
                 "steps": [],
             },
         }
-        self._write(state)
+        with _exclusive_state_lock(self.lock_path):
+            self._write(state)
         return state
 
     def update(self, *, status: RunStatus | str, **fields: Any) -> dict[str, Any]:
-        state = self.load()
-        state["status"] = RunStatus(status).value
-        state.update(fields)
-        state["updated_at"] = _now()
-        self._write(state)
+        new_status = RunStatus(status).value
+        with _exclusive_state_lock(self.lock_path):
+            state = self.load()
+            state["status"] = new_status
+            state.update(fields)
+            state["updated_at"] = _now()
+            self._write(state)
+        return state
+
+    def update_if_status(
+        self,
+        expected_status: RunStatus | str,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        """Compare-and-set: merge *fields* only while status is *expected*.
+
+        Under one lock: read the current state, return ``None`` without
+        writing if its status differs, otherwise merge and atomically write.
+        The status itself is not changed.
+        """
+
+        expected = RunStatus(expected_status).value
+        if "status" in fields:
+            raise ValueError("update_if_status does not change the status")
+        with _exclusive_state_lock(self.lock_path):
+            state = self.load()
+            if state.get("status") != expected:
+                return None
+            state.update(fields)
+            state["updated_at"] = _now()
+            self._write(state)
         return state
 
     def record_failure(
-        self, reason: str, detail: Any = None
+        self, reason: str, detail: Any = None, **fields: Any
     ) -> dict[str, Any]:
+        """Mark the run FAILED; *fields* are merged in the same write."""
+
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason must be a non-empty string")
+        if "status" in fields or "failure" in fields:
+            raise ValueError("record_failure owns status and failure")
         failure: dict[str, Any] = {"reason": reason}
         if detail is not None:
             failure["detail"] = detail
-        state = self.load()
-        state["status"] = RunStatus.FAILED.value
-        state["failure"] = failure
-        state["updated_at"] = _now()
-        self._write(state)
+        with _exclusive_state_lock(self.lock_path):
+            state = self.load()
+            state.update(fields)
+            state["status"] = RunStatus.FAILED.value
+            state["failure"] = failure
+            state["updated_at"] = _now()
+            self._write(state)
         return state
 
     def load(self) -> dict[str, Any]:
