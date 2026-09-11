@@ -77,6 +77,24 @@ def build_implementer_prompt(plan: str, *, template: str | None = None) -> str:
     return template.replace("{{PLAN}}", plan)
 
 
+def build_implementer_step_prompt(
+    step_contract: str, *, template: str | None = None
+) -> str:
+    """Put one bounded v2 step contract into the mechanical worker prompt."""
+
+    if not isinstance(step_contract, str):
+        raise TypeError("step_contract must be a string")
+    if template is None:
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "prompts"
+            / "implementer_step.txt"
+        ).read_text(encoding="utf-8")
+    if not isinstance(template, str):
+        raise TypeError("template must be a string")
+    return template.replace("{{STEP_CONTRACT}}", step_contract)
+
+
 def _tail(path: Path, limit: int) -> str:
     if limit <= 0 or not path.exists():
         return ""
@@ -321,5 +339,6 @@ __all__ = [
     "CodexAgent",
     "build_agent_environment",
     "build_implementer_prompt",
+    "build_implementer_step_prompt",
     "run_codex",
 ]

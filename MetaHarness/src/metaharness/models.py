@@ -25,6 +25,16 @@ class ExecutionRole(StrEnum):
     AUDITOR = "auditor"
 
 
+class PlanDecision(StrEnum):
+    READY = "READY"
+    BLOCKED = "BLOCKED"
+
+
+class ExecutionMode(StrEnum):
+    SINGLE = "SINGLE"
+    STAGED = "STAGED"
+
+
 @dataclass(frozen=True)
 class ModelProfile:
     id: str
@@ -60,6 +70,36 @@ class ModelProfile:
             raise ValueError("profile cost_tier is invalid")
         if not isinstance(self.latency_tier, str) or self.latency_tier not in {"fast", "standard", "slow"}:
             raise ValueError("profile latency_tier is invalid")
+
+
+@dataclass(frozen=True)
+class ImplementationStep:
+    id: str
+    title: str
+    implementer_profile: str
+    depends_on: str | None
+    objective: str
+    read_set: tuple[str, ...]
+    write_set: tuple[str, ...]
+    instructions: str
+    verify: str
+    forbidden: str
+
+
+@dataclass(frozen=True)
+class TaskPlanV2:
+    decision: PlanDecision
+    title: str
+    objective: str
+    constraints: str
+    execution_mode: ExecutionMode | None
+    reviewer_profile: str | None
+    steps: tuple[ImplementationStep, ...]
+    acceptance: str
+    tests: str
+    risks: str
+    blockers: str
+    raw: str
 
 
 class RunStatus(StrEnum):
@@ -115,6 +155,15 @@ class ContextConfig:
     max_hits: int = 8
     max_bytes: int = 160_000
     require_locator_head_at_base: bool = True
+
+
+@dataclass(frozen=True)
+class PlanningConfig:
+    protocol: str = "v1"
+
+    def __post_init__(self) -> None:
+        if self.protocol not in {"v1", "v2"}:
+            raise ValueError("planning protocol must be 'v1' or 'v2'")
 
 
 @dataclass(frozen=True)
@@ -216,6 +265,7 @@ class HarnessConfig:
         )
     )
     workspace_setup: tuple[WorkspaceSetupCommand, ...] = ()
+    planning: PlanningConfig = field(default_factory=PlanningConfig)
 
 
 @dataclass(frozen=True)

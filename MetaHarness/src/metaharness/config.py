@@ -22,6 +22,7 @@ from .models import (
     HarnessConfig,
     LLMEndpointConfig,
     ModelProfile,
+    PlanningConfig,
     ProfileDriver,
     SelectionMode,
     UIConfig,
@@ -535,6 +536,12 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     require_clean_base = _bool(expanded, "require_clean_base", True, "root")
     max_diff_bytes = _positive_int(expanded, "max_diff_bytes", 400_000, "root")
 
+    planning_data = _table(expanded, "planning")
+    protocol = planning_data.get("protocol", "v1")
+    if not isinstance(protocol, str) or protocol not in {"v1", "v2"}:
+        raise ConfigError("planning.protocol must be 'v1' or 'v2'")
+    planning = PlanningConfig(protocol=protocol)
+
     agent_data = _table(expanded, "agent")
     provider = agent_data.get("provider", "codex")
     if provider != "codex":
@@ -752,4 +759,5 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         runtime_environment=runtime_environment,
         codex_runtime=codex_runtime,
         workspace_setup=workspace_setup,
+        planning=planning,
     )

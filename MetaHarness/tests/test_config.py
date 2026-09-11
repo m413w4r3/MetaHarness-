@@ -100,6 +100,21 @@ class ConfigTests(unittest.TestCase):
             "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
         ))
 
+    def test_planning_protocol_defaults_to_v1_and_accepts_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name)))
+        self.assertEqual(config.planning.protocol, "v1")
+
+        contents = VALID_CONFIG + '\n[planning]\nprotocol = "v2"\n'
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), contents))
+        self.assertEqual(config.planning.protocol, "v2")
+
+        contents = VALID_CONFIG + '\n[planning]\nprotocol = "v3"\n'
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, "planning.protocol"):
+                load_config(self.write_config(Path(directory_name), contents))
+
     def test_plan_approval_config_defaults_and_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name)))

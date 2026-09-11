@@ -13,7 +13,6 @@ import os
 import re
 import tempfile
 from dataclasses import asdict, dataclass
-from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -24,11 +23,7 @@ from .llm.wire import (
     control_tokens,
     parse_labeled_document,
 )
-
-
-class PlanDecision(StrEnum):
-    READY = "READY"
-    BLOCKED = "BLOCKED"
+from .models import PlanDecision
 
 
 @dataclass(frozen=True)
