@@ -60,6 +60,7 @@ def _selected(
     *,
     schema_version: int = SCHEMA_VERSION,
     agent_env_allowlist: tuple[str, ...] = (),
+    codex_home: Path | None = None,
 ) -> SelectedProfile:
     return SelectedProfile(
         profile_id=profile.id,
@@ -69,7 +70,11 @@ def _selected(
         effort=profile.effort,
         sandbox=profile.sandbox,
         config_sha256=(
-            profile_execution_fingerprint(profile, agent_env_allowlist=agent_env_allowlist)
+            profile_execution_fingerprint(
+                profile,
+                agent_env_allowlist=agent_env_allowlist,
+                codex_home=codex_home,
+            )
             if schema_version == 2
             else None
         ),
@@ -94,6 +99,7 @@ def resolve_execution_selection(
         name: _selected(
             profile_for_role(config, requested[name], role),
             agent_env_allowlist=_env_allowlist(config, role),
+            codex_home=(config.codex_runtime.home if role is ExecutionRole.IMPLEMENTER else None),
         )
         for name, role in _ROLES
     }
@@ -267,6 +273,7 @@ def validate_execution_selection(
                 profile,
                 schema_version=selection.schema_version,
                 agent_env_allowlist=_env_allowlist(config, role),
+                codex_home=(config.codex_runtime.home if role is ExecutionRole.IMPLEMENTER else None),
             )
         except ProfileError as exc:
             raise ExecutionSelectionError(

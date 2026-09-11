@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from .approval import (
     write_plan_approval,
 )
 from .config import ConfigError, load_config
+from .agent.runtime import CodexRuntimeError, prepare_codex_home
 from .execution_selection import is_profile_aware_run
 from .gitops import GitError, assert_clean, git_root, resolve_commit
 from .llm.chat import validate_endpoint
@@ -181,7 +183,29 @@ def _doctor(config_path: Path) -> int:
         return 2
 
     problems: list[str] = []
+    config_dir = config_path.expanduser().resolve().parent
     print(f"config: {config_path.expanduser().resolve()}")
+    for env_file in config.environment.files:
+        try:
+            label = str(env_file.relative_to(config_dir))
+        except ValueError:
+            label = str(env_file)
+        print(f"OK environment file: {label}")
+    required_env_names = {
+        endpoint.api_key_env
+        for endpoint in (config.planner, config.reviewer)
+        if endpoint.api_key_env
+    }
+    required_env_names.update(
+        profile.api_key_env
+        for profile in config.model_profiles.values()
+        if profile.api_key_env
+    )
+    for name in sorted(required_env_names):
+        if name in config.runtime_environment:
+            print(f"OK env {name}: set")
+        else:
+            problems.append(f"required env {name} is not set")
     if not config.repo.is_dir():
         problems.append(f"repo does not exist: {config.repo}")
     else:
@@ -200,6 +224,27 @@ def _doctor(config_path: Path) -> int:
             problems.append(f"{label} is not a directory: {path}")
         else:
             print(f"{label}: {path}")
+    path_value = config.runtime_environment.get("PATH", "")
+    if shutil.which("codex", path=path_value):
+        print("OK codex binary: present")
+    else:
+        problems.append("codex binary is not resolvable")
+    try:
+        codex_home = prepare_codex_home(config)
+        print(f"OK codex home: {codex_home}")
+        print("OK codex MCP isolation: none configured")
+    except CodexRuntimeError as exc:
+        problems.append(str(exc))
+    for label, commands in (
+        ("workspace setup", config.workspace_setup),
+        ("check", config.checks),
+    ):
+        for command in commands:
+            executable = command.argv[0] if command.argv else ""
+            if shutil.which(executable, path=path_value):
+                print(f"OK {label} executable {command.name}: resolvable")
+            else:
+                problems.append(f"{label} executable {command.name} is not resolvable")
     if problems:
         for problem in problems:
             print(f"error: {problem}", file=sys.stderr)

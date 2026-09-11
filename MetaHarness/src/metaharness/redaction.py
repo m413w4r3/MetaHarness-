@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from .models import HarnessConfig
 
@@ -15,27 +15,36 @@ REDACTED = "[REDACTED]"
 _MIN_SECRET_LENGTH = 8
 
 
-def secret_values(env_names: Iterable[str | None]) -> tuple[str, ...]:
-    """Return the current values of the named environment variables."""
+def secret_values(
+    env_names: Iterable[str | None],
+    environment: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Return values from *environment*; ``None`` preserves old callers."""
 
+    source = os.environ if environment is None else environment
     values: set[str] = set()
     for name in env_names:
         if not name:
             continue
-        value = os.environ.get(name)
+        value = source.get(name)
         if value and len(value) >= _MIN_SECRET_LENGTH:
             values.add(value)
     return tuple(sorted(values, key=len, reverse=True))
 
 
-def config_secret_values(config: HarnessConfig) -> tuple[str, ...]:
+def config_secret_values(
+    config: HarnessConfig,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
     """Secrets referenced by all configured execution profiles."""
 
     names = [config.planner.api_key_env, config.reviewer.api_key_env]
     names.extend(
         profile.api_key_env for profile in config.model_profiles.values()
     )
-    return secret_values(names)
+    if environment is None and config.runtime_environment:
+        environment = config.runtime_environment
+    return secret_values(names, environment)
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:

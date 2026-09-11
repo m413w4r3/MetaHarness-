@@ -9,11 +9,9 @@
 - Any API key supplied through the environment variable named by
   `api_key_env`; never put the key itself in TOML.
 
-For the AutoWork profile, set the six `META_*` endpoint/model variables before
-loading `examples/autowork.toml`. Because relative TOML paths are resolved
-from the configuration file, copy this example to the MetaHarness checkout
-root (or adjust its paths) before running it. The endpoint paths can select a
-ChatGPT bridge or a WebAI-to-API Gemini bridge.
+For the AutoWork profile, copy this example to the MetaHarness checkout root
+(or adjust its paths) before running it. The endpoint configuration is
+explicit; secrets are loaded from the configured environment file.
 
 ## Local checks
 
@@ -38,6 +36,15 @@ python -m metaharness.cli run \
   --spec examples/spec-example.md \
   --run-id example-001
 ```
+
+On first use, authenticate the managed Codex runtime once:
+
+```sh
+CODEX_HOME="$HOME/.local/share/metaharness/codex" codex login
+```
+
+MetaHarness never copies the personal `CODEX_HOME`, MCP configuration, or
+credentials into that managed runtime.
 
 ## Plan approval
 
@@ -123,7 +130,9 @@ failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,
 `AGENT_COMMITTED`, `AGENT_GIT_VIOLATION`, `CHECK_SETUP_INVALID`,
 `CHECK_MUTATED`, `EMPTY_DIFF`, `DIFF_TOO_LARGE`, `SECRET_IN_DIFF`,
 `DETERMINISTIC_GATE_FAILED`, `REVIEW_REVISE`, `REVIEW_FAIL`,
-`PLAN_APPROVAL_INVALID`, `TOCTOU_FAILURE`, `GIT_FAILURE`. V0 stops and
+`PLAN_APPROVAL_INVALID`, `WORKSPACE_SETUP_FAILED`, `WORKSPACE_SETUP_TIMEOUT`,
+`WORKSPACE_SETUP_MUTATED`, `AGENT_NO_CHANGE`, `TOCTOU_FAILURE`, `GIT_FAILURE`.
+V0 stops and
 leaves the run directory and worktree available for inspection; it does not
 automatically repair or retry implementation work. Resolve the issue as an
 operator, then start a new run ID. Remove an obsolete worktree only through

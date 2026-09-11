@@ -13,6 +13,7 @@ from .approval import (
     write_plan_approval,
 )
 from .config import ConfigError, load_config
+from .environment import EnvironmentFileError, build_runtime_environment, parse_env_file
 from .context import (
     ContextBundle,
     ContextExcerpt,
@@ -25,18 +26,22 @@ from .models import (
     AgentConfig,
     ApprovalConfig,
     CheckConfig,
+    CodexRuntimeConfig,
     ContextConfig,
+    EnvironmentConfig,
     HarnessConfig,
     LLMEndpointConfig,
     ReviewRoute,
     ReviewVerdict,
     RunStatus,
+    WorkspaceSetupCommand,
 )
 from .orchestrator import Orchestrator, run_orchestrator
 from .review import Reviewer, ReviewParseError, ReviewResult, parse_review
 from .result import RunResult
 from .state import RunStateStore
 from .validation import CheckResult, ValidationError, run_checks
+from .workspace import WorkspaceSetupError, WorkspaceSetupResult, prepare_workspace
 
 __all__ = [
     "AgentConfig",
@@ -45,13 +50,16 @@ __all__ = [
     "ApprovalDecision",
     "ApprovalError",
     "CheckConfig",
+    "CodexRuntimeConfig",
     "CheckResult",
     "CodexAgent",
     "ConfigError",
     "ContextBundle",
     "ContextConfig",
+    "EnvironmentConfig",
     "ContextExcerpt",
     "EvidenceBundle",
+    "EnvironmentFileError",
     "HarnessConfig",
     "LLMEndpointConfig",
     "PlanApproval",
@@ -64,19 +72,25 @@ __all__ = [
     "RunStateStore",
     "RunResult",
     "RunStatus",
+    "WorkspaceSetupCommand",
+    "WorkspaceSetupError",
+    "WorkspaceSetupResult",
     "Orchestrator",
     "ValidationError",
     "build_context",
     "build_context_bundle",
+    "build_runtime_environment",
     "collect_evidence",
     "compute_plan_identity",
     "compute_plan_identity_from_run",
     "load_config",
     "parse_review",
+    "parse_env_file",
     "render_context",
     "read_plan_approval",
     "run_orchestrator",
     "run_checks",
     "wait_for_plan_approval",
     "write_plan_approval",
+    "prepare_workspace",
 ]

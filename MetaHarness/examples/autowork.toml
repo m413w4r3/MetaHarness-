@@ -3,10 +3,15 @@ base_ref = "main"
 
 runs_root = "../MetaHarness-runs"
 worktrees_root = "../MetaHarness-worktrees"
-
 require_clean_base = true
 max_diff_bytes = 400000
 allow_no_required_checks = false
+
+[environment]
+files = ["../Bridges/.env.models"]
+
+[codex_runtime]
+home = "~/.local/share/metaharness/codex"
 
 [approval]
 require_plan_approval = true
@@ -44,8 +49,9 @@ roles = ["planner", "reviewer"]
 driver = "openai-chat"
 model = "chatgpt-web"
 selection_mode = "external-ui"
-base_url = "${META_PLANNER_BASE_URL}"
-endpoint_path = "${META_PLANNER_ENDPOINT}"
+base_url = "http://127.0.0.1:8001"
+endpoint_path = "/v1/chat/completions"
+api_key_env = "BRIDGE_API_KEY"
 timeout_seconds = 420
 retries = 2
 description = "Strong semantic planning and review through the ChatGPT bridge."
@@ -81,3 +87,9 @@ timeout_seconds = 1800
 name = "test"
 argv = ["make", "test"]
 timeout_seconds = 5400
+
+[[workspace_setup]]
+name = "frontend-dependencies"
+argv = ["pnpm", "install", "--frozen-lockfile"]
+cwd = "frontend"
+timeout_seconds = 1800

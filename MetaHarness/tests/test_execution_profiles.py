@@ -234,6 +234,9 @@ runs_root = "{root}/runs"
 worktrees_root = "{root}/worktrees"
 allow_no_required_checks = true
 
+[codex_runtime]
+home = "{root}/codex-home"
+
 [ui]
 default_planner_profile = "chat"
 default_implementer_profile = "impl"

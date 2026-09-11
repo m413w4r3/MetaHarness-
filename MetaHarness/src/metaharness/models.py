@@ -69,6 +69,7 @@ class RunStatus(StrEnum):
     AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
     PLAN_REJECTED = "plan_rejected"
     WORKTREE_READY = "worktree_ready"
+    PREPARING = "preparing"
     IMPLEMENTING = "implementing"
     VALIDATING = "validating"
     REVIEWING = "reviewing"
@@ -132,7 +133,6 @@ class AgentConfig:
         "TMPDIR",
         "XDG_CONFIG_HOME",
         "XDG_CACHE_HOME",
-        "CODEX_HOME",
     )
 
 
@@ -161,6 +161,33 @@ class CheckConfig:
 
 
 @dataclass(frozen=True)
+class EnvironmentConfig:
+    files: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
+class CodexRuntimeConfig:
+    home: Path
+
+
+@dataclass(frozen=True)
+class WorkspaceSetupCommand:
+    name: str
+    argv: tuple[str, ...]
+    cwd: str = "."
+    timeout_seconds: int = 1200
+    env_allowlist: tuple[str, ...] = (
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "PNPM_HOME",
+    )
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     repo: Path
     base_ref: str
@@ -177,6 +204,18 @@ class HarnessConfig:
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     model_profiles: Mapping[str, ModelProfile] = field(default_factory=dict)
+    environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
+    runtime_environment: Mapping[str, str] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    codex_runtime: CodexRuntimeConfig = field(
+        default_factory=lambda: CodexRuntimeConfig(
+            Path.home() / ".local" / "share" / "metaharness" / "codex"
+        )
+    )
+    workspace_setup: tuple[WorkspaceSetupCommand, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -488,7 +488,7 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.assertEqual(failed["failure"]["reason"], "REVIEW_FAIL")
 
         _, empty_llm, empty = self.run_case(codex_behavior="none", run_id="empty")
-        self.assertEqual(empty["failure"]["reason"], "EMPTY_DIFF")
+        self.assertEqual(empty["failure"]["reason"], "AGENT_NO_CHANGE")
         self.assertEqual(empty_llm.reviewer_calls, 0)
 
         _, large_llm, large = self.run_case(max_diff=10, run_id="large", codex_behavior="large")

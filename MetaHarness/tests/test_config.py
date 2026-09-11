@@ -97,7 +97,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.planner.api_key_env, "META_PLANNER_API_KEY")
         self.assertEqual(config.agent.env_allowlist, (
             "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR",
-            "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME",
+            "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
         ))
 
     def test_plan_approval_config_defaults_and_is_validated(self) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 from .models import (
@@ -123,6 +124,7 @@ def profile_execution_fingerprint(
     profile: ModelProfile,
     *,
     agent_env_allowlist: tuple[str, ...] = (),
+    codex_home: Path | None = None,
 ) -> str:
     """SHA-256 of the profile fields that change execution.
 
@@ -157,6 +159,11 @@ def profile_execution_fingerprint(
             effort=profile.effort,
             sandbox=profile.sandbox,
             agent_env_allowlist=list(agent_env_allowlist),
+            codex_home=(
+                str(Path(codex_home).expanduser().resolve())
+                if codex_home is not None
+                else None
+            ),
         )
     else:  # pragma: no cover - ProfileDriver is closed
         raise ProfileError("profile driver is unknown")

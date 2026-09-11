@@ -9,7 +9,7 @@ import signal
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from ..gitops import GitError, current_head
 from ..models import AgentConfig
@@ -38,6 +38,8 @@ _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 def build_agent_environment(
     config: AgentConfig,
     *,
+    source_environment: Mapping[str, str] | None = None,
+    codex_home: Path | None = None,
     forbidden_names: Iterable[str] = (),
 ) -> dict[str, str]:
     """Build the explicit, minimal environment passed to Codex."""
@@ -48,11 +50,15 @@ def build_agent_environment(
     if any(_ENV_NAME.fullmatch(name) is None for name in names):
         raise ValueError("agent environment allowlist contains an invalid name")
     forbidden = frozenset(name for name in forbidden_names if name)
-    return {
-        name: os.environ[name]
+    source = os.environ if source_environment is None else source_environment
+    environment = {
+        name: source[name]
         for name in names
-        if name not in forbidden and name in os.environ
+        if name not in forbidden and name != "CODEX_HOME" and name in source
     }
+    if codex_home is not None:
+        environment["CODEX_HOME"] = str(Path(codex_home).expanduser().resolve())
+    return environment
 
 
 def _template_path() -> Path:

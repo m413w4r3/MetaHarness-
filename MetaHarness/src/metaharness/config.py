@@ -9,12 +9,15 @@ import tomllib
 from pathlib import Path
 from typing import Any, Mapping
 
+from .environment import EnvironmentFileError, build_runtime_environment
 from .llm.chat import PROTECTED_BODY_KEYS, LLMProtocolError, validate_endpoint
 from .models import (
     AgentConfig,
     ApprovalConfig,
     CheckConfig,
+    CodexRuntimeConfig,
     ContextConfig,
+    EnvironmentConfig,
     ExecutionRole,
     HarnessConfig,
     LLMEndpointConfig,
@@ -22,6 +25,7 @@ from .models import (
     ProfileDriver,
     SelectionMode,
     UIConfig,
+    WorkspaceSetupCommand,
 )
 
 
@@ -66,7 +70,7 @@ _PROFILE_ROLE_COMPATIBILITY = {
 }
 
 
-def _expand_string(value: str) -> str:
+def _expand_string(value: str, environment: Mapping[str, str]) -> str:
     """Expand ``${NAME}`` references in one non-recursive pass.
 
     A value taken from the environment is inserted literally: a ``${...}``
@@ -75,24 +79,24 @@ def _expand_string(value: str) -> str:
 
     def replace(match: re.Match[str]) -> str:
         name = match.group(1)
-        if name not in os.environ:
+        if name not in environment:
             raise ConfigError(f"environment variable {name!r} is not set")
-        return os.environ[name]
+        return environment[name]
 
     return _ENV_VAR.sub(replace, value)
 
 
-def _expand(value: Any) -> Any:
+def _expand(value: Any, environment: Mapping[str, str]) -> Any:
     """Recursively expand strings in TOML tables and arrays."""
 
     if isinstance(value, str):
-        return _expand_string(value)
+        return _expand_string(value, environment)
     if isinstance(value, list):
-        return [_expand(item) for item in value]
+        return [_expand(item, environment) for item in value]
     if isinstance(value, tuple):
-        return tuple(_expand(item) for item in value)
+        return tuple(_expand(item, environment) for item in value)
     if isinstance(value, dict):
-        return {key: _expand(item) for key, item in value.items()}
+        return {key: _expand(item, environment) for key, item in value.items()}
     return value
 
 
@@ -385,7 +389,7 @@ def _model_profiles(
             effort = _required_string(profile_data, "effort", where)
             sandbox = _required_string(profile_data, "sandbox", where)
             if sandbox not in _KNOWN_SANDBOXES:
-                raise ConfigError(f"unknown {where}.sandbox: {sandbox!r}")
+                raise ConfigError(f"unknown {where}.sandbox")
             if selection_mode is not SelectionMode.CLI:
                 raise ConfigError(f"{where}.selection_mode must be cli")
             result[profile_id] = ModelProfile(
@@ -440,6 +444,64 @@ def _checks(value: Any) -> tuple[CheckConfig, ...]:
     return tuple(result)
 
 
+def _environment_config(raw: Mapping[str, Any], config_dir: Path) -> EnvironmentConfig:
+    data = _table(raw, "environment")
+    files = data.get("files", [])
+    if isinstance(files, str) or not isinstance(files, (list, tuple)):
+        raise ConfigError("environment.files must be an array of paths")
+    paths: list[Path] = []
+    for index, value in enumerate(files):
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"environment.files[{index}] must be a non-empty path string")
+        paths.append(_path(value, f"environment.files[{index}]", config_dir))
+    return EnvironmentConfig(tuple(paths))
+
+
+def _codex_runtime(
+    raw: Mapping[str, Any], config_dir: Path, *, required: bool
+) -> CodexRuntimeConfig:
+    data = _table(raw, "codex_runtime")
+    if "home" not in data:
+        if required:
+            raise ConfigError("codex_runtime.home is required for explicit Codex profiles")
+        return CodexRuntimeConfig(
+            Path.home() / ".local" / "share" / "metaharness" / "codex"
+        )
+    return CodexRuntimeConfig(_path(data["home"], "codex_runtime.home", config_dir))
+
+
+def _workspace_setup(value: Any) -> tuple[WorkspaceSetupCommand, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError("workspace_setup must be an array of tables")
+    result: list[WorkspaceSetupCommand] = []
+    for index, item in enumerate(value):
+        where = f"workspace_setup[{index}]"
+        if not isinstance(item, dict):
+            raise ConfigError(f"{where} must be a table")
+        name = _required_string(item, "name", where)
+        argv = _string_array(item, "argv", (), where, allow_empty=False)
+        cwd = item.get("cwd", ".")
+        if not isinstance(cwd, str) or not cwd.strip() or "\x00" in cwd:
+            raise ConfigError(f"{where}.cwd must be a valid relative path")
+        if Path(cwd).is_absolute():
+            raise ConfigError(f"{where}.cwd must be relative to the worktree")
+        env_allowlist = _env_name_array(
+            item, "env_allowlist", WorkspaceSetupCommand.env_allowlist, where
+        )
+        result.append(
+            WorkspaceSetupCommand(
+                name=name,
+                argv=argv,
+                cwd=cwd,
+                timeout_seconds=_positive_int(item, "timeout_seconds", 1200, where),
+                env_allowlist=env_allowlist,
+            )
+        )
+    return tuple(result)
+
+
 def load_config(config_path: str | Path) -> HarnessConfig:
     """Load and validate a TOML configuration file."""
 
@@ -454,11 +516,18 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     except OSError as exc:
         raise ConfigError(f"cannot read configuration file {path}: {exc}") from exc
 
-    expanded = _expand(raw)
+    config_dir = path.parent
+    try:
+        environment = _environment_config(raw, config_dir)
+        runtime_environment = build_runtime_environment(
+            environment.files, os.environ
+        )
+    except EnvironmentFileError as exc:
+        raise ConfigError(str(exc)) from None
+
+    expanded = _expand(raw, runtime_environment)
     if not isinstance(expanded, dict):  # pragma: no cover - tomllib guarantee
         raise ConfigError("configuration root must be a table")
-    config_dir = path.parent
-
     repo = _path(expanded.get("repo"), "repo", config_dir)
     base_ref = _required_string(expanded, "base_ref", "root")
     runs_root = _path(expanded.get("runs_root"), "runs_root", config_dir)
@@ -477,7 +546,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         if not isinstance(value, str) or not value.strip():
             raise ConfigError(f"agent.{key} must be a non-empty string")
     if sandbox not in _KNOWN_SANDBOXES:
-        raise ConfigError(f"unknown agent.sandbox: {sandbox!r}")
+        raise ConfigError("unknown agent.sandbox")
     agent = AgentConfig(
         provider=provider,
         model=agent_model,
@@ -490,6 +559,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     )
 
     model_profiles, explicit_profiles = _model_profiles(expanded)
+    has_explicit_codex = any(
+        profile.driver is ProfileDriver.CODEX for profile in model_profiles.values()
+    )
     planner_data = _table(expanded, "planner")
     reviewer_data = _table(expanded, "reviewer")
     agent_data_present = "agent" in expanded
@@ -638,6 +710,20 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     )
 
     checks = _checks(expanded.get("checks", []))
+    codex_runtime = _codex_runtime(
+        expanded, config_dir, required=has_explicit_codex
+    )
+    for label, root in (
+        ("repo", repo),
+        ("runs_root", runs_root),
+        ("worktrees_root", worktrees_root),
+    ):
+        try:
+            codex_runtime.home.relative_to(root)
+        except ValueError:
+            continue
+        raise ConfigError(f"codex_runtime.home must not be inside {label}")
+    workspace_setup = _workspace_setup(expanded.get("workspace_setup", []))
     allow_no_required_checks = _bool(
         expanded, "allow_no_required_checks", False, "root"
     )
@@ -662,4 +748,8 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         approval=approval,
         ui=ui,
         model_profiles=model_profiles,
+        environment=environment,
+        runtime_environment=runtime_environment,
+        codex_runtime=codex_runtime,
+        workspace_setup=workspace_setup,
     )

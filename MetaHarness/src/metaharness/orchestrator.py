@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
+import os
 import re
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .agent.base import AgentError, AgentResult
 from .agent.codex import AgentCommittedError, CodexAgent, build_agent_environment
+from .agent.runtime import prepare_codex_home
 from .approval import (
     ApprovalDecision,
     ApprovalError,
@@ -78,6 +81,7 @@ from .result import RunResult, write_repair_task
 from .review import Reviewer, ReviewParseError, ReviewResult, blocking_finding_lines, parse_review
 from .state import RunStateStore
 from .validation import ValidationError, check_result_json
+from .workspace import WorkspaceSetupError, prepare_workspace
 
 
 class OrchestrationError(RuntimeError):
@@ -86,6 +90,28 @@ class OrchestrationError(RuntimeError):
 
 class CommitBoundaryError(OrchestrationError):
     """A commit precondition does not hold immediately before the commit."""
+
+
+def _chat_client(endpoint: Any, environment: Mapping[str, str]) -> OpenAIChatTextClient:
+    """Construct the production client with the runtime mapping.
+
+    A small signature compatibility branch keeps older test doubles and
+    embedding adapters working while the real client always receives it.
+    """
+
+    constructor = OpenAIChatTextClient
+    try:
+        parameters = inspect.signature(constructor).parameters.values()
+        accepts_environment = any(
+            parameter.name == "environment"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        accepts_environment = True
+    if accepts_environment:
+        return constructor(endpoint, environment=environment)
+    return constructor(endpoint)
 
 
 # Gate failures for which a semantic review is pointless or unsafe: the
@@ -313,19 +339,31 @@ class Orchestrator:
         self._recommender_client = recommender_client
         self._injected_agent = agent
         self._secrets: tuple[str, ...] = ()
+        # Loaded production configs always contain a process-environment
+        # mapping.  The fallback only preserves direct construction of the
+        # legacy HarnessConfig dataclass by embedding callers/tests.
+        self._runtime_environment = (
+            config.runtime_environment
+            if config.runtime_environment
+            else os.environ
+        )
 
     def _planner_for_profile(self, profile_id: str) -> Planner:
         profile = profile_for_role(self.config, profile_id, ExecutionRole.PLANNER)
         client = self._planner_client
         if client is None:
-            client = OpenAIChatTextClient(build_llm_endpoint(profile))
+            client = _chat_client(
+                build_llm_endpoint(profile), self._runtime_environment
+            )
         return Planner(client, allow_format_repair=False)
 
     def _reviewer_for_profile(self, profile_id: str) -> Reviewer:
         profile = profile_for_role(self.config, profile_id, ExecutionRole.REVIEWER)
         client = self._reviewer_client
         if client is None:
-            client = OpenAIChatTextClient(build_llm_endpoint(profile))
+            client = _chat_client(
+                build_llm_endpoint(profile), self._runtime_environment
+            )
         return Reviewer(client, allow_format_repair=False)
 
     def _recommender_for_profile(self, profile_id: str) -> ExecutionRecommender:
@@ -335,7 +373,9 @@ class Orchestrator:
             # This is deliberately a new client: the recommender has no
             # planner conversation/history, while using the same profile
             # endpoint and transport policy.
-            client = OpenAIChatTextClient(build_llm_endpoint(profile))
+            client = _chat_client(
+                build_llm_endpoint(profile), self._runtime_environment
+            )
         return ExecutionRecommender(client)
 
     def _maybe_recommend_profiles(
@@ -440,7 +480,15 @@ class Orchestrator:
         run_dir = (self.config.runs_root / selected_run_id).expanduser().resolve()
         if run_dir.exists():
             raise OrchestrationError(f"run directory already exists: {run_dir}")
-        self._secrets = config_secret_values(self.config)
+        if not hasattr(self, "_runtime_environment"):
+            self._runtime_environment = (
+                self.config.runtime_environment
+                if self.config.runtime_environment
+                else os.environ
+            )
+        self._secrets = config_secret_values(
+            self.config, self._runtime_environment
+        )
 
         store: RunStateStore | None = None
         try:
@@ -644,10 +692,30 @@ class Orchestrator:
         )
 
         ownership_before = _git_ownership(repo, info.worktree)
+        store.update(status=RunStatus.PREPARING)
+        try:
+            setup_results = prepare_workspace(
+                info.worktree,
+                self.config.workspace_setup,
+                environment=self._runtime_environment,
+                artifacts_dir=run_dir,
+                secrets=self._secrets,
+            )
+        except WorkspaceSetupError as exc:
+            if exc.results:
+                store.update(
+                    status=RunStatus.PREPARING,
+                    workspace_setup=[asdict(result) for result in exc.results],
+                )
+            raise
+        store.update(
+            status=RunStatus.PREPARING,
+            workspace_setup=[asdict(result) for result in setup_results],
+        )
+        codex_home = prepare_codex_home(self.config)
         store.update(status=RunStatus.IMPLEMENTING)
         implementation_contract = render_implementation_contract(plan)
         agent = self._agent_for_profile(selection.implementer.profile_id)
-        reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
         implementer_profile = profile_for_role(
             self.config, selection.implementer.profile_id, ExecutionRole.IMPLEMENTER
         )
@@ -660,11 +728,14 @@ class Orchestrator:
         try:
             agent_environment = build_agent_environment(
                 agent_config,
+                source_environment=self._runtime_environment,
+                codex_home=codex_home,
                 forbidden_names=(
                     planner_profile.api_key_env,
                     profile_for_role(self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER).api_key_env,
                 ),
             )
+            tree_before_agent = candidate_tree_sha(info.worktree)
             agent_result = agent.run(
                 implementation_contract,
                 info.worktree,
@@ -702,7 +773,18 @@ class Orchestrator:
             )
             return RunResult(run_dir, RunStatus.FAILED, state)
 
+        tree_after_agent = candidate_tree_sha(info.worktree)
+        store.update(
+            status=RunStatus.IMPLEMENTING,
+            agent_candidate_tree_before=tree_before_agent,
+            agent_candidate_tree_after=tree_after_agent,
+        )
+        if tree_after_agent == tree_before_agent:
+            state = store.record_failure("AGENT_NO_CHANGE")
+            return RunResult(run_dir, RunStatus.FAILED, state)
+
         store.update(status=RunStatus.VALIDATING)
+        reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
         evidence = collect_evidence(
             info.worktree,
             base_sha,
@@ -874,6 +956,8 @@ def _failure_reason(exc: Exception) -> str:
         return "LLM_FAILURE"
     if isinstance(exc, ValidationError):
         return "CHECK_SETUP_INVALID"
+    if isinstance(exc, WorkspaceSetupError):
+        return exc.code
     return exc.__class__.__name__.upper()
 
 

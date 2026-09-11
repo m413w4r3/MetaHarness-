@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from ..models import LLMEndpointConfig
 
@@ -83,8 +83,16 @@ def _opener() -> urllib.request.OpenerDirector:
 class OpenAIChatTextClient:
     """Client d'un endpoint chat OpenAI-compatible ne retournant que du texte."""
 
-    def __init__(self, config: LLMEndpointConfig):
+    def __init__(
+        self,
+        config: LLMEndpointConfig,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ):
         self.config = config
+        # ``None`` deliberately retains the old library-level behavior for
+        # callers/tests; MetaHarness always supplies its runtime mapping.
+        self._environment = os.environ if environment is None else environment
         self._url = _join_url(config.base_url, config.endpoint_path)
         conflicting_keys = PROTECTED_BODY_KEYS.intersection(config.extra_body)
         if conflicting_keys:
@@ -114,7 +122,7 @@ class OpenAIChatTextClient:
             "Content-Type": "application/json",
         }
         if self.config.api_key_env is not None:
-            headers["Authorization"] = f"Bearer {_api_key(self.config.api_key_env)}"
+            headers["Authorization"] = f"Bearer {_api_key(self.config.api_key_env, self._environment)}"
 
         request = urllib.request.Request(
             self._url,
@@ -178,9 +186,10 @@ class OpenAIChatTextClient:
         raise LLMHTTPError("LLM endpoint request failed")  # pragma: no cover
 
 
-def _api_key(env_name: str) -> str:
+def _api_key(env_name: str, environment: Mapping[str, str] | None = None) -> str:
+    source = os.environ if environment is None else environment
     try:
-        api_key = os.environ[env_name]
+        api_key = source[env_name]
     except KeyError:
         raise LLMError(
             f"API key environment variable {env_name!r} is not set"
