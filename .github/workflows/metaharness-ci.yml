@@ -1,0 +1,40 @@
+name: MetaHarness CI
+
+on:
+  push:
+    paths:
+      - "MetaHarness/**"
+      - ".github/workflows/metaharness-ci.yml"
+  pull_request:
+    paths:
+      - "MetaHarness/**"
+      - ".github/workflows/metaharness-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Offline unit tests only: no real bridge, provider, Docker or Codex.
+    # The real planner smoke test (scripts/manual/planner_real_smoke.py)
+    # stays manual and is never run here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: MetaHarness
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configure Git identity for test repositories
+        run: |
+          git config --global user.name "MetaHarness CI"
+          git config --global user.email "ci@example.invalid"
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Compile
+        run: python -m compileall -q src tests
