@@ -238,6 +238,7 @@ class OrchestratorE2ETests(unittest.TestCase):
         max_diff: int = 400000,
         check_cwd: str = ".",
         key_env: str | None = None,
+        require_plan_approval: bool = False,
     ) -> Path:
         config = self.root / "config.toml"
         key_line = f"\napi_key_env = {key_env!r}" if key_env else ""
@@ -249,6 +250,10 @@ class OrchestratorE2ETests(unittest.TestCase):
                 f"worktrees_root = {str(self.root / 'worktrees')!r}",
                 "require_clean_base = true",
                 f"max_diff_bytes = {max_diff}",
+                "",
+                "[approval]",
+                f"require_plan_approval = {'true' if require_plan_approval else 'false'}",
+                "poll_interval_seconds = 0.01",
                 "",
                 f"[planner]\nbase_url = {llm.base_url!r}\nendpoint_path = \"/planner\"\nmodel = \"fake-planner\"\nretries = 0{key_line}",
                 f"[reviewer]\nbase_url = {llm.base_url!r}\nendpoint_path = \"/reviewer\"\nmodel = \"fake-reviewer\"\nretries = 0",
@@ -316,6 +321,123 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.assertEqual(llm.planner_calls, 1)
         self.assertEqual(llm.reviewer_calls, 1)
         self.assertNotIn(self.spec.read_text(), (self.root / "prompt.txt").read_text())
+
+    def test_required_plan_approval_is_before_worktree_and_then_commits(self) -> None:
+        import time
+
+        run_id = "approval"
+        worktree = self.root / "worktrees" / run_id
+        llm = FakeLLM(worktree=worktree)
+        config = self.config_file(llm, run_id=run_id, require_plan_approval=True)
+        overrides = {
+            "PATH": str(self.root) + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_CODEX_BEHAVIOR": "change",
+            "FAKE_WORKTREE": str(worktree),
+            "FAKE_CHECK": "pass",
+            "FAKE_PROMPT": str(self.root / "prompt.txt"),
+        }
+        saved = {name: os.environ.get(name) for name in overrides}
+        result_holder: list[int] = []
+        try:
+            os.environ.update(overrides)
+            thread = threading.Thread(
+                target=lambda: result_holder.append(
+                    main(["run", "--config", str(config), "--spec", str(self.spec), "--run-id", run_id])
+                )
+            )
+            thread.start()
+            state_path = self.root / "runs" / run_id / "state.json"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if state_path.exists() and json.loads(state_path.read_text())["status"] == RunStatus.AWAITING_PLAN_APPROVAL.value:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(state_path.exists())
+            waiting = json.loads(state_path.read_text())
+            self.assertEqual(waiting["status"], RunStatus.AWAITING_PLAN_APPROVAL.value)
+            self.assertFalse(worktree.exists())
+            self.assertEqual(main(["approve-plan", "--run", str(self.root / "runs" / run_id)]), 0)
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+            final = json.loads(state_path.read_text())
+            self.assertEqual(result_holder, [0])
+            self.assertEqual(final["status"], RunStatus.COMMITTED.value)
+            self.assertTrue(worktree.exists())
+            self.assertTrue((self.root / "runs" / run_id / "plan_approval.json").exists())
+            self.assertEqual(llm.reviewer_calls, 1)
+            self.assertEqual(self.commits(run_id), 2)
+        finally:
+            for name, old in saved.items():
+                if old is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = old
+            llm.close()
+
+    def test_rejecting_plan_ends_before_agent_and_worktree(self) -> None:
+        import time
+
+        run_id = "rejected-plan"
+        worktree = self.root / "worktrees" / run_id
+        llm = FakeLLM(worktree=worktree)
+        config = self.config_file(llm, run_id=run_id, require_plan_approval=True)
+        overrides = {
+            "PATH": str(self.root) + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_CODEX_BEHAVIOR": "change",
+            "FAKE_WORKTREE": str(worktree),
+            "FAKE_CHECK": "pass",
+            "FAKE_PROMPT": str(self.root / "prompt.txt"),
+        }
+        saved = {name: os.environ.get(name) for name in overrides}
+        result_holder: list[int] = []
+        try:
+            os.environ.update(overrides)
+            thread = threading.Thread(
+                target=lambda: result_holder.append(
+                    main(["run", "--config", str(config), "--spec", str(self.spec), "--run-id", run_id])
+                )
+            )
+            thread.start()
+            state_path = self.root / "runs" / run_id / "state.json"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if state_path.exists() and json.loads(state_path.read_text())["status"] == RunStatus.AWAITING_PLAN_APPROVAL.value:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(main(["reject-plan", "--run", str(self.root / "runs" / run_id)]), 0)
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+            state = json.loads(state_path.read_text())
+            self.assertEqual(result_holder, [1])
+            self.assertEqual(state["status"], RunStatus.PLAN_REJECTED.value)
+            self.assertFalse(worktree.exists())
+            self.assertFalse((self.root / "prompt.txt").exists())
+            self.assertEqual(llm.reviewer_calls, 0)
+        finally:
+            for name, old in saved.items():
+                if old is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = old
+            llm.close()
+
+    def test_ctrl_c_while_plan_approval_waits_is_interrupted(self) -> None:
+        from unittest import mock
+
+        run_id = "approval-interrupted"
+        llm = FakeLLM()
+        config = load_config(self.config_file(llm, run_id=run_id, require_plan_approval=True))
+        try:
+            with mock.patch(
+                "metaharness.orchestrator.wait_for_plan_approval",
+                side_effect=KeyboardInterrupt,
+            ):
+                result = Orchestrator(config).run(self.spec, run_id=run_id)
+            self.assertEqual(result.status, RunStatus.INTERRUPTED)
+            self.assertEqual(result.state["failure"]["reason"], "INTERRUPTED")
+            self.assertFalse((self.root / "worktrees" / run_id).exists())
+        finally:
+            llm.close()
 
     def test_planner_blocked_creates_no_worktree(self) -> None:
         blocked = "STATUS: BLOCKED\nBLOCKERS: missing information\n"

@@ -10,6 +10,8 @@ class RunStatus(StrEnum):
     CREATED = "created"
     PLANNING = "planning"
     BLOCKED = "blocked"
+    AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
+    PLAN_REJECTED = "plan_rejected"
     WORKTREE_READY = "worktree_ready"
     IMPLEMENTING = "implementing"
     VALIDATING = "validating"
@@ -79,6 +81,12 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class ApprovalConfig:
+    require_plan_approval: bool = False
+    poll_interval_seconds: float = 0.5
+
+
+@dataclass(frozen=True)
 class CheckConfig:
     name: str
     argv: tuple[str, ...]
@@ -101,3 +109,4 @@ class HarnessConfig:
     checks: tuple[CheckConfig, ...]
     max_diff_bytes: int = 400_000
     allow_no_required_checks: bool = False
+    approval: ApprovalConfig = field(default_factory=ApprovalConfig)

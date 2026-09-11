@@ -39,6 +39,31 @@ python -m metaharness.cli run \
   --run-id example-001
 ```
 
+## Plan approval
+
+Set the following section to require the human gate:
+
+```toml
+[approval]
+require_plan_approval = true
+poll_interval_seconds = 0.5
+```
+
+Approval is manual and durable, and always happens before worktree creation:
+
+```sh
+python -m metaharness.cli status --run ../MetaHarness-runs/example-001
+python -m metaharness.cli approve-plan --run ../MetaHarness-runs/example-001
+# or, to terminate the run:
+python -m metaharness.cli reject-plan --run ../MetaHarness-runs/example-001
+```
+
+Inspect `planner.raw.md`, `implementation_contract.md` and
+`state.json.plan_identity` before deciding. The plan cannot be edited through
+this primitive. A rejection ends the run as `PLAN_REJECTED`; no worktree,
+agent, or commit is created. Ctrl-C while waiting is persisted as
+`INTERRUPTED`.
+
 Use `status` for a compact state view and `show` for state plus artifact names:
 
 ```sh
@@ -48,14 +73,14 @@ python -m metaharness.cli show --run ../MetaHarness-runs/example-001
 
 ## Failure handling
 
-`BLOCKED`, `REVISE`, `FAIL`, check failures, timeouts, mutations, stale HEAD,
+`BLOCKED`, `PLAN_REJECTED`, `REVISE`, `FAIL`, check failures, timeouts, mutations, stale HEAD,
 empty/oversized diffs, and review-boundary changes do not commit. Common
 failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,
 `REVIEWER_OUTPUT_INVALID`, `LLM_FAILURE`, `AGENT_TIMEOUT`, `AGENT_FAILED`,
 `AGENT_COMMITTED`, `AGENT_GIT_VIOLATION`, `CHECK_SETUP_INVALID`,
 `CHECK_MUTATED`, `EMPTY_DIFF`, `DIFF_TOO_LARGE`, `SECRET_IN_DIFF`,
 `DETERMINISTIC_GATE_FAILED`, `REVIEW_REVISE`, `REVIEW_FAIL`,
-`TOCTOU_FAILURE`, `GIT_FAILURE`. V0 stops and
+`PLAN_APPROVAL_INVALID`, `TOCTOU_FAILURE`, `GIT_FAILURE`. V0 stops and
 leaves the run directory and worktree available for inspection; it does not
 automatically repair or retry implementation work. Resolve the issue as an
 operator, then start a new run ID. Remove an obsolete worktree only through

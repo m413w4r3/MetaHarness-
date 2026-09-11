@@ -7,6 +7,13 @@ import json
 import sys
 from pathlib import Path
 
+from .approval import (
+    ApprovalDecision,
+    ApprovalError,
+    PlanIdentity,
+    compute_plan_identity_from_run,
+    write_plan_approval,
+)
 from .config import ConfigError, load_config
 from .gitops import GitError, assert_clean, git_root, resolve_commit
 from .llm.chat import validate_endpoint
@@ -41,6 +48,11 @@ def _config_check(config_path: Path) -> int:
         f"model={config.reviewer.model}"
     )
     print(f"agent: model={config.agent.model} effort={config.agent.effort}")
+    print(
+        "plan approval: "
+        f"{'required' if config.approval.require_plan_approval else 'disabled'} "
+        f"(poll={config.approval.poll_interval_seconds:g}s)"
+    )
     locator = "enabled" if config.context.locator_argv else "disabled"
     print(f"context locator: {locator}")
     print("checks: " + (", ".join(check.name for check in config.checks) or "none"))
@@ -110,6 +122,37 @@ def _show(run_dir: Path) -> int:
     return 0
 
 
+def _write_plan_decision(run_dir: Path, decision: ApprovalDecision) -> int:
+    try:
+        directory, state = _load_run_state(run_dir)
+        if state.get("status") != RunStatus.AWAITING_PLAN_APPROVAL.value:
+            raise ApprovalError("run must be awaiting_plan_approval")
+        state_identity = state.get("plan_identity")
+        if not isinstance(state_identity, dict):
+            raise ApprovalError("run state has no plan identity")
+        try:
+            expected_identity = PlanIdentity(
+                raw_sha256=state_identity["raw_sha256"],
+                contract_sha256=state_identity["contract_sha256"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ApprovalError("run state has an invalid plan identity") from exc
+        actual_identity = compute_plan_identity_from_run(directory)
+        if actual_identity != expected_identity:
+            raise ApprovalError("plan artifacts do not match state.plan_identity")
+        write_plan_approval(
+            directory,
+            decision=decision,
+            identity=expected_identity,
+            source="cli",
+        )
+    except (ApprovalError, OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"plan approval written: {directory / 'plan_approval.json'}")
+    return 0
+
+
 def _doctor(config_path: Path) -> int:
     """Check local prerequisites only; this function never constructs an LLM client."""
 
@@ -162,6 +205,14 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("--run", required=True, type=Path)
     doctor = subparsers.add_parser("doctor", help="check local prerequisites")
     doctor.add_argument("--config", required=True, type=Path)
+    approve = subparsers.add_parser(
+        "approve-plan", help="approve the exact plan for a waiting run"
+    )
+    approve.add_argument("--run", required=True, type=Path)
+    reject = subparsers.add_parser(
+        "reject-plan", help="reject the exact plan for a waiting run"
+    )
+    reject.add_argument("--run", required=True, type=Path)
     return parser
 
 
@@ -177,6 +228,10 @@ def main(argv: list[str] | None = None) -> int:
         return _show(args.run)
     if args.command == "doctor":
         return _doctor(args.config)
+    if args.command == "approve-plan":
+        return _write_plan_decision(args.run, ApprovalDecision.APPROVE)
+    if args.command == "reject-plan":
+        return _write_plan_decision(args.run, ApprovalDecision.REJECT)
     return 2  # pragma: no cover - argparse restricts commands
 
 

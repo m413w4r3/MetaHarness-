@@ -4,7 +4,8 @@ MetaHarness V0 transforme un SPEC humain en un run Git contrôlé : un planner
 produit un plan texte d’implémentation, Codex l’exécute dans un worktree isolé,
 les checks déterministes figent les preuves, puis un reviewer compare SPEC,
 plan et diff avant l’unique commit autorisé. L’implémenteur reçoit le plan,
-pas le SPEC original ; le reviewer reçoit les deux.
+pas le SPEC original ; le reviewer reçoit les deux. Une approbation humaine
+optionnelle peut être exigée après le planner et avant la création du worktree.
 
 V0 reste volontairement simple : un seul task, un seul agent, un seul planner,
 un seul reviewer, sans multi-agent, repair loop ni comportement mock. Les
@@ -22,6 +23,20 @@ python -m metaharness.cli run \
   --spec examples/spec-example.md \
   --run-id example-001
 ```
+
+Avec `[approval] require_plan_approval = true`, le run reste en
+`awaiting_plan_approval` et aucun worktree n’est créé. Après inspection des
+artefacts du plan, utiliser `approve-plan` ou `reject-plan` :
+
+```sh
+python -m metaharness.cli approve-plan --run ../MetaHarness-runs/example-001
+# ou
+python -m metaharness.cli reject-plan --run ../MetaHarness-runs/example-001
+```
+
+Une approbation reprend le pipeline ; un rejet termine le run en
+`plan_rejected`. Le plan n’est pas éditable et une seconde décision est
+refusée.
 
 Le profil exemple est copié à la racine car les chemins TOML relatifs sont
 résolus depuis le fichier de configuration. Ne versionnez pas la copie locale.

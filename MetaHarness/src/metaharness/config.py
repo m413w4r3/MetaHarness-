@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import tomllib
@@ -11,6 +12,7 @@ from typing import Any, Mapping
 from .llm.chat import PROTECTED_BODY_KEYS, LLMProtocolError, validate_endpoint
 from .models import (
     AgentConfig,
+    ApprovalConfig,
     CheckConfig,
     ContextConfig,
     HarnessConfig,
@@ -124,6 +126,25 @@ def _bool(data: Mapping[str, Any], key: str, default: bool, where: str) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{where}.{key} must be a boolean")
     return value
+
+
+def _bounded_float(
+    data: Mapping[str, Any],
+    key: str,
+    default: float,
+    where: str,
+    *,
+    maximum: float,
+) -> float:
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{where}.{key} must be a number")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise ConfigError(f"{where}.{key} must be greater than zero")
+    if result > maximum:
+        raise ConfigError(f"{where}.{key} must be at most {maximum:g}")
+    return result
 
 
 def _string_array(data: Mapping[str, Any], key: str, default: tuple[str, ...], where: str,
@@ -277,6 +298,20 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         ),
     )
 
+    approval_data = _table(expanded, "approval")
+    approval = ApprovalConfig(
+        require_plan_approval=_bool(
+            approval_data, "require_plan_approval", False, "approval"
+        ),
+        poll_interval_seconds=_bounded_float(
+            approval_data,
+            "poll_interval_seconds",
+            0.5,
+            "approval",
+            maximum=10.0,
+        ),
+    )
+
     checks = _checks(expanded.get("checks", []))
     allow_no_required_checks = _bool(
         expanded, "allow_no_required_checks", False, "root"
@@ -299,4 +334,5 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         checks=checks,
         max_diff_bytes=max_diff_bytes,
         allow_no_required_checks=allow_no_required_checks,
+        approval=approval,
     )

@@ -44,6 +44,7 @@ class RunStateStore:
             "branch": branch,
             "worktree": worktree,
             "planner": {},
+            "plan_identity": None,
             "agent": {},
             "checks": [],
             "review": {},

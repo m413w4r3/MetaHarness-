@@ -8,6 +8,10 @@ require_clean_base = true
 max_diff_bytes = 400000
 allow_no_required_checks = false
 
+[approval]
+require_plan_approval = true
+poll_interval_seconds = 0.5
+
 [agent]
 provider = "codex"
 model = "gpt-5.6-luna"

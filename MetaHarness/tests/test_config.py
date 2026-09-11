@@ -100,6 +100,25 @@ class ConfigTests(unittest.TestCase):
             "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME",
         ))
 
+    def test_plan_approval_config_defaults_and_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name)))
+        self.assertFalse(config.approval.require_plan_approval)
+        self.assertEqual(config.approval.poll_interval_seconds, 0.5)
+
+        for value, message in (("0", "greater than zero"), ("10.1", "at most"), ("true", "number"), ("\"0.5\"", "number")):
+            contents = VALID_CONFIG + f"\n[approval]\npoll_interval_seconds = {value}\n"
+            with self.subTest(value=value):
+                with tempfile.TemporaryDirectory() as directory_name:
+                    with self.assertRaisesRegex(ConfigError, message):
+                        load_config(self.write_config(Path(directory_name), contents))
+
+        contents = VALID_CONFIG + "\n[approval]\nrequire_plan_approval = true\npoll_interval_seconds = 2\n"
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), contents))
+        self.assertTrue(config.approval.require_plan_approval)
+        self.assertEqual(config.approval.poll_interval_seconds, 2.0)
+
     def test_agent_environment_allowlist_is_configurable_and_validated(self) -> None:
         contents = VALID_CONFIG.replace(
             'timeout_seconds = 5400\n\n[planner]',

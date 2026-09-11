@@ -13,6 +13,7 @@ repair loop, or behavior mock in V0.
 | Planner raw plan | Forensic planner response and decision record | Planner |
 | Parsed plan | Machine control metadata and source for the canonical contract | Harness control/rendering |
 | Implementation contract | Canonical executor input rendered from the parsed READY plan | Planner decisions, mechanically rendered |
+| Human plan approval | Explicit decision on the exact presented plan artifacts | APPROVE/REJECT |
 | Codex | Executor of the plan in an isolated worktree | Cannot change the plan or commit |
 | Deterministic gates | Checks, diff, HEAD, and mutation evidence | Mechanical evidence |
 | Reviewer | Semantic critic of SPEC, PLAN, diff, and evidence | PASS/REVISE/FAIL decision |
@@ -30,18 +31,26 @@ preamble/postamble are not sent to that agent.
    paths and ranges are validated, then the source is read from Git at the
    base SHA. Applicable nested `AGENTS.md`/`CLAUDE.md` files are loaded.
 3. Ask the planner for one labeled text plan. A BLOCKED plan stops the run.
-4. Render `implementation_contract.md` from the parsed READY plan, create one
-   worktree at the resolved base SHA, and give Codex that contract only.
+4. Render `implementation_contract.md` from the parsed READY plan and persist
+   the SHA-256 identity of the exact `planner.raw.md` and
+   `implementation_contract.md` bytes.
+5. If enabled, set `AWAITING_PLAN_APPROVAL` and wait for one approval artifact.
+   `APPROVE` allows the run to continue; `REJECT` ends it as
+   `PLAN_REJECTED`. This gate is before worktree creation, so rejection creates
+   no worktree, agent execution, or commit. A decision cannot approve another
+   plan because both hashes must match the state identity.
+6. Create one worktree at the resolved base SHA and give Codex that contract
+   only.
    After Codex exits, any commit, branch switch, branch creation/deletion or
    worktree creation/removal fails the run (`AGENT_COMMITTED` or
    `AGENT_GIT_VIOLATION`); the worktree is preserved, never reset.
-5. Run configured checks, snapshot the candidate tree before and after each
+7. Run configured checks, snapshot the candidate tree before and after each
    check, stage once, and freeze the full diff plus the index tree SHA as
    evidence. A check that mutates the candidate (required or not) fails the
    run before review; an empty, oversized or secret-bearing diff too.
-6. Give the reviewer the original SPEC, raw PLAN, context, diff, checks, and
+8. Give the reviewer the original SPEC, raw PLAN, context, diff, checks, and
    implementer report. The reviewer must return a coherent labeled verdict.
-7. On `PASS` with a green deterministic gate, `authorize_commit` re-derives
+9. On `PASS` with a green deterministic gate, `authorize_commit` re-derives
    every precondition (READY plan, agent exit 0, gate, reviewer answer parsed
    again, HEAD and branch, index tree, unstaged/untracked state, candidate
    tree) and `commit_reviewed_tree` creates the single harness commit.
@@ -76,6 +85,8 @@ the plan. It also receives the mechanical evidence, so semantic approval
 cannot replace deterministic checks.
 
 All run-state writes go through `RunStateStore`, which replaces JSON files
-atomically. No commit is created before review, and the staged tree SHA is
+atomically. The plan approval artifact is atomically published without
+replacement, so a second decision fails. No commit is created before review,
+and the staged tree SHA is
 verified again immediately before the commit. A changed index, HEAD, or
 worktree causes the commit boundary to fail.

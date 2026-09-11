@@ -11,6 +11,7 @@ interrupted worktrees are intentionally retained for inspection.
 | `planner.raw.md` | Exact raw planner response (written before parsing) |
 | `task_plan.json` | Parsed plan metadata and preserved raw plan |
 | `implementation_contract.md` | Canonical contract rendered from the parsed READY plan |
+| `plan_approval.json` | One exclusive APPROVE/REJECT decision bound to both plan SHA-256 hashes |
 | `agent.prompt.txt` | Canonical-contract implementer prompt |
 | `agent.events.jsonl` | Complete Codex stdout (JSONL events, parsed with bounded memory) |
 | `agent.final.md` / `agent.result.json` | Implementer report and protocol metadata |
@@ -30,6 +31,13 @@ run with `SECRET_IN_DIFF` before review and is persisted redacted. Full
 prompts and diffs are retained as named artifacts so `show` can remain a
 bounded summary command. State writes use atomic replacement through
 `RunStateStore`. A REVISE never triggers automatic re-implementation.
+
+When plan approval is enabled, `state.json` records `plan_identity` with the
+lowercase SHA-256 hashes of the exact UTF-8 bytes in `planner.raw.md` and
+`implementation_contract.md`. `plan_approval.json` must contain the same two
+hashes. It is checked before the worktree exists, so a malformed artifact,
+wrong hash, changed plan, or second decision fails closed. The `source` field
+(`cli`, `web-ui`, or `test`) is informational and is not an authority signal.
 
 The critical identity chain is:
 

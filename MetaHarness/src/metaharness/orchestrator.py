@@ -13,6 +13,12 @@ from typing import Any
 
 from .agent.base import AgentError, AgentResult
 from .agent.codex import AgentCommittedError, CodexAgent, build_agent_environment
+from .approval import (
+    ApprovalDecision,
+    ApprovalError,
+    compute_plan_identity_from_run,
+    wait_for_plan_approval,
+)
 from .config import load_config
 from .context import build_context, render_context
 from .evidence import (
@@ -387,6 +393,22 @@ class Orchestrator:
             )
             return RunResult(run_dir, RunStatus.BLOCKED, state)
 
+        plan_identity = compute_plan_identity_from_run(run_dir)
+        store.update(
+            status=RunStatus.PLANNING,
+            plan_identity=asdict(plan_identity),
+        )
+        if self.config.approval.require_plan_approval:
+            store.update(status=RunStatus.AWAITING_PLAN_APPROVAL)
+            approval = wait_for_plan_approval(
+                run_dir,
+                identity=plan_identity,
+                poll_interval_seconds=self.config.approval.poll_interval_seconds,
+            )
+            if approval.decision is ApprovalDecision.REJECT:
+                state = store.update(status=RunStatus.PLAN_REJECTED)
+                return RunResult(run_dir, RunStatus.PLAN_REJECTED, state)
+
         branch = f"harness/{_slug(plan.title)}/{run_id}"
         worktree_path = self.config.worktrees_root / run_id
         info = create_run_worktree(
@@ -606,6 +628,8 @@ def _failure_reason(exc: Exception) -> str:
         return "GIT_FAILURE"
     if isinstance(exc, AgentError):
         return getattr(exc, "code", "AGENT_FAILURE")
+    if isinstance(exc, ApprovalError):
+        return "PLAN_APPROVAL_INVALID"
     if isinstance(exc, PlanParseError):
         return "PLANNER_OUTPUT_INVALID"
     if isinstance(exc, ReviewParseError):
