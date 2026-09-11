@@ -87,6 +87,11 @@ class ApprovalConfig:
 
 
 @dataclass(frozen=True)
+class UIConfig:
+    max_active_runs: int = 1
+
+
+@dataclass(frozen=True)
 class CheckConfig:
     name: str
     argv: tuple[str, ...]
@@ -110,3 +115,4 @@ class HarnessConfig:
     max_diff_bytes: int = 400_000
     allow_no_required_checks: bool = False
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
+    ui: UIConfig = field(default_factory=UIConfig)

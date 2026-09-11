@@ -17,6 +17,7 @@ from .models import (
     ContextConfig,
     HarnessConfig,
     LLMEndpointConfig,
+    UIConfig,
 )
 
 
@@ -145,6 +146,25 @@ def _bounded_float(
     if result > maximum:
         raise ConfigError(f"{where}.{key} must be at most {maximum:g}")
     return result
+
+
+def _bounded_int(
+    data: Mapping[str, Any],
+    key: str,
+    default: int,
+    where: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{where}.{key} must be an integer")
+    if value < minimum:
+        raise ConfigError(f"{where}.{key} must be at least {minimum}")
+    if value > maximum:
+        raise ConfigError(f"{where}.{key} must be at most {maximum}")
+    return value
 
 
 def _string_array(data: Mapping[str, Any], key: str, default: tuple[str, ...], where: str,
@@ -312,6 +332,18 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         ),
     )
 
+    ui_data = _table(expanded, "ui")
+    ui = UIConfig(
+        max_active_runs=_bounded_int(
+            ui_data,
+            "max_active_runs",
+            1,
+            "ui",
+            minimum=1,
+            maximum=4,
+        )
+    )
+
     checks = _checks(expanded.get("checks", []))
     allow_no_required_checks = _bool(
         expanded, "allow_no_required_checks", False, "root"
@@ -335,4 +367,5 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         max_diff_bytes=max_diff_bytes,
         allow_no_required_checks=allow_no_required_checks,
         approval=approval,
+        ui=ui,
     )

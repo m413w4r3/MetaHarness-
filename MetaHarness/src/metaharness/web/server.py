@@ -17,8 +17,17 @@ from urllib.parse import parse_qs, urlsplit
 
 from ..config import load_config
 from ..models import HarnessConfig
-from .api import WebAPIError, approve_run, get_run, list_runs, progress, validate_run_id
-from .pages import render_index, render_run
+from .api import (
+    WebAPIError,
+    approve_run,
+    create_run,
+    get_run,
+    list_runs,
+    progress,
+    validate_run_id,
+)
+from .pages import render_index, render_new_run, render_run
+from .run_manager import RunManager
 
 HOST = "127.0.0.1"
 _MAX_BODY_BYTES = 64 * 1024
@@ -69,7 +78,7 @@ def allowed_origins(port: int) -> frozenset[str]:
 
 
 class MetaHarnessHTTPServer(ThreadingHTTPServer):
-    """HTTP server carrying only in-memory configuration and mutation token."""
+    """HTTP server carrying configuration, mutation token and run capacity."""
 
     daemon_threads = True
     allow_reuse_address = True
@@ -77,6 +86,10 @@ class MetaHarnessHTTPServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], config: HarnessConfig):
         self.config = config
         self.token = secrets.token_urlsafe(32)
+        self.run_manager = RunManager(
+            config,
+            max_active_runs=config.ui.max_active_runs,
+        )
         super().__init__(address, MetaHarnessRequestHandler)
 
 
@@ -144,6 +157,13 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 nonce = secrets.token_urlsafe(18)
                 self._html(render_index(list_runs(root), nonce=nonce), nonce)
                 return
+            if parsed.path == "/new":
+                nonce = secrets.token_urlsafe(18)
+                self._html(
+                    render_new_run(self.server.config, self.server.token, nonce=nonce),
+                    nonce,
+                )
+                return
             if len(parts) == 3 and parts[1] == "runs":
                 nonce = secrets.token_urlsafe(18)
                 run = get_run(root, self._run_id(parts[2]))
@@ -197,6 +217,18 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             self._check_origin()
             self._authorized()
             parts = self._path_parts()
+            if parts == ["", "api", "runs"]:
+                payload = self._body()
+                unknown = set(payload) - {"spec", "run_id"}
+                if unknown:
+                    raise WebAPIError(400, "unknown request field")
+                result = create_run(
+                    self.server.run_manager,
+                    spec=payload.get("spec"),
+                    run_id=payload.get("run_id"),
+                )
+                self._json(202, result)
+                return
             if len(parts) != 5 or parts[1:3] != ["api", "runs"] or parts[4] != "approval":
                 raise WebAPIError(404, "not found")
             payload = self._body()

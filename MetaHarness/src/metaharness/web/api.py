@@ -20,10 +20,12 @@ from ..approval import (
 )
 from ..models import RunStatus
 from ..state import RunStateStore
+from .run_manager import RunCapacityError, RunManager, RunManagerError
 
 ARTIFACT_ALLOWLIST = frozenset(
     {
         "state.json",
+        "spec.md",
         "planner.raw.md",
         "implementation_contract.md",
         "agent.events.jsonl",
@@ -42,6 +44,7 @@ PROGRESS_MAX_EVENT_BYTES = 1 * 1024 * 1024
 PROGRESS_MAX_SKIP_BYTES = 8 * 1024 * 1024
 _PROGRESS_SCAN_CHUNK_BYTES = 64 * 1024
 OVERSIZED_EVENT = "[oversized Codex event omitted]"
+MAX_SPEC_BYTES = 48 * 1024
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
@@ -52,6 +55,20 @@ class WebAPIError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+def validate_spec(value: object) -> str:
+    if not isinstance(value, str):
+        raise WebAPIError(400, "spec must be a string")
+    try:
+        encoded_length = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise WebAPIError(400, "spec must be valid UTF-8 text") from exc
+    if encoded_length > MAX_SPEC_BYTES:
+        raise WebAPIError(400, "spec is too large")
+    if not value.strip():
+        raise WebAPIError(400, "spec must not be empty")
+    return value
 
 
 def validate_run_id(value: str) -> str:
@@ -177,6 +194,7 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
     safe_id = validate_run_id(run_id)
     state = _load_state(directory)
     raw_plan = _load_text(_artifact_path(directory, "planner.raw.md"))
+    spec = _load_text(_artifact_path(directory, "spec.md"))
     contract = _load_text(_artifact_path(directory, "implementation_contract.md"))
     reviewer_raw = _load_text(_artifact_path(directory, "reviewer.raw.md"))
     # This shape is polled by the run page every STATE_POLL_MS: status,
@@ -185,6 +203,7 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
     return {
         **_state_summary(safe_id, state),
         "state": state,
+        "spec": spec,
         "plan": {
             "raw": raw_plan,
             "contract": contract,
@@ -325,16 +344,49 @@ def approve_run(runs_root: Path, run_id: str, decision: str) -> dict[str, Any]:
     return {"ok": True, "decision": selected.value}
 
 
+def create_run(
+    manager: RunManager,
+    *,
+    spec: object,
+    run_id: object = None,
+) -> dict[str, str]:
+    content = validate_spec(spec)
+    selected_id: str | None = None
+    if run_id is not None:
+        if not isinstance(run_id, str):
+            raise WebAPIError(400, "invalid run id")
+        selected_id = validate_run_id(run_id)
+        root = manager._config.runs_root.expanduser().resolve()
+        if (root / selected_id).exists():
+            raise WebAPIError(409, "run already exists")
+    try:
+        created_id = manager.start_run(content, run_id=selected_id)
+    except RunCapacityError as exc:
+        raise WebAPIError(409, "maximum active runs reached") from exc
+    except RunManagerError as exc:
+        # A concurrent creator can win between the existence check and the
+        # reservation; expose the same durable collision contract.
+        if selected_id is not None:
+            root = manager._config.runs_root.expanduser().resolve()
+            if (root / selected_id).exists():
+                raise WebAPIError(409, "run already exists") from exc
+        raise WebAPIError(503, "run could not be created") from exc
+    return {"ok": True, "run_id": created_id, "location": f"/runs/{created_id}"}  # type: ignore[dict-item]
+
+
 __all__ = [
     "ARTIFACT_ALLOWLIST",
+    "MAX_SPEC_BYTES",
     "OVERSIZED_EVENT",
     "PROGRESS_MAX_BYTES",
     "PROGRESS_MAX_EVENT_BYTES",
     "PROGRESS_MAX_SKIP_BYTES",
     "WebAPIError",
     "approve_run",
+    "create_run",
     "get_run",
     "list_runs",
     "progress",
     "validate_run_id",
+    "validate_spec",
 ]

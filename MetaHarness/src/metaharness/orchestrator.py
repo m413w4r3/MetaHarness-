@@ -9,7 +9,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .agent.base import AgentError, AgentResult
 from .agent.codex import AgentCommittedError, CodexAgent, build_agent_environment
@@ -92,9 +92,14 @@ _AGENT_ARTIFACTS = (
 )
 
 
-def _generated_run_id() -> str:
+def generate_run_id() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{timestamp}-{uuid.uuid4().hex[:10]}"
+
+
+# Kept as a compatibility alias for callers that imported the old private
+# helper while the public generator is used by the web run manager.
+_generated_run_id = generate_run_id
 
 
 def _safe_run_id(value: str) -> str:
@@ -294,23 +299,38 @@ class Orchestrator:
         self.agent = agent or CodexAgent(config.agent)
         self._secrets: tuple[str, ...] = ()
 
-    def run(self, spec: str | Path, *, run_id: str | None = None) -> RunResult:
-        """Run one SPEC and return its durable final state.
-
-        A worktree is deliberately never removed.  This keeps failed and
-        interrupted runs inspectable and makes the run directory the handoff
-        point for operators.
-        """
+    def run(
+        self, spec: str | Path, *, run_id: str | None = None
+    ) -> RunResult:
+        """Read one SPEC file and delegate execution to :meth:`run_text`."""
 
         spec_path = Path(spec).expanduser().resolve()
         try:
             spec_content = spec_path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             raise OrchestrationError(f"could not read spec {spec_path}: {exc}") from exc
+        return self.run_text(spec_content, run_id=run_id)
+
+    def run_text(
+        self,
+        spec_content: str,
+        *,
+        run_id: str | None = None,
+        on_created: Callable[[Path], None] | None = None,
+    ) -> RunResult:
+        """Run one in-memory SPEC and return its durable final state.
+
+        A worktree is deliberately never removed.  This keeps failed and
+        interrupted runs inspectable and makes the run directory the handoff
+        point for operators.
+        """
+
+        if not isinstance(spec_content, str):
+            raise OrchestrationError("spec must be a string")
         if not spec_content.strip():
             raise OrchestrationError("spec must not be empty")
 
-        selected_run_id = _safe_run_id(run_id) if run_id is not None else _generated_run_id()
+        selected_run_id = _safe_run_id(run_id) if run_id is not None else generate_run_id()
         run_dir = (self.config.runs_root / selected_run_id).expanduser().resolve()
         if run_dir.exists():
             raise OrchestrationError(f"run directory already exists: {run_dir}")
@@ -330,6 +350,8 @@ class Orchestrator:
                 repo=str(self.config.repo),
                 base_ref=self.config.base_ref,
             )
+            if on_created is not None:
+                on_created(run_dir)
             return self._execute(store, run_dir, selected_run_id, spec_content)
         except KeyboardInterrupt:
             if store is None:
@@ -658,5 +680,6 @@ __all__ = [
     "OrchestrationError",
     "Orchestrator",
     "authorize_commit",
+    "generate_run_id",
     "run_orchestrator",
 ]

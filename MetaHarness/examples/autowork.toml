@@ -12,6 +12,9 @@ allow_no_required_checks = false
 require_plan_approval = true
 poll_interval_seconds = 0.5
 
+[ui]
+max_active_runs = 1
+
 [agent]
 provider = "codex"
 model = "gpt-5.6-luna"

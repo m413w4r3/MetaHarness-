@@ -24,6 +24,17 @@ python -m metaharness.cli run \
   --run-id example-001
 ```
 
+Pour le flux normal depuis l’UI locale, démarrer le serveur puis ouvrir
+`http://127.0.0.1:8765/` :
+
+```sh
+metaharness web --config autowork.local.toml
+```
+
+Cliquer sur `NEW RUN`, saisir le SPEC puis `CREATE RUN`. Le planner, la
+demande d’approbation éventuelle, Codex, les checks et la review sont ensuite
+suivis depuis la page du run.
+
 Avec `[approval] require_plan_approval = true`, le run reste en
 `awaiting_plan_approval` et aucun worktree n’est créé. Après inspection des
 artefacts du plan, utiliser `approve-plan` ou `reject-plan` :

@@ -73,22 +73,30 @@ python -m metaharness.cli show --run ../MetaHarness-runs/example-001
 
 ## Local web UI
 
-Start the local observation and plan-approval UI in Terminal A:
+Start the local run UI:
 
 ```sh
 metaharness web --config autowork.local.toml --port 8765
 ```
 
-Run a SPEC in Terminal B:
+Open `http://127.0.0.1:8765/`, click `NEW RUN`, enter the SPEC and click
+`CREATE RUN`. The normal flow is:
+
+```text
+http://127.0.0.1:8765/
+↓
+NEW RUN → SPEC → CREATE RUN → planner → APPROVE → Codex → checks → review
+```
+
+The CLI remains available for automation and file-based runs:
 
 ```sh
 metaharness run --config autowork.local.toml --spec my-spec.md
 ```
 
-Open `http://127.0.0.1:8765/`, open the run, read the canonical plan, then
-approve or reject it and observe Codex progress, checks and review. The UI is
-read-only apart from the two plan-decision buttons: it never runs Codex or
-checks, changes a plan or worktree, commits, or writes `state.json` directly.
+Open the created run, read the canonical plan, then approve or reject it and
+observe Codex progress, checks and review. The UI never runs Codex or checks,
+changes a plan or worktree, commits, or writes `state.json` directly.
 
 The run page polls `GET /api/runs/<run_id>` every 2 seconds (status,
 timeline, header, failure, approval buttons, plan, checks, review, reviewer

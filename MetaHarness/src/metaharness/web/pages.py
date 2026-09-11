@@ -13,6 +13,8 @@ import json
 from html import escape
 from typing import Any
 
+from ..models import HarnessConfig
+
 
 def _e(value: Any) -> str:
     return escape("" if value is None else str(value), quote=True)
@@ -116,12 +118,64 @@ setInterval(refreshRuns, 2000);
 """
     body = f"""
 <header><h1>MetaHarness</h1><p class="muted">Observation locale des runs</p></header>
+<p><a href="/new">NEW RUN</a></p>
 <table>
   <thead><tr><th>RUN ID</th><th>STATUS</th><th>UPDATED</th><th>PLAN TITLE</th><th>COMMIT</th><th>FAILURE</th></tr></thead>
   <tbody id="runs-body">{table}</tbody>
 </table>
 """
     return _page("Runs", body, script, nonce=nonce)
+
+
+def render_new_run(
+    config: HarnessConfig,
+    token: str,
+    *,
+    nonce: str | None = None,
+) -> str:
+    script = f"""
+const META_TOKEN = {_json_script(token)};
+const form = document.getElementById('new-run-form');
+const button = document.getElementById('create-run');
+const message = document.getElementById('create-run-message');
+form.addEventListener('submit', async (event) => {{
+  event.preventDefault();
+  button.disabled = true;
+  message.textContent = '';
+  try {{
+    const response = await fetch('/api/runs', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json', 'X-MetaHarness-Token': META_TOKEN }},
+      body: JSON.stringify({{ spec: document.getElementById('spec').value, run_id: document.getElementById('run-id').value || null }})
+    }});
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.message || 'Unable to create run.');
+    window.location.assign(payload.location);
+  }} catch (error) {{
+    message.textContent = error instanceof Error ? error.message : 'Unable to create run.';
+    button.disabled = false;
+  }}
+}});
+"""
+    body = f"""
+<main>
+<p><a href="/">← Tous les runs</a></p>
+<h1>New Run</h1>
+<dl>
+  <dt>Repository</dt><dd><input type="text" value="{_e(config.repo)}" readonly></dd>
+  <dt>Base ref</dt><dd><input type="text" value="{_e(config.base_ref)}" readonly></dd>
+</dl>
+<form id="new-run-form">
+  <label for="spec">SPEC</label><br>
+  <textarea id="spec" rows="20" cols="100" required></textarea><br>
+  <label for="run-id">Run ID (optional)</label><br>
+  <input id="run-id" type="text" autocomplete="off"><br><br>
+  <button id="create-run" type="submit">CREATE RUN</button>
+  <span id="create-run-message" class="danger" role="status"></span>
+</form>
+</main>
+"""
+    return _page("New Run", body, script, nonce=nonce)
 
 
 _TIMELINE = (
@@ -165,6 +219,7 @@ RUN_PAGE_DYNAMIC_IDS = (
     "review",
     "reviewer-raw-state",
     "reviewer-raw",
+    "spec",
 )
 
 
@@ -324,6 +379,7 @@ function applyRun(run) {
   const plan = run.plan && typeof run.plan === 'object' ? run.plan : {};
   if (changed('contract', plan.contract)) setPre('plan-contract', plan.contract);
   if (changed('raw', plan.raw)) setPre('plan-raw', plan.raw);
+  if (changed('spec', run.spec)) setPre('spec', run.spec);
   if (changed('checks', run.checks)) renderChecks(run.checks);
   if (changed('review', run.review)) renderReview(run.review);
   byId('reviewer-raw-state').textContent = run.reviewer_raw_available ? 'reviewer.raw.md disponible' : 'reviewer.raw.md non disponible';
@@ -401,6 +457,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, nonce: str | No
 </div></section>
 <section><h2>Timeline</h2><ul class="timeline" id="timeline">{_timeline_items(status)}</ul></section>
 <section><h2>Plan</h2><h3>Canonical implementation contract</h3><pre id="plan-contract">{_e(plan.get('contract'))}</pre><h3>planner.raw.md</h3><pre id="plan-raw">{_e(plan.get('raw'))}</pre></section>
+<section><details><summary>SPEC</summary><pre id="spec">{_e(run.get('spec'))}</pre></details></section>
 <section><h2>Progress Codex</h2><ul id="progress-events"></ul></section>
 <section><h2>Checks</h2><div id="checks">{_check_cards(run.get('checks'))}</div></section>
 <section><h2>Review</h2><div id="review">{_review(run.get('review'))}</div></section>
@@ -415,5 +472,6 @@ __all__ = [
     "STATE_POLL_MS",
     "TERMINAL_STATUSES",
     "render_index",
+    "render_new_run",
     "render_run",
 ]
