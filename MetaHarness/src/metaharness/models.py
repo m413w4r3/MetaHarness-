@@ -187,6 +187,8 @@ class SelectedProfile:
     selection_mode: str
     effort: str | None = None
     sandbox: str | None = None
+    # SHA-256 of the execution-relevant profile configuration (schema 2).
+    config_sha256: str | None = None
 
 
 @dataclass(frozen=True)

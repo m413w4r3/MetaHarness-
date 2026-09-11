@@ -17,6 +17,13 @@ class RunCapacityError(RunManagerError):
     pass
 
 
+class RunCollisionError(RunManagerError):
+    pass
+
+
+_CREATION_TIMEOUT_SECONDS = 5.0
+
+
 class RunManager:
     def __init__(
         self,
@@ -46,18 +53,27 @@ class RunManager:
             raise RunManagerError(str(exc)) from exc
 
         with self._lock:
+            if selected_run_id in self._active_run_ids:
+                raise RunCollisionError("run already exists or is active")
             if len(self._active_run_ids) >= self._max_active_runs:
                 raise RunCapacityError("maximum active runs reached")
             self._active_run_ids.add(selected_run_id)
 
         created_event = threading.Event()
+        finished_event = threading.Event()
+        signal = threading.Condition()
+
+        def notify(event: threading.Event) -> None:
+            with signal:
+                event.set()
+                signal.notify_all()
 
         def worker() -> None:
             try:
                 orchestrator = self._orchestrator_factory(self._config)
                 kwargs = {
                     "run_id": selected_run_id,
-                    "on_created": lambda _run_dir: created_event.set(),
+                    "on_created": lambda _run_dir: notify(created_event),
                 }
                 if planner_profile is not None:
                     kwargs["planner_profile"] = planner_profile
@@ -68,16 +84,24 @@ class RunManager:
                 # daemon thread or strand capacity forever.
                 pass
             finally:
+                # Capacity is released before the caller is woken, so a
+                # failure reported by start_run() has already restored it.
                 with self._lock:
                     self._active_run_ids.discard(selected_run_id)
+                notify(finished_event)
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
-        if not created_event.wait(timeout=5.0):
-            if not thread.is_alive():
-                raise RunManagerError("run worker failed before durable creation")
-            raise RunManagerError("run creation timed out")
-        return selected_run_id
+        with signal:
+            signal.wait_for(
+                lambda: created_event.is_set() or finished_event.is_set(),
+                timeout=_CREATION_TIMEOUT_SECONDS,
+            )
+        if created_event.is_set():
+            return selected_run_id
+        if finished_event.is_set():
+            raise RunManagerError("run worker failed before durable creation")
+        raise RunManagerError("run creation timed out")
 
 
-__all__ = ["RunCapacityError", "RunManager", "RunManagerError"]
+__all__ = ["RunCapacityError", "RunCollisionError", "RunManager", "RunManagerError"]

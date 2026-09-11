@@ -37,6 +37,25 @@ _KNOWN_SANDBOXES = frozenset({
     "danger-full-access",
 })
 _PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_PROFILE_COMMON_KEYS = frozenset({
+    "display_name",
+    "roles",
+    "driver",
+    "model",
+    "selection_mode",
+    "timeout_seconds",
+    "description",
+    "strengths",
+    "cost_tier",
+    "latency_tier",
+})
+_PROFILE_DRIVER_KEYS = {
+    ProfileDriver.OPENAI_CHAT: frozenset({
+        "base_url", "endpoint_path", "api_key_env", "retries", "extra_body",
+    }),
+    # Codex has no retry policy: ``retries`` would be a silently unused option.
+    ProfileDriver.CODEX: frozenset({"effort", "sandbox"}),
+}
 _PROFILE_ROLE_COMPATIBILITY = {
     ProfileDriver.OPENAI_CHAT: frozenset({
         ExecutionRole.PLANNER, ExecutionRole.REVIEWER, ExecutionRole.AUDITOR,
@@ -293,6 +312,16 @@ def _model_profiles(
         if not isinstance(profile_data, dict):
             raise ConfigError(f"model_profiles.{profile_id} must be a table")
         where = f"model_profiles.{profile_id}"
+        try:
+            driver = ProfileDriver(profile_data.get("driver"))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{where}.driver is invalid") from exc
+        # Fail closed on typos and on options the driver does not use.
+        unknown = sorted(
+            set(profile_data) - _PROFILE_COMMON_KEYS - _PROFILE_DRIVER_KEYS[driver]
+        )
+        if unknown:
+            raise ConfigError(f"{where}.{unknown[0]} is not allowed for {driver.value}")
         display_name = _required_string(profile_data, "display_name", where)
         roles_raw = profile_data.get("roles")
         if isinstance(roles_raw, (str, bytes)) or not isinstance(roles_raw, (list, tuple)) or not roles_raw:
@@ -306,10 +335,6 @@ def _model_profiles(
             if role in roles:
                 raise ConfigError(f"{where}.roles must not contain duplicates")
             roles.append(role)
-        try:
-            driver = ProfileDriver(profile_data.get("driver"))
-        except (TypeError, ValueError) as exc:
-            raise ConfigError(f"{where}.driver is invalid") from exc
         model = _required_string(profile_data, "model", where)
         description = profile_data.get("description", "")
         if not isinstance(description, str):
@@ -335,9 +360,6 @@ def _model_profiles(
         if incompatible:
             raise ConfigError(f"{where}: driver/role mismatch")
         if driver is ProfileDriver.OPENAI_CHAT:
-            for key in ("effort", "sandbox"):
-                if key in profile_data:
-                    raise ConfigError(f"{where}.{key} is not allowed for openai-chat")
             if selection_mode is SelectionMode.CLI:
                 raise ConfigError(f"{where}.selection_mode must not be cli")
             endpoint = _endpoint(profile_data, where)
@@ -360,9 +382,6 @@ def _model_profiles(
                 latency_tier=latency_tier,
             )
         else:
-            for key in ("base_url", "endpoint_path", "api_key_env", "extra_body"):
-                if key in profile_data:
-                    raise ConfigError(f"{where}.{key} is not allowed for codex")
             effort = _required_string(profile_data, "effort", where)
             sandbox = _required_string(profile_data, "sandbox", where)
             if sandbox not in _KNOWN_SANDBOXES:
@@ -377,7 +396,6 @@ def _model_profiles(
                 model=model,
                 selection_mode=selection_mode,
                 timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
-                retries=_nonnegative_int(profile_data, "retries", 2, where),
                 effort=effort,
                 sandbox=sandbox,
                 description=description,

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import unquote
@@ -18,11 +19,18 @@ from ..approval import (
     compute_plan_identity_from_run,
     write_plan_approval,
 )
-from ..execution_selection import resolve_execution_selection, write_execution_selection
-from ..models import ExecutionRole, HarnessConfig, RunStatus
+from ..execution_selection import (
+    ExecutionSelectionConflict,
+    ExecutionSelectionError,
+    ensure_execution_selection,
+    is_profile_aware_run,
+    read_execution_selection_with_sha256,
+    resolve_execution_selection,
+)
+from ..models import ExecutionRole, ExecutionSelection, HarnessConfig, RunStatus
 from ..profiles import ProfileError, profile_for_role, profiles_for_config, safe_profile_metadata
 from ..state import RunStateStore
-from .run_manager import RunCapacityError, RunManager, RunManagerError
+from .run_manager import RunCapacityError, RunCollisionError, RunManager, RunManagerError
 
 ARTIFACT_ALLOWLIST = frozenset(
     {
@@ -336,19 +344,19 @@ def approve_run(
         selected = ApprovalDecision(decision)
     except (TypeError, ValueError) as exc:
         raise WebAPIError(400, "decision must be APPROVE or REJECT") from exc
+    # 1-2. Load state and require the approval gate.
     directory = _run_dir(runs_root, run_id)
     state = _load_state(directory)
     if state.get("status") != RunStatus.AWAITING_PLAN_APPROVAL.value:
         raise WebAPIError(409, "run is not awaiting plan approval")
+    profile_aware = is_profile_aware_run(state)
+    if selected is ApprovalDecision.APPROVE and profile_aware:
+        if config is None or not isinstance(implementer_profile, str) or not isinstance(reviewer_profile, str):
+            raise WebAPIError(400, "implementer_profile and reviewer_profile are required")
+    # 3. Verify the plan artifacts shown to the human.
     stored = state.get("plan_identity")
     if not isinstance(stored, dict):
         raise WebAPIError(409, "run has no valid plan identity")
-    modern_selection = isinstance(state.get("execution"), dict) and isinstance(
-        state.get("execution", {}).get("planner"), dict
-    ) and bool(state.get("execution", {}).get("planner", {}).get("profile_id"))
-    if selected is ApprovalDecision.APPROVE and modern_selection:
-        if config is None or not isinstance(implementer_profile, str) or not isinstance(reviewer_profile, str):
-            raise WebAPIError(400, "implementer_profile and reviewer_profile are required")
     try:
         expected = PlanIdentity(
             raw_sha256=stored["raw_sha256"],
@@ -358,55 +366,100 @@ def approve_run(
         actual = compute_plan_identity_from_run(directory)
     except (KeyError, TypeError, ValueError, ApprovalError, OSError, UnicodeError) as exc:
         raise WebAPIError(409, "plan artifacts do not match run state") from exc
-    if actual != expected:
-        raise WebAPIError(409, "plan artifacts do not match run state")
-    if selected is ApprovalDecision.APPROVE and modern_selection:
-        planner_profile = state["execution"]["planner"]["profile_id"]
-        try:
-            selection = resolve_execution_selection(
-                config,
-                planner_profile_id=planner_profile,
-                implementer_profile_id=implementer_profile,
-                reviewer_profile_id=reviewer_profile,
-            )
-            write_execution_selection(directory, selection)
-            identity = compute_plan_identity_from_run(directory)
-            RunStateStore(directory / "state.json").update(
-                status=state["status"],
-                plan_identity=identity.__dict__,
-                execution={
-                    "planner": {
-                        "profile_id": selection.planner.profile_id,
-                        "model": selection.planner.model,
-                        "selection_mode": selection.planner.selection_mode,
-                    },
-                    "implementer": {
-                        "profile_id": selection.implementer.profile_id,
-                        "model": selection.implementer.model,
-                        "effort": selection.implementer.effort,
-                        "selection_mode": selection.implementer.selection_mode,
-                    },
-                    "reviewer": {
-                        "profile_id": selection.reviewer.profile_id,
-                        "model": selection.reviewer.model,
-                        "selection_mode": selection.reviewer.selection_mode,
-                    },
-                },
-            )
-        except (ProfileError, ValueError, OSError, UnicodeError) as exc:
-            raise WebAPIError(400, "selected profile is invalid") from exc
+    if profile_aware:
+        # A selection already claimed by a concurrent request is checked by
+        # ensure_execution_selection(), not here: only raw/contract matter.
+        matches = (actual.raw_sha256, actual.contract_sha256) == (
+            expected.raw_sha256,
+            expected.contract_sha256,
+        )
     else:
-        identity = expected
+        matches = actual == expected
+    if not matches:
+        raise WebAPIError(409, "plan artifacts do not match run state")
+
+    if not (selected is ApprovalDecision.APPROVE and profile_aware):
+        # REJECT never executes anything; historic runs keep schema v1.
+        identity = (
+            PlanIdentity(expected.raw_sha256, expected.contract_sha256)
+            if profile_aware
+            else expected
+        )
+        _publish_decision(directory, selected, identity)
+        return {"ok": True, "decision": selected.value}
+
+    # 4-5. Resolve the requested profiles from trusted configuration only.
+    try:
+        requested = resolve_execution_selection(
+            config,
+            planner_profile_id=state["execution"]["planner"]["profile_id"],
+            implementer_profile_id=implementer_profile,
+            reviewer_profile_id=reviewer_profile,
+        )
+    except ProfileError as exc:
+        raise WebAPIError(400, "selected profile is invalid") from exc
+    # 6. Claim the selection immutably, then read back the exact durable bytes.
+    try:
+        ensure_execution_selection(directory, requested)
+        durable, execution_sha256 = read_execution_selection_with_sha256(directory)
+    except ExecutionSelectionConflict as exc:
+        raise WebAPIError(409, "a different execution selection is already recorded") from exc
+    except ExecutionSelectionError as exc:
+        raise WebAPIError(409, "execution selection is invalid") from exc
+    if durable != requested:
+        raise WebAPIError(409, "a different execution selection is already recorded")
+    # 7-8. Bind the decision to that selection and publish it exclusively.
+    identity = PlanIdentity(
+        raw_sha256=expected.raw_sha256,
+        contract_sha256=expected.contract_sha256,
+        execution_sha256=execution_sha256,
+    )
+    _publish_decision(directory, selected, identity)
+    # 9. Only now reflect the approved choice in state.json.  The orchestrator
+    # may already have left the gate, in which case it owns the state.
+    store = RunStateStore(directory / "state.json")
+    if store.load().get("status") == RunStatus.AWAITING_PLAN_APPROVAL.value:
+        store.update(
+            status=RunStatus.AWAITING_PLAN_APPROVAL,
+            plan_identity=asdict(identity),
+            execution=_execution_state(durable),
+        )
+    return {"ok": True, "decision": selected.value}
+
+
+def _publish_decision(
+    directory: Path, decision: ApprovalDecision, identity: PlanIdentity
+) -> None:
     try:
         write_plan_approval(
             directory,
-            decision=selected,
+            decision=decision,
             identity=identity,
             source="web-ui",
         )
     except ApprovalError as exc:
         raise WebAPIError(409, "plan approval already exists or is invalid") from exc
-    return {"ok": True, "decision": selected.value}
+
+
+def _execution_state(selection: ExecutionSelection) -> dict[str, Any]:
+    return {
+        "planner": {
+            "profile_id": selection.planner.profile_id,
+            "model": selection.planner.model,
+            "selection_mode": selection.planner.selection_mode,
+        },
+        "implementer": {
+            "profile_id": selection.implementer.profile_id,
+            "model": selection.implementer.model,
+            "effort": selection.implementer.effort,
+            "selection_mode": selection.implementer.selection_mode,
+        },
+        "reviewer": {
+            "profile_id": selection.reviewer.profile_id,
+            "model": selection.reviewer.model,
+            "selection_mode": selection.reviewer.selection_mode,
+        },
+    }
 
 
 def model_profiles(config: HarnessConfig) -> dict[str, Any]:
@@ -452,6 +505,8 @@ def create_run(
             created_id = manager.start_run(
                 content, run_id=selected_id, planner_profile=selected_planner
             )
+    except RunCollisionError as exc:
+        raise WebAPIError(409, "run already exists or is active") from exc
     except RunCapacityError as exc:
         raise WebAPIError(409, "maximum active runs reached") from exc
     except RunManagerError as exc:

@@ -52,9 +52,12 @@ from .recommendation import (
     write_recommendation_error,
 )
 from .execution_selection import (
-    read_execution_selection,
+    ExecutionSelectionError,
+    ensure_execution_selection,
+    is_profile_aware_run,
+    read_execution_selection_with_sha256,
     resolve_execution_selection,
-    write_execution_selection,
+    validate_execution_selection,
 )
 from .models import ExecutionRole, HarnessConfig, ReviewRoute, ReviewVerdict, RunStatus
 from .planning import (
@@ -489,10 +492,12 @@ class Orchestrator:
         spec: str,
     ) -> RunResult:
         repo = git_root(self.config.repo)
-        planner_selection = store.load().get("execution", {}).get("planner", {})
-        planner_profile_id = planner_selection.get("profile_id")
-        if not isinstance(planner_profile_id, str):
+        initial_state = store.load()
+        # Every run executed here is profile-aware: it can never fall back to
+        # current defaults or to a schema-v1 approval once awaiting approval.
+        if not is_profile_aware_run(initial_state):
             raise OrchestrationError("run has no planner profile")
+        planner_profile_id = initial_state["execution"]["planner"]["profile_id"]
         planner_profile = profile_for_role(
             self.config, planner_profile_id, ExecutionRole.PLANNER
         )
@@ -553,38 +558,48 @@ class Orchestrator:
                 state = store.update(status=RunStatus.PLAN_REJECTED)
                 return RunResult(run_dir, RunStatus.PLAN_REJECTED, state)
 
+            # The human-approved snapshot is the only execution authority:
+            # no schema-v1 approval and no materialization of defaults.
+            if approval.execution_sha256 is None:
+                raise ApprovalError(
+                    "profile-aware run requires a schema v2 approval bound to an execution selection"
+                )
             try:
-                selection = read_execution_selection(run_dir)
-            except ValueError:
-                # P15 CLI approvals have no profile snapshot.  Keep those
-                # historic approvals readable by materializing current
-                # defaults before continuing; all P16 web approvals already
-                # contain the durable snapshot and use schema v2.
-                if approval.execution_sha256 is not None:
-                    raise
-                selection = resolve_execution_selection(
+                selection, execution_sha256 = read_execution_selection_with_sha256(run_dir)
+            except ExecutionSelectionError as exc:
+                raise ApprovalError(f"approved execution selection is invalid: {exc}") from exc
+            if selection.schema_version != 2:
+                raise ApprovalError("profile-aware run requires execution selection schema 2")
+            if execution_sha256 != approval.execution_sha256:
+                raise ApprovalError("execution selection does not match approval")
+            durable_identity = compute_plan_identity_from_run(run_dir)
+            if (
+                approval.raw_sha256 != durable_identity.raw_sha256
+                or approval.contract_sha256 != durable_identity.contract_sha256
+                or durable_identity.execution_sha256 != execution_sha256
+            ):
+                raise ApprovalError("approval does not match durable execution selection")
+        else:
+            selection = ensure_execution_selection(
+                run_dir,
+                resolve_execution_selection(
                     self.config,
                     planner_profile_id=planner_profile.id,
                     implementer_profile_id=self.config.ui.default_implementer_profile or "legacy-implementer",
                     reviewer_profile_id=self.config.ui.default_reviewer_profile or "legacy-reviewer",
-                )
-                write_execution_selection(run_dir, selection)
-            durable_identity = compute_plan_identity_from_run(run_dir)
-            if approval.raw_sha256 != durable_identity.raw_sha256 or approval.contract_sha256 != durable_identity.contract_sha256 or (approval.execution_sha256 is not None and approval.execution_sha256 != durable_identity.execution_sha256):
-                raise ApprovalError("approval does not match durable execution selection")
-        else:
-            selection = resolve_execution_selection(
-                self.config,
-                planner_profile_id=planner_profile.id,
-                implementer_profile_id=self.config.ui.default_implementer_profile or "legacy-implementer",
-                reviewer_profile_id=self.config.ui.default_reviewer_profile or "legacy-reviewer",
+                ),
             )
-            write_execution_selection(run_dir, selection)
             durable_identity = compute_plan_identity_from_run(run_dir)
             store.update(
                 status=RunStatus.PLANNING,
                 plan_identity=dataclasses.asdict(durable_identity),
             )
+
+        # Prove, before any worktree, agent or reviewer, that the configured
+        # profiles are exactly the snapshot that was selected.
+        if selection.planner.profile_id != planner_profile.id:
+            raise ExecutionSelectionError("execution selection planner is not the run planner")
+        validate_execution_selection(self.config, selection)
 
         self._last_selection = selection
         execution_state = {
@@ -849,6 +864,8 @@ def _failure_reason(exc: Exception) -> str:
         return getattr(exc, "code", "AGENT_FAILURE")
     if isinstance(exc, ApprovalError):
         return "PLAN_APPROVAL_INVALID"
+    if isinstance(exc, ExecutionSelectionError):
+        return "EXECUTION_SELECTION_INVALID"
     if isinstance(exc, PlanParseError):
         return "PLANNER_OUTPUT_INVALID"
     if isinstance(exc, ReviewParseError):

@@ -21,6 +21,7 @@ from metaharness.cli import main  # noqa: E402
 from metaharness.config import load_config  # noqa: E402
 from metaharness.models import RunStatus  # noqa: E402
 from metaharness.orchestrator import Orchestrator  # noqa: E402
+from metaharness.web.api import approve_run  # noqa: E402
 
 
 def git(repo: Path, *args: str) -> str:
@@ -356,7 +357,19 @@ class OrchestratorE2ETests(unittest.TestCase):
             waiting = json.loads(state_path.read_text())
             self.assertEqual(waiting["status"], RunStatus.AWAITING_PLAN_APPROVAL.value)
             self.assertFalse(worktree.exists())
-            self.assertEqual(main(["approve-plan", "--run", str(self.root / "runs" / run_id)]), 0)
+            # A new run is profile-aware: the CLI refuses to write a schema-v1
+            # approval and the profile-aware (web) approval path is required.
+            run_dir = self.root / "runs" / run_id
+            self.assertEqual(main(["approve-plan", "--run", str(run_dir)]), 2)
+            self.assertFalse((run_dir / "plan_approval.json").exists())
+            approve_run(
+                self.root / "runs",
+                run_id,
+                "APPROVE",
+                config=load_config(config),
+                implementer_profile="legacy-implementer",
+                reviewer_profile="legacy-reviewer",
+            )
             thread.join(timeout=10)
             self.assertFalse(thread.is_alive())
             final = json.loads(state_path.read_text())

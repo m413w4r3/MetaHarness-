@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 from .models import (
@@ -117,6 +119,59 @@ def safe_profile_metadata(profile: ModelProfile) -> dict[str, Any]:
     }
 
 
+def profile_execution_fingerprint(
+    profile: ModelProfile,
+    *,
+    agent_env_allowlist: tuple[str, ...] = (),
+) -> str:
+    """SHA-256 of the profile fields that change execution.
+
+    Advisory UI fields (display name, description, strengths, tiers) are
+    excluded.  ``api_key_env`` is only the variable name, never its value.
+    """
+
+    if not isinstance(profile, ModelProfile):
+        raise TypeError("profile must be a ModelProfile")
+    if isinstance(agent_env_allowlist, (str, bytes)) or not all(
+        isinstance(name, str) for name in agent_env_allowlist
+    ):
+        raise ProfileError("agent_env_allowlist must contain variable names")
+    payload: dict[str, Any] = {
+        "id": profile.id,
+        "roles": [role.value for role in profile.roles],
+        "driver": profile.driver.value,
+        "model": profile.model,
+        "selection_mode": profile.selection_mode.value,
+        "timeout_seconds": profile.timeout_seconds,
+    }
+    if profile.driver is ProfileDriver.OPENAI_CHAT:
+        payload.update(
+            base_url=profile.base_url,
+            endpoint_path=profile.endpoint_path,
+            api_key_env=profile.api_key_env,
+            retries=profile.retries,
+            extra_body=dict(profile.extra_body),
+        )
+    elif profile.driver is ProfileDriver.CODEX:
+        payload.update(
+            effort=profile.effort,
+            sandbox=profile.sandbox,
+            agent_env_allowlist=list(agent_env_allowlist),
+        )
+    else:  # pragma: no cover - ProfileDriver is closed
+        raise ProfileError("profile driver is unknown")
+    try:
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ProfileError(f"profile {profile.id!r} is not canonically serializable") from exc
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def build_llm_endpoint(profile: ModelProfile) -> LLMEndpointConfig:
     if not isinstance(profile, ModelProfile):
         raise TypeError("profile must be a ModelProfile")
@@ -153,6 +208,7 @@ def build_agent_config(profile: ModelProfile) -> AgentConfig:
 __all__ = [
     "ProfileError",
     "profile_for_role",
+    "profile_execution_fingerprint",
     "safe_profile_metadata",
     "build_llm_endpoint",
     "build_agent_config",

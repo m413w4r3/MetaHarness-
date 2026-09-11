@@ -15,6 +15,7 @@ from .approval import (
     write_plan_approval,
 )
 from .config import ConfigError, load_config
+from .execution_selection import is_profile_aware_run
 from .gitops import GitError, assert_clean, git_root, resolve_commit
 from .llm.chat import validate_endpoint
 from .models import RunStatus
@@ -127,6 +128,15 @@ def _write_plan_decision(run_dir: Path, decision: ApprovalDecision) -> int:
         directory, state = _load_run_state(run_dir)
         if state.get("status") != RunStatus.AWAITING_PLAN_APPROVAL.value:
             raise ApprovalError("run must be awaiting_plan_approval")
+        profile_aware = is_profile_aware_run(state)
+        if decision is ApprovalDecision.APPROVE and profile_aware:
+            # The CLI cannot choose execution profiles; a schema-v1 approval
+            # would silently downgrade this run to unapproved defaults.
+            raise ApprovalError(
+                "this run is profile-aware: approve it through the profile-aware "
+                "web UI (metaharness web) so the implementer and reviewer "
+                "profiles are recorded; no approval was written"
+            )
         state_identity = state.get("plan_identity")
         if not isinstance(state_identity, dict):
             raise ApprovalError("run state has no plan identity")
@@ -138,7 +148,15 @@ def _write_plan_decision(run_dir: Path, decision: ApprovalDecision) -> int:
         except (KeyError, TypeError, ValueError) as exc:
             raise ApprovalError("run state has an invalid plan identity") from exc
         actual_identity = compute_plan_identity_from_run(directory)
-        if actual_identity != expected_identity:
+        if profile_aware:
+            # REJECT executes nothing: only the plan artifacts are compared.
+            matches = (actual_identity.raw_sha256, actual_identity.contract_sha256) == (
+                expected_identity.raw_sha256,
+                expected_identity.contract_sha256,
+            )
+        else:
+            matches = actual_identity == expected_identity
+        if not matches:
             raise ApprovalError("plan artifacts do not match state.plan_identity")
         write_plan_approval(
             directory,
