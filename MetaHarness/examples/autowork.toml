@@ -8,7 +8,7 @@ max_diff_bytes = 400000
 allow_no_required_checks = false
 
 [planning]
-protocol = "v1"
+protocol = "v2"
 
 [environment]
 files = ["../Bridges/.env.models"]

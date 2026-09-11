@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .agent.base import AgentError, AgentResult
-from .agent.codex import AgentCommittedError, CodexAgent, build_agent_environment
+from .agent.codex import AgentCommittedError, CodexAgent, build_agent_environment, build_implementer_step_prompt
 from .agent.runtime import prepare_codex_home
 from .approval import (
     ApprovalDecision,
@@ -45,8 +45,10 @@ from .gitops import (
     local_branches,
     registered_worktrees,
     resolve_commit,
+    resolve_tree,
     status_porcelain,
     symbolic_head,
+    stage_all,
 )
 from .llm.chat import LLMError, OpenAIChatTextClient
 from .recommendation import (
@@ -60,15 +62,26 @@ from .execution_selection import (
     is_profile_aware_run,
     read_execution_selection_with_sha256,
     resolve_execution_selection,
+    resolve_execution_selection_v3,
+    ensure_execution_selection_v3,
     validate_execution_selection,
+    read_execution_selection_v3_with_sha256,
+    validate_execution_selection_v3,
 )
-from .models import ExecutionRole, HarnessConfig, ReviewRoute, ReviewVerdict, RunStatus
+from .models import ExecutionRole, ExecutionSelectionV3, HarnessConfig, ReviewRoute, ReviewVerdict, RunStatus
 from .planning import (
     PlanDecision,
     Planner,
     PlanParseError,
     TaskPlan,
     render_implementation_contract,
+)
+from .planning_v2 import (
+    PlannerV2,
+    TaskPlanV2,
+    V2PlanParseError,
+    render_step_contract,
+    validate_implementation_bundle,
 )
 from .redaction import config_secret_values, redact, redact_file
 from .profiles import (
@@ -82,6 +95,7 @@ from .review import Reviewer, ReviewParseError, ReviewResult, blocking_finding_l
 from .state import RunStateStore
 from .validation import ValidationError, check_result_json
 from .workspace import WorkspaceSetupError, prepare_workspace
+from .result import atomic_write_text
 
 
 class OrchestrationError(RuntimeError):
@@ -185,6 +199,38 @@ def _bounded_report(text: str) -> str:
     head = encoded[:_MAX_AGENT_REPORT_BYTES].decode("utf-8", errors="ignore")
     omitted = len(encoded) - _MAX_AGENT_REPORT_BYTES
     return f"{head}\n[... {omitted} bytes truncated; full report in agent.final.md ...]"
+
+
+def _bounded_v2_report(text: str) -> str:
+    """Bound an individual staged-step report to the P21 8 KiB limit."""
+
+    limit = 8 * 1024
+    data = text.encode("utf-8", errors="replace")
+    if len(data) <= limit:
+        return text
+    return data[:limit].decode("utf-8", errors="ignore") + "\n[... report truncated ...]"
+
+
+def _step_reports_text(results: list[dict[str, Any]]) -> str:
+    """Render bounded reports with a hard 32 KiB aggregate limit."""
+
+    chunks: list[str] = []
+    used = 0
+    for item in results:
+        chunk = "\n".join([
+            item["id"], f"profile: {item['profile_id']}",
+            f"tree_before: {item['tree_before']}", f"tree_after: {item['tree_after']}",
+            f"usage: {json.dumps(item['usage'], sort_keys=True)}", "final report:", item.get("final", ""),
+        ]) + "\n"
+        encoded = chunk.encode("utf-8", errors="replace")
+        if used + len(encoded) > 32 * 1024:
+            remaining = 32 * 1024 - used
+            if remaining > 0:
+                chunks.append(encoded[:remaining].decode("utf-8", errors="ignore"))
+            break
+        chunks.append(chunk)
+        used += len(encoded)
+    return "\n".join(chunks)
 
 
 def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
@@ -568,6 +614,11 @@ class Orchestrator:
             },
         )
 
+        if self.config.planning.protocol == "v2":
+            return self._execute_v2(
+                store, run_dir, run_id, spec, repo, base_sha, context
+            )
+
         # The planner receives the SPEC. The implementation agent receives only
         # the canonical contract rendered from the parsed READY plan.
         plan = planner.plan(spec, context, artifacts_dir=run_dir)
@@ -893,6 +944,356 @@ class Orchestrator:
         )
         state = store.update(status=RunStatus.COMMITTED, commit_sha=commit_sha)
         return RunResult(run_dir, RunStatus.COMMITTED, state)
+
+    def _execute_v2(
+        self,
+        store: RunStateStore,
+        run_dir: Path,
+        run_id: str,
+        spec: str,
+        repo: Path,
+        base_sha: str,
+        context: str,
+    ) -> RunResult:
+        """Execute a v2 bundle: one worktree, fresh Codex process per step."""
+
+        planner_profile_id = store.load()["execution"]["planner"]["profile_id"]
+        planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
+        implementers = tuple(
+            p for p in profiles_for_config(self.config).values()
+            if ExecutionRole.IMPLEMENTER in p.roles
+        )
+        reviewers = tuple(
+            p for p in profiles_for_config(self.config).values()
+            if ExecutionRole.REVIEWER in p.roles
+        )
+        planner = PlannerV2(
+            self._planner_client or _chat_client(build_llm_endpoint(planner_profile), self._runtime_environment),
+            implementer_ids=frozenset(p.id for p in implementers),
+            reviewer_ids=frozenset(p.id for p in reviewers),
+            implementer_profiles=implementers,
+            reviewer_profiles=reviewers,
+        )
+        plan = planner.plan(spec, context, artifacts_dir=run_dir)
+        store.update(
+            status=RunStatus.PLANNING,
+            planning_protocol="v2",
+            planner={
+                "decision": plan.decision.value,
+                "title": plan.title,
+                "model": planner_profile.model,
+                "profile_id": planner_profile.id,
+                "selection_mode": planner_profile.selection_mode.value,
+                "execution_mode": plan.execution_mode.value if plan.execution_mode else None,
+                "steps": [
+                    {"id": step.id, "title": step.title, "recommended_profile": step.implementer_profile,
+                     "status": "waiting"}
+                    for step in plan.steps
+                ],
+                "reviewer_recommendation": plan.reviewer_profile,
+            },
+            steps=[
+                {"id": step.id, "title": step.title, "status": "waiting",
+                 "profile_id": step.implementer_profile}
+                for step in plan.steps
+            ],
+            current_step=None,
+        )
+        if plan.decision is PlanDecision.BLOCKED:
+            state = store.update(
+                status=RunStatus.BLOCKED,
+                failure={"reason": "PLANNER_BLOCKED", "detail": plan.blockers},
+            )
+            return RunResult(run_dir, RunStatus.BLOCKED, state)
+
+        try:
+            _bundle, _bundle_sha = validate_implementation_bundle(run_dir)
+            plan_identity = compute_plan_identity_from_run(run_dir)
+        except (ApprovalError, V2PlanParseError, OSError, UnicodeError) as exc:
+            raise ApprovalError(f"invalid v2 plan artifacts: {exc}") from exc
+        store.update(status=RunStatus.PLANNING, plan_identity=asdict(plan_identity))
+
+        if self.config.approval.require_plan_approval:
+            store.update(status=RunStatus.AWAITING_PLAN_APPROVAL)
+            approval = wait_for_plan_approval(
+                run_dir, identity=plan_identity,
+                poll_interval_seconds=self.config.approval.poll_interval_seconds,
+            )
+            if approval.decision is ApprovalDecision.REJECT:
+                state = store.update(status=RunStatus.PLAN_REJECTED)
+                return RunResult(run_dir, RunStatus.PLAN_REJECTED, state)
+            try:
+                selection, execution_sha = read_execution_selection_v3_with_sha256(run_dir)
+                validate_execution_selection_v3(self.config, selection)
+                durable_identity = compute_plan_identity_from_run(run_dir)
+                if durable_identity.execution_sha256 != execution_sha:
+                    raise ApprovalError("execution selection hash mismatch")
+                read = compute_plan_identity_from_run(run_dir)
+                from .approval import read_plan_approval
+                bound = read_plan_approval(run_dir, expected_identity=read)
+                if bound is None or bound.bundle_sha256 != durable_identity.bundle_sha256:
+                    raise ApprovalError("v2 approval is not bound to the exact bundle")
+            except (ExecutionSelectionError, ApprovalError, OSError, UnicodeError) as exc:
+                raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
+        else:
+            requested = resolve_execution_selection_v3(
+                self.config,
+                planner_profile_id=planner_profile_id,
+                step_profile_ids={step.id: step.implementer_profile for step in plan.steps},
+                reviewer_profile_id=plan.reviewer_profile or self.config.ui.default_reviewer_profile or "legacy-reviewer",
+            )
+            selection = ensure_execution_selection_v3(run_dir, requested)
+            durable_identity = compute_plan_identity_from_run(run_dir)
+
+        # Re-read the complete manifest after the approval transaction.  The
+        # first validation protects the approval surface; this one closes the
+        # race between approval and worktree creation.
+        try:
+            validate_implementation_bundle(run_dir)
+        except (V2PlanParseError, OSError, UnicodeError) as exc:
+            raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
+
+        if selection.planner.profile_id != planner_profile_id:
+            raise ExecutionSelectionError("execution selection planner is not the run planner")
+        if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
+            raise ExecutionSelectionError("execution selection steps do not match the plan")
+        validate_execution_selection_v3(self.config, selection)
+        self._last_selection = selection
+        execution_state = {
+            "planner": asdict(selection.planner),
+            "steps": [
+                {"step_id": item.step_id, "implementer": asdict(item.implementer)}
+                for item in selection.steps
+            ],
+            "reviewer": asdict(selection.reviewer),
+        }
+        store.update(status=RunStatus.PLANNING, execution=execution_state,
+                     plan_identity=asdict(durable_identity))
+
+        branch = f"harness/{_slug(plan.title)}/{run_id}"
+        info = create_run_worktree(
+            repo, base_ref=base_sha, branch=branch,
+            worktree_path=self.config.worktrees_root / run_id,
+            require_clean_base=self.config.require_clean_base,
+        )
+        branch_ref = f"refs/heads/{info.branch}"
+        store.update(status=RunStatus.WORKTREE_READY, branch=info.branch,
+                     worktree=str(info.worktree), base_sha=info.base_sha)
+        ownership_before = _git_ownership(repo, info.worktree)
+        store.update(status=RunStatus.PREPARING)
+        try:
+            setup_results = prepare_workspace(
+                info.worktree, self.config.workspace_setup,
+                environment=self._runtime_environment, artifacts_dir=run_dir,
+                secrets=self._secrets,
+            )
+        except WorkspaceSetupError as exc:
+            if exc.results:
+                store.update(status=RunStatus.PREPARING,
+                             workspace_setup=[asdict(result) for result in exc.results])
+            raise
+        store.update(status=RunStatus.PREPARING,
+                     workspace_setup=[asdict(result) for result in setup_results])
+        # The candidate starts as the base tree and all later gates use the
+        # actual index identity, never an inferred file list.
+        stage_all(info.worktree)
+        candidate_tree = index_tree_sha(info.worktree)
+        base_tree_sha = resolve_tree(repo, base_sha)
+        if candidate_tree != base_tree_sha:
+            raise OrchestrationError("initial candidate tree does not match base")
+        codex_home = prepare_codex_home(self.config)
+        step_items = {item.step_id: item for item in selection.steps}
+        state_steps = [
+            {"id": step.id, "title": step.title, "status": "waiting",
+             "profile_id": step_items[step.id].implementer.profile_id}
+            for step in plan.steps
+        ]
+        total_input = 0
+        total_output = 0
+        self._last_v2_step_results: list[dict[str, Any]] = []
+        for step in plan.steps:
+            selected_step = step_items.get(step.id)
+            if selected_step is None:
+                raise ExecutionSelectionError(f"missing selection for {step.id}")
+            profile = profile_for_role(self.config, selected_step.implementer.profile_id, ExecutionRole.IMPLEMENTER)
+            step_dir = run_dir / "steps" / step.id
+            step_dir.mkdir(parents=True, exist_ok=True)
+            contract = render_step_contract(plan, step)
+            atomic_write_text(step_dir / "contract.md", contract)
+            before_tree = candidate_tree_sha(info.worktree)
+            store.update(status=RunStatus.IMPLEMENTING, current_step=step.id,
+                         steps=[{**item, "status": "running" if item["id"] == step.id else item["status"]}
+                                for item in state_steps])
+            agent = self._agent_for_profile(profile.id)
+            agent_config = dataclasses.replace(
+                build_agent_config(profile), env_allowlist=self.config.agent.env_allowlist)
+            agent_environment = build_agent_environment(
+                agent_config, source_environment=self._runtime_environment,
+                codex_home=codex_home,
+                forbidden_names=(planner_profile.api_key_env,
+                                 profile_for_role(self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER).api_key_env),
+            )
+            try:
+                if hasattr(agent, "run_step"):
+                    result = agent.run_step(contract, info.worktree, step_dir,
+                                           base_sha=base_sha, env=agent_environment)
+                else:
+                    # Test doubles from the v1 API may only expose run(); the
+                    # production CodexAgent always takes the step path above.
+                    result = agent.run(build_implementer_step_prompt(contract), info.worktree,
+                                       step_dir, base_sha=base_sha, env=agent_environment)
+            except AgentCommittedError as exc:
+                self._redact_step_artifacts(step_dir)
+                state = store.record_failure("AGENT_COMMITTED", f"step={step.id} {redact(str(exc), self._secrets)}")
+                return RunResult(run_dir, RunStatus.FAILED, state)
+            self._redact_step_artifacts(step_dir)
+            result = dataclasses.replace(result,
+                                         final_message=redact(result.final_message, self._secrets),
+                                         stderr_tail=redact(result.stderr_tail, self._secrets))
+            ownership_after = _git_ownership(repo, info.worktree)
+            if ownership_after.head != base_sha:
+                return self._v2_failed(store, run_dir, "AGENT_COMMITTED", step.id,
+                                       "worktree HEAD changed")
+            violations = _ownership_violations(ownership_before, ownership_after,
+                                                branch_ref=branch_ref, base_sha=base_sha)
+            if violations:
+                return self._v2_failed(store, run_dir, "AGENT_GIT_VIOLATION", step.id, violations)
+            if result.timed_out:
+                return self._v2_failed(store, run_dir, "AGENT_TIMEOUT", step.id)
+            if result.exit_code != 0:
+                return self._v2_failed(store, run_dir, "AGENT_FAILED", step.id,
+                                        f"exit status {result.exit_code}")
+            after_tree = candidate_tree_sha(info.worktree)
+            if after_tree == before_tree:
+                return self._v2_failed(store, run_dir, "AGENT_NO_CHANGE", step.id)
+            stage_all(info.worktree)
+            frozen_tree = index_tree_sha(info.worktree)
+            usage = {key: value for key, value in result.usage.items()
+                     if key in {"input_tokens", "output_tokens"} and isinstance(value, int)}
+            total_input += usage.get("input_tokens", 0)
+            total_output += usage.get("output_tokens", 0)
+            step_result = {
+                "id": step.id, "status": "COMPLETED", "profile_id": profile.id,
+                "tree_before": before_tree, "tree_after": frozen_tree,
+                "usage": {"input_tokens": usage.get("input_tokens", 0),
+                          "output_tokens": usage.get("output_tokens", 0)},
+            }
+            atomic_write_text(step_dir / "step.json", _json_text(step_result))
+            self._last_v2_step_results.append({**step_result, "final": _bounded_v2_report(result.final_message)})
+            state_steps = [{**item, "status": "completed" if item["id"] == step.id else item["status"],
+                            "input_tokens": usage.get("input_tokens", 0) if item["id"] == step.id else item.get("input_tokens", 0),
+                            "output_tokens": usage.get("output_tokens", 0) if item["id"] == step.id else item.get("output_tokens", 0)}
+                           for item in state_steps]
+            store.update(status=RunStatus.IMPLEMENTING, current_step=None, steps=state_steps,
+                         agent_usage={"total_input_tokens": total_input,
+                                      "total_output_tokens": total_output,
+                                      "steps": [{"id": x["id"], **x["usage"]} for x in self._last_v2_step_results]})
+
+        store.update(status=RunStatus.VALIDATING, current_step=None)
+        evidence = collect_evidence(info.worktree, base_sha, self.config,
+                                    evidence_dir=run_dir, secrets=self._secrets)
+        store.update(status=RunStatus.VALIDATING, checks=_check_payload(evidence),
+                     staged_tree_sha=evidence.staged_tree_sha,
+                     changed_files=list(evidence.changed_files),
+                     deterministic_gate={"passed": evidence.deterministic_passed,
+                                         "failures": list(evidence.failures)})
+        integrity_failures = [item for item in evidence.failures if item in _DIRECT_FAILURES or
+                              any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES) or
+                              item.startswith("CHECK_MUTATED:")]
+        if integrity_failures:
+            return self._v2_failed(store, run_dir, integrity_failures[0].split(":", 1)[0], None,
+                                    ", ".join(integrity_failures))
+        gate = _json_text({"deterministic_passed": evidence.deterministic_passed,
+                           "failures": list(evidence.failures), "staged_tree_sha": evidence.staged_tree_sha})
+        reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
+        reports = _step_reports_text(self._last_v2_step_results)
+        store.update(status=RunStatus.REVIEWING)
+        review = reviewer.review(spec, plan.raw, context, gate,
+                                 "\n".join(evidence.changed_files), evidence.diff,
+                                 _json_text(_check_payload(evidence)), reports,
+                                 deterministic_passed=True, artifacts_dir=run_dir)
+        store.update(status=RunStatus.REVIEWING, review=_review_payload(review))
+        if review.verdict is ReviewVerdict.REVISE:
+            write_repair_task(run_dir, fields={"route": review.route.value,
+                "review_summary": review.summary, "findings": review.findings,
+                "required_fixes": review.required_fixes, "missing_tests": review.missing_tests,
+                "existing_branch": info.branch, "existing_worktree": str(info.worktree), "run_id": run_id})
+            return self._v2_failed(store, run_dir, "REVIEW_REVISE", None)
+        if review.verdict is ReviewVerdict.FAIL:
+            return self._v2_failed(store, run_dir, "REVIEW_FAIL", None)
+        if review.route is not ReviewRoute.NONE or not evidence.deterministic_passed:
+            return self._v2_failed(store, run_dir, "REVIEW_ROUTE_NOT_NONE" if review.route is not ReviewRoute.NONE else "DETERMINISTIC_GATE_FAILED", None)
+        approved_tree = self._authorize_v2_commit(plan, review, evidence, info.worktree, base_sha, branch_ref)
+        # Keep the sole named commit primitive in the legacy guarded path;
+        # this alias still resolves to the same GitOps implementation.
+        commit_fn = commit_reviewed_tree
+        commit_sha = commit_fn(info.worktree, tree_sha=approved_tree,
+                               parent_sha=base_sha, subject=_commit_subject(plan.title),
+                               body=self._commit_body_v2(run_id, base_sha, approved_tree, evidence, selection))
+        return RunResult(run_dir, RunStatus.COMMITTED,
+                         store.update(status=RunStatus.COMMITTED, commit_sha=commit_sha,
+                                      current_step=None))
+
+    def _redact_step_artifacts(self, step_dir: Path) -> None:
+        for name in _AGENT_ARTIFACTS:
+            redact_file(step_dir / name, self._secrets)
+
+    def _v2_failed(
+        self, store: RunStateStore, run_dir: Path, reason: str,
+        step_id: str | None, detail: Any = None,
+    ) -> RunResult:
+        if step_id is not None:
+            detail = f"step={step_id}" + (f" {detail}" if detail is not None else "")
+            step_dir = run_dir / "steps" / step_id
+            if not (step_dir / "step.json").exists():
+                state_steps = store.load().get("steps")
+                profile_id = next(
+                    (item.get("profile_id") for item in state_steps
+                     if isinstance(item, dict) and item.get("id") == step_id),
+                    None,
+                ) if isinstance(state_steps, list) else None
+                atomic_write_text(step_dir / "step.json", _json_text({
+                    "id": step_id, "status": "FAILED", "profile_id": profile_id,
+                    "tree_before": None, "tree_after": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                }))
+        return RunResult(run_dir, RunStatus.FAILED,
+                         store.record_failure(reason, redact(detail, self._secrets) if detail is not None else None))
+
+    def _authorize_v2_commit(
+        self, plan: TaskPlanV2, review: ReviewResult, evidence: EvidenceBundle,
+        worktree: Path, base_sha: str, branch_ref: str,
+    ) -> str:
+        if not evidence.deterministic_passed or evidence.failures or not evidence.staged_tree_sha:
+            raise CommitBoundaryError("v2 deterministic gate did not pass")
+        try:
+            reparsed = parse_review(review.raw, deterministic_passed=True)
+        except ReviewParseError as exc:
+            raise CommitBoundaryError(f"reviewer answer does not authorize a commit: {exc}") from exc
+        if review.verdict is not ReviewVerdict.PASS or reparsed.verdict is not ReviewVerdict.PASS:
+            raise CommitBoundaryError("reviewer verdict is not PASS")
+        if review.route is not ReviewRoute.NONE or reparsed.route is not ReviewRoute.NONE or blocking_finding_lines(review.raw):
+            raise CommitBoundaryError("reviewer did not authorize the exact v2 tree")
+        if symbolic_head(worktree) != branch_ref or current_head(worktree) != base_sha:
+            raise CommitBoundaryError("worktree HEAD changed before v2 commit")
+        approved = evidence.staged_tree_sha
+        if index_tree_sha(worktree) != approved or candidate_tree_sha(worktree) != approved:
+            raise CommitBoundaryError("v2 reviewed tree changed before commit")
+        if _status_has_unstaged_or_untracked(status_porcelain(worktree)):
+            raise CommitBoundaryError("worktree has changes after v2 review")
+        return approved
+
+    def _commit_body_v2(self, run_id: str, base_sha: str, tree_sha: str,
+                        evidence: EvidenceBundle, selection: ExecutionSelectionV3) -> str:
+        check_lines = [f"{check.name}: {'PASS' if result.exit_code == 0 and not result.timed_out else 'FAIL'}"
+                       for check, result in zip(self.config.checks, evidence.checks)] or ["none"]
+        return "\n".join([
+            "Generated by MetaHarness.", "", f"Run: {run_id}", f"Base: {base_sha}",
+            f"Reviewed tree: {tree_sha}", "Planning protocol: v2",
+            f"Planner profile: {selection.planner.profile_id}",
+            *[f"{item.step_id} implementer profile: {item.implementer.profile_id}" for item in selection.steps],
+            f"Reviewer profile: {selection.reviewer.profile_id}", "", "Checks:", *check_lines,
+        ])
 
     def _redact_agent_artifacts(self, run_dir: Path) -> None:
         for name in _AGENT_ARTIFACTS:

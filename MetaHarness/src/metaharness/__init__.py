@@ -30,6 +30,7 @@ from .models import (
     ContextConfig,
     EnvironmentConfig,
     ExecutionMode,
+    ExecutionSelectionV3,
     HarnessConfig,
     ImplementationStep,
     LLMEndpointConfig,
@@ -40,6 +41,8 @@ from .models import (
     RunStatus,
     TaskPlanV2,
     WorkspaceSetupCommand,
+    SelectedProfile,
+    StepExecutionSelection,
 )
 from .orchestrator import Orchestrator, run_orchestrator
 from .review import Reviewer, ReviewParseError, ReviewResult, parse_review
@@ -63,6 +66,7 @@ __all__ = [
     "ContextConfig",
     "EnvironmentConfig",
     "ExecutionMode",
+    "ExecutionSelectionV3",
     "ContextExcerpt",
     "EvidenceBundle",
     "EnvironmentFileError",
@@ -83,6 +87,8 @@ __all__ = [
     "RunStatus",
     "TaskPlanV2",
     "WorkspaceSetupCommand",
+    "SelectedProfile",
+    "StepExecutionSelection",
     "WorkspaceSetupError",
     "WorkspaceSetupResult",
     "Orchestrator",

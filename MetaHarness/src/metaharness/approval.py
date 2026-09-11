@@ -30,6 +30,7 @@ class PlanIdentity:
 
     raw_sha256: str
     contract_sha256: str
+    bundle_sha256: str | None = None
     execution_sha256: str | None = None
 
     def __post_init__(self) -> None:
@@ -37,6 +38,8 @@ class PlanIdentity:
         _validate_sha256(self.contract_sha256, "contract_sha256")
         if self.execution_sha256 is not None:
             _validate_sha256(self.execution_sha256, "execution_sha256")
+        if self.bundle_sha256 is not None:
+            _validate_sha256(self.bundle_sha256, "bundle_sha256")
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,7 @@ class PlanApproval:
     contract_sha256: str
     created_at: str
     source: str
+    bundle_sha256: str | None = None
     execution_sha256: str | None = None
 
     def __post_init__(self) -> None:
@@ -59,6 +63,8 @@ class PlanApproval:
         _validate_sha256(self.contract_sha256, "contract_sha256")
         if self.execution_sha256 is not None:
             _validate_sha256(self.execution_sha256, "execution_sha256")
+        if self.bundle_sha256 is not None:
+            _validate_sha256(self.bundle_sha256, "bundle_sha256")
         if not isinstance(self.created_at, str) or not self.created_at.strip():
             raise ApprovalError("approval created_at must be a non-empty string")
         if not isinstance(self.source, str) or self.source not in _SOURCES:
@@ -85,7 +91,11 @@ def _run_path(run_dir: str | Path) -> Path:
 
 
 def compute_plan_identity(
-    raw: str, contract: str, execution_sha256: str | None = None
+    raw: str,
+    contract: str,
+    execution_sha256: str | None = None,
+    *,
+    bundle_sha256: str | None = None,
 ) -> PlanIdentity:
     """Hash the exact UTF-8 encoding of both plan strings."""
 
@@ -95,6 +105,7 @@ def compute_plan_identity(
         raw_sha256=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         contract_sha256=hashlib.sha256(contract.encode("utf-8")).hexdigest(),
         execution_sha256=execution_sha256,
+        bundle_sha256=bundle_sha256,
     )
 
 
@@ -114,22 +125,36 @@ def compute_plan_identity_from_run(run_dir: str | Path) -> PlanIdentity:
             execution_sha256 = hashlib.sha256(execution_path.read_bytes()).hexdigest()
         except (OSError, UnicodeError) as exc:
             raise ApprovalError(f"could not read execution selection: {exc}") from exc
+    bundle_path = directory / "implementation_bundle.json"
+    bundle_sha256: str | None = None
+    if bundle_path.exists():
+        try:
+            bundle_sha256 = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+        except (OSError, UnicodeError) as exc:
+            raise ApprovalError(f"could not read implementation bundle: {exc}") from exc
     return PlanIdentity(
         raw_sha256=hashlib.sha256(raw).hexdigest(),
         contract_sha256=hashlib.sha256(contract).hexdigest(),
         execution_sha256=execution_sha256,
+        bundle_sha256=bundle_sha256,
     )
 
 
 def _approval_payload(approval: PlanApproval) -> dict[str, object]:
+    schema_version = 3 if approval.bundle_sha256 is not None else 2 if approval.execution_sha256 is not None else 1
     return {
-        "schema_version": 2 if approval.execution_sha256 is not None else 1,
+        "schema_version": schema_version,
         "decision": approval.decision.value,
         "raw_sha256": approval.raw_sha256,
         "contract_sha256": approval.contract_sha256,
         **(
             {"execution_sha256": approval.execution_sha256}
-            if approval.execution_sha256 is not None
+            if approval.execution_sha256 is not None or approval.bundle_sha256 is not None
+            else {}
+        ),
+        **(
+            {"bundle_sha256": approval.bundle_sha256}
+            if approval.bundle_sha256 is not None
             else {}
         ),
         "created_at": approval.created_at,
@@ -197,6 +222,7 @@ def write_plan_approval(
         raw_sha256=identity.raw_sha256,
         contract_sha256=identity.contract_sha256,
         execution_sha256=identity.execution_sha256,
+        bundle_sha256=identity.bundle_sha256,
         created_at=_now(),
         source=source,
     )
@@ -225,7 +251,7 @@ def read_plan_approval(
     if not isinstance(payload, dict):
         raise ApprovalError("approval JSON must contain an object")
     schema_version = payload.get("schema_version")
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in (1, 2):
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in (1, 2, 3):
         raise ApprovalError("approval schema_version is unsupported")
     required = ("decision", "raw_sha256", "contract_sha256", "created_at", "source")
     if any(field not in payload for field in required):
@@ -233,14 +259,24 @@ def read_plan_approval(
     if schema_version == 2:
         if "execution_sha256" not in payload:
             raise ApprovalError("approval artifact is missing an essential field")
+        if "bundle_sha256" in payload:
+            raise ApprovalError("schema 2 approval contains a bundle hash")
+    elif schema_version == 3:
+        if "execution_sha256" not in payload or "bundle_sha256" not in payload:
+            raise ApprovalError("approval artifact is missing an essential field")
+        if payload.get("execution_sha256") is None and payload.get("decision") != ApprovalDecision.REJECT.value:
+            raise ApprovalError("approved schema 3 decision must bind execution")
     elif "execution_sha256" in payload:
         raise ApprovalError("historic approval contains an execution hash")
+    if schema_version != 3 and "bundle_sha256" in payload:
+        raise ApprovalError("historic approval contains a bundle hash")
     try:
         approval = PlanApproval(
             decision=ApprovalDecision(payload["decision"]),
             raw_sha256=payload["raw_sha256"],
             contract_sha256=payload["contract_sha256"],
             execution_sha256=payload.get("execution_sha256"),
+            bundle_sha256=payload.get("bundle_sha256"),
             created_at=payload["created_at"],
             source=payload["source"],
         )
@@ -256,6 +292,13 @@ def read_plan_approval(
         actual_execution = hashlib.sha256(execution_bytes).hexdigest()
         if actual_execution != approval.execution_sha256:
             raise ApprovalError("execution selection does not match approval")
+    if approval.bundle_sha256 is not None:
+        try:
+            bundle_bytes = (_run_path(run_dir) / "implementation_bundle.json").read_bytes()
+        except OSError as exc:
+            raise ApprovalError("implementation bundle is missing") from exc
+        if hashlib.sha256(bundle_bytes).hexdigest() != approval.bundle_sha256:
+            raise ApprovalError("implementation bundle does not match approval")
     if (
         approval.raw_sha256 != expected_identity.raw_sha256
         or approval.contract_sha256 != expected_identity.contract_sha256
@@ -263,8 +306,13 @@ def read_plan_approval(
             expected_identity.execution_sha256 is not None
             and approval.execution_sha256 != expected_identity.execution_sha256
         )
+        or (
+            expected_identity.bundle_sha256 is not None
+            and approval.bundle_sha256 != expected_identity.bundle_sha256
+        )
         or (expected_identity.execution_sha256 is None and approval.execution_sha256 is not None
-            and schema_version != 2)
+            and schema_version not in (2, 3))
+        or (expected_identity.bundle_sha256 is None and approval.bundle_sha256 is not None)
     ):
         raise ApprovalError("approval does not match the expected plan identity")
     return approval

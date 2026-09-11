@@ -286,3 +286,21 @@ class ExecutionSelection:
     planner: SelectedProfile
     implementer: SelectedProfile
     reviewer: SelectedProfile
+
+
+@dataclass(frozen=True)
+class StepExecutionSelection:
+    """The immutable implementer snapshot selected for one v2 step."""
+
+    step_id: str
+    implementer: SelectedProfile
+
+
+@dataclass(frozen=True)
+class ExecutionSelectionV3:
+    """Durable planner, per-step implementer and reviewer selection."""
+
+    schema_version: int
+    planner: SelectedProfile
+    steps: tuple[StepExecutionSelection, ...]
+    reviewer: SelectedProfile

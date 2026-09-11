@@ -56,6 +56,13 @@ class RunStateStore:
             "approved_tree_sha": None,
             "commit_sha": None,
             "failure": None,
+            "steps": [],
+            "current_step": None,
+            "agent_usage": {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "steps": [],
+            },
         }
         self._write(state)
         return state

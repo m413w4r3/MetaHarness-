@@ -225,6 +225,57 @@ def _profile_options(config: HarnessConfig | None, role: str, selected: Any) -> 
     return "".join(result)
 
 
+def _v2_approval_form(
+    run_id: Any, token: str, state: dict[str, Any], config: HarnessConfig | None,
+) -> str:
+    planner = state.get("planner") if isinstance(state.get("planner"), dict) else {}
+    steps = planner.get("steps") if isinstance(planner.get("steps"), list) else state.get("steps", [])
+    rows: list[str] = []
+    for item in steps:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        step_id = item["id"]
+        selected = item.get("recommended_profile") or item.get("profile_id")
+        rows.append(
+            f'<section class="card"><h3>{_e(step_id)} — {_e(item.get("title"))}</h3>'
+            f'<p>Recommended: <span class="mono">{_e(selected)}</span></p>'
+            f'<label for="step-profile-{_e(step_id)}">Implementer</label>'
+            f'<select id="step-profile-{_e(step_id)}" name="step_profile__{_e(step_id)}" required>'
+            f'{_profile_options(config, "implementer", selected)}</select></section>'
+        )
+    reviewer = planner.get("reviewer_recommendation")
+    return f'''<section class="card"><h2>Execution plan</h2>
+<p>Execution strategy: <strong>{_e(planner.get("execution_mode"))}</strong> · {_e(len(rows))} steps</p>
+<form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE">
+{"".join(rows)}<label for="reviewer-profile">Reviewer</label><select id="reviewer-profile" name="reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select><br><button class="approve" type="submit">APPROVE PLAN</button></form>
+<form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT PLAN</button></form></section>'''
+
+
+def _v2_steps(state: dict[str, Any], artifacts: Any = None) -> str:
+    steps = state.get("steps") if isinstance(state.get("steps"), list) else []
+    if not steps:
+        return '<p class="muted">No staged steps.</p>'
+    cards: list[str] = []
+    artifact_map = {item.get("id"): item for item in artifacts if isinstance(item, dict)} if isinstance(artifacts, list) else {}
+    for item in steps:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "waiting"))
+        icon = "✓" if status == "completed" else "▶" if status == "running" else "…"
+        cards.append(
+            f'<details class="card"{" open" if status == "running" else ""}>'
+            f'<summary>{_e(item.get("id"))} {icon} — {_e(item.get("title"))} · '
+            f'{_e(item.get("input_tokens", 0))} in / {_e(item.get("output_tokens", 0))} out</summary>'
+            f'<p>profile: <span class="mono">{_e(item.get("profile_id"))}</span></p>'
+            f'<p>status: {_e(status)}</p>'
+            f'<details><summary>contract</summary><pre>{_e(artifact_map.get(item.get("id"), {}).get("contract"))}</pre></details>'
+            f'<details><summary>final report</summary><pre>{_e(artifact_map.get(item.get("id"), {}).get("final"))}</pre></details>'
+            f'<details><summary>stderr</summary><pre>{_e(artifact_map.get(item.get("id"), {}).get("stderr"))}</pre></details></details>'
+        )
+    usage = state.get("agent_usage") if isinstance(state.get("agent_usage"), dict) else {}
+    return f'<p><strong>Total Luna tokens:</strong> {_e(usage.get("total_input_tokens", 0))} in / {_e(usage.get("total_output_tokens", 0))} out</p>' + "".join(cards)
+
+
 def render_run(run: dict[str, Any], token: str | None = None, *, config: HarnessConfig | None = None, nonce: str | None = None, refresh_seconds: int | None = None) -> str:
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = state.get("status", run.get("status")); run_id = run.get("run_id")
@@ -240,7 +291,10 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
         names = {profile.id: profile.display_name for profile in profiles_for_config(config).values()}
         recommendation_note = f'<p>Recommended implementer: {_e(names.get(impl_selected, impl_selected))}<br>Recommended reviewer: {_e(names.get(review_selected, review_selected))}</p><p><strong>Rationale:</strong> {_e(recommendation.get("rationale"))}</p>'
     approval_forms = ""
-    if can_decide:
+    is_v2 = state.get("planning_protocol") == "v2"
+    if can_decide and is_v2:
+        approval_forms = _v2_approval_form(run_id, token or "", state, config)
+    elif can_decide:
         approval_forms = f'''<section class="card"><h2>Plan approval</h2>
 {recommendation_note}
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE"><label for="implementer-profile">Implementer profile</label><select id="implementer-profile" name="implementer_profile" required>{_profile_options(config, "implementer", impl_selected)}</select><label for="reviewer-profile">Reviewer profile</label><select id="reviewer-profile" name="reviewer_profile" required>{_profile_options(config, "reviewer", review_selected)}</select><br><button class="approve" type="submit">APPROVE</button></form>
@@ -256,7 +310,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
 {approval_forms}
 <section><h2>PLAN</h2><details open{_section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER"))}><summary>Canonical implementation contract</summary><pre>{_e(plan.get("contract"))}</pre></details><details><summary>planner.raw.md</summary><pre>{_e(plan.get("raw"))}</pre></details><details><summary>SPEC</summary><pre>{_e(run.get("spec"))}</pre></details></section>
 <section><h2>EXECUTION</h2>{_execution_card(state, config)}</section>
-<section><h2>AGENT</h2><details open{_section_open(run, ("AGENT_",))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details></section>
+<section><h2>AGENT</h2>{_v2_steps(state, run.get("step_artifacts")) if is_v2 else f'<details open{_section_open(run, ("AGENT_",))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'}</section>
 <section><h2>CHECKS</h2><details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
 <section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details><details><summary>reviewer.raw.md</summary><pre>{_e(run.get("reviewer_raw"))}</pre></details></section>
 <section><h2>Setup</h2><details open{_section_open(run, ("WORKSPACE_SETUP_",))}><summary>Workspace setup</summary>{_setup_cards(run.get("workspace_setup"))}</details></section>

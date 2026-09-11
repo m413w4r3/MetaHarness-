@@ -9,7 +9,7 @@ import time
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Mapping
 from urllib.parse import unquote
 
 from ..agent.events import parse_event, summarize_event
@@ -27,8 +27,13 @@ from ..execution_selection import (
     is_profile_aware_run,
     read_execution_selection_with_sha256,
     resolve_execution_selection,
+    ensure_execution_selection_v3,
+    read_execution_selection_v3_with_sha256,
+    resolve_execution_selection_v3,
+    validate_execution_selection_v3,
 )
 from ..models import ExecutionRole, ExecutionSelection, HarnessConfig, RunStatus
+from ..planning_v2 import V2PlanParseError, validate_implementation_bundle
 from ..profiles import ProfileError, profile_for_role, profiles_for_config, safe_profile_metadata
 from ..state import RunStateStore
 from .run_manager import RunCapacityError, RunCollisionError, RunManager, RunManagerError
@@ -39,6 +44,9 @@ ARTIFACT_ALLOWLIST = frozenset(
         "spec.md",
         "planner.raw.md",
         "implementation_contract.md",
+        "task_plan.json",
+        "task_plan_v2.json",
+        "implementation_bundle.json",
         "execution_recommendation.request.txt",
         "execution_recommendation.raw.md",
         "execution_recommendation.json",
@@ -297,6 +305,20 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
     workspace_setup = _load_json(_artifact_path(directory, "setup/results.json"))
     if not isinstance(workspace_setup, list):
         workspace_setup = state.get("workspace_setup", [])
+    step_artifacts: list[dict[str, Any]] = []
+    raw_steps = state.get("steps") if isinstance(state.get("steps"), list) else []
+    for item in raw_steps:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or re.fullmatch(r"S0[1-6]", item["id"]) is None:
+            continue
+        step_id = item["id"]
+        step_dir = directory / "steps" / step_id
+        step_artifacts.append({
+            **item,
+            "contract": _tail_text(step_dir / "contract.md", 16 * 1024),
+            "final": _tail_text(step_dir / "agent.final.md", 8 * 1024),
+            "stderr": _tail_text(step_dir / "agent.stderr.log", 8 * 1024),
+            "result": _load_json(step_dir / "agent.result.json", max_bytes=MAX_RESULT_BYTES),
+        })
     changed_files = _bounded_changed_files(
         _artifact_path(directory, "changed-files.txt")
     )
@@ -315,6 +337,8 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
         # both values still come exclusively from the allowlisted artifacts.
         "planner_raw": raw_plan,
         "implementation_contract": contract,
+        "task_plan": _load_json(_artifact_path(directory, "task_plan.json")),
+        "implementation_bundle": _load_json(_artifact_path(directory, "implementation_bundle.json")),
         "checks": _load_json(_artifact_path(directory, "checks.json")),
         "review": _load_json(_artifact_path(directory, "review.json")),
         "reviewer_raw": reviewer_raw,
@@ -332,6 +356,7 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
         "progress_tail": progress_tail(runs_root, safe_id, max_events=50),
         "candidate": {"changed_files": changed_files, "diff_tail": diff_tail},
         "workspace_setup": workspace_setup,
+        "step_artifacts": step_artifacts,
     }
 
 
@@ -462,6 +487,7 @@ def approve_run(
     config: HarnessConfig | None = None,
     implementer_profile: object = None,
     reviewer_profile: object = None,
+    step_profiles: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Perform the only web mutation through the core approval API."""
 
@@ -475,7 +501,14 @@ def approve_run(
     if state.get("status") != RunStatus.AWAITING_PLAN_APPROVAL.value:
         raise WebAPIError(409, "run is not awaiting plan approval")
     profile_aware = is_profile_aware_run(state)
-    if selected is ApprovalDecision.APPROVE and profile_aware:
+    v2 = state.get("planning_protocol") == "v2"
+    if v2:
+        if selected is ApprovalDecision.APPROVE:
+            if config is None or not isinstance(step_profiles, Mapping) or not isinstance(reviewer_profile, str):
+                raise WebAPIError(400, "step profiles and reviewer_profile are required")
+            if any(not isinstance(value, str) for value in step_profiles.values()):
+                raise WebAPIError(400, "invalid step profile field")
+    if selected is ApprovalDecision.APPROVE and profile_aware and not v2:
         if config is None or not isinstance(implementer_profile, str) or not isinstance(reviewer_profile, str):
             raise WebAPIError(400, "implementer_profile and reviewer_profile are required")
     # 3. Verify the plan artifacts shown to the human.
@@ -487,11 +520,16 @@ def approve_run(
             raw_sha256=stored["raw_sha256"],
             contract_sha256=stored["contract_sha256"],
             execution_sha256=stored.get("execution_sha256"),
+            bundle_sha256=stored.get("bundle_sha256"),
         )
         actual = compute_plan_identity_from_run(directory)
     except (KeyError, TypeError, ValueError, ApprovalError, OSError, UnicodeError) as exc:
         raise WebAPIError(409, "plan artifacts do not match run state") from exc
-    if profile_aware:
+    if v2:
+        matches = (actual.raw_sha256, actual.contract_sha256, actual.bundle_sha256) == (
+            expected.raw_sha256, expected.contract_sha256, expected.bundle_sha256,
+        )
+    elif profile_aware:
         # A selection already claimed by a concurrent request is checked by
         # ensure_execution_selection(), not here: only raw/contract matter.
         matches = (actual.raw_sha256, actual.contract_sha256) == (
@@ -502,6 +540,50 @@ def approve_run(
         matches = actual == expected
     if not matches:
         raise WebAPIError(409, "plan artifacts do not match run state")
+
+    if v2 and selected is ApprovalDecision.REJECT:
+        _publish_decision(directory, selected, expected)
+        return {"ok": True, "decision": selected.value}
+
+    if v2:
+        try:
+            bundle, _ = validate_implementation_bundle(directory)
+        except (V2PlanParseError, OSError, UnicodeError) as exc:
+            raise WebAPIError(409, "plan artifacts do not match run state") from exc
+        expected_ids = [entry["id"] for entry in bundle["steps"]]
+        if set(step_profiles) != set(expected_ids):
+            raise WebAPIError(400, "missing or unknown step profile field")
+        try:
+            requested = resolve_execution_selection_v3(
+                config,
+                planner_profile_id=state["execution"]["planner"]["profile_id"],
+                step_profile_ids={key: value for key, value in step_profiles.items()},
+                reviewer_profile_id=reviewer_profile,
+            )
+        except (ProfileError, ExecutionSelectionError) as exc:
+            raise WebAPIError(400, "selected profile is invalid") from exc
+        try:
+            ensure_execution_selection_v3(directory, requested)
+            durable, execution_sha256 = read_execution_selection_v3_with_sha256(directory)
+            validate_execution_selection_v3(config, durable)
+        except ExecutionSelectionConflict as exc:
+            raise WebAPIError(409, "a different execution selection is already recorded") from exc
+        except ExecutionSelectionError as exc:
+            raise WebAPIError(409, "execution selection is invalid") from exc
+        if durable != requested:
+            raise WebAPIError(409, "a different execution selection is already recorded")
+        identity = PlanIdentity(
+            raw_sha256=expected.raw_sha256,
+            contract_sha256=expected.contract_sha256,
+            execution_sha256=execution_sha256,
+            bundle_sha256=expected.bundle_sha256,
+        )
+        _publish_decision(directory, selected, identity)
+        store = RunStateStore(directory / "state.json")
+        if store.load().get("status") == RunStatus.AWAITING_PLAN_APPROVAL.value:
+            store.update(status=RunStatus.AWAITING_PLAN_APPROVAL,
+                         plan_identity=asdict(identity), execution=_execution_state_v3(durable))
+        return {"ok": True, "decision": selected.value}
 
     if not (selected is ApprovalDecision.APPROVE and profile_aware):
         # REJECT never executes anything; historic runs keep schema v1.
@@ -584,6 +666,14 @@ def _execution_state(selection: ExecutionSelection) -> dict[str, Any]:
             "model": selection.reviewer.model,
             "selection_mode": selection.reviewer.selection_mode,
         },
+    }
+
+
+def _execution_state_v3(selection: Any) -> dict[str, Any]:
+    return {
+        "planner": asdict(selection.planner),
+        "steps": [{"step_id": item.step_id, "implementer": asdict(item.implementer)} for item in selection.steps],
+        "reviewer": asdict(selection.reviewer),
     }
 
 

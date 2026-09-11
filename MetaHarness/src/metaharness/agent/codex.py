@@ -226,10 +226,41 @@ class CodexAgent:
 
         if not isinstance(plan, str):
             raise TypeError("plan must be a string")
+        return self._run_with_prompt(
+            build_implementer_prompt(plan), worktree, artifacts_dir,
+            base_sha=base_sha, env=env,
+        )
+
+    def run_step(
+        self,
+        step_contract: str,
+        worktree: str | Path,
+        artifacts_dir: str | Path,
+        *,
+        base_sha: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> AgentResult:
+        """Execute one fresh Codex process for one v2 step artifact directory."""
+
+        if not isinstance(step_contract, str):
+            raise TypeError("step_contract must be a string")
+        return self._run_with_prompt(
+            build_implementer_step_prompt(step_contract), worktree, artifacts_dir,
+            base_sha=base_sha, env=env,
+        )
+
+    def _run_with_prompt(
+        self,
+        prompt: str,
+        worktree: str | Path,
+        artifacts_dir: str | Path,
+        *,
+        base_sha: str | None,
+        env: dict[str, str] | None,
+    ) -> AgentResult:
         worktree_path = Path(worktree).expanduser().resolve()
         directory = Path(artifacts_dir).expanduser().resolve()
         directory.mkdir(parents=True, exist_ok=True)
-        prompt = build_implementer_prompt(plan)
         prompt_path = directory / "agent.prompt.txt"
         events_path = directory / "agent.events.jsonl"
         stderr_path = directory / "agent.stderr.log"

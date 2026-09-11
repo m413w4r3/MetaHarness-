@@ -282,6 +282,18 @@ def resolve_commit(repo: Path, ref: str) -> str:
     return commit_sha
 
 
+def resolve_tree(repo: Path, ref: str) -> str:
+    """Resolve a commit-ish to its tree object ID."""
+
+    if not isinstance(ref, str) or not ref.strip() or ref.startswith("-") or "\x00" in ref:
+        raise GitError("tree reference is invalid")
+    result = _git(repo, "rev-parse", "--verify", f"{ref}^{{tree}}")
+    tree_sha = result.stdout.strip()
+    if not tree_sha:
+        raise GitError("git did not return a tree object ID")
+    return tree_sha
+
+
 def current_head(repo: Path) -> str:
     """Return the complete commit object ID currently checked out."""
 

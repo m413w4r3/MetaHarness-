@@ -464,7 +464,56 @@ def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict
     for step in plan.steps:
         atomic_write_text(target / "steps" / f"{step.id}.contract.md", contracts[step.id])
     atomic_write_text(target / "implementation_bundle.json", json.dumps(bundle, ensure_ascii=False, indent=2) + "\n")
+    # ``task_plan.json`` is the stable v2 artifact name approved by the human.
+    # Keep the older suffixed name as a compatibility alias for existing tools.
+    atomic_write_text(
+        target / "task_plan.json",
+        json.dumps(
+            {**asdict(plan), "decision": plan.decision.value,
+             "execution_mode": plan.execution_mode.value if plan.execution_mode else None},
+            ensure_ascii=False, indent=2,
+        ) + "\n",
+    )
     return bundle
+
+
+def validate_implementation_bundle(directory: str | Path) -> tuple[dict[str, Any], str]:
+    """Validate the immutable v2 bundle and every contract hash it declares."""
+
+    target = Path(directory).expanduser().resolve()
+    bundle_path = target / "implementation_bundle.json"
+    try:
+        bundle_bytes = bundle_path.read_bytes()
+        payload = json.loads(bundle_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise V2PlanParseError("implementation bundle is missing or invalid") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise V2PlanParseError("implementation bundle schema_version is invalid")
+    steps = payload.get("steps")
+    if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_STEPS:
+        raise V2PlanParseError("implementation bundle steps are invalid")
+    expected_ids = [f"S{index:02d}" for index in range(1, len(steps) + 1)]
+    actual_ids: list[str] = []
+    for entry in steps:
+        if not isinstance(entry, dict) or set(entry) != {"id", "title", "implementer_profile", "depends_on", "contract_sha256"}:
+            raise V2PlanParseError("implementation bundle step entry is invalid")
+        step_id = entry.get("id")
+        if not isinstance(step_id, str) or step_id in actual_ids:
+            raise V2PlanParseError("implementation bundle step ID is invalid")
+        actual_ids.append(step_id)
+        declared = entry.get("contract_sha256")
+        if not isinstance(declared, str) or re.fullmatch(r"[0-9a-f]{64}", declared) is None:
+            raise V2PlanParseError("implementation bundle contract hash is invalid")
+        contract_path = target / "steps" / f"{step_id}.contract.md"
+        try:
+            actual = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise V2PlanParseError(f"missing contract for {step_id}") from exc
+        if actual != declared:
+            raise V2PlanParseError(f"contract hash mismatch for {step_id}")
+    if actual_ids != expected_ids:
+        raise V2PlanParseError("implementation bundle step IDs are not contiguous")
+    return payload, hashlib.sha256(bundle_bytes).hexdigest()
 
 
 persist_implementation_bundle = write_implementation_bundle
@@ -501,6 +550,12 @@ def persist_planning_v2_artifacts(
         )
         + "\n",
     )
+    # The unsuffixed artifact is the v2 approval surface.
+    if plan.decision is PlanDecision.BLOCKED:
+        atomic_write_text(
+            target / "task_plan.json",
+            json.dumps({**asdict(plan), "decision": plan.decision.value, "execution_mode": None}, ensure_ascii=False, indent=2) + "\n",
+        )
     if plan.decision is PlanDecision.READY:
         write_implementation_bundle(target, plan)
 
@@ -570,5 +625,5 @@ __all__ = [
     "build_planner_prompt_v2", "parse_task_plan_v2", "persist_implementation_bundle",
     "persist_planning_artifacts_v2", "persist_planning_v2_artifacts",
     "render_plan_summary_v2", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract",
-    "run_planner_v2", "write_implementation_bundle",
+    "run_planner_v2", "validate_implementation_bundle", "write_implementation_bundle",
 ]
