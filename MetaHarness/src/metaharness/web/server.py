@@ -23,6 +23,7 @@ from .api import (
     create_run,
     get_run,
     list_runs,
+    model_profiles,
     progress,
     validate_run_id,
 )
@@ -168,10 +169,16 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 nonce = secrets.token_urlsafe(18)
                 run = get_run(root, self._run_id(parts[2]))
                 # render_run embeds the token only on a page able to decide.
-                self._html(render_run(run, self.server.token, nonce=nonce), nonce)
+                self._html(
+                    render_run(run, self.server.token, config=self.server.config, nonce=nonce),
+                    nonce,
+                )
                 return
             if parsed.path == "/api/runs":
                 self._json(200, {"runs": list_runs(root)})
+                return
+            if parsed.path == "/api/model-profiles":
+                self._json(200, model_profiles(self.server.config))
                 return
             if len(parts) == 4 and parts[1:3] == ["api", "runs"]:
                 self._json(200, get_run(root, self._run_id(parts[3])))
@@ -219,13 +226,14 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             parts = self._path_parts()
             if parts == ["", "api", "runs"]:
                 payload = self._body()
-                unknown = set(payload) - {"spec", "run_id"}
+                unknown = set(payload) - {"spec", "run_id", "planner_profile"}
                 if unknown:
                     raise WebAPIError(400, "unknown request field")
                 result = create_run(
                     self.server.run_manager,
                     spec=payload.get("spec"),
                     run_id=payload.get("run_id"),
+                    planner_profile=payload.get("planner_profile"),
                 )
                 self._json(202, result)
                 return
@@ -235,10 +243,18 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             decision = payload.get("decision")
             if not isinstance(decision, str):
                 raise WebAPIError(400, "decision must be APPROVE or REJECT")
+            allowed = {"decision"} if decision == "REJECT" else {
+                "decision", "implementer_profile", "reviewer_profile"
+            }
+            if set(payload) - allowed:
+                raise WebAPIError(400, "unknown approval field")
             result = approve_run(
                 self.server.config.runs_root,
                 self._run_id(parts[3]),
                 decision,
+                config=self.server.config,
+                implementer_profile=payload.get("implementer_profile"),
+                reviewer_profile=payload.get("reviewer_profile"),
             )
             self._json(200, result)
         except WebAPIError as exc:

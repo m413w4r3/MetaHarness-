@@ -14,6 +14,7 @@ from html import escape
 from typing import Any
 
 from ..models import HarnessConfig
+from ..profiles import profiles_for_config, safe_profile_metadata
 
 
 def _e(value: Any) -> str:
@@ -133,6 +134,15 @@ def render_new_run(
     *,
     nonce: str | None = None,
 ) -> str:
+    profiles = [
+        safe_profile_metadata(profile)
+        for profile in profiles_for_config(config).values()
+        if any(role.value == "planner" for role in profile.roles)
+    ]
+    planner_options = "".join(
+        f'<option value="{_e(profile["id"])}"{" selected" if profile["id"] == config.ui.default_planner_profile else ""}>{_e(profile["display_name"])}</option>'
+        for profile in profiles
+    )
     script = f"""
 const META_TOKEN = {_json_script(token)};
 const form = document.getElementById('new-run-form');
@@ -146,7 +156,7 @@ form.addEventListener('submit', async (event) => {{
     const response = await fetch('/api/runs', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json', 'X-MetaHarness-Token': META_TOKEN }},
-      body: JSON.stringify({{ spec: document.getElementById('spec').value, run_id: document.getElementById('run-id').value || null }})
+      body: JSON.stringify({{ spec: document.getElementById('spec').value, run_id: document.getElementById('run-id').value || null, planner_profile: document.getElementById('planner-profile').value }})
     }});
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.message || 'Unable to create run.');
@@ -169,7 +179,9 @@ form.addEventListener('submit', async (event) => {{
   <label for="spec">SPEC</label><br>
   <textarea id="spec" rows="20" cols="100" required></textarea><br>
   <label for="run-id">Run ID (optional)</label><br>
-  <input id="run-id" type="text" autocomplete="off"><br><br>
+  <input id="run-id" type="text" autocomplete="off"><br>
+  <label for="planner-profile">Planner</label><br>
+  <select id="planner-profile">{planner_options}</select><br><br>
   <button id="create-run" type="submit">CREATE RUN</button>
   <span id="create-run-message" class="danger" role="status"></span>
 </form>
@@ -207,6 +219,7 @@ RUN_PAGE_DYNAMIC_IDS = (
     "approve",
     "reject",
     "approval-message",
+    "model-selection-warning",
     "base-sha",
     "branch",
     "worktree",
@@ -361,6 +374,13 @@ function updateApproval(status) {
   const disabled = !awaiting || decisionSent || META_TOKEN === null;
   byId('approve').disabled = disabled; byId('reject').disabled = disabled;
 }
+function renderSelectionWarning(run) {
+  const node = byId('model-selection-warning'); if (!node) return;
+  const execution = run && run.state && run.state.execution ? run.state.execution : {};
+  const modes = [execution.planner, execution.implementer, execution.reviewer].filter(Boolean).map(item => item.selection_mode);
+  node.hidden = !modes.includes('external-ui');
+  node.textContent = node.hidden ? '' : 'Model selection is external. MetaHarness cannot force or verify the actual model selected in the provider UI.';
+}
 function applyRun(run) {
   if (!run || typeof run !== 'object') return;
   const state = run.state && typeof run.state === 'object' ? run.state : {};
@@ -376,6 +396,7 @@ function applyRun(run) {
   if (changed('failure', run.failure)) renderFailure(run.failure);
   if (changed('status', status)) renderTimeline(status);
   updateApproval(status);
+  renderSelectionWarning(run);
   const plan = run.plan && typeof run.plan === 'object' ? run.plan : {};
   if (changed('contract', plan.contract)) setPre('plan-contract', plan.contract);
   if (changed('raw', plan.raw)) setPre('plan-raw', plan.raw);
@@ -403,7 +424,8 @@ function pollProgress() {
 function decide(decision) {
   if (META_TOKEN === null) return;
   byId('approve').disabled = true; byId('reject').disabled = true;
-  fetch('/api/runs/' + encodeURIComponent(RUN_ID) + '/approval', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MetaHarness-Token': META_TOKEN }, body: JSON.stringify({ decision }) })
+  const body = decision === 'APPROVE' ? { decision, implementer_profile: byId('implementer-profile').value, reviewer_profile: byId('reviewer-profile').value } : { decision };
+  fetch('/api/runs/' + encodeURIComponent(RUN_ID) + '/approval', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MetaHarness-Token': META_TOKEN }, body: JSON.stringify(body) })
     .then(response => response.json().then(payload => ({ ok: response.ok, payload })))
     .then(result => { if (result.ok) decisionSent = true; byId('approval-message').textContent = result.ok ? ' Décision enregistrée.' : ' ' + display(result.payload.message || 'Erreur.'); pollRun(); })
     .catch(() => { byId('approval-message').textContent = ' Erreur réseau.'; });
@@ -416,7 +438,13 @@ if (!TERMINAL_STATUSES.includes(page.dataset.status)) { statePoll = setInterval(
 STATE_POLL_MS = 2000
 
 
-def render_run(run: dict[str, Any], token: str | None = None, *, nonce: str | None = None) -> str:
+def render_run(
+    run: dict[str, Any],
+    token: str | None = None,
+    *,
+    config: HarnessConfig | None = None,
+    nonce: str | None = None,
+) -> str:
     """Render one run.
 
     The mutation token is embedded only while the run awaits plan approval:
@@ -433,6 +461,35 @@ def render_run(run: dict[str, Any], token: str | None = None, *, nonce: str | No
     disabled = "" if can_decide else " disabled"
     hidden = "" if can_decide else " hidden"
     reviewer_raw = run.get("reviewer_raw")
+    execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
+    external_selection = any(
+        isinstance(execution.get(role), dict)
+        and execution[role].get("selection_mode") == "external-ui"
+        for role in ("planner", "implementer", "reviewer")
+    )
+    warning_text = (
+        "Model selection is external. MetaHarness cannot force or verify the actual model selected in the provider UI."
+        if external_selection else ""
+    )
+    profile_metadata = {
+        role: [
+            safe_profile_metadata(profile)
+            for profile in profiles_for_config(config).values()
+            if any(item.value == role for item in profile.roles)
+        ]
+        for role in ("implementer", "reviewer")
+    } if config is not None else {"implementer": [], "reviewer": []}
+    defaults = {
+        "implementer": config.ui.default_implementer_profile if config else None,
+        "reviewer": config.ui.default_reviewer_profile if config else None,
+    }
+    def options(role: str) -> str:
+        return "".join(
+            f'<option value="{_e(item["id"])}"{" selected" if item["id"] == defaults[role] else ""}>{_e(item["display_name"])}</option>'
+            for item in profile_metadata[role]
+        )
+    implementer_options = options("implementer")
+    reviewer_options = options("reviewer")
     script = (
         f"const META_TOKEN = {_json_script(page_token)};\n"
         f"const RUN_ID = {_json_script(run_id)};\n"
@@ -447,7 +504,8 @@ def render_run(run: dict[str, Any], token: str | None = None, *, nonce: str | No
 <main id="run-page" data-run-id="{_e(run_id)}" data-status="{_e(status)}" data-updated-at="{_e(run.get('updated_at'))}">
 <p><a href="/">← Tous les runs</a></p>
 <header><h1>Run {_e(run_id)}</h1><p>Status : <strong id="run-status">{_e(status)}</strong> · <span class="muted">mis à jour <span id="run-updated">{_e(run.get('updated_at'))}</span></span></p></header>
-<div id="approval-actions"{hidden}><button id="approve" type="button"{disabled}>APPROVE PLAN</button><button id="reject" type="button"{disabled}>REJECT PLAN</button><span id="approval-message"></span></div>
+<div id="approval-actions"{hidden}><label for="implementer-profile">Implementer</label> <select id="implementer-profile">{implementer_options}</select> <label for="reviewer-profile">Reviewer</label> <select id="reviewer-profile">{reviewer_options}</select> <button id="approve" type="button"{disabled}>APPROVE PLAN</button><button id="reject" type="button"{disabled}>REJECT PLAN</button><span id="approval-message"></span></div>
+<p id="model-selection-warning" class="danger"{"" if external_selection else " hidden"}>{_e(warning_text)}</p>
 <section><h2>Header</h2><div class="grid">
   <div class="card"><strong>Base SHA</strong><br><span id="base-sha">{_e(state.get('base_sha'))}</span></div>
   <div class="card"><strong>Branch</strong><br><span id="branch">{_e(state.get('branch'))}</span></div>

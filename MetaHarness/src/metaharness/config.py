@@ -15,8 +15,12 @@ from .models import (
     ApprovalConfig,
     CheckConfig,
     ContextConfig,
+    ExecutionRole,
     HarnessConfig,
     LLMEndpointConfig,
+    ModelProfile,
+    ProfileDriver,
+    SelectionMode,
     UIConfig,
 )
 
@@ -32,6 +36,15 @@ _KNOWN_SANDBOXES = frozenset({
     "workspace-write",
     "danger-full-access",
 })
+_PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_PROFILE_ROLE_COMPATIBILITY = {
+    ProfileDriver.OPENAI_CHAT: frozenset({
+        ExecutionRole.PLANNER, ExecutionRole.REVIEWER, ExecutionRole.AUDITOR,
+    }),
+    ProfileDriver.CODEX: frozenset({
+        ExecutionRole.IMPLEMENTER, ExecutionRole.REPAIR,
+    }),
+}
 
 
 def _expand_string(value: str) -> str:
@@ -229,6 +242,141 @@ def _endpoint(data: Mapping[str, Any], name: str) -> LLMEndpointConfig:
     )
 
 
+def _profile_endpoint(profile: ModelProfile) -> LLMEndpointConfig:
+    if profile.base_url is None or profile.endpoint_path is None:
+        raise ConfigError(f"profile {profile.id!r} has no OpenAI endpoint")
+    return LLMEndpointConfig(
+        base_url=profile.base_url,
+        endpoint_path=profile.endpoint_path,
+        model=profile.model,
+        api_key_env=profile.api_key_env,
+        timeout_seconds=profile.timeout_seconds,
+        retries=profile.retries,
+        extra_body=dict(profile.extra_body),
+    )
+
+
+def _profile_agent(profile: ModelProfile) -> AgentConfig:
+    if profile.driver is not ProfileDriver.CODEX:
+        raise ConfigError(f"profile {profile.id!r} is not a Codex profile")
+    return AgentConfig(
+        model=profile.model,
+        effort=profile.effort or AgentConfig.effort,
+        sandbox=profile.sandbox or AgentConfig.sandbox,
+        timeout_seconds=profile.timeout_seconds,
+    )
+
+
+def _legacy_selection_mode(data: Mapping[str, Any], name: str) -> SelectionMode:
+    value = data.get("selection_mode", SelectionMode.REQUEST.value)
+    try:
+        mode = SelectionMode(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name}.selection_mode is invalid") from exc
+    if mode is SelectionMode.CLI:
+        raise ConfigError(f"{name}.selection_mode must be request or external-ui")
+    return mode
+
+
+def _model_profiles(
+    data: Mapping[str, Any],
+) -> tuple[dict[str, ModelProfile], bool]:
+    raw = data.get("model_profiles", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("model_profiles must be a table")
+    if not raw:
+        return {}, False
+    result: dict[str, ModelProfile] = {}
+    for profile_id, profile_data in raw.items():
+        if not isinstance(profile_id, str) or _PROFILE_ID.fullmatch(profile_id) is None:
+            raise ConfigError("model profile id is invalid")
+        if not isinstance(profile_data, dict):
+            raise ConfigError(f"model_profiles.{profile_id} must be a table")
+        where = f"model_profiles.{profile_id}"
+        display_name = _required_string(profile_data, "display_name", where)
+        roles_raw = profile_data.get("roles")
+        if isinstance(roles_raw, (str, bytes)) or not isinstance(roles_raw, (list, tuple)) or not roles_raw:
+            raise ConfigError(f"{where}.roles must be a non-empty array")
+        roles: list[ExecutionRole] = []
+        for value in roles_raw:
+            try:
+                role = ExecutionRole(value)
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"{where}.roles contains an invalid role") from exc
+            if role in roles:
+                raise ConfigError(f"{where}.roles must not contain duplicates")
+            roles.append(role)
+        try:
+            driver = ProfileDriver(profile_data.get("driver"))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{where}.driver is invalid") from exc
+        model = _required_string(profile_data, "model", where)
+        try:
+            selection_mode = SelectionMode(profile_data.get("selection_mode"))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{where}.selection_mode is invalid") from exc
+        incompatible = set(roles) - _PROFILE_ROLE_COMPATIBILITY[driver]
+        if incompatible:
+            raise ConfigError(f"{where}: driver/role mismatch")
+        if driver is ProfileDriver.OPENAI_CHAT:
+            for key in ("effort", "sandbox"):
+                if key in profile_data:
+                    raise ConfigError(f"{where}.{key} is not allowed for openai-chat")
+            if selection_mode is SelectionMode.CLI:
+                raise ConfigError(f"{where}.selection_mode must not be cli")
+            endpoint = _endpoint(profile_data, where)
+            result[profile_id] = ModelProfile(
+                id=profile_id,
+                display_name=display_name,
+                roles=tuple(roles),
+                driver=driver,
+                model=model,
+                selection_mode=selection_mode,
+                base_url=endpoint.base_url,
+                endpoint_path=endpoint.endpoint_path,
+                api_key_env=endpoint.api_key_env,
+                timeout_seconds=endpoint.timeout_seconds,
+                retries=endpoint.retries,
+                extra_body=endpoint.extra_body,
+            )
+        else:
+            for key in ("base_url", "endpoint_path", "api_key_env", "extra_body"):
+                if key in profile_data:
+                    raise ConfigError(f"{where}.{key} is not allowed for codex")
+            effort = _required_string(profile_data, "effort", where)
+            sandbox = _required_string(profile_data, "sandbox", where)
+            if sandbox not in _KNOWN_SANDBOXES:
+                raise ConfigError(f"unknown {where}.sandbox: {sandbox!r}")
+            if selection_mode is not SelectionMode.CLI:
+                raise ConfigError(f"{where}.selection_mode must be cli")
+            result[profile_id] = ModelProfile(
+                id=profile_id,
+                display_name=display_name,
+                roles=tuple(roles),
+                driver=driver,
+                model=model,
+                selection_mode=selection_mode,
+                timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
+                retries=_nonnegative_int(profile_data, "retries", 2, where),
+                effort=effort,
+                sandbox=sandbox,
+            )
+    return result, True
+
+
+def _check_default(
+    profiles: Mapping[str, ModelProfile], value: str | None, role: ExecutionRole
+) -> str:
+    if value is None:
+        raise ConfigError(f"ui.default_{role.value}_profile is required")
+    profile = profiles.get(value)
+    if profile is None:
+        raise ConfigError(f"default profile {value!r} does not exist")
+    if role not in profile.roles:
+        raise ConfigError(f"default profile {value!r} is incompatible with {role.value}")
+    return value
+
+
 def _checks(value: Any) -> tuple[CheckConfig, ...]:
     if value is None:
         return ()
@@ -299,8 +447,99 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         ),
     )
 
-    planner = _endpoint(_table(expanded, "planner"), "planner")
-    reviewer = _endpoint(_table(expanded, "reviewer"), "reviewer")
+    model_profiles, explicit_profiles = _model_profiles(expanded)
+    planner_data = _table(expanded, "planner")
+    reviewer_data = _table(expanded, "reviewer")
+    agent_data_present = "agent" in expanded
+    if explicit_profiles:
+        ui_data = _table(expanded, "ui")
+        planner_default = _check_default(
+            model_profiles,
+            ui_data.get("default_planner_profile"),
+            ExecutionRole.PLANNER,
+        )
+        implementer_default = _check_default(
+            model_profiles,
+            ui_data.get("default_implementer_profile"),
+            ExecutionRole.IMPLEMENTER,
+        )
+        reviewer_default = _check_default(
+            model_profiles,
+            ui_data.get("default_reviewer_profile"),
+            ExecutionRole.REVIEWER,
+        )
+        planner_profile = model_profiles[planner_default]
+        reviewer_profile = model_profiles[reviewer_default]
+        implementer_profile = model_profiles[implementer_default]
+        if planner_data:
+            planner = _endpoint(planner_data, "planner")
+        else:
+            planner = _profile_endpoint(planner_profile)
+        if reviewer_data:
+            reviewer = _endpoint(reviewer_data, "reviewer")
+        else:
+            reviewer = _profile_endpoint(reviewer_profile)
+        if agent_data_present:
+            # Keep accepting the P15 section while the profile is the source
+            # of truth for production execution.
+            old_agent_data = _table(expanded, "agent")
+            agent = AgentConfig(
+                model=_required_string(old_agent_data, "model", "agent"),
+                effort=_required_string(old_agent_data, "effort", "agent"),
+                sandbox=_required_string(old_agent_data, "sandbox", "agent"),
+                timeout_seconds=_positive_int(old_agent_data, "timeout_seconds", 5400, "agent"),
+                env_allowlist=_env_name_array(
+                    old_agent_data, "env_allowlist", AgentConfig.env_allowlist, "agent"
+                ),
+            )
+        else:
+            agent = _profile_agent(implementer_profile)
+    else:
+        planner = _endpoint(planner_data, "planner")
+        reviewer = _endpoint(reviewer_data, "reviewer")
+        # Synthetic profiles deliberately mirror the legacy sections without
+        # being written back to TOML.
+        model_profiles = {
+            "legacy-planner": ModelProfile(
+                id="legacy-planner",
+                display_name="Legacy Planner",
+                roles=(ExecutionRole.PLANNER,),
+                driver=ProfileDriver.OPENAI_CHAT,
+                model=planner.model,
+                selection_mode=_legacy_selection_mode(planner_data, "planner"),
+                base_url=planner.base_url,
+                endpoint_path=planner.endpoint_path,
+                api_key_env=planner.api_key_env,
+                timeout_seconds=planner.timeout_seconds,
+                retries=planner.retries,
+                extra_body=planner.extra_body,
+            ),
+            "legacy-implementer": ModelProfile(
+                id="legacy-implementer",
+                display_name="Legacy Implementer",
+                roles=(ExecutionRole.IMPLEMENTER,),
+                driver=ProfileDriver.CODEX,
+                model=agent.model,
+                selection_mode=SelectionMode.CLI,
+                effort=agent.effort,
+                sandbox=agent.sandbox,
+                timeout_seconds=agent.timeout_seconds,
+            ),
+            "legacy-reviewer": ModelProfile(
+                id="legacy-reviewer",
+                display_name="Legacy Reviewer",
+                roles=(ExecutionRole.REVIEWER,),
+                driver=ProfileDriver.OPENAI_CHAT,
+                model=reviewer.model,
+                selection_mode=_legacy_selection_mode(reviewer_data, "reviewer"),
+                base_url=reviewer.base_url,
+                endpoint_path=reviewer.endpoint_path,
+                api_key_env=reviewer.api_key_env,
+                timeout_seconds=reviewer.timeout_seconds,
+                retries=reviewer.retries,
+                extra_body=reviewer.extra_body,
+            ),
+        }
 
     context_data = _table(expanded, "context")
     context = ContextConfig(
@@ -341,7 +580,16 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             "ui",
             minimum=1,
             maximum=4,
-        )
+        ),
+        default_planner_profile=(
+            planner_default if explicit_profiles else "legacy-planner"
+        ),
+        default_implementer_profile=(
+            implementer_default if explicit_profiles else "legacy-implementer"
+        ),
+        default_reviewer_profile=(
+            reviewer_default if explicit_profiles else "legacy-reviewer"
+        ),
     )
 
     checks = _checks(expanded.get("checks", []))
@@ -368,4 +616,5 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         allow_no_required_checks=allow_no_required_checks,
         approval=approval,
         ui=ui,
+        model_profiles=model_profiles,
     )

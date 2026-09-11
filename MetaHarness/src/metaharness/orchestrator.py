@@ -46,7 +46,12 @@ from .gitops import (
     symbolic_head,
 )
 from .llm.chat import LLMError, OpenAIChatTextClient
-from .models import HarnessConfig, ReviewRoute, ReviewVerdict, RunStatus
+from .execution_selection import (
+    read_execution_selection,
+    resolve_execution_selection,
+    write_execution_selection,
+)
+from .models import ExecutionRole, HarnessConfig, ReviewRoute, ReviewVerdict, RunStatus
 from .planning import (
     PlanDecision,
     Planner,
@@ -55,6 +60,7 @@ from .planning import (
     render_implementation_contract,
 )
 from .redaction import config_secret_values, redact, redact_file
+from .profiles import build_agent_config, build_llm_endpoint, profile_for_role
 from .result import RunResult, write_repair_task
 from .review import Reviewer, ReviewParseError, ReviewResult, blocking_finding_lines, parse_review
 from .state import RunStateStore
@@ -288,19 +294,39 @@ class Orchestrator:
         if not isinstance(config, HarnessConfig):
             raise TypeError("config must be a HarnessConfig")
         self.config = config
-        self.planner = Planner(
-            planner_client if planner_client is not None else OpenAIChatTextClient(config.planner),
-            allow_format_repair=False,
-        )
-        self.reviewer = Reviewer(
-            reviewer_client if reviewer_client is not None else OpenAIChatTextClient(config.reviewer),
-            allow_format_repair=False,
-        )
-        self.agent = agent or CodexAgent(config.agent)
+        self._planner_client = planner_client
+        self._reviewer_client = reviewer_client
+        self._injected_agent = agent
         self._secrets: tuple[str, ...] = ()
 
+    def _planner_for_profile(self, profile_id: str) -> Planner:
+        profile = profile_for_role(self.config, profile_id, ExecutionRole.PLANNER)
+        client = self._planner_client
+        if client is None:
+            client = OpenAIChatTextClient(build_llm_endpoint(profile))
+        return Planner(client, allow_format_repair=False)
+
+    def _reviewer_for_profile(self, profile_id: str) -> Reviewer:
+        profile = profile_for_role(self.config, profile_id, ExecutionRole.REVIEWER)
+        client = self._reviewer_client
+        if client is None:
+            client = OpenAIChatTextClient(build_llm_endpoint(profile))
+        return Reviewer(client, allow_format_repair=False)
+
+    def _agent_for_profile(self, profile_id: str) -> CodexAgent:
+        profile = profile_for_role(self.config, profile_id, ExecutionRole.IMPLEMENTER)
+        if self._injected_agent is not None:
+            return self._injected_agent
+        return CodexAgent(
+            dataclasses.replace(
+                build_agent_config(profile),
+                env_allowlist=self.config.agent.env_allowlist,
+            )
+        )
+
     def run(
-        self, spec: str | Path, *, run_id: str | None = None
+        self, spec: str | Path, *, run_id: str | None = None,
+        planner_profile: str | None = None,
     ) -> RunResult:
         """Read one SPEC file and delegate execution to :meth:`run_text`."""
 
@@ -309,13 +335,16 @@ class Orchestrator:
             spec_content = spec_path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             raise OrchestrationError(f"could not read spec {spec_path}: {exc}") from exc
-        return self.run_text(spec_content, run_id=run_id)
+        if planner_profile is None:
+            return self.run_text(spec_content, run_id=run_id)
+        return self.run_text(spec_content, run_id=run_id, planner_profile=planner_profile)
 
     def run_text(
         self,
         spec_content: str,
         *,
         run_id: str | None = None,
+        planner_profile: str | None = None,
         on_created: Callable[[Path], None] | None = None,
     ) -> RunResult:
         """Run one in-memory SPEC and return its durable final state.
@@ -329,6 +358,11 @@ class Orchestrator:
             raise OrchestrationError("spec must be a string")
         if not spec_content.strip():
             raise OrchestrationError("spec must not be empty")
+
+        selected_planner_id = planner_profile or self.config.ui.default_planner_profile or "legacy-planner"
+        selected_planner = profile_for_role(
+            self.config, selected_planner_id, ExecutionRole.PLANNER
+        )
 
         selected_run_id = _safe_run_id(run_id) if run_id is not None else generate_run_id()
         run_dir = (self.config.runs_root / selected_run_id).expanduser().resolve()
@@ -349,6 +383,13 @@ class Orchestrator:
                 spec_path="spec.md",
                 repo=str(self.config.repo),
                 base_ref=self.config.base_ref,
+                execution={
+                    "planner": {
+                        "profile_id": selected_planner.id,
+                        "model": selected_planner.model,
+                        "selection_mode": selected_planner.selection_mode.value,
+                    }
+                },
             )
             if on_created is not None:
                 on_created(run_dir)
@@ -379,6 +420,14 @@ class Orchestrator:
         spec: str,
     ) -> RunResult:
         repo = git_root(self.config.repo)
+        planner_selection = store.load().get("execution", {}).get("planner", {})
+        planner_profile_id = planner_selection.get("profile_id")
+        if not isinstance(planner_profile_id, str):
+            raise OrchestrationError("run has no planner profile")
+        planner_profile = profile_for_role(
+            self.config, planner_profile_id, ExecutionRole.PLANNER
+        )
+        planner = self._planner_for_profile(planner_profile_id)
         if self.config.require_clean_base:
             assert_clean(repo)
         base_sha = resolve_commit(repo, self.config.base_ref)
@@ -399,13 +448,15 @@ class Orchestrator:
 
         # The planner receives the SPEC. The implementation agent receives only
         # the canonical contract rendered from the parsed READY plan.
-        plan = self.planner.plan(spec, context, artifacts_dir=run_dir)
+        plan = planner.plan(spec, context, artifacts_dir=run_dir)
         store.update(
             status=RunStatus.PLANNING,
             planner={
                 "decision": plan.decision.value,
                 "title": plan.title,
-                "model": self.config.planner.model,
+                "model": planner_profile.model,
+                "profile_id": planner_profile.id,
+                "selection_mode": planner_profile.selection_mode.value,
             },
         )
         if plan.decision is PlanDecision.BLOCKED:
@@ -431,6 +482,64 @@ class Orchestrator:
                 state = store.update(status=RunStatus.PLAN_REJECTED)
                 return RunResult(run_dir, RunStatus.PLAN_REJECTED, state)
 
+            try:
+                selection = read_execution_selection(run_dir)
+            except ValueError:
+                # P15 CLI approvals have no profile snapshot.  Keep those
+                # historic approvals readable by materializing current
+                # defaults before continuing; all P16 web approvals already
+                # contain the durable snapshot and use schema v2.
+                if approval.execution_sha256 is not None:
+                    raise
+                selection = resolve_execution_selection(
+                    self.config,
+                    planner_profile_id=planner_profile.id,
+                    implementer_profile_id=self.config.ui.default_implementer_profile or "legacy-implementer",
+                    reviewer_profile_id=self.config.ui.default_reviewer_profile or "legacy-reviewer",
+                )
+                write_execution_selection(run_dir, selection)
+            durable_identity = compute_plan_identity_from_run(run_dir)
+            if approval.raw_sha256 != durable_identity.raw_sha256 or approval.contract_sha256 != durable_identity.contract_sha256 or (approval.execution_sha256 is not None and approval.execution_sha256 != durable_identity.execution_sha256):
+                raise ApprovalError("approval does not match durable execution selection")
+        else:
+            selection = resolve_execution_selection(
+                self.config,
+                planner_profile_id=planner_profile.id,
+                implementer_profile_id=self.config.ui.default_implementer_profile or "legacy-implementer",
+                reviewer_profile_id=self.config.ui.default_reviewer_profile or "legacy-reviewer",
+            )
+            write_execution_selection(run_dir, selection)
+            durable_identity = compute_plan_identity_from_run(run_dir)
+            store.update(
+                status=RunStatus.PLANNING,
+                plan_identity=dataclasses.asdict(durable_identity),
+            )
+
+        self._last_selection = selection
+        execution_state = {
+            "planner": {
+                "profile_id": selection.planner.profile_id,
+                "model": selection.planner.model,
+                "selection_mode": selection.planner.selection_mode,
+            },
+            "implementer": {
+                "profile_id": selection.implementer.profile_id,
+                "model": selection.implementer.model,
+                "effort": selection.implementer.effort,
+                "selection_mode": selection.implementer.selection_mode,
+            },
+            "reviewer": {
+                "profile_id": selection.reviewer.profile_id,
+                "model": selection.reviewer.model,
+                "selection_mode": selection.reviewer.selection_mode,
+            },
+        }
+        store.update(
+            status=RunStatus.PLANNING,
+            execution=execution_state,
+            plan_identity=dataclasses.asdict(durable_identity),
+        )
+
         branch = f"harness/{_slug(plan.title)}/{run_id}"
         worktree_path = self.config.worktrees_root / run_id
         info = create_run_worktree(
@@ -451,15 +560,26 @@ class Orchestrator:
         ownership_before = _git_ownership(repo, info.worktree)
         store.update(status=RunStatus.IMPLEMENTING)
         implementation_contract = render_implementation_contract(plan)
+        agent = self._agent_for_profile(selection.implementer.profile_id)
+        reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
+        implementer_profile = profile_for_role(
+            self.config, selection.implementer.profile_id, ExecutionRole.IMPLEMENTER
+        )
+        agent_config = getattr(agent, "config", None)
+        if not isinstance(agent_config, type(self.config.agent)):
+            agent_config = dataclasses.replace(
+                build_agent_config(implementer_profile),
+                env_allowlist=self.config.agent.env_allowlist,
+            )
         try:
             agent_environment = build_agent_environment(
-                self.config.agent,
+                agent_config,
                 forbidden_names=(
-                    self.config.planner.api_key_env,
-                    self.config.reviewer.api_key_env,
+                    planner_profile.api_key_env,
+                    profile_for_role(self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER).api_key_env,
                 ),
             )
-            agent_result = self.agent.run(
+            agent_result = agent.run(
                 implementation_contract,
                 info.worktree,
                 run_dir,
@@ -540,7 +660,7 @@ class Orchestrator:
         store.update(status=RunStatus.REVIEWING)
         # The reviewer receives SPEC and PLAN so it can route a defect to
         # IMPLEMENTATION or REPLAN.  Diff, checks and report are review data.
-        review = self.reviewer.review(
+        review = reviewer.review(
             spec,
             plan.raw,
             context,
@@ -633,9 +753,15 @@ class Orchestrator:
                 f"Run: {run_id}",
                 f"Base: {base_sha}",
                 f"Reviewed tree: {tree_sha}",
-                f"Planner: {self.config.planner.model}",
-                f"Implementer: {self.config.agent.model} / {self.config.agent.effort}",
-                f"Reviewer: {self.config.reviewer.model}",
+                f"Planner profile: {self._last_selection.planner.profile_id}",
+                f"Planner model label: {self._last_selection.planner.model}",
+                f"Planner selection: {self._last_selection.planner.selection_mode}",
+                f"Implementer profile: {self._last_selection.implementer.profile_id}",
+                f"Implementer model: {self._last_selection.implementer.model}",
+                f"Implementer effort: {self._last_selection.implementer.effort}",
+                f"Reviewer profile: {self._last_selection.reviewer.profile_id}",
+                f"Reviewer model: {self._last_selection.reviewer.model}",
+                f"Reviewer selection: {self._last_selection.reviewer.selection_mode}",
                 "",
                 "Checks:",
                 *check_lines,

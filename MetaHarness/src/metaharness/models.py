@@ -3,7 +3,46 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+
+class ProfileDriver(StrEnum):
+    OPENAI_CHAT = "openai-chat"
+    CODEX = "codex"
+
+
+class SelectionMode(StrEnum):
+    REQUEST = "request"
+    CLI = "cli"
+    EXTERNAL_UI = "external-ui"
+
+
+class ExecutionRole(StrEnum):
+    PLANNER = "planner"
+    IMPLEMENTER = "implementer"
+    REVIEWER = "reviewer"
+    REPAIR = "repair"
+    AUDITOR = "auditor"
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    id: str
+    display_name: str
+    roles: tuple[ExecutionRole, ...]
+    driver: ProfileDriver
+    model: str
+    selection_mode: SelectionMode
+
+    base_url: str | None = None
+    endpoint_path: str | None = None
+    api_key_env: str | None = None
+    timeout_seconds: int = 300
+    retries: int = 2
+    extra_body: Mapping[str, Any] = field(default_factory=dict)
+
+    effort: str | None = None
+    sandbox: str | None = None
 
 
 class RunStatus(StrEnum):
@@ -89,6 +128,9 @@ class ApprovalConfig:
 @dataclass(frozen=True)
 class UIConfig:
     max_active_runs: int = 1
+    default_planner_profile: str | None = None
+    default_implementer_profile: str | None = None
+    default_reviewer_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,3 +158,22 @@ class HarnessConfig:
     allow_no_required_checks: bool = False
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
     ui: UIConfig = field(default_factory=UIConfig)
+    model_profiles: Mapping[str, ModelProfile] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SelectedProfile:
+    profile_id: str
+    driver: str
+    model: str
+    selection_mode: str
+    effort: str | None = None
+    sandbox: str | None = None
+
+
+@dataclass(frozen=True)
+class ExecutionSelection:
+    schema_version: int
+    planner: SelectedProfile
+    implementer: SelectedProfile
+    reviewer: SelectedProfile

@@ -33,7 +33,13 @@ class RunManager:
         self._lock = threading.Lock()
         self._active_run_ids: set[str] = set()
 
-    def start_run(self, spec: str, *, run_id: str | None = None) -> str:
+    def start_run(
+        self,
+        spec: str,
+        *,
+        run_id: str | None = None,
+        planner_profile: str | None = None,
+    ) -> str:
         try:
             selected_run_id = _safe_run_id(run_id) if run_id else generate_run_id()
         except (OrchestrationError, TypeError) as exc:
@@ -49,11 +55,13 @@ class RunManager:
         def worker() -> None:
             try:
                 orchestrator = self._orchestrator_factory(self._config)
-                orchestrator.run_text(
-                    spec,
-                    run_id=selected_run_id,
-                    on_created=lambda _run_dir: created_event.set(),
-                )
+                kwargs = {
+                    "run_id": selected_run_id,
+                    "on_created": lambda _run_dir: created_event.set(),
+                }
+                if planner_profile is not None:
+                    kwargs["planner_profile"] = planner_profile
+                orchestrator.run_text(spec, **kwargs)
             except BaseException:
                 # The orchestrator records business failures after durable
                 # initialization. Factory/thread failures must not escape the

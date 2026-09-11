@@ -29,9 +29,13 @@ def secret_values(env_names: Iterable[str | None]) -> tuple[str, ...]:
 
 
 def config_secret_values(config: HarnessConfig) -> tuple[str, ...]:
-    """Secrets referenced by the planner and reviewer endpoints."""
+    """Secrets referenced by all configured execution profiles."""
 
-    return secret_values((config.planner.api_key_env, config.reviewer.api_key_env))
+    names = [config.planner.api_key_env, config.reviewer.api_key_env]
+    names.extend(
+        profile.api_key_env for profile in config.model_profiles.values()
+    )
+    return secret_values(names)
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:

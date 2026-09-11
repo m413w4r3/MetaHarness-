@@ -14,24 +14,9 @@ poll_interval_seconds = 0.5
 
 [ui]
 max_active_runs = 1
-
-[agent]
-provider = "codex"
-model = "gpt-5.6-luna"
-effort = "high"
-sandbox = "workspace-write"
-timeout_seconds = 5400
-env_allowlist = [
-    "PATH",
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "TERM",
-    "TMPDIR",
-    "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
-    "CODEX_HOME",
-]
+default_planner_profile = "planner-chatgpt"
+default_implementer_profile = "codex-luna-high"
+default_reviewer_profile = "planner-chatgpt"
 
 [context]
 always_files = ["AGENTS.md", "CLAUDE.md", "README.md"]
@@ -52,19 +37,26 @@ max_hits = 8
 max_bytes = 160000
 require_locator_head_at_base = true
 
-[planner]
+[model_profiles."planner-chatgpt"]
+display_name = "ChatGPT UI Planner"
+roles = ["planner", "reviewer"]
+driver = "openai-chat"
+model = "chatgpt-web"
+selection_mode = "external-ui"
 base_url = "${META_PLANNER_BASE_URL}"
 endpoint_path = "${META_PLANNER_ENDPOINT}"
-model = "${META_PLANNER_MODEL}"
-timeout_seconds = 300
-retries = 2
-
-[reviewer]
-base_url = "${META_REVIEWER_BASE_URL}"
-endpoint_path = "${META_REVIEWER_ENDPOINT}"
-model = "${META_REVIEWER_MODEL}"
 timeout_seconds = 420
 retries = 2
+
+[model_profiles."codex-luna-high"]
+display_name = "Codex Luna High"
+roles = ["implementer", "repair"]
+driver = "codex"
+model = "gpt-5.6-luna"
+effort = "high"
+sandbox = "workspace-write"
+selection_mode = "cli"
+timeout_seconds = 5400
 
 [[checks]]
 name = "lint"
