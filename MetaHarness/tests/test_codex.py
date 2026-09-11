@@ -75,7 +75,7 @@ class CodexTests(unittest.TestCase):
         self.assertEqual(result.final_message, "final from codex\n")
         self.assertEqual(result.usage["total_tokens"], 7)
         prompt = (artifacts / "agent.prompt.txt").read_text()
-        self.assertIn("<AUTHORITATIVE IMPLEMENTATION PLAN>\nSTATUS: READY", prompt)
+        self.assertIn("<AUTHORITATIVE IMPLEMENTATION CONTRACT>\nSTATUS: READY", prompt)
         args = json.loads(args_capture.read_text())
         self.assertIn("--json", args)
         self.assertIn("--sandbox", args)

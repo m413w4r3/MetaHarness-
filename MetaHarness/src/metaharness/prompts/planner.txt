@@ -85,6 +85,9 @@ BLOCKED
 Use STATUS: BLOCKED only if the supplied information makes a safe implementation genuinely impossible.
 List exactly what is missing.
 
+READY is valid only when BLOCKERS is absent or explicitly NONE/N/A.
+BLOCKED requires real, non-placeholder BLOCKERS.
+
 OUTPUT FORMAT
 
 Prefer this compact shape:

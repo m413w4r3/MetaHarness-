@@ -132,6 +132,19 @@ class PlannerControlTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanParseError, "tests"):
             parse_task_plan(plan_with("STATUS: READY", BODY.replace("Export one report.", "N/A")))
 
+    def test_ready_with_real_blockers_fails(self) -> None:
+        with self.assertRaisesRegex(PlanParseError, "BLOCKERS"):
+            parse_task_plan(plan_with("STATUS: READY", BODY + "\nBLOCKERS: still undecided\n"))
+
+    def test_ready_with_none_blockers_passes(self) -> None:
+        for blockers in ("BLOCKERS: NONE", "BLOCKERS: N/A"):
+            with self.subTest(blockers=blockers):
+                self.assertEqual(
+                    parse_task_plan(plan_with("STATUS: READY", BODY + "\n" + blockers)).decision,
+                    PlanDecision.READY,
+                )
+        self.assertEqual(parse_task_plan(plan_with("STATUS: READY")).decision, PlanDecision.READY)
+
     def test_blocked_requires_real_blockers(self) -> None:
         for blockers in ("", "BLOCKERS: NONE", "BLOCKERS:\n- n/a"):
             with self.subTest(blockers=blockers):
@@ -244,18 +257,49 @@ class ReviewerControlTests(unittest.TestCase):
         with self.assertRaises(ReviewParseError):
             parse_review(PASS.replace("SUMMARY: ok", "SUMMARY: ok\n- MAJOR | hidden in summary"))
 
-    def test_pass_with_non_blocking_prose_is_accepted(self) -> None:
+    def test_pass_with_freeform_finding_fails(self) -> None:
         for finding in (
             "FINDINGS: No MAJOR or BLOCKER findings.",
+            "FINDINGS: There is a correctness problem that could lose state.",
             "FINDINGS:\n- MINOR | naming | could be clearer",
             "FINDINGS:\n- MAJOR: none\n- BLOCKER: none found",
             "FINDINGS: A major refactor was avoided.",
         ):
             with self.subTest(finding=finding):
-                self.assertEqual(
-                    parse_review(PASS.replace("FINDINGS: NONE", finding)).verdict,
-                    ReviewVerdict.PASS,
+                with self.assertRaises(ReviewParseError):
+                    parse_review(PASS.replace("FINDINGS: NONE", finding))
+
+    def test_pass_with_missing_tests_fails(self) -> None:
+        with self.assertRaises(ReviewParseError):
+            parse_review(
+                PASS.replace(
+                    "MISSING TESTS: NONE", "MISSING TESTS: Retry after partial persistence."
                 )
+            )
+
+    def test_pass_with_unknown_finding_severity_fails(self) -> None:
+        with self.assertRaises(ReviewParseError):
+            parse_review(
+                PASS.replace(
+                    "FINDINGS: NONE",
+                    "FINDINGS: - MAYBE IMPORTANT | persistence | state could be stale | investigate",
+                )
+            )
+
+    def test_pass_with_minor_finding_passes(self) -> None:
+        result = parse_review(
+            PASS.replace(
+                "FINDINGS: NONE",
+                "FINDINGS: MINOR | naming | variable name is unclear | optional rename",
+            )
+        )
+        self.assertEqual(result.verdict, ReviewVerdict.PASS)
+
+    def test_pass_with_nit_finding_passes(self) -> None:
+        result = parse_review(
+            PASS.replace("FINDINGS: NONE", "FINDINGS: NIT | style | comment wording | optional cleanup")
+        )
+        self.assertEqual(result.verdict, ReviewVerdict.PASS)
         fenced = PASS.replace("FINDINGS: NONE", "FINDINGS: NONE\n```\n- MAJOR | quoted log line\n```")
         self.assertEqual(parse_review(fenced).verdict, ReviewVerdict.PASS)
 

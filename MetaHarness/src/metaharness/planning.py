@@ -200,6 +200,8 @@ def parse_task_plan(raw: str) -> TaskPlan:
             raise PlanParseError(
                 "READY plan is missing required section(s): " + ", ".join(missing)
             )
+        if not _placeholder(values["blockers"]):
+            raise PlanParseError("READY plan cannot contain real BLOCKERS")
 
     return TaskPlan(
         decision=decision,
@@ -214,6 +216,33 @@ def parse_task_plan(raw: str) -> TaskPlan:
         blockers=values["blockers"],
         raw=raw,
     )
+
+
+def render_implementation_contract(plan: TaskPlan) -> str:
+    """Render the canonical implementer contract from a parsed READY plan."""
+
+    if not isinstance(plan, TaskPlan):
+        raise TypeError("plan must be a TaskPlan")
+    if plan.decision is not PlanDecision.READY:
+        raise PlanParseError("implementation contract requires a READY plan")
+
+    def optional(value: str) -> str:
+        return value if value.strip() else "NONE"
+
+    return "\n\n".join(
+        (
+            "META IMPLEMENTATION CONTRACT v1",
+            f"TITLE\n{plan.title}",
+            f"OBJECTIVE\n{plan.objective}",
+            f"CONSTRAINTS\n{optional(plan.constraints)}",
+            f"FILES\n{optional(plan.files)}",
+            f"IMPLEMENTATION\n{plan.implementation}",
+            f"ACCEPTANCE\n{plan.acceptance}",
+            f"TESTS\n{plan.tests}",
+            f"RISKS\n{optional(plan.risks)}",
+            "END META IMPLEMENTATION CONTRACT",
+        )
+    ) + "\n"
 
 
 def _completion_text(result: TextLLMResult | str) -> str:
@@ -308,6 +337,10 @@ def persist_planning_artifacts(
     _atomic_write_text(target / "context.txt", context)
     _atomic_write_text(target / "planner.request.txt", request)
     _atomic_write_text(target / "planner.raw.md", plan.raw)
+    if plan.decision is PlanDecision.READY:
+        _atomic_write_text(
+            target / "implementation_contract.md", render_implementation_contract(plan)
+        )
     normalized: dict[str, Any] = asdict(plan)
     normalized["decision"] = plan.decision.value
     _atomic_write_text(
@@ -412,5 +445,6 @@ __all__ = [
     "parse_task_plan",
     "parse_plan",
     "persist_planning_artifacts",
+    "render_implementation_contract",
     "run_planner",
 ]

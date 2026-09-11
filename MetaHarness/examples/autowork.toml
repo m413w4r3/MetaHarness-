@@ -6,6 +6,7 @@ worktrees_root = "../MetaHarness-worktrees"
 
 require_clean_base = true
 max_diff_bytes = 400000
+allow_no_required_checks = false
 
 [agent]
 provider = "codex"

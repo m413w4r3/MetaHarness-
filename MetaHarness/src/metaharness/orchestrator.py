@@ -33,7 +33,13 @@ from .gitops import (
 )
 from .llm.chat import LLMError, OpenAIChatTextClient
 from .models import HarnessConfig, ReviewRoute, ReviewVerdict, RunStatus
-from .planning import PlanDecision, Planner, PlanParseError, TaskPlan
+from .planning import (
+    PlanDecision,
+    Planner,
+    PlanParseError,
+    TaskPlan,
+    render_implementation_contract,
+)
 from .redaction import config_secret_values, redact, redact_file
 from .result import RunResult, write_repair_task
 from .review import Reviewer, ReviewParseError, ReviewResult, blocking_finding_lines, parse_review
@@ -345,8 +351,8 @@ class Orchestrator:
             },
         )
 
-        # The planner receives the SPEC; the implementation agent below only
-        # receives the planner's raw plan.
+        # The planner receives the SPEC. The implementation agent receives only
+        # the canonical contract rendered from the parsed READY plan.
         plan = self.planner.plan(spec, context, artifacts_dir=run_dir)
         store.update(
             status=RunStatus.PLANNING,
@@ -382,9 +388,10 @@ class Orchestrator:
 
         ownership_before = _git_ownership(repo, info.worktree)
         store.update(status=RunStatus.IMPLEMENTING)
+        implementation_contract = render_implementation_contract(plan)
         try:
             agent_result = self.agent.run(
-                plan.raw,
+                implementation_contract,
                 info.worktree,
                 run_dir,
                 base_sha=base_sha,

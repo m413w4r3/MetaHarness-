@@ -10,16 +10,18 @@ repair loop, or behavior mock in V0.
 | Layer | Meaning | Authority |
 | --- | --- | --- |
 | Human SPEC | Product intent and acceptance target | Human request |
-| Planner raw plan | Concrete implementation contract | Implementation authority |
-| Parsed plan | Machine control metadata (READY/BLOCKED and fields) | Harness control only |
+| Planner raw plan | Forensic planner response and decision record | Planner |
+| Parsed plan | Machine control metadata and source for the canonical contract | Harness control/rendering |
+| Implementation contract | Canonical executor input rendered from the parsed READY plan | Planner decisions, mechanically rendered |
 | Codex | Executor of the plan in an isolated worktree | Cannot change the plan or commit |
 | Deterministic gates | Checks, diff, HEAD, and mutation evidence | Mechanical evidence |
 | Reviewer | Semantic critic of SPEC, PLAN, diff, and evidence | PASS/REVISE/FAIL decision |
 | Git tree SHA | Identity of the reviewed staged code | Commit boundary |
 
-The raw plan is preserved as an artifact and is the exact text sent to the
-implementer. The parsed plan is used for routing and metadata; it is not a
-second implementation specification.
+The raw plan is preserved as a forensic artifact and remains the planner's
+decision record. The parsed READY plan is rendered into one canonical
+implementation contract for the implementer; the raw plan, SPEC, and planner
+preamble/postamble are not sent to that agent.
 
 ## Run flow
 
@@ -28,7 +30,8 @@ second implementation specification.
    paths and ranges are validated, then the source is read from Git at the
    base SHA. Applicable nested `AGENTS.md`/`CLAUDE.md` files are loaded.
 3. Ask the planner for one labeled text plan. A BLOCKED plan stops the run.
-4. Create one worktree at the resolved base SHA and give Codex the plan only.
+4. Render `implementation_contract.md` from the parsed READY plan, create one
+   worktree at the resolved base SHA, and give Codex that contract only.
    After Codex exits, any commit, branch switch, branch creation/deletion or
    worktree creation/removal fails the run (`AGENT_COMMITTED` or
    `AGENT_GIT_VIOLATION`); the worktree is preserved, never reset.
@@ -60,13 +63,14 @@ presentation (headings, bold labels, bracket/colon markers, one whole-answer
 fence) but strict on control values: `STATUS`, `VERDICT` and `ROUTE` lines
 must be exactly one known token, content of code fences is never metadata,
 and duplicated or contradictory control values fail closed. A `PASS` also
-requires `ROUTE: NONE`, an explicit empty `REQUIRED FIXES`, and no
-severity-tagged MAJOR/BLOCKER record anywhere outside code fences.
+requires `ROUTE: NONE`, a passed deterministic gate, explicit empty
+`REQUIRED FIXES` and `MISSING TESTS`, and FINDINGS consisting only of
+`NONE` or structured `MINOR`/`NIT` records. No unrecognized finding text or
+blocking severity can authorize a commit.
 
-The implementer does not receive the original SPEC. This makes the planner's
-raw plan the implementation authority, prevents an executor from silently
-reinterpreting product intent, and keeps the planning/execution boundary
-testable. The reviewer receives both SPEC and PLAN so it can independently
+The implementer does not receive the original SPEC or the planner's raw
+response. This makes the parsed canonical contract the execution boundary,
+while preserving the raw response for forensics. The reviewer receives both SPEC and PLAN so it can independently
 check that the plan preserved the product intent and that the diff followed
 the plan. It also receives the mechanical evidence, so semantic approval
 cannot replace deterministic checks.

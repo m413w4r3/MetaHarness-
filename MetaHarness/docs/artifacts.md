@@ -10,7 +10,8 @@ interrupted worktrees are intentionally retained for inspection.
 | `planner.request.txt` | Exact planner user message (written before the call) |
 | `planner.raw.md` | Exact raw planner response (written before parsing) |
 | `task_plan.json` | Parsed plan metadata and preserved raw plan |
-| `agent.prompt.txt` | Plan-only implementer prompt |
+| `implementation_contract.md` | Canonical contract rendered from the parsed READY plan |
+| `agent.prompt.txt` | Canonical-contract implementer prompt |
 | `agent.events.jsonl` | Complete Codex stdout (JSONL events, parsed with bounded memory) |
 | `agent.final.md` / `agent.result.json` | Implementer report and protocol metadata |
 | `diff.patch` | Complete staged binary-capable diff |

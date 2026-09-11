@@ -89,3 +89,4 @@ class HarnessConfig:
     agent: AgentConfig
     checks: tuple[CheckConfig, ...]
     max_diff_bytes: int = 400_000
+    allow_no_required_checks: bool = False

@@ -81,8 +81,14 @@ Write one finding per line, starting with its severity:
 - NIT | area | evidence | suggestion
 Write NONE when there is no finding.
 
-PASS is only valid with ROUTE: NONE, no BLOCKER or MAJOR finding, and
-REQUIRED FIXES: NONE. Any required change means REVISE.
+PASS is only valid when deterministic evidence passed, ROUTE is NONE,
+REQUIRED FIXES is explicitly empty/NONE/N/A, MISSING TESTS is explicitly
+empty/NONE/N/A, and FINDINGS is exactly NONE or one structured record per line
+using MINOR or NIT only:
+MINOR | area | evidence | suggestion
+NIT | area | evidence | suggestion
+Freeform findings and unknown, HIGH, CRITICAL, MAJOR, or BLOCKER severities
+must never be used under PASS. Any required change means REVISE.
 The VERDICT and ROUTE lines must contain exactly one value each.
 
 Prefer compact, concrete findings over long general commentary.

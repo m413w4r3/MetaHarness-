@@ -4,7 +4,7 @@ A senior planning model has already decided WHAT must be built and HOW the impor
 
 Your job is to implement that plan faithfully in the current Git worktree.
 
-The PLAN below is the implementation contract.
+The canonical implementation contract below is the implementation contract.
 Do not reinterpret the original product request; it is intentionally not provided to you.
 
 HARNESS RULES OVERRIDE THE PLAN IF THEY CONFLICT:
@@ -52,8 +52,8 @@ The outer harness will run mandatory checks independently.
 
 Your final message does not determine success.
 
-<AUTHORITATIVE IMPLEMENTATION PLAN>
+<AUTHORITATIVE IMPLEMENTATION CONTRACT>
 {{PLAN}}
-</AUTHORITATIVE IMPLEMENTATION PLAN>
+</AUTHORITATIVE IMPLEMENTATION CONTRACT>
 
 Implement the plan now.

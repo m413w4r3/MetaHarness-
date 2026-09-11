@@ -265,6 +265,15 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         ),
     )
 
+    checks = _checks(expanded.get("checks", []))
+    allow_no_required_checks = _bool(
+        expanded, "allow_no_required_checks", False, "root"
+    )
+    if not allow_no_required_checks and not any(check.required for check in checks):
+        raise ConfigError(
+            "at least one required check is configured; set allow_no_required_checks = true for docs-only projects"
+        )
+
     return HarnessConfig(
         repo=repo,
         base_ref=base_ref,
@@ -275,6 +284,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         reviewer=reviewer,
         context=context,
         agent=agent,
-        checks=_checks(expanded.get("checks", [])),
+        checks=checks,
         max_diff_bytes=max_diff_bytes,
+        allow_no_required_checks=allow_no_required_checks,
     )

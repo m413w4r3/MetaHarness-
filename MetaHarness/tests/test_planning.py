@@ -12,6 +12,7 @@ from metaharness.planning import (  # noqa: E402
     Planner,
     build_planner_prompt,
     parse_task_plan,
+    render_implementation_contract,
 )
 
 
@@ -165,6 +166,52 @@ TESTS: x
             self.assertEqual(normalized["decision"], "READY")
             self.assertEqual(normalized["raw"], READY)
             self.assertEqual(plan.raw, normalized["raw"])
+            contract = (directory / "implementation_contract.md").read_text()
+            self.assertIn("META IMPLEMENTATION CONTRACT v1", contract)
+            self.assertNotIn("Introductory text from the planner.", contract)
+            self.assertNotIn("END META PLAN", contract)
+            self.assertNotIn("BLOCKERS", contract)
+            self.assertNotIn("spec\n", contract)
+
+    def test_implementation_contract_rejects_blocked_plan(self):
+        plan = parse_task_plan("STATUS: BLOCKED\nBLOCKERS: missing input\n")
+        with self.assertRaises(PlanParseError):
+            render_implementation_contract(plan)
+
+    def test_implementation_contract_contains_only_parsed_sections(self):
+        plan = parse_task_plan(READY)
+        contract = render_implementation_contract(plan)
+        self.assertEqual(
+            contract,
+            """META IMPLEMENTATION CONTRACT v1
+
+TITLE
+Planner task
+
+OBJECTIVE
+Implement the requested behavior.
+
+CONSTRAINTS
+Keep the existing public API.
+
+FILES
+src/metaharness/planning.py; tests/test_planning.py
+
+IMPLEMENTATION
+Add the parser and planner orchestration.
+
+ACCEPTANCE
+The normalized plan is complete.
+
+TESTS
+Verify valid and invalid planner responses.
+
+RISKS
+Ambiguous labels must be rejected.
+
+END META IMPLEMENTATION CONTRACT
+""",
+        )
 
 
 if __name__ == "__main__":

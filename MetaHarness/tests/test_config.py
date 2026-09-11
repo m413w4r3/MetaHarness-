@@ -178,6 +178,28 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, message):
                     load_config(self.write_config(Path(directory_name), contents))
 
+    def test_config_requires_one_required_check_by_default(self) -> None:
+        cases = (
+            (VALID_CONFIG.replace("\n[[checks]]\nname = \"test\"\nargv = [\"make\", \"test\"]\n", "\n"), "required check"),
+            (VALID_CONFIG.replace('name = "test"', 'name = "optional"').replace("\n[[checks]]", "\n[[checks]]\nrequired = false"), "required check"),
+        )
+        for contents, message in cases:
+            with self.subTest(contents=contents):
+                with tempfile.TemporaryDirectory() as directory_name:
+                    with self.assertRaisesRegex(ConfigError, message):
+                        load_config(self.write_config(Path(directory_name), contents))
+
+        for checks in ("", "\n[[checks]]\nname = \"optional\"\nargv = [\"make\", \"test\"]\nrequired = false\n"):
+            contents = (
+                VALID_CONFIG.replace(
+                    '\n[[checks]]\nname = "test"\nargv = ["make", "test"]\n', checks
+                )
+                .replace("max_diff_bytes = 400000\n", "max_diff_bytes = 400000\nallow_no_required_checks = true\n")
+            )
+            with tempfile.TemporaryDirectory() as directory_name:
+                config = load_config(self.write_config(Path(directory_name), contents))
+            self.assertTrue(config.allow_no_required_checks)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,7 @@ _KNOWN_ROUTES = frozenset(item.value for item in ReviewRoute)
 _EMPTY_VALUES = frozenset({"", "none", "n/a", "na", "-", "—", "nil"})
 _END_MARKER = "end meta review"
 _CONTROL_FIELDS = frozenset({"verdict", "route"})
+_PASS_FINDING_SEVERITIES = frozenset({"MINOR", "NIT"})
 
 
 def _prompt_template_path() -> Path:
@@ -164,12 +165,12 @@ _BLOCKING_TAGS = (
         re.IGNORECASE,
     ),
     # "[MAJOR]", "(BLOCKER)"
-    re.compile(r"[\[(]\s*(?:major|blocker|critical)\s*[\])]", re.IGNORECASE),
+    re.compile(r"[\[(]\s*(?:major|blocker|critical|high)\s*[\])]", re.IGNORECASE),
     # "**MAJOR**", "__BLOCKER:__"
-    re.compile(r"(\*\*|__)\s*(?:major|blocker|critical)\s*:?\s*\1", re.IGNORECASE),
+    re.compile(r"(\*\*|__)\s*(?:major|blocker|critical|high)\s*:?\s*\1", re.IGNORECASE),
     # "MAJOR | area | ...", "BLOCKER: ...", "MAJOR — ...", bare "MAJOR"
     re.compile(
-        r"^[*_`]*(?:major|blocker|critical)[*_`]*(?=\s*(?:[|:\-–—]|$))",
+        r"^[*_`]*(?:major|blocker|critical|high)[*_`]*(?=\s*(?:[|:\-–—]|$))",
         re.IGNORECASE,
     ),
 )
@@ -234,6 +235,48 @@ def _is_explicitly_empty(value: str) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class ParsedFinding:
+    severity: str
+    raw: str
+
+
+def _finding_candidate(line: str) -> str:
+    candidate = line.strip()
+    candidate = re.sub(r"^(?:>\s*)?(?:[-*+]\s+|\d+[.)]\s+)+", "", candidate)
+    if candidate.startswith("|") and candidate.endswith("|"):
+        candidate = candidate[1:-1].strip()
+    return candidate
+
+
+def parse_finding_records(value: str) -> tuple[ParsedFinding, ...]:
+    """Parse the strict finding grammar used by a reviewer PASS."""
+
+    if not isinstance(value, str):
+        raise TypeError("findings must be a string")
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    if len(lines) == 1 and _finding_candidate(lines[0]).strip("`*_ ").rstrip(".").casefold() == "none":
+        return ()
+    if not lines:
+        raise ReviewParseError("PASS requires FINDINGS: NONE or structured records")
+
+    parsed: list[ParsedFinding] = []
+    for original in lines:
+        candidate = _finding_candidate(original)
+        parts = [part.strip() for part in candidate.split("|")]
+        if len(parts) != 4 or any(not part for part in parts):
+            raise ReviewParseError(
+                "PASS FINDINGS must contain only structured severity | area | evidence | suggestion records"
+            )
+        severity = parts[0].strip("`*_ ").upper()
+        if severity not in _PASS_FINDING_SEVERITIES:
+            raise ReviewParseError(
+                f"PASS FINDINGS contains unknown or forbidden severity: {parts[0]}"
+            )
+        parsed.append(ParsedFinding(severity=severity, raw=original))
+    return tuple(parsed)
+
+
 def parse_review(raw: str, *, deterministic_passed: bool = True) -> ReviewResult:
     """Parse a reviewer document and enforce verdict/route coherence.
 
@@ -273,10 +316,17 @@ def parse_review(raw: str, *, deterministic_passed: bool = True) -> ReviewResult
             raise ReviewParseError("PASS requires ROUTE: NONE")
         if blocking_finding_lines(raw):
             raise ReviewParseError("PASS cannot contain a structured MAJOR or BLOCKER finding")
+        if "findings" not in document.fields and "findings" not in document.sections:
+            raise ReviewParseError("PASS requires an explicit FINDINGS: NONE or structured records")
+        parse_finding_records(values["findings"])
         if "required_fixes" not in document.fields and "required_fixes" not in document.sections:
             raise ReviewParseError("PASS requires an explicit REQUIRED FIXES: NONE")
         if not _is_explicitly_empty(values["required_fixes"]):
             raise ReviewParseError("PASS requires empty or explicitly NONE/N/A REQUIRED FIXES")
+        if "missing_tests" not in document.fields and "missing_tests" not in document.sections:
+            raise ReviewParseError("PASS requires an explicit MISSING TESTS: NONE")
+        if not _is_explicitly_empty(values["missing_tests"]):
+            raise ReviewParseError("PASS requires empty or explicitly NONE/N/A MISSING TESTS")
     elif verdict is ReviewVerdict.REVISE:
         if route is ReviewRoute.NONE:
             raise ReviewParseError("REVISE requires a non-NONE ROUTE")
@@ -505,6 +555,8 @@ __all__ = [
     "build_repair_prompt",
     "build_review_repair_prompt",
     "build_reviewer_prompt",
+    "ParsedFinding",
+    "parse_finding_records",
     "parse_review",
     "parse_review_result",
     "persist_review_artifacts",
