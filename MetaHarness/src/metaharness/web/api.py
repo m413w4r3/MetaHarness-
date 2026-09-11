@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -48,6 +49,13 @@ ARTIFACT_ALLOWLIST = frozenset(
         "reviewer.raw.md",
         "execution_selection.json",
         "repair_task.md",
+        "agent.result.json",
+        "agent.final.md",
+        "agent.stderr.log",
+        "changed-files.txt",
+        "diff.patch",
+        "plan_approval.json",
+        "setup/results.json",
     }
 )
 # Window of complete JSONL lines returned by one progress request.
@@ -60,6 +68,9 @@ PROGRESS_MAX_SKIP_BYTES = 8 * 1024 * 1024
 _PROGRESS_SCAN_CHUNK_BYTES = 64 * 1024
 OVERSIZED_EVENT = "[oversized Codex event omitted]"
 MAX_SPEC_BYTES = 48 * 1024
+MAX_DIAGNOSTIC_TAIL_BYTES = 32 * 1024
+MAX_DIFF_BYTES = 64 * 1024
+MAX_RESULT_BYTES = 128 * 1024
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
@@ -110,8 +121,10 @@ def validate_run_id(value: str) -> str:
     return decoded
 
 
-def _load_json(path: Path) -> Any:
+def _load_json(path: Path, *, max_bytes: int | None = None) -> Any:
     try:
+        if max_bytes is not None and path.stat().st_size > max_bytes:
+            return None
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
         return None
@@ -120,6 +133,35 @@ def _load_json(path: Path) -> Any:
 def _load_text(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeError):
+        return None
+
+
+def _tail_text(path: Path, max_bytes: int) -> str | None:
+    """Read only a bounded UTF-8 tail from an allowlisted artifact."""
+
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - max_bytes))
+            return stream.read(max_bytes).decode("utf-8", errors="replace")
+    except (FileNotFoundError, OSError, UnicodeError):
+        return None
+
+
+def _bounded_changed_files(path: Path) -> list[str]:
+    content = _load_text_bounded(path, MAX_DIFF_BYTES)
+    if content is None:
+        return []
+    return [line for line in content.splitlines() if line][:4096]
+
+
+def _load_text_bounded(path: Path, max_bytes: int) -> str | None:
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(max_bytes)
+        return data.decode("utf-8", errors="replace")
     except (FileNotFoundError, OSError, UnicodeError):
         return None
 
@@ -212,9 +254,55 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
     spec = _load_text(_artifact_path(directory, "spec.md"))
     contract = _load_text(_artifact_path(directory, "implementation_contract.md"))
     reviewer_raw = _load_text(_artifact_path(directory, "reviewer.raw.md"))
-    # This shape is polled by the run page every STATE_POLL_MS: status,
-    # updated_at, state.{base_sha,branch,worktree,commit_sha,failure}, plan,
-    # checks, review and reviewer_raw(_available) must stay stable.
+    approval_payload = _load_json(_artifact_path(directory, "plan_approval.json"))
+    approval_decision = (
+        approval_payload.get("decision")
+        if isinstance(approval_payload, dict)
+        and approval_payload.get("decision") in {ApprovalDecision.APPROVE.value, ApprovalDecision.REJECT.value}
+        else None
+    )
+    agent_result = _load_json(
+        _artifact_path(directory, "agent.result.json"), max_bytes=MAX_RESULT_BYTES
+    )
+    if not isinstance(agent_result, dict):
+        agent_result = {}
+    raw_usage = agent_result.get("usage")
+    safe_usage = (
+        {
+            key: value
+            for key, value in raw_usage.items()
+            if key in {"input_tokens", "output_tokens", "total_tokens"}
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+        }
+        if isinstance(raw_usage, dict)
+        else {}
+    )
+    safe_result = {
+        key: agent_result[key]
+        for key in ("exit_code", "timed_out", "usage")
+        if key in agent_result
+    }
+    safe_result["usage"] = safe_usage
+    agent_diagnostics = {
+        "result": safe_result,
+        "final_tail": _tail_text(
+            _artifact_path(directory, "agent.final.md"), MAX_DIAGNOSTIC_TAIL_BYTES
+        ),
+        "stderr_tail": _tail_text(
+            _artifact_path(directory, "agent.stderr.log"), MAX_DIAGNOSTIC_TAIL_BYTES
+        ),
+        "usage": safe_usage,
+    }
+    workspace_setup = _load_json(_artifact_path(directory, "setup/results.json"))
+    if not isinstance(workspace_setup, list):
+        workspace_setup = state.get("workspace_setup", [])
+    changed_files = _bounded_changed_files(
+        _artifact_path(directory, "changed-files.txt")
+    )
+    diff_tail = _tail_text(_artifact_path(directory, "diff.patch"), MAX_DIFF_BYTES)
+    # Keep this shape stable for both the JSON API and the server-rendered run
+    # page; all newly exposed artifact data below is bounded or allowlisted.
     return {
         **_state_summary(safe_id, state),
         "state": state,
@@ -239,6 +327,11 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
         ),
         "repair_task": _load_text(_artifact_path(directory, "repair_task.md")),
         "failure": state.get("failure"),
+        "approval": {"recorded": approval_decision is not None, "decision": approval_decision},
+        "agent_diagnostics": agent_diagnostics,
+        "progress_tail": progress_tail(runs_root, safe_id, max_events=50),
+        "candidate": {"changed_files": changed_files, "diff_tail": diff_tail},
+        "workspace_setup": workspace_setup,
     }
 
 
@@ -327,6 +420,38 @@ def progress(runs_root: Path, run_id: str, offset: int) -> dict[str, Any]:
         return {"next_offset": 0, "events": []}
     except OSError as exc:
         raise WebAPIError(503, "progress is temporarily unavailable") from exc
+
+
+def progress_tail(runs_root: Path, run_id: str, max_events: int = 50) -> list[str]:
+    """Return at most the latest human-readable progress events.
+
+    The existing bounded JSONL reader is deliberately reused so a malformed
+    or very large event never turns the HTML/API read into an unbounded load.
+    """
+
+    if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events < 0:
+        raise WebAPIError(400, "max_events must be a non-negative integer")
+    if max_events == 0:
+        return []
+    directory = _run_dir(runs_root, run_id)
+    path = _artifact_path(directory, "agent.events.jsonl")
+    events: deque[str] = deque(maxlen=max_events)
+    offset = 0
+    try:
+        with path.open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            while offset < size:
+                payload = _read_progress(stream, offset)
+                next_offset = int(payload["next_offset"])
+                if next_offset <= offset:
+                    break
+                events.extend(str(item) for item in payload.get("events", []))
+                offset = next_offset
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise WebAPIError(503, "progress is temporarily unavailable") from exc
+    return list(events)
 
 
 def approve_run(
@@ -523,6 +648,8 @@ def create_run(
 __all__ = [
     "ARTIFACT_ALLOWLIST",
     "MAX_SPEC_BYTES",
+    "MAX_DIAGNOSTIC_TAIL_BYTES",
+    "MAX_DIFF_BYTES",
     "OVERSIZED_EVENT",
     "PROGRESS_MAX_BYTES",
     "PROGRESS_MAX_EVENT_BYTES",
@@ -534,6 +661,7 @@ __all__ = [
     "get_run",
     "list_runs",
     "progress",
+    "progress_tail",
     "validate_run_id",
     "validate_spec",
 ]

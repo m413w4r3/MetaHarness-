@@ -206,21 +206,9 @@ class WebServerTests(unittest.TestCase):
         store.update(status="implementing")
 
         page = self.get_html("/runs/live")
-        self.assertIn('id="run-page"', page)
-        self.assertIn('data-run-id="live"', page)
-        self.assertIn('data-status="implementing"', page)
-        self.assertIn("data-updated-at=", page)
-        script = page[page.index("<script"):page.index("</script>")]
-        for element_id in RUN_PAGE_DYNAMIC_IDS:
-            with self.subTest(element_id=element_id):
-                self.assertIn(f'id="{element_id}"', page)
-                self.assertIn(f"'{element_id}'", script)
-        self.assertIn("fetch('/api/runs/' + encodeURIComponent(RUN_ID), ", script)
-        self.assertIn("setInterval(pollRun, STATE_POLL_MS)", script)
-        self.assertIn("setInterval(pollProgress, 1000)", script)
-        self.assertIn(f"const STATE_POLL_MS = {STATE_POLL_MS};", script)
-        self.assertTrue(1000 <= STATE_POLL_MS <= 2000)
-        self.assertNotIn("innerHTML", page)
+        self.assertIn("Run <span class=\"mono\">live</span>", page)
+        self.assertIn('meta http-equiv="refresh" content="2"', page)
+        self.assertNotIn("<script", page)
 
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assertEqual(status, 200)
@@ -266,18 +254,16 @@ class WebServerTests(unittest.TestCase):
     def test_approval_controls_follow_status(self) -> None:
         self.create_run("before", "planning")
         page = self.get_html("/runs/before")
-        self.assertIn('<div id="approval-actions" hidden>', page)
-        self.assertIn('<button id="approve" type="button" disabled>', page)
-        self.assertIn("const META_TOKEN = null;", page)
-        # A page rendered before the gate reloads itself once to obtain
-        # the controls when polling observes awaiting_plan_approval.
-        self.assertIn("window.location.reload()", page)
+        self.assertNotIn('action="/runs/before/approval"', page)
+        self.assertIn('content="2"', page)
+        self.assertNotIn(self.server.token, page)
 
         self.create_run("gate", "awaiting_plan_approval")
         page = self.get_html("/runs/gate")
-        self.assertIn('<div id="approval-actions">', page)
-        self.assertIn('<button id="approve" type="button">', page)
-        self.assertIn('<button id="reject" type="button">', page)
+        self.assertIn('action="/runs/gate/approval"', page)
+        self.assertIn('>APPROVE</button>', page)
+        self.assertIn('>REJECT</button>', page)
+        self.assertNotIn('http-equiv="refresh"', page)
 
 
 class ProgressOffsetTests(unittest.TestCase):

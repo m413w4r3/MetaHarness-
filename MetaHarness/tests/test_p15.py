@@ -287,7 +287,9 @@ class HTTPSecurityP15Tests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("New Run", page)
         self.assertIn("CREATE RUN", page)
-        self.assertIn("fetch('/api/runs'", page)
+        self.assertIn('<form action="/runs" method="post"', page)
+        self.assertNotIn("<script", page)
+        self.assertNotIn('http-equiv="refresh"', page)
         self.assertIn(self.server.token, page)
         self.assertNotIn("innerHTML", page)
 

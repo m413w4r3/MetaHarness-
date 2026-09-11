@@ -202,7 +202,8 @@ class LocalServerHardeningTests(unittest.TestCase):
         status, _headers, done_page = self.request("GET", "/runs/done")
         self.assertEqual(status, 200)
         self.assertNotIn(self.server.token, done_page)
-        self.assertIn("const META_TOKEN = null;", done_page)
+        self.assertNotIn('name="_token"', done_page)
+        self.assertNotIn("<script", done_page)
         for path in ("/api/runs/waiting", "/api/runs/done", "/api/runs/waiting/progress"):
             _status, _headers, content = self.request("GET", path)
             self.assertNotIn(self.server.token, content)
@@ -222,17 +223,16 @@ class LocalServerHardeningTests(unittest.TestCase):
                     "connect-src 'self'",
                     "object-src 'none'",
                     "base-uri 'none'",
-                    "form-action 'none'",
+                    "script-src 'none'",
+                    "form-action 'self'",
                     "frame-ancestors 'none'",
                 ):
                     self.assertIn(directive, csp)
                 self.assertNotIn("unsafe-inline", csp)
                 self.assertNotIn("http", csp)
-                nonce = re.search(r"script-src 'nonce-([^']+)'", csp).group(1)
-                self.assertIn(f'<script nonce="{nonce}">', content)
+                nonce = re.search(r"style-src 'nonce-([^']+)'", csp).group(1)
                 self.assertIn(f'<style nonce="{nonce}">', content)
-                # Every inline block carries the nonce.
-                self.assertEqual(content.count("<script"), content.count(f'<script nonce="{nonce}">'))
+                self.assertNotIn("<script", content)
                 self.assertNotIn("innerHTML", content)
         _status, first, _ = self.request("GET", "/")
         _status, second, _ = self.request("GET", "/")

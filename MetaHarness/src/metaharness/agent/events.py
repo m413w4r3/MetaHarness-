@@ -137,6 +137,12 @@ def summarize_event(event: dict[str, Any]) -> str | None:
     event_type = event.get("type") or msg.get("type")
     item = event.get("item") or msg.get("item") or {}
     if isinstance(item, dict):
+        tool_name = item.get("tool_name") or item.get("name") or item.get("tool")
+        if isinstance(tool_name, str) and tool_name in {"apply_patch", "exec_command"}:
+            message = item.get("message")
+            if isinstance(message, str) and message:
+                return f"tool: {tool_name}\nmessage: {message.replace(chr(10), ' ')[:110]}"
+            return f"tool: {tool_name}"
         command = item.get("command")
         if command:
             return f"$ {str(command).replace(chr(10), ' ')[:110]}"

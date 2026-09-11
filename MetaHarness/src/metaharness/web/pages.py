@@ -1,15 +1,7 @@
-"""Small server-rendered HTML pages for the local MetaHarness UI.
-
-Every artifact value (plan, review, checks, paths, failures) is untrusted:
-server-side it is escaped with :func:`html.escape`; client-side the polling
-script only writes it through ``textContent`` or nodes created explicitly,
-never ``innerHTML``.  The inline ``<style>``/``<script>`` blocks carry the
-per-response CSP nonce set by the server.
-"""
+"""Server-rendered, JavaScript-free pages for the local MetaHarness UI."""
 
 from __future__ import annotations
 
-import json
 from html import escape
 from typing import Any
 
@@ -21,243 +13,150 @@ def _e(value: Any) -> str:
     return escape("" if value is None else str(value), quote=True)
 
 
-def _json_script(value: Any) -> str:
-    # Run IDs and tokens are validated/generated values. Escaping the two HTML
-    # delimiters also keeps this safe if the helper is reused for other data.
-    return (
-        json.dumps(value, ensure_ascii=False)
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-    )
-
-
-def _page(title: str, body: str, script: str = "", *, nonce: str | None = None) -> str:
+def _page(
+    title: str,
+    body: str,
+    *,
+    nonce: str | None = None,
+    refresh_seconds: int | None = None,
+) -> str:
     nonce_attribute = f' nonce="{_e(nonce)}"' if nonce else ""
+    refresh = (
+        f'<meta http-equiv="refresh" content="{refresh_seconds}">'
+        if refresh_seconds is not None
+        else ""
+    )
     return f"""<!doctype html>
 <html lang="fr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
+  {refresh}
   <title>{_e(title)} · MetaHarness</title>
   <style{nonce_attribute}>
     :root {{ color-scheme: light dark; font-family: system-ui, sans-serif; }}
-    body {{ max-width: 1180px; margin: 0 auto; padding: 1rem; line-height: 1.4; }}
+    body {{ max-width: 1240px; margin: 0 auto; padding: 1rem; line-height: 1.45; }}
     a {{ color: #6aa9ff; }}
+    header.sticky {{ position: sticky; top: 0; z-index: 2; padding: .8rem 0; background: Canvas; border-bottom: 1px solid #7776; }}
+    h1, h2, h3 {{ line-height: 1.2; }} h2 {{ margin-top: 2rem; }}
     table {{ width: 100%; border-collapse: collapse; margin: 1rem 0 2rem; }}
     th, td {{ text-align: left; border-bottom: 1px solid #7776; padding: .55rem; vertical-align: top; }}
-    pre {{ white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; border: 1px solid #7776; border-radius: .4rem; background: #7772; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .7rem; }}
-    .card {{ border: 1px solid #7776; border-radius: .4rem; padding: .8rem; }}
-    .timeline {{ list-style: none; padding: 0; max-width: 32rem; }}
-    .timeline li {{ border-left: 3px solid #7778; padding: .35rem .8rem; margin: 0; }}
-    .timeline li.current {{ border-color: #4cae4c; font-weight: 700; }}
-    .timeline li.done {{ opacity: .72; }}
-    button {{ padding: .55rem .8rem; margin-right: .5rem; cursor: pointer; }}
-    button:disabled {{ cursor: default; opacity: .55; }}
-    .danger {{ color: #ff8d8d; }}
-    .muted {{ opacity: .7; }}
-    dt {{ font-weight: 700; }} dd {{ margin: 0 0 .5rem; overflow-wrap: anywhere; }}
+    pre, code, .mono {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }}
+    pre {{ white-space: pre-wrap; overflow-wrap: anywhere; max-height: 32rem; overflow: auto; padding: 1rem; border: 1px solid #7776; border-radius: .4rem; background: #7772; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: .8rem; }}
+    .card {{ border: 1px solid #7776; border-radius: .5rem; padding: .85rem; }}
+    .card.pass {{ border-color: #4cae4c; }} .card.fail, .danger {{ color: #ff8d8d; }} .muted {{ opacity: .72; }}
+    .badge {{ display: inline-block; border: 1px solid #7778; border-radius: 999px; padding: .12rem .55rem; font-size: .9rem; font-weight: 700; }}
+    .badge.failed {{ border-color: #d66; color: #ff8d8d; }} .badge.success {{ border-color: #4cae4c; color: #71d471; }}
+    .timeline {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .35rem; list-style: none; padding: 0; }}
+    .timeline li {{ border: 1px solid #7776; border-radius: .35rem; padding: .4rem .55rem; }} .timeline li.current {{ border-color: #4cae4c; font-weight: 700; }} .timeline li.done {{ opacity: .72; }}
+    label {{ display: block; font-weight: 700; margin-top: .8rem; }} input, textarea, select {{ box-sizing: border-box; max-width: 100%; padding: .45rem; margin-top: .25rem; }} textarea {{ width: min(100%, 72rem); }}
+    button {{ padding: .6rem .9rem; margin: .8rem .5rem 0 0; cursor: pointer; font-weight: 700; }} button.approve {{ border-color: #4cae4c; }} button.reject {{ border-color: #d66; }}
+    dl {{ margin: .4rem 0; }} dt {{ font-weight: 700; }} dd {{ margin: 0 0 .55rem; overflow-wrap: anywhere; }} summary {{ cursor: pointer; font-weight: 700; }}
   </style>
 </head>
 <body>
 {body}
-{(f"<script{nonce_attribute}>" + script + "</script>") if script else ""}
 </body>
 </html>
 """
+
+
+_TIMELINE = (
+    ("created", "CREATED"), ("planning", "PLANNING"),
+    ("awaiting_plan_approval", "AWAITING PLAN APPROVAL"), ("worktree_ready", "WORKTREE"),
+    ("preparing", "PREPARING"), ("implementing", "IMPLEMENTING"),
+    ("validating", "VALIDATING"), ("reviewing", "REVIEWING"),
+    ("approved", "APPROVED"), ("committed", "COMMITTED"),
+)
+_ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
+_TERMINAL_LABELS = {"blocked": "BLOCKED", "plan_rejected": "REJECTED", "failed": "FAILED", "interrupted": "INTERRUPTED"}
+TERMINAL_STATUSES = frozenset({"committed", *_TERMINAL_LABELS})
+AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
+# Kept as harmless compatibility constants for callers that used the former
+# polling template. The page itself contains no script and does not poll.
+RUN_PAGE_DYNAMIC_IDS: tuple[str, ...] = ()
+STATE_POLL_MS = 2000
+
+
+def refresh_seconds_for_run(run: dict[str, Any]) -> int | None:
+    state = run.get("state") if isinstance(run.get("state"), dict) else {}
+    status = str(state.get("status", run.get("status", "")))
+    if status in TERMINAL_STATUSES:
+        return None
+    if status == AWAITING_APPROVAL_STATUS:
+        approval = run.get("approval") if isinstance(run.get("approval"), dict) else {}
+        return 1 if approval.get("recorded") else None
+    if status == "approved":
+        return 1
+    return 2
 
 
 def _failure(value: Any) -> str:
     if not value:
         return '<span class="muted">—</span>'
     if isinstance(value, dict):
-        reason = _e(value.get("reason"))
-        detail = value.get("detail")
-        suffix = f" — {_e(detail)}" if detail is not None else ""
-        return f'<span class="danger">{reason}{suffix}</span>'
+        suffix = f" — {_e(value.get('detail'))}" if value.get("detail") is not None else ""
+        return f'<span class="danger">{_e(value.get("reason"))}{suffix}</span>'
     return f'<span class="danger">{_e(value)}</span>'
 
 
-def render_index(runs: list[dict[str, Any]], *, nonce: str | None = None) -> str:
-    """Render the run list.  It has no mutation, hence no mutation token."""
+def _status_badge(status: Any) -> str:
+    value = str(status or "—")
+    style = "failed" if value in {"failed", "blocked", "plan_rejected", "interrupted"} else "success" if value in {"committed", "approved"} else ""
+    return f'<span class="badge {style}">{_e(value)}</span>'
 
+
+def render_index(runs: list[dict[str, Any]], *, nonce: str | None = None) -> str:
     rows = []
     for run in runs:
         run_id = run.get("run_id")
         rows.append(
             "<tr>"
             f'<td><a href="/runs/{_e(run_id)}">{_e(run_id)}</a></td>'
-            f"<td>{_e(run.get('status'))}</td>"
-            f"<td>{_e(run.get('updated_at'))}</td>"
-            f"<td>{_e(run.get('plan_title'))}</td>"
-            f"<td>{_e(run.get('commit_sha'))}</td>"
-            f"<td>{_failure(run.get('failure'))}</td>"
-            "</tr>"
+            f"<td>{_status_badge(run.get('status'))}</td><td>{_e(run.get('updated_at'))}</td>"
+            f"<td>{_e(run.get('plan_title'))}</td><td class=\"mono\">{_e(run.get('commit_sha'))}</td>"
+            f"<td>{_failure(run.get('failure'))}</td></tr>"
         )
     table = "".join(rows) or '<tr><td colspan="6" class="muted">Aucun run.</td></tr>'
-    script = """
-const tableBody = document.querySelector('#runs-body');
-function cell(value) { const node = document.createElement('td'); node.textContent = value == null ? '—' : String(value); return node; }
-function refreshRuns() {
-  fetch('/api/runs', { cache: 'no-store' }).then(response => response.json()).then(payload => {
-    while (tableBody.firstChild) tableBody.removeChild(tableBody.firstChild);
-    for (const run of (payload.runs || [])) {
-      const row = document.createElement('tr');
-      const linkCell = document.createElement('td');
-      const link = document.createElement('a');
-      link.href = '/runs/' + encodeURIComponent(String(run.run_id));
-      link.textContent = run.run_id == null ? '—' : String(run.run_id);
-      linkCell.appendChild(link); row.appendChild(linkCell);
-      for (const key of ['status', 'updated_at', 'plan_title', 'commit_sha', 'failure']) row.appendChild(cell(key === 'failure' && run[key] && typeof run[key] === 'object' ? run[key].reason : run[key]));
-      tableBody.appendChild(row);
-    }
-  }).catch(() => {});
-}
-setInterval(refreshRuns, 2000);
-"""
-    body = f"""
-<header><h1>MetaHarness</h1><p class="muted">Observation locale des runs</p></header>
+    body = f'''<header><h1>MetaHarness</h1><p class="muted">Observation locale des runs</p></header>
 <p><a href="/new">NEW RUN</a></p>
-<table>
-  <thead><tr><th>RUN ID</th><th>STATUS</th><th>UPDATED</th><th>PLAN TITLE</th><th>COMMIT</th><th>FAILURE</th></tr></thead>
-  <tbody id="runs-body">{table}</tbody>
-</table>
-"""
-    return _page("Runs", body, script, nonce=nonce)
+<table><thead><tr><th>RUN ID</th><th>STATUS</th><th>UPDATED</th><th>PLAN TITLE</th><th>COMMIT</th><th>FAILURE</th></tr></thead><tbody>{table}</tbody></table>'''
+    return _page("Runs", body, nonce=nonce, refresh_seconds=5)
 
 
-def render_new_run(
-    config: HarnessConfig,
-    token: str,
-    *,
-    nonce: str | None = None,
-) -> str:
-    profiles = [
-        safe_profile_metadata(profile)
-        for profile in profiles_for_config(config).values()
-        if any(role.value == "planner" for role in profile.roles)
-    ]
-    planner_options = "".join(
-        f'<option value="{_e(profile["id"])}"{" selected" if profile["id"] == config.ui.default_planner_profile else ""}>{_e(profile["display_name"])}</option>'
-        for profile in profiles
-    )
-    script = f"""
-const META_TOKEN = {_json_script(token)};
-const form = document.getElementById('new-run-form');
-const button = document.getElementById('create-run');
-const message = document.getElementById('create-run-message');
-form.addEventListener('submit', async (event) => {{
-  event.preventDefault();
-  button.disabled = true;
-  message.textContent = '';
-  try {{
-    const response = await fetch('/api/runs', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json', 'X-MetaHarness-Token': META_TOKEN }},
-      body: JSON.stringify({{ spec: document.getElementById('spec').value, run_id: document.getElementById('run-id').value || null, planner_profile: document.getElementById('planner-profile').value }})
-    }});
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.message || 'Unable to create run.');
-    window.location.assign(payload.location);
-  }} catch (error) {{
-    message.textContent = error instanceof Error ? error.message : 'Unable to create run.';
-    button.disabled = false;
-  }}
-}});
-"""
-    body = f"""
-<main>
-<p><a href="/">← Tous les runs</a></p>
-<h1>New Run</h1>
-<dl>
-  <dt>Repository</dt><dd><input type="text" value="{_e(config.repo)}" readonly></dd>
-  <dt>Base ref</dt><dd><input type="text" value="{_e(config.base_ref)}" readonly></dd>
-</dl>
-<form id="new-run-form">
-  <label for="spec">SPEC</label><br>
-  <textarea id="spec" rows="20" cols="100" required></textarea><br>
-  <label for="run-id">Run ID (optional)</label><br>
-  <input id="run-id" type="text" autocomplete="off"><br>
-  <label for="planner-profile">Planner</label><br>
-  <select id="planner-profile">{planner_options}</select><br><br>
-  <button id="create-run" type="submit">CREATE RUN</button>
-  <span id="create-run-message" class="danger" role="status"></span>
-</form>
-</main>
-"""
-    return _page("New Run", body, script, nonce=nonce)
-
-
-_TIMELINE = (
-    ("created", "CREATED"),
-    ("planning", "PLANNING"),
-    ("awaiting_plan_approval", "AWAITING PLAN APPROVAL"),
-    ("worktree_ready", "WORKTREE"),
-    ("implementing", "IMPLEMENTING"),
-    ("validating", "VALIDATING"),
-    ("reviewing", "REVIEWING"),
-    ("committed", "COMMITTED"),
-)
-_ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
-_TERMINAL_LABELS = {
-    "blocked": "BLOCKED",
-    "plan_rejected": "REJECTED",
-    "failed": "FAILED",
-    "interrupted": "INTERRUPTED",
-}
-# Statuses after which the run state can no longer change.
-TERMINAL_STATUSES = frozenset({"committed", *_TERMINAL_LABELS})
-AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
-
-# Elements the run-page polling script updates from ``GET /api/runs/<id>``.
-RUN_PAGE_DYNAMIC_IDS = (
-    "run-status",
-    "run-updated",
-    "approval-actions",
-    "approve",
-    "reject",
-    "approval-message",
-    "execution-recommendation",
-    "implementer-recommendation",
-    "reviewer-recommendation",
-    "recommendation-rationale",
-    "recommendation-message",
-    "implementer-profile",
-    "reviewer-profile",
-    "model-selection-warning",
-    "base-sha",
-    "branch",
-    "worktree",
-    "commit-sha",
-    "failure",
-    "timeline",
-    "plan-contract",
-    "plan-raw",
-    "checks",
-    "review",
-    "reviewer-raw-state",
-    "reviewer-raw",
-    "spec",
-)
+def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = None) -> str:
+    profiles = [safe_profile_metadata(profile) for profile in profiles_for_config(config).values() if any(role.value == "planner" for role in profile.roles)]
+    options = "".join(f'<option value="{_e(p["id"])}"{" selected" if p["id"] == config.ui.default_planner_profile else ""}>{_e(p["display_name"])}</option>' for p in profiles)
+    body = f'''<main><p><a href="/">← Tous les runs</a></p><h1>New Run</h1>
+<dl><dt>Repository</dt><dd class="mono">{_e(config.repo)}</dd><dt>Base ref</dt><dd class="mono">{_e(config.base_ref)}</dd></dl>
+<form action="/runs" method="post" accept-charset="UTF-8"><input type="hidden" name="_token" value="{_e(token)}">
+<label for="spec">SPEC</label><textarea id="spec" name="spec" rows="20" required></textarea>
+<label for="run-id">Run ID (optional)</label><input id="run-id" name="run_id" type="text" autocomplete="off" value="">
+<label for="planner-profile">Planner</label><select id="planner-profile" name="planner_profile" required>{options}</select><br><button type="submit">CREATE RUN</button></form></main>'''
+    return _page("New Run", body, nonce=nonce)
 
 
 def _timeline_items(status: Any) -> str:
     current = str(status or "")
-    terminal_label = _TERMINAL_LABELS.get(current)
     current_order = _ORDER.get(current, -1)
     items = []
     for value, label in _TIMELINE:
-        classes = []
-        if value == current:
-            classes.append("current")
-        elif current_order >= 0 and _ORDER.get(value, 99) < current_order:
-            classes.append("done")
-        items.append(f'<li class="{" ".join(classes)}">{label}</li>')
-    if terminal_label:
-        items.append(f'<li class="current danger">{terminal_label}</li>')
+        classes = "current" if value == current else "done" if current_order >= 0 and _ORDER.get(value, 99) < current_order else ""
+        items.append(f'<li class="{classes}">{label}</li>')
+    if current in _TERMINAL_LABELS:
+        items.append(f'<li class="current danger">{_TERMINAL_LABELS[current]}</li>')
     return "".join(items)
+
+
+def _failure_reason(run: dict[str, Any]) -> str:
+    failure = run.get("failure")
+    return str(failure.get("reason", "")) if isinstance(failure, dict) else str(failure or "")
+
+
+def _section_open(run: dict[str, Any], names: tuple[str, ...]) -> str:
+    return " open" if any(_failure_reason(run).startswith(name) for name in names) else ""
 
 
 def _check_cards(checks: Any) -> str:
@@ -270,17 +169,10 @@ def _check_cards(checks: Any) -> str:
         if not isinstance(check, dict):
             cards.append(f"<pre>{_e(check)}</pre>")
             continue
-        cards.append(
-            '<article class="card">'
-            f"<strong>{_e(check.get('name'))}</strong>"
-            f"<dl><dt>exit_code</dt><dd>{_e(check.get('exit_code'))}</dd>"
-            f"<dt>timed_out</dt><dd>{_e(check.get('timed_out'))}</dd>"
-            f"<dt>duration</dt><dd>{_e(check.get('duration_seconds', check.get('duration')))}</dd>"
-            f"<dt>workspace_mutated</dt><dd>{_e(check.get('workspace_mutated'))}</dd></dl>"
-            f"<p>stdout tail</p><pre>{_e(check.get('stdout_tail'))}</pre>"
-            f"<p>stderr tail</p><pre>{_e(check.get('stderr_tail'))}</pre>"
-            "</article>"
-        )
+        passed = check.get("exit_code") == 0 and not check.get("timed_out") and not check.get("workspace_mutated")
+        status = "PASS" if passed else "FAIL"
+        duration = check.get("duration_seconds", check.get("duration"))
+        cards.append(f'<article class="card {"pass" if passed else "fail"}"><h3>{_e(check.get("name"))} — {status}</h3><p><strong>{status}</strong> · exit code {_e(check.get("exit_code"))} · duration {_e(duration)} · mutation {_e(check.get("workspace_mutated"))}</p><details><summary>stdout / stderr</summary><p>stdout</p><pre>{_e(check.get("stdout_tail"))}</pre><p>stderr</p><pre>{_e(check.get("stderr_tail"))}</pre></details></article>')
     return '<div class="grid">' + "".join(cards) + "</div>"
 
 
@@ -289,302 +181,89 @@ def _review(review: Any) -> str:
         return '<p class="muted">Aucune review.</p>'
     if not isinstance(review, dict):
         return f"<pre>{_e(review)}</pre>"
-    def value(underscore: str, spaced: str | None = None) -> Any:
-        return review.get(underscore, review.get(spaced)) if spaced else review.get(underscore)
-
-    fields = (
-        ("verdict", value("verdict")),
-        ("route", value("route")),
-        ("summary", value("summary")),
-        ("findings", value("findings")),
-        ("required fixes", value("required_fixes", "required fixes")),
-        ("missing tests", value("missing_tests", "missing tests")),
-        ("residual risks", value("residual_risks", "residual risks")),
-    )
+    fields = (("verdict", review.get("verdict")), ("route", review.get("route")), ("summary", review.get("summary")), ("findings", review.get("findings")), ("required fixes", review.get("required_fixes", review.get("required fixes"))), ("missing tests", review.get("missing_tests", review.get("missing tests"))), ("residual risks", review.get("residual_risks", review.get("residual risks"))))
     return "<dl>" + "".join(f"<dt>{_e(label)}</dt><dd>{_e(value)}</dd>" for label, value in fields) + "</dl>"
 
 
-def _reviewer_raw_state(available: bool) -> str:
-    return "reviewer.raw.md disponible" if available else "reviewer.raw.md non disponible"
-
-
-_RUN_SCRIPT = """
-const page = document.getElementById('run-page');
-let decisionSent = false;
-let reloadRequested = false;
-let statePoll = null;
-let implementerTouched = false;
-let reviewerTouched = false;
-const rendered = {};
-function byId(id) { return document.getElementById(id); }
-function display(value) { if (value == null) return ''; return typeof value === 'object' ? JSON.stringify(value) : String(value); }
-function setText(id, value) { const node = byId(id); if (node) node.textContent = value == null || value === '' ? '—' : display(value); }
-function setPre(id, value) { const node = byId(id); if (node) node.textContent = display(value); }
-function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
-function el(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = display(text); if (className) node.className = className; return node; }
-function changed(key, value) { const signature = JSON.stringify(value === undefined ? null : value); if (rendered[key] === signature) return false; rendered[key] = signature; return true; }
-function renderFailure(failure) {
-  const node = byId('failure'); clear(node);
-  if (!failure) { node.appendChild(el('span', '—', 'muted')); return; }
-  const text = typeof failure === 'object' ? display(failure.reason) + (failure.detail != null ? ' — ' + display(failure.detail) : '') : display(failure);
-  node.appendChild(el('span', text, 'danger'));
-}
-function renderTimeline(status) {
-  const list = byId('timeline'); clear(list);
-  const order = TIMELINE.findIndex(item => item[0] === status);
-  TIMELINE.forEach((item, index) => {
-    const entry = el('li', item[1]);
-    if (item[0] === status) entry.className = 'current'; else if (order >= 0 && index < order) entry.className = 'done';
-    list.appendChild(entry);
-  });
-  if (Object.prototype.hasOwnProperty.call(TERMINAL_LABELS, status)) list.appendChild(el('li', TERMINAL_LABELS[status], 'current danger'));
-}
-function renderChecks(checks) {
-  const root = byId('checks'); clear(root);
-  if (!checks || (Array.isArray(checks) && checks.length === 0)) { root.appendChild(el('p', 'Aucun check.', 'muted')); return; }
-  if (!Array.isArray(checks)) { root.appendChild(el('pre', checks)); return; }
-  const grid = el('div', undefined, 'grid');
-  for (const check of checks) {
-    if (!check || typeof check !== 'object') { grid.appendChild(el('pre', check)); continue; }
-    const card = el('article', undefined, 'card');
-    card.appendChild(el('strong', check.name));
-    const list = document.createElement('dl');
-    const duration = check.duration_seconds !== undefined ? check.duration_seconds : check.duration;
-    for (const [label, value] of [['exit_code', check.exit_code], ['timed_out', check.timed_out], ['duration', duration], ['workspace_mutated', check.workspace_mutated]]) {
-      list.appendChild(el('dt', label)); list.appendChild(el('dd', value));
-    }
-    card.appendChild(list);
-    card.appendChild(el('p', 'stdout tail')); card.appendChild(el('pre', check.stdout_tail));
-    card.appendChild(el('p', 'stderr tail')); card.appendChild(el('pre', check.stderr_tail));
-    grid.appendChild(card);
-  }
-  root.appendChild(grid);
-}
-function renderReview(review) {
-  const root = byId('review'); clear(root);
-  if (!review) { root.appendChild(el('p', 'Aucune review.', 'muted')); return; }
-  if (typeof review !== 'object' || Array.isArray(review)) { root.appendChild(el('pre', review)); return; }
-  const pick = (a, b) => review[a] !== undefined ? review[a] : review[b];
-  const list = document.createElement('dl');
-  for (const [label, value] of [['verdict', review.verdict], ['route', review.route], ['summary', review.summary], ['findings', review.findings], ['required fixes', pick('required_fixes', 'required fixes')], ['missing tests', pick('missing_tests', 'missing tests')], ['residual risks', pick('residual_risks', 'residual risks')]]) {
-    list.appendChild(el('dt', label)); list.appendChild(el('dd', value));
-  }
-  root.appendChild(list);
-}
-function updateApproval(status) {
-  const awaiting = status === AWAITING_STATUS;
-  if (awaiting && META_TOKEN === null) {
-    // This page was rendered before the approval gate, without the mutation
-    // token: reload once so the server renders the decision controls.
-    if (!reloadRequested) { reloadRequested = true; window.location.reload(); }
-    return;
-  }
-  byId('approval-actions').hidden = !awaiting;
-  const disabled = !awaiting || decisionSent || META_TOKEN === null;
-  byId('approve').disabled = disabled; byId('reject').disabled = disabled;
-}
-function renderSelectionWarning(run) {
-  const node = byId('model-selection-warning'); if (!node) return;
-  const execution = run && run.state && run.state.execution ? run.state.execution : {};
-  const modes = [execution.planner, execution.implementer, execution.reviewer].filter(Boolean).map(item => item.selection_mode);
-  node.hidden = !modes.includes('external-ui');
-  node.textContent = node.hidden ? '' : 'Model selection is external. MetaHarness cannot force or verify the actual model selected in the provider UI.';
-}
-function renderRecommendation(recommendation) {
-  const section = byId('execution-recommendation');
-  if (!section) return;
-  if (!recommendation || typeof recommendation !== 'object' || !recommendation.status) {
-    section.hidden = true;
-    return;
-  }
-  section.hidden = false;
-  if (recommendation.status === 'READY') {
-    byId('recommendation-message').textContent = '';
-    const implementerName = PROFILE_NAMES[recommendation.implementer_profile] || recommendation.implementer_profile;
-    const reviewerName = PROFILE_NAMES[recommendation.reviewer_profile] || recommendation.reviewer_profile;
-    byId('implementer-recommendation').textContent = 'Implementer recommendation: ' + String(implementerName);
-    byId('reviewer-recommendation').textContent = 'Reviewer recommendation: ' + String(reviewerName);
-    byId('recommendation-rationale').textContent = recommendation.rationale == null ? '' : String(recommendation.rationale);
-    if (!implementerTouched && PROFILE_NAMES[recommendation.implementer_profile]) byId('implementer-profile').value = recommendation.implementer_profile;
-    if (!reviewerTouched && PROFILE_NAMES[recommendation.reviewer_profile]) byId('reviewer-profile').value = recommendation.reviewer_profile;
-  } else if (recommendation.status === 'FAILED') {
-    byId('implementer-recommendation').textContent = '';
-    byId('reviewer-recommendation').textContent = '';
-    byId('recommendation-rationale').textContent = '';
-    byId('recommendation-message').textContent = 'Recommendation unavailable.\nUsing configured defaults.';
-    if (!implementerTouched) byId('implementer-profile').value = DEFAULT_IMPLEMENTER;
-    if (!reviewerTouched) byId('reviewer-profile').value = DEFAULT_REVIEWER;
-  } else {
-    section.hidden = true;
-  }
-}
-function applyRun(run) {
-  if (!run || typeof run !== 'object') return;
-  const state = run.state && typeof run.state === 'object' ? run.state : {};
-  const status = state.status !== undefined ? state.status : run.status;
-  page.dataset.status = display(status);
-  page.dataset.updatedAt = display(run.updated_at);
-  setText('run-status', status);
-  setText('run-updated', run.updated_at);
-  setText('base-sha', state.base_sha);
-  setText('branch', state.branch);
-  setText('worktree', state.worktree);
-  setText('commit-sha', state.commit_sha !== undefined ? state.commit_sha : run.commit_sha);
-  if (changed('failure', run.failure)) renderFailure(run.failure);
-  if (changed('status', status)) renderTimeline(status);
-  updateApproval(status);
-  renderSelectionWarning(run);
-  renderRecommendation(status === AWAITING_STATUS ? state.recommendation : null);
-  const plan = run.plan && typeof run.plan === 'object' ? run.plan : {};
-  if (changed('contract', plan.contract)) setPre('plan-contract', plan.contract);
-  if (changed('raw', plan.raw)) setPre('plan-raw', plan.raw);
-  if (changed('spec', run.spec)) setPre('spec', run.spec);
-  if (changed('checks', run.checks)) renderChecks(run.checks);
-  if (changed('review', run.review)) renderReview(run.review);
-  byId('reviewer-raw-state').textContent = run.reviewer_raw_available ? 'reviewer.raw.md disponible' : 'reviewer.raw.md non disponible';
-  if (changed('reviewer_raw', run.reviewer_raw)) setPre('reviewer-raw', run.reviewer_raw);
-  if (TERMINAL_STATUSES.includes(status) && statePoll !== null) { clearInterval(statePoll); statePoll = null; }
-}
-function pollRun() {
-  fetch('/api/runs/' + encodeURIComponent(RUN_ID), { cache: 'no-store' })
-    .then(response => response.ok ? response.json() : null)
-    .then(applyRun)
-    .catch(() => {});
-}
-let progressOffset = 0;
-function addProgress(value) { const item = document.createElement('li'); item.textContent = value; byId('progress-events').appendChild(item); }
-function pollProgress() {
-  fetch('/api/runs/' + encodeURIComponent(RUN_ID) + '/progress?offset=' + progressOffset, { cache: 'no-store' }).then(response => response.json()).then(payload => {
-    progressOffset = Number(payload.next_offset || progressOffset);
-    for (const value of (payload.events || [])) addProgress(value);
-  }).catch(() => {});
-}
-function decide(decision) {
-  if (META_TOKEN === null) return;
-  byId('approve').disabled = true; byId('reject').disabled = true;
-  const body = decision === 'APPROVE' ? { decision, implementer_profile: byId('implementer-profile').value, reviewer_profile: byId('reviewer-profile').value } : { decision };
-  fetch('/api/runs/' + encodeURIComponent(RUN_ID) + '/approval', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MetaHarness-Token': META_TOKEN }, body: JSON.stringify(body) })
-    .then(response => response.json().then(payload => ({ ok: response.ok, payload })))
-    .then(result => { if (result.ok) decisionSent = true; byId('approval-message').textContent = result.ok ? ' Décision enregistrée.' : ' ' + display(result.payload.message || 'Erreur.'); pollRun(); })
-    .catch(() => { byId('approval-message').textContent = ' Erreur réseau.'; });
-}
-byId('approve').addEventListener('click', () => decide('APPROVE'));
-byId('reject').addEventListener('click', () => decide('REJECT'));
-byId('implementer-profile').addEventListener('change', () => { implementerTouched = true; });
-byId('reviewer-profile').addEventListener('change', () => { reviewerTouched = true; });
-pollProgress(); setInterval(pollProgress, 1000);
-if (!TERMINAL_STATUSES.includes(page.dataset.status)) { statePoll = setInterval(pollRun, STATE_POLL_MS); }
-"""
-STATE_POLL_MS = 2000
-
-
-def render_run(
-    run: dict[str, Any],
-    token: str | None = None,
-    *,
-    config: HarnessConfig | None = None,
-    nonce: str | None = None,
-) -> str:
-    """Render one run.
-
-    The mutation token is embedded only while the run awaits plan approval:
-    no other page can send a decision.  A page rendered earlier reloads once
-    when polling observes the approval gate.
-    """
-
-    state = run.get("state") if isinstance(run.get("state"), dict) else {}
-    plan = run.get("plan") if isinstance(run.get("plan"), dict) else {}
-    status = state.get("status", run.get("status"))
-    run_id = run.get("run_id")
-    can_decide = status == AWAITING_APPROVAL_STATUS and bool(token)
-    page_token = token if can_decide else None
-    disabled = "" if can_decide else " disabled"
-    hidden = "" if can_decide else " hidden"
-    reviewer_raw = run.get("reviewer_raw")
+def _execution_card(state: dict[str, Any], config: HarnessConfig | None) -> str:
     execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
-    external_selection = any(
-        isinstance(execution.get(role), dict)
-        and execution[role].get("selection_mode") == "external-ui"
-        for role in ("planner", "implementer", "reviewer")
-    )
-    warning_text = (
-        "Model selection is external. MetaHarness cannot force or verify the actual model selected in the provider UI."
-        if external_selection else ""
-    )
-    profile_metadata = {
-        role: [
-            safe_profile_metadata(profile)
-            for profile in profiles_for_config(config).values()
-            if any(item.value == role for item in profile.roles)
-        ]
-        for role in ("implementer", "reviewer")
-    } if config is not None else {"implementer": [], "reviewer": []}
-    defaults = {
-        "implementer": config.ui.default_implementer_profile if config else None,
-        "reviewer": config.ui.default_reviewer_profile if config else None,
-    }
+    metadata = {}
+    if config is not None:
+        metadata = {profile.id: safe_profile_metadata(profile) for profile in profiles_for_config(config).values()}
+    cards = []
+    for role, title in (("planner", "Planner"), ("implementer", "Implementer"), ("reviewer", "Reviewer")):
+        selected = execution.get(role) if isinstance(execution.get(role), dict) else {}
+        profile_id = selected.get("profile_id")
+        profile = metadata.get(profile_id, {})
+        model = selected.get("model", profile.get("model_label")); mode = selected.get("selection_mode", profile.get("selection_mode")); effort = selected.get("effort", profile.get("effort"))
+        warning = '<p class="danger">external-ui: le modèle est sélectionné dans le fournisseur externe.</p>' if mode == "external-ui" else ""
+        extra = f'<dt>effort</dt><dd>{_e(effort)}</dd>' if role == "implementer" else ""
+        cards.append(f'<article class="card"><h3>{title}</h3><dl><dt>profile</dt><dd>{_e(profile_id or "—")}</dd><dt>model</dt><dd>{_e(model or "—")}</dd><dt>selection mode</dt><dd>{_e(mode or "—")}</dd>{extra}</dl>{warning}</article>')
+    return '<div class="grid">' + "".join(cards) + "</div>"
+
+
+def _setup_cards(results: Any) -> str:
+    if not results:
+        return '<p class="muted">Aucune commande de setup.</p>'
+    cards = []
+    for result in results if isinstance(results, list) else []:
+        if not isinstance(result, dict):
+            continue
+        passed = result.get("exit_code") == 0 and not result.get("timed_out")
+        cards.append(f'<article class="card {"pass" if passed else "fail"}"><h3>{_e(result.get("name"))} — {"PASS" if passed else "FAIL"}</h3><p>duration {_e(result.get("duration_seconds"))} · exit code {_e(result.get("exit_code"))}</p><details><summary>stdout / stderr</summary><pre>{_e(result.get("stdout_tail"))}</pre><pre>{_e(result.get("stderr_tail"))}</pre></details></article>')
+    return '<div class="grid">' + "".join(cards) + "</div>"
+
+
+def _profile_options(config: HarnessConfig | None, role: str, selected: Any) -> str:
+    if config is None:
+        return ""
+    result = []
+    for profile in profiles_for_config(config).values():
+        item = safe_profile_metadata(profile)
+        if role in item["roles"]:
+            result.append(f'<option value="{_e(item["id"])}"{" selected" if item["id"] == selected else ""}>{_e(item["display_name"])}</option>')
+    return "".join(result)
+
+
+def render_run(run: dict[str, Any], token: str | None = None, *, config: HarnessConfig | None = None, nonce: str | None = None, refresh_seconds: int | None = None) -> str:
+    state = run.get("state") if isinstance(run.get("state"), dict) else {}
+    status = state.get("status", run.get("status")); run_id = run.get("run_id")
+    plan = run.get("plan") if isinstance(run.get("plan"), dict) else {}; failure = run.get("failure", state.get("failure"))
+    approval = run.get("approval") if isinstance(run.get("approval"), dict) else {}
+    can_decide = status == AWAITING_APPROVAL_STATUS and bool(token) and not approval.get("recorded")
+    execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
     recommendation = state.get("recommendation") if isinstance(state.get("recommendation"), dict) else {}
-    recommendation_ready = recommendation.get("status") == "READY"
-    profile_names = {
-        item["id"]: item["display_name"]
-        for values in profile_metadata.values()
-        for item in values
-    }
-    initial_selection = {
-        "implementer": recommendation.get("implementer_profile") if recommendation_ready else defaults["implementer"],
-        "reviewer": recommendation.get("reviewer_profile") if recommendation_ready else defaults["reviewer"],
-    }
-    def options(role: str) -> str:
-        return "".join(
-            f'<option value="{_e(item["id"])}"{" selected" if item["id"] == initial_selection[role] else ""}>{_e(item["display_name"])}</option>'
-            for item in profile_metadata[role]
-        )
-    implementer_options = options("implementer")
-    reviewer_options = options("reviewer")
-    script = (
-        f"const META_TOKEN = {_json_script(page_token)};\n"
-        f"const RUN_ID = {_json_script(run_id)};\n"
-        f"const TIMELINE = {_json_script([list(item) for item in _TIMELINE])};\n"
-        f"const TERMINAL_LABELS = {_json_script(_TERMINAL_LABELS)};\n"
-        f"const TERMINAL_STATUSES = {_json_script(sorted(TERMINAL_STATUSES))};\n"
-        f"const AWAITING_STATUS = {_json_script(AWAITING_APPROVAL_STATUS)};\n"
-        f"const PROFILE_NAMES = {_json_script(profile_names)};\n"
-        f"const DEFAULT_IMPLEMENTER = {_json_script(defaults['implementer'])};\n"
-        f"const DEFAULT_REVIEWER = {_json_script(defaults['reviewer'])};\n"
-        f"const STATE_POLL_MS = {STATE_POLL_MS};\n"
-        + _RUN_SCRIPT
-    )
-    body = f"""
-<main id="run-page" data-run-id="{_e(run_id)}" data-status="{_e(status)}" data-updated-at="{_e(run.get('updated_at'))}">
-<p><a href="/">← Tous les runs</a></p>
-<header><h1>Run {_e(run_id)}</h1><p>Status : <strong id="run-status">{_e(status)}</strong> · <span class="muted">mis à jour <span id="run-updated">{_e(run.get('updated_at'))}</span></span></p></header>
-<div id="approval-actions"{hidden}><label for="implementer-profile">Implementer</label> <select id="implementer-profile">{implementer_options}</select> <label for="reviewer-profile">Reviewer</label> <select id="reviewer-profile">{reviewer_options}</select> <button id="approve" type="button"{disabled}>APPROVE PLAN</button><button id="reject" type="button"{disabled}>REJECT PLAN</button><span id="approval-message"></span></div>
-<section id="execution-recommendation"{"" if recommendation.get("status") in {"READY", "FAILED"} and status == AWAITING_APPROVAL_STATUS else " hidden"}><h2>Execution recommendation</h2><p id="implementer-recommendation">{_e('Implementer recommendation: ' + str(profile_names.get(recommendation.get('implementer_profile'), recommendation.get('implementer_profile'))) if recommendation_ready else '')}</p><p id="reviewer-recommendation">{_e('Reviewer recommendation: ' + str(profile_names.get(recommendation.get('reviewer_profile'), recommendation.get('reviewer_profile'))) if recommendation_ready else '')}</p><p><strong>Rationale:</strong></p><p id="recommendation-rationale">{_e(recommendation.get('rationale') if recommendation_ready else '')}</p><p id="recommendation-message" class="danger">{_e('Recommendation unavailable.\nUsing configured defaults.' if recommendation.get('status') == 'FAILED' else '')}</p></section>
-<p id="model-selection-warning" class="danger"{"" if external_selection else " hidden"}>{_e(warning_text)}</p>
-<section><h2>Header</h2><div class="grid">
-  <div class="card"><strong>Base SHA</strong><br><span id="base-sha">{_e(state.get('base_sha'))}</span></div>
-  <div class="card"><strong>Branch</strong><br><span id="branch">{_e(state.get('branch'))}</span></div>
-  <div class="card"><strong>Worktree</strong><br><span id="worktree">{_e(state.get('worktree'))}</span></div>
-  <div class="card"><strong>Commit SHA</strong><br><span id="commit-sha">{_e(state.get('commit_sha'))}</span></div>
-  <div class="card"><strong>Failure</strong><br><span id="failure">{_failure(state.get('failure'))}</span></div>
-</div></section>
-<section><h2>Timeline</h2><ul class="timeline" id="timeline">{_timeline_items(status)}</ul></section>
-<section><h2>Plan</h2><h3>Canonical implementation contract</h3><pre id="plan-contract">{_e(plan.get('contract'))}</pre><h3>planner.raw.md</h3><pre id="plan-raw">{_e(plan.get('raw'))}</pre></section>
-<section><details><summary>SPEC</summary><pre id="spec">{_e(run.get('spec'))}</pre></details></section>
-<section><h2>Progress Codex</h2><ul id="progress-events"></ul></section>
-<section><h2>Checks</h2><div id="checks">{_check_cards(run.get('checks'))}</div></section>
-<section><h2>Review</h2><div id="review">{_review(run.get('review'))}</div></section>
-<section><h2>Reviewer raw</h2><p id="reviewer-raw-state" class="muted">{_reviewer_raw_state(reviewer_raw is not None)}</p><details><summary>Déplier reviewer.raw.md</summary><pre id="reviewer-raw">{_e(reviewer_raw)}</pre></details></section>
-</main>
-"""
-    return _page(f"Run {run_id}", body, script, nonce=nonce)
+    impl_selected = recommendation.get("implementer_profile") if recommendation.get("status") == "READY" else config.ui.default_implementer_profile if config else None
+    review_selected = recommendation.get("reviewer_profile") if recommendation.get("status") == "READY" else config.ui.default_reviewer_profile if config else None
+    recommendation_note = ""
+    if recommendation.get("status") == "READY" and config is not None:
+        names = {profile.id: profile.display_name for profile in profiles_for_config(config).values()}
+        recommendation_note = f'<p>Recommended implementer: {_e(names.get(impl_selected, impl_selected))}<br>Recommended reviewer: {_e(names.get(review_selected, review_selected))}</p><p><strong>Rationale:</strong> {_e(recommendation.get("rationale"))}</p>'
+    approval_forms = ""
+    if can_decide:
+        approval_forms = f'''<section class="card"><h2>Plan approval</h2>
+{recommendation_note}
+<form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE"><label for="implementer-profile">Implementer profile</label><select id="implementer-profile" name="implementer_profile" required>{_profile_options(config, "implementer", impl_selected)}</select><label for="reviewer-profile">Reviewer profile</label><select id="reviewer-profile" name="reviewer_profile" required>{_profile_options(config, "reviewer", review_selected)}</select><br><button class="approve" type="submit">APPROVE</button></form>
+<form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT</button></form></section>'''
+    elif approval.get("recorded"):
+        approval_forms = f'<section class="card"><h2>Plan approval</h2><p>Décision enregistrée : {_e(approval.get("decision"))}</p></section>'
+    diagnostics = run.get("agent_diagnostics") if isinstance(run.get("agent_diagnostics"), dict) else {}; result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}; usage = diagnostics.get("usage") if isinstance(diagnostics.get("usage"), dict) else {}
+    candidate = run.get("candidate") if isinstance(run.get("candidate"), dict) else {}; changed_files = candidate.get("changed_files") if isinstance(candidate.get("changed_files"), list) else []
+    refresh = refresh_seconds if refresh_seconds is not None else refresh_seconds_for_run(run)
+    failure_top = f'<p class="danger"><strong>FAILED: {_e(failure.get("reason") if isinstance(failure, dict) else failure)}</strong><br>{_e(failure.get("detail") if isinstance(failure, dict) else "")}</p>' if status == "failed" and failure else ""
+    body = f'''<main><p><a href="/">← Tous les runs</a></p>
+<header class="sticky"><h1>Run <span class="mono">{_e(run_id)}</span></h1><p>{_status_badge(status)} · updated_at <span class="mono">{_e(run.get("updated_at"))}</span></p>{failure_top}</header>
+{approval_forms}
+<section><h2>PLAN</h2><details open{_section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER"))}><summary>Canonical implementation contract</summary><pre>{_e(plan.get("contract"))}</pre></details><details><summary>planner.raw.md</summary><pre>{_e(plan.get("raw"))}</pre></details><details><summary>SPEC</summary><pre>{_e(run.get("spec"))}</pre></details></section>
+<section><h2>EXECUTION</h2>{_execution_card(state, config)}</section>
+<section><h2>AGENT</h2><details open{_section_open(run, ("AGENT_",))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details></section>
+<section><h2>CHECKS</h2><details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
+<section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details><details><summary>reviewer.raw.md</summary><pre>{_e(run.get("reviewer_raw"))}</pre></details></section>
+<section><h2>Setup</h2><details open{_section_open(run, ("WORKSPACE_SETUP_",))}><summary>Workspace setup</summary>{_setup_cards(run.get("workspace_setup"))}</details></section>
+<section><h2>DIFF / FILES</h2><p>Changed files</p><ul>{"".join(f'<li class="mono">{_e(path)}</li>' for path in changed_files) or '<li class="muted">Aucun fichier changé.</li>'}</ul><details><summary>Diff</summary><pre>{_e(candidate.get("diff_tail"))}</pre></details></section>
+<section><h2>DIAGNOSTICS</h2><p><strong>Failure:</strong> {_failure(failure)}</p><ul>{"".join(f'<li>{_e(item)}</li>' for item in (run.get("progress_tail") or [])) or '<li class="muted">Aucun événement.</li>'}</ul></section>
+<section><h2>Timeline</h2><ul class="timeline">{_timeline_items(status)}</ul></section></main>'''
+    return _page(f"Run {run_id}", body, nonce=nonce, refresh_seconds=refresh)
 
 
-__all__ = [
-    "RUN_PAGE_DYNAMIC_IDS",
-    "STATE_POLL_MS",
-    "TERMINAL_STATUSES",
-    "render_index",
-    "render_new_run",
-    "render_run",
-]
+__all__ = ["AWAITING_APPROVAL_STATUS", "RUN_PAGE_DYNAMIC_IDS", "STATE_POLL_MS", "TERMINAL_STATUSES", "refresh_seconds_for_run", "render_index", "render_new_run", "render_run"]

@@ -13,7 +13,7 @@ import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 from ..config import load_config
 from ..models import HarnessConfig
@@ -43,21 +43,17 @@ _API_CSP = "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ances
 
 
 def html_csp(nonce: str) -> str:
-    """CSP of an HTML page: only its own nonce-tagged inline style/script.
-
-    No external script, object/embed, ``<base>``, form target or framing is
-    allowed; ``fetch`` may only reach this same origin.
-    """
+    """CSP for the server-rendered UI, which deliberately has no scripts."""
 
     return (
         "default-src 'none'; "
-        f"script-src 'nonce-{nonce}'; "
+        "script-src 'none'; "
         f"style-src 'nonce-{nonce}'; "
         "connect-src 'self'; "
         "img-src 'self' data:; "
         "object-src 'none'; "
         "base-uri 'none'; "
-        "form-action 'none'; "
+        "form-action 'self'; "
         "frame-ancestors 'none'"
     )
 
@@ -170,7 +166,9 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 run = get_run(root, self._run_id(parts[2]))
                 # render_run embeds the token only on a page able to decide.
                 self._html(
-                    render_run(run, self.server.token, config=self.server.config, nonce=nonce),
+                    render_run(
+                        run, self.server.token, config=self.server.config, nonce=nonce
+                    ),
                     nonce,
                 )
                 return
@@ -201,6 +199,60 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
         if supplied is None or not secrets.compare_digest(supplied, self.server.token):
             raise WebAPIError(403, "mutation token required")
 
+    def _authorized_form(self, token: str | None) -> None:
+        if token is None or not secrets.compare_digest(token, self.server.token):
+            raise WebAPIError(403, "mutation token required")
+
+    def _form(self, expected: set[str], *, exact: bool = True) -> dict[str, str]:
+        content_type = self.headers.get("Content-Type")
+        if (
+            content_type is None
+            or content_type.split(";", 1)[0].strip().lower()
+            != "application/x-www-form-urlencoded"
+        ):
+            raise WebAPIError(400, "body must be application/x-www-form-urlencoded")
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length) if raw_length is not None else 0
+        except ValueError as exc:
+            raise WebAPIError(400, "invalid request body") from exc
+        if length < 0 or length > _MAX_BODY_BYTES:
+            raise WebAPIError(413, "request body is too large")
+        try:
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ValueError("short body")
+            pairs = parse_qsl(
+                raw.decode("utf-8"),
+                keep_blank_values=True,
+                strict_parsing=True,
+                encoding="utf-8",
+                errors="strict",
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise WebAPIError(400, "body must be valid form data") from exc
+        result: dict[str, str] = {}
+        for key, value in pairs:
+            if key not in expected:
+                raise WebAPIError(400, "unknown request field")
+            if key in result:
+                raise WebAPIError(400, "duplicated request field")
+            result[key] = value
+        if exact and set(result) != expected:
+            raise WebAPIError(400, "missing request field")
+        return result
+
+    def _redirect(self, location: str) -> None:
+        body = b""
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", "0")
+        for name, value in _SECURITY_HEADERS:
+            self.send_header(name, value)
+        self.send_header("Content-Security-Policy", _API_CSP)
+        self.end_headers()
+
     def _body(self) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length")
         try:
@@ -222,9 +274,9 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
         try:
             self._check_host()
             self._check_origin()
-            self._authorized()
             parts = self._path_parts()
             if parts == ["", "api", "runs"]:
+                self._authorized()
                 payload = self._body()
                 unknown = set(payload) - {"spec", "run_id", "planner_profile"}
                 if unknown:
@@ -237,8 +289,51 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._json(202, result)
                 return
+            if parts == ["", "runs"]:
+                payload = self._form({"_token", "spec", "run_id", "planner_profile"})
+                self._authorized_form(payload.get("_token"))
+                result = create_run(
+                    self.server.run_manager,
+                    spec=payload["spec"],
+                    run_id=payload["run_id"] or None,
+                    planner_profile=payload["planner_profile"] or None,
+                )
+                self._redirect(result["location"])
+                return
+            if len(parts) == 4 and parts[1] == "runs" and parts[3] == "approval":
+                # The decision controls use separate forms: REJECT has no
+                # profile fields, while APPROVE must bind both selections.
+                payload = self._form(
+                    {"_token", "decision", "implementer_profile", "reviewer_profile"},
+                    exact=False,
+                )
+                self._authorized_form(payload.get("_token"))
+                decision = payload.get("decision")
+                if decision == "APPROVE":
+                    if set(payload) != {
+                        "_token", "decision", "implementer_profile", "reviewer_profile"
+                    }:
+                        raise WebAPIError(400, "missing approval field")
+                elif decision == "REJECT":
+                    if set(payload) != {"_token", "decision"}:
+                        raise WebAPIError(400, "unknown approval field")
+                else:
+                    raise WebAPIError(400, "decision must be APPROVE or REJECT")
+                result = approve_run(
+                    self.server.config.runs_root,
+                    self._run_id(parts[2]),
+                    decision,
+                    config=self.server.config,
+                    implementer_profile=payload.get("implementer_profile"),
+                    reviewer_profile=payload.get("reviewer_profile")
+                    if decision == "APPROVE"
+                    else None,
+                )
+                self._redirect(f"/runs/{self._run_id(parts[2])}")
+                return
             if len(parts) != 5 or parts[1:3] != ["api", "runs"] or parts[4] != "approval":
                 raise WebAPIError(404, "not found")
+            self._authorized()
             payload = self._body()
             decision = payload.get("decision")
             if not isinstance(decision, str):

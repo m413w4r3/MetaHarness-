@@ -236,11 +236,9 @@ class RecommendationUITests(unittest.TestCase):
                 config=config,
             )
             self.assertIn('value="impl-b" selected', html)
-            self.assertIn('Implementer recommendation: Impl-B', html)
-            self.assertIn("rationale", html)
-            self.assertIn("textContent", html)
-            self.assertIn("implementerTouched = true", html)
-            self.assertIn("reviewerTouched = true", html)
+            self.assertIn("Impl-B", html)
+            self.assertIn("Use this profile.", html)
+            self.assertNotIn("<script", html)
 
 
 if __name__ == "__main__":
