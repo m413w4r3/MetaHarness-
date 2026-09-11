@@ -1,0 +1,16 @@
+BASE SHA: manual-smoke-test
+
+### PROJECT INSTRUCTION: AGENTS.md
+- Python 3.12.
+- Use unittest.
+- Preserve public API compatibility.
+- Do not add dependencies.
+
+### SOURCE: src/client.py:1-40
+class HttpClient:
+    def request(self, method: str, url: str) -> Response:
+        return self._transport.request(method, url)
+
+### SOURCE: tests/test_client.py:1-30
+class HttpClientTests(unittest.TestCase):
+    ...
