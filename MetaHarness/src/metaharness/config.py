@@ -311,6 +311,22 @@ def _model_profiles(
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"{where}.driver is invalid") from exc
         model = _required_string(profile_data, "model", where)
+        description = profile_data.get("description", "")
+        if not isinstance(description, str):
+            raise ConfigError(f"{where}.description must be a string")
+        if len(description) > 300:
+            raise ConfigError(f"{where}.description must be at most 300 characters")
+        strengths = _string_array(profile_data, "strengths", (), where)
+        if len(strengths) > 8 or any(len(item) > 80 for item in strengths):
+            raise ConfigError(
+                f"{where}.strengths must contain at most 8 entries of at most 80 characters"
+            )
+        cost_tier = profile_data.get("cost_tier", "standard")
+        if not isinstance(cost_tier, str) or cost_tier not in {"low", "standard", "high"}:
+            raise ConfigError(f"{where}.cost_tier is invalid")
+        latency_tier = profile_data.get("latency_tier", "standard")
+        if not isinstance(latency_tier, str) or latency_tier not in {"fast", "standard", "slow"}:
+            raise ConfigError(f"{where}.latency_tier is invalid")
         try:
             selection_mode = SelectionMode(profile_data.get("selection_mode"))
         except (TypeError, ValueError) as exc:
@@ -338,6 +354,10 @@ def _model_profiles(
                 timeout_seconds=endpoint.timeout_seconds,
                 retries=endpoint.retries,
                 extra_body=endpoint.extra_body,
+                description=description,
+                strengths=strengths,
+                cost_tier=cost_tier,
+                latency_tier=latency_tier,
             )
         else:
             for key in ("base_url", "endpoint_path", "api_key_env", "extra_body"):
@@ -360,6 +380,10 @@ def _model_profiles(
                 retries=_nonnegative_int(profile_data, "retries", 2, where),
                 effort=effort,
                 sandbox=sandbox,
+                description=description,
+                strengths=strengths,
+                cost_tier=cost_tier,
+                latency_tier=latency_tier,
             )
     return result, True
 
@@ -589,6 +613,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         ),
         default_reviewer_profile=(
             reviewer_default if explicit_profiles else "legacy-reviewer"
+        ),
+        enable_profile_recommendation=_bool(
+            ui_data, "enable_profile_recommendation", True, "ui"
         ),
     )
 

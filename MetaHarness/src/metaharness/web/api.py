@@ -30,6 +30,10 @@ ARTIFACT_ALLOWLIST = frozenset(
         "spec.md",
         "planner.raw.md",
         "implementation_contract.md",
+        "execution_recommendation.request.txt",
+        "execution_recommendation.raw.md",
+        "execution_recommendation.json",
+        "execution_recommendation.error.txt",
         "agent.events.jsonl",
         "checks.json",
         "review.json",
@@ -221,6 +225,9 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
         "reviewer_raw_available": reviewer_raw is not None,
         "execution_selection": _load_json(
             _artifact_path(directory, "execution_selection.json")
+        ),
+        "execution_recommendation": _load_json(
+            _artifact_path(directory, "execution_recommendation.json")
         ),
         "repair_task": _load_text(_artifact_path(directory, "repair_task.md")),
         "failure": state.get("failure"),

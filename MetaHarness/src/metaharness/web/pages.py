@@ -219,6 +219,13 @@ RUN_PAGE_DYNAMIC_IDS = (
     "approve",
     "reject",
     "approval-message",
+    "execution-recommendation",
+    "implementer-recommendation",
+    "reviewer-recommendation",
+    "recommendation-rationale",
+    "recommendation-message",
+    "implementer-profile",
+    "reviewer-profile",
     "model-selection-warning",
     "base-sha",
     "branch",
@@ -306,6 +313,8 @@ const page = document.getElementById('run-page');
 let decisionSent = false;
 let reloadRequested = false;
 let statePoll = null;
+let implementerTouched = false;
+let reviewerTouched = false;
 const rendered = {};
 function byId(id) { return document.getElementById(id); }
 function display(value) { if (value == null) return ''; return typeof value === 'object' ? JSON.stringify(value) : String(value); }
@@ -381,6 +390,34 @@ function renderSelectionWarning(run) {
   node.hidden = !modes.includes('external-ui');
   node.textContent = node.hidden ? '' : 'Model selection is external. MetaHarness cannot force or verify the actual model selected in the provider UI.';
 }
+function renderRecommendation(recommendation) {
+  const section = byId('execution-recommendation');
+  if (!section) return;
+  if (!recommendation || typeof recommendation !== 'object' || !recommendation.status) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  if (recommendation.status === 'READY') {
+    byId('recommendation-message').textContent = '';
+    const implementerName = PROFILE_NAMES[recommendation.implementer_profile] || recommendation.implementer_profile;
+    const reviewerName = PROFILE_NAMES[recommendation.reviewer_profile] || recommendation.reviewer_profile;
+    byId('implementer-recommendation').textContent = 'Implementer recommendation: ' + String(implementerName);
+    byId('reviewer-recommendation').textContent = 'Reviewer recommendation: ' + String(reviewerName);
+    byId('recommendation-rationale').textContent = recommendation.rationale == null ? '' : String(recommendation.rationale);
+    if (!implementerTouched && PROFILE_NAMES[recommendation.implementer_profile]) byId('implementer-profile').value = recommendation.implementer_profile;
+    if (!reviewerTouched && PROFILE_NAMES[recommendation.reviewer_profile]) byId('reviewer-profile').value = recommendation.reviewer_profile;
+  } else if (recommendation.status === 'FAILED') {
+    byId('implementer-recommendation').textContent = '';
+    byId('reviewer-recommendation').textContent = '';
+    byId('recommendation-rationale').textContent = '';
+    byId('recommendation-message').textContent = 'Recommendation unavailable.\nUsing configured defaults.';
+    if (!implementerTouched) byId('implementer-profile').value = DEFAULT_IMPLEMENTER;
+    if (!reviewerTouched) byId('reviewer-profile').value = DEFAULT_REVIEWER;
+  } else {
+    section.hidden = true;
+  }
+}
 function applyRun(run) {
   if (!run || typeof run !== 'object') return;
   const state = run.state && typeof run.state === 'object' ? run.state : {};
@@ -397,6 +434,7 @@ function applyRun(run) {
   if (changed('status', status)) renderTimeline(status);
   updateApproval(status);
   renderSelectionWarning(run);
+  renderRecommendation(status === AWAITING_STATUS ? state.recommendation : null);
   const plan = run.plan && typeof run.plan === 'object' ? run.plan : {};
   if (changed('contract', plan.contract)) setPre('plan-contract', plan.contract);
   if (changed('raw', plan.raw)) setPre('plan-raw', plan.raw);
@@ -432,6 +470,8 @@ function decide(decision) {
 }
 byId('approve').addEventListener('click', () => decide('APPROVE'));
 byId('reject').addEventListener('click', () => decide('REJECT'));
+byId('implementer-profile').addEventListener('change', () => { implementerTouched = true; });
+byId('reviewer-profile').addEventListener('change', () => { reviewerTouched = true; });
 pollProgress(); setInterval(pollProgress, 1000);
 if (!TERMINAL_STATUSES.includes(page.dataset.status)) { statePoll = setInterval(pollRun, STATE_POLL_MS); }
 """
@@ -483,9 +523,20 @@ def render_run(
         "implementer": config.ui.default_implementer_profile if config else None,
         "reviewer": config.ui.default_reviewer_profile if config else None,
     }
+    recommendation = state.get("recommendation") if isinstance(state.get("recommendation"), dict) else {}
+    recommendation_ready = recommendation.get("status") == "READY"
+    profile_names = {
+        item["id"]: item["display_name"]
+        for values in profile_metadata.values()
+        for item in values
+    }
+    initial_selection = {
+        "implementer": recommendation.get("implementer_profile") if recommendation_ready else defaults["implementer"],
+        "reviewer": recommendation.get("reviewer_profile") if recommendation_ready else defaults["reviewer"],
+    }
     def options(role: str) -> str:
         return "".join(
-            f'<option value="{_e(item["id"])}"{" selected" if item["id"] == defaults[role] else ""}>{_e(item["display_name"])}</option>'
+            f'<option value="{_e(item["id"])}"{" selected" if item["id"] == initial_selection[role] else ""}>{_e(item["display_name"])}</option>'
             for item in profile_metadata[role]
         )
     implementer_options = options("implementer")
@@ -497,6 +548,9 @@ def render_run(
         f"const TERMINAL_LABELS = {_json_script(_TERMINAL_LABELS)};\n"
         f"const TERMINAL_STATUSES = {_json_script(sorted(TERMINAL_STATUSES))};\n"
         f"const AWAITING_STATUS = {_json_script(AWAITING_APPROVAL_STATUS)};\n"
+        f"const PROFILE_NAMES = {_json_script(profile_names)};\n"
+        f"const DEFAULT_IMPLEMENTER = {_json_script(defaults['implementer'])};\n"
+        f"const DEFAULT_REVIEWER = {_json_script(defaults['reviewer'])};\n"
         f"const STATE_POLL_MS = {STATE_POLL_MS};\n"
         + _RUN_SCRIPT
     )
@@ -505,6 +559,7 @@ def render_run(
 <p><a href="/">← Tous les runs</a></p>
 <header><h1>Run {_e(run_id)}</h1><p>Status : <strong id="run-status">{_e(status)}</strong> · <span class="muted">mis à jour <span id="run-updated">{_e(run.get('updated_at'))}</span></span></p></header>
 <div id="approval-actions"{hidden}><label for="implementer-profile">Implementer</label> <select id="implementer-profile">{implementer_options}</select> <label for="reviewer-profile">Reviewer</label> <select id="reviewer-profile">{reviewer_options}</select> <button id="approve" type="button"{disabled}>APPROVE PLAN</button><button id="reject" type="button"{disabled}>REJECT PLAN</button><span id="approval-message"></span></div>
+<section id="execution-recommendation"{"" if recommendation.get("status") in {"READY", "FAILED"} and status == AWAITING_APPROVAL_STATUS else " hidden"}><h2>Execution recommendation</h2><p id="implementer-recommendation">{_e('Implementer recommendation: ' + str(profile_names.get(recommendation.get('implementer_profile'), recommendation.get('implementer_profile'))) if recommendation_ready else '')}</p><p id="reviewer-recommendation">{_e('Reviewer recommendation: ' + str(profile_names.get(recommendation.get('reviewer_profile'), recommendation.get('reviewer_profile'))) if recommendation_ready else '')}</p><p><strong>Rationale:</strong></p><p id="recommendation-rationale">{_e(recommendation.get('rationale') if recommendation_ready else '')}</p><p id="recommendation-message" class="danger">{_e('Recommendation unavailable.\nUsing configured defaults.' if recommendation.get('status') == 'FAILED' else '')}</p></section>
 <p id="model-selection-warning" class="danger"{"" if external_selection else " hidden"}>{_e(warning_text)}</p>
 <section><h2>Header</h2><div class="grid">
   <div class="card"><strong>Base SHA</strong><br><span id="base-sha">{_e(state.get('base_sha'))}</span></div>

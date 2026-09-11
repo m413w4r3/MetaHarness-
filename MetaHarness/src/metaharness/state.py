@@ -45,6 +45,7 @@ class RunStateStore:
             "worktree": worktree,
             "planner": {},
             "execution": {},
+            "recommendation": {},
             "plan_identity": None,
             "agent": {},
             "checks": [],

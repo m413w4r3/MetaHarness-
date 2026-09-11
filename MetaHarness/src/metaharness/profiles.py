@@ -110,6 +110,10 @@ def safe_profile_metadata(profile: ModelProfile) -> dict[str, Any]:
         "selection_mode": profile.selection_mode.value,
         "effort": profile.effort,
         "sandbox": profile.sandbox,
+        "description": profile.description,
+        "strengths": list(profile.strengths),
+        "cost_tier": profile.cost_tier,
+        "latency_tier": profile.latency_tier,
     }
 
 

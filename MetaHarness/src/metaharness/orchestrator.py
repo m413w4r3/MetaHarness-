@@ -46,6 +46,11 @@ from .gitops import (
     symbolic_head,
 )
 from .llm.chat import LLMError, OpenAIChatTextClient
+from .recommendation import (
+    ExecutionRecommender,
+    RecommendationError,
+    write_recommendation_error,
+)
 from .execution_selection import (
     read_execution_selection,
     resolve_execution_selection,
@@ -60,7 +65,12 @@ from .planning import (
     render_implementation_contract,
 )
 from .redaction import config_secret_values, redact, redact_file
-from .profiles import build_agent_config, build_llm_endpoint, profile_for_role
+from .profiles import (
+    build_agent_config,
+    build_llm_endpoint,
+    profile_for_role,
+    profiles_for_config,
+)
 from .result import RunResult, write_repair_task
 from .review import Reviewer, ReviewParseError, ReviewResult, blocking_finding_lines, parse_review
 from .state import RunStateStore
@@ -289,6 +299,7 @@ class Orchestrator:
         *,
         planner_client: Any | None = None,
         reviewer_client: Any | None = None,
+        recommender_client: Any | None = None,
         agent: CodexAgent | None = None,
     ) -> None:
         if not isinstance(config, HarnessConfig):
@@ -296,6 +307,7 @@ class Orchestrator:
         self.config = config
         self._planner_client = planner_client
         self._reviewer_client = reviewer_client
+        self._recommender_client = recommender_client
         self._injected_agent = agent
         self._secrets: tuple[str, ...] = ()
 
@@ -312,6 +324,63 @@ class Orchestrator:
         if client is None:
             client = OpenAIChatTextClient(build_llm_endpoint(profile))
         return Reviewer(client, allow_format_repair=False)
+
+    def _recommender_for_profile(self, profile_id: str) -> ExecutionRecommender:
+        profile = profile_for_role(self.config, profile_id, ExecutionRole.PLANNER)
+        client = self._recommender_client
+        if client is None:
+            # This is deliberately a new client: the recommender has no
+            # planner conversation/history, while using the same profile
+            # endpoint and transport policy.
+            client = OpenAIChatTextClient(build_llm_endpoint(profile))
+        return ExecutionRecommender(client)
+
+    def _maybe_recommend_profiles(
+        self,
+        store: RunStateStore,
+        run_dir: Path,
+        planner_profile_id: str,
+    ) -> None:
+        if not self.config.ui.enable_profile_recommendation:
+            return
+        profiles = profiles_for_config(self.config)
+        implementers = tuple(
+            profile for profile in profiles.values() if ExecutionRole.IMPLEMENTER in profile.roles
+        )
+        reviewers = tuple(
+            profile for profile in profiles.values() if ExecutionRole.REVIEWER in profile.roles
+        )
+        if len(implementers) <= 1 and len(reviewers) <= 1:
+            return
+        try:
+            contract = (run_dir / "implementation_contract.md").read_text(encoding="utf-8")
+            recommendation = self._recommender_for_profile(planner_profile_id).recommend(
+                contract,
+                implementers,
+                reviewers,
+                artifacts_dir=run_dir,
+            )
+        except (LLMError, RecommendationError, OSError, UnicodeError) as exc:
+            message = redact(" ".join(str(exc).split()), self._secrets)
+            warning = f"{type(exc).__name__}: {message}"[:1000]
+            try:
+                write_recommendation_error(run_dir, warning)
+            except (OSError, UnicodeError):
+                pass
+            store.update(
+                status=RunStatus.PLANNING,
+                recommendation={"status": "FAILED", "warning": warning},
+            )
+            return
+        store.update(
+            status=RunStatus.PLANNING,
+            recommendation={
+                "status": "READY",
+                "implementer_profile": recommendation.implementer_profile,
+                "reviewer_profile": recommendation.reviewer_profile,
+                "rationale": recommendation.rationale,
+            },
+        )
 
     def _agent_for_profile(self, profile_id: str) -> CodexAgent:
         profile = profile_for_role(self.config, profile_id, ExecutionRole.IMPLEMENTER)
@@ -465,6 +534,8 @@ class Orchestrator:
                 failure={"reason": "PLANNER_BLOCKED", "detail": plan.blockers},
             )
             return RunResult(run_dir, RunStatus.BLOCKED, state)
+
+        self._maybe_recommend_profiles(store, run_dir, planner_profile.id)
 
         plan_identity = compute_plan_identity_from_run(run_dir)
         store.update(

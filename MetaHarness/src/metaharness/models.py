@@ -44,6 +44,23 @@ class ModelProfile:
     effort: str | None = None
     sandbox: str | None = None
 
+    description: str = ""
+    strengths: tuple[str, ...] = ()
+    cost_tier: str = "standard"
+    latency_tier: str = "standard"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.description, str) or len(self.description) > 300:
+            raise ValueError("profile description must be at most 300 characters")
+        if not isinstance(self.strengths, tuple) or len(self.strengths) > 8:
+            raise ValueError("profile strengths must contain at most 8 entries")
+        if any(not isinstance(item, str) or len(item) > 80 for item in self.strengths):
+            raise ValueError("profile strengths entries must be at most 80 characters")
+        if not isinstance(self.cost_tier, str) or self.cost_tier not in {"low", "standard", "high"}:
+            raise ValueError("profile cost_tier is invalid")
+        if not isinstance(self.latency_tier, str) or self.latency_tier not in {"fast", "standard", "slow"}:
+            raise ValueError("profile latency_tier is invalid")
+
 
 class RunStatus(StrEnum):
     CREATED = "created"
@@ -131,6 +148,7 @@ class UIConfig:
     default_planner_profile: str | None = None
     default_implementer_profile: str | None = None
     default_reviewer_profile: str | None = None
+    enable_profile_recommendation: bool = True
 
 
 @dataclass(frozen=True)
