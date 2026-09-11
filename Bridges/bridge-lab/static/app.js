@@ -20,7 +20,8 @@ const surfaceHints = {
 const defaultModels = { bridge: "chatgpt-web", webai: "gemini-3-flash" };
 const terminalStatuses = new Set(["completed", "failed", "needs_review"]);
 const POLL_INTERVAL_MS = 1000;
-const POLL_TIMEOUT_MS = 120000;
+// Replaced at startup by /api/config (BRIDGE_TOTAL_TIMEOUT + margin).
+let pollTimeoutMs = 3720000;
 let pollController = null;
 
 function pretty(value) { return typeof value === "string" ? value : JSON.stringify(value, null, 2); }
@@ -212,7 +213,9 @@ async function pollBackground(responseId, initial) {
   let status = initial?.status || "queued";
   try {
     while (!terminalStatuses.has(status)) {
-      if (performance.now() - started > POLL_TIMEOUT_MS) throw new Error("Timeout global du polling background.");
+      if (performance.now() - started > pollTimeoutMs) {
+        throw new Error(`Timeout global du polling background (${Math.round(pollTimeoutMs / 1000)} s).`);
+      }
       await sleep(POLL_INTERVAL_MS, controller.signal);
       const res = await fetch(`/api/poll/responses/${encodeURIComponent(responseId)}`, { signal: controller.signal });
       const data = await res.json();
@@ -261,6 +264,16 @@ async function send() {
   } finally { $("send").disabled = false; }
 }
 
+async function loadConfig() {
+  try {
+    const res = await fetch("/api/config");
+    const data = await res.json();
+    if (Number.isFinite(data?.poll_timeout_ms) && data.poll_timeout_ms > 0) pollTimeoutMs = data.poll_timeout_ms;
+  } catch (_) {
+    // Keep the built-in default, aligned with BRIDGE_TOTAL_TIMEOUT=3600.
+  }
+}
+
 $("provider").addEventListener("change", updateSurfaces);
 $("surface").addEventListener("change", () => { updateSurfaceControls(); applyPreset("text"); });
 $("model").addEventListener("change", () => applyPreset("text"));
@@ -270,5 +283,6 @@ $("send").addEventListener("click", send);
 $("stopPolling").addEventListener("click", stopPolling);
 for (const button of document.querySelectorAll("[data-preset]")) button.addEventListener("click", () => applyPreset(button.dataset.preset));
 
+loadConfig();
 updateSurfaces();
 refreshStatus();

@@ -1,9 +1,12 @@
 # MetaHarness model stack
 
-Le compose commun démarre `chatgpt-bridge`, `WebAI-to-API` et `bridge-lab` sur
-le réseau Docker partagé `metaharness-models`. Les trois services peuvent donc
-se joindre par leurs noms `chatgpt-bridge`, `web_ai` et `bridge-lab`. Aucun
-gateway ou proxy intermédiaire n’est ajouté.
+Le compose commun démarre `chatgpt-bridge`, `WebAI-to-API` et `bridge-lab`.
+`chatgpt-bridge` et `web_ai` rejoignent le réseau Docker partagé
+`metaharness-models`, où les consommateurs (AutoWork) les joignent par leurs noms.
+`bridge-lab` n’est attaché qu’au réseau dédié `metaharness-bridge-lab`, partagé
+avec ces deux services : le lab, qui détient `BRIDGE_API_KEY`, n’est donc pas un
+proxy authentifié joignable depuis `metaharness-models`. Aucun gateway ou proxy
+intermédiaire n’est ajouté entre les consommateurs et les providers.
 
 ## Préparer depuis la racine MetaHarness-
 
@@ -56,7 +59,10 @@ le créent seulement s’il n’existe pas ; cette préparation est idempotente.
 installation neuve.
 
 - `models-build` construit explicitement les images et peut donc nécessiter
-  l’accès aux registres (notamment l’image Playwright de WebAI).
+  l’accès aux registres (notamment l’image Playwright de WebAI). L’image WebAI
+  locale est taggée `metaharness/webai:local`, jamais avec le nom de l’image
+  publique upstream : après une mise à jour, relancer `models-build` avant
+  `models-up`.
 - `models-up` utilise les images locales existantes, sans rebuild ni pull
   implicite.
 - `models-rebuild` construit explicitement, puis démarre avec ces images.
@@ -73,6 +79,9 @@ La configuration effective peut être vérifiée ainsi :
 ```bash
 docker compose --env-file .env.models -f compose.models.yaml config
 ```
+
+Cette sortie contient les valeurs de `.env.models`, secrets compris : ne pas la
+partager telle quelle (`config --quiet` valide sans rien afficher).
 
 Les probes minimales sont :
 
@@ -101,22 +110,26 @@ Depuis un conteneur raccordé à `metaharness-models` :
 ```text
 Bridge: http://chatgpt-bridge:8001/v1
 WebAI:  http://web_ai:6969/v1
-Lab:    http://bridge-lab:7070
 ```
+
+Le Lab n’est joignable que depuis le navigateur de l’hôte, via
+`http://127.0.0.1:7070`.
 
 Les bind mounts conservent la configuration WebAI (`config.conf` en lecture
 seule) et l’état d’authentification/runtime (`WEBAI_RUNTIME_DIR`).
 
 ## Raccorder AutoWork
 
-Après le démarrage de cette stack, configurer AutoWork avec :
+Après le démarrage de cette stack, l’override `compose.models.yaml` d’AutoWork
+fixe lui-même, pour `backend`, `worker` et `job-recovery` :
 
 ```env
 OPENAI_BRIDGE_BASE_URL=http://chatgpt-bridge:8001/v1
 WEBAI_BASE_URL=http://web_ai:6969/v1
 ```
 
-Puis, depuis `MetaHarness-/AutoWork`, utiliser son override réseau :
+`OPENAI_BRIDGE_API_KEY` (dans le `.env` d’AutoWork) doit égaler `BRIDGE_API_KEY`.
+Depuis `MetaHarness-/AutoWork`, démarrer avec l’override :
 
 ```bash
 docker compose \
@@ -125,6 +138,6 @@ docker compose \
   up -d
 ```
 
-Le backend et le worker AutoWork concernés rejoignent le réseau externe
-`metaharness-models`, comme les services de cette stack, et résolvent donc les
-noms `chatgpt-bridge` et `web_ai`.
+`backend`, `worker` et `job-recovery` rejoignent le réseau externe
+`metaharness-models` (et aucun autre réseau de cette stack) et résolvent donc
+les noms `chatgpt-bridge` et `web_ai`.

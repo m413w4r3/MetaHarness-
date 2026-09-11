@@ -23,6 +23,14 @@ WEBAI_BASE_URL = os.getenv("WEBAI_BASE_URL", "http://web_ai:6969").rstrip("/")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("LAB_REQUEST_TIMEOUT_SECONDS", "300"))
 MAX_REQUEST_BYTES = int(os.getenv("LAB_MAX_REQUEST_BYTES", str(1024 * 1024)))
 MAX_RESPONSE_BYTES = int(os.getenv("LAB_MAX_RESPONSE_BYTES", str(4 * 1024 * 1024)))
+# Background Responses polling must outlive the Bridge's own total budget
+# (BRIDGE_TOTAL_TIMEOUT) by a small margin, or the lab would give up on a run
+# the Bridge is still legitimately executing.
+BRIDGE_TOTAL_TIMEOUT_SECONDS = float(os.getenv("BRIDGE_TOTAL_TIMEOUT", "3600"))
+POLL_TIMEOUT_MARGIN_SECONDS = 120.0
+POLL_TIMEOUT_SECONDS = float(
+    os.getenv("LAB_POLL_TIMEOUT_SECONDS") or BRIDGE_TOTAL_TIMEOUT_SECONDS + POLL_TIMEOUT_MARGIN_SECONDS
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -232,6 +240,12 @@ async def _get_json(provider: Provider, path: str) -> dict[str, Any]:
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/config")
+async def lab_config() -> dict[str, Any]:
+    """Non-secret UI settings; BRIDGE_API_KEY never leaves this process."""
+    return {"poll_timeout_ms": int(POLL_TIMEOUT_SECONDS * 1000)}
 
 
 @app.get("/api/status/{provider}")

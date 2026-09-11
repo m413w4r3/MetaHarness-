@@ -10,6 +10,8 @@ Bridge Lab fait partie du compose principal de `MetaHarness-/Bridges`. Ajoute à
 
 ```env
 BRIDGE_LAB_PORT=7070
+# Budget du polling background ; vide = BRIDGE_TOTAL_TIMEOUT + 120 s.
+LAB_POLL_TIMEOUT_SECONDS=
 ```
 
 Puis, depuis `MetaHarness-/Bridges`, construis et démarre la stack :
@@ -38,12 +40,16 @@ http://127.0.0.1:7070
 - réponse SSE `stream=true` (bufferisée par le lab pour diagnostic) ;
 - extraction du texte assistant ;
 - métadonnées provider et erreurs de transport/parsing ;
-- polling GET des Responses background jusqu'à l'état terminal.
+- polling GET des Responses background jusqu'à l'état terminal, sans jamais
+  refaire le POST initial ; borné par `LAB_POLL_TIMEOUT_SECONDS` (défaut :
+  `BRIDGE_TOTAL_TIMEOUT` + 120 s) et interruptible par « Stop polling ».
 
 ## Sécurité
 
 - les URLs provider sont codées côté serveur ; pas de proxy URL arbitraire ;
 - `BRIDGE_API_KEY` reste seulement dans le conteneur `bridge-lab` ;
+- `bridge-lab` n'est attaché qu'au réseau dédié `metaharness-bridge-lab` : ce
+  proxy authentifié n'est pas joignable depuis `metaharness-models` (AutoWork) ;
 - l'UI est publiée sur `127.0.0.1` ;
 - tailles de requête/réponse bornées.
 

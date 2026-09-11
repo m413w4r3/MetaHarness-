@@ -37,6 +37,7 @@ services:
 
     networks:
       - models
+      - lab
 
     stop_grace_period: 30s
     restart: unless-stopped
@@ -49,7 +50,8 @@ services:
         APP_UID: ${APP_UID:-1000}
         APP_GID: ${APP_GID:-1000}
 
-    image: cornatul/webai.ai
+    # Local build: never tagged as the public upstream image.
+    image: metaharness/webai:local
 
     env_file:
       - ./WebAI-to-API/.env
@@ -82,6 +84,7 @@ services:
 
     networks:
       - models
+      - lab
 
     restart: unless-stopped
 
@@ -97,12 +100,17 @@ services:
       LAB_REQUEST_TIMEOUT_SECONDS: ${LAB_REQUEST_TIMEOUT_SECONDS:-300}
       LAB_MAX_REQUEST_BYTES: ${LAB_MAX_REQUEST_BYTES:-1048576}
       LAB_MAX_RESPONSE_BYTES: ${LAB_MAX_RESPONSE_BYTES:-4194304}
+      # Background polling outlives the Bridge total budget (+120 s by default).
+      BRIDGE_TOTAL_TIMEOUT: ${BRIDGE_TOTAL_TIMEOUT:-3600}
+      LAB_POLL_TIMEOUT_SECONDS: ${LAB_POLL_TIMEOUT_SECONDS:-}
 
     ports:
       - "127.0.0.1:${BRIDGE_LAB_PORT:-7070}:7070"
 
+    # Only on the lab network: the authenticated lab proxy is unreachable
+    # from metaharness-models, where consumers such as AutoWork live.
     networks:
-      - models
+      - lab
 
     restart: unless-stopped
 
@@ -112,5 +120,9 @@ volumes:
     name: chatgpt-bridge_bridge_data
 
 networks:
+  # Shared with model consumers (AutoWork joins it as an external network).
   models:
     name: metaharness-models
+  # Dedicated to bridge-lab and the two providers it tests.
+  lab:
+    name: metaharness-bridge-lab
