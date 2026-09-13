@@ -117,6 +117,38 @@ class P19WebTests(unittest.TestCase):
         status, _headers, _content = self.request("POST", "/runs", unknown)
         self.assertEqual(status, 400)
 
+    def test_html_create_accepts_opaque_origin_and_redirects(self) -> None:
+        token = self.token_from_new()
+        body = urlencode({"_token": token, "spec": "do it", "run_id": "", "planner_profile": ""})
+        with patch("metaharness.web.server.create_run", return_value={"location": "/runs/new-id"}) as create:
+            status, headers, _content = self.request(
+                "POST",
+                "/runs",
+                body,
+                Host=f"127.0.0.1:{self.server.server_port}",
+                Origin="null",
+            )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/runs/new-id")
+        create.assert_called_once()
+
+    def test_html_form_opaque_origin_still_requires_mutation_token(self) -> None:
+        self.create_waiting()
+        for token in (None, "wrong"):
+            with self.subTest(token=token):
+                fields = {"decision": "REJECT"}
+                if token is not None:
+                    fields["_token"] = token
+                status, _headers, content = self.request(
+                    "POST",
+                    "/runs/waiting/approval",
+                    urlencode(fields),
+                    Host=f"127.0.0.1:{self.server.server_port}",
+                    Origin="null",
+                )
+                self.assertEqual(status, 403)
+                self.assertIn(b"mutation token required", content)
+
     def test_html_approval_uses_form_token_origin_and_redirects(self) -> None:
         run = self.create_waiting()
         token = self.token_from_new()
@@ -136,6 +168,34 @@ class P19WebTests(unittest.TestCase):
         self.assertEqual(status, 303)
         self.assertEqual(headers["Location"], "/runs/waiting")
         self.assertEqual(json.loads((run / "plan_approval.json").read_text())["decision"], "REJECT")
+
+    def test_html_approval_accepts_opaque_origin_and_redirects(self) -> None:
+        run = self.create_waiting()
+        token = self.token_from_new()
+        form = urlencode({"_token": token, "decision": "REJECT"})
+        status, headers, _content = self.request(
+            "POST",
+            "/runs/waiting/approval",
+            form,
+            Host=f"127.0.0.1:{self.server.server_port}",
+            Origin="null",
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/runs/waiting")
+        self.assertEqual(json.loads((run / "plan_approval.json").read_text())["decision"], "REJECT")
+
+    def test_html_create_rejects_foreign_origin(self) -> None:
+        token = self.token_from_new()
+        body = urlencode({"_token": token, "spec": "do it", "run_id": "", "planner_profile": ""})
+        status, _headers, content = self.request(
+            "POST",
+            "/runs",
+            body,
+            Host=f"127.0.0.1:{self.server.server_port}",
+            Origin="http://evil.example",
+        )
+        self.assertEqual(status, 403)
+        self.assertIn(b"origin not allowed", content)
 
     def test_bounded_diagnostics_diff_and_progress(self) -> None:
         run = self.create_waiting("artifacts")

@@ -170,6 +170,50 @@ class LocalServerHardeningTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue((run_dir / "plan_approval.json").exists())
 
+    def test_api_create_rejects_opaque_origin(self) -> None:
+        status, _headers, content = self.request(
+            "POST",
+            "/api/runs",
+            {
+                "Host": f"127.0.0.1:{self.port}",
+                "Origin": "null",
+                "X-MetaHarness-Token": self.server.token,
+            },
+            {"spec": "do it", "run_id": "opaque-origin"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("origin not allowed", content)
+
+    def test_api_approval_rejects_opaque_origin(self) -> None:
+        run_dir = self.awaiting_run()
+        status, _headers, content = self.request(
+            "POST",
+            "/api/runs/waiting/approval",
+            {
+                "Host": f"127.0.0.1:{self.port}",
+                "Origin": "null",
+                "X-MetaHarness-Token": self.server.token,
+            },
+            {"decision": "REJECT"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("origin not allowed", content)
+        self.assertFalse((run_dir / "plan_approval.json").exists())
+
+    def test_api_foreign_origin_is_rejected(self) -> None:
+        status, _headers, content = self.request(
+            "POST",
+            "/api/runs",
+            {
+                "Host": f"127.0.0.1:{self.port}",
+                "Origin": "http://evil.example",
+                "X-MetaHarness-Token": self.server.token,
+            },
+            {"spec": "do it", "run_id": "foreign-origin"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("origin not allowed", content)
+
     def test_mutation_without_origin_is_accepted_with_host_and_token(self) -> None:
         run_dir = self.awaiting_run()
         status, _headers, _content = self.request(

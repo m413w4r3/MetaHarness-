@@ -138,10 +138,14 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
         if host is None or host.strip().lower() not in allowed_hosts(self.server.server_port):
             raise WebAPIError(403, "host not allowed")
 
-    def _check_origin(self) -> None:
+    def _check_origin(self, *, allow_opaque: bool = False) -> None:
         origin = self._single_header("Origin")
-        # A local CLI client may omit Origin; Host and token still apply.
-        if origin is not None and origin.strip() not in allowed_origins(self.server.server_port):
+        if origin is None:
+            return
+        value = origin.strip()
+        if allow_opaque and value == "null":
+            return
+        if value not in allowed_origins(self.server.server_port):
             raise WebAPIError(403, "origin not allowed")
 
     def do_GET(self) -> None:
@@ -273,8 +277,16 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             self._check_host()
-            self._check_origin()
             parts = self._path_parts()
+            html_form_route = (
+                parts == ["", "runs"]
+                or (
+                    len(parts) == 4
+                    and parts[1] == "runs"
+                    and parts[3] == "approval"
+                )
+            )
+            self._check_origin(allow_opaque=html_form_route)
             if parts == ["", "api", "runs"]:
                 self._authorized()
                 payload = self._body()
