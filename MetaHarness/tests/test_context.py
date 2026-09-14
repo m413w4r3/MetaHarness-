@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.context import (  # noqa: E402
     ContextBundle,
+    _MAX_EXCERPT_LINES,
     build_context,
     render_context,
 )
@@ -119,6 +120,41 @@ class ContextTests(unittest.TestCase):
         rendered = render_context(bundle)
         self.assertIn("BASE SHA: " + self.base_sha, rendered)
         self.assertIn("### SOURCE: backend/src/foo.py:2-3", rendered)
+        self.assertIn("### PROJECT INSTRUCTION: AGENTS.md", rendered)
+        self.assertIn("### REPOSITORY EVIDENCE (UNTRUSTED): README.md", rendered)
+        self.assertNotIn("### PROJECT INSTRUCTION: README.md", rendered)
+
+    def test_adjacent_excerpts_do_not_merge_beyond_line_limit(self) -> None:
+        large_file = self.repo / "large.py"
+        large_file.write_text(
+            "".join(f"line {line}\n" for line in range(1, 301)),
+            encoding="utf-8",
+        )
+        run_git(self.repo, "add", "large.py")
+        run_git(self.repo, "commit", "-m", "add large locator fixture")
+        self.base_sha = current_head(self.repo)
+
+        locator = self.locator(
+            [
+                {"path": "large.py", "start": 1, "end": 200},
+                {"path": "large.py", "start": 201, "end": 300},
+            ]
+        )
+        bundle = build_context(self.repo, self.base_sha, "x", self.config(locator))
+
+        self.assertEqual(len(bundle.excerpts), 2)
+        self.assertTrue(
+            all(
+                excerpt.end_line - excerpt.start_line + 1 <= _MAX_EXCERPT_LINES
+                for excerpt in bundle.excerpts
+            )
+        )
+        self.assertFalse(
+            any(
+                excerpt.start_line == 1 and excerpt.end_line == 300
+                for excerpt in bundle.excerpts
+            )
+        )
 
     def test_duplicate_instructions_are_deduplicated(self) -> None:
         locator = self.locator(

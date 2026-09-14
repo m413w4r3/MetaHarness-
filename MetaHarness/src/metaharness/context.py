@@ -208,6 +208,8 @@ def _merge_excerpt(
             continue
         start = min(existing.start_line, new.start_line)
         end = max(existing.end_line, new.end_line)
+        if end - start + 1 > _MAX_EXCERPT_LINES:
+            return False
         excerpts[index] = ContextExcerpt(
             path=existing.path,
             start_line=start,
@@ -419,7 +421,9 @@ def render_context(bundle: ContextBundle) -> str:
             parts.append(f"symbol: {excerpt.symbol}")
         parts.append(excerpt.content.rstrip("\n"))
     for path, content in trailing_files:
-        parts.extend(("", f"### PROJECT INSTRUCTION: {path}", content.rstrip("\n")))
+        parts.extend(
+            ("", f"### REPOSITORY EVIDENCE (UNTRUSTED): {path}", content.rstrip("\n"))
+        )
     return "\n".join(parts) + "\n"
 
 
