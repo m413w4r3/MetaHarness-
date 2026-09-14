@@ -178,11 +178,16 @@ class ClaudeCodeAgent:
         artifacts_dir: Path,
         profile: ModelProfile,
         environment: Mapping[str, str],
+        revision_dir: Path | None = None,
     ) -> ClaudeResult:
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
         worktree_path = Path(worktree).expanduser().resolve()
-        directory = Path(artifacts_dir).expanduser().resolve() / "revision"
+        directory = (
+            Path(revision_dir).expanduser().resolve()
+            if revision_dir is not None
+            else Path(artifacts_dir).expanduser().resolve() / "revision"
+        )
         directory.mkdir(parents=True, exist_ok=True)
         prompt_text = build_revision_prompt(prompt)
         prompt_path = directory / "agent.prompt.txt"

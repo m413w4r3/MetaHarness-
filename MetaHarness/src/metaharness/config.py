@@ -27,6 +27,7 @@ from .models import (
     PlanningConfig,
     ProfileDriver,
     RepositoryConfig,
+    RevisionConfig,
     SelectionMode,
     UIConfig,
     WorkspaceSetupCommand,
@@ -603,6 +604,13 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         single_step_max_mutable_paths=single_step_max_mutable_paths,
     )
 
+    revision_data = _table(expanded, "revision")
+    revision = RevisionConfig(
+        max_cycles=_bounded_int(
+            revision_data, "max_cycles", 2, "revision", minimum=2, maximum=2
+        )
+    )
+
     repository_data = _table(expanded, "repository")
     repository_remote = _required_string(repository_data, "remote", "repository") if "remote" in repository_data else "origin"
     if "\x00" in repository_remote or any(char.isspace() for char in repository_remote):
@@ -882,6 +890,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         claude_runtime=claude_runtime,
         workspace_setup=workspace_setup,
         planning=planning,
+        revision=revision,
         repository=repository,
         repository_section_explicit="repository" in expanded,
     )

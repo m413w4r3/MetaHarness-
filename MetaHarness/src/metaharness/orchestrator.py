@@ -60,6 +60,7 @@ from .gitops import (
     index_tree_sha,
     local_branches,
     build_repository_reference,
+    render_repository_reference,
     path_exists_in_tree,
     registered_worktrees,
     resolve_commit,
@@ -100,6 +101,7 @@ from .models import (
     ImplementationStep,
     ReviewRoute,
     ReviewVerdict,
+    RunCycle,
     RunStatus,
 )
 from .planning import (
@@ -111,15 +113,17 @@ from .planning import (
 )
 from .planning_v2 import (
     PlannerV2,
+    RepairPlannerV2,
     TaskPlanV2,
     V2PlanParseError,
     read_approved_step_contract,
     read_set_paths,
     validate_implementation_bundle,
 )
-from .usage import add_usage, empty_usage, normalize_usage
+from .usage import add_usage, empty_usage, normalize_usage, read_usage_artifact
 from .redaction import config_secret_values, redact, redact_file
 from .profiles import (
+    ProfileError,
     build_agent_config,
     build_claude_profile,
     build_llm_endpoint,
@@ -391,8 +395,10 @@ def _codex_auth_failure(run_dir: Path, stderr: str, *, step_id: str | None = Non
     return classify_codex_failure(stderr, _artifact_tail(events_path)) == "CODEX_AUTH_FAILURE"
 
 
-def _claude_auth_failure(run_dir: Path, stderr: str) -> bool:
-    events_path = run_dir / "revision" / "agent.events.jsonl"
+def _claude_auth_failure(
+    run_dir: Path, stderr: str, *, revision_dir: Path | None = None
+) -> bool:
+    events_path = (revision_dir or (run_dir / "revision")) / "agent.events.jsonl"
     return classify_claude_failure(stderr, _artifact_tail(events_path)) == "CLAUDE_AUTH_FAILURE"
 
 
@@ -649,8 +655,15 @@ class Orchestrator:
             },
         )
 
-    def _agent_for_profile(self, profile_id: str) -> CodexAgent:
-        profile = profile_for_role(self.config, profile_id, ExecutionRole.IMPLEMENTER)
+    def _agent_for_profile(
+        self, profile_id: str, role: ExecutionRole = ExecutionRole.IMPLEMENTER
+    ) -> CodexAgent:
+        try:
+            profile = profile_for_role(self.config, profile_id, role)
+        except ProfileError:
+            if role is not ExecutionRole.IMPLEMENTER:
+                raise
+            profile = profile_for_role(self.config, profile_id, ExecutionRole.REPAIR)
         if self._injected_agent is not None:
             return self._injected_agent
         return CodexAgent(
@@ -673,6 +686,7 @@ class Orchestrator:
         worktree: Path,
         run_dir: Path,
         prompt: str,
+        revision_dir: Path | None = None,
     ) -> Any | None:
         selected = getattr(selection, "reviser", None)
         if selected is None:
@@ -682,13 +696,155 @@ class Orchestrator:
         environment = build_claude_environment(
             self._runtime_environment, claude_home=claude_home
         )
+        kwargs: dict[str, Any] = {
+            "artifacts_dir": run_dir,
+            "profile": profile,
+            "environment": environment,
+        }
+        if revision_dir is not None:
+            kwargs["revision_dir"] = revision_dir
         return self._reviser_for_profile(profile.id).run_revision(
-            redact(prompt, self._secrets),
-            worktree,
-            artifacts_dir=run_dir,
-            profile=profile,
-            environment=environment,
+            redact(prompt, self._secrets), worktree, **kwargs
         )
+
+    @staticmethod
+    def _cycle_update(store: RunStateStore, number: int, **fields: Any) -> None:
+        """Merge one cycle record without replacing the other cycle records."""
+
+        state = store.load()
+        cycles = list(state.get("cycles") or [])
+        index = next(
+            (i for i, item in enumerate(cycles)
+             if isinstance(item, dict) and item.get("number") == number),
+            None,
+        )
+        record = asdict(RunCycle(number, "initial" if number == 1 else "repair"))
+        if index is not None and isinstance(cycles[index], dict):
+            record.update(cycles[index])
+        record.update(fields)
+        if index is None:
+            cycles.append(record)
+        else:
+            cycles[index] = record
+        store.update(status=state.get("status", RunStatus.PLANNING), cycles=cycles)
+
+    def _update_v2_usage(self, store: RunStateStore, run_dir: Path) -> None:
+        """Publish cycle-specific and backward-compatible token totals."""
+
+        def usage(path: Path) -> dict[str, int]:
+            return read_usage_artifact(path) or empty_usage()
+
+        luna_c01 = add_usage(
+            item.get("usage", empty_usage())
+            for item in getattr(self, "_last_v2_step_results", [])
+        )
+        luna_c02 = add_usage(
+            item.get("usage", empty_usage())
+            for item in getattr(self, "_repair_v2_step_results", [])
+        )
+        planner = usage(run_dir / "planner.usage.json")
+        claude_c01 = usage(run_dir / "revision" / "usage.json")
+        reviewer_c01 = usage(run_dir / "reviewer.usage.json")
+        repair_planner = usage(run_dir / "repair" / "C02" / "planner.usage.json")
+        claude_c02 = usage(run_dir / "revision" / "C02" / "usage.json")
+        reviewer_c02 = usage(run_dir / "review" / "C02" / "reviewer.usage.json")
+        has_c02 = any(
+            value != empty_usage()
+            for value in (repair_planner, luna_c02, claude_c02, reviewer_c02)
+        ) or bool(getattr(self, "_repair_v2_step_results", []))
+        implementer = add_usage((luna_c01, luna_c02))
+        reviser = add_usage((claude_c01, claude_c02))
+        reviewer = add_usage((reviewer_c01, reviewer_c02))
+        phase_usage: dict[str, Any] = {
+            "planner": planner,
+            "implementer": {"total": implementer, "steps": [
+                *[{**item, "cycle": 1} for item in getattr(self, "_last_v2_step_results", [])],
+                *[{**item, "cycle": 2} for item in getattr(self, "_repair_v2_step_results", [])],
+            ]},
+            "reviser": reviser,
+            "reviewer": reviewer,
+        }
+        if has_c02:
+            phase_usage.update({
+                "luna_c01": luna_c01,
+                "claude_c01": claude_c01,
+                "reviewer_c01": reviewer_c01,
+                "repair_planner_c02": repair_planner,
+                "luna_c02": luna_c02,
+                "claude_c02": claude_c02,
+                "reviewer_c02": reviewer_c02,
+            })
+        phase_usage["grand_total"] = add_usage(
+            (planner, luna_c01, claude_c01, reviewer_c01,
+             repair_planner, luna_c02, claude_c02, reviewer_c02)
+        )
+        store.update(status=store.load().get("status", RunStatus.PLANNING), usage=phase_usage)
+
+    @staticmethod
+    def _snapshot_cycle_artifacts(run_dir: Path) -> None:
+        """Publish immutable C01 aliases before any C02 work can start."""
+
+        groups = (
+            (run_dir / "revision", run_dir / "revision" / "C01"),
+            (run_dir, run_dir / "review" / "C01"),
+            (run_dir, run_dir / "checks" / "C01"),
+        )
+        names = {
+            "revision": ("agent.prompt.txt", "agent.events.jsonl", "agent.stderr.log",
+                         "agent.final.md", "agent.result.json", "pre_checks.json",
+                         "scope.json", "tree_before.txt", "tree_after.txt",
+                         "report.json", "usage.json"),
+            "review": ("reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json",
+                       "review.json"),
+            "checks": ("checks.json", "changed-files.txt", "diff.patch"),
+        }
+        for source, destination in groups:
+            kind = "revision" if destination.parent.name == "revision" else "review" if destination.parent.name == "review" else "checks"
+            for name in names[kind]:
+                source_path = source / name
+                if not source_path.exists():
+                    continue
+                try:
+                    content = source_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
+                    continue
+                atomic_write_text(destination / name, content)
+
+    @staticmethod
+    def _ensure_step_artifacts(step_dir: Path, result: Any) -> None:
+        """Make the durable C02 step envelope complete for test doubles too."""
+
+        if not (step_dir / "agent.final.md").exists():
+            atomic_write_text(step_dir / "agent.final.md", str(getattr(result, "final_message", "")))
+        if not (step_dir / "agent.stderr.log").exists():
+            atomic_write_text(step_dir / "agent.stderr.log", str(getattr(result, "stderr_tail", "")))
+        if not (step_dir / "agent.events.jsonl").exists():
+            atomic_write_text(step_dir / "agent.events.jsonl", "")
+        if not (step_dir / "agent.result.json").exists():
+            payload = asdict(result) if dataclasses.is_dataclass(result) else {
+                "exit_code": getattr(result, "exit_code", None),
+                "timed_out": getattr(result, "timed_out", None),
+                "usage": getattr(result, "usage", {}),
+            }
+            atomic_write_text(step_dir / "agent.result.json", _json_text(payload))
+
+    @staticmethod
+    def _ensure_revision_artifacts(artifact_dir: Path, result: Any) -> None:
+        """Complete the revision artifact set without replacing provider files."""
+
+        if not (artifact_dir / "agent.final.md").exists():
+            atomic_write_text(artifact_dir / "agent.final.md", str(getattr(result, "final_message", "")))
+        if not (artifact_dir / "agent.stderr.log").exists():
+            atomic_write_text(artifact_dir / "agent.stderr.log", str(getattr(result, "stderr_tail", "")))
+        if not (artifact_dir / "agent.events.jsonl").exists():
+            atomic_write_text(artifact_dir / "agent.events.jsonl", "")
+        if not (artifact_dir / "agent.result.json").exists():
+            payload = asdict(result) if dataclasses.is_dataclass(result) else {
+                "exit_code": getattr(result, "exit_code", None),
+                "timed_out": getattr(result, "timed_out", None),
+                "usage": getattr(result, "usage", {}),
+            }
+            atomic_write_text(artifact_dir / "agent.result.json", _json_text(payload))
 
     def run(
         self, spec: str | Path, *, run_id: str | None = None,
@@ -1421,6 +1577,8 @@ class Orchestrator:
                 "new META PLAN v2 runs require reviser and repair profiles"
             )
         p25 = has_cycle_profile
+        if p25 and self.config.revision.max_cycles != 2:
+            raise ExecutionSelectionError("revision.max_cycles must be exactly 2")
 
         planner_profile_id = store.load()["execution"]["planner"]["profile_id"]
         planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
@@ -1465,6 +1623,10 @@ class Orchestrator:
                 for step in plan.steps
             ],
             current_step=None,
+        )
+        self._cycle_update(
+            store, 1, status="running", plan_summary=plan.title,
+            steps_summary=[{"id": step.id, "title": step.title} for step in plan.steps],
         )
         if plan.decision is PlanDecision.BLOCKED:
             state = store.update(
@@ -1602,6 +1764,7 @@ class Orchestrator:
             for step in plan.steps
         ]
         self._last_v2_step_results: list[dict[str, Any]] = []
+        self._repair_v2_step_results: list[dict[str, Any]] = []
         self._v2_usage_rows: list[dict[str, Any]] = []
         # Tree every step must start from: the base, then each frozen step.
         expected_tree = candidate_tree
@@ -1728,6 +1891,9 @@ class Orchestrator:
                                        redact(str(exc), self._secrets))
             if revision_error is not None:
                 return self._v2_failed(store, run_dir, revision_error, None)
+            self._cycle_update(
+                store, 1, status="completed", claude_revision_report=revision_result.final_message if revision_result else "",
+            )
         elif selection.reviser is not None:
             store.update(status=RunStatus.REVISING, current_step=None)
             revision_prompt = (
@@ -1854,23 +2020,88 @@ class Orchestrator:
             luna_reports=_step_reports_text(self._last_v2_step_results),
             revision_report=revision_report,
             repository_state=repository_state,
+            iteration=1,
+            cycle_history="C01 is the initial implementation cycle.",
         )
         store.update(
             status=RunStatus.REVIEWING,
             review=_review_payload(review),
             review_iterations=1,
         )
+        self._cycle_update(
+            store, 1, status="reviewed",
+            luna_steps_summary=self._last_v2_step_results,
+            claude_revision_report=revision_result.final_message if revision_result else "",
+            checks=_check_payload(evidence), reviewer_conclusion=_review_payload(review),
+        )
+        self._update_v2_usage(store, run_dir)
+        if p25:
+            self._snapshot_cycle_artifacts(run_dir)
         if review.verdict is ReviewVerdict.REVISE:
+            if p25 and review.route is ReviewRoute.IMPLEMENTATION:
+                store.update(status=RunStatus.IMPLEMENTING, cycle=2)
+                self._cycle_update(
+                    store, 2, status="starting",
+                    trigger="Reviewer requested one bounded implementation correction loop.",
+                )
+                try:
+                    repair_plan, repair_agent_result, _repair_revision, evidence, review = self._execute_v2_repair_cycle(
+                        store=store, run_dir=run_dir, run_id=run_id, spec=spec,
+                        repo=repo, base_sha=base_sha, context=context,
+                        repository_reference=repository_reference, info=info,
+                        branch_ref=branch_ref, ownership_before=ownership_before,
+                        selection=selection, original_plan=plan,
+                        original_bundle=bundle, cycle_1_evidence=evidence,
+                        cycle_1_review=review, cycle_1_revision=revision_result,
+                    )
+                except ClaudeCommittedError as exc:
+                    self._redact_revision_artifacts(run_dir, revision_dir=run_dir / "revision" / "C02")
+                    return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None, redact(str(exc), self._secrets))
+                except (ClaudeAgentError, ClaudeRuntimeError) as exc:
+                    self._redact_revision_artifacts(run_dir, revision_dir=run_dir / "revision" / "C02")
+                    return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None, redact(str(exc), self._secrets))
+                except OrchestrationError as exc:
+                    reason = str(exc).split(":", 1)[0].strip() or "REPAIR_FAILED"
+                    return self._v2_failed(store, run_dir, reason, None)
+                if review.verdict is ReviewVerdict.REVISE and review.route is ReviewRoute.IMPLEMENTATION:
+                    return self._v2_failed(store, run_dir, "REVIEW_LOOP_EXHAUSTED", None)
+                if review.verdict is not ReviewVerdict.PASS or review.route is not ReviewRoute.NONE:
+                    return self._v2_failed(store, run_dir, "REVIEW_FAILED", None)
+                if not evidence.deterministic_passed:
+                    return self._v2_failed(store, run_dir, "DETERMINISTIC_GATE_FAILED", None)
+                approved_tree = self._authorize_v2_commit(
+                    repair_plan, review, evidence, info.worktree, base_sha, branch_ref
+                )
+                self._cycle_update(store, 2, status="approved")
+                commit_fn = commit_reviewed_tree
+                commit_sha = commit_fn(
+                    info.worktree, tree_sha=approved_tree, parent_sha=base_sha,
+                    subject=_commit_subject(repair_plan.title),
+                    body=self._commit_body_v2(run_id, base_sha, approved_tree, evidence, selection),
+                )
+                return RunResult(
+                    run_dir, RunStatus.COMMITTED,
+                    store.update(status=RunStatus.COMMITTED, commit_sha=commit_sha,
+                                 cycle=2, current_step=None),
+                )
+            if p25 and review.route is ReviewRoute.REPLAN:
+                return self._v2_failed(store, run_dir, "REPLAN_REQUIRED", None)
+            if p25 and review.route is ReviewRoute.HUMAN:
+                return self._v2_failed(store, run_dir, "HUMAN_REQUIRED", None)
             write_repair_task(run_dir, fields={"route": review.route.value,
                 "review_summary": review.summary, "findings": review.findings,
                 "required_fixes": review.required_fixes, "missing_tests": review.missing_tests,
                 "existing_branch": info.branch, "existing_worktree": str(info.worktree), "run_id": run_id})
             return self._v2_failed(store, run_dir, "REVIEW_REVISE", None)
         if review.verdict is ReviewVerdict.FAIL:
+            if p25:
+                return self._v2_failed(store, run_dir, "REVIEW_FAILED", None)
             return self._v2_failed(store, run_dir, "REVIEW_FAIL", None)
         if review.route is not ReviewRoute.NONE or not evidence.deterministic_passed:
             return self._v2_failed(store, run_dir, "REVIEW_ROUTE_NOT_NONE" if review.route is not ReviewRoute.NONE else "DETERMINISTIC_GATE_FAILED", None)
         approved_tree = self._authorize_v2_commit(plan, review, evidence, info.worktree, base_sha, branch_ref)
+        if p25:
+            self._cycle_update(store, 1, status="approved")
         # Keep the sole named commit primitive in the legacy guarded path;
         # this alias still resolves to the same GitOps implementation.
         commit_fn = commit_reviewed_tree
@@ -1897,24 +2128,30 @@ class Orchestrator:
         branch_ref: str,
         ownership_before: Any,
         selection: ExecutionSelectionV4,
+        artifact_dir: Path | None = None,
+        contract_dir: Path | None = None,
+        mutable_scope: list[str] | None = None,
+        luna_reports: str | None = None,
     ) -> tuple[Any | None, str | None]:
-        """Run P25's mandatory pre-check/revision/scope cycle."""
+        """Run one Claude pre-check/revision/scope cycle."""
 
+        artifact_dir = artifact_dir or (run_dir / "revision")
+        artifact_dir.mkdir(parents=True, exist_ok=True)
         stage_all(info.worktree)
         tree_before = candidate_tree_sha(info.worktree)
         store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
         pre_evidence = collect_evidence(
             info.worktree, base_sha, self.config,
-            evidence_dir=run_dir / "revision", secrets=self._secrets,
+            evidence_dir=artifact_dir, secrets=self._secrets,
             check_failures_hard=False,
         )
-        mutable_scope = sorted({
+        mutable_scope = mutable_scope or sorted({
             path for step in plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
         })
-        atomic_write_text(run_dir / "revision" / "scope.json", _json_text({
+        atomic_write_text(artifact_dir / "scope.json", _json_text({
             "approved_mutable_scope": mutable_scope,
-            "source": "union of all initial plan WRITE_SET, CREATE_SET, DELETE_SET",
+            "source": "human-approved mutable scope",
         }))
         pre_payload = {
             "checks": _check_payload(pre_evidence),
@@ -1922,12 +2159,12 @@ class Orchestrator:
             "deterministic_passed": pre_evidence.deterministic_passed,
             "staged_tree_sha": pre_evidence.staged_tree_sha,
         }
-        atomic_write_text(run_dir / "revision" / "pre_checks.json", _json_text(pre_payload))
+        atomic_write_text(artifact_dir / "pre_checks.json", _json_text(pre_payload))
         pre_hard = _hard_integrity_failures(pre_evidence)
         if pre_hard:
             return None, pre_hard[0].split(":", 1)[0]
         contracts = "\n\n".join(
-            read_approved_step_contract(run_dir, bundle, step.id)
+            read_approved_step_contract(contract_dir or run_dir, bundle, step.id)
             for step in plan.steps
         )
         revision_prompt = _revision_prompt(
@@ -1935,17 +2172,23 @@ class Orchestrator:
             spec=spec,
             plan=plan,
             contracts=contracts,
-            luna_reports=_step_reports_text(self._last_v2_step_results),
+            luna_reports=luna_reports if luna_reports is not None else _step_reports_text(self._last_v2_step_results),
             changed_files="\n".join(changed_paths_between_trees(repo, base_tree_sha, tree_before)),
             diff=pre_evidence.diff,
             pre_checks=_json_text(pre_payload),
             mutable_scope=_json_text(mutable_scope),
         )
         store.update(status=RunStatus.REVISING, current_step=None)
-        _persist_revision_tree(run_dir, "tree_before.txt", tree_before)
-        result = self._run_revision(selection, info.worktree, run_dir, revision_prompt)
-        claude_auth_failure = _claude_auth_failure(run_dir, result.stderr_tail)
-        self._redact_revision_artifacts(run_dir)
+        atomic_write_text(artifact_dir / "tree_before.txt", tree_before.rstrip() + "\n")
+        result = self._run_revision(
+            selection, info.worktree, run_dir, revision_prompt,
+            revision_dir=artifact_dir,
+        )
+        self._ensure_revision_artifacts(artifact_dir, result)
+        claude_auth_failure = _claude_auth_failure(
+            run_dir, result.stderr_tail, revision_dir=artifact_dir
+        )
+        self._redact_revision_artifacts(run_dir, revision_dir=artifact_dir)
         result = dataclasses.replace(
             result,
             final_message=redact(result.final_message, self._secrets),
@@ -1966,7 +2209,7 @@ class Orchestrator:
             return result, "AGENT_GIT_VIOLATION"
         stage_all(info.worktree)
         tree_after = candidate_tree_sha(info.worktree)
-        _persist_revision_tree(run_dir, "tree_after.txt", tree_after)
+        atomic_write_text(artifact_dir / "tree_after.txt", tree_after.rstrip() + "\n")
         changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
         outside_scope = [path for path in changed_paths if path not in set(mutable_scope)]
         usage = normalize_usage(result.usage)
@@ -1977,8 +2220,8 @@ class Orchestrator:
             "tree_after": tree_after,
             "usage": usage,
         }
-        atomic_write_text(run_dir / "revision" / "usage.json", _json_text(usage))
-        atomic_write_text(run_dir / "revision" / "report.json", _json_text({
+        atomic_write_text(artifact_dir / "usage.json", _json_text(usage))
+        atomic_write_text(artifact_dir / "report.json", _json_text({
             **revision_state,
             "final": _bounded_report(result.final_message),
             "stderr_tail": result.stderr_tail,
@@ -1988,6 +2231,295 @@ class Orchestrator:
         if outside_scope:
             return result, "REVISION_SCOPE_VIOLATION"
         return result, None
+
+    def _execute_v2_repair_cycle(
+        self,
+        *,
+        store: RunStateStore,
+        run_dir: Path,
+        run_id: str,
+        spec: str,
+        repo: Path,
+        base_sha: str,
+        context: str,
+        repository_reference: RepositoryReference,
+        info: Any,
+        branch_ref: str,
+        ownership_before: Any,
+        selection: ExecutionSelectionV4,
+        original_plan: TaskPlanV2,
+        original_bundle: Mapping[str, Any],
+        cycle_1_evidence: EvidenceBundle,
+        cycle_1_review: ReviewResult,
+        cycle_1_revision: Any | None,
+    ) -> tuple[TaskPlanV2, Any, Any | None, EvidenceBundle, ReviewResult]:
+        """Plan, execute, revise, check and review exactly one repair cycle."""
+
+        repair_dir = run_dir / "repair" / "C02"
+        repair_dir.mkdir(parents=True, exist_ok=True)
+        repair_profile = profile_for_role(
+            self.config, selection.repair_implementer.profile_id, ExecutionRole.REPAIR
+        )
+        reviewer_profile = profile_for_role(
+            self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER
+        )
+        planner_profile = profile_for_role(
+            self.config, selection.planner.profile_id, ExecutionRole.PLANNER
+        )
+        original_scope = sorted({
+            path for step in original_plan.steps
+            for path in (*step.write_set, *step.create_set, *step.delete_set)
+        })
+        original_contracts = "\n\n".join(
+            read_approved_step_contract(run_dir, original_bundle, step.id)
+            for step in original_plan.steps
+        )
+        tree_before = candidate_tree_sha(info.worktree)
+        current_state = _json_text({
+            "BASE_SHA": base_sha,
+            "HEAD_SHA": current_head(info.worktree),
+            "CANDIDATE_TREE_SHA": tree_before,
+            "CHANGED_FILES": changed_paths_between_trees(repo, resolve_tree(repo, base_sha), tree_before),
+            "GIT_STATUS": status_porcelain(info.worktree),
+        })
+        repair_planner = RepairPlannerV2(
+            self._planner_client or _chat_client(
+                build_llm_endpoint(planner_profile), self._runtime_environment
+            ),
+            implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+            reviewer_ids=frozenset({selection.reviewer.profile_id}),
+            implementer_profiles=(repair_profile,),
+            reviewer_profiles=(reviewer_profile,),
+            planning=self.config.planning,
+        )
+        repair_plan = repair_planner.plan(
+            repository_reference=render_repository_reference(repository_reference),
+            original_spec=spec,
+            original_meta_plan=original_plan.raw,
+            original_step_contracts=original_contracts,
+            current_repository_state=current_state,
+            current_cumulative_diff=cycle_1_evidence.diff,
+            final_checks_cycle_1=_json_text(_check_payload(cycle_1_evidence)),
+            claude_revision_report_cycle_1=(
+                cycle_1_revision.final_message if cycle_1_revision is not None else "NONE"
+            ),
+            reviewer_1_raw=cycle_1_review.raw,
+            reviewer_required_fixes=cycle_1_review.required_fixes,
+            original_approved_mutable_scope=_json_text(original_scope),
+            artifacts_dir=repair_dir,
+        )
+        self._cycle_update(
+            store, 2, status="planning", kind="repair",
+            plan_summary=repair_plan.title if repair_plan else "",
+        )
+        store.update(cycle=2, status=RunStatus.PLANNING)
+        if repair_plan.decision is PlanDecision.BLOCKED:
+            self._cycle_update(store, 2, status="blocked", blockers=repair_plan.blockers)
+            raise OrchestrationError("REPAIR_PLANNER_BLOCKED")
+        repair_bundle, _ = validate_implementation_bundle(
+            repair_dir, expected_step_ids=[step.id for step in repair_plan.steps]
+        )
+        repair_scope = sorted({
+            path for step in repair_plan.steps
+            for path in (*step.write_set, *step.create_set, *step.delete_set)
+        })
+        atomic_write_text(
+            repair_dir / "scope.json",
+            _json_text({
+                "repair_mutable_scope": repair_scope,
+                "original_approved_mutable_scope": original_scope,
+            }),
+        )
+        if not set(repair_scope).issubset(set(original_scope)):
+            self._cycle_update(
+                store, 2, status="failed", failure="REPAIR_SCOPE_EXPANSION",
+                repair_mutable_scope=repair_scope,
+            )
+            raise OrchestrationError("REPAIR_SCOPE_EXPANSION")
+        state_steps = [
+            {"id": step.id, "title": step.title, "status": "waiting",
+             "profile_id": selection.repair_implementer.profile_id}
+            for step in repair_plan.steps
+        ]
+        store.update(status=RunStatus.IMPLEMENTING, steps=state_steps, current_step=None)
+        expected_tree = tree_before
+        self._repair_v2_step_results = []
+        repair_agent_result: Any | None = None
+        codex_home = prepare_codex_home(self.config)
+        for step in repair_plan.steps:
+            step_dir = repair_dir / "steps" / step.id
+            step_dir.mkdir(parents=True, exist_ok=True)
+            contract = read_approved_step_contract(repair_dir, repair_bundle, step.id)
+            before_tree = candidate_tree_sha(info.worktree)
+            drift = self._step_contract_drift(repo, before_tree, expected_tree, step)
+            if drift:
+                raise OrchestrationError(f"STEP_CONTRACT_DRIFT: {step.id} {drift}")
+            store.update(
+                status=RunStatus.IMPLEMENTING, current_step=step.id,
+                steps=[{**item, "status": "running" if item["id"] == step.id else item["status"]}
+                       for item in state_steps],
+            )
+            agent = self._agent_for_profile(selection.repair_implementer.profile_id)
+            agent_config = dataclasses.replace(
+                build_agent_config(repair_profile),
+                env_allowlist=self.config.agent.env_allowlist,
+            )
+            agent_environment = build_agent_environment(
+                agent_config,
+                source_environment=self._runtime_environment,
+                codex_home=codex_home,
+                forbidden_names=(
+                    planner_profile.api_key_env,
+                    reviewer_profile.api_key_env,
+                ),
+            )
+            if hasattr(agent, "run_step"):
+                result = agent.run_step(
+                    contract, info.worktree, step_dir, base_sha=base_sha,
+                    env=agent_environment,
+                )
+            else:
+                result = agent.run(
+                    build_implementer_step_prompt(contract), info.worktree, step_dir,
+                    base_sha=base_sha, env=agent_environment,
+                )
+            self._ensure_step_artifacts(step_dir, result)
+            repair_agent_result = dataclasses.replace(
+                result,
+                final_message=redact(result.final_message, self._secrets),
+                stderr_tail=redact(result.stderr_tail, self._secrets),
+            )
+            self._redact_step_artifacts(step_dir)
+            usage = normalize_usage(repair_agent_result.usage)
+            failed_step = {
+                "usage": usage, "profile_id": repair_profile.id,
+                "tree_before": before_tree,
+            }
+            ownership_after = _git_ownership(repo, info.worktree)
+            if ownership_after.head != base_sha:
+                raise OrchestrationError("AGENT_COMMITTED")
+            violations = _ownership_violations(
+                ownership_before, ownership_after,
+                branch_ref=branch_ref, base_sha=base_sha,
+            )
+            if violations:
+                raise OrchestrationError("AGENT_GIT_VIOLATION: " + "; ".join(violations))
+            if repair_agent_result.timed_out:
+                raise OrchestrationError("AGENT_TIMEOUT")
+            if repair_agent_result.exit_code != 0:
+                raise OrchestrationError("AGENT_FAILED")
+            stage_all(info.worktree)
+            frozen_tree = index_tree_sha(info.worktree)
+            if frozen_tree == before_tree:
+                raise OrchestrationError("AGENT_NO_CHANGE")
+            changed_paths = changed_paths_between_trees(repo, before_tree, frozen_tree)
+            allowed = {*step.write_set, *step.create_set, *step.delete_set}
+            unexpected = [path for path in changed_paths if path not in allowed]
+            if unexpected:
+                raise OrchestrationError(
+                    "STEP_WRITE_SET_VIOLATION: " + _paths_detail(unexpected)
+                )
+            step_result = {
+                "id": step.id, "status": "COMPLETED", "profile_id": repair_profile.id,
+                "tree_before": before_tree, "tree_after": frozen_tree,
+                "changed_paths": list(changed_paths), "usage": usage,
+            }
+            atomic_write_text(step_dir / "step.json", _json_text(step_result))
+            self._repair_v2_step_results.append({
+                **step_result, "final": _bounded_v2_report(repair_agent_result.final_message)
+            })
+            expected_tree = frozen_tree
+            state_steps = [
+                {**item, "status": "completed", "usage": usage,
+                 "input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}
+                if item["id"] == step.id else item
+                for item in state_steps
+            ]
+            store.update(status=RunStatus.IMPLEMENTING, current_step=None, steps=state_steps)
+        self._update_v2_usage(store, run_dir)
+        cycle_2_revision, revision_error = self._run_v2_revision_cycle(
+            store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+            base_tree_sha=resolve_tree(repo, base_sha), spec=spec, plan=repair_plan,
+            bundle=repair_bundle, repository_reference=repository_reference, info=info,
+            branch_ref=branch_ref, ownership_before=ownership_before, selection=selection,
+            artifact_dir=run_dir / "revision" / "C02", contract_dir=repair_dir,
+            mutable_scope=original_scope,
+            luna_reports=_step_reports_text(self._repair_v2_step_results),
+        )
+        if revision_error is not None:
+            raise OrchestrationError(revision_error)
+        self._cycle_update(
+            store, 2, status="revised",
+            repair_luna_reports=_step_reports_text(self._repair_v2_step_results),
+            claude_revision_report=cycle_2_revision.final_message if cycle_2_revision else "",
+        )
+        checks_dir = run_dir / "checks" / "C02"
+        checks_dir.mkdir(parents=True, exist_ok=True)
+        evidence = collect_evidence(
+            info.worktree, base_sha, self.config, evidence_dir=checks_dir,
+            secrets=self._secrets, check_failures_hard=False,
+        )
+        store.update(
+            status=RunStatus.REVALIDATING, checks=_check_payload(evidence),
+            staged_tree_sha=evidence.staged_tree_sha,
+            changed_files=list(evidence.changed_files),
+            deterministic_gate={"passed": evidence.deterministic_passed,
+                                "failures": list(evidence.failures)},
+        )
+        integrity_failures = _hard_integrity_failures(evidence)
+        if integrity_failures:
+            raise OrchestrationError(integrity_failures[0].split(":", 1)[0])
+        review_dir = run_dir / "review" / "C02"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
+        cycle_history = _json_text({
+            "C01": {
+                "planner_summary": original_plan.title,
+                "luna_steps_summary": self._last_v2_step_results,
+                "claude_revision_report": cycle_1_revision.final_message if cycle_1_revision else "",
+                "checks": _check_payload(cycle_1_evidence),
+                "reviewer_1_conclusion": _review_payload(cycle_1_review),
+            },
+            "C02": {
+                "repair_planner_summary": repair_plan.title,
+                "repair_luna_reports": self._repair_v2_step_results,
+                "claude_revision_report": cycle_2_revision.final_message if cycle_2_revision else "",
+                "final_checks": _check_payload(evidence),
+            },
+        })
+        repository_state = _json_text({
+            "BASE_SHA": base_sha, "HEAD_SHA": current_head(info.worktree),
+            "CANDIDATE_TREE_SHA": evidence.staged_tree_sha,
+            "CHANGED_FILES": list(evidence.changed_files),
+            "GIT_STATUS": status_porcelain(info.worktree),
+        })
+        review = reviewer.review(
+            spec, repair_plan.raw, context,
+            _json_text({"deterministic_passed": evidence.deterministic_passed,
+                        "failures": list(evidence.failures),
+                        "staged_tree_sha": evidence.staged_tree_sha}),
+            "\n".join(evidence.changed_files), evidence.diff,
+            _json_text(_check_payload(evidence)),
+            _step_reports_text(self._repair_v2_step_results),
+            deterministic_passed=True, artifacts_dir=review_dir,
+            repository=_json_text(repository_reference_dict(repository_reference)),
+            luna_reports=_step_reports_text(self._repair_v2_step_results),
+            revision_report=_json_text({
+                "final": _bounded_report(cycle_2_revision.final_message) if cycle_2_revision else "",
+                "usage": normalize_usage(cycle_2_revision.usage) if cycle_2_revision else empty_usage(),
+            }),
+            repository_state=repository_state, iteration=2,
+            cycle_history=cycle_history,
+        )
+        store.update(status=RunStatus.REVIEWING, review=_review_payload(review), review_iterations=2)
+        self._cycle_update(
+            store, 2, status="reviewed", reviewer_conclusion=_review_payload(review),
+            final_checks=_check_payload(evidence),
+        )
+        self._update_v2_usage(store, run_dir)
+        if repair_agent_result is None:
+            raise OrchestrationError("repair cycle produced no agent result")
+        return repair_plan, repair_agent_result, cycle_2_revision, evidence, review
 
     def _redact_step_artifacts(self, step_dir: Path) -> None:
         for name in _AGENT_ARTIFACTS:
@@ -2038,6 +2570,14 @@ class Orchestrator:
     ) -> RunResult:
         state = store.load()
         fields = _terminal_step_fields(state, step_id)
+        cycles = list(state.get("cycles") or [])
+        current_cycle = state.get("cycle", 1)
+        for index, cycle in enumerate(cycles):
+            if isinstance(cycle, dict) and cycle.get("number") == current_cycle:
+                cycles[index] = {**cycle, "status": "failed", "failure": reason}
+                break
+        if cycles:
+            fields["cycles"] = cycles
         if step_id is not None:
             detail = f"step={step_id}" + (f" {detail}" if detail is not None else "")
             step_usage = normalize_usage(usage) if usage is not None else empty_usage()
@@ -2114,9 +2654,12 @@ class Orchestrator:
         for name in _AGENT_ARTIFACTS:
             redact_file(run_dir / name, self._secrets)
 
-    def _redact_revision_artifacts(self, run_dir: Path) -> None:
+    def _redact_revision_artifacts(
+        self, run_dir: Path, *, revision_dir: Path | None = None
+    ) -> None:
+        directory = revision_dir or (run_dir / "revision")
         for name in _REVISION_ARTIFACTS:
-            redact_file(run_dir / "revision" / name, self._secrets)
+            redact_file(directory / name, self._secrets)
 
     def _commit_body(
         self,

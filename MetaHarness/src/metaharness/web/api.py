@@ -84,6 +84,49 @@ ARTIFACT_ALLOWLIST = frozenset(
         "revision/tree_after.txt",
         "revision/report.json",
         "revision/usage.json",
+        "revision/C01/agent.prompt.txt",
+        "revision/C01/agent.events.jsonl",
+        "revision/C01/agent.result.json",
+        "revision/C01/agent.final.md",
+        "revision/C01/agent.stderr.log",
+        "revision/C01/pre_checks.json",
+        "revision/C01/scope.json",
+        "revision/C01/tree_before.txt",
+        "revision/C01/tree_after.txt",
+        "revision/C01/report.json",
+        "revision/C01/usage.json",
+        "revision/C02/agent.prompt.txt",
+        "revision/C02/agent.events.jsonl",
+        "revision/C02/agent.result.json",
+        "revision/C02/agent.final.md",
+        "revision/C02/agent.stderr.log",
+        "revision/C02/pre_checks.json",
+        "revision/C02/scope.json",
+        "revision/C02/tree_before.txt",
+        "revision/C02/tree_after.txt",
+        "revision/C02/report.json",
+        "revision/C02/usage.json",
+        "repair/C02/planner.request.txt",
+        "repair/C02/planner.raw.md",
+        "repair/C02/planner.usage.json",
+        "repair/C02/implementation_contract.md",
+        "repair/C02/implementation_bundle.json",
+        "repair/C02/task_plan.json",
+        "repair/C02/task_plan_v2.json",
+        "checks/C02/checks.json",
+        "checks/C02/changed-files.txt",
+        "checks/C02/diff.patch",
+        "review/C02/reviewer.request.txt",
+        "review/C02/reviewer.raw.md",
+        "review/C02/reviewer.usage.json",
+        "review/C02/review.json",
+        "review/C01/reviewer.request.txt",
+        "review/C01/reviewer.raw.md",
+        "review/C01/reviewer.usage.json",
+        "review/C01/review.json",
+        "checks/C01/checks.json",
+        "checks/C01/changed-files.txt",
+        "checks/C01/diff.patch",
         "changed-files.txt",
         "diff.patch",
         "plan_approval.json",
@@ -240,7 +283,11 @@ def _run_dir(runs_root: Path, run_id: str) -> Path:
 
 
 def _artifact_path(run_dir: Path, name: str) -> Path:
-    if name not in ARTIFACT_ALLOWLIST:
+    cycle_artifact = re.fullmatch(
+        r"(?:repair/C02/steps/S0[1-6]|revision/C0[12]|review/C0[12])/[A-Za-z0-9_.-]+",
+        name,
+    )
+    if name not in ARTIFACT_ALLOWLIST and cycle_artifact is None:
         raise ValueError("artifact is not allowlisted")
     return run_dir / name
 
@@ -461,19 +508,65 @@ def _usage_summary(
         for item in step_artifacts
         if isinstance(item.get("usage"), dict)
     ]
+    # After C02 the durable top-level ``steps`` field describes the current
+    # cycle. Re-read C01 from its immutable artifact directory for totals.
+    root_step_entries: list[dict[str, Any]] = []
+    try:
+        root_step_dirs = sorted((directory / "steps").iterdir(), key=lambda path: path.name)
+    except OSError:
+        root_step_dirs = []
+    for entry in root_step_dirs:
+        if not entry.is_dir() or _STEP_ID.fullmatch(entry.name) is None:
+            continue
+        payload = _load_json(entry / "step.json", max_bytes=MAX_RESULT_BYTES)
+        if isinstance(payload, dict) and isinstance(payload.get("usage"), dict):
+            root_step_entries.append({"id": entry.name, "usage": normalize_usage(payload["usage"])})
+    if root_step_entries:
+        steps = root_step_entries
     if steps:
         implementer = add_usage(step["usage"] for step in steps)
     elif isinstance(v1_agent_usage, dict) and v1_agent_usage:
         implementer = normalize_usage(v1_agent_usage)
     else:
         implementer = empty_usage()
-    return {
+    repair_steps: list[dict[str, Any]] = []
+    repair_steps_dir = directory / "repair" / "C02" / "steps"
+    try:
+        repair_entries = sorted(repair_steps_dir.iterdir(), key=lambda path: path.name)
+    except OSError:
+        repair_entries = []
+    for entry in repair_entries:
+        if not entry.is_dir() or _STEP_ID.fullmatch(entry.name) is None:
+            continue
+        step_json = _load_json(entry / "step.json", max_bytes=MAX_RESULT_BYTES)
+        if isinstance(step_json, dict) and isinstance(step_json.get("usage"), dict):
+            repair_steps.append({"id": entry.name, "usage": normalize_usage(step_json["usage"]), "cycle": 2})
+    luna_c01 = add_usage(step["usage"] for step in steps)
+    luna_c02 = add_usage(step["usage"] for step in repair_steps)
+    claude_c01 = reviser
+    reviewer_c01 = reviewer
+    repair_planner = read_usage_artifact(directory / "repair" / "C02" / "planner.usage.json") or empty_usage()
+    claude_c02 = read_usage_artifact(directory / "revision" / "C02" / "usage.json") or empty_usage()
+    reviewer_c02 = read_usage_artifact(directory / "review" / "C02" / "reviewer.usage.json") or empty_usage()
+    has_c02 = any(value != empty_usage() for value in (repair_planner, luna_c02, claude_c02, reviewer_c02)) or bool(repair_steps)
+    phase_usage = {
         "planner": planner,
-        "implementer": {"total": implementer, "steps": steps},
-        "reviser": reviser,
-        "reviewer": reviewer,
-        "grand_total": add_usage((planner, implementer, reviser, reviewer)),
+        "implementer": {"total": add_usage((luna_c01, luna_c02)), "steps": steps + repair_steps},
+        "reviser": add_usage((claude_c01, claude_c02)),
+        "reviewer": add_usage((reviewer_c01, reviewer_c02)),
     }
+    if has_c02:
+        phase_usage.update({
+            "luna_c01": luna_c01, "claude_c01": claude_c01,
+            "reviewer_c01": reviewer_c01, "repair_planner_c02": repair_planner,
+            "luna_c02": luna_c02, "claude_c02": claude_c02,
+            "reviewer_c02": reviewer_c02,
+        })
+    phase_usage["grand_total"] = add_usage(
+        (planner, luna_c01, claude_c01, reviewer_c01,
+         repair_planner, luna_c02, claude_c02, reviewer_c02)
+    )
+    return phase_usage
 
 
 def _summaries(

@@ -230,6 +230,23 @@ def _setup_cards(results: Any) -> str:
     return '<div class="grid">' + "".join(cards) + "</div>"
 
 
+def _cycles_section(state: dict[str, Any]) -> str:
+    cycles = state.get("cycles") if isinstance(state.get("cycles"), list) else []
+    if not cycles:
+        return ""
+    cards = []
+    for cycle in cycles:
+        if not isinstance(cycle, dict):
+            continue
+        number = cycle.get("number")
+        kind = str(cycle.get("kind", "")).upper()
+        title = f"CYCLE {number} — {kind}"
+        trigger = cycle.get("trigger")
+        extra = f'<p>{_e(trigger)}</p>' if trigger else ""
+        cards.append(f'<article class="card"><h3>{_e(title)}</h3><p>status: {_e(cycle.get("status"))}</p>{extra}<details><summary>cycle evidence</summary><pre>{_e(cycle)}</pre></details></article>')
+    return '<section><h2>CYCLES</h2><div class="grid">' + "".join(cards) + "</div></section>"
+
+
 def _profile_options(config: HarnessConfig | None, role: str, selected: Any) -> str:
     if config is None:
         return ""
@@ -356,14 +373,28 @@ def _usage_section(run: dict[str, Any]) -> str:
 
     usage = run.get("usage") if isinstance(run.get("usage"), dict) else {}
     implementer = usage.get("implementer") if isinstance(usage.get("implementer"), dict) else {}
-    rows = "".join(
-        f'<tr><th>{label}</th><td>{_usage_pair(value)}</td><td class="muted">{_usage_detail(value)}</td></tr>'
-        for label, value in (
+    if "luna_c01" in usage:
+        phase_rows = (
+            ("Planner initial", usage.get("planner")),
+            ("Luna C01", usage.get("luna_c01")),
+            ("Claude C01", usage.get("claude_c01")),
+            ("Reviewer C01", usage.get("reviewer_c01")),
+            ("Repair planner C02", usage.get("repair_planner_c02")),
+            ("Luna C02", usage.get("luna_c02")),
+            ("Claude C02", usage.get("claude_c02")),
+            ("Reviewer C02", usage.get("reviewer_c02")),
+            ("Grand total", usage.get("grand_total")),
+        )
+    else:
+        phase_rows = (
             ("Planner", usage.get("planner")),
             ("Luna", implementer.get("total")),
             ("Claude revision", usage.get("reviser")),
             ("Reviewer", usage.get("reviewer")),
         )
+    rows = "".join(
+        f'<tr><th>{label}</th><td>{_usage_pair(value)}</td><td class="muted">{_usage_detail(value)}</td></tr>'
+        for label, value in phase_rows
     )
     step_rows = []
     for step in implementer.get("steps") if isinstance(implementer.get("steps"), list) else []:
@@ -481,11 +512,19 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
     diagnostics = run.get("agent_diagnostics") if isinstance(run.get("agent_diagnostics"), dict) else {}; result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}; usage = diagnostics.get("usage") if isinstance(diagnostics.get("usage"), dict) else {}
     candidate = run.get("candidate") if isinstance(run.get("candidate"), dict) else {}; changed_files = candidate.get("changed_files") if isinstance(candidate.get("changed_files"), list) else []
     refresh = refresh_seconds if refresh_seconds is not None else refresh_seconds_for_run(run)
-    failure_top = f'<p class="danger"><strong>FAILED: {_e(failure.get("reason") if isinstance(failure, dict) else failure)}</strong><br>{_e(failure.get("detail") if isinstance(failure, dict) else "")}</p>' if status == "failed" and failure else ""
+    failure_reason = failure.get("reason") if isinstance(failure, dict) else failure
+    failure_note = (
+        "Reviewer requested one bounded implementation correction loop."
+        if failure_reason == "REVIEW_REVISE" else
+        "Automatic correction budget exhausted."
+        if failure_reason == "REVIEW_LOOP_EXHAUSTED" else ""
+    )
+    failure_top = f'<p class="danger"><strong>FAILED: {_e(failure_reason)}</strong><br>{_e(failure_note)}<br>{_e(failure.get("detail") if isinstance(failure, dict) else "")}</p>' if status == "failed" and failure else ""
     body = f'''<main><p><a href="/">← Tous les runs</a></p>
 <header class="sticky"><h1>Run <span class="mono">{_e(run_id)}</span></h1><p>{_status_badge(status)} · updated_at <span class="mono">{_e(run.get("updated_at"))}</span></p>{failure_top}</header>
 {_usage_section(run)}
 {approval_forms}
+{_cycles_section(state)}
 <section><h2>PLAN</h2><details open{_section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER"))}><summary>Canonical implementation contract</summary><pre>{_e(plan.get("contract"))}</pre></details><details><summary>planner.raw.md</summary><pre>{_e(plan.get("raw"))}</pre></details><details><summary>SPEC</summary><pre>{_e(run.get("spec"))}</pre></details></section>
 <section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config) if is_v2 else _execution_card(state, config)}</section>
 <section><h2>AGENT</h2>{_agent_auth_failure_notice(run, config)}{_v2_steps(state, run.get("step_artifacts")) if is_v2 else f'<details open{_section_open(run, ("AGENT_", "CODEX_AUTH_FAILURE"))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'}</section>

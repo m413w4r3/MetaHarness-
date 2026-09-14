@@ -190,6 +190,17 @@ class PlanningConfig:
 
 
 @dataclass(frozen=True)
+class RevisionConfig:
+    """Bounded automatic correction-loop configuration."""
+
+    max_cycles: int = 2
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_cycles, bool) or self.max_cycles != 2:
+            raise ValueError("revision.max_cycles must be exactly 2")
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     provider: str = "codex"
     model: str = "gpt-5.6-luna"
@@ -301,6 +312,7 @@ class HarnessConfig:
     )
     workspace_setup: tuple[WorkspaceSetupCommand, ...] = ()
     planning: PlanningConfig = field(default_factory=PlanningConfig)
+    revision: RevisionConfig = field(default_factory=RevisionConfig)
     repository: RepositoryConfig = field(default_factory=RepositoryConfig)
     # Compatibility marker for programmatic legacy configurations that do not
     # have a repository TOML section yet.
@@ -358,3 +370,16 @@ class ExecutionSelectionV4:
     reviser: SelectedProfile
     repair_implementer: SelectedProfile
     reviewer: SelectedProfile
+
+
+@dataclass(frozen=True)
+class RunCycle:
+    """One bounded orchestration cycle."""
+
+    number: int
+    kind: str
+
+    def __post_init__(self) -> None:
+        expected = {1: "initial", 2: "repair"}
+        if self.number not in expected or self.kind != expected[self.number]:
+            raise ValueError("run cycle must be initial cycle 1 or repair cycle 2")

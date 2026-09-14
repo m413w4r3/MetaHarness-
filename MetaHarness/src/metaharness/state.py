@@ -88,6 +88,8 @@ class RunStateStore:
             "review": {},
             "revision": {},
             "review_iterations": 0,
+            "cycle": 1,
+            "cycles": [],
             "approved_tree_sha": None,
             "commit_sha": None,
             "failure": None,

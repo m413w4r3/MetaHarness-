@@ -84,7 +84,7 @@ def _replace_placeholders(template: str, values: dict[str, str]) -> str:
     """Replace known placeholders once, preserving placeholders in evidence."""
 
     return re.sub(
-        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|DIFF|CHECKS|AGENT_REPORT|REPOSITORY|LUNA_REPORTS|REVISION_REPORT|REPOSITORY_STATE)\}\}",
+        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|DIFF|CHECKS|AGENT_REPORT|REPOSITORY|LUNA_REPORTS|REVISION_REPORT|REPOSITORY_STATE|ITERATION|CYCLE_HISTORY)\}\}",
         lambda match: values[match.group(0)],
         template,
     )
@@ -110,6 +110,8 @@ def build_reviewer_prompt(
     luna_reports: str = "",
     revision_report: str = "",
     repository_state: str = "",
+    iteration: int = 1,
+    cycle_history: str = "",
     template: str | None = None,
 ) -> str:
     """Build the reviewer's single user message.
@@ -132,6 +134,8 @@ def build_reviewer_prompt(
         "{{LUNA_REPORTS}}": _require_text("luna_reports", luna_reports),
         "{{REVISION_REPORT}}": _require_text("revision_report", revision_report),
         "{{REPOSITORY_STATE}}": _require_text("repository_state", repository_state),
+        "{{ITERATION}}": str(iteration),
+        "{{CYCLE_HISTORY}}": _require_text("cycle_history", cycle_history),
     }
     if template is None:
         template = _prompt_template_path().read_text(encoding="utf-8")
@@ -483,6 +487,8 @@ class Reviewer:
         luna_reports: str = "",
         revision_report: str = "",
         repository_state: str = "",
+        iteration: int = 1,
+        cycle_history: str = "",
     ) -> ReviewResult:
         request = build_reviewer_prompt(
             spec,
@@ -497,6 +503,8 @@ class Reviewer:
             luna_reports=luna_reports,
             revision_report=revision_report,
             repository_state=repository_state,
+            iteration=iteration,
+            cycle_history=cycle_history,
             template=self.template,
         )
         target = Path(artifacts_dir) if artifacts_dir is not None else None
@@ -559,6 +567,8 @@ def run_reviewer(
     luna_reports: str = "",
     revision_report: str = "",
     repository_state: str = "",
+    iteration: int = 1,
+    cycle_history: str = "",
 ) -> ReviewResult:
     """Functional convenience wrapper around :class:`Reviewer`."""
 
@@ -577,6 +587,8 @@ def run_reviewer(
         luna_reports=luna_reports,
         revision_report=revision_report,
         repository_state=repository_state,
+        iteration=iteration,
+        cycle_history=cycle_history,
     )
 
 

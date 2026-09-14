@@ -504,6 +504,52 @@ def build_planner_prompt_v2(
     return re.sub(r"\{\{SPEC\}\}|\{\{CONTEXT\}\}|\{\{REPOSITORY\}\}|\{\{IMPLEMENTER_PROFILES\}\}|\{\{REVIEWER_PROFILES\}\}", lambda match: values[match.group(0)], template)
 
 
+def build_repair_planner_prompt(
+    *,
+    repository_reference: str,
+    original_spec: str,
+    original_meta_plan: str,
+    original_step_contracts: str,
+    current_repository_state: str,
+    current_cumulative_diff: str,
+    final_checks_cycle_1: str,
+    claude_revision_report_cycle_1: str,
+    reviewer_1_raw: str,
+    reviewer_required_fixes: str,
+    original_approved_mutable_scope: str,
+    implementer_profiles: Sequence[ModelProfile] = (),
+    reviewer_profiles: Sequence[ModelProfile] = (),
+    template: str | None = None,
+) -> str:
+    """Build the bounded corrective planner request."""
+
+    values = {
+        "{{REPOSITORY}}": repository_reference,
+        "{{SPEC}}": original_spec,
+        "{{ORIGINAL_META_PLAN}}": original_meta_plan,
+        "{{ORIGINAL_STEP_CONTRACTS}}": original_step_contracts,
+        "{{CURRENT_REPOSITORY_STATE}}": current_repository_state,
+        "{{CURRENT_CUMULATIVE_DIFF}}": current_cumulative_diff,
+        "{{FINAL_CHECKS_CYCLE_1}}": final_checks_cycle_1,
+        "{{CLAUDE_REVISION_REPORT_CYCLE_1}}": claude_revision_report_cycle_1,
+        "{{REVIEWER_1_RAW}}": reviewer_1_raw,
+        "{{REVIEWER_REQUIRED_FIXES}}": reviewer_required_fixes,
+        "{{ORIGINAL_APPROVED_MUTABLE_SCOPE}}": original_approved_mutable_scope,
+        "{{IMPLEMENTER_PROFILES}}": render_safe_profile_catalogue(implementer_profiles),
+        "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
+    }
+    for name, value in values.items():
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a string")
+    if template is None:
+        template = (Path(__file__).with_name("prompts") / "repair_planner_v2.txt").read_text(encoding="utf-8")
+    return re.sub(
+        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_META_PLAN|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_1_RAW|REVIEWER_REQUIRED_FIXES|ORIGINAL_APPROVED_MUTABLE_SCOPE|IMPLEMENTER_PROFILES|REVIEWER_PROFILES)\}\}",
+        lambda match: values[match.group(0)],
+        template,
+    )
+
+
 def validate_decomposition_policy(
     plan: TaskPlanV2,
     planning: PlanningConfig,
@@ -756,6 +802,89 @@ class PlannerV2:
         return plan
 
 
+class RepairPlannerV2:
+    """Planner facade for one P26 corrective cycle.
+
+    It deliberately shares the strict META PLAN v2 parser and bundle writer;
+    only its request envelope and implementer catalogue are different.
+    """
+
+    def __init__(
+        self,
+        client: TextCompletionClient,
+        *,
+        implementer_ids: frozenset[str],
+        reviewer_ids: frozenset[str],
+        implementer_profiles: Sequence[ModelProfile] = (),
+        reviewer_profiles: Sequence[ModelProfile] = (),
+        planning: PlanningConfig | None = None,
+        template: str | None = None,
+    ):
+        self.client = client
+        self.implementer_ids = implementer_ids
+        self.reviewer_ids = reviewer_ids
+        self.implementer_profiles = implementer_profiles
+        self.reviewer_profiles = reviewer_profiles
+        self.planning = planning or PlanningConfig(protocol="v2")
+        self.template = template
+
+    def plan(
+        self,
+        *,
+        repository_reference: str,
+        original_spec: str,
+        original_meta_plan: str,
+        original_step_contracts: str,
+        current_repository_state: str,
+        current_cumulative_diff: str,
+        final_checks_cycle_1: str,
+        claude_revision_report_cycle_1: str,
+        reviewer_1_raw: str,
+        reviewer_required_fixes: str,
+        original_approved_mutable_scope: str,
+        artifacts_dir: str | Path,
+    ) -> TaskPlanV2:
+        request = build_repair_planner_prompt(
+            repository_reference=repository_reference,
+            original_spec=original_spec,
+            original_meta_plan=original_meta_plan,
+            original_step_contracts=original_step_contracts,
+            current_repository_state=current_repository_state,
+            current_cumulative_diff=current_cumulative_diff,
+            final_checks_cycle_1=final_checks_cycle_1,
+            claude_revision_report_cycle_1=claude_revision_report_cycle_1,
+            reviewer_1_raw=reviewer_1_raw,
+            reviewer_required_fixes=reviewer_required_fixes,
+            original_approved_mutable_scope=original_approved_mutable_scope,
+            implementer_profiles=self.implementer_profiles,
+            reviewer_profiles=self.reviewer_profiles,
+            template=self.template,
+        )
+        target = Path(artifacts_dir)
+        atomic_write_text(target / "planner.request.txt", request)
+        result = self.client.complete(request)
+        raw = result if isinstance(result, str) else getattr(result, "text", None)
+        write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, completion_usage(result))
+        if not isinstance(raw, str):
+            raise V2PlanParseError("repair planner client did not return text")
+        atomic_write_text(target / "planner.raw.md", raw)
+        plan = parse_task_plan_v2(
+            raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids
+        )
+        validate_decomposition_policy(plan, self.planning)
+        if plan.decision is PlanDecision.READY:
+            persist_planning_v2_artifacts(
+                target, spec=original_spec, context=current_repository_state,
+                request=request, plan=plan,
+            )
+        else:
+            atomic_write_text(
+                target / "task_plan.json",
+                json.dumps({**asdict(plan), "decision": plan.decision.value, "execution_mode": None}, ensure_ascii=False, indent=2) + "\n",
+            )
+        return plan
+
+
 def run_planner_v2(
     client: TextCompletionClient,
     spec: str,
@@ -788,6 +917,7 @@ __all__ = [
     "PlannerV2", "STEP_CONTRACT_NAME", "TaskPlanV2", "V2PlanParseError",
     "PlanDecision", "PlanParseError",
     "build_planner_prompt_v2", "parse_task_plan_v2", "persist_implementation_bundle",
+    "build_repair_planner_prompt", "RepairPlannerV2",
     "persist_planning_artifacts_v2", "persist_planning_v2_artifacts",
     "read_approved_step_contract", "read_set_paths",
     "render_plan_summary_v2", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract",
