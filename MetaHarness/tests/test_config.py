@@ -115,6 +115,43 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "planning.protocol"):
                 load_config(self.write_config(Path(directory_name), contents))
 
+    def test_staged_step_max_mutable_paths_defaults_and_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name)))
+        self.assertEqual(config.planning.staged_step_max_mutable_paths, 6)
+        self.assertEqual(config.planning.single_step_max_mutable_paths, 2)
+
+        contents = (
+            VALID_CONFIG
+            + '\n[planning]\nprotocol = "v2"\ndecomposition = "aggressive"\n'
+            + "staged_step_max_mutable_paths = 4\n"
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), contents))
+        self.assertEqual(config.planning.staged_step_max_mutable_paths, 4)
+
+        for value in ("0", "-1", "true", '"6"'):
+            with self.subTest(value=value):
+                contents = (
+                    VALID_CONFIG
+                    + f"\n[planning]\nstaged_step_max_mutable_paths = {value}\n"
+                )
+                with tempfile.TemporaryDirectory() as directory_name:
+                    with self.assertRaisesRegex(
+                        ConfigError, "planning.staged_step_max_mutable_paths"
+                    ):
+                        load_config(self.write_config(Path(directory_name), contents))
+
+    def test_planning_config_rejects_invalid_mutable_path_limits(self) -> None:
+        from metaharness.models import PlanningConfig
+
+        self.assertEqual(PlanningConfig().staged_step_max_mutable_paths, 6)
+        for name in ("single_step_max_mutable_paths", "staged_step_max_mutable_paths"):
+            for value in (0, -1, True, "6"):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaisesRegex(ValueError, name):
+                        PlanningConfig(**{name: value})
+
     def test_plan_approval_config_defaults_and_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name)))

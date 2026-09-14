@@ -635,6 +635,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     single_step_max_mutable_paths = _positive_int(
         planning_data, "single_step_max_mutable_paths", 2, "planning"
     )
+    staged_step_max_mutable_paths = _positive_int(
+        planning_data, "staged_step_max_mutable_paths", 6, "planning"
+    )
     execution_mode_policy = planning_data.get(
         "execution_mode_policy", ExecutionModePolicy.AUTO.value
     )
@@ -648,6 +651,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         protocol=protocol,
         decomposition=decomposition,
         single_step_max_mutable_paths=single_step_max_mutable_paths,
+        staged_step_max_mutable_paths=staged_step_max_mutable_paths,
         execution_mode_policy=execution_mode_policy,
     )
 

@@ -141,12 +141,21 @@ and `--strict-mcp-config` in `claude --help`.
 protocol = "v2"
 decomposition = "aggressive"
 execution_mode_policy = "require-staged"
+single_step_max_mutable_paths = 2
+staged_step_max_mutable_paths = 6
 
 [publish]
 enabled = true
 remote = "origin"
 mode = "fast-forward-base"
 ```
+
+With `decomposition = "aggressive"`, `single_step_max_mutable_paths` bounds a
+READY SINGLE plan and `staged_step_max_mutable_paths` (default 6) bounds every
+STAGED step. Mutable paths are the distinct union of WRITE_SET, CREATE_SET and
+DELETE_SET. Both limits are written into `planner.request.txt` and enforced
+after parsing with the same values (`PLANNER_OUTPUT_INVALID` otherwise).
+`balanced` applies neither limit.
 
 ```text
 main A → isolated run worktree → planner STAGED → Luna steps → Claude

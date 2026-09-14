@@ -500,6 +500,59 @@ architectural discovery.
 _PROTOCOL_ANCHOR = "The answer must use exactly this protocol."
 
 
+def render_decomposition_policy_text(
+    single_step_max_mutable_paths: int, staged_step_max_mutable_paths: int
+) -> str:
+    """Render the AGGRESSIVE mutable-scope policy from the configured limits.
+
+    The numbers come from :class:`PlanningConfig`, the same values that
+    :func:`validate_decomposition_policy` enforces after parsing.
+    """
+
+    for name, value in (
+        ("single_step_max_mutable_paths", single_step_max_mutable_paths),
+        ("staged_step_max_mutable_paths", staged_step_max_mutable_paths),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be an integer greater than zero")
+    single = single_step_max_mutable_paths
+    staged = staged_step_max_mutable_paths
+    return f"""This run uses AGGRESSIVE decomposition.
+
+A READY SINGLE plan may modify at most {single} distinct mutable paths across
+the union of WRITE_SET, CREATE_SET and DELETE_SET.
+
+Every STAGED step may modify at most {staged} distinct mutable paths across the
+union of WRITE_SET, CREATE_SET and DELETE_SET.
+
+This limit applies to the UNION of the three sets, not to each section
+independently. A path counts once in the union. WRITE_SET, CREATE_SET and
+DELETE_SET also keep their own structural limits. A READY plan must never
+exceed the active limit; the harness rejects it deterministically.
+
+The mutable-path limit bounds the scope of one worker; it is not an order to
+fragment an atomic operation unsafely. When a transformation exceeds the
+limit, decompose it only where a mechanically coherent decomposition exists:
+by transformation, layer, or dependency boundary. Do not create an artificial
+"implementation" step followed by a "tests" step to satisfy the limit; tests
+directly associated with a local transformation stay in the same step. Every
+step must leave the repository in a coherent state for the next step.
+
+A large task is not in itself a reason to return BLOCKED. BLOCKED remains
+reserved for when the architecture, paths or operations cannot be determined
+precisely, or when one atomic operation needs more mutable paths than the
+limit and no safe decomposition exists. In that case return BLOCKED instead
+of an invalid plan or a plan that asks the worker to discover a solution.
+"""
+
+
+def _insert_before_protocol(prompt: str, text: str) -> str:
+    index = prompt.find(_PROTOCOL_ANCHOR)
+    if index < 0:
+        return prompt.rstrip("\n") + "\n\n" + text
+    return prompt[:index] + text + "\n" + prompt[index:]
+
+
 def _apply_execution_mode_policy(prompt: str, policy: str) -> str:
     """Insert the configured EXECUTION_MODE policy before the wire protocol."""
 
@@ -507,10 +560,27 @@ def _apply_execution_mode_policy(prompt: str, policy: str) -> str:
         return prompt
     if policy != ExecutionModePolicy.REQUIRE_STAGED.value:
         raise ValueError("unknown execution mode policy")
-    index = prompt.find(_PROTOCOL_ANCHOR)
-    if index < 0:
-        return prompt.rstrip("\n") + "\n\n" + REQUIRE_STAGED_POLICY_TEXT
-    return prompt[:index] + REQUIRE_STAGED_POLICY_TEXT + "\n" + prompt[index:]
+    return _insert_before_protocol(prompt, REQUIRE_STAGED_POLICY_TEXT)
+
+
+def _apply_decomposition_policy(
+    prompt: str,
+    decomposition: str,
+    single_step_max_mutable_paths: int,
+    staged_step_max_mutable_paths: int,
+) -> str:
+    """Insert the AGGRESSIVE mutable-scope policy before the wire protocol."""
+
+    if decomposition == "balanced":
+        return prompt
+    if decomposition != "aggressive":
+        raise ValueError("unknown planning decomposition")
+    return _insert_before_protocol(
+        prompt,
+        render_decomposition_policy_text(
+            single_step_max_mutable_paths, staged_step_max_mutable_paths
+        ),
+    )
 
 
 def validate_execution_mode_policy(plan: TaskPlanV2, planning: PlanningConfig) -> None:
@@ -537,6 +607,9 @@ def build_planner_prompt_v2(
     reviewer_profiles: Sequence[ModelProfile] = (),
     template: str | None = None,
     execution_mode_policy: str = ExecutionModePolicy.AUTO.value,
+    decomposition: str = PlanningConfig.decomposition,
+    single_step_max_mutable_paths: int = PlanningConfig.single_step_max_mutable_paths,
+    staged_step_max_mutable_paths: int = PlanningConfig.staged_step_max_mutable_paths,
 ) -> str:
     if not isinstance(spec, str) or not isinstance(context, str):
         raise TypeError("spec and context must be strings")
@@ -553,9 +626,13 @@ def build_planner_prompt_v2(
         "{{IMPLEMENTER_PROFILES}}": render_safe_profile_catalogue(implementer_profiles),
         "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
     }
-    # The policy is inserted into the template before substitution so that
-    # SPEC or context text can never impersonate or displace it.
+    # Policies are inserted into the template before substitution so that
+    # SPEC or context text can never impersonate or displace them.
     template = _apply_execution_mode_policy(template, execution_mode_policy)
+    template = _apply_decomposition_policy(
+        template, decomposition,
+        single_step_max_mutable_paths, staged_step_max_mutable_paths,
+    )
     return re.sub(r"\{\{SPEC\}\}|\{\{CONTEXT\}\}|\{\{REPOSITORY\}\}|\{\{IMPLEMENTER_PROFILES\}\}|\{\{REVIEWER_PROFILES\}\}", lambda match: values[match.group(0)], template)
 
 
@@ -620,13 +697,17 @@ def validate_decomposition_policy(
         return len(set(step.write_set) | set(step.create_set) | set(step.delete_set))
 
     if plan.execution_mode is ExecutionMode.SINGLE:
-        if mutable_count(plan.steps[0]) > planning.single_step_max_mutable_paths:
+        limit = planning.single_step_max_mutable_paths
+    else:
+        limit = planning.staged_step_max_mutable_paths
+    mode = plan.execution_mode.value if plan.execution_mode else "UNKNOWN"
+    for step in plan.steps:
+        count = mutable_count(step)
+        if count > limit:
             raise V2PlanParseError(
-                "aggressive decomposition requires STAGED for this mutable scope"
+                f"aggressive {mode} step {step.id} may modify at most {limit} "
+                f"distinct mutable paths; got {count}"
             )
-        return
-    if any(mutable_count(step) > 3 for step in plan.steps):
-        raise V2PlanParseError("aggressive STAGED steps may modify at most 3 mutable paths")
 
 
 def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict[str, Any]:
@@ -837,6 +918,9 @@ class PlannerV2:
             implementer_profiles=self.implementer_profiles,
             reviewer_profiles=self.reviewer_profiles, template=self.template,
             execution_mode_policy=self.planning.execution_mode_policy,
+            decomposition=self.planning.decomposition,
+            single_step_max_mutable_paths=self.planning.single_step_max_mutable_paths,
+            staged_step_max_mutable_paths=self.planning.staged_step_max_mutable_paths,
         )
         target = Path(artifacts_dir) if artifacts_dir is not None else None
         if target is not None:
@@ -995,4 +1079,5 @@ __all__ = [
     "render_plan_summary_v2", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract",
     "run_planner_v2", "step_contract_path", "validate_decomposition_policy", "validate_implementation_bundle", "write_implementation_bundle",
     "REQUIRE_STAGED_POLICY_TEXT", "validate_execution_mode_policy",
+    "render_decomposition_policy_text",
 ]

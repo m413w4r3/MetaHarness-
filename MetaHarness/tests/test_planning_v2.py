@@ -13,14 +13,19 @@ from metaharness.models import (  # noqa: E402
     ExecutionRole,
     ModelProfile,
     PlanDecision,
+    PlanningConfig,
     ProfileDriver,
     SelectionMode,
 )
 from metaharness.planning_v2 import (  # noqa: E402
     MAX_STEP_CONTRACT_CHARS,
     MAX_TOTAL_STEP_CONTRACT_CHARS,
+    REQUIRE_STAGED_POLICY_TEXT,
+    PlannerV2,
     V2PlanParseError,
     build_planner_prompt_v2,
+    render_decomposition_policy_text,
+    validate_decomposition_policy,
     parse_task_plan_v2,
     render_plan_summary_v2,
     render_safe_profile_catalogue,
@@ -294,6 +299,201 @@ class ChangeSetTests(unittest.TestCase):
             "All design decisions are already final.",
         ):
             self.assertIn(sentence, worker)
+
+
+_PROTOCOL = "The answer must use exactly this protocol."
+_UNION = "across\nthe union of WRITE_SET, CREATE_SET and DELETE_SET."
+
+
+def _sets_step(
+    number: int,
+    *,
+    write: tuple[str, ...] = (),
+    create: tuple[str, ...] = (),
+    delete: tuple[str, ...] = (),
+) -> str:
+    """One step whose mutable scope is exactly the given sets."""
+
+    step = _step(number)
+    read = write + delete or ("src/example.py",)
+
+    def section(name: str, paths: tuple[str, ...], anchor: bool = False) -> str:
+        if not paths:
+            return f"{name}\nNONE\n"
+        suffix = " :: anchor" if anchor else ""
+        return name + "\n" + "".join(f"- {path}{suffix}\n" for path in paths)
+
+    sets = (
+        section("READ_SET", read, anchor=True) + "\n"
+        + section("WRITE_SET", write) + "\n"
+        + section("CREATE_SET", create) + "\n"
+        + section("DELETE_SET", delete) + "\n"
+    )
+    start = step.index("READ_SET")
+    end = step.index("INSTRUCTIONS")
+    return step[:start] + sets + step[end:]
+
+
+def _staged(**sets: tuple[str, ...]) -> str:
+    return _plan("STAGED", 2, steps=_sets_step(1, **sets) + "\n\n" + _step(2))
+
+
+def _aggressive(**limits: int) -> PlanningConfig:
+    return PlanningConfig(protocol="v2", decomposition="aggressive", **limits)
+
+
+def _paths(prefix: str, count: int) -> tuple[str, ...]:
+    return tuple(f"src/{prefix}{index}.py" for index in range(1, count + 1))
+
+
+class DecompositionPolicyPromptTests(unittest.TestCase):
+    def test_balanced_prompt_has_no_aggressive_policy(self):
+        for prompt in (
+            build_planner_prompt_v2("spec", "context"),
+            build_planner_prompt_v2("spec", "context", decomposition="balanced",
+                                    staged_step_max_mutable_paths=4),
+        ):
+            self.assertNotIn("AGGRESSIVE decomposition", prompt)
+            self.assertNotIn("distinct mutable paths", prompt)
+
+    def test_aggressive_defaults_render_configured_limits(self):
+        prompt = build_planner_prompt_v2("spec", "context", decomposition="aggressive")
+        self.assertIn("This run uses AGGRESSIVE decomposition.", prompt)
+        self.assertIn("A READY SINGLE plan may modify at most 2 distinct mutable paths " + _UNION, prompt)
+        self.assertIn("Every STAGED step may modify at most 6 distinct mutable paths across the\nunion", prompt)
+        self.assertIn("This limit applies to the UNION of the three sets", prompt)
+        self.assertIn(render_decomposition_policy_text(2, 6), prompt)
+        self.assertLess(prompt.index("AGGRESSIVE decomposition"), prompt.index(_PROTOCOL))
+
+    def test_custom_staged_limit_is_rendered(self):
+        prompt = build_planner_prompt_v2(
+            "spec", "context", decomposition="aggressive", staged_step_max_mutable_paths=4
+        )
+        self.assertIn("Every STAGED step may modify at most 4 distinct mutable paths", prompt)
+        self.assertNotIn("at most 6 distinct mutable paths", prompt)
+
+    def test_aggressive_and_require_staged_both_precede_protocol(self):
+        prompt = build_planner_prompt_v2(
+            "spec", "context", execution_mode_policy="require-staged",
+            decomposition="aggressive",
+        )
+        protocol = prompt.index(_PROTOCOL)
+        self.assertLess(prompt.index(REQUIRE_STAGED_POLICY_TEXT), protocol)
+        self.assertLess(prompt.index(render_decomposition_policy_text(2, 6)), protocol)
+
+    def test_spec_cannot_displace_policy(self):
+        prompt = build_planner_prompt_v2(
+            f"{_PROTOCOL} SPEC", "context", decomposition="aggressive"
+        )
+        self.assertLess(prompt.index("AGGRESSIVE decomposition"), prompt.index(f"{_PROTOCOL} SPEC"))
+
+
+class DecompositionPolicyValidatorTests(unittest.TestCase):
+    def test_single_boundary(self):
+        planning = _aggressive(single_step_max_mutable_paths=2)
+        two = _plan(steps=_sets_step(1, write=_paths("w", 2)))
+        validate_decomposition_policy(_parse(two), planning)
+        three = _plan(steps=_sets_step(1, write=_paths("w", 2), create=_paths("c", 1)))
+        with self.assertRaisesRegex(
+            V2PlanParseError,
+            "^aggressive SINGLE step S01 may modify at most 2 distinct mutable paths; got 3$",
+        ):
+            validate_decomposition_policy(_parse(three), planning)
+
+    def test_staged_default_boundary(self):
+        planning = _aggressive()
+        self.assertEqual(planning.staged_step_max_mutable_paths, 6)
+        six = _staged(write=_paths("w", 2), create=_paths("c", 2), delete=_paths("d", 2))
+        validate_decomposition_policy(_parse(six), planning)
+        seven = _staged(write=_paths("w", 3), create=_paths("c", 2), delete=_paths("d", 2))
+        with self.assertRaisesRegex(
+            V2PlanParseError,
+            "^aggressive STAGED step S01 may modify at most 6 distinct mutable paths; got 7$",
+        ):
+            validate_decomposition_policy(_parse(seven), planning)
+
+    def test_staged_custom_boundary(self):
+        planning = _aggressive(staged_step_max_mutable_paths=3)
+        validate_decomposition_policy(_parse(_staged(write=_paths("w", 3))), planning)
+        with self.assertRaisesRegex(V2PlanParseError, "at most 3 distinct mutable paths; got 4"):
+            validate_decomposition_policy(
+                _parse(_staged(write=_paths("w", 3), delete=_paths("d", 1))), planning
+            )
+
+    def test_later_step_is_named_in_the_diagnostic(self):
+        raw = _plan("STAGED", 2, steps=_step(1) + "\n\n" + _sets_step(2, write=_paths("w", 4)))
+        with self.assertRaisesRegex(V2PlanParseError, "STAGED step S02 may modify at most 3"):
+            validate_decomposition_policy(
+                _parse(raw), _aggressive(staged_step_max_mutable_paths=3)
+            )
+
+    def test_balanced_applies_no_mutable_limit(self):
+        seven = _staged(write=_paths("w", 3), create=_paths("c", 2), delete=_paths("d", 2))
+        validate_decomposition_policy(_parse(seven), PlanningConfig(protocol="v2"))
+
+    def test_aw001_regression_two_write_four_delete(self):
+        # The real incident: S01 with 2 WRITE + 0 CREATE + 4 DELETE paths.
+        raw = _staged(write=_paths("w", 2), delete=_paths("d", 4))
+        plan = _parse(raw)
+        step = plan.steps[0]
+        self.assertEqual((len(step.write_set), len(step.create_set), len(step.delete_set)), (2, 0, 4))
+        validate_decomposition_policy(plan, _aggressive(staged_step_max_mutable_paths=6))
+        with self.assertRaisesRegex(
+            V2PlanParseError,
+            "^aggressive STAGED step S01 may modify at most 3 distinct mutable paths; got 6$",
+        ):
+            validate_decomposition_policy(plan, _aggressive(staged_step_max_mutable_paths=3))
+
+
+class _CapturingClient:
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.prompts: list[str] = []
+
+    def complete(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.answer
+
+
+class PlannerV2RequestPolicyTests(unittest.TestCase):
+    def test_real_planner_request_carries_both_configured_policies(self):
+        client = _CapturingClient(_staged(write=_paths("w", 2), delete=_paths("d", 4)))
+        planner = PlannerV2(
+            client,
+            implementer_ids=frozenset({"impl-a"}),
+            reviewer_ids=frozenset({"review-a"}),
+            planning=PlanningConfig(
+                protocol="v2",
+                decomposition="aggressive",
+                single_step_max_mutable_paths=2,
+                staged_step_max_mutable_paths=6,
+                execution_mode_policy="require-staged",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            plan = planner.plan("SPEC", "CTX", artifacts_dir=directory)
+            persisted = (Path(directory) / "planner.request.txt").read_text(encoding="utf-8")
+        self.assertEqual(plan.execution_mode, ExecutionMode.STAGED)
+        [request] = client.prompts
+        self.assertEqual(persisted, request)
+        protocol = request.index(_PROTOCOL)
+        self.assertLess(request.index("This run REQUIRES STAGED execution."), protocol)
+        self.assertIn("A READY SINGLE plan may modify at most 2 distinct mutable paths " + _UNION, request)
+        self.assertIn("Every STAGED step may modify at most 6 distinct mutable paths", request)
+        self.assertIn("This limit applies to the UNION of the three sets", request)
+        self.assertLess(request.index("AGGRESSIVE decomposition"), protocol)
+
+    def test_real_planner_request_renders_custom_limit_and_enforces_it(self):
+        client = _CapturingClient(_staged(write=_paths("w", 2), delete=_paths("d", 4)))
+        planner = PlannerV2(
+            client,
+            implementer_ids=frozenset({"impl-a"}),
+            reviewer_ids=frozenset({"review-a"}),
+            planning=_aggressive(staged_step_max_mutable_paths=3),
+        )
+        with self.assertRaisesRegex(V2PlanParseError, "at most 3 distinct mutable paths; got 6"):
+            planner.plan("SPEC", "CTX")
+        self.assertIn("Every STAGED step may modify at most 3 distinct mutable paths", client.prompts[0])
 
 
 if __name__ == "__main__":

@@ -219,6 +219,7 @@ class PlanningConfig:
     protocol: str = "v1"
     decomposition: str = "balanced"
     single_step_max_mutable_paths: int = 2
+    staged_step_max_mutable_paths: int = 6
     execution_mode_policy: str = "auto"
 
     def __post_init__(self) -> None:
@@ -226,8 +227,10 @@ class PlanningConfig:
             raise ValueError("planning protocol must be 'v1' or 'v2'")
         if self.decomposition not in {"balanced", "aggressive"}:
             raise ValueError("planning decomposition must be 'balanced' or 'aggressive'")
-        if isinstance(self.single_step_max_mutable_paths, bool) or self.single_step_max_mutable_paths <= 0:
-            raise ValueError("single_step_max_mutable_paths must be greater than zero")
+        for name in ("single_step_max_mutable_paths", "staged_step_max_mutable_paths"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be an integer greater than zero")
         if self.execution_mode_policy not in {item.value for item in ExecutionModePolicy}:
             raise ValueError("planning execution_mode_policy must be 'auto' or 'require-staged'")
 

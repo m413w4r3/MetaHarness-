@@ -12,7 +12,13 @@ allow_no_required_checks = false
 protocol = "v2"
 decomposition = "aggressive"
 execution_mode_policy = "require-staged"
+# Aggressive decomposition only (balanced adds no such limit). Mutable paths
+# are counted over the distinct union WRITE_SET ∪ CREATE_SET ∪ DELETE_SET.
+# single_step_max_mutable_paths bounds a READY SINGLE plan;
+# staged_step_max_mutable_paths bounds every STAGED step. Both values are
+# rendered into the planner request and enforced after parsing.
 single_step_max_mutable_paths = 2
+staged_step_max_mutable_paths = 6
 
 # Target workflow: planner (STAGED) -> Luna steps -> Claude -> reviewer ->
 # optional C02 -> final reviewer PASS -> commit B(parent=A) in the isolated

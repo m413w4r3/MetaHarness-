@@ -108,7 +108,8 @@ class P23DecompositionTests(unittest.TestCase):
             "CREATE_SET\nNONE\n\nDELETE_SET\nNONE\n"
         )
         with self.assertRaisesRegex(
-            V2PlanParseError, "aggressive decomposition requires STAGED"
+            V2PlanParseError,
+            "aggressive SINGLE step S01 may modify at most 2 distinct mutable paths; got 3",
         ):
             validate_decomposition_policy(
                 _parse(_plan(steps=_plan_step_with_sets(sets))),
@@ -121,10 +122,22 @@ class P23DecompositionTests(unittest.TestCase):
             "WRITE_SET\n- src/a.py\n- src/b.py\n- src/c.py\n- src/d.py\n\n"
             "CREATE_SET\nNONE\n\nDELETE_SET\nNONE\n"
         )
-        with self.assertRaisesRegex(V2PlanParseError, "at most 3"):
+        plan = _parse(_plan("STAGED", 2, steps=_plan_step_with_sets(sets) + "\n\n" + _plan_step_with_sets(sets, 2)))
+        # Four mutable paths fit the default STAGED limit of six ...
+        validate_decomposition_policy(
+            plan, PlanningConfig(protocol="v2", decomposition="aggressive")
+        )
+        # ... and the limit is the configured value, not a hidden constant.
+        with self.assertRaisesRegex(
+            V2PlanParseError,
+            "aggressive STAGED step S01 may modify at most 3 distinct mutable paths; got 4",
+        ):
             validate_decomposition_policy(
-                _parse(_plan("STAGED", 2, steps=_plan_step_with_sets(sets) + "\n\n" + _plan_step_with_sets(sets, 2))),
-                PlanningConfig(protocol="v2", decomposition="aggressive"),
+                plan,
+                PlanningConfig(
+                    protocol="v2", decomposition="aggressive",
+                    staged_step_max_mutable_paths=3,
+                ),
             )
 
 
