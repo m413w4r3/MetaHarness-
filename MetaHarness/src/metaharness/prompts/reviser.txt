@@ -23,9 +23,7 @@ do not modify that path. Report clearly that replanning is required.
 
 Do not commit.
 Do not push.
-Do not use MCP.
-Do not use web/network.
-Do not run shell commands.
+Runtime capabilities are deliberately restricted; use only the tools exposed by MetaHarness.
 MetaHarness runs deterministic checks after you.
 
 <REPOSITORY REFERENCE>

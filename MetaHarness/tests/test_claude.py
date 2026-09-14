@@ -17,8 +17,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from metaharness.claude.agent import (  # noqa: E402
     ClaudeCodeAgent,
     build_claude_environment,
+    build_revision_prompt,
 )
-from metaharness.claude.runtime import prepare_claude_home  # noqa: E402
+from metaharness.claude.runtime import (  # noqa: E402
+    ClaudeRuntimeError,
+    prepare_claude_home,
+)
 from metaharness.config import load_config  # noqa: E402
 from metaharness.models import (  # noqa: E402
     AgentConfig,
@@ -75,6 +79,25 @@ class ClaudeTests(unittest.TestCase):
     def test_managed_home_and_environment_are_isolated(self) -> None:
         home = prepare_claude_home(self._config())
         self.assertEqual(home, (self.root / "claude-home").resolve())
+        self.assertEqual(
+            (home / "settings.json").read_text(),
+            '{\n'
+            '  "$schema": "https://json.schemastore.org/claude-code-settings.json",\n'
+            '  "permissions": {\n'
+            '    "disableBypassPermissionsMode": "disable",\n'
+            '    "deny": [\n'
+            '      "Agent",\n'
+            '      "AskUserQuestion",\n'
+            '      "Bash",\n'
+            '      "WebFetch",\n'
+            '      "WebSearch"\n'
+            '    ]\n'
+            '  }\n'
+            '}\n',
+        )
+        settings = json.loads((home / "settings.json").read_text())
+        self.assertEqual(settings["permissions"]["disableBypassPermissionsMode"], "disable")
+        self.assertNotIn("disableBypassPermissionsMode", settings)
         self.assertEqual((home / "empty-mcp.json").read_text(), '{\n  "mcpServers": {}\n}\n')
         environment = build_claude_environment(
             {
@@ -102,6 +125,28 @@ class ClaudeTests(unittest.TestCase):
                 "TMPDIR": str(home / "tmp"),
             },
         )
+
+    def test_managed_settings_reject_symlinks_and_replace_divergent_bytes(self) -> None:
+        home = self.root / "claude-home"
+        home.mkdir()
+        target = self.root / "personal-settings.json"
+        target.write_text('{"personal": true}\n', encoding="utf-8")
+        (home / "settings.json").symlink_to(target)
+        with self.assertRaisesRegex(ClaudeRuntimeError, "settings.json must not be a symlink"):
+            prepare_claude_home(self._config())
+
+        (home / "settings.json").unlink()
+        (home / "settings.json").mkdir()
+        with self.assertRaisesRegex(ClaudeRuntimeError, "settings.json must be a regular file"):
+            prepare_claude_home(self._config())
+        (home / "settings.json").rmdir()
+        (home / "settings.json").write_text('{"permissions": {"deny": []}}\n', encoding="utf-8")
+        credentials = home / "credentials.json"
+        credentials.write_text("credential-state\n", encoding="utf-8")
+        prepared = prepare_claude_home(self._config())
+        self.assertEqual(prepared / "settings.json", home.resolve() / "settings.json")
+        self.assertIn('"disableBypassPermissionsMode": "disable"', (home / "settings.json").read_text())
+        self.assertEqual(credentials.read_text(), "credential-state\n")
 
     def test_exact_argv_stdin_stream_result_and_usage(self) -> None:
         capture = self.root / "capture.json"
@@ -135,12 +180,22 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(recorded["stdin"].splitlines()[0], "inspect this")
         self.assertEqual(
             recorded["argv"],
-            ["--print", "--verbose", "--output-format", "stream-json", "--model", "opus", "--effort", "medium",
+            ["--print", "--verbose", "--output-format", "stream-json", "--bare", "--tools", "Read,Edit,Write,Grep,Glob",
+             "--no-session-persistence", "--no-chrome", "--disable-slash-commands", "--max-turns", "12",
+             "--model", "opus", "--effort", "medium",
              "--permission-mode", "acceptEdits", "--strict-mcp-config", "--mcp-config", str(home / "empty-mcp.json")],
         )
         self.assertEqual(result.final_message, "revised")
         self.assertEqual(result.usage["cached_input_tokens"], 2)
         self.assertTrue((self.root / "run/revision/agent.events.jsonl").exists())
+
+    def test_revision_prompt_keeps_semantics_without_repeating_removed_tools(self) -> None:
+        rendered = build_revision_prompt("review request")
+        self.assertIn("authorized by the implementation contract", rendered)
+        self.assertIn("Do not create commits", rendered)
+        self.assertIn("deterministic checks", rendered)
+        self.assertIn("Runtime capabilities are deliberately restricted", rendered)
+        self.assertNotIn("Do not execute Bash", rendered)
 
     def test_claude_profile_config_rejects_forbidden_fields(self) -> None:
         config = self.root / "bad.toml"

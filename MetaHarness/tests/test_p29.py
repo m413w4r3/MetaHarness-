@@ -276,18 +276,31 @@ class ClaudeCliTests(unittest.TestCase):
         )
         self.assertEqual((result.exit_code, result.final_message), (0, "ok"))
 
-    def test_doctor_requires_verbose_in_claude_help(self) -> None:
+    def test_doctor_uses_parser_probe_not_help_text(self) -> None:
         help_fake = self.root / "claude-help"
-        flags = ["--print", "--verbose", "--output-format", "--model", "--effort",
-                 "--permission-mode", "--mcp-config", "--strict-mcp-config"]
-        for missing, supported in ((None, True), ("--verbose", False)):
-            with self.subTest(missing=missing):
-                shown = [flag for flag in flags if flag != missing]
-                help_fake.write_text(f"#!{sys.executable}\nprint({' '.join(shown)!r})\n", encoding="utf-8")
-                help_fake.chmod(0o755)
-                ok, _detail = cli._probe_claude_capabilities(str(help_fake), {"PATH": "/usr/bin:/bin"}, self.root)
-                self.assertIs(ok, supported)
-        self.assertIn("--verbose", cli._CLAUDE_REQUIRED_CAPABILITIES)
+        help_fake.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "print('Usage: claude')\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        help_fake.chmod(0o755)
+        ok, _detail = cli._probe_claude_capabilities(
+            str(help_fake), {"PATH": "/usr/bin:/bin"}, self.root
+        )
+        self.assertTrue(ok)
+
+        help_fake.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "sys.exit(2 if '--no-chrome' in sys.argv else 0)\n",
+            encoding="utf-8",
+        )
+        ok, _detail = cli._probe_claude_capabilities(
+            str(help_fake), {"PATH": "/usr/bin:/bin"}, self.root
+        )
+        self.assertFalse(ok)
 
 
 class ResumeClaudeTests(P29Harness):

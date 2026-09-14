@@ -277,6 +277,38 @@ class DoctorTests(unittest.TestCase):
         self.assertNotIn("planner bridge", out)
         self.assertEqual(self.bridge.requests, [])
 
+    def test_claude_probe_is_parser_only_and_does_not_use_help_text(self) -> None:
+        probe = self.root / "claude-probe"
+        model_call = self.root / "model-call"
+        argv_record = self.root / "claude-argv.json"
+        probe.write_text(
+            f"#!{sys.executable}\n"
+            "import json, pathlib, sys\n"
+            f"pathlib.Path({str(argv_record)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+            f"if sys.argv[-1] != '--help': pathlib.Path({str(model_call)!r}).write_text('called')\n"
+            "print('Usage: claude')\n",
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        supported, _detail = cli._probe_claude_capabilities(
+            str(probe), {"PATH": str(self.bin)}, self.root
+        )
+        self.assertTrue(supported)
+        recorded = json.loads(argv_record.read_text())
+        self.assertEqual(recorded[-1], "--help")
+        self.assertFalse(model_call.exists())
+
+        probe.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "sys.exit(2 if '--no-chrome' in sys.argv else 0)\n",
+            encoding="utf-8",
+        )
+        supported, _detail = cli._probe_claude_capabilities(
+            str(probe), {"PATH": str(self.bin)}, self.root
+        )
+        self.assertFalse(supported)
+
 
 if __name__ == "__main__":
     unittest.main()

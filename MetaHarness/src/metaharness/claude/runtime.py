@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import stat
+import tempfile
 
 from ..models import HarnessConfig
 
@@ -15,6 +18,22 @@ class ClaudeRuntimeError(RuntimeError):
 
 
 _EMPTY_MCP = '{\n  "mcpServers": {}\n}\n'
+_MANAGED_SETTINGS = (
+    '{\n'
+    '  "$schema": "https://json.schemastore.org/claude-code-settings.json",\n'
+    '  "permissions": {\n'
+    '    "disableBypassPermissionsMode": "disable",\n'
+    '    "deny": [\n'
+    '      "Agent",\n'
+    '      "AskUserQuestion",\n'
+    '      "Bash",\n'
+    '      "WebFetch",\n'
+    '      "WebSearch"\n'
+    '    ]\n'
+    '  }\n'
+    '}\n'
+)
+_MANAGED_SETTINGS_SHAPE = json.loads(_MANAGED_SETTINGS)
 MANAGED_SUBDIRECTORIES = ("home", "cache", "tmp")
 
 
@@ -24,6 +43,67 @@ def _outside(path: Path, root: Path) -> bool:
     except ValueError:
         return True
     return False
+
+
+def _atomic_write_managed_settings(path: Path) -> None:
+    """Replace the managed settings file without writing through a link."""
+
+    temporary: str | None = None
+    try:
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(_MANAGED_SETTINGS)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        raise ClaudeRuntimeError("could not write managed Claude settings") from exc
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def _ensure_managed_settings(home: Path) -> None:
+    path = home / "settings.json"
+    try:
+        try:
+            file_stat = path.lstat()
+        except FileNotFoundError:
+            file_stat = None
+        if file_stat is not None:
+            if stat.S_ISLNK(file_stat.st_mode):
+                raise ClaudeRuntimeError(
+                    "managed Claude settings.json must not be a symlink"
+                )
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ClaudeRuntimeError(
+                    "managed Claude settings.json must be a regular file"
+                )
+        if file_stat is None or path.read_bytes() != _MANAGED_SETTINGS.encode("utf-8"):
+            _atomic_write_managed_settings(path)
+        with path.open("rb") as stream:
+            parsed = json.load(stream)
+        if parsed != _MANAGED_SETTINGS_SHAPE:
+            raise ClaudeRuntimeError(
+                "managed Claude settings.json has an unexpected shape"
+            )
+    except ClaudeRuntimeError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        raise ClaudeRuntimeError(
+            "could not prepare managed Claude settings.json"
+        ) from None
 
 
 def prepare_claude_home(config: HarnessConfig) -> Path:
@@ -57,6 +137,7 @@ def prepare_claude_home(config: HarnessConfig) -> Path:
             if not directory.is_dir():
                 raise ClaudeRuntimeError(f"managed Claude {name} path is not a directory")
             directory.chmod(0o700)
+        _ensure_managed_settings(home)
         mcp_path = home / "empty-mcp.json"
         if mcp_path.is_symlink():
             raise ClaudeRuntimeError("managed Claude MCP configuration must not be a symlink")

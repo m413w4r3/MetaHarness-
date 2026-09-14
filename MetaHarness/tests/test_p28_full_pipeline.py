@@ -921,14 +921,14 @@ class DoctorTests(unittest.TestCase):
             mode = open(MODE).read().strip() if os.path.exists(MODE) else "pass"
             with open(RECORD, "w") as stream:
                 json.dump({key: os.environ.get(key) for key in ("HOME", "CLAUDE_CONFIG_DIR", "TMPDIR", "XDG_CACHE_HOME", "CODEX_HOME")}, stream)
-            if args == ["--help"]:
-                flags = ["--print", "--verbose", "--output-format", "--model", "--effort", "--permission-mode", "--mcp-config", "--strict-mcp-config"]
-                if mode == "missing_capability":
-                    flags.remove("--effort")
-                print(" ".join(flags))
-                sys.exit(3 if mode == "help_nonzero" else 0)
             if args == ["auth", "--help"]:
                 print("Commands:\\n  status  Show authentication status"); sys.exit(0)
+            if args and args[-1] == "--help":
+                flags = ["--print", "--verbose", "--output-format", "--model", "--effort", "--permission-mode", "--mcp-config", "--strict-mcp-config"]
+                if mode == "missing_capability":
+                    sys.exit(2)
+                print(" ".join(flags))
+                sys.exit(3 if mode == "help_nonzero" else 0)
             if args == ["auth", "status"]:
                 if mode == "auth_failure":
                     print("Not logged in"); sys.exit(1)
@@ -1118,7 +1118,7 @@ class ClaudeIsolationTests(unittest.TestCase):
             self.assertNotIn(value, json.dumps(environment))
         # Nothing personal is copied: only the managed skeleton exists.
         self.assertEqual(sorted(path.name for path in home.iterdir()),
-                         ["cache", "empty-mcp.json", "home", "tmp"])
+                         ["cache", "empty-mcp.json", "home", "settings.json", "tmp"])
         self.assertEqual([path for path in (home / "home").rglob("*")], [])
         self.assertEqual((home / "empty-mcp.json").read_text(), '{\n  "mcpServers": {}\n}\n')
 
@@ -1158,7 +1158,7 @@ class ClaudeIsolationTests(unittest.TestCase):
         self.assertEqual(recorded["argv"][recorded["argv"].index("--mcp-config") + 1],
                          str(home / "empty-mcp.json"))
         self.assertEqual(sorted(path.name for path in home.iterdir()),
-                         ["cache", "empty-mcp.json", "home", "tmp"])
+                         ["cache", "empty-mcp.json", "home", "settings.json", "tmp"])
 
 
 class StructuralTests(unittest.TestCase):

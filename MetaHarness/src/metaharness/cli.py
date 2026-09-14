@@ -26,7 +26,11 @@ from .diagnostics import write_run_diagnostics
 from .agent.auth import check_codex_authentication
 from .agent.codex import build_agent_environment
 from .agent.runtime import CodexRuntimeError, prepare_codex_home
-from .claude.agent import build_claude_environment
+from .claude.agent import (
+    _MAX_REVISION_TURNS,
+    _REVISION_TOOLS,
+    build_claude_environment,
+)
 from .claude.auth import check_claude_authentication
 from .claude.runtime import ClaudeRuntimeError, prepare_claude_home
 from .execution_selection import is_profile_aware_run
@@ -56,16 +60,6 @@ _BRIDGE_HEALTH_TIMEOUT_SECONDS = 2
 _BRIDGE_HEALTH_MAX_BYTES = 64 * 1024
 _LOCAL_BRIDGE_HOSTS = frozenset({"127.0.0.1", "localhost"})
 _DOCTOR_DETAIL_CHARS = 300
-_CLAUDE_REQUIRED_CAPABILITIES = (
-    "--print",
-    "--verbose",
-    "--output-format",
-    "--model",
-    "--effort",
-    "--permission-mode",
-    "--mcp-config",
-    "--strict-mcp-config",
-)
 _CLAUDE_HELP_TIMEOUT_SECONDS = 20
 
 
@@ -325,11 +319,43 @@ def _probe_codex_sandbox(
 def _probe_claude_capabilities(
     claude: str, environment: Mapping[str, str], claude_home: Path
 ) -> tuple[bool, str | None]:
-    """Run only ``claude --help`` and verify the P24 CLI surface."""
+    """Ask Claude's parser to validate the managed runtime argv.
+
+    ``--help`` is deliberately last: Claude exits before a prompt/model call,
+    while unknown options still produce a non-zero parser failure.  Help text
+    is not used as a capability manifest because Claude does not promise to
+    list every supported option there.
+    """
+
+    argv = [
+        claude,
+        "--print",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--bare",
+        "--tools",
+        _REVISION_TOOLS,
+        "--no-session-persistence",
+        "--no-chrome",
+        "--disable-slash-commands",
+        "--max-turns",
+        str(_MAX_REVISION_TURNS),
+        "--model",
+        "probe",
+        "--effort",
+        "medium",
+        "--permission-mode",
+        "acceptEdits",
+        "--strict-mcp-config",
+        "--mcp-config",
+        str(claude_home / "empty-mcp.json"),
+        "--help",
+    ]
 
     try:
         result = subprocess.run(
-            [claude, "--help"],
+            argv,
             shell=False,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -348,10 +374,6 @@ def _probe_claude_capabilities(
     # mention every flag name.
     if result.returncode != 0:
         return False, f"exit {result.returncode}"
-    help_text = (result.stdout or "") + "\n" + (result.stderr or "")
-    missing = [option for option in _CLAUDE_REQUIRED_CAPABILITIES if option not in help_text]
-    if missing:
-        return False, "missing required option"
     return True, None
 
 

@@ -41,6 +41,8 @@ class ClaudeResult:
 
 _DEFAULT_TAIL_BYTES = 16 * 1024
 _MAX_EVENT_LINE_BYTES = 8 * 1024 * 1024
+_REVISION_TOOLS = "Read,Edit,Write,Grep,Glob"
+_MAX_REVISION_TURNS = 12
 # Only these names are inherited; HOME, TMPDIR and XDG_CACHE_HOME are forced
 # below the managed Claude home and never taken from the parent process.
 _ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TERM")
@@ -97,8 +99,8 @@ def build_revision_prompt(prompt: str) -> str:
         + "\n\n"
         "MetaHarness revision constraints:\n"
         "- Read and analyze the worktree, then edit only files authorized by the implementation contract.\n"
-        "- Do not execute Bash, shell commands, terminals, scripts, tests, linters, or any other command.\n"
         "- Do not create commits, move HEAD, switch branches, create or remove worktrees, or push.\n"
+        "- Runtime capabilities are deliberately restricted; use only the tools exposed by MetaHarness.\n"
         "- The harness, not you, runs deterministic checks. Finish with a concise revision report.\n"
     )
 
@@ -172,6 +174,14 @@ class ClaudeCodeAgent:
             "--verbose",
             "--output-format",
             "stream-json",
+            "--bare",
+            "--tools",
+            _REVISION_TOOLS,
+            "--no-session-persistence",
+            "--no-chrome",
+            "--disable-slash-commands",
+            "--max-turns",
+            str(_MAX_REVISION_TURNS),
             "--model",
             profile.model,
             "--effort",
@@ -264,4 +274,6 @@ __all__ = [
     "build_claude_environment",
     "build_revision_prompt",
     "classify_claude_failure",
+    "_MAX_REVISION_TURNS",
+    "_REVISION_TOOLS",
 ]
