@@ -47,6 +47,15 @@ _RUN_JS_CACHE: list[bytes] = []
 RUN_JS_PATH = "/static/run.js"
 
 
+def _reject_duplicate_json_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicated JSON field")
+        result[key] = value
+    return result
+
+
 def _run_js() -> bytes:
     """The single static run-page script, read once and never templated."""
 
@@ -293,7 +302,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             raise WebAPIError(413, "request body is too large")
         try:
             raw = self.rfile.read(length)
-            payload = json.loads(raw.decode("utf-8"))
+            payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_fields)
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise WebAPIError(400, "body must be valid JSON") from exc
         if not isinstance(payload, dict):
@@ -316,7 +325,14 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             if parts == ["", "api", "runs"]:
                 self._authorized()
                 payload = self._body()
-                unknown = set(payload) - {"spec", "run_id", "planner_profile"}
+                allowed = {
+                    "spec", "run_id", "planner_profile", "default_implementer_profile",
+                    "reviewer_profile", "reviser_profile", "repair_profile",
+                    "claude_revision_enabled", "repair_cycles", "decomposition",
+                    "execution_mode_policy", "single_step_max_mutable_paths",
+                    "staged_step_max_mutable_paths",
+                }
+                unknown = set(payload) - allowed
                 if unknown:
                     raise WebAPIError(400, "unknown request field")
                 result = create_run(
@@ -324,17 +340,45 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     spec=payload.get("spec"),
                     run_id=payload.get("run_id"),
                     planner_profile=payload.get("planner_profile"),
+                    default_implementer_profile=payload.get("default_implementer_profile"),
+                    reviewer_profile=payload.get("reviewer_profile"),
+                    reviser_profile=payload.get("reviser_profile"),
+                    repair_profile=payload.get("repair_profile"),
+                    claude_revision_enabled=payload.get("claude_revision_enabled"),
+                    repair_cycles=payload.get("repair_cycles"),
+                    decomposition=payload.get("decomposition"),
+                    execution_mode_policy=payload.get("execution_mode_policy"),
+                    single_step_max_mutable_paths=payload.get("single_step_max_mutable_paths"),
+                    staged_step_max_mutable_paths=payload.get("staged_step_max_mutable_paths"),
                 )
                 self._json(202, result)
                 return
             if parts == ["", "runs"]:
-                payload = self._form({"_token", "spec", "run_id", "planner_profile"})
+                payload = self._form({
+                    "_token", "spec", "run_id", "planner_profile", "default_implementer_profile",
+                    "reviewer_profile", "reviser_profile", "repair_profile",
+                    "claude_revision_enabled", "repair_cycles", "decomposition",
+                    "execution_mode_policy", "single_step_max_mutable_paths",
+                    "staged_step_max_mutable_paths",
+                }, exact=False)
+                if not {"_token", "spec", "run_id", "planner_profile"}.issubset(payload):
+                    raise WebAPIError(400, "missing request field")
                 self._authorized_form(payload.get("_token"))
                 result = create_run(
                     self.server.run_manager,
                     spec=payload["spec"],
                     run_id=payload["run_id"] or None,
-                    planner_profile=payload["planner_profile"] or None,
+                    planner_profile=payload["planner_profile"],
+                    default_implementer_profile=payload.get("default_implementer_profile"),
+                    reviewer_profile=payload.get("reviewer_profile"),
+                    reviser_profile=payload.get("reviser_profile"),
+                    repair_profile=payload.get("repair_profile"),
+                    claude_revision_enabled=payload.get("claude_revision_enabled"),
+                    repair_cycles=payload.get("repair_cycles"),
+                    decomposition=payload.get("decomposition"),
+                    execution_mode_policy=payload.get("execution_mode_policy"),
+                    single_step_max_mutable_paths=payload.get("single_step_max_mutable_paths"),
+                    staged_step_max_mutable_paths=payload.get("staged_step_max_mutable_paths"),
                 )
                 self._redirect(result["location"])
                 return

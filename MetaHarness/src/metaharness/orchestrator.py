@@ -173,6 +173,13 @@ from .state import RunStateStore
 from .validation import ValidationError, check_result_json
 from .workspace import WorkspaceSetupError, prepare_workspace
 from .result import ResultArtifactError, atomic_write_text
+from .run_options import (
+    RunOptions,
+    RunOptionsError,
+    effective_run_config,
+    legacy_or_durable_run_options,
+    write_run_options,
+)
 
 
 class OrchestrationError(RuntimeError):
@@ -998,6 +1005,7 @@ class Orchestrator:
         self._injected_agent = agent
         self._injected_reviser = reviser
         self._secrets: tuple[str, ...] = ()
+        self._legacy_run_options = True
         # Loaded production configs always contain a process-environment
         # mapping.  The fallback only preserves direct construction of the
         # legacy HarnessConfig dataclass by embedding callers/tests.
@@ -1238,6 +1246,7 @@ class Orchestrator:
     def run(
         self, spec: str | Path, *, run_id: str | None = None,
         planner_profile: str | None = None,
+        run_options: RunOptions | None = None,
     ) -> RunResult:
         """Read one SPEC file and delegate execution to :meth:`run_text`."""
 
@@ -1246,9 +1255,12 @@ class Orchestrator:
             spec_content = spec_path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             raise OrchestrationError(f"could not read spec {spec_path}: {exc}") from exc
-        if planner_profile is None:
-            return self.run_text(spec_content, run_id=run_id)
-        return self.run_text(spec_content, run_id=run_id, planner_profile=planner_profile)
+        kwargs: dict[str, Any] = {"run_id": run_id}
+        if planner_profile is not None:
+            kwargs["planner_profile"] = planner_profile
+        if run_options is not None:
+            kwargs["run_options"] = run_options
+        return self.run_text(spec_content, **kwargs)
 
     def run_text(
         self,
@@ -1256,6 +1268,7 @@ class Orchestrator:
         *,
         run_id: str | None = None,
         planner_profile: str | None = None,
+        run_options: RunOptions | None = None,
         on_created: Callable[[Path], None] | None = None,
     ) -> RunResult:
         """Run one in-memory SPEC and return its durable final state.
@@ -1270,10 +1283,20 @@ class Orchestrator:
         if not spec_content.strip():
             raise OrchestrationError("spec must not be empty")
 
-        selected_planner_id = planner_profile or self.config.ui.default_planner_profile or "legacy-planner"
-        selected_planner = profile_for_role(
-            self.config, selected_planner_id, ExecutionRole.PLANNER
-        )
+        original_config = self.config
+        try:
+            legacy_run_options = run_options is None
+            if run_options is None:
+                overrides = {"planner_profile": planner_profile} if planner_profile is not None else {}
+                run_options = RunOptions.from_config(original_config, **overrides)
+            elif planner_profile is not None and planner_profile != run_options.planner_profile:
+                raise OrchestrationError("planner profile conflicts with run options")
+            run_options.validate_profiles(original_config)
+            selected_planner = profile_for_role(
+                original_config, run_options.planner_profile, ExecutionRole.PLANNER
+            )
+        except RunOptionsError as exc:
+            raise OrchestrationError(str(exc)) from exc
 
         selected_run_id = _safe_run_id(run_id) if run_id is not None else generate_run_id()
         run_dir = (self.config.runs_root / selected_run_id).expanduser().resolve()
@@ -1295,13 +1318,21 @@ class Orchestrator:
             # The SPEC copy is created before state initialization, as the
             # CREATED phase contract requires both to exist together.
             (run_dir / "spec.md").write_text(spec_content, encoding="utf-8")
+            options_sha256 = write_run_options(run_dir, run_options)
             store = RunStateStore(run_dir / "state.json")
             store.initialize(selected_run_id)
+            # All downstream methods use this frozen per-run view.  The
+            # caller's HarnessConfig object is never mutated.
+            self._run_options = run_options
+            self._legacy_run_options = legacy_run_options
+            self.config = effective_run_config(original_config, run_options)
             store.update(
                 status=RunStatus.CREATED,
                 spec_path="spec.md",
                 repo=str(self.config.repo),
                 base_ref=self.config.base_ref,
+                run_options_sha256=options_sha256,
+                run_options=run_options.to_dict(),
                 execution={
                     "planner": {
                         "profile_id": selected_planner.id,
@@ -1780,7 +1811,8 @@ class Orchestrator:
         of this is ever replayed by a resume.
         """
 
-        revision_enabled = self.config.revision.enabled
+        revision_enabled = self._run_options.claude_revision_enabled
+        pipeline_enabled = revision_enabled or self._run_options.repair_cycles == 1
         planner_profile_id = planner_profile.id
         implementers = tuple(
             p for p in profiles_for_config(self.config).values()
@@ -1853,7 +1885,7 @@ class Orchestrator:
                 state = store.update(status=RunStatus.PLAN_REJECTED)
                 return RunResult(run_dir, RunStatus.PLAN_REJECTED, state)
             try:
-                if revision_enabled:
+                if pipeline_enabled:
                     # Schema 4 only: a v3 approval is never a fallback.
                     selection, execution_sha = read_execution_selection_v4_with_sha256(run_dir)
                     validate_execution_selection_v4(self.config, selection)
@@ -1870,22 +1902,28 @@ class Orchestrator:
             except (ExecutionSelectionError, ApprovalError, OSError, UnicodeError) as exc:
                 raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
         else:
-            if revision_enabled:
+            if pipeline_enabled:
                 requested = resolve_execution_selection_v4(
                     self.config,
                     planner_profile_id=planner_profile_id,
-                    step_profile_ids={step.id: step.implementer_profile for step in plan.steps},
+                    step_profile_ids={
+                        step.id: self.config.ui.default_implementer_profile or step.implementer_profile
+                        for step in plan.steps
+                    },
                     reviser_profile_id=self.config.ui.default_reviser_profile or "",
                     repair_implementer_profile_id=self.config.ui.default_repair_profile or "",
-                    reviewer_profile_id=plan.reviewer_profile or self.config.ui.default_reviewer_profile or "legacy-reviewer",
+                    reviewer_profile_id=self.config.ui.default_reviewer_profile or "legacy-reviewer",
                 )
                 selection = ensure_execution_selection_v4(run_dir, requested)
             else:
                 requested = resolve_execution_selection_v3(
                     self.config,
                     planner_profile_id=planner_profile_id,
-                    step_profile_ids={step.id: step.implementer_profile for step in plan.steps},
-                    reviewer_profile_id=plan.reviewer_profile or self.config.ui.default_reviewer_profile or "legacy-reviewer",
+                    step_profile_ids={
+                        step.id: self.config.ui.default_implementer_profile or step.implementer_profile
+                        for step in plan.steps
+                    },
+                    reviewer_profile_id=self.config.ui.default_reviewer_profile or "legacy-reviewer",
                 )
                 selection = ensure_execution_selection_v3(run_dir, requested)
             durable_identity = compute_plan_identity_from_run(run_dir)
@@ -1907,7 +1945,7 @@ class Orchestrator:
             raise ExecutionSelectionError("execution selection planner is not the run planner")
         if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
             raise ExecutionSelectionError("execution selection steps do not match the plan")
-        if revision_enabled:
+        if pipeline_enabled:
             if not isinstance(selection, ExecutionSelectionV4) or selection.schema_version != 4:
                 raise ExecutionSelectionError("revision.enabled requires execution selection schema 4")
             validate_execution_selection_v4(self.config, selection)
@@ -2042,7 +2080,8 @@ class Orchestrator:
         # The configuration is the only authority for P25/P26.  It was fully
         # cross-validated at load time; profiles in the catalogue never
         # enable Claude or C02 implicitly.
-        revision_enabled = self.config.revision.enabled
+        revision_enabled = self._run_options.claude_revision_enabled
+        repair_enabled = self._run_options.repair_cycles == 1
 
         planner_profile_id = store.load()["execution"]["planner"]["profile_id"]
         planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
@@ -2253,7 +2292,7 @@ class Orchestrator:
         else:
             evidence, review = resumed.c01_evidence, resumed.c01_review
         if review.verdict is ReviewVerdict.REVISE:
-            if revision_enabled and review.route is ReviewRoute.IMPLEMENTATION:
+            if repair_enabled and review.route is ReviewRoute.IMPLEMENTATION:
                 if at <= phase_index(ResumePhase.REVIEWER_C01):
                     store.update(status=RunStatus.IMPLEMENTING, cycle=2)
                     self._cycle_update(
@@ -2275,6 +2314,7 @@ class Orchestrator:
                         original_bundle=bundle, cycle_1_evidence=evidence,
                         cycle_1_review=review, cycle_1_revision=revision_result,
                         cycle_1_revision_report=revision_report_c01,
+                        claude_revision_enabled=revision_enabled,
                         resumed=resumed if at > phase_index(ResumePhase.REVIEWER_C01) else None,
                     )
                 except StepExecutionFailure as failure:
@@ -2331,6 +2371,15 @@ class Orchestrator:
                     repository_reference=repository_reference,
                     cycle=2,
                 )
+            if not repair_enabled:
+                write_repair_task(run_dir, fields={"route": review.route.value,
+                    "review_summary": review.summary, "findings": review.findings,
+                    "required_fixes": review.required_fixes, "missing_tests": review.missing_tests,
+                    "existing_branch": info.branch, "existing_worktree": str(info.worktree), "run_id": run_id})
+                # Preserve the historical terminal reason for direct CLI or
+                # embedding callers that did not provide a durable snapshot.
+                reason = "REVIEW_REVISE" if self._legacy_run_options else "HUMAN_REQUIRED"
+                return self._v2_failed(store, run_dir, reason, None)
             if revision_enabled and review.route is ReviewRoute.REPLAN:
                 return self._v2_failed(store, run_dir, "REPLAN_REQUIRED", None)
             if revision_enabled and review.route is ReviewRoute.HUMAN:
@@ -2777,6 +2826,7 @@ class Orchestrator:
         cycle_1_evidence: EvidenceBundle,
         cycle_1_review: ReviewResult,
         cycle_1_revision: Any | None,
+        claude_revision_enabled: bool,
         cycle_1_revision_report: str = "",
         resumed: "_ResumedRun | None" = None,
     ) -> tuple[TaskPlanV2, Any | None, EvidenceBundle, ReviewResult]:
@@ -2931,11 +2981,13 @@ class Orchestrator:
             following = repair_plan.steps[index + 1].id if index + 1 < len(repair_plan.steps) else None
             self._checkpoint(
                 run_dir,
-                ResumePhase.REPAIR_STEP if following else ResumePhase.CLAUDE_C02,
+                ResumePhase.REPAIR_STEP if following else (
+                    ResumePhase.CLAUDE_C02 if claude_revision_enabled else ResumePhase.REVIEWER_C02
+                ),
                 step_id=following, head=base_sha, tree=outcome.tree_after,
             )
         self._update_v2_usage(store, run_dir)
-        if at <= phase_index(ResumePhase.CLAUDE_C02):
+        if claude_revision_enabled and at <= phase_index(ResumePhase.CLAUDE_C02):
             if start is not None and start.phase is ResumePhase.CLAUDE_C02:
                 _archive_attempt(run_dir / "revision" / "C02")
             cycle_2_revision, revision_error = self._run_v2_revision_cycle(
@@ -2956,7 +3008,7 @@ class Orchestrator:
                 claude_revision_report=cycle_2_revision.final_message if cycle_2_revision else "",
             )
         else:
-            cycle_2_revision = resumed.c02_revision
+            cycle_2_revision = resumed.c02_revision if resumed is not None else None
         revision_report_c02 = (
             _revision_report_text(cycle_2_revision, run_dir / "revision" / "C02")
             if cycle_2_revision is not None else ""
@@ -3363,6 +3415,18 @@ class Orchestrator:
             state = store.load()
         except (OSError, ValueError) as exc:
             raise ResumeError(f"run state is unreadable: {exc}") from exc
+        try:
+            self._legacy_run_options = not (run_dir / "run_options.json").is_file()
+            options, _ = legacy_or_durable_run_options(
+                self.config,
+                run_dir,
+                expected_sha256=state.get("run_options_sha256")
+                if isinstance(state.get("run_options_sha256"), str) else None,
+            )
+            self._run_options = options
+            self.config = effective_run_config(self.config, options)
+        except RunOptionsError as exc:
+            raise ResumeNotAllowedError("run options are missing or invalid") from exc
         if not hasattr(self, "_runtime_environment"):
             self._runtime_environment = (
                 self.config.runtime_environment if self.config.runtime_environment else os.environ
@@ -3472,10 +3536,11 @@ class Orchestrator:
         def refuse(message: str) -> NoReturn:
             raise ResumeIntegrityError(message)
 
-        revision_enabled = self.config.revision.enabled
+        revision_enabled = self._run_options.claude_revision_enabled
+        repair_enabled = self._run_options.repair_cycles == 1
         if self.config.planning.protocol != "v2" or state.get("planning_protocol") != "v2":
             refuse("only META PLAN v2 runs can be resumed")
-        if not revision_enabled and checkpoint.phase not in (
+        if not revision_enabled and not repair_enabled and checkpoint.phase not in (
             ResumePhase.INITIAL_STEP, ResumePhase.REVIEWER_C01, ResumePhase.PUBLISH,
         ):
             refuse("this checkpoint requires revision.enabled")
@@ -3514,7 +3579,7 @@ class Orchestrator:
             refuse("the approval does not bind the checkpoint execution selection")
         # The approved execution selection, against today's configuration.
         try:
-            if revision_enabled:
+            if revision_enabled or repair_enabled:
                 selection, execution_sha = read_execution_selection_v4_with_sha256(run_dir)
                 validate_execution_selection_v4(self.config, selection)
             else:
@@ -3605,7 +3670,9 @@ class Orchestrator:
             restore_paths=restore,
         )
         if checkpoint.phase is not ResumePhase.PUBLISH:
-            self._load_resumed_results(run_dir, resumed, base_tree, revision_enabled)
+            self._load_resumed_results(
+                run_dir, resumed, base_tree, revision_enabled, repair_enabled
+            )
         return resumed
 
     @staticmethod
@@ -3645,7 +3712,8 @@ class Orchestrator:
         raise ResumeIntegrityError("the worktree differs from the checkpoint tree")
 
     def _load_resumed_results(
-        self, run_dir: Path, resumed: "_ResumedRun", base_tree: str, revision_enabled: bool,
+        self, run_dir: Path, resumed: "_ResumedRun", base_tree: str,
+        revision_enabled: bool, repair_enabled: bool,
     ) -> None:
         """Read back every phase before the checkpoint and verify its chain."""
 
@@ -3726,10 +3794,12 @@ class Orchestrator:
         repair_end = _verify_step_chain(repair_records, evidence.staged_tree_sha)
         if repair_end is None:
             refuse("C02 step trees do not form an unbroken chain")
-        if checkpoint.phase in (ResumePhase.REPAIR_STEP, ResumePhase.CLAUDE_C02) and repair_end != expected:
+        if checkpoint.phase in (
+            ResumePhase.REPAIR_STEP, ResumePhase.CLAUDE_C02, ResumePhase.REVIEWER_C02
+        ) and repair_end != expected:
             refuse("the checkpoint tree is not the last completed C02 tree")
         resumed.c02_steps = repair_records
-        if at > phase_index(ResumePhase.CLAUDE_C02):
+        if revision_enabled and at > phase_index(ResumePhase.CLAUDE_C02):
             revision = _load_revision(run_dir / "revision" / "C02")
             if revision is None or revision.tree_before != repair_end or revision.tree_after != expected:
                 refuse("the Claude C02 record does not match the checkpoint")

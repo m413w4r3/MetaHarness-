@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
 from typing import Callable
 
 from ..config import HarnessConfig
 from ..orchestrator import Orchestrator, OrchestrationError, _safe_run_id, generate_run_id
 from ..resume import ResumeNotAllowedError
+from ..run_options import RunOptions
 
 
 class RunManagerError(RuntimeError):
@@ -47,6 +49,7 @@ class RunManager:
         *,
         run_id: str | None = None,
         planner_profile: str | None = None,
+        run_options: RunOptions | None = None,
     ) -> str:
         try:
             selected_run_id = _safe_run_id(run_id) if run_id else generate_run_id()
@@ -78,6 +81,8 @@ class RunManager:
                 }
                 if planner_profile is not None:
                     kwargs["planner_profile"] = planner_profile
+                if run_options is not None and _supports_run_options(orchestrator.run_text):
+                    kwargs["run_options"] = run_options
                 orchestrator.run_text(spec, **kwargs)
             except BaseException:
                 # The orchestrator records business failures after durable
@@ -104,14 +109,9 @@ class RunManager:
             raise RunManagerError("run worker failed before durable creation")
         raise RunManagerError("run creation timed out")
 
-    def resume_run(self, run_id: str) -> str:
-        """Resume the same ``run_id`` in the background at its checkpoint.
 
-        Returns once the resume has been durably claimed, durably refused
-        (integrity/operator failure recorded in state), or is still
-        validating.  A run that is not resumable raises
-        :class:`RunResumeNotAllowedError` and its state is unchanged.
-        """
+    def resume_run(self, run_id: str) -> str:
+        """Resume the same ``run_id`` in the background at its checkpoint."""
 
         try:
             selected_run_id = _safe_run_id(run_id)
@@ -158,6 +158,19 @@ class RunManager:
                 raise RunResumeNotAllowedError(str(errors[0]))
             raise RunManagerError("run could not be resumed")
         return selected_run_id
+
+
+def _supports_run_options(method: Callable[..., object]) -> bool:
+    """Keep older embedding/test orchestrators source-compatible."""
+
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == "run_options" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 class RunResumeNotAllowedError(RunManagerError):

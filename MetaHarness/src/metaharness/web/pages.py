@@ -14,6 +14,7 @@ import json
 
 from ..models import ExecutionModePolicy, HarnessConfig
 from ..profiles import profiles_for_config, safe_profile_metadata
+from ..run_options import RunOptions
 from .api import LIVE_STOP_STATUSES, context_level, publish_target
 
 
@@ -156,8 +157,15 @@ def render_index(runs: list[dict[str, Any]], *, nonce: str | None = None) -> str
 
 
 def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = None) -> str:
-    profiles = [safe_profile_metadata(profile) for profile in profiles_for_config(config).values() if any(role.value == "planner" for role in profile.roles)]
-    options = "".join(f'<option value="{_e(p["id"])}"{" selected" if p["id"] == config.ui.default_planner_profile else ""}>{_e(p["display_name"])}</option>' for p in profiles)
+    defaults = RunOptions.from_config(config)
+    options = {
+        "planner": _new_profile_options(config, "planner", defaults.planner_profile),
+        "implementer": _new_profile_options(config, "implementer", defaults.default_implementer_profile),
+        "reviewer": _new_profile_options(config, "reviewer", defaults.reviewer_profile),
+        "reviser": _new_profile_options(config, "reviser", defaults.reviser_profile, optional=True),
+        "repair": _new_profile_options(config, "repair", defaults.repair_profile, optional=True),
+    }
+    claude = "enabled" if defaults.claude_revision_enabled else "disabled"
     body = f'''<main><p><a href="/">← Tous les runs</a></p><h1>New Run</h1>
 <dl><dt>Repository</dt><dd class="mono">{_e(config.repo)}</dd><dt>Base ref</dt><dd class="mono">{_e(config.base_ref)}</dd>
 <dt>Execution policy</dt><dd>{_e(_execution_policy_label(config))}</dd>
@@ -165,8 +173,36 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
 <form action="/runs" method="post" accept-charset="UTF-8"><input type="hidden" name="_token" value="{_e(token)}">
 <label for="spec">SPEC</label><textarea id="spec" name="spec" rows="20" required></textarea>
 <label for="run-id">Run ID (optional)</label><input id="run-id" name="run_id" type="text" autocomplete="off" value="">
-<label for="planner-profile">Planner</label><select id="planner-profile" name="planner_profile" required>{options}</select><br><button type="submit">CREATE RUN</button></form></main>'''
+<section class="card"><h2>RUN OPTIONS</h2>
+<h3>Planner</h3><select id="planner-profile" name="planner_profile" required>{options["planner"]}</select>
+<label for="implementer-profile">Default implementer</label><select id="implementer-profile" name="default_implementer_profile" required>{options["implementer"]}</select>
+<label for="reviewer-profile">Final reviewer</label><select id="reviewer-profile" name="reviewer_profile" required>{options["reviewer"]}</select>
+<label for="claude-revision">Claude revision</label><select id="claude-revision" name="claude_revision_enabled" required><option value="enabled"{" selected" if claude == "enabled" else ""}>enabled</option><option value="disabled"{" selected" if claude == "disabled" else ""}>disabled</option></select>
+<label for="reviser-profile">Claude reviser profile</label><select id="reviser-profile" name="reviser_profile" aria-describedby="reviser-help">{options["reviser"]}</select><p id="reviser-help" class="muted">Ce choix est validé côté serveur même si Claude est désactivé.</p>
+<label for="repair-cycles">Automatic repair cycles</label><select id="repair-cycles" name="repair_cycles" required><option value="0"{" selected" if defaults.repair_cycles == 0 else ""}>0</option><option value="1"{" selected" if defaults.repair_cycles == 1 else ""}>1</option></select>
+<label for="repair-profile">Repair implementer profile</label><select id="repair-profile" name="repair_profile">{options["repair"]}</select>
+<label for="decomposition">Decomposition</label><select id="decomposition" name="decomposition" required><option value="balanced"{" selected" if defaults.decomposition == "balanced" else ""}>balanced</option><option value="aggressive"{" selected" if defaults.decomposition == "aggressive" else ""}>aggressive</option></select>
+<label for="execution-mode-policy">Execution mode</label><select id="execution-mode-policy" name="execution_mode_policy" required><option value="auto"{" selected" if defaults.execution_mode_policy == "auto" else ""}>auto</option><option value="require-staged"{" selected" if defaults.execution_mode_policy == "require-staged" else ""}>require-staged</option></select>
+<label for="single-limit">SINGLE mutable paths</label><input id="single-limit" name="single_step_max_mutable_paths" type="number" min="1" step="1" value="{_e(defaults.single_step_max_mutable_paths)}" required>
+<label for="staged-limit">STAGED mutable paths</label><input id="staged-limit" name="staged_step_max_mutable_paths" type="number" min="1" step="1" value="{_e(defaults.staged_step_max_mutable_paths)}" required>
+</section><br><button type="submit">CREATE RUN</button></form></main>'''
     return _page("New Run", body, nonce=nonce)
+
+
+def _new_profile_options(
+    config: HarnessConfig, role: str, selected: Any, *, optional: bool = False,
+) -> str:
+    rows = []
+    if optional and selected is None:
+        rows.append('<option value="" selected>not configured</option>')
+    for profile in profiles_for_config(config).values():
+        item = safe_profile_metadata(profile)
+        if role in item["roles"]:
+            rows.append(
+                f'<option value="{_e(item["id"])}"{" selected" if item["id"] == selected else ""}>'
+                f'{_e(item["display_name"])}</option>'
+            )
+    return "".join(rows)
 
 
 def _execution_policy_label(config: HarnessConfig) -> str:
@@ -374,13 +410,17 @@ def _v2_approval_form(
         {profile.id: safe_profile_metadata(profile) for profile in profiles_for_config(config).values()}
         if config is not None else {}
     )
+    options = state.get("run_options") if isinstance(state.get("run_options"), dict) else {}
+    if not options and config is not None:
+        options = RunOptions.from_config(config).to_dict()
+    requested_profiles = options.get("profiles") if isinstance(options.get("profiles"), dict) else {}
     rows: list[str] = []
     overview: list[str] = []
     for item in steps:
         if not isinstance(item, dict) or not isinstance(item.get("id"), str):
             continue
         step_id = item["id"]
-        selected = item.get("recommended_profile") or item.get("profile_id")
+        selected = requested_profiles.get("default_implementer_profile") or item.get("recommended_profile") or item.get("profile_id")
         meta = metadata.get(selected, {})
         overview.append(
             f'<li><span class="mono">{_e(step_id)}</span> → recommended '
@@ -394,15 +434,17 @@ def _v2_approval_form(
             f'{_profile_options(config, "implementer", selected)}</select>'
             f'{_contract_block(artifact_map.get(step_id, {}))}</section>'
         )
-    reviewer = planner.get("reviewer_recommendation")
+    reviewer = requested_profiles.get("reviewer_profile") or planner.get("reviewer_recommendation")
     # Revision is shown (and selectable) only when revision.enabled: all four
     # execution families are then visible before APPROVE.  The repair
     # implementer is its own configured default, never derived from the
     # reviser, and only Codex profiles are offered for it.
     cycle_profiles = ""
-    if config is not None and config.revision.enabled:
-        reviser = config.ui.default_reviser_profile
-        repair = config.ui.default_repair_profile
+    pipeline = options.get("pipeline") if isinstance(options.get("pipeline"), dict) else {}
+    cycle_enabled = bool(pipeline.get("claude_revision_enabled")) or pipeline.get("repair_cycles") == 1
+    if config is not None and cycle_enabled:
+        reviser = requested_profiles.get("reviser_profile")
+        repair = requested_profiles.get("repair_profile")
         reviser_meta = metadata.get(reviser, {})
         repair_meta = metadata.get(repair, {})
         cycle_profiles = (
@@ -823,6 +865,45 @@ def _pipeline_section(overview: dict[str, Any]) -> str:
     )
 
 
+def _run_configuration(state: dict[str, Any], config: HarnessConfig | None = None) -> str:
+    """Render the safe requested snapshot and any changed final profiles."""
+
+    snapshot = state.get("run_options") if isinstance(state.get("run_options"), dict) else {}
+    if not snapshot and config is not None:
+        snapshot = RunOptions.from_config(config).to_dict()
+    planning = snapshot.get("planning") if isinstance(snapshot.get("planning"), dict) else {}
+    pipeline = snapshot.get("pipeline") if isinstance(snapshot.get("pipeline"), dict) else {}
+    requested = snapshot.get("profiles") if isinstance(snapshot.get("profiles"), dict) else {}
+    execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
+    final: dict[str, Any] = {}
+    planner = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
+    if planner.get("profile_id"):
+        final["planner_profile"] = planner["profile_id"]
+    steps = execution.get("steps") if isinstance(execution.get("steps"), list) else []
+    if steps and isinstance(steps[0], dict) and isinstance(steps[0].get("implementer"), dict):
+        final["default_implementer_profile"] = steps[0]["implementer"].get("profile_id")
+    for key, role in (("reviewer_profile", "reviewer"), ("reviser_profile", "reviser"), ("repair_profile", "repair_implementer")):
+        item = execution.get(role)
+        if isinstance(item, dict):
+            final[key] = item.get("profile_id")
+    rows = [
+        ("decomposition", planning.get("decomposition")),
+        ("execution mode", planning.get("execution_mode_policy")),
+        ("SINGLE mutable limit", planning.get("single_step_max_mutable_paths")),
+        ("STAGED mutable limit", planning.get("staged_step_max_mutable_paths")),
+        ("Claude revision", "on" if pipeline.get("claude_revision_enabled") else "off"),
+        ("repair cycles", pipeline.get("repair_cycles")),
+    ]
+    for key, label in (("planner_profile", "planner"), ("default_implementer_profile", "implementer"), ("reviewer_profile", "reviewer"), ("reviser_profile", "reviser"), ("repair_profile", "repair")):
+        rows.append((f"requested {label}", requested.get(key)))
+        if key in final and final.get(key) != requested.get(key):
+            rows.append((f"effective/final {label}", final.get(key)))
+    return '<section class="card"><h2>RUN CONFIGURATION</h2><dl>' + "".join(
+        f'<dt>{_e(label)}</dt><dd class="mono">{_e(value if value is not None else "—")}</dd>'
+        for label, value in rows
+    ) + '</dl></section>'
+
+
 def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, Any]) -> str:
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = str(state.get("status", run.get("status", "")) or "")
@@ -950,6 +1031,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
 {_run_card(run, token, overview, is_v2)}
 {_publish_section(state)}
 {_pipeline_section(overview)}
+{_run_configuration(state, config)}
 {approval_forms}
 <section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config) if is_v2 else _execution_card(state, config)}</section>
 <section class="current-cycle"><h2>CURRENT CYCLE</h2>{_agent_auth_failure_notice(run, config)}{_live_events_card(polls)}{agent_section}</section>

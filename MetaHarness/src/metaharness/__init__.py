@@ -68,6 +68,13 @@ from .models import (
 from .orchestrator import Orchestrator, run_orchestrator
 from .review import Reviewer, ReviewParseError, ReviewResult, parse_review
 from .result import RunResult
+from .run_options import (
+    RunOptions,
+    RunOptionsConflict,
+    RunOptionsError,
+    effective_run_config,
+    read_run_options_with_sha256,
+)
 from .state import RunStateStore
 from .validation import CheckResult, ValidationError, run_checks
 from .workspace import WorkspaceSetupError, WorkspaceSetupResult, prepare_workspace
@@ -116,6 +123,9 @@ __all__ = [
     "Reviewer",
     "RunStateStore",
     "RunResult",
+    "RunOptions",
+    "RunOptionsConflict",
+    "RunOptionsError",
     "RunStatus",
     "RunCycle",
     "TaskPlanV2",
@@ -146,4 +156,6 @@ __all__ = [
     "write_plan_approval",
     "prepare_workspace",
     "prepare_claude_home",
+    "effective_run_config",
+    "read_run_options_with_sha256",
 ]

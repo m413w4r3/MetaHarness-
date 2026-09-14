@@ -76,6 +76,8 @@ class RunStateStore:
             "base_sha": base_sha,
             "branch": branch,
             "worktree": worktree,
+            "run_options_sha256": None,
+            "run_options": {},
             "planner": {},
             "execution": {},
             "recommendation": {},

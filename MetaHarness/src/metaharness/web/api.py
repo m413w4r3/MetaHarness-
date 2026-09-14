@@ -49,6 +49,7 @@ from ..models import (
 )
 from ..planning_v2 import V2PlanParseError, step_contract_path, validate_implementation_bundle
 from ..profiles import ProfileError, profile_for_role, profiles_for_config, safe_profile_metadata
+from ..run_options import RunOptions, RunOptionsError, legacy_or_durable_run_options
 from ..state import RunStateStore
 from ..usage import (
     PLANNER_USAGE_ARTIFACT,
@@ -69,6 +70,7 @@ from .run_manager import (
 ARTIFACT_ALLOWLIST = frozenset(
     {
         "state.json",
+        "run_options.json",
         "spec.md",
         "planner.raw.md",
         "implementation_contract.md",
@@ -442,6 +444,9 @@ def get_run(
         "revision": _load_json(_artifact_path(directory, revision_path)),
         "execution_selection": _load_json(
             _artifact_path(directory, "execution_selection.json")
+        ),
+        "run_options": _load_json(
+            _artifact_path(directory, "run_options.json")
         ),
         "execution_recommendation": _load_json(
             _artifact_path(directory, "execution_recommendation.json")
@@ -871,28 +876,38 @@ def approve_run(
         raise WebAPIError(409, "run is not awaiting plan approval")
     profile_aware = is_profile_aware_run(state)
     v2 = state.get("planning_protocol") == "v2"
-    # revision.enabled is the only authority for the schema-4 selection; a
-    # reviser or repair field is never accepted to enable it implicitly.
-    revision_enabled = bool(config is not None and config.revision.enabled)
-    if selected is ApprovalDecision.APPROVE and not revision_enabled and (
+    try:
+        snapshot, _ = legacy_or_durable_run_options(
+            config, directory,
+            expected_sha256=state.get("run_options_sha256")
+            if isinstance(state.get("run_options_sha256"), str) else None,
+        ) if config is not None else (None, None)
+    except RunOptionsError as exc:
+        raise WebAPIError(409, "run options are invalid") from exc
+    # A reviser or repair field is never accepted to enable a pipeline
+    # implicitly: only the immutable creation snapshot decides this.
+    claude_revision_enabled = bool(snapshot and snapshot.claude_revision_enabled)
+    repair_enabled = bool(snapshot and snapshot.repair_cycles == 1)
+    pipeline_enabled = claude_revision_enabled or repair_enabled
+    if selected is ApprovalDecision.APPROVE and not pipeline_enabled and (
         reviser_profile is not None or repair_profile is not None
     ):
-        raise WebAPIError(400, "reviser_profile and repair_profile require revision.enabled")
+        raise WebAPIError(400, "reviser_profile and repair_profile require an enabled pipeline")
     if v2:
         if selected is ApprovalDecision.APPROVE:
             if config is None or not isinstance(step_profiles, Mapping) or not isinstance(reviewer_profile, str):
                 raise WebAPIError(400, "step profiles and reviewer_profile are required")
             if any(not isinstance(value, str) for value in step_profiles.values()):
                 raise WebAPIError(400, "invalid step profile field")
-        if selected is ApprovalDecision.APPROVE and revision_enabled:
+        if selected is ApprovalDecision.APPROVE and pipeline_enabled:
             # Each default comes from its own configured key: the repair
             # implementer is never derived from the reviser.
             if reviser_profile is None:
-                reviser_profile = config.ui.default_reviser_profile
+                reviser_profile = snapshot.reviser_profile if snapshot is not None else config.ui.default_reviser_profile
             elif not isinstance(reviser_profile, str) or not reviser_profile:
                 raise WebAPIError(400, "reviser_profile is invalid")
             if repair_profile is None:
-                repair_profile = config.ui.default_repair_profile
+                repair_profile = snapshot.repair_profile if snapshot is not None else config.ui.default_repair_profile
             elif not isinstance(repair_profile, str) or not repair_profile:
                 raise WebAPIError(400, "repair_profile is invalid")
     if selected is ApprovalDecision.APPROVE and profile_aware and not v2:
@@ -941,7 +956,7 @@ def approve_run(
         if set(step_profiles) != set(expected_ids):
             raise WebAPIError(400, "missing or unknown step profile field")
         try:
-            if revision_enabled:
+            if pipeline_enabled:
                 requested = resolve_execution_selection_v4(
                     config,
                     planner_profile_id=state["execution"]["planner"]["profile_id"],
@@ -1124,15 +1139,68 @@ def create_run(
     spec: object,
     run_id: object = None,
     planner_profile: object = None,
+    default_implementer_profile: object = None,
+    reviewer_profile: object = None,
+    reviser_profile: object = None,
+    repair_profile: object = None,
+    claude_revision_enabled: object = None,
+    repair_cycles: object = None,
+    decomposition: object = None,
+    execution_mode_policy: object = None,
+    single_step_max_mutable_paths: object = None,
+    staged_step_max_mutable_paths: object = None,
 ) -> dict[str, str]:
     content = validate_spec(spec)
-    if planner_profile is not None and not isinstance(planner_profile, str):
-        raise WebAPIError(400, "planner_profile is invalid")
-    selected_planner = planner_profile or manager._config.ui.default_planner_profile or "legacy-planner"
     try:
-        profile_for_role(manager._config, selected_planner, ExecutionRole.PLANNER)
-    except ProfileError as exc:
-        raise WebAPIError(400, "planner_profile is invalid or incompatible") from exc
+        def profile(value: object, name: str) -> str | None:
+            if value is None:
+                return None
+            if not isinstance(value, str) or not value.strip():
+                raise WebAPIError(400, f"{name} is invalid")
+            return value
+
+        def optional_profile(value: object, name: str) -> str | None:
+            if value == "":
+                return None
+            return profile(value, name)
+
+        def boolean(value: object, name: str) -> bool | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str) and value in {"enabled", "disabled"}:
+                return value == "enabled"
+            raise WebAPIError(400, f"{name} is invalid")
+
+        def integer(value: object, name: str) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                raise WebAPIError(400, f"{name} is invalid")
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+            raise WebAPIError(400, f"{name} is invalid")
+
+        overrides = {
+            "planner_profile": profile(planner_profile, "planner_profile"),
+            "default_implementer_profile": profile(default_implementer_profile, "default_implementer_profile"),
+            "reviewer_profile": profile(reviewer_profile, "reviewer_profile"),
+            "reviser_profile": optional_profile(reviser_profile, "reviser_profile"),
+            "repair_profile": optional_profile(repair_profile, "repair_profile"),
+            "claude_revision_enabled": boolean(claude_revision_enabled, "claude_revision_enabled"),
+            "repair_cycles": integer(repair_cycles, "repair_cycles"),
+            "decomposition": decomposition,
+            "execution_mode_policy": execution_mode_policy,
+            "single_step_max_mutable_paths": integer(single_step_max_mutable_paths, "single_step_max_mutable_paths"),
+            "staged_step_max_mutable_paths": integer(staged_step_max_mutable_paths, "staged_step_max_mutable_paths"),
+        }
+        overrides = {key: value for key, value in overrides.items() if value is not None}
+        options = RunOptions.from_config(manager._config, **overrides)
+    except RunOptionsError as exc:
+        raise WebAPIError(400, str(exc)) from exc
     selected_id: str | None = None
     if run_id is not None:
         if not isinstance(run_id, str):
@@ -1142,12 +1210,9 @@ def create_run(
         if (root / selected_id).exists():
             raise WebAPIError(409, "run already exists")
     try:
-        if planner_profile is None:
-            created_id = manager.start_run(content, run_id=selected_id)
-        else:
-            created_id = manager.start_run(
-                content, run_id=selected_id, planner_profile=selected_planner
-            )
+        created_id = manager.start_run(
+            content, run_id=selected_id, run_options=options,
+        )
     except RunCollisionError as exc:
         raise WebAPIError(409, "run already exists or is active") from exc
     except RunCapacityError as exc:
@@ -1270,7 +1335,13 @@ def run_pipeline(
     planner = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
     execution = state.get("execution") if isinstance(state.get("execution"), Mapping) else {}
     resume_phase = resume.get("phase") if isinstance(resume, Mapping) and resume.get("resumable") else None
-    revision_enabled = config.revision.enabled if config is not None else "reviser" in execution
+    snapshot = state.get("run_options") if isinstance(state.get("run_options"), Mapping) else {}
+    pipeline_snapshot = snapshot.get("pipeline") if isinstance(snapshot.get("pipeline"), Mapping) else {}
+    revision_enabled = bool(
+        pipeline_snapshot.get("claude_revision_enabled")
+        if pipeline_snapshot else (config.revision.enabled if config is not None else "reviser" in execution)
+    )
+    pipeline_enabled = revision_enabled or pipeline_snapshot.get("repair_cycles") == 1
     items: list[dict[str, str]] = []
 
     def add(key: str, label: str, value: str) -> None:
@@ -1357,7 +1428,7 @@ def run_pipeline(
     else:
         add("reviewer-c01", "Reviewer #1", "waiting")
 
-    if revision_enabled:
+    if pipeline_enabled:
         if cycle == 2:
             if resume_phase in _C02_PHASES:
                 value = "resumable"
