@@ -22,6 +22,7 @@ from .approval import (
     write_plan_approval,
 )
 from .config import ConfigError, load_config
+from .diagnostics import write_run_diagnostics
 from .agent.auth import check_codex_authentication
 from .agent.codex import build_agent_environment
 from .agent.runtime import CodexRuntimeError, prepare_codex_home
@@ -195,6 +196,29 @@ def _show(run_dir: Path) -> int:
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
+
+
+def _diagnostics(config_path: Path, target: str, *, stdout: bool = False) -> int:
+    """Regenerate the derived report for a run id or an explicit run dir."""
+
+    try:
+        config = load_config(config_path)
+        candidate = Path(target).expanduser()
+        if candidate.is_dir():
+            run_dir = candidate
+        elif candidate.is_absolute() or candidate.parent != Path("."):
+            raise ValueError("target must be an existing run directory or a run id")
+        else:
+            run_dir = config.runs_root / target
+        produced = write_run_diagnostics(config, run_dir)
+        if stdout:
+            sys.stdout.write(produced.read_text(encoding="utf-8"))
+        else:
+            print(f"diagnostics: {produced}")
+        return 0
+    except (ConfigError, OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 def _write_plan_decision(run_dir: Path, decision: ApprovalDecision) -> int:
@@ -626,6 +650,10 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--run", required=True, type=Path)
     show = subparsers.add_parser("show", help="show run state and artifacts")
     show.add_argument("--run", required=True, type=Path)
+    diagnostics = subparsers.add_parser("diagnostics", help="regenerate a run diagnostic report")
+    diagnostics.add_argument("target", help="run id or run directory")
+    diagnostics.add_argument("--config", required=True, type=Path)
+    diagnostics.add_argument("--stdout", action="store_true", help="write the report to stdout")
     doctor = subparsers.add_parser("doctor", help="check local prerequisites")
     doctor.add_argument("--config", required=True, type=Path)
     approve = subparsers.add_parser(
@@ -654,6 +682,8 @@ def main(argv: list[str] | None = None) -> int:
         return _status(args.run)
     if args.command == "show":
         return _show(args.run)
+    if args.command == "diagnostics":
+        return _diagnostics(args.config, args.target, stdout=args.stdout)
     if args.command == "doctor":
         return _doctor(args.config)
     if args.command == "approve-plan":

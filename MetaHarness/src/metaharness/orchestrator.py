@@ -160,6 +160,7 @@ from .resume import (
 from . import resume as resume_module
 from .usage import add_usage, empty_usage, normalize_usage, phase_usage_summary, read_usage_artifact
 from .redaction import config_secret_values, redact, redact_file
+from .diagnostics import write_run_diagnostics
 from .profiles import (
     ProfileError,
     build_agent_config,
@@ -1385,7 +1386,9 @@ class Orchestrator:
             )
             if on_created is not None:
                 on_created(run_dir)
-            return self._execute(store, run_dir, selected_run_id, spec_content)
+            return self._diagnose_result(
+                self._execute(store, run_dir, selected_run_id, spec_content)
+            )
         except KeyboardInterrupt:
             if store is None:
                 raise
@@ -1394,7 +1397,7 @@ class Orchestrator:
                 failure={"reason": "INTERRUPTED"},
                 **self._closing_step_fields(store, "interrupted"),
             )
-            return RunResult(run_dir, RunStatus.INTERRUPTED, state)
+            return self._diagnose_result(RunResult(run_dir, RunStatus.INTERRUPTED, state))
         except Exception as exc:
             if store is None:
                 raise
@@ -1403,7 +1406,22 @@ class Orchestrator:
                 redact(str(exc), self._secrets),
                 **self._closing_step_fields(store, "failed"),
             )
-            return RunResult(run_dir, RunStatus.FAILED, state)
+            return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, state))
+
+    def _diagnose_result(self, result: RunResult) -> RunResult:
+        """Best-effort terminal projection; diagnostics never changes a run result."""
+
+        if result.status in {
+            RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.BLOCKED,
+            RunStatus.PLAN_REJECTED, RunStatus.COMMITTED, RunStatus.PUBLISHED,
+        }:
+            try:
+                write_run_diagnostics(self.config, result.run_dir)
+            except Exception:
+                # ``write_run_diagnostics`` records diagnostics.error.txt when
+                # possible.  A reporting failure must not alter the pipeline.
+                pass
+        return result
 
     @staticmethod
     def _closing_step_fields(store: RunStateStore, terminal: str) -> dict[str, Any]:
@@ -3636,10 +3654,10 @@ class Orchestrator:
             ResumePhase.CONTEXT, ResumePhase.PLANNER,
             ResumePhase.PLAN_APPROVAL, ResumePhase.WORKTREE_SETUP,
         }:
-            return self._resume_pre_execution(
+            return self._diagnose_result(self._resume_pre_execution(
                 store, run_dir, selected, state, checkpoint, record,
                 on_claimed=on_claimed,
-            )
+            ))
         try:
             resumed = self._validate_resume(run_dir, state, checkpoint)
         except (ResumeIntegrityError, ResumeRequiresOperatorError) as exc:
@@ -3647,7 +3665,7 @@ class Orchestrator:
                 exc.code, redact(str(exc), self._secrets),
                 resume={**record, "status": "refused"}, current_step=None,
             )
-            return RunResult(run_dir, RunStatus.FAILED, failed)
+            return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
         claimed = store.transition_if(
             state.get("status", RunStatus.FAILED), state.get("updated_at"),
             status=PHASE_STATUS[checkpoint.phase], failure=None, current_step=None,
@@ -3666,13 +3684,13 @@ class Orchestrator:
             if resumed.restore_paths:
                 self._restore_revision_tree(resumed)
             if checkpoint.phase is ResumePhase.PUBLISH:
-                return self._complete_commit(
+                return self._diagnose_result(self._complete_commit(
                     store=store, run_dir=run_dir, info=resumed.info,
                     approved_tree=checkpoint.expected_tree_sha,
                     commit_sha=checkpoint.expected_head_sha,
                     repository_reference=resumed.repository_reference,
                     cycle=checkpoint.cycle,
-                )
+                ))
             if checkpoint.phase is ResumePhase.COMMIT:
                 commit_sha = resumed.existing_commit_sha
                 if commit_sha is None:
@@ -3685,38 +3703,38 @@ class Orchestrator:
                         subject=_commit_subject(plan_for_commit.title),
                         body=f"MetaHarness-Run: {selected}",
                     )
-                return self._complete_commit(
+                return self._diagnose_result(self._complete_commit(
                     store=store, run_dir=run_dir, info=resumed.info,
                     approved_tree=checkpoint.expected_tree_sha,
                     commit_sha=commit_sha,
                     repository_reference=resumed.repository_reference,
                     cycle=checkpoint.cycle,
-                )
-            return self._execute_v2(
+                ))
+            return self._diagnose_result(self._execute_v2(
                 store, run_dir, selected, resumed.spec, resumed.info.source_repo,
                 resumed.info.base_sha, resumed.context, resumed.repository_reference,
                 resumed=resumed,
-            )
+            ))
         except ResumeRequiresOperatorError as exc:
             failed = store.record_failure(
                 exc.code, redact(str(exc), self._secrets),
                 **self._closing_step_fields(store, "failed"),
             )
-            return RunResult(run_dir, RunStatus.FAILED, failed)
+            return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
         except KeyboardInterrupt:
             interrupted = store.update(
                 status=RunStatus.INTERRUPTED,
                 failure={"reason": "INTERRUPTED"},
                 **self._closing_step_fields(store, "interrupted"),
             )
-            return RunResult(run_dir, RunStatus.INTERRUPTED, interrupted)
+            return self._diagnose_result(RunResult(run_dir, RunStatus.INTERRUPTED, interrupted))
         except Exception as exc:
             failed = store.record_failure(
                 _failure_reason(exc),
                 redact(str(exc), self._secrets),
                 **self._closing_step_fields(store, "failed"),
             )
-            return RunResult(run_dir, RunStatus.FAILED, failed)
+            return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
 
     def _resume_pre_execution(
         self,

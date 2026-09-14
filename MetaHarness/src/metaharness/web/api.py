@@ -15,6 +15,7 @@ from urllib.parse import unquote
 
 from ..agent.diagnostics import TOKEN_DIAGNOSTICS_NAME
 from ..agent.events import parse_event, summarize_event, summarize_step_event
+from ..diagnostics import DIAGNOSTICS_ERROR_NAME, DIAGNOSTICS_NAME, MAX_REPORT_BYTES
 from ..resume import resume_info
 from ..approval import (
     ApprovalDecision,
@@ -148,6 +149,8 @@ ARTIFACT_ALLOWLIST = frozenset(
         "diff.patch",
         "plan_approval.json",
         "publish.json",
+        DIAGNOSTICS_NAME,
+        DIAGNOSTICS_ERROR_NAME,
         "setup/results.json",
         PLANNER_USAGE_ARTIFACT,
         REVIEWER_USAGE_ARTIFACT,
@@ -421,6 +424,23 @@ def get_run(
         changed_path, diff_path = "changed-files.txt", "diff.patch"
     changed_files = _bounded_changed_files(_artifact_path(directory, changed_path))
     diff_tail = _tail_text(_artifact_path(directory, diff_path), MAX_DIFF_BYTES)
+    diagnostics_path = _artifact_path(directory, DIAGNOSTICS_NAME)
+    diagnostics_content = _load_text_bounded(diagnostics_path, MAX_REPORT_BYTES)
+    diagnostics_meta: dict[str, Any] = {
+        "path": DIAGNOSTICS_NAME,
+        "available": diagnostics_content is not None,
+        "size": None,
+        "generated_at": None,
+        "content": diagnostics_content,
+    }
+    if diagnostics_content is not None:
+        generated_match = re.search(r'"generated_at"\s*:\s*"([^"]+)"', diagnostics_content[:16 * 1024])
+        if generated_match:
+            diagnostics_meta["generated_at"] = generated_match.group(1)
+    try:
+        diagnostics_meta["size"] = diagnostics_path.stat().st_size
+    except OSError:
+        pass
     # Keep this shape stable for both the JSON API and the server-rendered run
     # page; all newly exposed artifact data below is bounded or allowlisted.
     return {
@@ -464,6 +484,7 @@ def get_run(
         "cycle_artifacts": cycle_artifacts,
         "usage": phase_usage_summary(directory, v1_agent_usage=raw_usage),
         "overview": run_overview(directory, state, config),
+        "diagnostics": diagnostics_meta,
     }
 
 

@@ -1028,6 +1028,14 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
         approval_forms = f'<section class="card"><h2>Plan approval</h2><p>Décision enregistrée : {_e(approval.get("decision"))}</p></section>'
     diagnostics = run.get("agent_diagnostics") if isinstance(run.get("agent_diagnostics"), dict) else {}; result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}; usage = diagnostics.get("usage") if isinstance(diagnostics.get("usage"), dict) else {}
     candidate = run.get("candidate") if isinstance(run.get("candidate"), dict) else {}; changed_files = candidate.get("changed_files") if isinstance(candidate.get("changed_files"), list) else []
+    consolidated = run.get("diagnostics") if isinstance(run.get("diagnostics"), dict) else {}
+    consolidated_content = consolidated.get("content") if isinstance(consolidated.get("content"), str) else ""
+    diagnostics_section = (
+        f'<section><h2>DIAGNOSTICS</h2><p class="mono">Artifact: {_e(consolidated.get("path") or "diagnostics.md")} · '
+        f'size: {_e(consolidated.get("size") if consolidated.get("size") is not None else "—")} bytes · '
+        f'generated: {_e(consolidated.get("generated_at") or "—")}</p>'
+        f'<details open><summary>View consolidated report</summary><pre>{_e(consolidated_content or "Diagnostics not generated yet.")}</pre></details></section>'
+    )
     polls = run_page_polls(run)
     failed = status in {"failed", "interrupted"}
     agent_section = (
@@ -1047,6 +1055,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
 <section><h2>CHECKS</h2><details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
 <section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details></section>
 {_usage_section(run)}
+{diagnostics_section}
 <section><h2>PLAN</h2><details{plan_open}><summary>Canonical implementation contract</summary><pre>{_e(plan.get("contract"))}</pre></details><details><summary>planner.raw.md</summary><pre>{_e(plan.get("raw"))}</pre></details><details><summary>SPEC</summary><pre>{_e(run.get("spec"))}</pre></details></section>
 <section><h2>DIFF / FILES</h2><p>Changed files</p><ul>{"".join(f'<li class="mono">{_e(path)}</li>' for path in changed_files) or '<li class="muted">Aucun fichier changé.</li>'}</ul><details><summary>Diff</summary><pre>{_e(candidate.get("diff_tail"))}</pre></details></section>
 <section><h2>RAW ARTIFACTS / DIAGNOSTICS</h2>
