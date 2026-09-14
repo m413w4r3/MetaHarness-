@@ -15,10 +15,13 @@ from metaharness.diagnostics import (  # noqa: E402
     MAX_PLANNER_REQUEST_BYTES,
     MAX_REPORT_BYTES,
     build_run_diagnostics,
+    _read_bounded,
+    _summarized_events,
     write_run_diagnostics,
 )
 from metaharness.models import AgentConfig, ContextConfig, HarnessConfig, LLMEndpointConfig  # noqa: E402
 from metaharness.state import RunStateStore  # noqa: E402
+from metaharness.run_options import RunOptions, write_run_options  # noqa: E402
 from metaharness.web.api import _artifact_path, get_run  # noqa: E402
 from metaharness.web.pages import render_run  # noqa: E402
 
@@ -108,6 +111,62 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(_artifact_path(self.run_dir, "diagnostics.md"), self.run_dir / "diagnostics.md")
         with self.assertRaises(ValueError):
             _artifact_path(self.run_dir, "secret.txt")
+
+    def test_recent_events_are_read_from_the_tail(self) -> None:
+        events = self.run_dir / "long.events.jsonl"
+        old = json.dumps({"type": "old_failure", "item": {"type": "agent_message", "text": "OLD"}})
+        latest = json.dumps({"type": "error", "item": {"type": "agent_message", "text": "LATEST FAILURE"}})
+        events.write_text(old + "\n" + ("x" * (256 * 1024)) + "\n" + latest + "\n", encoding="utf-8")
+        summary = _summarized_events(events, ())
+        self.assertIn("LATEST FAILURE", summary)
+
+    def test_redaction_covers_head_and_tail_boundaries(self) -> None:
+        secret = "boundary-secret-value"
+        limit = 64
+        head = self.run_dir / "head.txt"
+        head.write_bytes((b"a" * (limit - len(secret) // 2)) + secret.encode() + b" tail")
+        head_text, _size, _truncated = _read_bounded(head, limit, (secret,))
+        self.assertNotIn(secret, head_text)
+        self.assertNotIn(secret[: len(secret) // 2], head_text)
+
+        tail = self.run_dir / "tail.txt"
+        suffix = b"s" * (limit - (len(secret) - len(secret) // 2))
+        tail.write_bytes(b"p" * 20 + b"b" * 10 + secret.encode() + suffix)
+        tail_text, _size, _truncated = _read_bounded(tail, limit, (secret,), tail=True)
+        self.assertNotIn(secret, tail_text)
+        self.assertNotIn(secret[len(secret) // 2 :], tail_text)
+
+    def test_claude_enabled_without_artifact_is_not_reported_disabled(self) -> None:
+        options = RunOptions(
+            schema_version=1, protocol="v2", decomposition="balanced",
+            execution_mode_policy="auto", single_step_max_mutable_paths=4,
+            staged_step_max_mutable_paths=6, claude_revision_enabled=True,
+            repair_cycles=0, planner_profile="planner", default_implementer_profile="impl",
+            reviewer_profile="review", reviser_profile="reviser", repair_profile=None,
+        )
+        write_run_options(self.run_dir, options)
+        report = build_run_diagnostics(self.config, self.run_dir)
+        self.assertIn("Claude revision enabled by run options, but no revision artifact was produced/reached.", report)
+        self.assertNotIn("Claude revision disabled for this run.", report)
+
+    def test_prompt_footprint_is_deterministic_and_reports_usage(self) -> None:
+        (self.run_dir / "spec.md").write_text("spec", encoding="utf-8")
+        (self.run_dir / "context.txt").write_text("context", encoding="utf-8")
+        (self.run_dir / "planner.request.txt").write_text("planner request", encoding="utf-8")
+        (self.run_dir / "planner.usage.json").write_text('{"input_tokens": 21}\n', encoding="utf-8")
+        step = self.run_dir / "steps" / "S01"
+        step.mkdir(parents=True)
+        (step / "agent.prompt.txt").write_text("step request", encoding="utf-8")
+        (step / "step.json").write_text('{"usage": {"input_tokens": 7}}\n', encoding="utf-8")
+        first = build_run_diagnostics(self.config, self.run_dir)
+        second = build_run_diagnostics(self.config, self.run_dir)
+        normalize = lambda value: re.sub(r'"generated_at": "[^"]+"', '"generated_at": "<time>"', value)
+        self.assertEqual(normalize(first), normalize(second))
+        self.assertIn("PROMPT FOOTPRINT", first)
+        self.assertIn("| planner.request.txt | 15 |", first)
+        self.assertIn("| steps/S01/agent.prompt.txt | 12 |", first)
+        self.assertIn("| planner.request.txt | 15 |", first)
+        self.assertLess(first.index("planner.request.txt"), first.index("steps/S01/agent.prompt.txt"))
 
 
 if __name__ == "__main__":

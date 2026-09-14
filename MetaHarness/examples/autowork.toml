@@ -23,7 +23,8 @@ staged_step_max_mutable_paths = 6
 # Target workflow: planner (STAGED) -> Luna steps -> Claude -> reviewer ->
 # optional C02 -> final reviewer PASS -> commit B(parent=A) in the isolated
 # run worktree -> CAS fast-forward of local main A->B -> push origin/main.
-# revision.enabled is the only switch for Claude revision and C02.
+# [revision] supplies legacy defaults/fallbacks; durable UI runs freeze Claude
+# revision and repair_cycles independently in run_options.json.
 [revision]
 enabled = true
 max_cycles = 2

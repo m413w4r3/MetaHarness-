@@ -138,6 +138,7 @@ from .planning_v2 import (
     read_approved_step_contract,
     read_set_paths,
     validate_implementation_bundle,
+    render_repair_plan_summary,
 )
 from .resume import (
     PHASE_STATUS,
@@ -3082,14 +3083,12 @@ class Orchestrator:
             repair_plan = repair_planner.plan(
                 repository_reference=render_repository_reference(repository_reference),
                 original_spec=spec,
-                original_meta_plan=original_plan.raw,
+                original_plan_summary=render_repair_plan_summary(original_plan),
                 original_step_contracts=original_contracts,
                 current_repository_state=current_state,
                 current_cumulative_diff=cycle_1_evidence.diff,
                 final_checks_cycle_1=_json_text(_check_payload(cycle_1_evidence)),
-                claude_revision_report_cycle_1=(
-                    cycle_1_revision.final_message if cycle_1_revision is not None else "NONE"
-                ),
+                claude_revision_report_cycle_1=cycle_1_revision_report or "NONE",
                 reviewer_required_fixes=cycle_1_review.required_fixes,
                 original_approved_mutable_scope=_json_text(original_scope),
                 artifacts_dir=repair_dir,

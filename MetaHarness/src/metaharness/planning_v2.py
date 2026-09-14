@@ -455,6 +455,28 @@ def render_plan_summary_v2(plan: TaskPlanV2) -> str:
     ) + "\n"
 
 
+def render_repair_plan_summary(plan: TaskPlanV2) -> str:
+    """Render only the original-plan facts not repeated by step contracts."""
+
+    if not isinstance(plan, TaskPlanV2):
+        raise TypeError("plan must be a TaskPlanV2")
+    mode = plan.execution_mode.value if plan.execution_mode is not None else "NONE"
+    steps = "\n".join(
+        f"- {step.id} | {step.title} | depends_on: {step.depends_on or 'NONE'}"
+        for step in plan.steps
+    ) or "NONE"
+    return "\n".join((
+        "TITLE: " + (plan.title or "NONE"),
+        "OBJECTIVE:\n" + (plan.objective or "NONE"),
+        "CONSTRAINTS:\n" + (plan.constraints or "NONE"),
+        "EXECUTION MODE: " + mode,
+        "ACCEPTANCE:\n" + (plan.acceptance or "NONE"),
+        "TESTS:\n" + (plan.tests or "NONE"),
+        "RISKS:\n" + (plan.risks or "NONE"),
+        "STEPS (id | title | depends_on):\n" + steps,
+    )) + "\n"
+
+
 def render_safe_profile_catalogue(profiles: Sequence[ModelProfile]) -> str:
     """Render planner-visible profile metadata, excluding endpoint credentials."""
 
@@ -640,8 +662,8 @@ def build_repair_planner_prompt(
     *,
     repository_reference: str,
     original_spec: str,
-    original_meta_plan: str,
     original_step_contracts: str,
+    original_plan_summary: str | None = None,
     current_repository_state: str,
     current_cumulative_diff: str,
     final_checks_cycle_1: str,
@@ -651,13 +673,22 @@ def build_repair_planner_prompt(
     implementer_profiles: Sequence[ModelProfile] = (),
     reviewer_profiles: Sequence[ModelProfile] = (),
     template: str | None = None,
+    original_meta_plan: str | None = None,
 ) -> str:
     """Build the bounded corrective planner request."""
 
+    if original_plan_summary is None:
+        # Compatibility for callers from the pre-P33 API.  The prompt itself
+        # always uses the renamed compact-summary placeholder.
+        original_plan_summary = original_meta_plan
+    elif original_meta_plan is not None and original_plan_summary != original_meta_plan:
+        raise ValueError("original_plan_summary and original_meta_plan disagree")
+    if original_plan_summary is None:
+        raise TypeError("original_plan_summary must be a string")
     values = {
         "{{REPOSITORY}}": repository_reference,
         "{{SPEC}}": original_spec,
-        "{{ORIGINAL_META_PLAN}}": original_meta_plan,
+        "{{ORIGINAL_PLAN_SUMMARY}}": original_plan_summary,
         "{{ORIGINAL_STEP_CONTRACTS}}": original_step_contracts,
         "{{CURRENT_REPOSITORY_STATE}}": current_repository_state,
         "{{CURRENT_CUMULATIVE_DIFF}}": current_cumulative_diff,
@@ -674,7 +705,7 @@ def build_repair_planner_prompt(
     if template is None:
         template = (Path(__file__).with_name("prompts") / "repair_planner_v2.txt").read_text(encoding="utf-8")
     return re.sub(
-        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_META_PLAN|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_REQUIRED_FIXES|ORIGINAL_APPROVED_MUTABLE_SCOPE|IMPLEMENTER_PROFILES|REVIEWER_PROFILES)\}\}",
+        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_PLAN_SUMMARY|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_REQUIRED_FIXES|ORIGINAL_APPROVED_MUTABLE_SCOPE|IMPLEMENTER_PROFILES|REVIEWER_PROFILES)\}\}",
         lambda match: values[match.group(0)],
         template,
     )
@@ -980,8 +1011,8 @@ class RepairPlannerV2:
         *,
         repository_reference: str,
         original_spec: str,
-        original_meta_plan: str,
         original_step_contracts: str,
+        original_plan_summary: str | None = None,
         current_repository_state: str,
         current_cumulative_diff: str,
         final_checks_cycle_1: str,
@@ -990,11 +1021,12 @@ class RepairPlannerV2:
         original_approved_mutable_scope: str,
         artifacts_dir: str | Path,
         conversation: LLMConversationHandle | None = None,
+        original_meta_plan: str | None = None,
     ) -> TaskPlanV2:
         request = build_repair_planner_prompt(
             repository_reference=repository_reference,
             original_spec=original_spec,
-            original_meta_plan=original_meta_plan,
+            original_plan_summary=original_plan_summary,
             original_step_contracts=original_step_contracts,
             current_repository_state=current_repository_state,
             current_cumulative_diff=current_cumulative_diff,
@@ -1005,6 +1037,7 @@ class RepairPlannerV2:
             implementer_profiles=self.implementer_profiles,
             reviewer_profiles=self.reviewer_profiles,
             template=self.template,
+            original_meta_plan=original_meta_plan,
         )
         target = Path(artifacts_dir)
         atomic_write_text(target / "planner.request.txt", request)
@@ -1072,7 +1105,7 @@ __all__ = [
     "build_repair_planner_prompt", "RepairPlannerV2",
     "persist_planning_artifacts_v2", "persist_planning_v2_artifacts",
     "read_approved_step_contract", "read_set_paths",
-    "render_plan_summary_v2", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract",
+    "render_plan_summary_v2", "render_repair_plan_summary", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract",
     "run_planner_v2", "step_contract_path", "validate_decomposition_policy", "validate_implementation_bundle", "write_implementation_bundle",
     "REQUIRE_STAGED_POLICY_TEXT", "validate_execution_mode_policy",
     "render_decomposition_policy_text",

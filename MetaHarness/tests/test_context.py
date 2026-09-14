@@ -168,6 +168,27 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(paths.count("AGENTS.md"), 1)
         self.assertEqual(paths.count("backend/AGENTS.md"), 1)
 
+    def test_locator_hit_for_agents_does_not_render_excerpt_twice(self) -> None:
+        locator = self.locator([{"path": "AGENTS.md", "start": 1, "end": 1}])
+        bundle = build_context(self.repo, self.base_sha, "x", self.config(locator))
+        rendered = render_context(bundle)
+        self.assertEqual(rendered.count("root rules"), 1)
+        self.assertNotIn("### SOURCE: AGENTS.md", rendered)
+
+    def test_readme_is_full_fallback_without_locator_hit(self) -> None:
+        locator = self.locator([])
+        bundle = build_context(self.repo, self.base_sha, "x", self.config(locator))
+        rendered = render_context(bundle)
+        self.assertIn("### REPOSITORY EVIDENCE (UNTRUSTED): README.md", rendered)
+        self.assertIn("project readme", rendered)
+
+    def test_readme_locator_hit_replaces_full_fallback(self) -> None:
+        locator = self.locator([{"path": "README.md", "start": 1, "end": 1}])
+        bundle = build_context(self.repo, self.base_sha, "x", self.config(locator))
+        rendered = render_context(bundle)
+        self.assertIn("### SOURCE: README.md:1-1", rendered)
+        self.assertNotIn("### REPOSITORY EVIDENCE (UNTRUSTED): README.md", rendered)
+
     def test_unsafe_paths_and_invalid_ranges_are_rejected(self) -> None:
         locator = self.locator(
             [

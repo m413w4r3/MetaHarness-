@@ -29,6 +29,7 @@ from metaharness.planning_v2 import (  # noqa: E402
     validate_decomposition_policy,
     parse_task_plan_v2,
     render_plan_summary_v2,
+    render_repair_plan_summary,
     render_safe_profile_catalogue,
     render_step_contract,
     write_implementation_bundle,
@@ -214,6 +215,28 @@ END META PLAN
         self.assertNotIn("REVIEWER_1_RAW", prompt)
         self.assertNotIn("REVIEWER #1 RAW", prompt)
         self.assertIn("REVIEWER REQUIRED FIXES\nFix the concrete defect.", prompt)
+
+    def test_repair_prompt_uses_compact_summary_and_one_canonical_instruction(self):
+        plan = _parse(_plan())
+        summary = render_repair_plan_summary(plan)
+        contracts = "INSTRUCTIONS\n1. DISTINCTIVE_CANONICAL_STEP_INSTRUCTION\n"
+        prompt = build_repair_planner_prompt(
+            repository_reference="repository",
+            original_spec="original spec",
+            original_plan_summary=summary,
+            original_step_contracts=contracts,
+            current_repository_state="current state",
+            current_cumulative_diff="cumulative diff",
+            final_checks_cycle_1="checks C01",
+            claude_revision_report_cycle_1="Claude C01 report",
+            reviewer_required_fixes="Fix the concrete defect.",
+            original_approved_mutable_scope="[\"src/example.py\"]",
+        )
+        self.assertIn("ORIGINAL PLAN SUMMARY", prompt)
+        self.assertNotIn("ORIGINAL META PLAN", prompt)
+        self.assertEqual(prompt.count("DISTINCTIVE_CANONICAL_STEP_INSTRUCTION"), 1)
+        self.assertNotIn("READ_SET", summary)
+        self.assertNotIn("INSTRUCTIONS", summary)
 
 
 def _change_step(sets: str) -> str:

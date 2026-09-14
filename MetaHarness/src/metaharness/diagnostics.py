@@ -21,7 +21,8 @@ from .profiles import profiles_for_config, safe_profile_metadata
 from .redaction import config_secret_values, redact
 from .result import atomic_write_text
 from .resume import ResumeCheckpointError, resume_info, read_checkpoint_record
-from .usage import phase_usage_summary
+from .run_options import RunOptionsError, read_run_options_with_sha256
+from .usage import normalize_usage, phase_usage_summary, read_usage_artifact
 
 REPORT_SCHEMA_VERSION = 1
 MAX_ARTIFACT_BYTES = 128 * 1024
@@ -94,19 +95,25 @@ def _read_bounded(path: Path, limit: int, secrets: tuple[str, ...], *, tail: boo
 
     try:
         size = path.stat().st_size
-        overlap = min(max((len(value.encode("utf-8")) for value in secrets), default=0), 4096)
+        # Keep enough context for configured exact secrets and for the
+        # existing credential-shaped redactors (Authorization/API-key).
+        overlap = max(max((len(value.encode("utf-8")) for value in secrets), default=0), 4096)
         with path.open("rb") as stream:
             if tail:
-                stream.seek(max(0, size - limit))
-                data = stream.read(limit)
+                visible_start = max(0, size - limit)
+                stream.seek(max(0, visible_start - overlap))
+                data = stream.read(size - max(0, visible_start - overlap))
             else:
-                data = stream.read(limit + overlap + 1)
+                data = stream.read(limit + overlap)
     except OSError:
         return "", None, False
-    truncated = len(data) > limit if not tail else size > limit
-    if not tail:
-        data = data[:limit]
-    text = _clean(data.decode("utf-8", errors="replace"), secrets)
+    truncated = size > limit
+    # Redact the extended buffer first.  Slicing the raw read before this
+    # point could expose the visible half of a secret crossing the cutoff.
+    cleaned = _clean(data.decode("utf-8", errors="replace"), secrets)
+    cleaned_bytes = cleaned.encode("utf-8", errors="replace")
+    bounded = cleaned_bytes[-limit:] if tail else cleaned_bytes[:limit]
+    text = bounded.decode("utf-8", errors="ignore")
     if truncated:
         text += f"\n[TRUNCATED: original {size} bytes]"
     return text, size, truncated
@@ -293,7 +300,6 @@ def _selection_summary(run_dir: Path, secrets: tuple[str, ...]) -> str:
 
 
 def _summarized_events(path: Path, secrets: tuple[str, ...], max_events: int = 30) -> str:
-    item = _artifact(path.parent.parent if path.parent.name == "steps" else path.parent, path.name)
     # The caller supplies a path that is already rooted; only the content is
     # returned here because provenance is rendered by the caller.
     if not path.is_file():
@@ -301,11 +307,18 @@ def _summarized_events(path: Path, secrets: tuple[str, ...], max_events: int = 3
     try:
         size = path.stat().st_size
         with path.open("rb") as stream:
-            data = stream.read(min(size, MAX_EVENT_SCAN_BYTES))
+            start = max(0, size - MAX_EVENT_SCAN_BYTES)
+            stream.seek(start)
+            data = stream.read(size - start)
     except OSError:
         return "No events.\n"
-    if size > MAX_EVENT_SCAN_BYTES:
-        data = data[data.find(b"\n") + 1:] if b"\n" in data else b""
+    if start > 0:
+        first_newline = data.find(b"\n")
+        data = data[first_newline + 1:] if first_newline >= 0 else b""
+    # JSONL records are complete only when terminated by a newline.  This
+    # also prevents a concurrent/truncated final record from being parsed.
+    if data and not data.endswith(b"\n"):
+        data = data[:data.rfind(b"\n") + 1] if b"\n" in data else b""
     summaries: list[str] = []
     for raw in data.splitlines():
         if len(raw) > MAX_EVENT_BYTES:
@@ -319,6 +332,89 @@ def _summarized_events(path: Path, secrets: tuple[str, ...], max_events: int = 3
     return "\n".join(summaries[-max_events:]) + ("\n" if summaries else "No summarized events.\n")
 
 
+def _input_tokens_for(path: Path, *, nested_usage: bool = False) -> int | None:
+    if nested_usage:
+        try:
+            if path.stat().st_size > MAX_ARTIFACT_BYTES:
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            return None
+        usage = payload.get("usage") if isinstance(payload, Mapping) else None
+        return normalize_usage(usage).get("input_tokens") if isinstance(usage, Mapping) else None
+    usage = read_usage_artifact(path)
+    return usage.get("input_tokens") if usage is not None else None
+
+
+def _prompt_footprint(run_dir: Path) -> str:
+    """Render deterministic metadata for every persisted prompt request."""
+
+    rows: list[tuple[str, Path, Path | None, bool]] = []
+
+    def add(relative: str, usage: str | None = None, *, nested_usage: bool = False) -> None:
+        artifact = run_dir / relative
+        if artifact.is_file():
+            rows.append((relative, artifact, run_dir / usage if usage else None, nested_usage))
+
+    add("planner.request.txt", "planner.usage.json")
+    for root, usage_name in (("steps", "step.json"), ("repair/C02/steps", "step.json")):
+        base = run_dir / root
+        try:
+            step_dirs = sorted(
+                path for path in base.iterdir()
+                if path.is_dir() and re.fullmatch(r"S0[1-6]", path.name)
+            )
+        except OSError:
+            step_dirs = []
+        for step_dir in step_dirs:
+            add(f"{root}/{step_dir.name}/agent.prompt.txt", f"{root}/{step_dir.name}/{usage_name}", nested_usage=True)
+    add("revision/C01/agent.prompt.txt", "revision/C01/usage.json")
+    add("review/C01/reviewer.request.txt", "review/C01/reviewer.usage.json")
+    add("repair/C02/planner.request.txt", "repair/C02/planner.usage.json")
+    add("revision/C02/agent.prompt.txt", "revision/C02/usage.json")
+    add("review/C02/reviewer.request.txt", "review/C02/reviewer.usage.json")
+
+    lines = ["Prompt artifacts:", "| Relative path | Bytes | SHA256 | Input tokens |", "|---|---:|---|---:|"]
+    for relative, artifact, usage_path, nested_usage in rows:
+        item = _artifact(run_dir, relative)
+        input_tokens = (
+            _input_tokens_for(usage_path, nested_usage=nested_usage)
+            if usage_path is not None and usage_path.is_file() else None
+        )
+        lines.append(
+            f"| {relative} | {item.size} | {item.sha256 or '—'} | "
+            f"{input_tokens if input_tokens is not None else '—'} |"
+        )
+    for relative in ("context.txt", "spec.md"):
+        item = _artifact(run_dir, relative)
+        if item.exists:
+            lines.append(f"| {relative} | {item.size} | {item.sha256 or '—'} | — |")
+    if len(lines) == 3:
+        lines.append("| (none) | — | — | — |")
+    return "\n".join(lines) + "\n"
+
+
+def _claude_status(config: HarnessConfig, run_dir: Path, revision_exists: bool) -> str:
+    options_path = run_dir / "run_options.json"
+    if options_path.is_file():
+        try:
+            options, _digest = read_run_options_with_sha256(run_dir)
+        except RunOptionsError:
+            return "Claude revision status unavailable: durable run options are malformed."
+        if not options.claude_revision_enabled:
+            return "Claude revision disabled by run options."
+        if not revision_exists:
+            return "Claude revision enabled by run options, but no revision artifact was produced/reached."
+        return "Claude revision artifacts present."
+    # Historical runs had no durable per-run switch; make the fallback
+    # explicit instead of treating a missing artifact as proof of disablement.
+    if not config.revision.enabled:
+        return "Claude revision disabled for this legacy run (configuration fallback)."
+    if not revision_exists:
+        return "Claude revision enabled for this legacy run, but no revision artifact was produced/reached."
+    return "Claude revision artifacts present (legacy configuration fallback)."
+
+
 def _event_artifact(run_dir: Path, relative: str, secrets: tuple[str, ...]) -> str:
     item = _artifact(run_dir, relative)
     return _artifact_header(item) + "Summarized events (tool arguments omitted):\n" + (
@@ -326,7 +422,7 @@ def _event_artifact(run_dir: Path, relative: str, secrets: tuple[str, ...]) -> s
     )
 
 
-def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
+def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
     prefix = "" if cycle == 1 else "repair/C02/"
     label = f"CYCLE C0{cycle}"
     parts = [_section(label, "")]
@@ -387,17 +483,19 @@ def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
         (run_dir / revision / name).exists()
         for name in ("agent.prompt.txt", "agent.result.json", "agent.final.md", "agent.stderr.log", "report.json", "tree_before.txt")
     )
-    claude_body = "Claude revision disabled for this run." if not revision_exists else "\n".join([
-        _artifact_text(run_dir, revision + "agent.prompt.txt", secrets),
-        _artifact_json(run_dir, revision + "agent.result.json", secrets),
-        _artifact_text(run_dir, revision + "agent.final.md", secrets),
-        _artifact_text(run_dir, revision + "agent.stderr.log", secrets, MAX_STDERR_BYTES, tail=True),
-        _artifact_json(run_dir, revision + "report.json", secrets),
-        _artifact_json(run_dir, revision + "usage.json", secrets),
-        _event_artifact(run_dir, revision + "agent.events.jsonl", secrets),
-        _artifact_text(run_dir, revision + "tree_before.txt", secrets),
-        _artifact_text(run_dir, revision + "tree_after.txt", secrets),
-    ])
+    claude_body = _claude_status(config, run_dir, revision_exists)
+    if revision_exists:
+        claude_body += "\n" + "\n".join([
+            _artifact_text(run_dir, revision + "agent.prompt.txt", secrets),
+            _artifact_json(run_dir, revision + "agent.result.json", secrets),
+            _artifact_text(run_dir, revision + "agent.final.md", secrets),
+            _artifact_text(run_dir, revision + "agent.stderr.log", secrets, MAX_STDERR_BYTES, tail=True),
+            _artifact_json(run_dir, revision + "report.json", secrets),
+            _artifact_json(run_dir, revision + "usage.json", secrets),
+            _event_artifact(run_dir, revision + "agent.events.jsonl", secrets),
+            _artifact_text(run_dir, revision + "tree_before.txt", secrets),
+            _artifact_text(run_dir, revision + "tree_after.txt", secrets),
+        ])
     parts.append(_section(f"CLAUDE C0{cycle}", claude_body))
     review = f"review/C0{cycle}/"
     if cycle == 1 and not (run_dir / review).is_dir() and (run_dir / "review.json").exists():
@@ -540,6 +638,7 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
         except ValueError:
             repository_meta["repository_reference"] = text
     body += _section("REPOSITORY / CONTEXT SUMMARY", _artifact_header(ref) + _clean(_json(repository_meta), secrets) + "\n" + _artifact_header(_artifact(directory, "context.txt")))
+    body += _section("PROMPT FOOTPRINT", _prompt_footprint(directory))
     body += _section("PLANNER REQUEST", _artifact_text(directory, "planner.request.txt", secrets, MAX_PLANNER_REQUEST_BYTES))
     body += _section("PLANNER RESPONSE", "\n".join([
         _artifact_text(directory, "planner.raw.md", secrets),
@@ -554,7 +653,7 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
         _safe_json_artifact(directory, "plan_approval.json", secrets, ("decision", "raw_sha256", "contract_sha256", "bundle_sha256", "execution_sha256", "source")),
         _selection_summary(directory, secrets),
     ]))
-    body += _cycle(directory, 1, secrets)
+    body += _cycle(config, directory, 1, secrets)
     if (directory / "repair" / "C02").is_dir():
         body += _section("REPAIR C02", "\n".join([
             _artifact_text(directory, "repair/C02/planner.request.txt", secrets, MAX_PLANNER_REQUEST_BYTES),
@@ -562,7 +661,7 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
             _plan_summary(directory, secrets, "repair/C02/task_plan_v2.json"),
             _bundle_summary(directory, secrets, "repair/C02/implementation_bundle.json"),
         ]))
-        body += _cycle(directory, 2, secrets)
+        body += _cycle(config, directory, 2, secrets)
     else:
         body += _section("REPAIR C02", "No repair cycle executed.")
     body += _section("COMMIT / PUBLISH", "\n".join([

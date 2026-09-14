@@ -329,6 +329,19 @@ def build_context(
             warnings.append(warning)
         if excerpt is None:
             continue
+        # Configured instruction files are rendered in full and have priority
+        # over locator excerpts from the same path.  The locator remains
+        # useful for discovering nested instruction files, but it must not
+        # create a second representation of one instruction file.
+        if (
+            PurePosixPath(excerpt.path).name in instruction_names
+            and PurePosixPath(excerpt.path).name in _INSTRUCTION_NAMES
+        ):
+            for instruction_path in _applicable_instruction_paths(
+                excerpt.path, instruction_names
+            ):
+                add_instruction(instruction_path)
+            continue
         # Duplicate and overlapping hits collapse into one excerpt; max_hits
         # counts distinct valid excerpts, not rejected or duplicate entries.
         if _merge_excerpt(valid_excerpts, excerpt, lines_for(excerpt.path) or []):
@@ -370,7 +383,12 @@ def build_context(
     for excerpt in valid_excerpts:
         if include(excerpt.path, excerpt.content):
             selected_excerpts.append(excerpt)
+    selected_excerpt_paths = {excerpt.path for excerpt in selected_excerpts}
     for path, content in always_tail:
+        # An ordinary always-file is either a full fallback or the selected
+        # locator excerpts for that path, never both.
+        if path in selected_excerpt_paths:
+            continue
         if include(path, content):
             selected_tail.append((path, content))
 
