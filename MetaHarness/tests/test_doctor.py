@@ -20,6 +20,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness import cli  # noqa: E402
+from metaharness.agent import auth as auth_module  # noqa: E402
+from metaharness.agent.auth import check_codex_authentication  # noqa: E402
 from metaharness.cli import _usable_secret_value, main  # noqa: E402
 
 SECRET = "doctor-secret-value-123"
@@ -94,9 +96,21 @@ class DoctorTests(unittest.TestCase):
             + textwrap.dedent(
                 """
                 import json, os, sys
-                with open(RECORD, "w") as stream:
-                    json.dump({"argv": sys.argv[1:], "codex_home": os.environ.get("CODEX_HOME"),
-                               "has_key": "BRIDGE_API_KEY" in os.environ}, stream)
+                args = sys.argv[1:]
+                if args == ["sandbox", "--", "/bin/true"]:
+                    with open(RECORD, "w") as stream:
+                        json.dump({"argv": args, "codex_home": os.environ.get("CODEX_HOME"),
+                                   "has_key": "BRIDGE_API_KEY" in os.environ}, stream)
+                if args == ["login", "--help"]:
+                    print("Commands:\\n  status  Show login status")
+                    sys.exit(0)
+                if args == ["login", "status"]:
+                    state = os.path.join(os.environ["CODEX_HOME"], "auth.json")
+                    if os.path.isfile(state) and os.path.getsize(state) > 0:
+                        print("Logged in")
+                        sys.exit(0)
+                    sys.stderr.write("Not logged in\\n")
+                    sys.exit(1)
                 mode = open(MODE).read().strip() if os.path.exists(MODE) else "ok"
                 if mode == "fail":
                     sys.stderr.write("bwrap: setting up uid map: Permission denied " + SECRET + "\\n")
@@ -115,8 +129,15 @@ class DoctorTests(unittest.TestCase):
         self.bridge.close()
         self.temp.cleanup()
 
-    def config(self, *, secret: str = SECRET, base_url: str | None = None) -> Path:
+    def config(
+        self, *, secret: str = SECRET, base_url: str | None = None,
+        authenticated: bool = True,
+    ) -> Path:
         (self.root / ".env.test").write_text(f"BRIDGE_API_KEY={secret}\n", encoding="utf-8")
+        codex_home = self.root / "codex-home"
+        if authenticated:
+            codex_home.mkdir(parents=True, exist_ok=True)
+            (codex_home / "auth.json").write_text("authenticated-state\n", encoding="utf-8")
         path = self.root / "doctor.toml"
         path.write_text(
             textwrap.dedent(
@@ -180,6 +201,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("OK env BRIDGE_API_KEY: usable", out)
         self.assertIn("OK codex sandbox: usable", out)
+        self.assertIn("OK codex authentication: available", out)
         self.assertIn("OK planner bridge: healthy", out)
         self.assertIn("doctor: PASS", out)
         self.assertNotIn(SECRET, out + err)
@@ -204,6 +226,41 @@ class DoctorTests(unittest.TestCase):
         self.assertNotIn(SECRET, out + err)
         self.assertIn("[REDACTED]", err)
         self.assertFalse((self.root / "runs").exists())
+
+    def test_unavailable_authentication_fails_closed_with_configured_home(self) -> None:
+        code, out, err = self.doctor(self.config(authenticated=False))
+        configured_home = str((self.root / "codex-home").resolve())
+        self.assertEqual(code, 1)
+        self.assertIn("OK codex sandbox: usable", out)
+        self.assertIn("error: codex authentication is unavailable for managed CODEX_HOME", err)
+        self.assertIn(f'hint: run CODEX_HOME="{configured_home}" codex login', err)
+        self.assertNotIn(SECRET, out + err)
+        self.assertNotIn("authenticated-state", out + err)
+
+    def test_authentication_status_is_local_and_does_not_make_model_call(self) -> None:
+        home = self.root / "auth-check"
+        home.mkdir()
+        environment = {"PATH": str(self.bin)}
+        (home / "auth.json").write_text(SECRET, encoding="utf-8")
+        status = check_codex_authentication(home, environment=environment)
+        self.assertTrue(status.available)
+        self.assertNotIn(SECRET, status.detail)
+
+    def test_legacy_cli_fallback_checks_only_nonempty_known_state(self) -> None:
+        home = self.root / "legacy-auth-check"
+        home.mkdir()
+        (home / "auth.json").write_text(SECRET, encoding="utf-8")
+        help_only = subprocess.CompletedProcess(
+            ["codex", "login", "--help"], 0,
+            stdout="Usage: codex login\nCommands:\n  device-auth\n",
+            stderr="",
+        )
+        with mock.patch.object(auth_module, "_run_local", return_value=help_only):
+            status = check_codex_authentication(
+                home, environment={"PATH": str(self.bin)}
+            )
+        self.assertTrue(status.available)
+        self.assertNotIn(SECRET, status.detail)
 
     def test_unhealthy_bridge_fails(self) -> None:
         self.bridge.payload = {"status": "starting"}

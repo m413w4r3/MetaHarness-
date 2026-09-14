@@ -11,7 +11,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.agent.base import AgentResult
-from metaharness.agent.codex import AgentCommittedError, CodexAgent, build_agent_environment
+from metaharness.agent.codex import (
+    AgentCommittedError,
+    CodexAgent,
+    build_agent_environment,
+    classify_codex_failure,
+)
 from metaharness.models import AgentConfig
 
 
@@ -128,6 +133,17 @@ class CodexTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("failed", result.stderr_tail)
+
+    def test_transport_auth_failure_classification_is_strict(self) -> None:
+        self.assertEqual(
+            classify_codex_failure("401 Unauthorized request-id=req-123"),
+            "CODEX_AUTH_FAILURE",
+        )
+        self.assertEqual(
+            classify_codex_failure("", '{"error":"Missing bearer or basic authentication in header"}'),
+            "CODEX_AUTH_FAILURE",
+        )
+        self.assertIsNone(classify_codex_failure("unrelated exit 1"))
 
     def test_silent_timeout_interrupts_process_group_and_is_bounded(self) -> None:
         executable = self.executable(

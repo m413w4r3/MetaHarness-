@@ -33,6 +33,23 @@ _DEFAULT_TAIL_BYTES = 16_384
 # Longer JSONL lines are kept in the artifact but not parsed in memory.
 _MAX_EVENT_LINE_BYTES = 8 * 1024 * 1024
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_CODEX_AUTH_FAILURE_SIGNALS = (
+    "401 unauthorized",
+    "missing bearer or basic authentication in header",
+    "authentication required",
+    "not logged in",
+)
+
+
+def classify_codex_failure(stderr: str, events: str = "") -> str | None:
+    """Classify only the strict, transport/auth failures known to Codex."""
+
+    if not isinstance(stderr, str) or not isinstance(events, str):
+        raise TypeError("Codex failure diagnostics must be strings")
+    haystack = f"{stderr}\n{events}".casefold()
+    if any(signal in haystack for signal in _CODEX_AUTH_FAILURE_SIGNALS):
+        return "CODEX_AUTH_FAILURE"
+    return None
 
 
 def build_agent_environment(
@@ -369,6 +386,7 @@ __all__ = [
     "AgentCommittedError",
     "CodexAgent",
     "build_agent_environment",
+    "classify_codex_failure",
     "build_implementer_prompt",
     "build_implementer_step_prompt",
     "run_codex",

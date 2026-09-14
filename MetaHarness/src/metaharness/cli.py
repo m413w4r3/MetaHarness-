@@ -22,6 +22,7 @@ from .approval import (
     write_plan_approval,
 )
 from .config import ConfigError, load_config
+from .agent.auth import check_codex_authentication
 from .agent.codex import build_agent_environment
 from .agent.runtime import CodexRuntimeError, prepare_codex_home
 from .execution_selection import is_profile_aware_run
@@ -371,6 +372,22 @@ def _doctor(config_path: Path) -> int:
             print("OK codex sandbox: usable")
         else:
             problems.append(f"codex sandbox probe failed\n  detail: {detail}")
+        auth_status = check_codex_authentication(
+            codex_home,
+            environment=probe_environment,
+        )
+        if auth_status.available:
+            print("OK codex authentication: available")
+        elif auth_status.detail == "codex authentication is unavailable":
+            problems.append(
+                "codex authentication is unavailable for managed CODEX_HOME\n"
+                f'hint: run CODEX_HOME="{codex_home}" codex login'
+            )
+        else:
+            problems.append(
+                "codex authentication could not be verified for managed CODEX_HOME\n"
+                f'hint: run CODEX_HOME="{codex_home}" codex login'
+            )
     for label, commands in (
         ("workspace setup", config.workspace_setup),
         ("check", config.checks),

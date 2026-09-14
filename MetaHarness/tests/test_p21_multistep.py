@@ -775,6 +775,34 @@ class TokenUsageTests(MultiStepHarness):
 
 
 class UITests(MultiStepHarness):
+    def test_codex_auth_failure_opens_agent_diagnostics_and_shows_login(self) -> None:
+        config = self.config(require_approval=False)
+        page = render_run(
+            {
+                "run_id": "auth-failure",
+                "state": {
+                    "status": "failed",
+                    "planning_protocol": "v2",
+                    "failure": {
+                        "reason": "CODEX_AUTH_FAILURE",
+                        "detail": "step=S01 Codex authentication failed",
+                    },
+                    "steps": [{"id": "S01", "status": "failed", "title": "Auth"}],
+                },
+                "failure": {
+                    "reason": "CODEX_AUTH_FAILURE",
+                    "detail": "step=S01 Codex authentication failed",
+                },
+            },
+            config=config,
+        )
+        self.assertIn("Codex authentication failed.", page)
+        self.assertIn(
+            f'CODEX_HOME="{config.codex_runtime.home}" codex login',
+            page,
+        )
+        self.assertIn('class="card step failed" open', page)
+
     def test_step_live_events_are_exposed_without_tool_arguments(self) -> None:
         agent = FakeAgent(three_step_actions())
         self.run_v2(three_steps(), agent)

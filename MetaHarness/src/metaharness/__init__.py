@@ -1,6 +1,11 @@
 """Fondations de MetaHarness V0."""
 
-from .agent import AgentResult, CodexAgent
+from .agent import (
+    AgentResult,
+    CodexAgent,
+    CodexAuthStatus,
+    check_codex_authentication,
+)
 from .approval import (
     ApprovalDecision,
     ApprovalError,
@@ -61,6 +66,7 @@ __all__ = [
     "CodexRuntimeConfig",
     "CheckResult",
     "CodexAgent",
+    "CodexAuthStatus",
     "ConfigError",
     "ContextBundle",
     "ContextConfig",
@@ -97,6 +103,7 @@ __all__ = [
     "build_context_bundle",
     "build_runtime_environment",
     "collect_evidence",
+    "check_codex_authentication",
     "compute_plan_identity",
     "compute_plan_identity_from_run",
     "load_config",

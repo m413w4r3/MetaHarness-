@@ -46,7 +46,12 @@ On first use, authenticate the managed Codex runtime once:
 
 ```sh
 CODEX_HOME="$HOME/.local/share/metaharness/codex" codex login
+metaharness doctor --config examples/autowork.toml
 ```
+
+Run `doctor` after this login. It checks Codex authentication separately from
+the local sandbox probe and fails closed when the managed home cannot be
+verified. It never makes a model request and never starts a login flow.
 
 MetaHarness never copies the personal `CODEX_HOME`, MCP configuration, or
 credentials into that managed runtime.

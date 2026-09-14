@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .agent.base import AgentError, AgentResult
-from .agent.codex import AgentCommittedError, CodexAgent, build_agent_environment, build_implementer_step_prompt
+from .agent.codex import (
+    AgentCommittedError,
+    CodexAgent,
+    build_agent_environment,
+    build_implementer_step_prompt,
+    classify_codex_failure,
+)
 from .agent.runtime import prepare_codex_home
 from .approval import (
     ApprovalDecision,
@@ -261,15 +267,38 @@ def _review_payload(review: ReviewResult) -> dict[str, Any]:
     return payload
 
 
-def _agent_payload(result: AgentResult) -> dict[str, Any]:
+def _agent_payload(result: AgentResult, *, auth_failure: bool = False) -> dict[str, Any]:
     # The full report is already persisted by CodexAgent.  State contains only
     # bounded protocol metadata and never an API key or an authorization value.
     return {
         "exit_code": result.exit_code,
         "timed_out": result.timed_out,
         "usage": dict(result.usage),
-        "stderr_tail": result.stderr_tail,
+        # Transport errors may contain provider URLs, request IDs, or other
+        # infrastructure identifiers.  The complete bounded artifact remains
+        # available to the local UI; state keeps a fixed safe marker instead.
+        "stderr_tail": "Codex authentication failed" if auth_failure else result.stderr_tail,
     }
+
+
+def _artifact_tail(path: Path, limit: int = 64 * 1024) -> str:
+    """Read only the tail needed for deterministic failure classification."""
+
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(max(0, size - limit))
+            return stream.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _codex_auth_failure(run_dir: Path, stderr: str, *, step_id: str | None = None) -> bool:
+    events_path = run_dir / "agent.events.jsonl"
+    if step_id is not None:
+        events_path = run_dir / "steps" / step_id / "agent.events.jsonl"
+    return classify_codex_failure(stderr, _artifact_tail(events_path)) == "CODEX_AUTH_FAILURE"
 
 
 _MAX_REPORTED_PATHS = 20
@@ -861,13 +890,21 @@ class Orchestrator:
             self._redact_agent_artifacts(run_dir)
             state = store.record_failure("AGENT_COMMITTED", redact(str(exc), self._secrets))
             return RunResult(run_dir, RunStatus.FAILED, state)
+        auth_failure = (
+            not agent_result.timed_out
+            and agent_result.exit_code != 0
+            and _codex_auth_failure(run_dir, agent_result.stderr_tail)
+        )
         self._redact_agent_artifacts(run_dir)
         agent_result = dataclasses.replace(
             agent_result,
             final_message=redact(agent_result.final_message, self._secrets),
             stderr_tail=redact(agent_result.stderr_tail, self._secrets),
         )
-        store.update(status=RunStatus.IMPLEMENTING, agent=_agent_payload(agent_result))
+        store.update(
+            status=RunStatus.IMPLEMENTING,
+            agent=_agent_payload(agent_result, auth_failure=auth_failure),
+        )
         violations = _ownership_violations(
             ownership_before,
             _git_ownership(repo, info.worktree),
@@ -881,6 +918,11 @@ class Orchestrator:
             state = store.record_failure("AGENT_TIMEOUT")
             return RunResult(run_dir, RunStatus.FAILED, state)
         if agent_result.exit_code != 0:
+            if auth_failure:
+                state = store.record_failure(
+                    "CODEX_AUTH_FAILURE", "Codex authentication failed"
+                )
+                return RunResult(run_dir, RunStatus.FAILED, state)
             state = store.record_failure(
                 "AGENT_FAILED", f"exit status {agent_result.exit_code}"
             )
@@ -1242,6 +1284,11 @@ class Orchestrator:
             if result.timed_out:
                 return self._v2_failed(store, run_dir, "AGENT_TIMEOUT", step.id, **failed_step)
             if result.exit_code != 0:
+                if _codex_auth_failure(run_dir, result.stderr_tail, step_id=step.id):
+                    return self._v2_failed(
+                        store, run_dir, "CODEX_AUTH_FAILURE", step.id,
+                        "Codex authentication failed", **failed_step
+                    )
                 return self._v2_failed(store, run_dir, "AGENT_FAILED", step.id,
                                         f"exit status {result.exit_code}", **failed_step)
             stage_all(info.worktree)

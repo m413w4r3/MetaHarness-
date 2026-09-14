@@ -159,6 +159,21 @@ def _section_open(run: dict[str, Any], names: tuple[str, ...]) -> str:
     return " open" if any(_failure_reason(run).startswith(name) for name in names) else ""
 
 
+def _agent_auth_failure_notice(run: dict[str, Any], config: HarnessConfig | None) -> str:
+    if _failure_reason(run) != "CODEX_AUTH_FAILURE":
+        return ""
+    configured_home = (
+        str(config.codex_runtime.home.expanduser().resolve())
+        if config is not None
+        else "<configured home>"
+    )
+    return (
+        '<div class="card fail"><p><strong>Codex authentication failed.</strong></p>'
+        "<p>Run once:</p>"
+        f'<pre>CODEX_HOME="{_e(configured_home)}" codex login</pre></div>'
+    )
+
+
 def _check_cards(checks: Any) -> str:
     if not checks:
         return '<p class="muted">Aucun check.</p>'
@@ -457,7 +472,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
 {approval_forms}
 <section><h2>PLAN</h2><details open{_section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER"))}><summary>Canonical implementation contract</summary><pre>{_e(plan.get("contract"))}</pre></details><details><summary>planner.raw.md</summary><pre>{_e(plan.get("raw"))}</pre></details><details><summary>SPEC</summary><pre>{_e(run.get("spec"))}</pre></details></section>
 <section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config) if is_v2 else _execution_card(state, config)}</section>
-<section><h2>AGENT</h2>{_v2_steps(state, run.get("step_artifacts")) if is_v2 else f'<details open{_section_open(run, ("AGENT_",))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'}</section>
+<section><h2>AGENT</h2>{_agent_auth_failure_notice(run, config)}{_v2_steps(state, run.get("step_artifacts")) if is_v2 else f'<details open{_section_open(run, ("AGENT_", "CODEX_AUTH_FAILURE"))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'}</section>
 <section><h2>CHECKS</h2><details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
 <section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details><details><summary>reviewer.raw.md</summary><pre>{_e(run.get("reviewer_raw"))}</pre></details></section>
 <section><h2>Setup</h2><details open{_section_open(run, ("WORKSPACE_SETUP_",))}><summary>Workspace setup</summary>{_setup_cards(run.get("workspace_setup"))}</details></section>

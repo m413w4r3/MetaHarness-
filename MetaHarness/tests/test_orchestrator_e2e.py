@@ -209,6 +209,12 @@ class OrchestratorE2ETests(unittest.TestCase):
                 elif behavior == 'staged-secret':
                     (worktree / '.gitattributes').write_text('*.py -diff\\n')
                     (worktree / 'secret.py').write_text(os.environ['FAKE_STAGED_SECRET'] + '\\n')
+                if behavior == 'auth-fail':
+                    sys.stderr.write(
+                        '401 Unauthorized request-id=req-123 '
+                        'https://api.openai.com/v1/responses\\n'
+                    )
+                    raise SystemExit(1)
                 final = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])
                 final.write_text(os.environ.get('FAKE_FINAL', 'fake codex completed\\n'))
                 if behavior == 'fail':
@@ -463,6 +469,13 @@ class OrchestratorE2ETests(unittest.TestCase):
         _, _, state = self.run_case(codex_behavior="fail")
         self.assertEqual(state["failure"]["reason"], "AGENT_FAILED")
         self.assertEqual(git(self.root / "worktrees" / "run-1", "rev-list", "--count", "HEAD"), "1")
+
+    def test_codex_auth_exit_is_classified_without_sensitive_detail(self) -> None:
+        _, _, state = self.run_case(codex_behavior="auth-fail")
+        self.assertEqual(state["failure"]["reason"], "CODEX_AUTH_FAILURE")
+        self.assertEqual(state["failure"]["detail"], "Codex authentication failed")
+        self.assertNotIn("request-id", json.dumps(state))
+        self.assertNotIn("https://api.openai.com", json.dumps(state))
 
     def test_codex_commit_itself_is_rejected(self) -> None:
         _, _, state = self.run_case(codex_behavior="commit")
