@@ -7,8 +7,39 @@ plan et diff avant l’unique commit autorisé. L’implémenteur reçoit le pla
 pas le SPEC original ; le reviewer reçoit les deux. Une approbation humaine
 optionnelle peut être exigée après le planner et avant la création du worktree.
 
-V0 reste volontairement simple : un seul task, un seul agent, un seul planner,
-un seul reviewer, sans multi-agent, repair loop ni comportement mock. Les
+Avec `[planning] protocol = "v2"` et `[revision] enabled = true` (le cas de
+`examples/autowork.toml`), le pipeline complet est :
+
+```text
+SPEC
+→ indexer + repo-aware planner
+→ human-approved STAGED bundle
+→ Luna steps
+→ pre-checks
+→ Claude revision
+→ final checks
+→ reviewer #1
+   ├ PASS → commit → push run branch
+   └ REVISE/IMPLEMENTATION
+       → repair planner
+       → Luna repair steps
+       → Claude revision C02
+       → checks
+       → reviewer #2
+          ├ PASS → commit → push run branch
+          └ otherwise → STOP
+```
+
+- maximum automatic cycles = 2 (C01 initial, C02 repair ; jamais de C03) ;
+- `revision.enabled` est la seule autorité : les profils reviser/repair du
+  catalogue n’activent rien implicitement ; sans elle, ni Claude ni C02 ;
+- la publication pousse uniquement la branche de run `harness/<plan>/<run-id>`,
+  sans force, sans tag, et never pushes base_ref (`main`) ;
+- MetaHarness never automatically merges the run branch : le merge reste une
+  décision humaine.
+
+Sans `revision.enabled`, le chemin historique reste disponible : un planner,
+les steps Codex, les checks, un reviewer et un commit. Les
 secrets ne sont jamais mis dans la configuration persistée : `api_key_env`
 contient seulement le nom d’une variable d’environnement. Les écritures d’état
 passent par `RunStateStore` et sont atomiques.

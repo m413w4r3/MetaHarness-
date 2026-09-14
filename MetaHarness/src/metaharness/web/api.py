@@ -44,9 +44,8 @@ from ..state import RunStateStore
 from ..usage import (
     PLANNER_USAGE_ARTIFACT,
     REVIEWER_USAGE_ARTIFACT,
-    add_usage,
-    empty_usage,
     normalize_usage,
+    phase_usage_summary,
     read_usage_artifact,
 )
 from .run_manager import RunCapacityError, RunCollisionError, RunManager, RunManagerError
@@ -385,45 +384,23 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
     workspace_setup = _load_json(_artifact_path(directory, "setup/results.json"))
     if not isinstance(workspace_setup, list):
         workspace_setup = state.get("workspace_setup", [])
-    bundle = _load_json(_artifact_path(directory, "implementation_bundle.json"), max_bytes=MAX_RESULT_BYTES)
-    declared_hashes = {
-        entry.get("id"): entry.get("contract_sha256")
-        for entry in (bundle.get("steps") if isinstance(bundle, dict) and isinstance(bundle.get("steps"), list) else [])
-        if isinstance(entry, dict)
-    }
-    step_artifacts: list[dict[str, Any]] = []
-    raw_steps = state.get("steps") if isinstance(state.get("steps"), list) else []
-    for item in raw_steps:
-        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or _STEP_ID.fullmatch(item["id"]) is None:
-            continue
-        step_id = item["id"]
-        step_dir = directory / "steps" / step_id
-        contract = _step_contract(directory, step_id, declared_hashes.get(step_id))
-        step_json = _load_json(step_dir / "step.json", max_bytes=MAX_RESULT_BYTES)
-        step_usage = (
-            normalize_usage(step_json.get("usage"))
-            if isinstance(step_json, dict) and isinstance(step_json.get("usage"), dict)
-            else None
-        )
-        step_artifacts.append({
-            **item,
-            "contract": contract["text"],
-            "contract_sha256": contract["sha256"],
-            "contract_matches_bundle": contract["matches"],
-            "contract_layout": contract["layout"],
-            "final": _tail_text(step_dir / "agent.final.md", 8 * 1024),
-            "stderr": _tail_text(step_dir / "agent.stderr.log", 8 * 1024),
-            "result": _load_json(step_dir / "agent.result.json", max_bytes=MAX_RESULT_BYTES),
-            "events": step_progress_tail(directory, step_id, max_events=STEP_EVENTS_MAX),
-            "usage": step_usage,
-            "high_context": bool(
-                step_usage and step_usage["input_tokens"] > HIGH_WORKER_INPUT_TOKENS
-            ),
-        })
-    changed_files = _bounded_changed_files(
-        _artifact_path(directory, "changed-files.txt")
-    )
-    diff_tail = _tail_text(_artifact_path(directory, "diff.patch"), MAX_DIFF_BYTES)
+    cycle_artifacts = _cycle_artifacts(directory, state)
+    # Historical field: C01 only, rebuilt from the root bundle and
+    # steps/Sxx/step.json, never from a state.steps that describes C02.
+    step_artifacts = cycle_artifacts[0]["steps"]
+    # Top-level aliases describe the FINAL cycle: C02 when it exists.
+    if len(cycle_artifacts) > 1:
+        checks_path = "checks/C02/checks.json"
+        review_path = "review/C02/review.json"
+        reviewer_raw = _load_text(_artifact_path(directory, "review/C02/reviewer.raw.md"))
+        revision_path = "revision/C02/report.json"
+        changed_path, diff_path = "checks/C02/changed-files.txt", "checks/C02/diff.patch"
+    else:
+        checks_path, review_path = "checks.json", "review.json"
+        revision_path = "revision/report.json"
+        changed_path, diff_path = "changed-files.txt", "diff.patch"
+    changed_files = _bounded_changed_files(_artifact_path(directory, changed_path))
+    diff_tail = _tail_text(_artifact_path(directory, diff_path), MAX_DIFF_BYTES)
     # Keep this shape stable for both the JSON API and the server-rendered run
     # page; all newly exposed artifact data below is bounded or allowlisted.
     return {
@@ -440,11 +417,11 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
         "implementation_contract": contract,
         "task_plan": _load_json(_artifact_path(directory, "task_plan.json")),
         "implementation_bundle": _load_json(_artifact_path(directory, "implementation_bundle.json")),
-        "checks": _load_json(_artifact_path(directory, "checks.json")),
-        "review": _load_json(_artifact_path(directory, "review.json")),
+        "checks": _load_json(_artifact_path(directory, checks_path)),
+        "review": _load_json(_artifact_path(directory, review_path)),
         "reviewer_raw": reviewer_raw,
         "reviewer_raw_available": reviewer_raw is not None,
-        "revision": _load_json(_artifact_path(directory, "revision/report.json")),
+        "revision": _load_json(_artifact_path(directory, revision_path)),
         "execution_selection": _load_json(
             _artifact_path(directory, "execution_selection.json")
         ),
@@ -460,8 +437,187 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
         "candidate": {"changed_files": changed_files, "diff_tail": diff_tail},
         "workspace_setup": workspace_setup,
         "step_artifacts": step_artifacts,
-        "usage": _usage_summary(directory, step_artifacts, raw_usage),
+        "cycle": _state_cycle(state),
+        "cycle_artifacts": cycle_artifacts,
+        "usage": phase_usage_summary(directory, v1_agent_usage=raw_usage),
     }
+
+
+def _state_cycle(state: Mapping[str, Any]) -> int:
+    cycle = state.get("cycle")
+    return cycle if cycle in (1, 2) and not isinstance(cycle, bool) else 1
+
+
+def _cycle_root(directory: Path, cycle: int) -> Path:
+    if cycle == 1:
+        return directory
+    if cycle == 2:
+        return directory / "repair" / "C02"
+    raise WebAPIError(400, "invalid cycle")
+
+
+def _bundle_entries(path: Path) -> list[dict[str, Any]]:
+    bundle = _load_json(path, max_bytes=MAX_RESULT_BYTES)
+    steps = bundle.get("steps") if isinstance(bundle, dict) else None
+    if not isinstance(steps, list):
+        return []
+    return [
+        entry for entry in steps
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        and _STEP_ID.fullmatch(entry["id"]) is not None
+    ]
+
+
+_DURABLE_STEP_STATUS = {"COMPLETED": "completed", "FAILED": "failed"}
+
+
+def _cycle_steps(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Steps of exactly one cycle, from that cycle's own artifact tree.
+
+    Live status comes from ``state.steps`` only while the state describes
+    this same cycle; otherwise the durable ``step.json`` is authoritative.
+    """
+
+    root = _cycle_root(directory, cycle)
+    entries = {entry["id"]: entry for entry in _bundle_entries(root / "implementation_bundle.json")}
+    raw_live = state.get("steps") if _state_cycle(state) == cycle else None
+    live = {
+        item["id"]: item for item in (raw_live if isinstance(raw_live, list) else [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        and _STEP_ID.fullmatch(item["id"]) is not None
+    }
+    ids = list(entries) or list(live)
+    if not ids:
+        try:
+            ids = sorted(
+                entry.name for entry in (root / "steps").iterdir()
+                if entry.is_dir() and _STEP_ID.fullmatch(entry.name) is not None
+            )
+        except OSError:
+            ids = []
+    result: list[dict[str, Any]] = []
+    for step_id in ids:
+        entry = entries.get(step_id, {})
+        step_dir = root / "steps" / step_id
+        step_json = _load_json(step_dir / "step.json", max_bytes=MAX_RESULT_BYTES)
+        step_json = step_json if isinstance(step_json, dict) else {}
+        step_usage = (
+            normalize_usage(step_json["usage"]) if isinstance(step_json.get("usage"), dict) else None
+        )
+        contract = _step_contract(root, step_id, entry.get("contract_sha256"))
+        item = live.get(step_id, {})
+        status = item.get("status") or _DURABLE_STEP_STATUS.get(
+            str(step_json.get("status")), "waiting"
+        )
+        result.append({
+            **item,
+            "id": step_id,
+            "cycle": cycle,
+            "title": item.get("title", entry.get("title")),
+            "profile_id": item.get("profile_id") or step_json.get("profile_id") or entry.get("implementer_profile"),
+            "status": status,
+            "failure_reason": step_json.get("reason"),
+            "contract": contract["text"],
+            "contract_sha256": contract["sha256"],
+            "contract_matches_bundle": contract["matches"],
+            "contract_layout": contract["layout"],
+            "final": _tail_text(step_dir / "agent.final.md", 8 * 1024),
+            "stderr": _tail_text(step_dir / "agent.stderr.log", 8 * 1024),
+            "result": _load_json(step_dir / "agent.result.json", max_bytes=MAX_RESULT_BYTES),
+            "events": cycle_step_progress_tail(directory, cycle, step_id, max_events=STEP_EVENTS_MAX),
+            "usage": step_usage,
+            "high_context": bool(
+                step_usage and step_usage["input_tokens"] > HIGH_WORKER_INPUT_TOKENS
+            ),
+        })
+    return result
+
+
+def _cycle_revision(directory: Path, cycle: int) -> dict[str, Any] | None:
+    if cycle == 1:
+        c01 = directory / "revision" / "C01"
+        source = c01 if c01.is_dir() else directory / "revision"
+    else:
+        source = directory / "revision" / "C02"
+    if not (source / "tree_before.txt").exists() and not (source / "report.json").exists():
+        return None
+    return {
+        "report": _load_json(source / "report.json", max_bytes=MAX_RESULT_BYTES),
+        "pre_checks": _load_json(source / "pre_checks.json", max_bytes=MAX_RESULT_BYTES),
+        "scope": _load_json(source / "scope.json", max_bytes=MAX_RESULT_BYTES),
+        "final": _tail_text(source / "agent.final.md", 8 * 1024),
+        "stderr": _tail_text(source / "agent.stderr.log", 8 * 1024),
+        "events": _tail_events(source / "agent.events.jsonl", STEP_EVENTS_MAX, summarize_step_event),
+        "usage": read_usage_artifact(source / "usage.json"),
+    }
+
+
+def _cycle_checks(directory: Path, cycle: int) -> dict[str, Any] | None:
+    if cycle == 1:
+        c01 = directory / "checks" / "C01"
+        source = c01 if (c01 / "checks.json").exists() else directory
+    else:
+        source = directory / "checks" / "C02"
+    checks = _load_json(source / "checks.json", max_bytes=MAX_RESULT_BYTES)
+    if checks is None:
+        return None
+    evidence = _load_json(source / "evidence.json", max_bytes=MAX_RESULT_BYTES + MAX_DIFF_BYTES * 8)
+    gate = (
+        {"passed": evidence.get("deterministic_passed"), "failures": evidence.get("failures")}
+        if isinstance(evidence, dict) else None
+    )
+    return {
+        "checks": checks,
+        "gate": gate,
+        "changed_files": _bounded_changed_files(source / "changed-files.txt"),
+        "diff_tail": _tail_text(source / "diff.patch", MAX_DIFF_BYTES),
+    }
+
+
+def _cycle_review(directory: Path, cycle: int) -> dict[str, Any] | None:
+    if cycle == 1:
+        c01 = directory / "review" / "C01"
+        source = c01 if c01.is_dir() else directory
+    else:
+        source = directory / "review" / "C02"
+    review = _load_json(source / "review.json", max_bytes=MAX_RESULT_BYTES)
+    raw = _load_text_bounded(source / "reviewer.raw.md", MAX_RESULT_BYTES)
+    if review is None and raw is None:
+        return None
+    return {
+        "review": review,
+        "raw": raw,
+        "usage": read_usage_artifact(source / REVIEWER_USAGE_ARTIFACT),
+    }
+
+
+def _cycle_artifacts(directory: Path, state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """C01 and (when it exists) C02, each read only from its own sources."""
+
+    records = {
+        item.get("number"): item for item in (state.get("cycles") or [])
+        if isinstance(item, dict)
+    } if isinstance(state.get("cycles"), list) else {}
+    cycles = []
+    for number, kind in ((1, "initial"), (2, "repair")):
+        if number == 2 and not (directory / "repair" / "C02").is_dir():
+            break
+        record = records.get(number, {})
+        cycles.append({
+            "number": number,
+            "kind": kind,
+            "status": record.get("status"),
+            "failure": record.get("failure"),
+            "plan_raw": (
+                _load_text_bounded(directory / "repair" / "C02" / "planner.raw.md", MAX_RESULT_BYTES)
+                if number == 2 else None
+            ),
+            "steps": _cycle_steps(directory, number, state),
+            "revision": _cycle_revision(directory, number),
+            "checks": _cycle_checks(directory, number),
+            "review": _cycle_review(directory, number),
+        })
+    return cycles
 
 
 def _step_contract(
@@ -495,80 +651,6 @@ def _step_contract(
             "layout": layout,
         }
     return {"text": None, "sha256": None, "matches": False, "layout": None}
-
-
-def _usage_summary(
-    directory: Path, step_artifacts: list[dict[str, Any]], v1_agent_usage: Any
-) -> dict[str, Any]:
-    """Aggregate persisted token usage per phase; no pricing is derived."""
-
-    planner = read_usage_artifact(directory / PLANNER_USAGE_ARTIFACT) or empty_usage()
-    reviser = read_usage_artifact(directory / "revision" / "usage.json") or empty_usage()
-    reviewer = read_usage_artifact(directory / REVIEWER_USAGE_ARTIFACT) or empty_usage()
-    steps = [
-        {"id": item["id"], "usage": item["usage"]}
-        for item in step_artifacts
-        if isinstance(item.get("usage"), dict)
-    ]
-    # After C02 the durable top-level ``steps`` field describes the current
-    # cycle. Re-read C01 from its immutable artifact directory for totals.
-    root_step_entries: list[dict[str, Any]] = []
-    try:
-        root_step_dirs = sorted((directory / "steps").iterdir(), key=lambda path: path.name)
-    except OSError:
-        root_step_dirs = []
-    for entry in root_step_dirs:
-        if not entry.is_dir() or _STEP_ID.fullmatch(entry.name) is None:
-            continue
-        payload = _load_json(entry / "step.json", max_bytes=MAX_RESULT_BYTES)
-        if isinstance(payload, dict) and isinstance(payload.get("usage"), dict):
-            root_step_entries.append({"id": entry.name, "usage": normalize_usage(payload["usage"])})
-    if root_step_entries:
-        steps = root_step_entries
-    if steps:
-        implementer = add_usage(step["usage"] for step in steps)
-    elif isinstance(v1_agent_usage, dict) and v1_agent_usage:
-        implementer = normalize_usage(v1_agent_usage)
-    else:
-        implementer = empty_usage()
-    repair_steps: list[dict[str, Any]] = []
-    repair_steps_dir = directory / "repair" / "C02" / "steps"
-    try:
-        repair_entries = sorted(repair_steps_dir.iterdir(), key=lambda path: path.name)
-    except OSError:
-        repair_entries = []
-    for entry in repair_entries:
-        if not entry.is_dir() or _STEP_ID.fullmatch(entry.name) is None:
-            continue
-        step_json = _load_json(entry / "step.json", max_bytes=MAX_RESULT_BYTES)
-        if isinstance(step_json, dict) and isinstance(step_json.get("usage"), dict):
-            repair_steps.append({"id": entry.name, "usage": normalize_usage(step_json["usage"]), "cycle": 2})
-    luna_c01 = add_usage(step["usage"] for step in steps)
-    luna_c02 = add_usage(step["usage"] for step in repair_steps)
-    claude_c01 = reviser
-    reviewer_c01 = reviewer
-    repair_planner = read_usage_artifact(directory / "repair" / "C02" / "planner.usage.json") or empty_usage()
-    claude_c02 = read_usage_artifact(directory / "revision" / "C02" / "usage.json") or empty_usage()
-    reviewer_c02 = read_usage_artifact(directory / "review" / "C02" / "reviewer.usage.json") or empty_usage()
-    has_c02 = any(value != empty_usage() for value in (repair_planner, luna_c02, claude_c02, reviewer_c02)) or bool(repair_steps)
-    phase_usage = {
-        "planner": planner,
-        "implementer": {"total": add_usage((luna_c01, luna_c02)), "steps": steps + repair_steps},
-        "reviser": add_usage((claude_c01, claude_c02)),
-        "reviewer": add_usage((reviewer_c01, reviewer_c02)),
-    }
-    if has_c02:
-        phase_usage.update({
-            "luna_c01": luna_c01, "claude_c01": claude_c01,
-            "reviewer_c01": reviewer_c01, "repair_planner_c02": repair_planner,
-            "luna_c02": luna_c02, "claude_c02": claude_c02,
-            "reviewer_c02": reviewer_c02,
-        })
-    phase_usage["grand_total"] = add_usage(
-        (planner, luna_c01, claude_c01, reviewer_c01,
-         repair_planner, luna_c02, claude_c02, reviewer_c02)
-    )
-    return phase_usage
 
 
 def _summaries(
@@ -706,26 +788,41 @@ def _tail_events(
     return list(events)
 
 
+def cycle_step_progress_tail(
+    run_dir: Path,
+    cycle: int,
+    step_id: str,
+    *,
+    max_events: int = STEP_EVENTS_MAX,
+) -> list[str]:
+    """Latest compact events of one step of one cycle.
+
+    Cycle 1 reads ``steps/Sxx/agent.events.jsonl``; cycle 2 reads
+    ``repair/C02/steps/Sxx/agent.events.jsonl``.  Uses the same bounded JSONL
+    window as :func:`progress_tail`; tool arguments are never rendered.
+    """
+
+    if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events < 0:
+        raise WebAPIError(400, "max_events must be a non-negative integer")
+    if isinstance(cycle, bool) or cycle not in (1, 2):
+        raise WebAPIError(400, "invalid cycle")
+    if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None:
+        raise WebAPIError(400, "invalid step id")
+    if max_events == 0:
+        return []
+    path = _cycle_root(Path(run_dir), cycle) / "steps" / step_id / "agent.events.jsonl"
+    return _tail_events(path, max_events, summarize_step_event)
+
+
 def step_progress_tail(
     run_dir: Path,
     step_id: str,
     *,
     max_events: int = STEP_EVENTS_MAX,
 ) -> list[str]:
-    """Latest compact events of one v2 step (``steps/Sxx/agent.events.jsonl``).
+    """Latest compact events of one C01 step (historical API)."""
 
-    Uses the same bounded JSONL window as :func:`progress_tail`; tool
-    arguments are never rendered.
-    """
-
-    if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events < 0:
-        raise WebAPIError(400, "max_events must be a non-negative integer")
-    if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None:
-        raise WebAPIError(400, "invalid step id")
-    if max_events == 0:
-        return []
-    path = Path(run_dir) / "steps" / step_id / "agent.events.jsonl"
-    return _tail_events(path, max_events, summarize_step_event)
+    return cycle_step_progress_tail(run_dir, 1, step_id, max_events=max_events)
 
 
 def approve_run(
@@ -753,15 +850,22 @@ def approve_run(
         raise WebAPIError(409, "run is not awaiting plan approval")
     profile_aware = is_profile_aware_run(state)
     v2 = state.get("planning_protocol") == "v2"
+    # revision.enabled is the only authority for the schema-4 selection; a
+    # reviser or repair field is never accepted to enable it implicitly.
+    revision_enabled = bool(config is not None and config.revision.enabled)
+    if selected is ApprovalDecision.APPROVE and not revision_enabled and (
+        reviser_profile is not None or repair_profile is not None
+    ):
+        raise WebAPIError(400, "reviser_profile and repair_profile require revision.enabled")
     if v2:
         if selected is ApprovalDecision.APPROVE:
             if config is None or not isinstance(step_profiles, Mapping) or not isinstance(reviewer_profile, str):
                 raise WebAPIError(400, "step profiles and reviewer_profile are required")
             if any(not isinstance(value, str) for value in step_profiles.values()):
                 raise WebAPIError(400, "invalid step profile field")
-        if selected is ApprovalDecision.APPROVE and config is not None and (
-            config.ui.default_reviser_profile and config.ui.default_repair_profile
-        ):
+        if selected is ApprovalDecision.APPROVE and revision_enabled:
+            # Each default comes from its own configured key: the repair
+            # implementer is never derived from the reviser.
             if reviser_profile is None:
                 reviser_profile = config.ui.default_reviser_profile
             elif not isinstance(reviser_profile, str) or not reviser_profile:
@@ -816,13 +920,13 @@ def approve_run(
         if set(step_profiles) != set(expected_ids):
             raise WebAPIError(400, "missing or unknown step profile field")
         try:
-            if config.ui.default_reviser_profile and config.ui.default_repair_profile:
+            if revision_enabled:
                 requested = resolve_execution_selection_v4(
                     config,
                     planner_profile_id=state["execution"]["planner"]["profile_id"],
                     step_profile_ids={key: value for key, value in step_profiles.items()},
-                    reviser_profile_id=reviser_profile or config.ui.default_reviser_profile,
-                    repair_implementer_profile_id=repair_profile or config.ui.default_repair_profile,
+                    reviser_profile_id=reviser_profile,
+                    repair_implementer_profile_id=repair_profile,
                     reviewer_profile_id=reviewer_profile,
                 )
             else:
@@ -831,7 +935,6 @@ def approve_run(
                     planner_profile_id=state["execution"]["planner"]["profile_id"],
                     step_profile_ids={key: value for key, value in step_profiles.items()},
                     reviewer_profile_id=reviewer_profile,
-                    reviser_profile_id=(reviser_profile or config.ui.default_reviser_profile),
                 )
         except (ProfileError, ExecutionSelectionError) as exc:
             raise WebAPIError(400, "selected profile is invalid") from exc
@@ -883,7 +986,6 @@ def approve_run(
             planner_profile_id=state["execution"]["planner"]["profile_id"],
             implementer_profile_id=implementer_profile,
             reviewer_profile_id=reviewer_profile,
-            reviser_profile_id=(reviser_profile or config.ui.default_reviser_profile),
         )
     except ProfileError as exc:
         raise WebAPIError(400, "selected profile is invalid") from exc
@@ -1054,6 +1156,7 @@ __all__ = [
     "WebAPIError",
     "approve_run",
     "create_run",
+    "cycle_step_progress_tail",
     "model_profiles",
     "get_run",
     "list_runs",

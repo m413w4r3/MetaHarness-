@@ -100,6 +100,7 @@ from .execution_selection import (
 from .models import (
     ExecutionRole,
     ExecutionSelectionV4,
+    ModelProfile,
     ExecutionSelectionV3,
     HarnessConfig,
     ImplementationStep,
@@ -124,7 +125,7 @@ from .planning_v2 import (
     read_set_paths,
     validate_implementation_bundle,
 )
-from .usage import add_usage, empty_usage, normalize_usage, read_usage_artifact
+from .usage import add_usage, empty_usage, normalize_usage, phase_usage_summary
 from .redaction import config_secret_values, redact, redact_file
 from .profiles import (
     ProfileError,
@@ -392,10 +393,9 @@ def _artifact_tail(path: Path, limit: int = 64 * 1024) -> str:
         return ""
 
 
-def _codex_auth_failure(run_dir: Path, stderr: str, *, step_id: str | None = None) -> bool:
-    events_path = run_dir / "agent.events.jsonl"
-    if step_id is not None:
-        events_path = run_dir / "steps" / step_id / "agent.events.jsonl"
+def _codex_auth_failure(events_path: Path, stderr: str) -> bool:
+    """Fixed-marker auth classification from stderr and one events file."""
+
     return classify_codex_failure(stderr, _artifact_tail(events_path)) == "CODEX_AUTH_FAILURE"
 
 
@@ -457,7 +457,7 @@ def _status_has_unstaged_or_untracked(status: tuple[str, ...]) -> list[str]:
 
 
 @dataclasses.dataclass(frozen=True)
-class _GitOwnership:
+class GitOwnership:
     """Git state the implementation agent is not allowed to change."""
 
     head_ref: str | None
@@ -466,8 +466,12 @@ class _GitOwnership:
     worktrees: frozenset[str]
 
 
-def _git_ownership(repo: Path, worktree: Path) -> _GitOwnership:
-    return _GitOwnership(
+# Compatibility alias for the former private name.
+_GitOwnership = GitOwnership
+
+
+def _git_ownership(repo: Path, worktree: Path) -> GitOwnership:
+    return GitOwnership(
         head_ref=symbolic_head(worktree),
         head=current_head(worktree),
         branches=local_branches(repo),
@@ -476,7 +480,7 @@ def _git_ownership(repo: Path, worktree: Path) -> _GitOwnership:
 
 
 def _ownership_violations(
-    before: _GitOwnership, after: _GitOwnership, *, branch_ref: str, base_sha: str
+    before: GitOwnership, after: GitOwnership, *, branch_ref: str, base_sha: str
 ) -> list[str]:
     problems: list[str] = []
     if after.head_ref != branch_ref:
@@ -498,6 +502,84 @@ def _ownership_violations(
     if removed_worktrees:
         problems.append("worktree(s) removed: " + ", ".join(removed_worktrees))
     return problems
+
+@dataclasses.dataclass(frozen=True)
+class StepExecutionOutcome:
+    """The durable result of one successful Codex step (C01 or C02)."""
+
+    step_id: str
+    profile_id: str
+    tree_before: str
+    tree_after: str
+    changed_paths: tuple[str, ...]
+    usage: dict[str, int]
+    final_report: str
+
+
+class StepExecutionFailure(OrchestrationError):
+    """One Codex step failed a gate; the C01/C02 caller owns the run status."""
+
+    def __init__(
+        self,
+        reason: str,
+        step_id: str,
+        detail: str | None = None,
+        *,
+        profile_id: str | None,
+        tree_before: str | None,
+        tree_after: str | None = None,
+        usage: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(f"{reason}: step={step_id}")
+        self.reason = reason
+        self.step_id = step_id
+        self.detail = detail
+        self.profile_id = profile_id
+        self.tree_before = tree_before
+        self.tree_after = tree_after
+        self.usage = usage
+
+
+@dataclasses.dataclass(frozen=True)
+class ReviewCycleInput:
+    """Cycle-specific reviewer evidence; the gate is always re-derived."""
+
+    iteration: int
+    plan_text: str
+    luna_reports: str
+    revision_report: str
+    cycle_history: str
+
+
+def _step_result_record(outcome: StepExecutionOutcome) -> dict[str, Any]:
+    return {
+        "id": outcome.step_id, "status": "COMPLETED", "profile_id": outcome.profile_id,
+        "tree_before": outcome.tree_before, "tree_after": outcome.tree_after,
+        "changed_paths": list(outcome.changed_paths),
+        "usage": outcome.usage,
+        "final": _bounded_v2_report(outcome.final_report),
+    }
+
+
+def _revision_report_text(result: Any, artifact_dir: Path) -> str:
+    """Bounded, reviewer-facing record of one Claude revision."""
+
+    def tree(name: str) -> str | None:
+        try:
+            return (artifact_dir / name).read_text(encoding="utf-8").strip() or None
+        except (OSError, UnicodeError):
+            return None
+
+    return _json_text({
+        "final": _bounded_report(result.final_message),
+        "tree_before": tree("tree_before.txt"),
+        "tree_after": tree("tree_after.txt"),
+        "usage": normalize_usage(result.usage),
+    })
+
+
+def _bounded_parse_detail(exc: Exception) -> str:
+    return " ".join(str(exc).split())[:500]
 
 
 def authorize_commit(
@@ -733,56 +815,16 @@ class Orchestrator:
         store.update(status=state.get("status", RunStatus.PLANNING), cycles=cycles)
 
     def _update_v2_usage(self, store: RunStateStore, run_dir: Path) -> None:
-        """Publish cycle-specific and backward-compatible token totals."""
+        """Publish cycle-specific and backward-compatible token totals.
 
-        def usage(path: Path) -> dict[str, int]:
-            return read_usage_artifact(path) or empty_usage()
+        Always derived from persisted artifacts (``steps/Sxx/step.json`` and
+        ``repair/C02/steps/Sxx/step.json``), never from ``state.steps``.
+        """
 
-        luna_c01 = add_usage(
-            item.get("usage", empty_usage())
-            for item in getattr(self, "_last_v2_step_results", [])
+        store.update(
+            status=store.load().get("status", RunStatus.PLANNING),
+            usage=phase_usage_summary(run_dir),
         )
-        luna_c02 = add_usage(
-            item.get("usage", empty_usage())
-            for item in getattr(self, "_repair_v2_step_results", [])
-        )
-        planner = usage(run_dir / "planner.usage.json")
-        claude_c01 = usage(run_dir / "revision" / "usage.json")
-        reviewer_c01 = usage(run_dir / "reviewer.usage.json")
-        repair_planner = usage(run_dir / "repair" / "C02" / "planner.usage.json")
-        claude_c02 = usage(run_dir / "revision" / "C02" / "usage.json")
-        reviewer_c02 = usage(run_dir / "review" / "C02" / "reviewer.usage.json")
-        has_c02 = any(
-            value != empty_usage()
-            for value in (repair_planner, luna_c02, claude_c02, reviewer_c02)
-        ) or bool(getattr(self, "_repair_v2_step_results", []))
-        implementer = add_usage((luna_c01, luna_c02))
-        reviser = add_usage((claude_c01, claude_c02))
-        reviewer = add_usage((reviewer_c01, reviewer_c02))
-        phase_usage: dict[str, Any] = {
-            "planner": planner,
-            "implementer": {"total": implementer, "steps": [
-                *[{**item, "cycle": 1} for item in getattr(self, "_last_v2_step_results", [])],
-                *[{**item, "cycle": 2} for item in getattr(self, "_repair_v2_step_results", [])],
-            ]},
-            "reviser": reviser,
-            "reviewer": reviewer,
-        }
-        if has_c02:
-            phase_usage.update({
-                "luna_c01": luna_c01,
-                "claude_c01": claude_c01,
-                "reviewer_c01": reviewer_c01,
-                "repair_planner_c02": repair_planner,
-                "luna_c02": luna_c02,
-                "claude_c02": claude_c02,
-                "reviewer_c02": reviewer_c02,
-            })
-        phase_usage["grand_total"] = add_usage(
-            (planner, luna_c01, claude_c01, reviewer_c01,
-             repair_planner, luna_c02, claude_c02, reviewer_c02)
-        )
-        store.update(status=store.load().get("status", RunStatus.PLANNING), usage=phase_usage)
 
     @staticmethod
     def _snapshot_cycle_artifacts(run_dir: Path) -> None:
@@ -1081,7 +1123,6 @@ class Orchestrator:
                     planner_profile_id=planner_profile.id,
                     implementer_profile_id=self.config.ui.default_implementer_profile or "legacy-implementer",
                     reviewer_profile_id=self.config.ui.default_reviewer_profile or "legacy-reviewer",
-                    reviser_profile_id=self.config.ui.default_reviser_profile,
                 ),
             )
             durable_identity = compute_plan_identity_from_run(run_dir)
@@ -1095,6 +1136,12 @@ class Orchestrator:
         if selection.planner.profile_id != planner_profile.id:
             raise ExecutionSelectionError("execution selection planner is not the run planner")
         validate_execution_selection(self.config, selection)
+        if selection.reviser is not None:
+            # Claude revision is a META PLAN v2 capability enabled only by
+            # revision.enabled; a v1 run never launches Claude Code.
+            raise ExecutionSelectionError(
+                "execution selection contains a reviser but revision is disabled"
+            )
 
         self._last_selection = selection
         execution_state = {
@@ -1206,7 +1253,7 @@ class Orchestrator:
         auth_failure = (
             not agent_result.timed_out
             and agent_result.exit_code != 0
-            and _codex_auth_failure(run_dir, agent_result.stderr_tail)
+            and _codex_auth_failure(run_dir / "agent.events.jsonl", agent_result.stderr_tail)
         )
         self._redact_agent_artifacts(run_dir)
         agent_result = dataclasses.replace(
@@ -1250,191 +1297,6 @@ class Orchestrator:
         if tree_after_agent == tree_before_agent:
             state = store.record_failure("AGENT_NO_CHANGE")
             return RunResult(run_dir, RunStatus.FAILED, state)
-
-        p25 = False
-        revision_result = None
-        if p25:
-            # Freeze the complete Luna candidate before asking Claude to
-            # inspect it.  The pre-check result is evidence, not a terminal
-            # verdict, unless an integrity boundary was violated.
-            stage_all(info.worktree)
-            tree_before_revision = candidate_tree_sha(info.worktree)
-            store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
-            pre_evidence = collect_evidence(
-                info.worktree, base_sha, self.config,
-                evidence_dir=run_dir / "revision", secrets=self._secrets,
-                check_failures_hard=False,
-            )
-            pre_hard = _hard_integrity_failures(pre_evidence)
-            mutable_scope = sorted({
-                path
-                for step in plan.steps
-                for path in (*step.write_set, *step.create_set, *step.delete_set)
-            })
-            atomic_write_text(run_dir / "revision" / "scope.json", _json_text({
-                "approved_mutable_scope": mutable_scope,
-                "source": "union of all initial plan WRITE_SET, CREATE_SET, DELETE_SET",
-            }))
-            atomic_write_text(run_dir / "revision" / "pre_checks.json", _json_text({
-                "checks": _check_payload(pre_evidence),
-                "failures": list(pre_evidence.failures),
-                "deterministic_passed": pre_evidence.deterministic_passed,
-                "staged_tree_sha": pre_evidence.staged_tree_sha,
-            }))
-            if pre_hard:
-                return self._v2_failed(store, run_dir, pre_hard[0].split(":", 1)[0], None,
-                                       ", ".join(pre_hard))
-            contracts = "\n\n".join(
-                read_approved_step_contract(run_dir, bundle, step.id)
-                for step in plan.steps
-            )
-            changed_files_before = "\n".join(changed_paths_between_trees(repo, base_tree_sha, tree_before_revision))
-            pre_checks_text = _json_text({
-                "checks": _check_payload(pre_evidence),
-                "failures": list(pre_evidence.failures),
-                "deterministic_passed": pre_evidence.deterministic_passed,
-            })
-            revision_prompt = _revision_prompt(
-                repository_reference=repository_reference,
-                spec=spec,
-                plan=plan,
-                contracts=contracts,
-                luna_reports=_step_reports_text(self._last_v2_step_results),
-                changed_files=changed_files_before,
-                diff=pre_evidence.diff,
-                pre_checks=pre_checks_text,
-                mutable_scope=_json_text(mutable_scope),
-            )
-            store.update(status=RunStatus.REVISING, current_step=None)
-            _persist_revision_tree(run_dir, "tree_before.txt", tree_before_revision)
-            try:
-                revision_result = self._run_revision(selection, info.worktree, run_dir, revision_prompt)
-            except ClaudeCommittedError as exc:
-                self._redact_revision_artifacts(run_dir)
-                return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None,
-                                       redact(str(exc), self._secrets))
-            except (ClaudeAgentError, ClaudeRuntimeError) as exc:
-                self._redact_revision_artifacts(run_dir)
-                return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None,
-                                       redact(str(exc), self._secrets))
-            claude_auth_failure = _claude_auth_failure(run_dir, revision_result.stderr_tail)
-            self._redact_revision_artifacts(run_dir)
-            revision_result = dataclasses.replace(
-                revision_result,
-                final_message=redact(revision_result.final_message, self._secrets),
-                stderr_tail=redact(revision_result.stderr_tail, self._secrets),
-            )
-            revision_ownership = _git_ownership(repo, info.worktree)
-            if revision_ownership.head != base_sha:
-                return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None,
-                                       "Claude changed HEAD")
-            revision_violations = _ownership_violations(
-                ownership_before, revision_ownership,
-                branch_ref=branch_ref, base_sha=base_sha,
-            )
-            if revision_violations:
-                return self._v2_failed(store, run_dir, "AGENT_GIT_VIOLATION", None,
-                                       "; ".join(revision_violations))
-            if revision_result.timed_out:
-                return self._v2_failed(store, run_dir, "CLAUDE_TIMEOUT", None)
-            if revision_result.exit_code != 0:
-                return self._v2_failed(
-                    store, run_dir,
-                    "CLAUDE_AUTH_FAILURE" if claude_auth_failure else "CLAUDE_FAILED",
-                    None, "Claude Code revision failed",
-                )
-            stage_all(info.worktree)
-            tree_after_revision = candidate_tree_sha(info.worktree)
-            _persist_revision_tree(run_dir, "tree_after.txt", tree_after_revision)
-            changed_by_revision = changed_paths_between_trees(
-                repo, tree_before_revision, tree_after_revision
-            )
-            outside_scope = [path for path in changed_by_revision if path not in set(mutable_scope)]
-            revision_status = "NO_CHANGE" if tree_after_revision == tree_before_revision else "COMPLETED"
-            revision_usage = normalize_usage(revision_result.usage)
-            atomic_write_text(run_dir / "revision" / "usage.json", _json_text(revision_usage))
-            revision_state = {
-                "profile_id": selection.reviser.profile_id,
-                "status": revision_status,
-                "tree_before": tree_before_revision,
-                "tree_after": tree_after_revision,
-                "usage": revision_usage,
-            }
-            atomic_write_text(run_dir / "revision" / "report.json", _json_text({
-                **revision_state,
-                "final": _bounded_report(revision_result.final_message),
-                "stderr_tail": revision_result.stderr_tail,
-                "changed_paths": list(changed_by_revision),
-            }))
-            store.update(status=RunStatus.REVISING, revision=revision_state)
-            if outside_scope:
-                return self._v2_failed(store, run_dir, "REVISION_SCOPE_VIOLATION", None,
-                                       f"unexpected={_paths_detail(outside_scope)}")
-        elif selection.reviser is not None:
-            store.update(status=RunStatus.REVISING)
-            revision_prompt = (
-                "Review and correct the Luna implementation in this worktree.\n\n"
-                "<AUTHORITATIVE IMPLEMENTATION CONTRACT>\n"
-                f"{implementation_contract}\n"
-                "</AUTHORITATIVE IMPLEMENTATION CONTRACT>\n\n"
-                "Inspect the actual files and make only necessary semantic or integration corrections.\n"
-                "Luna report (non-authoritative):\n"
-                f"{_bounded_report(agent_result.final_message)}"
-            )
-            try:
-                revision_result = self._run_revision(
-                    selection, info.worktree, run_dir, revision_prompt
-                )
-            except ClaudeCommittedError as exc:
-                self._redact_revision_artifacts(run_dir)
-                state = store.record_failure("CLAUDE_COMMITTED", redact(str(exc), self._secrets))
-                return RunResult(run_dir, RunStatus.FAILED, state)
-            except (ClaudeAgentError, ClaudeRuntimeError) as exc:
-                self._redact_revision_artifacts(run_dir)
-                state = store.record_failure(
-                    "CLAUDE_FAILED", redact(str(exc), self._secrets)
-                )
-                return RunResult(run_dir, RunStatus.FAILED, state)
-            claude_auth_failure = _claude_auth_failure(
-                run_dir, revision_result.stderr_tail
-            )
-            self._redact_revision_artifacts(run_dir)
-            revision_result = dataclasses.replace(
-                revision_result,
-                final_message=redact(revision_result.final_message, self._secrets),
-                stderr_tail=redact(revision_result.stderr_tail, self._secrets),
-            )
-            store.update(
-                status=RunStatus.REVISING,
-                revision=_agent_payload(
-                    revision_result,
-                    auth_failure=claude_auth_failure,
-                    provider="Claude Code",
-                    safe_stderr=True,
-                ),
-            )
-            if revision_result.timed_out:
-                state = store.record_failure("CLAUDE_TIMEOUT")
-                return RunResult(run_dir, RunStatus.FAILED, state)
-            if revision_result.exit_code != 0:
-                reason = "CLAUDE_AUTH_FAILURE" if claude_auth_failure else "CLAUDE_FAILED"
-                state = store.record_failure(reason, "Claude Code revision failed")
-                return RunResult(run_dir, RunStatus.FAILED, state)
-            revision_ownership = _git_ownership(repo, info.worktree)
-            revision_violations = _ownership_violations(
-                ownership_before,
-                revision_ownership,
-                branch_ref=branch_ref,
-                base_sha=base_sha,
-            )
-            if revision_violations:
-                reason = (
-                    "CLAUDE_COMMITTED"
-                    if revision_ownership.head != base_sha
-                    else "AGENT_GIT_VIOLATION"
-                )
-                state = store.record_failure(reason, "; ".join(revision_violations))
-                return RunResult(run_dir, RunStatus.FAILED, state)
 
         store.update(status=RunStatus.VALIDATING)
         reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
@@ -1489,9 +1351,7 @@ class Orchestrator:
             "\n".join(evidence.changed_files),
             evidence.diff,
             checks_text,
-            _bounded_report(
-                revision_result.final_message if revision_result is not None else agent_result.final_message
-            ),
+            _bounded_report(agent_result.final_message),
             # The deterministic gate is evaluated cumulatively below.  Passing
             # it here allows a reviewer PASS to remain a useful diagnostic on
             # a failed check, as required by V0.
@@ -1572,23 +1432,10 @@ class Orchestrator:
     ) -> RunResult:
         """Execute a v2 bundle: one worktree, fresh Codex process per step."""
 
-        # P25 is enabled only when the configuration explicitly provides the
-        # complete two-cycle authority.  Older P24 configurations remain
-        # readable/executable through the V3 compatibility path.
-        has_cycle_profile = bool(
-            self.config.ui.default_reviser_profile
-            or self.config.ui.default_repair_profile
-        )
-        if has_cycle_profile and not (
-            self.config.ui.default_reviser_profile
-            and self.config.ui.default_repair_profile
-        ):
-            raise ExecutionSelectionError(
-                "new META PLAN v2 runs require reviser and repair profiles"
-            )
-        p25 = has_cycle_profile
-        if p25 and self.config.revision.max_cycles != 2:
-            raise ExecutionSelectionError("revision.max_cycles must be exactly 2")
+        # The configuration is the only authority for P25/P26.  It was fully
+        # cross-validated at load time; profiles in the catalogue never
+        # enable Claude or C02 implicitly.
+        revision_enabled = self.config.revision.enabled
 
         planner_profile_id = store.load()["execution"]["planner"]["profile_id"]
         planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
@@ -1662,7 +1509,8 @@ class Orchestrator:
                 state = store.update(status=RunStatus.PLAN_REJECTED)
                 return RunResult(run_dir, RunStatus.PLAN_REJECTED, state)
             try:
-                if p25:
+                if revision_enabled:
+                    # Schema 4 only: a v3 approval is never a fallback.
                     selection, execution_sha = read_execution_selection_v4_with_sha256(run_dir)
                     validate_execution_selection_v4(self.config, selection)
                 else:
@@ -1679,7 +1527,7 @@ class Orchestrator:
             except (ExecutionSelectionError, ApprovalError, OSError, UnicodeError) as exc:
                 raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
         else:
-            if p25:
+            if revision_enabled:
                 requested = resolve_execution_selection_v4(
                     self.config,
                     planner_profile_id=planner_profile_id,
@@ -1695,7 +1543,6 @@ class Orchestrator:
                     planner_profile_id=planner_profile_id,
                     step_profile_ids={step.id: step.implementer_profile for step in plan.steps},
                     reviewer_profile_id=plan.reviewer_profile or self.config.ui.default_reviewer_profile or "legacy-reviewer",
-                    reviser_profile_id=self.config.ui.default_reviser_profile,
                 )
                 selection = ensure_execution_selection_v3(run_dir, requested)
             durable_identity = compute_plan_identity_from_run(run_dir)
@@ -1717,21 +1564,30 @@ class Orchestrator:
             raise ExecutionSelectionError("execution selection planner is not the run planner")
         if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
             raise ExecutionSelectionError("execution selection steps do not match the plan")
-        if p25:
+        if revision_enabled:
+            if not isinstance(selection, ExecutionSelectionV4) or selection.schema_version != 4:
+                raise ExecutionSelectionError("revision.enabled requires execution selection schema 4")
             validate_execution_selection_v4(self.config, selection)
         else:
             validate_execution_selection_v3(self.config, selection)
+            if selection.reviser is not None:
+                # A historical v3 snapshot carrying a reviser would launch
+                # Claude while revision is disabled: fail closed instead.
+                raise ExecutionSelectionError(
+                    "execution selection contains a reviser but revision is disabled"
+                )
         self._last_selection = selection
-        execution_state = {
+        execution_state: dict[str, Any] = {
             "planner": asdict(selection.planner),
             "steps": [
                 {"step_id": item.step_id, "implementer": asdict(item.implementer)}
                 for item in selection.steps
             ],
-            "reviewer": asdict(selection.reviewer),
         }
-        if selection.reviser is not None:
+        if isinstance(selection, ExecutionSelectionV4):
             execution_state["reviser"] = asdict(selection.reviser)
+            execution_state["repair_implementer"] = asdict(selection.repair_implementer)
+        execution_state["reviewer"] = asdict(selection.reviewer)
         store.update(status=RunStatus.PLANNING, execution=execution_state,
                      plan_identity=asdict(durable_identity))
 
@@ -1767,6 +1623,10 @@ class Orchestrator:
         if candidate_tree != base_tree_sha:
             raise OrchestrationError("initial candidate tree does not match base")
         codex_home = prepare_codex_home(self.config)
+        forbidden_env_names = (
+            planner_profile.api_key_env,
+            profile_for_role(self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER).api_key_env,
+        )
         step_items = {item.step_id: item for item in selection.steps}
         state_steps = [
             {"id": step.id, "title": step.title, "status": "waiting",
@@ -1782,99 +1642,35 @@ class Orchestrator:
             selected_step = step_items.get(step.id)
             if selected_step is None:
                 raise ExecutionSelectionError(f"missing selection for {step.id}")
-            profile = profile_for_role(self.config, selected_step.implementer.profile_id, ExecutionRole.IMPLEMENTER)
-            step_dir = run_dir / "steps" / step.id
-            step_dir.mkdir(parents=True, exist_ok=True)
             # The approved file is the executed file: its bytes are re-hashed
             # against the validated bundle and never re-rendered or rewritten.
             try:
                 contract = read_approved_step_contract(run_dir, bundle, step.id)
             except (V2PlanParseError, OSError, UnicodeError) as exc:
                 raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
-            before_tree = candidate_tree_sha(info.worktree)
-            drift = self._step_contract_drift(repo, before_tree, expected_tree, step)
-            if drift:
-                return self._v2_failed(store, run_dir, "STEP_CONTRACT_DRIFT", step.id, drift,
-                                       profile_id=profile.id, tree_before=before_tree)
             store.update(status=RunStatus.IMPLEMENTING, current_step=step.id,
                          steps=[{**item, "status": "running" if item["id"] == step.id else item["status"]}
                                 for item in state_steps])
-            agent = self._agent_for_profile(profile.id)
-            agent_config = dataclasses.replace(
-                build_agent_config(profile), env_allowlist=self.config.agent.env_allowlist)
-            agent_environment = build_agent_environment(
-                agent_config, source_environment=self._runtime_environment,
-                codex_home=codex_home,
-                forbidden_names=(planner_profile.api_key_env,
-                                 profile_for_role(self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER).api_key_env),
-            )
             try:
-                if hasattr(agent, "run_step"):
-                    result = agent.run_step(contract, info.worktree, step_dir,
-                                           base_sha=base_sha, env=agent_environment)
-                else:
-                    # Test doubles from the v1 API may only expose run(); the
-                    # production CodexAgent always takes the step path above.
-                    result = agent.run(build_implementer_step_prompt(contract), info.worktree,
-                                       step_dir, base_sha=base_sha, env=agent_environment)
-            except AgentCommittedError as exc:
-                self._redact_step_artifacts(step_dir)
-                return self._v2_failed(store, run_dir, "AGENT_COMMITTED", step.id,
-                                       redact(str(exc), self._secrets),
-                                       profile_id=profile.id, tree_before=before_tree)
-            self._redact_step_artifacts(step_dir)
-            result = dataclasses.replace(result,
-                                         final_message=redact(result.final_message, self._secrets),
-                                         stderr_tail=redact(result.stderr_tail, self._secrets))
-            usage = normalize_usage(result.usage)
-            self._v2_usage_rows.append({"id": step.id, **usage})
-            failed_step = {"usage": usage, "profile_id": profile.id, "tree_before": before_tree}
-            ownership_after = _git_ownership(repo, info.worktree)
-            if ownership_after.head != base_sha:
-                return self._v2_failed(store, run_dir, "AGENT_COMMITTED", step.id,
-                                       "worktree HEAD changed", **failed_step)
-            violations = _ownership_violations(ownership_before, ownership_after,
-                                                branch_ref=branch_ref, base_sha=base_sha)
-            if violations:
-                return self._v2_failed(store, run_dir, "AGENT_GIT_VIOLATION", step.id, violations,
-                                       **failed_step)
-            if result.timed_out:
-                return self._v2_failed(store, run_dir, "AGENT_TIMEOUT", step.id, **failed_step)
-            if result.exit_code != 0:
-                if _codex_auth_failure(run_dir, result.stderr_tail, step_id=step.id):
-                    return self._v2_failed(
-                        store, run_dir, "CODEX_AUTH_FAILURE", step.id,
-                        "Codex authentication failed", **failed_step
-                    )
-                return self._v2_failed(store, run_dir, "AGENT_FAILED", step.id,
-                                        f"exit status {result.exit_code}", **failed_step)
-            stage_all(info.worktree)
-            frozen_tree = index_tree_sha(info.worktree)
-            if frozen_tree == before_tree:
-                return self._v2_failed(store, run_dir, "AGENT_NO_CHANGE", step.id, **failed_step)
-            # Git, not the prompt, is the scope barrier: every changed path
-            # must be authorized by this step's WRITE, CREATE or DELETE set.
-            changed_paths = changed_paths_between_trees(repo, before_tree, frozen_tree)
-            allowed = {*step.write_set, *step.create_set, *step.delete_set}
-            unexpected = [path for path in changed_paths if path not in allowed]
-            if unexpected:
-                return self._v2_failed(
-                    store, run_dir, "STEP_WRITE_SET_VIOLATION", step.id,
-                    f"unexpected={_paths_detail(unexpected)}",
-                    **failed_step, tree_after=frozen_tree,
+                outcome = self._execute_codex_step(
+                    repo=repo, worktree=info.worktree, base_sha=base_sha,
+                    branch_ref=branch_ref, ownership_before=ownership_before,
+                    expected_tree=expected_tree, step=step, contract=contract,
+                    profile_id=selected_step.implementer.profile_id,
+                    artifact_dir=run_dir / "steps" / step.id,
+                    codex_home=codex_home, forbidden_env_names=forbidden_env_names,
                 )
-            expected_tree = frozen_tree
-            step_result = {
-                "id": step.id, "status": "COMPLETED", "profile_id": profile.id,
-                "tree_before": before_tree, "tree_after": frozen_tree,
-                "changed_paths": list(changed_paths),
-                "usage": usage,
-            }
-            atomic_write_text(step_dir / "step.json", _json_text(step_result))
-            self._last_v2_step_results.append({**step_result, "final": _bounded_v2_report(result.final_message)})
+            except StepExecutionFailure as failure:
+                if failure.usage is not None:
+                    self._v2_usage_rows.append({"id": step.id, **failure.usage})
+                return self._step_failed(store, run_dir, failure, run_dir / "steps" / step.id)
+            self._v2_usage_rows.append({"id": step.id, **outcome.usage})
+            expected_tree = outcome.tree_after
+            self._last_v2_step_results.append(_step_result_record(outcome))
             state_steps = [
-                {**item, "status": "completed", "usage": usage,
-                 "input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}
+                {**item, "status": "completed", "usage": outcome.usage,
+                 "input_tokens": outcome.usage["input_tokens"],
+                 "output_tokens": outcome.usage["output_tokens"]}
                 if item["id"] == step.id else item
                 for item in state_steps
             ]
@@ -1882,7 +1678,8 @@ class Orchestrator:
                          agent_usage=self._v2_agent_usage())
 
         revision_result = None
-        if p25:
+        revision_report_c01 = ""
+        if revision_enabled:
             try:
                 revision_result, revision_error = self._run_v2_revision_cycle(
                     store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
@@ -1901,138 +1698,53 @@ class Orchestrator:
                                        redact(str(exc), self._secrets))
             if revision_error is not None:
                 return self._v2_failed(store, run_dir, revision_error, None)
+            if revision_result is not None:
+                revision_report_c01 = _revision_report_text(revision_result, run_dir / "revision")
             self._cycle_update(
-                store, 1, status="completed", claude_revision_report=revision_result.final_message if revision_result else "",
+                store, 1, status="completed",
+                claude_revision_report=revision_result.final_message if revision_result else "",
             )
-        elif selection.reviser is not None:
-            store.update(status=RunStatus.REVISING, current_step=None)
-            revision_prompt = (
-                "Review and correct the completed Luna implementation steps in this worktree.\n\n"
-                "<AUTHORITATIVE PLAN>\n"
-                f"{plan.raw}\n"
-                "</AUTHORITATIVE PLAN>\n\n"
-                "The harness will run all deterministic checks after your edits.\n"
-                "Luna reports (non-authoritative):\n"
-                f"{_step_reports_text(self._last_v2_step_results)}"
-            )
-            try:
-                revision_result = self._run_revision(
-                    selection, info.worktree, run_dir, revision_prompt
-                )
-            except ClaudeCommittedError as exc:
-                self._redact_revision_artifacts(run_dir)
-                return self._v2_failed(
-                    store, run_dir, "CLAUDE_COMMITTED", None,
-                    redact(str(exc), self._secrets)
-                )
-            except (ClaudeAgentError, ClaudeRuntimeError) as exc:
-                self._redact_revision_artifacts(run_dir)
-                return self._v2_failed(
-                    store, run_dir, "CLAUDE_FAILED", None,
-                    redact(str(exc), self._secrets)
-                )
-            claude_auth_failure = _claude_auth_failure(run_dir, revision_result.stderr_tail)
-            self._redact_revision_artifacts(run_dir)
-            revision_result = dataclasses.replace(
-                revision_result,
-                final_message=redact(revision_result.final_message, self._secrets),
-                stderr_tail=redact(revision_result.stderr_tail, self._secrets),
-            )
-            store.update(
-                status=RunStatus.REVISING,
-                revision=_agent_payload(
-                    revision_result,
-                    auth_failure=claude_auth_failure,
-                    provider="Claude Code",
-                    safe_stderr=True,
-                ),
-            )
-            if revision_result.timed_out:
-                return self._v2_failed(store, run_dir, "CLAUDE_TIMEOUT", None)
-            if revision_result.exit_code != 0:
-                return self._v2_failed(
-                    store, run_dir,
-                    "CLAUDE_AUTH_FAILURE" if claude_auth_failure else "CLAUDE_FAILED",
-                    None,
-                    "Claude Code revision failed",
-                )
-            revision_ownership = _git_ownership(repo, info.worktree)
-            revision_violations = _ownership_violations(
-                ownership_before,
-                revision_ownership,
-                branch_ref=branch_ref,
-                base_sha=base_sha,
-            )
-            if revision_violations:
-                return self._v2_failed(
-                    store,
-                    run_dir,
-                    "CLAUDE_COMMITTED" if revision_ownership.head != base_sha else "AGENT_GIT_VIOLATION",
-                    None,
-                    "; ".join(revision_violations),
-                )
 
         store.update(
-            status=RunStatus.REVALIDATING if p25 else RunStatus.VALIDATING,
+            status=RunStatus.REVALIDATING if revision_enabled else RunStatus.VALIDATING,
             current_step=None,
         )
         evidence = collect_evidence(info.worktree, base_sha, self.config,
                                     evidence_dir=run_dir, secrets=self._secrets,
-                                    check_failures_hard=not p25)
+                                    check_failures_hard=not revision_enabled)
         store.update(status=RunStatus.VALIDATING, checks=_check_payload(evidence),
                      staged_tree_sha=evidence.staged_tree_sha,
                      changed_files=list(evidence.changed_files),
                      deterministic_gate={"passed": evidence.deterministic_passed,
                                          "failures": list(evidence.failures)})
-        integrity_failures = _hard_integrity_failures(evidence) if p25 else [item for item in evidence.failures if item in _DIRECT_FAILURES or
+        integrity_failures = _hard_integrity_failures(evidence) if revision_enabled else [item for item in evidence.failures if item in _DIRECT_FAILURES or
                               any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES) or
                               item.startswith("CHECK_MUTATED:")]
         if integrity_failures:
             return self._v2_failed(store, run_dir, integrity_failures[0].split(":", 1)[0], None,
                                     ", ".join(integrity_failures))
-        gate = _json_text({"deterministic_passed": evidence.deterministic_passed,
-                           "failures": list(evidence.failures), "staged_tree_sha": evidence.staged_tree_sha})
         reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
-        reports = (
-            revision_result.final_message
-            if revision_result is not None
-            else _step_reports_text(self._last_v2_step_results)
-        )
         store.update(status=RunStatus.REVIEWING)
-        repository_state = _json_text({
-            "BASE_SHA": base_sha,
-            "HEAD_SHA": base_sha,
-            "CANDIDATE_TREE_SHA": evidence.staged_tree_sha,
-            "CHANGED_FILES": list(evidence.changed_files),
-            "GIT_STATUS": status_porcelain(info.worktree),
-        })
-        revision_report = (
-            _json_text({
-                "final": _bounded_report(revision_result.final_message),
-                "tree_before": (run_dir / "revision" / "tree_before.txt").read_text(encoding="utf-8").strip()
-                if p25 and (run_dir / "revision" / "tree_before.txt").exists() else None,
-                "tree_after": (run_dir / "revision" / "tree_after.txt").read_text(encoding="utf-8").strip()
-                if p25 and (run_dir / "revision" / "tree_after.txt").exists() else None,
-                "usage": normalize_usage(revision_result.usage),
-            })
-            if revision_result is not None else ""
-        )
-        review = reviewer.review(
-            spec, plan.raw, context, gate,
-            "\n".join(evidence.changed_files), evidence.diff,
-            _json_text(_check_payload(evidence)), reports,
-            # Keep the response parseable so the reviewer can diagnose a
-            # failed normal check; the commit gate below still makes PASS
-            # impossible when the gate is red.
-            deterministic_passed=True,
-            artifacts_dir=run_dir,
-            repository=_json_text(repository_reference_dict(repository_reference)),
-            luna_reports=_step_reports_text(self._last_v2_step_results),
-            revision_report=revision_report,
-            repository_state=repository_state,
-            iteration=1,
-            cycle_history="C01 is the initial implementation cycle.",
-        )
+        try:
+            review = self._run_v2_reviewer(
+                reviewer=reviewer, spec=spec, context=context,
+                repository_reference=repository_reference, evidence=evidence,
+                input=ReviewCycleInput(
+                    iteration=1,
+                    plan_text=plan.raw,
+                    luna_reports=_step_reports_text(self._last_v2_step_results),
+                    revision_report=revision_report_c01,
+                    cycle_history="C01 is the initial implementation cycle.",
+                ),
+                artifacts_dir=run_dir, worktree=info.worktree, base_sha=base_sha,
+            )
+        except ReviewParseError as exc:
+            # Includes PASS on a red gate: fail closed, never commit, and
+            # never turn an invalid PASS into a C02 authorization.
+            if revision_enabled:
+                self._snapshot_cycle_artifacts(run_dir)
+            return self._v2_failed(store, run_dir, "REVIEWER_OUTPUT_INVALID", None,
+                                   _bounded_parse_detail(exc))
         store.update(
             status=RunStatus.REVIEWING,
             review=_review_payload(review),
@@ -2045,17 +1757,17 @@ class Orchestrator:
             checks=_check_payload(evidence), reviewer_conclusion=_review_payload(review),
         )
         self._update_v2_usage(store, run_dir)
-        if p25:
+        if revision_enabled:
             self._snapshot_cycle_artifacts(run_dir)
         if review.verdict is ReviewVerdict.REVISE:
-            if p25 and review.route is ReviewRoute.IMPLEMENTATION:
+            if revision_enabled and review.route is ReviewRoute.IMPLEMENTATION:
                 store.update(status=RunStatus.IMPLEMENTING, cycle=2)
                 self._cycle_update(
                     store, 2, status="starting",
                     trigger="Reviewer requested one bounded implementation correction loop.",
                 )
                 try:
-                    repair_plan, repair_agent_result, _repair_revision, evidence, review = self._execute_v2_repair_cycle(
+                    repair_plan, _repair_revision, evidence, review = self._execute_v2_repair_cycle(
                         store=store, run_dir=run_dir, run_id=run_id, spec=spec,
                         repo=repo, base_sha=base_sha, context=context,
                         repository_reference=repository_reference, info=info,
@@ -2063,7 +1775,16 @@ class Orchestrator:
                         selection=selection, original_plan=plan,
                         original_bundle=bundle, cycle_1_evidence=evidence,
                         cycle_1_review=review, cycle_1_revision=revision_result,
+                        cycle_1_revision_report=revision_report_c01,
                     )
+                except StepExecutionFailure as failure:
+                    return self._step_failed(
+                        store, run_dir, failure,
+                        run_dir / "repair" / "C02" / "steps" / failure.step_id,
+                    )
+                except ReviewParseError as exc:
+                    return self._v2_failed(store, run_dir, "REVIEWER_OUTPUT_INVALID", None,
+                                           _bounded_parse_detail(exc))
                 except ClaudeCommittedError as exc:
                     self._redact_revision_artifacts(run_dir, revision_dir=run_dir / "revision" / "C02")
                     return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None, redact(str(exc), self._secrets))
@@ -2103,9 +1824,9 @@ class Orchestrator:
                     repository_reference=repository_reference,
                     cycle=2,
                 )
-            if p25 and review.route is ReviewRoute.REPLAN:
+            if revision_enabled and review.route is ReviewRoute.REPLAN:
                 return self._v2_failed(store, run_dir, "REPLAN_REQUIRED", None)
-            if p25 and review.route is ReviewRoute.HUMAN:
+            if revision_enabled and review.route is ReviewRoute.HUMAN:
                 return self._v2_failed(store, run_dir, "HUMAN_REQUIRED", None)
             write_repair_task(run_dir, fields={"route": review.route.value,
                 "review_summary": review.summary, "findings": review.findings,
@@ -2113,13 +1834,13 @@ class Orchestrator:
                 "existing_branch": info.branch, "existing_worktree": str(info.worktree), "run_id": run_id})
             return self._v2_failed(store, run_dir, "REVIEW_REVISE", None)
         if review.verdict is ReviewVerdict.FAIL:
-            if p25:
+            if revision_enabled:
                 return self._v2_failed(store, run_dir, "REVIEW_FAILED", None)
             return self._v2_failed(store, run_dir, "REVIEW_FAIL", None)
         if review.route is not ReviewRoute.NONE or not evidence.deterministic_passed:
             return self._v2_failed(store, run_dir, "REVIEW_ROUTE_NOT_NONE" if review.route is not ReviewRoute.NONE else "DETERMINISTIC_GATE_FAILED", None)
         approved_tree = self._authorize_v2_commit(plan, review, evidence, info.worktree, base_sha, branch_ref)
-        if p25:
+        if revision_enabled:
             self._cycle_update(store, 1, status="approved")
         store.update(
             status=RunStatus.APPROVED,
@@ -2139,6 +1860,198 @@ class Orchestrator:
             approved_tree=approved_tree,
             commit_sha=commit_sha,
             repository_reference=repository_reference,
+        )
+
+    def _codex_step_profile(self, profile_id: str) -> ModelProfile:
+        """The approved Codex profile of one step (initial or repair role)."""
+
+        try:
+            return profile_for_role(self.config, profile_id, ExecutionRole.IMPLEMENTER)
+        except ProfileError:
+            return profile_for_role(self.config, profile_id, ExecutionRole.REPAIR)
+
+    def _execute_codex_step(
+        self,
+        *,
+        repo: Path,
+        worktree: Path,
+        base_sha: str,
+        branch_ref: str,
+        ownership_before: GitOwnership,
+        expected_tree: str,
+        step: ImplementationStep,
+        contract: str,
+        profile_id: str,
+        artifact_dir: Path,
+        codex_home: Path,
+        forbidden_env_names: tuple[str | None, ...],
+    ) -> StepExecutionOutcome:
+        """The single authoritative execution of one Codex step (C01 and C02).
+
+        Gates run in a fixed order and every failure raises
+        :class:`StepExecutionFailure`; the caller owns the run status.  The
+        worker's final report is data only and never drives a decision.
+        """
+
+        step_id = step.id
+        # 1-2. The exact tree Codex will receive, and the contract's Git
+        # preconditions on it.
+        tree_before = candidate_tree_sha(worktree)
+        drift = self._step_contract_drift(repo, tree_before, expected_tree, step)
+        if drift:
+            raise StepExecutionFailure(
+                "STEP_CONTRACT_DRIFT", step_id, drift,
+                profile_id=profile_id, tree_before=tree_before,
+            )
+        # 3-4. Approved profile and isolated environment.
+        profile = self._codex_step_profile(profile_id)
+        agent = self._agent_for_profile(profile.id)
+        agent_config = dataclasses.replace(
+            build_agent_config(profile), env_allowlist=self.config.agent.env_allowlist
+        )
+        environment = build_agent_environment(
+            agent_config, source_environment=self._runtime_environment,
+            codex_home=codex_home, forbidden_names=forbidden_env_names,
+        )
+        # 5. One fresh Codex process for this step.
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if hasattr(agent, "run_step"):
+                result = agent.run_step(contract, worktree, artifact_dir,
+                                        base_sha=base_sha, env=environment)
+            else:
+                # Test doubles from the v1 API may only expose run(); the
+                # production CodexAgent always takes the step path above.
+                result = agent.run(build_implementer_step_prompt(contract), worktree,
+                                   artifact_dir, base_sha=base_sha, env=environment)
+        except AgentCommittedError as exc:
+            self._redact_step_artifacts(artifact_dir)
+            raise StepExecutionFailure(
+                "AGENT_COMMITTED", step_id, redact(str(exc), self._secrets),
+                profile_id=profile.id, tree_before=tree_before,
+            ) from None
+        # 6. Complete and redact the durable artifacts.
+        self._ensure_step_artifacts(artifact_dir, result)
+        self._redact_step_artifacts(artifact_dir)
+        result = dataclasses.replace(
+            result,
+            final_message=redact(result.final_message, self._secrets),
+            stderr_tail=redact(result.stderr_tail, self._secrets),
+        )
+        usage = normalize_usage(result.usage)
+        failed = {"profile_id": profile.id, "tree_before": tree_before, "usage": usage}
+        # 7. Authentication classification from fixed markers only.
+        auth_failure = _codex_auth_failure(artifact_dir / "agent.events.jsonl", result.stderr_tail)
+        # 8-9. Git ownership: HEAD, branch, branches and worktrees.
+        ownership_after = _git_ownership(repo, worktree)
+        if ownership_after.head != base_sha:
+            raise StepExecutionFailure("AGENT_COMMITTED", step_id, "worktree HEAD changed", **failed)
+        violations = _ownership_violations(
+            ownership_before, ownership_after, branch_ref=branch_ref, base_sha=base_sha
+        )
+        if violations:
+            raise StepExecutionFailure(
+                "AGENT_GIT_VIOLATION", step_id, "; ".join(violations), **failed
+            )
+        # 10-11. Process outcome.
+        if result.timed_out:
+            raise StepExecutionFailure("AGENT_TIMEOUT", step_id, **failed)
+        if result.exit_code != 0:
+            if auth_failure:
+                raise StepExecutionFailure(
+                    "CODEX_AUTH_FAILURE", step_id, "Codex authentication failed", **failed
+                )
+            raise StepExecutionFailure(
+                "AGENT_FAILED", step_id, f"exit status {result.exit_code}", **failed
+            )
+        # 12-14. Freeze the candidate; a step must change it.
+        stage_all(worktree)
+        tree_after = index_tree_sha(worktree)
+        if tree_after == tree_before:
+            raise StepExecutionFailure("AGENT_NO_CHANGE", step_id, **failed)
+        # 15-16. Git, not the prompt, is the scope barrier: every changed path
+        # must be authorized by this step's WRITE, CREATE or DELETE set.
+        changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
+        allowed = {*step.write_set, *step.create_set, *step.delete_set}
+        unexpected = [path for path in changed_paths if path not in allowed]
+        if unexpected:
+            raise StepExecutionFailure(
+                "STEP_WRITE_SET_VIOLATION", step_id,
+                f"unexpected={_paths_detail(unexpected)}", **failed, tree_after=tree_after,
+            )
+        # 17-18. Durable step record, then the outcome.
+        atomic_write_text(artifact_dir / "step.json", _json_text({
+            "id": step_id, "status": "COMPLETED", "profile_id": profile.id,
+            "tree_before": tree_before, "tree_after": tree_after,
+            "changed_paths": list(changed_paths),
+            "usage": usage,
+        }))
+        return StepExecutionOutcome(
+            step_id=step_id,
+            profile_id=profile.id,
+            tree_before=tree_before,
+            tree_after=tree_after,
+            changed_paths=tuple(changed_paths),
+            usage=usage,
+            final_report=result.final_message,
+        )
+
+    def _step_failed(
+        self, store: RunStateStore, run_dir: Path, failure: StepExecutionFailure,
+        step_dir: Path,
+    ) -> RunResult:
+        return self._v2_failed(
+            store, run_dir, failure.reason, failure.step_id, failure.detail,
+            usage=failure.usage, profile_id=failure.profile_id,
+            tree_before=failure.tree_before, tree_after=failure.tree_after,
+            step_dir=step_dir,
+        )
+
+    def _run_v2_reviewer(
+        self,
+        *,
+        reviewer: Reviewer,
+        spec: str,
+        context: str,
+        repository_reference: RepositoryReference,
+        evidence: EvidenceBundle,
+        input: ReviewCycleInput,
+        artifacts_dir: Path,
+        worktree: Path,
+        base_sha: str,
+    ) -> ReviewResult:
+        """The single reviewer evidence assembly for C01 and C02.
+
+        The gate payload, the parse argument and the later commit gate all
+        use the same actual ``evidence.deterministic_passed``.
+        """
+
+        gate = _json_text({
+            "deterministic_passed": evidence.deterministic_passed,
+            "failures": list(evidence.failures),
+            "staged_tree_sha": evidence.staged_tree_sha,
+        })
+        repository_state = _json_text({
+            "BASE_SHA": base_sha,
+            "HEAD_SHA": current_head(worktree),
+            "CANDIDATE_TREE_SHA": evidence.staged_tree_sha,
+            "CHANGED_FILES": list(evidence.changed_files),
+            "GIT_STATUS": status_porcelain(worktree),
+        })
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        return reviewer.review(
+            spec, input.plan_text, context, gate,
+            "\n".join(evidence.changed_files), evidence.diff,
+            _json_text(_check_payload(evidence)),
+            input.revision_report or input.luna_reports,
+            deterministic_passed=evidence.deterministic_passed,
+            artifacts_dir=artifacts_dir,
+            repository=_json_text(repository_reference_dict(repository_reference)),
+            luna_reports=input.luna_reports,
+            revision_report=input.revision_report,
+            repository_state=repository_state,
+            iteration=input.iteration,
+            cycle_history=input.cycle_history,
         )
 
     def _run_v2_revision_cycle(
@@ -2281,7 +2194,8 @@ class Orchestrator:
         cycle_1_evidence: EvidenceBundle,
         cycle_1_review: ReviewResult,
         cycle_1_revision: Any | None,
-    ) -> tuple[TaskPlanV2, Any, Any | None, EvidenceBundle, ReviewResult]:
+        cycle_1_revision_report: str = "",
+    ) -> tuple[TaskPlanV2, Any | None, EvidenceBundle, ReviewResult]:
         """Plan, execute, revise, check and review exactly one repair cycle."""
 
         repair_dir = run_dir / "repair" / "C02"
@@ -2373,94 +2287,31 @@ class Orchestrator:
         store.update(status=RunStatus.IMPLEMENTING, steps=state_steps, current_step=None)
         expected_tree = tree_before
         self._repair_v2_step_results = []
-        repair_agent_result: Any | None = None
         codex_home = prepare_codex_home(self.config)
+        forbidden_env_names = (planner_profile.api_key_env, reviewer_profile.api_key_env)
         for step in repair_plan.steps:
-            step_dir = repair_dir / "steps" / step.id
-            step_dir.mkdir(parents=True, exist_ok=True)
             contract = read_approved_step_contract(repair_dir, repair_bundle, step.id)
-            before_tree = candidate_tree_sha(info.worktree)
-            drift = self._step_contract_drift(repo, before_tree, expected_tree, step)
-            if drift:
-                raise OrchestrationError(f"STEP_CONTRACT_DRIFT: {step.id} {drift}")
             store.update(
                 status=RunStatus.IMPLEMENTING, current_step=step.id,
                 steps=[{**item, "status": "running" if item["id"] == step.id else item["status"]}
                        for item in state_steps],
             )
-            agent = self._agent_for_profile(selection.repair_implementer.profile_id)
-            agent_config = dataclasses.replace(
-                build_agent_config(repair_profile),
-                env_allowlist=self.config.agent.env_allowlist,
+            # Same primitive, same gates and same failure reasons as C01; a
+            # StepExecutionFailure propagates to the caller, which owns state.
+            outcome = self._execute_codex_step(
+                repo=repo, worktree=info.worktree, base_sha=base_sha,
+                branch_ref=branch_ref, ownership_before=ownership_before,
+                expected_tree=expected_tree, step=step, contract=contract,
+                profile_id=selection.repair_implementer.profile_id,
+                artifact_dir=repair_dir / "steps" / step.id,
+                codex_home=codex_home, forbidden_env_names=forbidden_env_names,
             )
-            agent_environment = build_agent_environment(
-                agent_config,
-                source_environment=self._runtime_environment,
-                codex_home=codex_home,
-                forbidden_names=(
-                    planner_profile.api_key_env,
-                    reviewer_profile.api_key_env,
-                ),
-            )
-            if hasattr(agent, "run_step"):
-                result = agent.run_step(
-                    contract, info.worktree, step_dir, base_sha=base_sha,
-                    env=agent_environment,
-                )
-            else:
-                result = agent.run(
-                    build_implementer_step_prompt(contract), info.worktree, step_dir,
-                    base_sha=base_sha, env=agent_environment,
-                )
-            self._ensure_step_artifacts(step_dir, result)
-            repair_agent_result = dataclasses.replace(
-                result,
-                final_message=redact(result.final_message, self._secrets),
-                stderr_tail=redact(result.stderr_tail, self._secrets),
-            )
-            self._redact_step_artifacts(step_dir)
-            usage = normalize_usage(repair_agent_result.usage)
-            failed_step = {
-                "usage": usage, "profile_id": repair_profile.id,
-                "tree_before": before_tree,
-            }
-            ownership_after = _git_ownership(repo, info.worktree)
-            if ownership_after.head != base_sha:
-                raise OrchestrationError("AGENT_COMMITTED")
-            violations = _ownership_violations(
-                ownership_before, ownership_after,
-                branch_ref=branch_ref, base_sha=base_sha,
-            )
-            if violations:
-                raise OrchestrationError("AGENT_GIT_VIOLATION: " + "; ".join(violations))
-            if repair_agent_result.timed_out:
-                raise OrchestrationError("AGENT_TIMEOUT")
-            if repair_agent_result.exit_code != 0:
-                raise OrchestrationError("AGENT_FAILED")
-            stage_all(info.worktree)
-            frozen_tree = index_tree_sha(info.worktree)
-            if frozen_tree == before_tree:
-                raise OrchestrationError("AGENT_NO_CHANGE")
-            changed_paths = changed_paths_between_trees(repo, before_tree, frozen_tree)
-            allowed = {*step.write_set, *step.create_set, *step.delete_set}
-            unexpected = [path for path in changed_paths if path not in allowed]
-            if unexpected:
-                raise OrchestrationError(
-                    "STEP_WRITE_SET_VIOLATION: " + _paths_detail(unexpected)
-                )
-            step_result = {
-                "id": step.id, "status": "COMPLETED", "profile_id": repair_profile.id,
-                "tree_before": before_tree, "tree_after": frozen_tree,
-                "changed_paths": list(changed_paths), "usage": usage,
-            }
-            atomic_write_text(step_dir / "step.json", _json_text(step_result))
-            self._repair_v2_step_results.append({
-                **step_result, "final": _bounded_v2_report(repair_agent_result.final_message)
-            })
-            expected_tree = frozen_tree
+            self._repair_v2_step_results.append(_step_result_record(outcome))
+            expected_tree = outcome.tree_after
             state_steps = [
-                {**item, "status": "completed", "usage": usage,
-                 "input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}
+                {**item, "status": "completed", "usage": outcome.usage,
+                 "input_tokens": outcome.usage["input_tokens"],
+                 "output_tokens": outcome.usage["output_tokens"]}
                 if item["id"] == step.id else item
                 for item in state_steps
             ]
@@ -2477,6 +2328,10 @@ class Orchestrator:
         )
         if revision_error is not None:
             raise OrchestrationError(revision_error)
+        revision_report_c02 = (
+            _revision_report_text(cycle_2_revision, run_dir / "revision" / "C02")
+            if cycle_2_revision is not None else ""
+        )
         self._cycle_update(
             store, 2, status="revised",
             repair_luna_reports=_step_reports_text(self._repair_v2_step_results),
@@ -2484,6 +2339,7 @@ class Orchestrator:
         )
         checks_dir = run_dir / "checks" / "C02"
         checks_dir.mkdir(parents=True, exist_ok=True)
+        store.update(status=RunStatus.REVALIDATING, current_step=None)
         evidence = collect_evidence(
             info.worktree, base_sha, self.config, evidence_dir=checks_dir,
             secrets=self._secrets, check_failures_hard=False,
@@ -2498,8 +2354,6 @@ class Orchestrator:
         integrity_failures = _hard_integrity_failures(evidence)
         if integrity_failures:
             raise OrchestrationError(integrity_failures[0].split(":", 1)[0])
-        review_dir = run_dir / "review" / "C02"
-        review_dir.mkdir(parents=True, exist_ok=True)
         reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
         cycle_history = _json_text({
             "C01": {
@@ -2516,29 +2370,34 @@ class Orchestrator:
                 "final_checks": _check_payload(evidence),
             },
         })
-        repository_state = _json_text({
-            "BASE_SHA": base_sha, "HEAD_SHA": current_head(info.worktree),
-            "CANDIDATE_TREE_SHA": evidence.staged_tree_sha,
-            "CHANGED_FILES": list(evidence.changed_files),
-            "GIT_STATUS": status_porcelain(info.worktree),
-        })
-        review = reviewer.review(
-            spec, repair_plan.raw, context,
-            _json_text({"deterministic_passed": evidence.deterministic_passed,
-                        "failures": list(evidence.failures),
-                        "staged_tree_sha": evidence.staged_tree_sha}),
-            "\n".join(evidence.changed_files), evidence.diff,
-            _json_text(_check_payload(evidence)),
-            _step_reports_text(self._repair_v2_step_results),
-            deterministic_passed=True, artifacts_dir=review_dir,
-            repository=_json_text(repository_reference_dict(repository_reference)),
-            luna_reports=_step_reports_text(self._repair_v2_step_results),
-            revision_report=_json_text({
-                "final": _bounded_report(cycle_2_revision.final_message) if cycle_2_revision else "",
-                "usage": normalize_usage(cycle_2_revision.usage) if cycle_2_revision else empty_usage(),
-            }),
-            repository_state=repository_state, iteration=2,
-            cycle_history=cycle_history,
+        store.update(status=RunStatus.REVIEWING, current_step=None)
+        # Reviewer #2 checks original SPEC <-> original approved architecture
+        # <-> bounded repair <-> final cumulative diff, with every report.
+        review = self._run_v2_reviewer(
+            reviewer=reviewer, spec=spec, context=context,
+            repository_reference=repository_reference, evidence=evidence,
+            input=ReviewCycleInput(
+                iteration=2,
+                plan_text=(
+                    f"ORIGINAL APPROVED PLAN\n{original_plan.raw}\n\n"
+                    f"REPAIR PLAN C02\n{repair_plan.raw}"
+                ),
+                luna_reports=(
+                    "C01 LUNA REPORTS\n"
+                    f"{_step_reports_text(self._last_v2_step_results)}\n\n"
+                    "C02 LUNA REPAIR REPORTS\n"
+                    f"{_step_reports_text(self._repair_v2_step_results)}"
+                ),
+                revision_report=(
+                    "C01 CLAUDE REVISION\n"
+                    f"{cycle_1_revision_report or 'NONE'}\n\n"
+                    "C02 CLAUDE REVISION\n"
+                    f"{revision_report_c02 or 'NONE'}"
+                ),
+                cycle_history=cycle_history,
+            ),
+            artifacts_dir=run_dir / "review" / "C02",
+            worktree=info.worktree, base_sha=base_sha,
         )
         store.update(status=RunStatus.REVIEWING, review=_review_payload(review), review_iterations=2)
         self._cycle_update(
@@ -2546,9 +2405,7 @@ class Orchestrator:
             final_checks=_check_payload(evidence),
         )
         self._update_v2_usage(store, run_dir)
-        if repair_agent_result is None:
-            raise OrchestrationError("repair cycle produced no agent result")
-        return repair_plan, repair_agent_result, cycle_2_revision, evidence, review
+        return repair_plan, cycle_2_revision, evidence, review
 
     def _redact_step_artifacts(self, step_dir: Path) -> None:
         for name in _AGENT_ARTIFACTS:
@@ -2596,7 +2453,12 @@ class Orchestrator:
         profile_id: str | None = None,
         tree_before: str | None = None,
         tree_after: str | None = None,
+        step_dir: Path | None = None,
     ) -> RunResult:
+        try:
+            self._update_v2_usage(store, run_dir)
+        except (OSError, ValueError):
+            pass
         state = store.load()
         fields = _terminal_step_fields(state, step_id)
         cycles = list(state.get("cycles") or [])
@@ -2620,7 +2482,7 @@ class Orchestrator:
                 ]
             if hasattr(self, "_v2_usage_rows"):
                 fields["agent_usage"] = self._v2_agent_usage()
-            step_dir = run_dir / "steps" / step_id
+            step_dir = step_dir or (run_dir / "steps" / step_id)
             if not (step_dir / "step.json").exists():
                 if profile_id is None:
                     state_steps = state.get("steps")
@@ -2649,7 +2511,8 @@ class Orchestrator:
         if not evidence.deterministic_passed or evidence.failures or not evidence.staged_tree_sha:
             raise CommitBoundaryError("v2 deterministic gate did not pass")
         try:
-            reparsed = parse_review(review.raw, deterministic_passed=True)
+            # Same flag as the gate payload and the reviewer parse.
+            reparsed = parse_review(review.raw, deterministic_passed=evidence.deterministic_passed)
         except ReviewParseError as exc:
             raise CommitBoundaryError(f"reviewer answer does not authorize a commit: {exc}") from exc
         if review.verdict is not ReviewVerdict.PASS or reparsed.verdict is not ReviewVerdict.PASS:

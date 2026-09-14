@@ -464,6 +464,40 @@ def _check_default(
     return value
 
 
+def _validate_revision(
+    revision: RevisionConfig,
+    planning: PlanningConfig,
+    ui: UIConfig,
+    profiles: Mapping[str, ModelProfile],
+) -> None:
+    """Cross-validate the two-cycle architecture at load time, never mid-run."""
+
+    if not revision.enabled:
+        return
+    if planning.protocol != "v2":
+        raise ConfigError("revision.enabled requires planning.protocol = 'v2'")
+    if revision.max_cycles != 2:
+        raise ConfigError("revision.max_cycles must be exactly 2")
+    for key, value in (
+        ("default_reviser_profile", ui.default_reviser_profile),
+        ("default_repair_profile", ui.default_repair_profile),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"revision.enabled requires ui.{key}")
+    reviser = profiles.get(ui.default_reviser_profile or "")
+    if reviser is None or ExecutionRole.REVISER not in reviser.roles:
+        raise ConfigError("revision reviser profile must resolve for reviser")
+    if reviser.driver is not ProfileDriver.CLAUDE_CODE:
+        raise ConfigError("revision reviser profile must use claude-code driver")
+    repair = profiles.get(ui.default_repair_profile or "")
+    if repair is None or ExecutionRole.REPAIR not in repair.roles:
+        raise ConfigError("revision repair profile must resolve for repair")
+    # C02 is "repair planner -> Luna repair step(s)": a Claude profile may
+    # carry the repair role in the catalogue, but never as this default.
+    if repair.driver is not ProfileDriver.CODEX:
+        raise ConfigError("revision repair profile must use codex driver")
+
+
 def _checks(value: Any) -> tuple[CheckConfig, ...]:
     if value is None:
         return ()
@@ -606,10 +640,15 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     )
 
     revision_data = _table(expanded, "revision")
+    unknown_revision = sorted(set(revision_data) - {"enabled", "max_cycles"})
+    if unknown_revision:
+        raise ConfigError(f"revision.{unknown_revision[0]} is not allowed")
+    revision_max_cycles = revision_data.get("max_cycles", 2)
+    if isinstance(revision_max_cycles, bool) or revision_max_cycles != 2:
+        raise ConfigError("revision.max_cycles must be exactly 2")
     revision = RevisionConfig(
-        max_cycles=_bounded_int(
-            revision_data, "max_cycles", 2, "revision", minimum=2, maximum=2
-        )
+        enabled=_bool(revision_data, "enabled", False, "revision"),
+        max_cycles=revision_max_cycles,
     )
 
     repository_data = _table(expanded, "repository")
@@ -694,28 +733,18 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             ui_data.get("default_reviewer_profile"),
             ExecutionRole.REVIEWER,
         )
+        # Reviser and repair defaults are explicit only: a profile present in
+        # the catalogue never becomes a default, and never enables revision.
         reviser_default = ui_data.get("default_reviser_profile")
         if reviser_default is not None:
             reviser_default = _check_default(
                 model_profiles, reviser_default, ExecutionRole.REVISER
             )
-        else:
-            revisers = [
-                profile.id for profile in model_profiles.values()
-                if ExecutionRole.REVISER in profile.roles
-            ]
-            reviser_default = revisers[0] if len(revisers) == 1 else None
         repair_default = ui_data.get("default_repair_profile")
         if repair_default is not None:
             repair_default = _check_default(
                 model_profiles, repair_default, ExecutionRole.REPAIR
             )
-        else:
-            repairers = [
-                profile.id for profile in model_profiles.values()
-                if ExecutionRole.REPAIR in profile.roles
-            ]
-            repair_default = repairers[0] if len(repairers) == 1 else None
         planner_profile = model_profiles[planner_default]
         reviewer_profile = model_profiles[reviewer_default]
         implementer_profile = model_profiles[implementer_default]
@@ -844,6 +873,8 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             ui_data, "enable_profile_recommendation", True, "ui"
         ),
     )
+
+    _validate_revision(revision, planning, ui, model_profiles if explicit_profiles else {})
 
     checks = _checks(expanded.get("checks", []))
     codex_runtime = _codex_runtime(

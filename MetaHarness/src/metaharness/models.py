@@ -214,11 +214,18 @@ class PlanningConfig:
 
 @dataclass(frozen=True)
 class RevisionConfig:
-    """Bounded automatic correction-loop configuration."""
+    """Bounded automatic correction-loop configuration.
 
+    ``enabled`` is the only authority for the P25/P26 Claude revision and
+    C02 repair cycle; profiles present in the catalogue never enable it.
+    """
+
+    enabled: bool = False
     max_cycles: int = 2
 
     def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("revision.enabled must be a boolean")
         if isinstance(self.max_cycles, bool) or self.max_cycles != 2:
             raise ValueError("revision.max_cycles must be exactly 2")
 

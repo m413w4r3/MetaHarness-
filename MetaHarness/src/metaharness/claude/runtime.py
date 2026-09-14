@@ -15,6 +15,7 @@ class ClaudeRuntimeError(RuntimeError):
 
 
 _EMPTY_MCP = '{\n  "mcpServers": {}\n}\n'
+MANAGED_SUBDIRECTORIES = ("home", "cache", "tmp")
 
 
 def _outside(path: Path, root: Path) -> bool:
@@ -46,6 +47,16 @@ def prepare_claude_home(config: HarnessConfig) -> Path:
     try:
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
         home.chmod(0o700)
+        # Private HOME, cache and temporary directories: Claude never sees
+        # the personal ones, and nothing is copied into them.
+        for name in MANAGED_SUBDIRECTORIES:
+            directory = home / name
+            if directory.is_symlink():
+                raise ClaudeRuntimeError(f"managed Claude {name} directory must not be a symlink")
+            directory.mkdir(exist_ok=True, mode=0o700)
+            if not directory.is_dir():
+                raise ClaudeRuntimeError(f"managed Claude {name} path is not a directory")
+            directory.chmod(0o700)
         mcp_path = home / "empty-mcp.json"
         if mcp_path.is_symlink():
             raise ClaudeRuntimeError("managed Claude MCP configuration must not be a symlink")
@@ -68,4 +79,4 @@ def prepare_claude_home(config: HarnessConfig) -> Path:
     return home
 
 
-__all__ = ["ClaudeRuntimeError", "prepare_claude_home"]
+__all__ = ["MANAGED_SUBDIRECTORIES", "ClaudeRuntimeError", "prepare_claude_home"]

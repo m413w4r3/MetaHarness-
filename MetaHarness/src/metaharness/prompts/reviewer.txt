@@ -102,6 +102,22 @@ Freeform findings and unknown, HIGH, CRITICAL, MAJOR, or BLOCKER severities
 must never be used under PASS. Any required change means REVISE.
 The VERDICT and ROUTE lines must contain exactly one value each.
 
+When REQUIRED deterministic checks are red:
+
+- PASS is forbidden.
+- If concrete implementation/test changes inside the approved architecture
+  can fix the failure, use:
+    VERDICT: REVISE
+    ROUTE: IMPLEMENTATION
+
+- If the failure proves the approved plan or architecture is wrong, use:
+    VERDICT: REVISE
+    ROUTE: REPLAN
+
+- If resolving it requires an operator/product/security decision, use:
+    VERDICT: REVISE
+    ROUTE: HUMAN
+
 Prefer compact, concrete findings over long general commentary.
 
 Use this approximate output shape:

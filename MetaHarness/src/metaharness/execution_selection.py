@@ -17,6 +17,7 @@ from .models import (
     ExecutionSelectionV3,
     ExecutionSelectionV4,
     HarnessConfig,
+    ProfileDriver,
     SelectedProfile,
     StepExecutionSelection,
 )
@@ -199,6 +200,15 @@ def resolve_execution_selection_v3(
     return ExecutionSelectionV3(SCHEMA_VERSION_V3, planner, tuple(steps), reviewer, reviser)
 
 
+def _require_cycle_drivers(reviser: Any, repair: Any) -> None:
+    """C01/C02 revision is Claude Code; the C02 repair steps are Codex."""
+
+    if reviser.driver is not ProfileDriver.CLAUDE_CODE:
+        raise ExecutionSelectionError("revision reviser profile must use claude-code driver")
+    if repair.driver is not ProfileDriver.CODEX:
+        raise ExecutionSelectionError("revision repair profile must use codex driver")
+
+
 def resolve_execution_selection_v4(
     config: HarnessConfig,
     *,
@@ -210,6 +220,10 @@ def resolve_execution_selection_v4(
 ) -> ExecutionSelectionV4:
     """Resolve the complete execution authority for a new META PLAN v2 run."""
 
+    _require_cycle_drivers(
+        profile_for_role(config, reviser_profile_id, ExecutionRole.REVISER),
+        profile_for_role(config, repair_implementer_profile_id, ExecutionRole.REPAIR),
+    )
     planner = _selected(
         profile_for_role(config, planner_profile_id, ExecutionRole.PLANNER),
         agent_env_allowlist=_env_allowlist(config, ExecutionRole.PLANNER),
@@ -726,6 +740,10 @@ def validate_execution_selection_v4(config: HarnessConfig, selection: ExecutionS
         )
         if selected != expected:
             raise ExecutionSelectionError(f"execution selection {name} profile no longer matches config")
+    _require_cycle_drivers(
+        profile_for_role(config, selection.reviser.profile_id, ExecutionRole.REVISER),
+        profile_for_role(config, selection.repair_implementer.profile_id, ExecutionRole.REPAIR),
+    )
     if not selection.steps:
         raise ExecutionSelectionError("execution selection steps are missing")
     for item in selection.steps:

@@ -41,7 +41,9 @@ class ClaudeResult:
 
 _DEFAULT_TAIL_BYTES = 16 * 1024
 _MAX_EVENT_LINE_BYTES = 8 * 1024 * 1024
-_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "XDG_CACHE_HOME")
+# Only these names are inherited; HOME, TMPDIR and XDG_CACHE_HOME are forced
+# below the managed Claude home and never taken from the parent process.
+_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TERM")
 _AUTH_FAILURE_SIGNALS = (
     "401 unauthorized",
     "unauthorized",
@@ -57,7 +59,11 @@ _AUTH_FAILURE_SIGNALS = (
 def build_claude_environment(
     source_environment: Mapping[str, str], *, claude_home: Path
 ) -> dict[str, str]:
-    """Return the only environment inherited by Claude Code."""
+    """Return the only environment inherited by Claude Code.
+
+    The personal HOME, TMPDIR, XDG directories, CODEX_HOME and every API key
+    are dropped.  The credential stays in ``CLAUDE_CONFIG_DIR``.
+    """
 
     if not isinstance(source_environment, Mapping):
         raise TypeError("source_environment must be a mapping")
@@ -67,7 +73,10 @@ def build_claude_environment(
         for name in _ALLOWLIST
         if name in source_environment and isinstance(source_environment[name], str)
     }
+    environment["HOME"] = str(home / "home")
     environment["CLAUDE_CONFIG_DIR"] = str(home)
+    environment["XDG_CACHE_HOME"] = str(home / "cache")
+    environment["TMPDIR"] = str(home / "tmp")
     return environment
 
 

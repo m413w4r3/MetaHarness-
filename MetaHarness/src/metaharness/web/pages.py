@@ -254,30 +254,15 @@ def _setup_cards(results: Any) -> str:
     return '<div class="grid">' + "".join(cards) + "</div>"
 
 
-def _cycles_section(state: dict[str, Any]) -> str:
-    cycles = state.get("cycles") if isinstance(state.get("cycles"), list) else []
-    if not cycles:
-        return ""
-    cards = []
-    for cycle in cycles:
-        if not isinstance(cycle, dict):
-            continue
-        number = cycle.get("number")
-        kind = str(cycle.get("kind", "")).upper()
-        title = f"CYCLE {number} — {kind}"
-        trigger = cycle.get("trigger")
-        extra = f'<p>{_e(trigger)}</p>' if trigger else ""
-        cards.append(f'<article class="card"><h3>{_e(title)}</h3><p>status: {_e(cycle.get("status"))}</p>{extra}<details><summary>cycle evidence</summary><pre>{_e(cycle)}</pre></details></article>')
-    return '<section><h2>CYCLES</h2><div class="grid">' + "".join(cards) + "</div></section>"
-
-
-def _profile_options(config: HarnessConfig | None, role: str, selected: Any) -> str:
+def _profile_options(
+    config: HarnessConfig | None, role: str, selected: Any, *, driver: str | None = None,
+) -> str:
     if config is None:
         return ""
     result = []
     for profile in profiles_for_config(config).values():
         item = safe_profile_metadata(profile)
-        if role in item["roles"]:
+        if role in item["roles"] and (driver is None or item["driver"] == driver):
             result.append(f'<option value="{_e(item["id"])}"{" selected" if item["id"] == selected else ""}>{_e(item["display_name"])}</option>')
     return "".join(result)
 
@@ -315,66 +300,216 @@ def _v2_approval_form(
     planner = state.get("planner") if isinstance(state.get("planner"), dict) else {}
     steps = planner.get("steps") if isinstance(planner.get("steps"), list) else state.get("steps", [])
     artifact_map = _artifact_map(artifacts)
+    metadata = (
+        {profile.id: safe_profile_metadata(profile) for profile in profiles_for_config(config).values()}
+        if config is not None else {}
+    )
     rows: list[str] = []
+    overview: list[str] = []
     for item in steps:
         if not isinstance(item, dict) or not isinstance(item.get("id"), str):
             continue
         step_id = item["id"]
         selected = item.get("recommended_profile") or item.get("profile_id")
+        meta = metadata.get(selected, {})
+        overview.append(
+            f'<li><span class="mono">{_e(step_id)}</span> → recommended '
+            f'{_profile_triplet(selected, meta.get("model_label"), meta.get("effort"))}</li>'
+        )
         rows.append(
             f'<section class="card"><h3>{_e(step_id)} — {_e(item.get("title"))}</h3>'
             f'<p>Recommended implementer: <span class="mono">{_e(selected)}</span></p>'
-            f'<label for="step-profile-{_e(step_id)}">Implementer</label>'
+            f'<label for="step-profile-{_e(step_id)}">Implementer (selected)</label>'
             f'<select id="step-profile-{_e(step_id)}" name="step_profile__{_e(step_id)}" required>'
             f'{_profile_options(config, "implementer", selected)}</select>'
             f'{_contract_block(artifact_map.get(step_id, {}))}</section>'
         )
     reviewer = planner.get("reviewer_recommendation")
-    reviser = config.ui.default_reviser_profile if config is not None else None
-    repair = config.ui.default_repair_profile if config is not None else None
-    cycle_profiles = (
-        f'<label for="reviser-profile">Reviser</label><select id="reviser-profile" name="reviser_profile" required>{_profile_options(config, "reviser", reviser)}</select>'
-        f'<label for="repair-profile">Repair implementer</label><select id="repair-profile" name="repair_profile" required>{_profile_options(config, "repair", repair)}</select>'
-        if reviser and repair else ""
-    )
+    # Revision is shown (and selectable) only when revision.enabled: all four
+    # execution families are then visible before APPROVE.  The repair
+    # implementer is its own configured default, never derived from the
+    # reviser, and only Codex profiles are offered for it.
+    cycle_profiles = ""
+    if config is not None and config.revision.enabled:
+        reviser = config.ui.default_reviser_profile
+        repair = config.ui.default_repair_profile
+        reviser_meta = metadata.get(reviser, {})
+        repair_meta = metadata.get(repair, {})
+        cycle_profiles = (
+            '<section class="card revision-profile"><h3>Reviser</h3>'
+            f'<p>Claude <span class="mono">{_e(reviser_meta.get("model_label"))}</span> · '
+            f'recommended {_profile_triplet(reviser, reviser_meta.get("model_label"), reviser_meta.get("effort"))}</p>'
+            '<label for="reviser-profile">Reviser (selected)</label>'
+            f'<select id="reviser-profile" name="reviser_profile" required>{_profile_options(config, "reviser", reviser, driver="claude-code")}</select></section>'
+            '<section class="card repair-profile"><h3>Repair implementer</h3>'
+            f'<p>Codex <span class="mono">{_e(repair_meta.get("model_label"))}</span> · '
+            f'recommended {_profile_triplet(repair, repair_meta.get("model_label"), repair_meta.get("effort"))}</p>'
+            '<label for="repair-profile">Repair implementer (selected)</label>'
+            f'<select id="repair-profile" name="repair_profile" required>{_profile_options(config, "repair", repair, driver="codex")}</select></section>'
+        )
+    execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
+    planner_selected = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
+    reviewer_meta = metadata.get(reviewer, {})
     return f'''<section class="card"><h2>Execution plan</h2>
 <p>Execution mode: <strong>{_e(planner.get("execution_mode"))}</strong></p>
 <p>Steps: {_e(len(rows))}</p>
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE">
-<h3>Planner</h3><p class="mono">{_e(state.get("execution", {}).get("planner", {}).get("profile_id") if isinstance(state.get("execution"), dict) else "—")}</p>
-{"".join(rows)}{cycle_profiles}<label for="reviewer-profile">Reviewer</label><select id="reviewer-profile" name="reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select><br><button class="approve" type="submit">APPROVE PLAN</button></form>
+<h3>Planner</h3><p class="mono">{_e(planner_selected.get("profile_id") or "—")} / {_e(planner_selected.get("model") or "—")}</p>
+<h3>Initial implementation</h3><ul class="plan-steps">{"".join(overview)}</ul>
+{"".join(rows)}{cycle_profiles}<section class="card reviewer-profile"><h3>Reviewer</h3><p>recommended {_profile_triplet(reviewer, reviewer_meta.get("model_label"), reviewer_meta.get("selection_mode"))}</p><label for="reviewer-profile">Reviewer (selected)</label><select id="reviewer-profile" name="reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select></section><br><button class="approve" type="submit">APPROVE PLAN</button></form>
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT PLAN</button></form></section>'''
+
+
+def _step_card(item: dict[str, Any], artifact: dict[str, Any]) -> str:
+    status = str(item.get("status", "waiting"))
+    icon = _STEP_ICONS.get(status, "…")
+    usage = artifact.get("usage") if isinstance(artifact.get("usage"), dict) else item.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    warning = f" · {_HIGH_CONTEXT_WARNING}" if artifact.get("high_context") else ""
+    events = artifact.get("events") if isinstance(artifact.get("events"), list) else []
+    event_items = "".join(f"<li>{_e(event)}</li>" for event in events) or '<li class="muted">No event yet.</li>'
+    reason = artifact.get("failure_reason")
+    reason_line = f'<p class="danger">failure: {_e(reason)}</p>' if reason else ""
+    return (
+        f'<details class="card step {_e(status)}"{" open" if status in {"running", "failed"} else ""}>'
+        f'<summary>{_e(item.get("id"))} {icon} — {_e(item.get("title"))} · '
+        f'{_e(usage.get("input_tokens", 0))} input / {_e(usage.get("output_tokens", 0))} output{warning}</summary>'
+        f'<p>profile: <span class="mono">{_e(item.get("profile_id"))}</span></p>'
+        f'<p>status: {_e(status)}</p>{reason_line}'
+        f'<h4>Recent events</h4><ul class="events">{event_items}</ul>'
+        f'<details><summary>contract</summary><pre>{_e(artifact.get("contract"))}</pre></details>'
+        f'<details><summary>final report</summary><pre>{_e(artifact.get("final"))}</pre></details>'
+        f'<details><summary>stderr</summary><pre>{_e(artifact.get("stderr"))}</pre></details></details>'
+    )
 
 
 def _v2_steps(state: dict[str, Any], artifacts: Any = None) -> str:
     steps = state.get("steps") if isinstance(state.get("steps"), list) else []
     if not steps:
         return '<p class="muted">No staged steps.</p>'
-    cards: list[str] = []
     artifact_map = _artifact_map(artifacts)
-    for item in steps:
-        if not isinstance(item, dict):
+    return "".join(
+        _step_card(item, artifact_map.get(item.get("id"), {}))
+        for item in steps if isinstance(item, dict)
+    )
+
+
+# Statuses during which a cycle phase is the current one (auto-opened).
+_REVISION_PHASES = frozenset({"pre_revision_validating", "revising"})
+_CHECK_PHASES = frozenset({"validating", "revalidating"})
+_REVIEW_PHASES = frozenset({"reviewing"})
+
+
+def _checks_verdict(checks: Any) -> str:
+    if not isinstance(checks, dict):
+        return "—"
+    gate = checks.get("gate") if isinstance(checks.get("gate"), dict) else {}
+    if isinstance(gate.get("passed"), bool):
+        return "PASS" if gate["passed"] else "FAIL"
+    items = checks.get("checks") if isinstance(checks.get("checks"), list) else []
+    if not items:
+        return "—"
+    required = [item for item in items if isinstance(item, dict) and item.get("required", True)]
+    passed = all(
+        item.get("exit_code") == 0 and not item.get("timed_out") and not item.get("workspace_mutated")
+        for item in required
+    )
+    return "PASS" if passed else "FAIL"
+
+
+def _cycle_revision_block(revision: Any, open_attr: str) -> str:
+    if not isinstance(revision, dict):
+        return f'<details class="card revision"{open_attr}><summary>Claude revision</summary><p class="muted">Not started.</p></details>'
+    report = revision.get("report") if isinstance(revision.get("report"), dict) else {}
+    events = revision.get("events") if isinstance(revision.get("events"), list) else []
+    event_items = "".join(f"<li>{_e(event)}</li>" for event in events) or '<li class="muted">No event yet.</li>'
+    changed = report.get("changed_paths") if isinstance(report.get("changed_paths"), list) else []
+    return (
+        f'<details class="card revision"{open_attr}><summary>Claude revision · '
+        f'{_e(report.get("status") or "running")} · {_usage_pair(revision.get("usage"))}</summary>'
+        f'<p>profile: <span class="mono">{_e(report.get("profile_id"))}</span></p>'
+        f'<p>changed paths: <span class="mono">{_e(", ".join(str(path) for path in changed) or "—")}</span></p>'
+        f'<h4>Recent events</h4><ul class="events">{event_items}</ul>'
+        f'<details><summary>revision report</summary><pre>{_e(revision.get("final"))}</pre></details>'
+        f'<details><summary>pre-revision checks</summary><pre>{_e(revision.get("pre_checks"))}</pre></details></details>'
+    )
+
+
+def _cycle_checks_block(checks: Any, open_attr: str) -> str:
+    if not isinstance(checks, dict):
+        return f'<details class="card checks"{open_attr}><summary>Checks</summary><p class="muted">Not run.</p></details>'
+    changed = checks.get("changed_files") if isinstance(checks.get("changed_files"), list) else []
+    return (
+        f'<details class="card checks"{open_attr}><summary>Checks · {_checks_verdict(checks)}</summary>'
+        f'{_check_cards(checks.get("checks"))}'
+        f'<p>Changed files</p><ul>{"".join(f"<li class=mono>{_e(path)}</li>" for path in changed) or "<li class=muted>—</li>"}</ul>'
+        f'<details><summary>Diff</summary><pre>{_e(checks.get("diff_tail"))}</pre></details></details>'
+    )
+
+
+def _cycle_review_block(number: Any, review: Any, open_attr: str) -> str:
+    title = f"Reviewer #{_e(number)}"
+    if not isinstance(review, dict):
+        return f'<details class="card review"{open_attr}><summary>{title}</summary><p class="muted">Not reviewed.</p></details>'
+    result = review.get("review") if isinstance(review.get("review"), dict) else {}
+    verdict = f'{result.get("verdict") or "—"} / {result.get("route") or "—"}'
+    return (
+        f'<details class="card review"{open_attr}><summary>{title} · {_e(verdict)}</summary>'
+        f'{_review(result)}<details><summary>reviewer.raw.md</summary><pre>{_e(review.get("raw"))}</pre></details></details>'
+    )
+
+
+def _cycle_sections(run: dict[str, Any]) -> str:
+    """CYCLE 1 — INITIAL and (when it exists) CYCLE 2 — REPAIR, never mixed."""
+
+    cycles = run.get("cycle_artifacts") if isinstance(run.get("cycle_artifacts"), list) else []
+    state = run.get("state") if isinstance(run.get("state"), dict) else {}
+    status = str(state.get("status", ""))
+    current = run.get("cycle") if run.get("cycle") in (1, 2) else 1
+    terminal = status in TERMINAL_STATUSES
+    sections: list[str] = []
+    for cycle in cycles:
+        if not isinstance(cycle, dict):
             continue
-        status = str(item.get("status", "waiting"))
-        icon = _STEP_ICONS.get(status, "…")
-        artifact = artifact_map.get(item.get("id"), {})
-        usage = artifact.get("usage") if isinstance(artifact.get("usage"), dict) else item.get("usage")
-        usage = usage if isinstance(usage, dict) else {}
-        warning = f" · {_HIGH_CONTEXT_WARNING}" if artifact.get("high_context") else ""
-        events = artifact.get("events") if isinstance(artifact.get("events"), list) else []
-        event_items = "".join(f"<li>{_e(event)}</li>" for event in events) or '<li class="muted">No event yet.</li>'
-        cards.append(
-            f'<details class="card step {_e(status)}"{" open" if status in {"running", "failed"} else ""}>'
-            f'<summary>{_e(item.get("id"))} {icon} — {_e(item.get("title"))} · '
-            f'{_e(usage.get("input_tokens", 0))} input / {_e(usage.get("output_tokens", 0))} output{warning}</summary>'
-            f'<p>profile: <span class="mono">{_e(item.get("profile_id"))}</span></p>'
-            f'<p>status: {_e(status)}</p>'
-            f'<h4>Recent events</h4><ul class="events">{event_items}</ul>'
-            f'<details><summary>contract</summary><pre>{_e(artifact.get("contract"))}</pre></details>'
-            f'<details><summary>final report</summary><pre>{_e(artifact.get("final"))}</pre></details>'
-            f'<details><summary>stderr</summary><pre>{_e(artifact.get("stderr"))}</pre></details></details>'
+        number = cycle.get("number")
+        kind = str(cycle.get("kind", "")).upper()
+        active = number == current
+        steps = cycle.get("steps") if isinstance(cycle.get("steps"), list) else []
+        cards = "".join(
+            _step_card(item, item) for item in steps if isinstance(item, dict)
+        ) or '<p class="muted">No staged steps.</p>'
+
+        def phase_open(phases: frozenset[str]) -> str:
+            return " open" if active and not terminal and status in phases else ""
+
+        failure = cycle.get("failure")
+        header_note = f' · <span class="danger">{_e(failure)}</span>' if failure else ""
+        sections.append(
+            f'<details class="card cycle cycle-{_e(number)}"{" open" if active or terminal and number == len(cycles) else ""}>'
+            f'<summary>CYCLE {_e(number)} — {_e(kind)} · {_e(cycle.get("status") or "—")}{header_note}</summary>'
+            f'{cards}'
+            f'{_cycle_revision_block(cycle.get("revision"), phase_open(_REVISION_PHASES))}'
+            f'{_cycle_checks_block(cycle.get("checks"), phase_open(_CHECK_PHASES))}'
+            f'{_cycle_review_block(number, cycle.get("review"), phase_open(_REVIEW_PHASES))}'
+            '</details>'
         )
-    return "".join(cards)
+    return "".join(sections)
+
+
+def _final_summary(run: dict[str, Any]) -> str:
+    """One line matching the FINAL cycle's checks and reviewer."""
+
+    cycles = run.get("cycle_artifacts") if isinstance(run.get("cycle_artifacts"), list) else []
+    if not cycles or not isinstance(cycles[-1], dict):
+        return ""
+    final = cycles[-1]
+    review = final.get("review") if isinstance(final.get("review"), dict) else {}
+    result = review.get("review") if isinstance(review.get("review"), dict) else {}
+    verdict = f'{result.get("verdict") or "—"} / {result.get("route") or "—"}' if result else "—"
+    return (
+        f'<p class="final-summary">Final cycle C0{_e(final.get("number"))} ({_e(final.get("kind"))}) · '
+        f'checks {_checks_verdict(final.get("checks"))} · reviewer #{_e(final.get("number"))} {_e(verdict)}</p>'
+    )
 
 
 def _usage_pair(usage: Any) -> str:
@@ -477,9 +612,16 @@ def _execution_card_v2(
     )
     reviser_approved = approved.get("reviser") if isinstance(approved.get("reviser"), dict) else execution.get("reviser", {})
     repair_approved = approved.get("repair_implementer") if isinstance(approved.get("repair_implementer"), dict) else execution.get("repair_implementer", {})
+    reviser_approved = reviser_approved if isinstance(reviser_approved, dict) else {}
+    repair_approved = repair_approved if isinstance(repair_approved, dict) else {}
+    show_cycle = bool(
+        reviser_approved or repair_approved or (config is not None and config.revision.enabled)
+    )
+    pending = "<span class=muted>pending approval</span>"
     cycle_cards = (
-        f'<article class="card"><h3>Reviser</h3><dl><dt>approved</dt><dd>{_profile_triplet(reviser_approved.get("profile_id"), reviser_approved.get("model"), reviser_approved.get("effort"))}</dd></dl></article>'
-        f'<article class="card"><h3>Repair implementer</h3><dl><dt>approved</dt><dd>{_profile_triplet(repair_approved.get("profile_id"), repair_approved.get("model"), repair_approved.get("effort"))}</dd></dl></article>'
+        f'<article class="card"><h3>Reviser</h3><dl><dt>approved</dt><dd>{_profile_triplet(reviser_approved.get("profile_id"), reviser_approved.get("model"), reviser_approved.get("effort")) if reviser_approved else pending}</dd></dl></article>'
+        f'<article class="card"><h3>Repair implementer</h3><dl><dt>approved</dt><dd>{_profile_triplet(repair_approved.get("profile_id"), repair_approved.get("model"), repair_approved.get("effort")) if repair_approved else pending}</dd></dl></article>'
+        if show_cycle else ""
     )
     approved_steps = {
         item.get("step_id"): item.get("implementer")
@@ -545,14 +687,13 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
     )
     failure_top = f'<p class="danger"><strong>FAILED: {_e(failure_reason)}</strong><br>{_e(failure_note)}<br>{_e(failure.get("detail") if isinstance(failure, dict) else "")}</p>' if status == "failed" and failure else ""
     body = f'''<main><p><a href="/">← Tous les runs</a></p>
-<header class="sticky"><h1>Run <span class="mono">{_e(run_id)}</span></h1><p>{_status_badge(status)} · updated_at <span class="mono">{_e(run.get("updated_at"))}</span></p>{failure_top}</header>
+<header class="sticky"><h1>Run <span class="mono">{_e(run_id)}</span></h1><p>{_status_badge(status)} · updated_at <span class="mono">{_e(run.get("updated_at"))}</span></p>{_final_summary(run) if is_v2 else ""}{failure_top}</header>
 {_usage_section(run)}
 {approval_forms}
-{_cycles_section(state)}
 {_publish_section(state)}
 <section><h2>PLAN</h2><details open{_section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER"))}><summary>Canonical implementation contract</summary><pre>{_e(plan.get("contract"))}</pre></details><details><summary>planner.raw.md</summary><pre>{_e(plan.get("raw"))}</pre></details><details><summary>SPEC</summary><pre>{_e(run.get("spec"))}</pre></details></section>
 <section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config) if is_v2 else _execution_card(state, config)}</section>
-<section><h2>AGENT</h2>{_agent_auth_failure_notice(run, config)}{_v2_steps(state, run.get("step_artifacts")) if is_v2 else f'<details open{_section_open(run, ("AGENT_", "CODEX_AUTH_FAILURE"))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'}</section>
+<section><h2>AGENT</h2>{_agent_auth_failure_notice(run, config)}{(_cycle_sections(run) if isinstance(run.get("cycle_artifacts"), list) and run.get("cycle_artifacts") else _v2_steps(state, run.get("step_artifacts"))) if is_v2 else f'<details open{_section_open(run, ("AGENT_", "CODEX_AUTH_FAILURE"))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'}</section>
 <section><h2>CHECKS</h2><details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
 <section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details><details><summary>reviewer.raw.md</summary><pre>{_e(run.get("reviewer_raw"))}</pre></details></section>
 <section><h2>Setup</h2><details open{_section_open(run, ("WORKSPACE_SETUP_",))}><summary>Workspace setup</summary>{_setup_cards(run.get("workspace_setup"))}</details></section>

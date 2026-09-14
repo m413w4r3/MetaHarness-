@@ -13,13 +13,20 @@ protocol = "v2"
 decomposition = "aggressive"
 single_step_max_mutable_paths = 2
 
+# Target workflow: planner -> Luna step(s) -> Claude -> reviewer ->
+# optional C02 -> final reviewer PASS -> commit -> push run branch.
+# revision.enabled is the only switch for Claude revision and C02.
+[revision]
+enabled = true
+max_cycles = 2
+
 [repository]
 remote = "origin"
 planner_remote_exploration = true
 web_url = "https://github.com/m413w4r3/AutoWork"
 
 [publish]
-enabled = false
+enabled = true
 remote = "origin"
 mode = "run-branch"
 
@@ -43,6 +50,7 @@ default_planner_profile = "planner-chatgpt"
 default_implementer_profile = "codex-luna-high"
 default_reviewer_profile = "planner-chatgpt"
 default_reviser_profile = "claude-opus-medium"
+default_repair_profile = "codex-luna-high"
 
 [context]
 always_files = ["AGENTS.md", "CLAUDE.md", "README.md"]

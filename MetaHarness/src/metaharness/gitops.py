@@ -77,7 +77,9 @@ def run_branch_web_url(reference: RepositoryReference, branch: str) -> str | Non
     validate_run_branch(branch)
     if reference.web_url is None or normalize_github_web_url(reference.web_url) is None:
         return None
-    return f"{reference.web_url}/tree/{urllib.parse.quote(branch, safe='')}"
+    # Every component was validated by _RUN_BRANCH; "/" separates components
+    # and GitHub expects it literally in /tree/<branch>.
+    return f"{reference.web_url}/tree/{urllib.parse.quote(branch, safe='/')}"
 
 
 def _git(
@@ -218,8 +220,14 @@ def build_repository_reference(
     elif explicit is not None:
         # Validate that the configured remote exists even when its display URL
         # is explicitly overridden.
-        repository_remote_url(repo, config.remote)
+        remote_web_url = normalize_github_web_url(repository_remote_url(repo, config.remote))
         web_url = _validate_explicit_web_url(explicit)
+        # A remote that is itself a GitHub URL is the local repository's
+        # identity: the planner must never be sent to a different repository.
+        if remote_web_url is not None and (
+            normalize_github_web_url(web_url) or web_url
+        ) != remote_web_url:
+            raise ValueError("repository.web_url does not match configured Git remote")
     elif config.planner_remote_exploration:
         raw = repository_remote_url(repo, config.remote)
         web_url = normalize_github_web_url(raw)

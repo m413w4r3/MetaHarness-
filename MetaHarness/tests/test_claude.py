@@ -89,9 +89,18 @@ class ClaudeTests(unittest.TestCase):
             },
             claude_home=home,
         )
+        # P28: HOME, cache and TMPDIR are forced below the managed home; the
+        # personal HOME is never inherited.
         self.assertEqual(
             environment,
-            {"PATH": "/bin", "HOME": "/personal", "LANG": "C", "CLAUDE_CONFIG_DIR": str(home)},
+            {
+                "PATH": "/bin",
+                "LANG": "C",
+                "HOME": str(home / "home"),
+                "CLAUDE_CONFIG_DIR": str(home),
+                "XDG_CACHE_HOME": str(home / "cache"),
+                "TMPDIR": str(home / "tmp"),
+            },
         )
 
     def test_exact_argv_stdin_stream_result_and_usage(self) -> None:

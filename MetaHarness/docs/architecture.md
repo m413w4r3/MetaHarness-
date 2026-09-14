@@ -88,6 +88,60 @@ check that the plan preserved the product intent and that the diff followed
 the plan. It also receives the mechanical evidence, so semantic approval
 cannot replace deterministic checks.
 
+## META PLAN v2 with revision (two bounded cycles)
+
+With `[planning] protocol = "v2"` and `[revision] enabled = true`, the run is:
+
+```text
+SPEC
+→ indexer + repo-aware planner
+→ human-approved STAGED bundle
+→ Luna steps
+→ pre-checks
+→ Claude revision
+→ final checks
+→ reviewer #1
+   ├ PASS → commit → push run branch
+   └ REVISE/IMPLEMENTATION
+       → repair planner
+       → Luna repair steps
+       → Claude revision C02
+       → checks
+       → reviewer #2
+          ├ PASS → commit → push run branch
+          └ otherwise → STOP
+```
+
+- Maximum automatic cycles = 2. Reviewer #2 `REVISE / IMPLEMENTATION` stops
+  as `REVIEW_LOOP_EXHAUSTED`; `REPLAN` and `HUMAN` stop after reviewer #1.
+- `revision.enabled` is the only activation authority. It is cross-validated
+  at load time: protocol v2, an explicit `ui.default_reviser_profile` using the
+  `claude-code` driver, an explicit `ui.default_repair_profile` using the
+  `codex` driver, `max_cycles = 2`. Without it no Claude process and no C02
+  ever start, whatever profiles exist in the catalogue.
+- Every new run then uses `execution_selection.json` schema 4 (planner, steps,
+  reviser, repair implementer, reviewer), approved in the UI with all four
+  families visible. There is no v3 fallback; `state.execution` is only a view.
+- C01 and C02 steps run through the same `_execute_codex_step` primitive, with
+  the same ordered gates and failure reasons (`STEP_CONTRACT_DRIFT`,
+  `CODEX_AUTH_FAILURE`, `AGENT_COMMITTED`, `AGENT_GIT_VIOLATION`,
+  `AGENT_TIMEOUT`, `AGENT_FAILED`, `AGENT_NO_CHANGE`,
+  `STEP_WRITE_SET_VIOLATION`). The final report never drives a decision.
+- Both reviewers go through `_run_v2_reviewer`, which passes the actual
+  `deterministic_passed` to the gate payload, to `parse_review` and to the
+  commit gate. A reviewer PASS on a red required check is an invalid answer
+  (`REVIEWER_OUTPUT_INVALID`): no commit, no push, no C02.
+- Reviewer #2 receives the original approved plan and the C02 repair plan, the
+  C01 and C02 Luna reports, the C01 and C02 Claude revisions, and the cycle
+  history.
+- Artifacts are per cycle: C01 in `steps/`, `revision/C01/`, `checks/C01/`,
+  `review/C01/` (root copies for historical runs); C02 in `repair/C02/`,
+  `revision/C02/`, `checks/C02/`, `review/C02/`. The API exposes them as
+  `cycle_artifacts`; top-level aliases describe the final cycle.
+- Publication pushes only the exact committed run branch after the final
+  reviewer PASS and a green gate: no force, no tag, no delete, never
+  `base_ref`/`main`, and never an automatic merge of the run branch.
+
 All run-state writes go through `RunStateStore`, which replaces JSON files
 atomically. The plan approval artifact is atomically published without
 replacement, so a second decision fails. No commit is created before review,

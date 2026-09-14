@@ -16,6 +16,7 @@ from metaharness.models import (  # noqa: E402
     ExecutionRole,
     ModelProfile,
     ProfileDriver,
+    RevisionConfig,
     SelectionMode,
 )
 from metaharness.orchestrator import Orchestrator  # noqa: E402
@@ -98,6 +99,9 @@ class P26Harness(MultiStepHarness):
             ui=dataclasses.replace(
                 base.ui, default_reviser_profile="reviser", default_repair_profile="repair"
             ),
+            # P28: the two-cycle mode is enabled explicitly, never inferred
+            # from the reviser/repair defaults.
+            revision=RevisionConfig(enabled=True),
         )
 
     def run_p26(self, repair_plan: str, reviews: list[str], run_id: str = "p26"):

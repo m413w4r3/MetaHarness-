@@ -65,10 +65,53 @@ CLAUDE_CONFIG_DIR="$HOME/.local/share/metaharness/claude" claude
 metaharness doctor --config examples/autowork.toml
 ```
 
-Doctor first probes `claude --help`, then follows the supported `claude auth
-status` path when that subcommand is advertised. Claude receives an empty
-managed MCP file and never inherits the personal Claude settings, hooks or
-MCP configuration.
+Doctor first probes `claude --help` (a non-zero exit is unsupported), then
+follows the supported `claude auth status` path when that subcommand is
+advertised. Each Claude check runs only after the previous one passed, so a
+Claude problem yields exactly one Claude diagnostic and never a Codex one;
+Codex authentication is reported as available, unavailable or unverifiable
+independently of Claude. Claude receives an empty managed MCP file
+(`--strict-mcp-config`) and never inherits the personal Claude settings,
+hooks or MCP configuration. Its environment is only `PATH`, `LANG`, `LC_ALL`,
+`TERM`, plus `HOME=<claude_home>/home`, `CLAUDE_CONFIG_DIR=<claude_home>`,
+`XDG_CACHE_HOME=<claude_home>/cache` and `TMPDIR=<claude_home>/tmp`; no personal
+HOME/TMPDIR, `CODEX_HOME` or API key is passed, and no user file is copied.
+Claude Code is configuration-isolated and Git-scope-enforced; it is not an
+independent network sandbox.
+
+## Two-cycle pipeline and publication
+
+`examples/autowork.toml` enables the full target workflow:
+
+```toml
+[revision]
+enabled = true
+max_cycles = 2
+
+[publish]
+enabled = true
+remote = "origin"
+mode = "run-branch"
+```
+
+```text
+SPEC → indexer + repo-aware planner → human-approved STAGED bundle
+→ Luna steps → pre-checks → Claude revision → final checks → reviewer #1
+   ├ PASS → commit → push run branch
+   └ REVISE/IMPLEMENTATION → repair planner → Luna repair steps
+       → Claude revision C02 → checks → reviewer #2
+          ├ PASS → commit → push run branch
+          └ otherwise → STOP
+```
+
+Maximum automatic cycles = 2. The push happens once, after the final reviewer
+PASS and the exact-tree commit gate; it never pushes `base_ref`, never uses
+force, tags or deletion, and never automatically merges the run branch. A
+published run exposes the branch URL (`…/tree/harness/<plan>/<run-id>`).
+Failures specific to this mode: `REVIEW_LOOP_EXHAUSTED`, `REPLAN_REQUIRED`,
+`HUMAN_REQUIRED`, `REPAIR_PLANNER_BLOCKED`, `REPAIR_SCOPE_EXPANSION`,
+`REVISION_SCOPE_VIOLATION`, `PUSH_FAILED`. A C02 step fails with the same
+reasons as a C01 step.
 
 Reviser failures are classified as `CLAUDE_AUTH_FAILURE`, `CLAUDE_TIMEOUT`,
 `CLAUDE_FAILED`, or `CLAUDE_COMMITTED`.
@@ -132,9 +175,16 @@ With `[planning] protocol = "v2"`, the approval card shows the execution mode,
 the step count and, for every step, the recommended implementer, a profile
 dropdown and the exact `steps/Sxx/contract.md` bytes hashed in
 `implementation_bundle.json` — the same bytes each fresh Codex process
-receives. After approval each step card shows its status (✓ ✗ ▶ …), recent
-events (messages and tool names, never tool arguments) and token usage; the
-TOKEN USAGE table sums planner, Luna and reviewer tokens.
+receives. With `revision.enabled` the card also shows, before APPROVE, the
+Claude reviser and the Codex repair implementer (recommended and selected)
+next to the planner, the initial step implementers and the reviewer. After
+approval the run page renders `CYCLE 1 — INITIAL` and, only when it exists,
+`CYCLE 2 — REPAIR`, each with its own steps, Claude revision, checks and
+reviewer, read from that cycle's artifacts only. Each step card shows its
+status (✓ ✗ ▶ …), recent events (messages and tool names, never tool
+arguments) and token usage; the header summary and the CHECKS/REVIEW
+sections describe the final cycle. The TOKEN USAGE table is computed from the
+persisted `step.json` and usage artifacts of both cycles.
 
 Open the created run, read the canonical plan, then approve or reject it and
 observe Codex progress, checks and review. The UI never runs Codex or checks,

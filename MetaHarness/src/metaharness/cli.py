@@ -295,11 +295,53 @@ def _probe_claude_capabilities(
         return False, "timed out"
     except (OSError, ValueError) as exc:
         return False, type(exc).__name__
+    # A failing help command is unsupported even if its output happens to
+    # mention every flag name.
+    if result.returncode != 0:
+        return False, f"exit {result.returncode}"
     help_text = (result.stdout or "") + "\n" + (result.stderr or "")
     missing = [option for option in _CLAUDE_REQUIRED_CAPABILITIES if option not in help_text]
     if missing:
         return False, "missing required option"
     return True, None
+
+
+def _doctor_claude(config: HarnessConfig, path_value: str) -> list[str]:
+    """Check the managed Claude runtime; return at most one Claude problem.
+
+    Each check runs only when the previous one passed, so one root cause
+    yields one diagnostic, and none of them is ever reported as a Codex one.
+    """
+
+    claude = shutil.which("claude", path=path_value)
+    if not claude:
+        return ["claude binary is not resolvable"]
+    print("OK claude binary: present")
+    try:
+        claude_home = prepare_claude_home(config)
+    except ClaudeRuntimeError as exc:
+        return [str(exc)]
+    print(f"OK claude config home: {claude_home}")
+    print("OK claude MCP isolation: empty")
+    claude_environment = build_claude_environment(
+        config.runtime_environment, claude_home=claude_home
+    )
+    supported, _detail = _probe_claude_capabilities(
+        claude, claude_environment, claude_home
+    )
+    if not supported:
+        return ["unsupported Claude Code CLI for MetaHarness reviser"]
+    print("OK claude CLI capabilities: supported")
+    auth_status = check_claude_authentication(
+        claude_home, environment=claude_environment
+    )
+    if not auth_status.available:
+        return [
+            "Claude Code authentication unavailable\n"
+            f"hint: authenticate the managed Claude runtime at {claude_home}"
+        ]
+    print("OK claude authentication: available")
+    return []
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -473,49 +515,26 @@ def _doctor(config_path: Path) -> int:
                 "codex authentication is unavailable for managed CODEX_HOME\n"
                 f'hint: run CODEX_HOME="{codex_home}" codex login'
             )
-    claude_profiles = tuple(
-        profile for profile in profiles_for_config(config).values()
-        if profile.driver is ProfileDriver.CLAUDE_CODE
-    )
-    if claude_profiles:
-        claude = shutil.which("claude", path=path_value)
-        if claude:
-            print("OK claude binary: present")
-        else:
-            problems.append("claude binary is not resolvable")
-        claude_home: Path | None = None
-        try:
-            claude_home = prepare_claude_home(config)
-            print(f"OK claude config home: {claude_home}")
-            print("OK claude MCP isolation: empty")
-        except ClaudeRuntimeError as exc:
-            problems.append(str(exc))
-        if claude and claude_home is not None:
-            claude_environment = build_claude_environment(
-                config.runtime_environment, claude_home=claude_home
-            )
-            supported, detail = _probe_claude_capabilities(
-                claude, claude_environment, claude_home
-            )
-            if supported:
-                print("OK claude CLI capabilities: supported")
-            else:
-                problems.append("unsupported Claude Code CLI for MetaHarness reviser")
-            auth_status = check_claude_authentication(
-                claude_home, environment=claude_environment
-            )
-            if auth_status.available:
-                print("OK claude authentication: available")
-            else:
-                problems.append(
-                    "Claude Code authentication unavailable\n"
-                    f"hint: authenticate the managed Claude runtime at {claude_home}"
-                )
         else:
             problems.append(
                 "codex authentication could not be verified for managed CODEX_HOME\n"
                 f'hint: run CODEX_HOME="{codex_home}" codex login'
             )
+    if config.revision.enabled:
+        print(
+            "OK revision: enabled "
+            f"(max_cycles={config.revision.max_cycles}, "
+            f"reviser={config.ui.default_reviser_profile}, "
+            f"repair={config.ui.default_repair_profile})"
+        )
+    else:
+        print("OK revision: disabled")
+    claude_profiles = tuple(
+        profile for profile in profiles_for_config(config).values()
+        if profile.driver is ProfileDriver.CLAUDE_CODE
+    )
+    if claude_profiles:
+        problems.extend(_doctor_claude(config, path_value))
     for label, commands in (
         ("workspace setup", config.workspace_setup),
         ("check", config.checks),
