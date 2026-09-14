@@ -34,7 +34,9 @@ from .gitops import (
     assert_clean,
     build_repository_reference,
     git_root,
+    repository_remote_url,
     resolve_commit,
+    validate_run_branch,
 )
 from .llm.chat import validate_endpoint
 from .models import HarnessConfig, ProfileDriver, RunStatus
@@ -92,6 +94,11 @@ def _config_check(config_path: Path) -> int:
         f"{'required' if config.approval.require_plan_approval else 'disabled'} "
         f"(poll={config.approval.poll_interval_seconds:g}s)"
     )
+    print(
+        "publish: "
+        f"{'enabled' if config.publish.enabled else 'disabled'} "
+        f"(remote={config.publish.remote}, mode={config.publish.mode})"
+    )
     locator = "enabled" if config.context.locator_argv else "disabled"
     print(f"context locator: {locator}")
     print("checks: " + (", ".join(check.name for check in config.checks) or "none"))
@@ -111,7 +118,7 @@ def _run(config_path: Path, spec_path: Path, run_id: str | None) -> int:
         print(f"commit: {result.commit_sha}")
     if result.failure_reason:
         print(f"failure: {result.failure_reason}")
-    if result.status is RunStatus.COMMITTED:
+    if result.status in {RunStatus.COMMITTED, RunStatus.PUBLISHED}:
         return 0
     if result.status is RunStatus.INTERRUPTED:
         return 130
@@ -137,6 +144,10 @@ def _status(run_dir: Path) -> int:
         print("failure: " + json.dumps(state["failure"], ensure_ascii=False))
     if state.get("commit_sha"):
         print(f"commit: {state['commit_sha']}")
+    publish = state.get("publish")
+    if isinstance(publish, dict) and publish.get("status") == "pushed":
+        print(f"remote: {publish.get('remote')}")
+        print(f"branch: {publish.get('branch')}")
     return 0
 
 
@@ -354,6 +365,11 @@ def _doctor(config_path: Path) -> int:
     secrets = config_secret_values(config, config.runtime_environment)
     config_dir = config_path.expanduser().resolve().parent
     print(f"config: {config_path.expanduser().resolve()}")
+    git_executable = shutil.which("git", path=config.runtime_environment.get("PATH") or None)
+    if git_executable:
+        print("OK git executable: present")
+    else:
+        problems.append("git executable is not resolvable")
     for env_file in config.environment.files:
         try:
             label = str(env_file.relative_to(config_dir))
@@ -386,6 +402,15 @@ def _doctor(config_path: Path) -> int:
                 print("clean base: PASS")
             base_sha = resolve_commit(repo, config.base_ref)
             print(f"base: {config.base_ref} ({base_sha})")
+            if config.publish.enabled:
+                try:
+                    repository_remote_url(repo, config.publish.remote)
+                    validate_run_branch("harness/doctor/run", base_ref=config.base_ref)
+                except GitError as exc:
+                    problems.append(f"publish preflight failed: {exc}")
+                else:
+                    print(f"OK publish remote: {config.publish.remote}")
+                    print("OK publish branch namespace: harness/<plan>/<run-id>")
             if config.repository.planner_remote_exploration and (
                 config.repository_section_explicit or config.repository.web_url is not None
             ):

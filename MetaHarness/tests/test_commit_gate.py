@@ -72,7 +72,7 @@ class CommitPathStructureTests(unittest.TestCase):
             }
             used = forbidden & literals
             if path.name == "gitops.py":
-                self.assertEqual(used, {"commit-tree", "update-ref"})
+                self.assertEqual(used, {"commit-tree", "update-ref", "push"})
             else:
                 self.assertEqual(used, set(), path)
 

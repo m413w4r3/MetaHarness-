@@ -92,6 +92,7 @@ class RunStateStore:
             "cycles": [],
             "approved_tree_sha": None,
             "commit_sha": None,
+            "publish": {},
             "failure": None,
             "steps": [],
             "current_step": None,

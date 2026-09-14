@@ -26,6 +26,7 @@ interrupted worktrees are intentionally retained for inspection.
 | `reviewer.request.txt` | Exact reviewer user message (written before the call) |
 | `reviewer.raw.md` / `review.json` | Raw review (written before parsing) and normalized verdict |
 | `repair_task.md` / `repair_task.json` | REVISE only: route, summary, findings, required fixes, missing tests, branch, worktree, run id |
+| `publish.json` | Successful publication: remote name, run branch, commit SHA, optional safe GitHub branch URL |
 | `state.json` | Atomic run state and status transitions |
 | `state.lock` | Internal `flock` file serializing every state write; never served |
 | `planner.usage.json` / `reviewer.usage.json` | Token counters: `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens` (absent counters are 0) |

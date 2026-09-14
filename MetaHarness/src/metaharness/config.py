@@ -25,6 +25,7 @@ from .models import (
     LLMEndpointConfig,
     ModelProfile,
     PlanningConfig,
+    PublishConfig,
     ProfileDriver,
     RepositoryConfig,
     RevisionConfig,
@@ -623,6 +624,26 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         web_url=_repository_web_url(repository_data),
     )
 
+    publish_data = _table(expanded, "publish")
+    publish_remote = (
+        _required_string(publish_data, "remote", "publish")
+        if "remote" in publish_data else "origin"
+    )
+    if (
+        "\x00" in publish_remote
+        or any(char.isspace() for char in publish_remote)
+        or publish_remote.startswith("-")
+    ):
+        raise ConfigError("publish.remote must be a valid remote name")
+    publish_mode = publish_data.get("mode", "run-branch")
+    if not isinstance(publish_mode, str) or publish_mode != "run-branch":
+        raise ConfigError("publish.mode must be 'run-branch'")
+    publish = PublishConfig(
+        enabled=_bool(publish_data, "enabled", False, "publish"),
+        remote=publish_remote,
+        mode=publish_mode,
+    )
+
     agent_data = _table(expanded, "agent")
     provider = agent_data.get("provider", "codex")
     if provider != "codex":
@@ -892,5 +913,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         planning=planning,
         revision=revision,
         repository=repository,
+        publish=publish,
         repository_section_explicit="repository" in expanded,
     )

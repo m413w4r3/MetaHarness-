@@ -69,11 +69,11 @@ _TIMELINE = (
     ("preparing", "PREPARING"), ("implementing", "IMPLEMENTING"),
     ("pre_revision_validating", "PRE-REVISION VALIDATING"),
     ("revising", "REVISING"), ("revalidating", "REVALIDATING"), ("reviewing", "REVIEWING"),
-    ("approved", "APPROVED"), ("committed", "COMMITTED"),
+    ("approved", "APPROVED"), ("publishing", "PUBLISHING"), ("published", "PUBLISHED"),
 )
 _ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
 _TERMINAL_LABELS = {"blocked": "BLOCKED", "plan_rejected": "REJECTED", "failed": "FAILED", "interrupted": "INTERRUPTED"}
-TERMINAL_STATUSES = frozenset({"committed", *_TERMINAL_LABELS})
+TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
 AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
 # Kept as harmless compatibility constants for callers that used the former
 # polling template. The page itself contains no script and does not poll.
@@ -105,7 +105,7 @@ def _failure(value: Any) -> str:
 
 def _status_badge(status: Any) -> str:
     value = str(status or "—")
-    style = "failed" if value in {"failed", "blocked", "plan_rejected", "interrupted"} else "success" if value in {"committed", "approved"} else ""
+    style = "failed" if value in {"failed", "blocked", "plan_rejected", "interrupted"} else "success" if value in {"committed", "approved", "published"} else ""
     return f'<span class="badge {style}">{_e(value)}</span>'
 
 
@@ -142,10 +142,15 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
 def _timeline_items(status: Any) -> str:
     current = str(status or "")
     current_order = _ORDER.get(current, -1)
+    if current == "committed":
+        # Historic non-publishing runs end immediately after APPROVED.
+        current_order = _ORDER["approved"] + 1
     items = []
     for value, label in _TIMELINE:
         classes = "current" if value == current else "done" if current_order >= 0 and _ORDER.get(value, 99) < current_order else ""
         items.append(f'<li class="{classes}">{label}</li>')
+    if current == "committed":
+        items.append('<li class="current">COMMITTED</li>')
     if current in _TERMINAL_LABELS:
         items.append(f'<li class="current danger">{_TERMINAL_LABELS[current]}</li>')
     return "".join(items)
@@ -154,6 +159,25 @@ def _timeline_items(status: Any) -> str:
 def _failure_reason(run: dict[str, Any]) -> str:
     failure = run.get("failure")
     return str(failure.get("reason", "")) if isinstance(failure, dict) else str(failure or "")
+
+
+def _publish_section(state: dict[str, Any]) -> str:
+    publish = state.get("publish") if isinstance(state.get("publish"), dict) else {}
+    if not publish:
+        return ""
+    web_url = publish.get("web_url")
+    link = (
+        f'<a href="{_e(web_url)}" rel="noopener noreferrer">branch</a>'
+        if isinstance(web_url, str) and web_url.startswith("https://")
+        else _e(publish.get("branch"))
+    )
+    return (
+        '<section><h2>PUBLISH</h2><p><strong>'
+        f'{_e(str(state.get("status", "")).upper())}</strong></p>'
+        f'<dl><dt>commit</dt><dd class="mono">{_e(publish.get("commit_sha") or state.get("commit_sha"))}</dd>'
+        f'<dt>remote</dt><dd>{_e(publish.get("remote"))}</dd>'
+        f'<dt>branch</dt><dd class="mono">{link}</dd></dl></section>'
+    )
 
 
 def _section_open(run: dict[str, Any], names: tuple[str, ...]) -> str:
@@ -525,6 +549,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
 {_usage_section(run)}
 {approval_forms}
 {_cycles_section(state)}
+{_publish_section(state)}
 <section><h2>PLAN</h2><details open{_section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER"))}><summary>Canonical implementation contract</summary><pre>{_e(plan.get("contract"))}</pre></details><details><summary>planner.raw.md</summary><pre>{_e(plan.get("raw"))}</pre></details><details><summary>SPEC</summary><pre>{_e(run.get("spec"))}</pre></details></section>
 <section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config) if is_v2 else _execution_card(state, config)}</section>
 <section><h2>AGENT</h2>{_agent_auth_failure_notice(run, config)}{_v2_steps(state, run.get("step_artifacts")) if is_v2 else f'<details open{_section_open(run, ("AGENT_", "CODEX_AUTH_FAILURE"))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'}</section>

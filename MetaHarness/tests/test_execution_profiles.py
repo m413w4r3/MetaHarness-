@@ -857,8 +857,7 @@ class RuntimeSelectionTests(unittest.TestCase):
         )
         self.assertEqual(git(self.config.worktrees_root / "selected", "rev-list", "--count", "HEAD"), "2")
         body = git(self.config.worktrees_root / "selected", "log", "-1", "--format=%B")
-        self.assertIn("Implementer profile: impl-b", body)
-        self.assertIn("Reviewer profile: review-b", body)
+        self.assertEqual(body, "Add the feature\n\nMetaHarness-Run: selected")
 
     def test_fingerprint_mismatch_stops_before_worktree_agent_reviewer_and_commit(self) -> None:
         # The UI approved against one configuration; the runtime now holds a

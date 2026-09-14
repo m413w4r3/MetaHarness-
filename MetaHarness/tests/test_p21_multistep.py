@@ -462,7 +462,10 @@ class SingleAndStagedTests(MultiStepHarness):
         self.assertEqual(git(worktree, "rev-parse", "HEAD^"), self.base_sha)
         self.assertEqual(git(worktree, "rev-parse", "HEAD^{tree}"), result.state["staged_tree_sha"])
         self.assertEqual(git(worktree, "diff", "--name-only", self.base_sha, "HEAD"), "src/a.py")
-        self.assertIn("S01 implementer profile: impl-a", git(worktree, "log", "-1", "--format=%B"))
+        self.assertEqual(
+            git(worktree, "log", "-1", "--format=%B"),
+            "Staged feature\n\nMetaHarness-Run: run-1",
+        )
         self.assertEqual(result.state["steps"][0]["status"], "completed")
         self.assertIsNone(result.state["current_step"])
 
@@ -524,7 +527,10 @@ class ApprovalTests(MultiStepHarness):
         self.assertEqual(selection["steps"][1]["implementer"]["profile_id"], "impl-b")
         step_two = json.loads((run_dir / "steps" / "S02" / "step.json").read_text())
         self.assertEqual(step_two["profile_id"], "impl-b")
-        self.assertIn("S02 implementer profile: impl-b", git(self.worktree(), "log", "-1", "--format=%B"))
+        self.assertEqual(
+            git(self.worktree(), "log", "-1", "--format=%B"),
+            "Staged feature\n\nMetaHarness-Run: run-1",
+        )
         page_after = render_run(get_run(self.runs, "run-1"), "token", config=self.config_value)
         self.assertIn("approved <span class=\"mono\">impl-b / luna-b / low</span>", page_after)
 

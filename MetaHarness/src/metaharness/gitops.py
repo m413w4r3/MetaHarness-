@@ -45,6 +45,41 @@ class RepositoryReference:
     immutable_url: str | None
 
 
+@dataclass(frozen=True)
+class PushResult:
+    remote: str
+    branch: str
+    commit_sha: str
+    status: str = "pushed"
+
+
+_RUN_BRANCH = re.compile(
+    r"harness/[A-Za-z0-9][A-Za-z0-9_.-]{0,59}/[A-Za-z0-9][A-Za-z0-9_.-]*\Z"
+)
+
+
+def validate_run_branch(branch: str, *, base_ref: str | None = None) -> str:
+    """Validate the only branch namespace MetaHarness may publish."""
+
+    if not isinstance(branch, str) or _RUN_BRANCH.fullmatch(branch) is None:
+        raise GitError("run branch is outside the MetaHarness namespace")
+    forbidden = {"main", "master", "tag"}
+    if base_ref:
+        forbidden.add(base_ref)
+    if branch in forbidden:
+        raise GitError("run branch is a protected branch name")
+    return branch
+
+
+def run_branch_web_url(reference: RepositoryReference, branch: str) -> str | None:
+    """Return a credential-free GitHub branch URL when the repository is known."""
+
+    validate_run_branch(branch)
+    if reference.web_url is None or normalize_github_web_url(reference.web_url) is None:
+        return None
+    return f"{reference.web_url}/tree/{urllib.parse.quote(branch, safe='')}"
+
+
 def _git(
     repo: Path,
     *args: str,
@@ -83,7 +118,13 @@ def _git(
 def repository_remote_url(repo: Path, remote_name: str) -> str:
     """Return a configured remote URL using argv-only Git invocation."""
 
-    if not isinstance(remote_name, str) or not remote_name.strip() or "\x00" in remote_name:
+    if (
+        not isinstance(remote_name, str)
+        or not remote_name.strip()
+        or "\x00" in remote_name
+        or remote_name.startswith("-")
+        or any(char.isspace() for char in remote_name)
+    ):
         raise GitError("remote name is invalid")
     result = _git(repo, "remote", "get-url", "--", remote_name)
     url = result.stdout.strip()
@@ -751,6 +792,49 @@ def commit_reviewed_tree(
     if committed_tree != tree_sha:
         raise GitError("committed tree differs from the reviewed tree")
     return commit_sha
+
+
+def push_run_branch(
+    worktree: Path,
+    *,
+    remote: str,
+    branch: str,
+    commit_sha: str,
+) -> PushResult:
+    """Push exactly the current harness run branch, without force or tags."""
+
+    repository_remote_url(worktree, remote)
+    validate_run_branch(branch)
+    _require_object_id(commit_sha, "commit_sha")
+    if symbolic_head(worktree) != f"refs/heads/{branch}":
+        raise GitError("current branch does not match the run branch")
+    if current_head(worktree) != commit_sha:
+        raise GitError("HEAD does not match the commit to publish")
+    args = [
+        "push",
+        "--porcelain",
+        "--set-upstream",
+        remote,
+        f"HEAD:refs/heads/{branch}",
+    ]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(worktree), *args],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=600,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise GitError(f"git command failed: {type(exc).__name__}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        suffix = f": {detail}" if detail else ""
+        raise GitError(f"git push exited with {result.returncode}{suffix}")
+    return PushResult(remote=remote, branch=branch, commit_sha=commit_sha)
 
 
 def _validate_relative_path(relative_path: str) -> str:

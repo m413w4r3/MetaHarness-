@@ -18,6 +18,11 @@ remote = "origin"
 planner_remote_exploration = true
 web_url = "https://github.com/m413w4r3/AutoWork"
 
+[publish]
+enabled = false
+remote = "origin"
+mode = "run-branch"
+
 [environment]
 files = ["../../Bridges/.env.models"]
 

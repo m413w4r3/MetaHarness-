@@ -62,6 +62,7 @@ from .gitops import (
     build_repository_reference,
     render_repository_reference,
     path_exists_in_tree,
+    push_run_branch,
     registered_worktrees,
     resolve_commit,
     resolve_tree,
@@ -70,6 +71,9 @@ from .gitops import (
     status_porcelain,
     symbolic_head,
     stage_all,
+    repository_remote_url,
+    run_branch_web_url,
+    validate_run_branch,
 )
 from .llm.chat import LLMError, OpenAIChatTextClient
 from .recommendation import (
@@ -1544,10 +1548,16 @@ class Orchestrator:
             tree_sha=approved_tree,
             parent_sha=base_sha,
             subject=_commit_subject(plan.title),
-            body=self._commit_body(run_id, base_sha, approved_tree, evidence),
+            body=f"MetaHarness-Run: {run_id}",
         )
-        state = store.update(status=RunStatus.COMMITTED, commit_sha=commit_sha)
-        return RunResult(run_dir, RunStatus.COMMITTED, state)
+        return self._complete_commit(
+            store=store,
+            run_dir=run_dir,
+            info=info,
+            approved_tree=approved_tree,
+            commit_sha=commit_sha,
+            repository_reference=repository_reference,
+        )
 
     def _execute_v2(
         self,
@@ -2073,16 +2083,25 @@ class Orchestrator:
                     repair_plan, review, evidence, info.worktree, base_sha, branch_ref
                 )
                 self._cycle_update(store, 2, status="approved")
+                store.update(
+                    status=RunStatus.APPROVED,
+                    approved_tree_sha=approved_tree,
+                    current_step=None,
+                )
                 commit_fn = commit_reviewed_tree
                 commit_sha = commit_fn(
                     info.worktree, tree_sha=approved_tree, parent_sha=base_sha,
                     subject=_commit_subject(repair_plan.title),
-                    body=self._commit_body_v2(run_id, base_sha, approved_tree, evidence, selection),
+                    body=f"MetaHarness-Run: {run_id}",
                 )
-                return RunResult(
-                    run_dir, RunStatus.COMMITTED,
-                    store.update(status=RunStatus.COMMITTED, commit_sha=commit_sha,
-                                 cycle=2, current_step=None),
+                return self._complete_commit(
+                    store=store,
+                    run_dir=run_dir,
+                    info=info,
+                    approved_tree=approved_tree,
+                    commit_sha=commit_sha,
+                    repository_reference=repository_reference,
+                    cycle=2,
                 )
             if p25 and review.route is ReviewRoute.REPLAN:
                 return self._v2_failed(store, run_dir, "REPLAN_REQUIRED", None)
@@ -2102,15 +2121,25 @@ class Orchestrator:
         approved_tree = self._authorize_v2_commit(plan, review, evidence, info.worktree, base_sha, branch_ref)
         if p25:
             self._cycle_update(store, 1, status="approved")
+        store.update(
+            status=RunStatus.APPROVED,
+            approved_tree_sha=approved_tree,
+            current_step=None,
+        )
         # Keep the sole named commit primitive in the legacy guarded path;
         # this alias still resolves to the same GitOps implementation.
         commit_fn = commit_reviewed_tree
         commit_sha = commit_fn(info.worktree, tree_sha=approved_tree,
                                parent_sha=base_sha, subject=_commit_subject(plan.title),
-                               body=self._commit_body_v2(run_id, base_sha, approved_tree, evidence, selection))
-        return RunResult(run_dir, RunStatus.COMMITTED,
-                         store.update(status=RunStatus.COMMITTED, commit_sha=commit_sha,
-                                      current_step=None))
+                               body=f"MetaHarness-Run: {run_id}")
+        return self._complete_commit(
+            store=store,
+            run_dir=run_dir,
+            info=info,
+            approved_tree=approved_tree,
+            commit_sha=commit_sha,
+            repository_reference=repository_reference,
+        )
 
     def _run_v2_revision_cycle(
         self,
@@ -2636,19 +2665,104 @@ class Orchestrator:
             raise CommitBoundaryError("worktree has changes after v2 review")
         return approved
 
+    def _complete_commit(
+        self,
+        *,
+        store: RunStateStore,
+        run_dir: Path,
+        info: Any,
+        approved_tree: str,
+        commit_sha: str,
+        repository_reference: RepositoryReference,
+        cycle: int | None = None,
+    ) -> RunResult:
+        """Verify the commit tree and optionally publish the run branch once."""
+
+        fields: dict[str, Any] = {"commit_sha": commit_sha, "current_step": None}
+        if cycle is not None:
+            fields["cycle"] = cycle
+        if store.load().get("approved_tree_sha") != approved_tree:
+            state = store.record_failure(
+                "COMMIT_TREE_MISMATCH",
+                "durable approved tree differs from the commit candidate",
+                **fields,
+            )
+            return RunResult(run_dir, RunStatus.FAILED, state)
+        try:
+            committed_tree = resolve_tree(info.worktree, commit_sha)
+        except GitError as exc:
+            state = store.record_failure(
+                "COMMIT_TREE_MISMATCH",
+                "the committed object has no readable exact tree",
+                **fields,
+            )
+            return RunResult(run_dir, RunStatus.FAILED, state)
+        if committed_tree != approved_tree:
+            state = store.record_failure(
+                "COMMIT_TREE_MISMATCH",
+                "HEAD tree differs from the approved reviewed tree",
+                **fields,
+            )
+            return RunResult(run_dir, RunStatus.FAILED, state)
+
+        if not self.config.publish.enabled:
+            state = store.update(status=RunStatus.COMMITTED, **fields)
+            return RunResult(run_dir, RunStatus.COMMITTED, state)
+
+        # PUBLISHING is durable before the first and only push process starts.
+        store.update(status=RunStatus.PUBLISHING, **fields)
+        try:
+            if status_porcelain(info.worktree):
+                raise GitError("worktree is not clean before push")
+            if current_head(info.worktree) != commit_sha:
+                raise GitError("HEAD does not match the commit to publish")
+            expected_ref = f"refs/heads/{info.branch}"
+            if symbolic_head(info.worktree) != expected_ref:
+                raise GitError("current branch is not the expected run branch")
+            validate_run_branch(info.branch, base_ref=self.config.base_ref)
+            # This is deliberately a URL existence check, not a transport
+            # probe; its return value is never persisted or displayed.
+            repository_remote_url(info.worktree, self.config.publish.remote)
+            if resolve_tree(info.worktree, "HEAD") != approved_tree:
+                raise GitError("HEAD tree differs from the approved reviewed tree")
+            web_url = run_branch_web_url(repository_reference, info.branch)
+            push_run_branch(
+                info.worktree,
+                remote=self.config.publish.remote,
+                branch=info.branch,
+                commit_sha=commit_sha,
+            )
+        except (GitError, OSError, ValueError) as exc:
+            # Git transport diagnostics can contain a credential-bearing URL.
+            # Keep the durable failure bounded and secret-free.
+            state = store.record_failure(
+                "PUSH_FAILED",
+                "push did not complete",
+                **fields,
+            )
+            return RunResult(run_dir, RunStatus.FAILED, state)
+
+        publish_payload = {
+            "remote": self.config.publish.remote,
+            "branch": info.branch,
+            "commit_sha": commit_sha,
+            "web_url": web_url,
+            "status": "pushed",
+        }
+        atomic_write_text(
+            run_dir / "publish.json",
+            _json_text(publish_payload),
+        )
+        state = store.update(
+            status=RunStatus.PUBLISHED,
+            publish=publish_payload,
+            **fields,
+        )
+        return RunResult(run_dir, RunStatus.PUBLISHED, state)
+
     def _commit_body_v2(self, run_id: str, base_sha: str, tree_sha: str,
                         evidence: EvidenceBundle, selection: ExecutionSelectionV3) -> str:
-        check_lines = [f"{check.name}: {'PASS' if result.exit_code == 0 and not result.timed_out else 'FAIL'}"
-                       for check, result in zip(self.config.checks, evidence.checks)] or ["none"]
-        return "\n".join([
-            "Generated by MetaHarness.", "", f"Run: {run_id}", f"Base: {base_sha}",
-            f"Reviewed tree: {tree_sha}", "Planning protocol: v2",
-            f"Planner profile: {selection.planner.profile_id}",
-            *[f"{item.step_id} implementer profile: {item.implementer.profile_id}" for item in selection.steps],
-            f"Reviewer profile: {selection.reviewer.profile_id}",
-            *([f"Reviser profile: {selection.reviser.profile_id}"] if selection.reviser is not None else []),
-            "", "Checks:", *check_lines,
-        ])
+        return f"MetaHarness-Run: {run_id}"
 
     def _redact_agent_artifacts(self, run_dir: Path) -> None:
         for name in _AGENT_ARTIFACTS:
@@ -2668,40 +2782,7 @@ class Orchestrator:
         tree_sha: str,
         evidence: EvidenceBundle,
     ) -> str:
-        checks = self.config.checks
-        check_lines = []
-        # The body reports the deterministic result frozen in evidence; this
-        # method is only reached after all required checks passed.
-        for check, result in zip(checks, evidence.checks):
-            outcome = "PASS" if result.exit_code == 0 and not result.timed_out else "FAIL"
-            check_lines.append(f"{check.name}: {outcome}")
-        if not check_lines:
-            check_lines.append("none")
-        return "\n".join(
-            [
-                "Generated by MetaHarness.",
-                "",
-                f"Run: {run_id}",
-                f"Base: {base_sha}",
-                f"Reviewed tree: {tree_sha}",
-                f"Planner profile: {self._last_selection.planner.profile_id}",
-                f"Planner model label: {self._last_selection.planner.model}",
-                f"Planner selection: {self._last_selection.planner.selection_mode}",
-                f"Implementer profile: {self._last_selection.implementer.profile_id}",
-                f"Implementer model: {self._last_selection.implementer.model}",
-                f"Implementer effort: {self._last_selection.implementer.effort}",
-                f"Reviewer profile: {self._last_selection.reviewer.profile_id}",
-                f"Reviewer model: {self._last_selection.reviewer.model}",
-                f"Reviewer selection: {self._last_selection.reviewer.selection_mode}",
-                *([f"Reviser profile: {self._last_selection.reviser.profile_id}",
-                   f"Reviser model: {self._last_selection.reviser.model}",
-                   f"Reviser permission mode: {self._last_selection.reviser.permission_mode}"]
-                  if self._last_selection.reviser is not None else []),
-                "",
-                "Checks:",
-                *check_lines,
-            ]
-        )
+        return f"MetaHarness-Run: {run_id}"
 
 
 def _failure_reason(exc: Exception) -> str:

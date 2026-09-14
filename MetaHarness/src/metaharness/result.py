@@ -22,7 +22,11 @@ class RunResult:
 
     @property
     def committed(self) -> bool:
-        return self.status is RunStatus.COMMITTED
+        return self.status in {RunStatus.COMMITTED, RunStatus.PUBLISHED}
+
+    @property
+    def published(self) -> bool:
+        return self.status is RunStatus.PUBLISHED
 
     @property
     def commit_sha(self) -> str | None:

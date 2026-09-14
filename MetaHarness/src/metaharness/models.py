@@ -124,6 +124,8 @@ class RunStatus(StrEnum):
     REVALIDATING = "revalidating"
     REVIEWING = "reviewing"
     APPROVED = "approved"
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
     COMMITTED = "committed"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
@@ -172,6 +174,27 @@ class RepositoryConfig:
     remote: str = "origin"
     planner_remote_exploration: bool = True
     web_url: str | None = None
+
+
+@dataclass(frozen=True)
+class PublishConfig:
+    enabled: bool = False
+    remote: str = "origin"
+    mode: str = "run-branch"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("publish.enabled must be a boolean")
+        if (
+            not isinstance(self.remote, str)
+            or not self.remote.strip()
+            or any(char.isspace() for char in self.remote)
+            or "\x00" in self.remote
+            or self.remote.startswith("-")
+        ):
+            raise ValueError("publish.remote must be a valid remote name")
+        if self.mode != "run-branch":
+            raise ValueError("publish.mode must be 'run-branch'")
 
 
 @dataclass(frozen=True)
@@ -314,6 +337,7 @@ class HarnessConfig:
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     revision: RevisionConfig = field(default_factory=RevisionConfig)
     repository: RepositoryConfig = field(default_factory=RepositoryConfig)
+    publish: PublishConfig = field(default_factory=PublishConfig)
     # Compatibility marker for programmatic legacy configurations that do not
     # have a repository TOML section yet.
     repository_section_explicit: bool = field(default=False, repr=False, compare=False)
