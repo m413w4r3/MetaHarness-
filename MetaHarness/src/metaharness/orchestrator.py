@@ -11,9 +11,10 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, NoReturn
 
 from .agent.base import AgentError, AgentResult
+from .agent.diagnostics import TOKEN_DIAGNOSTICS_NAME, write_token_diagnostics
 from .agent.codex import (
     AgentCommittedError,
     CodexAgent,
@@ -34,7 +35,9 @@ from .claude.runtime import ClaudeRuntimeError, prepare_claude_home
 from .approval import (
     ApprovalDecision,
     ApprovalError,
+    PlanIdentity,
     compute_plan_identity_from_run,
+    read_plan_approval,
     wait_for_plan_approval,
 )
 from .config import load_config
@@ -49,8 +52,16 @@ from .evidence import (
     collect_evidence,
 )
 from .gitops import (
+    BaseMovedError,
+    BasePushError,
     GitError,
+    WorktreeInfo,
     assert_clean,
+    branch_exists,
+    commit_parents,
+    normalize_github_web_url,
+    publish_fast_forward_base,
+    restore_paths_from_tree,
     candidate_tree_sha,
     changed_paths_between_trees,
     commit_reviewed_tree,
@@ -75,7 +86,7 @@ from .gitops import (
     run_branch_web_url,
     validate_run_branch,
 )
-from .llm.chat import LLMError, OpenAIChatTextClient
+from .llm.chat import LLMConversationHandle, LLMError, OpenAIChatTextClient
 from .recommendation import (
     ExecutionRecommender,
     RecommendationError,
@@ -104,6 +115,7 @@ from .models import (
     ExecutionSelectionV3,
     HarnessConfig,
     ImplementationStep,
+    PublishMode,
     ReviewRoute,
     ReviewVerdict,
     RunCycle,
@@ -121,11 +133,31 @@ from .planning_v2 import (
     RepairPlannerV2,
     TaskPlanV2,
     V2PlanParseError,
+    parse_task_plan_v2,
     read_approved_step_contract,
     read_set_paths,
     validate_implementation_bundle,
 )
-from .usage import add_usage, empty_usage, normalize_usage, phase_usage_summary
+from .resume import (
+    PHASE_STATUS,
+    ResumeCheckpoint,
+    ResumeCheckpointError,
+    ResumeError,
+    ResumeIntegrityError,
+    ResumeNotAllowedError,
+    ResumePhase,
+    ResumeRequiresOperatorError,
+    load_resume_checkpoint,
+    mark_checkpoint_completed,
+    phase_index,
+    plan_identity_from_mapping,
+    read_checkpoint,
+    read_checkpoint_record,
+    resume_info,
+    resume_label,
+    write_checkpoint,
+)
+from .usage import add_usage, empty_usage, normalize_usage, phase_usage_summary, read_usage_artifact
 from .redaction import config_secret_values, redact, redact_file
 from .profiles import (
     ProfileError,
@@ -140,7 +172,7 @@ from .review import Reviewer, ReviewParseError, ReviewResult, blocking_finding_l
 from .state import RunStateStore
 from .validation import ValidationError, check_result_json
 from .workspace import WorkspaceSetupError, prepare_workspace
-from .result import atomic_write_text
+from .result import ResultArtifactError, atomic_write_text
 
 
 class OrchestrationError(RuntimeError):
@@ -286,7 +318,12 @@ def _step_reports_text(results: list[dict[str, Any]]) -> str:
 
 
 def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
-    return [check_result_json(check) for check in bundle.checks]
+    # A bundle rebuilt from ``evidence.json`` on resume carries the persisted
+    # reviewer-safe payloads instead of CheckResult objects.
+    return [
+        dict(check) if isinstance(check, Mapping) else check_result_json(check)
+        for check in bundle.checks
+    ]
 
 
 def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
@@ -297,8 +334,12 @@ def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
     still terminal integrity failures.
     """
 
+    return _hard_failure_items(bundle.failures)
+
+
+def _hard_failure_items(failures: Any) -> list[str]:
     return [
-        item for item in bundle.failures
+        item for item in failures
         if item in _DIRECT_FAILURES
         or any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES)
         or item.startswith("CHECK_MUTATED:")
@@ -633,6 +674,308 @@ def authorize_commit(
     return approved_tree
 
 
+_GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# Artifacts of one failed attempt, moved to ``attempts/NN/`` before the same
+# operation is retried so a stale report is never read as the new one.
+_ATTEMPT_ARTIFACTS = (
+    "agent.prompt.txt", "agent.events.jsonl", "agent.stderr.log", "agent.final.md",
+    "agent.result.json", "step.json", TOKEN_DIAGNOSTICS_NAME, "tree_after_failure.txt",
+)
+_PLANNER_CONVERSATION = "planner.conversation.json"
+
+
+class ReviewerTransportError(OrchestrationError):
+    """No reviewer answer was obtained: a transport failure, not a verdict."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _V2Setup:
+    """A planned, approved and prepared v2 run, ready for its first step."""
+
+    plan: TaskPlanV2
+    bundle: dict[str, Any]
+    selection: Any
+    info: WorktreeInfo
+    ownership_before: GitOwnership
+    base_tree_sha: str
+    checkpoint: ResumeCheckpoint | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _PersistedRevision:
+    """A completed Claude revision read back from its durable artifacts."""
+
+    final_message: str
+    usage: dict[str, int]
+    tree_before: str
+    tree_after: str
+    exit_code: int = 0
+    timed_out: bool = False
+    stderr_tail: str = ""
+
+
+@dataclasses.dataclass
+class _ResumedRun:
+    """Everything a resume needs, rebuilt from persisted artifacts only."""
+
+    checkpoint: ResumeCheckpoint
+    plan: TaskPlanV2
+    bundle: dict[str, Any]
+    selection: Any
+    info: WorktreeInfo
+    repository_reference: RepositoryReference
+    spec: str
+    context: str
+    restore_paths: tuple[str, ...] = ()
+    c01_steps: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    c01_revision: _PersistedRevision | None = None
+    c01_evidence: EvidenceBundle | None = None
+    c01_review: ReviewResult | None = None
+    repair_plan: TaskPlanV2 | None = None
+    repair_bundle: dict[str, Any] | None = None
+    repair_bundle_sha: str | None = None
+    c02_steps: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    c02_revision: _PersistedRevision | None = None
+
+
+def _read_json_artifact(path: Path, limit: int = 16 * 1024 * 1024) -> Any:
+    try:
+        if path.stat().st_size > limit:
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _read_bounded_text(path: Path, limit: int = 64 * 1024) -> str:
+    try:
+        with path.open("rb") as stream:
+            return stream.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _read_tree_file(path: Path) -> str | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value if _GIT_OBJECT_ID.fullmatch(value) else None
+
+
+def _is_object_id(value: Any) -> bool:
+    return isinstance(value, str) and _GIT_OBJECT_ID.fullmatch(value) is not None
+
+
+def _safe_candidate_tree(worktree: Path) -> str | None:
+    try:
+        return candidate_tree_sha(worktree)
+    except GitError:
+        return None
+
+
+def _record_failure_tree(artifact_dir: Path, worktree: Path) -> None:
+    """Record the tree a failed attempt left, so a resume can recognize it."""
+
+    tree = _safe_candidate_tree(worktree)
+    if tree is None:
+        return
+    try:
+        atomic_write_text(artifact_dir / "tree_after_failure.txt", tree + "\n")
+    except ResultArtifactError:
+        pass
+
+
+def _archive_attempt(directory: Path) -> None:
+    """Move a failed attempt's artifacts aside before retrying that operation."""
+
+    present = [name for name in _ATTEMPT_ARTIFACTS if (directory / name).exists()]
+    if not present:
+        return
+    root = directory / "attempts"
+    index = 1
+    while (root / f"{index:02d}").exists():
+        index += 1
+    target = root / f"{index:02d}"
+    target.mkdir(parents=True)
+    for name in present:
+        os.replace(directory / name, target / name)
+
+
+def _reusable_pre_checks(artifact_dir: Path, tree: str) -> tuple[dict[str, Any], str] | None:
+    """Durable pre-revision evidence frozen for exactly *tree*, if any."""
+
+    payload = _read_json_artifact(artifact_dir / "pre_checks.json")
+    if not isinstance(payload, dict) or payload.get("staged_tree_sha") != tree:
+        return None
+    failures = payload.get("failures")
+    if not isinstance(failures, list) or any(not isinstance(item, str) for item in failures):
+        return None
+    if _hard_failure_items(failures):
+        return None
+    evidence = _read_json_artifact(artifact_dir / "evidence.json")
+    if not isinstance(evidence, dict) or evidence.get("staged_tree_sha") != tree:
+        return None
+    try:
+        diff = (artifact_dir / "diff.patch").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    return payload, diff
+
+
+def _load_evidence(directory: Path) -> EvidenceBundle | None:
+    """Rebuild a frozen evidence bundle from ``evidence.json``."""
+
+    payload = _read_json_artifact(directory / "evidence.json")
+    if not isinstance(payload, dict):
+        return None
+    changed = payload.get("changed_files")
+    checks = payload.get("checks")
+    failures = payload.get("failures")
+    if (
+        not _is_object_id(payload.get("base_sha"))
+        or not _is_object_id(payload.get("staged_tree_sha"))
+        or not isinstance(payload.get("diff"), str)
+        or not isinstance(payload.get("deterministic_passed"), bool)
+        or not isinstance(changed, list) or any(not isinstance(item, str) for item in changed)
+        or not isinstance(checks, list) or any(not isinstance(item, dict) for item in checks)
+        or not isinstance(failures, list) or any(not isinstance(item, str) for item in failures)
+    ):
+        return None
+    return EvidenceBundle(
+        base_sha=payload["base_sha"],
+        staged_tree_sha=payload["staged_tree_sha"],
+        changed_files=tuple(changed),
+        diff=payload["diff"],
+        checks=tuple(checks),
+        deterministic_passed=payload["deterministic_passed"],
+        failures=tuple(failures),
+    )
+
+
+def _accepted_review(directory: Path, evidence: EvidenceBundle) -> ReviewResult | None:
+    """A reviewer answer already accepted for exactly this candidate tree."""
+
+    if not (directory / "review.json").is_file():
+        return None
+    try:
+        request = (directory / "reviewer.request.txt").read_text(encoding="utf-8")
+        raw = (directory / "reviewer.raw.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    if f'"CANDIDATE_TREE_SHA": "{evidence.staged_tree_sha}"' not in request:
+        return None
+    try:
+        return parse_review(raw, deterministic_passed=evidence.deterministic_passed)
+    except ReviewParseError:
+        return None
+
+
+def _load_c01_review(run_dir: Path, evidence: EvidenceBundle) -> ReviewResult | None:
+    for directory in (run_dir / "review" / "C01", run_dir):
+        try:
+            raw = (directory / "reviewer.raw.md").read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        try:
+            return parse_review(raw, deterministic_passed=evidence.deterministic_passed)
+        except ReviewParseError:
+            return None
+    return None
+
+
+def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
+    """One COMPLETED step record, in the shape of :func:`_step_result_record`."""
+
+    record = _read_json_artifact(step_dir / "step.json", 128 * 1024)
+    if not isinstance(record, dict) or record.get("id") != step_id or record.get("status") != "COMPLETED":
+        return None
+    changed = record.get("changed_paths")
+    if (
+        not _is_object_id(record.get("tree_before"))
+        or not _is_object_id(record.get("tree_after"))
+        or not isinstance(changed, list) or any(not isinstance(item, str) for item in changed)
+    ):
+        return None
+    return {
+        "id": step_id, "status": "COMPLETED", "profile_id": record.get("profile_id"),
+        "tree_before": record["tree_before"], "tree_after": record["tree_after"],
+        "changed_paths": list(changed),
+        "usage": normalize_usage(record.get("usage")),
+        "final": _bounded_v2_report(_read_bounded_text(step_dir / "agent.final.md")),
+    }
+
+
+def _verify_step_chain(records: list[dict[str, Any] | None], start_tree: str) -> str | None:
+    """The last tree of an unbroken step chain starting at *start_tree*."""
+
+    tree = start_tree
+    for record in records:
+        if record is None or record["tree_before"] != tree:
+            return None
+        tree = record["tree_after"]
+    return tree
+
+
+def _load_revision(directory: Path) -> _PersistedRevision | None:
+    report = _read_json_artifact(directory / "report.json", 1024 * 1024)
+    if not isinstance(report, dict) or report.get("status") not in {"COMPLETED", "NO_CHANGE"}:
+        return None
+    if not _is_object_id(report.get("tree_before")) or not _is_object_id(report.get("tree_after")):
+        return None
+    final = _read_bounded_text(directory / "agent.final.md", _MAX_AGENT_REPORT_BYTES * 2)
+    if not final and isinstance(report.get("final"), str):
+        final = report["final"]
+    usage = read_usage_artifact(directory / "usage.json") or normalize_usage(report.get("usage"))
+    return _PersistedRevision(final, usage, report["tree_before"], report["tree_after"])
+
+
+def _read_repository_reference(run_dir: Path) -> RepositoryReference | None:
+    payload = _read_json_artifact(run_dir / "repository_reference.json", 16 * 1024)
+    if not isinstance(payload, dict) or set(payload) != {"remote_name", "web_url", "base_sha", "immutable_url"}:
+        return None
+    if not isinstance(payload["remote_name"], str) or not _is_object_id(payload["base_sha"]):
+        return None
+    if any(payload[key] is not None and not isinstance(payload[key], str) for key in ("web_url", "immutable_url")):
+        return None
+    return RepositoryReference(**payload)
+
+
+def _persist_planner_conversation(run_dir: Path, handle: Any) -> None:
+    """Persist a driver-provided planner conversation handle, never a guess."""
+
+    if isinstance(handle, LLMConversationHandle):
+        atomic_write_text(run_dir / _PLANNER_CONVERSATION, _json_text({
+            "provider_id": handle.provider_id, "conversation_id": handle.conversation_id,
+        }))
+
+
+def _read_planner_conversation(run_dir: Path) -> LLMConversationHandle | None:
+    payload = _read_json_artifact(run_dir / _PLANNER_CONVERSATION, 4096)
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return LLMConversationHandle(payload.get("provider_id"), payload.get("conversation_id"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _commit_web_url(reference: RepositoryReference, commit_sha: str) -> str | None:
+    if reference.web_url is None:
+        return None
+    try:
+        normalized = normalize_github_web_url(reference.web_url)
+    except ValueError:
+        return None
+    return f"{normalized}/commit/{commit_sha}" if normalized is not None else None
+
+
+def _state_cycle_value(state: Mapping[str, Any]) -> int:
+    value = state.get("cycle")
+    return value if value in (1, 2) and not isinstance(value, bool) else 1
+
+
+
 class Orchestrator:
     """Execute exactly one planner, one implementation agent and one review."""
 
@@ -842,7 +1185,7 @@ class Orchestrator:
                          "report.json", "usage.json"),
             "review": ("reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json",
                        "review.json"),
-            "checks": ("checks.json", "changed-files.txt", "diff.patch"),
+            "checks": ("checks.json", "changed-files.txt", "diff.patch", "evidence.json"),
         }
         for source, destination in groups:
             kind = "revision" if destination.parent.name == "revision" else "review" if destination.parent.name == "review" else "checks"
@@ -1419,7 +1762,7 @@ class Orchestrator:
             repository_reference=repository_reference,
         )
 
-    def _execute_v2(
+    def _prepare_v2_run(
         self,
         store: RunStateStore,
         run_dir: Path,
@@ -1429,16 +1772,16 @@ class Orchestrator:
         base_sha: str,
         context: str,
         repository_reference: RepositoryReference,
-    ) -> RunResult:
-        """Execute a v2 bundle: one worktree, fresh Codex process per step."""
+        planner_profile: ModelProfile,
+    ) -> "_V2Setup | RunResult":
+        """Plan, obtain the approved selection, create the worktree and set up.
 
-        # The configuration is the only authority for P25/P26.  It was fully
-        # cross-validated at load time; profiles in the catalogue never
-        # enable Claude or C02 implicitly.
+        Returns a terminal :class:`RunResult` for BLOCKED/REJECTED plans.  None
+        of this is ever replayed by a resume.
+        """
+
         revision_enabled = self.config.revision.enabled
-
-        planner_profile_id = store.load()["execution"]["planner"]["profile_id"]
-        planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
+        planner_profile_id = planner_profile.id
         implementers = tuple(
             p for p in profiles_for_config(self.config).values()
             if ExecutionRole.IMPLEMENTER in p.roles
@@ -1457,6 +1800,7 @@ class Orchestrator:
             planning=self.config.planning,
         )
         plan = planner.plan(spec, context, artifacts_dir=run_dir)
+        _persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
         store.update(
             status=RunStatus.PLANNING,
             planning_protocol="v2",
@@ -1520,7 +1864,6 @@ class Orchestrator:
                 if durable_identity.execution_sha256 != execution_sha:
                     raise ApprovalError("execution selection hash mismatch")
                 read = compute_plan_identity_from_run(run_dir)
-                from .approval import read_plan_approval
                 bound = read_plan_approval(run_dir, expected_identity=read)
                 if bound is None or bound.bundle_sha256 != durable_identity.bundle_sha256:
                     raise ApprovalError("v2 approval is not bound to the exact bundle")
@@ -1590,6 +1933,11 @@ class Orchestrator:
         execution_state["reviewer"] = asdict(selection.reviewer)
         store.update(status=RunStatus.PLANNING, execution=execution_state,
                      plan_identity=asdict(durable_identity))
+        base_tree_sha = resolve_tree(repo, base_sha)
+        # Plan approval complete: the next operation is the first Luna step.
+        checkpoint = self._initial_checkpoint(plan, base_sha, base_tree_sha, durable_identity)
+        if checkpoint is not None:
+            write_checkpoint(run_dir, checkpoint)
 
         branch = f"harness/{_slug(plan.title)}/{run_id}"
         info = create_run_worktree(
@@ -1597,7 +1945,6 @@ class Orchestrator:
             worktree_path=self.config.worktrees_root / run_id,
             require_clean_base=self.config.require_clean_base,
         )
-        branch_ref = f"refs/heads/{info.branch}"
         store.update(status=RunStatus.WORKTREE_READY, branch=info.branch,
                      worktree=str(info.worktree), base_sha=info.base_sha)
         ownership_before = _git_ownership(repo, info.worktree)
@@ -1619,26 +1966,140 @@ class Orchestrator:
         # actual index identity, never an inferred file list.
         stage_all(info.worktree)
         candidate_tree = index_tree_sha(info.worktree)
-        base_tree_sha = resolve_tree(repo, base_sha)
         if candidate_tree != base_tree_sha:
             raise OrchestrationError("initial candidate tree does not match base")
+        # Worktree and setup complete: still the first Luna step.
+        if checkpoint is not None:
+            write_checkpoint(run_dir, checkpoint)
+        return _V2Setup(plan, bundle, selection, info, ownership_before, base_tree_sha, checkpoint)
+
+    @staticmethod
+    def _initial_checkpoint(
+        plan: TaskPlanV2, base_sha: str, base_tree_sha: str, identity: PlanIdentity,
+    ) -> ResumeCheckpoint | None:
+        if identity.execution_sha256 is None or not plan.steps:
+            return None
+        return ResumeCheckpoint(
+            ResumePhase.INITIAL_STEP, 1, plan.steps[0].id, base_sha, base_tree_sha,
+            identity.execution_sha256, identity,
+        )
+
+    def _checkpoint(
+        self,
+        run_dir: Path,
+        phase: ResumePhase,
+        *,
+        head: str | None,
+        tree: str | None,
+        cycle: int | None = None,
+        step_id: str | None = None,
+        repair_bundle_sha256: str | None = None,
+    ) -> None:
+        """Persist the next operation that has not yet succeeded.
+
+        Identity fields are carried over from the run's current checkpoint;
+        a run without one (v1, legacy callers) has nothing to resume.
+        """
+
+        try:
+            record = read_checkpoint_record(run_dir)
+        except ResumeCheckpointError:
+            record = None
+        if record is None or record[1] != "pending" or head is None or tree is None:
+            return
+        previous = record[0]
+        if phase_index(phase) <= phase_index(ResumePhase.REPAIR_PLANNER):
+            repair = None
+        else:
+            repair = repair_bundle_sha256 or previous.repair_bundle_sha256
+        if cycle is None:
+            cycle = 2 if phase_index(ResumePhase.REPAIR_PLANNER) <= phase_index(phase) < phase_index(ResumePhase.PUBLISH) else 1
+        write_checkpoint(run_dir, ResumeCheckpoint(
+            phase, cycle, step_id, head, tree,
+            previous.execution_selection_sha256, previous.plan_identity, repair,
+        ))
+
+    def _execute_v2(
+        self,
+        store: RunStateStore,
+        run_dir: Path,
+        run_id: str,
+        spec: str,
+        repo: Path,
+        base_sha: str,
+        context: str,
+        repository_reference: RepositoryReference,
+        *,
+        resumed: "_ResumedRun | None" = None,
+    ) -> RunResult:
+        """Execute a v2 bundle: one worktree, fresh Codex process per step.
+
+        With *resumed*, planning, approval and workspace setup are never
+        replayed: execution restarts at the checkpoint's next operation and
+        every earlier result is read back from its durable artifacts.
+        """
+
+        # The configuration is the only authority for P25/P26.  It was fully
+        # cross-validated at load time; profiles in the catalogue never
+        # enable Claude or C02 implicitly.
+        revision_enabled = self.config.revision.enabled
+
+        planner_profile_id = store.load()["execution"]["planner"]["profile_id"]
+        planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
+        if resumed is None:
+            prepared = self._prepare_v2_run(
+                store, run_dir, run_id, spec, repo, base_sha, context,
+                repository_reference, planner_profile,
+            )
+            if isinstance(prepared, RunResult):
+                return prepared
+            plan, bundle, selection = prepared.plan, prepared.bundle, prepared.selection
+            info, ownership_before = prepared.info, prepared.ownership_before
+            base_tree_sha = prepared.base_tree_sha
+            if prepared.checkpoint is None:
+                # A v2 run always has an execution selection bound to its
+                # plan identity once approved; never run without one.
+                raise OrchestrationError("v2 run has no execution selection identity")
+            start = prepared.checkpoint
+            completed_steps: list[dict[str, Any]] = []
+        else:
+            plan, bundle, selection = resumed.plan, resumed.bundle, resumed.selection
+            info = resumed.info
+            ownership_before = _git_ownership(repo, info.worktree)
+            base_tree_sha = resolve_tree(repo, base_sha)
+            start = resumed.checkpoint
+            completed_steps = list(resumed.c01_steps)
+            self._last_selection = selection
+        branch_ref = f"refs/heads/{info.branch}"
+        phase = start.phase
+        at = phase_index(phase)
         codex_home = prepare_codex_home(self.config)
         forbidden_env_names = (
             planner_profile.api_key_env,
             profile_for_role(self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER).api_key_env,
         )
         step_items = {item.step_id: item for item in selection.steps}
+        done_ids = {record["id"] for record in completed_steps}
         state_steps = [
-            {"id": step.id, "title": step.title, "status": "waiting",
+            {"id": step.id, "title": step.title,
+             "status": "completed" if step.id in done_ids else "waiting",
              "profile_id": step_items[step.id].implementer.profile_id}
             for step in plan.steps
         ]
-        self._last_v2_step_results: list[dict[str, Any]] = []
+        self._last_v2_step_results: list[dict[str, Any]] = list(completed_steps)
         self._repair_v2_step_results: list[dict[str, Any]] = []
-        self._v2_usage_rows: list[dict[str, Any]] = []
+        self._v2_usage_rows: list[dict[str, Any]] = [
+            {"id": record["id"], **record["usage"]} for record in completed_steps
+        ]
+        if resumed is not None and at <= phase_index(ResumePhase.REVIEWER_C01):
+            store.update(status=store.load().get("status", RunStatus.IMPLEMENTING),
+                         steps=state_steps, current_step=None, cycle=1)
         # Tree every step must start from: the base, then each frozen step.
-        expected_tree = candidate_tree
-        for step in plan.steps:
+        expected_tree = start.expected_tree_sha
+        retry_step = start.step_id if resumed is not None and phase is ResumePhase.INITIAL_STEP else None
+        for index, step in enumerate(plan.steps if phase is ResumePhase.INITIAL_STEP else ()):
+            if step.id in done_ids:
+                continue
             selected_step = step_items.get(step.id)
             if selected_step is None:
                 raise ExecutionSelectionError(f"missing selection for {step.id}")
@@ -1648,6 +2109,8 @@ class Orchestrator:
                 contract = read_approved_step_contract(run_dir, bundle, step.id)
             except (V2PlanParseError, OSError, UnicodeError) as exc:
                 raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
+            if step.id == retry_step:
+                _archive_attempt(run_dir / "steps" / step.id)
             store.update(status=RunStatus.IMPLEMENTING, current_step=step.id,
                          steps=[{**item, "status": "running" if item["id"] == step.id else item["status"]}
                                 for item in state_steps])
@@ -1676,96 +2139,132 @@ class Orchestrator:
             ]
             store.update(status=RunStatus.IMPLEMENTING, current_step=None, steps=state_steps,
                          agent_usage=self._v2_agent_usage())
+            following = plan.steps[index + 1].id if index + 1 < len(plan.steps) else None
+            # Step complete: the next operation is the next step, then
+            # Claude C01 (revision) or the final checks + reviewer #1.
+            self._checkpoint(
+                run_dir,
+                ResumePhase.INITIAL_STEP if following else (
+                    ResumePhase.CLAUDE_C01 if revision_enabled else ResumePhase.REVIEWER_C01
+                ),
+                step_id=following, head=base_sha, tree=outcome.tree_after,
+            )
 
         revision_result = None
         revision_report_c01 = ""
         if revision_enabled:
-            try:
-                revision_result, revision_error = self._run_v2_revision_cycle(
-                    store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
-                    base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
-                    repository_reference=repository_reference, info=info,
-                    branch_ref=branch_ref, ownership_before=ownership_before,
-                    selection=selection,
+            if at <= phase_index(ResumePhase.CLAUDE_C01):
+                if resumed is not None and phase is ResumePhase.CLAUDE_C01:
+                    _archive_attempt(run_dir / "revision")
+                try:
+                    revision_result, revision_error = self._run_v2_revision_cycle(
+                        store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                        base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
+                        repository_reference=repository_reference, info=info,
+                        branch_ref=branch_ref, ownership_before=ownership_before,
+                        selection=selection,
+                    )
+                except ClaudeCommittedError as exc:
+                    self._redact_revision_artifacts(run_dir)
+                    return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None,
+                                           redact(str(exc), self._secrets))
+                except (ClaudeAgentError, ClaudeRuntimeError) as exc:
+                    self._redact_revision_artifacts(run_dir)
+                    _record_failure_tree(run_dir / "revision", info.worktree)
+                    return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None,
+                                           redact(str(exc), self._secrets))
+                if revision_error is not None:
+                    return self._v2_failed(store, run_dir, revision_error, None)
+                self._cycle_update(
+                    store, 1, status="completed",
+                    claude_revision_report=revision_result.final_message if revision_result else "",
                 )
-            except ClaudeCommittedError as exc:
-                self._redact_revision_artifacts(run_dir)
-                return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None,
-                                       redact(str(exc), self._secrets))
-            except (ClaudeAgentError, ClaudeRuntimeError) as exc:
-                self._redact_revision_artifacts(run_dir)
-                return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None,
-                                       redact(str(exc), self._secrets))
-            if revision_error is not None:
-                return self._v2_failed(store, run_dir, revision_error, None)
+            elif resumed is not None:
+                revision_result = resumed.c01_revision
             if revision_result is not None:
                 revision_report_c01 = _revision_report_text(revision_result, run_dir / "revision")
-            self._cycle_update(
-                store, 1, status="completed",
-                claude_revision_report=revision_result.final_message if revision_result else "",
-            )
 
-        store.update(
-            status=RunStatus.REVALIDATING if revision_enabled else RunStatus.VALIDATING,
-            current_step=None,
-        )
-        evidence = collect_evidence(info.worktree, base_sha, self.config,
-                                    evidence_dir=run_dir, secrets=self._secrets,
-                                    check_failures_hard=not revision_enabled)
-        store.update(status=RunStatus.VALIDATING, checks=_check_payload(evidence),
-                     staged_tree_sha=evidence.staged_tree_sha,
-                     changed_files=list(evidence.changed_files),
-                     deterministic_gate={"passed": evidence.deterministic_passed,
-                                         "failures": list(evidence.failures)})
-        integrity_failures = _hard_integrity_failures(evidence) if revision_enabled else [item for item in evidence.failures if item in _DIRECT_FAILURES or
-                              any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES) or
-                              item.startswith("CHECK_MUTATED:")]
-        if integrity_failures:
-            return self._v2_failed(store, run_dir, integrity_failures[0].split(":", 1)[0], None,
-                                    ", ".join(integrity_failures))
-        reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
-        store.update(status=RunStatus.REVIEWING)
-        try:
-            review = self._run_v2_reviewer(
-                reviewer=reviewer, spec=spec, context=context,
-                repository_reference=repository_reference, evidence=evidence,
-                input=ReviewCycleInput(
-                    iteration=1,
-                    plan_text=plan.raw,
-                    luna_reports=_step_reports_text(self._last_v2_step_results),
-                    revision_report=revision_report_c01,
-                    cycle_history="C01 is the initial implementation cycle.",
-                ),
-                artifacts_dir=run_dir, worktree=info.worktree, base_sha=base_sha,
+        if at <= phase_index(ResumePhase.REVIEWER_C01):
+            store.update(
+                status=RunStatus.REVALIDATING if revision_enabled else RunStatus.VALIDATING,
+                current_step=None,
             )
-        except ReviewParseError as exc:
-            # Includes PASS on a red gate: fail closed, never commit, and
-            # never turn an invalid PASS into a C02 authorization.
+            evidence = self._final_evidence(
+                info.worktree, base_sha, run_dir,
+                check_failures_hard=not revision_enabled,
+                reuse=resumed is not None and phase is ResumePhase.REVIEWER_C01,
+            )
+            store.update(status=RunStatus.VALIDATING, checks=_check_payload(evidence),
+                         staged_tree_sha=evidence.staged_tree_sha,
+                         changed_files=list(evidence.changed_files),
+                         deterministic_gate={"passed": evidence.deterministic_passed,
+                                             "failures": list(evidence.failures)})
+            integrity_failures = _hard_integrity_failures(evidence) if revision_enabled else [item for item in evidence.failures if item in _DIRECT_FAILURES or
+                                  any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES) or
+                                  item.startswith("CHECK_MUTATED:")]
+            if integrity_failures:
+                return self._v2_failed(store, run_dir, integrity_failures[0].split(":", 1)[0], None,
+                                        ", ".join(integrity_failures))
+            # Final checks complete: the next operation is reviewer #1.
+            self._checkpoint(run_dir, ResumePhase.REVIEWER_C01, head=base_sha,
+                             tree=evidence.staged_tree_sha)
+            reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
+            store.update(status=RunStatus.REVIEWING)
+            try:
+                review = self._run_v2_reviewer(
+                    reviewer=reviewer, spec=spec, context=context,
+                    repository_reference=repository_reference, evidence=evidence,
+                    input=ReviewCycleInput(
+                        iteration=1,
+                        plan_text=plan.raw,
+                        luna_reports=_step_reports_text(self._last_v2_step_results),
+                        revision_report=revision_report_c01,
+                        cycle_history="C01 is the initial implementation cycle.",
+                    ),
+                    artifacts_dir=run_dir, worktree=info.worktree, base_sha=base_sha,
+                    reuse_accepted=resumed is not None and phase is ResumePhase.REVIEWER_C01,
+                )
+            except ReviewParseError as exc:
+                # Includes PASS on a red gate: fail closed, never commit, and
+                # never turn an invalid PASS into a C02 authorization.
+                if revision_enabled:
+                    self._snapshot_cycle_artifacts(run_dir)
+                return self._v2_failed(store, run_dir, "REVIEWER_OUTPUT_INVALID", None,
+                                       _bounded_parse_detail(exc))
+            except LLMError as exc:
+                # Transport only: no reviewer answer was accepted, so the same
+                # exact candidate can be reviewed again on resume.
+                return self._v2_failed(store, run_dir, "REVIEWER_TRANSPORT_FAILURE", None,
+                                       _bounded_parse_detail(exc))
+            store.update(
+                status=RunStatus.REVIEWING,
+                review=_review_payload(review),
+                review_iterations=1,
+            )
+            self._cycle_update(
+                store, 1, status="reviewed",
+                luna_steps_summary=self._last_v2_step_results,
+                claude_revision_report=revision_result.final_message if revision_result else "",
+                checks=_check_payload(evidence), reviewer_conclusion=_review_payload(review),
+            )
+            self._update_v2_usage(store, run_dir)
             if revision_enabled:
                 self._snapshot_cycle_artifacts(run_dir)
-            return self._v2_failed(store, run_dir, "REVIEWER_OUTPUT_INVALID", None,
-                                   _bounded_parse_detail(exc))
-        store.update(
-            status=RunStatus.REVIEWING,
-            review=_review_payload(review),
-            review_iterations=1,
-        )
-        self._cycle_update(
-            store, 1, status="reviewed",
-            luna_steps_summary=self._last_v2_step_results,
-            claude_revision_report=revision_result.final_message if revision_result else "",
-            checks=_check_payload(evidence), reviewer_conclusion=_review_payload(review),
-        )
-        self._update_v2_usage(store, run_dir)
-        if revision_enabled:
-            self._snapshot_cycle_artifacts(run_dir)
+        else:
+            evidence, review = resumed.c01_evidence, resumed.c01_review
         if review.verdict is ReviewVerdict.REVISE:
             if revision_enabled and review.route is ReviewRoute.IMPLEMENTATION:
-                store.update(status=RunStatus.IMPLEMENTING, cycle=2)
-                self._cycle_update(
-                    store, 2, status="starting",
-                    trigger="Reviewer requested one bounded implementation correction loop.",
-                )
+                if at <= phase_index(ResumePhase.REVIEWER_C01):
+                    store.update(status=RunStatus.IMPLEMENTING, cycle=2)
+                    self._cycle_update(
+                        store, 2, status="starting",
+                        trigger="Reviewer requested one bounded implementation correction loop.",
+                    )
+                    # Reviewer #1 complete: the next operation is the repair planner.
+                    self._checkpoint(run_dir, ResumePhase.REPAIR_PLANNER, head=base_sha,
+                                     tree=evidence.staged_tree_sha)
+                else:
+                    store.update(status=store.load().get("status", RunStatus.PLANNING), cycle=2)
                 try:
                     repair_plan, _repair_revision, evidence, review = self._execute_v2_repair_cycle(
                         store=store, run_dir=run_dir, run_id=run_id, spec=spec,
@@ -1776,6 +2275,7 @@ class Orchestrator:
                         original_bundle=bundle, cycle_1_evidence=evidence,
                         cycle_1_review=review, cycle_1_revision=revision_result,
                         cycle_1_revision_report=revision_report_c01,
+                        resumed=resumed if at > phase_index(ResumePhase.REVIEWER_C01) else None,
                     )
                 except StepExecutionFailure as failure:
                     return self._step_failed(
@@ -1790,7 +2290,14 @@ class Orchestrator:
                     return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None, redact(str(exc), self._secrets))
                 except (ClaudeAgentError, ClaudeRuntimeError) as exc:
                     self._redact_revision_artifacts(run_dir, revision_dir=run_dir / "revision" / "C02")
+                    _record_failure_tree(run_dir / "revision" / "C02", info.worktree)
                     return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None, redact(str(exc), self._secrets))
+                except ReviewerTransportError as exc:
+                    return self._v2_failed(store, run_dir, "REVIEWER_TRANSPORT_FAILURE", None,
+                                           _bounded_parse_detail(exc))
+                except LLMError as exc:
+                    return self._v2_failed(store, run_dir, "LLM_FAILURE", None,
+                                           _bounded_parse_detail(exc))
                 except OrchestrationError as exc:
                     reason = str(exc).split(":", 1)[0].strip() or "REPAIR_FAILED"
                     return self._v2_failed(store, run_dir, reason, None)
@@ -1939,6 +2446,11 @@ class Orchestrator:
             stderr_tail=redact(result.stderr_tail, self._secrets),
         )
         usage = normalize_usage(result.usage)
+        # Advisory, argument-free context diagnostics (never a gate).
+        try:
+            write_token_diagnostics(artifact_dir, usage, worktree=worktree)
+        except (OSError, ResultArtifactError):
+            pass
         failed = {"profile_id": profile.id, "tree_before": tree_before, "usage": usage}
         # 7. Authentication classification from fixed markers only.
         auth_failure = _codex_auth_failure(artifact_dir / "agent.events.jsonl", result.stderr_tail)
@@ -1953,16 +2465,21 @@ class Orchestrator:
             raise StepExecutionFailure(
                 "AGENT_GIT_VIOLATION", step_id, "; ".join(violations), **failed
             )
-        # 10-11. Process outcome.
+        # 10-11. Process outcome.  The tree left behind is recorded so that a
+        # resume can tell a clean retry from partial worker changes.
         if result.timed_out:
-            raise StepExecutionFailure("AGENT_TIMEOUT", step_id, **failed)
+            raise StepExecutionFailure(
+                "AGENT_TIMEOUT", step_id, **failed, tree_after=_safe_candidate_tree(worktree)
+            )
         if result.exit_code != 0:
             if auth_failure:
                 raise StepExecutionFailure(
-                    "CODEX_AUTH_FAILURE", step_id, "Codex authentication failed", **failed
+                    "CODEX_AUTH_FAILURE", step_id, "Codex authentication failed", **failed,
+                    tree_after=_safe_candidate_tree(worktree),
                 )
             raise StepExecutionFailure(
-                "AGENT_FAILED", step_id, f"exit status {result.exit_code}", **failed
+                "AGENT_FAILED", step_id, f"exit status {result.exit_code}", **failed,
+                tree_after=_safe_candidate_tree(worktree),
             )
         # 12-14. Freeze the candidate; a step must change it.
         stage_all(worktree)
@@ -2019,13 +2536,20 @@ class Orchestrator:
         artifacts_dir: Path,
         worktree: Path,
         base_sha: str,
+        reuse_accepted: bool = False,
     ) -> ReviewResult:
         """The single reviewer evidence assembly for C01 and C02.
 
         The gate payload, the parse argument and the later commit gate all
-        use the same actual ``evidence.deterministic_passed``.
+        use the same actual ``evidence.deterministic_passed``.  On a resume,
+        a reviewer answer already accepted for this exact candidate tree is
+        re-parsed instead of asking again; the call is always a fresh one.
         """
 
+        if reuse_accepted:
+            accepted = _accepted_review(artifacts_dir, evidence)
+            if accepted is not None:
+                return accepted
         gate = _json_text({
             "deterministic_passed": evidence.deterministic_passed,
             "failures": list(evidence.failures),
@@ -2039,7 +2563,7 @@ class Orchestrator:
             "GIT_STATUS": status_porcelain(worktree),
         })
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        return reviewer.review(
+        review = reviewer.review(
             spec, input.plan_text, context, gate,
             "\n".join(evidence.changed_files), evidence.diff,
             _json_text(_check_payload(evidence)),
@@ -2052,6 +2576,44 @@ class Orchestrator:
             repository_state=repository_state,
             iteration=input.iteration,
             cycle_history=input.cycle_history,
+        )
+        # planner_thread != reviewer_thread: a driver that reports the
+        # planner's own conversation for a review breaks independence.
+        run_root = artifacts_dir.parent.parent if artifacts_dir.parent.name == "review" else artifacts_dir
+        planner_thread = _read_planner_conversation(run_root)
+        reviewer_thread = getattr(reviewer, "last_conversation", None)
+        if planner_thread is not None and reviewer_thread == planner_thread:
+            raise ReviewParseError("reviewer reused the planner conversation")
+        return review
+
+    def _final_evidence(
+        self,
+        worktree: Path,
+        base_sha: str,
+        evidence_dir: Path,
+        *,
+        check_failures_hard: bool,
+        reuse: bool,
+    ) -> EvidenceBundle:
+        """Final checks for the exact current candidate.
+
+        On a reviewer resume, durable evidence already frozen for exactly
+        this index tree is reused: checks are never replayed for a tree whose
+        evidence is complete.
+        """
+
+        if reuse:
+            stored = _load_evidence(evidence_dir)
+            if (
+                stored is not None
+                and stored.base_sha == base_sha
+                and stored.staged_tree_sha == index_tree_sha(worktree)
+                and stored.staged_tree_sha == candidate_tree_sha(worktree)
+            ):
+                return stored
+        return collect_evidence(
+            worktree, base_sha, self.config, evidence_dir=evidence_dir,
+            secrets=self._secrets, check_failures_hard=check_failures_hard,
         )
 
     def _run_v2_revision_cycle(
@@ -2074,19 +2636,22 @@ class Orchestrator:
         contract_dir: Path | None = None,
         mutable_scope: list[str] | None = None,
         luna_reports: str | None = None,
+        cycle: int = 1,
     ) -> tuple[Any | None, str | None]:
-        """Run one Claude pre-check/revision/scope cycle."""
+        """Run one Claude pre-check/revision/scope cycle.
 
+        Pre-revision checks already durable for the exact current tree are
+        reused (a resume never replays them); Claude runs once per attempt.
+        """
+
+        claude_phase, review_phase = (
+            (ResumePhase.CLAUDE_C01, ResumePhase.REVIEWER_C01) if cycle == 1
+            else (ResumePhase.CLAUDE_C02, ResumePhase.REVIEWER_C02)
+        )
         artifact_dir = artifact_dir or (run_dir / "revision")
         artifact_dir.mkdir(parents=True, exist_ok=True)
         stage_all(info.worktree)
         tree_before = candidate_tree_sha(info.worktree)
-        store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
-        pre_evidence = collect_evidence(
-            info.worktree, base_sha, self.config,
-            evidence_dir=artifact_dir, secrets=self._secrets,
-            check_failures_hard=False,
-        )
         mutable_scope = mutable_scope or sorted({
             path for step in plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
@@ -2095,16 +2660,29 @@ class Orchestrator:
             "approved_mutable_scope": mutable_scope,
             "source": "human-approved mutable scope",
         }))
-        pre_payload = {
-            "checks": _check_payload(pre_evidence),
-            "failures": list(pre_evidence.failures),
-            "deterministic_passed": pre_evidence.deterministic_passed,
-            "staged_tree_sha": pre_evidence.staged_tree_sha,
-        }
-        atomic_write_text(artifact_dir / "pre_checks.json", _json_text(pre_payload))
-        pre_hard = _hard_integrity_failures(pre_evidence)
-        if pre_hard:
-            return None, pre_hard[0].split(":", 1)[0]
+        reused = _reusable_pre_checks(artifact_dir, tree_before)
+        if reused is None:
+            store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
+            pre_evidence = collect_evidence(
+                info.worktree, base_sha, self.config,
+                evidence_dir=artifact_dir, secrets=self._secrets,
+                check_failures_hard=False,
+            )
+            pre_payload = {
+                "checks": _check_payload(pre_evidence),
+                "failures": list(pre_evidence.failures),
+                "deterministic_passed": pre_evidence.deterministic_passed,
+                "staged_tree_sha": pre_evidence.staged_tree_sha,
+            }
+            atomic_write_text(artifact_dir / "pre_checks.json", _json_text(pre_payload))
+            pre_hard = _hard_integrity_failures(pre_evidence)
+            if pre_hard:
+                return None, pre_hard[0].split(":", 1)[0]
+            pre_diff = pre_evidence.diff
+            # Pre-revision checks complete: the next operation is Claude.
+            self._checkpoint(run_dir, claude_phase, cycle=cycle, head=base_sha, tree=tree_before)
+        else:
+            pre_payload, pre_diff = reused
         contracts = "\n\n".join(
             read_approved_step_contract(contract_dir or run_dir, bundle, step.id)
             for step in plan.steps
@@ -2116,7 +2694,7 @@ class Orchestrator:
             contracts=contracts,
             luna_reports=luna_reports if luna_reports is not None else _step_reports_text(self._last_v2_step_results),
             changed_files="\n".join(changed_paths_between_trees(repo, base_tree_sha, tree_before)),
-            diff=pre_evidence.diff,
+            diff=pre_diff,
             pre_checks=_json_text(pre_payload),
             mutable_scope=_json_text(mutable_scope),
         )
@@ -2137,8 +2715,10 @@ class Orchestrator:
             stderr_tail=redact(result.stderr_tail, self._secrets),
         )
         if result.timed_out:
+            _record_failure_tree(artifact_dir, info.worktree)
             return result, "CLAUDE_TIMEOUT"
         if result.exit_code != 0:
+            _record_failure_tree(artifact_dir, info.worktree)
             return result, "CLAUDE_AUTH_FAILURE" if claude_auth_failure else "CLAUDE_FAILED"
         revision_ownership = _git_ownership(repo, info.worktree)
         if revision_ownership.head != base_sha:
@@ -2172,6 +2752,9 @@ class Orchestrator:
         store.update(status=RunStatus.REVISING, revision=revision_state)
         if outside_scope:
             return result, "REVISION_SCOPE_VIOLATION"
+        # Claude complete and durable: the next operation is the final checks
+        # followed by the reviewer, on exactly this tree.
+        self._checkpoint(run_dir, review_phase, cycle=cycle, head=base_sha, tree=tree_after)
         return result, None
 
     def _execute_v2_repair_cycle(
@@ -2195,8 +2778,13 @@ class Orchestrator:
         cycle_1_review: ReviewResult,
         cycle_1_revision: Any | None,
         cycle_1_revision_report: str = "",
+        resumed: "_ResumedRun | None" = None,
     ) -> tuple[TaskPlanV2, Any | None, EvidenceBundle, ReviewResult]:
-        """Plan, execute, revise, check and review exactly one repair cycle."""
+        """Plan, execute, revise, check and review exactly one repair cycle.
+
+        With *resumed*, every C02 phase before its checkpoint is read back
+        from the durable ``repair/C02`` artifacts instead of being replayed.
+        """
 
         repair_dir = run_dir / "repair" / "C02"
         repair_dir.mkdir(parents=True, exist_ok=True)
@@ -2209,6 +2797,8 @@ class Orchestrator:
         planner_profile = profile_for_role(
             self.config, selection.planner.profile_id, ExecutionRole.PLANNER
         )
+        start = resumed.checkpoint if resumed is not None else None
+        at = phase_index(start.phase) if start is not None else phase_index(ResumePhase.REPAIR_PLANNER)
         original_scope = sorted({
             path for step in original_plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
@@ -2218,50 +2808,55 @@ class Orchestrator:
             for step in original_plan.steps
         )
         tree_before = candidate_tree_sha(info.worktree)
-        current_state = _json_text({
-            "BASE_SHA": base_sha,
-            "HEAD_SHA": current_head(info.worktree),
-            "CANDIDATE_TREE_SHA": tree_before,
-            "CHANGED_FILES": changed_paths_between_trees(repo, resolve_tree(repo, base_sha), tree_before),
-            "GIT_STATUS": status_porcelain(info.worktree),
-        })
-        repair_planner = RepairPlannerV2(
-            self._planner_client or _chat_client(
-                build_llm_endpoint(planner_profile), self._runtime_environment
-            ),
-            implementer_ids=frozenset({selection.repair_implementer.profile_id}),
-            reviewer_ids=frozenset({selection.reviewer.profile_id}),
-            implementer_profiles=(repair_profile,),
-            reviewer_profiles=(reviewer_profile,),
-            planning=self.config.planning,
-        )
-        repair_plan = repair_planner.plan(
-            repository_reference=render_repository_reference(repository_reference),
-            original_spec=spec,
-            original_meta_plan=original_plan.raw,
-            original_step_contracts=original_contracts,
-            current_repository_state=current_state,
-            current_cumulative_diff=cycle_1_evidence.diff,
-            final_checks_cycle_1=_json_text(_check_payload(cycle_1_evidence)),
-            claude_revision_report_cycle_1=(
-                cycle_1_revision.final_message if cycle_1_revision is not None else "NONE"
-            ),
-            reviewer_1_raw=cycle_1_review.raw,
-            reviewer_required_fixes=cycle_1_review.required_fixes,
-            original_approved_mutable_scope=_json_text(original_scope),
-            artifacts_dir=repair_dir,
-        )
-        self._cycle_update(
-            store, 2, status="planning", kind="repair",
-            plan_summary=repair_plan.title if repair_plan else "",
-        )
-        store.update(cycle=2, status=RunStatus.PLANNING)
-        if repair_plan.decision is PlanDecision.BLOCKED:
-            self._cycle_update(store, 2, status="blocked", blockers=repair_plan.blockers)
-            raise OrchestrationError("REPAIR_PLANNER_BLOCKED")
-        repair_bundle, _ = validate_implementation_bundle(
-            repair_dir, expected_step_ids=[step.id for step in repair_plan.steps]
-        )
+        if at <= phase_index(ResumePhase.REPAIR_PLANNER):
+            current_state = _json_text({
+                "BASE_SHA": base_sha,
+                "HEAD_SHA": current_head(info.worktree),
+                "CANDIDATE_TREE_SHA": tree_before,
+                "CHANGED_FILES": changed_paths_between_trees(repo, resolve_tree(repo, base_sha), tree_before),
+                "GIT_STATUS": status_porcelain(info.worktree),
+            })
+            repair_planner = RepairPlannerV2(
+                self._planner_client or _chat_client(
+                    build_llm_endpoint(planner_profile), self._runtime_environment
+                ),
+                implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+                reviewer_ids=frozenset({selection.reviewer.profile_id}),
+                implementer_profiles=(repair_profile,),
+                reviewer_profiles=(reviewer_profile,),
+                planning=self.config.planning,
+            )
+            repair_plan = repair_planner.plan(
+                repository_reference=render_repository_reference(repository_reference),
+                original_spec=spec,
+                original_meta_plan=original_plan.raw,
+                original_step_contracts=original_contracts,
+                current_repository_state=current_state,
+                current_cumulative_diff=cycle_1_evidence.diff,
+                final_checks_cycle_1=_json_text(_check_payload(cycle_1_evidence)),
+                claude_revision_report_cycle_1=(
+                    cycle_1_revision.final_message if cycle_1_revision is not None else "NONE"
+                ),
+                reviewer_1_raw=cycle_1_review.raw,
+                reviewer_required_fixes=cycle_1_review.required_fixes,
+                original_approved_mutable_scope=_json_text(original_scope),
+                artifacts_dir=repair_dir,
+                conversation=_read_planner_conversation(run_dir),
+            )
+            self._cycle_update(
+                store, 2, status="planning", kind="repair",
+                plan_summary=repair_plan.title if repair_plan else "",
+            )
+            store.update(cycle=2, status=RunStatus.PLANNING)
+            if repair_plan.decision is PlanDecision.BLOCKED:
+                self._cycle_update(store, 2, status="blocked", blockers=repair_plan.blockers)
+                raise OrchestrationError("REPAIR_PLANNER_BLOCKED")
+            repair_bundle, repair_bundle_sha = validate_implementation_bundle(
+                repair_dir, expected_step_ids=[step.id for step in repair_plan.steps]
+            )
+        else:
+            repair_plan = resumed.repair_plan
+            repair_bundle, repair_bundle_sha = resumed.repair_bundle, resumed.repair_bundle_sha
         repair_scope = sorted({
             path for step in repair_plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
@@ -2279,18 +2874,35 @@ class Orchestrator:
                 repair_mutable_scope=repair_scope,
             )
             raise OrchestrationError("REPAIR_SCOPE_EXPANSION")
+        if at <= phase_index(ResumePhase.REPAIR_PLANNER):
+            # Repair planner complete: the next operation is repair step 1.
+            self._checkpoint(
+                run_dir, ResumePhase.REPAIR_STEP, step_id=repair_plan.steps[0].id,
+                head=base_sha, tree=tree_before, repair_bundle_sha256=repair_bundle_sha,
+            )
+        completed = list(resumed.c02_steps) if resumed is not None else []
+        done_ids = {record["id"] for record in completed}
         state_steps = [
-            {"id": step.id, "title": step.title, "status": "waiting",
+            {"id": step.id, "title": step.title,
+             "status": "completed" if step.id in done_ids else "waiting",
              "profile_id": selection.repair_implementer.profile_id}
             for step in repair_plan.steps
         ]
         store.update(status=RunStatus.IMPLEMENTING, steps=state_steps, current_step=None)
-        expected_tree = tree_before
-        self._repair_v2_step_results = []
+        expected_tree = (
+            start.expected_tree_sha
+            if start is not None and start.phase is ResumePhase.REPAIR_STEP else tree_before
+        )
+        retry_step = start.step_id if start is not None and start.phase is ResumePhase.REPAIR_STEP else None
+        self._repair_v2_step_results = list(completed)
         codex_home = prepare_codex_home(self.config)
         forbidden_env_names = (planner_profile.api_key_env, reviewer_profile.api_key_env)
-        for step in repair_plan.steps:
+        for index, step in enumerate(repair_plan.steps):
+            if step.id in done_ids:
+                continue
             contract = read_approved_step_contract(repair_dir, repair_bundle, step.id)
+            if step.id == retry_step:
+                _archive_attempt(repair_dir / "steps" / step.id)
             store.update(
                 status=RunStatus.IMPLEMENTING, current_step=step.id,
                 steps=[{**item, "status": "running" if item["id"] == step.id else item["status"]}
@@ -2316,33 +2928,45 @@ class Orchestrator:
                 for item in state_steps
             ]
             store.update(status=RunStatus.IMPLEMENTING, current_step=None, steps=state_steps)
+            following = repair_plan.steps[index + 1].id if index + 1 < len(repair_plan.steps) else None
+            self._checkpoint(
+                run_dir,
+                ResumePhase.REPAIR_STEP if following else ResumePhase.CLAUDE_C02,
+                step_id=following, head=base_sha, tree=outcome.tree_after,
+            )
         self._update_v2_usage(store, run_dir)
-        cycle_2_revision, revision_error = self._run_v2_revision_cycle(
-            store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
-            base_tree_sha=resolve_tree(repo, base_sha), spec=spec, plan=repair_plan,
-            bundle=repair_bundle, repository_reference=repository_reference, info=info,
-            branch_ref=branch_ref, ownership_before=ownership_before, selection=selection,
-            artifact_dir=run_dir / "revision" / "C02", contract_dir=repair_dir,
-            mutable_scope=original_scope,
-            luna_reports=_step_reports_text(self._repair_v2_step_results),
-        )
-        if revision_error is not None:
-            raise OrchestrationError(revision_error)
+        if at <= phase_index(ResumePhase.CLAUDE_C02):
+            if start is not None and start.phase is ResumePhase.CLAUDE_C02:
+                _archive_attempt(run_dir / "revision" / "C02")
+            cycle_2_revision, revision_error = self._run_v2_revision_cycle(
+                store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                base_tree_sha=resolve_tree(repo, base_sha), spec=spec, plan=repair_plan,
+                bundle=repair_bundle, repository_reference=repository_reference, info=info,
+                branch_ref=branch_ref, ownership_before=ownership_before, selection=selection,
+                artifact_dir=run_dir / "revision" / "C02", contract_dir=repair_dir,
+                mutable_scope=original_scope,
+                luna_reports=_step_reports_text(self._repair_v2_step_results),
+                cycle=2,
+            )
+            if revision_error is not None:
+                raise OrchestrationError(revision_error)
+            self._cycle_update(
+                store, 2, status="revised",
+                repair_luna_reports=_step_reports_text(self._repair_v2_step_results),
+                claude_revision_report=cycle_2_revision.final_message if cycle_2_revision else "",
+            )
+        else:
+            cycle_2_revision = resumed.c02_revision
         revision_report_c02 = (
             _revision_report_text(cycle_2_revision, run_dir / "revision" / "C02")
             if cycle_2_revision is not None else ""
         )
-        self._cycle_update(
-            store, 2, status="revised",
-            repair_luna_reports=_step_reports_text(self._repair_v2_step_results),
-            claude_revision_report=cycle_2_revision.final_message if cycle_2_revision else "",
-        )
         checks_dir = run_dir / "checks" / "C02"
         checks_dir.mkdir(parents=True, exist_ok=True)
         store.update(status=RunStatus.REVALIDATING, current_step=None)
-        evidence = collect_evidence(
-            info.worktree, base_sha, self.config, evidence_dir=checks_dir,
-            secrets=self._secrets, check_failures_hard=False,
+        evidence = self._final_evidence(
+            info.worktree, base_sha, checks_dir, check_failures_hard=False,
+            reuse=start is not None and start.phase is ResumePhase.REVIEWER_C02,
         )
         store.update(
             status=RunStatus.REVALIDATING, checks=_check_payload(evidence),
@@ -2354,6 +2978,9 @@ class Orchestrator:
         integrity_failures = _hard_integrity_failures(evidence)
         if integrity_failures:
             raise OrchestrationError(integrity_failures[0].split(":", 1)[0])
+        # C02 final checks complete: the next operation is reviewer #2.
+        self._checkpoint(run_dir, ResumePhase.REVIEWER_C02, head=base_sha,
+                         tree=evidence.staged_tree_sha)
         reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
         cycle_history = _json_text({
             "C01": {
@@ -2373,32 +3000,38 @@ class Orchestrator:
         store.update(status=RunStatus.REVIEWING, current_step=None)
         # Reviewer #2 checks original SPEC <-> original approved architecture
         # <-> bounded repair <-> final cumulative diff, with every report.
-        review = self._run_v2_reviewer(
-            reviewer=reviewer, spec=spec, context=context,
-            repository_reference=repository_reference, evidence=evidence,
-            input=ReviewCycleInput(
-                iteration=2,
-                plan_text=(
-                    f"ORIGINAL APPROVED PLAN\n{original_plan.raw}\n\n"
-                    f"REPAIR PLAN C02\n{repair_plan.raw}"
+        try:
+            review = self._run_v2_reviewer(
+                reviewer=reviewer, spec=spec, context=context,
+                repository_reference=repository_reference, evidence=evidence,
+                input=ReviewCycleInput(
+                    iteration=2,
+                    plan_text=(
+                        f"ORIGINAL APPROVED PLAN\n{original_plan.raw}\n\n"
+                        f"REPAIR PLAN C02\n{repair_plan.raw}"
+                    ),
+                    luna_reports=(
+                        "C01 LUNA REPORTS\n"
+                        f"{_step_reports_text(self._last_v2_step_results)}\n\n"
+                        "C02 LUNA REPAIR REPORTS\n"
+                        f"{_step_reports_text(self._repair_v2_step_results)}"
+                    ),
+                    revision_report=(
+                        "C01 CLAUDE REVISION\n"
+                        f"{cycle_1_revision_report or 'NONE'}\n\n"
+                        "C02 CLAUDE REVISION\n"
+                        f"{revision_report_c02 or 'NONE'}"
+                    ),
+                    cycle_history=cycle_history,
                 ),
-                luna_reports=(
-                    "C01 LUNA REPORTS\n"
-                    f"{_step_reports_text(self._last_v2_step_results)}\n\n"
-                    "C02 LUNA REPAIR REPORTS\n"
-                    f"{_step_reports_text(self._repair_v2_step_results)}"
-                ),
-                revision_report=(
-                    "C01 CLAUDE REVISION\n"
-                    f"{cycle_1_revision_report or 'NONE'}\n\n"
-                    "C02 CLAUDE REVISION\n"
-                    f"{revision_report_c02 or 'NONE'}"
-                ),
-                cycle_history=cycle_history,
-            ),
-            artifacts_dir=run_dir / "review" / "C02",
-            worktree=info.worktree, base_sha=base_sha,
-        )
+                artifacts_dir=run_dir / "review" / "C02",
+                worktree=info.worktree, base_sha=base_sha,
+                reuse_accepted=start is not None and start.phase is ResumePhase.REVIEWER_C02,
+            )
+        except LLMError as exc:
+            raise ReviewerTransportError(
+                f"REVIEWER_TRANSPORT_FAILURE: {_bounded_parse_detail(exc)}"
+            ) from exc
         store.update(status=RunStatus.REVIEWING, review=_review_payload(review), review_iterations=2)
         self._cycle_update(
             store, 2, status="reviewed", reviewer_conclusion=_review_payload(review),
@@ -2539,7 +3172,14 @@ class Orchestrator:
         repository_reference: RepositoryReference,
         cycle: int | None = None,
     ) -> RunResult:
-        """Verify the commit tree and optionally publish the run branch once."""
+        """Verify the commit tree, then publish it exactly once.
+
+        ``run-branch`` pushes only the run branch.  ``fast-forward-base``
+        compare-and-swaps the local base branch from the run base to the
+        reviewed commit (no checkout of the user's worktree), then pushes that
+        exact commit to the remote base branch.  Agents never worked on the
+        base branch: they only ever touched the isolated run worktree.
+        """
 
         fields: dict[str, Any] = {"commit_sha": commit_sha, "current_step": None}
         if cycle is not None:
@@ -2568,12 +3208,22 @@ class Orchestrator:
             )
             return RunResult(run_dir, RunStatus.FAILED, state)
 
+        # The exact reviewed commit is durable: the next operation is the
+        # publication, which a resume retries alone.
+        self._checkpoint(
+            run_dir, ResumePhase.PUBLISH, cycle=cycle or _state_cycle_value(store.load()),
+            head=commit_sha, tree=approved_tree,
+        )
         if not self.config.publish.enabled:
             state = store.update(status=RunStatus.COMMITTED, **fields)
+            mark_checkpoint_completed(run_dir)
             return RunResult(run_dir, RunStatus.COMMITTED, state)
 
         # PUBLISHING is durable before the first and only push process starts.
         store.update(status=RunStatus.PUBLISHING, **fields)
+        fast_forward = self.config.publish.mode == PublishMode.FAST_FORWARD_BASE.value
+        base_branch = self.config.base_ref
+        outcome = None
         try:
             if status_porcelain(info.worktree):
                 raise GitError("worktree is not clean before push")
@@ -2588,13 +3238,57 @@ class Orchestrator:
             repository_remote_url(info.worktree, self.config.publish.remote)
             if resolve_tree(info.worktree, "HEAD") != approved_tree:
                 raise GitError("HEAD tree differs from the approved reviewed tree")
-            web_url = run_branch_web_url(repository_reference, info.branch)
-            push_run_branch(
-                info.worktree,
-                remote=self.config.publish.remote,
-                branch=info.branch,
-                commit_sha=commit_sha,
+            if fast_forward:
+                outcome = publish_fast_forward_base(
+                    info.source_repo,
+                    remote=self.config.publish.remote,
+                    base_branch=base_branch,
+                    base_sha=info.base_sha,
+                    commit_sha=commit_sha,
+                    approved_tree=approved_tree,
+                    run_branch=info.branch,
+                )
+                web_url = _commit_web_url(repository_reference, commit_sha)
+            else:
+                web_url = run_branch_web_url(repository_reference, info.branch)
+                push_run_branch(
+                    info.worktree,
+                    remote=self.config.publish.remote,
+                    branch=info.branch,
+                    commit_sha=commit_sha,
+                )
+        except BaseMovedError as exc:
+            state = store.record_failure(
+                "BASE_MOVED_SINCE_RUN",
+                f"{exc}; nothing was merged, rebased, forced or pushed",
+                publish={
+                    "mode": self.config.publish.mode, "target": base_branch,
+                    "remote": self.config.publish.remote, "commit_sha": commit_sha,
+                    "status": "refused", "local_base_updated": False,
+                },
+                **fields,
             )
+            return RunResult(run_dir, RunStatus.FAILED, state)
+        except BasePushError as exc:
+            # Git transport diagnostics can contain a credential-bearing URL:
+            # the durable failure is fixed text.
+            detail = "push did not complete"
+            if exc.local_base_updated:
+                detail += (
+                    f"; local {base_branch} already points to {commit_sha}"
+                    f" but {self.config.publish.remote}/{base_branch} was not updated"
+                )
+            state = store.record_failure(
+                "PUSH_FAILED",
+                detail,
+                publish={
+                    "mode": self.config.publish.mode, "target": base_branch,
+                    "remote": self.config.publish.remote, "commit_sha": commit_sha,
+                    "status": "push-failed", "local_base_updated": exc.local_base_updated,
+                },
+                **fields,
+            )
+            return RunResult(run_dir, RunStatus.FAILED, state)
         except (GitError, OSError, ValueError) as exc:
             # Git transport diagnostics can contain a credential-bearing URL.
             # Keep the durable failure bounded and secret-free.
@@ -2605,13 +3299,30 @@ class Orchestrator:
             )
             return RunResult(run_dir, RunStatus.FAILED, state)
 
-        publish_payload = {
-            "remote": self.config.publish.remote,
-            "branch": info.branch,
-            "commit_sha": commit_sha,
-            "web_url": web_url,
-            "status": "pushed",
-        }
+        if fast_forward and outcome is not None:
+            publish_payload = {
+                "mode": PublishMode.FAST_FORWARD_BASE.value,
+                "target": base_branch,
+                "remote": self.config.publish.remote,
+                "branch": base_branch,
+                "run_branch": info.branch,
+                "base_sha": info.base_sha,
+                "commit_sha": commit_sha,
+                "web_url": web_url,
+                "status": "pushed",
+                "local_base_updated": outcome.local_base_updated,
+                "base_checked_out_in": list(outcome.base_checked_out_in),
+            }
+        else:
+            publish_payload = {
+                "mode": PublishMode.RUN_BRANCH.value,
+                "target": info.branch,
+                "remote": self.config.publish.remote,
+                "branch": info.branch,
+                "commit_sha": commit_sha,
+                "web_url": web_url,
+                "status": "pushed",
+            }
         atomic_write_text(
             run_dir / "publish.json",
             _json_text(publish_payload),
@@ -2621,7 +3332,408 @@ class Orchestrator:
             publish=publish_payload,
             **fields,
         )
+        mark_checkpoint_completed(run_dir)
         return RunResult(run_dir, RunStatus.PUBLISHED, state)
+
+    # -- resume ------------------------------------------------------------
+
+    def resume(
+        self, run_id: str, *, on_claimed: Callable[[Path], None] | None = None,
+    ) -> RunResult:
+        """Resume a failed run at its durable checkpoint.
+
+        Never replays a successful phase.  Every persisted invariant is
+        validated first; a mismatch records ``RESUME_INTEGRITY_FAILURE`` (or
+        ``RESUME_REQUIRES_OPERATOR``) without any model call.  A run that is
+        not resumable raises :class:`ResumeNotAllowedError` and its state is
+        left untouched.
+        """
+
+        try:
+            selected = _safe_run_id(run_id)
+        except OrchestrationError as exc:
+            raise ResumeError(str(exc)) from exc
+        run_dir = (self.config.runs_root / selected).expanduser().resolve()
+        if not run_dir.is_dir():
+            raise ResumeError("run directory does not exist")
+        if not (run_dir / "state.json").is_file():
+            raise ResumeError("run state does not exist")
+        store = RunStateStore(run_dir / "state.json")
+        try:
+            state = store.load()
+        except (OSError, ValueError) as exc:
+            raise ResumeError(f"run state is unreadable: {exc}") from exc
+        if not hasattr(self, "_runtime_environment"):
+            self._runtime_environment = (
+                self.config.runtime_environment if self.config.runtime_environment else os.environ
+            )
+        self._secrets = config_secret_values(self.config, self._runtime_environment)
+        eligibility = resume_info(run_dir, state)
+        if not eligibility.resumable:
+            raise ResumeNotAllowedError(eligibility.reason or "run is not resumable")
+        try:
+            checkpoint = load_resume_checkpoint(run_dir, state)
+        except ResumeCheckpointError as exc:
+            raise ResumeNotAllowedError(str(exc)) from exc
+        if checkpoint is None:
+            raise ResumeNotAllowedError("no resume checkpoint")
+        previous = state.get("resume") if isinstance(state.get("resume"), dict) else {}
+        attempts = previous.get("attempts") if isinstance(previous.get("attempts"), int) else 0
+        record = {
+            "phase": checkpoint.phase.value,
+            "label": resume_label(checkpoint),
+            "attempts": attempts + 1,
+            "previous_status": state.get("status"),
+            "previous_failure": state.get("failure"),
+        }
+        try:
+            resumed = self._validate_resume(run_dir, state, checkpoint)
+        except (ResumeIntegrityError, ResumeRequiresOperatorError) as exc:
+            failed = store.record_failure(
+                exc.code, redact(str(exc), self._secrets),
+                resume={**record, "status": "refused"}, current_step=None,
+            )
+            return RunResult(run_dir, RunStatus.FAILED, failed)
+        claimed = store.transition_if(
+            state.get("status", RunStatus.FAILED), state.get("updated_at"),
+            status=PHASE_STATUS[checkpoint.phase], failure=None, current_step=None,
+            resume={**record, "status": "running",
+                    "restored_paths": list(resumed.restore_paths)},
+        )
+        if claimed is None:
+            raise ResumeError("run state changed while the resume was validated")
+        if read_checkpoint(run_dir) is None:
+            # A historical run: persist the inferred checkpoint so every later
+            # transition carries the same identity forward.
+            write_checkpoint(run_dir, checkpoint)
+        if on_claimed is not None:
+            on_claimed(run_dir)
+        try:
+            if resumed.restore_paths:
+                self._restore_revision_tree(resumed)
+            if checkpoint.phase is ResumePhase.PUBLISH:
+                return self._complete_commit(
+                    store=store, run_dir=run_dir, info=resumed.info,
+                    approved_tree=checkpoint.expected_tree_sha,
+                    commit_sha=checkpoint.expected_head_sha,
+                    repository_reference=resumed.repository_reference,
+                    cycle=checkpoint.cycle,
+                )
+            return self._execute_v2(
+                store, run_dir, selected, resumed.spec, resumed.info.source_repo,
+                resumed.info.base_sha, resumed.context, resumed.repository_reference,
+                resumed=resumed,
+            )
+        except ResumeRequiresOperatorError as exc:
+            failed = store.record_failure(
+                exc.code, redact(str(exc), self._secrets),
+                **self._closing_step_fields(store, "failed"),
+            )
+            return RunResult(run_dir, RunStatus.FAILED, failed)
+        except KeyboardInterrupt:
+            interrupted = store.update(
+                status=RunStatus.INTERRUPTED,
+                failure={"reason": "INTERRUPTED"},
+                **self._closing_step_fields(store, "interrupted"),
+            )
+            return RunResult(run_dir, RunStatus.INTERRUPTED, interrupted)
+        except Exception as exc:
+            failed = store.record_failure(
+                _failure_reason(exc),
+                redact(str(exc), self._secrets),
+                **self._closing_step_fields(store, "failed"),
+            )
+            return RunResult(run_dir, RunStatus.FAILED, failed)
+
+    def _restore_revision_tree(self, resumed: "_ResumedRun") -> None:
+        """Undo a failed Claude attempt's in-scope edits, exactly and boundedly."""
+
+        worktree = resumed.info.worktree
+        expected = resumed.checkpoint.expected_tree_sha
+        try:
+            restore_paths_from_tree(worktree, expected, resumed.restore_paths)
+            restored = (
+                index_tree_sha(worktree) == expected
+                and candidate_tree_sha(worktree) == expected
+                and not _status_has_unstaged_or_untracked(status_porcelain(worktree))
+            )
+        except GitError:
+            restored = False
+        if not restored:
+            raise ResumeRequiresOperatorError(
+                "the tree recorded in tree_before.txt could not be restored exactly"
+            )
+
+    def _validate_resume(
+        self, run_dir: Path, state: Mapping[str, Any], checkpoint: ResumeCheckpoint,
+    ) -> "_ResumedRun":
+        """Fail-closed integrity gate in front of every resume; no model call."""
+
+        def refuse(message: str) -> NoReturn:
+            raise ResumeIntegrityError(message)
+
+        revision_enabled = self.config.revision.enabled
+        if self.config.planning.protocol != "v2" or state.get("planning_protocol") != "v2":
+            refuse("only META PLAN v2 runs can be resumed")
+        if not revision_enabled and checkpoint.phase not in (
+            ResumePhase.INITIAL_STEP, ResumePhase.REVIEWER_C01, ResumePhase.PUBLISH,
+        ):
+            refuse("this checkpoint requires revision.enabled")
+        try:
+            repo = git_root(self.config.repo)
+        except GitError as exc:
+            refuse(f"repository is unavailable: {exc}")
+        if str(repo) != str(state.get("repo")):
+            refuse("the configured repository is not the run repository")
+        base_sha = state.get("base_sha")
+        if not isinstance(base_sha, str) or _GIT_OBJECT_ID.fullmatch(base_sha) is None:
+            refuse("run base SHA is invalid")
+        reference = _read_repository_reference(run_dir)
+        if reference is None or reference.base_sha != base_sha:
+            refuse("the base SHA changed for this run")
+        try:
+            spec = (run_dir / "spec.md").read_text(encoding="utf-8")
+            context = (run_dir / "context.txt").read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            refuse("run SPEC or planner context is unreadable")
+        # Plan identity and the human approval bound to it.
+        try:
+            identity = compute_plan_identity_from_run(run_dir)
+            recorded = plan_identity_from_mapping(state.get("plan_identity"))
+            approval = read_plan_approval(run_dir, expected_identity=identity)
+        except (ApprovalError, ResumeCheckpointError) as exc:
+            refuse(f"plan artifacts are invalid: {exc}")
+        if identity != checkpoint.plan_identity or identity != recorded:
+            refuse("plan identity no longer matches")
+        if approval is None or approval.decision is not ApprovalDecision.APPROVE:
+            refuse("plan approval was not APPROVE")
+        if (
+            approval.execution_sha256 != checkpoint.execution_selection_sha256
+            or approval.bundle_sha256 != identity.bundle_sha256
+        ):
+            refuse("the approval does not bind the checkpoint execution selection")
+        # The approved execution selection, against today's configuration.
+        try:
+            if revision_enabled:
+                selection, execution_sha = read_execution_selection_v4_with_sha256(run_dir)
+                validate_execution_selection_v4(self.config, selection)
+            else:
+                selection, execution_sha = read_execution_selection_v3_with_sha256(run_dir)
+                validate_execution_selection_v3(self.config, selection)
+                if selection.reviser is not None:
+                    refuse("execution selection contains a reviser but revision is disabled")
+        except (ExecutionSelectionError, ProfileError) as exc:
+            refuse(f"execution selection is invalid: {exc}")
+        if execution_sha != checkpoint.execution_selection_sha256 or execution_sha != identity.execution_sha256:
+            refuse("execution selection hash changed")
+        execution = state.get("execution") if isinstance(state.get("execution"), Mapping) else {}
+        planner_state = execution.get("planner") if isinstance(execution.get("planner"), Mapping) else {}
+        if selection.planner.profile_id != planner_state.get("profile_id"):
+            refuse("execution selection planner is not the run planner")
+        # The approved plan and its exact bundle.
+        profiles = profiles_for_config(self.config).values()
+        try:
+            plan = parse_task_plan_v2(
+                (run_dir / "planner.raw.md").read_text(encoding="utf-8"),
+                implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
+                reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
+            )
+            bundle, bundle_sha = validate_implementation_bundle(
+                run_dir, expected_step_ids=[step.id for step in plan.steps]
+            )
+        except (V2PlanParseError, OSError, UnicodeError) as exc:
+            refuse(f"approved plan is unreadable: {exc}")
+        if plan.decision is not PlanDecision.READY or bundle_sha != identity.bundle_sha256:
+            refuse("approved bundle changed")
+        if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
+            refuse("execution selection steps do not match the plan")
+        # Worktree, branch, HEAD and the exact candidate tree.
+        worktree_value, branch = state.get("worktree"), state.get("branch")
+        if not isinstance(worktree_value, str) or not isinstance(branch, str):
+            refuse("run has no worktree or branch")
+        worktree = Path(worktree_value).expanduser().resolve()
+        if not worktree.is_dir():
+            refuse("run worktree is missing")
+        scope = sorted({
+            path for step in plan.steps
+            for path in (*step.write_set, *step.create_set, *step.delete_set)
+        })
+        try:
+            if str(worktree) not in registered_worktrees(repo):
+                refuse("run worktree is not registered in the repository")
+            if not branch_exists(repo, branch):
+                refuse("run branch is missing")
+            if symbolic_head(worktree) != f"refs/heads/{branch}":
+                refuse("worktree HEAD is not the run branch")
+            head = current_head(worktree)
+            if head != checkpoint.expected_head_sha:
+                refuse("HEAD moved since the checkpoint")
+            if resolve_commit(repo, f"refs/heads/{branch}") != head:
+                refuse("run branch does not point to the worktree HEAD")
+            if checkpoint.phase is ResumePhase.PUBLISH:
+                if head != state.get("commit_sha") or commit_parents(repo, head) != (base_sha,):
+                    refuse("the recorded commit is not the run commit on the run base")
+                if (
+                    resolve_tree(repo, head) != checkpoint.expected_tree_sha
+                    or checkpoint.expected_tree_sha != state.get("approved_tree_sha")
+                ):
+                    refuse("the run commit tree is not the approved tree")
+            elif head != base_sha:
+                refuse("an agent-created commit moved the run branch")
+            base_tree = resolve_tree(repo, base_sha)
+            candidate = candidate_tree_sha(worktree)
+            index_tree = index_tree_sha(worktree)
+            dirty = _status_has_unstaged_or_untracked(status_porcelain(worktree))
+            restore: tuple[str, ...] = ()
+            if candidate != checkpoint.expected_tree_sha or index_tree != checkpoint.expected_tree_sha or dirty:
+                restore = self._explain_tree_drift(repo, run_dir, checkpoint, candidate, scope)
+            unapproved = [
+                path for path in changed_paths_between_trees(repo, base_tree, checkpoint.expected_tree_sha)
+                if path not in scope
+            ]
+        except GitError as exc:
+            refuse(f"Git state is unreadable: {exc}")
+        if unapproved:
+            refuse("the candidate contains a path outside the approved scope")
+        resumed = _ResumedRun(
+            checkpoint=checkpoint, plan=plan, bundle=bundle, selection=selection,
+            info=WorktreeInfo(
+                source_repo=repo, worktree=worktree, branch=branch,
+                base_ref=self.config.base_ref, base_sha=base_sha,
+            ),
+            repository_reference=reference, spec=spec, context=context,
+            restore_paths=restore,
+        )
+        if checkpoint.phase is not ResumePhase.PUBLISH:
+            self._load_resumed_results(run_dir, resumed, base_tree, revision_enabled)
+        return resumed
+
+    @staticmethod
+    def _explain_tree_drift(
+        repo: Path, run_dir: Path, checkpoint: ResumeCheckpoint, candidate: str,
+        scope: list[str],
+    ) -> tuple[str, ...]:
+        """Classify a candidate that is not the checkpoint tree.
+
+        Only one drift is recoverable: the tree a failed Claude attempt left
+        behind (recorded in ``tree_after_failure.txt``), when every changed
+        path is in the approved scope.  It is then restored exactly.  Any
+        other difference is tampering or an unknown writer.
+        """
+
+        phase = checkpoint.phase
+        if phase in (ResumePhase.CLAUDE_C01, ResumePhase.CLAUDE_C02):
+            directory = run_dir / "revision" / ("C02" if phase is ResumePhase.CLAUDE_C02 else "")
+            failure_tree = _read_tree_file(directory / "tree_after_failure.txt")
+            if failure_tree is not None and candidate == failure_tree:
+                changed = changed_paths_between_trees(repo, checkpoint.expected_tree_sha, candidate)
+                if not changed or any(path not in scope for path in changed):
+                    raise ResumeRequiresOperatorError(
+                        "the failed Claude attempt changed paths outside the approved scope"
+                    )
+                return tuple(changed)
+        elif phase in (ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP):
+            root = run_dir if phase is ResumePhase.INITIAL_STEP else run_dir / "repair" / "C02"
+            record = _read_json_artifact(root / "steps" / str(checkpoint.step_id) / "step.json")
+            if (
+                isinstance(record, dict) and record.get("status") == "FAILED"
+                and record.get("tree_after") == candidate
+            ):
+                raise ResumeRequiresOperatorError(
+                    f"the failed step {checkpoint.step_id} left partial changes; start a new run"
+                )
+        raise ResumeIntegrityError("the worktree differs from the checkpoint tree")
+
+    def _load_resumed_results(
+        self, run_dir: Path, resumed: "_ResumedRun", base_tree: str, revision_enabled: bool,
+    ) -> None:
+        """Read back every phase before the checkpoint and verify its chain."""
+
+        def refuse(message: str) -> NoReturn:
+            raise ResumeIntegrityError(message)
+
+        checkpoint = resumed.checkpoint
+        at = phase_index(checkpoint.phase)
+        expected = checkpoint.expected_tree_sha
+        ids = [step.id for step in resumed.plan.steps]
+        if checkpoint.phase is ResumePhase.INITIAL_STEP:
+            if checkpoint.step_id not in ids:
+                refuse("checkpoint step is not in the approved plan")
+            prior = ids[: ids.index(checkpoint.step_id)]
+        else:
+            prior = ids
+        records = [_load_completed_step(run_dir / "steps" / step_id, step_id) for step_id in prior]
+        if any(record is None for record in records):
+            refuse("a completed Luna step record is missing or invalid")
+        chain_end = _verify_step_chain(records, base_tree)
+        if chain_end is None:
+            refuse("Luna step trees do not form an unbroken chain")
+        if checkpoint.phase is ResumePhase.INITIAL_STEP or checkpoint.phase is ResumePhase.CLAUDE_C01 or (
+            not revision_enabled and checkpoint.phase is ResumePhase.REVIEWER_C01
+        ):
+            if chain_end != expected:
+                refuse("the checkpoint tree is not the last completed Luna tree")
+        resumed.c01_steps = records
+        if revision_enabled and at > phase_index(ResumePhase.CLAUDE_C01):
+            revision = _load_revision(run_dir / "revision")
+            if revision is None or revision.tree_before != chain_end:
+                refuse("the Claude C01 record is missing or not based on the Luna tree")
+            if checkpoint.phase is ResumePhase.REVIEWER_C01 and revision.tree_after != expected:
+                refuse("the checkpoint tree is not the Claude C01 tree")
+            resumed.c01_revision = revision
+        if at <= phase_index(ResumePhase.REVIEWER_C01):
+            return
+        evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
+        c01_tree = resumed.c01_revision.tree_after if resumed.c01_revision is not None else chain_end
+        if evidence is None or evidence.staged_tree_sha != c01_tree:
+            refuse("the C01 final evidence is missing or not for the C01 tree")
+        review = _load_c01_review(run_dir, evidence)
+        if review is None or review.verdict is not ReviewVerdict.REVISE or review.route is not ReviewRoute.IMPLEMENTATION:
+            refuse("reviewer #1 did not route an implementation repair")
+        resumed.c01_evidence, resumed.c01_review = evidence, review
+        if checkpoint.phase is ResumePhase.REPAIR_PLANNER:
+            if expected != evidence.staged_tree_sha:
+                refuse("the checkpoint tree is not the C01 reviewed tree")
+            return
+        repair_dir = run_dir / "repair" / "C02"
+        selection = resumed.selection
+        try:
+            repair_plan = parse_task_plan_v2(
+                (repair_dir / "planner.raw.md").read_text(encoding="utf-8"),
+                implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+                reviewer_ids=frozenset({selection.reviewer.profile_id}),
+            )
+            repair_bundle, repair_sha = validate_implementation_bundle(
+                repair_dir, expected_step_ids=[step.id for step in repair_plan.steps]
+            )
+        except (V2PlanParseError, OSError, UnicodeError, AttributeError) as exc:
+            refuse(f"the C02 repair plan is unreadable: {exc}")
+        if repair_plan.decision is not PlanDecision.READY or repair_sha != checkpoint.repair_bundle_sha256:
+            refuse("the C02 repair bundle changed")
+        resumed.repair_plan, resumed.repair_bundle, resumed.repair_bundle_sha = repair_plan, repair_bundle, repair_sha
+        repair_ids = [step.id for step in repair_plan.steps]
+        if checkpoint.phase is ResumePhase.REPAIR_STEP:
+            if checkpoint.step_id not in repair_ids:
+                refuse("checkpoint step is not in the repair plan")
+            repair_prior = repair_ids[: repair_ids.index(checkpoint.step_id)]
+        else:
+            repair_prior = repair_ids
+        repair_records = [
+            _load_completed_step(repair_dir / "steps" / step_id, step_id) for step_id in repair_prior
+        ]
+        if any(record is None for record in repair_records):
+            refuse("a completed C02 step record is missing or invalid")
+        repair_end = _verify_step_chain(repair_records, evidence.staged_tree_sha)
+        if repair_end is None:
+            refuse("C02 step trees do not form an unbroken chain")
+        if checkpoint.phase in (ResumePhase.REPAIR_STEP, ResumePhase.CLAUDE_C02) and repair_end != expected:
+            refuse("the checkpoint tree is not the last completed C02 tree")
+        resumed.c02_steps = repair_records
+        if at > phase_index(ResumePhase.CLAUDE_C02):
+            revision = _load_revision(run_dir / "revision" / "C02")
+            if revision is None or revision.tree_before != repair_end or revision.tree_after != expected:
+                refuse("the Claude C02 record does not match the checkpoint")
+            resumed.c02_revision = revision
 
     def _commit_body_v2(self, run_id: str, base_sha: str, tree_sha: str,
                         evidence: EvidenceBundle, selection: ExecutionSelectionV3) -> str:
@@ -2684,11 +3796,21 @@ def run_orchestrator(
     return Orchestrator(loaded).run(spec, run_id=run_id)
 
 
+def resume_run(config: HarnessConfig | str | Path, run_id: str) -> RunResult:
+    """Resume *run_id* at its durable checkpoint (same run id, same worktree)."""
+
+    loaded = load_config(config) if not isinstance(config, HarnessConfig) else config
+    return Orchestrator(loaded).resume(run_id)
+
+
 __all__ = [
     "CommitBoundaryError",
     "OrchestrationError",
     "Orchestrator",
+    "ResumeError",
+    "ResumeNotAllowedError",
     "authorize_commit",
     "generate_run_id",
+    "resume_run",
     "run_orchestrator",
 ]

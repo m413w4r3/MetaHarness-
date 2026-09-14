@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Mapping
 from urllib.parse import unquote
 
+from ..agent.diagnostics import TOKEN_DIAGNOSTICS_NAME
 from ..agent.events import parse_event, summarize_event, summarize_step_event
+from ..resume import resume_info
 from ..approval import (
     ApprovalDecision,
     ApprovalError,
@@ -37,18 +39,32 @@ from ..execution_selection import (
     resolve_execution_selection_v4,
     validate_execution_selection_v4,
 )
-from ..models import ExecutionRole, ExecutionSelection, ExecutionSelectionV4, HarnessConfig, RunStatus
+from ..models import (
+    ExecutionRole,
+    ExecutionSelection,
+    ExecutionSelectionV4,
+    HarnessConfig,
+    PublishMode,
+    RunStatus,
+)
 from ..planning_v2 import V2PlanParseError, step_contract_path, validate_implementation_bundle
 from ..profiles import ProfileError, profile_for_role, profiles_for_config, safe_profile_metadata
 from ..state import RunStateStore
 from ..usage import (
     PLANNER_USAGE_ARTIFACT,
     REVIEWER_USAGE_ARTIFACT,
+    add_usage,
     normalize_usage,
     phase_usage_summary,
     read_usage_artifact,
 )
-from .run_manager import RunCapacityError, RunCollisionError, RunManager, RunManagerError
+from .run_manager import (
+    RunCapacityError,
+    RunCollisionError,
+    RunManager,
+    RunManagerError,
+    RunResumeNotAllowedError,
+)
 
 ARTIFACT_ALLOWLIST = frozenset(
     {
@@ -333,7 +349,9 @@ def list_runs(runs_root: Path) -> list[dict[str, Any]]:
     return result
 
 
-def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
+def get_run(
+    runs_root: Path, run_id: str, *, config: HarnessConfig | None = None,
+) -> dict[str, Any]:
     directory = _run_dir(runs_root, run_id)
     safe_id = validate_run_id(run_id)
     state = _load_state(directory)
@@ -440,6 +458,7 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
         "cycle": _state_cycle(state),
         "cycle_artifacts": cycle_artifacts,
         "usage": phase_usage_summary(directory, v1_agent_usage=raw_usage),
+        "overview": run_overview(directory, state, config),
     }
 
 
@@ -511,6 +530,8 @@ def _cycle_steps(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[
         )
         result.append({
             **item,
+            "token_diagnostics": _token_diagnostics(step_dir),
+            "context_level": context_level(step_usage),
             "id": step_id,
             "cycle": cycle,
             "title": item.get("title", entry.get("title")),
@@ -1142,9 +1163,454 @@ def create_run(
     return {"ok": True, "run_id": created_id, "location": f"/runs/{created_id}"}  # type: ignore[dict-item]
 
 
+# -- token diagnostics, resumability and the live overview --------------------
+
+# Worker input tokens above these levels are flagged (advisory only; a run is
+# never failed because of its context usage).
+CONTEXT_WARNING_INPUT_TOKENS = HIGH_WORKER_INPUT_TOKENS
+CONTEXT_SEVERE_INPUT_TOKENS = 250_000
+LIVE_EVENTS_MAX = 20
+_LIVE_EVENT_WINDOW_BYTES = 256 * 1024
+# Statuses for which the run page stops polling: terminal, or waiting for a
+# human decision that needs the complete server-rendered page.
+LIVE_STOP_STATUSES = frozenset({
+    "committed", "published", "failed", "blocked", "plan_rejected", "interrupted",
+    "awaiting_plan_approval",
+})
+_DIAGNOSTIC_COUNTERS = (
+    "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
+    "event_count", "tool_call_count",
+)
+_DIAGNOSTIC_LISTS = ("files_read_observed", "commands_observed")
+_CHECK_FAILURE_PREFIXES = (
+    "CHECK_", "DETERMINISTIC_GATE", "EMPTY_DIFF", "DIFF_TOO_LARGE", "SECRET_IN",
+    "UNSCANNABLE", "UNREVIEWABLE", "HEAD_MISMATCH",
+)
+_PUBLISH_FAILURES = frozenset({
+    "PUSH_FAILED", "BASE_MOVED_SINCE_RUN", "COMMIT_TREE_MISMATCH", "TOCTOU_FAILURE",
+})
+_C02_PHASES = frozenset({"repair_planner", "repair_step", "claude_c02", "reviewer_c02"})
+_PIPELINE_STEP_STATE = {
+    "completed": "complete", "running": "running", "failed": "failed",
+    "interrupted": "failed", "waiting": "waiting",
+}
+
+
+def context_level(usage: Any) -> str:
+    """``normal``, ``warning`` (> 100k input) or ``severe`` (> 250k input)."""
+
+    tokens = usage.get("input_tokens") if isinstance(usage, Mapping) else None
+    if isinstance(tokens, bool) or not isinstance(tokens, int):
+        return "normal"
+    if tokens > CONTEXT_SEVERE_INPUT_TOKENS:
+        return "severe"
+    if tokens > CONTEXT_WARNING_INPUT_TOKENS:
+        return "warning"
+    return "normal"
+
+
+def _token_diagnostics(step_dir: Path) -> dict[str, Any] | None:
+    """The bounded, argument-free ``token_diagnostics.json`` of one step."""
+
+    payload = _load_json(step_dir / TOKEN_DIAGNOSTICS_NAME, max_bytes=64 * 1024)
+    if not isinstance(payload, dict):
+        return None
+    result: dict[str, Any] = {}
+    for key in _DIAGNOSTIC_COUNTERS:
+        value = payload.get(key)
+        result[key] = value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+    for key in _DIAGNOSTIC_LISTS:
+        value = payload.get(key)
+        items = value if isinstance(value, list) else []
+        result[key] = [item[:300] for item in items[:100] if isinstance(item, str)]
+    return result
+
+
+def _resume_payload(directory: Path, state: Mapping[str, Any]) -> dict[str, Any]:
+    info = resume_info(directory, state)
+    return {"resumable": info.resumable, "phase": info.phase, "label": info.label}
+
+
+def _step_statuses(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Light (id, status) pairs of one cycle for the pipeline; no event reads."""
+
+    root = _cycle_root(directory, cycle)
+    ids = [entry["id"] for entry in _bundle_entries(root / "implementation_bundle.json")]
+    raw_live = state.get("steps") if _state_cycle(state) == cycle else None
+    live = {
+        item["id"]: item.get("status") for item in (raw_live if isinstance(raw_live, list) else [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        and _STEP_ID.fullmatch(item["id"]) is not None
+    }
+    result: list[tuple[str, str]] = []
+    for step_id in ids or list(live):
+        status = live.get(step_id)
+        if not isinstance(status, str):
+            record = _load_json(root / "steps" / step_id / "step.json", max_bytes=MAX_RESULT_BYTES)
+            status = _DURABLE_STEP_STATUS.get(
+                str(record.get("status")) if isinstance(record, dict) else "", "waiting"
+            )
+        result.append((step_id, status))
+    return result
+
+
+def run_pipeline(
+    directory: Path,
+    state: Mapping[str, Any],
+    config: HarnessConfig | None = None,
+    resume: Mapping[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    """Server-computed pipeline states: complete/running/failed/waiting/resumable."""
+
+    status = str(state.get("status") or "")
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    reason = str(failure.get("reason") or "") if failure else ""
+    failed = status in {"failed", "interrupted"}
+    cycle = _state_cycle(state)
+    planner = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
+    execution = state.get("execution") if isinstance(state.get("execution"), Mapping) else {}
+    resume_phase = resume.get("phase") if isinstance(resume, Mapping) and resume.get("resumable") else None
+    revision_enabled = config.revision.enabled if config is not None else "reviser" in execution
+    items: list[dict[str, str]] = []
+
+    def add(key: str, label: str, value: str) -> None:
+        items.append({"key": key, "label": label, "state": value})
+
+    def failed_at(prefixes: tuple[str, ...], at_cycle: int) -> bool:
+        return failed and cycle == at_cycle and reason.startswith(prefixes)
+
+    decision = planner.get("decision")
+    if decision == "READY":
+        add("planner", "Planner", "complete")
+    elif decision == "BLOCKED" or status == "blocked" or failed:
+        add("planner", "Planner", "failed")
+    elif status in {"created", "planning"}:
+        add("planner", "Planner", "running")
+    else:
+        add("planner", "Planner", "waiting")
+
+    approval = _load_json(directory / "plan_approval.json", max_bytes=16 * 1024)
+    approval_decision = approval.get("decision") if isinstance(approval, dict) else None
+    if approval_decision == "APPROVE" or (
+        approval_decision is None and decision == "READY"
+        and (directory / "execution_selection.json").exists()
+        and status != AWAITING_APPROVAL
+    ):
+        add("approval", "Approval", "complete")
+    elif approval_decision == "REJECT" or status == "plan_rejected":
+        add("approval", "Approval", "failed")
+    elif status == AWAITING_APPROVAL:
+        add("approval", "Approval", "running")
+    elif failed and reason.startswith(("PLAN_APPROVAL", "EXECUTION_SELECTION")):
+        add("approval", "Approval", "failed")
+    else:
+        add("approval", "Approval", "waiting")
+
+    c01_steps = _step_statuses(directory, 1, state)
+    for step_id, step_status in c01_steps:
+        value = _PIPELINE_STEP_STATE.get(step_status, "waiting")
+        if value in {"failed", "running"} and resume_phase == "initial_step":
+            value = "resumable"
+        add(f"c1-{step_id}", f"Luna {step_id}", value)
+    if not c01_steps:
+        add("c1-luna", "Luna", "waiting")
+
+    if revision_enabled:
+        report = (
+            _load_json(directory / "revision" / "C01" / "report.json", max_bytes=MAX_RESULT_BYTES)
+            or _load_json(directory / "revision" / "report.json", max_bytes=MAX_RESULT_BYTES)
+        )
+        if isinstance(report, dict) and report.get("status") in {"COMPLETED", "NO_CHANGE"}:
+            add("claude-c01", "Claude C01", "complete")
+        elif resume_phase == "claude_c01":
+            add("claude-c01", "Claude C01", "resumable")
+        elif failed_at(("CLAUDE_", "REVISION_SCOPE"), 1):
+            add("claude-c01", "Claude C01", "failed")
+        elif not failed and cycle == 1 and status in {"pre_revision_validating", "revising"}:
+            add("claude-c01", "Claude C01", "running")
+        else:
+            add("claude-c01", "Claude C01", "waiting")
+
+    c01_review = (
+        _load_json(directory / "review" / "C01" / "review.json", max_bytes=MAX_RESULT_BYTES)
+        or _load_json(directory / "review.json", max_bytes=MAX_RESULT_BYTES)
+    )
+    evidence_ready = (directory / "checks" / "C01" / "evidence.json").exists() or (
+        directory / "evidence.json"
+    ).exists()
+    if evidence_ready:
+        add("checks-c01", "Checks", "complete")
+    elif failed_at(_CHECK_FAILURE_PREFIXES, 1):
+        add("checks-c01", "Checks", "failed")
+    elif not failed and cycle == 1 and status in {"validating", "revalidating"}:
+        add("checks-c01", "Checks", "running")
+    else:
+        add("checks-c01", "Checks", "waiting")
+    if isinstance(c01_review, dict):
+        add("reviewer-c01", "Reviewer #1", "complete")
+    elif resume_phase == "reviewer_c01":
+        add("reviewer-c01", "Reviewer #1", "resumable")
+    elif failed_at(("REVIEW",), 1):
+        add("reviewer-c01", "Reviewer #1", "failed")
+    elif not failed and cycle == 1 and status == "reviewing":
+        add("reviewer-c01", "Reviewer #1", "running")
+    else:
+        add("reviewer-c01", "Reviewer #1", "waiting")
+
+    if revision_enabled:
+        if cycle == 2:
+            if resume_phase in _C02_PHASES:
+                value = "resumable"
+            elif failed and reason not in _PUBLISH_FAILURES:
+                value = "failed"
+            elif status in {"approved", "publishing", "published", "committed"} or reason in _PUBLISH_FAILURES:
+                value = "complete"
+            else:
+                value = "running"
+        elif isinstance(c01_review, dict) and c01_review.get("verdict") == "PASS":
+            value = "skipped"
+        else:
+            value = "waiting"
+        add("repair-cycle", "Repair cycle", value)
+
+    publish_enabled = config.publish.enabled if config is not None else True
+    fast_forward = config is not None and config.publish.mode == PublishMode.FAST_FORWARD_BASE.value
+    label = (
+        f"Publish {config.base_ref}" if fast_forward and config is not None
+        else "Publish run branch" if publish_enabled else "Commit"
+    )
+    if status in {"published", "committed"}:
+        value = "complete"
+    elif resume_phase == "publish":
+        value = "resumable"
+    elif failed and reason in _PUBLISH_FAILURES:
+        value = "failed"
+    elif status in {"approved", "publishing"}:
+        value = "running"
+    else:
+        value = "waiting"
+    add("publish", label, value)
+    return items
+
+
+_REPAIR_SUBPHASES = {
+    "planning": "Repair planner",
+    "implementing": "Luna C02",
+    "pre_revision_validating": "Claude C02",
+    "revising": "Claude C02",
+    "validating": "Checks C02",
+    "revalidating": "Checks C02",
+    "reviewing": "Reviewer #2",
+}
+
+
+def _current_and_next(items: list[dict[str, str]], state: Mapping[str, Any]) -> tuple[str, str]:
+    status = str(state.get("status") or "")
+    cycle = _state_cycle(state)
+    if status == "published":
+        return "Published", "—"
+    if status == "committed":
+        return "Committed", "—"
+    index = next((i for i, item in enumerate(items) if item["state"] == "running"), None)
+    if index is not None:
+        label = items[index]["label"]
+        if items[index]["key"] == "repair-cycle":
+            label = _REPAIR_SUBPHASES.get(status, label)
+            step = state.get("current_step")
+            if label == "Luna C02" and isinstance(step, str) and _STEP_ID.fullmatch(step):
+                label = f"Luna C02 {step}"
+        current = f"Cycle {cycle} · {label}"
+    else:
+        index = next(
+            (i for i, item in enumerate(items) if item["state"] in {"failed", "resumable"}), None
+        )
+        if index is None:
+            completed = [i for i, item in enumerate(items) if item["state"] == "complete"]
+            index = completed[-1] if completed else -1
+            current = "—"
+        else:
+            current = items[index]["label"]
+    following = next(
+        (item["label"] for item in items[index + 1:] if item["state"] in {"waiting", "resumable"}),
+        "—",
+    )
+    return current, following
+
+
+def _usage_pair(value: Any) -> dict[str, int]:
+    usage = normalize_usage(value)
+    return {
+        "input_tokens": usage["input_tokens"],
+        "cached_input_tokens": usage["cached_input_tokens"],
+        "output_tokens": usage["output_tokens"],
+    }
+
+
+def _token_totals(directory: Path) -> dict[str, dict[str, int]]:
+    usage = phase_usage_summary(directory)
+    implementer = usage.get("implementer") if isinstance(usage.get("implementer"), dict) else {}
+    planner = add_usage((
+        normalize_usage(usage.get("planner")), normalize_usage(usage.get("repair_planner_c02")),
+    ))
+    return {
+        "planner": _usage_pair(planner),
+        "luna": _usage_pair(implementer.get("total")),
+        "claude": _usage_pair(usage.get("reviser")),
+        "reviewer": _usage_pair(usage.get("reviewer")),
+        "total": _usage_pair(usage.get("grand_total")),
+    }
+
+
+def publish_target(config: HarnessConfig | None, state: Mapping[str, Any]) -> tuple[str, str]:
+    """(short target, one-line description) shown before approval and after."""
+
+    if config is None:
+        publish = state.get("publish") if isinstance(state.get("publish"), Mapping) else {}
+        target = publish.get("target") or publish.get("branch") or "—"
+        return str(target), str(target)
+    if not config.publish.enabled:
+        return "none", "local commit only (publication disabled)"
+    if config.publish.mode == PublishMode.FAST_FORWARD_BASE.value:
+        return config.base_ref, f"{config.base_ref} via safe fast-forward after final PASS"
+    return "run branch", (
+        f"run branch harness/<plan>/<run-id> on {config.publish.remote} after final PASS"
+    )
+
+
+def run_overview(
+    directory: Path, state: Mapping[str, Any], config: HarnessConfig | None = None,
+) -> dict[str, Any]:
+    """Status/action-oriented summary shared by the page and the live endpoint."""
+
+    resume = _resume_payload(directory, state)
+    pipeline = run_pipeline(directory, state, config, resume)
+    current, following = _current_and_next(pipeline, state)
+    planner = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
+    steps = planner.get("steps") if isinstance(planner.get("steps"), list) else []
+    mode = planner.get("execution_mode") or "—"
+    target, target_detail = publish_target(config, state)
+    return {
+        "resume": resume,
+        "pipeline": pipeline,
+        "current_label": current,
+        "next_label": following,
+        "execution_label": f"{mode} · {len(steps)} Luna step{'s' if len(steps) != 1 else ''}",
+        "publish_target": target,
+        "publish_target_detail": target_detail,
+        "token_totals": _token_totals(directory),
+    }
+
+
+def _recent_events(
+    path: Path,
+    max_events: int,
+    summarize: Callable[[dict[str, Any]], str | None] = summarize_step_event,
+) -> list[str]:
+    """Latest summaries from only the last bounded window of a JSONL file."""
+
+    try:
+        with path.open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            start = max(0, size - _LIVE_EVENT_WINDOW_BYTES)
+            stream.seek(start)
+            data = stream.read(_LIVE_EVENT_WINDOW_BYTES)
+    except OSError:
+        return []
+    if start > 0:
+        newline = data.find(b"\n")
+        data = data[newline + 1:] if newline >= 0 else b""
+    complete = data[: data.rfind(b"\n") + 1]
+    return _summaries(complete, summarize)[-max_events:]
+
+
+def _live_events(directory: Path, state: Mapping[str, Any]) -> list[str]:
+    cycle = _state_cycle(state)
+    step = state.get("current_step")
+    if isinstance(step, str) and _STEP_ID.fullmatch(step):
+        path = _cycle_root(directory, cycle) / "steps" / step / "agent.events.jsonl"
+        return _recent_events(path, LIVE_EVENTS_MAX)
+    if state.get("status") == "revising":
+        source = directory / "revision" / "C02" if cycle == 2 else directory / "revision"
+        return _recent_events(source / "agent.events.jsonl", LIVE_EVENTS_MAX)
+    return []
+
+
+def live_status(
+    runs_root: Path, run_id: str, config: HarnessConfig | None = None,
+) -> dict[str, Any]:
+    """Small bounded live payload: no prompt, diff, secret or tool argument."""
+
+    directory = _run_dir(runs_root, run_id)
+    safe_id = validate_run_id(run_id)
+    state = _load_state(directory)
+    overview = run_overview(directory, state, config)
+    status = str(state.get("status") or "")
+    failure = state.get("failure")
+    failure_payload = (
+        {
+            "reason": str(failure.get("reason") or "")[:120],
+            "detail": " ".join(str(failure.get("detail") or "").split())[:300],
+        }
+        if isinstance(failure, dict) else None
+    )
+    step = state.get("current_step")
+    current_step = step if isinstance(step, str) and _STEP_ID.fullmatch(step) else None
+    cycle = _state_cycle(state)
+    return {
+        "run_id": safe_id,
+        "status": status,
+        "updated_at": state.get("updated_at"),
+        "cycle": cycle,
+        "phase": f"{status}:{current_step}" if current_step else status,
+        "current_step": current_step,
+        "failure": failure_payload,
+        "resumable": overview["resume"]["resumable"],
+        "resume_phase": overview["resume"]["phase"],
+        "resume_label": overview["resume"]["label"],
+        "running": status not in LIVE_STOP_STATUSES,
+        "token_totals": overview["token_totals"],
+        "progress_events": _live_events(directory, state),
+        "pipeline": overview["pipeline"],
+        "current_label": overview["current_label"],
+        "next_label": overview["next_label"],
+    }
+
+
+def resume_run_request(manager: RunManager, runs_root: Path, run_id: str) -> dict[str, Any]:
+    """Start the only resume mutation for the same run id."""
+
+    directory = _run_dir(runs_root, run_id)
+    safe_id = validate_run_id(run_id)
+    if not resume_info(directory, _load_state(directory)).resumable:
+        raise WebAPIError(409, "run is not resumable")
+    try:
+        manager.resume_run(safe_id)
+    except RunResumeNotAllowedError as exc:
+        raise WebAPIError(409, "run is not resumable") from exc
+    except RunCollisionError as exc:
+        raise WebAPIError(409, "run is already active") from exc
+    except RunCapacityError as exc:
+        raise WebAPIError(409, "maximum active runs reached") from exc
+    except RunManagerError as exc:
+        raise WebAPIError(503, "run could not be resumed") from exc
+    return {"ok": True, "run_id": safe_id, "location": f"/runs/{safe_id}"}
+
+
+AWAITING_APPROVAL = RunStatus.AWAITING_PLAN_APPROVAL.value
+
+
 __all__ = [
     "ARTIFACT_ALLOWLIST",
+    "CONTEXT_SEVERE_INPUT_TOKENS",
+    "CONTEXT_WARNING_INPUT_TOKENS",
+    "LIVE_STOP_STATUSES",
     "HIGH_WORKER_INPUT_TOKENS",
+    "context_level",
+    "live_status",
+    "publish_target",
+    "resume_run_request",
+    "run_overview",
+    "run_pipeline",
     "MAX_SPEC_BYTES",
     "MAX_STEP_CONTRACT_BYTES",
     "MAX_DIAGNOSTIC_TAIL_BYTES",

@@ -36,11 +36,46 @@ class LLMProtocolError(LLMError):
 
 
 @dataclass(frozen=True)
+class LLMConversationHandle:
+    """A stable conversation identifier officially exposed by a driver.
+
+    MetaHarness never fabricates one and never scrapes a UI to guess it: a
+    handle exists only when the driver/bridge returns it.  The only allowed
+    conversational reuse is the C02 repair planner continuing the initial
+    planner conversation; reviewers are always fresh.
+    """
+
+    provider_id: str
+    conversation_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("provider_id", "conversation_id"):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 256
+                or any(not character.isprintable() for character in value)
+            ):
+                raise ValueError(f"conversation {name} is invalid")
+
+
+def conversation_handle(result: object) -> LLMConversationHandle | None:
+    """The handle a completion officially carries, else ``None``."""
+
+    handle = getattr(result, "conversation", None)
+    return handle if isinstance(handle, LLMConversationHandle) else None
+
+
+@dataclass(frozen=True)
 class TextLLMResult:
     text: str
     model: str | None
     usage: dict[str, int]
     raw_response: dict
+    # Set only by a driver that exposes a stable conversation id.  The
+    # OpenAI-compatible bridge client never sets it.
+    conversation: LLMConversationHandle | None = None
 
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})

@@ -135,7 +135,7 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(recorded["stdin"].splitlines()[0], "inspect this")
         self.assertEqual(
             recorded["argv"],
-            ["--print", "--output-format", "stream-json", "--model", "opus", "--effort", "medium",
+            ["--print", "--verbose", "--output-format", "stream-json", "--model", "opus", "--effort", "medium",
              "--permission-mode", "acceptEdits", "--strict-mcp-config", "--mcp-config", str(home / "empty-mcp.json")],
         )
         self.assertEqual(result.final_message, "revised")

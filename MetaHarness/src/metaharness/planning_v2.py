@@ -15,8 +15,15 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, Sequence
 
 from .gitops import RepositoryReference, render_repository_reference
-from .llm.chat import TextLLMResult
-from .models import ExecutionMode, ImplementationStep, ModelProfile, PlanningConfig, TaskPlanV2
+from .llm.chat import LLMConversationHandle, TextLLMResult, conversation_handle
+from .models import (
+    ExecutionMode,
+    ExecutionModePolicy,
+    ImplementationStep,
+    ModelProfile,
+    PlanningConfig,
+    TaskPlanV2,
+)
 from .planning import PlanDecision, PlanParseError
 from .result import atomic_write_text
 from .usage import PLANNER_USAGE_ARTIFACT, completion_usage, write_usage_artifact
@@ -477,6 +484,50 @@ def render_safe_profile_catalogue(profiles: Sequence[ModelProfile]) -> str:
     return "\n\n".join(output)
 
 
+REQUIRE_STAGED_POLICY_TEXT = """This run REQUIRES STAGED execution.
+
+You must return between 2 and 6 coherent implementation steps.
+
+Do not create artificial "implementation then tests" steps when tests belong
+to the same local behavior.
+
+Instead decompose by independently understandable behavioral transformation,
+layer, subsystem, or dependency boundary.
+
+Each worker must receive a mechanically executable contract and must not need
+architectural discovery.
+"""
+_PROTOCOL_ANCHOR = "The answer must use exactly this protocol."
+
+
+def _apply_execution_mode_policy(prompt: str, policy: str) -> str:
+    """Insert the configured EXECUTION_MODE policy before the wire protocol."""
+
+    if policy == ExecutionModePolicy.AUTO.value:
+        return prompt
+    if policy != ExecutionModePolicy.REQUIRE_STAGED.value:
+        raise ValueError("unknown execution mode policy")
+    index = prompt.find(_PROTOCOL_ANCHOR)
+    if index < 0:
+        return prompt.rstrip("\n") + "\n\n" + REQUIRE_STAGED_POLICY_TEXT
+    return prompt[:index] + REQUIRE_STAGED_POLICY_TEXT + "\n" + prompt[index:]
+
+
+def validate_execution_mode_policy(plan: TaskPlanV2, planning: PlanningConfig) -> None:
+    """Fail closed on a READY SINGLE plan when STAGED is required.
+
+    A BLOCKED plan is always allowed: the policy constrains decomposition,
+    never the planner's ability to refuse an under-specified SPEC.
+    """
+
+    if not isinstance(plan, TaskPlanV2) or not isinstance(planning, PlanningConfig):
+        raise TypeError("plan and planning must be v2 model values")
+    if planning.execution_mode_policy != ExecutionModePolicy.REQUIRE_STAGED.value:
+        return
+    if plan.decision is PlanDecision.READY and plan.execution_mode is not ExecutionMode.STAGED:
+        raise V2PlanParseError("execution policy requires STAGED")
+
+
 def build_planner_prompt_v2(
     spec: str,
     context: str,
@@ -485,6 +536,7 @@ def build_planner_prompt_v2(
     implementer_profiles: Sequence[ModelProfile] = (),
     reviewer_profiles: Sequence[ModelProfile] = (),
     template: str | None = None,
+    execution_mode_policy: str = ExecutionModePolicy.AUTO.value,
 ) -> str:
     if not isinstance(spec, str) or not isinstance(context, str):
         raise TypeError("spec and context must be strings")
@@ -501,6 +553,9 @@ def build_planner_prompt_v2(
         "{{IMPLEMENTER_PROFILES}}": render_safe_profile_catalogue(implementer_profiles),
         "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
     }
+    # The policy is inserted into the template before substitution so that
+    # SPEC or context text can never impersonate or displace it.
+    template = _apply_execution_mode_policy(template, execution_mode_policy)
     return re.sub(r"\{\{SPEC\}\}|\{\{CONTEXT\}\}|\{\{REPOSITORY\}\}|\{\{IMPLEMENTER_PROFILES\}\}|\{\{REVIEWER_PROFILES\}\}", lambda match: values[match.group(0)], template)
 
 
@@ -773,14 +828,21 @@ class PlannerV2:
         self.repository_reference = repository_reference
         self.planning = planning or PlanningConfig(protocol="v2")
         self.template = template
+        self.last_conversation: LLMConversationHandle | None = None
 
     def plan(self, spec: str, context: str, *, repository_reference: RepositoryReference | None = None, artifacts_dir: str | Path | None = None) -> TaskPlanV2:
         reference = repository_reference if repository_reference is not None else self.repository_reference
-        request = build_planner_prompt_v2(spec, context, repository_reference=reference, implementer_profiles=self.implementer_profiles, reviewer_profiles=self.reviewer_profiles, template=self.template)
+        request = build_planner_prompt_v2(
+            spec, context, repository_reference=reference,
+            implementer_profiles=self.implementer_profiles,
+            reviewer_profiles=self.reviewer_profiles, template=self.template,
+            execution_mode_policy=self.planning.execution_mode_policy,
+        )
         target = Path(artifacts_dir) if artifacts_dir is not None else None
         if target is not None:
             atomic_write_text(target / "planner.request.txt", request)
         result = self.client.complete(request)
+        self.last_conversation = conversation_handle(result)
         raw = result if isinstance(result, str) else getattr(result, "text", None)
         if target is not None:
             # Tokens were consumed whether or not the answer parses.
@@ -790,6 +852,9 @@ class PlannerV2:
         if target is not None:
             atomic_write_text(target / "planner.raw.md", raw)
         plan = parse_task_plan_v2(raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids)
+        # Only the initial planner is bound by the execution mode policy; the
+        # bounded C02 repair plan keeps its own (possibly single-step) shape.
+        validate_execution_mode_policy(plan, self.planning)
         validate_decomposition_policy(plan, self.planning)
         if artifacts_dir is not None:
             persist_planning_v2_artifacts(
@@ -843,6 +908,7 @@ class RepairPlannerV2:
         reviewer_required_fixes: str,
         original_approved_mutable_scope: str,
         artifacts_dir: str | Path,
+        conversation: LLMConversationHandle | None = None,
     ) -> TaskPlanV2:
         request = build_repair_planner_prompt(
             repository_reference=repository_reference,
@@ -862,7 +928,13 @@ class RepairPlannerV2:
         )
         target = Path(artifacts_dir)
         atomic_write_text(target / "planner.request.txt", request)
-        result = self.client.complete(request)
+        resume_conversation = getattr(self.client, "complete_in_conversation", None)
+        if isinstance(conversation, LLMConversationHandle) and callable(resume_conversation):
+            # The only allowed conversational reuse: the driver officially
+            # exposed the initial planner conversation handle.
+            result = resume_conversation(conversation, request)
+        else:
+            result = self.client.complete(request)
         raw = result if isinstance(result, str) else getattr(result, "text", None)
         write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, completion_usage(result))
         if not isinstance(raw, str):
@@ -922,4 +994,5 @@ __all__ = [
     "read_approved_step_contract", "read_set_paths",
     "render_plan_summary_v2", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract",
     "run_planner_v2", "step_contract_path", "validate_decomposition_policy", "validate_implementation_bundle", "write_implementation_bundle",
+    "REQUIRE_STAGED_POLICY_TEXT", "validate_execution_mode_policy",
 ]

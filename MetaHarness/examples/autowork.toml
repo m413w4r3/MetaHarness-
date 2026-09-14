@@ -11,10 +11,12 @@ allow_no_required_checks = false
 [planning]
 protocol = "v2"
 decomposition = "aggressive"
+execution_mode_policy = "require-staged"
 single_step_max_mutable_paths = 2
 
-# Target workflow: planner -> Luna step(s) -> Claude -> reviewer ->
-# optional C02 -> final reviewer PASS -> commit -> push run branch.
+# Target workflow: planner (STAGED) -> Luna steps -> Claude -> reviewer ->
+# optional C02 -> final reviewer PASS -> commit B(parent=A) in the isolated
+# run worktree -> CAS fast-forward of local main A->B -> push origin/main.
 # revision.enabled is the only switch for Claude revision and C02.
 [revision]
 enabled = true
@@ -28,7 +30,7 @@ web_url = "https://github.com/m413w4r3/AutoWork"
 [publish]
 enabled = true
 remote = "origin"
-mode = "run-branch"
+mode = "fast-forward-base"
 
 [environment]
 files = ["../../Bridges/.env.models"]

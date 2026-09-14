@@ -147,6 +147,34 @@ class RunStateStore:
             self._write(state)
         return state
 
+    def transition_if(
+        self,
+        expected_status: RunStatus | str,
+        expected_updated_at: str | None,
+        *,
+        status: RunStatus | str,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        """Compare-and-set status transition.
+
+        Under one lock: return ``None`` without writing unless the current
+        status and ``updated_at`` are exactly the ones the caller observed;
+        otherwise set *status*, merge *fields* and write atomically.  Used to
+        claim a resumable run exactly once.
+        """
+
+        expected = RunStatus(expected_status).value
+        new_status = RunStatus(status).value
+        with _exclusive_state_lock(self.lock_path):
+            state = self.load()
+            if state.get("status") != expected or state.get("updated_at") != expected_updated_at:
+                return None
+            state["status"] = new_status
+            state.update(fields)
+            state["updated_at"] = _now()
+            self._write(state)
+        return state
+
     def record_failure(
         self, reason: str, detail: Any = None, **fields: Any
     ) -> dict[str, Any]:

@@ -116,6 +116,119 @@ reasons as a C01 step.
 Reviser failures are classified as `CLAUDE_AUTH_FAILURE`, `CLAUDE_TIMEOUT`,
 `CLAUDE_FAILED`, or `CLAUDE_COMMITTED`.
 
+Claude Code is invoked with an authoritative, non-configurable argv; the
+prompt is stdin and no shell is used:
+
+```text
+claude --print --verbose --output-format stream-json --model <model>
+       --effort <effort> --permission-mode <permission_mode>
+       --strict-mcp-config --mcp-config <managed>/empty-mcp.json
+```
+
+`--verbose` is mandatory: the installed CLI rejects `--print` with
+`--output-format=stream-json` otherwise (`Error: When using --print,
+--output-format=stream-json requires --verbose`, the failure of run
+`20260914T124017Z-7b74467062`). `doctor` requires `--print`, `--verbose`,
+`--output-format`, `--model`, `--effort`, `--permission-mode`, `--mcp-config`
+and `--strict-mcp-config` in `claude --help`.
+
+## Publication to main (`fast-forward-base`)
+
+`examples/autowork.toml` publishes the final reviewed commit to `main`:
+
+```toml
+[planning]
+protocol = "v2"
+decomposition = "aggressive"
+execution_mode_policy = "require-staged"
+
+[publish]
+enabled = true
+remote = "origin"
+mode = "fast-forward-base"
+```
+
+```text
+main A → isolated run worktree → planner STAGED → Luna steps → Claude
+→ reviewer → optional C02 → PASS → commit B(parent=A)
+→ CAS fast-forward local main A→B → push origin/main A→B
+```
+
+Agents never work on `main`: Luna, Claude and the reviewers only ever see the
+isolated worktree `harness/<plan>/<run-id>`; the user checkout is never
+checked out, reset or written. After the final PASS and the exact commit,
+publication re-resolves `refs/heads/main` and `refs/remotes/origin/main`
+(no implicit fetch) and requires: local main == remote-tracking main ==
+original `base_sha`, the run commit's only parent == `base_sha`, its tree ==
+the approved tree, and the run branch pointing to it. Local main then moves
+with `git update-ref refs/heads/main <commit> <base>` (compare-and-swap), and
+`git push --porcelain origin <commit>:refs/heads/main` publishes exactly that
+commit — no force, lease, merge, tag or delete. The run branch stays local and
+is not pushed in this mode.
+
+- `BASE_MOVED_SINCE_RUN`: main or origin/main moved (or the swap failed).
+  Nothing is merged, rebased, forced or pushed; start a new run from the new
+  main.
+- `PUSH_FAILED` after the swap: `state.publish.local_base_updated = true` and
+  the failure detail says that local main already points to the commit.
+  Resume retries publication only.
+- If the user checkout has `main` checked out, its index and files are not
+  updated by the ref move (`publish.json.base_checked_out_in`). Synchronize it
+  with `git -C <checkout> read-tree -m -u <base_sha> <commit_sha>`, which
+  refuses to overwrite local changes.
+
+`doctor` checks, in this mode, that `base_ref` is a local branch with a
+remote-tracking ref (`refs/remotes/<remote>/<base_ref>`).
+
+## Resume: failure != lost work
+
+Every durable transition rewrites `resume_checkpoint.json` atomically. It
+always names the next operation that has not yet succeeded:
+
+| After | Checkpoint |
+| --- | --- |
+| plan approval, worktree + setup | `initial_step` S01, base tree |
+| Luna step Sxx | next step, or `claude_c01` (revision) / `reviewer_c01`, with the step's tree |
+| pre-revision checks | `claude_c01`, post-Luna tree |
+| Claude complete | `reviewer_c01`, post-Claude tree |
+| final checks | `reviewer_c01`, the frozen evidence tree |
+| reviewer #1 REVISE/IMPLEMENTATION | `repair_planner` |
+| repair planner, each repair step | `repair_step` Sxx / `claude_c02` |
+| Claude C02, final checks C02 | `reviewer_c02` |
+| exact commit | `publish` (HEAD = commit) |
+
+A `PUBLISHED` (or `COMMITTED`) run marks it `completed`.
+
+```bash
+metaharness resume --config examples/autowork.toml --run-id <RUN_ID>
+```
+
+Resumable failures: `CLAUDE_FAILED`, `CLAUDE_AUTH_FAILURE`, `CLAUDE_TIMEOUT`
+(same Claude phase), `CODEX_AUTH_FAILURE`, `AGENT_TIMEOUT`, `AGENT_FAILED`
+(same step, only if the tree is still the step's `tree_before`),
+`REVIEWER_TRANSPORT_FAILURE` (same exact candidate; Claude and checks are not
+rerun), `LLM_FAILURE` of the repair planner, `PUSH_FAILED` (publication only),
+and `INTERRUPTED`. `STEP_WRITE_SET_VIOLATION`, `AGENT_COMMITTED`,
+`AGENT_GIT_VIOLATION`, invalid reviewer verdicts and `BASE_MOVED_SINCE_RUN`
+are never retried automatically.
+
+Before any resume, with no model call, MetaHarness verifies: run directory
+and state exist; the plan approval is `APPROVE`; the plan identity and the
+execution-selection hash still match; the worktree, the run branch and HEAD
+are unchanged; the staged candidate tree is exactly the checkpoint tree; the
+base SHA is unchanged; there is no untracked or unapproved path and no
+agent-created commit. Any mismatch records `RESUME_INTEGRITY_FAILURE`.
+
+If a failed Claude attempt edited files before failing, its left-over tree is
+recorded in `revision/Cxx/tree_after_failure.txt`. Resume restores exactly
+`revision/Cxx/tree_before.txt` through Git objects, and only for paths inside
+the approved scope; otherwise it records `RESUME_REQUIRES_OPERATOR`. A Codex
+step that left partial changes also requires an operator (no unbounded reset
+of any workspace). The previous attempt's agent artifacts move to
+`attempts/NN/` before the retry. A historical run without a checkpoint (Claude
+C01 or Codex step failure) gets one inferred from its artifacts and is then
+validated the same way.
+
 ## Plan approval
 
 Set the following section to require the human gate:
@@ -190,11 +303,35 @@ Open the created run, read the canonical plan, then approve or reject it and
 observe Codex progress, checks and review. The UI never runs Codex or checks,
 changes a plan or worktree, commits, or writes `state.json` directly.
 
-The run page polls `GET /api/runs/<run_id>` every 2 seconds (status,
-timeline, header, failure, approval buttons, plan, checks, review, reviewer
-raw) and the Codex progress JSONL every second, so transitions appear without
-a manual refresh. A JSONL event longer than 1 MiB is shown as
-`[oversized Codex event omitted]`; the progress offset always moves forward.
+The run page never reloads itself (no `<meta http-equiv="refresh">`). It is
+ordered by state and action: a sticky card (RUN, STATUS, CURRENT, NEXT,
+EXECUTION, PUBLISH TARGET, TOKENS; on failure a human message, the single
+NEXT ACTION resume button, then the technical detail), the execution
+pipeline (`✓` complete, `▶` running, `✗` failed, `·` waiting, `↻`
+resumable; states computed by the server), approval / model selection,
+current cycle, checks, token usage, plan, changed files, and raw artifacts /
+diagnostics (closed `<details>`, failure diagnostics opened automatically).
+While the run is running, the static `/static/run.js` (served as
+`application/javascript; charset=utf-8`, never templated) polls
+`GET /api/runs/<run_id>/live` every 2 seconds and updates only the card,
+pipeline, tokens and recent events through `textContent`, `classList` and
+`hidden` — never `innerHTML`, `eval`, `Function` or `document.write` — so open
+sections and the scroll position are preserved. The live payload is small
+and bounded (status, cycle, phase, current step, failure reason, resumable,
+token totals, recent messages and tool names) and never contains a prompt,
+diff, secret or tool argument. Polling stops when the run is terminal or
+awaiting approval; `Actualiser les détails` then fetches the complete
+server-rendered page on demand. Only a running run page has
+`script-src 'self'`; every other page keeps `script-src 'none'`.
+
+A resumable failed run shows exactly one primary action (`REPRENDRE À PARTIR
+DE CLAUDE`, `RETRY S02`, `RETRY REVIEWER #1`, `RETRY PUBLISH`, …) that posts
+to `/runs/<run_id>/resume` with the same exact-Host, origin and mutation-token
+protections as the approval form; the RunManager resumes the same run id.
+`failed` remains the historical status until the operator clicks it. Worker
+steps above 100k input tokens are flagged `High worker context usage`, above
+250k `SEVERE CONTEXT USAGE`, with a `Voir diagnostic` link to
+`steps/Sxx/token_diagnostics.json`; this never fails a run.
 
 Local security invariants: the server binds `127.0.0.1` only; every request
 must carry `Host: 127.0.0.1:<port>` or `Host: localhost:<port>` exactly
@@ -221,10 +358,18 @@ failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,
 path already exists in the tree before Codex), `STEP_WRITE_SET_VIOLATION`
 (Git shows a changed path outside the step's WRITE ∪ CREATE ∪ DELETE sets).
 A v2 failure detail always starts with `step=Sxx` when a step failed.
-V0 stops and
-leaves the run directory and worktree available for inspection; it does not
-automatically repair or retry implementation work. Resolve the issue as an
-operator, then start a new run ID. Remove an obsolete worktree only through
+A run stops and leaves the run directory and worktree available for
+inspection; it never retries on its own. When the failure is resumable (see
+"Resume: failure != lost work"), fix the cause (authentication, CLI, bridge,
+remote) and run `metaharness resume` or click the run page's single resume
+action: the same run id continues at its checkpoint. Otherwise
+(`RESUME_INTEGRITY_FAILURE`, `RESUME_REQUIRES_OPERATOR`, scope or Git
+violations, `BASE_MOVED_SINCE_RUN`) resolve the issue as an operator, then
+start a new run ID. New P29 reasons: `REVIEWER_TRANSPORT_FAILURE` (no reviewer
+answer was obtained), `BASE_MOVED_SINCE_RUN`, `RESUME_INTEGRITY_FAILURE`,
+`RESUME_REQUIRES_OPERATOR`; with `execution_mode_policy = "require-staged"` a
+READY SINGLE plan fails as `PLANNER_OUTPUT_INVALID` ("execution policy
+requires STAGED"). Remove an obsolete worktree only through
 the normal Git worktree workflow after confirming it is no longer needed.
 
 The locator is advisory and never supplies source truth: context is read from

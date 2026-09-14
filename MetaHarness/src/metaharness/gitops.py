@@ -845,6 +845,200 @@ def push_run_branch(
     return PushResult(remote=remote, branch=branch, commit_sha=commit_sha)
 
 
+class BaseMovedError(GitError):
+    """The base branch moved since the run started.
+
+    MetaHarness never merges, rebases or forces: the run stays unpublished.
+    """
+
+    code = "BASE_MOVED_SINCE_RUN"
+
+
+class BasePushError(GitError):
+    """The exact reviewed commit could not be pushed to the remote base."""
+
+    def __init__(self, message: str, *, local_base_updated: bool) -> None:
+        super().__init__(message)
+        self.local_base_updated = local_base_updated
+
+
+@dataclass(frozen=True)
+class FastForwardResult:
+    remote: str
+    base_branch: str
+    commit_sha: str
+    local_base_updated: bool
+    pushed: bool
+    # Worktrees (typically the user's checkout) that have the base branch
+    # checked out.  Their index and files are deliberately not touched.
+    base_checked_out_in: tuple[str, ...]
+
+
+def validate_base_branch(repo: Path, branch: str) -> str:
+    """Validate a plain local branch name usable as ``refs/heads/<branch>``."""
+
+    if (
+        not isinstance(branch, str)
+        or not branch
+        or branch == "HEAD"
+        or branch.startswith(("-", "refs/"))
+        or "\x00" in branch
+        or any(char.isspace() for char in branch)
+    ):
+        raise GitError("base branch name is invalid")
+    _git(repo, "check-ref-format", "--branch", branch)
+    return branch
+
+
+def _ref_commit(repo: Path, ref: str) -> str | None:
+    try:
+        value = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
+    except GitError:
+        return None
+    return value or None
+
+
+def commit_parents(repo: Path, commit_sha: str) -> tuple[str, ...]:
+    """The exact parent list of one commit object."""
+
+    commit = _require_object_id(commit_sha, "commit_sha")
+    fields = _git(repo, "rev-list", "--parents", "-n", "1", commit).stdout.split()
+    if not fields or fields[0] != commit:
+        raise GitError("commit object is unreadable")
+    return tuple(fields[1:])
+
+
+def branch_checkouts(repo: Path, branch: str) -> tuple[str, ...]:
+    """Paths of every registered worktree that has *branch* checked out."""
+
+    output = _git(repo, "worktree", "list", "--porcelain").stdout
+    paths: list[str] = []
+    current: str | None = None
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            current = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch}" and current is not None:
+            paths.append(current)
+    return tuple(paths)
+
+
+def publish_fast_forward_base(
+    repo: Path,
+    *,
+    remote: str,
+    base_branch: str,
+    base_sha: str,
+    commit_sha: str,
+    approved_tree: str,
+    run_branch: str,
+) -> FastForwardResult:
+    """Fast-forward ``refs/heads/<base>`` to the reviewed commit, then push it.
+
+    No checkout, merge, rebase, force, lease, tag or delete, and no implicit
+    fetch: the remote state is the local remote-tracking ref.  Preconditions:
+    local base == remote-tracking base == ``base_sha``; the commit's only
+    parent is ``base_sha``; its tree is ``approved_tree``; the run branch
+    points to it.  The local ref moves with a compare-and-swap ``update-ref``;
+    a failed swap is :class:`BaseMovedError`.  A retry after a failed push
+    accepts a local base that already points to the commit.
+    """
+
+    repository_remote_url(repo, remote)
+    validate_base_branch(repo, base_branch)
+    validate_run_branch(run_branch, base_ref=base_branch)
+    for label, value in (
+        ("base_sha", base_sha), ("commit_sha", commit_sha), ("approved_tree", approved_tree),
+    ):
+        _require_object_id(value, label)
+    local_ref = f"refs/heads/{base_branch}"
+    local = _ref_commit(repo, local_ref)
+    if local is None:
+        raise GitError("local base branch does not exist")
+    tracking = _ref_commit(repo, f"refs/remotes/{remote}/{base_branch}")
+    if tracking is None:
+        raise GitError("remote-tracking base branch is unavailable")
+    if commit_parents(repo, commit_sha) != (base_sha,):
+        raise GitError("run commit parent is not the run base")
+    if resolve_tree(repo, commit_sha) != approved_tree:
+        raise GitError("run commit tree is not the approved tree")
+    if _ref_commit(repo, f"refs/heads/{run_branch}") != commit_sha:
+        raise GitError("run branch does not point to the run commit")
+    already_local = local == commit_sha
+    if not already_local and local != base_sha:
+        raise BaseMovedError("local base branch moved since the run started")
+    checkouts = branch_checkouts(repo, base_branch)
+    if already_local and tracking == commit_sha:
+        # A previous attempt completed the push; nothing left to publish.
+        return FastForwardResult(remote, base_branch, commit_sha, True, False, checkouts)
+    if tracking != base_sha:
+        raise BaseMovedError("remote base branch moved since the run started")
+    if not already_local:
+        try:
+            _git(
+                repo, "update-ref", "-m",
+                "metaharness: fast-forward base to the reviewed commit",
+                local_ref, commit_sha, base_sha,
+            )
+        except GitError:
+            raise BaseMovedError("local base branch moved since the run started") from None
+        if _ref_commit(repo, local_ref) != commit_sha:
+            raise BaseMovedError("local base branch moved since the run started")
+    args = ["push", "--porcelain", remote, f"{commit_sha}:{local_ref}"]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=600,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise BasePushError(
+            f"git command failed: {type(exc).__name__}", local_base_updated=True
+        ) from exc
+    if result.returncode != 0:
+        # Transport diagnostics may contain credential-bearing URLs.
+        raise BasePushError(
+            f"git push exited with {result.returncode}", local_base_updated=True
+        )
+    return FastForwardResult(remote, base_branch, commit_sha, True, True, checkouts)
+
+
+def restore_paths_from_tree(worktree: Path, tree_sha: str, paths: tuple[str, ...] | list[str]) -> None:
+    """Restore exactly *paths* (index and files) to their state in *tree_sha*.
+
+    Bounded by construction: only the listed repo-relative paths are touched.
+    A path present in the tree is restored from the tree object; a path
+    absent from it (a file created later) is removed.  Nothing else in the
+    worktree is reset.
+    """
+
+    tree = _require_object_id(tree_sha, "tree_sha")
+    root = Path(worktree).expanduser().resolve()
+    checked = [_validate_relative_path(path) for path in paths]
+    present = [path for path in checked if path_exists_in_tree(root, tree, path)]
+    absent = [path for path in checked if path not in present]
+    for path in absent:
+        target = root / path
+        parent = target.parent.resolve()
+        if parent != root and root not in parent.parents:
+            raise GitError("restore path escapes the worktree")
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif os.path.lexists(target):
+            raise GitError("restore path is not a file")
+    if absent:
+        _git(root, "--literal-pathspecs", "rm", "-q", "--cached", "--ignore-unmatch", "--", *absent, timeout=600)
+    if present:
+        _git(
+            root, "--literal-pathspecs", "restore", f"--source={tree}",
+            "--staged", "--worktree", "--", *present, timeout=600,
+        )
+
+
 def _validate_relative_path(relative_path: str) -> str:
     if not isinstance(relative_path, str) or not relative_path:
         raise GitError("relative path must be non-empty")

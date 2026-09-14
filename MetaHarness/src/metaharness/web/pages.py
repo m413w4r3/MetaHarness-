@@ -1,12 +1,20 @@
-"""Server-rendered, JavaScript-free pages for the local MetaHarness UI."""
+"""Server-rendered pages for the local MetaHarness UI.
+
+Every page works without JavaScript.  A running run page additionally
+loads the static ``/static/run.js`` for targeted live updates; there is
+no full-page refresh and no inline script.
+"""
 
 from __future__ import annotations
 
 from html import escape
 from typing import Any
 
-from ..models import HarnessConfig
+import json
+
+from ..models import ExecutionModePolicy, HarnessConfig
 from ..profiles import profiles_for_config, safe_profile_metadata
+from .api import LIVE_STOP_STATUSES, context_level, publish_target
 
 
 def _e(value: Any) -> str:
@@ -19,8 +27,10 @@ def _page(
     *,
     nonce: str | None = None,
     refresh_seconds: int | None = None,
+    script: bool = False,
 ) -> str:
     nonce_attribute = f' nonce="{_e(nonce)}"' if nonce else ""
+    script_tag = '<script src="/static/run.js" defer></script>' if script else ""
     refresh = (
         f'<meta http-equiv="refresh" content="{refresh_seconds}">'
         if refresh_seconds is not None
@@ -54,7 +64,22 @@ def _page(
     label {{ display: block; font-weight: 700; margin-top: .8rem; }} input, textarea, select {{ box-sizing: border-box; max-width: 100%; padding: .45rem; margin-top: .25rem; }} textarea {{ width: min(100%, 72rem); }}
     button {{ padding: .6rem .9rem; margin: .8rem .5rem 0 0; cursor: pointer; font-weight: 700; }} button.approve {{ border-color: #4cae4c; }} button.reject {{ border-color: #d66; }}
     dl {{ margin: .4rem 0; }} dt {{ font-weight: 700; }} dd {{ margin: 0 0 .55rem; overflow-wrap: anywhere; }} summary {{ cursor: pointer; font-weight: 700; }}
+    .run-card {{ border: 1px solid #7776; border-radius: .6rem; padding: .8rem 1rem; }}
+    .run-card h1 {{ margin: 0 0 .5rem; font-size: 1.15rem; }}
+    .card-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .5rem 1rem; }}
+    .label {{ margin: 0; font-size: .72rem; letter-spacing: .08em; font-weight: 700; opacity: .7; }}
+    .value {{ margin: .1rem 0 .3rem; font-weight: 700; }} .small {{ font-size: .82rem; }}
+    dl.tokens {{ display: grid; grid-template-columns: auto 1fr; gap: 0 .5rem; margin: 0; font-size: .82rem; }} dl.tokens dd {{ margin: 0; }}
+    .failure-card {{ margin-top: .6rem; }} .failure-title {{ font-size: 1.1rem; margin: .2rem 0; }}
+    button.resume {{ border-color: #4cae4c; text-transform: uppercase; }}
+    ol.pipeline-list {{ list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: .35rem; }}
+    ol.pipeline-list li {{ border: 1px solid #7776; border-radius: .35rem; padding: .35rem .55rem; }}
+    .symbol {{ display: inline-block; width: 1.2rem; font-weight: 700; }}
+    .state-complete .symbol {{ color: #71d471; }} .state-running {{ border-color: #6aa9ff !important; font-weight: 700; }}
+    .state-failed {{ border-color: #d66 !important; color: #ff8d8d; }} .state-resumable {{ border-color: #e0a030 !important; }}
+    .state-skipped {{ opacity: .55; }} .context.warning {{ color: #e0a030; }} .context.severe {{ color: #ff8d8d; }}
   </style>
+  {script_tag}
 </head>
 <body>
 {body}
@@ -75,9 +100,12 @@ _ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
 _TERMINAL_LABELS = {"blocked": "BLOCKED", "plan_rejected": "REJECTED", "failed": "FAILED", "interrupted": "INTERRUPTED"}
 TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
 AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
-# Kept as harmless compatibility constants for callers that used the former
-# polling template. The page itself contains no script and does not poll.
-RUN_PAGE_DYNAMIC_IDS: tuple[str, ...] = ()
+# Elements updated in place by /static/run.js (textContent/classList/hidden).
+RUN_PAGE_DYNAMIC_IDS: tuple[str, ...] = (
+    "live-status", "live-updated", "live-current", "live-next", "live-failure",
+    "live-tokens-planner", "live-tokens-luna", "live-tokens-claude", "live-tokens-reviewer",
+    "live-events", "refresh-details",
+)
 STATE_POLL_MS = 2000
 
 
@@ -131,12 +159,20 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
     profiles = [safe_profile_metadata(profile) for profile in profiles_for_config(config).values() if any(role.value == "planner" for role in profile.roles)]
     options = "".join(f'<option value="{_e(p["id"])}"{" selected" if p["id"] == config.ui.default_planner_profile else ""}>{_e(p["display_name"])}</option>' for p in profiles)
     body = f'''<main><p><a href="/">← Tous les runs</a></p><h1>New Run</h1>
-<dl><dt>Repository</dt><dd class="mono">{_e(config.repo)}</dd><dt>Base ref</dt><dd class="mono">{_e(config.base_ref)}</dd></dl>
+<dl><dt>Repository</dt><dd class="mono">{_e(config.repo)}</dd><dt>Base ref</dt><dd class="mono">{_e(config.base_ref)}</dd>
+<dt>Execution policy</dt><dd>{_e(_execution_policy_label(config))}</dd>
+<dt>Publication target</dt><dd>{_e(publish_target(config, {})[1])}</dd></dl>
 <form action="/runs" method="post" accept-charset="UTF-8"><input type="hidden" name="_token" value="{_e(token)}">
 <label for="spec">SPEC</label><textarea id="spec" name="spec" rows="20" required></textarea>
 <label for="run-id">Run ID (optional)</label><input id="run-id" name="run_id" type="text" autocomplete="off" value="">
 <label for="planner-profile">Planner</label><select id="planner-profile" name="planner_profile" required>{options}</select><br><button type="submit">CREATE RUN</button></form></main>'''
     return _page("New Run", body, nonce=nonce)
+
+
+def _execution_policy_label(config: HarnessConfig) -> str:
+    if config.planning.execution_mode_policy == ExecutionModePolicy.REQUIRE_STAGED.value:
+        return "STAGED required"
+    return "auto (planner chooses SINGLE or STAGED)"
 
 
 def _timeline_items(status: Any) -> str:
@@ -165,6 +201,8 @@ def _publish_section(state: dict[str, Any]) -> str:
     publish = state.get("publish") if isinstance(state.get("publish"), dict) else {}
     if not publish:
         return ""
+    if publish.get("mode") == "fast-forward-base":
+        return _fast_forward_publish_section(state, publish)
     web_url = publish.get("web_url")
     link = (
         f'<a href="{_e(web_url)}" rel="noopener noreferrer">branch</a>'
@@ -178,6 +216,38 @@ def _publish_section(state: dict[str, Any]) -> str:
         f'<dt>remote</dt><dd>{_e(publish.get("remote"))}</dd>'
         f'<dt>branch</dt><dd class="mono">{link}</dd></dl></section>'
     )
+
+
+def _fast_forward_publish_section(state: dict[str, Any], publish: dict[str, Any]) -> str:
+    target = f'{publish.get("remote")}/{publish.get("target")}'
+    commit = publish.get("commit_sha") or state.get("commit_sha")
+    web_url = publish.get("web_url")
+    link = (
+        f' · <a href="{_e(web_url)}" rel="noopener noreferrer">commit</a>'
+        if isinstance(web_url, str) and web_url.startswith("https://") else ""
+    )
+    if publish.get("status") == "pushed":
+        headline = f'<p><strong>Published to {_e(target)}</strong></p><p class="mono">{_e(commit)}{link}</p>'
+    else:
+        local = (
+            f'<p class="danger">Local {_e(publish.get("target"))} already points to '
+            f'<span class="mono">{_e(commit)}</span>; {_e(target)} was not updated.</p>'
+            if publish.get("local_base_updated") else ""
+        )
+        headline = f'<p class="danger"><strong>Not published to {_e(target)}</strong> ({_e(publish.get("status"))})</p>{local}'
+    notices = "".join(
+        f'<p class="muted">The checkout <span class="mono">{_e(path)}</span> has '
+        f'{_e(publish.get("target"))} checked out: MetaHarness did not touch its index or files. '
+        f'Synchronize it with <span class="mono">git -C {_e(path)} read-tree -m -u '
+        f'{_e(publish.get("base_sha"))} {_e(commit)}</span> (refuses to overwrite local changes).</p>'
+        for path in (publish.get("base_checked_out_in") or []) if isinstance(path, str)
+    )
+    run_branch = publish.get("run_branch")
+    branch_line = (
+        f'<p class="muted">Isolated run branch (kept locally, not pushed): '
+        f'<span class="mono">{_e(run_branch)}</span></p>' if run_branch else ""
+    )
+    return f'<section class="publish"><h2>PUBLISH</h2>{headline}{branch_line}{notices}</section>'
 
 
 def _section_open(run: dict[str, Any], names: tuple[str, ...]) -> str:
@@ -353,6 +423,7 @@ def _v2_approval_form(
     return f'''<section class="card"><h2>Execution plan</h2>
 <p>Execution mode: <strong>{_e(planner.get("execution_mode"))}</strong></p>
 <p>Steps: {_e(len(rows))}</p>
+{_approval_targets(config)}
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE">
 <h3>Planner</h3><p class="mono">{_e(planner_selected.get("profile_id") or "—")} / {_e(planner_selected.get("model") or "—")}</p>
 <h3>Initial implementation</h3><ul class="plan-steps">{"".join(overview)}</ul>
@@ -360,12 +431,50 @@ def _v2_approval_form(
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT PLAN</button></form></section>'''
 
 
+def _approval_targets(config: HarnessConfig | None) -> str:
+    if config is None:
+        return ""
+    return (
+        f'<p>Execution policy: <strong>{_e(_execution_policy_label(config))}</strong></p>'
+        f'<p>Publication target: <strong>{_e(publish_target(config, {})[1])}</strong></p>'
+    )
+
+
+def _kilo(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "0"
+    return f"{value // 1000}k" if value >= 1000 else str(value)
+
+
+_CONTEXT_LABELS = {"warning": "High worker context usage", "severe": "SEVERE CONTEXT USAGE"}
+
+
+def _context_line(step_id: Any, cycle: Any, usage: dict[str, Any], level: str) -> str:
+    if level not in _CONTEXT_LABELS:
+        return ""
+    return (
+        f'<p class="context {level}">Luna {_e(step_id)} · {_kilo(usage.get("input_tokens"))} input · '
+        f'{_kilo(usage.get("cached_input_tokens"))} cached · <strong>{_CONTEXT_LABELS[level]}</strong>'
+        f' · <a href="#diag-c{_e(cycle)}-{_e(step_id)}">Voir diagnostic</a></p>'
+    )
+
+
 def _step_card(item: dict[str, Any], artifact: dict[str, Any]) -> str:
     status = str(item.get("status", "waiting"))
     icon = _STEP_ICONS.get(status, "…")
     usage = artifact.get("usage") if isinstance(artifact.get("usage"), dict) else item.get("usage")
     usage = usage if isinstance(usage, dict) else {}
-    warning = f" · {_HIGH_CONTEXT_WARNING}" if artifact.get("high_context") else ""
+    level = artifact.get("context_level") or context_level(usage)
+    warning = f" · {_e(_CONTEXT_LABELS[level])}" if level in _CONTEXT_LABELS else (
+        f" · {_HIGH_CONTEXT_WARNING}" if artifact.get("high_context") else ""
+    )
+    cycle = artifact.get("cycle", item.get("cycle", 1))
+    diagnostics = artifact.get("token_diagnostics")
+    diagnostic_block = (
+        f'<details id="diag-c{_e(cycle)}-{_e(item.get("id"))}" class="token-diagnostic">'
+        f'<summary>Token diagnostic</summary><pre>{_e(json.dumps(diagnostics, indent=2))}</pre></details>'
+        if isinstance(diagnostics, dict) else ""
+    )
     events = artifact.get("events") if isinstance(artifact.get("events"), list) else []
     event_items = "".join(f"<li>{_e(event)}</li>" for event in events) or '<li class="muted">No event yet.</li>'
     reason = artifact.get("failure_reason")
@@ -376,10 +485,12 @@ def _step_card(item: dict[str, Any], artifact: dict[str, Any]) -> str:
         f'{_e(usage.get("input_tokens", 0))} input / {_e(usage.get("output_tokens", 0))} output{warning}</summary>'
         f'<p>profile: <span class="mono">{_e(item.get("profile_id"))}</span></p>'
         f'<p>status: {_e(status)}</p>{reason_line}'
+        f'{_context_line(item.get("id"), cycle, usage, level)}'
         f'<h4>Recent events</h4><ul class="events">{event_items}</ul>'
         f'<details><summary>contract</summary><pre>{_e(artifact.get("contract"))}</pre></details>'
         f'<details><summary>final report</summary><pre>{_e(artifact.get("final"))}</pre></details>'
-        f'<details><summary>stderr</summary><pre>{_e(artifact.get("stderr"))}</pre></details></details>'
+        f'<details><summary>stderr</summary><pre>{_e(artifact.get("stderr"))}</pre></details>'
+        f'{diagnostic_block}</details>'
     )
 
 
@@ -560,10 +671,15 @@ def _usage_section(run: dict[str, Any]) -> str:
         if not isinstance(step, dict):
             continue
         step_usage = step.get("usage") if isinstance(step.get("usage"), dict) else {}
-        high = isinstance(step_usage.get("input_tokens"), int) and step_usage["input_tokens"] > _HIGH_WORKER_INPUT_TOKENS
+        level = context_level(step_usage)
+        flag = (
+            f' · <span class="context {level}">{_CONTEXT_LABELS[level]}</span>'
+            f' · <a href="#diag-c{_e(step.get("cycle", 1))}-{_e(step.get("id"))}">Voir diagnostic</a>'
+            if level in _CONTEXT_LABELS else ""
+        )
         step_rows.append(
             f'<tr><td class="mono">{_e(step.get("id"))}</td><td>{_usage_pair(step_usage)}</td>'
-            f'<td class="muted">{_usage_detail(step_usage)}{" · " + _HIGH_CONTEXT_WARNING if high else ""}</td></tr>'
+            f'<td class="muted">{_usage_detail(step_usage)}{flag}</td></tr>'
         )
     steps_table = (
         '<table class="usage-steps"><thead><tr><th>Luna step</th><th>tokens</th><th>detail</th></tr></thead>'
@@ -650,13 +766,158 @@ def _execution_card_v2(
     return f'<div class="grid">{planner_card}{cycle_cards}{reviewer_card}</div>{steps_table}'
 
 
+def run_page_polls(run: dict[str, Any]) -> bool:
+    """Whether the run page loads ``/static/run.js`` (running statuses only)."""
+
+    state = run.get("state") if isinstance(run.get("state"), dict) else {}
+    status = str(state.get("status", run.get("status", "")) or "")
+    return bool(status) and status not in LIVE_STOP_STATUSES
+
+
+_PIPELINE_SYMBOLS = {
+    "complete": "✓", "running": "▶", "failed": "✗", "waiting": "·", "resumable": "↻", "skipped": "–",
+}
+_FAILURE_MESSAGES = {
+    "CLAUDE_FAILED": "Claude invocation failed",
+    "CLAUDE_AUTH_FAILURE": "Claude authentication failed",
+    "CLAUDE_TIMEOUT": "Claude revision timed out",
+    "CLAUDE_COMMITTED": "Claude created a commit",
+    "CODEX_AUTH_FAILURE": "Codex authentication failed",
+    "AGENT_TIMEOUT": "Luna step timed out",
+    "AGENT_FAILED": "Luna step failed",
+    "AGENT_NO_CHANGE": "Luna step changed nothing",
+    "STEP_WRITE_SET_VIOLATION": "Luna step changed an unauthorized path",
+    "REVIEWER_TRANSPORT_FAILURE": "Reviewer could not be reached",
+    "REVIEWER_OUTPUT_INVALID": "Reviewer answer is invalid",
+    "LLM_FAILURE": "Model call failed",
+    "PUSH_FAILED": "Publication push failed",
+    "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
+    "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
+    "RESUME_REQUIRES_OPERATOR": "Resume requires an operator",
+    "REVIEW_LOOP_EXHAUSTED": "Automatic correction budget exhausted",
+    "INTERRUPTED": "Run interrupted",
+}
+
+
+def _short_id(run_id: Any) -> str:
+    text = str(run_id or "")
+    tail = text.rsplit("-", 1)[-1]
+    return tail if 0 < len(tail) < len(text) else text[:16]
+
+
+def _pipeline_section(overview: dict[str, Any]) -> str:
+    items = overview.get("pipeline") if isinstance(overview.get("pipeline"), list) else []
+    rows = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        state = item.get("state") if item.get("state") in _PIPELINE_SYMBOLS else "waiting"
+        rows.append(
+            f'<li class="state-{state}" data-pipeline-key="{_e(item.get("key"))}">'
+            f'<span class="symbol">{_PIPELINE_SYMBOLS[state]}</span> {_e(item.get("label"))}</li>'
+        )
+    return (
+        '<section class="pipeline"><h2>EXECUTION PIPELINE</h2>'
+        f'<ol class="pipeline-list">{"".join(rows)}</ol>'
+        '<p class="muted small">✓ complete · ▶ running · ✗ failed · · waiting · ↻ resumable</p></section>'
+    )
+
+
+def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, Any]) -> str:
+    state = run.get("state") if isinstance(run.get("state"), dict) else {}
+    status = str(state.get("status", run.get("status", "")) or "")
+    failure = run.get("failure", state.get("failure"))
+    if status not in {"failed", "interrupted"} or not isinstance(failure, dict):
+        return ""
+    reason = str(failure.get("reason") or "")
+    resume = overview.get("resume") if isinstance(overview.get("resume"), dict) else {}
+    note = (
+        "Reviewer requested one bounded implementation correction loop."
+        if reason == "REVIEW_REVISE" else
+        "Automatic correction budget exhausted."
+        if reason == "REVIEW_LOOP_EXHAUSTED" else ""
+    )
+    action = ""
+    if resume.get("resumable"):
+        label = _e(resume.get("label"))
+        button = (
+            f'<form action="/runs/{_e(run.get("run_id"))}/resume" method="post">'
+            f'<input type="hidden" name="_token" value="{_e(token)}">'
+            f'<button class="resume" type="submit">{label}</button></form>'
+            if token else f'<p><strong>{label}</strong></p>'
+        )
+        action = f'<p class="label">NEXT ACTION</p>{button}'
+    detail = failure.get("detail")
+    return (
+        '<div class="card fail failure-card"><p class="label">FAILED</p>'
+        f'<p class="failure-title"><strong>{_e(_FAILURE_MESSAGES.get(reason, reason or "Run failed"))}</strong></p>'
+        f'{action}'
+        f'<p class="danger small"><strong>FAILED: {_e(reason)}</strong>'
+        f'{"<br>" + _e(note) if note else ""}{"<br>" + _e(detail) if detail is not None else ""}</p></div>'
+    )
+
+
+def _run_card(run: dict[str, Any], token: str | None, overview: dict[str, Any], is_v2: bool) -> str:
+    state = run.get("state") if isinstance(run.get("state"), dict) else {}
+    status = str(state.get("status", run.get("status", "")) or "")
+    run_id = run.get("run_id")
+    totals = overview.get("token_totals") if isinstance(overview.get("token_totals"), dict) else {}
+    tokens = "".join(
+        f'<dt>{label}</dt><dd id="live-tokens-{key}">{_usage_pair(totals.get(key))}</dd>'
+        for key, label in (("planner", "Planner"), ("luna", "Luna"), ("claude", "Claude"), ("reviewer", "Reviewer"))
+    )
+    style = "failed" if status in {"failed", "blocked", "plan_rejected", "interrupted"} else "success" if status in {"committed", "approved", "published"} else ""
+    failure = run.get("failure", state.get("failure"))
+    live_reason = failure.get("reason") if isinstance(failure, dict) else ""
+    polls = run_page_polls(run)
+    return (
+        '<header class="sticky run-card">'
+        f'<h1>Run <span class="mono">{_e(run_id)}</span></h1>'
+        '<div class="card-grid">'
+        f'<div><p class="label">RUN</p><p class="value mono">{_e(_short_id(run_id))}</p></div>'
+        f'<div><p class="label">STATUS</p><p class="value"><span id="live-status" class="badge {style}">{_e(status.upper() or "—")}</span></p>'
+        f'<p class="muted small">updated <span id="live-updated" class="mono">{_e(run.get("updated_at"))}</span></p></div>'
+        f'<div><p class="label">CURRENT</p><p class="value" id="live-current">{_e(overview.get("current_label") or "—")}</p></div>'
+        f'<div><p class="label">NEXT</p><p class="value" id="live-next">{_e(overview.get("next_label") or "—")}</p></div>'
+        f'<div><p class="label">EXECUTION</p><p class="value">{_e(overview.get("execution_label") or "—")}</p></div>'
+        f'<div><p class="label">PUBLISH TARGET</p><p class="value">{_e(overview.get("publish_target") or "—")}</p>'
+        f'<p class="muted small">{_e(overview.get("publish_target_detail") or "")}</p></div>'
+        f'<div><p class="label">TOKENS</p><dl class="tokens">{tokens}</dl></div>'
+        '</div>'
+        f'{_final_summary(run) if is_v2 else ""}'
+        f'<p id="live-failure" class="danger"{"" if polls and live_reason else " hidden"}>{_e(live_reason)}</p>'
+        f'{_failure_card(run, token, overview)}'
+        + ('<button type="button" id="refresh-details" hidden>Actualiser les détails</button>' if polls else "")
+        + '</header>'
+    )
+
+
+def _live_events_card(polls: bool) -> str:
+    if not polls:
+        return ""
+    slots = "".join('<li data-slot hidden></li>' for _ in range(20))
+    return (
+        '<div class="card live"><h3>Live events</h3>'
+        f'<ul id="live-events" class="events"><li id="live-events-empty" class="muted">No live event yet.</li>{slots}</ul></div>'
+    )
+
+
 def render_run(run: dict[str, Any], token: str | None = None, *, config: HarnessConfig | None = None, nonce: str | None = None, refresh_seconds: int | None = None) -> str:
+    """Status/action-oriented run page.
+
+    Sections, in order: run status and next action, execution pipeline,
+    approval / model selection, current cycle, checks, token usage, plan,
+    changed files, raw artifacts / diagnostics.  ``refresh_seconds`` is kept
+    for compatibility and ignored: the page never reloads itself.
+    """
+
+    del refresh_seconds
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = state.get("status", run.get("status")); run_id = run.get("run_id")
     plan = run.get("plan") if isinstance(run.get("plan"), dict) else {}; failure = run.get("failure", state.get("failure"))
     approval = run.get("approval") if isinstance(run.get("approval"), dict) else {}
+    overview = run.get("overview") if isinstance(run.get("overview"), dict) else {}
     can_decide = status == AWAITING_APPROVAL_STATUS and bool(token) and not approval.get("recorded")
-    execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
     recommendation = state.get("recommendation") if isinstance(state.get("recommendation"), dict) else {}
     impl_selected = recommendation.get("implementer_profile") if recommendation.get("status") == "READY" else config.ui.default_implementer_profile if config else None
     review_selected = recommendation.get("reviewer_profile") if recommendation.get("status") == "READY" else config.ui.default_reviewer_profile if config else None
@@ -677,30 +938,31 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
         approval_forms = f'<section class="card"><h2>Plan approval</h2><p>Décision enregistrée : {_e(approval.get("decision"))}</p></section>'
     diagnostics = run.get("agent_diagnostics") if isinstance(run.get("agent_diagnostics"), dict) else {}; result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}; usage = diagnostics.get("usage") if isinstance(diagnostics.get("usage"), dict) else {}
     candidate = run.get("candidate") if isinstance(run.get("candidate"), dict) else {}; changed_files = candidate.get("changed_files") if isinstance(candidate.get("changed_files"), list) else []
-    refresh = refresh_seconds if refresh_seconds is not None else refresh_seconds_for_run(run)
-    failure_reason = failure.get("reason") if isinstance(failure, dict) else failure
-    failure_note = (
-        "Reviewer requested one bounded implementation correction loop."
-        if failure_reason == "REVIEW_REVISE" else
-        "Automatic correction budget exhausted."
-        if failure_reason == "REVIEW_LOOP_EXHAUSTED" else ""
+    polls = run_page_polls(run)
+    failed = status in {"failed", "interrupted"}
+    agent_section = (
+        (_cycle_sections(run) if isinstance(run.get("cycle_artifacts"), list) and run.get("cycle_artifacts") else _v2_steps(state, run.get("step_artifacts")))
+        if is_v2 else
+        f'<details open{_section_open(run, ("AGENT_", "CODEX_AUTH_FAILURE"))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'
     )
-    failure_top = f'<p class="danger"><strong>FAILED: {_e(failure_reason)}</strong><br>{_e(failure_note)}<br>{_e(failure.get("detail") if isinstance(failure, dict) else "")}</p>' if status == "failed" and failure else ""
-    body = f'''<main><p><a href="/">← Tous les runs</a></p>
-<header class="sticky"><h1>Run <span class="mono">{_e(run_id)}</span></h1><p>{_status_badge(status)} · updated_at <span class="mono">{_e(run.get("updated_at"))}</span></p>{_final_summary(run) if is_v2 else ""}{failure_top}</header>
-{_usage_section(run)}
-{approval_forms}
+    plan_open = " open" if _section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER")) else ""
+    body = f'''<main id="run" data-run-id="{_e(run_id)}" data-status="{_e(status)}"><p><a href="/">← Tous les runs</a></p>
+{_run_card(run, token, overview, is_v2)}
 {_publish_section(state)}
-<section><h2>PLAN</h2><details open{_section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER"))}><summary>Canonical implementation contract</summary><pre>{_e(plan.get("contract"))}</pre></details><details><summary>planner.raw.md</summary><pre>{_e(plan.get("raw"))}</pre></details><details><summary>SPEC</summary><pre>{_e(run.get("spec"))}</pre></details></section>
+{_pipeline_section(overview)}
+{approval_forms}
 <section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config) if is_v2 else _execution_card(state, config)}</section>
-<section><h2>AGENT</h2>{_agent_auth_failure_notice(run, config)}{(_cycle_sections(run) if isinstance(run.get("cycle_artifacts"), list) and run.get("cycle_artifacts") else _v2_steps(state, run.get("step_artifacts"))) if is_v2 else f'<details open{_section_open(run, ("AGENT_", "CODEX_AUTH_FAILURE"))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'}</section>
+<section class="current-cycle"><h2>CURRENT CYCLE</h2>{_agent_auth_failure_notice(run, config)}{_live_events_card(polls)}{agent_section}</section>
 <section><h2>CHECKS</h2><details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
-<section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details><details><summary>reviewer.raw.md</summary><pre>{_e(run.get("reviewer_raw"))}</pre></details></section>
-<section><h2>Setup</h2><details open{_section_open(run, ("WORKSPACE_SETUP_",))}><summary>Workspace setup</summary>{_setup_cards(run.get("workspace_setup"))}</details></section>
+<section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details></section>
+{_usage_section(run)}
+<section><h2>PLAN</h2><details{plan_open}><summary>Canonical implementation contract</summary><pre>{_e(plan.get("contract"))}</pre></details><details><summary>planner.raw.md</summary><pre>{_e(plan.get("raw"))}</pre></details><details><summary>SPEC</summary><pre>{_e(run.get("spec"))}</pre></details></section>
 <section><h2>DIFF / FILES</h2><p>Changed files</p><ul>{"".join(f'<li class="mono">{_e(path)}</li>' for path in changed_files) or '<li class="muted">Aucun fichier changé.</li>'}</ul><details><summary>Diff</summary><pre>{_e(candidate.get("diff_tail"))}</pre></details></section>
-<section><h2>DIAGNOSTICS</h2><p><strong>Failure:</strong> {_failure(failure)}</p><ul>{"".join(f'<li>{_e(item)}</li>' for item in (run.get("progress_tail") or [])) or '<li class="muted">Aucun événement.</li>'}</ul></section>
-<section><h2>Timeline</h2><ul class="timeline">{_timeline_items(status)}</ul></section></main>'''
-    return _page(f"Run {run_id}", body, nonce=nonce, refresh_seconds=refresh)
+<section><h2>RAW ARTIFACTS / DIAGNOSTICS</h2>
+<details{" open" if failed else ""}><summary>Failure diagnostics</summary><p><strong>Failure:</strong> {_failure(failure)}</p><ul>{"".join(f'<li>{_e(item)}</li>' for item in (run.get("progress_tail") or [])) or '<li class="muted">Aucun événement.</li>'}</ul></details>
+<details><summary>reviewer.raw.md</summary><pre>{_e(run.get("reviewer_raw"))}</pre></details>
+<details{_section_open(run, ("WORKSPACE_SETUP_",))}><summary>Workspace setup</summary>{_setup_cards(run.get("workspace_setup"))}</details>
+<details><summary>Timeline</summary><ul class="timeline">{_timeline_items(status)}</ul></details></section></main>'''
+    return _page(f"Run {run_id}", body, nonce=nonce, script=polls)
 
-
-__all__ = ["AWAITING_APPROVAL_STATUS", "RUN_PAGE_DYNAMIC_IDS", "STATE_POLL_MS", "TERMINAL_STATUSES", "refresh_seconds_for_run", "render_index", "render_new_run", "render_run"]
+__all__ = ["AWAITING_APPROVAL_STATUS", "RUN_PAGE_DYNAMIC_IDS", "STATE_POLL_MS", "TERMINAL_STATUSES", "refresh_seconds_for_run", "render_index", "render_new_run", "render_run", "run_page_polls"]

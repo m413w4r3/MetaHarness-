@@ -142,6 +142,45 @@ SPEC
   reviewer PASS and a green gate: no force, no tag, no delete, never
   `base_ref`/`main`, and never an automatic merge of the run branch.
 
+## Durable checkpoints and resume (P29)
+
+`resume.py` defines `ResumePhase` (`initial_step`, `claude_c01`,
+`reviewer_c01`, `repair_planner`, `repair_step`, `claude_c02`, `reviewer_c02`,
+`publish`) and `ResumeCheckpoint(phase, cycle, step_id, expected_head_sha,
+expected_tree_sha, execution_selection_sha256, plan_identity)` (plus the C02
+repair-bundle hash once the repair planner succeeded, since the C02 bundle
+has no human approval). `resume_checkpoint.json` is written atomically after
+every durable transition and always names the next operation that has not
+yet succeeded; an operation is never marked complete before its artifacts
+are durable.
+
+`Orchestrator.resume(run_id)` (CLI `metaharness resume`, web
+`POST /runs/<id>/resume`) is fail-closed: it re-validates approval, plan
+identity, execution selection hash, worktree, branch, HEAD, exact candidate
+tree, base SHA and scope before claiming the run with a compare-and-set state
+transition, then re-enters `_execute_v2` at the checkpoint. Nothing critical
+lives only in memory: step records, Claude revisions, evidence and accepted
+reviewer answers are read back from `steps/Sxx/step.json`,
+`revision/Cxx/report.json`, `evidence.json` and `review/Cxx/`, and their tree
+chain is verified. Durable pre-revision checks and final evidence for the
+exact current tree are reused, and a reviewer answer already accepted for
+that tree is re-parsed rather than requested again.
+
+## Conversation policy
+
+Planner and reviewers never share a logical conversation
+(`planner_thread != reviewer_thread`): every reviewer call is a fresh
+completion that receives its context through MetaHarness artifacts, so a
+reviewer never judges its own planning. The same bridge process, browser
+connection and external-ui model are reused. `LLMConversationHandle`
+(`provider_id`, `conversation_id`) exists only when a driver officially
+returns one — the OpenAI-compatible bridge client does not, and MetaHarness
+never fabricates or scrapes one. When a handle exists it is persisted in
+`planner.conversation.json` and the C02 repair planner may continue that
+conversation (`complete_in_conversation`); this is the only allowed reuse. A
+reviewer reporting the planner's handle is rejected as
+`REVIEWER_OUTPUT_INVALID`.
+
 All run-state writes go through `RunStateStore`, which replaces JSON files
 atomically. The plan approval artifact is atomically published without
 replacement, so a second decision fails. No commit is created before review,

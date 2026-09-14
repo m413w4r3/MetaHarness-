@@ -11,32 +11,61 @@ Avec `[planning] protocol = "v2"` et `[revision] enabled = true` (le cas de
 `examples/autowork.toml`), le pipeline complet est :
 
 ```text
-SPEC
-→ indexer + repo-aware planner
-→ human-approved STAGED bundle
-→ Luna steps
-→ pre-checks
-→ Claude revision
-→ final checks
-→ reviewer #1
-   ├ PASS → commit → push run branch
-   └ REVISE/IMPLEMENTATION
-       → repair planner
-       → Luna repair steps
-       → Claude revision C02
-       → checks
-       → reviewer #2
-          ├ PASS → commit → push run branch
-          └ otherwise → STOP
+main A
+  ↓
+isolated run worktree  (harness/<plan>/<run-id>, jamais le checkout AutoWork/)
+  ↓
+planner STAGED         (execution_mode_policy = "require-staged")
+  ↓
+Luna steps
+  ↓
+Claude                 (pre-checks → revision → final checks)
+  ↓
+reviewer #1
+  ↓
+optional C02           (repair planner → Luna repair → Claude C02 → reviewer #2)
+  ↓
+PASS
+  ↓
+commit B (parent = A)  (arbre exact approuvé, dans le worktree isolé)
+  ↓
+CAS fast-forward local main A→B   (git update-ref refs/heads/main B A)
+  ↓
+push origin/main A→B              (git push --porcelain origin B:refs/heads/main)
 ```
 
 - maximum automatic cycles = 2 (C01 initial, C02 repair ; jamais de C03) ;
 - `revision.enabled` est la seule autorité : les profils reviser/repair du
   catalogue n’activent rien implicitement ; sans elle, ni Claude ni C02 ;
-- la publication pousse uniquement la branche de run `harness/<plan>/<run-id>`,
-  sans force, sans tag, et never pushes base_ref (`main`) ;
-- MetaHarness never automatically merges the run branch : le merge reste une
-  décision humaine.
+- les agents ne travaillent jamais sur `main` : Luna, Claude et la review
+  n’écrivent que dans le worktree isolé ; le checkout utilisateur n’est jamais
+  modifié (ni checkout, ni index, ni fichiers) ;
+- `[publish] mode = "fast-forward-base"` (AutoWork) : après le PASS final et le
+  commit exact, `main` local avance par compare-and-swap de A vers B, puis B est
+  poussé sur `origin/main`. Si `main` ou `origin/main` (ref de suivi locale, sans
+  fetch implicite) a bougé : `BASE_MOVED_SINCE_RUN`, sans merge, rebase ni
+  force. `mode = "run-branch"` pousse seulement la branche de run ;
+- aucun force, lease, tag, delete ou merge automatique.
+
+### Reprise : failure != lost work
+
+Chaque transition durable met à jour `resume_checkpoint.json`, qui décrit
+toujours la prochaine opération non encore réussie (`initial_step`,
+`claude_c01`, `reviewer_c01`, `repair_planner`, `repair_step`, `claude_c02`,
+`reviewer_c02`, `publish`). Un run `failed` dont l’échec est reprenable
+(Claude, Codex avant mutation, transport reviewer, push) se reprend au même
+`run_id`, sans rejouer planner, approbation, setup ni step déjà réussi :
+
+```bash
+metaharness resume --config examples/autowork.toml --run-id <RUN_ID>
+```
+
+ou via le bouton unique de la page du run (`REPRENDRE À PARTIR DE CLAUDE`,
+`RETRY S02`, `RETRY REVIEWER #1`, `RETRY PUBLISH`…). Avant toute reprise,
+MetaHarness revérifie l’approbation, l’identité du plan, le hash de
+l’execution selection, le worktree, la branche, HEAD, l’arbre candidat exact et
+le scope approuvé ; au moindre écart : `RESUME_INTEGRITY_FAILURE`, sans aucun
+appel LLM.
 
 Sans `revision.enabled`, le chemin historique reste disponible : un planner,
 les steps Codex, les checks, un reviewer et un commit. Les

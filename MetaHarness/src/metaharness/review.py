@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .llm.chat import TextLLMResult
+from .llm.chat import TextLLMResult, conversation_handle
 from .llm.wire import (
     AmbiguousFieldError,
     WireParseError,
@@ -469,6 +469,7 @@ class Reviewer:
         self.client = client
         self.template = template
         self.allow_format_repair = allow_format_repair
+        self.last_conversation = None
 
     def review(
         self,
@@ -512,7 +513,10 @@ class Reviewer:
         # review must remain inspectable.
         if target is not None:
             _atomic_write_text(target / "reviewer.request.txt", request)
+        # Always a fresh completion: a reviewer never continues a planner
+        # conversation, so it cannot judge its own planning.
         first_result = self.client.complete(request)
+        self.last_conversation = conversation_handle(first_result)
         first_raw = _completion_text(first_result)
         usages = [normalize_usage(completion_usage(first_result))]
         if target is not None:

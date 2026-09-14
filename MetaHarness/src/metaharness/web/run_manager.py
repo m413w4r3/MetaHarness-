@@ -7,6 +7,7 @@ from typing import Callable
 
 from ..config import HarnessConfig
 from ..orchestrator import Orchestrator, OrchestrationError, _safe_run_id, generate_run_id
+from ..resume import ResumeNotAllowedError
 
 
 class RunManagerError(RuntimeError):
@@ -103,5 +104,75 @@ class RunManager:
             raise RunManagerError("run worker failed before durable creation")
         raise RunManagerError("run creation timed out")
 
+    def resume_run(self, run_id: str) -> str:
+        """Resume the same ``run_id`` in the background at its checkpoint.
 
-__all__ = ["RunCapacityError", "RunCollisionError", "RunManager", "RunManagerError"]
+        Returns once the resume has been durably claimed, durably refused
+        (integrity/operator failure recorded in state), or is still
+        validating.  A run that is not resumable raises
+        :class:`RunResumeNotAllowedError` and its state is unchanged.
+        """
+
+        try:
+            selected_run_id = _safe_run_id(run_id)
+        except (OrchestrationError, TypeError) as exc:
+            raise RunManagerError(str(exc)) from exc
+        with self._lock:
+            if selected_run_id in self._active_run_ids:
+                raise RunCollisionError("run already exists or is active")
+            if len(self._active_run_ids) >= self._max_active_runs:
+                raise RunCapacityError("maximum active runs reached")
+            self._active_run_ids.add(selected_run_id)
+
+        claimed_event = threading.Event()
+        finished_event = threading.Event()
+        signal = threading.Condition()
+        errors: list[BaseException] = []
+
+        def notify(event: threading.Event) -> None:
+            with signal:
+                event.set()
+                signal.notify_all()
+
+        def worker() -> None:
+            try:
+                orchestrator = self._orchestrator_factory(self._config)
+                orchestrator.resume(
+                    selected_run_id, on_claimed=lambda _run_dir: notify(claimed_event)
+                )
+            except BaseException as exc:  # recorded, never escapes the thread
+                errors.append(exc)
+            finally:
+                with self._lock:
+                    self._active_run_ids.discard(selected_run_id)
+                notify(finished_event)
+
+        threading.Thread(target=worker, daemon=True).start()
+        with signal:
+            signal.wait_for(
+                lambda: claimed_event.is_set() or finished_event.is_set(),
+                timeout=_RESUME_VALIDATION_TIMEOUT_SECONDS,
+            )
+        if not claimed_event.is_set() and finished_event.is_set() and errors:
+            if isinstance(errors[0], ResumeNotAllowedError):
+                raise RunResumeNotAllowedError(str(errors[0]))
+            raise RunManagerError("run could not be resumed")
+        return selected_run_id
+
+
+class RunResumeNotAllowedError(RunManagerError):
+    pass
+
+
+# Resume validation reads Git trees (no model call); allow it more time than
+# a creation before answering the browser, which then shows durable state.
+_RESUME_VALIDATION_TIMEOUT_SECONDS = 60.0
+
+
+__all__ = [
+    "RunCapacityError",
+    "RunCollisionError",
+    "RunManager",
+    "RunManagerError",
+    "RunResumeNotAllowedError",
+]

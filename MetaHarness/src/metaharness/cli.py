@@ -36,13 +36,16 @@ from .gitops import (
     git_root,
     repository_remote_url,
     resolve_commit,
+    validate_base_branch,
     validate_run_branch,
 )
 from .llm.chat import validate_endpoint
-from .models import HarnessConfig, ProfileDriver, RunStatus
-from .orchestrator import OrchestrationError, run_orchestrator
+from .models import HarnessConfig, ProfileDriver, PublishMode, RunStatus
+from .orchestrator import OrchestrationError, resume_run, run_orchestrator
 from .profiles import profiles_for_config
 from .redaction import config_secret_values, redact
+from .result import RunResult
+from .resume import ResumeError
 from .state import STATE_LOCK_NAME, RunStateStore
 
 _SANDBOX_PROBE_ARGV = ("sandbox", "--", "/bin/true")
@@ -53,6 +56,7 @@ _LOCAL_BRIDGE_HOSTS = frozenset({"127.0.0.1", "localhost"})
 _DOCTOR_DETAIL_CHARS = 300
 _CLAUDE_REQUIRED_CAPABILITIES = (
     "--print",
+    "--verbose",
     "--output-format",
     "--model",
     "--effort",
@@ -111,7 +115,21 @@ def _run(config_path: Path, spec_path: Path, run_id: str | None) -> int:
     except (ConfigError, OrchestrationError, OSError, UnicodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    return _report_result(result)
 
+
+def _resume(config_path: Path, run_id: str) -> int:
+    """Resume one run at its durable checkpoint; never replays a phase."""
+
+    try:
+        result = resume_run(config_path, run_id)
+    except (ConfigError, ResumeError, OrchestrationError, OSError, UnicodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return _report_result(result)
+
+
+def _report_result(result: RunResult) -> int:
     print(f"run: {result.run_dir}")
     print(f"status: {result.status.value}")
     if result.commit_sha:
@@ -445,14 +463,28 @@ def _doctor(config_path: Path) -> int:
             base_sha = resolve_commit(repo, config.base_ref)
             print(f"base: {config.base_ref} ({base_sha})")
             if config.publish.enabled:
+                fast_forward = config.publish.mode == PublishMode.FAST_FORWARD_BASE.value
                 try:
                     repository_remote_url(repo, config.publish.remote)
                     validate_run_branch("harness/doctor/run", base_ref=config.base_ref)
+                    if fast_forward:
+                        # The fast-forward target must be a local branch with
+                        # a remote-tracking ref; doctor never fetches.
+                        validate_base_branch(repo, config.base_ref)
+                        resolve_commit(repo, f"refs/heads/{config.base_ref}")
+                        resolve_commit(
+                            repo, f"refs/remotes/{config.publish.remote}/{config.base_ref}"
+                        )
                 except GitError as exc:
                     problems.append(f"publish preflight failed: {exc}")
                 else:
                     print(f"OK publish remote: {config.publish.remote}")
                     print("OK publish branch namespace: harness/<plan>/<run-id>")
+                    if fast_forward:
+                        print(
+                            f"OK publish target: {config.base_ref} via safe fast-forward "
+                            f"({config.publish.remote}/{config.base_ref} tracked locally)"
+                        )
             if config.repository.planner_remote_exploration and (
                 config.repository_section_explicit or config.repository.web_url is not None
             ):
@@ -578,6 +610,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", required=True, type=Path)
     run.add_argument("--spec", required=True, type=Path)
     run.add_argument("--run-id", type=str)
+    resume = subparsers.add_parser(
+        "resume", help="resume a failed run at its durable checkpoint"
+    )
+    resume.add_argument("--config", required=True, type=Path)
+    resume.add_argument("--run-id", required=True, type=str)
     status = subparsers.add_parser("status", help="show a run status")
     status.add_argument("--run", required=True, type=Path)
     show = subparsers.add_parser("show", help="show run state and artifacts")
@@ -604,6 +641,8 @@ def main(argv: list[str] | None = None) -> int:
         return _config_check(args.config)
     if args.command == "run":
         return _run(args.config, args.spec, args.run_id)
+    if args.command == "resume":
+        return _resume(args.config, args.run_id)
     if args.command == "status":
         return _status(args.run)
     if args.command == "show":

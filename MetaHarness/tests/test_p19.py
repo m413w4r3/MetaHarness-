@@ -99,7 +99,9 @@ class P19WebTests(unittest.TestCase):
         RunStateStore(run / "state.json").initialize("planning")
         status, _headers, planning = self.request("GET", "/runs/planning")
         self.assertEqual(status, 200)
-        self.assertIn(b'content="2"', planning)
+        # P29: the run page never reloads itself; it loads the static script.
+        self.assertNotIn(b'http-equiv="refresh"', planning)
+        self.assertIn(b"/static/run.js", planning)
 
     def test_html_create_rejects_bad_form_shape_and_redirects(self) -> None:
         token = self.token_from_new()

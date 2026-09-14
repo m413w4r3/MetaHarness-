@@ -20,12 +20,14 @@ from .models import (
     CodexRuntimeConfig,
     ContextConfig,
     EnvironmentConfig,
+    ExecutionModePolicy,
     ExecutionRole,
     HarnessConfig,
     LLMEndpointConfig,
     ModelProfile,
     PlanningConfig,
     PublishConfig,
+    PublishMode,
     ProfileDriver,
     RepositoryConfig,
     RevisionConfig,
@@ -633,10 +635,20 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     single_step_max_mutable_paths = _positive_int(
         planning_data, "single_step_max_mutable_paths", 2, "planning"
     )
+    execution_mode_policy = planning_data.get(
+        "execution_mode_policy", ExecutionModePolicy.AUTO.value
+    )
+    if not isinstance(execution_mode_policy, str) or execution_mode_policy not in {
+        item.value for item in ExecutionModePolicy
+    }:
+        raise ConfigError(
+            "planning.execution_mode_policy must be 'auto' or 'require-staged'"
+        )
     planning = PlanningConfig(
         protocol=protocol,
         decomposition=decomposition,
         single_step_max_mutable_paths=single_step_max_mutable_paths,
+        execution_mode_policy=execution_mode_policy,
     )
 
     revision_data = _table(expanded, "revision")
@@ -674,9 +686,11 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         or publish_remote.startswith("-")
     ):
         raise ConfigError("publish.remote must be a valid remote name")
-    publish_mode = publish_data.get("mode", "run-branch")
-    if not isinstance(publish_mode, str) or publish_mode != "run-branch":
-        raise ConfigError("publish.mode must be 'run-branch'")
+    publish_mode = publish_data.get("mode", PublishMode.RUN_BRANCH.value)
+    if not isinstance(publish_mode, str) or publish_mode not in {
+        item.value for item in PublishMode
+    }:
+        raise ConfigError("publish.mode must be 'run-branch' or 'fast-forward-base'")
     publish = PublishConfig(
         enabled=_bool(publish_data, "enabled", False, "publish"),
         remote=publish_remote,

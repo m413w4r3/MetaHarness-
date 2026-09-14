@@ -23,11 +23,13 @@ from .api import (
     create_run,
     get_run,
     list_runs,
+    live_status,
     model_profiles,
     progress,
+    resume_run_request,
     validate_run_id,
 )
-from .pages import render_index, render_new_run, render_run
+from .pages import render_index, render_new_run, render_run, run_page_polls
 from .run_manager import RunManager
 
 HOST = "127.0.0.1"
@@ -40,14 +42,31 @@ _SECURITY_HEADERS = (
     ("Cache-Control", "no-store"),
 )
 _API_CSP = "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+_STATIC_DIR = Path(__file__).with_name("static")
+_RUN_JS_CACHE: list[bytes] = []
+RUN_JS_PATH = "/static/run.js"
 
 
-def html_csp(nonce: str) -> str:
-    """CSP for the server-rendered UI, which deliberately has no scripts."""
+def _run_js() -> bytes:
+    """The single static run-page script, read once and never templated."""
 
+    if not _RUN_JS_CACHE:
+        _RUN_JS_CACHE.append((_STATIC_DIR / "run.js").read_bytes())
+    return _RUN_JS_CACHE[0]
+
+
+def html_csp(nonce: str, *, script_self: bool = False) -> str:
+    """CSP for the server-rendered UI.
+
+    No page has an inline script.  Only a running run page loads the static
+    same-origin ``/static/run.js`` (``script-src 'self'``); every other page
+    keeps ``script-src 'none'``.
+    """
+
+    script_source = "'self'" if script_self else "'none'"
     return (
         "default-src 'none'; "
-        "script-src 'none'; "
+        f"script-src {script_source}; "
         f"style-src 'nonce-{nonce}'; "
         "connect-src 'self'; "
         "img-src 'self' data:; "
@@ -165,15 +184,20 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     nonce,
                 )
                 return
+            if parsed.path == RUN_JS_PATH:
+                self._send(200, _run_js(), "application/javascript; charset=utf-8")
+                return
             if len(parts) == 3 and parts[1] == "runs":
                 nonce = secrets.token_urlsafe(18)
-                run = get_run(root, self._run_id(parts[2]))
-                # render_run embeds the token only on a page able to decide.
+                run = get_run(root, self._run_id(parts[2]), config=self.server.config)
+                # render_run embeds the token only on a page able to decide
+                # a plan approval or to resume a resumable run.
                 self._html(
                     render_run(
                         run, self.server.token, config=self.server.config, nonce=nonce
                     ),
                     nonce,
+                    script_self=run_page_polls(run),
                 )
                 return
             if parsed.path == "/api/runs":
@@ -183,7 +207,10 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 self._json(200, model_profiles(self.server.config))
                 return
             if len(parts) == 4 and parts[1:3] == ["api", "runs"]:
-                self._json(200, get_run(root, self._run_id(parts[3])))
+                self._json(200, get_run(root, self._run_id(parts[3]), config=self.server.config))
+                return
+            if len(parts) == 5 and parts[1:3] == ["api", "runs"] and parts[4] == "live":
+                self._json(200, live_status(root, self._run_id(parts[3]), self.server.config))
                 return
             if len(parts) == 5 and parts[1:3] == ["api", "runs"] and parts[4] == "progress":
                 query = parse_qs(parsed.query, keep_blank_values=True)
@@ -247,7 +274,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
         return result
 
     def _redirect(self, location: str) -> None:
-        body = b""
         self.send_response(303)
         self.send_header("Location", location)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -283,7 +309,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 or (
                     len(parts) == 4
                     and parts[1] == "runs"
-                    and parts[3] == "approval"
+                    and parts[3] in {"approval", "resume"}
                 )
             )
             self._check_origin(allow_opaque=html_form_route)
@@ -312,6 +338,19 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._redirect(result["location"])
                 return
+            if len(parts) == 4 and parts[1] == "runs" and parts[3] == "resume":
+                # The only resume mutation: same exact-Host, origin and token
+                # policy as the approval form; the RunManager resumes the same
+                # run id at its durable checkpoint.
+                payload = self._form({"_token"})
+                self._authorized_form(payload.get("_token"))
+                result = resume_run_request(
+                    self.server.run_manager,
+                    self.server.config.runs_root,
+                    self._run_id(parts[2]),
+                )
+                self._redirect(result["location"])
+                return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "approval":
                 payload = self._form(
                     {"_token", "decision", "implementer_profile", "reviewer_profile", "reviser_profile", "repair_profile"}
@@ -335,7 +374,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                         raise WebAPIError(400, "unknown approval field")
                 else:
                     raise WebAPIError(400, "decision must be APPROVE or REJECT")
-                result = approve_run(
+                approve_run(
                     self.server.config.runs_root,
                     self._run_id(parts[2]),
                     decision,
@@ -382,9 +421,12 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError, UnicodeError):
             self._error(WebAPIError(503, "request could not be served"))
 
-    def _html(self, content: str, nonce: str) -> None:
+    def _html(self, content: str, nonce: str, *, script_self: bool = False) -> None:
         self._send(
-            200, content.encode("utf-8"), "text/html; charset=utf-8", csp=html_csp(nonce)
+            200,
+            content.encode("utf-8"),
+            "text/html; charset=utf-8",
+            csp=html_csp(nonce, script_self=script_self),
         )
 
 
@@ -408,6 +450,7 @@ __all__ = [
     "HOST",
     "MetaHarnessHTTPServer",
     "MetaHarnessRequestHandler",
+    "RUN_JS_PATH",
     "allowed_hosts",
     "allowed_origins",
     "create_server",

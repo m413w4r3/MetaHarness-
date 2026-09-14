@@ -815,7 +815,10 @@ class ConfigActivationTests(P28Harness):
         self.assertEqual(raw["ui"]["default_reviser_profile"], "claude-opus-medium")
         self.assertEqual(raw["ui"]["default_repair_profile"], "codex-luna-high")
         self.assertIs(raw["publish"]["enabled"], True)
-        self.assertEqual(raw["publish"]["mode"], "run-branch")
+        # P29: publish the final reviewed commit to main by safe fast-forward,
+        # and require the planner to decompose (STAGED) for real work.
+        self.assertEqual(raw["publish"]["mode"], "fast-forward-base")
+        self.assertEqual(raw["planning"]["execution_mode_policy"], "require-staged")
         self.assertEqual(raw["publish"]["remote"], "origin")
         # Validate the real profiles through load_config with local paths.
         text = EXAMPLE.read_text(encoding="utf-8")
@@ -919,7 +922,7 @@ class DoctorTests(unittest.TestCase):
             with open(RECORD, "w") as stream:
                 json.dump({key: os.environ.get(key) for key in ("HOME", "CLAUDE_CONFIG_DIR", "TMPDIR", "XDG_CACHE_HOME", "CODEX_HOME")}, stream)
             if args == ["--help"]:
-                flags = ["--print", "--output-format", "--model", "--effort", "--permission-mode", "--mcp-config", "--strict-mcp-config"]
+                flags = ["--print", "--verbose", "--output-format", "--model", "--effort", "--permission-mode", "--mcp-config", "--strict-mcp-config"]
                 if mode == "missing_capability":
                     flags.remove("--effort")
                 print(" ".join(flags))

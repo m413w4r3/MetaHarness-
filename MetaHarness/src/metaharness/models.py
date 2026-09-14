@@ -176,6 +176,23 @@ class RepositoryConfig:
     web_url: str | None = None
 
 
+class ExecutionModePolicy(StrEnum):
+    """Planner freedom over EXECUTION_MODE, fixed by configuration."""
+
+    AUTO = "auto"
+    REQUIRE_STAGED = "require-staged"
+
+
+class PublishMode(StrEnum):
+    """Where a final reviewed commit is published."""
+
+    # Push only the run branch ``harness/<plan>/<run-id>``.
+    RUN_BRANCH = "run-branch"
+    # Compare-and-swap fast-forward of the local base branch to the reviewed
+    # commit, then push that exact commit to the remote base branch.
+    FAST_FORWARD_BASE = "fast-forward-base"
+
+
 @dataclass(frozen=True)
 class PublishConfig:
     enabled: bool = False
@@ -193,8 +210,8 @@ class PublishConfig:
             or self.remote.startswith("-")
         ):
             raise ValueError("publish.remote must be a valid remote name")
-        if self.mode != "run-branch":
-            raise ValueError("publish.mode must be 'run-branch'")
+        if self.mode not in {item.value for item in PublishMode}:
+            raise ValueError("publish.mode must be 'run-branch' or 'fast-forward-base'")
 
 
 @dataclass(frozen=True)
@@ -202,6 +219,7 @@ class PlanningConfig:
     protocol: str = "v1"
     decomposition: str = "balanced"
     single_step_max_mutable_paths: int = 2
+    execution_mode_policy: str = "auto"
 
     def __post_init__(self) -> None:
         if self.protocol not in {"v1", "v2"}:
@@ -210,6 +228,8 @@ class PlanningConfig:
             raise ValueError("planning decomposition must be 'balanced' or 'aggressive'")
         if isinstance(self.single_step_max_mutable_paths, bool) or self.single_step_max_mutable_paths <= 0:
             raise ValueError("single_step_max_mutable_paths must be greater than zero")
+        if self.execution_mode_policy not in {item.value for item in ExecutionModePolicy}:
+            raise ValueError("planning execution_mode_policy must be 'auto' or 'require-staged'")
 
 
 @dataclass(frozen=True)

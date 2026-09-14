@@ -207,8 +207,11 @@ class WebServerTests(unittest.TestCase):
 
         page = self.get_html("/runs/live")
         self.assertIn("Run <span class=\"mono\">live</span>", page)
-        self.assertIn('meta http-equiv="refresh" content="2"', page)
-        self.assertNotIn("<script", page)
+        # P29: no full-page refresh; targeted polling through the static
+        # same-origin script only (no inline script).
+        self.assertNotIn('http-equiv="refresh"', page)
+        self.assertIn('<script src="/static/run.js" defer></script>', page)
+        self.assertNotIn("<script>", page)
 
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assertEqual(status, 200)
@@ -255,7 +258,8 @@ class WebServerTests(unittest.TestCase):
         self.create_run("before", "planning")
         page = self.get_html("/runs/before")
         self.assertNotIn('action="/runs/before/approval"', page)
-        self.assertIn('content="2"', page)
+        self.assertNotIn('http-equiv="refresh"', page)
+        self.assertIn("/static/run.js", page)
         self.assertNotIn(self.server.token, page)
 
         self.create_run("gate", "awaiting_plan_approval")

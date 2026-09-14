@@ -33,6 +33,12 @@ interrupted worktrees are intentionally retained for inspection.
 | `implementation_bundle.json` | v2 only: step IDs, recommended profiles and the SHA-256 of every step contract |
 | `steps/Sxx/contract.md` | v2 only: the single authoritative step contract, written at planning, approved and executed byte-for-byte |
 | `steps/Sxx/agent.*` / `steps/Sxx/step.json` | v2 only: per-step Codex prompt, events, report, trees, changed paths and usage |
+| `steps/Sxx/token_diagnostics.json` | v2 only: input/cached/output/reasoning tokens, event and tool-call counts, at most 100 repository paths read (structured event fields only) and at most 100 command program names — never arguments |
+| `resume_checkpoint.json` | P29: the next operation that has not yet succeeded (`phase`, `cycle`, `step_id`, expected HEAD and tree, execution-selection hash, plan identity, C02 repair-bundle hash); `status` becomes `completed` once published/committed |
+| `revision/Cxx/tree_after_failure.txt` | Tree left by a failed Claude attempt; lets a resume restore `tree_before.txt` exactly (in-scope paths only) |
+| `steps/Sxx/attempts/NN/`, `revision/Cxx/attempts/NN/` | Artifacts of a failed attempt, moved aside before a resumed retry of the same operation |
+| `planner.conversation.json` | Only when the driver officially returned a planner conversation handle (never simulated) |
+| `publish.json` (fast-forward-base) | `mode`, `target`, `remote`, `base_sha`, `commit_sha`, `run_branch` (local only), `local_base_updated`, `base_checked_out_in` |
 
 Historic P20 runs stored contracts as `steps/Sxx.contract.md`; the UI can
 still display them, but new runs never write and never execute that layout.
