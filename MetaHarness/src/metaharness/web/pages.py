@@ -67,7 +67,8 @@ _TIMELINE = (
     ("created", "CREATED"), ("planning", "PLANNING"),
     ("awaiting_plan_approval", "AWAITING PLAN APPROVAL"), ("worktree_ready", "WORKTREE"),
     ("preparing", "PREPARING"), ("implementing", "IMPLEMENTING"),
-    ("validating", "VALIDATING"), ("revising", "REVISING"), ("reviewing", "REVIEWING"),
+    ("pre_revision_validating", "PRE-REVISION VALIDATING"),
+    ("revising", "REVISING"), ("revalidating", "REVALIDATING"), ("reviewing", "REVIEWING"),
     ("approved", "APPROVED"), ("committed", "COMMITTED"),
 )
 _ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
@@ -206,7 +207,7 @@ def _execution_card(state: dict[str, Any], config: HarnessConfig | None) -> str:
     if config is not None:
         metadata = {profile.id: safe_profile_metadata(profile) for profile in profiles_for_config(config).values()}
     cards = []
-    for role, title in (("planner", "Planner"), ("implementer", "Implementer"), ("reviser", "Reviser"), ("reviewer", "Reviewer")):
+    for role, title in (("planner", "Planner"), ("implementer", "Implementer"), ("reviser", "Reviser"), ("repair_implementer", "Repair implementer"), ("reviewer", "Reviewer")):
         selected = execution.get(role) if isinstance(execution.get(role), dict) else {}
         profile_id = selected.get("profile_id")
         profile = metadata.get(profile_id, {})
@@ -288,11 +289,19 @@ def _v2_approval_form(
             f'{_contract_block(artifact_map.get(step_id, {}))}</section>'
         )
     reviewer = planner.get("reviewer_recommendation")
+    reviser = config.ui.default_reviser_profile if config is not None else None
+    repair = config.ui.default_repair_profile if config is not None else None
+    cycle_profiles = (
+        f'<label for="reviser-profile">Reviser</label><select id="reviser-profile" name="reviser_profile" required>{_profile_options(config, "reviser", reviser)}</select>'
+        f'<label for="repair-profile">Repair implementer</label><select id="repair-profile" name="repair_profile" required>{_profile_options(config, "repair", repair)}</select>'
+        if reviser and repair else ""
+    )
     return f'''<section class="card"><h2>Execution plan</h2>
 <p>Execution mode: <strong>{_e(planner.get("execution_mode"))}</strong></p>
 <p>Steps: {_e(len(rows))}</p>
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE">
-{"".join(rows)}<label for="reviewer-profile">Reviewer</label><select id="reviewer-profile" name="reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select><br><button class="approve" type="submit">APPROVE PLAN</button></form>
+<h3>Planner</h3><p class="mono">{_e(state.get("execution", {}).get("planner", {}).get("profile_id") if isinstance(state.get("execution"), dict) else "—")}</p>
+{"".join(rows)}{cycle_profiles}<label for="reviewer-profile">Reviewer</label><select id="reviewer-profile" name="reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select><br><button class="approve" type="submit">APPROVE PLAN</button></form>
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT PLAN</button></form></section>'''
 
 
@@ -352,6 +361,7 @@ def _usage_section(run: dict[str, Any]) -> str:
         for label, value in (
             ("Planner", usage.get("planner")),
             ("Luna", implementer.get("total")),
+            ("Claude revision", usage.get("reviser")),
             ("Reviewer", usage.get("reviewer")),
         )
     )
@@ -393,7 +403,7 @@ def _execution_card_v2(
     execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
     planner_state = state.get("planner") if isinstance(state.get("planner"), dict) else {}
     selection = run.get("execution_selection")
-    approved = selection if isinstance(selection, dict) and selection.get("schema_version") == 3 else {}
+    approved = selection if isinstance(selection, dict) and selection.get("schema_version") in (3, 4) else {}
     planner = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
     planner_mode = planner.get("selection_mode")
     planner_warning = '<p class="danger">external-ui: le modèle est sélectionné dans le fournisseur externe.</p>' if planner_mode == "external-ui" else ""
@@ -409,6 +419,12 @@ def _execution_card_v2(
         f'<dt>recommended</dt><dd>{_profile_triplet(reviewer_recommended, recommended_meta.get("model_label"), recommended_meta.get("selection_mode"))}</dd>'
         f'<dt>approved</dt><dd>{_profile_triplet(reviewer_approved.get("profile_id"), reviewer_approved.get("model"), reviewer_approved.get("selection_mode")) if reviewer_approved else "<span class=muted>pending approval</span>"}</dd>'
         f'</dl></article>'
+    )
+    reviser_approved = approved.get("reviser") if isinstance(approved.get("reviser"), dict) else execution.get("reviser", {})
+    repair_approved = approved.get("repair_implementer") if isinstance(approved.get("repair_implementer"), dict) else execution.get("repair_implementer", {})
+    cycle_cards = (
+        f'<article class="card"><h3>Reviser</h3><dl><dt>approved</dt><dd>{_profile_triplet(reviser_approved.get("profile_id"), reviser_approved.get("model"), reviser_approved.get("effort"))}</dd></dl></article>'
+        f'<article class="card"><h3>Repair implementer</h3><dl><dt>approved</dt><dd>{_profile_triplet(repair_approved.get("profile_id"), repair_approved.get("model"), repair_approved.get("effort"))}</dd></dl></article>'
     )
     approved_steps = {
         item.get("step_id"): item.get("implementer")
@@ -434,7 +450,7 @@ def _execution_card_v2(
         + ("".join(rows) or '<tr><td class="muted">No step.</td></tr>')
         + "</tbody></table>"
     )
-    return f'<div class="grid">{planner_card}{reviewer_card}</div>{steps_table}'
+    return f'<div class="grid">{planner_card}{cycle_cards}{reviewer_card}</div>{steps_table}'
 
 
 def render_run(run: dict[str, Any], token: str | None = None, *, config: HarnessConfig | None = None, nonce: str | None = None, refresh_seconds: int | None = None) -> str:

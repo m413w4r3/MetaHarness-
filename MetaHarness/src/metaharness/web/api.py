@@ -32,8 +32,12 @@ from ..execution_selection import (
     read_execution_selection_v3_with_sha256,
     resolve_execution_selection_v3,
     validate_execution_selection_v3,
+    ensure_execution_selection_v4,
+    read_execution_selection_v4_with_sha256,
+    resolve_execution_selection_v4,
+    validate_execution_selection_v4,
 )
-from ..models import ExecutionRole, ExecutionSelection, HarnessConfig, RunStatus
+from ..models import ExecutionRole, ExecutionSelection, ExecutionSelectionV4, HarnessConfig, RunStatus
 from ..planning_v2 import V2PlanParseError, step_contract_path, validate_implementation_bundle
 from ..profiles import ProfileError, profile_for_role, profiles_for_config, safe_profile_metadata
 from ..state import RunStateStore
@@ -74,6 +78,12 @@ ARTIFACT_ALLOWLIST = frozenset(
         "revision/agent.result.json",
         "revision/agent.final.md",
         "revision/agent.stderr.log",
+        "revision/pre_checks.json",
+        "revision/scope.json",
+        "revision/tree_before.txt",
+        "revision/tree_after.txt",
+        "revision/report.json",
+        "revision/usage.json",
         "changed-files.txt",
         "diff.patch",
         "plan_approval.json",
@@ -386,6 +396,7 @@ def get_run(runs_root: Path, run_id: str) -> dict[str, Any]:
         "review": _load_json(_artifact_path(directory, "review.json")),
         "reviewer_raw": reviewer_raw,
         "reviewer_raw_available": reviewer_raw is not None,
+        "revision": _load_json(_artifact_path(directory, "revision/report.json")),
         "execution_selection": _load_json(
             _artifact_path(directory, "execution_selection.json")
         ),
@@ -443,6 +454,7 @@ def _usage_summary(
     """Aggregate persisted token usage per phase; no pricing is derived."""
 
     planner = read_usage_artifact(directory / PLANNER_USAGE_ARTIFACT) or empty_usage()
+    reviser = read_usage_artifact(directory / "revision" / "usage.json") or empty_usage()
     reviewer = read_usage_artifact(directory / REVIEWER_USAGE_ARTIFACT) or empty_usage()
     steps = [
         {"id": item["id"], "usage": item["usage"]}
@@ -458,8 +470,9 @@ def _usage_summary(
     return {
         "planner": planner,
         "implementer": {"total": implementer, "steps": steps},
+        "reviser": reviser,
         "reviewer": reviewer,
-        "grand_total": add_usage((planner, implementer, reviewer)),
+        "grand_total": add_usage((planner, implementer, reviser, reviewer)),
     }
 
 
@@ -629,6 +642,7 @@ def approve_run(
     implementer_profile: object = None,
     reviewer_profile: object = None,
     reviser_profile: object = None,
+    repair_profile: object = None,
     step_profiles: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Perform the only web mutation through the core approval API."""
@@ -650,6 +664,17 @@ def approve_run(
                 raise WebAPIError(400, "step profiles and reviewer_profile are required")
             if any(not isinstance(value, str) for value in step_profiles.values()):
                 raise WebAPIError(400, "invalid step profile field")
+        if selected is ApprovalDecision.APPROVE and config is not None and (
+            config.ui.default_reviser_profile and config.ui.default_repair_profile
+        ):
+            if reviser_profile is None:
+                reviser_profile = config.ui.default_reviser_profile
+            elif not isinstance(reviser_profile, str) or not reviser_profile:
+                raise WebAPIError(400, "reviser_profile is invalid")
+            if repair_profile is None:
+                repair_profile = config.ui.default_repair_profile
+            elif not isinstance(repair_profile, str) or not repair_profile:
+                raise WebAPIError(400, "repair_profile is invalid")
     if selected is ApprovalDecision.APPROVE and profile_aware and not v2:
         if config is None or not isinstance(implementer_profile, str) or not isinstance(reviewer_profile, str):
             raise WebAPIError(400, "implementer_profile and reviewer_profile are required")
@@ -696,19 +721,34 @@ def approve_run(
         if set(step_profiles) != set(expected_ids):
             raise WebAPIError(400, "missing or unknown step profile field")
         try:
-            requested = resolve_execution_selection_v3(
-                config,
-                planner_profile_id=state["execution"]["planner"]["profile_id"],
-                step_profile_ids={key: value for key, value in step_profiles.items()},
-                reviewer_profile_id=reviewer_profile,
-                reviser_profile_id=(reviser_profile or config.ui.default_reviser_profile),
-            )
+            if config.ui.default_reviser_profile and config.ui.default_repair_profile:
+                requested = resolve_execution_selection_v4(
+                    config,
+                    planner_profile_id=state["execution"]["planner"]["profile_id"],
+                    step_profile_ids={key: value for key, value in step_profiles.items()},
+                    reviser_profile_id=reviser_profile or config.ui.default_reviser_profile,
+                    repair_implementer_profile_id=repair_profile or config.ui.default_repair_profile,
+                    reviewer_profile_id=reviewer_profile,
+                )
+            else:
+                requested = resolve_execution_selection_v3(
+                    config,
+                    planner_profile_id=state["execution"]["planner"]["profile_id"],
+                    step_profile_ids={key: value for key, value in step_profiles.items()},
+                    reviewer_profile_id=reviewer_profile,
+                    reviser_profile_id=(reviser_profile or config.ui.default_reviser_profile),
+                )
         except (ProfileError, ExecutionSelectionError) as exc:
             raise WebAPIError(400, "selected profile is invalid") from exc
         try:
-            ensure_execution_selection_v3(directory, requested)
-            durable, execution_sha256 = read_execution_selection_v3_with_sha256(directory)
-            validate_execution_selection_v3(config, durable)
+            if isinstance(requested, ExecutionSelectionV4):
+                ensure_execution_selection_v4(directory, requested)
+                durable, execution_sha256 = read_execution_selection_v4_with_sha256(directory)
+                validate_execution_selection_v4(config, durable)
+            else:
+                ensure_execution_selection_v3(directory, requested)
+                durable, execution_sha256 = read_execution_selection_v3_with_sha256(directory)
+                validate_execution_selection_v3(config, durable)
         except ExecutionSelectionConflict as exc:
             raise WebAPIError(409, "a different execution selection is already recorded") from exc
         except ExecutionSelectionError as exc:
@@ -727,7 +767,7 @@ def approve_run(
         RunStateStore(directory / "state.json").update_if_status(
             RunStatus.AWAITING_PLAN_APPROVAL,
             plan_identity=asdict(identity),
-            execution=_execution_state_v3(durable),
+            execution=_execution_state_v4(durable) if isinstance(durable, ExecutionSelectionV4) else _execution_state_v3(durable),
         )
         return {"ok": True, "decision": selected.value}
 
@@ -835,6 +875,16 @@ def _execution_state_v3(selection: Any) -> dict[str, Any]:
     return state
 
 
+def _execution_state_v4(selection: ExecutionSelectionV4) -> dict[str, Any]:
+    return {
+        "planner": asdict(selection.planner),
+        "steps": [{"step_id": item.step_id, "implementer": asdict(item.implementer)} for item in selection.steps],
+        "reviser": asdict(selection.reviser),
+        "repair_implementer": asdict(selection.repair_implementer),
+        "reviewer": asdict(selection.reviewer),
+    }
+
+
 def model_profiles(config: HarnessConfig) -> dict[str, Any]:
     profiles = profiles_for_config(config)
     defaults = {
@@ -842,6 +892,7 @@ def model_profiles(config: HarnessConfig) -> dict[str, Any]:
         "implementer": config.ui.default_implementer_profile or "legacy-implementer",
         "reviewer": config.ui.default_reviewer_profile or "legacy-reviewer",
         "reviser": config.ui.default_reviser_profile,
+        "repair_implementer": config.ui.default_repair_profile,
     }
     return {
         "profiles": [safe_profile_metadata(profile) for profile in profiles.values()],

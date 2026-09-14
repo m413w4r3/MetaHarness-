@@ -314,7 +314,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "approval":
                 payload = self._form(
-                    {"_token", "decision", "implementer_profile", "reviewer_profile"}
+                    {"_token", "decision", "implementer_profile", "reviewer_profile", "reviser_profile", "repair_profile"}
                     | {f"step_profile__S{index:02d}" for index in range(1, 7)},
                     exact=False,
                 )
@@ -324,6 +324,8 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     step_fields = {key for key in payload if key.startswith("step_profile__")}
                     if step_fields:
                         expected = {"_token", "decision", "reviewer_profile"} | step_fields
+                        if "reviser_profile" in payload or "repair_profile" in payload:
+                            expected |= {"reviser_profile", "repair_profile"}
                         if set(payload) != expected:
                             raise WebAPIError(400, "missing approval field")
                     elif set(payload) != {"_token", "decision", "implementer_profile", "reviewer_profile"}:
@@ -342,6 +344,8 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     reviewer_profile=payload.get("reviewer_profile")
                     if decision == "APPROVE"
                     else None,
+                    reviser_profile=payload.get("reviser_profile") if decision == "APPROVE" else None,
+                    repair_profile=payload.get("repair_profile") if decision == "APPROVE" else None,
                     step_profiles={key.removeprefix("step_profile__"): value for key, value in payload.items() if key.startswith("step_profile__")}
                     if decision == "APPROVE" and any(key.startswith("step_profile__") for key in payload)
                     else None,
@@ -356,7 +360,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             if not isinstance(decision, str):
                 raise WebAPIError(400, "decision must be APPROVE or REJECT")
             allowed = {"decision"} if decision == "REJECT" else {
-                "decision", "implementer_profile", "reviewer_profile"
+                "decision", "implementer_profile", "reviewer_profile", "reviser_profile", "repair_profile"
             } | {key for key in payload if key.startswith("step_profile__")}
             if set(payload) - allowed:
                 raise WebAPIError(400, "unknown approval field")
@@ -367,6 +371,8 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 config=self.server.config,
                 implementer_profile=payload.get("implementer_profile"),
                 reviewer_profile=payload.get("reviewer_profile"),
+                reviser_profile=payload.get("reviser_profile"),
+                repair_profile=payload.get("repair_profile"),
                 step_profiles={key.removeprefix("step_profile__"): value for key, value in payload.items() if key.startswith("step_profile__")}
                 if any(key.startswith("step_profile__") for key in payload) else None,
             )

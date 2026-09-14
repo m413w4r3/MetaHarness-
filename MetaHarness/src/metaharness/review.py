@@ -84,7 +84,7 @@ def _replace_placeholders(template: str, values: dict[str, str]) -> str:
     """Replace known placeholders once, preserving placeholders in evidence."""
 
     return re.sub(
-        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|DIFF|CHECKS|AGENT_REPORT)\}\}",
+        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|DIFF|CHECKS|AGENT_REPORT|REPOSITORY|LUNA_REPORTS|REVISION_REPORT|REPOSITORY_STATE)\}\}",
         lambda match: values[match.group(0)],
         template,
     )
@@ -106,6 +106,10 @@ def build_reviewer_prompt(
     checks: str,
     agent_report: str,
     *,
+    repository: str = "",
+    luna_reports: str = "",
+    revision_report: str = "",
+    repository_state: str = "",
     template: str | None = None,
 ) -> str:
     """Build the reviewer's single user message.
@@ -124,6 +128,10 @@ def build_reviewer_prompt(
         "{{DIFF}}": _require_text("diff", diff),
         "{{CHECKS}}": _require_text("checks", checks),
         "{{AGENT_REPORT}}": _require_text("agent_report", agent_report),
+        "{{REPOSITORY}}": _require_text("repository", repository),
+        "{{LUNA_REPORTS}}": _require_text("luna_reports", luna_reports),
+        "{{REVISION_REPORT}}": _require_text("revision_report", revision_report),
+        "{{REPOSITORY_STATE}}": _require_text("repository_state", repository_state),
     }
     if template is None:
         template = _prompt_template_path().read_text(encoding="utf-8")
@@ -471,6 +479,10 @@ class Reviewer:
         *,
         deterministic_passed: bool = True,
         artifacts_dir: str | Path | None = None,
+        repository: str = "",
+        luna_reports: str = "",
+        revision_report: str = "",
+        repository_state: str = "",
     ) -> ReviewResult:
         request = build_reviewer_prompt(
             spec,
@@ -481,6 +493,10 @@ class Reviewer:
             diff,
             checks,
             agent_report,
+            repository=repository,
+            luna_reports=luna_reports,
+            revision_report=revision_report,
+            repository_state=repository_state,
             template=self.template,
         )
         target = Path(artifacts_dir) if artifacts_dir is not None else None
@@ -539,6 +555,10 @@ def run_reviewer(
     deterministic_passed: bool = True,
     artifacts_dir: str | Path | None = None,
     template: str | None = None,
+    repository: str = "",
+    luna_reports: str = "",
+    revision_report: str = "",
+    repository_state: str = "",
 ) -> ReviewResult:
     """Functional convenience wrapper around :class:`Reviewer`."""
 
@@ -553,6 +573,10 @@ def run_reviewer(
         agent_report,
         deterministic_passed=deterministic_passed,
         artifacts_dir=artifacts_dir,
+        repository=repository,
+        luna_reports=luna_reports,
+        revision_report=revision_report,
+        repository_state=repository_state,
     )
 
 

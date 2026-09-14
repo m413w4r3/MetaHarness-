@@ -84,12 +84,17 @@ from .execution_selection import (
     resolve_execution_selection,
     resolve_execution_selection_v3,
     ensure_execution_selection_v3,
+    resolve_execution_selection_v4,
+    ensure_execution_selection_v4,
     validate_execution_selection,
     read_execution_selection_v3_with_sha256,
     validate_execution_selection_v3,
+    read_execution_selection_v4_with_sha256,
+    validate_execution_selection_v4,
 )
 from .models import (
     ExecutionRole,
+    ExecutionSelectionV4,
     ExecutionSelectionV3,
     HarnessConfig,
     ImplementationStep,
@@ -273,6 +278,63 @@ def _step_reports_text(results: list[dict[str, Any]]) -> str:
 
 def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
     return [check_result_json(check) for check in bundle.checks]
+
+
+def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
+    """Return failures that make semantic review unsafe.
+
+    A normal configured check failure is evidence for the reviewer in P25;
+    mutations, timeouts, secrets, ownership and malformed/oversized trees are
+    still terminal integrity failures.
+    """
+
+    return [
+        item for item in bundle.failures
+        if item in _DIRECT_FAILURES
+        or any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES)
+        or item.startswith("CHECK_MUTATED:")
+        or item.startswith("CHECK_TIMEOUT:")
+    ]
+
+
+def _persist_revision_tree(run_dir: Path, name: str, tree: str) -> None:
+    atomic_write_text(run_dir / "revision" / name, tree.rstrip() + "\n")
+
+
+def _revision_prompt(
+    *,
+    repository_reference: RepositoryReference,
+    spec: str,
+    plan: TaskPlanV2,
+    contracts: str,
+    luna_reports: str,
+    changed_files: str,
+    diff: str,
+    pre_checks: str,
+    mutable_scope: str,
+) -> str:
+    template = (Path(__file__).with_name("prompts") / "reviser.txt").read_text(encoding="utf-8")
+    values = {
+        "{{REPOSITORY_REFERENCE}}": json.dumps(repository_reference_dict(repository_reference), ensure_ascii=False, indent=2),
+        "{{SPEC}}": spec,
+        "{{PLAN_SUMMARY}}": _json_text({
+            "title": plan.title,
+            "objective": plan.objective,
+            "constraints": plan.constraints,
+            "acceptance": plan.acceptance,
+            "tests": plan.tests,
+            "risks": plan.risks,
+        }),
+        "{{ALL_STEP_CONTRACTS}}": contracts,
+        "{{LUNA_STEP_REPORTS}}": luna_reports,
+        "{{CURRENT_CHANGED_FILES}}": changed_files,
+        "{{CURRENT_CUMULATIVE_DIFF}}": diff,
+        "{{PRE_REVISION_CHECKS}}": pre_checks,
+        "{{APPROVED_MUTABLE_SCOPE}}": mutable_scope,
+    }
+    for placeholder, value in values.items():
+        template = template.replace(placeholder, value)
+    return template
 
 
 def _json_text(value: Any) -> str:
@@ -1029,8 +1091,126 @@ class Orchestrator:
             state = store.record_failure("AGENT_NO_CHANGE")
             return RunResult(run_dir, RunStatus.FAILED, state)
 
+        p25 = False
         revision_result = None
-        if selection.reviser is not None:
+        if p25:
+            # Freeze the complete Luna candidate before asking Claude to
+            # inspect it.  The pre-check result is evidence, not a terminal
+            # verdict, unless an integrity boundary was violated.
+            stage_all(info.worktree)
+            tree_before_revision = candidate_tree_sha(info.worktree)
+            store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
+            pre_evidence = collect_evidence(
+                info.worktree, base_sha, self.config,
+                evidence_dir=run_dir / "revision", secrets=self._secrets,
+                check_failures_hard=False,
+            )
+            pre_hard = _hard_integrity_failures(pre_evidence)
+            mutable_scope = sorted({
+                path
+                for step in plan.steps
+                for path in (*step.write_set, *step.create_set, *step.delete_set)
+            })
+            atomic_write_text(run_dir / "revision" / "scope.json", _json_text({
+                "approved_mutable_scope": mutable_scope,
+                "source": "union of all initial plan WRITE_SET, CREATE_SET, DELETE_SET",
+            }))
+            atomic_write_text(run_dir / "revision" / "pre_checks.json", _json_text({
+                "checks": _check_payload(pre_evidence),
+                "failures": list(pre_evidence.failures),
+                "deterministic_passed": pre_evidence.deterministic_passed,
+                "staged_tree_sha": pre_evidence.staged_tree_sha,
+            }))
+            if pre_hard:
+                return self._v2_failed(store, run_dir, pre_hard[0].split(":", 1)[0], None,
+                                       ", ".join(pre_hard))
+            contracts = "\n\n".join(
+                read_approved_step_contract(run_dir, bundle, step.id)
+                for step in plan.steps
+            )
+            changed_files_before = "\n".join(changed_paths_between_trees(repo, base_tree_sha, tree_before_revision))
+            pre_checks_text = _json_text({
+                "checks": _check_payload(pre_evidence),
+                "failures": list(pre_evidence.failures),
+                "deterministic_passed": pre_evidence.deterministic_passed,
+            })
+            revision_prompt = _revision_prompt(
+                repository_reference=repository_reference,
+                spec=spec,
+                plan=plan,
+                contracts=contracts,
+                luna_reports=_step_reports_text(self._last_v2_step_results),
+                changed_files=changed_files_before,
+                diff=pre_evidence.diff,
+                pre_checks=pre_checks_text,
+                mutable_scope=_json_text(mutable_scope),
+            )
+            store.update(status=RunStatus.REVISING, current_step=None)
+            _persist_revision_tree(run_dir, "tree_before.txt", tree_before_revision)
+            try:
+                revision_result = self._run_revision(selection, info.worktree, run_dir, revision_prompt)
+            except ClaudeCommittedError as exc:
+                self._redact_revision_artifacts(run_dir)
+                return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None,
+                                       redact(str(exc), self._secrets))
+            except (ClaudeAgentError, ClaudeRuntimeError) as exc:
+                self._redact_revision_artifacts(run_dir)
+                return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None,
+                                       redact(str(exc), self._secrets))
+            claude_auth_failure = _claude_auth_failure(run_dir, revision_result.stderr_tail)
+            self._redact_revision_artifacts(run_dir)
+            revision_result = dataclasses.replace(
+                revision_result,
+                final_message=redact(revision_result.final_message, self._secrets),
+                stderr_tail=redact(revision_result.stderr_tail, self._secrets),
+            )
+            revision_ownership = _git_ownership(repo, info.worktree)
+            if revision_ownership.head != base_sha:
+                return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None,
+                                       "Claude changed HEAD")
+            revision_violations = _ownership_violations(
+                ownership_before, revision_ownership,
+                branch_ref=branch_ref, base_sha=base_sha,
+            )
+            if revision_violations:
+                return self._v2_failed(store, run_dir, "AGENT_GIT_VIOLATION", None,
+                                       "; ".join(revision_violations))
+            if revision_result.timed_out:
+                return self._v2_failed(store, run_dir, "CLAUDE_TIMEOUT", None)
+            if revision_result.exit_code != 0:
+                return self._v2_failed(
+                    store, run_dir,
+                    "CLAUDE_AUTH_FAILURE" if claude_auth_failure else "CLAUDE_FAILED",
+                    None, "Claude Code revision failed",
+                )
+            stage_all(info.worktree)
+            tree_after_revision = candidate_tree_sha(info.worktree)
+            _persist_revision_tree(run_dir, "tree_after.txt", tree_after_revision)
+            changed_by_revision = changed_paths_between_trees(
+                repo, tree_before_revision, tree_after_revision
+            )
+            outside_scope = [path for path in changed_by_revision if path not in set(mutable_scope)]
+            revision_status = "NO_CHANGE" if tree_after_revision == tree_before_revision else "COMPLETED"
+            revision_usage = normalize_usage(revision_result.usage)
+            atomic_write_text(run_dir / "revision" / "usage.json", _json_text(revision_usage))
+            revision_state = {
+                "profile_id": selection.reviser.profile_id,
+                "status": revision_status,
+                "tree_before": tree_before_revision,
+                "tree_after": tree_after_revision,
+                "usage": revision_usage,
+            }
+            atomic_write_text(run_dir / "revision" / "report.json", _json_text({
+                **revision_state,
+                "final": _bounded_report(revision_result.final_message),
+                "stderr_tail": revision_result.stderr_tail,
+                "changed_paths": list(changed_by_revision),
+            }))
+            store.update(status=RunStatus.REVISING, revision=revision_state)
+            if outside_scope:
+                return self._v2_failed(store, run_dir, "REVISION_SCOPE_VIOLATION", None,
+                                       f"unexpected={_paths_detail(outside_scope)}")
+        elif selection.reviser is not None:
             store.update(status=RunStatus.REVISING)
             revision_prompt = (
                 "Review and correct the Luna implementation in this worktree.\n\n"
@@ -1158,7 +1338,11 @@ class Orchestrator:
             deterministic_passed=True,
             artifacts_dir=run_dir,
         )
-        store.update(status=RunStatus.REVIEWING, review=_review_payload(review))
+        store.update(
+            status=RunStatus.REVIEWING,
+            review=_review_payload(review),
+            review_iterations=1,
+        )
 
         if review.verdict is ReviewVerdict.REVISE:
             # V0 never re-implements automatically: REVISE produces an
@@ -1221,6 +1405,22 @@ class Orchestrator:
         repository_reference: RepositoryReference,
     ) -> RunResult:
         """Execute a v2 bundle: one worktree, fresh Codex process per step."""
+
+        # P25 is enabled only when the configuration explicitly provides the
+        # complete two-cycle authority.  Older P24 configurations remain
+        # readable/executable through the V3 compatibility path.
+        has_cycle_profile = bool(
+            self.config.ui.default_reviser_profile
+            or self.config.ui.default_repair_profile
+        )
+        if has_cycle_profile and not (
+            self.config.ui.default_reviser_profile
+            and self.config.ui.default_repair_profile
+        ):
+            raise ExecutionSelectionError(
+                "new META PLAN v2 runs require reviser and repair profiles"
+            )
+        p25 = has_cycle_profile
 
         planner_profile_id = store.load()["execution"]["planner"]["profile_id"]
         planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
@@ -1290,8 +1490,12 @@ class Orchestrator:
                 state = store.update(status=RunStatus.PLAN_REJECTED)
                 return RunResult(run_dir, RunStatus.PLAN_REJECTED, state)
             try:
-                selection, execution_sha = read_execution_selection_v3_with_sha256(run_dir)
-                validate_execution_selection_v3(self.config, selection)
+                if p25:
+                    selection, execution_sha = read_execution_selection_v4_with_sha256(run_dir)
+                    validate_execution_selection_v4(self.config, selection)
+                else:
+                    selection, execution_sha = read_execution_selection_v3_with_sha256(run_dir)
+                    validate_execution_selection_v3(self.config, selection)
                 durable_identity = compute_plan_identity_from_run(run_dir)
                 if durable_identity.execution_sha256 != execution_sha:
                     raise ApprovalError("execution selection hash mismatch")
@@ -1303,14 +1507,25 @@ class Orchestrator:
             except (ExecutionSelectionError, ApprovalError, OSError, UnicodeError) as exc:
                 raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
         else:
-            requested = resolve_execution_selection_v3(
-                self.config,
-                planner_profile_id=planner_profile_id,
-                step_profile_ids={step.id: step.implementer_profile for step in plan.steps},
-                reviewer_profile_id=plan.reviewer_profile or self.config.ui.default_reviewer_profile or "legacy-reviewer",
-                reviser_profile_id=self.config.ui.default_reviser_profile,
-            )
-            selection = ensure_execution_selection_v3(run_dir, requested)
+            if p25:
+                requested = resolve_execution_selection_v4(
+                    self.config,
+                    planner_profile_id=planner_profile_id,
+                    step_profile_ids={step.id: step.implementer_profile for step in plan.steps},
+                    reviser_profile_id=self.config.ui.default_reviser_profile or "",
+                    repair_implementer_profile_id=self.config.ui.default_repair_profile or "",
+                    reviewer_profile_id=plan.reviewer_profile or self.config.ui.default_reviewer_profile or "legacy-reviewer",
+                )
+                selection = ensure_execution_selection_v4(run_dir, requested)
+            else:
+                requested = resolve_execution_selection_v3(
+                    self.config,
+                    planner_profile_id=planner_profile_id,
+                    step_profile_ids={step.id: step.implementer_profile for step in plan.steps},
+                    reviewer_profile_id=plan.reviewer_profile or self.config.ui.default_reviewer_profile or "legacy-reviewer",
+                    reviser_profile_id=self.config.ui.default_reviser_profile,
+                )
+                selection = ensure_execution_selection_v3(run_dir, requested)
             durable_identity = compute_plan_identity_from_run(run_dir)
 
         # Re-read the complete manifest after the approval transaction.  The
@@ -1330,7 +1545,10 @@ class Orchestrator:
             raise ExecutionSelectionError("execution selection planner is not the run planner")
         if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
             raise ExecutionSelectionError("execution selection steps do not match the plan")
-        validate_execution_selection_v3(self.config, selection)
+        if p25:
+            validate_execution_selection_v4(self.config, selection)
+        else:
+            validate_execution_selection_v3(self.config, selection)
         self._last_selection = selection
         execution_state = {
             "planner": asdict(selection.planner),
@@ -1491,7 +1709,26 @@ class Orchestrator:
                          agent_usage=self._v2_agent_usage())
 
         revision_result = None
-        if selection.reviser is not None:
+        if p25:
+            try:
+                revision_result, revision_error = self._run_v2_revision_cycle(
+                    store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                    base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
+                    repository_reference=repository_reference, info=info,
+                    branch_ref=branch_ref, ownership_before=ownership_before,
+                    selection=selection,
+                )
+            except ClaudeCommittedError as exc:
+                self._redact_revision_artifacts(run_dir)
+                return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None,
+                                       redact(str(exc), self._secrets))
+            except (ClaudeAgentError, ClaudeRuntimeError) as exc:
+                self._redact_revision_artifacts(run_dir)
+                return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None,
+                                       redact(str(exc), self._secrets))
+            if revision_error is not None:
+                return self._v2_failed(store, run_dir, revision_error, None)
+        elif selection.reviser is not None:
             store.update(status=RunStatus.REVISING, current_step=None)
             revision_prompt = (
                 "Review and correct the completed Luna implementation steps in this worktree.\n\n"
@@ -1559,15 +1796,19 @@ class Orchestrator:
                     "; ".join(revision_violations),
                 )
 
-        store.update(status=RunStatus.VALIDATING, current_step=None)
+        store.update(
+            status=RunStatus.REVALIDATING if p25 else RunStatus.VALIDATING,
+            current_step=None,
+        )
         evidence = collect_evidence(info.worktree, base_sha, self.config,
-                                    evidence_dir=run_dir, secrets=self._secrets)
+                                    evidence_dir=run_dir, secrets=self._secrets,
+                                    check_failures_hard=not p25)
         store.update(status=RunStatus.VALIDATING, checks=_check_payload(evidence),
                      staged_tree_sha=evidence.staged_tree_sha,
                      changed_files=list(evidence.changed_files),
                      deterministic_gate={"passed": evidence.deterministic_passed,
                                          "failures": list(evidence.failures)})
-        integrity_failures = [item for item in evidence.failures if item in _DIRECT_FAILURES or
+        integrity_failures = _hard_integrity_failures(evidence) if p25 else [item for item in evidence.failures if item in _DIRECT_FAILURES or
                               any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES) or
                               item.startswith("CHECK_MUTATED:")]
         if integrity_failures:
@@ -1582,11 +1823,43 @@ class Orchestrator:
             else _step_reports_text(self._last_v2_step_results)
         )
         store.update(status=RunStatus.REVIEWING)
-        review = reviewer.review(spec, plan.raw, context, gate,
-                                 "\n".join(evidence.changed_files), evidence.diff,
-                                 _json_text(_check_payload(evidence)), reports,
-                                 deterministic_passed=True, artifacts_dir=run_dir)
-        store.update(status=RunStatus.REVIEWING, review=_review_payload(review))
+        repository_state = _json_text({
+            "BASE_SHA": base_sha,
+            "HEAD_SHA": base_sha,
+            "CANDIDATE_TREE_SHA": evidence.staged_tree_sha,
+            "CHANGED_FILES": list(evidence.changed_files),
+            "GIT_STATUS": status_porcelain(info.worktree),
+        })
+        revision_report = (
+            _json_text({
+                "final": _bounded_report(revision_result.final_message),
+                "tree_before": (run_dir / "revision" / "tree_before.txt").read_text(encoding="utf-8").strip()
+                if p25 and (run_dir / "revision" / "tree_before.txt").exists() else None,
+                "tree_after": (run_dir / "revision" / "tree_after.txt").read_text(encoding="utf-8").strip()
+                if p25 and (run_dir / "revision" / "tree_after.txt").exists() else None,
+                "usage": normalize_usage(revision_result.usage),
+            })
+            if revision_result is not None else ""
+        )
+        review = reviewer.review(
+            spec, plan.raw, context, gate,
+            "\n".join(evidence.changed_files), evidence.diff,
+            _json_text(_check_payload(evidence)), reports,
+            # Keep the response parseable so the reviewer can diagnose a
+            # failed normal check; the commit gate below still makes PASS
+            # impossible when the gate is red.
+            deterministic_passed=True,
+            artifacts_dir=run_dir,
+            repository=_json_text(repository_reference_dict(repository_reference)),
+            luna_reports=_step_reports_text(self._last_v2_step_results),
+            revision_report=revision_report,
+            repository_state=repository_state,
+        )
+        store.update(
+            status=RunStatus.REVIEWING,
+            review=_review_payload(review),
+            review_iterations=1,
+        )
         if review.verdict is ReviewVerdict.REVISE:
             write_repair_task(run_dir, fields={"route": review.route.value,
                 "review_summary": review.summary, "findings": review.findings,
@@ -1607,6 +1880,114 @@ class Orchestrator:
         return RunResult(run_dir, RunStatus.COMMITTED,
                          store.update(status=RunStatus.COMMITTED, commit_sha=commit_sha,
                                       current_step=None))
+
+    def _run_v2_revision_cycle(
+        self,
+        *,
+        store: RunStateStore,
+        run_dir: Path,
+        repo: Path,
+        base_sha: str,
+        base_tree_sha: str,
+        spec: str,
+        plan: TaskPlanV2,
+        bundle: Mapping[str, Any],
+        repository_reference: RepositoryReference,
+        info: Any,
+        branch_ref: str,
+        ownership_before: Any,
+        selection: ExecutionSelectionV4,
+    ) -> tuple[Any | None, str | None]:
+        """Run P25's mandatory pre-check/revision/scope cycle."""
+
+        stage_all(info.worktree)
+        tree_before = candidate_tree_sha(info.worktree)
+        store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
+        pre_evidence = collect_evidence(
+            info.worktree, base_sha, self.config,
+            evidence_dir=run_dir / "revision", secrets=self._secrets,
+            check_failures_hard=False,
+        )
+        mutable_scope = sorted({
+            path for step in plan.steps
+            for path in (*step.write_set, *step.create_set, *step.delete_set)
+        })
+        atomic_write_text(run_dir / "revision" / "scope.json", _json_text({
+            "approved_mutable_scope": mutable_scope,
+            "source": "union of all initial plan WRITE_SET, CREATE_SET, DELETE_SET",
+        }))
+        pre_payload = {
+            "checks": _check_payload(pre_evidence),
+            "failures": list(pre_evidence.failures),
+            "deterministic_passed": pre_evidence.deterministic_passed,
+            "staged_tree_sha": pre_evidence.staged_tree_sha,
+        }
+        atomic_write_text(run_dir / "revision" / "pre_checks.json", _json_text(pre_payload))
+        pre_hard = _hard_integrity_failures(pre_evidence)
+        if pre_hard:
+            return None, pre_hard[0].split(":", 1)[0]
+        contracts = "\n\n".join(
+            read_approved_step_contract(run_dir, bundle, step.id)
+            for step in plan.steps
+        )
+        revision_prompt = _revision_prompt(
+            repository_reference=repository_reference,
+            spec=spec,
+            plan=plan,
+            contracts=contracts,
+            luna_reports=_step_reports_text(self._last_v2_step_results),
+            changed_files="\n".join(changed_paths_between_trees(repo, base_tree_sha, tree_before)),
+            diff=pre_evidence.diff,
+            pre_checks=_json_text(pre_payload),
+            mutable_scope=_json_text(mutable_scope),
+        )
+        store.update(status=RunStatus.REVISING, current_step=None)
+        _persist_revision_tree(run_dir, "tree_before.txt", tree_before)
+        result = self._run_revision(selection, info.worktree, run_dir, revision_prompt)
+        claude_auth_failure = _claude_auth_failure(run_dir, result.stderr_tail)
+        self._redact_revision_artifacts(run_dir)
+        result = dataclasses.replace(
+            result,
+            final_message=redact(result.final_message, self._secrets),
+            stderr_tail=redact(result.stderr_tail, self._secrets),
+        )
+        if result.timed_out:
+            return result, "CLAUDE_TIMEOUT"
+        if result.exit_code != 0:
+            return result, "CLAUDE_AUTH_FAILURE" if claude_auth_failure else "CLAUDE_FAILED"
+        revision_ownership = _git_ownership(repo, info.worktree)
+        if revision_ownership.head != base_sha:
+            return result, "CLAUDE_COMMITTED"
+        violations = _ownership_violations(
+            ownership_before, revision_ownership,
+            branch_ref=branch_ref, base_sha=base_sha,
+        )
+        if violations:
+            return result, "AGENT_GIT_VIOLATION"
+        stage_all(info.worktree)
+        tree_after = candidate_tree_sha(info.worktree)
+        _persist_revision_tree(run_dir, "tree_after.txt", tree_after)
+        changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
+        outside_scope = [path for path in changed_paths if path not in set(mutable_scope)]
+        usage = normalize_usage(result.usage)
+        revision_state = {
+            "profile_id": selection.reviser.profile_id,
+            "status": "NO_CHANGE" if tree_after == tree_before else "COMPLETED",
+            "tree_before": tree_before,
+            "tree_after": tree_after,
+            "usage": usage,
+        }
+        atomic_write_text(run_dir / "revision" / "usage.json", _json_text(usage))
+        atomic_write_text(run_dir / "revision" / "report.json", _json_text({
+            **revision_state,
+            "final": _bounded_report(result.final_message),
+            "stderr_tail": result.stderr_tail,
+            "changed_paths": list(changed_paths),
+        }))
+        store.update(status=RunStatus.REVISING, revision=revision_state)
+        if outside_scope:
+            return result, "REVISION_SCOPE_VIOLATION"
+        return result, None
 
     def _redact_step_artifacts(self, step_dir: Path) -> None:
         for name in _AGENT_ARTIFACTS:

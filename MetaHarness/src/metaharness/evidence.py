@@ -249,6 +249,7 @@ def collect_evidence(
     evidence_dir: str | Path | None = None,
     tail_bytes: int = DEFAULT_TAIL_BYTES,
     secrets: tuple[str, ...] = (),
+    check_failures_hard: bool = True,
 ) -> EvidenceBundle:
     """Run all configured checks, then stage and freeze the submitted tree."""
 

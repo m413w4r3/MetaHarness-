@@ -140,8 +140,8 @@ def compute_plan_identity_from_run(run_dir: str | Path) -> PlanIdentity:
     )
 
 
-def _approval_payload(approval: PlanApproval) -> dict[str, object]:
-    schema_version = 3 if approval.bundle_sha256 is not None else 2 if approval.execution_sha256 is not None else 1
+def _approval_payload(approval: PlanApproval, *, schema_version: int | None = None) -> dict[str, object]:
+    schema_version = schema_version or (3 if approval.bundle_sha256 is not None else 2 if approval.execution_sha256 is not None else 1)
     return {
         "schema_version": schema_version,
         "decision": approval.decision.value,
@@ -226,8 +226,17 @@ def write_plan_approval(
         created_at=_now(),
         source=source,
     )
-    content = json.dumps(_approval_payload(approval), ensure_ascii=False, indent=2) + "\n"
-    _publish_exclusive(_run_path(run_dir) / _APPROVAL_FILENAME, content)
+    directory = _run_path(run_dir)
+    schema_version = None
+    if normalized_decision is ApprovalDecision.APPROVE and identity.execution_sha256 is not None and identity.bundle_sha256 is not None:
+        try:
+            selection_payload = json.loads((directory / "execution_selection.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ApprovalError("execution selection is missing or invalid") from exc
+        if isinstance(selection_payload, dict) and selection_payload.get("schema_version") == 4:
+            schema_version = 4
+    content = json.dumps(_approval_payload(approval, schema_version=schema_version), ensure_ascii=False, indent=2) + "\n"
+    _publish_exclusive(directory / _APPROVAL_FILENAME, content)
 
 
 def read_plan_approval(
@@ -251,7 +260,7 @@ def read_plan_approval(
     if not isinstance(payload, dict):
         raise ApprovalError("approval JSON must contain an object")
     schema_version = payload.get("schema_version")
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in (1, 2, 3):
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in (1, 2, 3, 4):
         raise ApprovalError("approval schema_version is unsupported")
     required = ("decision", "raw_sha256", "contract_sha256", "created_at", "source")
     if any(field not in payload for field in required):
@@ -261,15 +270,22 @@ def read_plan_approval(
             raise ApprovalError("approval artifact is missing an essential field")
         if "bundle_sha256" in payload:
             raise ApprovalError("schema 2 approval contains a bundle hash")
-    elif schema_version == 3:
+    elif schema_version in (3, 4):
         if "execution_sha256" not in payload or "bundle_sha256" not in payload:
             raise ApprovalError("approval artifact is missing an essential field")
         if payload.get("execution_sha256") is None and payload.get("decision") != ApprovalDecision.REJECT.value:
             raise ApprovalError("approved schema 3 decision must bind execution")
     elif "execution_sha256" in payload:
         raise ApprovalError("historic approval contains an execution hash")
-    if schema_version != 3 and "bundle_sha256" in payload:
+    if schema_version not in (3, 4) and "bundle_sha256" in payload:
         raise ApprovalError("historic approval contains a bundle hash")
+    if schema_version == 4:
+        try:
+            selection_payload = json.loads((_run_path(run_dir) / "execution_selection.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ApprovalError("execution selection is missing or invalid") from exc
+        if not isinstance(selection_payload, dict) or selection_payload.get("schema_version") != 4:
+            raise ApprovalError("schema 4 approval requires execution selection schema 4")
     try:
         approval = PlanApproval(
             decision=ApprovalDecision(payload["decision"]),
@@ -311,7 +327,7 @@ def read_plan_approval(
             and approval.bundle_sha256 != expected_identity.bundle_sha256
         )
         or (expected_identity.execution_sha256 is None and approval.execution_sha256 is not None
-            and schema_version not in (2, 3))
+            and schema_version not in (2, 3, 4))
         or (expected_identity.bundle_sha256 is None and approval.bundle_sha256 is not None)
     ):
         raise ApprovalError("approval does not match the expected plan identity")

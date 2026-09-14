@@ -86,6 +86,8 @@ class RunStateStore:
             "workspace_setup": [],
             "checks": [],
             "review": {},
+            "revision": {},
+            "review_iterations": 0,
             "approved_tree_sha": None,
             "commit_sha": None,
             "failure": None,
@@ -95,6 +97,13 @@ class RunStateStore:
                 "total_input_tokens": 0,
                 "total_output_tokens": 0,
                 "steps": [],
+            },
+            "usage": {
+                "planner": {},
+                "luna": {"total": {}, "steps": []},
+                "reviser": {},
+                "reviewer": {},
+                "grand_total": {},
             },
         }
         with _exclusive_state_lock(self.lock_path):

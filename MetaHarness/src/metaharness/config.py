@@ -676,6 +676,17 @@ def load_config(config_path: str | Path) -> HarnessConfig:
                 if ExecutionRole.REVISER in profile.roles
             ]
             reviser_default = revisers[0] if len(revisers) == 1 else None
+        repair_default = ui_data.get("default_repair_profile")
+        if repair_default is not None:
+            repair_default = _check_default(
+                model_profiles, repair_default, ExecutionRole.REPAIR
+            )
+        else:
+            repairers = [
+                profile.id for profile in model_profiles.values()
+                if ExecutionRole.REPAIR in profile.roles
+            ]
+            repair_default = repairers[0] if len(repairers) == 1 else None
         planner_profile = model_profiles[planner_default]
         reviewer_profile = model_profiles[reviewer_default]
         implementer_profile = model_profiles[implementer_default]
@@ -799,6 +810,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             reviewer_default if explicit_profiles else "legacy-reviewer"
         ),
         default_reviser_profile=(reviser_default if explicit_profiles else None),
+        default_repair_profile=(repair_default if explicit_profiles else None),
         enable_profile_recommendation=_bool(
             ui_data, "enable_profile_recommendation", True, "ui"
         ),

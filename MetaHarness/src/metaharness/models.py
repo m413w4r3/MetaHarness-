@@ -119,7 +119,9 @@ class RunStatus(StrEnum):
     PREPARING = "preparing"
     IMPLEMENTING = "implementing"
     VALIDATING = "validating"
+    PRE_REVISION_VALIDATING = "pre_revision_validating"
     REVISING = "revising"
+    REVALIDATING = "revalidating"
     REVIEWING = "reviewing"
     APPROVED = "approved"
     COMMITTED = "committed"
@@ -219,6 +221,7 @@ class UIConfig:
     default_implementer_profile: str | None = None
     default_reviewer_profile: str | None = None
     default_reviser_profile: str | None = None
+    default_repair_profile: str | None = None
     enable_profile_recommendation: bool = True
 
 
@@ -343,3 +346,15 @@ class ExecutionSelectionV3:
     steps: tuple[StepExecutionSelection, ...]
     reviewer: SelectedProfile
     reviser: SelectedProfile | None = None
+
+
+@dataclass(frozen=True)
+class ExecutionSelectionV4:
+    """Immutable execution authority for new META PLAN v2 runs."""
+
+    schema_version: int
+    planner: SelectedProfile
+    steps: tuple[StepExecutionSelection, ...]
+    reviser: SelectedProfile
+    repair_implementer: SelectedProfile
+    reviewer: SelectedProfile
