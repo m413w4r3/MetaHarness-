@@ -42,6 +42,7 @@ _ROLES = (
 )
 _V1_FIELDS = frozenset({"profile_id", "driver", "model", "selection_mode", "effort", "sandbox"})
 _V2_FIELDS = _V1_FIELDS | {"config_sha256"}
+_OPTIONAL_PROFILE_FIELDS = frozenset({"permission_mode"})
 
 
 def is_profile_aware_run(state: Mapping[str, Any]) -> bool:
@@ -70,6 +71,7 @@ def _selected(
     schema_version: int = SCHEMA_VERSION,
     agent_env_allowlist: tuple[str, ...] = (),
     codex_home: Path | None = None,
+    claude_config_home: Path | None = None,
 ) -> SelectedProfile:
     return SelectedProfile(
         profile_id=profile.id,
@@ -78,11 +80,13 @@ def _selected(
         selection_mode=profile.selection_mode.value,
         effort=profile.effort,
         sandbox=profile.sandbox,
+        permission_mode=profile.permission_mode,
         config_sha256=(
             profile_execution_fingerprint(
                 profile,
                 agent_env_allowlist=agent_env_allowlist,
                 codex_home=codex_home,
+                claude_config_home=claude_config_home,
             )
             if schema_version == 2
             else None
@@ -96,6 +100,7 @@ def resolve_execution_selection(
     planner_profile_id: str,
     implementer_profile_id: str,
     reviewer_profile_id: str,
+    reviser_profile_id: str | None = None,
 ) -> ExecutionSelection:
     """Resolve three profiles from trusted config into a schema-2 snapshot."""
 
@@ -112,7 +117,14 @@ def resolve_execution_selection(
         )
         for name, role in _ROLES
     }
-    return ExecutionSelection(schema_version=SCHEMA_VERSION, **selected)
+    reviser = None
+    if reviser_profile_id is not None:
+        reviser = _selected(
+            profile_for_role(config, reviser_profile_id, ExecutionRole.REVISER),
+            agent_env_allowlist=_env_allowlist(config, ExecutionRole.REVISER),
+            claude_config_home=config.claude_runtime.home,
+        )
+    return ExecutionSelection(schema_version=SCHEMA_VERSION, **selected, reviser=reviser)
 
 
 _MAX_V3_STEPS = 6
@@ -150,6 +162,7 @@ def resolve_execution_selection_v3(
     planner_profile_id: str,
     step_profile_ids: Mapping[str, str],
     reviewer_profile_id: str,
+    reviser_profile_id: str | None = None,
 ) -> ExecutionSelectionV3:
     """Resolve one immutable profile snapshot for every ordered v2 step."""
 
@@ -174,7 +187,14 @@ def resolve_execution_selection_v3(
                 ),
             )
         )
-    return ExecutionSelectionV3(SCHEMA_VERSION_V3, planner, tuple(steps), reviewer)
+    reviser = None
+    if reviser_profile_id is not None:
+        reviser = _selected(
+            profile_for_role(config, reviser_profile_id, ExecutionRole.REVISER),
+            agent_env_allowlist=_env_allowlist(config, ExecutionRole.REVISER),
+            claude_config_home=config.claude_runtime.home,
+        )
+    return ExecutionSelectionV3(SCHEMA_VERSION_V3, planner, tuple(steps), reviewer, reviser)
 
 
 def _payload(selection: ExecutionSelection) -> dict[str, Any]:
@@ -186,12 +206,21 @@ def _payload(selection: ExecutionSelection) -> dict[str, Any]:
         if not isinstance(value, SelectedProfile):
             raise ExecutionSelectionError(f"execution selection {name} is invalid")
         fields = asdict(value)
+        if fields.get("permission_mode") is None:
+            fields.pop("permission_mode", None)
         if selection.schema_version == 1:
             if fields.pop("config_sha256") is not None:
                 raise ExecutionSelectionError("schema 1 selection cannot carry a fingerprint")
         elif not isinstance(value.config_sha256, str) or _SHA256.fullmatch(value.config_sha256) is None:
             raise ExecutionSelectionError(f"execution selection {name}.config_sha256 is invalid")
         payload[name] = fields
+    if selection.reviser is not None:
+        fields = asdict(selection.reviser)
+        if selection.schema_version == 1:
+            raise ExecutionSelectionError("schema 1 selection cannot carry a reviser")
+        if fields.get("permission_mode") is None:
+            fields.pop("permission_mode", None)
+        payload["reviser"] = fields
     return payload
 
 
@@ -210,18 +239,37 @@ def _payload_v3(selection: ExecutionSelectionV3) -> dict[str, Any]:
         if item.implementer.config_sha256 is None or _SHA256.fullmatch(item.implementer.config_sha256) is None:
             raise ExecutionSelectionError("execution selection implementer.config_sha256 is invalid")
         seen.add(item.step_id)
-        steps.append({"step_id": item.step_id, "implementer": asdict(item.implementer)})
+        implementer_fields = asdict(item.implementer)
+        if implementer_fields.get("permission_mode") is None:
+            implementer_fields.pop("permission_mode", None)
+        steps.append({"step_id": item.step_id, "implementer": implementer_fields})
     if not steps:
         raise ExecutionSelectionError("execution selection steps are missing")
     for name, profile in (("planner", selection.planner), ("reviewer", selection.reviewer)):
         if profile.config_sha256 is None or _SHA256.fullmatch(profile.config_sha256) is None:
             raise ExecutionSelectionError(f"execution selection {name}.config_sha256 is invalid")
+    if selection.reviser is not None:
+        if not isinstance(selection.reviser, SelectedProfile):
+            raise ExecutionSelectionError("execution selection reviser is invalid")
+        if selection.reviser.config_sha256 is None or _SHA256.fullmatch(selection.reviser.config_sha256) is None:
+            raise ExecutionSelectionError("execution selection reviser.config_sha256 is invalid")
+        steps_payload = {"reviser": _selected_payload(selection.reviser)}
+    else:
+        steps_payload = {}
     return {
         "schema_version": SCHEMA_VERSION_V3,
-        "planner": asdict(selection.planner),
+        "planner": _selected_payload(selection.planner),
         "steps": steps,
-        "reviewer": asdict(selection.reviewer),
+        "reviewer": _selected_payload(selection.reviewer),
+        **steps_payload,
     }
+
+
+def _selected_payload(value: SelectedProfile) -> dict[str, Any]:
+    fields = asdict(value)
+    if fields.get("permission_mode") is None:
+        fields.pop("permission_mode", None)
+    return fields
 
 
 def _publish_exclusive(path: Path, content: str) -> bool:
@@ -304,13 +352,14 @@ def _selected_from(value: Any, name: str, schema_version: int) -> SelectedProfil
     if not isinstance(value, dict):
         raise ExecutionSelectionError(f"execution selection {name} must be an object")
     required = _V2_FIELDS if schema_version == 2 else _V1_FIELDS
-    if set(value) != required:
+    accepted = set(value)
+    if accepted != required and accepted != required | _OPTIONAL_PROFILE_FIELDS:
         raise ExecutionSelectionError(f"execution selection {name} has invalid fields")
     strings = ("profile_id", "driver", "model", "selection_mode")
     if any(not isinstance(value[key], str) for key in strings):
         raise ExecutionSelectionError(f"execution selection {name} has invalid metadata")
-    for key in ("effort", "sandbox"):
-        if value[key] is not None and not isinstance(value[key], str):
+    for key in ("effort", "sandbox", "permission_mode"):
+        if value.get(key) is not None and not isinstance(value.get(key), str):
             raise ExecutionSelectionError(f"execution selection {name}.{key} is invalid")
     if schema_version == 2 and (
         not isinstance(value["config_sha256"], str)
@@ -334,19 +383,28 @@ def parse_execution_selection(data: bytes) -> ExecutionSelection:
         return parse_execution_selection_v3(data)  # type: ignore[return-value]
     if isinstance(schema_version, bool) or schema_version not in (1, 2):
         raise ExecutionSelectionError("execution selection schema_version is unsupported")
-    if set(payload) != {"schema_version", "planner", "implementer", "reviewer"}:
+    if set(payload) not in (
+        {"schema_version", "planner", "implementer", "reviewer"},
+        {"schema_version", "planner", "implementer", "reviewer", "reviser"},
+    ):
         raise ExecutionSelectionError("execution selection has invalid fields")
+    reviser = (
+        _selected_from(payload["reviser"], "reviser", schema_version)
+        if "reviser" in payload
+        else None
+    )
     return ExecutionSelection(
         schema_version=schema_version,
         **{
             name: _selected_from(payload[name], name, schema_version)
             for name, _role in _ROLES
         },
+        reviser=reviser,
     )
 
 
 def _selected_v3(value: Any, name: str) -> SelectedProfile:
-    if not isinstance(value, dict) or set(value) != _V2_FIELDS:
+    if not isinstance(value, dict) or set(value) not in (_V2_FIELDS, _V2_FIELDS | _OPTIONAL_PROFILE_FIELDS):
         raise ExecutionSelectionError(f"execution selection {name} is invalid")
     return _selected_from(value, name, 2)
 
@@ -356,7 +414,7 @@ def parse_execution_selection_v3(data: bytes) -> ExecutionSelectionV3:
         payload = json.loads(data.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ExecutionSelectionError("execution selection is missing or invalid") from exc
-    if not isinstance(payload, dict) or set(payload) != {"schema_version", "planner", "steps", "reviewer"} or payload.get("schema_version") != SCHEMA_VERSION_V3:
+    if not isinstance(payload, dict) or set(payload) not in ({"schema_version", "planner", "steps", "reviewer"}, {"schema_version", "planner", "steps", "reviewer", "reviser"}) or payload.get("schema_version") != SCHEMA_VERSION_V3:
         raise ExecutionSelectionError("execution selection schema_version is unsupported")
     raw_steps = payload.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
@@ -373,11 +431,13 @@ def parse_execution_selection_v3(data: bytes) -> ExecutionSelectionV3:
         steps.append(StepExecutionSelection(step_id, _selected_v3(item.get("implementer"), f"step {step_id}")))
     if [item.step_id for item in steps] != [f"S{index:02d}" for index in range(1, len(steps) + 1)]:
         raise ExecutionSelectionError("execution selection step IDs are not contiguous")
+    reviser = _selected_v3(payload["reviser"], "reviser") if "reviser" in payload else None
     return ExecutionSelectionV3(
         SCHEMA_VERSION_V3,
         _selected_v3(payload["planner"], "planner"),
         tuple(steps),
         _selected_v3(payload["reviewer"], "reviewer"),
+        reviser,
     )
 
 
@@ -444,6 +504,7 @@ def validate_execution_selection(
                 schema_version=selection.schema_version,
                 agent_env_allowlist=_env_allowlist(config, role),
                 codex_home=(config.codex_runtime.home if role is ExecutionRole.IMPLEMENTER else None),
+                claude_config_home=(config.claude_runtime.home if role is ExecutionRole.REVISER else None),
             )
         except ProfileError as exc:
             raise ExecutionSelectionError(
@@ -454,6 +515,14 @@ def validate_execution_selection(
                 f"execution selection {name} profile {selected.profile_id!r} "
                 "no longer matches the configured profile"
             )
+    if selection.reviser is not None:
+        try:
+            profile = profile_for_role(config, selection.reviser.profile_id, ExecutionRole.REVISER)
+        except ProfileError as exc:
+            raise ExecutionSelectionError(f"execution selection reviser profile is no longer available: {exc}") from exc
+        expected = _selected(profile, claude_config_home=config.claude_runtime.home)
+        if selection.reviser != expected:
+            raise ExecutionSelectionError("execution selection reviser profile no longer matches the configured profile")
 
 
 def validate_execution_selection_v3(config: HarnessConfig, selection: ExecutionSelectionV3) -> None:
@@ -470,6 +539,14 @@ def validate_execution_selection_v3(config: HarnessConfig, selection: ExecutionS
         expected = _selected(profile, agent_env_allowlist=_env_allowlist(config, role))
         if selected != expected:
             raise ExecutionSelectionError(f"execution selection {name} profile no longer matches config")
+    if selection.reviser is not None:
+        try:
+            profile = profile_for_role(config, selection.reviser.profile_id, ExecutionRole.REVISER)
+        except ProfileError as exc:
+            raise ExecutionSelectionError("execution selection reviser profile is unavailable") from exc
+        expected = _selected(profile, claude_config_home=config.claude_runtime.home)
+        if selection.reviser != expected:
+            raise ExecutionSelectionError("execution selection reviser profile no longer matches config")
     if not selection.steps:
         raise ExecutionSelectionError("execution selection steps are missing")
     for item in selection.steps:

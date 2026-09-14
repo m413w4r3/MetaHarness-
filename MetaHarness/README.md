@@ -26,6 +26,7 @@ cd ../MetaHarness
 /usr/bin/python3.12 -m pip install -e .
 
 CODEX_HOME="$HOME/.local/share/metaharness/codex" codex login
+CLAUDE_CONFIG_DIR="$HOME/.local/share/metaharness/claude" claude
 metaharness doctor --config examples/autowork.toml
 ```
 
@@ -46,16 +47,17 @@ depuis `examples/` ; le secret `BRIDGE_API_KEY` vient uniquement de
 
 `doctor` est le gate local avant l’UI : config, fichiers d’environnement,
 secrets utilisables (jamais affichés), repo propre et base SHA, racines de
-runs/worktrees, binaire Codex, `CODEX_HOME` géré sans MCP, probe
-`codex sandbox -- /bin/true`, authentification locale Codex, exécutables de
-setup et de checks, et `GET /health` du bridge local
+runs/worktrees, binaires Codex et Claude Code, `CODEX_HOME` et
+`CLAUDE_CONFIG_DIR` gérés sans MCP, probe `codex sandbox -- /bin/true`,
+capacités `claude --help`, authentification locale Codex et Claude,
+exécutables de setup et de checks, et `GET /health` du bridge local
 (127.0.0.1/localhost uniquement). Il ne lance aucun modèle. Doctor doit être
-exécuté après le login du `CODEX_HOME` géré.
+exécuté après l’authentification des runtimes gérés.
 
 Ouvrir `http://127.0.0.1:8765/`, cliquer sur `NEW RUN`, saisir le SPEC puis
 `CREATE RUN`. Le planner, l’approbation des contrats de step exacts, chaque
-step Luna, les checks, la review et la consommation de tokens sont ensuite
-suivis depuis la page du run.
+step Luna, la révision Claude, les checks, la review et la consommation de
+tokens sont ensuite suivis depuis la page du run.
 
 La CLI reste disponible pour l’automatisation :
 

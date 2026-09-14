@@ -59,6 +59,8 @@ def _integer_fields(value: Any) -> dict[str, int] | None:
         "total_tokens",
         "prompt_tokens",
         "completion_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
     }
     result = {key: number for key, number in accepted.items() if key in wanted}
     return result or None

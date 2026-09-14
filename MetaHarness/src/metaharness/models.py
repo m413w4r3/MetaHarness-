@@ -9,6 +9,7 @@ from typing import Any, Mapping
 class ProfileDriver(StrEnum):
     OPENAI_CHAT = "openai-chat"
     CODEX = "codex"
+    CLAUDE_CODE = "claude-code"
 
 
 class SelectionMode(StrEnum):
@@ -23,6 +24,7 @@ class ExecutionRole(StrEnum):
     REVIEWER = "reviewer"
     REPAIR = "repair"
     AUDITOR = "auditor"
+    REVISER = "reviser"
 
 
 class PlanDecision(StrEnum):
@@ -53,6 +55,7 @@ class ModelProfile:
 
     effort: str | None = None
     sandbox: str | None = None
+    permission_mode: str | None = None
 
     description: str = ""
     strengths: tuple[str, ...] = ()
@@ -116,6 +119,7 @@ class RunStatus(StrEnum):
     PREPARING = "preparing"
     IMPLEMENTING = "implementing"
     VALIDATING = "validating"
+    REVISING = "revising"
     REVIEWING = "reviewing"
     APPROVED = "approved"
     COMMITTED = "committed"
@@ -214,6 +218,7 @@ class UIConfig:
     default_planner_profile: str | None = None
     default_implementer_profile: str | None = None
     default_reviewer_profile: str | None = None
+    default_reviser_profile: str | None = None
     enable_profile_recommendation: bool = True
 
 
@@ -233,6 +238,11 @@ class EnvironmentConfig:
 
 @dataclass(frozen=True)
 class CodexRuntimeConfig:
+    home: Path
+
+
+@dataclass(frozen=True)
+class ClaudeRuntimeConfig:
     home: Path
 
 
@@ -281,6 +291,11 @@ class HarnessConfig:
             Path.home() / ".local" / "share" / "metaharness" / "codex"
         )
     )
+    claude_runtime: ClaudeRuntimeConfig = field(
+        default_factory=lambda: ClaudeRuntimeConfig(
+            Path.home() / ".local" / "share" / "metaharness" / "claude"
+        )
+    )
     workspace_setup: tuple[WorkspaceSetupCommand, ...] = ()
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     repository: RepositoryConfig = field(default_factory=RepositoryConfig)
@@ -297,6 +312,7 @@ class SelectedProfile:
     selection_mode: str
     effort: str | None = None
     sandbox: str | None = None
+    permission_mode: str | None = None
     # SHA-256 of the execution-relevant profile configuration (schema 2).
     config_sha256: str | None = None
 
@@ -307,6 +323,7 @@ class ExecutionSelection:
     planner: SelectedProfile
     implementer: SelectedProfile
     reviewer: SelectedProfile
+    reviser: SelectedProfile | None = None
 
 
 @dataclass(frozen=True)
@@ -325,3 +342,4 @@ class ExecutionSelectionV3:
     planner: SelectedProfile
     steps: tuple[StepExecutionSelection, ...]
     reviewer: SelectedProfile
+    reviser: SelectedProfile | None = None

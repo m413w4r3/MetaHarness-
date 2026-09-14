@@ -16,6 +16,7 @@ from .models import (
     AgentConfig,
     ApprovalConfig,
     CheckConfig,
+    ClaudeRuntimeConfig,
     CodexRuntimeConfig,
     ContextConfig,
     EnvironmentConfig,
@@ -62,6 +63,7 @@ _PROFILE_DRIVER_KEYS = {
     }),
     # Codex has no retry policy: ``retries`` would be a silently unused option.
     ProfileDriver.CODEX: frozenset({"effort", "sandbox"}),
+    ProfileDriver.CLAUDE_CODE: frozenset({"effort", "permission_mode"}),
 }
 _PROFILE_ROLE_COMPATIBILITY = {
     ProfileDriver.OPENAI_CHAT: frozenset({
@@ -69,6 +71,9 @@ _PROFILE_ROLE_COMPATIBILITY = {
     }),
     ProfileDriver.CODEX: frozenset({
         ExecutionRole.IMPLEMENTER, ExecutionRole.REPAIR,
+    }),
+    ProfileDriver.CLAUDE_CODE: frozenset({
+        ExecutionRole.REVISER, ExecutionRole.REPAIR,
     }),
 }
 
@@ -413,12 +418,17 @@ def _model_profiles(
                 latency_tier=latency_tier,
             )
         else:
-            effort = _required_string(profile_data, "effort", where)
-            sandbox = _required_string(profile_data, "sandbox", where)
-            if sandbox not in _KNOWN_SANDBOXES:
-                raise ConfigError(f"unknown {where}.sandbox")
             if selection_mode is not SelectionMode.CLI:
                 raise ConfigError(f"{where}.selection_mode must be cli")
+            effort = _required_string(profile_data, "effort", where)
+            if driver is ProfileDriver.CODEX:
+                sandbox = _required_string(profile_data, "sandbox", where)
+                if sandbox not in _KNOWN_SANDBOXES:
+                    raise ConfigError(f"unknown {where}.sandbox")
+                permission_mode = None
+            else:
+                sandbox = None
+                permission_mode = _required_string(profile_data, "permission_mode", where)
             result[profile_id] = ModelProfile(
                 id=profile_id,
                 display_name=display_name,
@@ -427,8 +437,10 @@ def _model_profiles(
                 model=model,
                 selection_mode=selection_mode,
                 timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
+                retries=0 if driver is ProfileDriver.CLAUDE_CODE else 2,
                 effort=effort,
                 sandbox=sandbox,
+                permission_mode=permission_mode,
                 description=description,
                 strengths=strengths,
                 cost_tier=cost_tier,
@@ -495,6 +507,19 @@ def _codex_runtime(
             Path.home() / ".local" / "share" / "metaharness" / "codex"
         )
     return CodexRuntimeConfig(_path(data["home"], "codex_runtime.home", config_dir))
+
+
+def _claude_runtime(
+    raw: Mapping[str, Any], config_dir: Path, *, required: bool
+) -> ClaudeRuntimeConfig:
+    data = _table(raw, "claude_runtime")
+    if "home" not in data:
+        if required:
+            raise ConfigError("claude_runtime.home is required for explicit Claude Code profiles")
+        return ClaudeRuntimeConfig(
+            Path.home() / ".local" / "share" / "metaharness" / "claude"
+        )
+    return ClaudeRuntimeConfig(_path(data["home"], "claude_runtime.home", config_dir))
 
 
 def _workspace_setup(value: Any) -> tuple[WorkspaceSetupCommand, ...]:
@@ -617,6 +642,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     has_explicit_codex = any(
         profile.driver is ProfileDriver.CODEX for profile in model_profiles.values()
     )
+    has_explicit_claude = any(
+        profile.driver is ProfileDriver.CLAUDE_CODE for profile in model_profiles.values()
+    )
     planner_data = _table(expanded, "planner")
     reviewer_data = _table(expanded, "reviewer")
     agent_data_present = "agent" in expanded
@@ -637,6 +665,17 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             ui_data.get("default_reviewer_profile"),
             ExecutionRole.REVIEWER,
         )
+        reviser_default = ui_data.get("default_reviser_profile")
+        if reviser_default is not None:
+            reviser_default = _check_default(
+                model_profiles, reviser_default, ExecutionRole.REVISER
+            )
+        else:
+            revisers = [
+                profile.id for profile in model_profiles.values()
+                if ExecutionRole.REVISER in profile.roles
+            ]
+            reviser_default = revisers[0] if len(revisers) == 1 else None
         planner_profile = model_profiles[planner_default]
         reviewer_profile = model_profiles[reviewer_default]
         implementer_profile = model_profiles[implementer_default]
@@ -759,6 +798,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         default_reviewer_profile=(
             reviewer_default if explicit_profiles else "legacy-reviewer"
         ),
+        default_reviser_profile=(reviser_default if explicit_profiles else None),
         enable_profile_recommendation=_bool(
             ui_data, "enable_profile_recommendation", True, "ui"
         ),
@@ -768,6 +808,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     codex_runtime = _codex_runtime(
         expanded, config_dir, required=has_explicit_codex
     )
+    claude_runtime = _claude_runtime(
+        expanded, config_dir, required=has_explicit_claude
+    )
     for label, root in (
         ("repo", repo),
         ("runs_root", runs_root),
@@ -776,8 +819,26 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         try:
             codex_runtime.home.relative_to(root)
         except ValueError:
-            continue
-        raise ConfigError(f"codex_runtime.home must not be inside {label}")
+            pass
+        else:
+            raise ConfigError(f"codex_runtime.home must not be inside {label}")
+        try:
+            claude_runtime.home.relative_to(root)
+        except ValueError:
+            pass
+        else:
+            raise ConfigError(f"claude_runtime.home must not be inside {label}")
+    try:
+        claude_runtime.home.relative_to(codex_runtime.home)
+    except ValueError:
+        try:
+            codex_runtime.home.relative_to(claude_runtime.home)
+        except ValueError:
+            pass
+        else:
+            raise ConfigError("claude_runtime.home must not overlap managed CODEX_HOME")
+    else:
+        raise ConfigError("claude_runtime.home must not overlap managed CODEX_HOME")
     workspace_setup = _workspace_setup(expanded.get("workspace_setup", []))
     allow_no_required_checks = _bool(
         expanded, "allow_no_required_checks", False, "root"
@@ -806,6 +867,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         environment=environment,
         runtime_environment=runtime_environment,
         codex_runtime=codex_runtime,
+        claude_runtime=claude_runtime,
         workspace_setup=workspace_setup,
         planning=planning,
         repository=repository,

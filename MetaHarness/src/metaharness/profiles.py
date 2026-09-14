@@ -113,6 +113,7 @@ def safe_profile_metadata(profile: ModelProfile) -> dict[str, Any]:
         "selection_mode": profile.selection_mode.value,
         "effort": profile.effort,
         "sandbox": profile.sandbox,
+        "permission_mode": profile.permission_mode,
         "description": profile.description,
         "strengths": list(profile.strengths),
         "cost_tier": profile.cost_tier,
@@ -125,6 +126,7 @@ def profile_execution_fingerprint(
     *,
     agent_env_allowlist: tuple[str, ...] = (),
     codex_home: Path | None = None,
+    claude_config_home: Path | None = None,
 ) -> str:
     """SHA-256 of the profile fields that change execution.
 
@@ -162,6 +164,16 @@ def profile_execution_fingerprint(
             codex_home=(
                 str(Path(codex_home).expanduser().resolve())
                 if codex_home is not None
+                else None
+            ),
+        )
+    elif profile.driver is ProfileDriver.CLAUDE_CODE:
+        payload.update(
+            effort=profile.effort,
+            permission_mode=profile.permission_mode,
+            claude_config_home=(
+                str(Path(claude_config_home).expanduser().resolve())
+                if claude_config_home is not None
                 else None
             ),
         )
@@ -212,6 +224,27 @@ def build_agent_config(profile: ModelProfile) -> AgentConfig:
     )
 
 
+def build_claude_profile(profile: ModelProfile) -> ModelProfile:
+    """Validate and return a Claude Code reviser profile."""
+
+    if not isinstance(profile, ModelProfile):
+        raise TypeError("profile must be a ModelProfile")
+    if profile.driver is not ProfileDriver.CLAUDE_CODE:
+        raise ProfileError("profile driver is not claude-code")
+    if profile.effort is None or profile.permission_mode is None:
+        raise ProfileError("claude-code profile has no effort or permission_mode")
+    if (
+        profile.sandbox is not None
+        or profile.base_url is not None
+        or profile.endpoint_path is not None
+        or profile.api_key_env is not None
+        or profile.retries != 0
+        or profile.extra_body
+    ):
+        raise ProfileError("claude-code profile contains forbidden endpoint or sandbox fields")
+    return profile
+
+
 __all__ = [
     "ProfileError",
     "profile_for_role",
@@ -219,4 +252,5 @@ __all__ = [
     "safe_profile_metadata",
     "build_llm_endpoint",
     "build_agent_config",
+    "build_claude_profile",
 ]

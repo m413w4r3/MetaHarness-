@@ -25,6 +25,9 @@ from .config import ConfigError, load_config
 from .agent.auth import check_codex_authentication
 from .agent.codex import build_agent_environment
 from .agent.runtime import CodexRuntimeError, prepare_codex_home
+from .claude.agent import build_claude_environment
+from .claude.auth import check_claude_authentication
+from .claude.runtime import ClaudeRuntimeError, prepare_claude_home
 from .execution_selection import is_profile_aware_run
 from .gitops import (
     GitError,
@@ -46,6 +49,16 @@ _BRIDGE_HEALTH_TIMEOUT_SECONDS = 2
 _BRIDGE_HEALTH_MAX_BYTES = 64 * 1024
 _LOCAL_BRIDGE_HOSTS = frozenset({"127.0.0.1", "localhost"})
 _DOCTOR_DETAIL_CHARS = 300
+_CLAUDE_REQUIRED_CAPABILITIES = (
+    "--print",
+    "--output-format",
+    "--model",
+    "--effort",
+    "--permission-mode",
+    "--mcp-config",
+    "--strict-mcp-config",
+)
+_CLAUDE_HELP_TIMEOUT_SECONDS = 20
 
 
 def _endpoint(base_url: str, endpoint_path: str) -> str:
@@ -249,6 +262,35 @@ def _probe_codex_sandbox(
     return None
 
 
+def _probe_claude_capabilities(
+    claude: str, environment: Mapping[str, str], claude_home: Path
+) -> tuple[bool, str | None]:
+    """Run only ``claude --help`` and verify the P24 CLI surface."""
+
+    try:
+        result = subprocess.run(
+            [claude, "--help"],
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=_CLAUDE_HELP_TIMEOUT_SECONDS,
+            env=dict(environment),
+            cwd=claude_home,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+    except (OSError, ValueError) as exc:
+        return False, type(exc).__name__
+    help_text = (result.stdout or "") + "\n" + (result.stderr or "")
+    missing = [option for option in _CLAUDE_REQUIRED_CAPABILITIES if option not in help_text]
+    if missing:
+        return False, "missing required option"
+    return True, None
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
         return None
@@ -406,6 +448,44 @@ def _doctor(config_path: Path) -> int:
                 "codex authentication is unavailable for managed CODEX_HOME\n"
                 f'hint: run CODEX_HOME="{codex_home}" codex login'
             )
+    claude_profiles = tuple(
+        profile for profile in profiles_for_config(config).values()
+        if profile.driver is ProfileDriver.CLAUDE_CODE
+    )
+    if claude_profiles:
+        claude = shutil.which("claude", path=path_value)
+        if claude:
+            print("OK claude binary: present")
+        else:
+            problems.append("claude binary is not resolvable")
+        claude_home: Path | None = None
+        try:
+            claude_home = prepare_claude_home(config)
+            print(f"OK claude config home: {claude_home}")
+            print("OK claude MCP isolation: empty")
+        except ClaudeRuntimeError as exc:
+            problems.append(str(exc))
+        if claude and claude_home is not None:
+            claude_environment = build_claude_environment(
+                config.runtime_environment, claude_home=claude_home
+            )
+            supported, detail = _probe_claude_capabilities(
+                claude, claude_environment, claude_home
+            )
+            if supported:
+                print("OK claude CLI capabilities: supported")
+            else:
+                problems.append("unsupported Claude Code CLI for MetaHarness reviser")
+            auth_status = check_claude_authentication(
+                claude_home, environment=claude_environment
+            )
+            if auth_status.available:
+                print("OK claude authentication: available")
+            else:
+                problems.append(
+                    "Claude Code authentication unavailable\n"
+                    f"hint: authenticate the managed Claude runtime at {claude_home}"
+                )
         else:
             problems.append(
                 "codex authentication could not be verified for managed CODEX_HOME\n"

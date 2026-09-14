@@ -69,6 +69,11 @@ ARTIFACT_ALLOWLIST = frozenset(
         "agent.result.json",
         "agent.final.md",
         "agent.stderr.log",
+        "revision/agent.prompt.txt",
+        "revision/agent.events.jsonl",
+        "revision/agent.result.json",
+        "revision/agent.final.md",
+        "revision/agent.stderr.log",
         "changed-files.txt",
         "diff.patch",
         "plan_approval.json",
@@ -623,6 +628,7 @@ def approve_run(
     config: HarnessConfig | None = None,
     implementer_profile: object = None,
     reviewer_profile: object = None,
+    reviser_profile: object = None,
     step_profiles: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Perform the only web mutation through the core approval API."""
@@ -695,6 +701,7 @@ def approve_run(
                 planner_profile_id=state["execution"]["planner"]["profile_id"],
                 step_profile_ids={key: value for key, value in step_profiles.items()},
                 reviewer_profile_id=reviewer_profile,
+                reviser_profile_id=(reviser_profile or config.ui.default_reviser_profile),
             )
         except (ProfileError, ExecutionSelectionError) as exc:
             raise WebAPIError(400, "selected profile is invalid") from exc
@@ -741,6 +748,7 @@ def approve_run(
             planner_profile_id=state["execution"]["planner"]["profile_id"],
             implementer_profile_id=implementer_profile,
             reviewer_profile_id=reviewer_profile,
+            reviser_profile_id=(reviser_profile or config.ui.default_reviser_profile),
         )
     except ProfileError as exc:
         raise WebAPIError(400, "selected profile is invalid") from exc
@@ -787,7 +795,7 @@ def _publish_decision(
 
 
 def _execution_state(selection: ExecutionSelection) -> dict[str, Any]:
-    return {
+    state = {
         "planner": {
             "profile_id": selection.planner.profile_id,
             "model": selection.planner.model,
@@ -805,14 +813,26 @@ def _execution_state(selection: ExecutionSelection) -> dict[str, Any]:
             "selection_mode": selection.reviewer.selection_mode,
         },
     }
+    if selection.reviser is not None:
+        state["reviser"] = {
+            "profile_id": selection.reviser.profile_id,
+            "model": selection.reviser.model,
+            "effort": selection.reviser.effort,
+            "permission_mode": selection.reviser.permission_mode,
+            "selection_mode": selection.reviser.selection_mode,
+        }
+    return state
 
 
 def _execution_state_v3(selection: Any) -> dict[str, Any]:
-    return {
+    state = {
         "planner": asdict(selection.planner),
         "steps": [{"step_id": item.step_id, "implementer": asdict(item.implementer)} for item in selection.steps],
         "reviewer": asdict(selection.reviewer),
     }
+    if selection.reviser is not None:
+        state["reviser"] = asdict(selection.reviser)
+    return state
 
 
 def model_profiles(config: HarnessConfig) -> dict[str, Any]:
@@ -821,6 +841,7 @@ def model_profiles(config: HarnessConfig) -> dict[str, Any]:
         "planner": config.ui.default_planner_profile or "legacy-planner",
         "implementer": config.ui.default_implementer_profile or "legacy-implementer",
         "reviewer": config.ui.default_reviewer_profile or "legacy-reviewer",
+        "reviser": config.ui.default_reviser_profile,
     }
     return {
         "profiles": [safe_profile_metadata(profile) for profile in profiles.values()],

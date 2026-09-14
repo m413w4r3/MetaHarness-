@@ -22,6 +22,15 @@ from .agent.codex import (
     classify_codex_failure,
 )
 from .agent.runtime import prepare_codex_home
+from .claude.agent import (
+    ClaudeAgentError,
+    ClaudeCodeAgent,
+    ClaudeCommittedError,
+    build_claude_environment,
+    build_revision_prompt,
+    classify_claude_failure,
+)
+from .claude.runtime import ClaudeRuntimeError, prepare_claude_home
 from .approval import (
     ApprovalDecision,
     ApprovalError,
@@ -107,6 +116,7 @@ from .usage import add_usage, empty_usage, normalize_usage
 from .redaction import config_secret_values, redact, redact_file
 from .profiles import (
     build_agent_config,
+    build_claude_profile,
     build_llm_endpoint,
     profile_for_role,
     profiles_for_config,
@@ -165,6 +175,13 @@ _DIRECT_FAILURES = frozenset(
 _COMMIT_SUBJECT_LIMIT = 72
 _MAX_AGENT_REPORT_BYTES = 32_000
 _AGENT_ARTIFACTS = (
+    "agent.events.jsonl",
+    "agent.stderr.log",
+    "agent.final.md",
+    "agent.result.json",
+)
+_REVISION_ARTIFACTS = (
+    "agent.prompt.txt",
     "agent.events.jsonl",
     "agent.stderr.log",
     "agent.final.md",
@@ -270,7 +287,13 @@ def _review_payload(review: ReviewResult) -> dict[str, Any]:
     return payload
 
 
-def _agent_payload(result: AgentResult, *, auth_failure: bool = False) -> dict[str, Any]:
+def _agent_payload(
+    result: Any,
+    *,
+    auth_failure: bool = False,
+    provider: str = "Codex",
+    safe_stderr: bool = False,
+) -> dict[str, Any]:
     # The full report is already persisted by CodexAgent.  State contains only
     # bounded protocol metadata and never an API key or an authorization value.
     return {
@@ -280,7 +303,9 @@ def _agent_payload(result: AgentResult, *, auth_failure: bool = False) -> dict[s
         # Transport errors may contain provider URLs, request IDs, or other
         # infrastructure identifiers.  The complete bounded artifact remains
         # available to the local UI; state keeps a fixed safe marker instead.
-        "stderr_tail": "Codex authentication failed" if auth_failure else result.stderr_tail,
+        "stderr_tail": (
+            f"{provider} authentication failed" if auth_failure else ("" if safe_stderr else result.stderr_tail)
+        ),
     }
 
 
@@ -302,6 +327,11 @@ def _codex_auth_failure(run_dir: Path, stderr: str, *, step_id: str | None = Non
     if step_id is not None:
         events_path = run_dir / "steps" / step_id / "agent.events.jsonl"
     return classify_codex_failure(stderr, _artifact_tail(events_path)) == "CODEX_AUTH_FAILURE"
+
+
+def _claude_auth_failure(run_dir: Path, stderr: str) -> bool:
+    events_path = run_dir / "revision" / "agent.events.jsonl"
+    return classify_claude_failure(stderr, _artifact_tail(events_path)) == "CLAUDE_AUTH_FAILURE"
 
 
 _MAX_REPORTED_PATHS = 20
@@ -460,6 +490,7 @@ class Orchestrator:
         reviewer_client: Any | None = None,
         recommender_client: Any | None = None,
         agent: CodexAgent | None = None,
+        reviser: ClaudeCodeAgent | None = None,
     ) -> None:
         if not isinstance(config, HarnessConfig):
             raise TypeError("config must be a HarnessConfig")
@@ -468,6 +499,7 @@ class Orchestrator:
         self._reviewer_client = reviewer_client
         self._recommender_client = recommender_client
         self._injected_agent = agent
+        self._injected_reviser = reviser
         self._secrets: tuple[str, ...] = ()
         # Loaded production configs always contain a process-environment
         # mapping.  The fallback only preserves direct construction of the
@@ -564,6 +596,36 @@ class Orchestrator:
                 build_agent_config(profile),
                 env_allowlist=self.config.agent.env_allowlist,
             )
+        )
+
+    def _reviser_for_profile(self, profile_id: str) -> ClaudeCodeAgent:
+        profile = profile_for_role(self.config, profile_id, ExecutionRole.REVISER)
+        build_claude_profile(profile)
+        if self._injected_reviser is not None:
+            return self._injected_reviser
+        return ClaudeCodeAgent()
+
+    def _run_revision(
+        self,
+        selection: Any,
+        worktree: Path,
+        run_dir: Path,
+        prompt: str,
+    ) -> Any | None:
+        selected = getattr(selection, "reviser", None)
+        if selected is None:
+            return None
+        profile = profile_for_role(self.config, selected.profile_id, ExecutionRole.REVISER)
+        claude_home = prepare_claude_home(self.config)
+        environment = build_claude_environment(
+            self._runtime_environment, claude_home=claude_home
+        )
+        return self._reviser_for_profile(profile.id).run_revision(
+            redact(prompt, self._secrets),
+            worktree,
+            artifacts_dir=run_dir,
+            profile=profile,
+            environment=environment,
         )
 
     def run(
@@ -797,6 +859,7 @@ class Orchestrator:
                     planner_profile_id=planner_profile.id,
                     implementer_profile_id=self.config.ui.default_implementer_profile or "legacy-implementer",
                     reviewer_profile_id=self.config.ui.default_reviewer_profile or "legacy-reviewer",
+                    reviser_profile_id=self.config.ui.default_reviser_profile,
                 ),
             )
             durable_identity = compute_plan_identity_from_run(run_dir)
@@ -830,6 +893,14 @@ class Orchestrator:
                 "selection_mode": selection.reviewer.selection_mode,
             },
         }
+        if selection.reviser is not None:
+            execution_state["reviser"] = {
+                "profile_id": selection.reviser.profile_id,
+                "model": selection.reviser.model,
+                "effort": selection.reviser.effort,
+                "permission_mode": selection.reviser.permission_mode,
+                "selection_mode": selection.reviser.selection_mode,
+            }
         store.update(
             status=RunStatus.PLANNING,
             execution=execution_state,
@@ -958,6 +1029,73 @@ class Orchestrator:
             state = store.record_failure("AGENT_NO_CHANGE")
             return RunResult(run_dir, RunStatus.FAILED, state)
 
+        revision_result = None
+        if selection.reviser is not None:
+            store.update(status=RunStatus.REVISING)
+            revision_prompt = (
+                "Review and correct the Luna implementation in this worktree.\n\n"
+                "<AUTHORITATIVE IMPLEMENTATION CONTRACT>\n"
+                f"{implementation_contract}\n"
+                "</AUTHORITATIVE IMPLEMENTATION CONTRACT>\n\n"
+                "Inspect the actual files and make only necessary semantic or integration corrections.\n"
+                "Luna report (non-authoritative):\n"
+                f"{_bounded_report(agent_result.final_message)}"
+            )
+            try:
+                revision_result = self._run_revision(
+                    selection, info.worktree, run_dir, revision_prompt
+                )
+            except ClaudeCommittedError as exc:
+                self._redact_revision_artifacts(run_dir)
+                state = store.record_failure("CLAUDE_COMMITTED", redact(str(exc), self._secrets))
+                return RunResult(run_dir, RunStatus.FAILED, state)
+            except (ClaudeAgentError, ClaudeRuntimeError) as exc:
+                self._redact_revision_artifacts(run_dir)
+                state = store.record_failure(
+                    "CLAUDE_FAILED", redact(str(exc), self._secrets)
+                )
+                return RunResult(run_dir, RunStatus.FAILED, state)
+            claude_auth_failure = _claude_auth_failure(
+                run_dir, revision_result.stderr_tail
+            )
+            self._redact_revision_artifacts(run_dir)
+            revision_result = dataclasses.replace(
+                revision_result,
+                final_message=redact(revision_result.final_message, self._secrets),
+                stderr_tail=redact(revision_result.stderr_tail, self._secrets),
+            )
+            store.update(
+                status=RunStatus.REVISING,
+                revision=_agent_payload(
+                    revision_result,
+                    auth_failure=claude_auth_failure,
+                    provider="Claude Code",
+                    safe_stderr=True,
+                ),
+            )
+            if revision_result.timed_out:
+                state = store.record_failure("CLAUDE_TIMEOUT")
+                return RunResult(run_dir, RunStatus.FAILED, state)
+            if revision_result.exit_code != 0:
+                reason = "CLAUDE_AUTH_FAILURE" if claude_auth_failure else "CLAUDE_FAILED"
+                state = store.record_failure(reason, "Claude Code revision failed")
+                return RunResult(run_dir, RunStatus.FAILED, state)
+            revision_ownership = _git_ownership(repo, info.worktree)
+            revision_violations = _ownership_violations(
+                ownership_before,
+                revision_ownership,
+                branch_ref=branch_ref,
+                base_sha=base_sha,
+            )
+            if revision_violations:
+                reason = (
+                    "CLAUDE_COMMITTED"
+                    if revision_ownership.head != base_sha
+                    else "AGENT_GIT_VIOLATION"
+                )
+                state = store.record_failure(reason, "; ".join(revision_violations))
+                return RunResult(run_dir, RunStatus.FAILED, state)
+
         store.update(status=RunStatus.VALIDATING)
         reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
         evidence = collect_evidence(
@@ -1011,7 +1149,9 @@ class Orchestrator:
             "\n".join(evidence.changed_files),
             evidence.diff,
             checks_text,
-            _bounded_report(agent_result.final_message),
+            _bounded_report(
+                revision_result.final_message if revision_result is not None else agent_result.final_message
+            ),
             # The deterministic gate is evaluated cumulatively below.  Passing
             # it here allows a reviewer PASS to remain a useful diagnostic on
             # a failed check, as required by V0.
@@ -1168,6 +1308,7 @@ class Orchestrator:
                 planner_profile_id=planner_profile_id,
                 step_profile_ids={step.id: step.implementer_profile for step in plan.steps},
                 reviewer_profile_id=plan.reviewer_profile or self.config.ui.default_reviewer_profile or "legacy-reviewer",
+                reviser_profile_id=self.config.ui.default_reviser_profile,
             )
             selection = ensure_execution_selection_v3(run_dir, requested)
             durable_identity = compute_plan_identity_from_run(run_dir)
@@ -1199,6 +1340,8 @@ class Orchestrator:
             ],
             "reviewer": asdict(selection.reviewer),
         }
+        if selection.reviser is not None:
+            execution_state["reviser"] = asdict(selection.reviser)
         store.update(status=RunStatus.PLANNING, execution=execution_state,
                      plan_identity=asdict(durable_identity))
 
@@ -1347,6 +1490,75 @@ class Orchestrator:
             store.update(status=RunStatus.IMPLEMENTING, current_step=None, steps=state_steps,
                          agent_usage=self._v2_agent_usage())
 
+        revision_result = None
+        if selection.reviser is not None:
+            store.update(status=RunStatus.REVISING, current_step=None)
+            revision_prompt = (
+                "Review and correct the completed Luna implementation steps in this worktree.\n\n"
+                "<AUTHORITATIVE PLAN>\n"
+                f"{plan.raw}\n"
+                "</AUTHORITATIVE PLAN>\n\n"
+                "The harness will run all deterministic checks after your edits.\n"
+                "Luna reports (non-authoritative):\n"
+                f"{_step_reports_text(self._last_v2_step_results)}"
+            )
+            try:
+                revision_result = self._run_revision(
+                    selection, info.worktree, run_dir, revision_prompt
+                )
+            except ClaudeCommittedError as exc:
+                self._redact_revision_artifacts(run_dir)
+                return self._v2_failed(
+                    store, run_dir, "CLAUDE_COMMITTED", None,
+                    redact(str(exc), self._secrets)
+                )
+            except (ClaudeAgentError, ClaudeRuntimeError) as exc:
+                self._redact_revision_artifacts(run_dir)
+                return self._v2_failed(
+                    store, run_dir, "CLAUDE_FAILED", None,
+                    redact(str(exc), self._secrets)
+                )
+            claude_auth_failure = _claude_auth_failure(run_dir, revision_result.stderr_tail)
+            self._redact_revision_artifacts(run_dir)
+            revision_result = dataclasses.replace(
+                revision_result,
+                final_message=redact(revision_result.final_message, self._secrets),
+                stderr_tail=redact(revision_result.stderr_tail, self._secrets),
+            )
+            store.update(
+                status=RunStatus.REVISING,
+                revision=_agent_payload(
+                    revision_result,
+                    auth_failure=claude_auth_failure,
+                    provider="Claude Code",
+                    safe_stderr=True,
+                ),
+            )
+            if revision_result.timed_out:
+                return self._v2_failed(store, run_dir, "CLAUDE_TIMEOUT", None)
+            if revision_result.exit_code != 0:
+                return self._v2_failed(
+                    store, run_dir,
+                    "CLAUDE_AUTH_FAILURE" if claude_auth_failure else "CLAUDE_FAILED",
+                    None,
+                    "Claude Code revision failed",
+                )
+            revision_ownership = _git_ownership(repo, info.worktree)
+            revision_violations = _ownership_violations(
+                ownership_before,
+                revision_ownership,
+                branch_ref=branch_ref,
+                base_sha=base_sha,
+            )
+            if revision_violations:
+                return self._v2_failed(
+                    store,
+                    run_dir,
+                    "CLAUDE_COMMITTED" if revision_ownership.head != base_sha else "AGENT_GIT_VIOLATION",
+                    None,
+                    "; ".join(revision_violations),
+                )
+
         store.update(status=RunStatus.VALIDATING, current_step=None)
         evidence = collect_evidence(info.worktree, base_sha, self.config,
                                     evidence_dir=run_dir, secrets=self._secrets)
@@ -1364,7 +1576,11 @@ class Orchestrator:
         gate = _json_text({"deterministic_passed": evidence.deterministic_passed,
                            "failures": list(evidence.failures), "staged_tree_sha": evidence.staged_tree_sha})
         reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
-        reports = _step_reports_text(self._last_v2_step_results)
+        reports = (
+            revision_result.final_message
+            if revision_result is not None
+            else _step_reports_text(self._last_v2_step_results)
+        )
         store.update(status=RunStatus.REVIEWING)
         review = reviewer.review(spec, plan.raw, context, gate,
                                  "\n".join(evidence.changed_files), evidence.diff,
@@ -1508,12 +1724,18 @@ class Orchestrator:
             f"Reviewed tree: {tree_sha}", "Planning protocol: v2",
             f"Planner profile: {selection.planner.profile_id}",
             *[f"{item.step_id} implementer profile: {item.implementer.profile_id}" for item in selection.steps],
-            f"Reviewer profile: {selection.reviewer.profile_id}", "", "Checks:", *check_lines,
+            f"Reviewer profile: {selection.reviewer.profile_id}",
+            *([f"Reviser profile: {selection.reviser.profile_id}"] if selection.reviser is not None else []),
+            "", "Checks:", *check_lines,
         ])
 
     def _redact_agent_artifacts(self, run_dir: Path) -> None:
         for name in _AGENT_ARTIFACTS:
             redact_file(run_dir / name, self._secrets)
+
+    def _redact_revision_artifacts(self, run_dir: Path) -> None:
+        for name in _REVISION_ARTIFACTS:
+            redact_file(run_dir / "revision" / name, self._secrets)
 
     def _commit_body(
         self,
@@ -1547,6 +1769,10 @@ class Orchestrator:
                 f"Reviewer profile: {self._last_selection.reviewer.profile_id}",
                 f"Reviewer model: {self._last_selection.reviewer.model}",
                 f"Reviewer selection: {self._last_selection.reviewer.selection_mode}",
+                *([f"Reviser profile: {self._last_selection.reviser.profile_id}",
+                   f"Reviser model: {self._last_selection.reviser.model}",
+                   f"Reviser permission mode: {self._last_selection.reviser.permission_mode}"]
+                  if self._last_selection.reviser is not None else []),
                 "",
                 "Checks:",
                 *check_lines,

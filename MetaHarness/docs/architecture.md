@@ -1,9 +1,9 @@
 # Architecture
 
-MetaHarness V0 is a single-task, single-agent state machine. It creates one
-planner decision, one Codex implementation run, one deterministic evidence
-snapshot, and one independent semantic review. There is no multi-agent mode,
-repair loop, or behavior mock in V0.
+MetaHarness V0 is a single-task state machine. It creates one
+planner decision, one Codex implementation run, an optional Claude Code
+revision, one deterministic evidence snapshot, and one independent semantic
+review. There is no repair loop or behavior mock in V0.
 
 ## Source-of-truth boundaries
 
@@ -15,6 +15,7 @@ repair loop, or behavior mock in V0.
 | Implementation contract | Canonical executor input rendered from the parsed READY plan | Planner decisions, mechanically rendered |
 | Human plan approval | Explicit decision on the exact presented plan artifacts | APPROVE/REJECT |
 | Codex | Executor of the plan in an isolated worktree | Cannot change the plan or commit |
+| Claude Code | Semantic reviser/corrector after Luna | Isolated managed config; cannot run checks or commit |
 | Deterministic gates | Checks, diff, HEAD, and mutation evidence | Mechanical evidence |
 | Reviewer | Semantic critic of SPEC, PLAN, diff, and evidence | PASS/REVISE/FAIL decision |
 | Git tree SHA | Identity of the reviewed staged code | Commit boundary |
@@ -44,13 +45,16 @@ preamble/postamble are not sent to that agent.
    After Codex exits, any commit, branch switch, branch creation/deletion or
    worktree creation/removal fails the run (`AGENT_COMMITTED` or
    `AGENT_GIT_VIOLATION`); the worktree is preserved, never reset.
-7. Run configured checks, snapshot the candidate tree before and after each
+7. If selected, Claude Code reads the resulting worktree and corrects
+   authorized files without shell commands; a Claude commit fails the run as
+   `CLAUDE_COMMITTED`.
+8. Run configured checks, snapshot the candidate tree before and after each
    check, stage once, and freeze the full diff plus the index tree SHA as
    evidence. A check that mutates the candidate (required or not) fails the
    run before review; an empty, oversized or secret-bearing diff too.
-8. Give the reviewer the original SPEC, raw PLAN, context, diff, checks, and
+9. Give the reviewer the original SPEC, raw PLAN, context, diff, checks, and
    implementer report. The reviewer must return a coherent labeled verdict.
-9. On `PASS` with a green deterministic gate, `authorize_commit` re-derives
+10. On `PASS` with a green deterministic gate, `authorize_commit` re-derives
    every precondition (READY plan, agent exit 0, gate, reviewer answer parsed
    again, HEAD and branch, index tree, unstaged/untracked state, candidate
    tree) and `commit_reviewed_tree` creates the single harness commit.

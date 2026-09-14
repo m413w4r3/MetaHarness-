@@ -24,6 +24,9 @@ files = ["../../Bridges/.env.models"]
 [codex_runtime]
 home = "~/.local/share/metaharness/codex"
 
+[claude_runtime]
+home = "~/.local/share/metaharness/claude"
+
 [approval]
 require_plan_approval = true
 poll_interval_seconds = 0.5
@@ -34,6 +37,7 @@ enable_profile_recommendation = true
 default_planner_profile = "planner-chatgpt"
 default_implementer_profile = "codex-luna-high"
 default_reviewer_profile = "planner-chatgpt"
+default_reviser_profile = "claude-opus-medium"
 
 [context]
 always_files = ["AGENTS.md", "CLAUDE.md", "README.md"]
@@ -83,6 +87,20 @@ description = "Primary implementation profile for normal repository changes."
 strengths = ["implementation", "unit tests", "repository navigation"]
 cost_tier = "standard"
 latency_tier = "fast"
+
+[model_profiles."claude-opus-medium"]
+display_name = "Claude Opus Medium RevisER"
+roles = ["reviser", "repair"]
+driver = "claude-code"
+model = "opus"
+effort = "medium"
+permission_mode = "acceptEdits"
+selection_mode = "cli"
+timeout_seconds = 5400
+description = "Independent semantic revision and correction after Luna."
+strengths = ["semantic revision", "integration review", "corrective editing"]
+cost_tier = "high"
+latency_tier = "slow"
 
 [[checks]]
 name = "lint"

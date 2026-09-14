@@ -67,7 +67,7 @@ _TIMELINE = (
     ("created", "CREATED"), ("planning", "PLANNING"),
     ("awaiting_plan_approval", "AWAITING PLAN APPROVAL"), ("worktree_ready", "WORKTREE"),
     ("preparing", "PREPARING"), ("implementing", "IMPLEMENTING"),
-    ("validating", "VALIDATING"), ("reviewing", "REVIEWING"),
+    ("validating", "VALIDATING"), ("revising", "REVISING"), ("reviewing", "REVIEWING"),
     ("approved", "APPROVED"), ("committed", "COMMITTED"),
 )
 _ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
@@ -206,7 +206,7 @@ def _execution_card(state: dict[str, Any], config: HarnessConfig | None) -> str:
     if config is not None:
         metadata = {profile.id: safe_profile_metadata(profile) for profile in profiles_for_config(config).values()}
     cards = []
-    for role, title in (("planner", "Planner"), ("implementer", "Implementer"), ("reviewer", "Reviewer")):
+    for role, title in (("planner", "Planner"), ("implementer", "Implementer"), ("reviser", "Reviser"), ("reviewer", "Reviewer")):
         selected = execution.get(role) if isinstance(execution.get(role), dict) else {}
         profile_id = selected.get("profile_id")
         profile = metadata.get(profile_id, {})

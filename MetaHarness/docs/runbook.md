@@ -56,6 +56,23 @@ verified. It never makes a model request and never starts a login flow.
 MetaHarness never copies the personal `CODEX_HOME`, MCP configuration, or
 credentials into that managed runtime.
 
+When a `claude-code` reviser profile is configured, authenticate Claude Code
+in its managed home through the CLI itself. MetaHarness does not assume an
+authentication subcommand that is absent from the installed version:
+
+```sh
+CLAUDE_CONFIG_DIR="$HOME/.local/share/metaharness/claude" claude
+metaharness doctor --config examples/autowork.toml
+```
+
+Doctor first probes `claude --help`, then follows the supported `claude auth
+status` path when that subcommand is advertised. Claude receives an empty
+managed MCP file and never inherits the personal Claude settings, hooks or
+MCP configuration.
+
+Reviser failures are classified as `CLAUDE_AUTH_FAILURE`, `CLAUDE_TIMEOUT`,
+`CLAUDE_FAILED`, or `CLAUDE_COMMITTED`.
+
 ## Plan approval
 
 Set the following section to require the human gate:

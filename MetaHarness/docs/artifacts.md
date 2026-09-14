@@ -15,6 +15,9 @@ interrupted worktrees are intentionally retained for inspection.
 | `agent.prompt.txt` | Canonical-contract implementer prompt |
 | `agent.events.jsonl` | Complete Codex stdout (JSONL events, parsed with bounded memory) |
 | `agent.final.md` / `agent.result.json` | Implementer report and protocol metadata |
+| `revision/agent.events.jsonl` | Complete Claude Code reviser stdout (bounded JSONL parsing) |
+| `revision/agent.stderr.log` | Claude Code reviser stderr tail source |
+| `revision/agent.final.md` / `revision/agent.result.json` | Reviser report, status and normalized usage |
 | `setup/results.json` / `setup/*.log` | Workspace dependency setup results and redacted logs |
 | `diff.patch` | Complete staged binary-capable diff |
 | `changed-files.txt` | Staged path list |
