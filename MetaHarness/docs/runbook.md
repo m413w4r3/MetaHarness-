@@ -36,11 +36,20 @@ metaharness run \
   --run-id example-001
 ```
 
+### Pipeline configuration
+
+`[revision]` supplies defaults and the legacy fallback. Every new durable UI
+run captures its effective choices in `run_options.json`; the captured
+`claude_revision_enabled` and `repair_cycles` values are independent. The
+currently supported values for `repair_cycles` are only `0` and `1`.
+
 `doctor` never contacts a model. Besides local files, Git and executables it
-runs `codex sandbox -- /bin/true` with the managed `CODEX_HOME` (this detects
-bubblewrap/AppArmor refusals) and, for OpenAI-chat profiles on `127.0.0.1` or
+runs the managed Codex runtime's `codex sandbox -- /bin/true` probe (which
+detects bubblewrap/AppArmor refusals), a Codex `exec` parser/config
+compatibility probe, and, for OpenAI-chat profiles on `127.0.0.1` or
 `localhost` only, an unauthenticated `GET <base_url>/health` expecting
-`{"status": "ok"}`.
+`{"status": "ok"}`. It also validates the managed Claude restricted runtime
+and its parser-only compatibility probe. No probe makes a model call.
 
 On first use, authenticate the managed Codex runtime once:
 
@@ -65,15 +74,18 @@ CLAUDE_CONFIG_DIR="$HOME/.local/share/metaharness/claude" claude
 metaharness doctor --config examples/autowork.toml
 ```
 
-Doctor first probes `claude --help` (a non-zero exit is unsupported), then
+Doctor first probes the complete restricted Claude argv with `--help` (a
+non-zero exit, including an unsupported `--restricted` or `--settings`, is
+unsupported), then
 follows the supported `claude auth status` path when that subcommand is
 advertised. Each Claude check runs only after the previous one passed, so a
 Claude problem yields exactly one Claude diagnostic and never a Codex one;
 Codex authentication is reported as available, unavailable or unverifiable
-independently of Claude. Claude receives an empty managed MCP file
-(`--strict-mcp-config`) and never inherits the personal Claude settings,
-hooks or MCP configuration. Its environment is only `PATH`, `LANG`, `LC_ALL`,
-`TERM`, plus `HOME=<claude_home>/home`, `CLAUDE_CONFIG_DIR=<claude_home>`,
+independently of Claude. Claude receives `--restricted`, the managed
+`settings.json`, and an empty managed MCP file (`--strict-mcp-config`); it
+never inherits the personal Claude settings, hooks or MCP configuration. Its
+environment is only `PATH`, `LANG`, `LC_ALL`, `TERM`, plus
+`HOME=<claude_home>/home`, `CLAUDE_CONFIG_DIR=<claude_home>`,
 `XDG_CACHE_HOME=<claude_home>/cache` and `TMPDIR=<claude_home>/tmp`; no personal
 HOME/TMPDIR, `CODEX_HOME` or API key is passed, and no user file is copied.
 Claude Code is configuration-isolated and Git-scope-enforced; it is not an
@@ -121,7 +133,10 @@ prompt is stdin and no shell is used:
 
 ```text
 claude --print --verbose --output-format stream-json --model <model>
-       --effort <effort> --permission-mode <permission_mode>
+       --bare --restricted --tools Read,Edit,Write,Grep,Glob
+       --no-session-persistence --no-chrome --disable-slash-commands
+       --max-turns 12 --effort <effort> --permission-mode <permission_mode>
+       --settings <managed>/settings.json
        --strict-mcp-config --mcp-config <managed>/empty-mcp.json
 ```
 
@@ -129,8 +144,10 @@ claude --print --verbose --output-format stream-json --model <model>
 `--output-format=stream-json` otherwise (`Error: When using --print,
 --output-format=stream-json requires --verbose`, the failure of run
 `20260914T124017Z-7b74467062`). `doctor` requires `--print`, `--verbose`,
-`--output-format`, `--model`, `--effort`, `--permission-mode`, `--mcp-config`
-and `--strict-mcp-config` in `claude --help`.
+`--output-format`, `--bare`, `--restricted`, `--tools`,
+`--no-session-persistence`, `--no-chrome`, `--disable-slash-commands`,
+`--max-turns`, `--model`, `--effort`, `--permission-mode`, `--settings`,
+`--mcp-config` and `--strict-mcp-config` in `claude --help`.
 
 ## Publication to main (`fast-forward-base`)
 
@@ -193,6 +210,11 @@ remote-tracking ref (`refs/remotes/<remote>/<base_ref>`).
 
 Every durable transition rewrites `resume_checkpoint.json` atomically. It
 always names the next operation that has not yet succeeded:
+
+At the conceptual level, supported phases are context, planner, plan approval,
+workspace setup, worker steps, checks, Claude, reviewer, repair planner/steps,
+commit and publish. Corruptions, identity violations and
+`AGENT_CONTRACT_MISMATCH` are deliberately non-resumable.
 
 | After | Checkpoint |
 | --- | --- |

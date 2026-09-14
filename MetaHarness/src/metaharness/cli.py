@@ -60,6 +60,7 @@ _BRIDGE_HEALTH_TIMEOUT_SECONDS = 2
 _BRIDGE_HEALTH_MAX_BYTES = 64 * 1024
 _LOCAL_BRIDGE_HOSTS = frozenset({"127.0.0.1", "localhost"})
 _DOCTOR_DETAIL_CHARS = 300
+_CODEX_HELP_TIMEOUT_SECONDS = 20
 _CLAUDE_HELP_TIMEOUT_SECONDS = 20
 
 
@@ -316,6 +317,51 @@ def _probe_codex_sandbox(
     return None
 
 
+def _probe_codex_cli(
+    codex: str,
+    environment: Mapping[str, str],
+    codex_home: Path,
+    secrets: tuple[str, ...],
+) -> tuple[bool, str | None]:
+    """Validate the production Codex parser/config path without a model call.
+
+    ``--help`` is deliberately last. This exercises the real ``exec`` parser
+    and strict managed config loading, while ``--ephemeral`` and the absence
+    of a prompt/model keep the probe read-only and non-persistent.
+    """
+
+    argv = [
+        codex,
+        "exec",
+        "--strict-config",
+        "--ephemeral",
+        "--sandbox",
+        "workspace-write",
+        "--help",
+    ]
+    try:
+        result = subprocess.run(
+            argv,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=_CODEX_HELP_TIMEOUT_SECONDS,
+            env=dict(environment),
+            cwd=codex_home,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {_CODEX_HELP_TIMEOUT_SECONDS}s"
+    except (OSError, ValueError) as exc:
+        return False, _bounded_detail(f"could not start: {type(exc).__name__}", secrets)
+    if result.returncode != 0:
+        output = (result.stderr or "") + " " + (result.stdout or "")
+        return False, _bounded_detail(f"exit {result.returncode}: {output}", secrets)
+    return True, None
+
+
 def _probe_claude_capabilities(
     claude: str, environment: Mapping[str, str], claude_home: Path
 ) -> tuple[bool, str | None]:
@@ -334,6 +380,7 @@ def _probe_claude_capabilities(
         "--output-format",
         "stream-json",
         "--bare",
+        "--restricted",
         "--tools",
         _REVISION_TOOLS,
         "--no-session-persistence",
@@ -347,6 +394,8 @@ def _probe_claude_capabilities(
         "medium",
         "--permission-mode",
         "acceptEdits",
+        "--settings",
+        str(claude_home / "settings.json"),
         "--strict-mcp-config",
         "--mcp-config",
         str(claude_home / "empty-mcp.json"),
@@ -584,6 +633,13 @@ def _doctor(config_path: Path) -> int:
             codex_home=codex_home,
             forbidden_names=required_env_names,
         )
+        supported, _detail = _probe_codex_cli(
+            codex, probe_environment, codex_home, secrets
+        )
+        if supported:
+            print("OK codex CLI compatibility: supported")
+        else:
+            problems.append("unsupported Codex CLI for MetaHarness worker")
         detail = _probe_codex_sandbox(codex, probe_environment, codex_home, secrets)
         if detail is None:
             print("OK codex sandbox: usable")

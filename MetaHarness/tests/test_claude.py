@@ -180,10 +180,11 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(recorded["stdin"].splitlines()[0], "inspect this")
         self.assertEqual(
             recorded["argv"],
-            ["--print", "--verbose", "--output-format", "stream-json", "--bare", "--tools", "Read,Edit,Write,Grep,Glob",
+            ["--print", "--verbose", "--output-format", "stream-json", "--bare", "--restricted", "--tools", "Read,Edit,Write,Grep,Glob",
              "--no-session-persistence", "--no-chrome", "--disable-slash-commands", "--max-turns", "12",
              "--model", "opus", "--effort", "medium",
-             "--permission-mode", "acceptEdits", "--strict-mcp-config", "--mcp-config", str(home / "empty-mcp.json")],
+             "--permission-mode", "acceptEdits", "--settings", str(home / "settings.json"),
+             "--strict-mcp-config", "--mcp-config", str(home / "empty-mcp.json")],
         )
         self.assertEqual(result.final_message, "revised")
         self.assertEqual(result.usage["cached_input_tokens"], 2)

@@ -112,6 +112,9 @@ class DoctorTests(unittest.TestCase):
                     sys.stderr.write("Not logged in\\n")
                     sys.exit(1)
                 mode = open(MODE).read().strip() if os.path.exists(MODE) else "ok"
+                if mode == "parser_fail" and args and args[0] == "exec":
+                    sys.stderr.write("unknown option: --strict-config\\n")
+                    sys.exit(2)
                 if mode == "fail":
                     sys.stderr.write("bwrap: setting up uid map: Permission denied " + SECRET + "\\n")
                     sys.exit(1)
@@ -201,6 +204,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("OK env BRIDGE_API_KEY: usable", out)
         self.assertIn("OK codex sandbox: usable", out)
+        self.assertIn("OK codex CLI compatibility: supported", out)
         self.assertIn("OK codex authentication: available", out)
         self.assertIn("OK planner bridge: healthy", out)
         self.assertIn("doctor: PASS", out)
@@ -225,6 +229,14 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("bwrap: setting up uid map", err)
         self.assertNotIn(SECRET, out + err)
         self.assertIn("[REDACTED]", err)
+        self.assertFalse((self.root / "runs").exists())
+
+    def test_codex_parser_failure_is_reported_without_a_model_call(self) -> None:
+        self.mode.write_text("parser_fail", encoding="utf-8")
+        code, _out, err = self.doctor(self.config())
+        self.assertEqual(code, 1)
+        self.assertIn("error: unsupported Codex CLI for MetaHarness worker", err)
+        self.assertNotIn("model", err.casefold())
         self.assertFalse((self.root / "runs").exists())
 
     def test_unavailable_authentication_fails_closed_with_configured_home(self) -> None:
@@ -296,6 +308,9 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(supported)
         recorded = json.loads(argv_record.read_text())
         self.assertEqual(recorded[-1], "--help")
+        self.assertIn("--restricted", recorded)
+        self.assertIn("--settings", recorded)
+        self.assertIn(str(self.root / "settings.json"), recorded)
         self.assertFalse(model_call.exists())
 
         probe.write_text(

@@ -35,8 +35,10 @@ push origin/main A→B              (git push --porcelain origin B:refs/heads/ma
 ```
 
 - maximum automatic cycles = 2 (C01 initial, C02 repair ; jamais de C03) ;
-- `revision.enabled` est la seule autorité : les profils reviser/repair du
-  catalogue n’activent rien implicitement ; sans elle, ni Claude ni C02 ;
+- `[revision]` fournit les defaults et le fallback legacy ; chaque nouveau run
+  capture ses choix effectifs dans `run_options.json`. `claude_revision_enabled`
+  et `repair_cycles` sont indépendants ; `repair_cycles` vaut actuellement
+  seulement `0` ou `1` ;
 - les agents ne travaillent jamais sur `main` : Luna, Claude et la review
   n’écrivent que dans le worktree isolé ; le checkout utilisateur n’est jamais
   modifié (ni checkout, ni index, ni fichiers) ;
@@ -50,9 +52,10 @@ push origin/main A→B              (git push --porcelain origin B:refs/heads/ma
 ### Reprise : failure != lost work
 
 Chaque transition durable met à jour `resume_checkpoint.json`, qui décrit
-toujours la prochaine opération non encore réussie (`initial_step`,
-`claude_c01`, `reviewer_c01`, `repair_planner`, `repair_step`, `claude_c02`,
-`reviewer_c02`, `publish`). Un run `failed` dont l’échec est reprenable
+toujours la prochaine opération non encore réussie. Les phases supportées sont
+conceptuellement : context, planner, plan approval, workspace setup, worker
+steps, checks, Claude, reviewer, repair planner/steps, commit et publish.
+Un run `failed` dont l’échec est reprenable
 (Claude, Codex avant mutation, transport reviewer, push) se reprend au même
 `run_id`, sans rejouer planner, approbation, setup ni step déjà réussi :
 
@@ -65,7 +68,8 @@ ou via le bouton unique de la page du run (`REPRENDRE À PARTIR DE CLAUDE`,
 MetaHarness revérifie l’approbation, l’identité du plan, le hash de
 l’execution selection, le worktree, la branche, HEAD, l’arbre candidat exact et
 le scope approuvé ; au moindre écart : `RESUME_INTEGRITY_FAILURE`, sans aucun
-appel LLM.
+appel LLM. Les corruptions, violations d’identité et
+`AGENT_CONTRACT_MISMATCH` restent volontairement non-resumables.
 
 Sans `revision.enabled`, le chemin historique reste disponible : un planner,
 les steps Codex, les checks, un reviewer et un commit. Les
@@ -108,11 +112,13 @@ depuis `examples/` ; le secret `BRIDGE_API_KEY` vient uniquement de
 `doctor` est le gate local avant l’UI : config, fichiers d’environnement,
 secrets utilisables (jamais affichés), repo propre et base SHA, racines de
 runs/worktrees, binaires Codex et Claude Code, `CODEX_HOME` et
-`CLAUDE_CONFIG_DIR` gérés sans MCP, probe `codex sandbox -- /bin/true`,
-capacités `claude --help`, authentification locale Codex et Claude,
-exécutables de setup et de checks, et `GET /health` du bridge local
-(127.0.0.1/localhost uniquement). Il ne lance aucun modèle. Doctor doit être
-exécuté après l’authentification des runtimes gérés.
+`CLAUDE_CONFIG_DIR` gérés sans MCP, runtime Codex managed, probe sandbox
+`codex sandbox -- /bin/true`, probe de compatibilité CLI/parser Codex,
+runtime Claude managed en mode restricted, probe parser-only Claude,
+authentification locale Codex et Claude, exécutables de setup et de checks, et
+`GET /health` du bridge local (127.0.0.1/localhost uniquement). Il ne lance
+aucun modèle. Doctor doit être exécuté après l’authentification des runtimes
+gérés.
 
 Ouvrir `http://127.0.0.1:8765/`, cliquer sur `NEW RUN`, saisir le SPEC puis
 `CREATE RUN`. Le planner, l’approbation des contrats de step exacts, chaque

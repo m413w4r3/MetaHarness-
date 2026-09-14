@@ -255,6 +255,23 @@ class CodexRuntimeTests(unittest.TestCase):
         self.assertEqual(parsed, tomllib.loads(_MANAGED_CONFIG))
         self.assertNotIn("mcp_servers", parsed)
         self.assertFalse(parsed["agents"]["enabled"])
+        for key in (
+            "multi_agent",
+            "apps",
+            "plugins",
+            "remote_plugin",
+            "plugin_sharing",
+            "recommended_plugins",
+            "tool_suggest",
+            "skill_search",
+            "skill_mcp_dependency_install",
+            "enable_mcp_apps",
+            "hooks",
+            "worktrees",
+            "memories",
+            "memory_tool",
+        ):
+            self.assertFalse(parsed["features"][key], key)
         self.assertFalse(parsed["features"]["plugins"])
         self.assertFalse(parsed["features"]["memories"])
         self.assertFalse(parsed["features"]["memory_tool"])
