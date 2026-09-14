@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import tomllib
+import os
+import stat
+import tempfile
 from pathlib import Path
 
 from ..models import HarnessConfig
@@ -16,8 +19,91 @@ class CodexRuntimeError(RuntimeError):
 
 _MANAGED_CONFIG = (
     "# Managed by MetaHarness.\n"
-    "# Intentionally contains no MCP server configuration.\n"
+    "# Dedicated to bounded mechanical implementation workers.\n"
+    "\n"
+    "approval_policy = \"never\"\n"
+    "sandbox_mode = \"workspace-write\"\n"
+    "web_search = \"disabled\"\n"
+    "\n"
+    "developer_instructions = \"\"\"\n"
+    "You are the MetaHarness mechanical implementation worker.\n"
+    "\n"
+    "The approved step contract supplied on stdin is authoritative.\n"
+    "MetaHarness owns architecture, repository discovery, decomposition, review,\n"
+    "commits, publishing, and repair routing.\n"
+    "\n"
+    "Do not redesign the task, perform repository-wide discovery, use network\n"
+    "research, broaden scope, commit, push, switch branches, create worktrees, or\n"
+    "move HEAD.\n"
+    "\n"
+    "Read only the declared READ_SET, applicable project instructions loaded by\n"
+    "Codex, and strictly necessary direct local imports needed to resolve named\n"
+    "symbols from the contract.\n"
+    "\n"
+    "Modify only WRITE_SET, CREATE_SET and DELETE_SET paths.\n"
+    "\n"
+    "Before editing, verify that the named paths, anchors and structural\n"
+    "preconditions needed by the contract exist. If a material structural\n"
+    "contradiction makes the prescribed change non-mechanical, do not invent an\n"
+    "alternative architecture.\n"
+    "\n"
+    "When that happens, make no edits and start the final response with exactly:\n"
+    "\n"
+    "META CONTRACT MISMATCH v1\n"
+    "\n"
+    "Then give a short concrete explanation.\n"
+    "\n"
+    "For normal successful work, give a concise implementation report. No strict\n"
+    "machine protocol is required for successful completion.\n"
+    "\"\"\"\n"
+    "\n"
+    "[sandbox_workspace_write]\n"
+    "network_access = false\n"
+    "\n"
+    "[agents]\n"
+    "enabled = false\n"
+    "\n"
+    "[features]\n"
+    "multi_agent = false\n"
+    "plugins = false\n"
+    "recommended_plugins = false\n"
+    "memories = false\n"
+    "memory_tool = false\n"
+    "\n"
+    "[features.multi_agent_v2]\n"
+    "enabled = false\n"
 )
+
+_MANAGED_CONFIG_SHAPE = tomllib.loads(_MANAGED_CONFIG)
+
+
+def _atomic_write_managed_config(path: Path, content: str) -> None:
+    """Replace one managed config without ever following the destination."""
+
+    temporary: str | None = None
+    try:
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        raise CodexRuntimeError("could not write managed Codex config") from exc
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 
 def prepare_codex_home(config: HarnessConfig) -> Path:
@@ -36,19 +122,26 @@ def prepare_codex_home(config: HarnessConfig) -> Path:
         )
     try:
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        home.chmod(0o700)
         config_path = home / "config.toml"
-        if not config_path.exists():
-            config_path.write_text(_MANAGED_CONFIG, encoding="utf-8")
-        else:
-            with config_path.open("rb") as stream:
-                parsed = tomllib.load(stream)
-            if parsed.get("mcp_servers"):
-                raise CodexRuntimeError(
-                    "MetaHarness CODEX_HOME must not configure MCP servers"
-                )
+        try:
+            config_stat = config_path.lstat()
+        except FileNotFoundError:
+            config_stat = None
+        if config_stat is not None:
+            if stat.S_ISLNK(config_stat.st_mode):
+                raise CodexRuntimeError("managed Codex config.toml must not be a symlink")
+            if not stat.S_ISREG(config_stat.st_mode):
+                raise CodexRuntimeError("managed Codex config.toml must be a regular file")
+        if config_stat is None or config_path.read_bytes() != _MANAGED_CONFIG.encode("utf-8"):
+            _atomic_write_managed_config(config_path, _MANAGED_CONFIG)
+        with config_path.open("rb") as stream:
+            parsed = tomllib.load(stream)
+        if parsed != _MANAGED_CONFIG_SHAPE:
+            raise CodexRuntimeError("managed Codex config.toml has an unexpected shape")
     except CodexRuntimeError:
         raise
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         raise CodexRuntimeError(
             "could not prepare managed CODEX_HOME"
         ) from None

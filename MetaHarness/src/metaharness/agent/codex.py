@@ -39,6 +39,7 @@ _CODEX_AUTH_FAILURE_SIGNALS = (
     "authentication required",
     "not logged in",
 )
+CONTRACT_MISMATCH_HEADER = "META CONTRACT MISMATCH v1"
 
 
 def classify_codex_failure(stderr: str, events: str = "") -> str | None:
@@ -49,6 +50,21 @@ def classify_codex_failure(stderr: str, events: str = "") -> str | None:
     haystack = f"{stderr}\n{events}".casefold()
     if any(signal in haystack for signal in _CODEX_AUTH_FAILURE_SIGNALS):
         return "CODEX_AUTH_FAILURE"
+    return None
+
+
+def contract_mismatch_explanation(final_message: str) -> str | None:
+    """Return the protocol exception, if it is the first content line."""
+
+    if not isinstance(final_message, str):
+        raise TypeError("Codex final message must be a string")
+    lines = final_message.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if line != CONTRACT_MISMATCH_HEADER:
+            return None
+        return "\n".join(lines[index + 1:]).strip()
     return None
 
 
@@ -179,6 +195,8 @@ class CodexAgent:
             self.executable,
             "exec",
             "--json",
+            "--strict-config",
+            "--ephemeral",
             "--sandbox",
             self.config.sandbox,
             "--output-last-message",
@@ -387,6 +405,8 @@ __all__ = [
     "CodexAgent",
     "build_agent_environment",
     "classify_codex_failure",
+    "CONTRACT_MISMATCH_HEADER",
+    "contract_mismatch_explanation",
     "build_implementer_prompt",
     "build_implementer_step_prompt",
     "run_codex",

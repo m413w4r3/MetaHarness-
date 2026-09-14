@@ -293,12 +293,14 @@ class ChangeSetTests(unittest.TestCase):
             self.assertIn(sentence, planner)
         worker = build_implementer_step_prompt("CONTRACT")
         for sentence in (
-            "Do not run repository-wide discovery commands.",
-            "- repo-wide grep/git-grep/rg.",
-            "Do not inspect other step contracts.",
-            "All design decisions are already final.",
+            "Execute exactly the approved META IMPLEMENTATION STEP below.",
+            "The MetaHarness developer instructions supplied by the managed Codex runtime",
+            "The contract is authoritative for this step.",
+            "<STEP CONTRACT>\nCONTRACT\n</STEP CONTRACT>",
         ):
             self.assertIn(sentence, worker)
+        self.assertNotIn("Do not run repository-wide discovery commands.", worker)
+        self.assertNotIn("Do not inspect other step contracts.", worker)
 
 
 _PROTOCOL = "The answer must use exactly this protocol."

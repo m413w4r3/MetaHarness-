@@ -191,9 +191,11 @@ class FakeAgent:
         actions: dict[str, Callable[[Path], Any]] | None = None,
         *,
         usage: dict[str, dict[str, int]] | None = None,
+        final_messages: dict[str, str] | None = None,
     ):
         self.actions = actions or {}
         self.usage = usage or {}
+        self.final_messages = final_messages or {}
         self.calls: list[dict[str, Any]] = []
 
     def run_step(self, contract: str, worktree: Any, artifacts_dir: Any, *, base_sha: str | None = None,
@@ -222,11 +224,12 @@ class FakeAgent:
         (directory / "agent.events.jsonl").write_text(
             "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
         )
-        (directory / "agent.final.md").write_text(f"{step_id} done\n", encoding="utf-8")
+        final_message = self.final_messages.get(step_id, f"{step_id} done\n")
+        (directory / "agent.final.md").write_text(final_message, encoding="utf-8")
         timed_out = outcome == "timeout"
         return AgentResult(
             exit_code=124 if timed_out else 0, timed_out=timed_out,
-            final_message=f"{step_id} done\n", usage=dict(usage), stderr_tail="",
+            final_message=final_message, usage=dict(usage), stderr_tail="",
         )
 
 
@@ -667,6 +670,51 @@ class StepGateTests(MultiStepHarness):
         self.assertEqual([item["status"] for item in result.state["steps"]], ["completed", "failed", "waiting"])
         self.assertIsNone(result.state["current_step"])
         self.assert_stopped_before_final_gates(reviewer)
+
+    def test_contract_mismatch_stops_before_staging_and_next_step(self) -> None:
+        agent = FakeAgent(
+            three_step_actions(),
+            final_messages={"S01": "META CONTRACT MISMATCH v1\nThe anchor is absent.\n"},
+        )
+        result, _orchestrator, _planner, reviewer = self.run_v2(three_steps(), agent)
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.state["failure"]["reason"], "AGENT_CONTRACT_MISMATCH")
+        self.assertEqual([call["step"] for call in agent.calls], ["S01"])
+        self.assertEqual(
+            [item["status"] for item in result.state["steps"]],
+            ["failed", "waiting", "waiting"],
+        )
+        self.assertIn("The anchor is absent.", result.state["failure"]["detail"])
+        self.assert_stopped_before_final_gates(reviewer)
+
+    def test_contract_mismatch_records_accidental_candidate_modifications(self) -> None:
+        agent = FakeAgent(
+            {"S01": lambda wt: write(wt / "src/a.py", "accidental\n")},
+            final_messages={"S01": "\nMETA CONTRACT MISMATCH v1\nWrong shape.\n"},
+        )
+        result, _orchestrator, _planner, reviewer = self.run_v2(
+            plan_text(step_block(1)), agent
+        )
+        self.assertEqual(result.state["failure"]["reason"], "AGENT_CONTRACT_MISMATCH")
+        self.assertIn("worker left candidate modifications", result.state["failure"]["detail"])
+        step_dir = self.runs / "run-1" / "steps" / "S01"
+        self.assertTrue((step_dir / "tree_after_failure.txt").is_file())
+        step = json.loads((step_dir / "step.json").read_text())
+        self.assertNotEqual(step["tree_before"], step["tree_after"])
+        self.assert_stopped_before_final_gates(reviewer)
+
+    def test_normal_success_report_with_later_phrase_is_accepted(self) -> None:
+        agent = FakeAgent(
+            {"S01": lambda wt: write(wt / "src/a.py", "A = 2\n")},
+            final_messages={
+                "S01": "Implemented the requested change. The prose mentions "
+                "META CONTRACT MISMATCH v1 only as a rejected example.\n"
+            },
+        )
+        result, _orchestrator, _planner, _reviewer = self.run_v2(
+            plan_text(step_block(1)), agent
+        )
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
 
     def test_legacy_v2_plan_without_create_delete_sections_still_runs(self) -> None:
         plan = plan_text(step_block(1, legacy=True))

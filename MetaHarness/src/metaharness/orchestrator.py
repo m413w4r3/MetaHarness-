@@ -21,6 +21,7 @@ from .agent.codex import (
     build_agent_environment,
     build_implementer_step_prompt,
     classify_codex_failure,
+    contract_mismatch_explanation,
 )
 from .agent.runtime import prepare_codex_home
 from .claude.agent import (
@@ -2677,6 +2678,28 @@ class Orchestrator:
         failed = {"profile_id": profile.id, "tree_before": tree_before, "usage": usage}
         # 7. Authentication classification from fixed markers only.
         auth_failure = _codex_auth_failure(artifact_dir / "agent.events.jsonl", result.stderr_tail)
+        # A structural mismatch is the only worker report that has protocol
+        # meaning.  It is checked before any staging and its explanation stays
+        # bounded and non-authoritative.
+        mismatch = None
+        if not result.timed_out and result.exit_code == 0:
+            mismatch = contract_mismatch_explanation(result.final_message)
+        if mismatch is not None:
+            tree_after = _safe_candidate_tree(worktree)
+            _record_failure_tree(artifact_dir, worktree)
+            details = []
+            if mismatch:
+                details.append(_bounded_v2_report(mismatch))
+            if tree_after is not None and tree_after != tree_before:
+                details.append("worker left candidate modifications")
+            elif tree_after is None:
+                details.append("failure tree could not be read")
+            raise StepExecutionFailure(
+                "AGENT_CONTRACT_MISMATCH", step_id,
+                "; ".join(details) or "worker reported a contract mismatch",
+                profile_id=profile.id, tree_before=tree_before,
+                tree_after=tree_after, usage=usage,
+            )
         # 8-9. Git ownership: HEAD, branch, branches and worktrees.
         ownership_after = _git_ownership(repo, worktree)
         if ownership_after.head != base_sha:
