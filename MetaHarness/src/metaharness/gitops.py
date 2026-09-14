@@ -7,7 +7,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+import urllib.parse
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from subprocess import CompletedProcess
 
@@ -34,6 +35,14 @@ class StagedBlob:
     path: str
     object_id: str
     size: int
+
+
+@dataclass(frozen=True)
+class RepositoryReference:
+    remote_name: str
+    web_url: str | None
+    base_sha: str
+    immutable_url: str | None
 
 
 def _git(
@@ -69,6 +78,150 @@ def _git(
         suffix = f": {detail}" if detail else ""
         raise GitError(f"git command exited with {result.returncode}{suffix}")
     return result
+
+
+def repository_remote_url(repo: Path, remote_name: str) -> str:
+    """Return a configured remote URL using argv-only Git invocation."""
+
+    if not isinstance(remote_name, str) or not remote_name.strip() or "\x00" in remote_name:
+        raise GitError("remote name is invalid")
+    result = _git(repo, "remote", "get-url", "--", remote_name)
+    url = result.stdout.strip()
+    if not url:
+        raise GitError(f"remote {remote_name!r} has no URL")
+    return url
+
+
+def _github_path(path: str) -> str | None:
+    if path.startswith("/"):
+        path = path[1:]
+    if path.endswith("/") or "//" in path:
+        return None
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) != 2 or any(not part or part in {".", ".."} for part in parts):
+        return None
+    if any(char in path for char in "?#\\"):
+        return None
+    return f"https://github.com/{parts[0]}/{parts[1]}"
+
+
+def normalize_github_web_url(remote_url: str) -> str | None:
+    """Normalize one of the supported GitHub transport URL forms."""
+
+    if not isinstance(remote_url, str) or not remote_url.strip():
+        return None
+    value = remote_url.strip()
+    if "?" in value or "#" in value:
+        raise ValueError("repository URL must not contain query or fragment")
+
+    scp = re.fullmatch(r"git@github\.com:([^:]+)", value, re.IGNORECASE)
+    if scp:
+        return _github_path(scp.group(1))
+
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("repository URL is invalid") from exc
+    if parsed.username is not None or parsed.password is not None:
+        if not (parsed.scheme.lower() == "ssh" and parsed.username == "git" and parsed.password is None):
+            raise ValueError("repository URL contains credentials")
+    if parsed.scheme.lower() not in {"ssh", "https"}:
+        return None
+    if hostname is None or hostname.lower() != "github.com" or port is not None:
+        return None
+    if parsed.scheme.lower() == "ssh" and parsed.username != "git":
+        raise ValueError("repository URL contains credentials")
+    return _github_path(parsed.path)
+
+
+def _validate_explicit_web_url(web_url: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(web_url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("repository web_url is invalid") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not hostname
+        or port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.strip("/")
+    ):
+        raise ValueError("repository web_url must be HTTPS without credentials, query, or fragment")
+    if parsed.path.startswith("/") and parsed.path.endswith("/"):
+        raise ValueError("repository web_url path is ambiguous")
+    return web_url
+
+
+def build_repository_reference(
+    repo: Path,
+    *,
+    base_sha: str,
+    config: "RepositoryConfig",
+) -> RepositoryReference:
+    """Build the secret-free repository identity visible to planners."""
+
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", base_sha):
+        raise GitError("base SHA is invalid")
+    explicit = config.web_url
+    if not config.planner_remote_exploration:
+        web_url = None
+    elif explicit is not None:
+        # Validate that the configured remote exists even when its display URL
+        # is explicitly overridden.
+        repository_remote_url(repo, config.remote)
+        web_url = _validate_explicit_web_url(explicit)
+    elif config.planner_remote_exploration:
+        raw = repository_remote_url(repo, config.remote)
+        web_url = normalize_github_web_url(raw)
+    else:
+        web_url = None
+    github_url = normalize_github_web_url(web_url) if web_url is not None else None
+    if web_url is not None:
+        hostname = urllib.parse.urlsplit(web_url).hostname
+        if hostname and hostname.lower() == "github.com" and github_url is None:
+            raise ValueError("repository web_url path is ambiguous")
+        if github_url is not None:
+            web_url = github_url
+    immutable_url = f"{github_url}/tree/{base_sha}" if github_url is not None else None
+    return RepositoryReference(config.remote, web_url, base_sha, immutable_url)
+
+
+def render_repository_reference(reference: RepositoryReference) -> str:
+    """Render only the non-secret repository identity for a planner prompt."""
+
+    if not isinstance(reference, RepositoryReference):
+        raise TypeError("reference must be a RepositoryReference")
+    exploration = "ALLOWED" if reference.web_url and reference.immutable_url else "UNAVAILABLE"
+    return "\n".join(
+        (
+            "WEB URL:",
+            reference.web_url or "UNAVAILABLE",
+            "",
+            "BASE SHA:",
+            reference.base_sha,
+            "",
+            "IMMUTABLE BASE URL:",
+            reference.immutable_url or "UNAVAILABLE",
+            "",
+            "REMOTE EXPLORATION:",
+            exploration,
+        )
+    )
+
+
+def repository_reference_dict(reference: RepositoryReference) -> dict[str, str | None]:
+    """Return the exact secret-free artifact shape."""
+
+    return asdict(reference)
 
 
 def _git_bytes(repo: Path, *args: str, timeout: int = 60) -> bytes:

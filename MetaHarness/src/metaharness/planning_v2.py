@@ -14,8 +14,9 @@ from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, Sequence
 
+from .gitops import RepositoryReference, render_repository_reference
 from .llm.chat import TextLLMResult
-from .models import ExecutionMode, ImplementationStep, ModelProfile, TaskPlanV2
+from .models import ExecutionMode, ImplementationStep, ModelProfile, PlanningConfig, TaskPlanV2
 from .planning import PlanDecision, PlanParseError
 from .result import atomic_write_text
 from .usage import PLANNER_USAGE_ARTIFACT, completion_usage, write_usage_artifact
@@ -480,21 +481,51 @@ def build_planner_prompt_v2(
     spec: str,
     context: str,
     *,
+    repository_reference: RepositoryReference | None = None,
     implementer_profiles: Sequence[ModelProfile] = (),
     reviewer_profiles: Sequence[ModelProfile] = (),
     template: str | None = None,
 ) -> str:
     if not isinstance(spec, str) or not isinstance(context, str):
         raise TypeError("spec and context must be strings")
+    if repository_reference is not None and not isinstance(repository_reference, RepositoryReference):
+        raise TypeError("repository_reference must be a RepositoryReference")
     if template is None:
         template = (Path(__file__).with_name("prompts") / "planner_v2.txt").read_text(encoding="utf-8")
     values = {
         "{{SPEC}}": spec,
         "{{CONTEXT}}": context,
+        "{{REPOSITORY}}": render_repository_reference(repository_reference) if repository_reference else (
+            "WEB URL:\nUNAVAILABLE\n\nBASE SHA:\nUNAVAILABLE\n\nIMMUTABLE BASE URL:\nUNAVAILABLE\n\nREMOTE EXPLORATION:\nUNAVAILABLE"
+        ),
         "{{IMPLEMENTER_PROFILES}}": render_safe_profile_catalogue(implementer_profiles),
         "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
     }
-    return re.sub(r"\{\{SPEC\}\}|\{\{CONTEXT\}\}|\{\{IMPLEMENTER_PROFILES\}\}|\{\{REVIEWER_PROFILES\}\}", lambda match: values[match.group(0)], template)
+    return re.sub(r"\{\{SPEC\}\}|\{\{CONTEXT\}\}|\{\{REPOSITORY\}\}|\{\{IMPLEMENTER_PROFILES\}\}|\{\{REVIEWER_PROFILES\}\}", lambda match: values[match.group(0)], template)
+
+
+def validate_decomposition_policy(
+    plan: TaskPlanV2,
+    planning: PlanningConfig,
+) -> None:
+    """Apply the configured mutable-scope policy after strict v2 parsing."""
+
+    if not isinstance(plan, TaskPlanV2) or not isinstance(planning, PlanningConfig):
+        raise TypeError("plan and planning must be v2 model values")
+    if plan.decision is not PlanDecision.READY or planning.decomposition != "aggressive":
+        return
+
+    def mutable_count(step: ImplementationStep) -> int:
+        return len(set(step.write_set) | set(step.create_set) | set(step.delete_set))
+
+    if plan.execution_mode is ExecutionMode.SINGLE:
+        if mutable_count(plan.steps[0]) > planning.single_step_max_mutable_paths:
+            raise V2PlanParseError(
+                "aggressive decomposition requires STAGED for this mutable scope"
+            )
+        return
+    if any(mutable_count(step) > 3 for step in plan.steps):
+        raise V2PlanParseError("aggressive STAGED steps may modify at most 3 mutable paths")
 
 
 def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict[str, Any]:
@@ -687,16 +718,19 @@ class TextCompletionClient(Protocol):
 class PlannerV2:
     """Standalone v2 planner entry point; it never invokes P17 recommender."""
 
-    def __init__(self, client: TextCompletionClient, *, implementer_ids: frozenset[str], reviewer_ids: frozenset[str], implementer_profiles: Sequence[ModelProfile] = (), reviewer_profiles: Sequence[ModelProfile] = (), template: str | None = None):
+    def __init__(self, client: TextCompletionClient, *, implementer_ids: frozenset[str], reviewer_ids: frozenset[str], implementer_profiles: Sequence[ModelProfile] = (), reviewer_profiles: Sequence[ModelProfile] = (), repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None):
         self.client = client
         self.implementer_ids = implementer_ids
         self.reviewer_ids = reviewer_ids
         self.implementer_profiles = implementer_profiles
         self.reviewer_profiles = reviewer_profiles
+        self.repository_reference = repository_reference
+        self.planning = planning or PlanningConfig(protocol="v2")
         self.template = template
 
-    def plan(self, spec: str, context: str, *, artifacts_dir: str | Path | None = None) -> TaskPlanV2:
-        request = build_planner_prompt_v2(spec, context, implementer_profiles=self.implementer_profiles, reviewer_profiles=self.reviewer_profiles, template=self.template)
+    def plan(self, spec: str, context: str, *, repository_reference: RepositoryReference | None = None, artifacts_dir: str | Path | None = None) -> TaskPlanV2:
+        reference = repository_reference if repository_reference is not None else self.repository_reference
+        request = build_planner_prompt_v2(spec, context, repository_reference=reference, implementer_profiles=self.implementer_profiles, reviewer_profiles=self.reviewer_profiles, template=self.template)
         target = Path(artifacts_dir) if artifacts_dir is not None else None
         if target is not None:
             atomic_write_text(target / "planner.request.txt", request)
@@ -710,6 +744,7 @@ class PlannerV2:
         if target is not None:
             atomic_write_text(target / "planner.raw.md", raw)
         plan = parse_task_plan_v2(raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids)
+        validate_decomposition_policy(plan, self.planning)
         if artifacts_dir is not None:
             persist_planning_v2_artifacts(
                 artifacts_dir,
@@ -730,6 +765,8 @@ def run_planner_v2(
     reviewer_ids: frozenset[str],
     implementer_profiles: Sequence[ModelProfile] = (),
     reviewer_profiles: Sequence[ModelProfile] = (),
+    repository_reference: RepositoryReference | None = None,
+    planning: PlanningConfig | None = None,
     artifacts_dir: str | Path | None = None,
     template: str | None = None,
 ) -> TaskPlanV2:
@@ -739,6 +776,8 @@ def run_planner_v2(
         reviewer_ids=reviewer_ids,
         implementer_profiles=implementer_profiles,
         reviewer_profiles=reviewer_profiles,
+        repository_reference=repository_reference,
+        planning=planning,
         template=template,
     ).plan(spec, context, artifacts_dir=artifacts_dir)
 
@@ -752,5 +791,5 @@ __all__ = [
     "persist_planning_artifacts_v2", "persist_planning_v2_artifacts",
     "read_approved_step_contract", "read_set_paths",
     "render_plan_summary_v2", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract",
-    "run_planner_v2", "step_contract_path", "validate_implementation_bundle", "write_implementation_bundle",
+    "run_planner_v2", "step_contract_path", "validate_decomposition_policy", "validate_implementation_bundle", "write_implementation_bundle",
 ]

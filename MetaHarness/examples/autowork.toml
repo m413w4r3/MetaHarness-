@@ -10,6 +10,13 @@ allow_no_required_checks = false
 
 [planning]
 protocol = "v2"
+decomposition = "aggressive"
+single_step_max_mutable_paths = 2
+
+[repository]
+remote = "origin"
+planner_remote_exploration = true
+web_url = "https://github.com/m413w4r3/AutoWork"
 
 [environment]
 files = ["../../Bridges/.env.models"]

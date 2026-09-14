@@ -50,10 +50,13 @@ from .gitops import (
     git_root,
     index_tree_sha,
     local_branches,
+    build_repository_reference,
     path_exists_in_tree,
     registered_worktrees,
     resolve_commit,
     resolve_tree,
+    RepositoryReference,
+    repository_reference_dict,
     status_porcelain,
     symbolic_head,
     stage_all,
@@ -692,6 +695,22 @@ class Orchestrator:
         base_sha = resolve_commit(repo, self.config.base_ref)
         store.update(status=RunStatus.CREATED, repo=str(repo), base_sha=base_sha)
 
+        try:
+            repository_reference = build_repository_reference(
+                repo, base_sha=base_sha, config=self.config.repository
+            )
+        except GitError:
+            # ``doctor`` remains the fail-closed preflight for enabled remote
+            # exploration.  Direct programmatic callers may omit a remote;
+            # the exact local base context is still sufficient to proceed.
+            repository_reference = RepositoryReference(
+                self.config.repository.remote, None, base_sha, None
+            )
+        atomic_write_text(
+            run_dir / "repository_reference.json",
+            json.dumps(repository_reference_dict(repository_reference), indent=2) + "\n",
+        )
+
         context_bundle = build_context(repo, base_sha, spec, self.config.context)
         context = render_context(context_bundle)
         store.update(
@@ -707,7 +726,8 @@ class Orchestrator:
 
         if self.config.planning.protocol == "v2":
             return self._execute_v2(
-                store, run_dir, run_id, spec, repo, base_sha, context
+                store, run_dir, run_id, spec, repo, base_sha, context,
+                repository_reference,
             )
 
         # The planner receives the SPEC. The implementation agent receives only
@@ -1058,6 +1078,7 @@ class Orchestrator:
         repo: Path,
         base_sha: str,
         context: str,
+        repository_reference: RepositoryReference,
     ) -> RunResult:
         """Execute a v2 bundle: one worktree, fresh Codex process per step."""
 
@@ -1077,6 +1098,8 @@ class Orchestrator:
             reviewer_ids=frozenset(p.id for p in reviewers),
             implementer_profiles=implementers,
             reviewer_profiles=reviewers,
+            repository_reference=repository_reference,
+            planning=self.config.planning,
         )
         plan = planner.plan(spec, context, artifacts_dir=run_dir)
         store.update(

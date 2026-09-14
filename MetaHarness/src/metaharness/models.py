@@ -162,12 +162,25 @@ class ContextConfig:
 
 
 @dataclass(frozen=True)
+class RepositoryConfig:
+    remote: str = "origin"
+    planner_remote_exploration: bool = True
+    web_url: str | None = None
+
+
+@dataclass(frozen=True)
 class PlanningConfig:
     protocol: str = "v1"
+    decomposition: str = "balanced"
+    single_step_max_mutable_paths: int = 2
 
     def __post_init__(self) -> None:
         if self.protocol not in {"v1", "v2"}:
             raise ValueError("planning protocol must be 'v1' or 'v2'")
+        if self.decomposition not in {"balanced", "aggressive"}:
+            raise ValueError("planning decomposition must be 'balanced' or 'aggressive'")
+        if isinstance(self.single_step_max_mutable_paths, bool) or self.single_step_max_mutable_paths <= 0:
+            raise ValueError("single_step_max_mutable_paths must be greater than zero")
 
 
 @dataclass(frozen=True)
@@ -270,6 +283,10 @@ class HarnessConfig:
     )
     workspace_setup: tuple[WorkspaceSetupCommand, ...] = ()
     planning: PlanningConfig = field(default_factory=PlanningConfig)
+    repository: RepositoryConfig = field(default_factory=RepositoryConfig)
+    # Compatibility marker for programmatic legacy configurations that do not
+    # have a repository TOML section yet.
+    repository_section_explicit: bool = field(default=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True)

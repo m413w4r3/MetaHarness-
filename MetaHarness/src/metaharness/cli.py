@@ -26,7 +26,13 @@ from .agent.auth import check_codex_authentication
 from .agent.codex import build_agent_environment
 from .agent.runtime import CodexRuntimeError, prepare_codex_home
 from .execution_selection import is_profile_aware_run
-from .gitops import GitError, assert_clean, git_root, resolve_commit
+from .gitops import (
+    GitError,
+    assert_clean,
+    build_repository_reference,
+    git_root,
+    resolve_commit,
+)
 from .llm.chat import validate_endpoint
 from .models import HarnessConfig, ProfileDriver, RunStatus
 from .orchestrator import OrchestrationError, run_orchestrator
@@ -338,6 +344,23 @@ def _doctor(config_path: Path) -> int:
                 print("clean base: PASS")
             base_sha = resolve_commit(repo, config.base_ref)
             print(f"base: {config.base_ref} ({base_sha})")
+            if config.repository.planner_remote_exploration and (
+                config.repository_section_explicit or config.repository.web_url is not None
+            ):
+                try:
+                    reference = build_repository_reference(
+                        repo, base_sha=base_sha, config=config.repository
+                    )
+                except (GitError, ValueError) as exc:
+                    problems.append(f"planner repository reference is invalid: {exc}")
+                else:
+                    if reference.web_url is None:
+                        problems.append(
+                            "planner repository remote URL is not a supported GitHub URL"
+                        )
+                    else:
+                        print(f"OK planner repository: {reference.web_url}")
+                    print(f"OK planner immutable base: {reference.base_sha}")
         except GitError as exc:
             problems.append(str(exc))
     for label, path in (("runs_root", config.runs_root), ("worktrees_root", config.worktrees_root)):

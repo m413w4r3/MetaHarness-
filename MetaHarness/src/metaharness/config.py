@@ -6,6 +6,7 @@ import math
 import os
 import re
 import tomllib
+import urllib.parse
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -24,6 +25,7 @@ from .models import (
     ModelProfile,
     PlanningConfig,
     ProfileDriver,
+    RepositoryConfig,
     SelectionMode,
     UIConfig,
     WorkspaceSetupCommand,
@@ -125,6 +127,30 @@ def _optional_string(
         raise ConfigError(f"{where}.{key} must be a string or null")
     if isinstance(value, str) and not value.strip():
         raise ConfigError(f"{where}.{key} must not be empty")
+    return value
+
+
+def _repository_web_url(data: Mapping[str, Any]) -> str | None:
+    value = _optional_string(data, "web_url", None, "repository")
+    if value is None:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigError("repository.web_url must be a valid HTTPS URL") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not hostname
+        or port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.strip("/")
+    ):
+        raise ConfigError("repository.web_url must be an HTTPS URL without credentials, query, or fragment")
     return value
 
 
@@ -540,7 +566,29 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     protocol = planning_data.get("protocol", "v1")
     if not isinstance(protocol, str) or protocol not in {"v1", "v2"}:
         raise ConfigError("planning.protocol must be 'v1' or 'v2'")
-    planning = PlanningConfig(protocol=protocol)
+    decomposition = planning_data.get("decomposition", "balanced")
+    if not isinstance(decomposition, str) or decomposition not in {"balanced", "aggressive"}:
+        raise ConfigError("planning.decomposition must be 'balanced' or 'aggressive'")
+    single_step_max_mutable_paths = _positive_int(
+        planning_data, "single_step_max_mutable_paths", 2, "planning"
+    )
+    planning = PlanningConfig(
+        protocol=protocol,
+        decomposition=decomposition,
+        single_step_max_mutable_paths=single_step_max_mutable_paths,
+    )
+
+    repository_data = _table(expanded, "repository")
+    repository_remote = _required_string(repository_data, "remote", "repository") if "remote" in repository_data else "origin"
+    if "\x00" in repository_remote or any(char.isspace() for char in repository_remote):
+        raise ConfigError("repository.remote must be a non-whitespace remote name")
+    repository = RepositoryConfig(
+        remote=repository_remote,
+        planner_remote_exploration=_bool(
+            repository_data, "planner_remote_exploration", True, "repository"
+        ),
+        web_url=_repository_web_url(repository_data),
+    )
 
     agent_data = _table(expanded, "agent")
     provider = agent_data.get("provider", "codex")
@@ -760,4 +808,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         codex_runtime=codex_runtime,
         workspace_setup=workspace_setup,
         planning=planning,
+        repository=repository,
+        repository_section_explicit="repository" in expanded,
     )
