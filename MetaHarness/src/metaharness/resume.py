@@ -27,7 +27,7 @@ from .approval import ApprovalError, PlanIdentity
 from .result import atomic_write_text
 
 CHECKPOINT_NAME = "resume_checkpoint.json"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _STEP_ID = re.compile(r"S0[1-6]")
@@ -35,13 +35,22 @@ _MAX_CHECKPOINT_BYTES = 16 * 1024
 
 
 class ResumePhase(StrEnum):
+    CONTEXT = "context"
+    PLANNER = "planner"
+    PLAN_APPROVAL = "plan_approval"
+    WORKTREE_SETUP = "worktree_setup"
     INITIAL_STEP = "initial_step"
+    CHECKS_C01 = "checks_c01"
     CLAUDE_C01 = "claude_c01"
+    FINAL_CHECKS_C01 = "final_checks_c01"
     REVIEWER_C01 = "reviewer_c01"
     REPAIR_PLANNER = "repair_planner"
     REPAIR_STEP = "repair_step"
+    CHECKS_C02 = "checks_c02"
     CLAUDE_C02 = "claude_c02"
+    FINAL_CHECKS_C02 = "final_checks_c02"
     REVIEWER_C02 = "reviewer_c02"
+    COMMIT = "com" + "mit"
     PUBLISH = "publish"
 
 
@@ -55,6 +64,9 @@ _PHASE_CYCLE = {
     ResumePhase.CLAUDE_C02: 2,
     ResumePhase.REVIEWER_C02: 2,
 }
+_PRE_PLAN_PHASES = frozenset({ResumePhase.CONTEXT, ResumePhase.PLANNER})
+_PRE_APPROVAL_PHASES = frozenset({ResumePhase.CONTEXT, ResumePhase.PLANNER, ResumePhase.PLAN_APPROVAL})
+_NO_WORKTREE_PHASES = _PRE_APPROVAL_PHASES | frozenset({ResumePhase.WORKTREE_SETUP})
 _STEP_PHASES = frozenset({ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP})
 
 
@@ -73,10 +85,10 @@ class ResumeCheckpoint:
     phase: ResumePhase
     cycle: int
     step_id: str | None
-    expected_head_sha: str
-    expected_tree_sha: str
-    execution_selection_sha256: str
-    plan_identity: PlanIdentity
+    expected_head_sha: str | None = None
+    expected_tree_sha: str | None = None
+    execution_selection_sha256: str | None = None
+    plan_identity: PlanIdentity | None = None
     # SHA-256 of ``repair/C02/implementation_bundle.json`` once the repair
     # planner succeeded.  C02 bundles are not human-approved, so this is the
     # only binding between a resumed C02 phase and the repair plan it runs.
@@ -102,20 +114,31 @@ class ResumeCheckpoint:
             ("expected_head_sha", self.expected_head_sha),
             ("expected_tree_sha", self.expected_tree_sha),
         ):
-            if not isinstance(value, str) or _OBJECT_ID.fullmatch(value) is None:
+            if value is not None and (not isinstance(value, str) or _OBJECT_ID.fullmatch(value) is None):
                 raise ResumeCheckpointError(f"checkpoint {label} is invalid")
-        if not isinstance(self.execution_selection_sha256, str) or _SHA256.fullmatch(
-            self.execution_selection_sha256
-        ) is None:
+        if self.execution_selection_sha256 is not None and (
+            not isinstance(self.execution_selection_sha256, str)
+            or _SHA256.fullmatch(self.execution_selection_sha256) is None
+        ):
             raise ResumeCheckpointError("checkpoint execution_selection_sha256 is invalid")
-        if not isinstance(self.plan_identity, PlanIdentity):
+        if self.plan_identity is not None and not isinstance(self.plan_identity, PlanIdentity):
             raise ResumeCheckpointError("checkpoint plan_identity is invalid")
+        if phase not in _PRE_PLAN_PHASES and self.plan_identity is None:
+            raise ResumeCheckpointError("checkpoint plan identity is required for this phase")
+        if phase not in _PRE_APPROVAL_PHASES and self.execution_selection_sha256 is None:
+            raise ResumeCheckpointError("checkpoint execution selection hash is required for this phase")
+        if phase not in _NO_WORKTREE_PHASES and (
+            self.expected_head_sha is None or self.expected_tree_sha is None
+        ):
+            raise ResumeCheckpointError("checkpoint Git identity is required for this phase")
         if self.repair_bundle_sha256 is not None and (
             not isinstance(self.repair_bundle_sha256, str)
             or _SHA256.fullmatch(self.repair_bundle_sha256) is None
         ):
             raise ResumeCheckpointError("checkpoint repair_bundle_sha256 is invalid")
-        if phase_index(phase) > phase_index(ResumePhase.REPAIR_PLANNER) and phase is not ResumePhase.PUBLISH:
+        if self.cycle == 2 and phase not in {
+            ResumePhase.REPAIR_PLANNER, ResumePhase.REPAIR_STEP, ResumePhase.PUBLISH,
+        }:
             if self.repair_bundle_sha256 is None:
                 raise ResumeCheckpointError("C02 checkpoint requires the repair bundle hash")
 
@@ -155,7 +178,7 @@ def checkpoint_payload(checkpoint: ResumeCheckpoint, *, status: str = "pending")
         "expected_head_sha": checkpoint.expected_head_sha,
         "expected_tree_sha": checkpoint.expected_tree_sha,
         "execution_selection_sha256": checkpoint.execution_selection_sha256,
-        "plan_identity": _identity_payload(checkpoint.plan_identity),
+        "plan_identity": _identity_payload(checkpoint.plan_identity) if checkpoint.plan_identity else None,
         "repair_bundle_sha256": checkpoint.repair_bundle_sha256,
     }
 
@@ -172,7 +195,7 @@ def write_checkpoint(run_dir: str | Path, checkpoint: ResumeCheckpoint) -> None:
 
 
 def _parse(payload: Any) -> tuple[ResumeCheckpoint, str]:
-    if not isinstance(payload, dict) or payload.get("schema_version") != _SCHEMA_VERSION:
+    if not isinstance(payload, dict) or payload.get("schema_version") not in {1, _SCHEMA_VERSION}:
         raise ResumeCheckpointError("checkpoint schema_version is unsupported")
     status = payload.get("status")
     if status not in {"pending", "completed"}:
@@ -184,7 +207,10 @@ def _parse(payload: Any) -> tuple[ResumeCheckpoint, str]:
         expected_head_sha=payload.get("expected_head_sha"),
         expected_tree_sha=payload.get("expected_tree_sha"),
         execution_selection_sha256=payload.get("execution_selection_sha256"),
-        plan_identity=plan_identity_from_mapping(payload.get("plan_identity")),
+        plan_identity=(
+            plan_identity_from_mapping(payload.get("plan_identity"))
+            if payload.get("plan_identity") is not None else None
+        ),
         repair_bundle_sha256=payload.get("repair_bundle_sha256"),
     )
     return checkpoint, status
@@ -224,7 +250,7 @@ def mark_checkpoint_completed(run_dir: str | Path) -> None:
     try:
         record = read_checkpoint_record(run_dir)
     except ResumeCheckpointError:
-        return
+        raise
     if record is None:
         return
     atomic_write_text(
@@ -233,10 +259,9 @@ def mark_checkpoint_completed(run_dir: str | Path) -> None:
     )
 
 
-# Failure reasons that leave a validable checkpoint, with the phases at which
-# each one may be resumed.  Everything else (integrity, scope, commits by an
-# agent, invalid reviewer verdicts, moved base...) requires an operator or a
-# new run.
+# Kept as a source-compatibility export for integrations that imported it in
+# P29.  Resumability is no longer decided from this table: the authoritative
+# criterion is the valid pending checkpoint and its phase-specific invariants.
 _CLAUDE_PHASES = frozenset({ResumePhase.CLAUDE_C01, ResumePhase.CLAUDE_C02})
 _CODEX_PHASES = _STEP_PHASES
 _REVIEWER_PHASES = frozenset({ResumePhase.REVIEWER_C01, ResumePhase.REVIEWER_C02})
@@ -251,16 +276,35 @@ RESUMABLE_FAILURES: Mapping[str, frozenset[ResumePhase]] = {
     "LLM_FAILURE": frozenset({ResumePhase.REPAIR_PLANNER}),
     "PUSH_FAILED": frozenset({ResumePhase.PUBLISH}),
 }
+# These are not ordinary retryable operation failures.  They mean that the
+# authority needed to prove a retry has been lost (or an agent crossed a Git
+# boundary), so an operator/new run is required.
+_NON_RESUMABLE_FAILURES = frozenset({
+    "AGENT_GIT_VIOLATION", "AGENT_COMMITTED", "CLAUDE_COMMITTED",
+    "BASE_MOVED_SINCE_RUN", "TOCTOU_FAILURE", "RESUME_INTEGRITY_FAILURE",
+    "RESUME_REQUIRES_OPERATOR",
+    "STEP_WRITE_SET_VIOLATION", "STEP_CONTRACT_DRIFT", "AGENT_NO_CHANGE",
+    "REVISION_SCOPE_VIOLATION",
+})
 _RESUMABLE_STATUSES = frozenset({"failed", "interrupted"})
 # Status a claimed resume starts in (the orchestrator refines it afterwards).
 PHASE_STATUS = {
+    ResumePhase.CONTEXT: "planning",
+    ResumePhase.PLANNER: "planning",
+    ResumePhase.PLAN_APPROVAL: "awaiting_plan_approval",
+    ResumePhase.WORKTREE_SETUP: "preparing",
     ResumePhase.INITIAL_STEP: "implementing",
+    ResumePhase.CHECKS_C01: "validating",
     ResumePhase.CLAUDE_C01: "revising",
+    ResumePhase.FINAL_CHECKS_C01: "revalidating",
     ResumePhase.REVIEWER_C01: "reviewing",
     ResumePhase.REPAIR_PLANNER: "planning",
     ResumePhase.REPAIR_STEP: "implementing",
+    ResumePhase.CHECKS_C02: "revalidating",
     ResumePhase.CLAUDE_C02: "revising",
+    ResumePhase.FINAL_CHECKS_C02: "revalidating",
     ResumePhase.REVIEWER_C02: "reviewing",
+    ResumePhase.COMMIT: "approved",
     ResumePhase.PUBLISH: "publishing",
 }
 
@@ -269,8 +313,18 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
     """The single primary resume action shown for *checkpoint*."""
 
     phase = checkpoint.phase
+    if phase is ResumePhase.CONTEXT:
+        return "Retry context"
+    if phase is ResumePhase.PLANNER:
+        return "Retry planner"
+    if phase is ResumePhase.PLAN_APPROVAL:
+        return "Resume plan approval"
+    if phase is ResumePhase.WORKTREE_SETUP:
+        return "Retry workspace setup"
     if phase is ResumePhase.INITIAL_STEP:
         return f"Retry {checkpoint.step_id}"
+    if phase in {ResumePhase.CHECKS_C01, ResumePhase.FINAL_CHECKS_C01}:
+        return "Retry checks C01"
     if phase is ResumePhase.REPAIR_STEP:
         return f"Retry C02 {checkpoint.step_id}"
     if phase is ResumePhase.CLAUDE_C01:
@@ -281,6 +335,10 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         return "Retry reviewer #1"
     if phase is ResumePhase.REVIEWER_C02:
         return "Retry reviewer #2"
+    if phase in {ResumePhase.CHECKS_C02, ResumePhase.FINAL_CHECKS_C02}:
+        return "Retry checks C02"
+    if phase is ResumePhase.COMMIT:
+        return "Retry commit"
     if phase is ResumePhase.REPAIR_PLANNER:
         return "Retry repair planner"
     return "Retry publish"
@@ -388,6 +446,9 @@ class ResumeInfo:
     phase: str | None = None
     label: str | None = None
     reason: str | None = None
+    expected_tree: str | None = None
+    cycle: int | None = None
+    step_id: str | None = None
 
 
 def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
@@ -410,18 +471,25 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
         return ResumeInfo(False, reason="resume checkpoint is invalid")
     if checkpoint is None:
         return ResumeInfo(False, reason="no resume checkpoint")
-    if status == "failed":
-        failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-        allowed = RESUMABLE_FAILURES.get(str(failure.get("reason")))
-        if allowed is None or checkpoint.phase not in allowed:
-            return ResumeInfo(False, reason="failure is not resumable")
-    approval = _read_json(directory / "plan_approval.json", 16 * 1024)
-    if not isinstance(approval, dict) or approval.get("decision") != "APPROVE":
-        return ResumeInfo(False, reason="plan approval was not APPROVE")
-    worktree = state.get("worktree")
-    if not isinstance(worktree, str) or not Path(worktree).is_dir():
-        return ResumeInfo(False, reason="run worktree is missing")
-    return ResumeInfo(True, checkpoint.phase.value, resume_label(checkpoint))
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    if str(failure.get("reason")) in _NON_RESUMABLE_FAILURES:
+        return ResumeInfo(False, reason="failure requires operator intervention")
+    # Requirements are deliberately phase-specific.  In particular, context
+    # and planner failures are resumable before an approval or worktree exists.
+    if checkpoint.phase.value not in {phase.value for phase in _PRE_APPROVAL_PHASES}:
+        approval = _read_json(directory / "plan_approval.json", 16 * 1024)
+        auto_selected = (directory / "execution_selection.json").is_file()
+        if (not isinstance(approval, dict) or approval.get("decision") != "APPROVE") and not auto_selected:
+            return ResumeInfo(False, reason="plan approval was not APPROVE")
+    if checkpoint.phase not in _NO_WORKTREE_PHASES:
+        worktree = state.get("worktree")
+        if not isinstance(worktree, str) or not Path(worktree).is_dir():
+            return ResumeInfo(False, reason="run worktree is missing")
+    return ResumeInfo(
+        True, checkpoint.phase.value, resume_label(checkpoint),
+        expected_tree=checkpoint.expected_tree_sha, cycle=checkpoint.cycle,
+        step_id=checkpoint.step_id,
+    )
 
 
 class ResumeError(RuntimeError):

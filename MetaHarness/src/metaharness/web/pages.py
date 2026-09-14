@@ -921,13 +921,22 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     action = ""
     if resume.get("resumable"):
         label = _e(resume.get("label"))
+        checkpoint = resume.get("phase") or "—"
+        checkpoint_detail = (
+            f'<p class="small mono">RESUME FROM {_e(checkpoint)}'
+            f' · tree={_e(resume.get("expected_tree") or "—")}'
+            f' · cycle={_e(resume.get("cycle") or "—")}'
+            f' · step={_e(resume.get("step_id") or "—")}</p>'
+        )
         button = (
             f'<form action="/runs/{_e(run.get("run_id"))}/resume" method="post">'
             f'<input type="hidden" name="_token" value="{_e(token)}">'
             f'<button class="resume" type="submit">{label}</button></form>'
             if token else f'<p><strong>{label}</strong></p>'
         )
-        action = f'<p class="label">NEXT ACTION</p>{button}'
+        action = f'<p class="label">NEXT ACTION</p>{checkpoint_detail}{button}'
+    elif resume.get("reason"):
+        action = f'<p class="danger small">RESUME REFUSED: {_e(resume.get("reason"))}</p>'
     detail = failure.get("detail")
     return (
         '<div class="card fail failure-card"><p class="label">FAILED</p>'

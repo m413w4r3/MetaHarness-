@@ -157,6 +157,7 @@ from .resume import (
     resume_label,
     write_checkpoint,
 )
+from . import resume as resume_module
 from .usage import add_usage, empty_usage, normalize_usage, phase_usage_summary, read_usage_artifact
 from .redaction import config_secret_values, redact, redact_file
 from .profiles import (
@@ -687,7 +688,17 @@ _GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _ATTEMPT_ARTIFACTS = (
     "agent.prompt.txt", "agent.events.jsonl", "agent.stderr.log", "agent.final.md",
     "agent.result.json", "step.json", TOKEN_DIAGNOSTICS_NAME, "tree_after_failure.txt",
+    "usage.json", "results.json",
 )
+_PLANNER_ATTEMPT_ARTIFACTS = (
+    "planner.request.txt", "planner.raw.md", "task_plan_v2.json", "task_plan.json",
+    "implementation_bundle.json", "planner.usage.json",
+)
+_REVIEW_ATTEMPT_ARTIFACTS = (
+    "reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json", "review.json",
+)
+_CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "evidence.json")
+_REVISION_ATTEMPT_ARTIFACTS = _AGENT_ARTIFACTS + ("tree_after_failure.txt",)
 _PLANNER_CONVERSATION = "planner.conversation.json"
 
 
@@ -743,6 +754,9 @@ class _ResumedRun:
     repair_bundle_sha: str | None = None
     c02_steps: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     c02_revision: _PersistedRevision | None = None
+    c02_evidence: EvidenceBundle | None = None
+    c02_review: ReviewResult | None = None
+    existing_commit_sha: str | None = None
 
 
 def _read_json_artifact(path: Path, limit: int = 16 * 1024 * 1024) -> Any:
@@ -793,10 +807,10 @@ def _record_failure_tree(artifact_dir: Path, worktree: Path) -> None:
         pass
 
 
-def _archive_attempt(directory: Path) -> None:
+def _archive_attempt(directory: Path, *, names: tuple[str, ...] = _ATTEMPT_ARTIFACTS) -> None:
     """Move a failed attempt's artifacts aside before retrying that operation."""
 
-    present = [name for name in _ATTEMPT_ARTIFACTS if (directory / name).exists()]
+    present = [name for name in names if (directory / name).exists()]
     if not present:
         return
     root = directory / "attempts"
@@ -807,6 +821,26 @@ def _archive_attempt(directory: Path) -> None:
     target.mkdir(parents=True)
     for name in present:
         os.replace(directory / name, target / name)
+
+
+def _archive_attempt_tree(directory: Path) -> None:
+    """Archive every file of a retryable operation, including dynamic logs."""
+
+    if not directory.is_dir():
+        return
+    files = [path for path in directory.rglob("*") if path.is_file() and "attempts" not in path.parts]
+    if not files:
+        return
+    root = directory / "attempts"
+    index = 1
+    while (root / f"{index:02d}").exists():
+        index += 1
+    target = root / f"{index:02d}"
+    for source in files:
+        relative = source.relative_to(directory)
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
 
 
 def _reusable_pre_checks(artifact_dir: Path, tree: str) -> tuple[dict[str, Any], str] | None:
@@ -1321,6 +1355,13 @@ class Orchestrator:
             options_sha256 = write_run_options(run_dir, run_options)
             store = RunStateStore(run_dir / "state.json")
             store.initialize(selected_run_id)
+            # This is the first durable boundary.  It intentionally carries
+            # no Git/plan identity yet: context and repository discovery are
+            # themselves resumable operations.
+            if run_options.protocol == "v2":
+                resume_module.write_checkpoint(
+                    run_dir, ResumeCheckpoint(ResumePhase.CONTEXT, 1, None, None, None, None, None)
+                )
             # All downstream methods use this frozen per-run view.  The
             # caller's HarnessConfig object is never mutated.
             self._run_options = run_options
@@ -1333,6 +1374,7 @@ class Orchestrator:
                 base_ref=self.config.base_ref,
                 run_options_sha256=options_sha256,
                 run_options=run_options.to_dict(),
+                run_options_explicit=not legacy_run_options,
                 execution={
                     "planner": {
                         "profile_id": selected_planner.id,
@@ -1393,7 +1435,10 @@ class Orchestrator:
         if self.config.require_clean_base:
             assert_clean(repo)
         base_sha = resolve_commit(repo, self.config.base_ref)
-        store.update(status=RunStatus.CREATED, repo=str(repo), base_sha=base_sha)
+        store.update(
+            status=RunStatus.CREATED, repo=str(repo), base_sha=base_sha,
+            planning_protocol=self.config.planning.protocol,
+        )
 
         try:
             repository_reference = build_repository_reference(
@@ -1411,8 +1456,24 @@ class Orchestrator:
             json.dumps(repository_reference_dict(repository_reference), indent=2) + "\n",
         )
 
-        context_bundle = build_context(repo, base_sha, spec, self.config.context)
-        context = render_context(context_bundle)
+        # Context is a durable boundary of its own.  The checkpoint is moved
+        # before the planner call and remains there when context construction
+        # fails or is interrupted.
+        base_tree_sha = resolve_tree(repo, base_sha)
+        if self.config.planning.protocol == "v2":
+            self._write_phase_checkpoint(
+                run_dir, ResumePhase.CONTEXT, head=base_sha, tree=base_tree_sha
+            )
+        try:
+            context_bundle = build_context(repo, base_sha, spec, self.config.context)
+            context = render_context(context_bundle)
+        except Exception:
+            if self.config.planning.protocol == "v2":
+                self._write_phase_checkpoint(
+                    run_dir, ResumePhase.CONTEXT, head=base_sha, tree=base_tree_sha
+                )
+            raise
+        atomic_write_text(run_dir / "context.txt", context)
         store.update(
             status=RunStatus.PLANNING,
             context={
@@ -1424,6 +1485,10 @@ class Orchestrator:
             },
         )
 
+        if self.config.planning.protocol == "v2":
+            self._write_phase_checkpoint(
+                run_dir, ResumePhase.PLANNER, head=base_sha, tree=base_tree_sha
+            )
         if self.config.planning.protocol == "v2":
             return self._execute_v2(
                 store, run_dir, run_id, spec, repo, base_sha, context,
@@ -1804,6 +1869,8 @@ class Orchestrator:
         context: str,
         repository_reference: RepositoryReference,
         planner_profile: ModelProfile,
+        existing_plan: TaskPlanV2 | None = None,
+        existing_info: WorktreeInfo | None = None,
     ) -> "_V2Setup | RunResult":
         """Plan, obtain the approved selection, create the worktree and set up.
 
@@ -1822,17 +1889,31 @@ class Orchestrator:
             p for p in profiles_for_config(self.config).values()
             if ExecutionRole.REVIEWER in p.roles
         )
-        planner = PlannerV2(
-            self._planner_client or _chat_client(build_llm_endpoint(planner_profile), self._runtime_environment),
-            implementer_ids=frozenset(p.id for p in implementers),
-            reviewer_ids=frozenset(p.id for p in reviewers),
-            implementer_profiles=implementers,
-            reviewer_profiles=reviewers,
-            repository_reference=repository_reference,
-            planning=self.config.planning,
-        )
-        plan = planner.plan(spec, context, artifacts_dir=run_dir)
-        _persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
+        if existing_plan is None:
+            planner = PlannerV2(
+                self._planner_client or _chat_client(build_llm_endpoint(planner_profile), self._runtime_environment),
+                implementer_ids=frozenset(p.id for p in implementers),
+                reviewer_ids=frozenset(p.id for p in reviewers),
+                implementer_profiles=implementers,
+                reviewer_profiles=reviewers,
+                repository_reference=repository_reference,
+                planning=self.config.planning,
+            )
+            try:
+                plan = planner.plan(spec, context, artifacts_dir=run_dir)
+            except Exception:
+                # The failed planner answer is deliberately left in place and
+                # will be archived by the next planner attempt.
+                self._write_phase_checkpoint(
+                    run_dir, ResumePhase.PLANNER, head=base_sha,
+                    tree=resolve_tree(repo, base_sha),
+                )
+                raise
+            _persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
+        else:
+            # Resume of PLANNER has already produced and durably parsed this
+            # plan.  Re-entering setup must never call the planner again.
+            plan = existing_plan
         store.update(
             status=RunStatus.PLANNING,
             planning_protocol="v2",
@@ -1874,6 +1955,10 @@ class Orchestrator:
         except (ApprovalError, V2PlanParseError, OSError, UnicodeError) as exc:
             raise ApprovalError(f"invalid v2 plan artifacts: {exc}") from exc
         store.update(status=RunStatus.PLANNING, plan_identity=asdict(plan_identity))
+        self._write_phase_checkpoint(
+            run_dir, ResumePhase.PLAN_APPROVAL, head=base_sha,
+            tree=resolve_tree(repo, base_sha), plan_identity=plan_identity,
+        )
 
         if self.config.approval.require_plan_approval:
             store.update(status=RunStatus.AWAITING_PLAN_APPROVAL)
@@ -1972,17 +2057,25 @@ class Orchestrator:
         store.update(status=RunStatus.PLANNING, execution=execution_state,
                      plan_identity=asdict(durable_identity))
         base_tree_sha = resolve_tree(repo, base_sha)
+        self._write_phase_checkpoint(
+            run_dir, ResumePhase.WORKTREE_SETUP, head=base_sha,
+            tree=base_tree_sha, plan_identity=durable_identity,
+            execution_selection_sha256=durable_identity.execution_sha256,
+        )
         # Plan approval complete: the next operation is the first Luna step.
         checkpoint = self._initial_checkpoint(plan, base_sha, base_tree_sha, durable_identity)
         if checkpoint is not None:
             write_checkpoint(run_dir, checkpoint)
 
         branch = f"harness/{_slug(plan.title)}/{run_id}"
-        info = create_run_worktree(
-            repo, base_ref=base_sha, branch=branch,
-            worktree_path=self.config.worktrees_root / run_id,
-            require_clean_base=self.config.require_clean_base,
-        )
+        if existing_info is None:
+            info = create_run_worktree(
+                repo, base_ref=base_sha, branch=branch,
+                worktree_path=self.config.worktrees_root / run_id,
+                require_clean_base=self.config.require_clean_base,
+            )
+        else:
+            info = existing_info
         store.update(status=RunStatus.WORKTREE_READY, branch=info.branch,
                      worktree=str(info.worktree), base_sha=info.base_sha)
         ownership_before = _git_ownership(repo, info.worktree)
@@ -2022,6 +2115,45 @@ class Orchestrator:
             identity.execution_sha256, identity,
         )
 
+    @staticmethod
+    def _write_phase_checkpoint(
+        run_dir: Path,
+        phase: ResumePhase,
+        *,
+        head: str | None,
+        tree: str | None,
+        plan_identity: PlanIdentity | None = None,
+        execution_selection_sha256: str | None = None,
+        step_id: str | None = None,
+        cycle: int | None = None,
+        repair_bundle_sha256: str | None = None,
+    ) -> None:
+        """Write a new-schema boundary without changing the old hook API."""
+
+        try:
+            record = read_checkpoint_record(run_dir)
+        except ResumeCheckpointError:
+            # A malformed checkpoint is evidence of lost authority.  Do not
+            # silently replace it with a new boundary; the next resume must
+            # remain fail-closed and expose the corruption to the operator.
+            raise
+        if record is None:
+            return
+        previous = record[0]
+        identity = plan_identity if plan_identity is not None else previous.plan_identity
+        execution = (
+            execution_selection_sha256
+            if execution_selection_sha256 is not None else previous.execution_selection_sha256
+        )
+        resume_module.write_checkpoint(
+            run_dir,
+            ResumeCheckpoint(
+                phase, cycle or (2 if phase_index(phase) >= phase_index(ResumePhase.REPAIR_PLANNER) else 1),
+                step_id, head, tree, execution, identity,
+                repair_bundle_sha256 or previous.repair_bundle_sha256,
+            ),
+        )
+
     def _checkpoint(
         self,
         run_dir: Path,
@@ -2042,7 +2174,7 @@ class Orchestrator:
         try:
             record = read_checkpoint_record(run_dir)
         except ResumeCheckpointError:
-            record = None
+            raise
         if record is None or record[1] != "pending" or head is None or tree is None:
             return
         previous = record[0]
@@ -2069,6 +2201,7 @@ class Orchestrator:
         repository_reference: RepositoryReference,
         *,
         resumed: "_ResumedRun | None" = None,
+        prepared: "_V2Setup | RunResult | None" = None,
     ) -> RunResult:
         """Execute a v2 bundle: one worktree, fresh Codex process per step.
 
@@ -2086,7 +2219,7 @@ class Orchestrator:
         planner_profile_id = store.load()["execution"]["planner"]["profile_id"]
         planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
         if resumed is None:
-            prepared = self._prepare_v2_run(
+            prepared = prepared or self._prepare_v2_run(
                 store, run_dir, run_id, spec, repo, base_sha, context,
                 repository_reference, planner_profile,
             )
@@ -2192,9 +2325,9 @@ class Orchestrator:
         revision_result = None
         revision_report_c01 = ""
         if revision_enabled:
-            if at <= phase_index(ResumePhase.CLAUDE_C01):
+            if at <= phase_index(ResumePhase.CLAUDE_C01) and phase is not ResumePhase.CHECKS_C01:
                 if resumed is not None and phase is ResumePhase.CLAUDE_C01:
-                    _archive_attempt(run_dir / "revision")
+                    _archive_attempt(run_dir / "revision", names=_REVISION_ATTEMPT_ARTIFACTS)
                 try:
                     revision_result, revision_error = self._run_v2_revision_cycle(
                         store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
@@ -2228,11 +2361,20 @@ class Orchestrator:
                 status=RunStatus.REVALIDATING if revision_enabled else RunStatus.VALIDATING,
                 current_step=None,
             )
-            evidence = self._final_evidence(
-                info.worktree, base_sha, run_dir,
-                check_failures_hard=not revision_enabled,
-                reuse=resumed is not None and phase is ResumePhase.REVIEWER_C01,
-            )
+            try:
+                if resumed is not None and phase is ResumePhase.CHECKS_C01:
+                    _archive_attempt(run_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
+                evidence = self._final_evidence(
+                    info.worktree, base_sha, run_dir,
+                    check_failures_hard=not revision_enabled,
+                    reuse=resumed is not None and phase is ResumePhase.REVIEWER_C01,
+                )
+            except Exception:
+                self._write_phase_checkpoint(
+                    run_dir, ResumePhase.CHECKS_C01, cycle=1,
+                    head=base_sha, tree=candidate_tree_sha(info.worktree),
+                )
+                raise
             store.update(status=RunStatus.VALIDATING, checks=_check_payload(evidence),
                          staged_tree_sha=evidence.staged_tree_sha,
                          changed_files=list(evidence.changed_files),
@@ -2242,6 +2384,10 @@ class Orchestrator:
                                   any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES) or
                                   item.startswith("CHECK_MUTATED:")]
             if integrity_failures:
+                self._write_phase_checkpoint(
+                    run_dir, ResumePhase.CHECKS_C01, cycle=1,
+                    head=base_sha, tree=evidence.staged_tree_sha,
+                )
                 return self._v2_failed(store, run_dir, integrity_failures[0].split(":", 1)[0], None,
                                         ", ".join(integrity_failures))
             # Final checks complete: the next operation is reviewer #1.
@@ -2250,6 +2396,8 @@ class Orchestrator:
             reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
             store.update(status=RunStatus.REVIEWING)
             try:
+                if resumed is not None and phase is ResumePhase.REVIEWER_C01:
+                    _archive_attempt(run_dir, names=_REVIEW_ATTEMPT_ARTIFACTS)
                 review = self._run_v2_reviewer(
                     reviewer=reviewer, spec=spec, context=context,
                     repository_reference=repository_reference, evidence=evidence,
@@ -2356,6 +2504,10 @@ class Orchestrator:
                     approved_tree_sha=approved_tree,
                     current_step=None,
                 )
+                self._write_phase_checkpoint(
+                    run_dir, ResumePhase.COMMIT, cycle=2, head=base_sha,
+                    tree=approved_tree,
+                )
                 commit_fn = commit_reviewed_tree
                 commit_sha = commit_fn(
                     info.worktree, tree_sha=approved_tree, parent_sha=base_sha,
@@ -2405,6 +2557,10 @@ class Orchestrator:
         )
         # Keep the sole named commit primitive in the legacy guarded path;
         # this alias still resolves to the same GitOps implementation.
+        self._write_phase_checkpoint(
+            run_dir, ResumePhase.COMMIT, cycle=1, head=base_sha,
+            tree=approved_tree,
+        )
         commit_fn = commit_reviewed_tree
         commit_sha = commit_fn(info.worktree, tree_sha=approved_tree,
                                parent_sha=base_sha, subject=_commit_subject(plan.title),
@@ -2711,6 +2867,11 @@ class Orchestrator:
         }))
         reused = _reusable_pre_checks(artifact_dir, tree_before)
         if reused is None:
+            self._write_phase_checkpoint(
+                run_dir,
+                ResumePhase.CHECKS_C01 if cycle == 1 else ResumePhase.CHECKS_C02,
+                cycle=cycle, head=base_sha, tree=tree_before,
+            )
             store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
             pre_evidence = collect_evidence(
                 info.worktree, base_sha, self.config,
@@ -2859,6 +3020,7 @@ class Orchestrator:
         )
         tree_before = candidate_tree_sha(info.worktree)
         if at <= phase_index(ResumePhase.REPAIR_PLANNER):
+            _archive_attempt_tree(repair_dir)
             current_state = _json_text({
                 "BASE_SHA": base_sha,
                 "HEAD_SHA": current_head(info.worktree),
@@ -2987,9 +3149,11 @@ class Orchestrator:
                 step_id=following, head=base_sha, tree=outcome.tree_after,
             )
         self._update_v2_usage(store, run_dir)
-        if claude_revision_enabled and at <= phase_index(ResumePhase.CLAUDE_C02):
+        if claude_revision_enabled and at <= phase_index(ResumePhase.CLAUDE_C02) and (
+            start is None or start.phase is not ResumePhase.CHECKS_C02
+        ):
             if start is not None and start.phase is ResumePhase.CLAUDE_C02:
-                _archive_attempt(run_dir / "revision" / "C02")
+                _archive_attempt(run_dir / "revision" / "C02", names=_REVISION_ATTEMPT_ARTIFACTS)
             cycle_2_revision, revision_error = self._run_v2_revision_cycle(
                 store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
                 base_tree_sha=resolve_tree(repo, base_sha), spec=spec, plan=repair_plan,
@@ -3016,10 +3180,20 @@ class Orchestrator:
         checks_dir = run_dir / "checks" / "C02"
         checks_dir.mkdir(parents=True, exist_ok=True)
         store.update(status=RunStatus.REVALIDATING, current_step=None)
-        evidence = self._final_evidence(
-            info.worktree, base_sha, checks_dir, check_failures_hard=False,
-            reuse=start is not None and start.phase is ResumePhase.REVIEWER_C02,
-        )
+        try:
+            if start is not None and start.phase is ResumePhase.CHECKS_C02:
+                _archive_attempt(checks_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
+            evidence = self._final_evidence(
+                info.worktree, base_sha, checks_dir, check_failures_hard=False,
+                reuse=start is not None and start.phase is ResumePhase.REVIEWER_C02,
+            )
+        except Exception:
+            self._write_phase_checkpoint(
+                run_dir, ResumePhase.CHECKS_C02, cycle=2, head=base_sha,
+                tree=candidate_tree_sha(info.worktree),
+                repair_bundle_sha256=repair_bundle_sha,
+            )
+            raise
         store.update(
             status=RunStatus.REVALIDATING, checks=_check_payload(evidence),
             staged_tree_sha=evidence.staged_tree_sha,
@@ -3029,6 +3203,11 @@ class Orchestrator:
         )
         integrity_failures = _hard_integrity_failures(evidence)
         if integrity_failures:
+            self._write_phase_checkpoint(
+                run_dir, ResumePhase.CHECKS_C02, cycle=2,
+                head=base_sha, tree=evidence.staged_tree_sha,
+                repair_bundle_sha256=repair_bundle_sha,
+            )
             raise OrchestrationError(integrity_failures[0].split(":", 1)[0])
         # C02 final checks complete: the next operation is reviewer #2.
         self._checkpoint(run_dir, ResumePhase.REVIEWER_C02, head=base_sha,
@@ -3053,6 +3232,8 @@ class Orchestrator:
         # Reviewer #2 checks original SPEC <-> original approved architecture
         # <-> bounded repair <-> final cumulative diff, with every report.
         try:
+            if start is not None and start.phase is ResumePhase.REVIEWER_C02:
+                _archive_attempt(run_dir / "review" / "C02", names=_REVIEW_ATTEMPT_ARTIFACTS)
             review = self._run_v2_reviewer(
                 reviewer=reviewer, spec=spec, context=context,
                 repository_reference=repository_reference, evidence=evidence,
@@ -3277,6 +3458,7 @@ class Orchestrator:
         base_branch = self.config.base_ref
         outcome = None
         try:
+            _archive_attempt(run_dir, names=("publish.json",))
             if status_porcelain(info.worktree):
                 raise GitError("worktree is not clean before push")
             if current_head(info.worktree) != commit_sha:
@@ -3416,7 +3598,7 @@ class Orchestrator:
         except (OSError, ValueError) as exc:
             raise ResumeError(f"run state is unreadable: {exc}") from exc
         try:
-            self._legacy_run_options = not (run_dir / "run_options.json").is_file()
+            self._legacy_run_options = not bool(state.get("run_options_explicit", False))
             options, _ = legacy_or_durable_run_options(
                 self.config,
                 run_dir,
@@ -3450,6 +3632,14 @@ class Orchestrator:
             "previous_status": state.get("status"),
             "previous_failure": state.get("failure"),
         }
+        if checkpoint.phase in {
+            ResumePhase.CONTEXT, ResumePhase.PLANNER,
+            ResumePhase.PLAN_APPROVAL, ResumePhase.WORKTREE_SETUP,
+        }:
+            return self._resume_pre_execution(
+                store, run_dir, selected, state, checkpoint, record,
+                on_claimed=on_claimed,
+            )
         try:
             resumed = self._validate_resume(run_dir, state, checkpoint)
         except (ResumeIntegrityError, ResumeRequiresOperatorError) as exc:
@@ -3483,6 +3673,25 @@ class Orchestrator:
                     repository_reference=resumed.repository_reference,
                     cycle=checkpoint.cycle,
                 )
+            if checkpoint.phase is ResumePhase.COMMIT:
+                commit_sha = resumed.existing_commit_sha
+                if commit_sha is None:
+                    plan_for_commit = resumed.repair_plan if checkpoint.cycle == 2 and resumed.repair_plan else resumed.plan
+                    commit_fn = commit_reviewed_tree
+                    commit_sha = commit_fn(
+                        resumed.info.worktree,
+                        tree_sha=checkpoint.expected_tree_sha,
+                        parent_sha=resumed.info.base_sha,
+                        subject=_commit_subject(plan_for_commit.title),
+                        body=f"MetaHarness-Run: {selected}",
+                    )
+                return self._complete_commit(
+                    store=store, run_dir=run_dir, info=resumed.info,
+                    approved_tree=checkpoint.expected_tree_sha,
+                    commit_sha=commit_sha,
+                    repository_reference=resumed.repository_reference,
+                    cycle=checkpoint.cycle,
+                )
             return self._execute_v2(
                 store, run_dir, selected, resumed.spec, resumed.info.source_repo,
                 resumed.info.base_sha, resumed.context, resumed.repository_reference,
@@ -3508,6 +3717,224 @@ class Orchestrator:
                 **self._closing_step_fields(store, "failed"),
             )
             return RunResult(run_dir, RunStatus.FAILED, failed)
+
+    def _resume_pre_execution(
+        self,
+        store: RunStateStore,
+        run_dir: Path,
+        run_id: str,
+        state: Mapping[str, Any],
+        checkpoint: ResumeCheckpoint,
+        record: Mapping[str, Any],
+        *,
+        on_claimed: Callable[[Path], None] | None = None,
+    ) -> RunResult:
+        """Resume context/planning/approval/setup without requiring later artifacts."""
+
+        def refuse(message: str) -> NoReturn:
+            raise ResumeIntegrityError(message)
+
+        claimed = store.transition_if(
+            state.get("status", RunStatus.FAILED), state.get("updated_at"),
+            status=PHASE_STATUS[checkpoint.phase], failure=None, current_step=None,
+            resume={**record, "status": "running"},
+        )
+        if claimed is None:
+            raise ResumeError("run state changed while the resume was validated")
+        if on_claimed is not None:
+            on_claimed(run_dir)
+        try:
+            repo = git_root(self.config.repo)
+            if state.get("repo") not in {None, str(repo), str(self.config.repo)}:
+                refuse("the configured repository is not the run repository")
+            spec = (run_dir / "spec.md").read_text(encoding="utf-8")
+            base_sha = state.get("base_sha")
+            if base_sha is None:
+                base_sha = resolve_commit(repo, self.config.base_ref)
+                base_tree = resolve_tree(repo, base_sha)
+                store.update(status=RunStatus.PLANNING, repo=str(repo), base_sha=base_sha)
+            else:
+                if not _is_object_id(base_sha):
+                    refuse("run base SHA is invalid")
+                base_tree = resolve_tree(repo, base_sha)
+            if checkpoint.expected_head_sha is not None and checkpoint.expected_head_sha != base_sha:
+                refuse("the checkpoint base SHA changed")
+            if checkpoint.expected_tree_sha is not None and checkpoint.expected_tree_sha != base_tree:
+                refuse("the checkpoint base tree changed")
+            reference = _read_repository_reference(run_dir)
+            if (run_dir / "repository_reference.json").exists() and reference is None:
+                refuse("repository reference artifact is corrupted")
+            if reference is None:
+                if checkpoint.phase is not ResumePhase.CONTEXT:
+                    refuse("repository reference artifact is missing")
+                try:
+                    reference = build_repository_reference(repo, base_sha=base_sha, config=self.config.repository)
+                except GitError:
+                    reference = RepositoryReference(self.config.repository.remote, None, base_sha, None)
+                atomic_write_text(run_dir / "repository_reference.json", json.dumps(
+                    repository_reference_dict(reference), indent=2
+                ) + "\n")
+            if reference.base_sha != base_sha:
+                refuse("the base SHA changed for this run")
+
+            context_path = run_dir / "context.txt"
+            if checkpoint.phase is ResumePhase.CONTEXT:
+                context_bundle = build_context(repo, base_sha, spec, self.config.context)
+                context = render_context(context_bundle)
+                atomic_write_text(context_path, context)
+                store.update(status=RunStatus.PLANNING, context={
+                    "base_sha": context_bundle.base_sha,
+                    "locator_used": context_bundle.locator_used,
+                    "locator_warning": context_bundle.locator_warning,
+                    "omitted": list(context_bundle.omitted),
+                    "total_bytes": context_bundle.total_bytes,
+                })
+                self._write_phase_checkpoint(run_dir, ResumePhase.PLANNER,
+                                             head=base_sha, tree=base_tree)
+                checkpoint = ResumeCheckpoint(
+                    ResumePhase.PLANNER, 1, None, base_sha, base_tree, None, None
+                )
+            context = context_path.read_text(encoding="utf-8")
+            planner_profile_id = (
+                state.get("execution", {}).get("planner", {}).get("profile_id")
+                if isinstance(state.get("execution"), Mapping)
+                and isinstance(state.get("execution", {}).get("planner"), Mapping)
+                else None
+            )
+            if not isinstance(planner_profile_id, str):
+                refuse("run planner profile is missing")
+            planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
+            profiles = profiles_for_config(self.config).values()
+            if checkpoint.phase is ResumePhase.PLANNER:
+                _archive_attempt(run_dir, names=_PLANNER_ATTEMPT_ARTIFACTS)
+                planner = PlannerV2(
+                    self._planner_client or _chat_client(
+                        build_llm_endpoint(planner_profile), self._runtime_environment
+                    ),
+                    implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
+                    reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
+                    implementer_profiles=tuple(p for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
+                    reviewer_profiles=tuple(p for p in profiles if ExecutionRole.REVIEWER in p.roles),
+                    repository_reference=reference, planning=self.config.planning,
+                )
+                plan = planner.plan(spec, context, artifacts_dir=run_dir)
+                _persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
+            else:
+                raw = (run_dir / "planner.raw.md").read_text(encoding="utf-8")
+                plan = parse_task_plan_v2(
+                    raw,
+                    implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
+                    reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
+                )
+                if checkpoint.plan_identity is not None:
+                    try:
+                        if compute_plan_identity_from_run(run_dir) != checkpoint.plan_identity:
+                            refuse("plan identity no longer matches")
+                    except (ApprovalError, OSError, UnicodeError) as exc:
+                        refuse(f"plan artifacts are invalid: {exc}")
+            if checkpoint.phase in {ResumePhase.PLAN_APPROVAL, ResumePhase.WORKTREE_SETUP}:
+                try:
+                    _bundle, bundle_sha = validate_implementation_bundle(
+                        run_dir, expected_step_ids=[step.id for step in plan.steps]
+                    )
+                    identity = compute_plan_identity_from_run(run_dir)
+                except (ApprovalError, V2PlanParseError, OSError, UnicodeError) as exc:
+                    refuse(f"plan artifacts are invalid: {exc}")
+                if checkpoint.plan_identity is not None and identity != checkpoint.plan_identity:
+                    refuse("plan identity no longer matches")
+                recorded_identity = state.get("plan_identity")
+                if isinstance(recorded_identity, Mapping):
+                    try:
+                        if identity != plan_identity_from_mapping(recorded_identity):
+                            refuse("plan identity no longer matches state")
+                    except ResumeCheckpointError as exc:
+                        refuse(str(exc))
+                if checkpoint.phase is ResumePhase.WORKTREE_SETUP:
+                    try:
+                        if self._run_options.claude_revision_enabled or self._run_options.repair_cycles == 1:
+                            _selection, selection_sha = read_execution_selection_v4_with_sha256(run_dir)
+                            validate_execution_selection_v4(self.config, _selection)
+                        else:
+                            _selection, selection_sha = read_execution_selection_v3_with_sha256(run_dir)
+                            validate_execution_selection_v3(self.config, _selection)
+                    except (ExecutionSelectionError, ProfileError, OSError, UnicodeError) as exc:
+                        refuse(f"execution selection is invalid: {exc}")
+                    if selection_sha != checkpoint.execution_selection_sha256:
+                        refuse("execution selection hash changed")
+                    if self.config.approval.require_plan_approval:
+                        try:
+                            approval = read_plan_approval(run_dir, expected_identity=identity)
+                        except ApprovalError as exc:
+                            refuse(f"approval artifact is invalid: {exc}")
+                        if approval is None or approval.decision is not ApprovalDecision.APPROVE:
+                            refuse("approval was changed or is no longer APPROVE")
+            existing_info = self._existing_setup_worktree(
+                repo, run_dir, run_id, plan, base_sha, self.config.worktrees_root,
+                self.config.base_ref,
+            ) if checkpoint.phase is ResumePhase.WORKTREE_SETUP else None
+            if existing_info is not None:
+                _archive_attempt_tree(run_dir / "setup")
+            prepared = self._prepare_v2_run(
+                store, run_dir, run_id, spec, repo, base_sha, context,
+                reference, planner_profile, existing_plan=plan,
+                existing_info=existing_info,
+            )
+            if isinstance(prepared, RunResult):
+                return prepared
+            return self._execute_v2(
+                store, run_dir, run_id, spec, repo, base_sha, context, reference,
+                prepared=prepared,
+            )
+        except ResumeRequiresOperatorError as exc:
+            failed = store.record_failure(exc.code, redact(str(exc), self._secrets),
+                                          **self._closing_step_fields(store, "failed"))
+            return RunResult(run_dir, RunStatus.FAILED, failed)
+        except KeyboardInterrupt:
+            interrupted = store.update(status=RunStatus.INTERRUPTED,
+                                       failure={"reason": "INTERRUPTED"},
+                                       **self._closing_step_fields(store, "interrupted"))
+            return RunResult(run_dir, RunStatus.INTERRUPTED, interrupted)
+        except Exception as exc:
+            failed = store.record_failure(_failure_reason(exc), redact(str(exc), self._secrets),
+                                          **self._closing_step_fields(store, "failed"))
+            return RunResult(run_dir, RunStatus.FAILED, failed)
+
+    @staticmethod
+    def _existing_setup_worktree(
+        repo: Path, run_dir: Path, run_id: str, plan: TaskPlanV2, base_sha: str,
+        worktrees_root: Path, base_ref: str,
+    ) -> WorktreeInfo | None:
+        """Return only an exactly recognizable partial setup; never delete/repair it."""
+
+        expected_branch = f"harness/{_slug(plan.title)}/{run_id}"
+        raw_path = None
+        try:
+            raw_state = _read_json_artifact(run_dir / "state.json", 256 * 1024)
+            raw_path = raw_state.get("worktree") if isinstance(raw_state, dict) else None
+            recorded_branch = raw_state.get("branch") if isinstance(raw_state, dict) else None
+        except Exception:
+            recorded_branch = None
+        path = Path(raw_path).expanduser().resolve() if isinstance(raw_path, str) else (
+            Path(worktrees_root).expanduser().resolve() / run_id
+        )
+        if not path.exists():
+            if branch_exists(repo, expected_branch):
+                raise ResumeIntegrityError("expected run branch exists without its worktree")
+            return None
+        if recorded_branch not in {None, expected_branch}:
+            raise ResumeIntegrityError("partial worktree has an unexpected branch")
+        try:
+            if not path.is_dir() or str(path) not in registered_worktrees(repo):
+                raise ResumeIntegrityError("partial worktree is not registered")
+            if not branch_exists(repo, expected_branch) or symbolic_head(path) != f"refs/heads/{expected_branch}":
+                raise ResumeIntegrityError("partial worktree branch is not the expected run branch")
+            if current_head(path) != base_sha or candidate_tree_sha(path) != resolve_tree(repo, base_sha):
+                raise ResumeIntegrityError("partial worktree is not exactly at the run base")
+            if status_porcelain(path):
+                raise ResumeRequiresOperatorError("partial worktree is not clean")
+        except GitError as exc:
+            raise ResumeIntegrityError(f"partial worktree is unreadable: {exc}") from exc
+        return WorktreeInfo(repo, path, expected_branch, base_ref, base_sha)
 
     def _restore_revision_tree(self, resumed: "_ResumedRun") -> None:
         """Undo a failed Claude attempt's in-scope edits, exactly and boundedly."""
@@ -3541,7 +3968,8 @@ class Orchestrator:
         if self.config.planning.protocol != "v2" or state.get("planning_protocol") != "v2":
             refuse("only META PLAN v2 runs can be resumed")
         if not revision_enabled and not repair_enabled and checkpoint.phase not in (
-            ResumePhase.INITIAL_STEP, ResumePhase.REVIEWER_C01, ResumePhase.PUBLISH,
+            ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01,
+            ResumePhase.REVIEWER_C01, ResumePhase.COMMIT, ResumePhase.PUBLISH,
         ):
             refuse("this checkpoint requires revision.enabled")
         try:
@@ -3570,13 +3998,16 @@ class Orchestrator:
             refuse(f"plan artifacts are invalid: {exc}")
         if identity != checkpoint.plan_identity or identity != recorded:
             refuse("plan identity no longer matches")
-        if approval is None or approval.decision is not ApprovalDecision.APPROVE:
-            refuse("plan approval was not APPROVE")
-        if (
-            approval.execution_sha256 != checkpoint.execution_selection_sha256
-            or approval.bundle_sha256 != identity.bundle_sha256
-        ):
-            refuse("the approval does not bind the checkpoint execution selection")
+        if self.config.approval.require_plan_approval:
+            if approval is None or approval.decision is not ApprovalDecision.APPROVE:
+                refuse("plan approval was not APPROVE")
+            if (
+                approval.execution_sha256 != checkpoint.execution_selection_sha256
+                or approval.bundle_sha256 != identity.bundle_sha256
+            ):
+                refuse("the approval does not bind the checkpoint execution selection")
+        elif approval is not None and approval.decision is not ApprovalDecision.APPROVE:
+            refuse("plan approval artifact is not APPROVE")
         # The approved execution selection, against today's configuration.
         try:
             if revision_enabled or repair_enabled:
@@ -3631,7 +4062,21 @@ class Orchestrator:
             if symbolic_head(worktree) != f"refs/heads/{branch}":
                 refuse("worktree HEAD is not the run branch")
             head = current_head(worktree)
-            if head != checkpoint.expected_head_sha:
+            existing_commit: str | None = None
+            if checkpoint.phase is ResumePhase.COMMIT and head != checkpoint.expected_head_sha:
+                # A crash can occur after commit-tree/update-ref and before
+                # state.json.  Reuse only the single exact commit object.
+                try:
+                    if (
+                        commit_parents(repo, head) == (base_sha,)
+                        and resolve_tree(repo, head) == checkpoint.expected_tree_sha
+                    ):
+                        existing_commit = head
+                    else:
+                        refuse("commit exists but is not the exact approved commit")
+                except GitError as exc:
+                    refuse(f"existing commit is unreadable: {exc}")
+            elif head != checkpoint.expected_head_sha:
                 refuse("HEAD moved since the checkpoint")
             if resolve_commit(repo, f"refs/heads/{branch}") != head:
                 refuse("run branch does not point to the worktree HEAD")
@@ -3643,7 +4088,7 @@ class Orchestrator:
                     or checkpoint.expected_tree_sha != state.get("approved_tree_sha")
                 ):
                     refuse("the run commit tree is not the approved tree")
-            elif head != base_sha:
+            elif checkpoint.phase is not ResumePhase.COMMIT and head != base_sha:
                 refuse("an agent-created commit moved the run branch")
             base_tree = resolve_tree(repo, base_sha)
             candidate = candidate_tree_sha(worktree)
@@ -3651,7 +4096,10 @@ class Orchestrator:
             dirty = _status_has_unstaged_or_untracked(status_porcelain(worktree))
             restore: tuple[str, ...] = ()
             if candidate != checkpoint.expected_tree_sha or index_tree != checkpoint.expected_tree_sha or dirty:
-                restore = self._explain_tree_drift(repo, run_dir, checkpoint, candidate, scope)
+                restore = self._explain_tree_drift(
+                    repo, run_dir, checkpoint, candidate, scope,
+                    restore_failed_steps=not self._legacy_run_options,
+                )
             unapproved = [
                 path for path in changed_paths_between_trees(repo, base_tree, checkpoint.expected_tree_sha)
                 if path not in scope
@@ -3668,6 +4116,7 @@ class Orchestrator:
             ),
             repository_reference=reference, spec=spec, context=context,
             restore_paths=restore,
+            existing_commit_sha=existing_commit,
         )
         if checkpoint.phase is not ResumePhase.PUBLISH:
             self._load_resumed_results(
@@ -3678,7 +4127,7 @@ class Orchestrator:
     @staticmethod
     def _explain_tree_drift(
         repo: Path, run_dir: Path, checkpoint: ResumeCheckpoint, candidate: str,
-        scope: list[str],
+        scope: list[str], *, restore_failed_steps: bool = False,
     ) -> tuple[str, ...]:
         """Classify a candidate that is not the checkpoint tree.
 
@@ -3706,6 +4155,12 @@ class Orchestrator:
                 isinstance(record, dict) and record.get("status") == "FAILED"
                 and record.get("tree_after") == candidate
             ):
+                changed = changed_paths_between_trees(repo, checkpoint.expected_tree_sha, candidate)
+                # The durable bundle is the authority for the mutable scope;
+                # this branch is only enabled for P30 snapshots.  Legacy P29
+                # runs retain their historical operator-required behavior.
+                if restore_failed_steps and changed and all(path in scope for path in changed):
+                    return tuple(changed)
                 raise ResumeRequiresOperatorError(
                     f"the failed step {checkpoint.step_id} left partial changes; start a new run"
                 )
@@ -3736,7 +4191,7 @@ class Orchestrator:
         chain_end = _verify_step_chain(records, base_tree)
         if chain_end is None:
             refuse("Luna step trees do not form an unbroken chain")
-        if checkpoint.phase is ResumePhase.INITIAL_STEP or checkpoint.phase is ResumePhase.CLAUDE_C01 or (
+        if checkpoint.phase in (ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01, ResumePhase.CLAUDE_C01) or (
             not revision_enabled and checkpoint.phase is ResumePhase.REVIEWER_C01
         ):
             if chain_end != expected:
@@ -3750,6 +4205,15 @@ class Orchestrator:
                 refuse("the checkpoint tree is not the Claude C01 tree")
             resumed.c01_revision = revision
         if at <= phase_index(ResumePhase.REVIEWER_C01):
+            return
+        if checkpoint.phase is ResumePhase.COMMIT and not repair_enabled:
+            evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
+            if evidence is None or evidence.staged_tree_sha != expected:
+                refuse("the C01 commit evidence is missing or not for the approved tree")
+            review = _load_c01_review(run_dir, evidence)
+            if review is None or review.verdict is not ReviewVerdict.PASS or review.route is not ReviewRoute.NONE:
+                refuse("the C01 reviewer PASS is missing for commit")
+            resumed.c01_evidence, resumed.c01_review = evidence, review
             return
         evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
         c01_tree = resumed.c01_revision.tree_after if resumed.c01_revision is not None else chain_end
@@ -3804,6 +4268,14 @@ class Orchestrator:
             if revision is None or revision.tree_before != repair_end or revision.tree_after != expected:
                 refuse("the Claude C02 record does not match the checkpoint")
             resumed.c02_revision = revision
+        if checkpoint.phase is ResumePhase.COMMIT:
+            evidence = _load_evidence(run_dir / "checks" / "C02")
+            if evidence is None or evidence.staged_tree_sha != expected:
+                refuse("the C02 commit evidence is missing or not for the approved tree")
+            review = _load_c01_review(run_dir / "review" / "C02", evidence)
+            if review is None or review.verdict is not ReviewVerdict.PASS or review.route is not ReviewRoute.NONE:
+                refuse("the C02 reviewer PASS is missing for commit")
+            resumed.c02_evidence, resumed.c02_review = evidence, review
 
     def _commit_body_v2(self, run_id: str, base_sha: str, tree_sha: str,
                         evidence: EvidenceBundle, selection: ExecutionSelectionV3) -> str:

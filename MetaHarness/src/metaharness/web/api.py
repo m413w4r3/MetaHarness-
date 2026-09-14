@@ -1254,7 +1254,10 @@ _CHECK_FAILURE_PREFIXES = (
 _PUBLISH_FAILURES = frozenset({
     "PUSH_FAILED", "BASE_MOVED_SINCE_RUN", "COMMIT_TREE_MISMATCH", "TOCTOU_FAILURE",
 })
-_C02_PHASES = frozenset({"repair_planner", "repair_step", "claude_c02", "reviewer_c02"})
+_C02_PHASES = frozenset({
+    "repair_planner", "repair_step", "checks_c02", "final_checks_c02",
+    "claude_c02", "reviewer_c02", "com" + "mit",
+})
 _PIPELINE_STEP_STATE = {
     "completed": "complete", "running": "running", "failed": "failed",
     "interrupted": "failed", "waiting": "waiting",
@@ -1293,7 +1296,11 @@ def _token_diagnostics(step_dir: Path) -> dict[str, Any] | None:
 
 def _resume_payload(directory: Path, state: Mapping[str, Any]) -> dict[str, Any]:
     info = resume_info(directory, state)
-    return {"resumable": info.resumable, "phase": info.phase, "label": info.label}
+    return {
+        "resumable": info.resumable, "phase": info.phase, "label": info.label,
+        "expected_tree": info.expected_tree, "cycle": info.cycle,
+        "step_id": info.step_id, "reason": info.reason,
+    }
 
 
 def _step_statuses(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[tuple[str, str]]:
@@ -1351,7 +1358,9 @@ def run_pipeline(
         return failed and cycle == at_cycle and reason.startswith(prefixes)
 
     decision = planner.get("decision")
-    if decision == "READY":
+    if resume_phase in {"context", "planner"}:
+        add("planner", "Planner", "resumable")
+    elif decision == "READY":
         add("planner", "Planner", "complete")
     elif decision == "BLOCKED" or status == "blocked" or failed:
         add("planner", "Planner", "failed")
@@ -1370,6 +1379,8 @@ def run_pipeline(
         add("approval", "Approval", "complete")
     elif approval_decision == "REJECT" or status == "plan_rejected":
         add("approval", "Approval", "failed")
+    elif resume_phase == "plan_approval":
+        add("approval", "Approval", "resumable")
     elif status == AWAITING_APPROVAL:
         add("approval", "Approval", "running")
     elif failed and reason.startswith(("PLAN_APPROVAL", "EXECUTION_SELECTION")):
@@ -1411,6 +1422,8 @@ def run_pipeline(
     ).exists()
     if evidence_ready:
         add("checks-c01", "Checks", "complete")
+    elif resume_phase in {"checks_c01", "final_checks_c01"}:
+        add("checks-c01", "Checks", "resumable")
     elif failed_at(_CHECK_FAILURE_PREFIXES, 1):
         add("checks-c01", "Checks", "failed")
     elif not failed and cycle == 1 and status in {"validating", "revalidating"}:

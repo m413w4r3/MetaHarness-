@@ -46,6 +46,7 @@ from .profiles import profiles_for_config
 from .redaction import config_secret_values, redact
 from .result import RunResult
 from .resume import ResumeError
+from .resume import resume_info
 from .state import STATE_LOCK_NAME, RunStateStore
 
 _SANDBOX_PROBE_ARGV = ("sandbox", "--", "/bin/true")
@@ -158,6 +159,12 @@ def _status(run_dir: Path) -> int:
     print(f"run: {directory}")
     print(f"run_id: {state.get('run_id', '')}")
     print(f"status: {state.get('status', '')}")
+    info = resume_info(directory, state)
+    print(f"resumable: {'yes' if info.resumable else 'no'}")
+    print(f"checkpoint: {info.phase or '—'}")
+    print(f"resume: {info.label or '—'}")
+    if info.reason:
+        print(f"resume refusal: {info.reason}")
     if state.get("failure"):
         print("failure: " + json.dumps(state["failure"], ensure_ascii=False))
     if state.get("commit_sha"):
