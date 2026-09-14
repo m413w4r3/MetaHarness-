@@ -646,7 +646,6 @@ def build_repair_planner_prompt(
     current_cumulative_diff: str,
     final_checks_cycle_1: str,
     claude_revision_report_cycle_1: str,
-    reviewer_1_raw: str,
     reviewer_required_fixes: str,
     original_approved_mutable_scope: str,
     implementer_profiles: Sequence[ModelProfile] = (),
@@ -664,7 +663,6 @@ def build_repair_planner_prompt(
         "{{CURRENT_CUMULATIVE_DIFF}}": current_cumulative_diff,
         "{{FINAL_CHECKS_CYCLE_1}}": final_checks_cycle_1,
         "{{CLAUDE_REVISION_REPORT_CYCLE_1}}": claude_revision_report_cycle_1,
-        "{{REVIEWER_1_RAW}}": reviewer_1_raw,
         "{{REVIEWER_REQUIRED_FIXES}}": reviewer_required_fixes,
         "{{ORIGINAL_APPROVED_MUTABLE_SCOPE}}": original_approved_mutable_scope,
         "{{IMPLEMENTER_PROFILES}}": render_safe_profile_catalogue(implementer_profiles),
@@ -676,7 +674,7 @@ def build_repair_planner_prompt(
     if template is None:
         template = (Path(__file__).with_name("prompts") / "repair_planner_v2.txt").read_text(encoding="utf-8")
     return re.sub(
-        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_META_PLAN|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_1_RAW|REVIEWER_REQUIRED_FIXES|ORIGINAL_APPROVED_MUTABLE_SCOPE|IMPLEMENTER_PROFILES|REVIEWER_PROFILES)\}\}",
+        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_META_PLAN|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_REQUIRED_FIXES|ORIGINAL_APPROVED_MUTABLE_SCOPE|IMPLEMENTER_PROFILES|REVIEWER_PROFILES)\}\}",
         lambda match: values[match.group(0)],
         template,
     )
@@ -988,7 +986,6 @@ class RepairPlannerV2:
         current_cumulative_diff: str,
         final_checks_cycle_1: str,
         claude_revision_report_cycle_1: str,
-        reviewer_1_raw: str,
         reviewer_required_fixes: str,
         original_approved_mutable_scope: str,
         artifacts_dir: str | Path,
@@ -1003,7 +1000,6 @@ class RepairPlannerV2:
             current_cumulative_diff=current_cumulative_diff,
             final_checks_cycle_1=final_checks_cycle_1,
             claude_revision_report_cycle_1=claude_revision_report_cycle_1,
-            reviewer_1_raw=reviewer_1_raw,
             reviewer_required_fixes=reviewer_required_fixes,
             original_approved_mutable_scope=original_approved_mutable_scope,
             implementer_profiles=self.implementer_profiles,

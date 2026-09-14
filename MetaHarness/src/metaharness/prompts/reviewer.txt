@@ -120,12 +120,27 @@ When REQUIRED deterministic checks are red:
 
 Prefer compact, concrete findings over long general commentary.
 
-Use this approximate output shape:
+Use exactly the META REVIEW v1 wire protocol below. This is a strict wire
+contract:
+
+- The response must begin exactly with `META REVIEW v1`; output no text before
+  that marker.
+- The response must end exactly with `END META REVIEW`; output no text after
+  that marker.
+- VERDICT must be exactly one of `PASS`, `REVISE`, or `FAIL`.
+- ROUTE must be exactly one of `NONE`, `IMPLEMENTATION`, `REPLAN`, or
+  `HUMAN`.
+- Every section shown in the template below is mandatory and must appear in
+  this order: `SUMMARY`, `FINDINGS`, `REQUIRED FIXES`, `MISSING TESTS`, and
+  `RESIDUAL RISKS`.
+- When a section is explicitly empty, use `NONE` (or the empty marker allowed
+  by the protocol) instead of omitting the section.
+- Do not add any other prose, headings, metadata, JSON, or code fences.
 
 META REVIEW v1
 
-VERDICT: PASS|REVISE|FAIL
-ROUTE: NONE|IMPLEMENTATION|REPLAN|HUMAN
+VERDICT: <PASS, REVISE, or FAIL>
+ROUTE: <NONE, IMPLEMENTATION, REPLAN, or HUMAN>
 
 SUMMARY
 ...

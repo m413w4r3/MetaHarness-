@@ -2813,7 +2813,7 @@ class Orchestrator:
             spec, input.plan_text, context, gate,
             "\n".join(evidence.changed_files), evidence.diff,
             _json_text(_check_payload(evidence)),
-            input.revision_report or input.luna_reports,
+            "NONE",
             deterministic_passed=evidence.deterministic_passed,
             artifacts_dir=artifacts_dir,
             repository=_json_text(repository_reference_dict(repository_reference)),
@@ -3090,7 +3090,6 @@ class Orchestrator:
                 claude_revision_report_cycle_1=(
                     cycle_1_revision.final_message if cycle_1_revision is not None else "NONE"
                 ),
-                reviewer_1_raw=cycle_1_review.raw,
                 reviewer_required_fixes=cycle_1_review.required_fixes,
                 original_approved_mutable_scope=_json_text(original_scope),
                 artifacts_dir=repair_dir,

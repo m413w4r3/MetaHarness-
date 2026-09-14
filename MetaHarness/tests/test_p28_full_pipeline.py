@@ -549,6 +549,20 @@ class FullPipelineTests(P28Harness):
         self.assertEqual(result.state["cycle"], 2)
         self.assertEqual(result.state["review_iterations"], 2)
         self.assertEqual(git(self.worktree(), "show", "HEAD:src/a.py"), "A = 4")
+        # C01 v2 passes the worker/revision evidence through its dedicated
+        # sections; the legacy AGENT_REPORT slot is explicitly empty.
+        first = reviewer.prompts[0]
+        self.assertIn(
+            "<NON-AUTHORITATIVE IMPLEMENTER REPORT>\nNONE\n"
+            "</NON-AUTHORITATIVE IMPLEMENTER REPORT>",
+            first,
+        )
+        self.assertEqual(first.count("C01 S01 report"), 1)
+        self.assertEqual(first.count("Claude C01 revision report"), 1)
+        repair_prompt = planner.prompts[1]
+        self.assertNotIn("REVIEWER #1 RAW", repair_prompt)
+        self.assertNotIn("META REVIEW v1", repair_prompt)
+        self.assertIn("REVIEWER REQUIRED FIXES\nCorrect src/a.py.", repair_prompt)
         # Reviewer #2 evidence: both plans, all worker reports, both revisions.
         second = reviewer.prompts[1]
         original = (result.run_dir / "planner.raw.md").read_text()

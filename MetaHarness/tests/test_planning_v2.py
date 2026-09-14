@@ -24,6 +24,7 @@ from metaharness.planning_v2 import (  # noqa: E402
     PlannerV2,
     V2PlanParseError,
     build_planner_prompt_v2,
+    build_repair_planner_prompt,
     render_decomposition_policy_text,
     validate_decomposition_policy,
     parse_task_plan_v2,
@@ -195,6 +196,24 @@ END META PLAN
         worker = build_implementer_step_prompt("contract")
         self.assertIn("contract", worker)
         self.assertNotIn("{{STEP_CONTRACT}}", worker)
+
+    def test_repair_planner_prompt_keeps_required_fixes_without_raw_review(self):
+        prompt = build_repair_planner_prompt(
+            repository_reference="repository",
+            original_spec="original spec",
+            original_meta_plan="original plan",
+            original_step_contracts="original contracts",
+            current_repository_state="current state",
+            current_cumulative_diff="cumulative diff",
+            final_checks_cycle_1="checks C01",
+            claude_revision_report_cycle_1="Claude C01 report",
+            reviewer_required_fixes="Fix the concrete defect.",
+            original_approved_mutable_scope="[\"src/example.py\"]",
+        )
+
+        self.assertNotIn("REVIEWER_1_RAW", prompt)
+        self.assertNotIn("REVIEWER #1 RAW", prompt)
+        self.assertIn("REVIEWER REQUIRED FIXES\nFix the concrete defect.", prompt)
 
 
 def _change_step(sets: str) -> str:
