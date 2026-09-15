@@ -598,6 +598,40 @@ class FastForwardMainTests(P29Harness):
         self.assertIn('"status": "warning"', diagnostics)
         self.assertIn("run_branch_cleanup", diagnostics)
 
+    def test_publication_is_durable_before_cleanup_interrupt(self) -> None:
+        config = self.make_config(mode="fast-forward-base")
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")})
+        orchestrator, planner, reviewer, luna_client, claude = self.orchestrator(
+            config, plans=[SINGLE_PLAN], reviews=[PASS], luna=luna,
+        )
+        with mock.patch.object(
+            orchestrator, "_cleanup_published_run_branch", side_effect=KeyboardInterrupt,
+        ):
+            result = self.run_approved(config, orchestrator, "cleanup-interrupt")
+
+        candidate = json.loads((result.run_dir / "candidate/C01/commit.json").read_text())
+        state = json.loads((result.run_dir / "state.json").read_text())
+        publish = json.loads((result.run_dir / "publish.json").read_text())
+        self.assertEqual(result.status, RunStatus.PUBLISHED)
+        self.assertEqual(self.origin_main(), candidate["commit_sha"])
+        self.assertEqual(state["status"], RunStatus.PUBLISHED.value)
+        self.assertEqual(publish["commit_sha"], candidate["commit_sha"])
+        self.assertEqual(publish["run_branch_cleanup"]["status"], "pending")
+        self.assertEqual(read_checkpoint_record(result.run_dir)[1], "completed")
+        # Cleanup was interrupted before it could delete the branch; that
+        # branch's presence must not affect the already durable publication.
+        self.assertIn(f"refs/heads/{state['branch']}", self.remote_refs())
+        self.assertFalse(resume_info(result.run_dir, state).resumable)
+
+        second, planner2, reviewer2, luna2, claude2 = self.orchestrator(config)
+        with self.assertRaises(ResumeNotAllowedError):
+            second.resume("cleanup-interrupt")
+        self.assertEqual((planner2.prompts, reviewer2.prompts, luna2.calls, claude2.calls),
+                         ([], [], [], []))
+        self.assertEqual((len(planner.prompts), len(reviewer.prompts)), (1, 1))
+        self.assertEqual(len(luna_client.calls), 1)
+        self.assertEqual(len(claude.calls), 1)
+
     def test_moved_main_is_refused_without_merge_rebase_or_force(self) -> None:
         config = self.make_config(mode="fast-forward-base")
         luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")})

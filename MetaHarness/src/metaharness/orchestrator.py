@@ -3997,6 +3997,36 @@ class Orchestrator:
             pass
         return cleanup
 
+    def _persist_published_run_branch_cleanup(
+        self,
+        *,
+        store: RunStateStore,
+        run_dir: Path,
+        info: WorktreeInfo,
+        commit_sha: str,
+        publish_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Complete best-effort cleanup after publication is durable.
+
+        The publication state and completed checkpoint are deliberately
+        written by the caller before this method is entered.  If interruption
+        happens while cleaning up, the already-published state must not be
+        downgraded to INTERRUPTED by the outer run boundary.
+        """
+
+        try:
+            cleanup = self._cleanup_published_run_branch(
+                store=store, info=info, commit_sha=commit_sha,
+            )
+        except KeyboardInterrupt:
+            return store.load()
+        publish_payload = {
+            **publish_payload,
+            "run_branch_cleanup": cleanup,
+        }
+        atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
+        return store.update(status=RunStatus.PUBLISHED, publish=publish_payload)
+
     def _complete_candidate_publication(
         self,
         *,
@@ -4066,9 +4096,12 @@ class Orchestrator:
                     "web_url": _commit_web_url(repository_reference, commit_sha),
                     "status": "pushed", "local_base_updated": outcome.local_base_updated,
                     "base_checked_out_in": list(outcome.base_checked_out_in),
-                    "run_branch_cleanup": self._cleanup_published_run_branch(
-                        store=store, info=info, commit_sha=commit_sha,
-                    ),
+                    "run_branch_cleanup": {
+                        "status": "pending",
+                        "remote": self.config.publish.remote,
+                        "branch": info.branch,
+                        "commit_sha": commit_sha,
+                    },
                 }
             else:
                 publish_payload = {
@@ -4104,6 +4137,11 @@ class Orchestrator:
         atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
         state = store.update(status=RunStatus.PUBLISHED, publish=publish_payload, **fields)
         mark_checkpoint_completed(run_dir)
+        if fast_forward:
+            state = self._persist_published_run_branch_cleanup(
+                store=store, run_dir=run_dir, info=info, commit_sha=commit_sha,
+                publish_payload=publish_payload,
+            )
         return RunResult(run_dir, RunStatus.PUBLISHED, state)
 
     def _complete_commit(
@@ -4258,9 +4296,12 @@ class Orchestrator:
                 "status": "pushed",
                 "local_base_updated": outcome.local_base_updated,
                 "base_checked_out_in": list(outcome.base_checked_out_in),
-                "run_branch_cleanup": self._cleanup_published_run_branch(
-                    store=store, info=info, commit_sha=commit_sha,
-                ),
+                "run_branch_cleanup": {
+                    "status": "pending",
+                    "remote": self.config.publish.remote,
+                    "branch": info.branch,
+                    "commit_sha": commit_sha,
+                },
             }
         else:
             publish_payload = {
@@ -4282,6 +4323,11 @@ class Orchestrator:
             **fields,
         )
         mark_checkpoint_completed(run_dir)
+        if fast_forward:
+            state = self._persist_published_run_branch_cleanup(
+                store=store, run_dir=run_dir, info=info, commit_sha=commit_sha,
+                publish_payload=publish_payload,
+            )
         return RunResult(run_dir, RunStatus.PUBLISHED, state)
 
     # -- resume ------------------------------------------------------------
