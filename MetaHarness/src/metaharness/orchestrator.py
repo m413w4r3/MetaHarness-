@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import re
+import tempfile
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -959,6 +960,18 @@ def _load_c01_review(run_dir: Path, evidence: EvidenceBundle) -> ReviewResult | 
     return None
 
 
+def _load_accepted_c01_review(
+    run_dir: Path, evidence: EvidenceBundle, candidate_sha: str,
+) -> ReviewResult | None:
+    """Reviewer #1's accepted answer for exactly the pushed C01 candidate."""
+
+    for directory in (run_dir / "review" / "C01", run_dir):
+        review = _accepted_review(directory, evidence, candidate_sha)
+        if review is not None:
+            return review
+    return None
+
+
 def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
     """One COMPLETED step record, in the shape of :func:`_step_result_record`."""
 
@@ -1071,11 +1084,11 @@ def _repair_mutation_sets(plan: TaskPlanV2) -> tuple[list[str], list[str], list[
     return writes, creates, deletes
 
 
-def _write_scope_delta(
+def _build_scope_delta(
     repair_dir: Path, *, original_scope: list[str], plan: TaskPlanV2,
     candidate_commit_sha: str, review: ReviewResult, repair_bundle_sha: str,
 ) -> tuple[dict[str, Any], str]:
-    """Persist the scope delta from parsed plan sets, never reviewer prose."""
+    """The canonical scope delta, in memory only: from parsed plan sets, never reviewer prose."""
 
     writes, creates, deletes = _repair_mutation_sets(plan)
     requested = sorted(set(writes) | set(creates) | set(deletes))
@@ -1110,9 +1123,64 @@ def _write_scope_delta(
         "repair_plan_sha256": plan_sha,
         "repair_bundle_sha256": repair_bundle_sha,
     }
-    content = _json_text(payload)
-    atomic_write_text(repair_dir / "scope_delta.json", content)
-    return payload, hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return payload, _json_text(payload)
+
+
+def _create_file_once(path: Path, data: bytes) -> None:
+    """Atomically create *path* with *data*; never replace an existing file.
+
+    Raises :class:`FileExistsError` when *path* already exists.
+    """
+
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+    finally:
+        os.unlink(temporary)
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _ensure_scope_delta(
+    repair_dir: Path, content: str, *, expected_sha256: str | None,
+) -> str:
+    """Persist ``scope_delta.json`` exactly once, then only verify it.
+
+    The first creation writes the canonical bytes atomically.  An existing
+    artifact is never rewritten: its bytes must equal the canonical bytes and,
+    when the checkpoint binds one, the checkpoint hash.  Any difference is a
+    :class:`ResumeIntegrityError` and the file is left as found.
+    """
+
+    expected = content.encode("utf-8")
+    digest = hashlib.sha256(expected).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise ResumeIntegrityError("the C02 scope delta changed")
+    path = repair_dir / "scope_delta.json"
+    if expected_sha256 is None:
+        try:
+            _create_file_once(path, expected)
+            return digest
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise OrchestrationError("REPAIR_SCOPE_DELTA_UNWRITABLE") from exc
+    try:
+        if path.stat().st_size > 256 * 1024:
+            raise ResumeIntegrityError("the C02 scope delta is too large")
+        existing = path.read_bytes()
+    except OSError as exc:
+        raise ResumeIntegrityError(f"the C02 scope delta is unreadable: {exc}") from exc
+    if existing != expected:
+        raise ResumeIntegrityError("the C02 scope delta changed")
+    return digest
 
 
 def _candidate_chain_parent(
@@ -2691,8 +2759,11 @@ class Orchestrator:
                         audit_request=("plan/scope repair" if review.route is ReviewRoute.REPLAN
                                        else "implementation repair"),
                     )
-                    # Reviewer #1 complete: the next operation is the repair planner.
-                    self._checkpoint(run_dir, ResumePhase.REPAIR_PLANNER, head=base_sha,
+                    # Reviewer #1 complete: the next operation is the repair
+                    # planner, from the committed, pushed and reviewed C01
+                    # candidate (never BASE).
+                    self._checkpoint(run_dir, ResumePhase.REPAIR_PLANNER, cycle=2,
+                                     head=c01_candidate["commit_sha"],
                                      tree=evidence.staged_tree_sha)
                 else:
                     store.update(status=store.load().get("status", RunStatus.PLANNING), cycle=2)
@@ -3454,13 +3525,17 @@ class Orchestrator:
             path for step in repair_plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
         })
-        scope_delta, scope_delta_sha = _write_scope_delta(
+        scope_delta, scope_delta_content = _build_scope_delta(
             repair_dir, original_scope=original_scope, plan=repair_plan,
             candidate_commit_sha=cycle_parent_sha, review=cycle_1_review,
             repair_bundle_sha=repair_bundle_sha,
         )
-        if start is not None and start.scope_delta_sha256 is not None and scope_delta_sha != start.scope_delta_sha256:
-            raise ResumeIntegrityError("the C02 scope delta changed")
+        # Created once; on every later pass (resume included) the persisted
+        # bytes are only compared, never repaired.
+        scope_delta_sha = _ensure_scope_delta(
+            repair_dir, scope_delta_content,
+            expected_sha256=start.scope_delta_sha256 if start is not None else None,
+        )
         for path in scope_delta["requested_write_paths"] + scope_delta["requested_delete_paths"]:
             if not path_exists_in_tree(repo, cycle_parent_sha, path):
                 raise OrchestrationError("REPAIR_SCOPE_EXISTING_PATH_MISSING")
@@ -4751,6 +4826,11 @@ class Orchestrator:
                     refuse(f"existing commit is unreadable: {exc}")
             elif head != checkpoint.expected_head_sha:
                 refuse("HEAD moved since the checkpoint")
+            if (
+                checkpoint.phase is ResumePhase.REPAIR_PLANNER
+                and resolve_tree(repo, head) != checkpoint.expected_tree_sha
+            ):
+                refuse("the C01 candidate commit is not the reviewed C01 tree")
             if resolve_commit(repo, f"refs/heads/{branch}") != head:
                 refuse("run branch does not point to the worktree HEAD")
             if checkpoint.phase is ResumePhase.PUBLISH:
@@ -5001,8 +5081,6 @@ class Orchestrator:
                 # the reviewer is retried with the already pushed commit.
                 pass
             return
-        if checkpoint.phase is ResumePhase.REPAIR_PLANNER:
-            return
         if checkpoint.phase is ResumePhase.COMMIT and not repair_enabled:
             evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
             if evidence is None or evidence.staged_tree_sha != expected:
@@ -5015,15 +5093,25 @@ class Orchestrator:
         evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
         if evidence is None or evidence.staged_tree_sha != c01_tree:
             refuse("the C01 final evidence is missing or not for the C01 tree")
-        review = _load_c01_review(run_dir, evidence)
+        if checkpoint.phase is ResumePhase.REPAIR_PLANNER:
+            # The repair planner starts from the committed, pushed and
+            # reviewed C01 candidate: only reviewer #1's accepted answer for
+            # exactly that commit and tree may authorize C02.
+            if expected != evidence.staged_tree_sha:
+                refuse("the checkpoint tree is not the C01 reviewed tree")
+            c01_record = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+            c01_sha = c01_record.get("commit_sha") if isinstance(c01_record, dict) else None
+            if not _is_object_id(c01_sha) or checkpoint.expected_head_sha != c01_sha:
+                refuse("the repair planner checkpoint is not the C01 candidate commit")
+            review = _load_accepted_c01_review(run_dir, evidence, c01_sha)
+        else:
+            review = _load_c01_review(run_dir, evidence)
         if review is None or review.verdict is not ReviewVerdict.REVISE or review.route not in {
             ReviewRoute.IMPLEMENTATION, ReviewRoute.REPLAN,
         }:
             refuse("reviewer #1 did not route an implementation repair")
         resumed.c01_evidence, resumed.c01_review = evidence, review
         if checkpoint.phase is ResumePhase.REPAIR_PLANNER:
-            if expected != evidence.staged_tree_sha:
-                refuse("the checkpoint tree is not the C01 reviewed tree")
             return
         repair_dir = run_dir / "repair" / "C02"
         selection = resumed.selection

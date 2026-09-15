@@ -21,9 +21,11 @@ execution_mode_policy = "require-staged"
 single_step_max_mutable_paths = 2
 staged_step_max_mutable_paths = 6
 
-# Target workflow: planner (STAGED) -> Luna steps -> Claude -> reviewer ->
-# optional C02 -> final reviewer PASS -> commit B(parent=A) in the isolated
-# run worktree -> CAS fast-forward of local main A->B -> push origin/main.
+# Target workflow: planner (STAGED) -> Luna steps -> Claude -> checks ->
+# candidate commit C01 (parent = BASE), pushed to the run branch -> reviewer
+# -> optional C02 -> candidate commit C02 (parent = C01), pushed -> reviewer.
+# The final PASS publishes the exact approved candidate chain tip (no new
+# commit): CAS fast-forward of local main BASE->tip -> push origin/main.
 # [revision] supplies legacy defaults/fallbacks; durable UI runs freeze Claude
 # revision and repair_cycles independently in run_options.json.
 # AutoWork recommendation: repair_scope_policy = "auto-bounded" and

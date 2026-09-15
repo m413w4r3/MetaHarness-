@@ -369,6 +369,10 @@ class RevisesThenTransportFails(QueueClient):
         return super().complete(prompt)
 
 
+class PlansThenTransportFails(RevisesThenTransportFails):
+    """Planner: the initial plan answers; the repair planner hits a transport failure."""
+
+
 def real_then_interrupt(real):
     """Let the real Git operation land, then crash before it is recorded."""
 
@@ -616,23 +620,135 @@ class P40ResumeAuthorityTests(P29Harness):
         claude = EditingFailingC02Claude(log=self.events)
         claude.edit = False
         config, failed = self.aw001_interrupted("aw001-delta", luna=luna, claude=claude)
-        real = orchestrator_module._write_scope_delta
+        delta_path = failed.run_dir / "repair/C02/scope_delta.json"
+        persisted = delta_path.read_bytes()
+        real = orchestrator_module._build_scope_delta
 
         def recomputed_differently(*args, **kwargs):
-            payload, _sha = real(*args, **kwargs)
-            return payload, "f" * 64
+            payload, content = real(*args, **kwargs)
+            return payload, content + "\n"
 
         second, *models = self.orchestrator(config, reviews=[PASS])
         # The mismatch surfaces inside the C02 execution path, through the
         # generic resume handler rather than the pre-claim validation.
-        with mock.patch.object(orchestrator_module, "_write_scope_delta", side_effect=recomputed_differently):
+        with mock.patch.object(orchestrator_module, "_build_scope_delta", side_effect=recomputed_differently):
             refused = second.resume("aw001-delta")
         self.assertEqual(refused.status, RunStatus.FAILED)
         self.assertEqual(refused.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(delta_path.read_bytes(), persisted)   # never rewritten
         self.assertFalse(resume_info(refused.run_dir, refused.state).resumable)
         self.no_model_calls(*models)
         with self.assertRaises(ResumeNotAllowedError):
             self.orchestrator(config)[0].resume("aw001-delta")
+
+    def test_scope_delta_mutation_after_resume_validation_fails_closed_without_overwrite(self) -> None:
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"), (2, "S01"): self.aw001_repair})
+        claude = EditingFailingC02Claude(log=self.events)
+        claude.edit = False
+        config, failed = self.aw001_interrupted("aw001-toctou", luna=luna, claude=claude)
+        run_dir = failed.run_dir
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.CLAUDE_C02)
+        delta_path = run_dir / "repair/C02/scope_delta.json"
+        self.assertEqual(hashlib.sha256(delta_path.read_bytes()).hexdigest(), checkpoint.scope_delta_sha256)
+        delta = json.loads(delta_path.read_text())
+        delta["added_paths"] = sorted([*delta["added_paths"], "src/b.py"])
+        delta["requested_write_paths"] = sorted([*delta["requested_write_paths"], "src/b.py"])
+        tampered = (json.dumps(delta, indent=2) + "\n").encode("utf-8")
+        claimed: list[tuple[object, str]] = []
+
+        def tamper_after_validation(claimed_dir: Path) -> None:
+            # Runs after _validate_resume() succeeded and the run was claimed,
+            # before _execute_v2(): the validate -> claim -> execute window.
+            state = json.loads((claimed_dir / "state.json").read_text())
+            claimed.append((read_checkpoint(claimed_dir), state["resume"]["status"]))
+            delta_path.write_bytes(tampered)
+
+        second, *models = self.orchestrator(config, reviews=[PASS])
+        refused = second.resume("aw001-toctou", on_claimed=tamper_after_validation)
+        self.assertEqual(claimed, [(checkpoint, "running")])   # initial validation passed
+        self.assertEqual(refused.status, RunStatus.FAILED)
+        self.assertEqual(refused.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(delta_path.read_bytes(), tampered)   # not repaired to canonical bytes
+        self.assertFalse(resume_info(refused.run_dir, refused.state).resumable)
+        self.no_model_calls(*models)
+        with self.assertRaises(ResumeNotAllowedError):
+            self.orchestrator(config)[0].resume("aw001-toctou")
+
+    # -- REPAIR_PLANNER: transport failure after reviewer #1 REVISE ----------
+    def repair_planner_transport_then_resume(
+        self, run_id: str, *, review: str, repair_plan: str, repair,
+    ) -> Path:
+        config = self.make_config()
+        planner = PlansThenTransportFails("planner", [SINGLE_PLAN], self.events)
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")})
+        claude = FakeClaude({1: writer("src/a.py", "A = 20\n")}, log=self.events)
+        orchestrator, _planner, reviewer, _luna, _claude = self.orchestrator(
+            config, planner=planner, reviews=[review], luna=luna, claude=claude,
+        )
+        with self.count_pushes() as first_pushes:
+            failed = self.run_approved(config, orchestrator, run_id,
+                                       run_options=RunOptions.from_config(config))
+        self.assertEqual(failed.state["failure"]["reason"], "LLM_FAILURE")
+        self.assertEqual(len(planner.prompts), 2)   # initial plan + failed repair planner
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertEqual([call["cycle"] for call in luna.calls], [1])
+        self.assertEqual([call["cycle"] for call in claude.calls], [1])
+        self.assertEqual(first_pushes.call_count, 1)   # the C01 candidate
+        run_dir = failed.run_dir
+        c01_bytes = (run_dir / "candidate/C01/commit.json").read_bytes()
+        c01 = json.loads(c01_bytes)
+        c01_tree = git(self.repo, "rev-parse", f"{c01['commit_sha']}^{{tree}}")
+        revision = json.loads((run_dir / "revision/report.json").read_text())
+        self.assertEqual(revision["tree_after"], c01_tree)   # Claude C01 really changed C01
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual((checkpoint.phase, checkpoint.cycle), (ResumePhase.REPAIR_PLANNER, 2))
+        self.assertEqual(checkpoint.expected_head_sha, c01["commit_sha"])
+        self.assertNotEqual(checkpoint.expected_head_sha, self.base_sha)
+        self.assertEqual(checkpoint.expected_tree_sha, c01_tree)
+        self.assertEqual(git(self.worktree(run_id), "rev-parse", "HEAD"), c01["commit_sha"])
+        self.assertTrue(resume_info(run_dir, failed.state).resumable)
+        self.assertFalse((run_dir / "repair/C02/scope_delta.json").exists())
+
+        second, planner2, reviewer2, luna2, claude2 = self.orchestrator(
+            config, plans=[repair_plan], reviews=[PASS], luna=FakeLuna({(2, "S01"): repair}),
+        )
+        with self.count_pushes() as pushes:
+            resumed = second.resume(run_id)
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        # Only the repair planner is replayed, from the exact C01 candidate.
+        self.assertEqual(len(planner2.prompts), 1)
+        self.assertIn(c01["commit_sha"], planner2.prompts[0])
+        self.assertEqual([(call["cycle"], call["step"]) for call in luna2.calls], [(2, "S01")])
+        self.assertEqual([call["cycle"] for call in claude2.calls], [2])
+        self.assertEqual(len(reviewer2.prompts), 1)   # reviewer #2 only
+        self.assertEqual(pushes.call_count, 1)   # the C02 candidate only
+        self.assertEqual((run_dir / "candidate/C01/commit.json").read_bytes(), c01_bytes)
+        c02 = json.loads((run_dir / "candidate/C02/commit.json").read_text())
+        self.assertTrue(c02["pushed_at"])
+        self.assertEqual(commit_parents(self.repo, c02["commit_sha"]), (c01["commit_sha"],))
+        self.assertEqual(commit_parents(self.repo, c01["commit_sha"]), (self.base_sha,))
+        self.assertEqual(resumed.state["commit_sha"], c02["commit_sha"])
+        self.assertEqual(self.commits_on_run_branch(run_id), "2")
+        return run_dir
+
+    def test_repair_planner_transport_failure_resumes_repair_planner_only_replan(self) -> None:
+        run_dir = self.repair_planner_transport_then_resume(
+            "planner-replan", review=REVISE_REPLAN, repair_plan=self.aw001_repair_plan(),
+            repair=self.aw001_repair,
+        )
+        delta = json.loads((run_dir / "repair/C02/scope_delta.json").read_text())
+        self.assertEqual(delta["added_paths"], sorted(AW001_FILES))
+        head = self.worktree("planner-replan")
+        self.assertEqual(git(head, "show", "HEAD:docs/agent/CONTRACT.md"), "contract v2")
+        self.assertEqual(git(head, "show", "HEAD:src/a.py"), "A = 20")
+
+    def test_repair_planner_transport_failure_resumes_repair_planner_only_implementation(self) -> None:
+        self.repair_planner_transport_then_resume(
+            "planner-impl", review=REVISE_IMPLEMENTATION, repair_plan=REPAIR_PLAN,
+            repair=writer("src/a.py", "A = 3\n"),
+        )
+        self.assertEqual(git(self.worktree("planner-impl"), "show", "HEAD:src/a.py"), "A = 3")
 
     # -- C02 fast-forward publication ------------------------------------------
     def test_fast_forward_publishes_exact_c02_chain(self) -> None:
