@@ -500,24 +500,31 @@ def _validate_revision(
         raise ConfigError("revision repair profile must use codex driver")
 
 
-def _checks(value: Any) -> tuple[CheckConfig, ...]:
+def _checks(value: Any, *, catalogue: bool = False) -> tuple[CheckConfig, ...]:
     if value is None:
         return ()
     if not isinstance(value, list):
         raise ConfigError("checks must be an array of tables")
     result: list[CheckConfig] = []
     for index, item in enumerate(value):
-        where = f"checks[{index}]"
+        where = f"{'check_catalog' if catalogue else 'checks'}[{index}]"
         if not isinstance(item, dict):
             raise ConfigError(f"{where} must be a table")
-        name = _required_string(item, "name", where)
+        name_key = "id" if catalogue else "name"
+        name = _required_string(item, name_key, where)
+        if name in {entry.name for entry in result}:
+            raise ConfigError(f"{where}.{name_key} must be unique")
         argv = _string_array(item, "argv", (), where, allow_empty=False)
         cwd = item.get("cwd", ".")
         if not isinstance(cwd, str) or not cwd.strip():
             raise ConfigError(f"{where}.cwd must be a non-empty string")
         timeout = _positive_int(item, "timeout_seconds", 3600, where)
         required = _bool(item, "required", True, where)
-        result.append(CheckConfig(name, argv, cwd, timeout, required))
+        preflight_argv = _string_array(item, "preflight_argv", (), where)
+        description = item.get("description", "")
+        if not isinstance(description, str) or len(description) > 300:
+            raise ConfigError(f"{where}.description must be a string of at most 300 characters")
+        result.append(CheckConfig(name, argv, cwd, timeout, required, preflight_argv, description))
     return tuple(result)
 
 
@@ -894,7 +901,30 @@ def load_config(config_path: str | Path) -> HarnessConfig:
 
     _validate_revision(revision, planning, ui, model_profiles if explicit_profiles else {})
 
-    checks = _checks(expanded.get("checks", []))
+    legacy_checks = _checks(expanded.get("checks", []))
+    configured_catalog = _checks(expanded.get("check_catalog", []), catalogue=True)
+    # A trusted catalogue is the v2 source of truth.  Keep the historical
+    # ``checks`` table as a source when no catalogue is configured.
+    checks = configured_catalog or legacy_checks
+    default_check_ids = _string_array(
+        expanded, "default_check_ids",
+        tuple(
+            check.name for check in (
+                configured_catalog or legacy_checks
+            ) if check.required
+        ),
+        "root",
+    )
+    if configured_catalog:
+        catalogue_ids = {check.name for check in configured_catalog}
+        unknown_defaults = [item for item in default_check_ids if item not in catalogue_ids]
+        if unknown_defaults:
+            raise ConfigError(
+                "default_check_ids contains unknown trusted check ID(s): "
+                + ", ".join(unknown_defaults)
+            )
+        if len(set(default_check_ids)) != len(default_check_ids):
+            raise ConfigError("default_check_ids must not contain duplicates")
     codex_runtime = _codex_runtime(
         expanded, config_dir, required=has_explicit_codex
     )
@@ -933,7 +963,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     allow_no_required_checks = _bool(
         expanded, "allow_no_required_checks", False, "root"
     )
-    if not allow_no_required_checks and not any(check.required for check in checks):
+    if not allow_no_required_checks and not default_check_ids:
         raise ConfigError(
             "at least one required check is configured; set allow_no_required_checks = true for docs-only projects"
         )
@@ -949,6 +979,8 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         context=context,
         agent=agent,
         checks=checks,
+        check_catalog=configured_catalog,
+        default_check_ids=tuple(default_check_ids),
         max_diff_bytes=max_diff_bytes,
         allow_no_required_checks=allow_no_required_checks,
         approval=approval,

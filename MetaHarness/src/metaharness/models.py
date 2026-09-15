@@ -107,6 +107,7 @@ class TaskPlanV2:
     risks: str
     blockers: str
     raw: str
+    required_checks: tuple[str, ...] = ()
 
 
 class RunStatus(StrEnum):
@@ -297,6 +298,19 @@ class CheckConfig:
     cwd: str = "."
     timeout_seconds: int = 3600
     required: bool = True
+    preflight_argv: tuple[str, ...] = ()
+    description: str = ""
+
+    @property
+    def id(self) -> str:
+        """Stable trusted catalogue identifier (legacy configs use ``name``)."""
+
+        return self.name
+
+
+# Public P42 names; retain CheckConfig for the pre-catalogue API.
+CheckCatalogEntry = CheckConfig
+TrustedCheckConfig = CheckConfig
 
 
 @dataclass(frozen=True)
@@ -372,6 +386,42 @@ class HarnessConfig:
     # Compatibility marker for programmatic legacy configurations that do not
     # have a repository TOML section yet.
     repository_section_explicit: bool = field(default=False, repr=False, compare=False)
+    # P42 trusted catalogue.  ``checks`` remains a compatibility alias for
+    # programmatic/v1 configurations; TOML v2 stores the explicit catalogue
+    # separately.
+    check_catalog: tuple[CheckConfig, ...] = ()
+    default_check_ids: tuple[str, ...] = ()
+
+    def trusted_checks(self) -> tuple[CheckConfig, ...]:
+        return self.check_catalog or self.checks
+
+    def trusted_check_map(self) -> dict[str, CheckConfig]:
+        return {check.id: check for check in self.trusted_checks()}
+
+    def required_check_ids(self) -> tuple[str, ...]:
+        configured = self.default_check_ids
+        if configured:
+            return configured
+        return tuple(check.id for check in self.trusted_checks() if check.required)
+
+    def select_checks(self, ids: tuple[str, ...] | list[str] | None = None) -> tuple[CheckConfig, ...]:
+        catalogue = self.trusted_check_map()
+        # Historical ``checks`` configurations executed all entries (with
+        # ``required`` controlling the gate).  An explicit P42 catalogue uses
+        # the planner/default selection instead.
+        if ids is None:
+            selected = (
+                tuple(check.id for check in self.checks)
+                if not self.check_catalog else self.required_check_ids()
+            )
+        else:
+            selected = tuple(ids)
+        if len(set(selected)) != len(selected):
+            raise ValueError("required check IDs must be unique")
+        unknown = [check_id for check_id in selected if check_id not in catalogue]
+        if unknown:
+            raise ValueError("unknown trusted check ID(s): " + ", ".join(unknown))
+        return tuple(catalogue[check_id] for check_id in selected)
 
 
 @dataclass(frozen=True)

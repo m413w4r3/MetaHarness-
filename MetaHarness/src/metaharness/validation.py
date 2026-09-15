@@ -122,6 +122,7 @@ def run_checks(
     worktree: str | Path,
     config: HarnessConfig,
     *,
+    required_check_ids: tuple[str, ...] | list[str] | None = None,
     logs_dir: str | Path | None = None,
     tail_bytes: int = DEFAULT_TAIL_BYTES,
     secrets: tuple[str, ...] = (),
@@ -145,15 +146,19 @@ def run_checks(
             pass
         else:
             raise ValidationError("logs_dir must be outside the worktree")
+    try:
+        selected = config.select_checks(required_check_ids)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
     # Every cwd is validated before any command runs.
-    cwds = [resolve_check_cwd(root, check) for check in config.checks]
+    cwds = [resolve_check_cwd(root, check) for check in selected]
     used_log_stems: set[str] = set()
     results: list[CheckResult] = []
 
     with tempfile.TemporaryDirectory(prefix="metaharness-checks-") as scratch:
         log_root = output_dir if output_dir is not None else Path(scratch)
         log_root.mkdir(parents=True, exist_ok=True)
-        for check, cwd in zip(config.checks, cwds):
+        for check, cwd in zip(selected, cwds):
             stem = _safe_log_stem(check.name, used_log_stems)
             stdout_path = log_root / f"{stem}.stdout.log"
             stderr_path = log_root / f"{stem}.stderr.log"
@@ -201,6 +206,43 @@ def run_checks(
             )
 
     return tuple(results)
+
+
+def run_check_preflights(
+    worktree: str | Path,
+    config: HarnessConfig,
+    required_check_ids: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """Run trusted preflight argv for the selected checks only.
+
+    The returned values are stable gate reasons.  No planner/model text is
+    interpreted as a command; both argv and cwd come from the trusted config.
+    """
+
+    root = Path(worktree).expanduser().resolve()
+    try:
+        selected = config.select_checks(required_check_ids)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    failures: list[str] = []
+    for check in selected:
+        if not check.preflight_argv:
+            continue
+        cwd = resolve_check_cwd(root, check)
+        try:
+            exit_code, timed_out = run_bounded(
+                check.preflight_argv,
+                cwd=cwd,
+                timeout_seconds=check.timeout_seconds,
+                stdout=tempfile.TemporaryFile(),
+                stderr=tempfile.TemporaryFile(),
+                grace_seconds=_CHECK_GRACE_SECONDS,
+            )
+        except (OSError, ValueError):
+            exit_code, timed_out = -1, False
+        if timed_out or exit_code != 0:
+            failures.append(f"CHECK_PREFLIGHT_FAILED:{check.id}")
+    return tuple(failures)
 
 
 def check_result_json(result: CheckResult, *, log_stem: str | None = None) -> dict[str, Any]:

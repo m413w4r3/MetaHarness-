@@ -80,6 +80,12 @@ secrets ne sont jamais mis dans la configuration persistée : `api_key_env`
 contient seulement le nom d’une variable d’environnement. Les écritures d’état
 passent par `RunStateStore` et sont atomiques.
 
+Les checks v2 proviennent du catalogue trusted `[[check_catalog]]` de la
+configuration. Le planner ne sélectionne que leurs IDs dans
+`REQUIRED_CHECKS`; les argv restent exclusivement dans MetaHarness. Les IDs
+`default_check_ids` sont toujours requis, et les preflights configurés sont
+exécutés avant les workers coûteux.
+
 ## Installation (une seule fois)
 
 ```bash

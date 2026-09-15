@@ -79,6 +79,7 @@ class EvidenceBundle:
     checks: tuple[CheckResult, ...]
     deterministic_passed: bool
     failures: tuple[str, ...]
+    required_check_ids: tuple[str, ...] = ()
 
 
 class EvidenceError(RuntimeError):
@@ -251,6 +252,7 @@ def collect_evidence(
     secrets: tuple[str, ...] = (),
     check_failures_hard: bool = True,
     expected_head_sha: str | None = None,
+    required_check_ids: tuple[str, ...] | list[str] | None = None,
 ) -> EvidenceBundle:
     """Run all configured checks, then stage and freeze the submitted tree."""
 
@@ -271,7 +273,8 @@ def collect_evidence(
             raise EvidenceError("evidence_dir must be outside the worktree")
         logs_dir = evidence_path / "checks"
     checks = run_checks(
-        root, config, logs_dir=logs_dir, tail_bytes=tail_bytes, secrets=secrets
+        root, config, required_check_ids=required_check_ids,
+        logs_dir=logs_dir, tail_bytes=tail_bytes, secrets=secrets
     )
 
     head_matches = current_head(root) == (expected_head_sha or base_sha)
@@ -294,12 +297,19 @@ def collect_evidence(
     if contains_secret(diff, secrets):
         # The diff would be sent to the reviewer endpoint and persisted.
         failures.append(SECRET_IN_DIFF)
-    for check, check_config in zip(checks, config.checks):
+    try:
+        selected_configs = config.select_checks(required_check_ids)
+    except ValueError as exc:
+        raise EvidenceError(str(exc)) from exc
+    for check, check_config in zip(checks, selected_configs):
         # A mutation changes the code that is reviewed, whatever the check's
         # importance: it always closes the gate.
         if check.workspace_mutated:
             failures.append(f"CHECK_MUTATED:{check.name}")
-        if not check_config.required:
+        # P42 selection itself is the mandatory contract.  ``required`` only
+        # retains the legacy per-check behavior when no planner selection was
+        # supplied.
+        if required_check_ids is None and not check_config.required:
             continue
         if check.timed_out:
             failures.append(f"CHECK_TIMEOUT:{check.name}")
@@ -314,6 +324,7 @@ def collect_evidence(
         checks=checks,
         deterministic_passed=not failures,
         failures=tuple(failures),
+        required_check_ids=tuple(check.id for check in selected_configs),
     )
     if evidence_dir is not None:
         persist_evidence(bundle, evidence_dir, write_logs=False, secrets=secrets)

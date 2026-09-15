@@ -54,6 +54,7 @@ from .evidence import (
     EvidenceBundle,
     collect_evidence,
 )
+from .validation import run_check_preflights
 from .gitops import (
     BaseMovedError,
     BasePushError,
@@ -341,10 +342,13 @@ def _step_reports_text(results: list[dict[str, Any]]) -> str:
 def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
     # A bundle rebuilt from ``evidence.json`` on resume carries the persisted
     # reviewer-safe payloads instead of CheckResult objects.
-    return [
-        dict(check) if isinstance(check, Mapping) else check_result_json(check)
-        for check in bundle.checks
-    ]
+    payload: list[dict[str, Any]] = []
+    for check in bundle.checks:
+        item = dict(check) if isinstance(check, Mapping) else check_result_json(check)
+        if bundle.required_check_ids:
+            item["required"] = item.get("name") in bundle.required_check_ids
+        payload.append(item)
+    return payload
 
 
 def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
@@ -911,6 +915,10 @@ def _load_evidence(directory: Path) -> EvidenceBundle | None:
         checks=tuple(checks),
         deterministic_passed=payload["deterministic_passed"],
         failures=tuple(failures),
+        required_check_ids=tuple(
+            item for item in payload.get("required_check_ids", [])
+            if isinstance(item, str)
+        ),
     )
 
 
@@ -1869,6 +1877,7 @@ class Orchestrator:
             info.worktree,
             base_sha,
             self.config,
+            required_check_ids=getattr(plan, "required_checks", ()) or None,
             evidence_dir=run_dir,
             secrets=self._secrets,
         )
@@ -1879,6 +1888,7 @@ class Orchestrator:
             changed_files=list(evidence.changed_files),
             deterministic_gate={
                 "passed": evidence.deterministic_passed,
+                "required_check_ids": list(evidence.required_check_ids),
                 "failures": list(evidence.failures),
             },
         )
@@ -1900,6 +1910,7 @@ class Orchestrator:
         gate = _json_text(
             {
                 "deterministic_passed": evidence.deterministic_passed,
+                "required_check_ids": list(evidence.required_check_ids),
                 "failures": list(evidence.failures),
                 "staged_tree_sha": evidence.staged_tree_sha,
             }
@@ -2024,6 +2035,8 @@ class Orchestrator:
                 reviewer_profiles=reviewers,
                 repository_reference=repository_reference,
                 planning=self.config.planning,
+                check_catalog=self.config.check_catalog,
+                default_check_ids=self.config.default_check_ids,
             )
             try:
                 plan = planner.plan(spec, context, artifacts_dir=run_dir)
@@ -2050,6 +2063,7 @@ class Orchestrator:
                 "profile_id": planner_profile.id,
                 "selection_mode": planner_profile.selection_mode.value,
                 "execution_mode": plan.execution_mode.value if plan.execution_mode else None,
+                "required_checks": list(plan.required_checks),
                 "steps": [
                     {"id": step.id, "title": step.title, "recommended_profile": step.implementer_profile,
                      "status": "waiting"}
@@ -2225,6 +2239,11 @@ class Orchestrator:
         candidate_tree = index_tree_sha(info.worktree)
         if candidate_tree != base_tree_sha:
             raise OrchestrationError("initial candidate tree does not match base")
+        preflight_failures = run_check_preflights(
+            info.worktree, self.config, plan.required_checks
+        )
+        if preflight_failures:
+            raise OrchestrationError(preflight_failures[0])
         # Worktree and setup complete: still the first Luna step.
         if checkpoint is not None:
             write_checkpoint(run_dir, checkpoint)
@@ -2499,6 +2518,7 @@ class Orchestrator:
                     info.worktree, base_sha, run_dir,
                     check_failures_hard=not revision_enabled,
                     reuse=resumed is not None and phase is ResumePhase.REVIEWER_C01,
+                    required_check_ids=plan.required_checks or None,
                 )
             except Exception:
                 self._write_phase_checkpoint(
@@ -2510,6 +2530,7 @@ class Orchestrator:
                          staged_tree_sha=evidence.staged_tree_sha,
                          changed_files=list(evidence.changed_files),
                          deterministic_gate={"passed": evidence.deterministic_passed,
+                                             "required_check_ids": list(evidence.required_check_ids),
                                              "failures": list(evidence.failures)})
             integrity_failures = _hard_integrity_failures(evidence) if revision_enabled else [item for item in evidence.failures if item in _DIRECT_FAILURES or
                                   any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES) or
@@ -3054,6 +3075,7 @@ class Orchestrator:
                 return accepted
         gate = _json_text({
             "deterministic_passed": evidence.deterministic_passed,
+            "required_check_ids": list(evidence.required_check_ids),
             "failures": list(evidence.failures),
             "staged_tree_sha": evidence.staged_tree_sha,
         })
@@ -3099,6 +3121,7 @@ class Orchestrator:
         check_failures_hard: bool,
         reuse: bool,
         expected_head_sha: str | None = None,
+        required_check_ids: tuple[str, ...] | None = None,
     ) -> EvidenceBundle:
         """Final checks for the exact current candidate.
 
@@ -3120,7 +3143,7 @@ class Orchestrator:
         return collect_evidence(
             worktree, base_sha, self.config, evidence_dir=evidence_dir,
             secrets=self._secrets, check_failures_hard=check_failures_hard,
-            expected_head_sha=expected_head_sha,
+            expected_head_sha=expected_head_sha, required_check_ids=required_check_ids,
         )
 
     def _run_v2_revision_cycle(
@@ -3178,6 +3201,7 @@ class Orchestrator:
             store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
             pre_evidence = collect_evidence(
                 info.worktree, base_sha, self.config,
+                required_check_ids=plan.required_checks or None,
                 evidence_dir=artifact_dir, secrets=self._secrets,
                 check_failures_hard=False,
                 expected_head_sha=expected_head,
@@ -3351,6 +3375,8 @@ class Orchestrator:
                 implementer_profiles=(repair_profile,),
                 reviewer_profiles=(reviewer_profile,),
                 planning=self.config.planning,
+                check_catalog=self.config.check_catalog,
+                original_required_check_ids=original_plan.required_checks,
             )
             repair_plan = repair_planner.plan(
                 repository_reference=render_repository_reference(repository_reference),
@@ -3541,6 +3567,7 @@ class Orchestrator:
                 evidence = self._final_evidence(
                     info.worktree, base_sha, checks_dir, check_failures_hard=False,
                     reuse=False, expected_head_sha=cycle_parent_sha,
+                    required_check_ids=repair_plan.required_checks or None,
                 )
             except Exception:
                 self._write_phase_checkpoint(
@@ -3554,6 +3581,7 @@ class Orchestrator:
                 staged_tree_sha=evidence.staged_tree_sha,
                 changed_files=list(evidence.changed_files),
                 deterministic_gate={"passed": evidence.deterministic_passed,
+                                    "required_check_ids": list(evidence.required_check_ids),
                                     "failures": list(evidence.failures)},
             )
             integrity_failures = _hard_integrity_failures(evidence)
@@ -4334,6 +4362,8 @@ class Orchestrator:
                     implementer_profiles=tuple(p for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
                     reviewer_profiles=tuple(p for p in profiles if ExecutionRole.REVIEWER in p.roles),
                     repository_reference=reference, planning=self.config.planning,
+                    check_catalog=self.config.check_catalog,
+                    default_check_ids=self.config.default_check_ids,
                 )
                 plan = planner.plan(spec, context, artifacts_dir=run_dir)
                 _persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
@@ -4343,6 +4373,8 @@ class Orchestrator:
                     raw,
                     implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
                     reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
+                    check_catalog=self.config.check_catalog,
+                    default_check_ids=self.config.default_check_ids,
                 )
                 if checkpoint.plan_identity is not None:
                     try:
@@ -4553,6 +4585,8 @@ class Orchestrator:
                 (run_dir / "planner.raw.md").read_text(encoding="utf-8"),
                 implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
                 reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
+                check_catalog=self.config.check_catalog,
+                default_check_ids=self.config.default_check_ids,
             )
             bundle, bundle_sha = validate_implementation_bundle(
                 run_dir, expected_step_ids=[step.id for step in plan.steps]
@@ -4857,6 +4891,8 @@ class Orchestrator:
                 (repair_dir / "planner.raw.md").read_text(encoding="utf-8"),
                 implementer_ids=frozenset({selection.repair_implementer.profile_id}),
                 reviewer_ids=frozenset({selection.reviewer.profile_id}),
+                check_catalog=self.config.check_catalog,
+                inherited_check_ids=resumed.plan.required_checks,
             )
             repair_bundle, repair_sha = validate_implementation_bundle(
                 repair_dir, expected_step_ids=[step.id for step in repair_plan.steps]
@@ -4945,6 +4981,8 @@ class Orchestrator:
 
 
 def _failure_reason(exc: Exception) -> str:
+    if isinstance(exc, OrchestrationError) and str(exc).startswith("CHECK_PREFLIGHT_FAILED:"):
+        return str(exc).split()[0]
     if isinstance(exc, CandidatePushError):
         return exc.code
     if isinstance(exc, CommitBoundaryError):

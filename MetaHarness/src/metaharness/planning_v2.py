@@ -21,6 +21,7 @@ from .models import (
     ExecutionModePolicy,
     ImplementationStep,
     ModelProfile,
+    CheckConfig,
     PlanningConfig,
     TaskPlanV2,
 )
@@ -52,7 +53,7 @@ _TEXT_SECTIONS = frozenset(
     {"OBJECTIVE", "CONSTRAINTS", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS"}
 )
 _ENVELOPE_INLINE = frozenset({"STATUS", "TITLE", "EXECUTION_MODE", "STEP_COUNT", "REVIEWER_PROFILE"})
-_ENVELOPE_SECTIONS = frozenset({"OBJECTIVE", "CONSTRAINTS", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS"})
+_ENVELOPE_SECTIONS = frozenset({"OBJECTIVE", "CONSTRAINTS", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS", "REQUIRED_CHECKS"})
 _STEP_INLINE = frozenset({"TITLE", "IMPLEMENTER_PROFILE", "DEPENDS_ON"})
 _STEP_SECTIONS = frozenset({"OBJECTIVE", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN"})
 
@@ -352,7 +353,54 @@ def _validate_bounds(plan: TaskPlanV2) -> None:
         raise V2PlanParseError("step contracts exceed MAX_TOTAL_STEP_CONTRACT_CHARS")
 
 
-def parse_task_plan_v2(raw: str, *, implementer_ids: frozenset[str], reviewer_ids: frozenset[str]) -> TaskPlanV2:
+def _parse_required_checks(
+    value: str,
+    *,
+    check_catalog: Sequence[CheckConfig],
+    default_check_ids: Sequence[str],
+    inherited_check_ids: Sequence[str],
+) -> tuple[str, ...]:
+    catalog_ids = tuple(check.id for check in check_catalog)
+    if len(set(catalog_ids)) != len(catalog_ids):
+        raise V2PlanParseError("trusted check catalogue contains duplicate IDs")
+    if not catalog_ids:
+        return ()
+    unknown_required = [
+        check_id for check_id in (*default_check_ids, *inherited_check_ids)
+        if check_id not in catalog_ids
+    ]
+    if unknown_required:
+        raise V2PlanParseError("unknown configured required check ID: " + unknown_required[0])
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    if not lines:
+        raise V2PlanParseError("READY plan requires REQUIRED_CHECKS")
+    selected: list[str] = []
+    for line in lines:
+        match = re.fullmatch(r"-\s+([A-Za-z0-9][A-Za-z0-9_.-]{0,63})", line)
+        if match is None:
+            raise V2PlanParseError("REQUIRED_CHECKS must contain only '- <catalogue id>' lines")
+        check_id = match.group(1)
+        if check_id not in catalog_ids:
+            raise V2PlanParseError(f"unknown required check ID: {check_id}")
+        if check_id not in selected:
+            selected.append(check_id)
+    required = tuple(dict.fromkeys((*default_check_ids, *inherited_check_ids)))
+    missing = [check_id for check_id in required if check_id not in selected]
+    if missing:
+        raise V2PlanParseError("REQUIRED_CHECKS is missing defaults: " + ", ".join(missing))
+    # The model chooses membership; the harness owns deterministic ordering.
+    return tuple(check_id for check_id in catalog_ids if check_id in selected)
+
+
+def parse_task_plan_v2(
+    raw: str,
+    *,
+    implementer_ids: frozenset[str],
+    reviewer_ids: frozenset[str],
+    check_catalog: Sequence[CheckConfig] = (),
+    default_check_ids: Sequence[str] = (),
+    inherited_check_ids: Sequence[str] = (),
+) -> TaskPlanV2:
     """Parse the exact v2 wire protocol and preserve ``raw`` unchanged."""
 
     if not isinstance(raw, str):
@@ -425,9 +473,16 @@ def parse_task_plan_v2(raw: str, *, implementer_ids: frozenset[str], reviewer_id
             raise V2PlanParseError(f"READY plan is missing {name}")
     if blockers and blockers.casefold() not in {"none", "n/a", "na", "-", "—", "nil"}:
         raise V2PlanParseError("READY plan cannot contain real BLOCKERS")
+    required_checks = _parse_required_checks(
+        sections.get("REQUIRED_CHECKS", ""),
+        check_catalog=check_catalog,
+        default_check_ids=default_check_ids,
+        inherited_check_ids=inherited_check_ids,
+    )
     plan = TaskPlanV2(
         decision, title, objective, sections["CONSTRAINTS"].strip(), ExecutionMode(mode), reviewer,
-        tuple(steps), sections["ACCEPTANCE"].strip(), sections["TESTS"].strip(), sections["RISKS"].strip(), blockers or "NONE", raw
+        tuple(steps), sections["ACCEPTANCE"].strip(), sections["TESTS"].strip(), sections["RISKS"].strip(), blockers or "NONE", raw,
+        required_checks,
     )
     _validate_bounds(plan)
     return plan
@@ -447,6 +502,7 @@ def render_plan_summary_v2(plan: TaskPlanV2) -> str:
             f"## Objective\n{plan.objective}",
             f"## Constraints\n{plan.constraints or 'NONE'}",
             f"## Execution mode\n{mode}",
+            "## Required checks\n" + ("\n".join(f"- {check_id}" for check_id in plan.required_checks) or "NONE"),
             "## Ordered steps\n" + ("\n\n".join(summaries) if summaries else "NONE"),
             f"## Acceptance\n{plan.acceptance or 'NONE'}",
             f"## Tests\n{plan.tests or 'NONE'}",
@@ -504,6 +560,24 @@ def render_safe_profile_catalogue(profiles: Sequence[ModelProfile]) -> str:
             )
         )
     return "\n\n".join(output)
+
+
+def render_safe_check_catalogue(checks: Sequence[CheckConfig]) -> str:
+    """Render only trusted check IDs and human descriptions for the planner."""
+
+    output: list[str] = []
+    for check in checks:
+        if not isinstance(check, CheckConfig):
+            raise TypeError("checks must contain CheckConfig values")
+        output.append(
+            "\n".join((
+                "CHECK",
+                f"ID: {check.id}",
+                f"DESCRIPTION: {check.description or 'No description configured.'}",
+                "END CHECK",
+            ))
+        )
+    return "\n\n".join(output) or "NONE"
 
 
 REQUIRE_STAGED_POLICY_TEXT = """This run REQUIRES STAGED execution.
@@ -632,6 +706,8 @@ def build_planner_prompt_v2(
     decomposition: str = PlanningConfig.decomposition,
     single_step_max_mutable_paths: int = PlanningConfig.single_step_max_mutable_paths,
     staged_step_max_mutable_paths: int = PlanningConfig.staged_step_max_mutable_paths,
+    check_catalog: Sequence[CheckConfig] = (),
+    default_check_ids: Sequence[str] = (),
 ) -> str:
     if not isinstance(spec, str) or not isinstance(context, str):
         raise TypeError("spec and context must be strings")
@@ -647,6 +723,8 @@ def build_planner_prompt_v2(
         ),
         "{{IMPLEMENTER_PROFILES}}": render_safe_profile_catalogue(implementer_profiles),
         "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
+        "{{CHECK_CATALOG}}": render_safe_check_catalogue(check_catalog),
+        "{{DEFAULT_CHECK_IDS}}": "\n".join(f"- {check_id}" for check_id in default_check_ids) or "NONE",
     }
     # Policies are inserted into the template before substitution so that
     # SPEC or context text can never impersonate or displace them.
@@ -655,7 +733,7 @@ def build_planner_prompt_v2(
         template, decomposition,
         single_step_max_mutable_paths, staged_step_max_mutable_paths,
     )
-    return re.sub(r"\{\{SPEC\}\}|\{\{CONTEXT\}\}|\{\{REPOSITORY\}\}|\{\{IMPLEMENTER_PROFILES\}\}|\{\{REVIEWER_PROFILES\}\}", lambda match: values[match.group(0)], template)
+    return re.sub(r"\{\{(?:SPEC|CONTEXT|REPOSITORY|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|DEFAULT_CHECK_IDS)\}\}", lambda match: values[match.group(0)], template)
 
 
 def build_repair_planner_prompt(
@@ -678,6 +756,8 @@ def build_repair_planner_prompt(
     reviewer_profiles: Sequence[ModelProfile] = (),
     template: str | None = None,
     original_meta_plan: str | None = None,
+    check_catalog: Sequence[CheckConfig] = (),
+    original_required_check_ids: Sequence[str] = (),
 ) -> str:
     """Build the bounded corrective planner request."""
 
@@ -706,6 +786,8 @@ def build_repair_planner_prompt(
         "{{REVIEWER_MISSING_TESTS}}": reviewer_missing_tests,
         "{{IMPLEMENTER_PROFILES}}": render_safe_profile_catalogue(implementer_profiles),
         "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
+        "{{CHECK_CATALOG}}": render_safe_check_catalogue(check_catalog),
+        "{{ORIGINAL_REQUIRED_CHECKS}}": "\n".join(f"- {check_id}" for check_id in original_required_check_ids) or "NONE",
     }
     for name, value in values.items():
         if not isinstance(value, str):
@@ -713,7 +795,7 @@ def build_repair_planner_prompt(
     if template is None:
         template = (Path(__file__).with_name("prompts") / "repair_planner_v2.txt").read_text(encoding="utf-8")
     return re.sub(
-        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_PLAN_SUMMARY|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_REQUIRED_FIXES|REVIEWER_MISSING_TESTS|REVIEWER_RESULT|ORIGINAL_APPROVED_MUTABLE_SCOPE|CANDIDATE_COMMIT_SHA|CANDIDATE_IMMUTABLE_URL|IMPLEMENTER_PROFILES|REVIEWER_PROFILES)\}\}",
+        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_PLAN_SUMMARY|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_REQUIRED_FIXES|REVIEWER_MISSING_TESTS|REVIEWER_RESULT|ORIGINAL_APPROVED_MUTABLE_SCOPE|CANDIDATE_COMMIT_SHA|CANDIDATE_IMMUTABLE_URL|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|ORIGINAL_REQUIRED_CHECKS)\}\}",
         lambda match: values[match.group(0)],
         template,
     )
@@ -770,6 +852,7 @@ def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict
         "schema_version": 1,
         "execution_mode": plan.execution_mode.value if plan.execution_mode else None,
         "reviewer_profile": plan.reviewer_profile,
+        "required_checks": list(plan.required_checks),
         "steps": entries,
     }
     atomic_write_text(target / "implementation_contract.md", render_plan_summary_v2(plan))
@@ -937,7 +1020,7 @@ class TextCompletionClient(Protocol):
 class PlannerV2:
     """Standalone v2 planner entry point; it never invokes P17 recommender."""
 
-    def __init__(self, client: TextCompletionClient, *, implementer_ids: frozenset[str], reviewer_ids: frozenset[str], implementer_profiles: Sequence[ModelProfile] = (), reviewer_profiles: Sequence[ModelProfile] = (), repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None):
+    def __init__(self, client: TextCompletionClient, *, implementer_ids: frozenset[str], reviewer_ids: frozenset[str], implementer_profiles: Sequence[ModelProfile] = (), reviewer_profiles: Sequence[ModelProfile] = (), repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None, check_catalog: Sequence[CheckConfig] = (), default_check_ids: Sequence[str] = ()):
         self.client = client
         self.implementer_ids = implementer_ids
         self.reviewer_ids = reviewer_ids
@@ -946,6 +1029,8 @@ class PlannerV2:
         self.repository_reference = repository_reference
         self.planning = planning or PlanningConfig(protocol="v2")
         self.template = template
+        self.check_catalog = tuple(check_catalog)
+        self.default_check_ids = tuple(default_check_ids)
         self.last_conversation: LLMConversationHandle | None = None
 
     def plan(self, spec: str, context: str, *, repository_reference: RepositoryReference | None = None, artifacts_dir: str | Path | None = None) -> TaskPlanV2:
@@ -958,6 +1043,8 @@ class PlannerV2:
             decomposition=self.planning.decomposition,
             single_step_max_mutable_paths=self.planning.single_step_max_mutable_paths,
             staged_step_max_mutable_paths=self.planning.staged_step_max_mutable_paths,
+            check_catalog=self.check_catalog,
+            default_check_ids=self.default_check_ids,
         )
         target = Path(artifacts_dir) if artifacts_dir is not None else None
         if target is not None:
@@ -972,7 +1059,8 @@ class PlannerV2:
             raise V2PlanParseError("planner client did not return text")
         if target is not None:
             atomic_write_text(target / "planner.raw.md", raw)
-        plan = parse_task_plan_v2(raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids)
+        plan = parse_task_plan_v2(raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids,
+                                  check_catalog=self.check_catalog, default_check_ids=self.default_check_ids)
         # Only the initial planner is bound by the execution mode policy; the
         # bounded C02 repair plan keeps its own (possibly single-step) shape.
         validate_execution_mode_policy(plan, self.planning)
@@ -1005,6 +1093,8 @@ class RepairPlannerV2:
         reviewer_profiles: Sequence[ModelProfile] = (),
         planning: PlanningConfig | None = None,
         template: str | None = None,
+        check_catalog: Sequence[CheckConfig] = (),
+        original_required_check_ids: Sequence[str] = (),
     ):
         self.client = client
         self.implementer_ids = implementer_ids
@@ -1013,6 +1103,8 @@ class RepairPlannerV2:
         self.reviewer_profiles = reviewer_profiles
         self.planning = planning or PlanningConfig(protocol="v2")
         self.template = template
+        self.check_catalog = tuple(check_catalog)
+        self.original_required_check_ids = tuple(original_required_check_ids)
 
     def plan(
         self,
@@ -1054,6 +1146,8 @@ class RepairPlannerV2:
             reviewer_profiles=self.reviewer_profiles,
             template=self.template,
             original_meta_plan=original_meta_plan,
+            check_catalog=self.check_catalog,
+            original_required_check_ids=self.original_required_check_ids,
         )
         target = Path(artifacts_dir)
         atomic_write_text(target / "planner.request.txt", request)
@@ -1070,7 +1164,8 @@ class RepairPlannerV2:
             raise V2PlanParseError("repair planner client did not return text")
         atomic_write_text(target / "planner.raw.md", raw)
         plan = parse_task_plan_v2(
-            raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids
+            raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids,
+            check_catalog=self.check_catalog, inherited_check_ids=self.original_required_check_ids,
         )
         validate_decomposition_policy(plan, self.planning)
         if plan.decision is PlanDecision.READY:
@@ -1099,6 +1194,8 @@ def run_planner_v2(
     planning: PlanningConfig | None = None,
     artifacts_dir: str | Path | None = None,
     template: str | None = None,
+    check_catalog: Sequence[CheckConfig] = (),
+    default_check_ids: Sequence[str] = (),
 ) -> TaskPlanV2:
     return PlannerV2(
         client,
@@ -1109,6 +1206,8 @@ def run_planner_v2(
         repository_reference=repository_reference,
         planning=planning,
         template=template,
+        check_catalog=check_catalog,
+        default_check_ids=default_check_ids,
     ).plan(spec, context, artifacts_dir=artifacts_dir)
 
 

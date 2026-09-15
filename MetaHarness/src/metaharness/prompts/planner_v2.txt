@@ -137,6 +137,12 @@ names, secrets, or other credentials.
 
 Do not output code fences.
 
+REQUIRED_CHECKS is the complete deterministic gate selection. Select only
+trusted IDs from the catalogue below. Include every configured default ID.
+If the SPEC explicitly requires a validation represented by a trusted check,
+select that ID. A VERIFY step is not a substitute for a selected final check.
+Never invent an ID and never output commands or argv.
+
 The answer must use exactly this protocol. Do not add prose before or after it.
 
 META PLAN v2
@@ -149,6 +155,9 @@ OBJECTIVE
 
 CONSTRAINTS
 <text or NONE>
+
+REQUIRED_CHECKS
+{{DEFAULT_CHECK_IDS}}
 
 EXECUTION_MODE: SINGLE|STAGED
 STEP_COUNT: <integer>
@@ -204,6 +213,12 @@ IMPLEMENTER PROFILES
 
 REVIEWER PROFILES
 {{REVIEWER_PROFILES}}
+
+TRUSTED CHECK CATALOGUE
+{{CHECK_CATALOG}}
+
+DEFAULT REQUIRED CHECK IDS
+{{DEFAULT_CHECK_IDS}}
 
 REPOSITORY REFERENCE
 {{REPOSITORY}}

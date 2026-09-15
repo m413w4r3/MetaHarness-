@@ -42,6 +42,8 @@ from .models import (
     AgentConfig,
     ApprovalConfig,
     CheckConfig,
+    CheckCatalogEntry,
+    TrustedCheckConfig,
     ClaudeRuntimeConfig,
     CodexRuntimeConfig,
     ContextConfig,
@@ -76,7 +78,7 @@ from .run_options import (
     read_run_options_with_sha256,
 )
 from .state import RunStateStore
-from .validation import CheckResult, ValidationError, run_checks
+from .validation import CheckResult, ValidationError, run_check_preflights, run_checks
 from .workspace import WorkspaceSetupError, WorkspaceSetupResult, prepare_workspace
 
 __all__ = [
@@ -86,6 +88,8 @@ __all__ = [
     "ApprovalDecision",
     "ApprovalError",
     "CheckConfig",
+    "CheckCatalogEntry",
+    "TrustedCheckConfig",
     "ClaudeAgentError",
     "ClaudeAuthStatus",
     "ClaudeCodeAgent",
@@ -152,6 +156,7 @@ __all__ = [
     "read_plan_approval",
     "run_orchestrator",
     "run_checks",
+    "run_check_preflights",
     "wait_for_plan_approval",
     "write_plan_approval",
     "prepare_workspace",

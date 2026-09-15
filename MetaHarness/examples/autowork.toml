@@ -7,6 +7,7 @@ worktrees_root = "../../MetaHarness-worktrees"
 require_clean_base = true
 max_diff_bytes = 400000
 allow_no_required_checks = false
+default_check_ids = ["lint", "typecheck", "test"]
 
 [planning]
 protocol = "v2"
@@ -126,20 +127,37 @@ strengths = ["semantic revision", "integration review", "corrective editing"]
 cost_tier = "high"
 latency_tier = "slow"
 
-[[checks]]
-name = "lint"
+[[check_catalog]]
+id = "lint"
+description = "Repository lint gate."
 argv = ["make", "lint"]
 timeout_seconds = 18000
 
-[[checks]]
-name = "typecheck"
+[[check_catalog]]
+id = "typecheck"
+description = "Repository type-check gate."
 argv = ["make", "typecheck"]
 timeout_seconds = 18000
 
-[[checks]]
-name = "test"
+[[check_catalog]]
+id = "test"
+description = "Repository unit and application test gate."
 argv = ["make", "test"]
 timeout_seconds = 54000
+
+[[check_catalog]]
+id = "test-integration"
+description = "PostgreSQL-backed integration test gate."
+argv = ["make", "test-integration"]
+timeout_seconds = 54000
+preflight_argv = ["docker", "info"]
+
+[[check_catalog]]
+id = "alembic-heads"
+description = "Alembic migration head evidence."
+cwd = "backend"
+argv = ["uv", "run", "alembic", "heads"]
+timeout_seconds = 300
 
 [[workspace_setup]]
 name = "frontend-dependencies"

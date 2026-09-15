@@ -19,6 +19,12 @@ Do not assume either is correct.
 
 A green test suite is evidence, not proof.
 
+The DETERMINISTIC GATE and CHECK RESULTS identify the trusted REQUIRED_CHECKS.
+Report the result of every required check explicitly. PASS is forbidden if a
+required ID is missing from the results, failed, timed out, mutated the
+workspace, or was never run. Never infer an aggregate green result from prose
+or from a subset of the listed checks.
+
 Your job has THREE comparisons:
 
 A. ORIGINAL SPEC versus PLAN

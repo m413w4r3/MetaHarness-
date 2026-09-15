@@ -30,6 +30,9 @@ Use the exact profile IDs supplied below. Emit all four path-set sections in
 every step. Keep every mutable path inside ORIGINAL APPROVED MUTABLE SCOPE,
 except for a path that is demonstrably required by a concrete reviewer finding;
 such a path is a bounded scope addition, never permission for redesign.
+The repair plan must preserve every ORIGINAL_REQUIRED_CHECKS ID in
+REQUIRED_CHECKS. It may add trusted IDs when the reviewer requires additional
+evidence. Select IDs only; never output commands or argv.
 
 META PLAN v2
 
@@ -41,6 +44,9 @@ OBJECTIVE
 
 CONSTRAINTS
 <text or NONE>
+
+REQUIRED_CHECKS
+- original-required-check-id
 
 EXECUTION_MODE: SINGLE|STAGED
 STEP_COUNT: <integer>
@@ -96,6 +102,12 @@ REPAIR IMPLEMENTER PROFILES
 
 REVIEWER PROFILES
 {{REVIEWER_PROFILES}}
+
+TRUSTED CHECK CATALOGUE
+{{CHECK_CATALOG}}
+
+ORIGINAL REQUIRED CHECK IDS
+{{ORIGINAL_REQUIRED_CHECKS}}
 
 REPOSITORY REFERENCE
 {{REPOSITORY}}
