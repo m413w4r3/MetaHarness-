@@ -85,8 +85,11 @@ class RunOptionsTests(unittest.TestCase):
         self.assertNotEqual(self.config.planning.staged_step_max_mutable_paths, 9)
         with tempfile.TemporaryDirectory() as directory:
             fallback, digest = legacy_or_durable_run_options(self.config, directory)
-            self.assertEqual(fallback, RunOptions.from_config(self.config))
-            self.assertIsNone(digest)
+        self.assertEqual(
+            fallback,
+            RunOptions.from_config(self.config, repair_scope_policy="deny-expansion"),
+        )
+        self.assertIsNone(digest)
 
     def test_new_run_html_contains_safe_controls(self):
         html = render_new_run(self.config, "token")

@@ -168,10 +168,11 @@ class P29Harness(P28Harness):
         return orchestrator, planner, reviewer, luna, claude
 
     def run_approved(self, config: Any, orchestrator: Orchestrator, run_id: str,
-                     steps: tuple[str, ...] = ("S01",)) -> Any:
+                     steps: tuple[str, ...] = ("S01",), run_options: Any = None) -> Any:
         holder: dict[str, Any] = {}
         thread = threading.Thread(
-            target=lambda: holder.setdefault("result", orchestrator.run_text(SPEC, run_id=run_id)))
+            target=lambda: holder.setdefault(
+                "result", orchestrator.run_text(SPEC, run_id=run_id, run_options=run_options)))
         thread.start()
         state_path = config.runs_root / run_id / "state.json"
         deadline = time.monotonic() + 20

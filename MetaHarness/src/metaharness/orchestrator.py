@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import inspect
 import json
 import os
@@ -10,7 +11,7 @@ import re
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, NoReturn
 
 from .agent.base import AgentError, AgentResult
@@ -39,6 +40,7 @@ from .approval import (
     PlanIdentity,
     compute_plan_identity_from_run,
     read_plan_approval,
+    read_scope_approval,
     wait_for_plan_approval,
 )
 from .config import load_config
@@ -194,6 +196,12 @@ class OrchestrationError(RuntimeError):
 
 class CommitBoundaryError(OrchestrationError):
     """A commit precondition does not hold immediately before the commit."""
+
+
+class ScopeApprovalRequired(OrchestrationError):
+    """C02 is durably paused until its exact scope delta is approved."""
+
+    code = "WAITING_SCOPE_APPROVAL"
 
 
 def _chat_client(endpoint: Any, environment: Mapping[str, str]) -> OpenAIChatTextClient:
@@ -603,6 +611,7 @@ class ReviewCycleInput:
     luna_reports: str
     revision_report: str
     cycle_history: str
+    scope_delta: str = ""
 
 
 def _step_result_record(outcome: StepExecutionOutcome) -> dict[str, Any]:
@@ -1035,6 +1044,67 @@ def _candidate_commit_path(run_dir: Path, cycle: int) -> Path:
     return run_dir / "candidate" / f"C{cycle:02d}" / "commit.json"
 
 
+def _repair_mutation_sets(plan: TaskPlanV2) -> tuple[list[str], list[str], list[str]]:
+    """Return canonical C02 mutation sets and reject structural ambiguity."""
+
+    writes = sorted({path for step in plan.steps for path in step.write_set})
+    creates = sorted({path for step in plan.steps for path in step.create_set})
+    deletes = sorted({path for step in plan.steps for path in step.delete_set})
+    if (set(writes) & set(creates)) or (set(writes) & set(deletes)) or (set(creates) & set(deletes)):
+        raise OrchestrationError("REPAIR_SCOPE_MUTATION_SETS_OVERLAP")
+    for path in (*writes, *creates, *deletes):
+        posix = PurePosixPath(path)
+        if (not path or path.startswith("/") or "\\" in path
+                or any(part in {"", ".", ".."} for part in posix.parts)
+                or any(char in path for char in "*?[")):
+            raise OrchestrationError("REPAIR_SCOPE_UNSAFE_PATH")
+    return writes, creates, deletes
+
+
+def _write_scope_delta(
+    repair_dir: Path, *, original_scope: list[str], plan: TaskPlanV2,
+    candidate_commit_sha: str, review: ReviewResult, repair_bundle_sha: str,
+) -> tuple[dict[str, Any], str]:
+    """Persist the scope delta from parsed plan sets, never reviewer prose."""
+
+    writes, creates, deletes = _repair_mutation_sets(plan)
+    requested = sorted(set(writes) | set(creates) | set(deletes))
+    original = sorted(set(original_scope))
+    added = sorted(set(requested) - set(original))
+    unchanged = sorted(set(requested) & set(original))
+    findings = review.required_fixes.strip() or review.findings.strip()
+    reasons: dict[str, Any] = {}
+    for path in added:
+        steps = [step for step in plan.steps if path in set(step.write_set) | set(step.create_set) | set(step.delete_set)]
+        step = steps[0]
+        reasons[path] = {
+            "reason": f"{step.title}: {step.objective}",
+            "source_finding": findings,
+        }
+    try:
+        raw_plan = (repair_dir / "planner.raw.md").read_bytes()
+    except OSError as exc:
+        raise OrchestrationError("REPAIR_SCOPE_PLAN_UNREADABLE") from exc
+    plan_sha = hashlib.sha256(raw_plan).hexdigest()
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "original_mutable_paths": original,
+        "requested_write_paths": writes,
+        "requested_create_paths": creates,
+        "requested_delete_paths": deletes,
+        "added_paths": added,
+        "unchanged_paths": unchanged,
+        "added_path_reasons": reasons,
+        "source_finding": findings,
+        "candidate_commit_sha": candidate_commit_sha,
+        "repair_plan_sha256": plan_sha,
+        "repair_bundle_sha256": repair_bundle_sha,
+    }
+    content = _json_text(payload)
+    atomic_write_text(repair_dir / "scope_delta.json", content)
+    return payload, hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def _candidate_commit_payload(
     *, commit_sha: str, tree_sha: str, parent_sha: str, branch: str,
     remote: str, immutable_url: str | None, pushed_at: str | None = None,
@@ -1356,6 +1426,11 @@ class Orchestrator:
             legacy_run_options = run_options is None
             if run_options is None:
                 overrides = {"planner_profile": planner_profile} if planner_profile is not None else {}
+                # Direct callers that predate the durable run-options
+                # snapshot retain the historical terminal REPLAN and
+                # no-expansion behavior.  New/API callers opt into bounded
+                # repair by passing an explicit RunOptions instance.
+                overrides["repair_scope_policy"] = "deny-expansion"
                 run_options = RunOptions.from_config(original_config, **overrides)
             elif planner_profile is not None and planner_profile != run_options.planner_profile:
                 raise OrchestrationError("planner profile conflicts with run options")
@@ -2178,6 +2253,7 @@ class Orchestrator:
         step_id: str | None = None,
         cycle: int | None = None,
         repair_bundle_sha256: str | None = None,
+        scope_delta_sha256: str | None = None,
     ) -> None:
         """Write a new-schema boundary without changing the old hook API."""
 
@@ -2202,6 +2278,7 @@ class Orchestrator:
                 phase, cycle or (2 if phase_index(phase) >= phase_index(ResumePhase.REPAIR_PLANNER) else 1),
                 step_id, head, tree, execution, identity,
                 repair_bundle_sha256 or previous.repair_bundle_sha256,
+                scope_delta_sha256 or previous.scope_delta_sha256,
             ),
         )
 
@@ -2215,6 +2292,7 @@ class Orchestrator:
         cycle: int | None = None,
         step_id: str | None = None,
         repair_bundle_sha256: str | None = None,
+        scope_delta_sha256: str | None = None,
     ) -> None:
         """Persist the next operation that has not yet succeeded.
 
@@ -2238,6 +2316,7 @@ class Orchestrator:
         write_checkpoint(run_dir, ResumeCheckpoint(
             phase, cycle, step_id, head, tree,
             previous.execution_selection_sha256, previous.plan_identity, repair,
+            scope_delta_sha256 or previous.scope_delta_sha256,
         ))
 
     def _execute_v2(
@@ -2543,12 +2622,18 @@ class Orchestrator:
             if review is None:
                 raise ResumeIntegrityError("C01 reviewer result is missing")
         if review.verdict is ReviewVerdict.REVISE:
-            if repair_enabled and review.route is ReviewRoute.IMPLEMENTATION:
+            repair_routes = {ReviewRoute.IMPLEMENTATION}
+            if not self._legacy_run_options:
+                repair_routes.add(ReviewRoute.REPLAN)
+            if repair_enabled and review.route in repair_routes:
                 if at <= phase_index(ResumePhase.REVIEWER_C01):
                     store.update(status=RunStatus.IMPLEMENTING, cycle=2)
                     self._cycle_update(
                         store, 2, status="starting",
                         trigger="Reviewer requested one bounded implementation correction loop.",
+                        audit_route=review.route.value,
+                        audit_request=("plan/scope repair" if review.route is ReviewRoute.REPLAN
+                                       else "implementation repair"),
                     )
                     # Reviewer #1 complete: the next operation is the repair planner.
                     self._checkpoint(run_dir, ResumePhase.REPAIR_PLANNER, head=base_sha,
@@ -2586,14 +2671,27 @@ class Orchestrator:
                 except ReviewerTransportError as exc:
                     return self._v2_failed(store, run_dir, "REVIEWER_TRANSPORT_FAILURE", None,
                                            _bounded_parse_detail(exc))
+                except ScopeApprovalRequired:
+                    return RunResult(run_dir, RunStatus.WAITING_SCOPE_APPROVAL, store.load())
                 except LLMError as exc:
                     return self._v2_failed(store, run_dir, "LLM_FAILURE", None,
                                            _bounded_parse_detail(exc))
                 except OrchestrationError as exc:
                     reason = str(exc).split(":", 1)[0].strip() or "REPAIR_FAILED"
                     return self._v2_failed(store, run_dir, reason, None)
-                if review.verdict is ReviewVerdict.REVISE and review.route is ReviewRoute.IMPLEMENTATION:
-                    return self._v2_failed(store, run_dir, "REVIEW_LOOP_EXHAUSTED", None)
+                if review.verdict is ReviewVerdict.REVISE and review.route in {
+                    ReviewRoute.IMPLEMENTATION, ReviewRoute.REPLAN,
+                }:
+                    # Legacy direct callers retain the P40 implementation
+                    # reason.  Durable runs uniformly expose a spent repair
+                    # budget as an operator-required terminal outcome.
+                    reason = (
+                        "REVIEW_LOOP_EXHAUSTED"
+                        if self._legacy_run_options and review.route is ReviewRoute.IMPLEMENTATION
+                        else "REPAIR_EXHAUSTED"
+                    )
+                    return self._v2_failed(store, run_dir, reason, None,
+                                           "HUMAN_REQUIRED")
                 if review.verdict is not ReviewVerdict.PASS or review.route is not ReviewRoute.NONE:
                     return self._v2_failed(store, run_dir, "REVIEW_FAILED", None)
                 if not evidence.deterministic_passed:
@@ -3265,6 +3363,10 @@ class Orchestrator:
                 claude_revision_report_cycle_1=cycle_1_revision_report or "NONE",
                 reviewer_required_fixes=cycle_1_review.required_fixes,
                 original_approved_mutable_scope=_json_text(original_scope),
+                candidate_commit_sha=cycle_parent_sha,
+                candidate_immutable_url=str(c01_candidate_record.get("immutable_commit_url") or ""),
+                reviewer_result=_json_text(_review_payload(cycle_1_review)),
+                reviewer_missing_tests=cycle_1_review.missing_tests,
                 artifacts_dir=repair_dir,
                 conversation=_read_planner_conversation(run_dir),
             )
@@ -3286,24 +3388,63 @@ class Orchestrator:
             path for step in repair_plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
         })
+        scope_delta, scope_delta_sha = _write_scope_delta(
+            repair_dir, original_scope=original_scope, plan=repair_plan,
+            candidate_commit_sha=cycle_parent_sha, review=cycle_1_review,
+            repair_bundle_sha=repair_bundle_sha,
+        )
+        for path in scope_delta["requested_write_paths"] + scope_delta["requested_delete_paths"]:
+            if not path_exists_in_tree(repo, cycle_parent_sha, path):
+                raise OrchestrationError("REPAIR_SCOPE_EXISTING_PATH_MISSING")
+        for path in scope_delta["requested_create_paths"]:
+            if path_exists_in_tree(repo, cycle_parent_sha, path):
+                raise OrchestrationError("REPAIR_SCOPE_CREATE_PATH_EXISTS")
+        if scope_delta["added_paths"] and not cycle_1_review.required_fixes.strip() and not cycle_1_review.findings.strip():
+            raise OrchestrationError("REPAIR_SCOPE_UNJUSTIFIED")
         atomic_write_text(
             repair_dir / "scope.json",
             _json_text({
                 "repair_mutable_scope": repair_scope,
                 "original_approved_mutable_scope": original_scope,
+                "scope_delta_sha256": scope_delta_sha,
             }),
         )
-        if not set(repair_scope).issubset(set(original_scope)):
+        added_paths = scope_delta["added_paths"]
+        policy = self._run_options.repair_scope_policy
+        bound = self._run_options.repair_scope_max_added_paths
+        if len(added_paths) > bound:
             self._cycle_update(
-                store, 2, status="failed", failure="REPAIR_SCOPE_EXPANSION",
-                repair_mutable_scope=repair_scope,
+                store, 2, status="failed", failure="REPAIR_SCOPE_BOUND_EXCEEDED",
+                repair_mutable_scope=repair_scope, scope_delta=scope_delta,
             )
+            raise OrchestrationError("HUMAN_REQUIRED: repair scope bound exceeded")
+        if added_paths and policy == "deny-expansion":
+            self._cycle_update(store, 2, status="failed", failure="REPAIR_SCOPE_EXPANSION",
+                               repair_mutable_scope=repair_scope, scope_delta=scope_delta)
             raise OrchestrationError("REPAIR_SCOPE_EXPANSION")
+        if added_paths and policy == "require-approval":
+            approval = read_scope_approval(repair_dir, expected_sha256=scope_delta_sha)
+            if approval is None:
+                self._checkpoint(run_dir, ResumePhase.SCOPE_APPROVAL, cycle=2,
+                                 head=cycle_parent_sha, tree=tree_before,
+                                 repair_bundle_sha256=repair_bundle_sha,
+                                 scope_delta_sha256=scope_delta_sha)
+                self._cycle_update(store, 2, status="waiting_scope_approval",
+                                   scope_delta=scope_delta)
+                store.update(status=RunStatus.WAITING_SCOPE_APPROVAL,
+                             scope_delta=scope_delta, current_step=None)
+                raise ScopeApprovalRequired()
+            if approval.decision is not ApprovalDecision.APPROVE:
+                raise OrchestrationError("HUMAN_REQUIRED: repair scope rejected")
+        elif added_paths and policy == "auto-bounded":
+            self._cycle_update(store, 2, status="scope_auto_approved",
+                               scope_delta=scope_delta)
         if at <= phase_index(ResumePhase.REPAIR_PLANNER):
             # Repair planner complete: the next operation is repair step 1.
             self._checkpoint(
                 run_dir, ResumePhase.REPAIR_STEP, step_id=repair_plan.steps[0].id,
                 head=cycle_parent_sha, tree=tree_before, repair_bundle_sha256=repair_bundle_sha,
+                scope_delta_sha256=scope_delta_sha,
             )
         completed = list(resumed.c02_steps) if resumed is not None else []
         done_ids = {record["id"] for record in completed}
@@ -3373,7 +3514,7 @@ class Orchestrator:
                 bundle=repair_bundle, repository_reference=repository_reference, info=info,
                 branch_ref=branch_ref, ownership_before=ownership_before, selection=selection,
                 artifact_dir=run_dir / "revision" / "C02", contract_dir=repair_dir,
-                mutable_scope=original_scope,
+                mutable_scope=repair_scope,
                 luna_reports=_step_reports_text(self._repair_v2_step_results),
                 cycle=2,
             )
@@ -3468,6 +3609,7 @@ class Orchestrator:
             c02_candidate = self._push_candidate(
                 run_dir=run_dir, info=info, cycle=2, candidate=c02_candidate, store=store,
             )
+            self._cycle_update(store, 2, status="candidate_pushed")
         # C02 candidate push complete: the next operation is reviewer #2.
         self._checkpoint(run_dir, ResumePhase.REVIEWER_C02, cycle=2,
                          head=c02_candidate["commit_sha"], tree=evidence.staged_tree_sha,
@@ -3501,7 +3643,8 @@ class Orchestrator:
                     iteration=2,
                     plan_text=(
                         f"ORIGINAL APPROVED PLAN\n{original_plan.raw}\n\n"
-                        f"REPAIR PLAN C02\n{repair_plan.raw}"
+                        f"REPAIR PLAN C02\n{repair_plan.raw}\n\n"
+                        f"SCOPE DELTA C02\n{_json_text(scope_delta)}"
                     ),
                     luna_reports=(
                         "C01 LUNA REPORTS\n"
@@ -3516,6 +3659,7 @@ class Orchestrator:
                         f"{revision_report_c02 or 'NONE'}"
                     ),
                     cycle_history=cycle_history,
+                    scope_delta=_json_text(scope_delta),
                 ),
                 artifacts_dir=run_dir / "review" / "C02",
                 worktree=info.worktree, base_sha=base_sha,
@@ -4440,7 +4584,7 @@ class Orchestrator:
             head = current_head(worktree)
             existing_commit: str | None = None
             c02_phases = {
-                ResumePhase.REPAIR_PLANNER, ResumePhase.REPAIR_STEP,
+                ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL, ResumePhase.REPAIR_STEP,
                 ResumePhase.CHECKS_C02, ResumePhase.CLAUDE_C02,
                 ResumePhase.FINAL_CHECKS_C02, ResumePhase.CANDIDATE_COMMIT_C02,
                 ResumePhase.CANDIDATE_PUSH_C02, ResumePhase.REVIEWER_C02,
@@ -4697,7 +4841,9 @@ class Orchestrator:
         if evidence is None or evidence.staged_tree_sha != c01_tree:
             refuse("the C01 final evidence is missing or not for the C01 tree")
         review = _load_c01_review(run_dir, evidence)
-        if review is None or review.verdict is not ReviewVerdict.REVISE or review.route is not ReviewRoute.IMPLEMENTATION:
+        if review is None or review.verdict is not ReviewVerdict.REVISE or review.route not in {
+            ReviewRoute.IMPLEMENTATION, ReviewRoute.REPLAN,
+        }:
             refuse("reviewer #1 did not route an implementation repair")
         resumed.c01_evidence, resumed.c01_review = evidence, review
         if checkpoint.phase is ResumePhase.REPAIR_PLANNER:
@@ -4720,6 +4866,13 @@ class Orchestrator:
         if repair_plan.decision is not PlanDecision.READY or repair_sha != checkpoint.repair_bundle_sha256:
             refuse("the C02 repair bundle changed")
         resumed.repair_plan, resumed.repair_bundle, resumed.repair_bundle_sha = repair_plan, repair_bundle, repair_sha
+        if checkpoint.phase is ResumePhase.SCOPE_APPROVAL:
+            delta = _read_json_artifact(repair_dir / "scope_delta.json", 256 * 1024)
+            if (not isinstance(delta, dict) or checkpoint.scope_delta_sha256 is None
+                    or hashlib.sha256((repair_dir / "scope_delta.json").read_bytes()).hexdigest()
+                    != checkpoint.scope_delta_sha256):
+                refuse("the C02 scope delta changed")
+            return
         repair_ids = [step.id for step in repair_plan.steps]
         if checkpoint.phase is ResumePhase.REPAIR_STEP:
             if checkpoint.step_id not in repair_ids:

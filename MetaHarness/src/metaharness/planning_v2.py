@@ -670,6 +670,10 @@ def build_repair_planner_prompt(
     claude_revision_report_cycle_1: str,
     reviewer_required_fixes: str,
     original_approved_mutable_scope: str,
+    candidate_commit_sha: str = "",
+    candidate_immutable_url: str = "",
+    reviewer_result: str = "",
+    reviewer_missing_tests: str = "",
     implementer_profiles: Sequence[ModelProfile] = (),
     reviewer_profiles: Sequence[ModelProfile] = (),
     template: str | None = None,
@@ -696,6 +700,10 @@ def build_repair_planner_prompt(
         "{{CLAUDE_REVISION_REPORT_CYCLE_1}}": claude_revision_report_cycle_1,
         "{{REVIEWER_REQUIRED_FIXES}}": reviewer_required_fixes,
         "{{ORIGINAL_APPROVED_MUTABLE_SCOPE}}": original_approved_mutable_scope,
+        "{{CANDIDATE_COMMIT_SHA}}": candidate_commit_sha,
+        "{{CANDIDATE_IMMUTABLE_URL}}": candidate_immutable_url,
+        "{{REVIEWER_RESULT}}": reviewer_result,
+        "{{REVIEWER_MISSING_TESTS}}": reviewer_missing_tests,
         "{{IMPLEMENTER_PROFILES}}": render_safe_profile_catalogue(implementer_profiles),
         "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
     }
@@ -705,7 +713,7 @@ def build_repair_planner_prompt(
     if template is None:
         template = (Path(__file__).with_name("prompts") / "repair_planner_v2.txt").read_text(encoding="utf-8")
     return re.sub(
-        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_PLAN_SUMMARY|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_REQUIRED_FIXES|ORIGINAL_APPROVED_MUTABLE_SCOPE|IMPLEMENTER_PROFILES|REVIEWER_PROFILES)\}\}",
+        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_PLAN_SUMMARY|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_REQUIRED_FIXES|REVIEWER_MISSING_TESTS|REVIEWER_RESULT|ORIGINAL_APPROVED_MUTABLE_SCOPE|CANDIDATE_COMMIT_SHA|CANDIDATE_IMMUTABLE_URL|IMPLEMENTER_PROFILES|REVIEWER_PROFILES)\}\}",
         lambda match: values[match.group(0)],
         template,
     )
@@ -1022,6 +1030,10 @@ class RepairPlannerV2:
         artifacts_dir: str | Path,
         conversation: LLMConversationHandle | None = None,
         original_meta_plan: str | None = None,
+        candidate_commit_sha: str = "",
+        candidate_immutable_url: str = "",
+        reviewer_result: str = "",
+        reviewer_missing_tests: str = "",
     ) -> TaskPlanV2:
         request = build_repair_planner_prompt(
             repository_reference=repository_reference,
@@ -1034,6 +1046,10 @@ class RepairPlannerV2:
             claude_revision_report_cycle_1=claude_revision_report_cycle_1,
             reviewer_required_fixes=reviewer_required_fixes,
             original_approved_mutable_scope=original_approved_mutable_scope,
+            candidate_commit_sha=candidate_commit_sha,
+            candidate_immutable_url=candidate_immutable_url,
+            reviewer_result=reviewer_result,
+            reviewer_missing_tests=reviewer_missing_tests,
             implementer_profiles=self.implementer_profiles,
             reviewer_profiles=self.reviewer_profiles,
             template=self.template,

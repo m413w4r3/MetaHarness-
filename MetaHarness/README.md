@@ -39,6 +39,9 @@ push origin/main A→B              (git push --porcelain origin B:refs/heads/ma
   capture ses choix effectifs dans `run_options.json`. `claude_revision_enabled`
   et `repair_cycles` sont indépendants ; `repair_cycles` vaut actuellement
   seulement `0` ou `1` ;
+- pour AutoWork, la portée de réparation recommandée est
+  `repair_scope_policy = "auto-bounded"` avec
+  `repair_scope_max_added_paths = 4` ;
 - les agents ne travaillent jamais sur `main` : Luna, Claude et la review
   n’écrivent que dans le worktree isolé ; le checkout utilisateur n’est jamais
   modifié (ni checkout, ni index, ni fichiers) ;

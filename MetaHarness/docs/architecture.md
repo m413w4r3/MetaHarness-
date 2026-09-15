@@ -102,7 +102,8 @@ SPEC
 → final checks
 → reviewer #1
    ├ PASS → commit → push run branch
-   └ REVISE/IMPLEMENTATION
+   ├ REVISE/IMPLEMENTATION
+   └ REVISE/REPLAN
        → repair planner
        → Luna repair steps
        → Claude revision C02
@@ -112,8 +113,15 @@ SPEC
           └ otherwise → STOP
 ```
 
-- Maximum automatic cycles = 2. Reviewer #2 `REVISE / IMPLEMENTATION` stops
-  as `REVIEW_LOOP_EXHAUSTED`; `REPLAN` and `HUMAN` stop after reviewer #1.
+- Maximum automatic cycles = 2. Reviewer #1 `REVISE / IMPLEMENTATION` and
+  `REVISE / REPLAN` both enter the single bounded C02 repair cycle. `HUMAN`
+  remains operator-controlled. Any new semantic REVISE after C02 is
+  `REPAIR_EXHAUSTED / HUMAN_REQUIRED`.
+- C02 writes `repair/C02/scope_delta.json`, derived from parsed plan mutation
+  sets. New paths are governed by durable `repair_scope_policy` and
+  `repair_scope_max_added_paths` options. `auto-bounded` is recommended for
+  AutoWork with a bound of 4; `require-approval` writes an exact-hash
+  `scope_approval.json` and pauses without allowing path editing.
 - `revision.enabled` is the only activation authority. It is cross-validated
   at load time: protocol v2, an explicit `ui.default_reviser_profile` using the
   `claude-code` driver, an explicit `ui.default_repair_profile` using the
@@ -132,8 +140,8 @@ SPEC
   commit gate. A reviewer PASS on a red required check is an invalid answer
   (`REVIEWER_OUTPUT_INVALID`): no commit, no push, no C02.
 - Reviewer #2 receives the original approved plan and the C02 repair plan, the
-  C01 and C02 Luna reports, the C01 and C02 Claude revisions, and the cycle
-  history.
+  C01 and C02 Luna reports, the C01 and C02 Claude revisions, the scope delta,
+  and the cycle history.
 - Artifacts are per cycle: C01 in `steps/`, `revision/C01/`, `checks/C01/`,
   `review/C01/` (root copies for historical runs); C02 in `repair/C02/`,
   `revision/C02/`, `checks/C02/`, `review/C02/`. The API exposes them as

@@ -75,6 +75,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCES = frozenset({"cli", "web-ui", "test"})
 _SCHEMA_VERSION = 2
 _APPROVAL_FILENAME = "plan_approval.json"
+_SCOPE_APPROVAL_FILENAME = "scope_approval.json"
 
 
 def _validate_sha256(value: object, field: str) -> None:
@@ -357,14 +358,73 @@ def wait_for_plan_approval(
         time.sleep(poll_interval_seconds)
 
 
+@dataclass(frozen=True)
+class ScopeApproval:
+    """Immutable decision for an exact, planner-derived scope delta."""
+
+    decision: ApprovalDecision
+    scope_delta_sha256: str
+    created_at: str
+    source: str
+
+    def __post_init__(self) -> None:
+        try:
+            decision = ApprovalDecision(self.decision)
+        except (TypeError, ValueError) as exc:
+            raise ApprovalError("scope approval decision is unknown") from exc
+        object.__setattr__(self, "decision", decision)
+        _validate_sha256(self.scope_delta_sha256, "scope_delta_sha256")
+        if not isinstance(self.created_at, str) or not self.created_at.strip():
+            raise ApprovalError("scope approval created_at must be non-empty")
+        if not isinstance(self.source, str) or self.source not in _SOURCES:
+            raise ApprovalError("scope approval source is invalid")
+
+
+def write_scope_approval(
+    run_dir: Path, *, decision: ApprovalDecision, scope_delta_sha256: str, source: str,
+) -> None:
+    approval = ScopeApproval(decision, scope_delta_sha256, _now(), source)
+    content = json.dumps({
+        "schema_version": 1, "decision": approval.decision.value,
+        "scope_delta_sha256": approval.scope_delta_sha256,
+        "created_at": approval.created_at, "source": approval.source,
+    }, ensure_ascii=False, indent=2) + "\n"
+    _publish_exclusive(_run_path(run_dir) / _SCOPE_APPROVAL_FILENAME, content)
+
+
+def read_scope_approval(run_dir: Path, *, expected_sha256: str) -> ScopeApproval | None:
+    path = _run_path(run_dir) / _SCOPE_APPROVAL_FILENAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ApprovalError("scope approval JSON is invalid") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ApprovalError("scope approval schema_version is unsupported")
+    try:
+        result = ScopeApproval(
+            ApprovalDecision(payload["decision"]), payload["scope_delta_sha256"],
+            payload["created_at"], payload["source"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ApprovalError("scope approval artifact is invalid") from exc
+    if result.scope_delta_sha256 != expected_sha256:
+        raise ApprovalError("scope approval does not match scope delta")
+    return result
+
+
 __all__ = [
     "ApprovalDecision",
     "ApprovalError",
     "PlanApproval",
     "PlanIdentity",
+    "ScopeApproval",
     "compute_plan_identity",
     "compute_plan_identity_from_run",
     "read_plan_approval",
     "wait_for_plan_approval",
     "write_plan_approval",
+    "read_scope_approval",
+    "write_scope_approval",
 ]

@@ -42,6 +42,10 @@ metaharness run \
 run captures its effective choices in `run_options.json`; the captured
 `claude_revision_enabled` and `repair_cycles` values are independent. The
 currently supported values for `repair_cycles` are only `0` and `1`.
+For AutoWork, use `repair_scope_policy = "auto-bounded"` and
+`repair_scope_max_added_paths = 4`. Use `require-approval` when an operator
+must explicitly accept an exact planner-derived scope delta; use
+`deny-expansion` for historical behavior.
 
 `doctor` never contacts a model. Besides local files, Git and executables it
 runs the managed Codex runtime's `codex sandbox -- /bin/true` probe (which

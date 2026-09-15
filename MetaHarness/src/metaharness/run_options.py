@@ -23,6 +23,7 @@ class RunOptionsConflict(RunOptionsError):
 
 SCHEMA_VERSION = 1
 RUN_OPTIONS_NAME = "run_options.json"
+REPAIR_SCOPE_POLICIES = frozenset({"auto-bounded", "require-approval", "deny-expansion"})
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,8 @@ class RunOptions:
     reviewer_profile: str
     reviser_profile: str | None
     repair_profile: str | None
+    repair_scope_policy: str = "auto-bounded"
+    repair_scope_max_added_paths: int = 4
 
     def __post_init__(self) -> None:
         if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int) or self.schema_version != SCHEMA_VERSION:
@@ -72,6 +75,12 @@ class RunOptions:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise RunOptionsError(f"run options {name} is invalid")
+        if self.repair_scope_policy not in REPAIR_SCOPE_POLICIES:
+            raise RunOptionsError("run options repair_scope_policy is invalid")
+        if (isinstance(self.repair_scope_max_added_paths, bool)
+                or not isinstance(self.repair_scope_max_added_paths, int)
+                or self.repair_scope_max_added_paths <= 0):
+            raise RunOptionsError("run options repair_scope_max_added_paths must be greater than zero")
 
     @classmethod
     def from_config(cls, config: HarnessConfig, **overrides: Any) -> "RunOptions":
@@ -82,7 +91,7 @@ class RunOptions:
             "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
             "claude_revision_enabled", "repair_cycles", "planner_profile",
             "default_implementer_profile", "reviewer_profile", "reviser_profile",
-            "repair_profile",
+            "repair_profile", "repair_scope_policy", "repair_scope_max_added_paths",
         }
         unknown = set(overrides) - allowed
         if unknown:
@@ -102,6 +111,8 @@ class RunOptions:
             "reviewer_profile": config.ui.default_reviewer_profile or "legacy-reviewer",
             "reviser_profile": config.ui.default_reviser_profile,
             "repair_profile": config.ui.default_repair_profile,
+            "repair_scope_policy": "auto-bounded",
+            "repair_scope_max_added_paths": 4,
         }
         values.update(overrides)
         result = cls(**values)
@@ -149,6 +160,8 @@ class RunOptions:
             "pipeline": {
                 "claude_revision_enabled": self.claude_revision_enabled,
                 "repair_cycles": self.repair_cycles,
+                "repair_scope_policy": self.repair_scope_policy,
+                "repair_scope_max_added_paths": self.repair_scope_max_added_paths,
             },
             "profiles": {
                 "planner_profile": self.planner_profile,
@@ -173,7 +186,10 @@ class RunOptions:
             "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
         }:
             raise RunOptionsError("run options planning schema is invalid")
-        if not isinstance(pipeline, Mapping) or set(pipeline) != {"claude_revision_enabled", "repair_cycles"}:
+        if (not isinstance(pipeline, Mapping)
+                or not {"claude_revision_enabled", "repair_cycles"}.issubset(set(pipeline))
+                or set(pipeline) - {"claude_revision_enabled", "repair_cycles",
+                                    "repair_scope_policy", "repair_scope_max_added_paths"}):
             raise RunOptionsError("run options pipeline schema is invalid")
         if not isinstance(profiles, Mapping) or set(profiles) != {
             "planner_profile", "default_implementer_profile", "reviewer_profile",
@@ -195,6 +211,10 @@ class RunOptions:
                 reviewer_profile=profiles["reviewer_profile"],
                 reviser_profile=profiles["reviser_profile"],
                 repair_profile=profiles["repair_profile"],
+                # Old snapshots intentionally retain the historical
+                # no-expansion behavior when resumed.
+                repair_scope_policy=pipeline.get("repair_scope_policy", "deny-expansion"),
+                repair_scope_max_added_paths=pipeline.get("repair_scope_max_added_paths", 4),
             )
             if result.claude_revision_enabled and result.reviser_profile is None:
                 raise RunOptionsError("Claude revision requires a reviser profile")
@@ -271,7 +291,10 @@ def legacy_or_durable_run_options(
     if not path.exists():
         if expected_sha256 is not None:
             raise RunOptionsError("run_options.json is missing")
-        options = RunOptions.from_config(config)
+        # A pre-snapshot run must remain on the historical no-expansion
+        # policy when it is resumed.  New durable runs receive the
+        # auto-bounded default through the normal creation path.
+        options = RunOptions.from_config(config, repair_scope_policy="deny-expansion")
         return options, None
     return read_run_options_with_sha256(run_dir, expected_sha256)
 
@@ -301,7 +324,7 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
 
 
 __all__ = [
-    "RUN_OPTIONS_NAME", "SCHEMA_VERSION", "RunOptions", "RunOptionsConflict",
+    "RUN_OPTIONS_NAME", "SCHEMA_VERSION", "REPAIR_SCOPE_POLICIES", "RunOptions", "RunOptionsConflict",
     "RunOptionsError", "canonical_run_options_bytes", "effective_run_config",
     "legacy_or_durable_run_options", "read_run_options_with_sha256",
     "run_options_sha256", "write_run_options",

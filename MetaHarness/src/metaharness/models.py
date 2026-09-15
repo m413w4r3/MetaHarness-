@@ -114,6 +114,7 @@ class RunStatus(StrEnum):
     PLANNING = "planning"
     BLOCKED = "blocked"
     AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
+    WAITING_SCOPE_APPROVAL = "waiting_scope_approval"
     PLAN_REJECTED = "plan_rejected"
     WORKTREE_READY = "worktree_ready"
     PREPARING = "preparing"

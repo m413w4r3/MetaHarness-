@@ -22,6 +22,8 @@ from ..approval import (
     ApprovalError,
     PlanIdentity,
     compute_plan_identity_from_run,
+    read_scope_approval,
+    write_scope_approval,
     write_plan_approval,
 )
 from ..execution_selection import (
@@ -131,6 +133,9 @@ ARTIFACT_ALLOWLIST = frozenset(
         "repair/C02/implementation_bundle.json",
         "repair/C02/task_plan.json",
         "repair/C02/task_plan_v2.json",
+        "repair/C02/scope.json",
+        "repair/C02/scope_delta.json",
+        "repair/C02/scope_approval.json",
         "checks/C02/checks.json",
         "checks/C02/changed-files.txt",
         "checks/C02/diff.patch",
@@ -473,6 +478,7 @@ def get_run(
             _artifact_path(directory, "execution_recommendation.json")
         ),
         "repair_task": _load_text(_artifact_path(directory, "repair_task.md")),
+        "scope_delta": _load_json(_artifact_path(directory, "repair/C02/scope_delta.json"), max_bytes=256 * 1024),
         "failure": state.get("failure"),
         "publish": _load_json(_artifact_path(directory, "publish.json")),
         "approval": {"recorded": approval_decision is not None, "decision": approval_decision},
@@ -1174,6 +1180,8 @@ def create_run(
     execution_mode_policy: object = None,
     single_step_max_mutable_paths: object = None,
     staged_step_max_mutable_paths: object = None,
+    repair_scope_policy: object = None,
+    repair_scope_max_added_paths: object = None,
 ) -> dict[str, str]:
     content = validate_spec(spec)
     try:
@@ -1221,6 +1229,8 @@ def create_run(
             "execution_mode_policy": execution_mode_policy,
             "single_step_max_mutable_paths": integer(single_step_max_mutable_paths, "single_step_max_mutable_paths"),
             "staged_step_max_mutable_paths": integer(staged_step_max_mutable_paths, "staged_step_max_mutable_paths"),
+            "repair_scope_policy": repair_scope_policy,
+            "repair_scope_max_added_paths": integer(repair_scope_max_added_paths, "repair_scope_max_added_paths"),
         }
         overrides = {key: value for key, value in overrides.items() if value is not None}
         options = RunOptions.from_config(manager._config, **overrides)
@@ -1266,6 +1276,7 @@ _LIVE_EVENT_WINDOW_BYTES = 256 * 1024
 LIVE_STOP_STATUSES = frozenset({
     "committed", "published", "failed", "blocked", "plan_rejected", "interrupted",
     "awaiting_plan_approval",
+    "waiting_scope_approval",
 })
 _DIAGNOSTIC_COUNTERS = (
     "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
@@ -1280,7 +1291,7 @@ _PUBLISH_FAILURES = frozenset({
     "PUSH_FAILED", "BASE_MOVED_SINCE_RUN", "COMMIT_TREE_MISMATCH", "TOCTOU_FAILURE",
 })
 _C02_PHASES = frozenset({
-    "repair_planner", "repair_step", "checks_c02", "final_checks_c02",
+    "repair_planner", "scope_approval", "repair_step", "checks_c02", "final_checks_c02",
     "claude_c02", "candidate_commit_c02", "candidate_push_c02",
     "reviewer_c02", "com" + "mit",
 })
@@ -1468,8 +1479,18 @@ def run_pipeline(
         add("reviewer-c01", "Reviewer #1", "waiting")
 
     if pipeline_enabled:
+        cycle_records = state.get("cycles") if isinstance(state.get("cycles"), list) else []
+        repair_record = next((item for item in cycle_records
+                              if isinstance(item, Mapping) and item.get("number") == 2), {})
+        repair_label = "Repair cycle"
+        if repair_record.get("audit_route") == "REPLAN":
+            repair_label = "Repair cycle · plan/scope repair"
+        elif repair_record.get("audit_route") == "IMPLEMENTATION":
+            repair_label = "Repair cycle · implementation repair"
         if cycle == 2:
             if resume_phase in _C02_PHASES:
+                value = "resumable"
+            elif status == "waiting_scope_approval":
                 value = "resumable"
             elif failed and reason not in _PUBLISH_FAILURES:
                 value = "failed"
@@ -1481,7 +1502,7 @@ def run_pipeline(
             value = "skipped"
         else:
             value = "waiting"
-        add("repair-cycle", "Repair cycle", value)
+        add("repair-cycle", repair_label, value)
 
     publish_enabled = config.publish.enabled if config is not None else True
     fast_forward = config is not None and config.publish.mode == PublishMode.FAST_FORWARD_BASE.value
@@ -1511,6 +1532,9 @@ _REPAIR_SUBPHASES = {
     "validating": "Checks C02",
     "revalidating": "Checks C02",
     "reviewing": "Reviewer #2",
+    "waiting_scope_approval": "Scope approval",
+    "scope_auto_approved": "Scope expansion auto-approved",
+    "candidate_pushed": "Candidate C02 pushed",
 }
 
 
@@ -1706,6 +1730,40 @@ def resume_run_request(manager: RunManager, runs_root: Path, run_id: str) -> dic
     return {"ok": True, "run_id": safe_id, "location": f"/runs/{safe_id}"}
 
 
+def approve_repair_scope(
+    runs_root: Path, run_id: str, decision: str,
+) -> dict[str, Any]:
+    """Record APPROVE/REJECT for the exact planner-derived C02 delta."""
+
+    try:
+        selected = ApprovalDecision(decision)
+    except (TypeError, ValueError) as exc:
+        raise WebAPIError(400, "decision must be APPROVE or REJECT") from exc
+    directory = _run_dir(runs_root, run_id)
+    state = _load_state(directory)
+    if state.get("status") != RunStatus.WAITING_SCOPE_APPROVAL.value:
+        raise WebAPIError(409, "run is not waiting for scope approval")
+    delta_path = directory / "repair" / "C02" / "scope_delta.json"
+    try:
+        delta_hash = hashlib.sha256(delta_path.read_bytes()).hexdigest()
+        if not isinstance(_load_json(delta_path, max_bytes=256 * 1024), dict):
+            raise ValueError
+        existing = read_scope_approval(directory / "repair" / "C02", expected_sha256=delta_hash)
+        if existing is not None:
+            raise WebAPIError(409, "scope approval already exists")
+        write_scope_approval(directory / "repair" / "C02", decision=selected,
+                             scope_delta_sha256=delta_hash, source="web-ui")
+    except WebAPIError:
+        raise
+    except (OSError, ValueError, ApprovalError) as exc:
+        raise WebAPIError(409, "scope delta is invalid") from exc
+    if selected is ApprovalDecision.REJECT:
+        RunStateStore(directory / "state.json").update(
+            status=RunStatus.FAILED, failure={"reason": "HUMAN_REQUIRED", "detail": "repair scope rejected"}
+        )
+    return {"ok": True, "decision": selected.value, "scope_delta_sha256": delta_hash}
+
+
 AWAITING_APPROVAL = RunStatus.AWAITING_PLAN_APPROVAL.value
 
 
@@ -1719,6 +1777,7 @@ __all__ = [
     "live_status",
     "publish_target",
     "resume_run_request",
+    "approve_repair_scope",
     "run_overview",
     "run_pipeline",
     "MAX_SPEC_BYTES",

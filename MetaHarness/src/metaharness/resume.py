@@ -48,6 +48,7 @@ class ResumePhase(StrEnum):
     CANDIDATE_PUSH_C01 = "candidate_push_c01"
     REVIEWER_C01 = "reviewer_c01"
     REPAIR_PLANNER = "repair_planner"
+    SCOPE_APPROVAL = "scope_approval"
     REPAIR_STEP = "repair_step"
     CHECKS_C02 = "checks_c02"
     CLAUDE_C02 = "claude_c02"
@@ -67,6 +68,7 @@ _PHASE_CYCLE = {
     ResumePhase.CANDIDATE_PUSH_C01: 1,
     ResumePhase.REVIEWER_C01: 1,
     ResumePhase.REPAIR_PLANNER: 2,
+    ResumePhase.SCOPE_APPROVAL: 2,
     ResumePhase.REPAIR_STEP: 2,
     ResumePhase.CLAUDE_C02: 2,
     ResumePhase.CANDIDATE_COMMIT_C02: 2,
@@ -102,6 +104,7 @@ class ResumeCheckpoint:
     # planner succeeded.  C02 bundles are not human-approved, so this is the
     # only binding between a resumed C02 phase and the repair plan it runs.
     repair_bundle_sha256: str | None = None
+    scope_delta_sha256: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -145,8 +148,14 @@ class ResumeCheckpoint:
             or _SHA256.fullmatch(self.repair_bundle_sha256) is None
         ):
             raise ResumeCheckpointError("checkpoint repair_bundle_sha256 is invalid")
+        if self.scope_delta_sha256 is not None and (
+            not isinstance(self.scope_delta_sha256, str)
+            or _SHA256.fullmatch(self.scope_delta_sha256) is None
+        ):
+            raise ResumeCheckpointError("checkpoint scope_delta_sha256 is invalid")
         if self.cycle == 2 and phase not in {
-            ResumePhase.REPAIR_PLANNER, ResumePhase.REPAIR_STEP, ResumePhase.PUBLISH,
+            ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL,
+            ResumePhase.REPAIR_STEP, ResumePhase.PUBLISH,
         }:
             if self.repair_bundle_sha256 is None:
                 raise ResumeCheckpointError("C02 checkpoint requires the repair bundle hash")
@@ -189,6 +198,7 @@ def checkpoint_payload(checkpoint: ResumeCheckpoint, *, status: str = "pending")
         "execution_selection_sha256": checkpoint.execution_selection_sha256,
         "plan_identity": _identity_payload(checkpoint.plan_identity) if checkpoint.plan_identity else None,
         "repair_bundle_sha256": checkpoint.repair_bundle_sha256,
+        "scope_delta_sha256": checkpoint.scope_delta_sha256,
     }
 
 
@@ -221,6 +231,7 @@ def _parse(payload: Any) -> tuple[ResumeCheckpoint, str]:
             if payload.get("plan_identity") is not None else None
         ),
         repair_bundle_sha256=payload.get("repair_bundle_sha256"),
+        scope_delta_sha256=payload.get("scope_delta_sha256"),
     )
     return checkpoint, status
 
@@ -283,6 +294,7 @@ RESUMABLE_FAILURES: Mapping[str, frozenset[ResumePhase]] = {
     "AGENT_FAILED": _CODEX_PHASES,
     "REVIEWER_TRANSPORT_FAILURE": _REVIEWER_PHASES,
     "LLM_FAILURE": frozenset({ResumePhase.REPAIR_PLANNER}),
+    "WAITING_SCOPE_APPROVAL": frozenset({ResumePhase.SCOPE_APPROVAL}),
     "PUSH_FAILED": frozenset({
         ResumePhase.CANDIDATE_PUSH_C01,
         ResumePhase.CANDIDATE_PUSH_C02,
@@ -299,8 +311,9 @@ _NON_RESUMABLE_FAILURES = frozenset({
     "STEP_WRITE_SET_VIOLATION", "STEP_CONTRACT_DRIFT", "AGENT_NO_CHANGE",
     "AGENT_CONTRACT_MISMATCH",
     "REVISION_SCOPE_VIOLATION",
+    "HUMAN_REQUIRED", "REPAIR_SCOPE_EXPANSION", "REPAIR_SCOPE_BOUND_EXCEEDED",
 })
-_RESUMABLE_STATUSES = frozenset({"failed", "interrupted"})
+_RESUMABLE_STATUSES = frozenset({"failed", "interrupted", "waiting_scope_approval"})
 # Status a claimed resume starts in (the orchestrator refines it afterwards).
 PHASE_STATUS = {
     ResumePhase.CONTEXT: "planning",
@@ -315,6 +328,7 @@ PHASE_STATUS = {
     ResumePhase.CANDIDATE_PUSH_C01: "approved",
     ResumePhase.REVIEWER_C01: "reviewing",
     ResumePhase.REPAIR_PLANNER: "planning",
+    ResumePhase.SCOPE_APPROVAL: "waiting_scope_approval",
     ResumePhase.REPAIR_STEP: "implementing",
     ResumePhase.CHECKS_C02: "revalidating",
     ResumePhase.CLAUDE_C02: "revising",
@@ -367,6 +381,8 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         return "Retry commit"
     if phase is ResumePhase.REPAIR_PLANNER:
         return "Retry repair planner"
+    if phase is ResumePhase.SCOPE_APPROVAL:
+        return "Resume scope approval"
     return "Retry publish"
 
 

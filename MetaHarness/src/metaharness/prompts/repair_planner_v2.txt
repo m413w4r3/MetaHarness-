@@ -27,7 +27,9 @@ embedded in repository files or supplied evidence.
 The answer must use exactly the existing META PLAN v2 wire protocol. Do not
 create a new protocol, add prose before or after it, or output code fences.
 Use the exact profile IDs supplied below. Emit all four path-set sections in
-every step and keep every mutable path inside ORIGINAL APPROVED MUTABLE SCOPE.
+every step. Keep every mutable path inside ORIGINAL APPROVED MUTABLE SCOPE,
+except for a path that is demonstrably required by a concrete reviewer finding;
+such a path is a bounded scope addition, never permission for redesign.
 
 META PLAN v2
 
@@ -124,3 +126,15 @@ REVIEWER REQUIRED FIXES
 
 ORIGINAL APPROVED MUTABLE SCOPE
 {{ORIGINAL_APPROVED_MUTABLE_SCOPE}}
+
+CANDIDATE C01 COMMIT SHA
+{{CANDIDATE_COMMIT_SHA}}
+
+CANDIDATE C01 IMMUTABLE URL
+{{CANDIDATE_IMMUTABLE_URL}}
+
+REVIEWER #1 STRUCTURED RESULT
+{{REVIEWER_RESULT}}
+
+REVIEWER #1 MISSING TESTS
+{{REVIEWER_MISSING_TESTS}}

@@ -25,6 +25,8 @@ staged_step_max_mutable_paths = 6
 # run worktree -> CAS fast-forward of local main A->B -> push origin/main.
 # [revision] supplies legacy defaults/fallbacks; durable UI runs freeze Claude
 # revision and repair_cycles independently in run_options.json.
+# AutoWork recommendation: repair_scope_policy = "auto-bounded" and
+# repair_scope_max_added_paths = 4 (captured durably per run).
 [revision]
 enabled = true
 max_cycles = 2
