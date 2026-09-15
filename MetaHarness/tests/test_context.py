@@ -2,10 +2,13 @@ import json
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "examples" / "autowork.toml"
 
 from metaharness.context import (  # noqa: E402
     ContextBundle,
@@ -229,6 +232,45 @@ class ContextTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertIn("HEAD differs", bundle.locator_warning or "")
         self.assertEqual(bundle.base_sha, self.base_sha)
+
+    def test_example_config_keeps_readme_out_of_permanent_context(self) -> None:
+        example = tomllib.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+        example_always = tuple(example["context"]["always_files"])
+        self.assertEqual(example_always, ("AGENTS.md",))
+
+        (self.repo / "CLAUDE.md").write_text("claude pointer\n", encoding="utf-8")
+        (self.repo / "README.md").write_text(
+            "project readme\n" + "".join(f"doc line {n}\n" for n in range(200)),
+            encoding="utf-8",
+        )
+        run_git(self.repo, "add", "--all")
+        run_git(self.repo, "commit", "-m", "fixture docs")
+        base_sha = current_head(self.repo)
+
+        def planner_context(always: tuple[str, ...], hits: list[dict[str, object]]) -> str:
+            config = self.config(self.locator(hits), always_files=always)
+            return render_context(build_context(self.repo, base_sha, "x", config))
+
+        legacy_always = ("AGENTS.md", "CLAUDE.md", "README.md")
+        source_hit = [{"path": "backend/src/foo.py", "start": 1, "end": 1}]
+        before = planner_context(legacy_always, source_hit)
+        after = planner_context(example_always, source_hit)
+
+        self.assertIn("### PROJECT INSTRUCTION: AGENTS.md", after)
+        self.assertIn("### PROJECT INSTRUCTION: backend/AGENTS.md", after)
+        self.assertIn("### SOURCE: backend/src/foo.py:1-1", after)
+        self.assertNotIn("README.md", after)
+        self.assertNotIn("claude pointer", after)
+        self.assertIn("### REPOSITORY EVIDENCE (UNTRUSTED): README.md", before)
+        self.assertLess(len(after.encode("utf-8")), len(before.encode("utf-8")))
+
+        readme_hit = planner_context(
+            example_always, [{"path": "README.md", "start": 1, "end": 1}]
+        )
+        self.assertIn("### PROJECT INSTRUCTION: AGENTS.md", readme_hit)
+        self.assertIn("### SOURCE: README.md:1-1\nproject readme\n", readme_hit)
+        self.assertNotIn("doc line", readme_hit)
+        self.assertNotIn("### REPOSITORY EVIDENCE (UNTRUSTED): README.md", readme_hit)
 
     def test_budget_omits_complete_elements(self) -> None:
         bundle = build_context(

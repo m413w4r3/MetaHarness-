@@ -62,7 +62,7 @@ default_reviser_profile = "claude-opus-medium"
 default_repair_profile = "codex-luna-high"
 
 [context]
-always_files = ["AGENTS.md", "CLAUDE.md", "README.md"]
+always_files = ["AGENTS.md"]
 # "--" keeps a SPEC starting with "-" from being parsed as a ctx.py option.
 locator_argv = [
     "uv",
