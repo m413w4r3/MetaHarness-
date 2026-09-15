@@ -19,15 +19,30 @@ planner STAGED         (execution_mode_policy = "require-staged")
   ↓
 Luna steps
   ↓
-Claude                 (pre-checks → revision → final checks)
+Claude correction C01  (pre-checks → revision)
   ↓
-reviewer #1
+final deterministic checks C01
   ↓
-optional C02           (repair planner → Luna repair → Claude C02 → reviewer #2)
+immutable C01 candidate commit
   ↓
-PASS
+push exact C01 run-branch candidate
   ↓
-commit B (parent = A)  (arbre exact approuvé, dans le worktree isolé)
+GPT reviewer via bridge #1
+  ↓
+PASS → publish approved C01 candidate
+REVISE → bounded C02 (repair planner + scope validation)
+  ↓
+  C02 Luna → C02 Claude correction → final deterministic checks C02
+  ↓
+  immutable C02 candidate commit
+  ↓
+  push exact C02 run-branch candidate
+  ↓
+  GPT reviewer via bridge #2
+    PASS → publish approved C02 candidate
+    otherwise → STOP / operator
+
+approved candidate (fast-forward-base)
   ↓
 CAS fast-forward local main A→B   (git update-ref refs/heads/main B A)
   ↓
@@ -45,9 +60,10 @@ push origin/main A→B              (git push --porcelain origin B:refs/heads/ma
 - les agents ne travaillent jamais sur `main` : Luna, Claude et la review
   n’écrivent que dans le worktree isolé ; le checkout utilisateur n’est jamais
   modifié (ni checkout, ni index, ni fichiers) ;
-- `[publish] mode = "fast-forward-base"` (AutoWork) : après le PASS final et le
-  commit exact, `main` local avance par compare-and-swap de A vers B, puis B est
-  poussé sur `origin/main`. Si `main` ou `origin/main` (ref de suivi locale, sans
+- `[publish] mode = "fast-forward-base"` (AutoWork) : chaque candidat exact est
+  commité puis poussé sur la branche de run avant sa review ; après le PASS
+  final, `main` local avance par compare-and-swap de A vers B, puis B est poussé
+  sur `origin/main`. Si `main` ou `origin/main` (ref de suivi locale, sans
   fetch implicite) a bougé : `BASE_MOVED_SINCE_RUN`, sans merge, rebase ni
   force. `mode = "run-branch"` pousse seulement la branche de run ;
 - aucun force, lease, tag, delete ou merge automatique.

@@ -18,7 +18,7 @@ review. There is no repair loop or behavior mock in V0.
 | Claude Code | Semantic reviser/corrector after Luna | Isolated managed config; cannot run checks or commit |
 | Deterministic gates | Checks, diff, HEAD, and mutation evidence | Mechanical evidence |
 | Reviewer | Semantic critic of SPEC, PLAN, diff, and evidence | PASS/REVISE/FAIL decision |
-| Git tree SHA | Identity of the reviewed staged code | Commit boundary |
+| Git tree SHA | Identity of the exact candidate tree submitted to checks and review | Candidate commit and publication gates |
 
 The raw plan is preserved as a forensic artifact and remains the planner's
 decision record. The parsed READY plan is rendered into one canonical
@@ -66,10 +66,12 @@ background child cannot modify the candidate after its snapshot. A
 descendant that creates its own session escapes this cleanup (no cgroups in
 V0).
 
-The commit is built from the reviewed tree object (`git commit-tree`), not
-from the index, and the branch is advanced with a compare-and-swap
-`git update-ref HEAD <new> <base>`. Commit hooks therefore cannot restage
-content, and a moved HEAD makes the update fail.
+Commit objects are built from the exact candidate tree object
+(`git commit-tree`), not from the index, and the branch is advanced with a
+compare-and-swap `git update-ref HEAD <new> <base>`. Commit hooks therefore
+cannot restage content, and a moved HEAD makes the update fail. In v2, this
+candidate commit is created before semantic review; publication remains gated
+by the final reviewer PASS.
 
 Planner and reviewer answers are free Markdown. The parser is tolerant on
 presentation (headings, bold labels, bracket/colon markers, one whole-answer
@@ -97,20 +99,21 @@ SPEC
 → indexer + repo-aware planner
 → human-approved STAGED bundle
 → Luna steps
-→ pre-checks
-→ Claude revision
-→ final checks
-→ reviewer #1
-   ├ PASS → commit → push run branch
-   ├ REVISE/IMPLEMENTATION
-   └ REVISE/REPLAN
-       → repair planner
-       → Luna repair steps
-       → Claude revision C02
-       → checks
-       → reviewer #2
-          ├ PASS → commit → push run branch
-          └ otherwise → STOP
+→ Claude correction C01
+→ final deterministic checks C01
+→ immutable C01 candidate commit
+→ push exact C01 run-branch candidate
+→ GPT reviewer via bridge #1
+   ├ PASS → publish approved C01 candidate
+   └ REVISE → bounded C02 (repair planner + scope validation)
+       → C02 Luna
+       → C02 Claude correction
+       → final deterministic checks C02
+       → immutable C02 candidate commit
+       → push exact C02 run-branch candidate
+       → GPT reviewer via bridge #2
+          ├ PASS → publish approved C02 candidate
+          └ otherwise → STOP / operator
 ```
 
 - Maximum automatic cycles = 2. Reviewer #1 `REVISE / IMPLEMENTATION` and
@@ -139,6 +142,9 @@ SPEC
   `deterministic_passed` to the gate payload, to `parse_review` and to the
   commit gate. A reviewer PASS on a red required check is an invalid answer
   (`REVIEWER_OUTPUT_INVALID`): no commit, no push, no C02.
+- Deterministic checks are selected by planner IDs from the trusted check
+  catalog; MetaHarness owns the commands and arguments, always requires the
+  configured defaults, and runs configured preflights before expensive workers.
 - Reviewer #2 receives the original approved plan and the C02 repair plan, the
   C01 and C02 Luna reports, the C01 and C02 Claude revisions, the scope delta,
   and the cycle history.
@@ -146,18 +152,24 @@ SPEC
   `review/C01/` (root copies for historical runs); C02 in `repair/C02/`,
   `revision/C02/`, `checks/C02/`, `review/C02/`. The API exposes them as
   `cycle_artifacts`; top-level aliases describe the final cycle.
-- Publication pushes only the exact committed run branch after the final
-  reviewer PASS and a green gate: no force, no tag, no delete, never
-  `base_ref`/`main`, and never an automatic merge of the run branch.
+- Each cycle creates and pushes its exact immutable candidate on the run branch
+  before semantic review. Publication happens only after the final reviewer
+  PASS and a green gate, using that already-pushed approved candidate: no
+  force, no tag, no delete, never `base_ref`/`main`, and never an automatic
+  merge of the run branch.
 
 ## Durable checkpoints and resume (P29)
 
 `resume.py` defines `ResumePhase` (`initial_step`, `claude_c01`,
-`reviewer_c01`, `repair_planner`, `repair_step`, `claude_c02`, `reviewer_c02`,
-`publish`) and `ResumeCheckpoint(phase, cycle, step_id, expected_head_sha,
-expected_tree_sha, execution_selection_sha256, plan_identity)` (plus the C02
-repair-bundle hash once the repair planner succeeded, since the C02 bundle
-has no human approval). `resume_checkpoint.json` is written atomically after
+`final_checks_c01`, `candidate_commit_c01`, `candidate_push_c01`,
+`reviewer_c01`, `repair_planner`, `scope_approval`, `repair_step`, `claude_c02`,
+`final_checks_c02`, `candidate_commit_c02`, `candidate_push_c02`,
+`reviewer_c02`, `publish`) and `ResumeCheckpoint(phase, cycle, step_id,
+expected_head_sha, expected_tree_sha, execution_selection_sha256, plan_identity)`
+(plus the C02
+repair-bundle and scope-delta hashes once repair planning and scope validation
+succeed, since the C02 bundle has no human approval). `resume_checkpoint.json`
+is written atomically after
 every durable transition and always names the next operation that has not
 yet succeeded; an operation is never marked complete before its artifacts
 are durable.
@@ -191,7 +203,8 @@ reviewer reporting the planner's handle is rejected as
 
 All run-state writes go through `RunStateStore`, which replaces JSON files
 atomically. The plan approval artifact is atomically published without
-replacement, so a second decision fails. No commit is created before review,
-and the staged tree SHA is
-verified again immediately before the commit. A changed index, HEAD, or
-worktree causes the commit boundary to fail.
+replacement, so a second decision fails. In v2, the candidate commit is
+created after final deterministic checks and before semantic review; the exact
+candidate tree SHA is verified again immediately before that commit. Final
+publication still requires reviewer approval. A changed index, HEAD, or
+worktree causes the candidate boundary to fail.

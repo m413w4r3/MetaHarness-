@@ -112,18 +112,23 @@ mode = "run-branch"
 
 ```text
 SPEC → indexer + repo-aware planner → human-approved STAGED bundle
-→ Luna steps → pre-checks → Claude revision → final checks → reviewer #1
-   ├ PASS → commit → push run branch
-   └ REVISE/IMPLEMENTATION → repair planner → Luna repair steps
-       → Claude revision C02 → checks → reviewer #2
-          ├ PASS → commit → push run branch
-          └ otherwise → STOP
+→ Luna → Claude correction C01 → final deterministic checks C01
+→ immutable C01 candidate commit → push exact C01 run-branch candidate
+→ GPT reviewer via bridge #1
+   ├ PASS → publish approved C01 candidate
+   └ REVISE → bounded C02 (repair planner + scope validation)
+       → C02 Luna → C02 Claude correction → final deterministic checks C02
+       → immutable C02 candidate commit → push exact C02 run-branch candidate
+       → GPT reviewer via bridge #2
+          ├ PASS → publish approved C02 candidate
+          └ otherwise → STOP / operator
 ```
 
-Maximum automatic cycles = 2. The push happens once, after the final reviewer
-PASS and the exact-tree commit gate; it never pushes `base_ref`, never uses
-force, tags or deletion, and never automatically merges the run branch. A
-published run exposes the branch URL (`…/tree/harness/<plan>/<run-id>`).
+Maximum automatic cycles = 2. Each cycle pushes its exact candidate before its
+reviewer; publication happens only after the final reviewer PASS and the
+exact-tree candidate gate. It never pushes `base_ref`, never uses force, tags
+or deletion, and never automatically merges the run branch. A published run
+exposes the branch URL (`…/tree/harness/<plan>/<run-id>`).
 Failures specific to this mode: `REVIEW_LOOP_EXHAUSTED`, `REPLAN_REQUIRED`,
 `HUMAN_REQUIRED`, `REPAIR_PLANNER_BLOCKED`, `REPAIR_SCOPE_EXPANSION`,
 `REVISION_SCOPE_VIOLATION`, `PUSH_FAILED`. A C02 step fails with the same
@@ -186,29 +191,37 @@ after parsing with the same values (`PLANNER_OUTPUT_INVALID` otherwise).
 `balanced` applies neither limit.
 
 ```text
-main A → isolated run worktree → planner STAGED → Luna steps → Claude
-→ reviewer → optional C02 → PASS → commit B(parent=A)
+main A → isolated run worktree → planner STAGED → Luna → Claude C01
+→ final deterministic checks → immutable candidate commit/push → reviewer #1
+→ PASS → publish C01, or REVISE → bounded C02
+→ C02 Luna → Claude C02 → final deterministic checks → candidate commit/push
+→ reviewer #2 → PASS → publish C02, otherwise stop/operator
+
+approved candidate (fast-forward-base)
 → CAS fast-forward local main A→B → push origin/main A→B
 ```
 
 Agents never work on `main`: Luna, Claude and the reviewers only ever see the
 isolated worktree `harness/<plan>/<run-id>`; the user checkout is never
-checked out, reset or written. After the final PASS and the exact commit,
-publication re-resolves `refs/heads/main` and `refs/remotes/origin/main`
+checked out, reset or written. After the final PASS, publication uses the
+already-created exact candidate commit and re-resolves `refs/heads/main` and
+`refs/remotes/origin/main`
 (no implicit fetch) and requires: local main == remote-tracking main ==
 original `base_sha`, the run commit's only parent == `base_sha`, its tree ==
 the approved tree, and the run branch pointing to it. Local main then moves
 with `git update-ref refs/heads/main <commit> <base>` (compare-and-swap), and
 `git push --porcelain origin <commit>:refs/heads/main` publishes exactly that
-commit — no force, lease, merge, tag or delete. The run branch stays local and
-is not pushed in this mode.
+commit — no force, lease, merge, tag or delete. Each exact candidate was
+already pushed to the run branch before its reviewer; that run branch remains
+the immutable candidate reference.
 
 - `BASE_MOVED_SINCE_RUN`: main or origin/main moved (or the swap failed).
   Nothing is merged, rebased, forced or pushed; start a new run from the new
   main.
-- `PUSH_FAILED` after the swap: `state.publish.local_base_updated = true` and
-  the failure detail says that local main already points to the commit.
-  Resume retries publication only.
+- `PUSH_FAILED` during candidate push resumes at that candidate push. After
+  the base-branch swap, `state.publish.local_base_updated = true` and the
+  failure detail says that local main already points to the commit; resume then
+  retries publication only.
 - If the user checkout has `main` checked out, its index and files are not
   updated by the ref move (`publish.json.base_checked_out_in`). Synchronize it
   with `git -C <checkout> read-tree -m -u <base_sha> <commit_sha>`, which
@@ -223,8 +236,8 @@ Every durable transition rewrites `resume_checkpoint.json` atomically. It
 always names the next operation that has not yet succeeded:
 
 At the conceptual level, supported phases are context, planner, plan approval,
-workspace setup, worker steps, checks, Claude, reviewer, repair planner/steps,
-commit and publish. Corruptions, identity violations and
+workspace setup, worker steps, checks, Claude, candidate commit/push, reviewer,
+repair planner/steps, and publish. Corruptions, identity violations and
 `AGENT_CONTRACT_MISMATCH` are deliberately non-resumable.
 
 | After | Checkpoint |
@@ -232,12 +245,16 @@ commit and publish. Corruptions, identity violations and
 | plan approval, worktree + setup | `initial_step` S01, base tree |
 | Luna step Sxx | next step, or `claude_c01` (revision) / `reviewer_c01`, with the step's tree |
 | pre-revision checks | `claude_c01`, post-Luna tree |
-| Claude complete | `reviewer_c01`, post-Claude tree |
-| final checks | `reviewer_c01`, the frozen evidence tree |
-| reviewer #1 REVISE/IMPLEMENTATION | `repair_planner` |
+| Claude complete | `final_checks_c01`, post-Claude tree |
+| final checks C01 | `candidate_commit_c01`, the frozen evidence tree |
+| exact C01 candidate commit | `candidate_push_c01` |
+| exact C01 candidate push | `reviewer_c01` |
+| reviewer #1 REVISE/IMPLEMENTATION or REPLAN | `repair_planner` |
 | repair planner, each repair step | `repair_step` Sxx / `claude_c02` |
-| Claude C02, final checks C02 | `reviewer_c02` |
-| exact commit | `publish` (HEAD = commit) |
+| final checks C02 | `candidate_commit_c02`, the frozen evidence tree |
+| exact C02 candidate commit | `candidate_push_c02` |
+| exact C02 candidate push | `reviewer_c02` |
+| approved candidate | `publish` (HEAD = candidate commit) |
 
 A `PUBLISHED` (or `COMMITTED`) run marks it `completed`.
 
@@ -249,7 +266,8 @@ Resumable failures: `CLAUDE_FAILED`, `CLAUDE_AUTH_FAILURE`, `CLAUDE_TIMEOUT`
 (same Claude phase), `CODEX_AUTH_FAILURE`, `AGENT_TIMEOUT`, `AGENT_FAILED`
 (same step, only if the tree is still the step's `tree_before`),
 `REVIEWER_TRANSPORT_FAILURE` (same exact candidate; Claude and checks are not
-rerun), `LLM_FAILURE` of the repair planner, `PUSH_FAILED` (publication only),
+rerun), `LLM_FAILURE` of the repair planner, `PUSH_FAILED` (candidate or
+publication push),
 and `INTERRUPTED`. `STEP_WRITE_SET_VIOLATION`, `AGENT_COMMITTED`,
 `AGENT_GIT_VIOLATION`, invalid reviewer verdicts and `BASE_MOVED_SINCE_RUN`
 are never retried automatically.
