@@ -720,7 +720,16 @@ class UiTests(P29Harness):
         result = self.run_approved(config, orchestrator, "web-resume")
         self.assertEqual(result.state["failure"]["reason"], "CLAUDE_FAILED")
         server = self._server(config)
-        server.run_manager._orchestrator_factory = lambda cfg: Orchestrator(
+        resume_finished = threading.Event()
+
+        class ResumeSignalingOrchestrator(Orchestrator):
+            def resume(self, *args: Any, **kwargs: Any) -> Any:
+                try:
+                    return super().resume(*args, **kwargs)
+                finally:
+                    resume_finished.set()
+
+        server.run_manager._orchestrator_factory = lambda cfg: ResumeSignalingOrchestrator(
             cfg, planner_client=QueueClient("planner", [], []), reviewer_client=reviewer,
             agent=luna, reviser=FakeClaude())
         status, _headers, page = self.request(server, "GET", "/runs/web-resume")
@@ -739,6 +748,7 @@ class UiTests(P29Harness):
                 time.sleep(0.05)
         self.assertEqual(state["status"], "published", state.get("failure"))
         self.assertEqual(state["run_id"], "web-resume")
+        self.assertTrue(resume_finished.wait(5))
 
     def test_token_diagnostics_severe_usage_is_flagged_not_failed(self) -> None:
         config = self.make_config()
