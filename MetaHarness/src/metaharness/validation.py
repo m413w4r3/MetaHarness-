@@ -230,14 +230,15 @@ def run_check_preflights(
             continue
         cwd = resolve_check_cwd(root, check)
         try:
-            exit_code, timed_out = run_bounded(
-                check.preflight_argv,
-                cwd=cwd,
-                timeout_seconds=check.timeout_seconds,
-                stdout=tempfile.TemporaryFile(),
-                stderr=tempfile.TemporaryFile(),
-                grace_seconds=_CHECK_GRACE_SECONDS,
-            )
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                exit_code, timed_out = run_bounded(
+                    check.preflight_argv,
+                    cwd=cwd,
+                    timeout_seconds=check.timeout_seconds,
+                    stdout=stdout,
+                    stderr=stderr,
+                    grace_seconds=_CHECK_GRACE_SECONDS,
+                )
         except (OSError, ValueError):
             exit_code, timed_out = -1, False
         if timed_out or exit_code != 0:

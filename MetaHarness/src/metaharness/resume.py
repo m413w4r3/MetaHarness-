@@ -1,10 +1,13 @@
 """Durable resume checkpoints.
 
 A checkpoint always names the *next operation that has not yet succeeded*:
-after Luna S01 completes, the checkpoint is ``claude_c01`` with the post-Luna
-candidate tree; after Claude C01 and the final checks, it is
-``candidate_commit_c01`` with the post-Claude tree.  Candidate commit and
-push checkpoints precede ``reviewer_c01``.  An operation is never marked
+after Luna S01 completes, the checkpoint is ``checks_c01`` with the post-Luna
+candidate tree; with Claude enabled, ``checks_c01`` means the pre-revision
+checks are pending, ``claude_c01`` that Claude is next, and
+``final_checks_c01`` (post-Claude tree) that Claude completed durably and only
+the final checks remain.  After the final checks it is
+``candidate_commit_c01``.  Candidate commit and push checkpoints precede
+``reviewer_c01``; C02 uses the same shape.  An operation is never marked
 complete before all of its mandatory artifacts are durable, so a resume never
 replays a phase that already succeeded.
 

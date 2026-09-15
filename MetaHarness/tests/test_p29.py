@@ -438,8 +438,8 @@ class ResumeClaudeTests(P29Harness):
         self.assertEqual(phases, [
             ("initial_step", "S01"), ("initial_step", "S01"),            # approval, setup
             ("initial_step", "S02"), ("initial_step", "S03"),            # each Luna step
-            ("claude_c01", None), ("claude_c01", None),                  # S03 done, pre-checks done
-            ("checks_c01", None), ("candidate_commit_c01", None),
+            ("checks_c01", None), ("claude_c01", None),                  # S03 done, pre-checks done
+            ("final_checks_c01", None), ("candidate_commit_c01", None),  # Claude done, final checks done
             ("candidate_push_c01", None), ("reviewer_c01", None),         # candidate pushed, reviewer done
             ("publish", None),                                           # exact commit done
         ])

@@ -949,16 +949,20 @@ def publish_fast_forward_base(
     commit_sha: str,
     approved_tree: str,
     run_branch: str,
+    expected_parent: str | None = None,
 ) -> FastForwardResult:
     """Fast-forward ``refs/heads/<base>`` to the reviewed commit, then push it.
 
     No checkout, merge, rebase, force, lease, tag or delete, and no implicit
     fetch: the remote state is the local remote-tracking ref.  Preconditions:
     local base == remote-tracking base == ``base_sha``; the commit's only
-    parent is ``base_sha``; its tree is ``approved_tree``; the run branch
-    points to it.  The local ref moves with a compare-and-swap ``update-ref``;
-    a failed swap is :class:`BaseMovedError`.  A retry after a failed push
-    accepts a local base that already points to the commit.
+    parent is *expected_parent* (``base_sha`` when omitted, the historical
+    contract); an explicit *expected_parent* other than the base must itself
+    have ``base_sha`` as its only parent (BASE -> C01 -> C02); the commit's
+    tree is ``approved_tree``; the run branch points to it.  The local ref
+    moves with a compare-and-swap ``update-ref``; a failed swap is
+    :class:`BaseMovedError`.  A retry after a failed push accepts a local
+    base that already points to the commit.
     """
 
     repository_remote_url(repo, remote)
@@ -968,6 +972,7 @@ def publish_fast_forward_base(
         ("base_sha", base_sha), ("commit_sha", commit_sha), ("approved_tree", approved_tree),
     ):
         _require_object_id(value, label)
+    parent = base_sha if expected_parent is None else _require_object_id(expected_parent, "expected_parent")
     local_ref = f"refs/heads/{base_branch}"
     local = _ref_commit(repo, local_ref)
     if local is None:
@@ -975,8 +980,13 @@ def publish_fast_forward_base(
     tracking = _ref_commit(repo, f"refs/remotes/{remote}/{base_branch}")
     if tracking is None:
         raise GitError("remote-tracking base branch is unavailable")
-    if commit_parents(repo, commit_sha) != (base_sha,):
-        raise GitError("run commit parent is not the run base")
+    if commit_parents(repo, commit_sha) != (parent,):
+        raise GitError(
+            "run commit parent is not the run base" if parent == base_sha
+            else "run commit parent is not the expected candidate parent"
+        )
+    if parent != base_sha and commit_parents(repo, parent) != (base_sha,):
+        raise GitError("expected candidate parent is not a direct child of the run base")
     if resolve_tree(repo, commit_sha) != approved_tree:
         raise GitError("run commit tree is not the approved tree")
     if _ref_commit(repo, f"refs/heads/{run_branch}") != commit_sha:

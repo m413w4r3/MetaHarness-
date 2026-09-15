@@ -160,11 +160,15 @@ SPEC
 
 ## Durable checkpoints and resume (P29)
 
-`resume.py` defines `ResumePhase` (`initial_step`, `claude_c01`,
+`resume.py` defines `ResumePhase` (`initial_step`, `checks_c01`, `claude_c01`,
 `final_checks_c01`, `candidate_commit_c01`, `candidate_push_c01`,
-`reviewer_c01`, `repair_planner`, `scope_approval`, `repair_step`, `claude_c02`,
-`final_checks_c02`, `candidate_commit_c02`, `candidate_push_c02`,
-`reviewer_c02`, `publish`) and `ResumeCheckpoint(phase, cycle, step_id,
+`reviewer_c01`, `repair_planner`, `scope_approval`, `repair_step`,
+`checks_c02`, `claude_c02`, `final_checks_c02`, `candidate_commit_c02`,
+`candidate_push_c02`, `reviewer_c02`, `publish`; with Claude, `checks_cxx` =
+pre-revision checks pending, `claude_cxx` = Claude next, `final_checks_cxx` =
+Claude durably done, final checks next; checkpoint trees are the Luna tree
+before Claude and the Claude record's `tree_after` after it) and
+`ResumeCheckpoint(phase, cycle, step_id,
 expected_head_sha, expected_tree_sha, execution_selection_sha256, plan_identity)`
 (plus the C02
 repair-bundle and scope-delta hashes once repair planning and scope validation

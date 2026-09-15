@@ -207,8 +207,10 @@ checked out, reset or written. After the final PASS, publication uses the
 already-created exact candidate commit and re-resolves `refs/heads/main` and
 `refs/remotes/origin/main`
 (no implicit fetch) and requires: local main == remote-tracking main ==
-original `base_sha`, the run commit's only parent == `base_sha`, its tree ==
-the approved tree, and the run branch pointing to it. Local main then moves
+original `base_sha`, an exact candidate chain (C01 parent == `base_sha`; C02
+parent == the persisted C01 candidate), the final candidate's tree == the
+approved tree, and the run branch pointing to it. Publication fast-forwards
+`base_sha` to the exact approved candidate chain tip (C01, or C02 on top of C01). Local main then moves
 with `git update-ref refs/heads/main <commit> <base>` (compare-and-swap), and
 `git push --porcelain origin <commit>:refs/heads/main` publishes exactly that
 commit — no force, lease, merge, tag or delete. Each exact candidate was
@@ -243,14 +245,15 @@ repair planner/steps, and publish. Corruptions, identity violations and
 | After | Checkpoint |
 | --- | --- |
 | plan approval, worktree + setup | `initial_step` S01, base tree |
-| Luna step Sxx | next step, or `claude_c01` (revision) / `reviewer_c01`, with the step's tree |
+| Luna step Sxx | next step, or `checks_c01` (pre-revision checks with Claude, final checks without), with the step's tree |
 | pre-revision checks | `claude_c01`, post-Luna tree |
-| Claude complete | `final_checks_c01`, post-Claude tree |
+| Claude complete | `final_checks_c01`, post-Claude tree (resume runs only the final checks) |
 | final checks C01 | `candidate_commit_c01`, the frozen evidence tree |
 | exact C01 candidate commit | `candidate_push_c01` |
 | exact C01 candidate push | `reviewer_c01` |
 | reviewer #1 REVISE/IMPLEMENTATION or REPLAN | `repair_planner` |
-| repair planner, each repair step | `repair_step` Sxx / `claude_c02` |
+| repair planner, each repair step | `repair_step` Sxx / `checks_c02` |
+| pre-revision checks C02, Claude C02 complete | `claude_c02`, then `final_checks_c02` (post-Claude tree) |
 | final checks C02 | `candidate_commit_c02`, the frozen evidence tree |
 | exact C02 candidate commit | `candidate_push_c02` |
 | exact C02 candidate push | `reviewer_c02` |

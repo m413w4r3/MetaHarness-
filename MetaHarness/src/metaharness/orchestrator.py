@@ -716,6 +716,8 @@ _REVIEW_ATTEMPT_ARTIFACTS = (
     "reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json", "review.json",
 )
 _CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "evidence.json")
+# Archiving ``pre_checks.json`` makes a CHECKS_Cxx resume replay the checks.
+_PRE_CHECK_ATTEMPT_ARTIFACTS = _CHECK_ATTEMPT_ARTIFACTS + ("pre_checks.json",)
 _REVISION_ATTEMPT_ARTIFACTS = _AGENT_ARTIFACTS + ("tree_after_failure.txt",)
 _PLANNER_CONVERSATION = "planner.conversation.json"
 
@@ -1111,6 +1113,35 @@ def _write_scope_delta(
     content = _json_text(payload)
     atomic_write_text(repair_dir / "scope_delta.json", content)
     return payload, hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _candidate_chain_parent(
+    worktree: Path, run_dir: Path, base_sha: str, cycle: int, commit_sha: str,
+) -> str:
+    """The exact direct parent the published candidate of *cycle* must have.
+
+    C01: ``BASE``.  C02: the persisted C01 candidate, itself exactly parented
+    to ``BASE`` with its recorded tree.  Raises :class:`GitError` otherwise.
+    """
+
+    record = _read_json_artifact(_candidate_commit_path(run_dir, cycle))
+    if not isinstance(record, dict) or record.get("commit_sha") != commit_sha:
+        raise GitError("candidate commit artifact does not match publication")
+    expected_parent = base_sha
+    if cycle == 2:
+        c01 = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+        if not isinstance(c01, dict) or not _is_object_id(c01.get("commit_sha")):
+            raise GitError("C01 candidate commit artifact is missing")
+        if (
+            c01.get("parent_sha") != base_sha
+            or commit_parents(worktree, c01["commit_sha"]) != (base_sha,)
+            or resolve_tree(worktree, c01["commit_sha"]) != c01.get("tree_sha")
+        ):
+            raise GitError("C01 candidate identity is not exact")
+        expected_parent = c01["commit_sha"]
+    if record.get("parent_sha") != expected_parent or commit_parents(worktree, commit_sha) != (expected_parent,):
+        raise GitError("candidate commit parent is not the expected parent")
+    return expected_parent
 
 
 def _candidate_commit_payload(
@@ -2461,20 +2492,23 @@ class Orchestrator:
             store.update(status=RunStatus.IMPLEMENTING, current_step=None, steps=state_steps,
                          agent_usage=self._v2_agent_usage())
             following = plan.steps[index + 1].id if index + 1 < len(plan.steps) else None
-            # Step complete: the next operation is the next step, then
-            # Claude C01 (revision) or the final checks + reviewer #1.
+            # Step complete: the next operation is the next step, then the
+            # C01 checks (pre-revision checks with Claude, final without).
             self._checkpoint(
                 run_dir,
-                ResumePhase.INITIAL_STEP if following else (
-                    ResumePhase.CLAUDE_C01 if revision_enabled else ResumePhase.CHECKS_C01
-                ),
+                ResumePhase.INITIAL_STEP if following else ResumePhase.CHECKS_C01,
                 step_id=following, head=base_sha, tree=outcome.tree_after,
             )
 
+        # With Claude, CHECKS_C01 names the pending pre-revision checks and
+        # FINAL_CHECKS_C01 the final checks after a durable Claude revision.
+        final_checks_phase = ResumePhase.FINAL_CHECKS_C01 if revision_enabled else ResumePhase.CHECKS_C01
         revision_result = None
         revision_report_c01 = ""
         if revision_enabled:
-            if at <= phase_index(ResumePhase.CLAUDE_C01) and phase is not ResumePhase.CHECKS_C01:
+            if at <= phase_index(ResumePhase.CLAUDE_C01):
+                if resumed is not None and phase is ResumePhase.CHECKS_C01:
+                    _archive_attempt(run_dir / "revision", names=_PRE_CHECK_ATTEMPT_ARTIFACTS)
                 if resumed is not None and phase is ResumePhase.CLAUDE_C01:
                     _archive_attempt(run_dir / "revision", names=_REVISION_ATTEMPT_ARTIFACTS)
                 try:
@@ -2511,8 +2545,11 @@ class Orchestrator:
                 status=RunStatus.REVALIDATING if revision_enabled else RunStatus.VALIDATING,
                 current_step=None,
             )
+            # The final checks evaluate exactly the checkpointed tree; a failure
+            # keeps that boundary instead of blessing whatever the checks left.
+            checks_tree = candidate_tree_sha(info.worktree)
             try:
-                if resumed is not None and phase is ResumePhase.CHECKS_C01:
+                if resumed is not None and phase is final_checks_phase:
                     _archive_attempt(run_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
                 evidence = self._final_evidence(
                     info.worktree, base_sha, run_dir,
@@ -2522,8 +2559,7 @@ class Orchestrator:
                 )
             except Exception:
                 self._write_phase_checkpoint(
-                    run_dir, ResumePhase.CHECKS_C01, cycle=1,
-                    head=base_sha, tree=candidate_tree_sha(info.worktree),
+                    run_dir, final_checks_phase, cycle=1, head=base_sha, tree=checks_tree,
                 )
                 raise
             store.update(status=RunStatus.VALIDATING, checks=_check_payload(evidence),
@@ -2537,8 +2573,7 @@ class Orchestrator:
                                   item.startswith("CHECK_MUTATED:")]
             if integrity_failures:
                 self._write_phase_checkpoint(
-                    run_dir, ResumePhase.CHECKS_C01, cycle=1,
-                    head=base_sha, tree=evidence.staged_tree_sha,
+                    run_dir, final_checks_phase, cycle=1, head=base_sha, tree=checks_tree,
                 )
                 return self._v2_failed(store, run_dir, integrity_failures[0].split(":", 1)[0], None,
                                         ", ".join(integrity_failures))
@@ -3299,7 +3334,7 @@ class Orchestrator:
         # followed by candidate commit/push and then the reviewer.
         self._checkpoint(
             run_dir,
-            ResumePhase.CHECKS_C01 if cycle == 1 else ResumePhase.CHECKS_C02,
+            ResumePhase.FINAL_CHECKS_C01 if cycle == 1 else ResumePhase.FINAL_CHECKS_C02,
             cycle=cycle, head=expected_head, tree=tree_after,
         )
         return result, None
@@ -3483,8 +3518,11 @@ class Orchestrator:
                 head=cycle_parent_sha, tree=tree_before, repair_bundle_sha256=repair_bundle_sha,
                 scope_delta_sha256=scope_delta_sha,
             )
-        run_claude_c02 = claude_revision_enabled and at <= phase_index(ResumePhase.CLAUDE_C02) and (
-            start is None or start.phase is not ResumePhase.CHECKS_C02
+        # With Claude, CHECKS_C02 and CLAUDE_C02 both precede the revision;
+        # FINAL_CHECKS_C02 means Claude C02 already completed durably.
+        run_claude_c02 = claude_revision_enabled and at <= phase_index(ResumePhase.CLAUDE_C02)
+        final_checks_phase = (
+            ResumePhase.FINAL_CHECKS_C02 if claude_revision_enabled else ResumePhase.CHECKS_C02
         )
         if pending_steps or run_claude_c02:
             # The repair plan may require trusted checks C01 did not; their
@@ -3544,13 +3582,13 @@ class Orchestrator:
             following = repair_plan.steps[index + 1].id if index + 1 < len(repair_plan.steps) else None
             self._checkpoint(
                 run_dir,
-                ResumePhase.REPAIR_STEP if following else (
-                    ResumePhase.CLAUDE_C02 if claude_revision_enabled else ResumePhase.CHECKS_C02
-                ),
+                ResumePhase.REPAIR_STEP if following else ResumePhase.CHECKS_C02,
                 step_id=following, head=cycle_parent_sha, tree=outcome.tree_after,
             )
         self._update_v2_usage(store, run_dir)
         if run_claude_c02:
+            if start is not None and start.phase is ResumePhase.CHECKS_C02:
+                _archive_attempt(run_dir / "revision" / "C02", names=_PRE_CHECK_ATTEMPT_ARTIFACTS)
             if start is not None and start.phase is ResumePhase.CLAUDE_C02:
                 _archive_attempt(run_dir / "revision" / "C02", names=_REVISION_ATTEMPT_ARTIFACTS)
             cycle_2_revision, revision_error = self._run_v2_revision_cycle(
@@ -3580,8 +3618,9 @@ class Orchestrator:
         checks_dir.mkdir(parents=True, exist_ok=True)
         store.update(status=RunStatus.REVALIDATING, current_step=None)
         if start is None or phase_index(start.phase) <= phase_index(ResumePhase.FINAL_CHECKS_C02):
+            checks_tree = candidate_tree_sha(info.worktree)
             try:
-                if start is not None and start.phase is ResumePhase.CHECKS_C02:
+                if start is not None and start.phase is final_checks_phase:
                     _archive_attempt(checks_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
                 evidence = self._final_evidence(
                     info.worktree, base_sha, checks_dir, check_failures_hard=False,
@@ -3590,9 +3629,8 @@ class Orchestrator:
                 )
             except Exception:
                 self._write_phase_checkpoint(
-                    run_dir, ResumePhase.CHECKS_C02, cycle=2, head=cycle_parent_sha,
-                    tree=candidate_tree_sha(info.worktree),
-                    repair_bundle_sha256=repair_bundle_sha,
+                    run_dir, final_checks_phase, cycle=2, head=cycle_parent_sha,
+                    tree=checks_tree, repair_bundle_sha256=repair_bundle_sha,
                 )
                 raise
             store.update(
@@ -3606,8 +3644,8 @@ class Orchestrator:
             integrity_failures = _hard_integrity_failures(evidence)
             if integrity_failures:
                 self._write_phase_checkpoint(
-                    run_dir, ResumePhase.CHECKS_C02, cycle=2,
-                    head=cycle_parent_sha, tree=evidence.staged_tree_sha,
+                    run_dir, final_checks_phase, cycle=2,
+                    head=cycle_parent_sha, tree=checks_tree,
                     repair_bundle_sha256=repair_bundle_sha,
                 )
                 raise OrchestrationError(integrity_failures[0].split(":", 1)[0])
@@ -3869,8 +3907,10 @@ class Orchestrator:
                 raise GitError("candidate commit is not the run branch tip")
             if resolve_tree(info.worktree, commit_sha) != approved_tree:
                 raise GitError("candidate commit tree differs from approved tree")
-            if commit_parents(info.worktree, commit_sha) == ():
-                raise GitError("candidate commit has no parent")
+            # BASE -> C01 (-> C02): the exact direct parent, never "any descendant".
+            expected_parent = _candidate_chain_parent(
+                info.worktree, run_dir, info.base_sha, cycle or 1, commit_sha,
+            )
             validate_run_branch(info.branch, base_ref=self.config.base_ref)
             if self.config.publish.enabled:
                 repository_remote_url(info.worktree, self.config.publish.remote)
@@ -3903,7 +3943,7 @@ class Orchestrator:
                     info.source_repo, remote=self.config.publish.remote,
                     base_branch=base_branch, base_sha=info.base_sha,
                     commit_sha=commit_sha, approved_tree=approved_tree,
-                    run_branch=info.branch,
+                    run_branch=info.branch, expected_parent=expected_parent,
                 )
                 publish_payload = {
                     "mode": PublishMode.FAST_FORWARD_BASE.value,
@@ -4627,6 +4667,14 @@ class Orchestrator:
             path for step in plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
         })
+        if checkpoint.cycle == 2 and checkpoint.phase not in {
+            ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL,
+        }:
+            # After repair planning and scope validation the cumulative
+            # authority is C01 scope UNION the validated C02 repair scope.
+            scope = sorted(set(scope) | set(
+                self._validated_repair_scope(run_dir, checkpoint, plan, selection, scope)
+            ))
         try:
             if str(worktree) not in registered_worktrees(repo):
                 refuse("run worktree is not registered in the repository")
@@ -4772,6 +4820,82 @@ class Orchestrator:
             )
         return resumed
 
+    def _validated_repair_scope(
+        self, run_dir: Path, checkpoint: ResumeCheckpoint, plan: TaskPlanV2,
+        selection: Any, original_scope: list[str],
+    ) -> list[str]:
+        """The C02 repair mutable scope, derived only from hash-bound artifacts.
+
+        The repair bundle and ``scope_delta.json`` must match the checkpoint
+        hashes, the delta must be exactly the parsed repair plan's mutation
+        sets against the C01 scope, and an expansion must satisfy the run's
+        scope policy (including the exact scope approval when required).
+        Nothing is taken from ``state.json`` or reviewer prose.
+        """
+
+        def refuse(message: str) -> NoReturn:
+            raise ResumeIntegrityError(message)
+
+        if checkpoint.scope_delta_sha256 is None:
+            # No validated scope delta: no expansion authority at all.
+            return []
+        if checkpoint.repair_bundle_sha256 is None:
+            refuse("the C02 scope delta is not bound to a repair bundle")
+        repair_dir = run_dir / "repair" / "C02"
+        try:
+            repair_plan = parse_task_plan_v2(
+                (repair_dir / "planner.raw.md").read_text(encoding="utf-8"),
+                implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+                reviewer_ids=frozenset({selection.reviewer.profile_id}),
+                check_catalog=self.config.check_catalog,
+                inherited_check_ids=plan.required_checks,
+            )
+            _bundle, repair_sha = validate_implementation_bundle(
+                repair_dir, expected_step_ids=[step.id for step in repair_plan.steps]
+            )
+            writes, creates, deletes = _repair_mutation_sets(repair_plan)
+            path = repair_dir / "scope_delta.json"
+            if path.stat().st_size > 256 * 1024:
+                refuse("the C02 scope delta is too large")
+            delta_bytes = path.read_bytes()
+            delta = json.loads(delta_bytes.decode("utf-8"))
+        except (V2PlanParseError, OrchestrationError, OSError, UnicodeError, ValueError,
+                AttributeError) as exc:
+            refuse(f"the C02 repair scope is unreadable: {exc}")
+        if repair_plan.decision is not PlanDecision.READY or repair_sha != checkpoint.repair_bundle_sha256:
+            refuse("the C02 repair bundle changed")
+        if hashlib.sha256(delta_bytes).hexdigest() != checkpoint.scope_delta_sha256:
+            refuse("the C02 scope delta changed")
+        requested = sorted(set(writes) | set(creates) | set(deletes))
+        added = sorted(set(requested) - set(original_scope))
+        if (
+            not isinstance(delta, dict)
+            or delta.get("repair_bundle_sha256") != repair_sha
+            or delta.get("original_mutable_paths") != sorted(set(original_scope))
+            or delta.get("requested_write_paths") != writes
+            or delta.get("requested_create_paths") != creates
+            or delta.get("requested_delete_paths") != deletes
+            or delta.get("added_paths") != added
+        ):
+            refuse("the C02 scope delta does not match the repair plan")
+        if added:
+            options = self._run_options
+            if (
+                options.repair_scope_policy == "deny-expansion"
+                or len(added) > options.repair_scope_max_added_paths
+            ):
+                refuse("the C02 scope delta is not allowed by the run scope policy")
+            if options.repair_scope_policy == "require-approval":
+                try:
+                    approval = read_scope_approval(
+                        repair_dir, expected_sha256=checkpoint.scope_delta_sha256
+                    )
+                except ApprovalError as exc:
+                    refuse(f"the C02 scope approval is invalid: {exc}")
+                if approval is None or approval.decision is not ApprovalDecision.APPROVE:
+                    refuse("the C02 scope expansion was not approved")
+        return requested
+
     @staticmethod
     def _explain_tree_drift(
         repo: Path, run_dir: Path, checkpoint: ResumeCheckpoint, candidate: str,
@@ -4836,24 +4960,25 @@ class Orchestrator:
         records = [_load_completed_step(run_dir / "steps" / step_id, step_id) for step_id in prior]
         if any(record is None for record in records):
             refuse("a completed Luna step record is missing or invalid")
-        chain_end = _verify_step_chain(records, base_tree)
-        if chain_end is None:
+        # Two distinct identities per cycle: worker_tree is the last Luna tree;
+        # once Claude succeeded, its record's tree_after (revision_tree) is the
+        # only authority for every later C01 phase.
+        worker_tree = _verify_step_chain(records, base_tree)
+        if worker_tree is None:
             refuse("Luna step trees do not form an unbroken chain")
-        if checkpoint.phase in (ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01, ResumePhase.CLAUDE_C01,
-                               ResumePhase.FINAL_CHECKS_C01, ResumePhase.CANDIDATE_COMMIT_C01,
-                               ResumePhase.CANDIDATE_PUSH_C01) or (
-            not revision_enabled and checkpoint.phase is ResumePhase.REVIEWER_C01
-        ):
-            if chain_end != expected:
-                refuse("the checkpoint tree is not the last completed Luna tree")
         resumed.c01_steps = records
-        if revision_enabled and at > phase_index(ResumePhase.CLAUDE_C01):
+        c01_tree = worker_tree
+        if revision_enabled and at >= phase_index(ResumePhase.FINAL_CHECKS_C01):
             revision = _load_revision(run_dir / "revision")
-            if revision is None or revision.tree_before != chain_end:
+            if revision is None or revision.tree_before != worker_tree:
                 refuse("the Claude C01 record is missing or not based on the Luna tree")
-            if checkpoint.phase is ResumePhase.REVIEWER_C01 and revision.tree_after != expected:
-                refuse("the checkpoint tree is not the Claude C01 tree")
             resumed.c01_revision = revision
+            c01_tree = revision.tree_after
+        if at <= phase_index(ResumePhase.REVIEWER_C01) and expected != c01_tree:
+            refuse(
+                "the checkpoint tree is not the Claude C01 tree" if resumed.c01_revision is not None
+                else "the checkpoint tree is not the last completed Luna tree"
+            )
         if checkpoint.phase in {
             ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01,
             ResumePhase.CLAUDE_C01, ResumePhase.FINAL_CHECKS_C01,
@@ -4861,13 +4986,11 @@ class Orchestrator:
             return
         if at <= phase_index(ResumePhase.CANDIDATE_COMMIT_C01):
             evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
-            c01_tree = resumed.c01_revision.tree_after if resumed.c01_revision is not None else chain_end
-            if evidence is None or evidence.staged_tree_sha != c01_tree or expected != c01_tree:
+            if evidence is None or evidence.staged_tree_sha != c01_tree:
                 refuse("the C01 candidate evidence is missing or not for the candidate tree")
             resumed.c01_evidence = evidence
             return
         evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
-        c01_tree = resumed.c01_revision.tree_after if resumed.c01_revision is not None else chain_end
         if evidence is None or evidence.staged_tree_sha != c01_tree:
             refuse("the C01 candidate evidence is missing or not for the candidate tree")
         resumed.c01_evidence = evidence
@@ -4890,7 +5013,6 @@ class Orchestrator:
             resumed.c01_evidence, resumed.c01_review = evidence, review
             return
         evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
-        c01_tree = resumed.c01_revision.tree_after if resumed.c01_revision is not None else chain_end
         if evidence is None or evidence.staged_tree_sha != c01_tree:
             refuse("the C01 final evidence is missing or not for the C01 tree")
         review = _load_c01_review(run_dir, evidence)
@@ -4940,20 +5062,24 @@ class Orchestrator:
         ]
         if any(record is None for record in repair_records):
             refuse("a completed C02 step record is missing or invalid")
+        # Same two identities for C02: the last repair Luna tree, then the
+        # Claude C02 record's tree_after once Claude C02 succeeded.
         repair_end = _verify_step_chain(repair_records, evidence.staged_tree_sha)
         if repair_end is None:
             refuse("C02 step trees do not form an unbroken chain")
-        if checkpoint.phase in (
-            ResumePhase.REPAIR_STEP, ResumePhase.CLAUDE_C02, ResumePhase.REVIEWER_C02,
-            ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,
-        ) and repair_end != expected:
-            refuse("the checkpoint tree is not the last completed C02 tree")
         resumed.c02_steps = repair_records
-        if revision_enabled and at > phase_index(ResumePhase.CLAUDE_C02):
+        c02_tree = repair_end
+        if revision_enabled and at >= phase_index(ResumePhase.FINAL_CHECKS_C02):
             revision = _load_revision(run_dir / "revision" / "C02")
-            if revision is None or revision.tree_before != repair_end or revision.tree_after != expected:
-                refuse("the Claude C02 record does not match the checkpoint")
+            if revision is None or revision.tree_before != repair_end:
+                refuse("the Claude C02 record is missing or not based on the C02 Luna tree")
             resumed.c02_revision = revision
+            c02_tree = revision.tree_after
+        if expected != c02_tree:
+            refuse(
+                "the checkpoint tree is not the Claude C02 tree" if resumed.c02_revision is not None
+                else "the checkpoint tree is not the last completed C02 tree"
+            )
         if checkpoint.phase in {
             ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,
             ResumePhase.REVIEWER_C02,
@@ -5000,6 +5126,10 @@ class Orchestrator:
 
 
 def _failure_reason(exc: Exception) -> str:
+    if isinstance(exc, (ResumeIntegrityError, ResumeRequiresOperatorError)):
+        # Their stable ``.code`` is the authority: these reasons must stay
+        # recognizable as permanently non-resumable.
+        return exc.code
     if isinstance(exc, OrchestrationError) and str(exc).startswith("CHECK_PREFLIGHT_FAILED:"):
         return str(exc).split()[0]
     if isinstance(exc, CandidatePushError):
