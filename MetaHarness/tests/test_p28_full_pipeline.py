@@ -440,11 +440,11 @@ class P28Harness(unittest.TestCase):
         self.assertEqual(self.remote_refs(), "")
         self.assertNotIn("push", self.events)
 
-    def assert_published_once(self, result: Any, pushed: Any, run_id: str = "p28") -> None:
+    def assert_published_once(self, result: Any, pushed: Any, run_id: str = "p28", expected_pushes: int = 1, expected_commits: int = 1) -> None:
         self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
-        self.assertEqual(pushed.call_count, 1)
+        self.assertEqual(pushed.call_count, expected_pushes)
         worktree = self.worktree(run_id)
-        self.assertEqual(git(worktree, "rev-list", "--count", f"{self.base_sha}..HEAD"), "1")
+        self.assertEqual(git(worktree, "rev-list", "--count", f"{self.base_sha}..HEAD"), str(expected_commits))
         self.assertEqual(git(worktree, "rev-parse", "HEAD"), result.state["commit_sha"])
         self.assertEqual(git(worktree, "rev-parse", "HEAD^{tree}"), result.state["approved_tree_sha"])
         branch = result.state["branch"]
@@ -457,10 +457,10 @@ class P28Harness(unittest.TestCase):
         # Never main / base_ref, never a tag.
         refs = self.remote_refs().splitlines()
         self.assertEqual([line.split()[1] for line in refs], [f"refs/heads/{branch}"])
-        # The single push is after the final reviewer PASS.
+        # The candidate push is before the final reviewer PASS; final
+        # publication is recorded only after PASS.
         last_pass = max(i for i, event in enumerate(self.events) if event == "reviewer:VERDICT: PASS")
-        self.assertEqual(self.events.index("push"), len(self.events) - 1)
-        self.assertGreater(self.events.index("push"), last_pass)
+        self.assertLess(self.events.index("push"), last_pass)
 
 
 class FullPipelineTests(P28Harness):
@@ -481,7 +481,7 @@ class FullPipelineTests(P28Harness):
         self.assertEqual(len(reviewer.prompts), 1)
         self.assertFalse((result.run_dir / "repair" / "C02").exists())
         self.assertEqual(self.events, ["planner:META PLAN v2", "claude:C01",
-                                       "reviewer:VERDICT: PASS", "push"])
+                                       "push", "reviewer:VERDICT: PASS"])
         selection = json.loads((result.run_dir / "execution_selection.json").read_text())
         self.assertEqual(selection["schema_version"], 4)
         self.assertEqual(
@@ -519,14 +519,12 @@ class FullPipelineTests(P28Harness):
         result, planner, reviewer, _claude, pushed = self.run_pipeline(
             luna=luna, reviews=[PASS],
         )
-        self.assertEqual(result.state["failure"]["reason"], "REVIEWER_OUTPUT_INVALID")
-        self.assertIn("PASS is forbidden", result.state["failure"]["detail"])
+        self.assertEqual(result.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
         self.assert_no_commit_no_push(result, pushed)
-        self.assertEqual((len(planner.prompts), len(reviewer.prompts)), (1, 1))
+        self.assertEqual((len(planner.prompts), len(reviewer.prompts)), (1, 0))
         self.assertFalse((result.run_dir / "repair" / "C02").exists())
         self.assertIsNone(result.state.get("approved_tree_sha"))
-        # The gate payload the reviewer saw carried the same red flag.
-        self.assertIn('"deterministic_passed": false', reviewer.prompts[0])
+        self.assertFalse(reviewer.prompts)
 
     def _c01_then_repair(self, c02_behavior: Any, reviews: list[str], *,
                          claude: FakeClaude | None = None, run_id: str = "p28"):
@@ -539,10 +537,10 @@ class FullPipelineTests(P28Harness):
         luna, result, planner, reviewer, claude, pushed = self._c01_then_repair(
             writer("src/a.py", "A = 4\n"), [REVISE_IMPLEMENTATION, PASS],
         )
-        self.assert_published_once(result, pushed)
+        self.assert_published_once(result, pushed, expected_pushes=2, expected_commits=2)
         self.assertEqual(self.events, [
-            "planner:META PLAN v2", "claude:C01", "reviewer:VERDICT: REVISE",
-            "planner:META PLAN v2", "claude:C02", "reviewer:VERDICT: PASS", "push",
+            "planner:META PLAN v2", "claude:C01", "push", "reviewer:VERDICT: REVISE",
+            "planner:META PLAN v2", "claude:C02", "push", "reviewer:VERDICT: PASS",
         ])
         self.assertEqual([(call["cycle"], call["step"]) for call in luna.calls], [(1, "S01"), (2, "S01")])
         self.assertEqual([call["cycle"] for call in claude.calls], [1, 2])
@@ -582,9 +580,9 @@ class FullPipelineTests(P28Harness):
         _luna, result, planner, reviewer, _claude, pushed = self._c01_then_repair(
             writer("src/a.py", "A = BUG\n"), [REVISE_IMPLEMENTATION, PASS],
         )
-        self.assertEqual(result.state["failure"]["reason"], "REVIEWER_OUTPUT_INVALID")
-        self.assert_no_commit_no_push(result, pushed)
-        self.assertEqual((len(planner.prompts), len(reviewer.prompts)), (2, 2))
+        self.assertEqual(result.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertEqual(pushed.call_count, 1)
+        self.assertEqual((len(planner.prompts), len(reviewer.prompts)), (2, 1))
         self.assertFalse((result.run_dir / "repair" / "C03").exists())
         self.assertFalse(result.state["deterministic_gate"]["passed"])
 
@@ -593,7 +591,8 @@ class FullPipelineTests(P28Harness):
             writer("src/a.py", "A = 4\n"), [REVISE_IMPLEMENTATION, REVISE_IMPLEMENTATION],
         )
         self.assertEqual(result.state["failure"]["reason"], "REVIEW_LOOP_EXHAUSTED")
-        self.assert_no_commit_no_push(result, pushed)
+        self.assertEqual(pushed.call_count, 2)
+        self.assertEqual(git(self.worktree(), "rev-parse", "HEAD^^"), self.base_sha)
         self.assertEqual((len(planner.prompts), len(reviewer.prompts)), (2, 2))
         self.assertFalse((result.run_dir / "repair" / "C03").exists())
 
@@ -634,7 +633,7 @@ class FullPipelineTests(P28Harness):
                         self.assertEqual(failure["detail"], "step=S01 Codex authentication failed")
                     self.assertEqual(json.loads((step_dir / "step.json").read_text())["reason"], reason)
                     self.assertEqual(result.state["steps"][0]["status"], "failed")
-                    self.assertEqual(pushed.call_count, 0)
+                    self.assertEqual(pushed.call_count, 0 if cycle == 1 else 1)
                     self.assertIsNone(result.state.get("commit_sha"))
                     self.assertFalse((result.run_dir / "repair" / "C03").exists())
 
@@ -1220,17 +1219,11 @@ class StructuralTests(unittest.TestCase):
 
     def test_push_remains_after_final_review_authorization(self) -> None:
         v2 = inspect.getsource(Orchestrator._execute_v2)
-        c02_gate = v2.index("repair_plan, review, evidence, info.worktree, base_sha, branch_ref")
-        c01_gate = v2.index("self._authorize_v2_commit(plan, review, evidence")
-        self.assertLess(v2.index("REVIEW_LOOP_EXHAUSTED"), c02_gate)
-        self.assertLess(c02_gate, v2.index("commit_reviewed_tree"))
-        self.assertLess(c02_gate, v2.index("cycle=2,"))
-        self.assertLess(c01_gate, v2.rindex("return self._complete_commit("))
-        self.assertEqual(v2.count("self._complete_commit("), 2)
-        complete = inspect.getsource(Orchestrator._complete_commit)
-        self.assertLess(complete.index("COMMIT_TREE_MISMATCH"), complete.index("push_run_branch("))
-        self.assertLess(complete.index("validate_run_branch("), complete.index("push_run_branch("))
-        self.assertEqual(complete.count("push_run_branch("), 1)
+        self.assertLess(v2.index("_push_candidate("), v2.index("_run_v2_reviewer("))
+        self.assertIn("_complete_candidate_publication", v2)
+        complete = inspect.getsource(Orchestrator._complete_candidate_publication)
+        self.assertIn("publish_fast_forward_base", complete)
+        self.assertNotIn("commit_candidate_tree", complete)
 
 
 if __name__ == "__main__":

@@ -133,7 +133,7 @@ prompt is stdin and no shell is used:
 
 ```text
 claude --print --verbose --output-format stream-json --model <model>
-       --bare --restricted --tools Read,Edit,Write,Grep,Glob
+       --safe-mode --restricted --tools Read,Edit,Write,Grep,Glob
        --no-session-persistence --no-chrome --disable-slash-commands
        --max-turns 12 --effort <effort> --permission-mode <permission_mode>
        --settings <managed>/settings.json
@@ -144,10 +144,17 @@ claude --print --verbose --output-format stream-json --model <model>
 `--output-format=stream-json` otherwise (`Error: When using --print,
 --output-format=stream-json requires --verbose`, the failure of run
 `20260914T124017Z-7b74467062`). `doctor` requires `--print`, `--verbose`,
-`--output-format`, `--bare`, `--restricted`, `--tools`,
+`--output-format`, `--safe-mode`, `--restricted`, `--tools`,
 `--no-session-persistence`, `--no-chrome`, `--disable-slash-commands`,
 `--max-turns`, `--model`, `--effort`, `--permission-mode`, `--settings`,
 `--mcp-config` and `--strict-mcp-config` in `claude --help`.
+
+`--safe-mode` is intentional for subscription authentication: unlike
+`--bare`, it keeps OAuth credentials available from the managed
+`CLAUDE_CONFIG_DIR` while disabling Claude customizations (CLAUDE.md, skills,
+plugins, hooks, MCP discovery, commands, agents and memory). `--restricted`
+remains the capability boundary for file and command tools; MetaHarness also
+passes its exact tool list, managed settings and empty MCP configuration.
 
 ## Publication to main (`fast-forward-base`)
 

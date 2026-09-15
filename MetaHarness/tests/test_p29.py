@@ -438,7 +438,8 @@ class ResumeClaudeTests(P29Harness):
             ("initial_step", "S01"), ("initial_step", "S01"),            # approval, setup
             ("initial_step", "S02"), ("initial_step", "S03"),            # each Luna step
             ("claude_c01", None), ("claude_c01", None),                  # S03 done, pre-checks done
-            ("reviewer_c01", None), ("reviewer_c01", None),              # Claude done, final checks done
+            ("checks_c01", None), ("candidate_commit_c01", None),
+            ("candidate_push_c01", None), ("reviewer_c01", None),         # candidate pushed, reviewer done
             ("publish", None),                                           # exact commit done
         ])
         run_dir = result.run_dir
@@ -511,7 +512,7 @@ class ResumeCodexReviewerPublishTests(P29Harness):
         self.assertEqual((planner2.prompts, luna2.calls, claude2.calls), ([], [], []))
         self.assertEqual(len(claude.calls), 1)
         self.assertEqual(self.checks_ran(), checks_before)
-        self.assertEqual(pushed.call_count, 1)
+        self.assertEqual(pushed.call_count, 0)
 
 
 class FastForwardMainTests(P29Harness):
@@ -532,16 +533,20 @@ class FastForwardMainTests(P29Harness):
         with self.count_pushes() as pushed:
             result = self.run_approved(config, orchestrator, "ffmain")
         self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
-        commit = result.state["commit_sha"]
+        commit = json.loads((result.run_dir / "candidate/C01/commit.json").read_text())["commit_sha"]
         self.assertEqual(git(self.repo, "rev-parse", "refs/heads/main"), commit)
         self.assertEqual(git(self.repo, "rev-parse", f"{commit}^"), self.base_sha)
+        commit = result.state["commit_sha"]
         self.assertEqual(self.origin_main(), commit)
         self.assertEqual(git(self.repo, "rev-parse", f"{commit}^{{tree}}"), result.state["approved_tree_sha"])
-        # No checkout: the user's files were not touched; the run branch was
-        # never pushed and remains local.
+        # No checkout: the user's files were not touched; the candidate run
+        # branch is pushed before review, while main changes only after PASS.
         self.assertEqual((self.repo / "src/a.py").read_text(), checkout_file)
-        self.assertEqual(pushed.call_count, 0)
-        self.assertEqual([line.split()[1] for line in self.remote_refs().splitlines()], ["refs/heads/main"])
+        self.assertEqual(pushed.call_count, 1)
+        self.assertEqual(
+            {line.split()[1] for line in self.remote_refs().splitlines()},
+            {"refs/heads/main", f"refs/heads/{result.state['branch']}"},
+        )
         self.assertEqual(git(self.repo, "rev-parse", f"refs/heads/{result.state['branch']}"), commit)
         publish = json.loads((result.run_dir / "publish.json").read_text())
         self.assertEqual((publish["mode"], publish["target"], publish["commit_sha"]),
@@ -581,19 +586,17 @@ class FastForwardMainTests(P29Harness):
         orchestrator, planner, reviewer, *_rest = self.orchestrator(config, plans=[SINGLE_PLAN], reviews=[PASS], luna=luna)
         result = self.run_approved(config, orchestrator, "push-retry")
         self.assertEqual(result.state["failure"]["reason"], "PUSH_FAILED")
-        commit = result.state["commit_sha"]
-        self.assertIn(f"local main already points to {commit}", result.state["failure"]["detail"])
-        self.assertTrue(result.state["publish"]["local_base_updated"])
-        self.assertEqual(git(self.repo, "rev-parse", "refs/heads/main"), commit)
+        commit = json.loads((result.run_dir / "candidate/C01/commit.json").read_text())["commit_sha"]
+        self.assertEqual(git(self.repo, "rev-parse", "refs/heads/main"), self.base_sha)
         info = resume_info(result.run_dir, result.state)
-        self.assertEqual((info.phase, info.label), ("publish", "Retry publish"))
+        self.assertEqual((info.phase, info.label), ("candidate_push_c01", "Push candidate C01"))
         git(self.repo, "remote", "set-url", "origin", str(self.bare))
-        second, planner2, reviewer2, luna2, claude2 = self.orchestrator(config)
+        second, planner2, reviewer2, luna2, claude2 = self.orchestrator(config, reviews=[PASS])
         resumed = second.resume("push-retry")
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
         self.assertEqual(self.origin_main(), commit)
         self.assertEqual(resumed.state["commit_sha"], commit)
-        self.assertEqual((planner2.prompts, reviewer2.prompts, luna2.calls, claude2.calls), ([], [], [], []))
+        self.assertEqual((planner2.prompts, len(reviewer2.prompts), luna2.calls, claude2.calls), ([], 1, [], []))
         self.assertEqual(self.commits_on_run_branch("push-retry"), "1")
 
 

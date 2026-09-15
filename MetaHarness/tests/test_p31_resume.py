@@ -69,7 +69,7 @@ class P31ResumeTests(P29Harness):
         self.assertEqual(len(retry_planner.prompts), 1)
         self.assertTrue((failed.run_dir / "attempts" / "01" / "planner.request.txt").exists())
 
-    def test_commit_object_is_reconciled_without_a_duplicate(self) -> None:
+    def test_candidate_commit_is_reconciled_without_a_duplicate(self) -> None:
         config_path = self.root / "p31-no-publish.toml"
         config_path.write_text(
             self.config_text(require_approval=False, revision=False, publish=False),
@@ -77,7 +77,7 @@ class P31ResumeTests(P29Harness):
         )
         config = load_config(config_path)
         planner = QueueClient("planner", [SINGLE_PLAN], self.events)
-        original = orchestrator_module.commit_reviewed_tree
+        original = orchestrator_module.commit_candidate_tree
         crashed = False
 
         def commit_then_crash(*args: object, **kwargs: object) -> str:
@@ -88,7 +88,7 @@ class P31ResumeTests(P29Harness):
                 raise RuntimeError("simulated state update crash")
             return value
 
-        with mock.patch.object(orchestrator_module, "commit_reviewed_tree", side_effect=commit_then_crash):
+        with mock.patch.object(orchestrator_module, "commit_candidate_tree", side_effect=commit_then_crash):
             failed = Orchestrator(
                 config,
                 planner_client=planner,
@@ -97,12 +97,12 @@ class P31ResumeTests(P29Harness):
                 reviser=FakeClaude(log=self.events),
             ).run_text(SPEC, run_id="commit-reconcile")
         self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
-        self.assertEqual(read_checkpoint(failed.run_dir).phase, ResumePhase.COMMIT)
+        self.assertEqual(read_checkpoint(failed.run_dir).phase, ResumePhase.CANDIDATE_COMMIT_C01)
 
         resumed = Orchestrator(
             config,
             planner_client=QueueClient("planner", [], self.events),
-            reviewer_client=QueueClient("reviewer", [], self.events),
+            reviewer_client=QueueClient("reviewer", [PASS], self.events),
             agent=FakeLuna({}),
             reviser=FakeClaude(log=self.events),
         ).resume("commit-reconcile")

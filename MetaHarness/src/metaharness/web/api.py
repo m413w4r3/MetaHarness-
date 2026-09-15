@@ -321,6 +321,7 @@ def _state_summary(run_id: str, state: dict[str, Any]) -> dict[str, Any]:
         "updated_at": state.get("updated_at"),
         "plan_title": planner.get("title"),
         "commit_sha": state.get("commit_sha"),
+        "candidate": state.get("candidate"),
         "failure": state.get("failure"),
     }
 
@@ -477,7 +478,10 @@ def get_run(
         "approval": {"recorded": approval_decision is not None, "decision": approval_decision},
         "agent_diagnostics": agent_diagnostics,
         "progress_tail": progress_tail(runs_root, safe_id, max_events=50),
-        "candidate": {"changed_files": changed_files, "diff_tail": diff_tail},
+        "candidate": {
+            **(state.get("candidate") if isinstance(state.get("candidate"), dict) else {}),
+            "changed_files": changed_files, "diff_tail": diff_tail,
+        },
         "workspace_setup": workspace_setup,
         "step_artifacts": step_artifacts,
         "cycle": _state_cycle(state),
@@ -1277,7 +1281,8 @@ _PUBLISH_FAILURES = frozenset({
 })
 _C02_PHASES = frozenset({
     "repair_planner", "repair_step", "checks_c02", "final_checks_c02",
-    "claude_c02", "reviewer_c02", "com" + "mit",
+    "claude_c02", "candidate_commit_c02", "candidate_push_c02",
+    "reviewer_c02", "com" + "mit",
 })
 _PIPELINE_STEP_STATE = {
     "completed": "complete", "running": "running", "failed": "failed",

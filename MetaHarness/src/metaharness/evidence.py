@@ -250,6 +250,7 @@ def collect_evidence(
     tail_bytes: int = DEFAULT_TAIL_BYTES,
     secrets: tuple[str, ...] = (),
     check_failures_hard: bool = True,
+    expected_head_sha: str | None = None,
 ) -> EvidenceBundle:
     """Run all configured checks, then stage and freeze the submitted tree."""
 
@@ -273,7 +274,7 @@ def collect_evidence(
         root, config, logs_dir=logs_dir, tail_bytes=tail_bytes, secrets=secrets
     )
 
-    head_matches = current_head(root) == base_sha
+    head_matches = current_head(root) == (expected_head_sha or base_sha)
     # This is intentionally after every check, including failed checks, so the
     # tree written below is the exact tree offered to the reviewer.
     stage_all(root)

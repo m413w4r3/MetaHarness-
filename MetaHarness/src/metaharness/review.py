@@ -84,7 +84,7 @@ def _replace_placeholders(template: str, values: dict[str, str]) -> str:
     """Replace known placeholders once, preserving placeholders in evidence."""
 
     return re.sub(
-        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|DIFF|CHECKS|AGENT_REPORT|REPOSITORY|LUNA_REPORTS|REVISION_REPORT|REPOSITORY_STATE|ITERATION|CYCLE_HISTORY)\}\}",
+        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|DIFF|CHECKS|AGENT_REPORT|REPOSITORY|LUNA_REPORTS|REVISION_REPORT|REPOSITORY_STATE|CANDIDATE_COMMIT|ITERATION|CYCLE_HISTORY)\}\}",
         lambda match: values[match.group(0)],
         template,
     )
@@ -110,6 +110,7 @@ def build_reviewer_prompt(
     luna_reports: str = "",
     revision_report: str = "",
     repository_state: str = "",
+    candidate_commit: str = "",
     iteration: int = 1,
     cycle_history: str = "",
     template: str | None = None,
@@ -134,6 +135,7 @@ def build_reviewer_prompt(
         "{{LUNA_REPORTS}}": _require_text("luna_reports", luna_reports),
         "{{REVISION_REPORT}}": _require_text("revision_report", revision_report),
         "{{REPOSITORY_STATE}}": _require_text("repository_state", repository_state),
+        "{{CANDIDATE_COMMIT}}": _require_text("candidate_commit", candidate_commit),
         "{{ITERATION}}": str(iteration),
         "{{CYCLE_HISTORY}}": _require_text("cycle_history", cycle_history),
     }
@@ -488,6 +490,7 @@ class Reviewer:
         luna_reports: str = "",
         revision_report: str = "",
         repository_state: str = "",
+        candidate_commit: str = "",
         iteration: int = 1,
         cycle_history: str = "",
     ) -> ReviewResult:
@@ -504,6 +507,7 @@ class Reviewer:
             luna_reports=luna_reports,
             revision_report=revision_report,
             repository_state=repository_state,
+            candidate_commit=candidate_commit,
             iteration=iteration,
             cycle_history=cycle_history,
             template=self.template,
@@ -571,6 +575,7 @@ def run_reviewer(
     luna_reports: str = "",
     revision_report: str = "",
     repository_state: str = "",
+    candidate_commit: str = "",
     iteration: int = 1,
     cycle_history: str = "",
 ) -> ReviewResult:
@@ -590,7 +595,8 @@ def run_reviewer(
         repository=repository,
         luna_reports=luna_reports,
         revision_report=revision_report,
-        repository_state=repository_state,
+            repository_state=repository_state,
+            candidate_commit=candidate_commit,
         iteration=iteration,
         cycle_history=cycle_history,
     )

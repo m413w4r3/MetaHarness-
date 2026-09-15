@@ -165,6 +165,15 @@ def _status(run_dir: Path) -> int:
         print("failure: " + json.dumps(state["failure"], ensure_ascii=False))
     if state.get("commit_sha"):
         print(f"commit: {state['commit_sha']}")
+    candidates = state.get("candidate")
+    if isinstance(candidates, dict):
+        for cycle in ("C01", "C02"):
+            candidate = candidates.get(cycle)
+            if isinstance(candidate, dict):
+                print(f"CANDIDATE {cycle}: {candidate.get('commit_sha', '—')}")
+                print(f"candidate pushed: {'yes' if candidate.get('pushed_at') else 'no'}")
+                print(f"candidate branch: {candidate.get('branch', '—')}")
+                print(f"candidate link: {candidate.get('immutable_commit_url') or '—'}")
     publish = state.get("publish")
     if isinstance(publish, dict) and publish.get("status") == "pushed":
         print(f"remote: {publish.get('remote')}")
@@ -379,7 +388,10 @@ def _probe_claude_capabilities(
         "--verbose",
         "--output-format",
         "stream-json",
-        "--bare",
+        # Keep this parser-only argv aligned with ClaudeCodeAgent: safe mode
+        # preserves managed subscription/OAuth authentication, while
+        # restricted mode supplies the capability boundary.
+        "--safe-mode",
         "--restricted",
         "--tools",
         _REVISION_TOOLS,

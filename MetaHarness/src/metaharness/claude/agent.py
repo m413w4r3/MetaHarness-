@@ -174,7 +174,11 @@ class ClaudeCodeAgent:
             "--verbose",
             "--output-format",
             "stream-json",
-            "--bare",
+            # Safe mode, unlike ``--bare``, keeps Claude subscription/OAuth
+            # authentication available from the managed CLAUDE_CONFIG_DIR
+            # while disabling foreign customizations.  ``--restricted``
+            # remains the authority for tool and filesystem confinement.
+            "--safe-mode",
             "--restricted",
             "--tools",
             _REVISION_TOOLS,

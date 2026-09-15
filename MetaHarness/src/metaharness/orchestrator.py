@@ -66,6 +66,7 @@ from .gitops import (
     candidate_tree_sha,
     changed_paths_between_trees,
     commit_reviewed_tree,
+    commit_candidate_tree,
     create_run_worktree,
     current_head,
     git_root,
@@ -75,6 +76,7 @@ from .gitops import (
     render_repository_reference,
     path_exists_in_tree,
     push_run_branch,
+    remote_run_branch_tip,
     registered_worktrees,
     resolve_commit,
     resolve_tree,
@@ -709,6 +711,12 @@ class ReviewerTransportError(OrchestrationError):
     """No reviewer answer was obtained: a transport failure, not a verdict."""
 
 
+class CandidatePushError(OrchestrationError):
+    """The immutable candidate could not be pushed to the run branch."""
+
+    code = "PUSH_FAILED"
+
+
 @dataclasses.dataclass(frozen=True)
 class _V2Setup:
     """A planned, approved and prepared v2 run, ready for its first step."""
@@ -897,7 +905,9 @@ def _load_evidence(directory: Path) -> EvidenceBundle | None:
     )
 
 
-def _accepted_review(directory: Path, evidence: EvidenceBundle) -> ReviewResult | None:
+def _accepted_review(
+    directory: Path, evidence: EvidenceBundle, candidate_sha: str | None = None,
+) -> ReviewResult | None:
     """A reviewer answer already accepted for exactly this candidate tree."""
 
     if not (directory / "review.json").is_file():
@@ -908,6 +918,8 @@ def _accepted_review(directory: Path, evidence: EvidenceBundle) -> ReviewResult 
     except (OSError, UnicodeError):
         return None
     if f'"CANDIDATE_TREE_SHA": "{evidence.staged_tree_sha}"' not in request:
+        return None
+    if candidate_sha is not None and candidate_sha not in request:
         return None
     try:
         return parse_review(raw, deterministic_passed=evidence.deterministic_passed)
@@ -1017,6 +1029,25 @@ def _commit_web_url(reference: RepositoryReference, commit_sha: str) -> str | No
 def _state_cycle_value(state: Mapping[str, Any]) -> int:
     value = state.get("cycle")
     return value if value in (1, 2) and not isinstance(value, bool) else 1
+
+
+def _candidate_commit_path(run_dir: Path, cycle: int) -> Path:
+    return run_dir / "candidate" / f"C{cycle:02d}" / "commit.json"
+
+
+def _candidate_commit_payload(
+    *, commit_sha: str, tree_sha: str, parent_sha: str, branch: str,
+    remote: str, immutable_url: str | None, pushed_at: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "commit_sha": commit_sha,
+        "tree_sha": tree_sha,
+        "parent_sha": parent_sha,
+        "branch": branch,
+        "remote": remote,
+        "immutable_commit_url": immutable_url,
+        "pushed_at": pushed_at,
+    }
 
 
 
@@ -2337,7 +2368,7 @@ class Orchestrator:
             self._checkpoint(
                 run_dir,
                 ResumePhase.INITIAL_STEP if following else (
-                    ResumePhase.CLAUDE_C01 if revision_enabled else ResumePhase.REVIEWER_C01
+                    ResumePhase.CLAUDE_C01 if revision_enabled else ResumePhase.CHECKS_C01
                 ),
                 step_id=following, head=base_sha, tree=outcome.tree_after,
             )
@@ -2376,7 +2407,8 @@ class Orchestrator:
             if revision_result is not None:
                 revision_report_c01 = _revision_report_text(revision_result, run_dir / "revision")
 
-        if at <= phase_index(ResumePhase.REVIEWER_C01):
+        c01_candidate: dict[str, Any]
+        if at <= phase_index(ResumePhase.FINAL_CHECKS_C01):
             store.update(
                 status=RunStatus.REVALIDATING if revision_enabled else RunStatus.VALIDATING,
                 current_step=None,
@@ -2410,9 +2442,57 @@ class Orchestrator:
                 )
                 return self._v2_failed(store, run_dir, integrity_failures[0].split(":", 1)[0], None,
                                         ", ".join(integrity_failures))
-            # Final checks complete: the next operation is reviewer #1.
-            self._checkpoint(run_dir, ResumePhase.REVIEWER_C01, head=base_sha,
-                             tree=evidence.staged_tree_sha)
+        else:
+            evidence = resumed.c01_evidence
+            if evidence is None:
+                raise ResumeIntegrityError("C01 candidate evidence is missing")
+
+        if at <= phase_index(ResumePhase.CANDIDATE_COMMIT_C01):
+            # The deterministic gate is the only gate before the immutable
+            # candidate commit.  Semantic review deliberately comes later.
+            if not evidence.deterministic_passed:
+                return self._v2_failed(store, run_dir, "DETERMINISTIC_GATE_FAILED", None)
+            self._checkpoint(run_dir, ResumePhase.CANDIDATE_COMMIT_C01,
+                             head=base_sha, tree=evidence.staged_tree_sha)
+            if current_head(info.worktree) == base_sha:
+                self._authorize_candidate_tree(
+                    evidence, info.worktree, base_sha, branch_ref
+                )
+            elif not (
+                resumed is not None and resumed.existing_commit_sha is not None
+                and commit_parents(info.worktree, resumed.existing_commit_sha) == (base_sha,)
+                and resolve_tree(info.worktree, resumed.existing_commit_sha) == evidence.staged_tree_sha
+            ):
+                raise ResumeIntegrityError("C01 candidate commit exists with the wrong identity")
+            c01_candidate = self._ensure_candidate_commit(
+                run_dir=run_dir, info=info, cycle=1, tree_sha=evidence.staged_tree_sha,
+                parent_sha=base_sha, title=plan.title,
+                repository_reference=repository_reference, store=store, run_id=run_id,
+            )
+        else:
+            c01_candidate = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+            if not isinstance(c01_candidate, dict):
+                raise ResumeIntegrityError("C01 candidate commit artifact is missing")
+
+        if at <= phase_index(ResumePhase.CANDIDATE_PUSH_C01):
+            self._checkpoint(
+                run_dir, ResumePhase.CANDIDATE_PUSH_C01,
+                head=c01_candidate["commit_sha"], tree=evidence.staged_tree_sha,
+            )
+            try:
+                c01_candidate = self._push_candidate(
+                    run_dir=run_dir, info=info, cycle=1, candidate=c01_candidate, store=store,
+                )
+            except (GitError, OSError, ValueError) as exc:
+                return self._v2_failed(store, run_dir, "PUSH_FAILED", None, "candidate push did not complete")
+
+        if at <= phase_index(ResumePhase.REVIEWER_C01):
+            # Candidate push complete: the reviewer receives the exact pushed
+            # commit, never a moving default branch or a local staged tree.
+            self._checkpoint(
+                run_dir, ResumePhase.REVIEWER_C01,
+                head=c01_candidate["commit_sha"], tree=evidence.staged_tree_sha,
+            )
             reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
             store.update(status=RunStatus.REVIEWING)
             try:
@@ -2429,6 +2509,7 @@ class Orchestrator:
                         cycle_history="C01 is the initial implementation cycle.",
                     ),
                     artifacts_dir=run_dir, worktree=info.worktree, base_sha=base_sha,
+                    candidate_commit=c01_candidate,
                     reuse_accepted=resumed is not None and phase is ResumePhase.REVIEWER_C01,
                 )
             except ReviewParseError as exc:
@@ -2458,7 +2539,9 @@ class Orchestrator:
             if revision_enabled:
                 self._snapshot_cycle_artifacts(run_dir)
         else:
-            evidence, review = resumed.c01_evidence, resumed.c01_review
+            review = resumed.c01_review
+            if review is None:
+                raise ResumeIntegrityError("C01 reviewer result is missing")
         if review.verdict is ReviewVerdict.REVISE:
             if repair_enabled and review.route is ReviewRoute.IMPLEMENTATION:
                 if at <= phase_index(ResumePhase.REVIEWER_C01):
@@ -2515,31 +2598,22 @@ class Orchestrator:
                     return self._v2_failed(store, run_dir, "REVIEW_FAILED", None)
                 if not evidence.deterministic_passed:
                     return self._v2_failed(store, run_dir, "DETERMINISTIC_GATE_FAILED", None)
-                approved_tree = self._authorize_v2_commit(
-                    repair_plan, review, evidence, info.worktree, base_sha, branch_ref
-                )
+                approved_tree = evidence.staged_tree_sha
                 self._cycle_update(store, 2, status="approved")
                 store.update(
                     status=RunStatus.APPROVED,
                     approved_tree_sha=approved_tree,
                     current_step=None,
                 )
-                self._write_phase_checkpoint(
-                    run_dir, ResumePhase.COMMIT, cycle=2, head=base_sha,
-                    tree=approved_tree,
-                )
-                commit_fn = commit_reviewed_tree
-                commit_sha = commit_fn(
-                    info.worktree, tree_sha=approved_tree, parent_sha=base_sha,
-                    subject=_commit_subject(repair_plan.title),
-                    body=f"MetaHarness-Run: {run_id}",
-                )
-                return self._complete_commit(
+                candidate = _read_json_artifact(_candidate_commit_path(run_dir, 2))
+                if not isinstance(candidate, dict) or not _is_object_id(candidate.get("commit_sha")):
+                    raise ResumeIntegrityError("C02 candidate commit artifact is missing after PASS")
+                return self._complete_candidate_publication(
                     store=store,
                     run_dir=run_dir,
                     info=info,
                     approved_tree=approved_tree,
-                    commit_sha=commit_sha,
+                    commit_sha=candidate["commit_sha"],
                     repository_reference=repository_reference,
                     cycle=2,
                 )
@@ -2567,7 +2641,7 @@ class Orchestrator:
             return self._v2_failed(store, run_dir, "REVIEW_FAIL", None)
         if review.route is not ReviewRoute.NONE or not evidence.deterministic_passed:
             return self._v2_failed(store, run_dir, "REVIEW_ROUTE_NOT_NONE" if review.route is not ReviewRoute.NONE else "DETERMINISTIC_GATE_FAILED", None)
-        approved_tree = self._authorize_v2_commit(plan, review, evidence, info.worktree, base_sha, branch_ref)
+        approved_tree = evidence.staged_tree_sha
         if revision_enabled:
             self._cycle_update(store, 1, status="approved")
         store.update(
@@ -2575,22 +2649,15 @@ class Orchestrator:
             approved_tree_sha=approved_tree,
             current_step=None,
         )
-        # Keep the sole named commit primitive in the legacy guarded path;
-        # this alias still resolves to the same GitOps implementation.
-        self._write_phase_checkpoint(
-            run_dir, ResumePhase.COMMIT, cycle=1, head=base_sha,
-            tree=approved_tree,
-        )
-        commit_fn = commit_reviewed_tree
-        commit_sha = commit_fn(info.worktree, tree_sha=approved_tree,
-                               parent_sha=base_sha, subject=_commit_subject(plan.title),
-                               body=f"MetaHarness-Run: {run_id}")
-        return self._complete_commit(
+        candidate = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+        if not isinstance(candidate, dict) or not _is_object_id(candidate.get("commit_sha")):
+            raise ResumeIntegrityError("C01 candidate commit artifact is missing after PASS")
+        return self._complete_candidate_publication(
             store=store,
             run_dir=run_dir,
             info=info,
             approved_tree=approved_tree,
-            commit_sha=commit_sha,
+            commit_sha=candidate["commit_sha"],
             repository_reference=repository_reference,
         )
 
@@ -2771,6 +2838,95 @@ class Orchestrator:
             step_dir=step_dir,
         )
 
+    def _authorize_candidate_tree(
+        self, evidence: EvidenceBundle, worktree: Path, parent_sha: str, branch_ref: str,
+    ) -> str:
+        """Authorize the immutable candidate tree before semantic review."""
+
+        if not evidence.deterministic_passed or evidence.failures or not evidence.staged_tree_sha:
+            raise CommitBoundaryError("deterministic gate did not pass for candidate commit")
+        if symbolic_head(worktree) != branch_ref or current_head(worktree) != parent_sha:
+            raise CommitBoundaryError("worktree HEAD changed before candidate commit")
+        candidate = evidence.staged_tree_sha
+        if index_tree_sha(worktree) != candidate or candidate_tree_sha(worktree) != candidate:
+            raise CommitBoundaryError("candidate tree changed before candidate commit")
+        if _status_has_unstaged_or_untracked(status_porcelain(worktree)):
+            raise CommitBoundaryError("worktree has changes before candidate commit")
+        return candidate
+
+    def _ensure_candidate_commit(
+        self, *, run_dir: Path, info: WorktreeInfo, cycle: int, tree_sha: str,
+        parent_sha: str, title: str, repository_reference: RepositoryReference,
+        store: RunStateStore, run_id: str,
+    ) -> dict[str, Any]:
+        """Reconcile or create exactly one candidate commit for a cycle."""
+
+        path = _candidate_commit_path(run_dir, cycle)
+        stored = _read_json_artifact(path)
+        commit_sha = stored.get("commit_sha") if isinstance(stored, dict) else None
+        if not _is_object_id(commit_sha):
+            commit_sha = None
+        if commit_sha is None:
+            try:
+                head = current_head(info.worktree)
+                if commit_parents(info.worktree, head) == (parent_sha,) and resolve_tree(info.worktree, head) == tree_sha:
+                    commit_sha = head
+            except GitError:
+                pass
+        if commit_sha is None:
+            commit_sha = commit_candidate_tree(
+                info.worktree, tree_sha=tree_sha, parent_sha=parent_sha,
+                subject=_commit_subject(title), body=f"MetaHarness-Run: {run_id}",
+            )
+        if current_head(info.worktree) != commit_sha:
+            raise CommitBoundaryError("candidate commit is not the run branch tip")
+        if commit_parents(info.worktree, commit_sha) != (parent_sha,) or resolve_tree(info.worktree, commit_sha) != tree_sha:
+            raise CommitBoundaryError("candidate commit identity is not exact")
+        payload = _candidate_commit_payload(
+            commit_sha=commit_sha, tree_sha=tree_sha, parent_sha=parent_sha,
+            branch=info.branch, remote=self.config.publish.remote,
+            immutable_url=_commit_web_url(repository_reference, commit_sha),
+            pushed_at=(stored.get("pushed_at") if isinstance(stored, dict) else None),
+        )
+        atomic_write_text(path, _json_text(payload))
+        candidate_state = dict(store.load().get("candidate") or {})
+        candidate_state[f"C{cycle:02d}"] = payload
+        store.update(
+            status=RunStatus.APPROVED, candidate=candidate_state,
+            candidate_commit_sha=commit_sha, approved_tree_sha=tree_sha,
+        )
+        return payload
+
+    def _push_candidate(
+        self, *, run_dir: Path, info: WorktreeInfo, cycle: int, candidate: dict[str, Any],
+        store: RunStateStore,
+    ) -> dict[str, Any]:
+        """Push the exact candidate commit, once, with no force capability."""
+
+        if self.config.publish.enabled:
+            try:
+                remote_tip = remote_run_branch_tip(
+                    info.source_repo, remote=self.config.publish.remote, branch=info.branch
+                )
+                if remote_tip != candidate["commit_sha"]:
+                    push_run_branch(
+                        info.worktree, remote=self.config.publish.remote,
+                        branch=info.branch, commit_sha=candidate["commit_sha"],
+                    )
+                if remote_run_branch_tip(
+                    info.source_repo, remote=self.config.publish.remote, branch=info.branch
+                ) != candidate["commit_sha"]:
+                    raise GitError("remote run branch does not point to the candidate commit")
+            except (GitError, OSError, ValueError) as exc:
+                raise CandidatePushError("PUSH_FAILED: candidate push did not complete") from exc
+            candidate = dict(candidate)
+            candidate["pushed_at"] = candidate.get("pushed_at") or datetime.now(timezone.utc).isoformat()
+            atomic_write_text(_candidate_commit_path(run_dir, cycle), _json_text(candidate))
+            candidate_state = dict(store.load().get("candidate") or {})
+            candidate_state[f"C{cycle:02d}"] = candidate
+            store.update(status=store.load().get("status", RunStatus.APPROVED), candidate=candidate_state)
+        return candidate
+
     def _run_v2_reviewer(
         self,
         *,
@@ -2783,6 +2939,7 @@ class Orchestrator:
         artifacts_dir: Path,
         worktree: Path,
         base_sha: str,
+        candidate_commit: Mapping[str, Any],
         reuse_accepted: bool = False,
     ) -> ReviewResult:
         """The single reviewer evidence assembly for C01 and C02.
@@ -2794,7 +2951,7 @@ class Orchestrator:
         """
 
         if reuse_accepted:
-            accepted = _accepted_review(artifacts_dir, evidence)
+            accepted = _accepted_review(artifacts_dir, evidence, candidate_commit.get("commit_sha"))
             if accepted is not None:
                 return accepted
         gate = _json_text({
@@ -2806,6 +2963,7 @@ class Orchestrator:
             "BASE_SHA": base_sha,
             "HEAD_SHA": current_head(worktree),
             "CANDIDATE_TREE_SHA": evidence.staged_tree_sha,
+            "CANDIDATE_COMMIT_SHA": candidate_commit.get("commit_sha"),
             "CHANGED_FILES": list(evidence.changed_files),
             "GIT_STATUS": status_porcelain(worktree),
         })
@@ -2821,6 +2979,7 @@ class Orchestrator:
             luna_reports=input.luna_reports,
             revision_report=input.revision_report,
             repository_state=repository_state,
+            candidate_commit=_json_text(dict(candidate_commit)),
             iteration=input.iteration,
             cycle_history=input.cycle_history,
         )
@@ -2841,6 +3000,7 @@ class Orchestrator:
         *,
         check_failures_hard: bool,
         reuse: bool,
+        expected_head_sha: str | None = None,
     ) -> EvidenceBundle:
         """Final checks for the exact current candidate.
 
@@ -2854,6 +3014,7 @@ class Orchestrator:
             if (
                 stored is not None
                 and stored.base_sha == base_sha
+                and current_head(worktree) == (expected_head_sha or base_sha)
                 and stored.staged_tree_sha == index_tree_sha(worktree)
                 and stored.staged_tree_sha == candidate_tree_sha(worktree)
             ):
@@ -2861,6 +3022,7 @@ class Orchestrator:
         return collect_evidence(
             worktree, base_sha, self.config, evidence_dir=evidence_dir,
             secrets=self._secrets, check_failures_hard=check_failures_hard,
+            expected_head_sha=expected_head_sha,
         )
 
     def _run_v2_revision_cycle(
@@ -2897,6 +3059,7 @@ class Orchestrator:
         )
         artifact_dir = artifact_dir or (run_dir / "revision")
         artifact_dir.mkdir(parents=True, exist_ok=True)
+        expected_head = current_head(info.worktree)
         stage_all(info.worktree)
         tree_before = candidate_tree_sha(info.worktree)
         mutable_scope = mutable_scope or sorted({
@@ -2912,13 +3075,14 @@ class Orchestrator:
             self._write_phase_checkpoint(
                 run_dir,
                 ResumePhase.CHECKS_C01 if cycle == 1 else ResumePhase.CHECKS_C02,
-                cycle=cycle, head=base_sha, tree=tree_before,
+                cycle=cycle, head=expected_head, tree=tree_before,
             )
             store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
             pre_evidence = collect_evidence(
                 info.worktree, base_sha, self.config,
                 evidence_dir=artifact_dir, secrets=self._secrets,
                 check_failures_hard=False,
+                expected_head_sha=expected_head,
             )
             pre_payload = {
                 "checks": _check_payload(pre_evidence),
@@ -2973,11 +3137,11 @@ class Orchestrator:
             _record_failure_tree(artifact_dir, info.worktree)
             return result, "CLAUDE_AUTH_FAILURE" if claude_auth_failure else "CLAUDE_FAILED"
         revision_ownership = _git_ownership(repo, info.worktree)
-        if revision_ownership.head != base_sha:
+        if revision_ownership.head != expected_head:
             return result, "CLAUDE_COMMITTED"
         violations = _ownership_violations(
             ownership_before, revision_ownership,
-            branch_ref=branch_ref, base_sha=base_sha,
+            branch_ref=branch_ref, base_sha=expected_head,
         )
         if violations:
             return result, "AGENT_GIT_VIOLATION"
@@ -3005,8 +3169,12 @@ class Orchestrator:
         if outside_scope:
             return result, "REVISION_SCOPE_VIOLATION"
         # Claude complete and durable: the next operation is the final checks
-        # followed by the reviewer, on exactly this tree.
-        self._checkpoint(run_dir, review_phase, cycle=cycle, head=base_sha, tree=tree_after)
+        # followed by candidate commit/push and then the reviewer.
+        self._checkpoint(
+            run_dir,
+            ResumePhase.CHECKS_C01 if cycle == 1 else ResumePhase.CHECKS_C02,
+            cycle=cycle, head=expected_head, tree=tree_after,
+        )
         return result, None
 
     def _execute_v2_repair_cycle(
@@ -3052,6 +3220,10 @@ class Orchestrator:
         )
         start = resumed.checkpoint if resumed is not None else None
         at = phase_index(start.phase) if start is not None else phase_index(ResumePhase.REPAIR_PLANNER)
+        c01_candidate_record = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+        if not isinstance(c01_candidate_record, dict) or not _is_object_id(c01_candidate_record.get("commit_sha")):
+            raise ResumeIntegrityError("C01 candidate commit is missing for C02")
+        cycle_parent_sha = c01_candidate_record["commit_sha"]
         original_scope = sorted({
             path for step in original_plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
@@ -3061,6 +3233,8 @@ class Orchestrator:
             for step in original_plan.steps
         )
         tree_before = candidate_tree_sha(info.worktree)
+        if start is None and current_head(info.worktree) != cycle_parent_sha:
+            raise ResumeIntegrityError("C02 does not start from the C01 candidate commit")
         if at <= phase_index(ResumePhase.REPAIR_PLANNER):
             _archive_attempt_tree(repair_dir)
             current_state = _json_text({
@@ -3129,7 +3303,7 @@ class Orchestrator:
             # Repair planner complete: the next operation is repair step 1.
             self._checkpoint(
                 run_dir, ResumePhase.REPAIR_STEP, step_id=repair_plan.steps[0].id,
-                head=base_sha, tree=tree_before, repair_bundle_sha256=repair_bundle_sha,
+                head=cycle_parent_sha, tree=tree_before, repair_bundle_sha256=repair_bundle_sha,
             )
         completed = list(resumed.c02_steps) if resumed is not None else []
         done_ids = {record["id"] for record in completed}
@@ -3162,7 +3336,7 @@ class Orchestrator:
             # Same primitive, same gates and same failure reasons as C01; a
             # StepExecutionFailure propagates to the caller, which owns state.
             outcome = self._execute_codex_step(
-                repo=repo, worktree=info.worktree, base_sha=base_sha,
+                repo=repo, worktree=info.worktree, base_sha=cycle_parent_sha,
                 branch_ref=branch_ref, ownership_before=ownership_before,
                 expected_tree=expected_tree, step=step, contract=contract,
                 profile_id=selection.repair_implementer.profile_id,
@@ -3183,9 +3357,9 @@ class Orchestrator:
             self._checkpoint(
                 run_dir,
                 ResumePhase.REPAIR_STEP if following else (
-                    ResumePhase.CLAUDE_C02 if claude_revision_enabled else ResumePhase.REVIEWER_C02
+                    ResumePhase.CLAUDE_C02 if claude_revision_enabled else ResumePhase.CHECKS_C02
                 ),
-                step_id=following, head=base_sha, tree=outcome.tree_after,
+                step_id=following, head=cycle_parent_sha, tree=outcome.tree_after,
             )
         self._update_v2_usage(store, run_dir)
         if claude_revision_enabled and at <= phase_index(ResumePhase.CLAUDE_C02) and (
@@ -3219,38 +3393,85 @@ class Orchestrator:
         checks_dir = run_dir / "checks" / "C02"
         checks_dir.mkdir(parents=True, exist_ok=True)
         store.update(status=RunStatus.REVALIDATING, current_step=None)
-        try:
-            if start is not None and start.phase is ResumePhase.CHECKS_C02:
-                _archive_attempt(checks_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
-            evidence = self._final_evidence(
-                info.worktree, base_sha, checks_dir, check_failures_hard=False,
-                reuse=start is not None and start.phase is ResumePhase.REVIEWER_C02,
+        if start is None or phase_index(start.phase) <= phase_index(ResumePhase.FINAL_CHECKS_C02):
+            try:
+                if start is not None and start.phase is ResumePhase.CHECKS_C02:
+                    _archive_attempt(checks_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
+                evidence = self._final_evidence(
+                    info.worktree, base_sha, checks_dir, check_failures_hard=False,
+                    reuse=False, expected_head_sha=cycle_parent_sha,
+                )
+            except Exception:
+                self._write_phase_checkpoint(
+                    run_dir, ResumePhase.CHECKS_C02, cycle=2, head=cycle_parent_sha,
+                    tree=candidate_tree_sha(info.worktree),
+                    repair_bundle_sha256=repair_bundle_sha,
+                )
+                raise
+            store.update(
+                status=RunStatus.REVALIDATING, checks=_check_payload(evidence),
+                staged_tree_sha=evidence.staged_tree_sha,
+                changed_files=list(evidence.changed_files),
+                deterministic_gate={"passed": evidence.deterministic_passed,
+                                    "failures": list(evidence.failures)},
             )
-        except Exception:
-            self._write_phase_checkpoint(
-                run_dir, ResumePhase.CHECKS_C02, cycle=2, head=base_sha,
-                tree=candidate_tree_sha(info.worktree),
+            integrity_failures = _hard_integrity_failures(evidence)
+            if integrity_failures:
+                self._write_phase_checkpoint(
+                    run_dir, ResumePhase.CHECKS_C02, cycle=2,
+                    head=cycle_parent_sha, tree=evidence.staged_tree_sha,
+                    repair_bundle_sha256=repair_bundle_sha,
+                )
+                raise OrchestrationError(integrity_failures[0].split(":", 1)[0])
+        else:
+            evidence = resumed.c02_evidence
+            if evidence is None:
+                raise ResumeIntegrityError("C02 candidate evidence is missing")
+
+        c01_candidate = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+        if not isinstance(c01_candidate, dict) or not _is_object_id(c01_candidate.get("commit_sha")):
+            raise ResumeIntegrityError("C01 candidate commit is missing for C02 ancestry")
+        c02_candidate: dict[str, Any]
+        if start is None or phase_index(start.phase) <= phase_index(ResumePhase.CANDIDATE_COMMIT_C02):
+            if not evidence.deterministic_passed:
+                raise OrchestrationError("DETERMINISTIC_GATE_FAILED")
+            self._checkpoint(
+                run_dir, ResumePhase.CANDIDATE_COMMIT_C02, cycle=2,
+                head=c01_candidate["commit_sha"], tree=evidence.staged_tree_sha,
                 repair_bundle_sha256=repair_bundle_sha,
             )
-            raise
-        store.update(
-            status=RunStatus.REVALIDATING, checks=_check_payload(evidence),
-            staged_tree_sha=evidence.staged_tree_sha,
-            changed_files=list(evidence.changed_files),
-            deterministic_gate={"passed": evidence.deterministic_passed,
-                                "failures": list(evidence.failures)},
-        )
-        integrity_failures = _hard_integrity_failures(evidence)
-        if integrity_failures:
-            self._write_phase_checkpoint(
-                run_dir, ResumePhase.CHECKS_C02, cycle=2,
-                head=base_sha, tree=evidence.staged_tree_sha,
+            if current_head(info.worktree) == c01_candidate["commit_sha"]:
+                self._authorize_candidate_tree(
+                    evidence, info.worktree, c01_candidate["commit_sha"], branch_ref
+                )
+            elif not (
+                resumed is not None and resumed.existing_commit_sha is not None
+                and commit_parents(info.worktree, resumed.existing_commit_sha) == (c01_candidate["commit_sha"],)
+                and resolve_tree(info.worktree, resumed.existing_commit_sha) == evidence.staged_tree_sha
+            ):
+                raise ResumeIntegrityError("C02 candidate commit exists with the wrong identity")
+            c02_candidate = self._ensure_candidate_commit(
+                run_dir=run_dir, info=info, cycle=2, tree_sha=evidence.staged_tree_sha,
+                parent_sha=c01_candidate["commit_sha"], title=repair_plan.title,
+                repository_reference=repository_reference, store=store, run_id=run_id,
+            )
+        else:
+            c02_candidate = _read_json_artifact(_candidate_commit_path(run_dir, 2))
+            if not isinstance(c02_candidate, dict):
+                raise ResumeIntegrityError("C02 candidate commit artifact is missing")
+        if start is None or phase_index(start.phase) <= phase_index(ResumePhase.CANDIDATE_PUSH_C02):
+            self._checkpoint(
+                run_dir, ResumePhase.CANDIDATE_PUSH_C02, cycle=2,
+                head=c02_candidate["commit_sha"], tree=evidence.staged_tree_sha,
                 repair_bundle_sha256=repair_bundle_sha,
             )
-            raise OrchestrationError(integrity_failures[0].split(":", 1)[0])
-        # C02 final checks complete: the next operation is reviewer #2.
-        self._checkpoint(run_dir, ResumePhase.REVIEWER_C02, head=base_sha,
-                         tree=evidence.staged_tree_sha)
+            c02_candidate = self._push_candidate(
+                run_dir=run_dir, info=info, cycle=2, candidate=c02_candidate, store=store,
+            )
+        # C02 candidate push complete: the next operation is reviewer #2.
+        self._checkpoint(run_dir, ResumePhase.REVIEWER_C02, cycle=2,
+                         head=c02_candidate["commit_sha"], tree=evidence.staged_tree_sha,
+                         repair_bundle_sha256=repair_bundle_sha)
         reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
         cycle_history = _json_text({
             "C01": {
@@ -3298,6 +3519,7 @@ class Orchestrator:
                 ),
                 artifacts_dir=run_dir / "review" / "C02",
                 worktree=info.worktree, base_sha=base_sha,
+                candidate_commit=c02_candidate,
                 reuse_accepted=start is not None and start.phase is ResumePhase.REVIEWER_C02,
             )
         except LLMError as exc:
@@ -3432,6 +3654,110 @@ class Orchestrator:
         if _status_has_unstaged_or_untracked(status_porcelain(worktree)):
             raise CommitBoundaryError("worktree has changes after v2 review")
         return approved
+
+    def _complete_candidate_publication(
+        self,
+        *,
+        store: RunStateStore,
+        run_dir: Path,
+        info: Any,
+        approved_tree: str,
+        commit_sha: str,
+        repository_reference: RepositoryReference,
+        cycle: int | None = None,
+    ) -> RunResult:
+        """Publish an already pushed candidate, only after reviewer PASS."""
+
+        fields: dict[str, Any] = {"commit_sha": commit_sha, "current_step": None}
+        if cycle is not None:
+            fields["cycle"] = cycle
+        try:
+            if store.load().get("approved_tree_sha") != approved_tree:
+                raise GitError("durable approved tree differs from candidate tree")
+            if current_head(info.worktree) != commit_sha:
+                raise GitError("candidate commit is not the run branch tip")
+            if resolve_tree(info.worktree, commit_sha) != approved_tree:
+                raise GitError("candidate commit tree differs from approved tree")
+            if commit_parents(info.worktree, commit_sha) == ():
+                raise GitError("candidate commit has no parent")
+            validate_run_branch(info.branch, base_ref=self.config.base_ref)
+            if self.config.publish.enabled:
+                repository_remote_url(info.worktree, self.config.publish.remote)
+        except (GitError, OSError, ValueError) as exc:
+            state = store.record_failure("COMMIT_TREE_MISMATCH", "candidate identity is not exact", **fields)
+            return RunResult(run_dir, RunStatus.FAILED, state)
+
+        self._checkpoint(
+            run_dir, ResumePhase.PUBLISH, cycle=cycle or _state_cycle_value(store.load()),
+            head=commit_sha, tree=approved_tree,
+        )
+        if not self.config.publish.enabled:
+            state = store.update(status=RunStatus.COMMITTED, **fields)
+            mark_checkpoint_completed(run_dir)
+            return RunResult(run_dir, RunStatus.COMMITTED, state)
+
+        store.update(status=RunStatus.PUBLISHING, **fields)
+        base_branch = self.config.base_ref
+        try:
+            fast_forward = self.config.publish.mode == PublishMode.FAST_FORWARD_BASE.value
+            candidate = _read_json_artifact(_candidate_commit_path(run_dir, cycle or 1))
+            if not isinstance(candidate, dict) or candidate.get("commit_sha") != commit_sha:
+                raise GitError("candidate commit artifact does not match publication")
+            if remote_run_branch_tip(
+                info.source_repo, remote=self.config.publish.remote, branch=info.branch
+            ) != commit_sha:
+                raise GitError("candidate run branch is not pushed")
+            if fast_forward:
+                outcome = publish_fast_forward_base(
+                    info.source_repo, remote=self.config.publish.remote,
+                    base_branch=base_branch, base_sha=info.base_sha,
+                    commit_sha=commit_sha, approved_tree=approved_tree,
+                    run_branch=info.branch,
+                )
+                publish_payload = {
+                    "mode": PublishMode.FAST_FORWARD_BASE.value,
+                    "target": base_branch, "remote": self.config.publish.remote,
+                    "branch": base_branch, "run_branch": info.branch,
+                    "base_sha": info.base_sha, "commit_sha": commit_sha,
+                    "web_url": _commit_web_url(repository_reference, commit_sha),
+                    "status": "pushed", "local_base_updated": outcome.local_base_updated,
+                    "base_checked_out_in": list(outcome.base_checked_out_in),
+                }
+            else:
+                publish_payload = {
+                    "mode": PublishMode.RUN_BRANCH.value,
+                    "target": info.branch, "remote": self.config.publish.remote,
+                    "branch": info.branch, "commit_sha": commit_sha,
+                    "web_url": _commit_web_url(repository_reference, commit_sha),
+                    "status": "pushed",
+                }
+        except BaseMovedError as exc:
+            state = store.record_failure(
+                "BASE_MOVED_SINCE_RUN", f"{exc}; candidate remains unpublished",
+                publish={"mode": self.config.publish.mode, "target": base_branch,
+                         "remote": self.config.publish.remote, "commit_sha": commit_sha,
+                         "status": "refused", "local_base_updated": False}, **fields,
+            )
+            return RunResult(run_dir, RunStatus.FAILED, state)
+        except BasePushError as exc:
+            detail = "push did not complete"
+            if exc.local_base_updated:
+                detail += f"; local {base_branch} already points to {commit_sha}"
+            state = store.record_failure(
+                "PUSH_FAILED", detail,
+                publish={"mode": self.config.publish.mode, "target": base_branch,
+                         "remote": self.config.publish.remote, "commit_sha": commit_sha,
+                         "status": "push-failed", "local_base_updated": exc.local_base_updated},
+                **fields,
+            )
+            return RunResult(run_dir, RunStatus.FAILED, state)
+        except (GitError, OSError, ValueError):
+            state = store.record_failure("PUSH_FAILED", "publication did not complete", **fields)
+            return RunResult(run_dir, RunStatus.FAILED, state)
+        atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
+        state = store.update(status=RunStatus.PUBLISHED, publish=publish_payload, **fields)
+        mark_checkpoint_completed(run_dir)
+        return RunResult(run_dir, RunStatus.PUBLISHED, state)
 
     def _complete_commit(
         self,
@@ -3705,6 +4031,15 @@ class Orchestrator:
             if resumed.restore_paths:
                 self._restore_revision_tree(resumed)
             if checkpoint.phase is ResumePhase.PUBLISH:
+                candidate_path = _candidate_commit_path(run_dir, checkpoint.cycle)
+                if _read_json_artifact(candidate_path) is not None:
+                    return self._diagnose_result(self._complete_candidate_publication(
+                        store=store, run_dir=run_dir, info=resumed.info,
+                        approved_tree=checkpoint.expected_tree_sha,
+                        commit_sha=checkpoint.expected_head_sha,
+                        repository_reference=resumed.repository_reference,
+                        cycle=checkpoint.cycle,
+                    ))
                 return self._diagnose_result(self._complete_commit(
                     store=store, run_dir=run_dir, info=resumed.info,
                     approved_tree=checkpoint.expected_tree_sha,
@@ -4008,7 +4343,9 @@ class Orchestrator:
             refuse("only META PLAN v2 runs can be resumed")
         if not revision_enabled and not repair_enabled and checkpoint.phase not in (
             ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01,
-            ResumePhase.REVIEWER_C01, ResumePhase.COMMIT, ResumePhase.PUBLISH,
+            ResumePhase.FINAL_CHECKS_C01, ResumePhase.CANDIDATE_COMMIT_C01,
+            ResumePhase.CANDIDATE_PUSH_C01, ResumePhase.REVIEWER_C01,
+            ResumePhase.COMMIT, ResumePhase.PUBLISH,
         ):
             refuse("this checkpoint requires revision.enabled")
         try:
@@ -4102,7 +4439,59 @@ class Orchestrator:
                 refuse("worktree HEAD is not the run branch")
             head = current_head(worktree)
             existing_commit: str | None = None
-            if checkpoint.phase is ResumePhase.COMMIT and head != checkpoint.expected_head_sha:
+            c02_phases = {
+                ResumePhase.REPAIR_PLANNER, ResumePhase.REPAIR_STEP,
+                ResumePhase.CHECKS_C02, ResumePhase.CLAUDE_C02,
+                ResumePhase.FINAL_CHECKS_C02, ResumePhase.CANDIDATE_COMMIT_C02,
+                ResumePhase.CANDIDATE_PUSH_C02, ResumePhase.REVIEWER_C02,
+            }
+            phase_expected_head = base_sha
+            if checkpoint.phase in c02_phases:
+                prior = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+                if not isinstance(prior, dict) or not _is_object_id(prior.get("commit_sha")):
+                    refuse("C01 candidate commit is missing for C02 resume")
+                phase_expected_head = prior["commit_sha"]
+            candidate_phases = {
+                ResumePhase.CANDIDATE_COMMIT_C01, ResumePhase.CANDIDATE_PUSH_C01,
+                ResumePhase.REVIEWER_C01, ResumePhase.CANDIDATE_COMMIT_C02,
+                ResumePhase.CANDIDATE_PUSH_C02, ResumePhase.REVIEWER_C02,
+            }
+            if checkpoint.phase in candidate_phases:
+                cycle = 2 if checkpoint.phase in {
+                    ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,
+                    ResumePhase.REVIEWER_C02,
+                } else 1
+                candidate_payload = _read_json_artifact(_candidate_commit_path(run_dir, cycle))
+                if not isinstance(candidate_payload, dict):
+                    # A crash before artifact persistence can still be
+                    # reconciled from the exact commit object below.
+                    candidate_payload = {}
+                expected_parent = base_sha
+                if cycle == 2:
+                    prior = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+                    if not isinstance(prior, dict) or not _is_object_id(prior.get("commit_sha")):
+                        refuse("C01 candidate commit is missing for C02 ancestry")
+                    expected_parent = prior["commit_sha"]
+                expected_tree = checkpoint.expected_tree_sha
+                recorded_commit = candidate_payload.get("commit_sha")
+                if _is_object_id(recorded_commit):
+                    if recorded_commit != head and checkpoint.phase is not ResumePhase.CANDIDATE_COMMIT_C01 and checkpoint.phase is not ResumePhase.CANDIDATE_COMMIT_C02:
+                        refuse("run branch does not point to the recorded candidate commit")
+                    candidate_commit = recorded_commit
+                elif checkpoint.phase in {ResumePhase.CANDIDATE_COMMIT_C01, ResumePhase.CANDIDATE_COMMIT_C02} and head != checkpoint.expected_head_sha:
+                    candidate_commit = head
+                else:
+                    candidate_commit = None
+                if candidate_commit is not None:
+                    try:
+                        if commit_parents(repo, candidate_commit) != (expected_parent,) or resolve_tree(repo, candidate_commit) != expected_tree:
+                            refuse("candidate commit is not the exact parent/tree identity")
+                    except GitError as exc:
+                        refuse(f"candidate commit is unreadable: {exc}")
+                    existing_commit = candidate_commit
+                elif checkpoint.phase not in {ResumePhase.CANDIDATE_COMMIT_C01, ResumePhase.CANDIDATE_COMMIT_C02}:
+                    refuse("candidate commit is missing")
+            elif checkpoint.phase is ResumePhase.COMMIT and head != checkpoint.expected_head_sha:
                 # A crash can occur after commit-tree/update-ref and before
                 # state.json.  Reuse only the single exact commit object.
                 try:
@@ -4120,19 +4509,42 @@ class Orchestrator:
             if resolve_commit(repo, f"refs/heads/{branch}") != head:
                 refuse("run branch does not point to the worktree HEAD")
             if checkpoint.phase is ResumePhase.PUBLISH:
-                if head != state.get("commit_sha") or commit_parents(repo, head) != (base_sha,):
-                    refuse("the recorded commit is not the run commit on the run base")
+                candidate_path = _candidate_commit_path(run_dir, checkpoint.cycle)
+                candidate_record = _read_json_artifact(candidate_path)
+                expected_parent = base_sha
+                if checkpoint.cycle == 2:
+                    prior = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+                    if not isinstance(prior, dict) or not _is_object_id(prior.get("commit_sha")):
+                        refuse("C01 candidate commit is missing for C02 publication")
+                    expected_parent = prior["commit_sha"]
+                if head != state.get("commit_sha") or commit_parents(repo, head) != (expected_parent,):
+                    refuse("the recorded commit is not the exact candidate commit")
                 if (
                     resolve_tree(repo, head) != checkpoint.expected_tree_sha
                     or checkpoint.expected_tree_sha != state.get("approved_tree_sha")
                 ):
                     refuse("the run commit tree is not the approved tree")
-            elif checkpoint.phase is not ResumePhase.COMMIT and head != base_sha:
+                if self.config.publish.enabled and remote_run_branch_tip(
+                    repo, remote=self.config.publish.remote, branch=branch
+                ) != head:
+                    refuse("the candidate run branch is not pushed")
+            elif checkpoint.phase not in {ResumePhase.COMMIT, *candidate_phases} and head != phase_expected_head:
                 refuse("an agent-created commit moved the run branch")
             base_tree = resolve_tree(repo, base_sha)
             candidate = candidate_tree_sha(worktree)
             index_tree = index_tree_sha(worktree)
             dirty = _status_has_unstaged_or_untracked(status_porcelain(worktree))
+            if checkpoint.phase in {
+                ResumePhase.CANDIDATE_PUSH_C01, ResumePhase.REVIEWER_C01,
+                ResumePhase.CANDIDATE_PUSH_C02, ResumePhase.REVIEWER_C02,
+            } and self.config.publish.enabled:
+                remote_tip = remote_run_branch_tip(
+                    repo, remote=self.config.publish.remote, branch=branch
+                )
+                if checkpoint.phase in {ResumePhase.REVIEWER_C01, ResumePhase.REVIEWER_C02} and remote_tip != head:
+                    refuse("remote run branch does not point to the candidate commit")
+                if checkpoint.phase in {ResumePhase.CANDIDATE_PUSH_C01, ResumePhase.CANDIDATE_PUSH_C02} and remote_tip not in {None, head}:
+                    refuse("remote run branch points to a different commit")
             restore: tuple[str, ...] = ()
             if candidate != checkpoint.expected_tree_sha or index_tree != checkpoint.expected_tree_sha or dirty:
                 restore = self._explain_tree_drift(
@@ -4230,7 +4642,9 @@ class Orchestrator:
         chain_end = _verify_step_chain(records, base_tree)
         if chain_end is None:
             refuse("Luna step trees do not form an unbroken chain")
-        if checkpoint.phase in (ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01, ResumePhase.CLAUDE_C01) or (
+        if checkpoint.phase in (ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01, ResumePhase.CLAUDE_C01,
+                               ResumePhase.FINAL_CHECKS_C01, ResumePhase.CANDIDATE_COMMIT_C01,
+                               ResumePhase.CANDIDATE_PUSH_C01) or (
             not revision_enabled and checkpoint.phase is ResumePhase.REVIEWER_C01
         ):
             if chain_end != expected:
@@ -4243,7 +4657,31 @@ class Orchestrator:
             if checkpoint.phase is ResumePhase.REVIEWER_C01 and revision.tree_after != expected:
                 refuse("the checkpoint tree is not the Claude C01 tree")
             resumed.c01_revision = revision
+        if checkpoint.phase in {
+            ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01,
+            ResumePhase.CLAUDE_C01, ResumePhase.FINAL_CHECKS_C01,
+        }:
+            return
+        if at <= phase_index(ResumePhase.CANDIDATE_COMMIT_C01):
+            evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
+            c01_tree = resumed.c01_revision.tree_after if resumed.c01_revision is not None else chain_end
+            if evidence is None or evidence.staged_tree_sha != c01_tree or expected != c01_tree:
+                refuse("the C01 candidate evidence is missing or not for the candidate tree")
+            resumed.c01_evidence = evidence
+            return
+        evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
+        c01_tree = resumed.c01_revision.tree_after if resumed.c01_revision is not None else chain_end
+        if evidence is None or evidence.staged_tree_sha != c01_tree:
+            refuse("the C01 candidate evidence is missing or not for the candidate tree")
+        resumed.c01_evidence = evidence
         if at <= phase_index(ResumePhase.REVIEWER_C01):
+            resumed.c01_review = _load_c01_review(run_dir, evidence)
+            if checkpoint.phase is ResumePhase.REVIEWER_C01 and resumed.c01_review is None:
+                # A transport failure intentionally has no accepted review;
+                # the reviewer is retried with the already pushed commit.
+                pass
+            return
+        if checkpoint.phase is ResumePhase.REPAIR_PLANNER:
             return
         if checkpoint.phase is ResumePhase.COMMIT and not repair_enabled:
             evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
@@ -4298,7 +4736,8 @@ class Orchestrator:
         if repair_end is None:
             refuse("C02 step trees do not form an unbroken chain")
         if checkpoint.phase in (
-            ResumePhase.REPAIR_STEP, ResumePhase.CLAUDE_C02, ResumePhase.REVIEWER_C02
+            ResumePhase.REPAIR_STEP, ResumePhase.CLAUDE_C02, ResumePhase.REVIEWER_C02,
+            ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,
         ) and repair_end != expected:
             refuse("the checkpoint tree is not the last completed C02 tree")
         resumed.c02_steps = repair_records
@@ -4307,6 +4746,17 @@ class Orchestrator:
             if revision is None or revision.tree_before != repair_end or revision.tree_after != expected:
                 refuse("the Claude C02 record does not match the checkpoint")
             resumed.c02_revision = revision
+        if checkpoint.phase in {
+            ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,
+            ResumePhase.REVIEWER_C02,
+        }:
+            evidence = _load_evidence(run_dir / "checks" / "C02")
+            if evidence is None or evidence.staged_tree_sha != expected:
+                refuse("the C02 candidate evidence is missing or not for the candidate tree")
+            resumed.c02_evidence = evidence
+            if checkpoint.phase is ResumePhase.REVIEWER_C02:
+                resumed.c02_review = _load_c01_review(run_dir / "review" / "C02", evidence)
+            return
         if checkpoint.phase is ResumePhase.COMMIT:
             evidence = _load_evidence(run_dir / "checks" / "C02")
             if evidence is None or evidence.staged_tree_sha != expected:
@@ -4342,6 +4792,8 @@ class Orchestrator:
 
 
 def _failure_reason(exc: Exception) -> str:
+    if isinstance(exc, CandidatePushError):
+        return exc.code
     if isinstance(exc, CommitBoundaryError):
         return "TOCTOU_FAILURE"
     if isinstance(exc, GitError):

@@ -748,7 +748,7 @@ def changed_paths_between_trees(
     return tuple(sorted({path for path in output.split("\0") if path}))
 
 
-def commit_reviewed_tree(
+def commit_candidate_tree(
     worktree: Path,
     *,
     tree_sha: str,
@@ -758,8 +758,8 @@ def commit_reviewed_tree(
 ) -> str:
     """Commit exactly *tree_sha* on top of *parent_sha* and return the commit.
 
-    This is the only commit primitive of MetaHarness.  It never reads the
-    index: the commit object is built from the reviewed tree identity, so a
+    This is the candidate-commit primitive of MetaHarness.  It never reads
+    the index: the commit object is built from the candidate tree identity, so a
     late index change cannot enter it.  ``git commit-tree`` runs no commit
     hook that could restage content.  The branch is then advanced with a
     compare-and-swap ``update-ref``: if HEAD is no longer *parent_sha*, Git
@@ -775,9 +775,9 @@ def commit_reviewed_tree(
     if "\n" in clean_subject or len(clean_subject) > 72:
         raise GitError("commit subject must be one line of at most 72 characters")
     if _git(worktree, "cat-file", "-t", tree_sha).stdout.strip() != "tree":
-        raise GitError("reviewed tree object does not exist")
+        raise GitError("candidate tree object does not exist")
     if _git(worktree, "rev-parse", "--verify", f"{parent_sha}^{{tree}}").stdout.strip() == tree_sha:
-        raise GitError("no changes to commit")
+        raise GitError("no changes to commit for candidate tree")
 
     args = ["commit-tree", tree_sha, "-p", parent_sha, "-m", clean_subject]
     if body:
@@ -789,7 +789,7 @@ def commit_reviewed_tree(
         worktree,
         "update-ref",
         "-m",
-        "metaharness: commit reviewed tree",
+        "metaharness: commit candidate tree",
         "HEAD",
         commit_sha,
         parent_sha,
@@ -798,8 +798,13 @@ def commit_reviewed_tree(
         raise GitError("HEAD does not point to the harness commit")
     committed_tree = _git(worktree, "rev-parse", "--verify", f"{commit_sha}^{{tree}}").stdout.strip()
     if committed_tree != tree_sha:
-        raise GitError("committed tree differs from the reviewed tree")
+        raise GitError("committed tree differs from the candidate tree")
     return commit_sha
+
+
+# Compatibility for integrations that imported the pre-P40 name.  New code
+# must use the candidate terminology because this operation precedes review.
+commit_reviewed_tree = commit_candidate_tree
 
 
 def push_run_branch(
@@ -843,6 +848,19 @@ def push_run_branch(
         suffix = f": {detail}" if detail else ""
         raise GitError(f"git push exited with {result.returncode}{suffix}")
     return PushResult(remote=remote, branch=branch, commit_sha=commit_sha)
+
+
+def remote_run_branch_tip(repo: Path, *, remote: str, branch: str) -> str | None:
+    """Read the exact remote run-branch tip without changing local refs."""
+
+    repository_remote_url(repo, remote)
+    validate_run_branch(branch)
+    output = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}").stdout
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == f"refs/heads/{branch}":
+            return _require_object_id(fields[0], "remote commit_sha")
+    return None
 
 
 class BaseMovedError(GitError):

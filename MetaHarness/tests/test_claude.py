@@ -19,6 +19,7 @@ from metaharness.claude.agent import (  # noqa: E402
     build_claude_environment,
     build_revision_prompt,
 )
+from metaharness.claude.auth import check_claude_authentication  # noqa: E402
 from metaharness.claude.runtime import (  # noqa: E402
     ClaudeRuntimeError,
     prepare_claude_home,
@@ -180,7 +181,7 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(recorded["stdin"].splitlines()[0], "inspect this")
         self.assertEqual(
             recorded["argv"],
-            ["--print", "--verbose", "--output-format", "stream-json", "--bare", "--restricted", "--tools", "Read,Edit,Write,Grep,Glob",
+            ["--print", "--verbose", "--output-format", "stream-json", "--safe-mode", "--restricted", "--tools", "Read,Edit,Write,Grep,Glob",
              "--no-session-persistence", "--no-chrome", "--disable-slash-commands", "--max-turns", "12",
              "--model", "opus", "--effort", "medium",
              "--permission-mode", "acceptEdits", "--settings", str(home / "settings.json"),
@@ -189,6 +190,66 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(result.final_message, "revised")
         self.assertEqual(result.usage["cached_input_tokens"], 2)
         self.assertTrue((self.root / "run/revision/agent.events.jsonl").exists())
+
+    def test_subscription_auth_uses_safe_mode_without_copying_credentials(self) -> None:
+        capture = self.root / "subscription-capture.json"
+        executable = self._executable(
+            "claude",
+            f"""
+            import json, os, pathlib, sys
+            args = sys.argv[1:]
+            if args == ["auth", "--help"]:
+                print("Commands: status")
+                raise SystemExit(0)
+            if args == ["auth", "status"]:
+                print("Logged in")
+                raise SystemExit(0)
+            pathlib.Path({str(capture)!r}).write_text(json.dumps({{
+                "argv": args,
+                "env": dict(os.environ),
+            }}))
+            print(json.dumps({{"type": "result", "result": "ok"}}))
+            """,
+        )
+        home = prepare_claude_home(self._config())
+        managed_credentials = home / ".credentials.json"
+        managed_credentials.write_text("managed-subscription-credential\n", encoding="utf-8")
+        credentials_before = managed_credentials.read_bytes()
+        source = {
+            "PATH": str(self.root),
+            "HOME": str(self.root / "personal"),
+            "ANTHROPIC_API_KEY": "must-not-propagate",
+            "OPENAI_API_KEY": "must-not-propagate",
+        }
+        environment = build_claude_environment(source, claude_home=home)
+
+        auth_status = check_claude_authentication(home, environment=environment)
+        self.assertTrue(auth_status.available)
+        profile = ModelProfile(
+            id="claude",
+            display_name="Claude",
+            roles=(ExecutionRole.REVISER,),
+            driver=ProfileDriver.CLAUDE_CODE,
+            model="opus",
+            selection_mode=SelectionMode.CLI,
+            effort="medium",
+            permission_mode="acceptEdits",
+            timeout_seconds=5,
+            retries=0,
+        )
+        ClaudeCodeAgent(executable=str(executable)).run_revision(
+            "inspect this", self.repo, artifacts_dir=self.root / "subscription-run",
+            profile=profile, environment=environment,
+        )
+
+        recorded = json.loads(capture.read_text())
+        self.assertIn("--safe-mode", recorded["argv"])
+        self.assertNotIn("--bare", recorded["argv"])
+        self.assertIn("--restricted", recorded["argv"])
+        self.assertEqual(recorded["env"]["CLAUDE_CONFIG_DIR"], str(home))
+        self.assertNotIn("ANTHROPIC_API_KEY", recorded["env"])
+        self.assertNotIn("OPENAI_API_KEY", recorded["env"])
+        self.assertEqual(managed_credentials.read_bytes(), credentials_before)
 
     def test_revision_prompt_keeps_semantics_without_repeating_removed_tools(self) -> None:
         rendered = build_revision_prompt("review request")

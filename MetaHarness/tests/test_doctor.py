@@ -308,6 +308,8 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(supported)
         recorded = json.loads(argv_record.read_text())
         self.assertEqual(recorded[-1], "--help")
+        self.assertIn("--safe-mode", recorded)
+        self.assertNotIn("--bare", recorded)
         self.assertIn("--restricted", recorded)
         self.assertIn("--settings", recorded)
         self.assertIn(str(self.root / "settings.json"), recorded)

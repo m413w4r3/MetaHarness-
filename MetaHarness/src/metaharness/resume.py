@@ -2,10 +2,11 @@
 
 A checkpoint always names the *next operation that has not yet succeeded*:
 after Luna S01 completes, the checkpoint is ``claude_c01`` with the post-Luna
-candidate tree; after Claude C01 and the final checks, it is ``reviewer_c01``
-with the post-Claude tree.  An operation is never marked complete before all
-of its mandatory artifacts are durable, so a resume never replays a phase
-that already succeeded.
+candidate tree; after Claude C01 and the final checks, it is
+``candidate_commit_c01`` with the post-Claude tree.  Candidate commit and
+push checkpoints precede ``reviewer_c01``.  An operation is never marked
+complete before all of its mandatory artifacts are durable, so a resume never
+replays a phase that already succeeded.
 
 This module is deliberately read-only with respect to Git and never calls a
 model: it persists and reads ``resume_checkpoint.json`` and decides, cheaply,
@@ -43,12 +44,16 @@ class ResumePhase(StrEnum):
     CHECKS_C01 = "checks_c01"
     CLAUDE_C01 = "claude_c01"
     FINAL_CHECKS_C01 = "final_checks_c01"
+    CANDIDATE_COMMIT_C01 = "candidate_commit_c01"
+    CANDIDATE_PUSH_C01 = "candidate_push_c01"
     REVIEWER_C01 = "reviewer_c01"
     REPAIR_PLANNER = "repair_planner"
     REPAIR_STEP = "repair_step"
     CHECKS_C02 = "checks_c02"
     CLAUDE_C02 = "claude_c02"
     FINAL_CHECKS_C02 = "final_checks_c02"
+    CANDIDATE_COMMIT_C02 = "candidate_commit_c02"
+    CANDIDATE_PUSH_C02 = "candidate_push_c02"
     REVIEWER_C02 = "reviewer_c02"
     COMMIT = "com" + "mit"
     PUBLISH = "publish"
@@ -58,10 +63,14 @@ _PHASE_ORDER = {phase: index for index, phase in enumerate(ResumePhase)}
 _PHASE_CYCLE = {
     ResumePhase.INITIAL_STEP: 1,
     ResumePhase.CLAUDE_C01: 1,
+    ResumePhase.CANDIDATE_COMMIT_C01: 1,
+    ResumePhase.CANDIDATE_PUSH_C01: 1,
     ResumePhase.REVIEWER_C01: 1,
     ResumePhase.REPAIR_PLANNER: 2,
     ResumePhase.REPAIR_STEP: 2,
     ResumePhase.CLAUDE_C02: 2,
+    ResumePhase.CANDIDATE_COMMIT_C02: 2,
+    ResumePhase.CANDIDATE_PUSH_C02: 2,
     ResumePhase.REVIEWER_C02: 2,
 }
 _PRE_PLAN_PHASES = frozenset({ResumePhase.CONTEXT, ResumePhase.PLANNER})
@@ -274,7 +283,11 @@ RESUMABLE_FAILURES: Mapping[str, frozenset[ResumePhase]] = {
     "AGENT_FAILED": _CODEX_PHASES,
     "REVIEWER_TRANSPORT_FAILURE": _REVIEWER_PHASES,
     "LLM_FAILURE": frozenset({ResumePhase.REPAIR_PLANNER}),
-    "PUSH_FAILED": frozenset({ResumePhase.PUBLISH}),
+    "PUSH_FAILED": frozenset({
+        ResumePhase.CANDIDATE_PUSH_C01,
+        ResumePhase.CANDIDATE_PUSH_C02,
+        ResumePhase.PUBLISH,
+    }),
 }
 # These are not ordinary retryable operation failures.  They mean that the
 # authority needed to prove a retry has been lost (or an agent crossed a Git
@@ -298,12 +311,16 @@ PHASE_STATUS = {
     ResumePhase.CHECKS_C01: "validating",
     ResumePhase.CLAUDE_C01: "revising",
     ResumePhase.FINAL_CHECKS_C01: "revalidating",
+    ResumePhase.CANDIDATE_COMMIT_C01: "approved",
+    ResumePhase.CANDIDATE_PUSH_C01: "approved",
     ResumePhase.REVIEWER_C01: "reviewing",
     ResumePhase.REPAIR_PLANNER: "planning",
     ResumePhase.REPAIR_STEP: "implementing",
     ResumePhase.CHECKS_C02: "revalidating",
     ResumePhase.CLAUDE_C02: "revising",
     ResumePhase.FINAL_CHECKS_C02: "revalidating",
+    ResumePhase.CANDIDATE_COMMIT_C02: "approved",
+    ResumePhase.CANDIDATE_PUSH_C02: "approved",
     ResumePhase.REVIEWER_C02: "reviewing",
     ResumePhase.COMMIT: "approved",
     ResumePhase.PUBLISH: "publishing",
@@ -330,8 +347,16 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         return f"Retry C02 {checkpoint.step_id}"
     if phase is ResumePhase.CLAUDE_C01:
         return "Reprendre à partir de Claude"
+    if phase is ResumePhase.CANDIDATE_COMMIT_C01:
+        return "Create candidate commit C01"
+    if phase is ResumePhase.CANDIDATE_PUSH_C01:
+        return "Push candidate C01"
     if phase is ResumePhase.CLAUDE_C02:
         return "Reprendre à partir de Claude C02"
+    if phase is ResumePhase.CANDIDATE_COMMIT_C02:
+        return "Create candidate commit C02"
+    if phase is ResumePhase.CANDIDATE_PUSH_C02:
+        return "Push candidate C02"
     if phase is ResumePhase.REVIEWER_C01:
         return "Retry reviewer #1"
     if phase is ResumePhase.REVIEWER_C02:

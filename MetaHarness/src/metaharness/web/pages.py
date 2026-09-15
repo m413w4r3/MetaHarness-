@@ -234,18 +234,39 @@ def _failure_reason(run: dict[str, Any]) -> str:
 
 
 def _publish_section(state: dict[str, Any]) -> str:
+    candidates = state.get("candidate") if isinstance(state.get("candidate"), dict) else {}
+    candidate_rows = []
+    for cycle in ("C01", "C02"):
+        item = candidates.get(cycle)
+        if not isinstance(item, dict):
+            continue
+        url = item.get("immutable_commit_url")
+        link = (
+            f'<a href="{_e(url)}" rel="noopener noreferrer">{_e(item.get("commit_sha"))}</a>'
+            if isinstance(url, str) and url.startswith("https://")
+            else _e(item.get("commit_sha"))
+        )
+        candidate_rows.append(
+            f'<dt>{_e(cycle)} commit</dt><dd class="mono">{link}</dd>'
+            f'<dt>pushed</dt><dd>{"yes" if item.get("pushed_at") else "no"}</dd>'
+            f'<dt>run branch</dt><dd class="mono">{_e(item.get("branch"))}</dd>'
+        )
+    candidate_section = (
+        '<section><h2>CANDIDATE</h2><dl>' + "".join(candidate_rows) + "</dl></section>"
+        if candidate_rows else ""
+    )
     publish = state.get("publish") if isinstance(state.get("publish"), dict) else {}
     if not publish:
-        return ""
+        return candidate_section
     if publish.get("mode") == "fast-forward-base":
-        return _fast_forward_publish_section(state, publish)
+        return candidate_section + _fast_forward_publish_section(state, publish)
     web_url = publish.get("web_url")
     link = (
         f'<a href="{_e(web_url)}" rel="noopener noreferrer">branch</a>'
         if isinstance(web_url, str) and web_url.startswith("https://")
         else _e(publish.get("branch"))
     )
-    return (
+    return candidate_section + (
         '<section><h2>PUBLISH</h2><p><strong>'
         f'{_e(str(state.get("status", "")).upper())}</strong></p>'
         f'<dl><dt>commit</dt><dd class="mono">{_e(publish.get("commit_sha") or state.get("commit_sha"))}</dd>'
