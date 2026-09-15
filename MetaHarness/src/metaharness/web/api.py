@@ -166,7 +166,7 @@ MAX_STEP_CONTRACT_BYTES = 64 * 1024
 STEP_EVENTS_MAX = 30
 # Worker input above this many tokens is flagged (advisory only).
 HIGH_WORKER_INPUT_TOKENS = 100_000
-_STEP_ID = re.compile(r"S0[1-6]\Z")
+_STEP_ID = re.compile(r"S0[1-8]\Z")
 # Window of complete JSONL lines returned by one progress request.
 PROGRESS_MAX_BYTES = 256 * 1024
 # A longer single event is omitted from the UI (the artifact keeps it; the
@@ -310,7 +310,7 @@ def _run_dir(runs_root: Path, run_id: str) -> Path:
 
 def _artifact_path(run_dir: Path, name: str) -> Path:
     cycle_artifact = re.fullmatch(
-        r"(?:repair/C02/steps/S0[1-6]|revision/C0[12]|review/C0[12])/[A-Za-z0-9_.-]+",
+        r"(?:repair/C02/steps/S0[1-8]|revision/C0[12]|review/C0[12])/[A-Za-z0-9_.-]+",
         name,
     )
     if name not in ARTIFACT_ALLOWLIST and cycle_artifact is None:

@@ -34,7 +34,7 @@ CHECKPOINT_NAME = "resume_checkpoint.json"
 _SCHEMA_VERSION = 2
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_STEP_ID = re.compile(r"S0[1-6]")
+_STEP_ID = re.compile(r"S0[1-8]")
 _MAX_CHECKPOINT_BYTES = 16 * 1024
 
 
@@ -459,7 +459,7 @@ def infer_legacy_checkpoint(run_dir: str | Path, state: Mapping[str, Any]) -> Re
             )
         if reason in {"CODEX_AUTH_FAILURE", "AGENT_TIMEOUT", "AGENT_FAILED"}:
             detail = failure.get("detail")
-            match = re.match(r"step=(S0[1-6])\b", detail) if isinstance(detail, str) else None
+            match = re.match(r"step=(S0[1-8])\b", detail) if isinstance(detail, str) else None
             if match is None:
                 return None
             record = _read_json(directory / "steps" / match.group(1) / "step.json")

@@ -18,6 +18,7 @@ from metaharness.models import (  # noqa: E402
     SelectionMode,
 )
 from metaharness.planning_v2 import (  # noqa: E402
+    MAX_STEPS,
     MAX_STEP_CONTRACT_CHARS,
     MAX_TOTAL_STEP_CONTRACT_CHARS,
     REQUIRE_STAGED_POLICY_TEXT,
@@ -111,6 +112,7 @@ def _parse(raw: str):
 
 class PlanningV2Tests(unittest.TestCase):
     def test_single_and_staged_boundaries(self):
+        self.assertEqual(MAX_STEPS, 8)
         single = _parse(_plan())
         self.assertEqual(single.execution_mode, ExecutionMode.SINGLE)
         self.assertEqual(single.steps[0].id, "S01")
@@ -119,6 +121,33 @@ class PlanningV2Tests(unittest.TestCase):
         self.assertEqual([step.id for step in staged.steps], ["S01", "S02"])
         six = "\n\n".join(_step(number) for number in range(1, 7))
         self.assertEqual(len(_parse(_plan("STAGED", 6, steps=six)).steps), 6)
+        eight = "\n\n".join(_step(number) for number in range(1, 9))
+        self.assertEqual([step.id for step in _parse(_plan("STAGED", 8, steps=eight)).steps],
+                         [f"S{number:02d}" for number in range(1, 9)])
+
+    def test_blocked_execution_metadata_is_rejected(self):
+        observed = """META PLAN v2
+
+STATUS: BLOCKED
+TITLE: Cannot safely plan
+
+OBJECTIVE
+The requested change cannot be planned safely.
+
+CONSTRAINTS
+The repository context is insufficient.
+
+EXECUTION_MODE: STAGED
+STEP_COUNT: 7
+REVIEWER_PROFILE: review-a
+
+BLOCKERS
+The required architectural information is missing.
+
+END META PLAN
+"""
+        with self.assertRaises(V2PlanParseError):
+            _parse(observed)
 
     def test_blocked_has_no_steps(self):
         plan = _parse("""META PLAN v2
@@ -134,6 +163,24 @@ END META PLAN
 """)
         self.assertEqual(plan.decision, PlanDecision.BLOCKED)
         self.assertEqual(plan.steps, ())
+
+    def test_minimal_blocked_wire_format_is_accepted(self):
+        plan = _parse("""META PLAN v2
+
+STATUS: BLOCKED
+TITLE: Waiting for an API contract
+
+OBJECTIVE
+The implementation cannot be specified safely yet.
+
+BLOCKERS
+The required API contract is absent.
+
+END META PLAN
+""")
+        self.assertEqual(plan.decision, PlanDecision.BLOCKED)
+        self.assertEqual(plan.title, "Waiting for an API contract")
+        self.assertEqual(plan.blockers, "The required API contract is absent.")
 
     def test_strict_structure_rejects_requested_invalid_cases(self):
         cases = {
@@ -180,6 +227,40 @@ END META PLAN
             self.assertEqual(json.loads((Path(directory) / "implementation_bundle.json").read_text())["schema_version"], 1)
             self.assertIn("ordered steps", (Path(directory) / "implementation_contract.md").read_text().lower())
 
+    def test_aw002_synthetic_seven_steps_parse_and_write_bundle(self):
+        steps = "\n\n".join(
+            _sets_step(number, write=_paths(f"aw002_{number}_", 6))
+            for number in range(1, 8)
+        )
+        plan = _parse(_plan("STAGED", 7, steps=steps))
+        self.assertEqual([step.id for step in plan.steps],
+                         [f"S{number:02d}" for number in range(1, 8)])
+        self.assertTrue(all(
+            len(set(step.write_set) | set(step.create_set) | set(step.delete_set)) <= 6
+            for step in plan.steps
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = write_implementation_bundle(directory, plan)
+            self.assertEqual([entry["id"] for entry in bundle["steps"]],
+                             [f"S{number:02d}" for number in range(1, 8)])
+            self.assertTrue((Path(directory) / "implementation_bundle.json").exists())
+
+    def test_nine_steps_and_s09_are_rejected(self):
+        nine = "\n\n".join(_step(number) for number in range(1, 10))
+        with self.assertRaises(V2PlanParseError):
+            _parse(_plan("STAGED", 9, steps=nine))
+        with self.assertRaises(V2PlanParseError):
+            _parse(_plan(
+                "STAGED", 8,
+                steps="\n\n".join(_step(number) for number in range(1, 8))
+                + "\n\n" + _step(9),
+            ))
+
+    def test_noncontiguous_eighth_step_is_rejected(self):
+        steps = "\n\n".join(_step(number) for number in range(1, 7)) + "\n\n" + _step(8)
+        with self.assertRaises(V2PlanParseError):
+            _parse(_plan("STAGED", 7, steps=steps))
+
     def test_prompt_and_safe_catalogue(self):
         profile = ModelProfile(
             id="impl-a", display_name="Implementer", roles=(ExecutionRole.IMPLEMENTER,),
@@ -215,6 +296,8 @@ END META PLAN
         self.assertNotIn("REVIEWER_1_RAW", prompt)
         self.assertNotIn("REVIEWER #1 RAW", prompt)
         self.assertIn("REVIEWER REQUIRED FIXES\nFix the concrete defect.", prompt)
+        self.assertIn("STATUS: BLOCKED", prompt)
+        self.assertIn("For BLOCKED, do not emit CONSTRAINTS, REQUIRED_CHECKS, EXECUTION_MODE,", prompt)
 
     def test_repair_prompt_uses_compact_summary_and_one_canonical_instruction(self):
         plan = _parse(_plan())
@@ -331,6 +414,8 @@ class ChangeSetTests(unittest.TestCase):
             "Hard parser limit remains 8000 characters.",
             "CREATE_SET\nNONE",
             "DELETE_SET\nNONE",
+            "STAGED has 2 to 8 steps. SINGLE has exactly 1 step.",
+            "Step IDs are contiguous S01 through S08",
         ):
             self.assertIn(sentence, planner)
         worker = build_implementer_step_prompt("CONTRACT")

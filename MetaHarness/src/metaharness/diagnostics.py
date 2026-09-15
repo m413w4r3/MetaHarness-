@@ -362,7 +362,7 @@ def _prompt_footprint(run_dir: Path) -> str:
         try:
             step_dirs = sorted(
                 path for path in base.iterdir()
-                if path.is_dir() and re.fullmatch(r"S0[1-6]", path.name)
+                if path.is_dir() and re.fullmatch(r"S0[1-8]", path.name)
             )
         except OSError:
             step_dirs = []

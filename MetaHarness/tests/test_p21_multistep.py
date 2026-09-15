@@ -200,7 +200,7 @@ class FakeAgent:
 
     def run_step(self, contract: str, worktree: Any, artifacts_dir: Any, *, base_sha: str | None = None,
                  env: dict[str, str] | None = None) -> AgentResult:
-        step_id = re.search(r"^STEP\n(S0[1-6]) / ", contract, re.M).group(1)
+        step_id = re.search(r"^STEP\n(S0[1-8]) / ", contract, re.M).group(1)
         root = Path(worktree)
         seen = {
             name: (root / name).read_text(encoding="utf-8")
@@ -751,7 +751,7 @@ class ScopeTests(MultiStepHarness):
                 r'''
                 import json, os, pathlib, re, sys
                 prompt = sys.stdin.read()
-                step = re.search(r"^STEP\n(S0[1-6]) / ", prompt, re.M).group(1)
+                step = re.search(r"^STEP\n(S0[1-8]) / ", prompt, re.M).group(1)
                 worktree = pathlib.Path(sys.argv[sys.argv.index("-C") + 1])
                 with open(__PIDS__, "a") as stream:
                     stream.write(f"{step} {os.getpid()} {os.environ.get('CODEX_HOME', '')}\n")
@@ -917,7 +917,7 @@ class SelectionCanonicalTests(MultiStepHarness):
         ensure_execution_selection_v3(self.root / "sel", first)
         durable = json.loads((self.root / "sel" / "execution_selection.json").read_text())
         self.assertEqual([item["step_id"] for item in durable["steps"]], ["S01", "S02", "S03"])
-        for invalid in ({"S01": "impl-a", "S03": "impl-a"}, {"S02": "impl-a"}, {"S07": "impl-a"}, {}):
+        for invalid in ({"S01": "impl-a", "S03": "impl-a"}, {"S02": "impl-a"}, {"S09": "impl-a"}, {}):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ExecutionSelectionError):
                     resolve_execution_selection_v3(

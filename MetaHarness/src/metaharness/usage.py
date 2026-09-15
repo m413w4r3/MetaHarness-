@@ -129,7 +129,7 @@ def read_usage_artifact(path: str | Path) -> dict[str, int] | None:
     return normalize_usage(payload)
 
 
-_STEP_DIRECTORY = re.compile(r"S0[1-6]\Z")
+_STEP_DIRECTORY = re.compile(r"S0[1-8]\Z")
 _MAX_STEP_RECORD_BYTES = 128 * 1024
 
 

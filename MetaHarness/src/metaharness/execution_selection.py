@@ -37,7 +37,7 @@ SCHEMA_VERSION = 2
 SCHEMA_VERSION_V3 = 3
 SCHEMA_VERSION_V4 = 4
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_STEP_ID = re.compile(r"S0[1-6]\Z")
+_STEP_ID = re.compile(r"S0[1-8]\Z")
 _ROLES = (
     ("planner", ExecutionRole.PLANNER),
     ("implementer", ExecutionRole.IMPLEMENTER),
@@ -130,7 +130,7 @@ def resolve_execution_selection(
     return ExecutionSelection(schema_version=SCHEMA_VERSION, **selected, reviser=reviser)
 
 
-_MAX_V3_STEPS = 6
+_MAX_V3_STEPS = 8
 
 
 def _canonical_step_items(step_profile_ids: Mapping[str, str]) -> list[tuple[str, str]]:
@@ -138,7 +138,7 @@ def _canonical_step_items(step_profile_ids: Mapping[str, str]) -> list[tuple[str
 
     The order never depends on the insertion order of the request mapping:
     IDs are validated, sorted numerically, and must then be unique,
-    contiguous from S01, and at most six.
+    contiguous from S01, and at most eight.
     """
 
     if not isinstance(step_profile_ids, Mapping) or not step_profile_ids:
@@ -149,7 +149,7 @@ def _canonical_step_items(step_profile_ids: Mapping[str, str]) -> list[tuple[str
             raise ExecutionSelectionError("v3 step selection is invalid")
         items.append((step_id, profile_id))
     if len(items) > _MAX_V3_STEPS:
-        raise ExecutionSelectionError("v3 selection may contain at most six steps")
+        raise ExecutionSelectionError("v3 selection may contain at most eight steps")
     ordered = sorted(items, key=lambda item: int(item[0][1:]))
     ids = [step_id for step_id, _profile_id in ordered]
     if len(set(ids)) != len(ids):

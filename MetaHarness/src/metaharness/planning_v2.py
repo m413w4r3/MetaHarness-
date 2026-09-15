@@ -30,7 +30,7 @@ from .result import atomic_write_text
 from .usage import PLANNER_USAGE_ARTIFACT, completion_usage, write_usage_artifact
 
 
-MAX_STEPS = 6
+MAX_STEPS = 8
 MAX_STEP_CONTRACT_CHARS = 8_000
 MAX_TOTAL_STEP_CONTRACT_CHARS = 32_000
 MAX_READ_SET = 8
@@ -45,7 +45,7 @@ _HEADER = "META PLAN v2"
 _END = "END META PLAN"
 _STEP_BEGIN = re.compile(r"^BEGIN STEP (.+)$")
 _STEP_END = re.compile(r"^END STEP (.+)$")
-_STEP_ID = re.compile(r"S0[1-6]")
+_STEP_ID = re.compile(r"S0[1-8]")
 _INLINE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*:\s*(.*)$")
 _PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
@@ -153,7 +153,7 @@ def _extract_step_blocks(lines: list[str], start: int, end: int) -> tuple[list[t
             continue
         step_id = begin.group(1)
         if _STEP_ID.fullmatch(step_id) is None:
-            raise V2PlanParseError("step ID must be exactly S01 through S06")
+            raise V2PlanParseError("step ID must be exactly S01 through S08")
         close: int | None = None
         for candidate in range(index + 1, end):
             candidate_line = lines[candidate].strip()
@@ -456,7 +456,7 @@ def parse_task_plan_v2(
     if mode == ExecutionMode.SINGLE.value and step_count != 1:
         raise V2PlanParseError("SINGLE requires exactly one step")
     if mode == ExecutionMode.STAGED.value and not 2 <= step_count <= MAX_STEPS:
-        raise V2PlanParseError("STAGED requires between two and six steps")
+        raise V2PlanParseError("STAGED requires between two and eight steps")
     reviewer = inline.get("REVIEWER_PROFILE", "")
     if not _PROFILE.fullmatch(reviewer) or reviewer not in reviewer_ids:
         raise V2PlanParseError("unknown reviewer profile")
@@ -464,7 +464,7 @@ def parse_task_plan_v2(
         raise V2PlanParseError("STEP_COUNT does not match step blocks")
     expected = [f"S{index:02d}" for index in range(1, step_count + 1)]
     if [step_id for step_id, _ in blocks] != expected:
-        raise V2PlanParseError("step IDs must be contiguous S01 through S06")
+        raise V2PlanParseError("step IDs must be contiguous S01 through S08")
     steps: list[ImplementationStep] = []
     for step_id, body in blocks:
         steps.append(_parse_step(step_id, body, implementer_ids, frozenset(step.id for step in steps)))
@@ -878,7 +878,7 @@ def step_contract_path(directory: str | Path, step_id: str) -> Path:
     """Canonical path of one step contract: ``steps/<STEP>/contract.md``."""
 
     if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None:
-        raise V2PlanParseError("step ID must be exactly S01 through S06")
+        raise V2PlanParseError("step ID must be exactly S01 through S08")
     return Path(directory) / "steps" / step_id / STEP_CONTRACT_NAME
 
 

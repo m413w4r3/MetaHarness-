@@ -108,7 +108,7 @@ For every step:
 - prefer the minimum number of steps;
 - prefer the minimum READ_SET sufficient for safe implementation.
 
-STAGED has 2 to 6 steps. SINGLE has exactly 1 step.
+STAGED has 2 to 8 steps. SINGLE has exactly 1 step.
 
 Each step declares four path sets:
 - READ_SET: existing files needed to understand the step.
@@ -128,7 +128,7 @@ READ_SET. A CREATE_SET path must not appear in READ_SET. A path may appear in
 only one of WRITE_SET, CREATE_SET and DELETE_SET, and each step must write,
 create or delete at least one path. Changing any other path fails the step
 deterministically. Paths must be exact, repo-relative, non-wildcard paths.
-Step IDs are contiguous S01 through S06; a step may depend only on NONE or an
+Step IDs are contiguous S01 through S08; a step may depend only on NONE or an
 earlier step.
 
 Profiles are recommendations, not human authority. Choose exact IDs from the
@@ -143,6 +143,26 @@ If the SPEC explicitly requires a validation represented by a trusted check,
 select that ID. A VERIFY step is not a substitute for a selected final check.
 Never invent an ID and never output commands or argv.
 
+When returning BLOCKED, use exactly this wire format:
+
+META PLAN v2
+
+STATUS: BLOCKED
+TITLE: <title>
+
+OBJECTIVE
+<text>
+
+BLOCKERS
+<real concrete blockers>
+
+END META PLAN
+
+For BLOCKED, do not emit CONSTRAINTS, REQUIRED_CHECKS, EXECUTION_MODE,
+STEP_COUNT, REVIEWER_PROFILE, BEGIN/END STEP, ACCEPTANCE, TESTS, or RISKS.
+Do not emit a pseudo-plan READY with incomplete execution details.
+
+When returning READY, use the following protocol.
 The answer must use exactly this protocol. Do not add prose before or after it.
 
 META PLAN v2
