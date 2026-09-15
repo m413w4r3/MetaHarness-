@@ -184,7 +184,7 @@ def _safe_state(state: Mapping[str, Any]) -> dict[str, Any]:
     publish = state.get("publish")
     result["publish"] = {
         key: publish.get(key)
-        for key in ("mode", "target", "remote", "branch", "run_branch", "base_sha", "commit_sha", "web_url", "status", "local_base_updated")
+        for key in ("mode", "target", "remote", "branch", "run_branch", "base_sha", "commit_sha", "web_url", "status", "local_base_updated", "run_branch_cleanup")
         if isinstance(publish, Mapping) and key in publish
     }
     result["planner"] = {
@@ -665,7 +665,7 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
     else:
         body += _section("REPAIR C02", "No repair cycle executed.")
     body += _section("COMMIT / PUBLISH", "\n".join([
-        _safe_json_artifact(directory, "publish.json", secrets, ("mode", "target", "remote", "branch", "run_branch", "base_sha", "commit_sha", "web_url", "status", "local_base_updated")),
+        _safe_json_artifact(directory, "publish.json", secrets, ("mode", "target", "remote", "branch", "run_branch", "base_sha", "commit_sha", "web_url", "status", "local_base_updated", "run_branch_cleanup")),
         "Commit SHA: " + str(state.get("commit_sha", "—")),
     ]))
     body += _attempts(directory, secrets)

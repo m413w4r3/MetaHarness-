@@ -73,6 +73,7 @@ from .gitops import (
     commit_candidate_tree,
     create_run_worktree,
     current_head,
+    delete_run_branch,
     git_root,
     index_tree_sha,
     local_branches,
@@ -3959,6 +3960,43 @@ class Orchestrator:
             raise CommitBoundaryError("worktree has changes after v2 review")
         return approved
 
+    def _cleanup_published_run_branch(
+        self,
+        *,
+        store: RunStateStore,
+        info: WorktreeInfo,
+        commit_sha: str,
+    ) -> dict[str, Any]:
+        """Best-effort cleanup after a successful fast-forward publication."""
+
+        cleanup: dict[str, Any] = {
+            "status": "warning",
+            "remote": self.config.publish.remote,
+            "branch": info.branch,
+            "commit_sha": commit_sha,
+            "warning": "run branch cleanup did not complete; branch retained",
+        }
+        try:
+            persisted_branch = store.load().get("branch")
+            if persisted_branch != info.branch:
+                raise GitError("persisted run branch does not match the run branch")
+            validate_run_branch(persisted_branch, base_ref=self.config.base_ref)
+            result = delete_run_branch(
+                info.source_repo,
+                remote=self.config.publish.remote,
+                branch=persisted_branch,
+                expected_commit_sha=commit_sha,
+                base_ref=self.config.base_ref,
+            )
+            cleanup["status"] = result.status
+            cleanup.pop("warning")
+        except Exception:
+            # Cleanup is deliberately not a publication failure.  Keep the
+            # warning fixed and secret-free; the branch remains for retry or
+            # operator cleanup when its identity is not exact.
+            pass
+        return cleanup
+
     def _complete_candidate_publication(
         self,
         *,
@@ -4028,6 +4066,9 @@ class Orchestrator:
                     "web_url": _commit_web_url(repository_reference, commit_sha),
                     "status": "pushed", "local_base_updated": outcome.local_base_updated,
                     "base_checked_out_in": list(outcome.base_checked_out_in),
+                    "run_branch_cleanup": self._cleanup_published_run_branch(
+                        store=store, info=info, commit_sha=commit_sha,
+                    ),
                 }
             else:
                 publish_payload = {
@@ -4217,6 +4258,9 @@ class Orchestrator:
                 "status": "pushed",
                 "local_base_updated": outcome.local_base_updated,
                 "base_checked_out_in": list(outcome.base_checked_out_in),
+                "run_branch_cleanup": self._cleanup_published_run_branch(
+                    store=store, info=info, commit_sha=commit_sha,
+                ),
             }
         else:
             publish_payload = {

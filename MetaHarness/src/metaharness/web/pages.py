@@ -302,11 +302,16 @@ def _fast_forward_publish_section(state: dict[str, Any], publish: dict[str, Any]
         for path in (publish.get("base_checked_out_in") or []) if isinstance(path, str)
     )
     run_branch = publish.get("run_branch")
+    cleanup = publish.get("run_branch_cleanup")
+    cleanup_line = (
+        f'<p class="muted">Run branch cleanup: <span class="mono">{_e(cleanup.get("status"))}</span></p>'
+        if isinstance(cleanup, dict) else ""
+    )
     branch_line = (
-        f'<p class="muted">Isolated run branch (kept locally, not pushed): '
+        f'<p class="muted">Isolated run branch: '
         f'<span class="mono">{_e(run_branch)}</span></p>' if run_branch else ""
     )
-    return f'<section class="publish"><h2>PUBLISH</h2>{headline}{branch_line}{notices}</section>'
+    return f'<section class="publish"><h2>PUBLISH</h2>{headline}{cleanup_line}{branch_line}{notices}</section>'
 
 
 def _section_open(run: dict[str, Any], names: tuple[str, ...]) -> str:

@@ -1215,7 +1215,7 @@ class StructuralTests(unittest.TestCase):
         self.assertIn('"push",', gitops)
         self.assertNotIn("--force", gitops)
         self.assertNotIn("--tags", gitops)
-        self.assertNotIn("--delete", gitops)
+        self.assertIn("--delete", gitops)
 
     def test_push_remains_after_final_review_authorization(self) -> None:
         v2 = inspect.getsource(Orchestrator._execute_v2)

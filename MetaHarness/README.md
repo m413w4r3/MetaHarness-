@@ -47,6 +47,8 @@ approved candidate (fast-forward-base)
 CAS fast-forward local main A→B   (git update-ref refs/heads/main B A)
   ↓
 push origin/main A→B              (git push --porcelain origin B:refs/heads/main)
+  ↓
+delete remote run branch           (fast-forward-base only; after publication)
 ```
 
 - maximum automatic cycles = 2 (C01 initial, C02 repair ; jamais de C03) ;
@@ -63,10 +65,13 @@ push origin/main A→B              (git push --porcelain origin B:refs/heads/ma
 - `[publish] mode = "fast-forward-base"` (AutoWork) : chaque candidat exact est
   commité puis poussé sur la branche de run avant sa review ; après le PASS
   final, `main` local avance par compare-and-swap de A vers B, puis B est poussé
-  sur `origin/main`. Si `main` ou `origin/main` (ref de suivi locale, sans
-  fetch implicite) a bougé : `BASE_MOVED_SINCE_RUN`, sans merge, rebase ni
-  force. `mode = "run-branch"` pousse seulement la branche de run ;
-- aucun force, lease, tag, delete ou merge automatique.
+  sur `origin/main`. Une fois cette publication réussie, la branche distante
+  temporaire du run est supprimée idempotemment. Si `main` ou `origin/main`
+  (ref de suivi locale, sans fetch implicite) a bougé :
+  `BASE_MOVED_SINCE_RUN`, sans merge, rebase ni force.
+  `mode = "run-branch"` pousse seulement la branche de run ;
+- aucun force, lease, tag ou merge automatique ; un échec du cleanup après
+  publication laisse le run `PUBLISHED` avec un warning diagnostiqué.
 
 ### Reprise : failure != lost work
 

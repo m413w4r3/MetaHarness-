@@ -15,11 +15,13 @@ from metaharness.gitops import (  # noqa: E402
     commit_reviewed_tree,
     create_run_worktree,
     current_head,
+    delete_run_branch,
     git_root,
     index_tree_sha,
     local_branches,
     read_file_at_commit,
     resolve_commit,
+    remote_run_branch_tip,
     stage_all,
     staged_changed_blobs,
     staged_changed_files,
@@ -75,6 +77,42 @@ class GitOpsTests(unittest.TestCase):
         self.assertTrue(status_porcelain(self.repo))
         with self.assertRaises(GitError):
             assert_clean(self.repo)
+
+    def test_delete_run_branch_is_idempotent_and_exact(self) -> None:
+        bare = self.root / "origin.git"
+        run_git(self.repo, "init", "--bare", str(bare))
+        run_git(self.repo, "remote", "add", "origin", str(bare))
+        branch = "harness/test/run"
+
+        absent = delete_run_branch(
+            self.repo, remote="origin", branch=branch, expected_commit_sha=self.initial_sha,
+        )
+        self.assertEqual(absent.status, "already_absent")
+
+        run_git(self.repo, "branch", branch, self.initial_sha)
+        run_git(self.repo, "push", "-q", "origin", f"{branch}:{branch}")
+        deleted = delete_run_branch(
+            self.repo, remote="origin", branch=branch, expected_commit_sha=self.initial_sha,
+        )
+        self.assertEqual(deleted.status, "success")
+        self.assertIsNone(remote_run_branch_tip(self.repo, remote="origin", branch=branch))
+
+    def test_delete_run_branch_keeps_a_moved_remote_branch(self) -> None:
+        bare = self.root / "origin-moved.git"
+        run_git(self.repo, "init", "--bare", str(bare))
+        run_git(self.repo, "remote", "add", "moved", str(bare))
+        branch = "harness/test/moved"
+        run_git(self.repo, "branch", branch, self.initial_sha)
+        run_git(self.repo, "push", "-q", "moved", f"{branch}:{branch}")
+        (self.repo / "README.md").write_text("moved contents\n", encoding="utf-8")
+        run_git(self.repo, "add", "README.md")
+        run_git(self.repo, "commit", "-qm", "moved")
+        moved_sha = current_head(self.repo)
+        run_git(self.repo, "push", "-q", "moved", f"{moved_sha}:refs/heads/{branch}")
+        with self.assertRaisesRegex(GitError, "no longer points"):
+            delete_run_branch(
+                self.repo, remote="moved", branch=branch, expected_commit_sha=self.initial_sha,
+            )
 
     def test_create_worktree_checks_clean_base_collisions_and_head(self) -> None:
         dirty_worktree = self.root / "dirty worktree"

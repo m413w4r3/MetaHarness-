@@ -34,6 +34,8 @@ from metaharness.approval import PlanIdentity  # noqa: E402
 from metaharness.claude.agent import ClaudeCodeAgent, ClaudeResult, build_claude_environment  # noqa: E402
 from metaharness.claude.runtime import prepare_claude_home  # noqa: E402
 from metaharness.config import ConfigError, load_config  # noqa: E402
+from metaharness.diagnostics import build_run_diagnostics  # noqa: E402
+from metaharness.gitops import GitError  # noqa: E402
 from metaharness.llm.chat import LLMConversationHandle, LLMHTTPError, TextLLMResult  # noqa: E402
 from metaharness.models import (  # noqa: E402
     ExecutionMode,
@@ -546,16 +548,55 @@ class FastForwardMainTests(P29Harness):
         self.assertEqual(pushed.call_count, 1)
         self.assertEqual(
             {line.split()[1] for line in self.remote_refs().splitlines()},
-            {"refs/heads/main", f"refs/heads/{result.state['branch']}"},
+            {"refs/heads/main"},
         )
-        self.assertEqual(git(self.repo, "rev-parse", f"refs/heads/{result.state['branch']}"), commit)
         publish = json.loads((result.run_dir / "publish.json").read_text())
         self.assertEqual((publish["mode"], publish["target"], publish["commit_sha"]),
                          ("fast-forward-base", "main", commit))
+        self.assertEqual(publish["run_branch_cleanup"]["status"], "success")
+        self.assertEqual(result.state["publish"]["run_branch_cleanup"]["status"], "success")
         self.assertIn(str(self.repo.resolve()), publish["base_checked_out_in"])
         page = render_run(get_run(self.runs, "ffmain", config=config), None, config=config)
         self.assertIn("Published to origin/main", page)
+        self.assertIn("Run branch cleanup", page)
         self.assertIn(commit, page)
+
+    def test_revise_keeps_the_pushed_run_branch(self) -> None:
+        config = self.make_config(mode="fast-forward-base", revision=False)
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")})
+        orchestrator, *_rest = self.orchestrator(
+            config, plans=[SINGLE_PLAN], reviews=[REVISE_IMPLEMENTATION], luna=luna,
+        )
+        result = self.run_approved(config, orchestrator, "revise-kept")
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.state["failure"]["reason"], "REVIEW_REVISE")
+        self.assertEqual(
+            subprocess.run(
+                ["git", "--git-dir", str(self.bare), "rev-parse", f"refs/heads/{result.state['branch']}"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip(),
+            result.state["candidate_commit_sha"],
+        )
+
+    def test_cleanup_warning_does_not_fail_a_published_run(self) -> None:
+        config = self.make_config(mode="fast-forward-base")
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")})
+        orchestrator, *_rest = self.orchestrator(
+            config, plans=[SINGLE_PLAN], reviews=[PASS], luna=luna,
+        )
+        with mock.patch.object(
+            orchestrator_module, "delete_run_branch", side_effect=GitError("cleanup transport error")
+        ):
+            result = self.run_approved(config, orchestrator, "cleanup-warning")
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        cleanup = result.state["publish"]["run_branch_cleanup"]
+        self.assertEqual(cleanup["status"], "warning")
+        self.assertIn("branch retained", cleanup["warning"])
+        self.assertEqual(self.origin_main(), result.state["commit_sha"])
+        self.assertIn(f"refs/heads/{result.state['branch']}", self.remote_refs())
+        diagnostics = build_run_diagnostics(config, result.run_dir)
+        self.assertIn('"status": "warning"', diagnostics)
+        self.assertIn("run_branch_cleanup", diagnostics)
 
     def test_moved_main_is_refused_without_merge_rebase_or_force(self) -> None:
         config = self.make_config(mode="fast-forward-base")

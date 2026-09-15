@@ -53,6 +53,14 @@ class PushResult:
     status: str = "pushed"
 
 
+@dataclass(frozen=True)
+class RunBranchCleanupResult:
+    remote: str
+    branch: str
+    commit_sha: str
+    status: str
+
+
 _RUN_BRANCH = re.compile(
     r"harness/[A-Za-z0-9][A-Za-z0-9_.-]{0,59}/[A-Za-z0-9][A-Za-z0-9_.-]*\Z"
 )
@@ -861,6 +869,51 @@ def remote_run_branch_tip(repo: Path, *, remote: str, branch: str) -> str | None
         if len(fields) == 2 and fields[1] == f"refs/heads/{branch}":
             return _require_object_id(fields[0], "remote commit_sha")
     return None
+
+
+def delete_run_branch(
+    repo: Path,
+    *,
+    remote: str,
+    branch: str,
+    expected_commit_sha: str,
+    base_ref: str | None = None,
+) -> RunBranchCleanupResult:
+    """Delete exactly one remote run branch, without force or a target branch.
+
+    The remote branch must still point to the published candidate.  This
+    compare-before-delete check avoids deleting a branch that was recreated or
+    moved after publication.  A missing branch is a successful idempotent
+    cleanup result.
+    """
+
+    repository_remote_url(repo, remote)
+    validate_run_branch(branch, base_ref=base_ref)
+    _require_object_id(expected_commit_sha, "expected_commit_sha")
+    tip = remote_run_branch_tip(repo, remote=remote, branch=branch)
+    if tip is None:
+        return RunBranchCleanupResult(remote, branch, expected_commit_sha, "already_absent")
+    if tip != expected_commit_sha:
+        raise GitError("remote run branch no longer points to the published candidate")
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "push", "--porcelain", "--delete", remote, branch],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=600,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise GitError(f"git command failed: {type(exc).__name__}") from exc
+    if result.returncode != 0:
+        # Transport diagnostics may contain credential-bearing URLs.
+        raise GitError(f"git push --delete exited with {result.returncode}")
+    if remote_run_branch_tip(repo, remote=remote, branch=branch) is not None:
+        raise GitError("remote run branch was not deleted")
+    return RunBranchCleanupResult(remote, branch, expected_commit_sha, "success")
 
 
 class BaseMovedError(GitError):

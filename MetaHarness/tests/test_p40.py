@@ -261,6 +261,7 @@ class P40CandidatePipelineTests(P29Harness):
         class ObservingReviewer(QueueClient):
             def complete(self, prompt: str):
                 self.main_before_pass = git(harness.repo, "rev-parse", "refs/heads/main")
+                self.run_branch_before_pass = bool(harness.remote_refs())
                 return super().complete(prompt)
         reviewer = ObservingReviewer("reviewer", [PASS], self.events)
         orchestrator, _planner, _reviewer, _luna, _claude = self.orchestrator(
@@ -273,13 +274,9 @@ class P40CandidatePipelineTests(P29Harness):
         self.assertEqual(candidate["commit_sha"], result.state["commit_sha"])
         self.assertEqual(candidate["parent_sha"], self.base_sha)
         self.assertTrue(candidate["pushed_at"])
-        self.assertEqual(
-            subprocess.run(
-                ["git", "-C", str(self.bare), "rev-parse", f"refs/heads/{result.state['branch']}"],
-                check=True, capture_output=True, text=True,
-            ).stdout.strip(),
-            candidate["commit_sha"],
-        )
+        self.assertTrue(reviewer.run_branch_before_pass)
+        self.assertNotIn(f"refs/heads/{result.state['branch']}", self.remote_refs())
+        self.assertEqual(result.state["publish"]["run_branch_cleanup"]["status"], "success")
         self.assertEqual(reviewer.main_before_pass, self.base_sha)
         self.assertLess(self.events.index("push"), next(
             index for index, value in enumerate(self.events) if value.startswith("reviewer:")
@@ -809,6 +806,8 @@ class P40ResumeAuthorityTests(P29Harness):
         publish = json.loads((run_dir / "publish.json").read_text())
         self.assertEqual((publish["mode"], publish["commit_sha"], publish["base_sha"]),
                          ("fast-forward-base", c02, self.base_sha))
+        self.assertEqual(publish["run_branch_cleanup"]["status"], "success")
+        self.assertNotIn("refs/heads/" + result.state["branch"], self.remote_refs())
         forbidden = {"merge", "rebase", "--force", "-f", "--force-with-lease", "--squash",
                      "cherry-pick", "reset"}
         for argv in git_argv:
