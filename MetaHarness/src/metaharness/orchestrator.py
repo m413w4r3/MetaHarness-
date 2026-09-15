@@ -2698,7 +2698,10 @@ class Orchestrator:
                     return self._v2_failed(store, run_dir, "LLM_FAILURE", None,
                                            _bounded_parse_detail(exc))
                 except OrchestrationError as exc:
-                    reason = str(exc).split(":", 1)[0].strip() or "REPAIR_FAILED"
+                    reason = (
+                        _failure_reason(exc) if str(exc).startswith("CHECK_PREFLIGHT_FAILED:")
+                        else str(exc).split(":", 1)[0].strip()
+                    ) or "REPAIR_FAILED"
                     return self._v2_failed(store, run_dir, reason, None)
                 if review.verdict is ReviewVerdict.REVISE and review.route in {
                     ReviewRoute.IMPLEMENTATION, ReviewRoute.REPLAN,
@@ -3217,8 +3220,10 @@ class Orchestrator:
             if pre_hard:
                 return None, pre_hard[0].split(":", 1)[0]
             pre_diff = pre_evidence.diff
-            # Pre-revision checks complete: the next operation is Claude.
-            self._checkpoint(run_dir, claude_phase, cycle=cycle, head=base_sha, tree=tree_before)
+            # Pre-revision checks complete: the next operation is Claude.  The
+            # authorized HEAD is the worktree HEAD (base for C01, the C01
+            # candidate commit for C02), exactly as _validate_resume expects.
+            self._checkpoint(run_dir, claude_phase, cycle=cycle, head=expected_head, tree=tree_before)
         else:
             pre_payload, pre_diff = reused
         contracts = "\n\n".join(
@@ -3419,6 +3424,8 @@ class Orchestrator:
             candidate_commit_sha=cycle_parent_sha, review=cycle_1_review,
             repair_bundle_sha=repair_bundle_sha,
         )
+        if start is not None and start.scope_delta_sha256 is not None and scope_delta_sha != start.scope_delta_sha256:
+            raise ResumeIntegrityError("the C02 scope delta changed")
         for path in scope_delta["requested_write_paths"] + scope_delta["requested_delete_paths"]:
             if not path_exists_in_tree(repo, cycle_parent_sha, path):
                 raise OrchestrationError("REPAIR_SCOPE_EXISTING_PATH_MISSING")
@@ -3465,15 +3472,29 @@ class Orchestrator:
         elif added_paths and policy == "auto-bounded":
             self._cycle_update(store, 2, status="scope_auto_approved",
                                scope_delta=scope_delta)
-        if at <= phase_index(ResumePhase.REPAIR_PLANNER):
-            # Repair planner complete: the next operation is repair step 1.
+        completed = list(resumed.c02_steps) if resumed is not None else []
+        done_ids = {record["id"] for record in completed}
+        pending_steps = [step for step in repair_plan.steps if step.id not in done_ids]
+        if at <= phase_index(ResumePhase.SCOPE_APPROVAL) and pending_steps:
+            # Repair planner (and any scope approval) complete: the durable
+            # next operation is the first repair step, before any worker runs.
             self._checkpoint(
-                run_dir, ResumePhase.REPAIR_STEP, step_id=repair_plan.steps[0].id,
+                run_dir, ResumePhase.REPAIR_STEP, step_id=pending_steps[0].id,
                 head=cycle_parent_sha, tree=tree_before, repair_bundle_sha256=repair_bundle_sha,
                 scope_delta_sha256=scope_delta_sha,
             )
-        completed = list(resumed.c02_steps) if resumed is not None else []
-        done_ids = {record["id"] for record in completed}
+        run_claude_c02 = claude_revision_enabled and at <= phase_index(ResumePhase.CLAUDE_C02) and (
+            start is None or start.phase is not ResumePhase.CHECKS_C02
+        )
+        if pending_steps or run_claude_c02:
+            # The repair plan may require trusted checks C01 did not; their
+            # config-only preflights run before any expensive C02 worker and,
+            # on failure, leave the checkpoint at the next worker boundary.
+            preflight_failures = run_check_preflights(
+                info.worktree, self.config, repair_plan.required_checks
+            )
+            if preflight_failures:
+                raise OrchestrationError(preflight_failures[0])
         state_steps = [
             {"id": step.id, "title": step.title,
              "status": "completed" if step.id in done_ids else "waiting",
@@ -3529,9 +3550,7 @@ class Orchestrator:
                 step_id=following, head=cycle_parent_sha, tree=outcome.tree_after,
             )
         self._update_v2_usage(store, run_dir)
-        if claude_revision_enabled and at <= phase_index(ResumePhase.CLAUDE_C02) and (
-            start is None or start.phase is not ResumePhase.CHECKS_C02
-        ):
+        if run_claude_c02:
             if start is not None and start.phase is ResumePhase.CLAUDE_C02:
                 _archive_attempt(run_dir / "revision" / "C02", names=_REVISION_ATTEMPT_ARTIFACTS)
             cycle_2_revision, revision_error = self._run_v2_revision_cycle(

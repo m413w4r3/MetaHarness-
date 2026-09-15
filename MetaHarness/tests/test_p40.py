@@ -10,13 +10,14 @@ import time
 import unittest
 from pathlib import Path
 
+from metaharness.claude.agent import ClaudeResult
 from metaharness.gitops import commit_parents
 from metaharness.models import RunStatus
 from metaharness.approval import write_scope_approval
 from metaharness.run_options import RunOptions
 from metaharness.resume import ResumePhase, read_checkpoint
 from tests.test_p29 import (
-    P29Harness, QueueClient, FakeLuna, SINGLE_PLAN, REPAIR_PLAN, PASS,
+    P29Harness, QueueClient, FakeClaude, FakeLuna, SINGLE_PLAN, REPAIR_PLAN, PASS,
     REVISE_IMPLEMENTATION, SPEC, writer, git, plan_text, step_block, write,
     TransportFailingClient,
 )
@@ -36,7 +37,119 @@ END META REVIEW
 """
 
 
+class FailingC02Claude(FakeClaude):
+    """Claude double that revises C01 and fails C02 after its pre-checks."""
+
+    def run_revision(self, prompt, worktree, *, artifacts_dir, profile, environment,
+                     revision_dir=None) -> ClaudeResult:
+        target = Path(revision_dir) if revision_dir is not None else Path(artifacts_dir) / "revision"
+        if target.name != "C02":
+            return super().run_revision(prompt, worktree, artifacts_dir=artifacts_dir, profile=profile,
+                                        environment=environment, revision_dir=revision_dir)
+        self.calls.append({"cycle": 2, "prompt": prompt})
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "agent.stderr.log").write_text("claude C02 crashed\n", encoding="utf-8")
+        (target / "agent.events.jsonl").write_text("", encoding="utf-8")
+        return ClaudeResult(1, False, "", {}, "claude C02 crashed")
+
+
 class P40CandidatePipelineTests(P29Harness):
+    def _scope_repair_files(self) -> str:
+        write(self.repo / "docs/agent/CONTRACT.md", "contract v1\n")
+        write(self.repo / "backend/pyproject.toml", "[project]\nname = 'aw001'\n")
+        git(self.repo, "add", "docs/agent/CONTRACT.md", "backend/pyproject.toml")
+        git(self.repo, "commit", "-qm", "AW-001 approval files")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        return plan_text(
+            step_block(1, read=("docs/agent/CONTRACT.md", "backend/pyproject.toml"),
+                       write_set=("docs/agent/CONTRACT.md", "backend/pyproject.toml"),
+                       operation="Repair omitted files"), title="AW-001 approval repair")
+
+    def test_claude_c02_checkpoint_binds_c01_candidate_and_resumes_claude_only(self) -> None:
+        config = self.make_config()
+        luna = FakeLuna({
+            (1, "S01"): writer("src/a.py", "A = 2\n"),
+            (2, "S01"): writer("src/a.py", "A = 3\n"),
+        })
+        orchestrator, planner, _reviewer, _luna, _claude = self.orchestrator(
+            config, plans=[SINGLE_PLAN, REPAIR_PLAN], reviews=[REVISE_IMPLEMENTATION],
+            luna=luna, claude=FailingC02Claude(log=self.events),
+        )
+        with self.count_pushes() as first_pushes:
+            failed = self.run_approved(config, orchestrator, "claude-c02")
+        self.assertEqual(failed.state["failure"]["reason"], "CLAUDE_FAILED")
+        self.assertEqual(first_pushes.call_count, 1)  # the C01 candidate only
+        run_dir = failed.run_dir
+        c01 = json.loads((run_dir / "candidate/C01/commit.json").read_text())
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.CLAUDE_C02)
+        self.assertEqual(checkpoint.expected_head_sha, c01["commit_sha"])
+        repair_step = json.loads((run_dir / "repair/C02/steps/S01/step.json").read_text())
+        self.assertEqual(checkpoint.expected_tree_sha, repair_step["tree_after"])
+        self.assertEqual(len(planner.prompts), 2)
+        self.assertFalse((run_dir / "candidate/C02/commit.json").exists())
+
+        second, second_planner, _r, second_luna, second_claude = self.orchestrator(
+            config, reviews=[PASS]
+        )
+        with self.count_pushes() as pushes:
+            resumed = second.resume("claude-c02")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(second_planner.prompts, [])
+        self.assertEqual(second_luna.calls, [])
+        self.assertEqual([call["cycle"] for call in second_claude.calls], [2])
+        self.assertEqual(pushes.call_count, 1)  # the C02 candidate, never C01 again
+        c02 = json.loads((run_dir / "candidate/C02/commit.json").read_text())
+        self.assertEqual(c02["parent_sha"], c01["commit_sha"])
+        self.assertEqual(
+            json.loads((run_dir / "candidate/C01/commit.json").read_text())["commit_sha"],
+            c01["commit_sha"],
+        )
+        self.assertEqual(resumed.state["commit_sha"], c02["commit_sha"])
+        self.assertEqual(
+            git(self.repo, "rev-list", "--count", f"{self.base_sha}..{c02['commit_sha']}"), "2"
+        )
+
+    def test_scope_approval_persists_repair_step_before_first_repair_worker(self) -> None:
+        repair_plan = self._scope_repair_files()
+        config = self.make_config()
+        options = RunOptions.from_config(config, repair_scope_policy="require-approval")
+        orchestrator, *_rest = self.orchestrator(
+            config, plans=[SINGLE_PLAN, repair_plan], reviews=[REVISE_REPLAN],
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")}),
+        )
+        waiting = self.run_approved(config, orchestrator, "scope-step", run_options=options)
+        self.assertEqual(waiting.status, RunStatus.WAITING_SCOPE_APPROVAL)
+        run_dir = waiting.run_dir
+        paused = read_checkpoint(run_dir)
+        self.assertEqual(paused.phase, ResumePhase.SCOPE_APPROVAL)
+        delta_sha = hashlib.sha256((run_dir / "repair/C02/scope_delta.json").read_bytes()).hexdigest()
+        self.assertEqual(paused.scope_delta_sha256, delta_sha)
+        write_scope_approval(run_dir / "repair/C02", decision="APPROVE",
+                             scope_delta_sha256=delta_sha, source="test")
+        c01 = json.loads((run_dir / "candidate/C01/commit.json").read_text())
+        observed = []
+
+        def repair(root: Path) -> None:
+            # Observed from inside the first repair worker invocation.
+            observed.append(read_checkpoint(run_dir))
+            write(root / "docs/agent/CONTRACT.md", "contract v2\n")
+            write(root / "backend/pyproject.toml", "[project]\nname = 'aw001-fixed'\n")
+
+        second, second_planner, *_rest = self.orchestrator(
+            config, reviews=[PASS], luna=FakeLuna({(2, "S01"): repair}),
+        )
+        resumed = second.resume("scope-step")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(second_planner.prompts, [])
+        self.assertEqual(len(observed), 1)
+        durable = observed[0]
+        self.assertEqual((durable.phase, durable.step_id), (ResumePhase.REPAIR_STEP, "S01"))
+        self.assertEqual(durable.expected_head_sha, c01["commit_sha"])
+        self.assertEqual(durable.expected_tree_sha, paused.expected_tree_sha)
+        self.assertEqual(durable.repair_bundle_sha256, paused.repair_bundle_sha256)
+        self.assertEqual(durable.scope_delta_sha256, paused.scope_delta_sha256)
+
     def test_require_approval_pauses_and_resumes_against_exact_delta(self) -> None:
         write(self.repo / "docs/agent/CONTRACT.md", "contract v1\n")
         write(self.repo / "backend/pyproject.toml", "[project]\nname = 'aw001'\n")
