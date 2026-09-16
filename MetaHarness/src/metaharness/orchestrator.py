@@ -170,6 +170,7 @@ from .resume import (
     ResumeNotAllowedError,
     ResumePhase,
     ResumeRequiresOperatorError,
+    is_clean_contract_mismatch_artifact,
     load_resume_checkpoint,
     mark_checkpoint_completed,
     phase_index,
@@ -342,13 +343,45 @@ def _step_reports_text(results: list[dict[str, Any]]) -> str:
     chunks: list[str] = []
     for item in results:
         chunk = "\n".join([
-            item["id"], f"profile: {item['profile_id']}",
+            item["id"], f"status: {item.get('status', 'COMPLETED')}",
+            f"profile: {item['profile_id']}",
             f"tree_before: {item['tree_before']}", f"tree_after: {item['tree_after']}",
             f"usage: {json.dumps(item['usage'], sort_keys=True)}", "final report:",
             _bounded_v2_report(item.get("final", "")),
         ]) + "\n"
         chunks.append(chunk)
     return "\n".join(chunks)
+
+
+def _deferred_contract_mismatches(
+    plan: TaskPlanV2, results: list[dict[str, Any]],
+) -> str:
+    """Render bounded summaries for Claude and the independent reviewer."""
+
+    steps = {step.id: step for step in plan.steps}
+    summaries: list[dict[str, Any]] = []
+    for item in results:
+        if item.get("status") != "DEFERRED_CONTRACT_MISMATCH":
+            continue
+        step = steps.get(item.get("id"))
+        if step is None:
+            continue
+        summaries.append({
+            "step_id": step.id,
+            "step_title": step.title,
+            "mismatch": _bounded_v2_report(str(item.get("mismatch") or "")),
+            "original_scope": {
+                "write": list(step.write_set),
+                "create": list(step.create_set),
+                "delete": list(step.delete_set),
+            },
+            "tree_at_mismatch": item.get("tree_before"),
+        })
+    return _json_text(summaries) if summaries else "NONE\n"
+
+
+def _has_deferred_contract_mismatches(results: list[dict[str, Any]]) -> bool:
+    return any(item.get("status") == "DEFERRED_CONTRACT_MISMATCH" for item in results)
 
 
 def _semantic_diff_payload(diff: str, max_bytes: int) -> tuple[str, bool, int]:
@@ -371,16 +404,20 @@ def _truncation_note(truncated: bool) -> str:
 def _compact_step_history(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep C02 history structural; reports live in ``luna_reports``."""
 
-    return [
-        {
+    compact: list[dict[str, Any]] = []
+    for item in results:
+        record = {
             "id": item.get("id"),
             "profile_id": item.get("profile_id"),
             "tree_after": item.get("tree_after"),
             "changed_paths": item.get("changed_paths", []),
             "usage": item.get("usage", {}),
         }
-        for item in results
-    ]
+        if item.get("status") == "DEFERRED_CONTRACT_MISMATCH":
+            record["status"] = item["status"]
+            record["mismatch"] = _bounded_v2_report(str(item.get("mismatch") or ""))
+        compact.append(record)
+    return compact
 
 
 def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
@@ -432,6 +469,7 @@ def _revision_prompt(
     diff_truncated: bool,
     pre_checks: str,
     mutable_scope: str,
+    deferred_mismatches: str,
 ) -> str:
     template = (Path(__file__).with_name("prompts") / "reviser.txt").read_text(encoding="utf-8")
     values = {
@@ -452,6 +490,7 @@ def _revision_prompt(
         "{{SEMANTIC_DIFF_NOTE}}": _truncation_note(diff_truncated),
         "{{PRE_REVISION_CHECKS}}": pre_checks,
         "{{APPROVED_MUTABLE_SCOPE}}": mutable_scope,
+        "{{DEFERRED_LUNA_CONTRACT_MISMATCHES}}": deferred_mismatches,
     }
     for placeholder, value in values.items():
         template = template.replace(placeholder, value)
@@ -591,6 +630,15 @@ def _git_ownership(repo: Path, worktree: Path) -> GitOwnership:
     )
 
 
+def _git_ownership_payload(ownership: GitOwnership) -> dict[str, Any]:
+    return {
+        "head_ref": ownership.head_ref,
+        "head": ownership.head,
+        "branches": sorted(ownership.branches),
+        "worktrees": sorted(ownership.worktrees),
+    }
+
+
 def _ownership_violations(
     before: GitOwnership, after: GitOwnership, *, branch_ref: str, base_sha: str
 ) -> list[str]:
@@ -628,6 +676,26 @@ class StepExecutionOutcome:
     final_report: str
 
 
+class DeferredStepExecutionOutcome:
+    """A clean mismatch result without widening the normal outcome schema."""
+
+    status = "DEFERRED_CONTRACT_MISMATCH"
+
+    def __init__(
+        self, *, step_id: str, profile_id: str, tree_before: str,
+        tree_after: str, changed_paths: tuple[str, ...], usage: dict[str, int],
+        final_report: str, mismatch: str,
+    ) -> None:
+        self.step_id = step_id
+        self.profile_id = profile_id
+        self.tree_before = tree_before
+        self.tree_after = tree_after
+        self.changed_paths = changed_paths
+        self.usage = usage
+        self.final_report = final_report
+        self.mismatch = mismatch
+
+
 class StepExecutionFailure(OrchestrationError):
     """One Codex step failed a gate; the C01/C02 caller owns the run status."""
 
@@ -641,6 +709,8 @@ class StepExecutionFailure(OrchestrationError):
         tree_before: str | None,
         tree_after: str | None = None,
         usage: dict[str, int] | None = None,
+        mismatch: str | None = None,
+        clean_contract_mismatch: bool = False,
     ) -> None:
         super().__init__(f"{reason}: step={step_id}")
         self.reason = reason
@@ -650,6 +720,8 @@ class StepExecutionFailure(OrchestrationError):
         self.tree_before = tree_before
         self.tree_after = tree_after
         self.usage = usage
+        self.mismatch = mismatch
+        self.clean_contract_mismatch = clean_contract_mismatch
 
 
 @dataclasses.dataclass(frozen=True)
@@ -662,15 +734,19 @@ class ReviewCycleInput:
     revision_report: str
     cycle_history: str
     scope_delta: str = ""
+    deferred_mismatches: str = ""
 
 
 def _step_result_record(outcome: StepExecutionOutcome) -> dict[str, Any]:
+    status = getattr(outcome, "status", "COMPLETED")
     return {
-        "id": outcome.step_id, "status": "COMPLETED", "profile_id": outcome.profile_id,
+        "id": outcome.step_id, "status": status, "profile_id": outcome.profile_id,
         "tree_before": outcome.tree_before, "tree_after": outcome.tree_after,
         "changed_paths": list(outcome.changed_paths),
         "usage": outcome.usage,
         "final": _bounded_v2_report(outcome.final_report),
+        **({"mismatch": _bounded_v2_report(getattr(outcome, "mismatch", ""))}
+           if getattr(outcome, "mismatch", None) else {}),
     }
 
 
@@ -1032,10 +1108,13 @@ def _load_accepted_c01_review(
 
 
 def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
-    """One COMPLETED step record, in the shape of :func:`_step_result_record`."""
+    """One completed or cleanly deferred step record."""
 
     record = _read_json_artifact(step_dir / "step.json", 128 * 1024)
-    if not isinstance(record, dict) or record.get("id") != step_id or record.get("status") != "COMPLETED":
+    if not isinstance(record, dict) or record.get("id") != step_id:
+        return None
+    status = record.get("status")
+    if status not in {"COMPLETED", "DEFERRED_CONTRACT_MISMATCH"}:
         return None
     changed = record.get("changed_paths")
     if (
@@ -1044,12 +1123,22 @@ def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
         or not isinstance(changed, list) or any(not isinstance(item, str) for item in changed)
     ):
         return None
+    if status == "DEFERRED_CONTRACT_MISMATCH" and (
+        record["tree_before"] != record["tree_after"]
+        or changed
+        or not isinstance(record.get("mismatch"), str)
+        or not record["mismatch"].strip()
+        or len(record["mismatch"].encode("utf-8", errors="replace")) > _MAX_STEP_REPORT_BYTES
+    ):
+        return None
     return {
-        "id": step_id, "status": "COMPLETED", "profile_id": record.get("profile_id"),
+        "id": step_id, "status": status, "profile_id": record.get("profile_id"),
         "tree_before": record["tree_before"], "tree_after": record["tree_after"],
         "changed_paths": list(changed),
         "usage": normalize_usage(record.get("usage")),
         "final": _bounded_v2_report(_read_bounded_text(step_dir / "agent.final.md")),
+        **({"mismatch": _bounded_v2_report(record["mismatch"])}
+           if status == "DEFERRED_CONTRACT_MISMATCH" else {}),
     }
 
 
@@ -1925,6 +2014,7 @@ class Orchestrator:
         )
 
         ownership_before = _git_ownership(repo, info.worktree)
+        store.update(git_ownership=_git_ownership_payload(ownership_before))
         store.update(status=RunStatus.PREPARING)
         try:
             setup_results = prepare_workspace(
@@ -2564,7 +2654,10 @@ class Orchestrator:
         done_ids = {record["id"] for record in completed_steps}
         state_steps = [
             {"id": step.id, "title": step.title,
-             "status": "completed" if step.id in done_ids else "waiting",
+             "status": next(
+                 (record["status"].lower() for record in completed_steps if record["id"] == step.id),
+                 "waiting",
+             ),
              "profile_id": step_items[step.id].implementer.profile_id}
             for step in plan.steps
         ]
@@ -2613,7 +2706,7 @@ class Orchestrator:
             expected_tree = outcome.tree_after
             self._last_v2_step_results.append(_step_result_record(outcome))
             state_steps = [
-                {**item, "status": "completed", "usage": outcome.usage,
+                {**item, "status": "deferred" if getattr(outcome, "status", "COMPLETED") == "DEFERRED_CONTRACT_MISMATCH" else "completed", "usage": outcome.usage,
                  "input_tokens": outcome.usage["input_tokens"],
                  "output_tokens": outcome.usage["output_tokens"]}
                 if item["id"] == step.id else item
@@ -2628,6 +2721,15 @@ class Orchestrator:
                 run_dir,
                 ResumePhase.INITIAL_STEP if following else ResumePhase.CHECKS_C01,
                 step_id=following, head=base_sha, tree=outcome.tree_after,
+            )
+
+        deferred_mismatches = _deferred_contract_mismatches(
+            plan, self._last_v2_step_results
+        )
+        if _has_deferred_contract_mismatches(self._last_v2_step_results) and not revision_enabled:
+            return self._v2_failed(
+                store, run_dir, "UNRESOLVED_CONTRACT_MISMATCH", None,
+                "HUMAN_REQUIRED: Claude revision is disabled while Luna contract mismatches are deferred",
             )
 
         # With Claude, CHECKS_C01 names the pending pre-revision checks and
@@ -2648,6 +2750,7 @@ class Orchestrator:
                         repository_reference=repository_reference, info=info,
                         branch_ref=branch_ref, ownership_before=ownership_before,
                         selection=selection,
+                        deferred_mismatches=deferred_mismatches,
                     )
                 except ClaudeCommittedError as exc:
                     self._redact_revision_artifacts(run_dir)
@@ -2771,6 +2874,7 @@ class Orchestrator:
                         iteration=1,
                         plan_text=plan.raw,
                         luna_reports=_step_reports_text(self._last_v2_step_results),
+                        deferred_mismatches=deferred_mismatches,
                         revision_report=revision_report_c01,
                         cycle_history="C01 is the initial implementation cycle.",
                     ),
@@ -3037,6 +3141,13 @@ class Orchestrator:
         failed = {"profile_id": profile.id, "tree_before": tree_before, "usage": usage}
         # 7. Authentication classification from fixed markers only.
         auth_failure = _codex_auth_failure(artifact_dir / "agent.events.jsonl", result.stderr_tail)
+        # Capture ownership before interpreting the worker's structural report.
+        # A clean mismatch is allowed to defer only when the complete Git
+        # boundary is untouched.
+        ownership_after = _git_ownership(repo, worktree)
+        ownership_violations = _ownership_violations(
+            ownership_before, ownership_after, branch_ref=branch_ref, base_sha=base_sha
+        )
         # A structural mismatch is the only worker report that has protocol
         # meaning.  It is checked before any staging and its explanation stays
         # bounded and non-authoritative.
@@ -3045,6 +3156,28 @@ class Orchestrator:
             mismatch = contract_mismatch_explanation(result.final_message)
         if mismatch is not None:
             tree_after = _safe_candidate_tree(worktree)
+            residual = list(status_porcelain(worktree, include_ignored=True))
+            clean = (
+                bool(mismatch.strip())
+                and
+                tree_after == tree_before
+                and not ownership_violations
+                and not residual
+            )
+            if clean:
+                atomic_write_text(artifact_dir / "step.json", _json_text({
+                    "id": step_id, "status": "DEFERRED_CONTRACT_MISMATCH",
+                    "profile_id": profile.id,
+                    "tree_before": tree_before, "tree_after": tree_before,
+                    "changed_paths": [], "mismatch": _bounded_v2_report(mismatch),
+                    "usage": usage,
+                }))
+                return DeferredStepExecutionOutcome(
+                    step_id=step_id, profile_id=profile.id,
+                    tree_before=tree_before, tree_after=tree_before,
+                    changed_paths=(), usage=usage, final_report=result.final_message,
+                    mismatch=_bounded_v2_report(mismatch),
+                )
             _record_failure_tree(artifact_dir, worktree)
             details = []
             if mismatch:
@@ -3053,22 +3186,24 @@ class Orchestrator:
                 details.append("worker left candidate modifications")
             elif tree_after is None:
                 details.append("failure tree could not be read")
+            if ownership_violations:
+                details.extend(ownership_violations)
+            if residual:
+                details.append("worker left residual Git modifications: " + _paths_detail(residual))
             raise StepExecutionFailure(
                 "AGENT_CONTRACT_MISMATCH", step_id,
                 "; ".join(details) or "worker reported a contract mismatch",
                 profile_id=profile.id, tree_before=tree_before,
                 tree_after=tree_after, usage=usage,
+                mismatch=_bounded_v2_report(mismatch),
+                clean_contract_mismatch=False,
             )
         # 8-9. Git ownership: HEAD, branch, branches and worktrees.
-        ownership_after = _git_ownership(repo, worktree)
         if ownership_after.head != base_sha:
             raise StepExecutionFailure("AGENT_COMMITTED", step_id, "worktree HEAD changed", **failed)
-        violations = _ownership_violations(
-            ownership_before, ownership_after, branch_ref=branch_ref, base_sha=base_sha
-        )
-        if violations:
+        if ownership_violations:
             raise StepExecutionFailure(
-                "AGENT_GIT_VIOLATION", step_id, "; ".join(violations), **failed
+                "AGENT_GIT_VIOLATION", step_id, "; ".join(ownership_violations), **failed
             )
         # 10-11. Process outcome.  The tree left behind is recorded so that a
         # resume can tell a clean retry from partial worker changes.
@@ -3126,6 +3261,8 @@ class Orchestrator:
             store, run_dir, failure.reason, failure.step_id, failure.detail,
             usage=failure.usage, profile_id=failure.profile_id,
             tree_before=failure.tree_before, tree_after=failure.tree_after,
+            mismatch=failure.mismatch,
+            mismatch_clean=failure.clean_contract_mismatch,
             step_dir=step_dir,
         )
 
@@ -3278,6 +3415,7 @@ class Orchestrator:
             candidate_commit=_json_text(dict(candidate_commit)),
             iteration=input.iteration,
             cycle_history=input.cycle_history,
+            deferred_mismatches=input.deferred_mismatches,
         )
         # planner_thread != reviewer_thread: a driver that reports the
         # planner's own conversation for a review breaks independence.
@@ -3344,6 +3482,7 @@ class Orchestrator:
         contract_dir: Path | None = None,
         mutable_scope: list[str] | None = None,
         luna_reports: str | None = None,
+        deferred_mismatches: str | None = None,
         cycle: int = 1,
     ) -> tuple[Any | None, str | None]:
         """Run one Claude pre-check/revision/scope cycle.
@@ -3393,6 +3532,11 @@ class Orchestrator:
             }
             atomic_write_text(artifact_dir / "pre_checks.json", _json_text(pre_payload))
             pre_hard = _hard_integrity_failures(pre_evidence)
+            # A clean deferred mismatch intentionally leaves no candidate
+            # delta for the pre-revision gate.  Claude is the recovery owner,
+            # so EMPTY_DIFF is evidence for Claude here, not a terminal gate.
+            if deferred_mismatches.strip() not in {"", "NONE"}:
+                pre_hard = [item for item in pre_hard if item != "EMPTY_DIFF"]
             if pre_hard:
                 return None, pre_hard[0].split(":", 1)[0]
             pre_diff = pre_evidence.diff
@@ -3420,6 +3564,7 @@ class Orchestrator:
             diff_truncated=diff_truncated,
             pre_checks=_json_text(pre_payload),
             mutable_scope=_json_text(mutable_scope),
+            deferred_mismatches=deferred_mismatches or "NONE\n",
         )
         store.update(status=RunStatus.REVISING, current_step=None)
         atomic_write_text(artifact_dir / "tree_before.txt", tree_before.rstrip() + "\n")
@@ -3685,7 +3830,10 @@ class Orchestrator:
                 raise OrchestrationError(preflight_failures[0])
         state_steps = [
             {"id": step.id, "title": step.title,
-             "status": "completed" if step.id in done_ids else "waiting",
+             "status": next(
+                 (record["status"].lower() for record in completed if record["id"] == step.id),
+                 "waiting",
+             ),
              "profile_id": selection.repair_implementer.profile_id}
             for step in repair_plan.steps
         ]
@@ -3722,7 +3870,7 @@ class Orchestrator:
             self._repair_v2_step_results.append(_step_result_record(outcome))
             expected_tree = outcome.tree_after
             state_steps = [
-                {**item, "status": "completed", "usage": outcome.usage,
+                {**item, "status": "deferred" if getattr(outcome, "status", "COMPLETED") == "DEFERRED_CONTRACT_MISMATCH" else "completed", "usage": outcome.usage,
                  "input_tokens": outcome.usage["input_tokens"],
                  "output_tokens": outcome.usage["output_tokens"]}
                 if item["id"] == step.id else item
@@ -3736,6 +3884,13 @@ class Orchestrator:
                 step_id=following, head=cycle_parent_sha, tree=outcome.tree_after,
             )
         self._update_v2_usage(store, run_dir)
+        deferred_mismatches = _deferred_contract_mismatches(
+            repair_plan, self._repair_v2_step_results
+        )
+        if _has_deferred_contract_mismatches(self._repair_v2_step_results) and not claude_revision_enabled:
+            raise OrchestrationError(
+                "UNRESOLVED_CONTRACT_MISMATCH: HUMAN_REQUIRED: Claude revision is disabled"
+            )
         if run_claude_c02:
             if start is not None and start.phase is ResumePhase.CHECKS_C02:
                 _archive_attempt(run_dir / "revision" / "C02", names=_PRE_CHECK_ATTEMPT_ARTIFACTS)
@@ -3749,6 +3904,12 @@ class Orchestrator:
                 artifact_dir=run_dir / "revision" / "C02", contract_dir=repair_dir,
                 mutable_scope=repair_scope,
                 luna_reports=_step_reports_text(self._repair_v2_step_results),
+                deferred_mismatches=(
+                    "C01 DEFERRED CONTRACT MISMATCHES\n"
+                    f"{_deferred_contract_mismatches(original_plan, self._last_v2_step_results)}\n"
+                    "C02 DEFERRED CONTRACT MISMATCHES\n"
+                    f"{deferred_mismatches}"
+                ),
                 cycle=2,
             )
             if revision_error is not None:
@@ -3896,6 +4057,12 @@ class Orchestrator:
                     ),
                     cycle_history=cycle_history,
                     scope_delta=_json_text(scope_delta),
+                    deferred_mismatches=(
+                        "C01 DEFERRED CONTRACT MISMATCHES\n"
+                        f"{_deferred_contract_mismatches(original_plan, self._last_v2_step_results)}\n"
+                        "C02 DEFERRED CONTRACT MISMATCHES\n"
+                        f"{deferred_mismatches}"
+                    ),
                 ),
                 artifacts_dir=run_dir / "review" / "C02",
                 worktree=info.worktree, base_sha=base_sha,
@@ -3960,6 +4127,8 @@ class Orchestrator:
         profile_id: str | None = None,
         tree_before: str | None = None,
         tree_after: str | None = None,
+        mismatch: str | None = None,
+        mismatch_clean: bool = False,
         step_dir: Path | None = None,
     ) -> RunResult:
         try:
@@ -4002,6 +4171,10 @@ class Orchestrator:
                     "id": step_id, "status": "FAILED", "reason": reason,
                     "profile_id": profile_id,
                     "tree_before": tree_before, "tree_after": tree_after,
+                    **({"changed_paths": []} if reason == "AGENT_CONTRACT_MISMATCH" and tree_before == tree_after else {}),
+                    **({"mismatch": _bounded_v2_report(mismatch)} if mismatch else {}),
+                    **({"mismatch_clean": mismatch_clean}
+                       if reason == "AGENT_CONTRACT_MISMATCH" else {}),
                     "usage": step_usage,
                 }))
         return RunResult(run_dir, RunStatus.FAILED,
@@ -4484,6 +4657,9 @@ class Orchestrator:
                 resume={**record, "status": "refused"}, current_step=None,
             )
             return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
+        # Validation may reconcile a historical clean mismatch and advance
+        # the durable boundary to the following Luna step.
+        checkpoint = resumed.checkpoint
         claimed = store.transition_if(
             state.get("status", RunStatus.FAILED), state.get("updated_at"),
             status=PHASE_STATUS[checkpoint.phase], failure=None, current_step=None,
@@ -5219,6 +5395,61 @@ class Orchestrator:
             ]
         except GitError as exc:
             refuse(f"Git state is unreadable: {exc}")
+        # A historical/current run may have failed before clean mismatch
+        # semantics existed.  Reconcile only the exact no-op shape: the
+        # failed artifact, checkpoint tree, current candidate/index, and
+        # clean worktree must all agree.  Any residual evidence remains an
+        # operator-required failure.
+        failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+        if (
+            failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
+            and is_clean_contract_mismatch_artifact(run_dir, state, checkpoint)
+        ):
+            step_id = checkpoint.step_id
+            record = _read_json_artifact(run_dir / "steps" / step_id / "step.json")
+            if not isinstance(record, dict):
+                raise ResumeIntegrityError("clean mismatch artifact is missing")
+            if (
+                candidate != record.get("tree_before")
+                or index_tree != candidate
+                or dirty
+                or status_porcelain(worktree, include_ignored=True)
+            ):
+                raise ResumeRequiresOperatorError(
+                    "clean contract mismatch proof no longer matches the current worktree"
+                )
+            recorded_ownership = state.get("git_ownership")
+            if isinstance(recorded_ownership, Mapping):
+                current_ownership = _git_ownership(repo, worktree)
+                if _git_ownership_payload(current_ownership) != dict(recorded_ownership):
+                    raise ResumeRequiresOperatorError(
+                        "clean contract mismatch proof no longer matches Git ownership"
+                    )
+            mismatch = record.get("mismatch")
+            if not isinstance(mismatch, str) or not mismatch.strip():
+                detail = failure.get("detail")
+                mismatch = re.sub(rf"^step={re.escape(step_id)}\s*", "", detail or "")
+            mismatch = _bounded_v2_report(redact(mismatch, self._secrets))
+            if not mismatch:
+                raise ResumeIntegrityError("clean contract mismatch explanation is missing")
+            atomic_write_text(run_dir / "steps" / step_id / "step.json", _json_text({
+                "id": step_id, "status": "DEFERRED_CONTRACT_MISMATCH",
+                "profile_id": record.get("profile_id"),
+                "tree_before": record["tree_before"], "tree_after": record["tree_before"],
+                "changed_paths": [], "mismatch": mismatch,
+                "usage": normalize_usage(record.get("usage")),
+            }))
+            ids = [step.id for step in plan.steps]
+            index = ids.index(step_id)
+            following = ids[index + 1] if index + 1 < len(ids) else None
+            next_phase = ResumePhase.INITIAL_STEP if following else ResumePhase.CHECKS_C01
+            checkpoint = ResumeCheckpoint(
+                next_phase, 1, following, checkpoint.expected_head_sha,
+                record["tree_before"], checkpoint.execution_selection_sha256,
+                checkpoint.plan_identity, checkpoint.repair_bundle_sha256,
+                checkpoint.scope_delta_sha256,
+            )
+            resume_module.write_checkpoint(run_dir, checkpoint)
         if unapproved:
             refuse("the candidate contains a path outside the approved scope")
         resumed = _ResumedRun(

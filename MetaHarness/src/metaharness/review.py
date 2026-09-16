@@ -113,6 +113,7 @@ def build_reviewer_prompt(
     candidate_commit: str = "",
     iteration: int = 1,
     cycle_history: str = "",
+    deferred_mismatches: str = "",
     template: str | None = None,
 ) -> str:
     """Build the reviewer's single user message.
@@ -138,6 +139,9 @@ def build_reviewer_prompt(
         "{{CANDIDATE_COMMIT}}": _require_text("candidate_commit", candidate_commit),
         "{{ITERATION}}": str(iteration),
         "{{CYCLE_HISTORY}}": _require_text("cycle_history", cycle_history),
+        "{{DEFERRED_CONTRACT_MISMATCHES}}": _require_text(
+            "deferred_mismatches", deferred_mismatches
+        ),
     }
     if template is None:
         template = _prompt_template_path().read_text(encoding="utf-8")
@@ -493,6 +497,7 @@ class Reviewer:
         candidate_commit: str = "",
         iteration: int = 1,
         cycle_history: str = "",
+        deferred_mismatches: str = "",
     ) -> ReviewResult:
         request = build_reviewer_prompt(
             spec,
@@ -510,6 +515,7 @@ class Reviewer:
             candidate_commit=candidate_commit,
             iteration=iteration,
             cycle_history=cycle_history,
+            deferred_mismatches=deferred_mismatches,
             template=self.template,
         )
         target = Path(artifacts_dir) if artifacts_dir is not None else None

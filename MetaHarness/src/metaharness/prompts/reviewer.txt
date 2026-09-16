@@ -218,6 +218,14 @@ when additional source context is needed.
 {{LUNA_REPORTS}}
 </LUNA REPORTS>
 
+<DEFERRED CONTRACT MISMATCHES>
+{{DEFERRED_CONTRACT_MISMATCHES}}
+
+These summaries identify Luna steps that were not implemented directly.
+Claude was responsible for recovering their intent in the final worktree;
+review the candidate against the original SPEC and approved plan normally.
+</DEFERRED CONTRACT MISMATCHES>
+
 <REVISION REPORT>
 {{REVISION_REPORT}}
 </REVISION REPORT>

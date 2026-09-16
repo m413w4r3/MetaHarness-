@@ -305,6 +305,7 @@ RESUMABLE_FAILURES: Mapping[str, frozenset[ResumePhase]] = {
         ResumePhase.CANDIDATE_PUSH_C02,
         ResumePhase.PUBLISH,
     }),
+    "AGENT_CONTRACT_MISMATCH": frozenset({ResumePhase.INITIAL_STEP}),
 }
 # These are not ordinary retryable operation failures.  They mean that the
 # authority needed to prove a retry has been lost (or an agent crossed a Git
@@ -314,7 +315,6 @@ _NON_RESUMABLE_FAILURES = frozenset({
     "BASE_MOVED_SINCE_RUN", "TOCTOU_FAILURE", "RESUME_INTEGRITY_FAILURE",
     "RESUME_REQUIRES_OPERATOR",
     "STEP_WRITE_SET_VIOLATION", "STEP_CONTRACT_DRIFT", "AGENT_NO_CHANGE",
-    "AGENT_CONTRACT_MISMATCH",
     "REVISION_SCOPE_VIOLATION",
     "HUMAN_REQUIRED", "REPAIR_SCOPE_EXPANSION", "REPAIR_SCOPE_BOUND_EXCEEDED",
 })
@@ -519,7 +519,14 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     if checkpoint is None:
         return ResumeInfo(False, reason="no resume checkpoint")
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-    if str(failure.get("reason")) in _NON_RESUMABLE_FAILURES:
+    failure_reason = str(failure.get("reason"))
+    clean_mismatch = (
+        failure_reason == "AGENT_CONTRACT_MISMATCH"
+        and is_clean_contract_mismatch_artifact(directory, state, checkpoint)
+    )
+    if failure_reason in _NON_RESUMABLE_FAILURES or (
+        failure_reason == "AGENT_CONTRACT_MISMATCH" and not clean_mismatch
+    ):
         return ResumeInfo(False, reason="failure requires operator intervention")
     # Requirements are deliberately phase-specific.  In particular, context
     # and planner failures are resumable before an approval or worktree exists.
@@ -533,10 +540,48 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
         if not isinstance(worktree, str) or not Path(worktree).is_dir():
             return ResumeInfo(False, reason="run worktree is missing")
     return ResumeInfo(
-        True, checkpoint.phase.value, resume_label(checkpoint),
+        True, checkpoint.phase.value,
+        "CONTINUE AFTER CLEAN MISMATCH" if clean_mismatch else resume_label(checkpoint),
         expected_tree=checkpoint.expected_tree_sha, cycle=checkpoint.cycle,
         step_id=checkpoint.step_id,
     )
+
+
+def is_clean_contract_mismatch_artifact(
+    run_dir: str | Path, state: Mapping[str, Any], checkpoint: ResumeCheckpoint,
+) -> bool:
+    """Cheap proof that a failed mismatch has the shape eligible for recovery.
+
+    Git identity and the current worktree are deliberately checked by the
+    orchestrator; this helper only decides whether the durable evidence is
+    sufficient to attempt that fail-closed validation.
+    """
+
+    if checkpoint.phase is not ResumePhase.INITIAL_STEP or checkpoint.step_id is None:
+        return False
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    if failure.get("reason") != "AGENT_CONTRACT_MISMATCH":
+        return False
+    record = _read_json(
+        Path(run_dir) / "steps" / checkpoint.step_id / "step.json", 128 * 1024
+    )
+    if not isinstance(record, dict) or record.get("id") != checkpoint.step_id:
+        return False
+    if record.get("status") != "FAILED":
+        return False
+    before, after = record.get("tree_before"), record.get("tree_after")
+    if not isinstance(before, str) or not _OBJECT_ID.fullmatch(before) or before != after:
+        return False
+    changed = record.get("changed_paths", [])
+    if changed != []:
+        return False
+    if record.get("mismatch_clean") is False:
+        return False
+    mismatch = record.get("mismatch")
+    if not isinstance(mismatch, str) or not mismatch.strip():
+        detail = failure.get("detail")
+        mismatch = _LEGACY_STEP_DETAIL.sub("", detail, count=1) if isinstance(detail, str) else ""
+    return isinstance(mismatch, str) and bool(mismatch.strip()) and len(mismatch.encode("utf-8", errors="replace")) <= 32_000
 
 
 class ResumeError(RuntimeError):
@@ -581,5 +626,6 @@ __all__ = [
     "read_checkpoint_record",
     "resume_info",
     "resume_label",
+    "is_clean_contract_mismatch_artifact",
     "write_checkpoint",
 ]

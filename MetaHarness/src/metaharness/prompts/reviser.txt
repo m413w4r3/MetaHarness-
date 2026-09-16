@@ -46,6 +46,21 @@ MetaHarness runs deterministic checks after you.
 {{LUNA_STEP_REPORTS}}
 </LUNA STEP REPORTS>
 
+<DEFERRED LUNA CONTRACT MISMATCHES>
+{{DEFERRED_LUNA_CONTRACT_MISMATCHES}}
+
+These Luna steps could not complete their approved transformation because
+their local contract became incompatible with the partially migrated
+repository.
+
+Inspect the final worktree and resolve every remaining issue necessary to
+satisfy the original approved plan and SPEC.
+
+You may modify any path in the overall approved mutable scope, including paths
+belonging to deferred steps. Do not replay the steps literally and do not
+expand beyond that scope.
+</DEFERRED LUNA CONTRACT MISMATCHES>
+
 <CURRENT CHANGED FILES>
 {{CURRENT_CHANGED_FILES}}
 </CURRENT CHANGED FILES>

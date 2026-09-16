@@ -241,6 +241,22 @@ class FakeLuna:
                            usage=usage, stderr_tail=stderr)
 
 
+class CleanMismatchLuna(FakeLuna):
+    """Luna double that reports a clean contract mismatch for selected steps."""
+
+    def __init__(self, behaviors: dict[tuple[int, str], Any], mismatch_steps: set[str]):
+        super().__init__(behaviors)
+        self.mismatch_steps = mismatch_steps
+
+    def run_step(self, contract: str, worktree: Any, artifacts_dir: Any, **kwargs: Any) -> AgentResult:
+        result = super().run_step(contract, worktree, artifacts_dir, **kwargs)
+        if Path(artifacts_dir).name in self.mismatch_steps:
+            message = "META CONTRACT MISMATCH v1\nlocal contract is stale\n"
+            Path(artifacts_dir, "agent.final.md").write_text(message, encoding="utf-8")
+            return dataclasses.replace(result, final_message=message)
+        return result
+
+
 def writer(path: str, content: str) -> Callable[[Path], None]:
     return lambda root: write(root / path, content)
 
@@ -464,6 +480,43 @@ class P28Harness(unittest.TestCase):
 
 
 class FullPipelineTests(P28Harness):
+    def test_clean_contract_mismatch_is_deferred_and_recovered_by_claude(self) -> None:
+        luna = CleanMismatchLuna(
+            {
+                (1, "S02"): writer("src/b.py", "B = 2\n"),
+                (1, "S03"): writer("src/c.py", "C = 3\n"),
+            },
+            {"S01"},
+        )
+        result, _planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=luna,
+            reviews=[PASS],
+            plan=STAGED_PLAN,
+            claude=FakeClaude({1: writer("src/a.py", "A = 2\n")}),
+        )
+        self.assert_published_once(result, pushed)
+        self.assertEqual([call["step"] for call in luna.calls], ["S01", "S02", "S03"])
+        step = json.loads((result.run_dir / "steps/S01/step.json").read_text())
+        self.assertEqual(step["status"], "DEFERRED_CONTRACT_MISMATCH")
+        self.assertEqual(step["changed_paths"], [])
+        self.assertIn("local contract is stale", step["mismatch"])
+        self.assertIn("DEFERRED LUNA CONTRACT MISMATCHES", claude.calls[0]["prompt"])
+        self.assertIn("S01", claude.calls[0]["prompt"])
+        self.assertIn("DEFERRED CONTRACT MISMATCHES", reviewer.prompts[0])
+        self.assertIn("S01", reviewer.prompts[0])
+
+    def test_clean_contract_mismatch_without_claude_never_creates_candidate(self) -> None:
+        luna = CleanMismatchLuna({}, {"S01"})
+        result, _planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=luna, reviews=[PASS], revision=False,
+        )
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.state["failure"]["reason"], "UNRESOLVED_CONTRACT_MISMATCH")
+        self.assertFalse((result.run_dir / "candidate/C01/commit.json").exists())
+        self.assertEqual(pushed.call_count, 0)
+        self.assertEqual(reviewer.prompts, [])
+        self.assertEqual(claude.calls, [])
+
     def test_v2_large_diff_uses_excerpt_but_still_revises_commits_pushes_and_reviews(self) -> None:
         config = dataclasses.replace(self.load(), max_diff_bytes=400)
         large = "A = " + ("1" * 100_000) + "\n"

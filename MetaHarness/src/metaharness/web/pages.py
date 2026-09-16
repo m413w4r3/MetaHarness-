@@ -549,12 +549,16 @@ def _step_card(item: dict[str, Any], artifact: dict[str, Any]) -> str:
     event_items = "".join(f"<li>{_e(event)}</li>" for event in events) or '<li class="muted">No event yet.</li>'
     reason = artifact.get("failure_reason")
     reason_line = f'<p class="danger">failure: {_e(reason)}</p>' if reason else ""
+    mismatch_line = (
+        f'<p class="warning"><strong>DEFERRED CONTRACT MISMATCH</strong>: {_e(artifact.get("mismatch"))}</p>'
+        if status == "deferred" and artifact.get("mismatch") else ""
+    )
     return (
-        f'<details class="card step {_e(status)}"{" open" if status in {"running", "failed"} else ""}>'
+        f'<details class="card step {_e(status)}"{" open" if status in {"running", "failed", "deferred"} else ""}>'
         f'<summary>{_e(item.get("id"))} {icon} — {_e(item.get("title"))} · '
         f'{_e(usage.get("input_tokens", 0))} input / {_e(usage.get("output_tokens", 0))} output{warning}</summary>'
         f'<p>profile: <span class="mono">{_e(item.get("profile_id"))}</span></p>'
-        f'<p>status: {_e(status)}</p>{reason_line}'
+        f'<p>status: {_e(status)}</p>{reason_line}{mismatch_line}'
         f'{_context_line(item.get("id"), cycle, usage, level)}'
         f'<h4>Recent events</h4><ul class="events">{event_items}</ul>'
         f'<details><summary>contract</summary><pre>{_e(artifact.get("contract"))}</pre></details>'
@@ -845,7 +849,7 @@ def run_page_polls(run: dict[str, Any]) -> bool:
 
 
 _PIPELINE_SYMBOLS = {
-    "complete": "✓", "running": "▶", "failed": "✗", "waiting": "·", "resumable": "↻", "skipped": "–",
+    "complete": "✓", "running": "▶", "failed": "✗", "deferred": "⚠", "waiting": "·", "resumable": "↻", "skipped": "–",
 }
 _FAILURE_MESSAGES = {
     "CLAUDE_FAILED": "Claude invocation failed",
@@ -856,6 +860,7 @@ _FAILURE_MESSAGES = {
     "AGENT_TIMEOUT": "Luna step timed out",
     "AGENT_FAILED": "Luna step failed",
     "AGENT_NO_CHANGE": "Luna step changed nothing",
+    "UNRESOLVED_CONTRACT_MISMATCH": "Deferred Luna contract mismatch needs Claude or an operator",
     "STEP_WRITE_SET_VIOLATION": "Luna step changed an unauthorized path",
     "REVIEWER_TRANSPORT_FAILURE": "Reviewer could not be reached",
     "REVIEWER_OUTPUT_INVALID": "Reviewer answer is invalid",
@@ -892,7 +897,7 @@ def _pipeline_section(overview: dict[str, Any]) -> str:
     return (
         '<section class="pipeline"><h2>EXECUTION PIPELINE</h2>'
         f'<ol class="pipeline-list">{"".join(rows)}</ol>'
-        '<p class="muted small">✓ complete · ▶ running · ✗ failed · · waiting · ↻ resumable</p></section>'
+        '<p class="muted small">✓ complete · ▶ running · ⚠ deferred · ✗ failed · · waiting · ↻ resumable</p></section>'
     )
 
 

@@ -536,10 +536,13 @@ def registered_worktrees(repo: Path) -> frozenset[str]:
     )
 
 
-def status_porcelain(repo: Path) -> tuple[str, ...]:
+def status_porcelain(repo: Path, *, include_ignored: bool = False) -> tuple[str, ...]:
     """Return Git's porcelain status lines, including all untracked files."""
 
-    result = _git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+    args = ["status", "--porcelain=v1", "--untracked-files=all"]
+    if include_ignored:
+        args.append("--ignored=matching")
+    result = _git(repo, *args)
     return tuple(result.stdout.splitlines())
 
 

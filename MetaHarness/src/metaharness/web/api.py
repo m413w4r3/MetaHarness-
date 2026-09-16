@@ -537,7 +537,11 @@ def _bundle_entries(path: Path) -> list[dict[str, Any]]:
     ]
 
 
-_DURABLE_STEP_STATUS = {"COMPLETED": "completed", "FAILED": "failed"}
+_DURABLE_STEP_STATUS = {
+    "COMPLETED": "completed",
+    "DEFERRED_CONTRACT_MISMATCH": "deferred",
+    "FAILED": "failed",
+}
 
 
 def _cycle_steps(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -578,6 +582,16 @@ def _cycle_steps(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[
         status = item.get("status") or _DURABLE_STEP_STATUS.get(
             str(step_json.get("status")), "waiting"
         )
+        failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+        if (
+            status == "failed"
+            and failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
+            and step_json.get("reason") == "AGENT_CONTRACT_MISMATCH"
+            and step_json.get("tree_before") == step_json.get("tree_after")
+            and step_json.get("changed_paths", []) == []
+            and step_json.get("mismatch_clean") is not False
+        ):
+            status = "deferred"
         result.append({
             **item,
             "token_diagnostics": _token_diagnostics(step_dir),
@@ -588,6 +602,9 @@ def _cycle_steps(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[
             "profile_id": item.get("profile_id") or step_json.get("profile_id") or entry.get("implementer_profile"),
             "status": status,
             "failure_reason": step_json.get("reason"),
+            "mismatch": step_json.get("mismatch"),
+            "tree_before": step_json.get("tree_before"),
+            "tree_after": step_json.get("tree_after"),
             "contract": contract["text"],
             "contract_sha256": contract["sha256"],
             "contract_matches_bundle": contract["matches"],
@@ -1311,6 +1328,7 @@ _C02_PHASES = frozenset({
 })
 _PIPELINE_STEP_STATE = {
     "completed": "complete", "running": "running", "failed": "failed",
+    "deferred": "deferred",
     "interrupted": "failed", "waiting": "waiting",
 }
 
@@ -1387,6 +1405,18 @@ def _step_statuses(directory: Path, cycle: int, state: Mapping[str, Any]) -> lis
             status = _DURABLE_STEP_STATUS.get(
                 str(record.get("status")) if isinstance(record, dict) else "", "waiting"
             )
+        failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+        record = _load_json(root / "steps" / step_id / "step.json", max_bytes=MAX_RESULT_BYTES)
+        if (
+            status == "failed"
+            and failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
+            and isinstance(record, dict)
+            and record.get("reason") == "AGENT_CONTRACT_MISMATCH"
+            and record.get("tree_before") == record.get("tree_after")
+            and record.get("changed_paths", []) == []
+            and record.get("mismatch_clean") is not False
+        ):
+            status = "deferred"
         result.append((step_id, status))
     return result
 
