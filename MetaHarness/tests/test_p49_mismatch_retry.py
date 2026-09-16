@@ -147,6 +147,19 @@ class DriftingOrchestrator(Orchestrator):
         return outcome
 
 
+class CrashBeforeBoundedRetryOrchestrator(Orchestrator):
+    """Crash after a synthetic mismatch is durable, before its retry starts."""
+
+    def _run_codex_step_attempt(self, **kwargs: Any):  # type: ignore[override]
+        outcome = super()._run_codex_step_attempt(**kwargs)
+        if (
+            isinstance(outcome, DeferredStepExecutionOutcome)
+            and kwargs.get("mismatch_retry_count") == 0
+        ):
+            raise RuntimeError("simulated crash before bounded retry")
+        return outcome
+
+
 # The AW-002 recovery shape: eight completed steps, a clean mismatch on S09
 # and one step left after it.
 TEN_STEPS = tuple(f"S{number:02d}" for number in range(1, 11))
@@ -260,6 +273,148 @@ class MismatchRetryHarness(P29Harness):
 
 
 class BoundedRetryTests(MismatchRetryHarness):
+    def test_successful_no_change_retries_and_then_completes(self) -> None:
+        config = self.make_config()
+        luna = self.migration_luna(
+            mismatch_steps=set(),
+            behaviors={(1, "S03", 1): "nochange",
+                        (1, "S03", 2): writer("src/c.py", "C = 3\n")},
+        )
+        orchestrator, _planner, _reviewer, _l, _claude = self.orchestrator(
+            config, plans=[FOUR_STEP_PLAN], reviews=[PASS], luna=luna,
+        )
+        with self.count_pushes():
+            result = self.run_approved(config, orchestrator, "nochange-retry-ok", FOUR_STEPS)
+
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual([call["step"] for call in luna.calls],
+                         ["S01", "S02", "S03", "S03", "S04"])
+        self.assertIsNone(luna.calls[2]["retry_addendum"])
+        self.assertIn("Worker completed successfully without producing an in-scope candidate",
+                      luna.calls[3]["retry_addendum"])
+        step = json.loads((result.run_dir / "steps/S03/step.json").read_text())
+        self.assertEqual((step["status"], step["mismatch_retry_count"], step["changed_paths"]),
+                         ("COMPLETED", 1, ["src/c.py"]))
+
+    def test_successful_no_change_twice_is_deferred_and_chain_continues(self) -> None:
+        config = self.make_config()
+        luna = self.migration_luna(
+            mismatch_steps=set(), behaviors={(1, "S03", 2): "nochange"},
+        )
+        orchestrator, _planner, _reviewer, _l, claude = self.orchestrator(
+            config, plans=[FOUR_STEP_PLAN], reviews=[PASS], luna=luna,
+        )
+        with self.count_pushes():
+            result = self.run_approved(config, orchestrator, "nochange-deferred", FOUR_STEPS)
+
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual([call["step"] for call in luna.calls],
+                         ["S01", "S02", "S03", "S03", "S04"])
+        step = json.loads((result.run_dir / "steps/S03/step.json").read_text())
+        self.assertEqual((step["status"], step["tree_before"], step["tree_after"],
+                          step["changed_paths"], step["mismatch_retry_count"]),
+                         ("DEFERRED_CONTRACT_MISMATCH", step["tree_before"],
+                          step["tree_before"], [], 1))
+        self.assertIn("No in-scope change remained necessary after bounded retry", step["mismatch"])
+        self.assertIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
+
+    def test_successful_no_change_twice_without_claude_is_unresolved(self) -> None:
+        config = self.make_config(revision=False)
+        luna = self.migration_luna(
+            mismatch_steps=set(), behaviors={(1, "S03", 2): "nochange"},
+        )
+        orchestrator, _planner, reviewer, _l, claude = self.orchestrator(
+            config, plans=[FOUR_STEP_PLAN], reviews=[PASS], luna=luna,
+        )
+        with self.count_pushes():
+            result = self.run_approved(config, orchestrator, "nochange-unresolved", FOUR_STEPS)
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.state["failure"]["reason"], "UNRESOLVED_CONTRACT_MISMATCH")
+        self.assertEqual([call["step"] for call in luna.calls],
+                         ["S01", "S02", "S03", "S03", "S04"])
+        self.assertEqual((claude.calls, reviewer.prompts), ([], []))
+
+    def test_no_change_with_head_drift_fails_closed(self) -> None:
+        def move_head(root: Path) -> None:
+            git(root, "commit", "--allow-empty", "-qm", "foreign head move")
+
+        config = self.make_config()
+        luna = self.migration_luna(mismatch_steps=set(), behaviors={(1, "S03", 1): move_head})
+        orchestrator, _planner, _reviewer, _l, _claude = self.orchestrator(
+            config, plans=[FOUR_STEP_PLAN], reviews=[PASS], luna=luna,
+        )
+        result = self.run_approved(config, orchestrator, "nochange-head-drift", FOUR_STEPS)
+
+        self.assertEqual(result.state["failure"]["reason"], "AGENT_COMMITTED")
+        self.assertEqual([call["step"] for call in luna.calls], ["S01", "S02", "S03"])
+
+    def test_no_change_with_untracked_out_of_scope_file_fails_closed(self) -> None:
+        config = self.make_config()
+        luna = self.migration_luna(
+            mismatch_steps=set(),
+            behaviors={(1, "S03", 1): writer("src/leftover.py", "leftover = True\n")},
+        )
+        orchestrator, _planner, _reviewer, _l, _claude = self.orchestrator(
+            config, plans=[FOUR_STEP_PLAN], reviews=[PASS], luna=luna,
+        )
+        result = self.run_approved(config, orchestrator, "nochange-untracked", FOUR_STEPS)
+
+        self.assertEqual(result.state["failure"]["reason"], "STEP_WRITE_SET_VIOLATION")
+        self.assertEqual([call["step"] for call in luna.calls], ["S01", "S02", "S03"])
+
+    def test_exit1_without_change_is_not_retried_as_no_change(self) -> None:
+        config = self.make_config()
+        luna = self.migration_luna(mismatch_steps=set(), behaviors={(1, "S03", 1): "exit1"})
+        orchestrator, _planner, _reviewer, _l, _claude = self.orchestrator(
+            config, plans=[FOUR_STEP_PLAN], reviews=[PASS], luna=luna,
+        )
+        result = self.run_approved(config, orchestrator, "nochange-exit1", FOUR_STEPS)
+
+        self.assertEqual(result.state["failure"]["reason"], "AGENT_FAILED")
+        self.assertEqual([call["step"] for call in luna.calls], ["S01", "S02", "S03"])
+
+    def test_timeout_without_change_is_not_retried_as_no_change(self) -> None:
+        config = self.make_config()
+        luna = self.migration_luna(mismatch_steps=set(), behaviors={(1, "S03", 1): "timeout"})
+        orchestrator, _planner, _reviewer, _l, _claude = self.orchestrator(
+            config, plans=[FOUR_STEP_PLAN], reviews=[PASS], luna=luna,
+        )
+        result = self.run_approved(config, orchestrator, "nochange-timeout", FOUR_STEPS)
+
+        self.assertEqual(result.state["failure"]["reason"], "AGENT_TIMEOUT")
+        self.assertEqual([call["step"] for call in luna.calls], ["S01", "S02", "S03"])
+
+    def test_resume_between_no_change_attempts_never_creates_a_third_attempt(self) -> None:
+        config = self.make_config()
+        first_luna = self.migration_luna(mismatch_steps=set())
+        first = CrashBeforeBoundedRetryOrchestrator(
+            config,
+            planner_client=QueueClient("planner", [FOUR_STEP_PLAN], self.events),
+            reviewer_client=QueueClient("reviewer", [], self.events),
+            agent=first_luna,
+            reviser=FakeClaude(log=self.events),
+        )
+        failed = self.run_approved(config, first, "nochange-crash", FOUR_STEPS)
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        self.assertEqual([call["step"] for call in first_luna.calls], ["S01", "S02", "S03"])
+
+        retry_luna = self.migration_luna(
+            mismatch_steps=set(),
+            behaviors={(1, "S03", 1): writer("src/c.py", "C = 3\n"),
+                        (1, "S04"): writer("src/future.py", "from src.c import present\n")},
+        )
+        resumed_orchestrator, planner, _reviewer, _l, _claude = self.orchestrator(
+            config, reviews=[PASS], luna=retry_luna,
+        )
+        with self.count_pushes():
+            resumed = resumed_orchestrator.resume("nochange-crash")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual([call["step"] for call in retry_luna.calls], ["S03", "S04"])
+        self.assertIn("<MISMATCH RETRY ADDENDUM>", retry_luna.calls[0]["retry_addendum"])
+        self.assertEqual(planner.prompts, [])
+
     def test_clean_mismatch_retry_completes_and_defers_only_the_verification(self) -> None:
         config = self.make_config()
         luna = self.migration_luna(reports={"S03#2": DEFERRED_REPORT})

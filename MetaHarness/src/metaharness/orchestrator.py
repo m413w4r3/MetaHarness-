@@ -868,6 +868,17 @@ class DeferredStepExecutionOutcome:
         self.deferred_verify = deferred_verify
 
 
+_SYNTHETIC_NO_CHANGE_MISMATCH = (
+    "Worker completed successfully without producing an in-scope candidate "
+    "change. Retry once to distinguish an already-satisfied step from a stale "
+    "contract."
+)
+_BOUNDED_NO_CHANGE_MISMATCH = (
+    "No in-scope change remained necessary after bounded retry; the step is "
+    "deferred until the contract is revisited."
+)
+
+
 class StepExecutionFailure(OrchestrationError):
     """One Codex step failed a gate; the C01/C02 caller owns the run status."""
 
@@ -3494,6 +3505,8 @@ class Orchestrator:
                 return "the candidate tree is no longer the pre-step tree"
             if index_tree_sha(worktree) != tree_before:
                 return "the index is no longer the pre-step index"
+            if _status_has_unstaged_or_untracked(status_porcelain(worktree)):
+                return "the worktree has unstaged or untracked modifications"
         except GitError as exc:
             return f"Git state is unreadable: {exc}"
         violations = _ownership_violations(
@@ -3625,6 +3638,26 @@ class Orchestrator:
         mismatch = None
         if not result.timed_out and result.exit_code == 0:
             mismatch = contract_mismatch_explanation(result.final_message)
+            if mismatch is None:
+                # A successful, completely clean no-op has the same semantic
+                # meaning as a worker-declared structural mismatch.  Feed it
+                # through the existing bounded retry path; any boundary drift
+                # remains fail-closed below.
+                no_change_tree = _safe_candidate_tree(worktree)
+                no_change_index = _safe_index_tree(worktree)
+                no_change_status = _safe_status(worktree)
+                if (
+                    no_change_tree == tree_before
+                    and index_before == tree_before
+                    and no_change_index == tree_before
+                    and not _status_has_unstaged_or_untracked(status_before)
+                    and no_change_status == status_before
+                    and not ownership_violations
+                ):
+                    mismatch = (
+                        _BOUNDED_NO_CHANGE_MISMATCH
+                        if mismatch_retry_count else _SYNTHETIC_NO_CHANGE_MISMATCH
+                    )
         if mismatch is not None:
             tree_after = _safe_candidate_tree(worktree)
             index_after = _safe_index_tree(worktree)
