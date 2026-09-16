@@ -166,6 +166,102 @@ def _safe_json_artifact(run_dir: Path, relative: str, secrets: tuple[str, ...], 
     return result + "JSON (bounded):\n" + text + "\n"
 
 
+_MAX_TERMINAL_ERRORS = 8
+_MAX_TERMINAL_FIELD_CHARS = 500
+
+
+def _terminal_text(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return "—"
+    return " ".join(value.split())[:_MAX_TERMINAL_FIELD_CHARS] or "—"
+
+
+def _claude_terminal_summary(
+    run_dir: Path, relative: str, secrets: tuple[str, ...]
+) -> str:
+    """Render only bounded terminal metadata from the durable result."""
+
+    item = _artifact(run_dir, relative)
+    payload: Mapping[str, Any] = {}
+    if item.exists:
+        text, _size, truncated = _read_bounded(item.path, MAX_ARTIFACT_BYTES, secrets)
+        try:
+            candidate = json.loads(text) if not truncated else None
+        except (TypeError, ValueError):
+            candidate = None
+        if isinstance(candidate, Mapping):
+            payload = candidate
+
+    is_error = payload.get("terminal_is_error")
+    is_error_text = str(is_error).lower() if isinstance(is_error, bool) else "—"
+    num_turns = payload.get("terminal_num_turns")
+    num_turns_text = str(num_turns) if isinstance(num_turns, int) and not isinstance(num_turns, bool) else "—"
+    raw_errors = payload.get("terminal_errors")
+    if isinstance(raw_errors, (list, tuple)):
+        errors = [
+            _terminal_text(error)
+            for error in raw_errors[:_MAX_TERMINAL_ERRORS]
+            if isinstance(error, str) and error
+        ]
+        errors_text = "; ".join(errors) if errors else "—"
+    else:
+        errors_text = "—"
+    summary = "\n".join([
+        "Terminal:",
+        f"  type: {_terminal_text(payload.get('terminal_type'))}",
+        f"  subtype: {_terminal_text(payload.get('terminal_subtype'))}",
+        f"  is_error: {is_error_text}",
+        f"  num_turns: {num_turns_text}",
+        f"  stop_reason: {_terminal_text(payload.get('terminal_stop_reason'))}",
+        f"  errors: {errors_text}",
+    ])
+    return _clean(summary, secrets)
+
+
+def _claude_result_artifact(
+    run_dir: Path, relative: str, secrets: tuple[str, ...]
+) -> str:
+    """Keep the legacy result visible without replaying untrusted fields."""
+
+    item = _artifact(run_dir, relative)
+    result = _artifact_header(item)
+    if not item.exists:
+        return result
+    text, _size, truncated = _read_bounded(item.path, MAX_ARTIFACT_BYTES, secrets)
+    try:
+        payload = json.loads(text) if not truncated else None
+    except (TypeError, ValueError):
+        payload = None
+    if not isinstance(payload, Mapping):
+        return result + "JSON (bounded):\n" + text + "\n"
+
+    safe = {
+        key: payload[key]
+        for key in (
+            "exit_code", "timed_out", "final_message", "usage", "stderr_tail",
+        )
+        if key in payload
+    }
+    for key in ("terminal_type", "terminal_subtype", "terminal_stop_reason"):
+        if key in payload:
+            safe[key] = _terminal_text(payload[key])
+    if isinstance(payload.get("terminal_is_error"), bool):
+        safe["terminal_is_error"] = payload["terminal_is_error"]
+    if (
+        isinstance(payload.get("terminal_num_turns"), int)
+        and not isinstance(payload.get("terminal_num_turns"), bool)
+    ):
+        safe["terminal_num_turns"] = payload["terminal_num_turns"]
+    errors = payload.get("terminal_errors")
+    if isinstance(errors, (list, tuple)):
+        safe["terminal_errors"] = [
+            _terminal_text(error)
+            for error in errors[:_MAX_TERMINAL_ERRORS]
+            if isinstance(error, str) and error
+        ]
+    return result + "JSON (safe subset):\n" + _clean(_json(safe), secrets)
+
+
 def _section(title: str, body: str) -> str:
     return f"## {title}\n\n{body.rstrip()}\n\n"
 
@@ -487,9 +583,12 @@ def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str,
     )
     claude_body = _claude_status(config, run_dir, revision_exists)
     if revision_exists:
+        claude_body += "\n" + _claude_terminal_summary(
+            run_dir, revision + "agent.result.json", secrets
+        )
         claude_body += "\n" + "\n".join([
             _artifact_text(run_dir, revision + "agent.prompt.txt", secrets),
-            _artifact_json(run_dir, revision + "agent.result.json", secrets),
+            _claude_result_artifact(run_dir, revision + "agent.result.json", secrets),
             _artifact_text(run_dir, revision + "agent.final.md", secrets),
             _artifact_text(run_dir, revision + "agent.stderr.log", secrets, MAX_STDERR_BYTES, tail=True),
             _artifact_json(run_dir, revision + "report.json", secrets),

@@ -865,6 +865,7 @@ _FAILURE_MESSAGES = {
     "CLAUDE_FAILED": "Claude invocation failed",
     "CLAUDE_AUTH_FAILURE": "Claude authentication failed",
     "CLAUDE_TIMEOUT": "Claude revision timed out",
+    "CLAUDE_MAX_TURNS": "Claude stopped after reaching its turn limit",
     "CLAUDE_COMMITTED": "Claude created a commit",
     "CODEX_AUTH_FAILURE": "Codex authentication failed",
     "AGENT_TIMEOUT": "Luna step timed out",

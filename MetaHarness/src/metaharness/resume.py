@@ -285,8 +285,9 @@ def mark_checkpoint_completed(run_dir: str | Path) -> None:
 
 
 # Kept as a source-compatibility export for integrations that imported it in
-# P29.  Resumability is no longer decided from this table: the authoritative
-# criterion is the valid pending checkpoint and its phase-specific invariants.
+# P29.  A valid pending checkpoint and its phase-specific invariants remain
+# authoritative; this table also rejects an explicitly classified failure
+# paired with an impossible operation phase.
 _CLAUDE_PHASES = frozenset({ResumePhase.CLAUDE_C01, ResumePhase.CLAUDE_C02})
 _CODEX_PHASES = _STEP_PHASES
 _REVIEWER_PHASES = frozenset({ResumePhase.REVIEWER_C01, ResumePhase.REVIEWER_C02})
@@ -294,6 +295,7 @@ RESUMABLE_FAILURES: Mapping[str, frozenset[ResumePhase]] = {
     "CLAUDE_FAILED": _CLAUDE_PHASES,
     "CLAUDE_AUTH_FAILURE": _CLAUDE_PHASES,
     "CLAUDE_TIMEOUT": _CLAUDE_PHASES,
+    "CLAUDE_MAX_TURNS": _CLAUDE_PHASES,
     "CODEX_AUTH_FAILURE": _CODEX_PHASES,
     "AGENT_TIMEOUT": _CODEX_PHASES,
     "AGENT_FAILED": _CODEX_PHASES,
@@ -452,7 +454,7 @@ def infer_legacy_checkpoint(run_dir: str | Path, state: Mapping[str, Any]) -> Re
     except ResumeCheckpointError:
         return None
     try:
-        if reason in {"CLAUDE_FAILED", "CLAUDE_AUTH_FAILURE", "CLAUDE_TIMEOUT"}:
+        if reason in {"CLAUDE_FAILED", "CLAUDE_AUTH_FAILURE", "CLAUDE_TIMEOUT", "CLAUDE_MAX_TURNS"}:
             if (directory / "revision" / "tree_after.txt").exists():
                 return None
             tree = (_read_text(directory / "revision" / "tree_before.txt") or "").strip()
@@ -520,6 +522,9 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
         return ResumeInfo(False, reason="no resume checkpoint")
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     failure_reason = str(failure.get("reason"))
+    allowed_phases = RESUMABLE_FAILURES.get(failure_reason)
+    if allowed_phases is not None and checkpoint.phase not in allowed_phases:
+        return ResumeInfo(False, reason="failure does not match resume checkpoint")
     clean_mismatch = (
         failure_reason == "AGENT_CONTRACT_MISMATCH"
         and is_clean_contract_mismatch_artifact(directory, state, checkpoint)

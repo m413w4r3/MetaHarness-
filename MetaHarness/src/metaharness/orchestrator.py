@@ -3893,7 +3893,14 @@ class Orchestrator:
             return result, "CLAUDE_TIMEOUT"
         if result.exit_code != 0:
             _record_failure_tree(artifact_dir, info.worktree)
-            return result, "CLAUDE_AUTH_FAILURE" if claude_auth_failure else "CLAUDE_FAILED"
+            if claude_auth_failure:
+                return result, "CLAUDE_AUTH_FAILURE"
+            # Claude's terminal result is authoritative when available.  The
+            # textual fallback above remains for older CLI versions and old
+            # artifacts that do not expose terminal metadata.
+            if getattr(result, "terminal_subtype", None) == "error_max_turns":
+                return result, "CLAUDE_MAX_TURNS"
+            return result, "CLAUDE_FAILED"
         revision_ownership = _git_ownership(repo, info.worktree)
         if revision_ownership.head != expected_head:
             return result, "CLAUDE_COMMITTED"
