@@ -350,6 +350,19 @@ def _check_cards(checks: Any) -> str:
     return '<div class="grid">' + "".join(cards) + "</div>"
 
 
+def _check_repair_notice(run: dict[str, Any]) -> str:
+    state = run.get("state") if isinstance(run.get("state"), dict) else {}
+    repair = state.get("check_repair") if isinstance(state.get("check_repair"), dict) else {}
+    if not repair.get("attempted"):
+        return ""
+    failure_ids = repair.get("failure_ids") if isinstance(repair.get("failure_ids"), list) else []
+    detail = ", ".join(str(item) for item in failure_ids) or "ordinary CHECK_FAILED failures"
+    return (
+        '<div class="card fail"><p><strong>automatic check repair attempted</strong></p>'
+        f'<p>Failed checks: {_e(detail)}</p></div>'
+    )
+
+
 def _review(review: Any) -> str:
     if not review:
         return '<p class="muted">Aucune review.</p>'
@@ -1157,7 +1170,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
 {approval_forms}
 <section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config) if is_v2 else _execution_card(state, config)}</section>
 <section class="current-cycle"><h2>CURRENT CYCLE</h2>{_agent_auth_failure_notice(run, config)}{_live_events_card(polls)}{agent_section}</section>
-<section><h2>CHECKS</h2><details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
+<section><h2>CHECKS</h2>{_check_repair_notice(run)}<details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
 <section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details></section>
 {_usage_section(run)}
 {diagnostics_section}

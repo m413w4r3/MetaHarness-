@@ -467,9 +467,11 @@ def _prompt_footprint(run_dir: Path) -> str:
         for step_dir in step_dirs:
             add(f"{root}/{step_dir.name}/agent.prompt.txt", f"{root}/{step_dir.name}/{usage_name}", nested_usage=True)
     add("revision/C01/agent.prompt.txt", "revision/C01/usage.json")
+    add("revision/check-repair/C01/agent.prompt.txt", "revision/check-repair/C01/usage.json")
     add("review/C01/reviewer.request.txt", "review/C01/reviewer.usage.json")
     add("repair/C02/planner.request.txt", "repair/C02/planner.usage.json")
     add("revision/C02/agent.prompt.txt", "revision/C02/usage.json")
+    add("revision/check-repair/C02/agent.prompt.txt", "revision/check-repair/C02/usage.json")
     add("review/C02/reviewer.request.txt", "review/C02/reviewer.usage.json")
 
     lines = ["Prompt artifacts:", "| Relative path | Bytes | SHA256 | Input tokens |", "|---|---:|---|---:|"]
@@ -598,6 +600,21 @@ def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str,
             _artifact_text(run_dir, revision + "tree_after.txt", secrets),
         ])
     parts.append(_section(f"CLAUDE C0{cycle}", claude_body))
+    check_repair = run_dir / "revision" / "check-repair" / f"C0{cycle}"
+    if check_repair.is_dir():
+        before = f"checks/C0{cycle}/attempts/01/evidence.json"
+        current = f"checks/C0{cycle}/evidence.json"
+        parts.append(_section("AUTOMATIC CHECK REPAIR", "\n".join([
+            "automatic check repair attempted",
+            _artifact_text(run_dir, f"revision/check-repair/C0{cycle}/agent.prompt.txt", secrets),
+            _claude_result_artifact(run_dir, f"revision/check-repair/C0{cycle}/agent.result.json", secrets),
+            _artifact_text(run_dir, f"revision/check-repair/C0{cycle}/agent.final.md", secrets),
+            _artifact_json(run_dir, f"revision/check-repair/C0{cycle}/report.json", secrets),
+            "Checks before correction:",
+            _safe_json_artifact(run_dir, before, secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
+            "Checks after correction:",
+            _safe_json_artifact(run_dir, current, secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
+        ])))
     review = f"review/C0{cycle}/"
     if cycle == 1 and not (run_dir / review).is_dir() and (run_dir / "review.json").exists():
         review = ""

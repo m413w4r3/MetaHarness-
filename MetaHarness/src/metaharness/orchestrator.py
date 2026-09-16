@@ -483,6 +483,25 @@ def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
     return _hard_failure_items(bundle.failures)
 
 
+def _soft_check_failures(bundle: EvidenceBundle) -> list[str]:
+    """Return ordinary deterministic check failures eligible for one repair.
+
+    This deliberately accepts only the exact ``CHECK_FAILED:<name>`` family.
+    Anything else, including a future failure category, fails closed and must
+    never be handed to the corrective Claude pass.
+    """
+
+    if _hard_integrity_failures(bundle) or bundle.deterministic_passed:
+        return []
+    failures = list(bundle.failures)
+    if not failures or any(
+        not isinstance(item, str) or not item.startswith("CHECK_FAILED:")
+        for item in failures
+    ):
+        return []
+    return failures
+
+
 def _hard_failure_items(failures: Any) -> list[str]:
     return [
         item for item in failures
@@ -535,6 +554,92 @@ def _revision_prompt(
     for placeholder, value in values.items():
         template = template.replace(placeholder, value)
     return template
+
+
+def _check_repair_prompt(
+    *,
+    repository_reference: RepositoryReference,
+    spec: str,
+    plan: TaskPlanV2,
+    contracts: str,
+    changed_files: str,
+    diff: str,
+    diff_truncated: bool,
+    evidence: EvidenceBundle,
+    mutable_scope: list[str],
+    previous_report: str,
+) -> str:
+    """Build the bounded prompt for the single automatic check repair."""
+
+    failed_ids = _soft_check_failures(evidence)
+    failed_names = {item.split(":", 1)[1] for item in failed_ids}
+    checks: list[dict[str, Any]] = []
+    for check in evidence.checks:
+        payload = dict(check) if isinstance(check, Mapping) else check_result_json(check)
+        if payload.get("name") in failed_names:
+            checks.append({
+                "name": payload.get("name"),
+                "exit_code": payload.get("exit_code"),
+                "stdout_tail": payload.get("stdout_tail", ""),
+                "stderr_tail": payload.get("stderr_tail", ""),
+            })
+    return """You are performing one bounded automatic check-repair pass in MetaHarness.
+
+Repository reference:
+{{REPOSITORY_REFERENCE}}
+
+SPEC:
+{{SPEC}}
+
+Approved plan and useful contracts:
+{{PLAN_SUMMARY}}
+{{CONTRACTS}}
+
+Exact failure IDs (the only failures you may address):
+{{FAILURE_IDS}}
+
+Failed check details:
+{{CHECK_DETAILS}}
+
+Current changed files:
+{{CHANGED_FILES}}
+
+Current semantic diff:
+{{DIFF}}
+{{DIFF_NOTE}}
+
+Approved mutable scope:
+{{MUTABLE_SCOPE}}
+
+Previous Claude report, if present:
+{{PREVIOUS_REPORT}}
+
+Correct only the deterministic check failures listed below. Preserve all
+already-correct behavior. Do not broaden scope. Do not modify generated
+ignored artifacts merely to hide a check failure. Do not weaken or delete a
+test unless the test itself is demonstrably stale relative to the approved SPEC.
+
+Make only the smallest source/test changes needed inside the approved mutable
+scope. Do not run or invoke a shell with any stdout or stderr copied from the
+check details as a command. Leave the worktree with the corrected files only.
+""".replace("{{REPOSITORY_REFERENCE}}", _json_text(repository_reference_dict(repository_reference))) \
+        .replace("{{SPEC}}", spec) \
+        .replace("{{PLAN_SUMMARY}}", _json_text({
+            "title": plan.title,
+            "objective": plan.objective,
+            "constraints": plan.constraints,
+            "acceptance": plan.acceptance,
+            "tests": plan.tests,
+            "risks": plan.risks,
+        })) \
+        .replace("{{CONTRACTS}}", contracts) \
+        .replace("{{FAILURE_IDS}}", _json_text(failed_ids)) \
+        .replace("{{CHECK_DETAILS}}", _json_text(checks)) \
+        .replace("{{CHANGED_FILES}}", changed_files) \
+        .replace("{{DIFF}}", diff) \
+        .replace("{{DIFF_NOTE}}", _truncation_note(diff_truncated)) \
+        .replace("{{MUTABLE_SCOPE}}", _json_text(mutable_scope)) \
+        .replace("{{PREVIOUS_REPORT}}", previous_report or "NONE\n")
 
 
 def _json_text(value: Any) -> str:
@@ -981,6 +1086,7 @@ class _ResumedRun:
     # bounded retry this resume owes that step.
     mismatch_retries: dict[str, str] = dataclasses.field(default_factory=dict)
     c01_revision: _PersistedRevision | None = None
+    c01_check_repair_revision: _PersistedRevision | None = None
     c01_evidence: EvidenceBundle | None = None
     c01_review: ReviewResult | None = None
     repair_plan: TaskPlanV2 | None = None
@@ -988,6 +1094,7 @@ class _ResumedRun:
     repair_bundle_sha: str | None = None
     c02_steps: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     c02_revision: _PersistedRevision | None = None
+    c02_check_repair_revision: _PersistedRevision | None = None
     c02_evidence: EvidenceBundle | None = None
     c02_review: ReviewResult | None = None
     existing_commit_sha: str | None = None
@@ -2867,6 +2974,7 @@ class Orchestrator:
         final_checks_phase = ResumePhase.FINAL_CHECKS_C01 if revision_enabled else ResumePhase.CHECKS_C01
         revision_result = None
         revision_report_c01 = ""
+        check_repair_result_c01 = None
         if revision_enabled:
             if at <= phase_index(ResumePhase.CLAUDE_C01):
                 if resumed is not None and phase is ResumePhase.CHECKS_C01:
@@ -2949,11 +3057,114 @@ class Orchestrator:
             if evidence is None:
                 raise ResumeIntegrityError("C01 candidate evidence is missing")
 
+        soft_failures_c01 = _soft_check_failures(evidence) if revision_enabled else []
+        if not evidence.deterministic_passed and revision_enabled:
+            if not soft_failures_c01:
+                return self._v2_failed(
+                    store, run_dir, "DETERMINISTIC_GATE_FAILED", None,
+                    ", ".join(evidence.failures),
+                )
+            check_repair_phase = ResumePhase.CHECK_REPAIR_C01
+            retry_checks_phase = ResumePhase.FINAL_CHECKS_RETRY_C01
+            self._cycle_update(
+                store, 1, status="check_repair_attempted",
+                automatic_check_repair={
+                    "attempted": True, "failure_ids": soft_failures_c01,
+                    "before": _check_payload(evidence),
+                },
+            )
+            store.update(
+                status=RunStatus.REVISING,
+                check_repair={"attempted": True, "failure_ids": soft_failures_c01},
+            )
+            if at <= phase_index(check_repair_phase):
+                try:
+                    check_repair_result_c01, repair_error = self._run_v2_revision_cycle(
+                        store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                        base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
+                        repository_reference=repository_reference, info=info,
+                        branch_ref=branch_ref, ownership_before=ownership_before,
+                        selection=selection, mutable_scope=sorted({
+                            path for step in plan.steps
+                            for path in (*step.write_set, *step.create_set, *step.delete_set)
+                        }), check_repair_evidence=evidence, cycle=1,
+                    )
+                except ClaudeCommittedError as exc:
+                    self._redact_revision_artifacts(
+                        run_dir, revision_dir=run_dir / "revision" / "check-repair" / "C01"
+                    )
+                    return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None,
+                                           redact(str(exc), self._secrets))
+                except (ClaudeAgentError, ClaudeRuntimeError) as exc:
+                    self._redact_revision_artifacts(
+                        run_dir, revision_dir=run_dir / "revision" / "check-repair" / "C01"
+                    )
+                    _record_failure_tree(run_dir / "revision" / "check-repair" / "C01", info.worktree)
+                    return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None,
+                                           redact(str(exc), self._secrets))
+                if repair_error is not None:
+                    return self._v2_failed(
+                        store, run_dir, repair_error, None, ", ".join(soft_failures_c01)
+                    )
+            elif resumed is not None:
+                check_repair_result_c01 = resumed.c01_check_repair_revision
+
+            if at <= phase_index(retry_checks_phase):
+                store.update(status=RunStatus.REVALIDATING, current_step=None)
+                retry_tree = candidate_tree_sha(info.worktree)
+                try:
+                    _archive_attempt(run_dir / "checks" / "C01", names=_CHECK_ATTEMPT_ARTIFACTS)
+                    evidence = self._final_evidence(
+                        info.worktree, base_sha, run_dir / "checks" / "C01",
+                        check_failures_hard=False, reuse=False,
+                        expected_head_sha=base_sha,
+                        required_check_ids=plan.required_checks or None,
+                        enforce_diff_size=False,
+                    )
+                except Exception:
+                    self._write_phase_checkpoint(
+                        run_dir, retry_checks_phase, cycle=1,
+                        head=base_sha, tree=retry_tree,
+                    )
+                    raise
+                store.update(
+                    status=RunStatus.REVALIDATING, checks=_check_payload(evidence),
+                    staged_tree_sha=evidence.staged_tree_sha,
+                    changed_files=list(evidence.changed_files),
+                    deterministic_gate={"passed": evidence.deterministic_passed,
+                                        "required_check_ids": list(evidence.required_check_ids),
+                                        "failures": list(evidence.failures)},
+                    check_repair={"attempted": True, "failure_ids": soft_failures_c01,
+                                  "after": list(evidence.failures)},
+                )
+                retry_integrity = _hard_integrity_failures(evidence)
+                if retry_integrity:
+                    return self._v2_failed(
+                        store, run_dir, retry_integrity[0].split(":", 1)[0], None,
+                        ", ".join(retry_integrity),
+                    )
+                if not evidence.deterministic_passed:
+                    return self._v2_failed(
+                        store, run_dir, "DETERMINISTIC_GATE_FAILED", None,
+                        ", ".join(evidence.failures),
+                    )
+            if check_repair_result_c01 is not None:
+                revision_report_c01 = _json_text({
+                    "initial_revision": revision_report_c01,
+                    "automatic_check_repair": _revision_report_text(
+                        check_repair_result_c01,
+                        run_dir / "revision" / "check-repair" / "C01",
+                    ),
+                })
+
         if at <= phase_index(ResumePhase.CANDIDATE_COMMIT_C01):
             # The deterministic gate is the only gate before the immutable
             # candidate commit.  Semantic review deliberately comes later.
             if not evidence.deterministic_passed:
-                return self._v2_failed(store, run_dir, "DETERMINISTIC_GATE_FAILED", None)
+                return self._v2_failed(
+                    store, run_dir, "DETERMINISTIC_GATE_FAILED", None,
+                    ", ".join(evidence.failures),
+                )
             self._checkpoint(run_dir, ResumePhase.CANDIDATE_COMMIT_C01,
                              head=base_sha, tree=evidence.staged_tree_sha)
             if current_head(info.worktree) == base_sha:
@@ -3787,6 +3998,7 @@ class Orchestrator:
         luna_reports: str | None = None,
         deferred_mismatches: str | None = None,
         deferred_mismatch_present: bool = False,
+        check_repair_evidence: EvidenceBundle | None = None,
         cycle: int = 1,
     ) -> tuple[Any | None, str | None]:
         """Run one Claude pre-check/revision/scope cycle.
@@ -3799,11 +4011,17 @@ class Orchestrator:
             (ResumePhase.CLAUDE_C01, ResumePhase.REVIEWER_C01) if cycle == 1
             else (ResumePhase.CLAUDE_C02, ResumePhase.REVIEWER_C02)
         )
-        artifact_dir = artifact_dir or (run_dir / "revision")
+        is_check_repair = check_repair_evidence is not None
+        artifact_dir = artifact_dir or (
+            run_dir / "revision" / "check-repair" / f"C0{cycle}"
+            if is_check_repair else run_dir / "revision"
+        )
         artifact_dir.mkdir(parents=True, exist_ok=True)
         expected_head = current_head(info.worktree)
         stage_all(info.worktree)
         tree_before = candidate_tree_sha(info.worktree)
+        if is_check_repair and check_repair_evidence.staged_tree_sha != tree_before:
+            return None, "TOCTOU_FAILURE"
         mutable_scope = mutable_scope or sorted({
             path for step in plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
@@ -3812,46 +4030,59 @@ class Orchestrator:
             "approved_mutable_scope": mutable_scope,
             "source": "human-approved mutable scope",
         }))
-        reused = _reusable_pre_checks(artifact_dir, tree_before)
-        if reused is None:
-            self._write_phase_checkpoint(
-                run_dir,
-                ResumePhase.CHECKS_C01 if cycle == 1 else ResumePhase.CHECKS_C02,
-                cycle=cycle, head=expected_head, tree=tree_before,
+        if is_check_repair:
+            # This boundary is deliberately written before invoking Claude so
+            # a timeout/transport failure resumes this exact corrective pass.
+            repair_phase = (
+                ResumePhase.CHECK_REPAIR_C01 if cycle == 1
+                else ResumePhase.CHECK_REPAIR_C02
             )
-            store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
-            pre_evidence = collect_evidence(
-                info.worktree, base_sha, self.config,
-                required_check_ids=plan.required_checks or None,
-                evidence_dir=artifact_dir, secrets=self._secrets,
-                check_failures_hard=False,
-                expected_head_sha=expected_head,
-                enforce_diff_size=False,
+            self._checkpoint(
+                run_dir, repair_phase, cycle=cycle, head=expected_head, tree=tree_before,
             )
-            pre_payload = {
-                "checks": _check_payload(pre_evidence),
-                "failures": list(pre_evidence.failures),
-                "deterministic_passed": pre_evidence.deterministic_passed,
-                "staged_tree_sha": pre_evidence.staged_tree_sha,
-            }
-            atomic_write_text(artifact_dir / "pre_checks.json", _json_text(pre_payload))
-            pre_hard = _hard_integrity_failures(pre_evidence)
-            # A clean deferred mismatch intentionally leaves no candidate
-            # delta for the pre-revision gate.  Claude is the recovery owner,
-            # so EMPTY_DIFF is evidence for Claude here, not a terminal gate.
-            # A deferred *verify* dependency is not this case: that step did
-            # change the candidate, so the normal gate applies.
-            if deferred_mismatch_present:
-                pre_hard = [item for item in pre_hard if item != "EMPTY_DIFF"]
-            if pre_hard:
-                return None, pre_hard[0].split(":", 1)[0]
-            pre_diff = pre_evidence.diff
-            # Pre-revision checks complete: the next operation is Claude.  The
-            # authorized HEAD is the worktree HEAD (base for C01, the C01
-            # candidate commit for C02), exactly as _validate_resume expects.
-            self._checkpoint(run_dir, claude_phase, cycle=cycle, head=expected_head, tree=tree_before)
+            pre_payload = {"checks": _check_payload(check_repair_evidence)}
+            pre_diff = check_repair_evidence.diff
         else:
-            pre_payload, pre_diff = reused
+            reused = _reusable_pre_checks(artifact_dir, tree_before)
+            if reused is None:
+                self._write_phase_checkpoint(
+                    run_dir,
+                    ResumePhase.CHECKS_C01 if cycle == 1 else ResumePhase.CHECKS_C02,
+                    cycle=cycle, head=expected_head, tree=tree_before,
+                )
+                store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
+                pre_evidence = collect_evidence(
+                    info.worktree, base_sha, self.config,
+                    required_check_ids=plan.required_checks or None,
+                    evidence_dir=artifact_dir, secrets=self._secrets,
+                    check_failures_hard=False,
+                    expected_head_sha=expected_head,
+                    enforce_diff_size=False,
+                )
+                pre_payload = {
+                    "checks": _check_payload(pre_evidence),
+                    "failures": list(pre_evidence.failures),
+                    "deterministic_passed": pre_evidence.deterministic_passed,
+                    "staged_tree_sha": pre_evidence.staged_tree_sha,
+                }
+                atomic_write_text(artifact_dir / "pre_checks.json", _json_text(pre_payload))
+                pre_hard = _hard_integrity_failures(pre_evidence)
+                # A clean deferred mismatch intentionally leaves no candidate
+                # delta for the pre-revision gate.  Claude is the recovery owner,
+                # so EMPTY_DIFF is evidence for Claude here, not a terminal gate.
+                # A deferred *verify* dependency is not this case: that step did
+                # change the candidate, so the normal gate applies.
+                if deferred_mismatch_present:
+                    pre_hard = [item for item in pre_hard if item != "EMPTY_DIFF"]
+                if pre_hard:
+                    return None, pre_hard[0].split(":", 1)[0]
+                pre_diff = pre_evidence.diff
+                # Pre-revision checks complete: the next operation is Claude.  The
+                # authorized HEAD is the worktree HEAD (base for C01, the C01
+                # candidate commit for C02), exactly as _validate_resume expects.
+                self._checkpoint(run_dir, claude_phase, cycle=cycle, head=expected_head, tree=tree_before)
+            else:
+                pre_payload, pre_diff = reused
         contracts = "\n\n".join(
             read_approved_step_contract(contract_dir or run_dir, bundle, step.id)
             for step in plan.steps
@@ -3859,19 +4090,35 @@ class Orchestrator:
         semantic_diff, diff_truncated, _full_diff_bytes = _semantic_diff_payload(
             pre_diff, self.config.max_diff_bytes
         )
-        revision_prompt = _revision_prompt(
-            repository_reference=repository_reference,
-            spec=spec,
-            plan=plan,
-            contracts=contracts,
-            luna_reports=luna_reports if luna_reports is not None else _step_reports_text(self._last_v2_step_results),
-            changed_files="\n".join(changed_paths_between_trees(repo, base_tree_sha, tree_before)),
-            diff=semantic_diff,
-            diff_truncated=diff_truncated,
-            pre_checks=_json_text(pre_payload),
-            mutable_scope=_json_text(mutable_scope),
-            deferred_mismatches=deferred_mismatches or "NONE\n",
-        )
+        if is_check_repair:
+            previous_dir = run_dir / "revision" / (f"C0{cycle}" if cycle == 2 else "")
+            previous_report = _read_bounded_text(previous_dir / "agent.final.md")
+            revision_prompt = _check_repair_prompt(
+                repository_reference=repository_reference,
+                spec=spec,
+                plan=plan,
+                contracts=contracts,
+                changed_files="\n".join(check_repair_evidence.changed_files),
+                diff=semantic_diff,
+                diff_truncated=diff_truncated,
+                evidence=check_repair_evidence,
+                mutable_scope=mutable_scope,
+                previous_report=previous_report,
+            )
+        else:
+            revision_prompt = _revision_prompt(
+                repository_reference=repository_reference,
+                spec=spec,
+                plan=plan,
+                contracts=contracts,
+                luna_reports=luna_reports if luna_reports is not None else _step_reports_text(self._last_v2_step_results),
+                changed_files="\n".join(changed_paths_between_trees(repo, base_tree_sha, tree_before)),
+                diff=semantic_diff,
+                diff_truncated=diff_truncated,
+                pre_checks=_json_text(pre_payload),
+                mutable_scope=_json_text(mutable_scope),
+                deferred_mismatches=deferred_mismatches or "NONE\n",
+            )
         store.update(status=RunStatus.REVISING, current_step=None)
         atomic_write_text(artifact_dir / "tree_before.txt", tree_before.rstrip() + "\n")
         result = self._run_revision(
@@ -3929,16 +4176,21 @@ class Orchestrator:
             "final": _bounded_report(result.final_message),
             "stderr_tail": result.stderr_tail,
             "changed_paths": list(changed_paths),
+            **({"failure_ids": _soft_check_failures(check_repair_evidence)}
+               if is_check_repair else {}),
         }))
         store.update(status=RunStatus.REVISING, revision=revision_state)
         if outside_scope:
             return result, "REVISION_SCOPE_VIOLATION"
         # Claude complete and durable: the next operation is the final checks
         # followed by candidate commit/push and then the reviewer.
+        next_revision_phase = (
+            (ResumePhase.FINAL_CHECKS_RETRY_C01 if cycle == 1 else ResumePhase.FINAL_CHECKS_RETRY_C02)
+            if is_check_repair
+            else (ResumePhase.FINAL_CHECKS_C01 if cycle == 1 else ResumePhase.FINAL_CHECKS_C02)
+        )
         self._checkpoint(
-            run_dir,
-            ResumePhase.FINAL_CHECKS_C01 if cycle == 1 else ResumePhase.FINAL_CHECKS_C02,
-            cycle=cycle, head=expected_head, tree=tree_after,
+            run_dir, next_revision_phase, cycle=cycle, head=expected_head, tree=tree_after,
         )
         return result, None
 
@@ -4248,6 +4500,7 @@ class Orchestrator:
             _revision_report_text(cycle_2_revision, run_dir / "revision" / "C02")
             if cycle_2_revision is not None else ""
         )
+        check_repair_result_c02 = None
         checks_dir = run_dir / "checks" / "C02"
         checks_dir.mkdir(parents=True, exist_ok=True)
         store.update(status=RunStatus.REVALIDATING, current_step=None)
@@ -4289,13 +4542,100 @@ class Orchestrator:
             if evidence is None:
                 raise ResumeIntegrityError("C02 candidate evidence is missing")
 
+        soft_failures_c02 = _soft_check_failures(evidence) if claude_revision_enabled else []
+        if not evidence.deterministic_passed and claude_revision_enabled:
+            if not soft_failures_c02:
+                raise OrchestrationError(
+                    "DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures)
+                )
+            check_repair_phase = ResumePhase.CHECK_REPAIR_C02
+            retry_checks_phase = ResumePhase.FINAL_CHECKS_RETRY_C02
+            self._cycle_update(
+                store, 2, status="check_repair_attempted",
+                automatic_check_repair={
+                    "attempted": True, "failure_ids": soft_failures_c02,
+                    "before": _check_payload(evidence),
+                },
+            )
+            store.update(
+                status=RunStatus.REVISING,
+                check_repair={"attempted": True, "failure_ids": soft_failures_c02},
+            )
+            if at <= phase_index(check_repair_phase):
+                check_repair_result_c02, repair_error = self._run_v2_revision_cycle(
+                    store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                    base_tree_sha=resolve_tree(repo, base_sha), spec=spec,
+                    plan=repair_plan, bundle=repair_bundle,
+                    repository_reference=repository_reference, info=info,
+                    branch_ref=branch_ref, ownership_before=ownership_before,
+                    selection=selection, artifact_dir=(
+                        run_dir / "revision" / "check-repair" / "C02"
+                    ), contract_dir=repair_dir, mutable_scope=repair_scope,
+                    check_repair_evidence=evidence, cycle=2,
+                )
+                if repair_error is not None:
+                    raise OrchestrationError(
+                        f"{repair_error}: " + ", ".join(soft_failures_c02)
+                    )
+            elif resumed is not None:
+                check_repair_result_c02 = resumed.c02_check_repair_revision
+            if at <= phase_index(retry_checks_phase):
+                store.update(status=RunStatus.REVALIDATING, current_step=None)
+                retry_tree = candidate_tree_sha(info.worktree)
+                try:
+                    _archive_attempt(checks_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
+                    evidence = self._final_evidence(
+                        info.worktree, base_sha, checks_dir,
+                        check_failures_hard=False, reuse=False,
+                        expected_head_sha=cycle_parent_sha,
+                        required_check_ids=repair_plan.required_checks or None,
+                        enforce_diff_size=False,
+                    )
+                except Exception:
+                    self._write_phase_checkpoint(
+                        run_dir, retry_checks_phase, cycle=2,
+                        head=cycle_parent_sha, tree=retry_tree,
+                        repair_bundle_sha256=repair_bundle_sha,
+                    )
+                    raise
+                store.update(
+                    status=RunStatus.REVALIDATING, checks=_check_payload(evidence),
+                    staged_tree_sha=evidence.staged_tree_sha,
+                    changed_files=list(evidence.changed_files),
+                    deterministic_gate={"passed": evidence.deterministic_passed,
+                                        "required_check_ids": list(evidence.required_check_ids),
+                                        "failures": list(evidence.failures)},
+                    check_repair={"attempted": True, "failure_ids": soft_failures_c02,
+                                  "after": list(evidence.failures)},
+                )
+                retry_integrity = _hard_integrity_failures(evidence)
+                if retry_integrity:
+                    raise OrchestrationError(
+                        retry_integrity[0].split(":", 1)[0] + ": "
+                        + ", ".join(retry_integrity)
+                    )
+                if not evidence.deterministic_passed:
+                    raise OrchestrationError(
+                        "DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures)
+                    )
+            if check_repair_result_c02 is not None:
+                revision_report_c02 = _json_text({
+                    "initial_revision": revision_report_c02,
+                    "automatic_check_repair": _revision_report_text(
+                        check_repair_result_c02,
+                        run_dir / "revision" / "check-repair" / "C02",
+                    ),
+                })
+
         c01_candidate = _read_json_artifact(_candidate_commit_path(run_dir, 1))
         if not isinstance(c01_candidate, dict) or not _is_object_id(c01_candidate.get("commit_sha")):
             raise ResumeIntegrityError("C01 candidate commit is missing for C02 ancestry")
         c02_candidate: dict[str, Any]
         if start is None or phase_index(start.phase) <= phase_index(ResumePhase.CANDIDATE_COMMIT_C02):
             if not evidence.deterministic_passed:
-                raise OrchestrationError("DETERMINISTIC_GATE_FAILED")
+                raise OrchestrationError(
+                    "DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures)
+                )
             self._checkpoint(
                 run_dir, ResumePhase.CANDIDATE_COMMIT_C02, cycle=2,
                 head=c01_candidate["commit_sha"], tree=evidence.staged_tree_sha,
@@ -5605,7 +5945,8 @@ class Orchestrator:
             c02_phases = {
                 ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL, ResumePhase.REPAIR_STEP,
                 ResumePhase.CHECKS_C02, ResumePhase.CLAUDE_C02,
-                ResumePhase.FINAL_CHECKS_C02, ResumePhase.CANDIDATE_COMMIT_C02,
+                ResumePhase.FINAL_CHECKS_C02, ResumePhase.CHECK_REPAIR_C02,
+                ResumePhase.FINAL_CHECKS_RETRY_C02, ResumePhase.CANDIDATE_COMMIT_C02,
                 ResumePhase.CANDIDATE_PUSH_C02, ResumePhase.REVIEWER_C02,
             }
             phase_expected_head = base_sha
@@ -6071,8 +6412,14 @@ class Orchestrator:
         """
 
         phase = checkpoint.phase
-        if phase in (ResumePhase.CLAUDE_C01, ResumePhase.CLAUDE_C02):
-            directory = run_dir / "revision" / ("C02" if phase is ResumePhase.CLAUDE_C02 else "")
+        if phase in (ResumePhase.CLAUDE_C01, ResumePhase.CLAUDE_C02,
+                     ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_C02):
+            if phase is ResumePhase.CHECK_REPAIR_C01:
+                directory = run_dir / "revision" / "check-repair" / "C01"
+            elif phase is ResumePhase.CHECK_REPAIR_C02:
+                directory = run_dir / "revision" / "check-repair" / "C02"
+            else:
+                directory = run_dir / "revision" / ("C02" if phase is ResumePhase.CLAUDE_C02 else "")
             failure_tree = _read_tree_file(directory / "tree_after_failure.txt")
             if failure_tree is not None and candidate == failure_tree:
                 changed = changed_paths_between_trees(repo, checkpoint.expected_tree_sha, candidate)
@@ -6135,15 +6482,39 @@ class Orchestrator:
                 refuse("the Claude C01 record is missing or not based on the Luna tree")
             resumed.c01_revision = revision
             c01_tree = revision.tree_after
+        initial_c01_tree = c01_tree
+        check_repair_dir_c01 = run_dir / "revision" / "check-repair" / "C01"
+        if revision_enabled and at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_C01) and (
+            check_repair_dir_c01 / "report.json"
+        ).exists():
+            repair_revision = _load_revision(
+                check_repair_dir_c01
+            )
+            if repair_revision is None or repair_revision.tree_before != initial_c01_tree:
+                refuse("the C01 check-repair record is missing or not based on the red checks tree")
+            resumed.c01_check_repair_revision = repair_revision
+            c01_tree = repair_revision.tree_after
         if at <= phase_index(ResumePhase.REVIEWER_C01) and expected != c01_tree:
             refuse(
                 "the checkpoint tree is not the Claude C01 tree" if resumed.c01_revision is not None
                 else "the checkpoint tree is not the last completed Luna tree"
             )
+        if checkpoint.phase is ResumePhase.INITIAL_STEP:
+            return
         if checkpoint.phase in {
-            ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01,
+            ResumePhase.CHECKS_C01,
             ResumePhase.CLAUDE_C01, ResumePhase.FINAL_CHECKS_C01,
+            ResumePhase.CHECK_REPAIR_C01, ResumePhase.FINAL_CHECKS_RETRY_C01,
         }:
+            evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
+            expected_evidence_tree = (
+                initial_c01_tree if checkpoint.phase in {
+                    ResumePhase.CHECK_REPAIR_C01, ResumePhase.FINAL_CHECKS_RETRY_C01,
+                } else c01_tree
+            )
+            if evidence is None or evidence.staged_tree_sha != expected_evidence_tree:
+                refuse("the C01 final evidence is missing or not for the expected checks tree")
+            resumed.c01_evidence = evidence
             return
         if at <= phase_index(ResumePhase.CANDIDATE_COMMIT_C01):
             evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
@@ -6244,19 +6615,41 @@ class Orchestrator:
                 refuse("the Claude C02 record is missing or not based on the C02 Luna tree")
             resumed.c02_revision = revision
             c02_tree = revision.tree_after
+        initial_c02_tree = c02_tree
+        check_repair_dir_c02 = run_dir / "revision" / "check-repair" / "C02"
+        if revision_enabled and at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_C02) and (
+            check_repair_dir_c02 / "report.json"
+        ).exists():
+            repair_revision = _load_revision(
+                check_repair_dir_c02
+            )
+            if repair_revision is None or repair_revision.tree_before != initial_c02_tree:
+                refuse("the C02 check-repair record is missing or not based on the red checks tree")
+            resumed.c02_check_repair_revision = repair_revision
+            c02_tree = repair_revision.tree_after
         if expected != c02_tree:
             refuse(
                 "the checkpoint tree is not the Claude C02 tree" if resumed.c02_revision is not None
                 else "the checkpoint tree is not the last completed C02 tree"
             )
         if checkpoint.phase in {
+            ResumePhase.CHECK_REPAIR_C02, ResumePhase.FINAL_CHECKS_RETRY_C02,
             ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,
             ResumePhase.REVIEWER_C02,
         }:
             evidence = _load_evidence(run_dir / "checks" / "C02")
-            if evidence is None or evidence.staged_tree_sha != expected:
+            expected_evidence_tree = (
+                initial_c02_tree if checkpoint.phase in {
+                    ResumePhase.CHECK_REPAIR_C02, ResumePhase.FINAL_CHECKS_RETRY_C02,
+                } else expected
+            )
+            if evidence is None or evidence.staged_tree_sha != expected_evidence_tree:
                 refuse("the C02 candidate evidence is missing or not for the candidate tree")
             resumed.c02_evidence = evidence
+            if checkpoint.phase in {
+                ResumePhase.CHECK_REPAIR_C02, ResumePhase.FINAL_CHECKS_RETRY_C02,
+            }:
+                return
             if checkpoint.phase is ResumePhase.REVIEWER_C02:
                 resumed.c02_review = _load_c01_review(run_dir / "review" / "C02", evidence)
             return

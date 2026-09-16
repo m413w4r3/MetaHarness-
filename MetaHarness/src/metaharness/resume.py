@@ -49,6 +49,8 @@ class ResumePhase(StrEnum):
     CHECKS_C01 = "checks_c01"
     CLAUDE_C01 = "claude_c01"
     FINAL_CHECKS_C01 = "final_checks_c01"
+    CHECK_REPAIR_C01 = "check_repair_c01"
+    FINAL_CHECKS_RETRY_C01 = "final_checks_retry_c01"
     CANDIDATE_COMMIT_C01 = "candidate_commit_c01"
     CANDIDATE_PUSH_C01 = "candidate_push_c01"
     REVIEWER_C01 = "reviewer_c01"
@@ -58,6 +60,8 @@ class ResumePhase(StrEnum):
     CHECKS_C02 = "checks_c02"
     CLAUDE_C02 = "claude_c02"
     FINAL_CHECKS_C02 = "final_checks_c02"
+    CHECK_REPAIR_C02 = "check_repair_c02"
+    FINAL_CHECKS_RETRY_C02 = "final_checks_retry_c02"
     CANDIDATE_COMMIT_C02 = "candidate_commit_c02"
     CANDIDATE_PUSH_C02 = "candidate_push_c02"
     REVIEWER_C02 = "reviewer_c02"
@@ -69,6 +73,9 @@ _PHASE_ORDER = {phase: index for index, phase in enumerate(ResumePhase)}
 _PHASE_CYCLE = {
     ResumePhase.INITIAL_STEP: 1,
     ResumePhase.CLAUDE_C01: 1,
+    ResumePhase.FINAL_CHECKS_C01: 1,
+    ResumePhase.CHECK_REPAIR_C01: 1,
+    ResumePhase.FINAL_CHECKS_RETRY_C01: 1,
     ResumePhase.CANDIDATE_COMMIT_C01: 1,
     ResumePhase.CANDIDATE_PUSH_C01: 1,
     ResumePhase.REVIEWER_C01: 1,
@@ -76,6 +83,9 @@ _PHASE_CYCLE = {
     ResumePhase.SCOPE_APPROVAL: 2,
     ResumePhase.REPAIR_STEP: 2,
     ResumePhase.CLAUDE_C02: 2,
+    ResumePhase.FINAL_CHECKS_C02: 2,
+    ResumePhase.CHECK_REPAIR_C02: 2,
+    ResumePhase.FINAL_CHECKS_RETRY_C02: 2,
     ResumePhase.CANDIDATE_COMMIT_C02: 2,
     ResumePhase.CANDIDATE_PUSH_C02: 2,
     ResumePhase.REVIEWER_C02: 2,
@@ -288,7 +298,10 @@ def mark_checkpoint_completed(run_dir: str | Path) -> None:
 # P29.  A valid pending checkpoint and its phase-specific invariants remain
 # authoritative; this table also rejects an explicitly classified failure
 # paired with an impossible operation phase.
-_CLAUDE_PHASES = frozenset({ResumePhase.CLAUDE_C01, ResumePhase.CLAUDE_C02})
+_CLAUDE_PHASES = frozenset({
+    ResumePhase.CLAUDE_C01, ResumePhase.CLAUDE_C02,
+    ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_C02,
+})
 _CODEX_PHASES = _STEP_PHASES
 _REVIEWER_PHASES = frozenset({ResumePhase.REVIEWER_C01, ResumePhase.REVIEWER_C02})
 RESUMABLE_FAILURES: Mapping[str, frozenset[ResumePhase]] = {
@@ -331,6 +344,8 @@ PHASE_STATUS = {
     ResumePhase.CHECKS_C01: "validating",
     ResumePhase.CLAUDE_C01: "revising",
     ResumePhase.FINAL_CHECKS_C01: "revalidating",
+    ResumePhase.CHECK_REPAIR_C01: "revising",
+    ResumePhase.FINAL_CHECKS_RETRY_C01: "revalidating",
     ResumePhase.CANDIDATE_COMMIT_C01: "approved",
     ResumePhase.CANDIDATE_PUSH_C01: "approved",
     ResumePhase.REVIEWER_C01: "reviewing",
@@ -340,6 +355,8 @@ PHASE_STATUS = {
     ResumePhase.CHECKS_C02: "revalidating",
     ResumePhase.CLAUDE_C02: "revising",
     ResumePhase.FINAL_CHECKS_C02: "revalidating",
+    ResumePhase.CHECK_REPAIR_C02: "revising",
+    ResumePhase.FINAL_CHECKS_RETRY_C02: "revalidating",
     ResumePhase.CANDIDATE_COMMIT_C02: "approved",
     ResumePhase.CANDIDATE_PUSH_C02: "approved",
     ResumePhase.REVIEWER_C02: "reviewing",
@@ -364,6 +381,10 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         return f"Retry {checkpoint.step_id}"
     if phase in {ResumePhase.CHECKS_C01, ResumePhase.FINAL_CHECKS_C01}:
         return "Retry checks C01"
+    if phase is ResumePhase.CHECK_REPAIR_C01:
+        return "Repair failed checks C01"
+    if phase is ResumePhase.FINAL_CHECKS_RETRY_C01:
+        return "Retry final checks C01"
     if phase is ResumePhase.REPAIR_STEP:
         return f"Retry C02 {checkpoint.step_id}"
     if phase is ResumePhase.CLAUDE_C01:
@@ -374,6 +395,10 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         return "Push candidate C01"
     if phase is ResumePhase.CLAUDE_C02:
         return "Reprendre à partir de Claude C02"
+    if phase is ResumePhase.CHECK_REPAIR_C02:
+        return "Repair failed checks C02"
+    if phase is ResumePhase.FINAL_CHECKS_RETRY_C02:
+        return "Retry final checks C02"
     if phase is ResumePhase.CANDIDATE_COMMIT_C02:
         return "Create candidate commit C02"
     if phase is ResumePhase.CANDIDATE_PUSH_C02:

@@ -64,6 +64,7 @@ from metaharness.models import (  # noqa: E402
     SelectionMode,
 )
 from metaharness.orchestrator import Orchestrator  # noqa: E402
+from metaharness.resume import ResumePhase, read_checkpoint  # noqa: E402
 from metaharness.web.api import (  # noqa: E402
     WebAPIError,
     approve_run,
@@ -282,10 +283,15 @@ def writer(path: str, content: str) -> Callable[[Path], None]:
 
 
 class FakeClaude:
-    """Claude Code double: optional in-scope edit per cycle, exact artifacts."""
+    """Claude double with distinct initial and automatic-repair actions."""
 
-    def __init__(self, actions: dict[int, Callable[[Path], None]] | None = None, log: list[str] | None = None):
+    def __init__(self, actions: dict[int, Callable[[Path], None]] | None = None,
+                 log: list[str] | None = None,
+                 stage_actions: dict[tuple[int, str], Callable[[Path], None]] | None = None,
+                 failures: dict[tuple[int, str], str] | None = None):
         self.actions = actions or {}
+        self.stage_actions = stage_actions or {}
+        self.failures = failures or {}
         self.calls: list[dict[str, Any]] = []
         self.log = log
 
@@ -293,14 +299,29 @@ class FakeClaude:
                      profile: ModelProfile, environment: dict[str, str],
                      revision_dir: Path | None = None) -> ClaudeResult:
         target = Path(revision_dir) if revision_dir is not None else Path(artifacts_dir) / "revision"
-        cycle = 2 if target.name == "C02" else 1
-        self.calls.append({"cycle": cycle, "prompt": prompt, "environment": dict(environment)})
+        cycle = 2 if "C02" in target.parts else 1
+        stage = "check-repair" if "check-repair" in target.parts else "initial-revision"
+        self.calls.append({"cycle": cycle, "stage": stage, "prompt": prompt,
+                           "environment": dict(environment), "revision_dir": target})
         if self.log is not None:
             self.log.append(f"claude:C0{cycle}")
-        if cycle in self.actions:
-            self.actions[cycle](Path(worktree))
+        action = self.stage_actions.get((cycle, stage))
+        if action is None and stage == "initial-revision":
+            action = self.actions.get(cycle)
+        if action is not None:
+            action(Path(worktree))
         target.mkdir(parents=True, exist_ok=True)
-        final = f"Claude C0{cycle} revision report\n"
+        (target / "agent.prompt.txt").write_text(prompt, encoding="utf-8")
+        failure = self.failures.get((cycle, stage))
+        if failure == "timeout":
+            (target / "agent.events.jsonl").write_text("", encoding="utf-8")
+            (target / "agent.stderr.log").write_text("timeout\n", encoding="utf-8")
+            return ClaudeResult(124, True, "", {}, "timeout")
+        final = (
+            f"Claude C0{cycle} revision report\n"
+            if stage == "initial-revision"
+            else f"Claude C0{cycle} check-repair report\n"
+        )
         (target / "agent.events.jsonl").write_text(
             json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": f"claude C0{cycle}"}}) + "\n",
             encoding="utf-8",
@@ -645,6 +666,110 @@ class FullPipelineTests(P28Harness):
         self.assertFalse((result.run_dir / "repair" / "C02").exists())
         self.assertIsNone(result.state.get("approved_tree_sha"))
         self.assertFalse(reviewer.prompts)
+
+    def test_i_automatic_check_repair_c01_fixes_red_final_check(self) -> None:
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(stage_actions={(1, "check-repair"): writer("src/a.py", "A = 3\n")})
+        result, _planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=luna, reviews=[PASS], claude=claude, run_id="check-repair-c01",
+        )
+        self.assert_published_once(result, pushed, run_id="check-repair-c01")
+        self.assertEqual([call["stage"] for call in claude.calls], ["initial-revision", "check-repair"])
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertEqual(claude.calls[1]["revision_dir"].relative_to(result.run_dir).as_posix(), "revision/check-repair/C01")
+        self.assertTrue((result.run_dir / "revision/check-repair/C01/agent.prompt.txt").exists())
+        self.assertIn("CHECK_FAILED:gate", (result.run_dir / "revision/check-repair/C01/agent.prompt.txt").read_text())
+
+    def test_j_automatic_check_repair_c01_is_bounded_and_stays_red(self) -> None:
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude()
+        result, _planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=luna, reviews=[PASS], claude=claude, run_id="check-repair-red",
+        )
+        self.assertEqual(result.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assert_no_commit_no_push(result, pushed, run_id="check-repair-red")
+        self.assertEqual(len(claude.calls), 2)
+        self.assertEqual(reviewer.prompts, [])
+        self.assertIn("CHECK_FAILED:gate", result.state["failure"]["detail"])
+
+    def test_k_automatic_check_repair_c02_has_full_parity(self) -> None:
+        claude = FakeClaude(stage_actions={(2, "check-repair"): writer("src/a.py", "A = 5\n")})
+        _luna, result, _planner, reviewer, claude, pushed = self._c01_then_repair(
+            writer("src/a.py", "A = BUG\n"), [REVISE_IMPLEMENTATION, PASS], claude=claude,
+            run_id="check-repair-c02",
+        )
+        self.assert_published_once(result, pushed, run_id="check-repair-c02", expected_pushes=2, expected_commits=2)
+        self.assertEqual([(call["cycle"], call["stage"]) for call in claude.calls], [
+            (1, "initial-revision"), (2, "initial-revision"), (2, "check-repair"),
+        ])
+        self.assertEqual(len(reviewer.prompts), 2)
+        self.assertTrue((result.run_dir / "revision/check-repair/C02/report.json").exists())
+
+    def test_l_check_repair_timeout_resumes_without_replaying_luna_or_initial_revision(self) -> None:
+        first_claude = FakeClaude(failures={(1, "check-repair"): "timeout"})
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        first, _planner, _reviewer, _claude, pushed = self.run_pipeline(
+            luna=luna, reviews=[PASS], claude=first_claude, run_id="check-repair-resume",
+        )
+        self.assertEqual(first.state["failure"]["reason"], "CLAUDE_TIMEOUT")
+        self.assertEqual(read_checkpoint(first.run_dir).phase, ResumePhase.CHECK_REPAIR_C01)
+        self.assertEqual(len(first_claude.calls), 2)
+        fresh_claude = FakeClaude(stage_actions={(1, "check-repair"): writer("src/a.py", "A = 3\n")})
+        fresh = Orchestrator(
+            self.config_value,
+            planner_client=QueueClient("planner", [], self.events),
+            reviewer_client=QueueClient("reviewer", [PASS], self.events),
+            agent=FakeLuna({}), reviser=fresh_claude,
+        ).resume("check-repair-resume")
+        self.assertEqual(fresh.status, RunStatus.PUBLISHED, fresh.state.get("failure"))
+        self.assertEqual(git(self.worktree("check-repair-resume"), "show", "HEAD:src/a.py"), "A = 3")
+        self.assertEqual([call["stage"] for call in fresh_claude.calls], ["check-repair"])
+        self.assertEqual(fresh_claude.calls[0]["cycle"], 1)
+
+    def test_m_check_timeout_never_starts_automatic_repair(self) -> None:
+        self.check.write_text(
+            "import pathlib, sys, time\n"
+            "if 'TRIGGER' in pathlib.Path('src/a.py').read_text(): time.sleep(6)\n"
+            "sys.exit(0)\n", encoding="utf-8",
+        )
+        config_path = self.root / "timeout.toml"
+        config_path.write_text(self.config_text().replace("timeout_seconds = 30", "timeout_seconds = 1"), encoding="utf-8")
+        config = load_config(config_path)
+        planner = QueueClient("planner", [SINGLE_PLAN], self.events)
+        reviewer = QueueClient("reviewer", [PASS], self.events)
+        claude = FakeClaude({1: writer("src/a.py", "A = TRIGGER\n")})
+        result = Orchestrator(
+            config, planner_client=planner, reviewer_client=reviewer,
+            agent=FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")}), reviser=claude,
+        ).run_text(SPEC, run_id="check-timeout")
+        self.assertEqual(result.state["failure"]["reason"], "CHECK_TIMEOUT")
+        self.assertEqual(len(claude.calls), 1)
+        self.assertEqual(reviewer.prompts, [])
+        self.assertFalse((result.run_dir / "revision/check-repair/C01").exists())
+
+    def test_n_check_mutation_never_starts_automatic_repair(self) -> None:
+        self.check.write_text(
+            "import pathlib\npathlib.Path('src/a.py').write_text('MUTATED\\n')\n", encoding="utf-8",
+        )
+        result, _planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")}),
+            reviews=[PASS], run_id="check-mutated",
+        )
+        self.assertEqual(result.state["failure"]["reason"], "CHECK_MUTATED")
+        self.assert_no_commit_no_push(result, pushed, run_id="check-mutated")
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(reviewer.prompts, [])
+
+    def test_o_check_repair_scope_violation_is_terminal(self) -> None:
+        claude = FakeClaude(stage_actions={(1, "check-repair"): writer("README.md", "outside\n")})
+        result, _planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")}),
+            reviews=[PASS], claude=claude, run_id="check-repair-scope",
+        )
+        self.assertEqual(result.state["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
+        self.assert_no_commit_no_push(result, pushed, run_id="check-repair-scope")
+        self.assertEqual(len(claude.calls), 2)
+        self.assertEqual(reviewer.prompts, [])
 
     def _c01_then_repair(self, c02_behavior: Any, reviews: list[str], *,
                          claude: FakeClaude | None = None, run_id: str = "p28"):
