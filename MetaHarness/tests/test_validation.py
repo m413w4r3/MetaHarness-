@@ -1,3 +1,5 @@
+import dataclasses
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -13,8 +15,10 @@ from metaharness.models import (  # noqa: E402
     HarnessConfig,
     LLMEndpointConfig,
 )
+from metaharness.approval import write_check_authority  # noqa: E402
 from metaharness.validation import (  # noqa: E402
     ValidationError,
+    config_with_check_authority,
     resolve_check_cwd,
     run_checks,
 )
@@ -132,6 +136,113 @@ class ValidationTests(unittest.TestCase):
         self.assertLessEqual(len(result.stdout_tail.encode()), 32)
         self.assertEqual((output / "checks" / "logs.stdout.log").read_text(), result.stdout_log)
         self.assertEqual((output / "checks" / "logs.stderr.log").read_text(), result.stderr_log)
+
+
+class CheckAuthorityTests(ValidationTests):
+    """A run owning a check authority never reads argv from today's TOML."""
+
+    CATALOGUE = (
+        CheckConfig("lint", ("frozen-lint",), timeout_seconds=11),
+        CheckConfig("test", ("frozen-test",), timeout_seconds=12),
+        CheckConfig("integration", ("frozen-integration",), timeout_seconds=13),
+    )
+
+    def authority_run(self, name: str = "run") -> Path:
+        directory = Path(self.tempdir.name) / name
+        directory.mkdir(parents=True, exist_ok=True)
+        write_check_authority(
+            directory, self.CATALOGUE, required_check_ids=("lint", "test"),
+        )
+        return directory
+
+    def current_config(self) -> HarnessConfig:
+        """Today's configuration, with every command deliberately changed."""
+
+        return dataclasses.replace(
+            self.config(()),
+            check_catalog=tuple(
+                CheckConfig(check.id, ("CHANGED", check.id), "src", timeout_seconds=99,
+                            preflight_argv=("CHANGED-preflight",))
+                for check in self.CATALOGUE
+            ),
+            default_check_ids=("lint", "test"),
+        )
+
+    def test_selection_and_catalogue_come_from_the_authority(self) -> None:
+        run_dir = self.authority_run()
+        frozen, ids = config_with_check_authority(self.current_config(), run_dir)
+        self.assertEqual(ids, ("lint", "test"))
+        self.assertEqual([check.argv for check in frozen.select_checks(ids)],
+                         [("frozen-lint",), ("frozen-test",)])
+        self.assertEqual([check.id for check in frozen.trusted_checks()],
+                         ["lint", "test", "integration"])
+
+    def test_a_requested_check_outside_c01_uses_the_frozen_command(self) -> None:
+        run_dir = self.authority_run()
+        frozen, ids = config_with_check_authority(
+            self.current_config(), run_dir, requested_check_ids=("test", "integration"),
+        )
+        self.assertEqual(ids, ("test", "integration"))
+        selected = frozen.select_checks(ids)
+        self.assertEqual([check.argv for check in selected],
+                         [("frozen-test",), ("frozen-integration",)])
+        # Nothing of the current TOML's command surface survives.
+        self.assertEqual([check.cwd for check in selected], [".", "."])
+        self.assertEqual([check.timeout_seconds for check in selected], [12, 13])
+        self.assertEqual([check.preflight_argv for check in selected], [(), ()])
+
+    def test_a_requested_check_absent_from_the_authority_fails_closed(self) -> None:
+        run_dir = self.authority_run()
+        config = dataclasses.replace(
+            self.current_config(),
+            check_catalog=self.current_config().check_catalog + (
+                CheckConfig("late", ("CHANGED", "late")),
+            ),
+            default_check_ids=("lint", "test"),
+        )
+        with self.assertRaises(ValidationError) as caught:
+            config_with_check_authority(config, run_dir, requested_check_ids=("late",))
+        self.assertIn("late", str(caught.exception))
+
+    def test_a_requested_check_untrusted_today_fails_closed(self) -> None:
+        run_dir = self.authority_run()
+        config = dataclasses.replace(
+            self.current_config(),
+            check_catalog=tuple(
+                check for check in self.current_config().check_catalog
+                if check.id != "integration"
+            ),
+        )
+        with self.assertRaises(ValidationError):
+            config_with_check_authority(config, run_dir, requested_check_ids=("integration",))
+
+    def test_a_rewritten_authority_is_rejected_against_the_approved_hash(self) -> None:
+        run_dir = self.authority_run()
+        approved = hashlib.sha256(
+            (run_dir / "check_authority.json").read_bytes()
+        ).hexdigest()
+        config = self.current_config()
+        # The unchanged bytes still verify.
+        config_with_check_authority(config, run_dir, expected_sha256=approved)
+        (run_dir / "check_authority.json").unlink()
+        write_check_authority(
+            run_dir,
+            tuple(dataclasses.replace(check, argv=("attacker", check.id))
+                  for check in self.CATALOGUE),
+            required_check_ids=("lint", "test"),
+        )
+        with self.assertRaises(ValidationError):
+            config_with_check_authority(config, run_dir, expected_sha256=approved)
+
+    def test_a_run_without_an_authority_keeps_the_legacy_behavior(self) -> None:
+        directory = Path(self.tempdir.name) / "legacy"
+        directory.mkdir()
+        config = self.config((CheckConfig("lint", ("make", "lint")),))
+        frozen, ids = config_with_check_authority(
+            config, directory, requested_check_ids=("lint",),
+        )
+        self.assertIs(frozen, config)
+        self.assertEqual(ids, ("lint",))
 
 
 if __name__ == "__main__":

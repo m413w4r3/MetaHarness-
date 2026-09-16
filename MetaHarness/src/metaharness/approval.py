@@ -122,7 +122,10 @@ def compute_plan_identity(
     )
 
 
-def _check_authority_payload(checks: tuple[CheckConfig, ...]) -> dict[str, object]:
+def _check_authority_payload(
+    checks: tuple[CheckConfig, ...],
+    required_check_ids: tuple[str, ...] | None = None,
+) -> dict[str, object]:
     entries: list[dict[str, object]] = []
     for check in checks:
         entry: dict[str, object] = {
@@ -136,17 +139,31 @@ def _check_authority_payload(checks: tuple[CheckConfig, ...]) -> dict[str, objec
         if check.description:
             entry["description"] = check.description
         entries.append(entry)
+    # Schema 1 froze exactly the initially selected checks, so the selection
+    # and the catalogue were the same list.  Schema 2 freezes the whole
+    # trusted catalogue and names the C01 selection separately, so a repair
+    # plan can request another approved check without ever reaching today's
+    # configuration for its argv.
+    if required_check_ids is None:
+        return {
+            "schema_version": 1,
+            "required_check_ids": [check.id for check in checks],
+            "checks": entries,
+        }
     return {
-        "schema_version": 1,
-        "required_check_ids": [check.id for check in checks],
+        "schema_version": 2,
+        "required_check_ids": list(required_check_ids),
         "checks": entries,
     }
 
 
-def _canonical_check_authority(checks: tuple[CheckConfig, ...]) -> bytes:
+def _canonical_check_authority(
+    checks: tuple[CheckConfig, ...],
+    required_check_ids: tuple[str, ...] | None = None,
+) -> bytes:
     return (
         json.dumps(
-            _check_authority_payload(checks),
+            _check_authority_payload(checks, required_check_ids),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -219,7 +236,8 @@ def read_check_authority(
         payload = json.loads(content.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ApprovalError("check authority JSON is invalid") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+    schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or schema_version not in (1, 2):
         raise ApprovalError("check authority schema_version is unsupported")
     required_ids = payload.get("required_check_ids")
     raw_checks = payload.get("checks")
@@ -233,27 +251,62 @@ def read_check_authority(
     if len(set(required_ids)) != len(required_ids):
         raise ApprovalError("check authority contains duplicate check IDs")
     checks = tuple(_validate_check_authority_check(item, index) for index, item in enumerate(raw_checks))
-    if tuple(check.id for check in checks) != tuple(required_ids):
-        raise ApprovalError("check authority order does not match required_check_ids")
+    catalogue_ids = tuple(check.id for check in checks)
+    if schema_version == 1:
+        if catalogue_ids != tuple(required_ids):
+            raise ApprovalError("check authority order does not match required_check_ids")
+    else:
+        if len(set(catalogue_ids)) != len(catalogue_ids):
+            raise ApprovalError("check authority contains duplicate check IDs")
+        unknown = [check_id for check_id in required_ids if check_id not in set(catalogue_ids)]
+        if unknown:
+            raise ApprovalError(
+                "check authority required_check_ids are not in the frozen catalogue: " + unknown[0]
+            )
     if trusted_check_ids is not None:
         trusted = set(trusted_check_ids)
         missing = [check_id for check_id in required_ids if check_id not in trusted]
         if missing:
             raise ApprovalError("check authority references an unknown trusted check ID: " + missing[0])
-    if content != _canonical_check_authority(checks):
+    canonical = _canonical_check_authority(
+        checks, tuple(required_ids) if schema_version == 2 else None
+    )
+    if content != canonical:
         raise ApprovalError("check authority JSON is not canonical")
     return tuple(required_ids), checks
 
 
 def write_check_authority(
-    run_dir: str | Path, checks: tuple[CheckConfig, ...] | list[CheckConfig]
+    run_dir: str | Path,
+    checks: tuple[CheckConfig, ...] | list[CheckConfig],
+    *,
+    required_check_ids: tuple[str, ...] | list[str] | None = None,
 ) -> str:
-    """Publish check definitions once; identical publication is idempotent."""
+    """Publish check definitions once; identical publication is idempotent.
+
+    Without *required_check_ids* this writes the historical schema 1, where
+    the frozen list is both the catalogue and the selection.  With it, the
+    schema 2 artifact freezes the whole trusted catalogue and records the
+    initial C01 selection separately.
+    """
 
     normalized = tuple(checks)
     if any(not isinstance(check, CheckConfig) for check in normalized):
         raise ApprovalError("check authority must contain only trusted CheckConfig values")
-    content = _canonical_check_authority(normalized)
+    catalogue_ids = tuple(check.id for check in normalized)
+    if len(set(catalogue_ids)) != len(catalogue_ids):
+        raise ApprovalError("check authority must not contain duplicate check IDs")
+    selection: tuple[str, ...] | None = None
+    if required_check_ids is not None:
+        selection = tuple(required_check_ids)
+        if len(set(selection)) != len(selection):
+            raise ApprovalError("check authority required_check_ids must be unique")
+        unknown = [check_id for check_id in selection if check_id not in set(catalogue_ids)]
+        if unknown:
+            raise ApprovalError(
+                "check authority required_check_ids are not in the frozen catalogue: " + unknown[0]
+            )
+    content = _canonical_check_authority(normalized, selection)
     path = _run_path(run_dir) / _CHECK_AUTHORITY_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
     try:

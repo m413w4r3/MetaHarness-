@@ -29,6 +29,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness import cli  # noqa: E402
+from metaharness.approval import (  # noqa: E402
+    read_check_authority,
+    write_check_authority,
+)
 from metaharness import orchestrator as orchestrator_module  # noqa: E402
 from metaharness.agent.base import AgentResult  # noqa: E402
 from metaharness.claude.agent import (  # noqa: E402
@@ -947,6 +951,258 @@ class FullPipelineTests(P28Harness):
         selection = json.loads((result.run_dir / "execution_selection.json").read_text())
         self.assertEqual(selection["schema_version"], 3)
         self.assertNotIn("reviser", selection)
+
+
+def required_checks_section(plan: str, *check_ids: str) -> str:
+    section = "REQUIRED_CHECKS\n" + "".join(f"- {check_id}\n" for check_id in check_ids)
+    return plan.replace("CONSTRAINTS\nNONE\n", f"CONSTRAINTS\nNONE\n\n{section}", 1)
+
+
+class CheckAuthorityPipelineTests(P28Harness):
+    """``checks/C01`` is canonical, and the frozen catalogue is the only argv."""
+
+    def evidence(self, path: Path) -> dict[str, Any]:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_p_check_repair_c01_keeps_the_red_attempt_and_publishes_the_green(self) -> None:
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(stage_actions={(1, "check-repair"): writer("src/a.py", "A = 3\n")})
+        result, _planner, _reviewer, _claude, pushed = self.run_pipeline(
+            luna=luna, reviews=[PASS], claude=claude, run_id="c01-layout",
+        )
+        self.assert_published_once(result, pushed, run_id="c01-layout")
+        run_dir = result.run_dir
+        checks_dir = run_dir / "checks" / "C01"
+
+        red = self.evidence(checks_dir / "attempts" / "01" / "evidence.json")
+        self.assertFalse(red["deterministic_passed"])
+        self.assertIn("CHECK_FAILED:gate", red["failures"])
+        for name in ("checks.json", "changed-files.txt", "diff.patch"):
+            self.assertTrue((checks_dir / "attempts" / "01" / name).exists(), name)
+
+        green = self.evidence(checks_dir / "evidence.json")
+        self.assertTrue(green["deterministic_passed"])
+        self.assertEqual(green["failures"], [])
+        candidate = json.loads((run_dir / "candidate/C01/commit.json").read_text())
+        self.assertEqual(candidate["tree_sha"], green["staged_tree_sha"])
+        # The historical root aliases exist and are the corrected evidence.
+        self.assertEqual(self.evidence(run_dir / "evidence.json"), green)
+        self.assertEqual((run_dir / "diff.patch").read_text(),
+                         (checks_dir / "diff.patch").read_text())
+
+    def test_q_the_green_c01_evidence_survives_the_c02_snapshot(self) -> None:
+        claude = FakeClaude(stage_actions={(1, "check-repair"): writer("src/a.py", "A = 3\n")})
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n"),
+                         (2, "S01"): writer("src/a.py", "A = 4\n")})
+        result, _planner, reviewer, _claude, pushed = self.run_pipeline(
+            luna=luna, reviews=[REVISE_IMPLEMENTATION, PASS], repair_plan=REPAIR_PLAN,
+            claude=claude, run_id="c01-snapshot",
+        )
+        self.assert_published_once(result, pushed, run_id="c01-snapshot",
+                                   expected_pushes=2, expected_commits=2)
+        self.assertEqual(len(reviewer.prompts), 2)
+        run_dir = result.run_dir
+        green = self.evidence(run_dir / "checks" / "C01" / "evidence.json")
+        self.assertTrue(green["deterministic_passed"])
+        self.assertEqual(
+            green["staged_tree_sha"],
+            json.loads((run_dir / "candidate/C01/commit.json").read_text())["tree_sha"],
+        )
+        # The pre-repair red evidence stays archived and never returns.
+        red = self.evidence(run_dir / "checks/C01/attempts/01/evidence.json")
+        self.assertFalse(red["deterministic_passed"])
+        self.assertNotEqual(red["staged_tree_sha"], green["staged_tree_sha"])
+        self.assertTrue(self.evidence(run_dir / "checks/C02/evidence.json")["deterministic_passed"])
+
+    # -- frozen catalogue -------------------------------------------------
+    def catalogue_config(self) -> tuple[Any, Path]:
+        """A three-check catalogue; C01 selects only ``lint`` and ``gate``."""
+
+        self.integration_marker = self.root / "integration-ran.txt"
+        integration = self.root / "integration.py"
+        integration.write_text(
+            "import sys\nopen(sys.argv[1], 'a').write('frozen\\n')\nsys.exit(0)\n",
+            encoding="utf-8",
+        )
+        text = self.config_text()
+        text = text.replace("require_clean_base = true",
+                            'require_clean_base = true\ndefault_check_ids = ["gate"]', 1)
+        text = text.replace('[[checks]]\nname = "gate"', '[[check_catalog]]\nid = "gate"', 1)
+        text += textwrap.dedent(f"""
+            [[check_catalog]]
+            id = "lint"
+            argv = [{sys.executable!r}, "-c", "pass"]
+            timeout_seconds = 30
+
+            [[check_catalog]]
+            id = "integration"
+            argv = [{sys.executable!r}, {str(integration)!r}, {str(self.integration_marker)!r}]
+            timeout_seconds = 30
+            """)
+        path = self.root / "catalogue.toml"
+        path.write_text(text, encoding="utf-8")
+        return load_config(path), path
+
+    def test_r_c02_may_require_a_frozen_check_the_current_toml_has_changed(self) -> None:
+        config, path = self.catalogue_config()
+        changed_marker = self.root / "changed-ran.txt"
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
+                         (2, "S01"): writer("src/a.py", "A = 3\n")})
+        planner = QueueClient("planner", [
+            required_checks_section(SINGLE_PLAN, "lint", "gate"),
+            required_checks_section(REPAIR_PLAN, "lint", "gate", "integration"),
+        ], self.events)
+        reviewer = QueueClient("reviewer", [REVISE_IMPLEMENTATION, PASS], self.events)
+        claude = FakeClaude(log=self.events)
+        orchestrator = Orchestrator(config, planner_client=planner, reviewer_client=reviewer,
+                                    agent=luna, reviser=claude)
+
+        # After C01 the operator rewrites ``integration`` in the TOML.  The
+        # replacement command must never run: C02 uses the approved catalogue.
+        changed = self.root / "changed.py"
+        changed.write_text(
+            "import sys\nopen(sys.argv[1], 'a').write('changed\\n')\n", encoding="utf-8",
+        )
+        real_repair = Orchestrator._execute_v2_repair_cycle
+
+        def rewrite_then_repair(self_, **kwargs: Any):
+            text = path.read_text(encoding="utf-8").replace(
+                f"{str(self.root / 'integration.py')!r}, {str(self.integration_marker)!r}",
+                f"{str(changed)!r}, {str(changed_marker)!r}",
+            )
+            path.write_text(text, encoding="utf-8")
+            self_.config = load_config(path)
+            return real_repair(self_, **kwargs)
+
+        with mock.patch.object(Orchestrator, "_execute_v2_repair_cycle", rewrite_then_repair):
+            result = orchestrator.run_text(SPEC, run_id="frozen-catalogue")
+
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.state["deterministic_gate"]["required_check_ids"],
+                         ["gate", "lint", "integration"])
+        # The frozen integration command ran; the rewritten one never did.
+        self.assertTrue(self.integration_marker.exists())
+        self.assertFalse(changed_marker.exists())
+        authority = json.loads((result.run_dir / "check_authority.json").read_text())
+        self.assertEqual(authority["schema_version"], 2)
+        self.assertEqual(authority["required_check_ids"], ["gate", "lint"])
+        self.assertEqual(sorted(entry["id"] for entry in authority["checks"]),
+                         ["gate", "integration", "lint"])
+
+    def test_s_a_repair_check_absent_from_the_authority_fails_closed(self) -> None:
+        config, path = self.catalogue_config()
+        late_marker = self.root / "late-ran.txt"
+        late = self.root / "late.py"
+        late.write_text("import sys\nopen(sys.argv[1], 'a').write('late\\n')\n", encoding="utf-8")
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")})
+        planner = QueueClient("planner", [
+            required_checks_section(SINGLE_PLAN, "gate"),
+            required_checks_section(REPAIR_PLAN, "gate", "late"),
+        ], self.events)
+        orchestrator = Orchestrator(
+            config, planner_client=planner,
+            reviewer_client=QueueClient("reviewer", [REVISE_IMPLEMENTATION, PASS], self.events),
+            agent=luna, reviser=FakeClaude(log=self.events),
+        )
+        real_repair = Orchestrator._execute_v2_repair_cycle
+
+        def add_late_check(self_, **kwargs: Any):
+            path.write_text(path.read_text(encoding="utf-8") + textwrap.dedent(f"""
+                [[check_catalog]]
+                id = "late"
+                argv = [{sys.executable!r}, {str(late)!r}, {str(late_marker)!r}]
+                timeout_seconds = 30
+                """), encoding="utf-8")
+            self_.config = load_config(path)
+            return real_repair(self_, **kwargs)
+
+        with mock.patch.object(Orchestrator, "_execute_v2_repair_cycle", add_late_check):
+            result = orchestrator.run_text(SPEC, run_id="late-check")
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.state["failure"]["reason"], "CHECK_SETUP_INVALID")
+        self.assertIn("late", result.state["failure"]["detail"])
+        self.assertFalse(late_marker.exists())
+        self.assertFalse((result.run_dir / "checks" / "C02" / "evidence.json").exists())
+
+    def test_t_a_rewritten_check_authority_is_rejected_before_any_check_runs(self) -> None:
+        """A live TOCTOU: canonical, same IDs, attacker-controlled command."""
+
+        for field, mutate in (
+            ("argv", lambda check, marker: dataclasses.replace(
+                check, argv=(sys.executable, str(marker[0]), str(marker[1])))),
+            ("cwd", lambda check, marker: dataclasses.replace(check, cwd="src")),
+            ("timeout_seconds", lambda check, marker: dataclasses.replace(
+                check, timeout_seconds=1)),
+            ("preflight_argv", lambda check, marker: dataclasses.replace(
+                check, preflight_argv=(sys.executable, str(marker[0]), str(marker[1])))),
+        ):
+            with self.subTest(field=field):
+                self.setUp()
+                self.assert_rewritten_authority_fails(field, mutate)
+
+    def assert_rewritten_authority_fails(self, field: str, mutate: Any) -> None:
+        marker_script = self.root / "attacker.py"
+        marker_script.write_text(
+            "import sys\nopen(sys.argv[1], 'a').write('attacker\\n')\n", encoding="utf-8",
+        )
+        marker = self.root / f"attacker-{field}.txt"
+        config = self.load()
+
+        def rewrite(root: Path) -> None:
+            run_dir = self.runs / "toctou"
+            frozen = read_check_authority(run_dir)
+            (run_dir / "check_authority.json").unlink()
+            write_check_authority(
+                run_dir,
+                tuple(mutate(check, (marker_script, marker)) for check in frozen[1]),
+                required_check_ids=frozen[0],
+            )
+            write(root / "src/a.py", "A = 2\n")
+
+        result, _planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=FakeLuna({(1, "S01"): rewrite}), reviews=[PASS], run_id="toctou",
+        )
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.state["failure"]["reason"], "CHECK_SETUP_INVALID")
+        self.assertFalse(marker.exists(), f"the rewritten {field} was executed")
+        self.assertEqual(reviewer.prompts, [])
+        self.assert_no_commit_no_push(result, pushed, run_id="toctou")
+
+    def test_u_a_structured_error_terminal_fails_even_with_exit_code_zero(self) -> None:
+        cases = (
+            ("error_max_turns", "CLAUDE_MAX_TURNS"),
+            ("error_during_execution", "CLAUDE_FAILED"),
+        )
+        for subtype, reason in cases:
+            with self.subTest(subtype=subtype):
+                self.setUp()
+                self.assert_error_terminal_fails(subtype, reason)
+
+    def assert_error_terminal_fails(self, subtype: str, reason: str) -> None:
+        class ErrorTerminalClaude(FakeClaude):
+            def run_revision(self_, prompt: str, worktree: Path, **kwargs: Any) -> ClaudeResult:
+                result = super().run_revision(prompt, worktree, **kwargs)
+                # A CLI that exits 0 after an explicitly errored terminal.
+                return dataclasses.replace(
+                    result, exit_code=0, timed_out=False,
+                    terminal_type="result", terminal_subtype=subtype,
+                    terminal_is_error=True,
+                )
+
+        claude = ErrorTerminalClaude()
+        run_id = f"terminal-{subtype.replace('_', '-')}"
+        result, _planner, reviewer, _claude, pushed = self.run_pipeline(
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")}),
+            reviews=[PASS], claude=claude, run_id=run_id,
+        )
+        self.assertEqual(result.state["failure"]["reason"], reason)
+        self.assert_no_commit_no_push(result, pushed, run_id=run_id)
+        # Nothing downstream of the failed revision happened.
+        self.assertEqual(len(claude.calls), 1)
+        self.assertEqual(reviewer.prompts, [])
+        self.assertFalse((result.run_dir / "checks" / "C01" / "evidence.json").exists())
+        self.assertFalse((result.run_dir / "candidate").exists())
 
 
 class ApprovalV4Tests(P28Harness):

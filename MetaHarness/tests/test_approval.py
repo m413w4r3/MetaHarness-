@@ -123,6 +123,65 @@ class ApprovalTests(unittest.TestCase):
         with self.assertRaises(ApprovalError):
             read_plan_approval(directory, expected_identity=identity)
 
+    def test_schema_2_freezes_the_whole_catalogue_and_names_the_selection(self) -> None:
+        directory = self._run_dir("authority-schema2")
+        catalogue = [
+            CheckConfig("lint", ("make", "lint")),
+            CheckConfig("test", ("make", "test")),
+            CheckConfig("integration", ("make", "integration")),
+        ]
+        write_check_authority(directory, catalogue, required_check_ids=("lint", "test"))
+        payload = json.loads((directory / "check_authority.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["required_check_ids"], ["lint", "test"])
+        self.assertEqual([entry["id"] for entry in payload["checks"]],
+                         ["lint", "test", "integration"])
+        required_ids, frozen = read_check_authority(directory)
+        self.assertEqual(required_ids, ("lint", "test"))
+        # The catalogue keeps the check C01 did not select, with its argv.
+        self.assertEqual([check.id for check in frozen], ["lint", "test", "integration"])
+        self.assertEqual(frozen[2].argv, ("make", "integration"))
+        # Republishing the identical bytes stays idempotent; different bytes do not.
+        write_check_authority(directory, catalogue, required_check_ids=("lint", "test"))
+        with self.assertRaises(ApprovalError):
+            write_check_authority(directory, catalogue, required_check_ids=("lint",))
+
+    def test_schema_2_rejects_a_selection_outside_the_frozen_catalogue(self) -> None:
+        directory = self._run_dir("authority-outside")
+        catalogue = [CheckConfig("lint", ("make", "lint"))]
+        with self.assertRaises(ApprovalError):
+            write_check_authority(directory, catalogue, required_check_ids=("lint", "test"))
+        with self.assertRaises(ApprovalError):
+            write_check_authority(directory, catalogue, required_check_ids=("lint", "lint"))
+        self.assertFalse((directory / "check_authority.json").exists())
+        payload = {
+            "schema_version": 2,
+            "required_check_ids": ["absent"],
+            "checks": [{"id": "lint", "argv": ["make", "lint"], "cwd": ".",
+                        "timeout_seconds": 1800, "preflight_argv": [], "required": True}],
+        }
+        (directory / "check_authority.json").write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ApprovalError):
+            read_check_authority(directory)
+
+    def test_schema_1_stays_readable_and_is_never_rewritten(self) -> None:
+        directory = self._run_dir("authority-schema1")
+        check = CheckConfig("lint", ("make", "lint"))
+        write_check_authority(directory, [check])
+        before = (directory / "check_authority.json").read_bytes()
+        self.assertEqual(json.loads(before)["schema_version"], 1)
+        required_ids, frozen = read_check_authority(directory)
+        self.assertEqual((required_ids, [c.id for c in frozen]), (("lint",), ["lint"]))
+        read_check_authority(
+            directory,
+            expected_sha256=hashlib.sha256(before).hexdigest(),
+            trusted_check_ids=("lint",),
+        )
+        self.assertEqual((directory / "check_authority.json").read_bytes(), before)
+
     def test_wait_returns_decision_and_preserves_keyboard_interrupt(self) -> None:
         directory = self._run_dir("wait")
         with mock.patch("metaharness.approval.time.sleep", side_effect=KeyboardInterrupt):

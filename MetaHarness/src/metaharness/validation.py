@@ -35,12 +35,18 @@ class ValidationError(RuntimeError):
 def config_with_check_authority(
     config: HarnessConfig, run_dir: str | Path, *,
     requested_check_ids: tuple[str, ...] | list[str] | None = None,
+    expected_sha256: str | None = None,
 ) -> tuple[HarnessConfig, tuple[str, ...] | None]:
     """Return the run's frozen check config, or the legacy config.
 
-    The current TOML is used only to confirm that the frozen IDs remain in
-    the trusted catalogue.  The command-bearing values always come from the
-    durable authority artifact.
+    The current TOML is used only to confirm that the requested IDs remain in
+    the trusted catalogue.  The command-bearing values (argv, cwd, timeout,
+    preflight argv) always come from the durable authority artifact: once a
+    run owns a ``check_authority.json`` there is no fallback to today's
+    configuration, even for an ID the initial C01 selection did not include.
+
+    *expected_sha256* is the already durable hash the approval bound.  It is
+    verified on every live use, not only on resume.
     """
 
     directory = Path(run_dir).expanduser().resolve()
@@ -54,28 +60,39 @@ def config_with_check_authority(
     try:
         authority = read_check_authority(
             directory,
+            expected_sha256=expected_sha256,
             trusted_check_ids=tuple(check.id for check in config.trusted_checks()),
         )
     except ApprovalError as exc:
         raise ValidationError(str(exc)) from exc
     if authority is None:
         return config, requested_check_ids
-    authority_ids, checks = authority
+    authority_ids, catalogue = authority
     selected_ids = authority_ids
+    checks = catalogue
     if requested_check_ids is not None:
         selected_ids = tuple(requested_check_ids)
-        try:
-            current_selected = config.select_checks(selected_ids)
-        except ValueError as exc:
-            raise ValidationError(str(exc)) from exc
-        authority_by_id = dict(zip(authority_ids, checks))
-        checks = tuple(
-            authority_by_id.get(check.id, check) for check in current_selected
-        )
+        if len(set(selected_ids)) != len(selected_ids):
+            raise ValidationError("required check IDs must be unique")
+        frozen_by_id = {check.id: check for check in catalogue}
+        # The installation may still veto an ID, but it can never supply one.
+        trusted_ids = {check.id for check in config.trusted_checks()}
+        resolved: list[CheckConfig] = []
+        for check_id in selected_ids:
+            frozen_check = frozen_by_id.get(check_id)
+            if frozen_check is None:
+                raise ValidationError(
+                    "requested check is absent from the run's approved check authority: "
+                    + check_id
+                )
+            if check_id not in trusted_ids:
+                raise ValidationError("unknown trusted check ID(s): " + check_id)
+            resolved.append(frozen_check)
+        checks = tuple(resolved)
     frozen = dataclasses.replace(
         config,
         checks=checks,
-        check_catalog=checks,
+        check_catalog=catalogue,
         default_check_ids=selected_ids,
     )
     return frozen, selected_ids

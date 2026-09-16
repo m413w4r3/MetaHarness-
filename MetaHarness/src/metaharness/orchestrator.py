@@ -1038,6 +1038,9 @@ _REVIEW_ATTEMPT_ARTIFACTS = (
     "reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json", "review.json",
 )
 _CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "evidence.json")
+# The historical root aliases of the C01 evidence.  ``checks/C01`` is the
+# canonical directory; these names are only ever republished *from* it.
+_CHECK_ALIAS_ARTIFACTS = _CHECK_ATTEMPT_ARTIFACTS
 # Archiving ``pre_checks.json`` makes a CHECKS_Cxx resume replay the checks.
 _PRE_CHECK_ATTEMPT_ARTIFACTS = _CHECK_ATTEMPT_ARTIFACTS + ("pre_checks.json",)
 _REVISION_ATTEMPT_ARTIFACTS = _AGENT_ARTIFACTS + ("tree_after_failure.txt",)
@@ -1812,34 +1815,52 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _snapshot_cycle_artifacts(run_dir: Path) -> None:
+    def _copy_artifacts(source: Path, destination: Path, names: tuple[str, ...]) -> None:
+        for name in names:
+            source_path = source / name
+            if not source_path.exists():
+                continue
+            try:
+                content = source_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            atomic_write_text(destination / name, content)
+
+    @classmethod
+    def _publish_check_aliases(cls, run_dir: Path, checks_dir: Path) -> None:
+        """Republish the canonical C01 evidence under its root aliases.
+
+        Authority only ever flows ``checks/C01 -> run_dir``.  The reverse copy
+        would let a pre-repair red evidence overwrite the corrected one.
+        """
+
+        cls._copy_artifacts(checks_dir, run_dir, _CHECK_ALIAS_ARTIFACTS)
+
+    @classmethod
+    def _snapshot_cycle_artifacts(cls, run_dir: Path) -> None:
         """Publish immutable C01 aliases before any C02 work can start."""
 
-        groups = (
-            (run_dir / "revision", run_dir / "revision" / "C01"),
-            (run_dir, run_dir / "review" / "C01"),
-            (run_dir, run_dir / "checks" / "C01"),
+        cls._copy_artifacts(
+            run_dir / "revision", run_dir / "revision" / "C01",
+            ("agent.prompt.txt", "agent.events.jsonl", "agent.stderr.log",
+             "agent.final.md", "agent.result.json", "pre_checks.json",
+             "scope.json", "tree_before.txt", "tree_after.txt",
+             "report.json", "usage.json"),
         )
-        names = {
-            "revision": ("agent.prompt.txt", "agent.events.jsonl", "agent.stderr.log",
-                         "agent.final.md", "agent.result.json", "pre_checks.json",
-                         "scope.json", "tree_before.txt", "tree_after.txt",
-                         "report.json", "usage.json"),
-            "review": ("reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json",
-                       "review.json"),
-            "checks": ("checks.json", "changed-files.txt", "diff.patch", "evidence.json"),
-        }
-        for source, destination in groups:
-            kind = "revision" if destination.parent.name == "revision" else "review" if destination.parent.name == "review" else "checks"
-            for name in names[kind]:
-                source_path = source / name
-                if not source_path.exists():
-                    continue
-                try:
-                    content = source_path.read_text(encoding="utf-8")
-                except (OSError, UnicodeError):
-                    continue
-                atomic_write_text(destination / name, content)
+        cls._copy_artifacts(
+            run_dir, run_dir / "review" / "C01",
+            ("reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json", "review.json"),
+        )
+        checks_dir = run_dir / "checks" / "C01"
+        if (checks_dir / "evidence.json").is_file():
+            # ``checks/C01`` already holds the final C01 evidence (possibly the
+            # green retry after an automatic check repair): never overwrite it
+            # with the stale root aliases.
+            cls._publish_check_aliases(run_dir, checks_dir)
+        else:
+            # A run created before ``checks/C01`` became canonical kept its
+            # only C01 evidence at the run root.
+            cls._copy_artifacts(run_dir, checks_dir, _CHECK_ALIAS_ARTIFACTS)
 
     @staticmethod
     def _ensure_step_artifacts(step_dir: Path, result: Any) -> None:
@@ -2594,7 +2615,13 @@ class Orchestrator:
                 # Preserve the historical ``[[checks]]`` selection semantics
                 # for v2 configurations that predate the explicit catalogue.
                 selected_checks = self.config.select_checks(None)
-            write_check_authority(run_dir, selected_checks)
+            # Freeze the whole trusted catalogue, not just the C01 selection:
+            # a C02 repair plan may legitimately require another approved
+            # check, and it must still run the argv approved at this boundary.
+            write_check_authority(
+                run_dir, tuple(self.config.trusted_checks()),
+                required_check_ids=tuple(check.id for check in selected_checks),
+            )
             _bundle, _bundle_sha = validate_implementation_bundle(run_dir)
             plan_identity = compute_plan_identity_from_run(run_dir)
         except (ApprovalError, V2PlanParseError, OSError, UnicodeError) as exc:
@@ -2749,7 +2776,11 @@ class Orchestrator:
         candidate_tree = index_tree_sha(info.worktree)
         if candidate_tree != base_tree_sha:
             raise OrchestrationError("initial candidate tree does not match base")
-        check_config, check_ids = config_with_check_authority(self.config, run_dir)
+        # The workspace preflight is the first live use of the authority; the
+        # expected hash is the one this run's identity already durably bound.
+        check_config, check_ids = config_with_check_authority(
+            self.config, run_dir, expected_sha256=durable_identity.checks_sha256,
+        )
         preflight_failures = run_check_preflights(
             info.worktree, check_config, check_ids or plan.required_checks
         )
@@ -2770,6 +2801,35 @@ class Orchestrator:
             ResumePhase.INITIAL_STEP, 1, plan.steps[0].id, base_sha, base_tree_sha,
             identity.execution_sha256, identity,
         )
+
+    @staticmethod
+    def _approved_check_authority_sha256(run_dir: Path) -> str | None:
+        """The check authority hash the run's durable boundary already binds.
+
+        This is deliberately *not* a hash of the file being read: the expected
+        value comes from the checkpoint written before the approval, so a
+        rewritten ``check_authority.json`` is rejected on every live use, not
+        only on resume.  A run created before the artifact existed has no hash
+        and keeps its legacy behavior.
+        """
+
+        directory = Path(run_dir).expanduser().resolve()
+        while not (directory / "check_authority.json").is_file():
+            parent = directory.parent
+            if parent == directory:
+                return None
+            directory = parent
+        try:
+            record = read_checkpoint_record(directory)
+        except ResumeCheckpointError as exc:
+            raise ValidationError(f"the run checkpoint is unreadable: {exc}") from exc
+        identity = record[0].plan_identity if record is not None else None
+        approved = identity.checks_sha256 if identity is not None else None
+        if approved is None:
+            raise ValidationError(
+                "the run has a check authority but no durable approved hash"
+            )
+        return approved
 
     @staticmethod
     def _write_phase_checkpoint(
@@ -3050,16 +3110,22 @@ class Orchestrator:
             # The final checks evaluate exactly the checkpointed tree; a failure
             # keeps that boundary instead of blessing whatever the checks left.
             checks_tree = candidate_tree_sha(info.worktree)
+            checks_dir_c01 = run_dir / "checks" / "C01"
+            checks_dir_c01.mkdir(parents=True, exist_ok=True)
             try:
                 if resumed is not None and phase is final_checks_phase:
-                    _archive_attempt(run_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
+                    _archive_attempt(checks_dir_c01, names=_CHECK_ATTEMPT_ARTIFACTS)
                 evidence = self._final_evidence(
-                    info.worktree, base_sha, run_dir,
+                    info.worktree, base_sha, checks_dir_c01,
                     check_failures_hard=not revision_enabled,
                     reuse=resumed is not None and phase is ResumePhase.REVIEWER_C01,
                     required_check_ids=plan.required_checks or None,
                     enforce_diff_size=False,
+                    # A run created before ``checks/C01`` was canonical kept
+                    # its only final evidence at the run root.
+                    reuse_fallback_dir=run_dir,
                 )
+                self._publish_check_aliases(run_dir, checks_dir_c01)
             except Exception:
                 self._write_phase_checkpoint(
                     run_dir, final_checks_phase, cycle=1, head=base_sha, tree=checks_tree,
@@ -3106,6 +3172,11 @@ class Orchestrator:
                 check_repair={"attempted": True, "failure_ids": soft_failures_c01},
             )
             if at <= phase_index(check_repair_phase):
+                if resumed is not None and phase is check_repair_phase:
+                    # The previous attempt produced the failure tree this
+                    # resume already validated and restored; its prompt, events
+                    # and logs are archived before new ones are written.
+                    _archive_attempt_tree(run_dir / "revision" / "check-repair" / "C01")
                 try:
                     check_repair_result_c01, repair_error = self._run_v2_revision_cycle(
                         store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
@@ -3149,6 +3220,7 @@ class Orchestrator:
                         required_check_ids=plan.required_checks or None,
                         enforce_diff_size=False,
                     )
+                    self._publish_check_aliases(run_dir, run_dir / "checks" / "C01")
                 except Exception:
                     self._write_phase_checkpoint(
                         run_dir, retry_checks_phase, cycle=1,
@@ -4001,16 +4073,20 @@ class Orchestrator:
         expected_head_sha: str | None = None,
         required_check_ids: tuple[str, ...] | None = None,
         enforce_diff_size: bool = False,
+        reuse_fallback_dir: Path | None = None,
     ) -> EvidenceBundle:
         """Final checks for the exact current candidate.
 
         On a reviewer resume, durable evidence already frozen for exactly
         this index tree is reused: checks are never replayed for a tree whose
-        evidence is complete.
+        evidence is complete.  *reuse_fallback_dir* lets a run created before
+        ``checks/C01`` became canonical reuse its root evidence.
         """
 
         if reuse:
             stored = _load_evidence(evidence_dir)
+            if stored is None and reuse_fallback_dir is not None:
+                stored = _load_evidence(reuse_fallback_dir)
             if (
                 stored is not None
                 and stored.base_sha == base_sha
@@ -4021,6 +4097,7 @@ class Orchestrator:
                 return stored
         check_config, check_ids = config_with_check_authority(
             self.config, evidence_dir, requested_check_ids=required_check_ids,
+            expected_sha256=self._approved_check_authority_sha256(evidence_dir),
         )
         return collect_evidence(
             worktree, base_sha, check_config, evidence_dir=evidence_dir,
@@ -4106,6 +4183,7 @@ class Orchestrator:
                 store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
                 check_config, check_ids = config_with_check_authority(
                     self.config, run_dir, requested_check_ids=plan.required_checks or None,
+                    expected_sha256=self._approved_check_authority_sha256(run_dir),
                 )
                 pre_evidence = collect_evidence(
                     info.worktree, base_sha, check_config,
@@ -4194,14 +4272,19 @@ class Orchestrator:
         if result.timed_out:
             _record_failure_tree(artifact_dir, info.worktree)
             return result, "CLAUDE_TIMEOUT"
-        if result.exit_code != 0:
+        terminal_is_error = getattr(result, "terminal_is_error", None) is True
+        terminal_subtype = getattr(result, "terminal_subtype", None)
+        # A structured terminal marked ``is_error`` is a failure on its own.
+        # Some CLI versions and wrappers still exit 0 after one, so exit code
+        # is the last signal consulted, never the gate for the others.
+        if terminal_is_error or result.exit_code != 0:
             _record_failure_tree(artifact_dir, info.worktree)
             if claude_auth_failure:
                 return result, "CLAUDE_AUTH_FAILURE"
             # Claude's terminal result is authoritative when available.  The
             # textual fallback above remains for older CLI versions and old
             # artifacts that do not expose terminal metadata.
-            if getattr(result, "terminal_subtype", None) == "error_max_turns":
+            if terminal_subtype == "error_max_turns":
                 return result, "CLAUDE_MAX_TURNS"
             return result, "CLAUDE_FAILED"
         revision_ownership = _git_ownership(repo, info.worktree)
@@ -4446,6 +4529,7 @@ class Orchestrator:
             # on failure, leave the checkpoint at the next worker boundary.
             check_config, check_ids = config_with_check_authority(
                 self.config, run_dir, requested_check_ids=repair_plan.required_checks,
+                expected_sha256=self._approved_check_authority_sha256(run_dir),
             )
             preflight_failures = run_check_preflights(
                 info.worktree, check_config, check_ids or repair_plan.required_checks
@@ -4621,6 +4705,10 @@ class Orchestrator:
                 check_repair={"attempted": True, "failure_ids": soft_failures_c02},
             )
             if at <= phase_index(check_repair_phase):
+                if start is not None and start.phase is check_repair_phase:
+                    # Same guarantee as C01: never lose the logs of the attempt
+                    # that produced the failure tree this resume restored.
+                    _archive_attempt_tree(run_dir / "revision" / "check-repair" / "C02")
                 check_repair_result_c02, repair_error = self._run_v2_revision_cycle(
                     store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
                     base_tree_sha=resolve_tree(repo, base_sha), spec=spec,
@@ -5990,11 +6078,13 @@ class Orchestrator:
         try:
             frozen_check_config, frozen_check_ids = config_with_check_authority(
                 self.config, run_dir,
+                expected_sha256=checkpoint.plan_identity.checks_sha256
+                if checkpoint.plan_identity is not None else None,
             )
             if frozen_check_ids is not None:
-                for frozen_check in frozen_check_config.trusted_checks():
+                for frozen_check in frozen_check_config.select_checks(frozen_check_ids):
                     resolve_check_cwd(worktree, frozen_check)
-        except ValidationError as exc:
+        except (ValidationError, ValueError) as exc:
             refuse(f"check authority is invalid: {exc}")
         scope = sorted({
             path for step in plan.steps
