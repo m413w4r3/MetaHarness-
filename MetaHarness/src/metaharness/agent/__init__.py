@@ -8,7 +8,9 @@ from .codex import (
     build_agent_environment,
     build_implementer_prompt,
     build_implementer_step_prompt,
+    build_mismatch_retry_addendum,
     classify_codex_failure,
+    deferred_verify_dependency,
 )
 from .events import extract_final, extract_usage, parse_event
 from .runtime import CodexRuntimeError, prepare_codex_home
@@ -22,8 +24,10 @@ __all__ = [
     "build_agent_environment",
     "build_implementer_prompt",
     "build_implementer_step_prompt",
+    "build_mismatch_retry_addendum",
     "classify_codex_failure",
     "check_codex_authentication",
+    "deferred_verify_dependency",
     "CodexRuntimeError",
     "extract_final",
     "extract_usage",

@@ -541,10 +541,33 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
             return ResumeInfo(False, reason="run worktree is missing")
     return ResumeInfo(
         True, checkpoint.phase.value,
-        "CONTINUE AFTER CLEAN MISMATCH" if clean_mismatch else resume_label(checkpoint),
+        _clean_mismatch_label(directory, checkpoint) if clean_mismatch
+        else resume_label(checkpoint),
         expected_tree=checkpoint.expected_tree_sha, cycle=checkpoint.cycle,
         step_id=checkpoint.step_id,
     )
+
+
+def _clean_mismatch_label(run_dir: Path, checkpoint: ResumeCheckpoint) -> str:
+    """Whether the recovery will retry the step once or defer it."""
+
+    return (
+        "CONTINUE AFTER CLEAN MISMATCH"
+        if mismatch_retry_spent(run_dir, checkpoint.step_id)
+        else f"RETRY {checkpoint.step_id} AFTER CLEAN MISMATCH"
+    )
+
+
+def mismatch_retry_spent(run_dir: str | Path, step_id: str | None) -> bool:
+    """Whether this step already used its single bounded mismatch retry."""
+
+    if not step_id:
+        return False
+    record = _read_json(Path(run_dir) / "steps" / step_id / "step.json", 128 * 1024)
+    if not isinstance(record, dict):
+        return False
+    spent = record.get("mismatch_retry_count")
+    return isinstance(spent, int) and spent >= 1
 
 
 def is_clean_contract_mismatch_artifact(
@@ -627,5 +650,6 @@ __all__ = [
     "resume_info",
     "resume_label",
     "is_clean_contract_mismatch_artifact",
+    "mismatch_retry_spent",
     "write_checkpoint",
 ]

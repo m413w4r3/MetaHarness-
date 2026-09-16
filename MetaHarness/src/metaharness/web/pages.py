@@ -553,6 +553,16 @@ def _step_card(item: dict[str, Any], artifact: dict[str, Any]) -> str:
         f'<p class="warning"><strong>DEFERRED CONTRACT MISMATCH</strong>: {_e(artifact.get("mismatch"))}</p>'
         if status == "deferred" and artifact.get("mismatch") else ""
     )
+    if artifact.get("mismatch_retry_count"):
+        mismatch_line += (
+            f'<p class="muted small">bounded mismatch retries: '
+            f'{_e(artifact.get("mismatch_retry_count"))}</p>'
+        )
+    if artifact.get("deferred_verify"):
+        mismatch_line += (
+            '<p class="warning"><strong>DEFERRED VERIFY DEPENDENCY</strong>: '
+            f'{_e(artifact.get("deferred_verify"))}</p>'
+        )
     return (
         f'<details class="card step {_e(status)}"{" open" if status in {"running", "failed", "deferred"} else ""}>'
         f'<summary>{_e(item.get("id"))} {icon} — {_e(item.get("title"))} · '

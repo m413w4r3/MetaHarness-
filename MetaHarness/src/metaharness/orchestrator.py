@@ -13,7 +13,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping, NoReturn
+from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 from .agent.base import AgentError, AgentResult
 from .agent.diagnostics import TOKEN_DIAGNOSTICS_NAME, write_token_diagnostics
@@ -22,8 +22,10 @@ from .agent.codex import (
     CodexAgent,
     build_agent_environment,
     build_implementer_step_prompt,
+    build_mismatch_retry_addendum,
     classify_codex_failure,
     contract_mismatch_explanation,
+    deferred_verify_dependency,
 )
 from .agent.runtime import prepare_codex_home
 from .claude.agent import (
@@ -173,6 +175,7 @@ from .resume import (
     is_clean_contract_mismatch_artifact,
     load_resume_checkpoint,
     mark_checkpoint_completed,
+    mismatch_retry_spent,
     phase_index,
     plan_identity_from_mapping,
     read_checkpoint,
@@ -361,23 +364,58 @@ def _deferred_contract_mismatches(
     steps = {step.id: step for step in plan.steps}
     summaries: list[dict[str, Any]] = []
     for item in results:
-        if item.get("status") != "DEFERRED_CONTRACT_MISMATCH":
+        deferred = item.get("status") == "DEFERRED_CONTRACT_MISMATCH"
+        verify = _bounded_v2_report(str(item.get("deferred_verify") or ""))
+        if not deferred and not verify:
             continue
         step = steps.get(item.get("id"))
         if step is None:
             continue
-        summaries.append({
+        scope = {
+            "write": list(step.write_set),
+            "create": list(step.create_set),
+            "delete": list(step.delete_set),
+        }
+        record: dict[str, Any] = {
             "step_id": step.id,
             "step_title": step.title,
-            "mismatch": _bounded_v2_report(str(item.get("mismatch") or "")),
-            "original_scope": {
-                "write": list(step.write_set),
-                "create": list(step.create_set),
-                "delete": list(step.delete_set),
-            },
-            "tree_at_mismatch": item.get("tree_before"),
-        })
+            "kind": (
+                "DEFERRED_CONTRACT_MISMATCH" if deferred
+                else "DEFERRED_VERIFY_DEPENDENCY"
+            ),
+            "original_scope": scope,
+        }
+        if deferred:
+            record["mismatch"] = _bounded_v2_report(str(item.get("mismatch") or ""))
+            record["tree_at_mismatch"] = item.get("tree_before")
+        if item.get("initial_mismatch"):
+            record["initial_mismatch"] = _bounded_v2_report(str(item["initial_mismatch"]))
+        if item.get("mismatch_retry_count"):
+            record["mismatch_retry_count"] = item["mismatch_retry_count"]
+        if verify:
+            # The step completed inside its approved scope but one VERIFY
+            # command still fails on a path a later step owns.  Claude and
+            # the reviewer must decide; nothing here accepts that failure.
+            record["deferred_verify_dependency"] = verify
+        summaries.append(record)
     return _json_text(summaries) if summaries else "NONE\n"
+
+
+def _future_step_ownership(
+    steps: Sequence[ImplementationStep], index: int,
+) -> dict[str, tuple[str, ...]]:
+    """The mutation paths the approved plan assigns to the remaining steps.
+
+    Informative only: a bounded retry uses it to recognize an out-of-scope
+    verification dependency.  It never grants write authority.
+    """
+
+    ownership: dict[str, tuple[str, ...]] = {}
+    for step in steps[index + 1:]:
+        paths = tuple(sorted({*step.write_set, *step.create_set, *step.delete_set}))
+        if paths:
+            ownership[step.id] = paths
+    return ownership
 
 
 def _has_deferred_contract_mismatches(results: list[dict[str, Any]]) -> bool:
@@ -416,6 +454,8 @@ def _compact_step_history(results: list[dict[str, Any]]) -> list[dict[str, Any]]
         if item.get("status") == "DEFERRED_CONTRACT_MISMATCH":
             record["status"] = item["status"]
             record["mismatch"] = _bounded_v2_report(str(item.get("mismatch") or ""))
+        if item.get("deferred_verify"):
+            record["deferred_verify"] = _bounded_v2_report(str(item["deferred_verify"]))
         compact.append(record)
     return compact
 
@@ -674,6 +714,11 @@ class StepExecutionOutcome:
     changed_paths: tuple[str, ...]
     usage: dict[str, int]
     final_report: str
+    # A verification the worker could not complete because an out-of-scope
+    # path owned by a later approved step still fails.  Data only: the
+    # deterministic gate and the reviewer remain the authority.
+    deferred_verify: str = ""
+    mismatch_retry_count: int = 0
 
 
 class DeferredStepExecutionOutcome:
@@ -684,7 +729,8 @@ class DeferredStepExecutionOutcome:
     def __init__(
         self, *, step_id: str, profile_id: str, tree_before: str,
         tree_after: str, changed_paths: tuple[str, ...], usage: dict[str, int],
-        final_report: str, mismatch: str,
+        final_report: str, mismatch: str, initial_mismatch: str = "",
+        mismatch_retry_count: int = 0, deferred_verify: str = "",
     ) -> None:
         self.step_id = step_id
         self.profile_id = profile_id
@@ -694,6 +740,9 @@ class DeferredStepExecutionOutcome:
         self.usage = usage
         self.final_report = final_report
         self.mismatch = mismatch
+        self.initial_mismatch = initial_mismatch
+        self.mismatch_retry_count = mismatch_retry_count
+        self.deferred_verify = deferred_verify
 
 
 class StepExecutionFailure(OrchestrationError):
@@ -711,6 +760,8 @@ class StepExecutionFailure(OrchestrationError):
         usage: dict[str, int] | None = None,
         mismatch: str | None = None,
         clean_contract_mismatch: bool = False,
+        mismatch_retry_count: int = 0,
+        initial_mismatch: str | None = None,
     ) -> None:
         super().__init__(f"{reason}: step={step_id}")
         self.reason = reason
@@ -722,6 +773,8 @@ class StepExecutionFailure(OrchestrationError):
         self.usage = usage
         self.mismatch = mismatch
         self.clean_contract_mismatch = clean_contract_mismatch
+        self.mismatch_retry_count = mismatch_retry_count
+        self.initial_mismatch = initial_mismatch
 
 
 @dataclasses.dataclass(frozen=True)
@@ -747,6 +800,12 @@ def _step_result_record(outcome: StepExecutionOutcome) -> dict[str, Any]:
         "final": _bounded_v2_report(outcome.final_report),
         **({"mismatch": _bounded_v2_report(getattr(outcome, "mismatch", ""))}
            if getattr(outcome, "mismatch", None) else {}),
+        **({"initial_mismatch": _bounded_v2_report(getattr(outcome, "initial_mismatch", ""))}
+           if getattr(outcome, "initial_mismatch", None) else {}),
+        **({"mismatch_retry_count": getattr(outcome, "mismatch_retry_count", 0)}
+           if getattr(outcome, "mismatch_retry_count", 0) else {}),
+        **({"deferred_verify": _bounded_v2_report(getattr(outcome, "deferred_verify", ""))}
+           if getattr(outcome, "deferred_verify", None) else {}),
     }
 
 
@@ -900,6 +959,9 @@ class _ResumedRun:
     context: str
     restore_paths: tuple[str, ...] = ()
     c01_steps: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    # step id -> the clean mismatch its first attempt returned, for the single
+    # bounded retry this resume owes that step.
+    mismatch_retries: dict[str, str] = dataclasses.field(default_factory=dict)
     c01_revision: _PersistedRevision | None = None
     c01_evidence: EvidenceBundle | None = None
     c01_review: ReviewResult | None = None
@@ -947,6 +1009,34 @@ def _safe_candidate_tree(worktree: Path) -> str | None:
         return candidate_tree_sha(worktree)
     except GitError:
         return None
+
+
+def _safe_index_tree(worktree: Path) -> str | None:
+    try:
+        return index_tree_sha(worktree)
+    except GitError:
+        return None
+
+
+def _safe_status(worktree: Path) -> tuple[str, ...] | None:
+    try:
+        return status_porcelain(worktree)
+    except GitError:
+        return None
+
+
+def _new_status_lines(
+    before: tuple[str, ...], after: tuple[str, ...] | None,
+) -> list[str]:
+    """The porcelain status lines an attempt added or removed."""
+
+    if after is None:
+        return ["the Git status could not be read"]
+    kept = set(before)
+    seen = set(after)
+    return [line for line in after if line not in kept] + [
+        line for line in before if line not in seen
+    ]
 
 
 def _record_failure_tree(artifact_dir: Path, worktree: Path) -> None:
@@ -1139,6 +1229,14 @@ def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
         "final": _bounded_v2_report(_read_bounded_text(step_dir / "agent.final.md")),
         **({"mismatch": _bounded_v2_report(record["mismatch"])}
            if status == "DEFERRED_CONTRACT_MISMATCH" else {}),
+        **({"initial_mismatch": _bounded_v2_report(str(record["initial_mismatch"]))}
+           if isinstance(record.get("initial_mismatch"), str) and record["initial_mismatch"].strip()
+           else {}),
+        **({"mismatch_retry_count": record["mismatch_retry_count"]}
+           if isinstance(record.get("mismatch_retry_count"), int) else {}),
+        **({"deferred_verify": _bounded_v2_report(str(record["deferred_verify"]))}
+           if isinstance(record.get("deferred_verify"), str) and record["deferred_verify"].strip()
+           else {}),
     }
 
 
@@ -2672,6 +2770,9 @@ class Orchestrator:
         # Tree every step must start from: the base, then each frozen step.
         expected_tree = start.expected_tree_sha
         retry_step = start.step_id if resumed is not None and phase is ResumePhase.INITIAL_STEP else None
+        # A clean mismatch persisted by an earlier run: this run performs that
+        # step's single bounded retry, with the addendum and no replay.
+        pending_retries = dict(resumed.mismatch_retries) if resumed is not None else {}
         for index, step in enumerate(plan.steps if phase is ResumePhase.INITIAL_STEP else ()):
             if step.id in done_ids:
                 continue
@@ -2697,6 +2798,8 @@ class Orchestrator:
                     profile_id=selected_step.implementer.profile_id,
                     artifact_dir=run_dir / "steps" / step.id,
                     codex_home=codex_home, forbidden_env_names=forbidden_env_names,
+                    future_ownership=_future_step_ownership(plan.steps, index),
+                    pending_mismatch_retry=pending_retries.pop(step.id, None),
                 )
             except StepExecutionFailure as failure:
                 if failure.usage is not None:
@@ -2751,6 +2854,9 @@ class Orchestrator:
                         branch_ref=branch_ref, ownership_before=ownership_before,
                         selection=selection,
                         deferred_mismatches=deferred_mismatches,
+                        deferred_mismatch_present=_has_deferred_contract_mismatches(
+                            self._last_v2_step_results
+                        ),
                     )
                 except ClaudeCommittedError as exc:
                     self._redact_revision_artifacts(run_dir)
@@ -3079,6 +3185,89 @@ class Orchestrator:
         artifact_dir: Path,
         codex_home: Path,
         forbidden_env_names: tuple[str | None, ...],
+        future_ownership: Mapping[str, tuple[str, ...]] | None = None,
+        pending_mismatch_retry: str | None = None,
+    ) -> StepExecutionOutcome:
+        """One approved step, with at most one bounded mismatch retry.
+
+        A *clean* structural mismatch — the worker changed nothing at all — is
+        retried exactly once with the same contract, the same profile, the same
+        mutable scope and the same candidate tree, in a new fresh Codex
+        process.  The retry only adds a prompt addendum; it never widens
+        WRITE/CREATE/DELETE.  There is never a third attempt.
+
+        With *pending_mismatch_retry*, the first attempt already happened in an
+        earlier run and this call **is** the bounded retry.
+        """
+
+        common = {
+            "repo": repo, "worktree": worktree, "base_sha": base_sha,
+            "branch_ref": branch_ref, "ownership_before": ownership_before,
+            "expected_tree": expected_tree, "step": step, "contract": contract,
+            "profile_id": profile_id, "artifact_dir": artifact_dir,
+            "codex_home": codex_home, "forbidden_env_names": forbidden_env_names,
+            "future_ownership": future_ownership,
+        }
+        if pending_mismatch_retry:
+            return self._run_codex_step_attempt(
+                **common, initial_mismatch=pending_mismatch_retry,
+                mismatch_retry_count=1,
+            )
+        outcome = self._run_codex_step_attempt(
+            **common, initial_mismatch=None, mismatch_retry_count=0,
+        )
+        if not isinstance(outcome, DeferredStepExecutionOutcome):
+            return outcome
+        # The boundary must still be exactly the pre-step boundary before a
+        # second worker is allowed to run against it.
+        if self._pre_step_boundary_drift(
+            repo, worktree, ownership_before,
+            branch_ref=branch_ref, base_sha=base_sha, tree_before=outcome.tree_before,
+        ):
+            return outcome
+        # Attempt 1 keeps its own artifacts, including its diagnostics.
+        _archive_attempt(artifact_dir)
+        return self._run_codex_step_attempt(
+            **common, initial_mismatch=outcome.mismatch, mismatch_retry_count=1,
+        )
+
+    def _pre_step_boundary_drift(
+        self, repo: Path, worktree: Path, ownership_before: GitOwnership, *,
+        branch_ref: str, base_sha: str, tree_before: str,
+    ) -> str | None:
+        """Why the repository is no longer exactly in its pre-step state."""
+
+        try:
+            if candidate_tree_sha(worktree) != tree_before:
+                return "the candidate tree is no longer the pre-step tree"
+            if index_tree_sha(worktree) != tree_before:
+                return "the index is no longer the pre-step index"
+        except GitError as exc:
+            return f"Git state is unreadable: {exc}"
+        violations = _ownership_violations(
+            ownership_before, _git_ownership(repo, worktree),
+            branch_ref=branch_ref, base_sha=base_sha,
+        )
+        return "; ".join(violations) or None
+
+    def _run_codex_step_attempt(
+        self,
+        *,
+        repo: Path,
+        worktree: Path,
+        base_sha: str,
+        branch_ref: str,
+        ownership_before: GitOwnership,
+        expected_tree: str,
+        step: ImplementationStep,
+        contract: str,
+        profile_id: str,
+        artifact_dir: Path,
+        codex_home: Path,
+        forbidden_env_names: tuple[str | None, ...],
+        future_ownership: Mapping[str, tuple[str, ...]] | None = None,
+        initial_mismatch: str | None = None,
+        mismatch_retry_count: int = 0,
     ) -> StepExecutionOutcome:
         """The single authoritative execution of one Codex step (C01 and C02).
 
@@ -3097,6 +3286,11 @@ class Orchestrator:
                 "STEP_CONTRACT_DRIFT", step_id, drift,
                 profile_id=profile_id, tree_before=tree_before,
             )
+        # The complete Git boundary a no-op mismatch must leave untouched.
+        # Accumulated modifications from the earlier steps are legitimate, so
+        # the gate is "unchanged", never "empty".
+        index_before = index_tree_sha(worktree)
+        status_before = status_porcelain(worktree)
         # 3-4. Approved profile and isolated environment.
         profile = self._codex_step_profile(profile_id)
         agent = self._agent_for_profile(profile.id)
@@ -3107,17 +3301,28 @@ class Orchestrator:
             agent_config, source_environment=self._runtime_environment,
             codex_home=codex_home, forbidden_names=forbidden_env_names,
         )
-        # 5. One fresh Codex process for this step.
+        # 5. One fresh Codex process for this step.  On a bounded retry the
+        # contract is byte-identical; only the addendum is added.
+        retry_addendum = (
+            build_mismatch_retry_addendum(
+                initial_mismatch=initial_mismatch or "",
+                future_ownership=future_ownership,
+            )
+            if mismatch_retry_count else None
+        )
+        extra = {"retry_addendum": retry_addendum} if retry_addendum else {}
         artifact_dir.mkdir(parents=True, exist_ok=True)
         try:
             if hasattr(agent, "run_step"):
                 result = agent.run_step(contract, worktree, artifact_dir,
-                                        base_sha=base_sha, env=environment)
+                                        base_sha=base_sha, env=environment, **extra)
             else:
                 # Test doubles from the v1 API may only expose run(); the
                 # production CodexAgent always takes the step path above.
-                result = agent.run(build_implementer_step_prompt(contract), worktree,
-                                   artifact_dir, base_sha=base_sha, env=environment)
+                result = agent.run(
+                    build_implementer_step_prompt(contract, retry_addendum=retry_addendum),
+                    worktree, artifact_dir, base_sha=base_sha, env=environment,
+                )
         except AgentCommittedError as exc:
             self._redact_step_artifacts(artifact_dir)
             raise StepExecutionFailure(
@@ -3156,20 +3361,35 @@ class Orchestrator:
             mismatch = contract_mismatch_explanation(result.final_message)
         if mismatch is not None:
             tree_after = _safe_candidate_tree(worktree)
-            residual = list(status_porcelain(worktree, include_ignored=True))
+            index_after = _safe_index_tree(worktree)
+            status_after = _safe_status(worktree)
+            # Clean means "the worker changed nothing": the candidate tree,
+            # the index, the porcelain status and Git ownership are all exactly
+            # what this step received.  It is deliberately not "git status is
+            # empty": the cumulative modifications of the earlier approved
+            # steps are legitimate and untracked-but-ignored files are never a
+            # gate here.
             clean = (
                 bool(mismatch.strip())
-                and
-                tree_after == tree_before
+                and tree_after == tree_before
+                and index_after == index_before
+                and status_after == status_before
                 and not ownership_violations
-                and not residual
             )
             if clean:
+                deferred_verify = _bounded_v2_report(
+                    deferred_verify_dependency(result.final_message) or ""
+                )
                 atomic_write_text(artifact_dir / "step.json", _json_text({
                     "id": step_id, "status": "DEFERRED_CONTRACT_MISMATCH",
                     "profile_id": profile.id,
                     "tree_before": tree_before, "tree_after": tree_before,
                     "changed_paths": [], "mismatch": _bounded_v2_report(mismatch),
+                    **({"initial_mismatch": _bounded_v2_report(initial_mismatch)}
+                       if mismatch_retry_count and initial_mismatch else {}),
+                    **({"mismatch_retry_count": mismatch_retry_count}
+                       if mismatch_retry_count else {}),
+                    **({"deferred_verify": deferred_verify} if deferred_verify else {}),
                     "usage": usage,
                 }))
                 return DeferredStepExecutionOutcome(
@@ -3177,6 +3397,12 @@ class Orchestrator:
                     tree_before=tree_before, tree_after=tree_before,
                     changed_paths=(), usage=usage, final_report=result.final_message,
                     mismatch=_bounded_v2_report(mismatch),
+                    initial_mismatch=(
+                        _bounded_v2_report(initial_mismatch)
+                        if mismatch_retry_count and initial_mismatch else ""
+                    ),
+                    mismatch_retry_count=mismatch_retry_count,
+                    deferred_verify=deferred_verify,
                 )
             _record_failure_tree(artifact_dir, worktree)
             details = []
@@ -3186,8 +3412,11 @@ class Orchestrator:
                 details.append("worker left candidate modifications")
             elif tree_after is None:
                 details.append("failure tree could not be read")
+            if index_after is None or index_after != index_before:
+                details.append("worker left index modifications")
             if ownership_violations:
                 details.extend(ownership_violations)
+            residual = _new_status_lines(status_before, status_after)
             if residual:
                 details.append("worker left residual Git modifications: " + _paths_detail(residual))
             raise StepExecutionFailure(
@@ -3197,6 +3426,11 @@ class Orchestrator:
                 tree_after=tree_after, usage=usage,
                 mismatch=_bounded_v2_report(mismatch),
                 clean_contract_mismatch=False,
+                mismatch_retry_count=mismatch_retry_count,
+                initial_mismatch=(
+                    _bounded_v2_report(initial_mismatch)
+                    if mismatch_retry_count and initial_mismatch else None
+                ),
             )
         # 8-9. Git ownership: HEAD, branch, branches and worktrees.
         if ownership_after.head != base_sha:
@@ -3236,11 +3470,21 @@ class Orchestrator:
                 "STEP_WRITE_SET_VIOLATION", step_id,
                 f"unexpected={_paths_detail(unexpected)}", **failed, tree_after=tree_after,
             )
-        # 17-18. Durable step record, then the outcome.
+        # 17-18. Durable step record, then the outcome.  A deferred verify
+        # dependency is recorded as data for Claude and the reviewer; it never
+        # relaxes a deterministic gate.
+        deferred_verify = _bounded_v2_report(
+            deferred_verify_dependency(result.final_message) or ""
+        )
         atomic_write_text(artifact_dir / "step.json", _json_text({
             "id": step_id, "status": "COMPLETED", "profile_id": profile.id,
             "tree_before": tree_before, "tree_after": tree_after,
             "changed_paths": list(changed_paths),
+            **({"mismatch_retry_count": mismatch_retry_count}
+               if mismatch_retry_count else {}),
+            **({"initial_mismatch": _bounded_v2_report(initial_mismatch)}
+               if mismatch_retry_count and initial_mismatch else {}),
+            **({"deferred_verify": deferred_verify} if deferred_verify else {}),
             "usage": usage,
         }))
         return StepExecutionOutcome(
@@ -3251,6 +3495,8 @@ class Orchestrator:
             changed_paths=tuple(changed_paths),
             usage=usage,
             final_report=result.final_message,
+            deferred_verify=deferred_verify,
+            mismatch_retry_count=mismatch_retry_count,
         )
 
     def _step_failed(
@@ -3263,6 +3509,8 @@ class Orchestrator:
             tree_before=failure.tree_before, tree_after=failure.tree_after,
             mismatch=failure.mismatch,
             mismatch_clean=failure.clean_contract_mismatch,
+            mismatch_retry_count=failure.mismatch_retry_count,
+            initial_mismatch=failure.initial_mismatch,
             step_dir=step_dir,
         )
 
@@ -3483,6 +3731,7 @@ class Orchestrator:
         mutable_scope: list[str] | None = None,
         luna_reports: str | None = None,
         deferred_mismatches: str | None = None,
+        deferred_mismatch_present: bool = False,
         cycle: int = 1,
     ) -> tuple[Any | None, str | None]:
         """Run one Claude pre-check/revision/scope cycle.
@@ -3535,7 +3784,9 @@ class Orchestrator:
             # A clean deferred mismatch intentionally leaves no candidate
             # delta for the pre-revision gate.  Claude is the recovery owner,
             # so EMPTY_DIFF is evidence for Claude here, not a terminal gate.
-            if deferred_mismatches.strip() not in {"", "NONE"}:
+            # A deferred *verify* dependency is not this case: that step did
+            # change the candidate, so the normal gate applies.
+            if deferred_mismatch_present:
                 pre_hard = [item for item in pre_hard if item != "EMPTY_DIFF"]
             if pre_hard:
                 return None, pre_hard[0].split(":", 1)[0]
@@ -3866,6 +4117,7 @@ class Orchestrator:
                 profile_id=selection.repair_implementer.profile_id,
                 artifact_dir=repair_dir / "steps" / step.id,
                 codex_home=codex_home, forbidden_env_names=forbidden_env_names,
+                future_ownership=_future_step_ownership(repair_plan.steps, index),
             )
             self._repair_v2_step_results.append(_step_result_record(outcome))
             expected_tree = outcome.tree_after
@@ -3909,6 +4161,10 @@ class Orchestrator:
                     f"{_deferred_contract_mismatches(original_plan, self._last_v2_step_results)}\n"
                     "C02 DEFERRED CONTRACT MISMATCHES\n"
                     f"{deferred_mismatches}"
+                ),
+                deferred_mismatch_present=(
+                    _has_deferred_contract_mismatches(self._last_v2_step_results)
+                    or _has_deferred_contract_mismatches(self._repair_v2_step_results)
                 ),
                 cycle=2,
             )
@@ -4129,6 +4385,8 @@ class Orchestrator:
         tree_after: str | None = None,
         mismatch: str | None = None,
         mismatch_clean: bool = False,
+        mismatch_retry_count: int = 0,
+        initial_mismatch: str | None = None,
         step_dir: Path | None = None,
     ) -> RunResult:
         try:
@@ -4175,6 +4433,10 @@ class Orchestrator:
                     **({"mismatch": _bounded_v2_report(mismatch)} if mismatch else {}),
                     **({"mismatch_clean": mismatch_clean}
                        if reason == "AGENT_CONTRACT_MISMATCH" else {}),
+                    **({"mismatch_retry_count": mismatch_retry_count}
+                       if mismatch_retry_count else {}),
+                    **({"initial_mismatch": _bounded_v2_report(initial_mismatch)}
+                       if initial_mismatch else {}),
                     "usage": step_usage,
                 }))
         return RunResult(run_dir, RunStatus.FAILED,
@@ -5395,12 +5657,16 @@ class Orchestrator:
             ]
         except GitError as exc:
             refuse(f"Git state is unreadable: {exc}")
-        # A historical/current run may have failed before clean mismatch
-        # semantics existed.  Reconcile only the exact no-op shape: the
-        # failed artifact, checkpoint tree, current candidate/index, and
-        # clean worktree must all agree.  Any residual evidence remains an
+        # A run may have failed on a clean structural mismatch, possibly
+        # before clean mismatch semantics existed.  Reconcile only the exact
+        # no-op shape: the failed artifact, the checkpoint tree and the
+        # current candidate/index must all agree, with no unstaged or
+        # untracked residue.  The accumulated, staged modifications of the
+        # earlier approved steps are legitimate and are never a gate; nor are
+        # ignored files.  Any real residual evidence remains an
         # operator-required failure.
         failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+        mismatch_retries: dict[str, str] = {}
         if (
             failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
             and is_clean_contract_mismatch_artifact(run_dir, state, checkpoint)
@@ -5409,12 +5675,7 @@ class Orchestrator:
             record = _read_json_artifact(run_dir / "steps" / step_id / "step.json")
             if not isinstance(record, dict):
                 raise ResumeIntegrityError("clean mismatch artifact is missing")
-            if (
-                candidate != record.get("tree_before")
-                or index_tree != candidate
-                or dirty
-                or status_porcelain(worktree, include_ignored=True)
-            ):
+            if candidate != record.get("tree_before") or index_tree != candidate or dirty:
                 raise ResumeRequiresOperatorError(
                     "clean contract mismatch proof no longer matches the current worktree"
                 )
@@ -5432,24 +5693,39 @@ class Orchestrator:
             mismatch = _bounded_v2_report(redact(mismatch, self._secrets))
             if not mismatch:
                 raise ResumeIntegrityError("clean contract mismatch explanation is missing")
-            atomic_write_text(run_dir / "steps" / step_id / "step.json", _json_text({
-                "id": step_id, "status": "DEFERRED_CONTRACT_MISMATCH",
-                "profile_id": record.get("profile_id"),
-                "tree_before": record["tree_before"], "tree_after": record["tree_before"],
-                "changed_paths": [], "mismatch": mismatch,
-                "usage": normalize_usage(record.get("usage")),
-            }))
-            ids = [step.id for step in plan.steps]
-            index = ids.index(step_id)
-            following = ids[index + 1] if index + 1 < len(ids) else None
-            next_phase = ResumePhase.INITIAL_STEP if following else ResumePhase.CHECKS_C01
-            checkpoint = ResumeCheckpoint(
-                next_phase, 1, following, checkpoint.expected_head_sha,
-                record["tree_before"], checkpoint.execution_selection_sha256,
-                checkpoint.plan_identity, checkpoint.repair_bundle_sha256,
-                checkpoint.scope_delta_sha256,
-            )
-            resume_module.write_checkpoint(run_dir, checkpoint)
+            spent = record.get("mismatch_retry_count")
+            if not mismatch_retry_spent(run_dir, step_id):
+                # The bounded retry budget of this step is intact: replay
+                # nothing, restore nothing, and run exactly one fresh worker
+                # on the same step with the mismatch retry addendum.  The
+                # checkpoint already names this step and its pre-step tree.
+                mismatch_retries[step_id] = mismatch
+            else:
+                # The retry was already spent: the clean mismatch becomes the
+                # deferred outcome and the chain continues.  Never a third
+                # attempt.
+                atomic_write_text(run_dir / "steps" / step_id / "step.json", _json_text({
+                    "id": step_id, "status": "DEFERRED_CONTRACT_MISMATCH",
+                    "profile_id": record.get("profile_id"),
+                    "tree_before": record["tree_before"], "tree_after": record["tree_before"],
+                    "changed_paths": [], "mismatch": mismatch,
+                    "mismatch_retry_count": spent,
+                    **({"initial_mismatch": _bounded_v2_report(str(record["initial_mismatch"]))}
+                       if isinstance(record.get("initial_mismatch"), str)
+                       and record["initial_mismatch"].strip() else {}),
+                    "usage": normalize_usage(record.get("usage")),
+                }))
+                ids = [step.id for step in plan.steps]
+                index = ids.index(step_id)
+                following = ids[index + 1] if index + 1 < len(ids) else None
+                next_phase = ResumePhase.INITIAL_STEP if following else ResumePhase.CHECKS_C01
+                checkpoint = ResumeCheckpoint(
+                    next_phase, 1, following, checkpoint.expected_head_sha,
+                    record["tree_before"], checkpoint.execution_selection_sha256,
+                    checkpoint.plan_identity, checkpoint.repair_bundle_sha256,
+                    checkpoint.scope_delta_sha256,
+                )
+                resume_module.write_checkpoint(run_dir, checkpoint)
         if unapproved:
             refuse("the candidate contains a path outside the approved scope")
         resumed = _ResumedRun(
@@ -5460,6 +5736,7 @@ class Orchestrator:
             ),
             repository_reference=reference, spec=spec, context=context,
             restore_paths=restore,
+            mismatch_retries=mismatch_retries,
             existing_commit_sha=existing_commit,
         )
         if checkpoint.phase is not ResumePhase.PUBLISH:

@@ -201,14 +201,21 @@ class FakeLuna:
         self.calls: list[dict[str, Any]] = []
 
     def run_step(self, contract: str, worktree: Any, artifacts_dir: Any, *,
-                 base_sha: str | None = None, env: dict[str, str] | None = None) -> AgentResult:
+                 base_sha: str | None = None, env: dict[str, str] | None = None,
+                 retry_addendum: str | None = None) -> AgentResult:
         directory = Path(artifacts_dir)
         cycle = 2 if directory.parent.parent.name == "C02" else 1
         step_id = directory.name
         root = Path(worktree)
+        attempt = 1 + sum(
+            1 for call in self.calls if (call["cycle"], call["step"]) == (cycle, step_id)
+        )
         self.calls.append({"cycle": cycle, "step": step_id, "contract": contract,
-                           "env": dict(env or {}), "dir": directory})
-        behavior = self.behaviors.get((cycle, step_id), "nochange")
+                           "env": dict(env or {}), "dir": directory,
+                           "retry_addendum": retry_addendum, "attempt": attempt})
+        behavior = self.behaviors.get((cycle, step_id, attempt), None)
+        if behavior is None:
+            behavior = self.behaviors.get((cycle, step_id), "nochange")
         usage = {"input_tokens": 100 * cycle + int(step_id[1:]), "output_tokens": 10}
         events = [
             {"type": "item.completed", "item": {"type": "agent_message", "text": f"C0{cycle} {step_id} working"}},
@@ -242,16 +249,29 @@ class FakeLuna:
 
 
 class CleanMismatchLuna(FakeLuna):
-    """Luna double that reports a clean contract mismatch for selected steps."""
+    """Luna double that reports a contract mismatch for selected attempts.
 
-    def __init__(self, behaviors: dict[tuple[int, str], Any], mismatch_steps: set[str]):
+    ``mismatch_steps`` holds a step id (every attempt) or a ``"S01#1"`` key
+    naming exactly one attempt of that step.
+    """
+
+    def __init__(
+        self,
+        behaviors: dict[tuple[int, str], Any],
+        mismatch_steps: set[str],
+        *,
+        mismatch_text: str = "local contract is stale",
+    ):
         super().__init__(behaviors)
         self.mismatch_steps = mismatch_steps
+        self.mismatch_text = mismatch_text
 
     def run_step(self, contract: str, worktree: Any, artifacts_dir: Any, **kwargs: Any) -> AgentResult:
         result = super().run_step(contract, worktree, artifacts_dir, **kwargs)
-        if Path(artifacts_dir).name in self.mismatch_steps:
-            message = "META CONTRACT MISMATCH v1\nlocal contract is stale\n"
+        call = self.calls[-1]
+        keys = {call["step"], f"{call['step']}#{call['attempt']}"}
+        if keys & self.mismatch_steps:
+            message = f"META CONTRACT MISMATCH v1\n{self.mismatch_text}\n"
             Path(artifacts_dir, "agent.final.md").write_text(message, encoding="utf-8")
             return dataclasses.replace(result, final_message=message)
         return result
@@ -495,11 +515,22 @@ class FullPipelineTests(P28Harness):
             claude=FakeClaude({1: writer("src/a.py", "A = 2\n")}),
         )
         self.assert_published_once(result, pushed)
-        self.assertEqual([call["step"] for call in luna.calls], ["S01", "S02", "S03"])
+        # The clean mismatch is retried exactly once, then deferred.
+        self.assertEqual([call["step"] for call in luna.calls], ["S01", "S01", "S02", "S03"])
+        self.assertIsNone(luna.calls[0]["retry_addendum"])
+        self.assertIn("MISMATCH RETRY ADDENDUM", luna.calls[1]["retry_addendum"])
         step = json.loads((result.run_dir / "steps/S01/step.json").read_text())
         self.assertEqual(step["status"], "DEFERRED_CONTRACT_MISMATCH")
         self.assertEqual(step["changed_paths"], [])
+        self.assertEqual(step["mismatch_retry_count"], 1)
         self.assertIn("local contract is stale", step["mismatch"])
+        self.assertIn("local contract is stale", step["initial_mismatch"])
+        # Attempt 1 keeps its own diagnostics, never overwritten.
+        archived = json.loads(
+            (result.run_dir / "steps/S01/attempts/01/step.json").read_text()
+        )
+        self.assertEqual(archived["status"], "DEFERRED_CONTRACT_MISMATCH")
+        self.assertNotIn("mismatch_retry_count", archived)
         self.assertIn("DEFERRED LUNA CONTRACT MISMATCHES", claude.calls[0]["prompt"])
         self.assertIn("S01", claude.calls[0]["prompt"])
         self.assertIn("DEFERRED CONTRACT MISMATCHES", reviewer.prompts[0])
@@ -512,6 +543,7 @@ class FullPipelineTests(P28Harness):
         )
         self.assertEqual(result.status, RunStatus.FAILED)
         self.assertEqual(result.state["failure"]["reason"], "UNRESOLVED_CONTRACT_MISMATCH")
+        self.assertEqual([call["attempt"] for call in luna.calls], [1, 2])
         self.assertFalse((result.run_dir / "candidate/C01/commit.json").exists())
         self.assertEqual(pushed.call_count, 0)
         self.assertEqual(reviewer.prompts, [])
@@ -1278,9 +1310,18 @@ class StructuralTests(unittest.TestCase):
 
     def test_one_authoritative_codex_step_executor(self) -> None:
         module = inspect.getsource(orchestrator_module)
-        executor = inspect.getsource(Orchestrator._execute_codex_step)
+        attempt = inspect.getsource(Orchestrator._run_codex_step_attempt)
         self.assertEqual(module.count(".run_step("), 1)
-        self.assertIn(".run_step(", executor)
+        self.assertIn(".run_step(", attempt)
+        # The bounded mismatch retry is the only reason a step runs twice, and
+        # `_execute_codex_step` is the only caller of the attempt executor.
+        self.assertEqual(module.count("self._run_codex_step_attempt("), 3)
+        self.assertEqual(
+            inspect.getsource(Orchestrator._execute_codex_step).count(
+                "self._run_codex_step_attempt("
+            ),
+            3,
+        )
         for name in ("_execute_v2", "_execute_v2_repair_cycle"):
             source = inspect.getsource(getattr(Orchestrator, name))
             self.assertEqual(source.count("self._execute_codex_step("), 1, name)
@@ -1290,7 +1331,8 @@ class StructuralTests(unittest.TestCase):
                 self.assertNotIn(forbidden, source, (name, forbidden))
         self.assertEqual(
             [field.name for field in dataclasses.fields(orchestrator_module.StepExecutionOutcome)],
-            ["step_id", "profile_id", "tree_before", "tree_after", "changed_paths", "usage", "final_report"],
+            ["step_id", "profile_id", "tree_before", "tree_after", "changed_paths", "usage",
+             "final_report", "deferred_verify", "mismatch_retry_count"],
         )
 
     def test_only_gitops_names_history_changing_git_primitives(self) -> None:

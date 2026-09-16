@@ -221,9 +221,14 @@ when additional source context is needed.
 <DEFERRED CONTRACT MISMATCHES>
 {{DEFERRED_CONTRACT_MISMATCHES}}
 
-These summaries identify Luna steps that were not implemented directly.
-Claude was responsible for recovering their intent in the final worktree;
-review the candidate against the original SPEC and approved plan normally.
+These summaries identify Luna steps that were not implemented directly
+(KIND: DEFERRED_CONTRACT_MISMATCH) and steps whose approved in-scope work
+completed but left a verification failing on a path a later step owns
+(KIND: DEFERRED_VERIFY_DEPENDENCY).
+
+Claude was responsible for recovering their intent in the final worktree; no
+deferred verification was accepted as a final result.  Review the candidate
+against the original SPEC and approved plan normally.
 </DEFERRED CONTRACT MISMATCHES>
 
 <REVISION REPORT>
