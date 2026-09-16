@@ -115,11 +115,20 @@ def _run(config_path: Path, spec_path: Path, run_id: str | None) -> int:
     return _report_result(result)
 
 
-def _resume(config_path: Path, run_id: str) -> int:
-    """Resume one run at its durable checkpoint; never replays a phase."""
+def _resume(config_path: Path, run_id: str, revalidate_integrity: bool = False) -> int:
+    """Resume one run at its durable checkpoint; never replays a phase.
+
+    ``--revalidate-integrity`` is an operator-only intent: it re-opens the
+    complete fail-closed validation of a run already closed with
+    ``RESUME_INTEGRITY_FAILURE``.  It bypasses no invariant -- a run whose
+    invariants still do not hold is refused again, without any model call,
+    check or Git write.
+    """
 
     try:
-        result = resume_run(config_path, run_id)
+        result = resume_run(
+            config_path, run_id, revalidate_integrity=revalidate_integrity
+        )
     except (ConfigError, ResumeError, OrchestrationError, OSError, UnicodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -748,6 +757,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume.add_argument("--config", required=True, type=Path)
     resume.add_argument("--run-id", required=True, type=str)
+    resume.add_argument(
+        "--revalidate-integrity", action="store_true",
+        help=(
+            "re-run the complete resume validation of a run closed with "
+            "RESUME_INTEGRITY_FAILURE (bypasses no invariant)"
+        ),
+    )
     recover = subparsers.add_parser(
         "recover-plan",
         help="replace a failed planner answer with a READY META PLAN v2 (no planner call)",
@@ -786,7 +802,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         return _run(args.config, args.spec, args.run_id)
     if args.command == "resume":
-        return _resume(args.config, args.run_id)
+        return _resume(args.config, args.run_id, args.revalidate_integrity)
     if args.command == "recover-plan":
         return _recover_plan(args.config, args.run_id, args.plan)
     if args.command == "status":

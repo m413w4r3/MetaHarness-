@@ -527,15 +527,55 @@ class ResumeInfo:
     step_id: str | None = None
 
 
-def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
+def integrity_revalidation_allowed(
+    run_dir: str | Path, state: Mapping[str, Any]
+) -> bool:
+    """Whether an operator may ask for a second full validation of this run.
+
+    Only a run closed by the resume validation itself qualifies, and only
+    while its checkpoint is still pending: the operation the checkpoint names
+    has provably never succeeded, so replaying the *validation* cannot replay
+    a completed phase.  This decides nothing about the invariants themselves.
+    """
+
+    if state.get("status") != "failed":
+        return False
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    if failure.get("reason") != "RESUME_INTEGRITY_FAILURE":
+        return False
+    try:
+        record = read_checkpoint_record(run_dir)
+    except ResumeCheckpointError:
+        return False
+    return record is not None and record[1] == "pending"
+
+
+def resume_info(
+    run_dir: str | Path, state: Mapping[str, Any], *,
+    revalidate_integrity: bool = False,
+) -> ResumeInfo:
     """Cheap, read-only resumability for the API/UI; no Git, no model.
 
     ``True`` only means "a validable checkpoint exists for this failure": the
     orchestrator still performs the complete integrity validation and fails
     closed with ``RESUME_INTEGRITY_FAILURE`` when it does not hold.
+
+    *revalidate_integrity* is an explicit operator intent (``metaharness
+    resume --revalidate-integrity``).  It waives exactly one cheap rejection
+    -- the classification of ``RESUME_INTEGRITY_FAILURE`` as permanently
+    non-resumable -- so that a run refused by a since-fixed validation defect
+    can be put back through the *complete* fail-closed validation.  It waives
+    no invariant: every checkpoint hash, plan identity, selection, check
+    authority, scope and approval check still runs, and no model or check is
+    invoked before all of them hold.
     """
 
     directory = Path(run_dir)
+    revalidating = revalidate_integrity and integrity_revalidation_allowed(directory, state)
+    if revalidate_integrity and not revalidating:
+        return ResumeInfo(
+            False, reason="this run is not eligible for an integrity revalidation"
+        )
     status = state.get("status")
     if status not in _RESUMABLE_STATUSES:
         return ResumeInfo(False, reason="run is not failed or interrupted")
@@ -556,7 +596,7 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
         failure_reason == "AGENT_CONTRACT_MISMATCH"
         and is_clean_contract_mismatch_artifact(directory, state, checkpoint)
     )
-    if failure_reason in _NON_RESUMABLE_FAILURES or (
+    if (failure_reason in _NON_RESUMABLE_FAILURES and not revalidating) or (
         failure_reason == "AGENT_CONTRACT_MISMATCH" and not clean_mismatch
     ):
         return ResumeInfo(False, reason="failure requires operator intervention")
@@ -673,6 +713,7 @@ __all__ = [
     "ResumeRequiresOperatorError",
     "checkpoint_payload",
     "infer_legacy_checkpoint",
+    "integrity_revalidation_allowed",
     "load_resume_checkpoint",
     "mark_checkpoint_completed",
     "phase_index",

@@ -68,7 +68,13 @@ from metaharness.models import (  # noqa: E402
     SelectionMode,
 )
 from metaharness.orchestrator import Orchestrator  # noqa: E402
-from metaharness.resume import ResumePhase, read_checkpoint  # noqa: E402
+from metaharness.resume import (  # noqa: E402
+    ResumeNotAllowedError,
+    ResumePhase,
+    read_checkpoint,
+    read_checkpoint_record,
+    resume_info,
+)
 from metaharness.web.api import (  # noqa: E402
     WebAPIError,
     approve_run,
@@ -1206,6 +1212,358 @@ class CheckAuthorityPipelineTests(P28Harness):
         self.assertEqual(reviewer.prompts, [])
         self.assertFalse((result.run_dir / "checks" / "C01" / "evidence.json").exists())
         self.assertFalse((result.run_dir / "candidate").exists())
+
+
+THIRD_TREE = "c" * 40
+
+
+class CheckRepairRetryResumeTests(P28Harness):
+    """``FINAL_CHECKS_RETRY`` resumes against the repaired tree.
+
+    ``CHECK_REPAIR_C0x`` and ``FINAL_CHECKS_RETRY_C0x`` have opposite evidence
+    invariants.  At ``CHECK_REPAIR`` the repair Claude has not succeeded yet,
+    so the canonical bundle is the red first pass for the pre-repair tree.  At
+    ``FINAL_CHECKS_RETRY`` that Claude did succeed, the checkpoint tree is the
+    *repaired* tree, the red first pass has been archived under
+    ``attempts/01`` and the canonical bundle is either absent (the first retry
+    crashed) or the retry's own bundle for the repaired tree.
+    """
+
+    def evidence(self, path: Path) -> dict[str, Any]:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def checks_ran(self) -> int:
+        """How many times the real check argv has executed so far."""
+
+        return len(self.counter.read_text().splitlines()) if self.counter.exists() else 0
+
+    def retarget(self, path: Path, tree_sha: str) -> None:
+        payload = self.evidence(path)
+        payload["staged_tree_sha"] = tree_sha
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def resume(self, run_id: str, *, reviews: list[str] | None = None,
+               revalidate_integrity: bool = False):
+        """Resume with fresh doubles so any model call is observable."""
+
+        planner = QueueClient("planner", [], self.events)
+        reviewer = QueueClient("reviewer", list(reviews or []), self.events)
+        claude, luna = FakeClaude(), FakeLuna({})
+        result = Orchestrator(
+            self.config_value, planner_client=planner, reviewer_client=reviewer,
+            agent=luna, reviser=claude,
+        ).resume(run_id, revalidate_integrity=revalidate_integrity)
+        return result, planner, reviewer, claude, luna
+
+    def assert_no_agent_ran(self, planner, reviewer, claude, luna) -> None:
+        self.assertEqual(planner.prompts, [])
+        self.assertEqual(reviewer.prompts, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(luna.calls, [])
+
+    # -- C01 ---------------------------------------------------------------
+
+    def _red_retry_c01(self, run_id: str) -> Any:
+        """A run whose repaired C01 tree is a *different*, still red tree."""
+
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(stage_actions={
+            (1, "check-repair"): writer("src/a.py", "A = STILL BUG\n"),
+        })
+        result, _planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=luna, reviews=[PASS], claude=claude, run_id=run_id,
+        )
+        self.assertEqual(result.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertEqual([call["stage"] for call in claude.calls],
+                         ["initial-revision", "check-repair"])
+        self.assert_no_commit_no_push(result, pushed, run_id=run_id)
+        self.assertEqual(reviewer.prompts, [])
+        return result
+
+    def repair_trees(self, run_dir: Path, cycle: str) -> tuple[str, str]:
+        report = json.loads(
+            (run_dir / "revision" / "check-repair" / cycle / "report.json").read_text()
+        )
+        self.assertNotEqual(report["tree_before"], report["tree_after"])
+        return report["tree_before"], report["tree_after"]
+
+    def test_r_a_red_c01_retry_resumes_and_replays_only_the_retry_checks(self) -> None:
+        first = self._red_retry_c01("retry-red-c01")
+        run_dir = first.run_dir
+        checks = run_dir / "checks" / "C01"
+        initial_tree, repaired_tree = self.repair_trees(run_dir, "C01")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.FINAL_CHECKS_RETRY_C01)
+        self.assertEqual(checkpoint.expected_tree_sha, repaired_tree)
+        self.assertEqual(
+            self.evidence(checks / "attempts" / "01" / "evidence.json")["staged_tree_sha"],
+            initial_tree,
+        )
+        current = self.evidence(checks / "evidence.json")
+        self.assertEqual(current["staged_tree_sha"], repaired_tree)
+        self.assertIn("CHECK_FAILED:gate", current["failures"])
+
+        before = self.checks_ran()
+        second, planner, reviewer, claude, luna = self.resume("retry-red-c01")
+        # The refusal is gone: the retry checks were re-executed on the
+        # repaired tree and stayed red on their own evidence.
+        self.assertEqual(second.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertGreater(self.checks_ran(), before)
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+        self.assertEqual(
+            self.evidence(checks / "attempts" / "02" / "evidence.json")["staged_tree_sha"],
+            repaired_tree,
+        )
+        self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
+                         repaired_tree)
+
+    def test_s_a_c01_retry_crash_before_its_evidence_still_resumes(self) -> None:
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(stage_actions={
+            (1, "check-repair"): writer("src/a.py", "A = STILL BUG\n"),
+        })
+        real = Orchestrator._final_evidence
+        calls: list[int] = []
+
+        def crash_inside_the_retry(self_: Any, *args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("simulated crash inside the retry checks")
+            return real(self_, *args, **kwargs)
+
+        with mock.patch.object(Orchestrator, "_final_evidence", crash_inside_the_retry):
+            first, _planner, reviewer, _claude, pushed = self.run_pipeline(
+                luna=luna, reviews=[PASS], claude=claude, run_id="retry-crash-c01",
+            )
+        self.assertEqual(first.state["failure"]["reason"], "RUNTIMEERROR")
+        self.assert_no_commit_no_push(first, pushed, run_id="retry-crash-c01")
+        self.assertEqual(reviewer.prompts, [])
+        run_dir = first.run_dir
+        checks = run_dir / "checks" / "C01"
+        initial_tree, repaired_tree = self.repair_trees(run_dir, "C01")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual((checkpoint.phase, checkpoint.expected_tree_sha),
+                         (ResumePhase.FINAL_CHECKS_RETRY_C01, repaired_tree))
+        # The red first pass is archived and there is no current bundle.
+        self.assertFalse((checks / "evidence.json").exists())
+        self.assertEqual(
+            self.evidence(checks / "attempts" / "01" / "evidence.json")["staged_tree_sha"],
+            initial_tree,
+        )
+        # The root aliases still name the first pass, which is exactly why
+        # they are never the authority for the repaired tree.
+        self.assertEqual(self.evidence(run_dir / "evidence.json")["staged_tree_sha"],
+                         initial_tree)
+
+        before = self.checks_ran()
+        second, planner, reviewer, claude, luna = self.resume("retry-crash-c01")
+        self.assertEqual(second.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertGreater(self.checks_ran(), before)
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+        self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
+                         repaired_tree)
+
+    def test_t_a_c01_retry_bundle_for_a_third_tree_fails_closed(self) -> None:
+        first = self._red_retry_c01("retry-third-c01")
+        checks = first.run_dir / "checks" / "C01"
+        self.retarget(checks / "evidence.json", THIRD_TREE)
+        before = self.checks_ran()
+        second, planner, reviewer, claude, luna = self.resume("retry-third-c01")
+        self.assertEqual(second.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.checks_ran(), before)
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+
+    def test_u_a_c01_archived_first_pass_for_a_wrong_tree_fails_closed(self) -> None:
+        first = self._red_retry_c01("retry-archive-c01")
+        checks = first.run_dir / "checks" / "C01"
+        self.retarget(checks / "attempts" / "01" / "evidence.json", THIRD_TREE)
+        before = self.checks_ran()
+        second, planner, reviewer, claude, luna = self.resume("retry-archive-c01")
+        self.assertEqual(second.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.checks_ran(), before)
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+
+    # -- C02 ---------------------------------------------------------------
+
+    def _red_retry_c02(self, run_id: str) -> Any:
+        """The same four states, one cycle later."""
+
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
+                         (2, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(stage_actions={
+            (2, "check-repair"): writer("src/a.py", "A = STILL BUG\n"),
+        })
+        result, _planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=luna, reviews=[REVISE_IMPLEMENTATION, PASS], repair_plan=REPAIR_PLAN,
+            claude=claude, run_id=run_id,
+        )
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual([(call["cycle"], call["stage"]) for call in claude.calls], [
+            (1, "initial-revision"), (2, "initial-revision"), (2, "check-repair"),
+        ])
+        # Only reviewer #1 ran: C02 never reached its own reviewer.
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertEqual(pushed.call_count, 1)
+        return result
+
+    def test_v_a_red_c02_retry_resumes_and_replays_only_the_retry_checks(self) -> None:
+        first = self._red_retry_c02("retry-red-c02")
+        run_dir = first.run_dir
+        checks = run_dir / "checks" / "C02"
+        initial_tree, repaired_tree = self.repair_trees(run_dir, "C02")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.FINAL_CHECKS_RETRY_C02)
+        self.assertEqual(checkpoint.expected_tree_sha, repaired_tree)
+        self.assertEqual(
+            self.evidence(checks / "attempts" / "01" / "evidence.json")["staged_tree_sha"],
+            initial_tree,
+        )
+        self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
+                         repaired_tree)
+
+        before = self.checks_ran()
+        second, planner, reviewer, claude, luna = self.resume("retry-red-c02")
+        self.assertEqual(second.status, RunStatus.FAILED)
+        self.assertNotEqual(second.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertGreater(self.checks_ran(), before)
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+        self.assertEqual(
+            self.evidence(checks / "attempts" / "02" / "evidence.json")["staged_tree_sha"],
+            repaired_tree,
+        )
+
+    def test_w_a_c02_retry_crash_before_its_evidence_still_resumes(self) -> None:
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
+                         (2, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(stage_actions={
+            (2, "check-repair"): writer("src/a.py", "A = STILL BUG\n"),
+        })
+        real = Orchestrator._final_evidence
+        calls: list[int] = []
+
+        def crash_inside_the_c02_retry(self_: Any, *args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            # C01 final checks, C02 final checks, then the C02 retry.
+            if len(calls) == 3:
+                raise RuntimeError("simulated crash inside the C02 retry checks")
+            return real(self_, *args, **kwargs)
+
+        with mock.patch.object(Orchestrator, "_final_evidence", crash_inside_the_c02_retry):
+            first, _planner, reviewer, _claude, _pushed = self.run_pipeline(
+                luna=luna, reviews=[REVISE_IMPLEMENTATION, PASS], repair_plan=REPAIR_PLAN,
+                claude=claude, run_id="retry-crash-c02",
+            )
+        self.assertEqual(first.state["failure"]["reason"], "RUNTIMEERROR")
+        self.assertEqual(len(reviewer.prompts), 1)
+        run_dir = first.run_dir
+        checks = run_dir / "checks" / "C02"
+        initial_tree, repaired_tree = self.repair_trees(run_dir, "C02")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual((checkpoint.phase, checkpoint.expected_tree_sha),
+                         (ResumePhase.FINAL_CHECKS_RETRY_C02, repaired_tree))
+        self.assertFalse((checks / "evidence.json").exists())
+        self.assertEqual(
+            self.evidence(checks / "attempts" / "01" / "evidence.json")["staged_tree_sha"],
+            initial_tree,
+        )
+
+        before = self.checks_ran()
+        second, planner, reviewer, claude, luna = self.resume("retry-crash-c02")
+        self.assertEqual(second.status, RunStatus.FAILED)
+        self.assertNotEqual(second.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertGreater(self.checks_ran(), before)
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+        self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
+                         repaired_tree)
+
+    def test_x_a_c02_retry_bundle_for_a_third_tree_fails_closed(self) -> None:
+        first = self._red_retry_c02("retry-third-c02")
+        self.retarget(first.run_dir / "checks" / "C02" / "evidence.json", THIRD_TREE)
+        before = self.checks_ran()
+        second, planner, reviewer, claude, luna = self.resume("retry-third-c02")
+        self.assertEqual(second.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.checks_ran(), before)
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+
+    def test_y_a_c02_archived_first_pass_for_a_wrong_tree_fails_closed(self) -> None:
+        first = self._red_retry_c02("retry-archive-c02")
+        self.retarget(
+            first.run_dir / "checks" / "C02" / "attempts" / "01" / "evidence.json",
+            THIRD_TREE,
+        )
+        before = self.checks_ran()
+        second, planner, reviewer, claude, luna = self.resume("retry-archive-c02")
+        self.assertEqual(second.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.checks_ran(), before)
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+
+    # -- operator revalidation --------------------------------------------
+
+    def test_z_revalidate_integrity_reopens_the_validation_without_bypassing_it(self) -> None:
+        """``--revalidate-integrity`` re-opens the validation, nothing else."""
+
+        first = self._red_retry_c01("revalidate-c01")
+        run_dir = first.run_dir
+        checks = run_dir / "checks" / "C01"
+        _initial_tree, repaired_tree = self.repair_trees(run_dir, "C01")
+        intact = self.evidence(checks / "evidence.json")
+        self.retarget(checks / "evidence.json", THIRD_TREE)
+
+        # 1. A broken invariant closes the run and leaves it non-resumable.
+        refused, planner, reviewer, claude, luna = self.resume("revalidate-c01")
+        self.assertEqual(refused.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+        state = json.loads((run_dir / "state.json").read_text())
+        self.assertFalse(resume_info(run_dir, state).resumable)
+        self.assertEqual(read_checkpoint_record(run_dir)[1], "pending")
+
+        # 2. Without the flag the run stays refused before any validation.
+        with self.assertRaises(ResumeNotAllowedError):
+            self.resume("revalidate-c01")
+
+        # 3. With the flag the *complete* validation runs again -- and still
+        #    refuses, without a model call, a check or a Git write.
+        before = self.checks_ran()
+        head = git(self.worktree("revalidate-c01"), "rev-parse", "HEAD")
+        again, planner, reviewer, claude, luna = self.resume(
+            "revalidate-c01", revalidate_integrity=True,
+        )
+        self.assertEqual(again.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.checks_ran(), before)
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+        self.assertEqual(git(self.worktree("revalidate-c01"), "rev-parse", "HEAD"), head)
+        self.assertIsNone(again.state.get("commit_sha"))
+        self.assertEqual(read_checkpoint_record(run_dir)[1], "pending")
+        self.assertTrue(
+            resume_info(
+                run_dir, json.loads((run_dir / "state.json").read_text()),
+                revalidate_integrity=True,
+            ).resumable
+        )
+
+        # 4. Once the invariant holds again, the same checkpoint is resumed
+        #    and its pending operation -- the retry checks -- executes.
+        (checks / "evidence.json").write_text(json.dumps(intact), encoding="utf-8")
+        resumed, planner, reviewer, claude, luna = self.resume(
+            "revalidate-c01", revalidate_integrity=True,
+        )
+        self.assertEqual(resumed.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertGreater(self.checks_ran(), before)
+        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+        self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
+                         repaired_tree)
+
+    def test_z_revalidate_integrity_is_rejected_for_any_other_failure(self) -> None:
+        first = self._red_retry_c01("revalidate-other")
+        state = json.loads((first.run_dir / "state.json").read_text())
+        self.assertEqual(state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        info = resume_info(first.run_dir, state, revalidate_integrity=True)
+        self.assertFalse(info.resumable)
+        self.assertEqual(info.reason, "this run is not eligible for an integrity revalidation")
+        with self.assertRaises(ResumeNotAllowedError):
+            self.resume("revalidate-other", revalidate_integrity=True)
+        # The ordinary resume of that same run is unaffected.
+        self.assertTrue(resume_info(first.run_dir, state).resumable)
 
 
 class ApprovalV4Tests(P28Harness):

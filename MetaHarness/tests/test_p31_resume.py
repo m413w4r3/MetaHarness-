@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import json
 import hashlib
 import shutil
+import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 from pathlib import Path
 
+from metaharness import cli
 from metaharness.config import load_config
 from metaharness.approval import PlanIdentity, write_scope_approval
 from metaharness.models import RunStatus
@@ -21,6 +25,8 @@ from metaharness.resume import (
     ResumeIntegrityError,
     ResumePhase,
     checkpoint_payload,
+    integrity_revalidation_allowed,
+    mark_checkpoint_completed,
     read_checkpoint,
     resume_info,
     write_checkpoint,
@@ -492,6 +498,100 @@ class C01EvidenceAuthorityResumeTests(P29Harness):
         self.assertTrue((repair_dir / "report.json").exists())
         self.assertNotEqual((repair_dir / "agent.final.md").read_text(encoding="utf-8"), "")
         self.assertFalse((repair_dir / "attempts" / "02").exists())
+
+
+class IntegrityRevalidationEligibilityTests(unittest.TestCase):
+    """``--revalidate-integrity`` gates on an explicit, narrow durable shape.
+
+    It is an operator intent, never a bypass: it only stops ``resume_info``
+    from rejecting ``RESUME_INTEGRITY_FAILURE`` up front, so that the
+    orchestrator's complete fail-closed validation can run a second time.
+    """
+
+    CHECKPOINT = ResumeCheckpoint(
+        phase=ResumePhase.FINAL_CHECKS_RETRY_C01, cycle=1, step_id=None,
+        expected_head_sha="1" * 40, expected_tree_sha="2" * 40,
+        execution_selection_sha256="d" * 64,
+        plan_identity=PlanIdentity("a" * 64, "b" * 64, "c" * 64, "d" * 64),
+    )
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.run_dir = Path(self.temp.name) / "run"
+        self.worktree = Path(self.temp.name) / "worktree"
+        self.worktree.mkdir(parents=True)
+        self.run_dir.mkdir(parents=True)
+        (self.run_dir / "plan_approval.json").write_text(
+            json.dumps({"decision": "APPROVE"}), encoding="utf-8"
+        )
+        write_checkpoint(self.run_dir, self.CHECKPOINT)
+
+    def state(self, reason: str = "RESUME_INTEGRITY_FAILURE") -> dict:
+        return {
+            "status": "failed", "planning_protocol": "v2",
+            "worktree": str(self.worktree), "failure": {"reason": reason},
+        }
+
+    def test_the_flag_is_required_to_revalidate_an_integrity_failure(self) -> None:
+        state = self.state()
+        self.assertTrue(integrity_revalidation_allowed(self.run_dir, state))
+        plain = resume_info(self.run_dir, state)
+        self.assertFalse(plain.resumable)
+        self.assertEqual(plain.reason, "failure requires operator intervention")
+        opened = resume_info(self.run_dir, state, revalidate_integrity=True)
+        self.assertTrue(opened.resumable)
+        self.assertEqual(opened.phase, ResumePhase.FINAL_CHECKS_RETRY_C01.value)
+        self.assertEqual(opened.expected_tree, self.CHECKPOINT.expected_tree_sha)
+
+    def test_the_flag_never_waives_another_failure_or_a_closed_checkpoint(self) -> None:
+        for label, state in (
+            ("other failure", self.state("AGENT_COMMITTED")),
+            ("not failed", {**self.state(), "status": "interrupted"}),
+            ("no failure", {**self.state(), "failure": None}),
+        ):
+            with self.subTest(label):
+                self.assertFalse(integrity_revalidation_allowed(self.run_dir, state))
+                info = resume_info(self.run_dir, state, revalidate_integrity=True)
+                self.assertFalse(info.resumable)
+                self.assertEqual(
+                    info.reason, "this run is not eligible for an integrity revalidation"
+                )
+        mark_checkpoint_completed(self.run_dir)
+        self.assertFalse(integrity_revalidation_allowed(self.run_dir, self.state()))
+
+    def test_the_flag_waives_nothing_else_resume_info_checks(self) -> None:
+        """Every other cheap requirement still rejects the run."""
+
+        shutil.rmtree(self.worktree)
+        self.assertFalse(
+            resume_info(self.run_dir, self.state(), revalidate_integrity=True).resumable
+        )
+        self.worktree.mkdir(parents=True)
+        (self.run_dir / "plan_approval.json").write_text(
+            json.dumps({"decision": "REJECT"}), encoding="utf-8"
+        )
+        info = resume_info(self.run_dir, self.state(), revalidate_integrity=True)
+        self.assertFalse(info.resumable)
+        self.assertEqual(info.reason, "plan approval was not APPROVE")
+
+    def test_the_cli_flag_reaches_the_orchestrator_and_defaults_to_off(self) -> None:
+        for argv, expected in (
+            (["resume", "--config", "c.toml", "--run-id", "r"], False),
+            (["resume", "--config", "c.toml", "--run-id", "r", "--revalidate-integrity"], True),
+        ):
+            with self.subTest(argv=argv[-1]):
+                args = cli.build_parser().parse_args(argv)
+                self.assertEqual(args.revalidate_integrity, expected)
+                with mock.patch.object(cli, "resume_run") as resume_run:
+                    resume_run.return_value = mock.Mock(
+                        status=RunStatus.FAILED, run_dir=self.run_dir, state=self.state(),
+                    )
+                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        cli._resume(Path(args.config), args.run_id, args.revalidate_integrity)
+                self.assertEqual(
+                    resume_run.call_args.kwargs, {"revalidate_integrity": expected}
+                )
 
 
 if __name__ == "__main__":

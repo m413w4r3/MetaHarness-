@@ -286,6 +286,33 @@ are unchanged; the staged candidate tree is exactly the checkpoint tree; the
 base SHA is unchanged; there is no untracked or unapproved path and no
 agent-created commit. Any mismatch records `RESUME_INTEGRITY_FAILURE`.
 
+Evidence invariants are phase-specific, and the two automatic check-repair
+phases are opposites. At `check_repair_c0x` the repair Claude has not
+succeeded yet, so the canonical `checks/C0x/evidence.json` must still be the
+red first pass for the pre-repair tree. At `final_checks_retry_c0x` that
+Claude *did* succeed, the checkpoint tree is the **repaired** tree, the red
+first pass has moved to `checks/C0x/attempts/01/`, and the canonical bundle is
+either absent (the first retry crashed) or the retry's own bundle for the
+repaired tree. The retry checks are always re-executed, so a red bundle is
+never read as proof that the new checks are green.
+
+A run closed by this validation stays non-resumable by default. An operator
+who has fixed the cause can ask for a second *complete* validation of the
+same pending checkpoint:
+
+```bash
+metaharness resume --config examples/autowork.toml --run-id <RUN_ID> \
+  --revalidate-integrity
+```
+
+The flag is accepted only when the run is `failed` with
+`RESUME_INTEGRITY_FAILURE` and its `resume_checkpoint.json` is still
+`pending`. It bypasses nothing: it only stops the cheap eligibility table from
+rejecting the run up front, and every check above still runs fail-closed. If
+the validation refuses again the run stays `RESUME_INTEGRITY_FAILURE`, with no
+model call, no check and no Git write. It is deliberately CLI-only; the run
+page exposes no such button.
+
 If a failed Claude attempt edited files before failing, its left-over tree is
 recorded in `revision/Cxx/tree_after_failure.txt`. Resume restores exactly
 `revision/Cxx/tree_before.txt` through Git objects, and only for paths inside

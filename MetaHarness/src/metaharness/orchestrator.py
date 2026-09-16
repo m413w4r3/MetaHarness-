@@ -1296,6 +1296,48 @@ def _load_evidence(directory: Path) -> EvidenceBundle | None:
     )
 
 
+def _retry_checks_evidence(
+    checks_dir: Path, *, cycle: str, initial_tree: str, repaired_tree: str,
+    legacy_dir: Path | None = None,
+) -> tuple[EvidenceBundle | None, str | None]:
+    """Resolve the evidence authority of a ``FINAL_CHECKS_RETRY`` resume.
+
+    This phase is reached only after the automatic check-repair Claude
+    *succeeded*, so the checkpoint tree is the repaired tree, not the red tree
+    the repair answered to.  Two durable states are legitimate:
+
+    * the first retry crashed before writing its evidence -- the red
+      first-pass bundle has already been moved to ``attempts/01/`` and there
+      is no current bundle;
+    * a complete retry already ran and stayed red -- the current bundle is for
+      the repaired tree.
+
+    The red first-pass evidence stays the authority the repair answers to, so
+    it is preferred when present; the retry checks are re-executed in both
+    cases, which is why a red current bundle is never read as proof that the
+    new checks are green.  Returns ``(evidence, refusal)``.
+    """
+
+    prior = _load_evidence(checks_dir / "attempts" / "01")
+    if prior is not None and prior.staged_tree_sha != initial_tree:
+        return None, (
+            f"the archived {cycle} first-pass evidence is not for the pre-repair checks tree"
+        )
+    # Only a run without the per-cycle directory may fall back to the root
+    # aliases: those aliases still name the *first* pass once the retry
+    # archived it, so they are never the authority for the repaired tree.
+    current = (
+        _load_evidence(checks_dir) if checks_dir.is_dir() or legacy_dir is None
+        else _load_evidence(legacy_dir)
+    )
+    if current is not None and current.staged_tree_sha != repaired_tree:
+        return None, f"the {cycle} retry evidence is not for the repaired checks tree"
+    evidence = prior or current
+    if evidence is None:
+        return None, f"the {cycle} final evidence is missing or not for the expected checks tree"
+    return evidence, None
+
+
 def _accepted_review(
     directory: Path, evidence: EvidenceBundle, candidate_sha: str | None = None,
 ) -> ReviewResult | None:
@@ -5398,6 +5440,7 @@ class Orchestrator:
 
     def resume(
         self, run_id: str, *, on_claimed: Callable[[Path], None] | None = None,
+        revalidate_integrity: bool = False,
     ) -> RunResult:
         """Resume a failed run at its durable checkpoint.
 
@@ -5406,6 +5449,15 @@ class Orchestrator:
         ``RESUME_REQUIRES_OPERATOR``) without any model call.  A run that is
         not resumable raises :class:`ResumeNotAllowedError` and its state is
         left untouched.
+
+        *revalidate_integrity* is the explicit operator intent behind
+        ``metaharness resume --revalidate-integrity``.  It only waives the
+        cheap classification of ``RESUME_INTEGRITY_FAILURE`` as permanently
+        non-resumable, so that the *complete* validation below runs again on a
+        run a since-fixed validation defect had refused.  Every invariant is
+        still enforced fail-closed: when the validation refuses a second time
+        the run stays ``RESUME_INTEGRITY_FAILURE``, nothing is written to Git
+        and no model or check runs.
         """
 
         try:
@@ -5439,7 +5491,9 @@ class Orchestrator:
                 self.config.runtime_environment if self.config.runtime_environment else os.environ
             )
         self._secrets = config_secret_values(self.config, self._runtime_environment)
-        eligibility = resume_info(run_dir, state)
+        eligibility = resume_info(
+            run_dir, state, revalidate_integrity=revalidate_integrity
+        )
         if not eligibility.resumable:
             raise ResumeNotAllowedError(eligibility.reason or "run is not resumable")
         try:
@@ -5456,6 +5510,7 @@ class Orchestrator:
             "attempts": attempts + 1,
             "previous_status": state.get("status"),
             "previous_failure": state.get("failure"),
+            **({"revalidate_integrity": True} if revalidate_integrity else {}),
         }
         if checkpoint.phase in {
             ResumePhase.CONTEXT, ResumePhase.PLANNER,
@@ -6697,15 +6752,27 @@ class Orchestrator:
                 refuse("the C01 final evidence is not for the expected checks tree")
             resumed.c01_evidence = evidence
             return
-        if checkpoint.phase in {
-            ResumePhase.CHECK_REPAIR_C01, ResumePhase.FINAL_CHECKS_RETRY_C01,
-        }:
-            # Here the first final-checks pass did complete: its red evidence
-            # for the pre-repair tree is the authority the repair answers to,
-            # so it must exist.
+        if checkpoint.phase is ResumePhase.CHECK_REPAIR_C01:
+            # The first final-checks pass completed and the repair Claude has
+            # not succeeded yet: the canonical bundle is still the red evidence
+            # for the pre-repair tree, which is the authority the repair
+            # answers to, so it must exist and be for exactly that tree.
             evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
             if evidence is None or evidence.staged_tree_sha != initial_c01_tree:
                 refuse("the C01 final evidence is missing or not for the expected checks tree")
+            resumed.c01_evidence = evidence
+            return
+        if checkpoint.phase is ResumePhase.FINAL_CHECKS_RETRY_C01:
+            # The repair Claude did succeed, so ``c01_tree`` is the repaired
+            # tree and the canonical bundle is either absent (the first retry
+            # crashed) or the retry's own red bundle for that repaired tree.
+            evidence, refusal = _retry_checks_evidence(
+                run_dir / "checks" / "C01", cycle="C01",
+                initial_tree=initial_c01_tree, repaired_tree=c01_tree,
+                legacy_dir=run_dir,
+            )
+            if refusal is not None:
+                refuse(refusal)
             resumed.c01_evidence = evidence
             return
         if at <= phase_index(ResumePhase.CANDIDATE_COMMIT_C01):
@@ -6824,24 +6891,34 @@ class Orchestrator:
                 "the checkpoint tree is not the Claude C02 tree" if resumed.c02_revision is not None
                 else "the checkpoint tree is not the last completed C02 tree"
             )
+        if checkpoint.phase is ResumePhase.CHECK_REPAIR_C02:
+            # C02 parity with ``CHECK_REPAIR_C01``: the red pre-repair bundle
+            # is mandatory and must be for the pre-repair C02 tree.
+            evidence = _load_evidence(run_dir / "checks" / "C02")
+            if evidence is None or evidence.staged_tree_sha != initial_c02_tree:
+                refuse("the C02 final evidence is missing or not for the expected checks tree")
+            resumed.c02_evidence = evidence
+            return
+        if checkpoint.phase is ResumePhase.FINAL_CHECKS_RETRY_C02:
+            # C02 parity with ``FINAL_CHECKS_RETRY_C01``: the checkpoint tree
+            # is the repaired C02 tree and the current bundle, when present,
+            # must be the retry's own bundle for it.
+            evidence, refusal = _retry_checks_evidence(
+                run_dir / "checks" / "C02", cycle="C02",
+                initial_tree=initial_c02_tree, repaired_tree=c02_tree,
+            )
+            if refusal is not None:
+                refuse(refusal)
+            resumed.c02_evidence = evidence
+            return
         if checkpoint.phase in {
-            ResumePhase.CHECK_REPAIR_C02, ResumePhase.FINAL_CHECKS_RETRY_C02,
             ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,
             ResumePhase.REVIEWER_C02,
         }:
             evidence = _load_evidence(run_dir / "checks" / "C02")
-            expected_evidence_tree = (
-                initial_c02_tree if checkpoint.phase in {
-                    ResumePhase.CHECK_REPAIR_C02, ResumePhase.FINAL_CHECKS_RETRY_C02,
-                } else expected
-            )
-            if evidence is None or evidence.staged_tree_sha != expected_evidence_tree:
+            if evidence is None or evidence.staged_tree_sha != expected:
                 refuse("the C02 candidate evidence is missing or not for the candidate tree")
             resumed.c02_evidence = evidence
-            if checkpoint.phase in {
-                ResumePhase.CHECK_REPAIR_C02, ResumePhase.FINAL_CHECKS_RETRY_C02,
-            }:
-                return
             if checkpoint.phase is ResumePhase.REVIEWER_C02:
                 resumed.c02_review = _load_c01_review(run_dir / "review" / "C02", evidence)
             return
@@ -6923,11 +7000,14 @@ def run_orchestrator(
     return Orchestrator(loaded).run(spec, run_id=run_id)
 
 
-def resume_run(config: HarnessConfig | str | Path, run_id: str) -> RunResult:
+def resume_run(
+    config: HarnessConfig | str | Path, run_id: str, *,
+    revalidate_integrity: bool = False,
+) -> RunResult:
     """Resume *run_id* at its durable checkpoint (same run id, same worktree)."""
 
     loaded = load_config(config) if not isinstance(config, HarnessConfig) else config
-    return Orchestrator(loaded).resume(run_id)
+    return Orchestrator(loaded).resume(run_id, revalidate_integrity=revalidate_integrity)
 
 
 def recover_plan_run(config: HarnessConfig | str | Path, run_id: str, replacement_raw: str) -> RunResult:
