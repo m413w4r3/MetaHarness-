@@ -679,6 +679,24 @@ def _git_ownership_payload(ownership: GitOwnership) -> dict[str, Any]:
     }
 
 
+def _ownership_from_payload(payload: Mapping[str, Any]) -> GitOwnership | None:
+    """Rebuild a persisted ownership proof, or ``None`` when it is malformed."""
+
+    head_ref, head = payload.get("head_ref"), payload.get("head")
+    branches, worktrees = payload.get("branches"), payload.get("worktrees")
+    if (
+        (head_ref is not None and not isinstance(head_ref, str))
+        or not _is_object_id(head)
+        or not isinstance(branches, list) or any(not isinstance(item, str) for item in branches)
+        or not isinstance(worktrees, list) or any(not isinstance(item, str) for item in worktrees)
+    ):
+        return None
+    return GitOwnership(
+        head_ref=head_ref, head=head,
+        branches=frozenset(branches), worktrees=frozenset(worktrees),
+    )
+
+
 def _ownership_violations(
     before: GitOwnership, after: GitOwnership, *, branch_ref: str, base_sha: str
 ) -> list[str]:
@@ -2112,8 +2130,12 @@ class Orchestrator:
         )
 
         ownership_before = _git_ownership(repo, info.worktree)
-        store.update(git_ownership=_git_ownership_payload(ownership_before))
-        store.update(status=RunStatus.PREPARING)
+        # The durable ownership proof is persisted with the status of the
+        # write it belongs to: the state store owns the status of every update.
+        store.update(
+            status=RunStatus.PREPARING,
+            git_ownership=_git_ownership_payload(ownership_before),
+        )
         try:
             setup_results = prepare_workspace(
                 info.worktree,
@@ -2568,7 +2590,12 @@ class Orchestrator:
         store.update(status=RunStatus.WORKTREE_READY, branch=info.branch,
                      worktree=str(info.worktree), base_sha=info.base_sha)
         ownership_before = _git_ownership(repo, info.worktree)
-        store.update(status=RunStatus.PREPARING)
+        # Persisted with an explicit status so a later resume has the stronger
+        # durable ownership proof of the pre-execution boundary.
+        store.update(
+            status=RunStatus.PREPARING,
+            git_ownership=_git_ownership_payload(ownership_before),
+        )
         try:
             setup_results = prepare_workspace(
                 info.worktree, self.config.workspace_setup,
@@ -3219,12 +3246,26 @@ class Orchestrator:
         if not isinstance(outcome, DeferredStepExecutionOutcome):
             return outcome
         # The boundary must still be exactly the pre-step boundary before a
-        # second worker is allowed to run against it.
-        if self._pre_step_boundary_drift(
+        # second worker is allowed to run against it.  Drift here is lost
+        # authority, never a deferrable outcome: fail closed so that no second
+        # worker and no later step runs.
+        drift = self._pre_step_boundary_drift(
             repo, worktree, ownership_before,
             branch_ref=branch_ref, base_sha=base_sha, tree_before=outcome.tree_before,
-        ):
-            return outcome
+        )
+        if drift:
+            # Attempt 1 keeps its own artifacts, but its deferred record must
+            # not remain the step's current durable record: the step failed.
+            _archive_attempt(artifact_dir)
+            raise StepExecutionFailure(
+                "STEP_CONTRACT_DRIFT", outcome.step_id,
+                _bounded_v2_report(
+                    f"the step boundary drifted before the bounded mismatch retry: {drift}"
+                ),
+                profile_id=outcome.profile_id, tree_before=outcome.tree_before,
+                tree_after=_safe_candidate_tree(worktree), usage=outcome.usage,
+                mismatch=outcome.mismatch,
+            )
         # Attempt 1 keeps its own artifacts, including its diagnostics.
         _archive_attempt(artifact_dir)
         return self._run_codex_step_attempt(
@@ -3277,6 +3318,17 @@ class Orchestrator:
         """
 
         step_id = step.id
+        # The retry mode of this invocation.  Every failure it can raise
+        # carries it, so a resume of a transient failure reruns exactly this
+        # semantic operation (same contract, same addendum, same future
+        # ownership) instead of a new normal first attempt.
+        retry_mode: dict[str, Any] = (
+            {
+                "mismatch_retry_count": mismatch_retry_count,
+                "initial_mismatch": _bounded_v2_report(initial_mismatch or "") or None,
+            }
+            if mismatch_retry_count else {}
+        )
         # 1-2. The exact tree Codex will receive, and the contract's Git
         # preconditions on it.
         tree_before = candidate_tree_sha(worktree)
@@ -3284,7 +3336,7 @@ class Orchestrator:
         if drift:
             raise StepExecutionFailure(
                 "STEP_CONTRACT_DRIFT", step_id, drift,
-                profile_id=profile_id, tree_before=tree_before,
+                profile_id=profile_id, tree_before=tree_before, **retry_mode,
             )
         # The complete Git boundary a no-op mismatch must leave untouched.
         # Accumulated modifications from the earlier steps are legitimate, so
@@ -3327,7 +3379,7 @@ class Orchestrator:
             self._redact_step_artifacts(artifact_dir)
             raise StepExecutionFailure(
                 "AGENT_COMMITTED", step_id, redact(str(exc), self._secrets),
-                profile_id=profile.id, tree_before=tree_before,
+                profile_id=profile.id, tree_before=tree_before, **retry_mode,
             ) from None
         # 6. Complete and redact the durable artifacts.
         self._ensure_step_artifacts(artifact_dir, result)
@@ -3343,7 +3395,10 @@ class Orchestrator:
             write_token_diagnostics(artifact_dir, usage, worktree=worktree)
         except (OSError, ResultArtifactError):
             pass
-        failed = {"profile_id": profile.id, "tree_before": tree_before, "usage": usage}
+        failed = {
+            "profile_id": profile.id, "tree_before": tree_before, "usage": usage,
+            **retry_mode,
+        }
         # 7. Authentication classification from fixed markers only.
         auth_failure = _codex_auth_failure(artifact_dir / "agent.events.jsonl", result.stderr_tail)
         # Capture ownership before interpreting the worker's structural report.
@@ -4094,6 +4149,10 @@ class Orchestrator:
             if start is not None and start.phase is ResumePhase.REPAIR_STEP else tree_before
         )
         retry_step = start.step_id if start is not None and start.phase is ResumePhase.REPAIR_STEP else None
+        # A clean mismatch (or a transient failure of its bounded retry)
+        # persisted by an earlier run: this run owes that step exactly the same
+        # semantic retry, with the addendum and no replay.
+        pending_retries = dict(resumed.mismatch_retries) if resumed is not None else {}
         self._repair_v2_step_results = list(completed)
         codex_home = prepare_codex_home(self.config)
         forbidden_env_names = (planner_profile.api_key_env, reviewer_profile.api_key_env)
@@ -4118,6 +4177,7 @@ class Orchestrator:
                 artifact_dir=repair_dir / "steps" / step.id,
                 codex_home=codex_home, forbidden_env_names=forbidden_env_names,
                 future_ownership=_future_step_ownership(repair_plan.steps, index),
+                pending_mismatch_retry=pending_retries.pop(step.id, None),
             )
             self._repair_v2_step_results.append(_step_result_record(outcome))
             expected_tree = outcome.tree_after
@@ -5422,6 +5482,7 @@ class Orchestrator:
         def refuse(message: str) -> NoReturn:
             raise ResumeIntegrityError(message)
 
+        original_checkpoint = checkpoint
         revision_enabled = self._run_options.claude_revision_enabled
         repair_enabled = self._run_options.repair_cycles == 1
         if self.config.planning.protocol != "v2" or state.get("planning_protocol") != "v2":
@@ -5645,6 +5706,25 @@ class Orchestrator:
                     refuse("remote run branch does not point to the candidate commit")
                 if checkpoint.phase in {ResumePhase.CANDIDATE_PUSH_C01, ResumePhase.CANDIDATE_PUSH_C02} and remote_tip not in {None, head}:
                     refuse("remote run branch points to a different commit")
+            # A crash can happen after a worker's durable step record was
+            # written and before the checkpoint named the following step.
+            # That exact shape is reconciled here, before any drift verdict,
+            # so the step is never executed twice.
+            reconciled_retries: dict[str, str] = {}
+            if checkpoint.phase in {ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP}:
+                step_ids = (
+                    [step.id for step in plan.steps]
+                    if checkpoint.phase is ResumePhase.INITIAL_STEP
+                    else self._repair_step_ids(run_dir, checkpoint, selection, plan.required_checks)
+                )
+                reconciled = self._reconcile_durable_step(
+                    run_dir, checkpoint, step_ids or [], repo=repo, worktree=worktree,
+                    candidate=candidate, index_tree=index_tree, dirty=dirty, scope=scope,
+                    expected_head=phase_expected_head, branch_ref=f"refs/heads/{branch}",
+                    recorded_ownership=state.get("git_ownership"),
+                )
+                if reconciled is not None:
+                    checkpoint, reconciled_retries = reconciled
             restore: tuple[str, ...] = ()
             if candidate != checkpoint.expected_tree_sha or index_tree != checkpoint.expected_tree_sha or dirty:
                 restore = self._explain_tree_drift(
@@ -5666,7 +5746,7 @@ class Orchestrator:
         # ignored files.  Any real residual evidence remains an
         # operator-required failure.
         failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-        mismatch_retries: dict[str, str] = {}
+        mismatch_retries: dict[str, str] = dict(reconciled_retries)
         if (
             failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
             and is_clean_contract_mismatch_artifact(run_dir, state, checkpoint)
@@ -5726,6 +5806,17 @@ class Orchestrator:
                     checkpoint.scope_delta_sha256,
                 )
                 resume_module.write_checkpoint(run_dir, checkpoint)
+        # A transient failure (timeout, transport, auth) of a step that was
+        # already running its single bounded mismatch retry keeps that mode:
+        # the same operation is rerun with the same contract, the same retry
+        # addendum and the same future ownership.  A transport retry never
+        # creates a normal first attempt, and never a second semantic retry.
+        if not mismatch_retries and checkpoint.phase in {
+            ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP,
+        }:
+            pending = self._pending_mismatch_retry_mode(run_dir, checkpoint)
+            if pending:
+                mismatch_retries[str(checkpoint.step_id)] = pending
         if unapproved:
             refuse("the candidate contains a path outside the approved scope")
         resumed = _ResumedRun(
@@ -5743,7 +5834,141 @@ class Orchestrator:
             self._load_resumed_results(
                 run_dir, resumed, base_tree, revision_enabled, repair_enabled
             )
+        if checkpoint != original_checkpoint:
+            # A reconciled boundary is persisted only once every durable
+            # artifact before it has been read back and verified.
+            resume_module.write_checkpoint(run_dir, checkpoint)
         return resumed
+
+    @staticmethod
+    def _step_root(run_dir: Path, checkpoint: ResumeCheckpoint) -> Path:
+        """The durable step directory root of a step checkpoint's cycle."""
+
+        return (
+            run_dir if checkpoint.phase is ResumePhase.INITIAL_STEP
+            else run_dir / "repair" / "C02"
+        )
+
+    @staticmethod
+    def _pending_mismatch_retry_mode(
+        run_dir: Path, checkpoint: ResumeCheckpoint,
+    ) -> str:
+        """The initial mismatch a failed step must be retried with, if any.
+
+        A step whose durable record failed *while already in mismatch-retry
+        mode* keeps that mode across the transient failure: the resume owes it
+        the same semantic retry, not a fresh first attempt.
+        """
+
+        record = _read_json_artifact(
+            Orchestrator._step_root(run_dir, checkpoint)
+            / "steps" / str(checkpoint.step_id) / "step.json",
+            128 * 1024,
+        )
+        if not isinstance(record, dict) or record.get("id") != checkpoint.step_id:
+            return ""
+        if record.get("status") != "FAILED":
+            return ""
+        spent = record.get("mismatch_retry_count")
+        initial = record.get("initial_mismatch")
+        if (
+            not isinstance(spent, int) or isinstance(spent, bool) or spent < 1
+            or not isinstance(initial, str) or not initial.strip()
+        ):
+            return ""
+        return _bounded_v2_report(initial)
+
+    def _repair_step_ids(
+        self, run_dir: Path, checkpoint: ResumeCheckpoint, selection: Any,
+        inherited_check_ids: Any,
+    ) -> list[str] | None:
+        """The C02 step ids of the hash-bound repair bundle, or ``None``."""
+
+        repair_dir = run_dir / "repair" / "C02"
+        try:
+            repair_plan = parse_task_plan_v2(
+                (repair_dir / "planner.raw.md").read_text(encoding="utf-8"),
+                implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+                reviewer_ids=frozenset({selection.reviewer.profile_id}),
+                check_catalog=self.config.check_catalog,
+                inherited_check_ids=inherited_check_ids,
+            )
+            _bundle, repair_sha = validate_implementation_bundle(
+                repair_dir, expected_step_ids=[step.id for step in repair_plan.steps]
+            )
+        except (V2PlanParseError, OrchestrationError, OSError, UnicodeError, ValueError,
+                AttributeError):
+            return None
+        if repair_plan.decision is not PlanDecision.READY or repair_sha != checkpoint.repair_bundle_sha256:
+            return None
+        return [step.id for step in repair_plan.steps]
+
+    def _reconcile_durable_step(
+        self, run_dir: Path, checkpoint: ResumeCheckpoint, step_ids: list[str], *,
+        repo: Path, worktree: Path, candidate: str, index_tree: str,
+        dirty: list[str], scope: list[str], expected_head: str, branch_ref: str,
+        recorded_ownership: Any,
+    ) -> tuple[ResumeCheckpoint, dict[str, str]] | None:
+        """Reconcile a step that succeeded durably before the checkpoint moved.
+
+        A crash can happen after ``steps/Sxx/step.json`` is ``COMPLETED`` (or
+        a deferred clean mismatch) and before the checkpoint names Sxx+1.
+        Only that exact shape is accepted — the record's own pre-step tree is
+        the checkpoint tree, the current candidate *and* index are exactly its
+        post-step tree, there is no residue, every changed path is in the
+        approved mutable scope of that cycle and the Git boundary still holds.
+        The boundary then advances without invoking the worker again; anything
+        else returns ``None`` and stays subject to the drift verdict.
+        """
+
+        step_id = checkpoint.step_id
+        if step_id is None or step_id not in step_ids:
+            return None
+        record = _load_completed_step(
+            self._step_root(run_dir, checkpoint) / "steps" / step_id, step_id
+        )
+        if record is None:
+            return None
+        if (
+            record["tree_before"] != checkpoint.expected_tree_sha
+            or candidate != record["tree_after"]
+            or index_tree != record["tree_after"]
+            or dirty
+            or any(path not in scope for path in record["changed_paths"])
+        ):
+            return None
+        try:
+            ownership = _git_ownership(repo, worktree)
+        except GitError:
+            return None
+        if ownership.head_ref != branch_ref or ownership.head != expected_head:
+            return None
+        if isinstance(recorded_ownership, Mapping):
+            before = _ownership_from_payload(recorded_ownership)
+            if before is None or _ownership_violations(
+                before, ownership, branch_ref=branch_ref, base_sha=expected_head
+            ):
+                return None
+        spent = record.get("mismatch_retry_count")
+        if record["status"] == "DEFERRED_CONTRACT_MISMATCH" and not (
+            isinstance(spent, int) and not isinstance(spent, bool) and spent >= 1
+        ):
+            # The durable deferral still owns its single bounded retry: keep
+            # the same step and schedule exactly that retry, nothing else.
+            return checkpoint, {step_id: str(record.get("mismatch") or "")}
+        index = step_ids.index(step_id)
+        following = step_ids[index + 1] if index + 1 < len(step_ids) else None
+        checks_phase = (
+            ResumePhase.CHECKS_C01 if checkpoint.phase is ResumePhase.INITIAL_STEP
+            else ResumePhase.CHECKS_C02
+        )
+        return ResumeCheckpoint(
+            checkpoint.phase if following else checks_phase,
+            checkpoint.cycle, following, checkpoint.expected_head_sha,
+            record["tree_after"], checkpoint.execution_selection_sha256,
+            checkpoint.plan_identity, checkpoint.repair_bundle_sha256,
+            checkpoint.scope_delta_sha256,
+        ), {}
 
     def _validated_repair_scope(
         self, run_dir: Path, checkpoint: ResumeCheckpoint, plan: TaskPlanV2,

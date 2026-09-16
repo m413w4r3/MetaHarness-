@@ -131,14 +131,55 @@ def read_usage_artifact(path: str | Path) -> dict[str, int] | None:
 
 
 _STEP_DIRECTORY = STEP_ID_RE
+_ATTEMPT_DIRECTORY = re.compile(r"[0-9]{2,}")
 _MAX_STEP_RECORD_BYTES = 128 * 1024
 
 
-def persisted_step_usage(steps_dir: str | Path) -> list[dict[str, Any]]:
-    """``[{"id", "usage"}]`` read from every ``Sxx/step.json`` under *steps_dir*.
+def _step_record_usage(record: Path) -> dict[str, int] | None:
+    """The canonical usage of one bounded ``step.json``, if it has any."""
 
-    Luna totals are always derived from these durable records, never from
-    ``state.steps``, which only describes the current cycle.
+    try:
+        if record.stat().st_size > _MAX_STEP_RECORD_BYTES:
+            return None
+        payload = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("usage"), dict):
+        return normalize_usage(payload["usage"])
+    return None
+
+
+def _archived_attempt_usage(step_dir: Path) -> list[dict[str, int]]:
+    """Usage of every archived attempt of one step, oldest attempt first.
+
+    ``_archive_attempt`` *moves* a finished attempt's artifacts into
+    ``attempts/NN/``, so an archived record is never also the current one:
+    summing them can not double-count a Luna invocation.
+    """
+
+    try:
+        entries = sorted((step_dir / "attempts").iterdir(), key=lambda path: path.name)
+    except OSError:
+        return []
+    rows: list[dict[str, int]] = []
+    for entry in entries:
+        if _ATTEMPT_DIRECTORY.fullmatch(entry.name) is None or not entry.is_dir():
+            continue
+        usage = _step_record_usage(entry / "step.json")
+        if usage is not None:
+            rows.append(usage)
+    return rows
+
+
+def persisted_step_usage(steps_dir: str | Path) -> list[dict[str, Any]]:
+    """``[{"id", "usage", "attempts"}]`` for every ``Sxx`` under *steps_dir*.
+
+    One logical step may have run several times (a bounded mismatch retry, a
+    transient transport failure, a resume).  ``usage`` is the aggregate of
+    every actual Luna invocation of that step: its current ``step.json`` plus
+    each archived ``attempts/NN/step.json``.  Luna totals are always derived
+    from these durable records, never from ``state.steps``, which only
+    describes the current cycle.
     """
 
     try:
@@ -149,15 +190,15 @@ def persisted_step_usage(steps_dir: str | Path) -> list[dict[str, Any]]:
     for entry in entries:
         if _STEP_DIRECTORY.fullmatch(entry.name) is None or not entry.is_dir():
             continue
-        record = entry / "step.json"
-        try:
-            if record.stat().st_size > _MAX_STEP_RECORD_BYTES:
-                continue
-            payload = json.loads(record.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError):
+        records = _archived_attempt_usage(entry)
+        current = _step_record_usage(entry / "step.json")
+        if current is not None:
+            records.append(current)
+        if not records:
             continue
-        if isinstance(payload, dict) and isinstance(payload.get("usage"), dict):
-            rows.append({"id": entry.name, "usage": normalize_usage(payload["usage"])})
+        rows.append({
+            "id": entry.name, "usage": add_usage(records), "attempts": len(records),
+        })
     return rows
 
 

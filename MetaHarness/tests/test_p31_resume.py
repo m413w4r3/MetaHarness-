@@ -31,7 +31,68 @@ from tests.test_p29 import (
 )
 
 
+TWO_STEP_PLAN = plan_text(
+    step_block(1),
+    step_block(2, read=("src/a.py", "src/b.py"), write_set=("src/b.py",)),
+    title="P31 two-step plan",
+)
+
+
 class P31ResumeTests(P29Harness):
+    def test_a_completed_step_is_reconciled_instead_of_being_replayed(self) -> None:
+        """A crash between a step's durable record and its checkpoint.
+
+        The worker of ``S01`` already succeeded and its record is durable, so
+        the resume advances the boundary to ``S02`` without invoking that
+        worker a second time.
+        """
+
+        config = self.make_config()
+        actions = {
+            (1, "S01"): writer("src/a.py", "A = 2\n"),
+            (1, "S02"): writer("src/b.py", "B = 2\n"),
+        }
+        luna = FakeLuna(dict(actions))
+        orchestrator, _planner, _reviewer, _l, _claude = self.orchestrator(
+            config, plans=[TWO_STEP_PLAN], reviews=[PASS], luna=luna,
+        )
+        real = Orchestrator._checkpoint
+        crashed: list[str] = []
+
+        def crash_before_the_next_step(self_, run_dir, phase, **kwargs):
+            if not crashed and kwargs.get("step_id") == "S02":
+                crashed.append("S02")
+                raise RuntimeError("simulated crash before the checkpoint advanced")
+            return real(self_, run_dir, phase, **kwargs)
+
+        with mock.patch.object(Orchestrator, "_checkpoint", crash_before_the_next_step):
+            failed = self.run_approved(
+                config, orchestrator, "crash-after-step", ("S01", "S02")
+            )
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        self.assertEqual([call["step"] for call in luna.calls], ["S01"])
+        # The durable record is COMPLETED while the checkpoint still names S01.
+        record = json.loads((failed.run_dir / "steps/S01/step.json").read_text())
+        self.assertEqual((record["status"], record["changed_paths"]),
+                         ("COMPLETED", ["src/a.py"]))
+        self.assertEqual(read_checkpoint(failed.run_dir).step_id, "S01")
+
+        second_luna = FakeLuna({(1, "S02"): actions[(1, "S02")]})
+        second, planner, _reviewer, _l, _claude = self.orchestrator(
+            config, reviews=[PASS], luna=second_luna,
+        )
+        resumed = second.resume("crash-after-step")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        # S01's worker call count is unchanged; the resume starts at S02.
+        self.assertEqual([call["step"] for call in luna.calls], ["S01"])
+        self.assertEqual([call["step"] for call in second_luna.calls], ["S02"])
+        self.assertEqual(planner.prompts, [])
+        self.assertEqual(
+            json.loads((resumed.run_dir / "steps/S01/step.json").read_text())["tree_after"],
+            record["tree_after"],
+        )
+
     def test_auto_bounded_scope_waiting_restarts_without_replanning(self) -> None:
         config = self.make_config()
         paths = tuple(f"repair/restart-{number:02d}.txt" for number in range(1, 8))

@@ -90,6 +90,13 @@ ONLY if the requested transformation itself cannot be implemented coherently
 inside the approved mutable scope, or safe completion genuinely requires an
 unauthorized modification.
 
+NO-CHANGE HANDLING:
+
+If no repository change is necessary or safely possible inside this step's
+scope, do not exit as a normal successful no-change result. Return
+META CONTRACT MISMATCH v1 with the bounded explanation so MetaHarness can
+defer the step safely.
+
 </MISMATCH RETRY ADDENDUM>
 """
 _CLOSING_CONTRACT_TAG = "</STEP CONTRACT>"
