@@ -16,12 +16,14 @@ from metaharness.approval import (  # noqa: E402
     PlanIdentity,
     compute_plan_identity,
     compute_plan_identity_from_run,
+    read_check_authority,
     read_plan_approval,
     wait_for_plan_approval,
     write_plan_approval,
+    write_check_authority,
 )
 from metaharness.cli import main  # noqa: E402
-from metaharness.models import RunStatus  # noqa: E402
+from metaharness.models import CheckConfig, RunStatus  # noqa: E402
 from metaharness.state import RunStateStore  # noqa: E402
 
 
@@ -96,6 +98,30 @@ class ApprovalTests(unittest.TestCase):
         other = compute_plan_identity("other", self.contract)
         with self.assertRaises(ApprovalError):
             read_plan_approval(directory, expected_identity=other)
+
+    def test_check_authority_hash_is_bound_to_approval(self) -> None:
+        directory = self._run_dir("check-authority")
+        (directory / "planner.raw.md").write_text(self.raw, encoding="utf-8")
+        (directory / "implementation_contract.md").write_text(self.contract, encoding="utf-8")
+        check = CheckConfig("lint", ("make", "lint"), timeout_seconds=18000)
+        write_check_authority(directory, [check])
+        identity = compute_plan_identity_from_run(directory)
+        write_plan_approval(
+            directory, decision=ApprovalDecision.APPROVE,
+            identity=identity, source="test",
+        )
+        payload = json.loads((directory / "plan_approval.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema_version"], 5)
+        self.assertEqual(payload["checks_sha256"], identity.checks_sha256)
+        self.assertEqual(read_check_authority(directory)[0], ("lint",))
+
+        changed = json.loads((directory / "check_authority.json").read_text(encoding="utf-8"))
+        changed["checks"][0]["argv"] = ["make", "different-lint"]
+        (directory / "check_authority.json").write_text(
+            json.dumps(changed), encoding="utf-8"
+        )
+        with self.assertRaises(ApprovalError):
+            read_plan_approval(directory, expected_identity=identity)
 
     def test_wait_returns_decision_and_preserves_keyboard_interrupt(self) -> None:
         directory = self._run_dir("wait")

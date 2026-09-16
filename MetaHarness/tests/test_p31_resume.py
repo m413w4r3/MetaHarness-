@@ -17,6 +17,7 @@ import metaharness.orchestrator as orchestrator_module
 from metaharness.resume import (
     ResumeCheckpoint,
     ResumeCheckpointError,
+    ResumeIntegrityError,
     ResumePhase,
     checkpoint_payload,
     read_checkpoint,
@@ -140,6 +141,77 @@ class P31ResumeTests(P29Harness):
         self.assertEqual(fresh_planner.prompts, [])
         self.assertEqual([(call["cycle"], call["step"]) for call in fresh_luna.calls], [(2, "S01")])
         self.assertEqual(delta_path.read_bytes(), before)
+
+    def test_resume_uses_approved_check_argv_after_config_changes(self) -> None:
+        config = self.make_config()
+        actions = {
+            (1, "S01"): writer("src/a.py", "A = 2\n"),
+            (1, "S02"): writer("src/b.py", "B = 2\n"),
+        }
+        first_luna = FakeLuna(dict(actions))
+        first, _planner, _reviewer, _luna, _claude = self.orchestrator(
+            config, plans=[TWO_STEP_PLAN], reviews=[PASS], luna=first_luna,
+        )
+        real_checkpoint = Orchestrator._checkpoint
+        crashed: list[str] = []
+
+        def crash_before_s02(self_, run_dir, phase, **kwargs):
+            if not crashed and kwargs.get("step_id") == "S02":
+                crashed.append("S02")
+                raise RuntimeError("simulated stop")
+            return real_checkpoint(self_, run_dir, phase, **kwargs)
+
+        with mock.patch.object(Orchestrator, "_checkpoint", crash_before_s02):
+            failed = self.run_approved(config, first, "argv-authority", ("S01", "S02"))
+        changed_config = self.root / "p29.toml"
+        replacement = self.root / "replacement-check-ran.txt"
+        changed_config.write_text(
+            changed_config.read_text(encoding="utf-8").replace(
+                str(self.counter), str(replacement)
+            ),
+            encoding="utf-8",
+        )
+        fresh = load_config(changed_config)
+        second_luna = FakeLuna({(1, "S02"): actions[(1, "S02")]})
+        second, planner, _reviewer, _luna, _claude = self.orchestrator(
+            fresh, reviews=[PASS], luna=second_luna,
+        )
+        resumed = second.resume("argv-authority")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertTrue((failed.run_dir / "check_authority.json").is_file())
+        self.assertFalse(replacement.exists())
+        self.assertEqual(len(self.counter.read_text(encoding="utf-8").splitlines()), 2)
+        self.assertEqual(planner.prompts, [])
+
+    def test_changed_check_authority_refuses_resume_before_model_or_check(self) -> None:
+        config = self.make_config()
+        first_luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")})
+        first, _planner, _reviewer, _luna, _claude = self.orchestrator(
+            config, plans=[SINGLE_PLAN], reviews=[PASS], luna=first_luna,
+        )
+        real_checkpoint = Orchestrator._checkpoint
+        crashed: list[str] = []
+
+        def crash_at_checks(self_, run_dir, phase, **kwargs):
+            if not crashed and phase is ResumePhase.CHECKS_C01:
+                crashed.append("checks_c01")
+                raise RuntimeError("simulated stop")
+            return real_checkpoint(self_, run_dir, phase, **kwargs)
+
+        with mock.patch.object(Orchestrator, "_checkpoint", crash_at_checks):
+            failed = self.run_approved(config, first, "authority-tamper")
+        authority = failed.run_dir / "check_authority.json"
+        authority.write_bytes(authority.read_bytes() + b"\n")
+        planner = QueueClient("planner", [], self.events)
+        resumed = Orchestrator(
+            load_config(self.config_path()), planner_client=planner,
+            reviewer_client=QueueClient("reviewer", [PASS], self.events),
+            agent=FakeLuna({}), reviser=FakeClaude(log=self.events),
+        ).resume("authority-tamper")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(resumed.state["failure"]["reason"], ResumeIntegrityError.code)
+        self.assertEqual(planner.prompts, [])
 
     def test_pre_approval_checkpoint_does_not_require_approval_or_worktree(self) -> None:
         run_dir = self.runs / "pre-approval"

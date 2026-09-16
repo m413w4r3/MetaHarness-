@@ -182,6 +182,7 @@ def _identity_payload(identity: PlanIdentity) -> dict[str, str | None]:
         "contract_sha256": identity.contract_sha256,
         "bundle_sha256": identity.bundle_sha256,
         "execution_sha256": identity.execution_sha256,
+        "checks_sha256": identity.checks_sha256,
     }
 
 
@@ -196,6 +197,7 @@ def plan_identity_from_mapping(value: Any) -> PlanIdentity:
             contract_sha256=value["contract_sha256"],
             bundle_sha256=value.get("bundle_sha256"),
             execution_sha256=value.get("execution_sha256"),
+            checks_sha256=value.get("checks_sha256"),
         )
     except (KeyError, TypeError, ApprovalError) as exc:
         raise ResumeCheckpointError("plan identity is invalid") from exc

@@ -44,6 +44,8 @@ from .approval import (
     compute_plan_identity_from_run,
     read_plan_approval,
     read_scope_approval,
+    read_check_authority,
+    write_check_authority,
     wait_for_plan_approval,
 )
 from .config import load_config
@@ -58,7 +60,12 @@ from .evidence import (
     bounded_semantic_diff,
     collect_evidence,
 )
-from .validation import run_check_preflights
+from .validation import (
+    ValidationError,
+    config_with_check_authority,
+    resolve_check_cwd,
+    run_check_preflights,
+)
 from .gitops import (
     BaseMovedError,
     BasePushError,
@@ -2579,6 +2586,15 @@ class Orchestrator:
             return RunResult(run_dir, RunStatus.BLOCKED, state)
 
         try:
+            # REQUIRED_CHECKS has already been parsed against the trusted
+            # catalogue.  Materialize those exact trusted definitions before
+            # the plan can become approval authority.
+            selected_checks = self.config.select_checks(plan.required_checks)
+            if not plan.required_checks and not self.config.check_catalog:
+                # Preserve the historical ``[[checks]]`` selection semantics
+                # for v2 configurations that predate the explicit catalogue.
+                selected_checks = self.config.select_checks(None)
+            write_check_authority(run_dir, selected_checks)
             _bundle, _bundle_sha = validate_implementation_bundle(run_dir)
             plan_identity = compute_plan_identity_from_run(run_dir)
         except (ApprovalError, V2PlanParseError, OSError, UnicodeError) as exc:
@@ -2733,8 +2749,9 @@ class Orchestrator:
         candidate_tree = index_tree_sha(info.worktree)
         if candidate_tree != base_tree_sha:
             raise OrchestrationError("initial candidate tree does not match base")
+        check_config, check_ids = config_with_check_authority(self.config, run_dir)
         preflight_failures = run_check_preflights(
-            info.worktree, self.config, plan.required_checks
+            info.worktree, check_config, check_ids or plan.required_checks
         )
         if preflight_failures:
             raise OrchestrationError(preflight_failures[0])
@@ -4002,10 +4019,13 @@ class Orchestrator:
                 and stored.staged_tree_sha == candidate_tree_sha(worktree)
             ):
                 return stored
+        check_config, check_ids = config_with_check_authority(
+            self.config, evidence_dir, requested_check_ids=required_check_ids,
+        )
         return collect_evidence(
-            worktree, base_sha, self.config, evidence_dir=evidence_dir,
+            worktree, base_sha, check_config, evidence_dir=evidence_dir,
             secrets=self._secrets, check_failures_hard=check_failures_hard,
-            expected_head_sha=expected_head_sha, required_check_ids=required_check_ids,
+            expected_head_sha=expected_head_sha, required_check_ids=check_ids,
             enforce_diff_size=enforce_diff_size,
         )
 
@@ -4084,9 +4104,12 @@ class Orchestrator:
                     cycle=cycle, head=expected_head, tree=tree_before,
                 )
                 store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
+                check_config, check_ids = config_with_check_authority(
+                    self.config, run_dir, requested_check_ids=plan.required_checks or None,
+                )
                 pre_evidence = collect_evidence(
-                    info.worktree, base_sha, self.config,
-                    required_check_ids=plan.required_checks or None,
+                    info.worktree, base_sha, check_config,
+                    required_check_ids=check_ids,
                     evidence_dir=artifact_dir, secrets=self._secrets,
                     check_failures_hard=False,
                     expected_head_sha=expected_head,
@@ -4421,8 +4444,11 @@ class Orchestrator:
             # The repair plan may require trusted checks C01 did not; their
             # config-only preflights run before any expensive C02 worker and,
             # on failure, leave the checkpoint at the next worker boundary.
+            check_config, check_ids = config_with_check_authority(
+                self.config, run_dir, requested_check_ids=repair_plan.required_checks,
+            )
             preflight_failures = run_check_preflights(
-                info.worktree, self.config, repair_plan.required_checks
+                info.worktree, check_config, check_ids or repair_plan.required_checks
             )
             if preflight_failures:
                 raise OrchestrationError(preflight_failures[0])
@@ -5895,9 +5921,16 @@ class Orchestrator:
         try:
             identity = compute_plan_identity_from_run(run_dir)
             recorded = plan_identity_from_mapping(state.get("plan_identity"))
+            authority = read_check_authority(
+                run_dir,
+                expected_sha256=identity.checks_sha256,
+                trusted_check_ids=tuple(check.id for check in self.config.trusted_checks()),
+            )
             approval = read_plan_approval(run_dir, expected_identity=identity)
         except (ApprovalError, ResumeCheckpointError) as exc:
             refuse(f"plan artifacts are invalid: {exc}")
+        if checkpoint.plan_identity is not None and checkpoint.plan_identity.checks_sha256 is not None and authority is None:
+            refuse("check authority is missing for this run")
         if identity != checkpoint.plan_identity or identity != recorded:
             refuse("plan identity no longer matches")
         if self.config.approval.require_plan_approval:
@@ -5954,6 +5987,15 @@ class Orchestrator:
         worktree = Path(worktree_value).expanduser().resolve()
         if not worktree.is_dir():
             refuse("run worktree is missing")
+        try:
+            frozen_check_config, frozen_check_ids = config_with_check_authority(
+                self.config, run_dir,
+            )
+            if frozen_check_ids is not None:
+                for frozen_check in frozen_check_config.trusted_checks():
+                    resolve_check_cwd(worktree, frozen_check)
+        except ValidationError as exc:
+            refuse(f"check authority is invalid: {exc}")
         scope = sorted({
             path for step in plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)

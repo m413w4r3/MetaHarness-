@@ -10,10 +10,12 @@ from __future__ import annotations
 import re
 import tempfile
 import time
+import dataclasses
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .approval import ApprovalError, read_check_authority
 from .gitops import GitError, candidate_tree_sha, current_head, symbolic_head
 from .models import CheckConfig, HarnessConfig
 from .procutil import read_capped, run_bounded
@@ -28,6 +30,55 @@ _CHECK_GRACE_SECONDS = 5.0
 
 class ValidationError(RuntimeError):
     """A configured check cannot be run safely."""
+
+
+def config_with_check_authority(
+    config: HarnessConfig, run_dir: str | Path, *,
+    requested_check_ids: tuple[str, ...] | list[str] | None = None,
+) -> tuple[HarnessConfig, tuple[str, ...] | None]:
+    """Return the run's frozen check config, or the legacy config.
+
+    The current TOML is used only to confirm that the frozen IDs remain in
+    the trusted catalogue.  The command-bearing values always come from the
+    durable authority artifact.
+    """
+
+    directory = Path(run_dir).expanduser().resolve()
+    while True:
+        if (directory / "check_authority.json").is_file():
+            break
+        parent = directory.parent
+        if parent == directory:
+            return config, requested_check_ids
+        directory = parent
+    try:
+        authority = read_check_authority(
+            directory,
+            trusted_check_ids=tuple(check.id for check in config.trusted_checks()),
+        )
+    except ApprovalError as exc:
+        raise ValidationError(str(exc)) from exc
+    if authority is None:
+        return config, requested_check_ids
+    authority_ids, checks = authority
+    selected_ids = authority_ids
+    if requested_check_ids is not None:
+        selected_ids = tuple(requested_check_ids)
+        try:
+            current_selected = config.select_checks(selected_ids)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        authority_by_id = dict(zip(authority_ids, checks))
+        checks = tuple(
+            authority_by_id.get(check.id, check) for check in current_selected
+        )
+    frozen = dataclasses.replace(
+        config,
+        checks=checks,
+        check_catalog=checks,
+        default_check_ids=selected_ids,
+    )
+    return frozen, selected_ids
 
 
 @dataclass(frozen=True)
