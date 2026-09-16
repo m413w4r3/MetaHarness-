@@ -199,7 +199,7 @@ class FakeAgent:
         self.calls: list[dict[str, Any]] = []
 
     def run_step(self, contract: str, worktree: Any, artifacts_dir: Any, *, base_sha: str | None = None,
-                 env: dict[str, str] | None = None) -> AgentResult:
+                 env: dict[str, str] | None = None, retry_addendum: str | None = None) -> AgentResult:
         step_id = re.search(r"^STEP\n(S0[1-8]) / ", contract, re.M).group(1)
         root = Path(worktree)
         seen = {
@@ -209,8 +209,9 @@ class FakeAgent:
         }
         self.calls.append({
             "step": step_id, "contract": contract,
-            "prompt": build_implementer_step_prompt(contract),
+            "prompt": build_implementer_step_prompt(contract, retry_addendum=retry_addendum),
             "env": dict(env or {}), "seen": seen, "artifacts_dir": Path(artifacts_dir),
+            "retry_addendum": retry_addendum,
         })
         outcome = self.actions[step_id](root) if step_id in self.actions else None
         usage = self.usage.get(step_id, step_usage(int(step_id[1:])))
@@ -578,11 +579,25 @@ class ApprovalTests(MultiStepHarness):
 
 
 class StepGateTests(MultiStepHarness):
-    def test_no_change_fails_with_agent_no_change(self) -> None:
+    def test_clean_no_change_is_retried_once_then_deferred(self) -> None:
+        # Since P4 a clean no-change is no longer the terminal AGENT_NO_CHANGE:
+        # it is fed through the bounded mismatch retry (same contract, one
+        # addendum) and, if the retry changes nothing either, the step becomes
+        # DEFERRED_CONTRACT_MISMATCH.  With Claude revision disabled here, the
+        # deferred step is terminal as UNRESOLVED_CONTRACT_MISMATCH -- still
+        # strictly before the final gates.
         agent = FakeAgent({})
         result, _orchestrator, _planner, reviewer = self.run_v2(plan_text(step_block(1)), agent)
-        self.assertEqual(result.state["failure"]["reason"], "AGENT_NO_CHANGE")
-        self.assertEqual(result.state["failure"]["detail"], "step=S01")
+        self.assertEqual(
+            [(call["step"], call["retry_addendum"] is not None) for call in agent.calls],
+            [("S01", False), ("S01", True)],
+        )
+        self.assertEqual(result.state["failure"]["reason"], "UNRESOLVED_CONTRACT_MISMATCH")
+        self.assertEqual(result.state["steps"][0]["status"], "deferred")
+        record = json.loads((result.run_dir / "steps/S01/step.json").read_text())
+        self.assertEqual(record["status"], "DEFERRED_CONTRACT_MISMATCH")
+        self.assertEqual((record["mismatch_retry_count"], record["changed_paths"]), (1, []))
+        self.assertEqual(record["tree_after"], record["tree_before"])
         self.assert_stopped_before_final_gates(reviewer)
 
     def test_unexpected_modification_fails_with_write_set_violation(self) -> None:

@@ -5683,6 +5683,21 @@ class Orchestrator:
                     archived = _archive_attempt_target(run_dir)
                 os.replace(run_dir / "steps", archived / "steps")
             persist_recovered_plan_artifacts(run_dir, plan)
+            # The recovered plan becomes approval authority here, so the check
+            # authority it selects must be frozen here too -- exactly as the
+            # planner path does before its own approval gate.  Without it the
+            # operator would be offered the gate while ``check_authority.json``
+            # does not exist yet, and the write-once decision published in that
+            # window could never bind the ``checks_sha256`` the run later
+            # expects.  The whole trusted catalogue is frozen, not just the C01
+            # selection, so a C02 repair plan still runs approved argv.
+            selected_checks = config.select_checks(plan.required_checks)
+            if not plan.required_checks and not config.check_catalog:
+                selected_checks = config.select_checks(None)
+            write_check_authority(
+                run_dir, tuple(config.trusted_checks()),
+                required_check_ids=tuple(check.id for check in selected_checks),
+            )
             validate_implementation_bundle(run_dir, expected_step_ids=[step.id for step in plan.steps])
             identity = compute_plan_identity_from_run(run_dir)
             if identity.raw_sha256 != replacement_sha or identity.execution_sha256 is not None:
@@ -6669,15 +6684,27 @@ class Orchestrator:
         if checkpoint.phase in {
             ResumePhase.CHECKS_C01,
             ResumePhase.CLAUDE_C01, ResumePhase.FINAL_CHECKS_C01,
+        }:
+            # These three phases are checkpointed *before* the C01 final checks
+            # have produced their evidence, so there is usually none on disk --
+            # a Claude crash or a crash inside the checks themselves lands
+            # here.  The resume re-runs the final checks from
+            # ``FINAL_CHECKS_C01`` and never consumes ``c01_evidence``, so a
+            # missing bundle is normal and not an integrity failure.  Evidence
+            # that *is* present must still be for the tree being resumed.
+            evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
+            if evidence is not None and evidence.staged_tree_sha != c01_tree:
+                refuse("the C01 final evidence is not for the expected checks tree")
+            resumed.c01_evidence = evidence
+            return
+        if checkpoint.phase in {
             ResumePhase.CHECK_REPAIR_C01, ResumePhase.FINAL_CHECKS_RETRY_C01,
         }:
+            # Here the first final-checks pass did complete: its red evidence
+            # for the pre-repair tree is the authority the repair answers to,
+            # so it must exist.
             evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
-            expected_evidence_tree = (
-                initial_c01_tree if checkpoint.phase in {
-                    ResumePhase.CHECK_REPAIR_C01, ResumePhase.FINAL_CHECKS_RETRY_C01,
-                } else c01_tree
-            )
-            if evidence is None or evidence.staged_tree_sha != expected_evidence_tree:
+            if evidence is None or evidence.staged_tree_sha != initial_c01_tree:
                 refuse("the C01 final evidence is missing or not for the expected checks tree")
             resumed.c01_evidence = evidence
             return

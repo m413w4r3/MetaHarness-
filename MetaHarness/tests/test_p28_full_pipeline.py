@@ -846,12 +846,15 @@ class FullPipelineTests(P28Harness):
         self.assertFalse((result.run_dir / "repair" / "C03").exists())
 
     def test_g_codex_failures_have_c01_c02_parity(self) -> None:
+        # "nochange" is deliberately absent: since P4 a clean no-change is no
+        # longer a terminal Codex failure.  It is handled by bounded retry and
+        # may end as DEFERRED_CONTRACT_MISMATCH, so it has no C01/C02 terminal
+        # parity to assert here.  The dedicated P49 tests own that coverage.
         expected = {
             "auth": "CODEX_AUTH_FAILURE",
             "commit": "AGENT_COMMITTED",
             "timeout": "AGENT_TIMEOUT",
             "unexpected": "STEP_WRITE_SET_VIOLATION",
-            "nochange": "AGENT_NO_CHANGE",
             "exit1": "AGENT_FAILED",
         }
         for behavior, reason in expected.items():

@@ -1130,11 +1130,20 @@ class SafetyTests(MismatchRetryHarness):
         with self.count_pushes() as pushed:
             result = self.run_approved(config, orchestrator, "deferred-red", FOUR_STEPS)
 
+        # The initial revision leaves the gate red, so P3 spends its single
+        # automatic check-repair on it; the check stays red and the run is
+        # terminal.  No reviewer, no candidate commit, no push.
         self.assertEqual(result.status, RunStatus.FAILED)
         self.assertEqual(result.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
-        self.assertEqual(len(claude.calls), 1)
+        self.assertEqual(
+            [(call["cycle"], call["stage"]) for call in claude.calls],
+            [(1, "initial-revision"), (1, "check-repair")],
+        )
         self.assertEqual((reviewer.prompts, pushed.call_count), ([], 0))
         self.assertFalse((result.run_dir / "candidate/C01/commit.json").exists())
+        self.assertFalse((result.run_dir / "candidate/C02").exists())
+        self.assertFalse((result.run_dir / "review").exists())
+        self.assertIsNone(result.state.get("commit_sha"))
 
 
 if __name__ == "__main__":
