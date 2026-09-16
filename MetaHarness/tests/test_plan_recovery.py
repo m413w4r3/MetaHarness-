@@ -18,6 +18,7 @@ import unittest
 from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any, Callable
+from unittest import mock
 from urllib.parse import urlencode
 
 from metaharness.approval import (
@@ -28,6 +29,7 @@ from metaharness.approval import (
 )
 from metaharness.models import RunStatus
 from metaharness.orchestrator import Orchestrator
+import metaharness.orchestrator as orchestrator_module
 from metaharness.plan_recovery import (
     MAX_REPLACEMENT_PLAN_BYTES,
     PLAN_RECOVERY_ARTIFACT,
@@ -267,6 +269,91 @@ class PlanRecoveryHarness(P29Harness):
 
 
 class PlanRecoveryTests(PlanRecoveryHarness):
+    def assert_blocked_recovery_persistence_failure(self, run_id: str) -> tuple[Any, ...]:
+        config, blocked = self.blocked_planner_run(run_id)
+        replacement = recovery_plan(7)
+        planner = QueueClient("planner", [], self.events)
+        luna = FakeLuna(luna_behaviors(7))
+        orchestrator = Orchestrator(
+            config, planner_client=planner,
+            reviewer_client=QueueClient("reviewer", [PASS], self.events),
+            agent=luna, reviser=FakeClaude(log=self.events),
+        )
+
+        return config, replacement, blocked, planner, luna, orchestrator
+
+    def assert_recovery_failure_keeps_blocked_shape(
+        self, run_id: str, planner: QueueClient, luna: FakeLuna,
+    ) -> None:
+        run_dir = self.runs / run_id
+        state = self.state(run_id)
+        self.assertEqual(state["status"], RunStatus.BLOCKED.value)
+        self.assertEqual(state["failure"]["reason"], "PLANNER_BLOCKED")
+        self.assertEqual(read_checkpoint(run_dir).phase, ResumePhase.PLANNER)
+        self.assertFalse((self.root / "worktrees" / run_id).exists())
+        self.assertEqual(git(self.repo, "branch", "--list", "harness/*"), "")
+        self.assertEqual(planner.prompts, [])
+        self.assertEqual(luna.calls, [])
+        self.assertTrue(plan_recovery_info(run_dir, state).eligible)
+
+    def finish_blocked_recovery_after_persistence_failure(
+        self, config: Any, run_id: str, replacement: str,
+        planner: QueueClient, luna: FakeLuna,
+    ) -> None:
+        thread, holder = self.recover_in_thread(
+            config, run_id, replacement, planner=planner, luna=luna, reviews=[PASS],
+        )
+        self.wait_for_approval_gate(run_id, thread, expected_step_count=7)
+        self.assertNotIn("error", holder)
+        self.assertEqual(planner.prompts, [])
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(read_checkpoint(self.runs / run_id).phase, ResumePhase.PLAN_APPROVAL)
+        self.approve(config, run_id, 7)
+        thread.join(timeout=120)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", holder)
+        self.assertEqual(holder["result"].status, RunStatus.PUBLISHED, holder["result"].state.get("failure"))
+        self.assertEqual([call["step"] for call in luna.calls], _ids(7))
+        self.assertEqual(planner.prompts, [])
+
+    def test_blocked_recovery_checkpoint_failure_preserves_recoverability(self) -> None:
+        config, replacement, _blocked, planner, luna, orchestrator = (
+            self.assert_blocked_recovery_persistence_failure("aw-002-blocked-checkpoint-crash")
+        )
+        with mock.patch.object(
+            orchestrator_module.Orchestrator,
+            "_write_phase_checkpoint",
+            side_effect=RuntimeError("checkpoint persistence crash"),
+        ):
+            with self.assertRaises(RuntimeError):
+                orchestrator.recover_plan("aw-002-blocked-checkpoint-crash", replacement)
+
+        self.assert_recovery_failure_keeps_blocked_shape(
+            "aw-002-blocked-checkpoint-crash", planner, luna,
+        )
+        self.finish_blocked_recovery_after_persistence_failure(
+            config, "aw-002-blocked-checkpoint-crash", replacement, planner, luna,
+        )
+
+    def test_blocked_recovery_artifact_failure_preserves_recoverability(self) -> None:
+        config, replacement, _blocked, planner, luna, orchestrator = (
+            self.assert_blocked_recovery_persistence_failure("aw-002-blocked-artifact-crash")
+        )
+        with mock.patch.object(
+            orchestrator_module,
+            "persist_recovered_plan_artifacts",
+            side_effect=RuntimeError("artifact persistence crash"),
+        ):
+            with self.assertRaises(RuntimeError):
+                orchestrator.recover_plan("aw-002-blocked-artifact-crash", replacement)
+
+        self.assert_recovery_failure_keeps_blocked_shape(
+            "aw-002-blocked-artifact-crash", planner, luna,
+        )
+        self.finish_blocked_recovery_after_persistence_failure(
+            config, "aw-002-blocked-artifact-crash", replacement, planner, luna,
+        )
+
     def test_aw002_blocked_planner_recovers_with_seven_step_plan_without_planner(self) -> None:
         config, blocked = self.blocked_planner_run("aw-002-blocked-seven")
         run_dir = blocked.run_dir

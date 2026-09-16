@@ -4630,7 +4630,7 @@ class Orchestrator:
         if source_status is None:
             refuse("run is not in an exact recoverable planner state")
         claimed = store.transition_if(
-            source_status, state.get("updated_at"), status=RunStatus.FAILED,
+            source_status, state.get("updated_at"), status=source_status,
             plan_recovery={"status": "persisting", "replacement_raw_sha256": replacement_sha},
         )
         if claimed is None:
@@ -4661,7 +4661,7 @@ class Orchestrator:
             )
         except Exception as exc:
             store.update(
-                status=RunStatus.FAILED,
+                status=source_status,
                 plan_recovery={"status": "failed", "replacement_raw_sha256": replacement_sha,
                                "detail": redact(str(exc), self._secrets_or_empty())},
             )
