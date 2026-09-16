@@ -21,7 +21,12 @@ from metaharness.gitops import commit_parents
 from metaharness.llm.chat import LLMHTTPError
 from metaharness.models import RunStatus
 from metaharness.approval import write_scope_approval
-from metaharness.orchestrator import Orchestrator, _failure_reason
+from metaharness.orchestrator import (
+    Orchestrator,
+    _compact_step_history,
+    _failure_reason,
+    _step_reports_text,
+)
 from metaharness.run_options import RunOptions
 from metaharness.resume import (
     ResumeIntegrityError, ResumeNotAllowedError, ResumePhase, ResumeRequiresOperatorError,
@@ -65,6 +70,56 @@ class FailingC02Claude(FakeClaude):
 
 
 class P40CandidatePipelineTests(P29Harness):
+    def test_step_reports_keep_all_steps_and_bound_each_body(self) -> None:
+        results = [
+            {
+                "id": f"S{index:02d}", "profile_id": "luna",
+                "tree_before": f"before-{index}", "tree_after": f"after-{index}",
+                "usage": {"input_tokens": index, "output_tokens": index},
+                "final": "x" * 10_000,
+            }
+            for index in range(1, 21)
+        ]
+        rendered = _step_reports_text(results)
+
+        for index in range(1, 21):
+            self.assertIn(f"S{index:02d}\n", rendered)
+        bodies = rendered.split("final report:\n")[1:]
+        self.assertEqual(len(bodies), 20)
+        for body in bodies:
+            report = body.split("\n\nS", 1)[0].rstrip("\n")
+            self.assertLessEqual(len(report.encode()), 2_048)
+
+    def test_compact_cycle_history_does_not_duplicate_final_reports(self) -> None:
+        records = [{
+            "id": "S01", "profile_id": "luna", "tree_after": "tree",
+            "changed_paths": ["src/a.py"], "usage": {"output_tokens": 4},
+            "final": "full report must remain in luna_reports",
+        }]
+
+        compact = _compact_step_history(records)
+
+        self.assertEqual(compact, [{
+            "id": "S01", "profile_id": "luna", "tree_after": "tree",
+            "changed_paths": ["src/a.py"], "usage": {"output_tokens": 4},
+        }])
+
+    def test_thirty_two_step_report_prompt_keeps_the_last_step(self) -> None:
+        results = [
+            {
+                "id": f"S{index:02d}", "profile_id": "luna",
+                "tree_before": "before", "tree_after": "after",
+                "usage": {}, "final": f"report-{index}",
+            }
+            for index in range(1, 33)
+        ]
+
+        rendered = _step_reports_text(results)
+
+        self.assertIn("S01\n", rendered)
+        self.assertIn("S32\n", rendered)
+        self.assertEqual(rendered.count("final report:\n"), 32)
+
     def _scope_repair_files(self) -> str:
         write(self.repo / "docs/agent/CONTRACT.md", "contract v1\n")
         write(self.repo / "backend/pyproject.toml", "[project]\nname = 'aw001'\n")

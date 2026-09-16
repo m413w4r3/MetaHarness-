@@ -464,6 +464,41 @@ class P28Harness(unittest.TestCase):
 
 
 class FullPipelineTests(P28Harness):
+    def test_v2_large_diff_uses_excerpt_but_still_revises_commits_pushes_and_reviews(self) -> None:
+        config = dataclasses.replace(self.load(), max_diff_bytes=400)
+        large = "A = " + ("1" * 100_000) + "\n"
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", large)})
+        planner = QueueClient("planner", [SINGLE_PLAN], self.events)
+        reviewer = QueueClient("reviewer", [PASS], self.events)
+        claude = FakeClaude(log=self.events)
+        orchestrator = Orchestrator(
+            config, planner_client=planner, reviewer_client=reviewer,
+            agent=luna, reviser=claude,
+        )
+
+        real_push = orchestrator_module.push_run_branch
+
+        def push(*args: Any, **kwargs: Any) -> Any:
+            self.events.append("push")
+            return real_push(*args, **kwargs)
+
+        with mock.patch.object(orchestrator_module, "push_run_branch", side_effect=push) as pushed:
+            result = orchestrator.run_text(SPEC, run_id="large-v2")
+
+        self.assert_published_once(result, pushed, run_id="large-v2")
+        self.assertEqual(len(claude.calls), 1)
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertIn("TRUNCATED: true", claude.calls[0]["prompt"])
+        self.assertIn("TRUNCATED: true", reviewer.prompts[0])
+        self.assertNotIn("DIFF_TOO_LARGE", result.state["deterministic_gate"]["failures"])
+        candidate = json.loads((result.run_dir / "candidate/C01/commit.json").read_text())
+        self.assertIn(candidate["commit_sha"], reviewer.prompts[0])
+        if candidate["immutable_commit_url"]:
+            self.assertIn(candidate["immutable_commit_url"], reviewer.prompts[0])
+        else:
+            self.assertIn('"immutable_commit_url": null', reviewer.prompts[0])
+        self.assertIn("1" * 100_000, (result.run_dir / "diff.patch").read_text())
+
     def test_a_staged_c01_pass_commits_and_pushes_once(self) -> None:
         luna = FakeLuna({
             (1, "S01"): writer("src/a.py", "A = 2\n"),

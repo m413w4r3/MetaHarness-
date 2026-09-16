@@ -473,7 +473,9 @@ server-side and written with `textContent` client-side, never as HTML.
 ## Failure handling
 
 `BLOCKED`, `PLAN_REJECTED`, `REVISE`, `FAIL`, check failures, timeouts, mutations, stale HEAD,
-empty/oversized diffs, and review-boundary changes do not commit. Common
+empty diffs, and review-boundary changes do not commit. Legacy v1 also treats
+an oversized diff as a gate; v2 uses `max_diff_bytes` only as the inline
+semantic-model diff budget. Common
 failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,
 `REVIEWER_OUTPUT_INVALID`, `LLM_FAILURE`, `AGENT_TIMEOUT`, `AGENT_FAILED`,
 `AGENT_COMMITTED`, `AGENT_GIT_VIOLATION`, `CHECK_SETUP_INVALID`,

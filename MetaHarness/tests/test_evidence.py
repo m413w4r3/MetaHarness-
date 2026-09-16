@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from metaharness.evidence import collect_evidence  # noqa: E402
+from metaharness.evidence import bounded_semantic_diff, collect_evidence  # noqa: E402
 from metaharness.gitops import current_head, index_tree_sha, stage_all  # noqa: E402
 from metaharness.models import (  # noqa: E402
     AgentConfig,
@@ -133,6 +133,35 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(large.deterministic_passed)
         self.assertIn("DIFF_TOO_LARGE", large.failures)
         self.assertIn(content, large.diff)
+
+    def test_bounded_semantic_diff_is_exactly_bounded_and_covers_all_files(self) -> None:
+        diff = "".join(
+            f"diff --git a/file-{index}.py b/file-{index}.py\n"
+            f"@@ -1 +1 @@\n-old-{index}\n+new-{index}\n"
+            for index in range(20)
+        )
+        excerpt, truncated, full_bytes = bounded_semantic_diff(diff, 1000)
+
+        self.assertTrue(truncated)
+        self.assertEqual(full_bytes, len(diff.encode("utf-8")))
+        self.assertLessEqual(len(excerpt.encode("utf-8")), 1000)
+        self.assertTrue(excerpt.startswith("SEMANTIC DIFF EXCERPT\n"))
+        self.assertIn("TRUNCATED: true", excerpt)
+        self.assertEqual(
+            sum(line.startswith("diff --git ") for line in excerpt.splitlines()), 20
+        )
+
+    def test_v2_evidence_keeps_large_diff_as_evidence_without_size_failure(self) -> None:
+        content = "A" * 200
+        (self.repo / "keep.txt").write_text(content, encoding="utf-8")
+        bundle = collect_evidence(
+            self.repo, self.base_sha, self.config(max_diff_bytes=1),
+            enforce_diff_size=False,
+        )
+
+        self.assertTrue(bundle.deterministic_passed)
+        self.assertNotIn("DIFF_TOO_LARGE", bundle.failures)
+        self.assertIn(content, bundle.diff)
 
     def test_head_mismatch_and_tree_sha_change_with_index_content(self) -> None:
         stage_all(self.repo)

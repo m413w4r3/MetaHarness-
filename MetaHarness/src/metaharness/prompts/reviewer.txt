@@ -196,6 +196,12 @@ Now review:
 {{DIFF}}
 </STAGED DIFF>
 
+CANDIDATE COMMIT is authoritative.
+
+When SEMANTIC DIFF EXCERPT says TRUNCATED=true, do not treat omitted diff
+content as evidence of absence. Inspect the immutable candidate repository
+when additional source context is needed.
+
 <CHECK RESULTS>
 {{CHECKS}}
 </CHECK RESULTS>

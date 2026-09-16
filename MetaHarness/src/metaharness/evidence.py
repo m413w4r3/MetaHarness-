@@ -70,6 +70,102 @@ _TEXT_DIFF_SUFFIXES = frozenset(
 )
 
 
+def _utf8_prefix(value: str, limit: int) -> str:
+    """Return a valid UTF-8 prefix no larger than *limit* bytes."""
+
+    if limit <= 0:
+        return ""
+    return value.encode("utf-8", errors="replace")[:limit].decode(
+        "utf-8", errors="ignore"
+    )
+
+
+def _diff_sections(diff: str) -> list[str]:
+    """Split a git diff into deterministic per-file sections."""
+
+    sections: list[str] = []
+    current: list[str] = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git ") and current:
+            sections.append("".join(current))
+            current = []
+        current.append(line)
+    if current:
+        sections.append("".join(current))
+    return sections or ([diff] if diff else [])
+
+
+def _bounded_section(section: str, budget: int) -> str:
+    """Keep a section header and both ends of its body within *budget*."""
+
+    encoded = section.encode("utf-8", errors="replace")
+    if len(encoded) <= budget:
+        return section
+    if budget <= 0:
+        return ""
+    lines = section.splitlines(keepends=True)
+    header = lines[0] if lines else section
+    marker = "\n[... file diff body abbreviated ...]\n"
+    marker_bytes = len(marker.encode("utf-8"))
+    if budget <= marker_bytes:
+        return _utf8_prefix(section, budget)
+    header_text = _utf8_prefix(header, max(1, budget // 4))
+    remaining = budget - len(header_text.encode("utf-8")) - marker_bytes
+    if remaining <= 0:
+        return _utf8_prefix(header_text + marker, budget)
+    body = "".join(lines[1:])
+    head_budget = (remaining + 1) // 2
+    tail_budget = remaining - head_budget
+    head = _utf8_prefix(body, head_budget)
+    tail = _utf8_prefix(body[-max(1, tail_budget):], tail_budget)
+    result = header_text + head + marker + tail
+    return _utf8_prefix(result, budget)
+
+
+def bounded_semantic_diff(diff: str, max_bytes: int) -> tuple[str, bool, int]:
+    """Build a deterministic, representative diff payload for semantic models.
+
+    The exact diff remains the evidence artifact.  This helper only bounds the
+    copy embedded in an LLM request and distributes the budget across all git
+    file sections so early files cannot crowd out later ones.
+    """
+
+    if not isinstance(diff, str):
+        raise TypeError("diff must be a string")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    full_bytes = len(diff.encode("utf-8", errors="replace"))
+    if full_bytes <= max_bytes:
+        return diff, False, full_bytes
+
+    sections = _diff_sections(diff)
+    metadata = (
+        "SEMANTIC DIFF EXCERPT\n"
+        f"FULL_DIFF_BYTES: {full_bytes}\n"
+        "TRUNCATED: true\n"
+        f"FILES_CHANGED: {len(sections)}\n\n"
+        "The exact candidate commit/tree remains authoritative.\n"
+        "Some diff bodies are abbreviated because this is an LLM context budget,\n"
+        "not an execution or correctness gate.\n\n"
+    )
+    metadata_bytes = len(metadata.encode("utf-8"))
+    if metadata_bytes >= max_bytes:
+        return _utf8_prefix(metadata, max_bytes), True, full_bytes
+
+    available = max_bytes - metadata_bytes
+    # Every section gets a deterministic share.  This guarantees that a
+    # large plan still exposes the last file rather than stopping at a prefix.
+    base, extra = divmod(available, len(sections) or 1)
+    excerpts: list[str] = []
+    for index, section in enumerate(sections):
+        budget = base + (1 if index < extra else 0)
+        excerpt = _bounded_section(section, budget)
+        if excerpt:
+            excerpts.append(excerpt)
+    payload = metadata + "\n".join(excerpts)
+    return _utf8_prefix(payload, max_bytes), True, full_bytes
+
+
 @dataclass(frozen=True)
 class EvidenceBundle:
     base_sha: str
@@ -253,6 +349,7 @@ def collect_evidence(
     check_failures_hard: bool = True,
     expected_head_sha: str | None = None,
     required_check_ids: tuple[str, ...] | list[str] | None = None,
+    enforce_diff_size: bool = True,
 ) -> EvidenceBundle:
     """Run all configured checks, then stage and freeze the submitted tree."""
 
@@ -290,7 +387,7 @@ def collect_evidence(
         head_matches=head_matches,
         diff=diff,
         changed_files=changed_files,
-        max_diff_bytes=config.max_diff_bytes,
+        max_diff_bytes=config.max_diff_bytes if enforce_diff_size else 2**63 - 1,
     )
     failures.extend(_staged_blob_failures(root, changed_files, changes, secrets))
     failures.extend(_unreviewable_text_diff_failures(root, changed_files, changes))

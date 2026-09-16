@@ -53,6 +53,7 @@ from .evidence import (
     UNSCANNABLE_STAGED_BLOB,
     UNREVIEWABLE_TEXT_DIFF,
     EvidenceBundle,
+    bounded_semantic_diff,
     collect_evidence,
 )
 from .validation import run_check_preflights
@@ -247,7 +248,6 @@ def _chat_client(endpoint: Any, environment: Mapping[str, str]) -> OpenAIChatTex
 _DIRECT_FAILURES = frozenset(
     {
         "EMPTY_DIFF",
-        DIFF_TOO_LARGE,
         "HEAD_MISMATCH",
         SECRET_IN_DIFF,
         SECRET_IN_STAGED_BLOB,
@@ -255,8 +255,10 @@ _DIRECT_FAILURES = frozenset(
         UNREVIEWABLE_TEXT_DIFF,
     }
 )
+_LEGACY_DIRECT_FAILURES = _DIRECT_FAILURES | frozenset({DIFF_TOO_LARGE})
 _COMMIT_SUBJECT_LIMIT = 72
 _MAX_AGENT_REPORT_BYTES = 32_000
+_MAX_STEP_REPORT_BYTES = 2_048
 _AGENT_ARTIFACTS = (
     "agent.events.jsonl",
     "agent.stderr.log",
@@ -323,35 +325,62 @@ def _bounded_report(text: str) -> str:
 
 
 def _bounded_v2_report(text: str) -> str:
-    """Bound an individual staged-step report to the P21 8 KiB limit."""
+    """Bound an individual staged-step report for every semantic prompt."""
 
-    limit = 8 * 1024
+    limit = _MAX_STEP_REPORT_BYTES
     data = text.encode("utf-8", errors="replace")
     if len(data) <= limit:
         return text
-    return data[:limit].decode("utf-8", errors="ignore") + "\n[... report truncated ...]"
+    marker = b"\n[... report truncated ...]"
+    head = data[: max(0, limit - len(marker))].decode("utf-8", errors="ignore")
+    return head + marker.decode()
 
 
 def _step_reports_text(results: list[dict[str, Any]]) -> str:
-    """Render bounded reports with a hard 32 KiB aggregate limit."""
+    """Render every step with bounded metadata and a bounded report body."""
 
     chunks: list[str] = []
-    used = 0
     for item in results:
         chunk = "\n".join([
             item["id"], f"profile: {item['profile_id']}",
             f"tree_before: {item['tree_before']}", f"tree_after: {item['tree_after']}",
-            f"usage: {json.dumps(item['usage'], sort_keys=True)}", "final report:", item.get("final", ""),
+            f"usage: {json.dumps(item['usage'], sort_keys=True)}", "final report:",
+            _bounded_v2_report(item.get("final", "")),
         ]) + "\n"
-        encoded = chunk.encode("utf-8", errors="replace")
-        if used + len(encoded) > 32 * 1024:
-            remaining = 32 * 1024 - used
-            if remaining > 0:
-                chunks.append(encoded[:remaining].decode("utf-8", errors="ignore"))
-            break
         chunks.append(chunk)
-        used += len(encoded)
     return "\n".join(chunks)
+
+
+def _semantic_diff_payload(diff: str, max_bytes: int) -> tuple[str, bool, int]:
+    """Return the model-facing diff plus its truncation facts."""
+
+    return bounded_semantic_diff(diff, max_bytes)
+
+
+def _truncation_note(truncated: bool) -> str:
+    if not truncated:
+        return ""
+    return (
+        "\n\nThe inline diff is abbreviated.\n"
+        "Inspect the current worktree with your allowed read tools when additional\n"
+        "context is required.\n"
+        "Do not infer that omitted diff text means an unchanged file.\n"
+    )
+
+
+def _compact_step_history(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep C02 history structural; reports live in ``luna_reports``."""
+
+    return [
+        {
+            "id": item.get("id"),
+            "profile_id": item.get("profile_id"),
+            "tree_after": item.get("tree_after"),
+            "changed_paths": item.get("changed_paths", []),
+            "usage": item.get("usage", {}),
+        }
+        for item in results
+    ]
 
 
 def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
@@ -400,6 +429,7 @@ def _revision_prompt(
     luna_reports: str,
     changed_files: str,
     diff: str,
+    diff_truncated: bool,
     pre_checks: str,
     mutable_scope: str,
 ) -> str:
@@ -419,6 +449,7 @@ def _revision_prompt(
         "{{LUNA_STEP_REPORTS}}": luna_reports,
         "{{CURRENT_CHANGED_FILES}}": changed_files,
         "{{CURRENT_CUMULATIVE_DIFF}}": diff,
+        "{{SEMANTIC_DIFF_NOTE}}": _truncation_note(diff_truncated),
         "{{PRE_REVISION_CHECKS}}": pre_checks,
         "{{APPROVED_MUTABLE_SCOPE}}": mutable_scope,
     }
@@ -2024,8 +2055,8 @@ class Orchestrator:
             item
             for item in evidence.failures
             if (
-                item in _DIRECT_FAILURES
-                or any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES)
+                item in _LEGACY_DIRECT_FAILURES
+                or any(item.startswith(f"{prefix}:") for prefix in _LEGACY_DIRECT_FAILURES)
                 or item.startswith("CHECK_MUTATED:")
             )
         ]
@@ -2655,6 +2686,7 @@ class Orchestrator:
                     check_failures_hard=not revision_enabled,
                     reuse=resumed is not None and phase is ResumePhase.REVIEWER_C01,
                     required_check_ids=plan.required_checks or None,
+                    enforce_diff_size=False,
                 )
             except Exception:
                 self._write_phase_checkpoint(
@@ -3228,9 +3260,13 @@ class Orchestrator:
             "GIT_STATUS": status_porcelain(worktree),
         })
         artifacts_dir.mkdir(parents=True, exist_ok=True)
+        semantic_diff, diff_truncated, _full_diff_bytes = _semantic_diff_payload(
+            evidence.diff, self.config.max_diff_bytes
+        )
         review = reviewer.review(
             spec, input.plan_text, context, gate,
-            "\n".join(evidence.changed_files), evidence.diff,
+            "\n".join(evidence.changed_files),
+            semantic_diff,
             _json_text(_check_payload(evidence)),
             "NONE",
             deterministic_passed=evidence.deterministic_passed,
@@ -3262,6 +3298,7 @@ class Orchestrator:
         reuse: bool,
         expected_head_sha: str | None = None,
         required_check_ids: tuple[str, ...] | None = None,
+        enforce_diff_size: bool = False,
     ) -> EvidenceBundle:
         """Final checks for the exact current candidate.
 
@@ -3284,6 +3321,7 @@ class Orchestrator:
             worktree, base_sha, self.config, evidence_dir=evidence_dir,
             secrets=self._secrets, check_failures_hard=check_failures_hard,
             expected_head_sha=expected_head_sha, required_check_ids=required_check_ids,
+            enforce_diff_size=enforce_diff_size,
         )
 
     def _run_v2_revision_cycle(
@@ -3345,6 +3383,7 @@ class Orchestrator:
                 evidence_dir=artifact_dir, secrets=self._secrets,
                 check_failures_hard=False,
                 expected_head_sha=expected_head,
+                enforce_diff_size=False,
             )
             pre_payload = {
                 "checks": _check_payload(pre_evidence),
@@ -3367,6 +3406,9 @@ class Orchestrator:
             read_approved_step_contract(contract_dir or run_dir, bundle, step.id)
             for step in plan.steps
         )
+        semantic_diff, diff_truncated, _full_diff_bytes = _semantic_diff_payload(
+            pre_diff, self.config.max_diff_bytes
+        )
         revision_prompt = _revision_prompt(
             repository_reference=repository_reference,
             spec=spec,
@@ -3374,7 +3416,8 @@ class Orchestrator:
             contracts=contracts,
             luna_reports=luna_reports if luna_reports is not None else _step_reports_text(self._last_v2_step_results),
             changed_files="\n".join(changed_paths_between_trees(repo, base_tree_sha, tree_before)),
-            diff=pre_diff,
+            diff=semantic_diff,
+            diff_truncated=diff_truncated,
             pre_checks=_json_text(pre_payload),
             mutable_scope=_json_text(mutable_scope),
         )
@@ -3520,13 +3563,16 @@ class Orchestrator:
                 check_catalog=self.config.check_catalog,
                 original_required_check_ids=original_plan.required_checks,
             )
+            semantic_diff, diff_truncated, _full_diff_bytes = _semantic_diff_payload(
+                cycle_1_evidence.diff, self.config.max_diff_bytes
+            )
             repair_plan = repair_planner.plan(
                 repository_reference=render_repository_reference(repository_reference),
                 original_spec=spec,
                 original_plan_summary=render_repair_plan_summary(original_plan),
                 original_step_contracts=original_contracts,
                 current_repository_state=current_state,
-                current_cumulative_diff=cycle_1_evidence.diff,
+                current_cumulative_diff=semantic_diff,
                 final_checks_cycle_1=_json_text(_check_payload(cycle_1_evidence)),
                 claude_revision_report_cycle_1=cycle_1_revision_report or "NONE",
                 reviewer_required_fixes=cycle_1_review.required_fixes,
@@ -3730,6 +3776,7 @@ class Orchestrator:
                     info.worktree, base_sha, checks_dir, check_failures_hard=False,
                     reuse=False, expected_head_sha=cycle_parent_sha,
                     required_check_ids=repair_plan.required_checks or None,
+                    enforce_diff_size=False,
                 )
             except Exception:
                 self._write_phase_checkpoint(
@@ -3807,14 +3854,14 @@ class Orchestrator:
         cycle_history = _json_text({
             "C01": {
                 "planner_summary": original_plan.title,
-                "luna_steps_summary": self._last_v2_step_results,
+                "luna_steps_summary": _compact_step_history(self._last_v2_step_results),
                 "claude_revision_report": cycle_1_revision.final_message if cycle_1_revision else "",
                 "checks": _check_payload(cycle_1_evidence),
                 "reviewer_1_conclusion": _review_payload(cycle_1_review),
             },
             "C02": {
                 "repair_planner_summary": repair_plan.title,
-                "repair_luna_reports": self._repair_v2_step_results,
+                "repair_luna_reports": _compact_step_history(self._repair_v2_step_results),
                 "claude_revision_report": cycle_2_revision.final_message if cycle_2_revision else "",
                 "final_checks": _check_payload(evidence),
             },
