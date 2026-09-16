@@ -27,7 +27,6 @@ from .agent.auth import check_codex_authentication
 from .agent.codex import build_agent_environment
 from .agent.runtime import CodexRuntimeError, prepare_codex_home
 from .claude.agent import (
-    _MAX_REVISION_TURNS,
     _REVISION_TOOLS,
     build_claude_environment,
 )
@@ -413,8 +412,6 @@ def _probe_claude_capabilities(
         "--no-session-persistence",
         "--no-chrome",
         "--disable-slash-commands",
-        "--max-turns",
-        str(_MAX_REVISION_TURNS),
         "--model",
         "probe",
         "--effort",

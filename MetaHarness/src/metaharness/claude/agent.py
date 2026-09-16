@@ -42,7 +42,8 @@ class ClaudeResult:
 _DEFAULT_TAIL_BYTES = 16 * 1024
 _MAX_EVENT_LINE_BYTES = 8 * 1024 * 1024
 _REVISION_TOOLS = "Read,Edit,Write,Grep,Glob"
-_MAX_REVISION_TURNS = 12
+# Revision lifetime is bounded by profile.timeout_seconds through run_bounded,k
+# not by an arbitrary Claude turn count.
 # Only these names are inherited; HOME, TMPDIR and XDG_CACHE_HOME are forced
 # below the managed Claude home and never taken from the parent process.
 _ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TERM")
@@ -185,8 +186,6 @@ class ClaudeCodeAgent:
             "--no-session-persistence",
             "--no-chrome",
             "--disable-slash-commands",
-            "--max-turns",
-            str(_MAX_REVISION_TURNS),
             "--model",
             profile.model,
             "--effort",
@@ -281,6 +280,5 @@ __all__ = [
     "build_claude_environment",
     "build_revision_prompt",
     "classify_claude_failure",
-    "_MAX_REVISION_TURNS",
     "_REVISION_TOOLS",
 ]

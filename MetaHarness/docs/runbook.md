@@ -144,7 +144,7 @@ prompt is stdin and no shell is used:
 claude --print --verbose --output-format stream-json --model <model>
        --safe-mode --restricted --tools Read,Edit,Write,Grep,Glob
        --no-session-persistence --no-chrome --disable-slash-commands
-       --max-turns 12 --effort <effort> --permission-mode <permission_mode>
+       --effort <effort> --permission-mode <permission_mode>
        --settings <managed>/settings.json
        --strict-mcp-config --mcp-config <managed>/empty-mcp.json
 ```

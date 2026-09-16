@@ -182,7 +182,7 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(
             recorded["argv"],
             ["--print", "--verbose", "--output-format", "stream-json", "--safe-mode", "--restricted", "--tools", "Read,Edit,Write,Grep,Glob",
-             "--no-session-persistence", "--no-chrome", "--disable-slash-commands", "--max-turns", "12",
+             "--no-session-persistence", "--no-chrome", "--disable-slash-commands",
              "--model", "opus", "--effort", "medium",
              "--permission-mode", "acceptEdits", "--settings", str(home / "settings.json"),
              "--strict-mcp-config", "--mcp-config", str(home / "empty-mcp.json")],
