@@ -134,7 +134,7 @@ class P31CheckpointCompatibilityTests(unittest.TestCase):
                 (path / "resume_checkpoint.json").write_text(json.dumps(payload), encoding="utf-8")
                 self.assertEqual(read_checkpoint(path), checkpoint)
 
-    def test_step_checkpoints_accept_s07_s08_and_reject_s09(self) -> None:
+    def test_step_checkpoints_accept_s07_s08_s37_and_reject_s100(self) -> None:
         import tempfile
 
         identity = PlanIdentity("a" * 64, "b" * 64, "c" * 64, "d" * 64)
@@ -145,14 +145,14 @@ class P31CheckpointCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             for phase, cycle, extra in phases:
-                for step_id in ("S07", "S08"):
+                for step_id in ("S07", "S08", "S37"):
                     with self.subTest(phase=phase.value, step=step_id):
                         checkpoint = ResumeCheckpoint(
                             phase, cycle, step_id, "1" * 40, "2" * 40, "d" * 64, identity, **extra
                         )
                         write_checkpoint(path, checkpoint)
                         self.assertEqual(read_checkpoint(path), checkpoint)
-                for step_id in ("S09", "S00", "S10"):
+                for step_id in ("S00", "S100", "s37"):
                     with self.subTest(phase=phase.value, step=step_id):
                         with self.assertRaises(ResumeCheckpointError):
                             ResumeCheckpoint(
@@ -161,7 +161,7 @@ class P31CheckpointCompatibilityTests(unittest.TestCase):
                 payload = checkpoint_payload(ResumeCheckpoint(
                     phase, cycle, "S08", "1" * 40, "2" * 40, "d" * 64, identity, **extra
                 ))
-                payload["step_id"] = "S09"
+                payload["step_id"] = "S100"
                 (path / "resume_checkpoint.json").write_text(json.dumps(payload), encoding="utf-8")
                 with self.assertRaises(ResumeCheckpointError):
                     read_checkpoint(path)

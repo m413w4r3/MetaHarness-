@@ -172,7 +172,9 @@ ARTIFACT_ALLOWLIST = frozenset(
         REVIEWER_USAGE_ARTIFACT,
     }
 )
-# A step contract is at most 8000 characters; anything larger is not shown.
+# The parser caps a step contract at 16000 characters; the UI read bound is
+# deliberately higher so a malformed artifact is reported rather than read
+# without a bound.
 MAX_STEP_CONTRACT_BYTES = 64 * 1024
 STEP_EVENTS_MAX = 30
 # Worker input above this many tokens is flagged (advisory only).

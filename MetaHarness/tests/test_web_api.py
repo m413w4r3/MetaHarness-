@@ -148,15 +148,37 @@ class WebServerTests(unittest.TestCase):
         connection.close()
         return response.status
 
-    def test_html_approval_form_accepts_step_profiles_through_s08_only(self) -> None:
-        self.create_run("form-steps", "committed")
-        fields = {"_token": self.server.token, "decision": "APPROVE", "reviewer_profile": "r"}
-        eight = {f"step_profile__S{number:02d}": "luna" for number in range(1, 9)}
-        # The form parser accepts S07/S08; the gate then refuses the state.
-        self.assertEqual(self.post_form("/runs/form-steps/approval", {**fields, **eight}), 409)
-        self.assertEqual(
-            self.post_form("/runs/form-steps/approval", {**fields, **eight, "step_profile__S09": "luna"}), 400
+    def test_approval_fields_follow_the_actual_12_step_bundle(self) -> None:
+        run_dir = self.create_run("form-steps", "committed")
+        (run_dir / "implementation_bundle.json").write_text(
+            json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),
+            encoding="utf-8",
         )
+        fields = {"_token": self.server.token, "decision": "APPROVE", "reviewer_profile": "r"}
+        twelve = {f"step_profile__S{number:02d}": "luna" for number in range(1, 13)}
+        # The fields for the actual bundle are accepted; the gate then refuses
+        # this deliberately incomplete synthetic run.
+        self.assertEqual(self.post_form("/runs/form-steps/approval", {**fields, **twelve}), 409)
+        self.assertEqual(
+            self.post_form("/runs/form-steps/approval", {**fields, **twelve, "step_profile__S13": "luna"}), 400
+        )
+
+        page_dir = self.create_run("form-page", "awaiting_plan_approval")
+        (page_dir / "implementation_bundle.json").write_text(
+            json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),
+            encoding="utf-8",
+        )
+        RunStateStore(page_dir / "state.json").update(
+            status="awaiting_plan_approval",
+            planning_protocol="v2",
+            planner={
+                "execution_mode": "STAGED",
+                "steps": [{"id": f"S{number:02d}", "title": f"Step {number}"} for number in range(1, 13)],
+            },
+        )
+        page = self.get_html("/runs/form-page")
+        self.assertEqual(page.count('name="step_profile__'), 12)
+        self.assertNotIn('name="step_profile__S13"', page)
 
     def test_wrong_state_is_conflict(self) -> None:
         self.create_run("done", "committed")

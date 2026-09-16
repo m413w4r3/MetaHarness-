@@ -11,9 +11,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-MAX_STEPS = 8
+PROTOCOL_MAX_STEPS = 99
+# Protocol syntax bound, not a recommended execution size.
+MAX_STEPS = PROTOCOL_MAX_STEPS
 
-# ``S01`` .. ``S08``: an explicit alternation, so the bound is exactly
+# ``S01`` .. ``S99``: an explicit alternation, so the bound is exactly
 # MAX_STEPS and never an accidental character-class range.
 STEP_ID_PATTERN = "S(?:" + "|".join(f"{number:02d}" for number in range(1, MAX_STEPS + 1)) + ")"
 STEP_ID_RE = re.compile(STEP_ID_PATTERN)
@@ -38,6 +40,7 @@ LAST_STEP_ID = ALL_STEP_IDS[-1]
 
 
 __all__ = [
-    "ALL_STEP_IDS", "LAST_STEP_ID", "MAX_STEPS", "STEP_ID_PATTERN", "STEP_ID_RE",
+    "ALL_STEP_IDS", "LAST_STEP_ID", "MAX_STEPS", "PROTOCOL_MAX_STEPS",
+    "STEP_ID_PATTERN", "STEP_ID_RE",
     "is_step_id", "step_ids",
 ]

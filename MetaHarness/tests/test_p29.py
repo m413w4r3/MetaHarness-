@@ -893,6 +893,15 @@ class ExecutionPolicyTests(P29Harness):
         self.assertLess(required.index(REQUIRE_STAGED_POLICY_TEXT), required.index("The answer must use exactly this protocol."))
         self.assertNotIn("REQUIRES STAGED", build_planner_prompt_v2("SPEC", "CTX"))
 
+    def test_prompt_capacity_is_injected_from_the_shared_protocol_authority(self) -> None:
+        prompt = build_planner_prompt_v2("SPEC", "CTX")
+        self.assertIn("STAGED has 2 to 99 steps", prompt)
+        self.assertIn("Step IDs are contiguous S01 through S99", prompt)
+        self.assertIn("Hard per-step parser limit: 16000 characters", prompt)
+        self.assertNotIn("{{MAX_STEPS}}", prompt)
+        self.assertNotIn("{{LAST_STEP_ID}}", prompt)
+        self.assertNotIn("{{MAX_STEP_CONTRACT_CHARS}}", prompt)
+
     def test_planner_single_answer_fails_before_any_bundle(self) -> None:
         planner = PlannerV2(
             QueueClient("planner", [SINGLE_PLAN], []), **self.ids(),

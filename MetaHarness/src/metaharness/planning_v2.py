@@ -31,14 +31,7 @@ from .step_ids import LAST_STEP_ID, MAX_STEPS, STEP_ID_RE, step_ids
 from .usage import PLANNER_USAGE_ARTIFACT, completion_usage, write_usage_artifact
 
 
-MAX_STEP_CONTRACT_CHARS = 8_000
-# Eight steps at the ~4000-character target fit with margin; eight contracts
-# at the 8000-character hard limit do not.
-MAX_TOTAL_STEP_CONTRACT_CHARS = 48_000
-MAX_READ_SET = 8
-MAX_WRITE_SET = 6
-MAX_CREATE_SET = 6
-MAX_DELETE_SET = 6
+MAX_STEP_CONTRACT_CHARS = 16_000
 # Canonical layout of the approved step contracts, written at planning time
 # and executed byte-for-byte: ``steps/<STEP>/contract.md``.
 STEP_CONTRACT_NAME = "contract.md"
@@ -210,8 +203,6 @@ def _read_set(value: str) -> tuple[str, ...]:
         result.append(path + " :: " + anchor)
     if not result:
         raise V2PlanParseError("READ_SET is missing")
-    if len(result) > MAX_READ_SET:
-        raise V2PlanParseError(f"READ_SET may contain at most {MAX_READ_SET} paths")
     return tuple(result)
 
 
@@ -221,7 +212,7 @@ def read_set_paths(read_set: Sequence[str]) -> tuple[str, ...]:
     return tuple(item.split(" :: ", 1)[0] for item in read_set)
 
 
-def _path_set(value: str, *, name: str, limit: int) -> tuple[str, ...]:
+def _path_set(value: str, *, name: str) -> tuple[str, ...]:
     """Parse a ``- path`` list; exactly ``NONE`` is the explicit empty set."""
 
     if not value.strip():
@@ -240,8 +231,6 @@ def _path_set(value: str, *, name: str, limit: int) -> tuple[str, ...]:
         result.append(path)
     if not result:
         raise V2PlanParseError(f"{name} is missing")
-    if len(result) > limit:
-        raise V2PlanParseError(f"{name} may contain at most {limit} paths")
     return tuple(result)
 
 
@@ -251,15 +240,15 @@ def _change_sets(
     """Validate WRITE/CREATE/DELETE sets against READ_SET and each other."""
 
     reads = set(read_set_paths(read_set))
-    write_set = _path_set(values["WRITE_SET"], name="WRITE_SET", limit=MAX_WRITE_SET)
+    write_set = _path_set(values["WRITE_SET"], name="WRITE_SET")
     # Plans emitted before CREATE_SET/DELETE_SET existed omit both sections.
     create_set = (
-        _path_set(values["CREATE_SET"], name="CREATE_SET", limit=MAX_CREATE_SET)
+        _path_set(values["CREATE_SET"], name="CREATE_SET")
         if "CREATE_SET" in values
         else ()
     )
     delete_set = (
-        _path_set(values["DELETE_SET"], name="DELETE_SET", limit=MAX_DELETE_SET)
+        _path_set(values["DELETE_SET"], name="DELETE_SET")
         if "DELETE_SET" in values
         else ()
     )
@@ -352,8 +341,6 @@ def _validate_bounds(plan: TaskPlanV2) -> None:
     contracts = [_render_step_contract_unchecked(plan, step) for step in plan.steps]
     if any(len(contract) > MAX_STEP_CONTRACT_CHARS for contract in contracts):
         raise V2PlanParseError("step contract exceeds MAX_STEP_CONTRACT_CHARS")
-    if sum(map(len, contracts)) > MAX_TOTAL_STEP_CONTRACT_CHARS:
-        raise V2PlanParseError("step contracts exceed MAX_TOTAL_STEP_CONTRACT_CHARS")
 
 
 def _parse_required_checks(
@@ -624,9 +611,8 @@ Every STAGED step may modify at most {staged} distinct mutable paths across the
 union of WRITE_SET, CREATE_SET and DELETE_SET.
 
 This limit applies to the UNION of the three sets, not to each section
-independently. A path counts once in the union. WRITE_SET, CREATE_SET and
-DELETE_SET also keep their own structural limits. A READY plan must never
-exceed the active limit; the harness rejects it deterministically.
+independently. A path counts once in the union. A READY plan must never exceed
+the active limit; the harness rejects it deterministically.
 
 The mutable-path limit bounds the scope of one worker; it is not an order to
 fragment an atomic operation unsafely. When a transformation exceeds the
@@ -727,6 +713,9 @@ def build_planner_prompt_v2(
         "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
         "{{CHECK_CATALOG}}": render_safe_check_catalogue(check_catalog),
         "{{DEFAULT_CHECK_IDS}}": "\n".join(f"- {check_id}" for check_id in default_check_ids) or "NONE",
+        "{{MAX_STEPS}}": str(MAX_STEPS),
+        "{{LAST_STEP_ID}}": LAST_STEP_ID,
+        "{{MAX_STEP_CONTRACT_CHARS}}": str(MAX_STEP_CONTRACT_CHARS),
     }
     # Policies are inserted into the template before substitution so that
     # SPEC or context text can never impersonate or displace them.
@@ -735,7 +724,7 @@ def build_planner_prompt_v2(
         template, decomposition,
         single_step_max_mutable_paths, staged_step_max_mutable_paths,
     )
-    return re.sub(r"\{\{(?:SPEC|CONTEXT|REPOSITORY|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|DEFAULT_CHECK_IDS)\}\}", lambda match: values[match.group(0)], template)
+    return re.sub(r"\{\{(?:SPEC|CONTEXT|REPOSITORY|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|DEFAULT_CHECK_IDS|MAX_STEPS|LAST_STEP_ID|MAX_STEP_CONTRACT_CHARS)\}\}", lambda match: values[match.group(0)], template)
 
 
 def build_repair_planner_prompt(
@@ -790,6 +779,9 @@ def build_repair_planner_prompt(
         "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
         "{{CHECK_CATALOG}}": render_safe_check_catalogue(check_catalog),
         "{{ORIGINAL_REQUIRED_CHECKS}}": "\n".join(f"- {check_id}" for check_id in original_required_check_ids) or "NONE",
+        "{{MAX_STEPS}}": str(MAX_STEPS),
+        "{{LAST_STEP_ID}}": LAST_STEP_ID,
+        "{{MAX_STEP_CONTRACT_CHARS}}": str(MAX_STEP_CONTRACT_CHARS),
     }
     for name, value in values.items():
         if not isinstance(value, str):
@@ -797,7 +789,7 @@ def build_repair_planner_prompt(
     if template is None:
         template = (Path(__file__).with_name("prompts") / "repair_planner_v2.txt").read_text(encoding="utf-8")
     return re.sub(
-        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_PLAN_SUMMARY|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_REQUIRED_FIXES|REVIEWER_MISSING_TESTS|REVIEWER_RESULT|ORIGINAL_APPROVED_MUTABLE_SCOPE|CANDIDATE_COMMIT_SHA|CANDIDATE_IMMUTABLE_URL|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|ORIGINAL_REQUIRED_CHECKS)\}\}",
+        r"\{\{(?:REPOSITORY|SPEC|ORIGINAL_PLAN_SUMMARY|ORIGINAL_STEP_CONTRACTS|CURRENT_REPOSITORY_STATE|CURRENT_CUMULATIVE_DIFF|FINAL_CHECKS_CYCLE_1|CLAUDE_REVISION_REPORT_CYCLE_1|REVIEWER_REQUIRED_FIXES|REVIEWER_MISSING_TESTS|REVIEWER_RESULT|ORIGINAL_APPROVED_MUTABLE_SCOPE|CANDIDATE_COMMIT_SHA|CANDIDATE_IMMUTABLE_URL|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|ORIGINAL_REQUIRED_CHECKS|MAX_STEPS|LAST_STEP_ID|MAX_STEP_CONTRACT_CHARS)\}\}",
         lambda match: values[match.group(0)],
         template,
     )
@@ -1234,8 +1226,7 @@ def run_planner_v2(
 
 
 __all__ = [
-    "ExecutionMode", "ImplementationStep", "MAX_CREATE_SET", "MAX_DELETE_SET", "MAX_READ_SET",
-    "MAX_STEPS", "MAX_STEP_CONTRACT_CHARS", "MAX_TOTAL_STEP_CONTRACT_CHARS", "MAX_WRITE_SET",
+    "ExecutionMode", "ImplementationStep", "MAX_STEPS", "MAX_STEP_CONTRACT_CHARS",
     "PlannerV2", "STEP_CONTRACT_NAME", "TaskPlanV2", "V2PlanParseError",
     "PlanDecision", "PlanParseError",
     "build_planner_prompt_v2", "parse_task_plan_v2", "persist_implementation_bundle",

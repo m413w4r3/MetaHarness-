@@ -31,7 +31,7 @@ from .step_ids import is_step_id
 
 PLAN_RECOVERY_ARTIFACT = "planner_recovery.json"
 PLAN_RECOVERY_SCHEMA_VERSION = 1
-MAX_REPLACEMENT_PLAN_BYTES = 128 * 1024
+MAX_REPLACEMENT_PLAN_BYTES = 2 * 1024 * 1024
 # State/failure pairs whose PLANNER checkpoint proves that no executable plan
 # crossed the approval boundary.  The pair is authoritative: a
 # ``PLANNER_BLOCKED`` failure in any other state is not recoverable here.

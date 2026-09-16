@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, parse_qsl, urlsplit
 from ..config import load_config
 from ..models import HarnessConfig
 from ..plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
-from ..step_ids import ALL_STEP_IDS
+from ..step_ids import is_step_id
 from .api import (
     WebAPIError,
     approve_run,
@@ -69,6 +69,27 @@ def _run_js() -> bytes:
     if not _RUN_JS_CACHE:
         _RUN_JS_CACHE.append((_STATIC_DIR / "run.js").read_bytes())
     return _RUN_JS_CACHE[0]
+
+
+def _actual_plan_step_ids(run_dir: Path) -> frozenset[str]:
+    """Return only step IDs declared by this run's implementation bundle."""
+
+    try:
+        payload = json.loads((run_dir / "implementation_bundle.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return frozenset()
+    steps = payload.get("steps") if isinstance(payload, dict) else None
+    if not isinstance(steps, list):
+        return frozenset()
+    return frozenset(
+        item["id"] for item in steps
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        and is_step_id(item["id"])
+    )
+
+
+def _step_profile_fields(run_dir: Path) -> set[str]:
+    return {f"step_profile__{step_id}" for step_id in _actual_plan_step_ids(run_dir)}
 
 
 def html_csp(nonce: str, *, script_self: bool = False) -> str:
@@ -322,6 +343,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
         try:
             self._check_host()
             parts = self._path_parts()
+            root = self.server.config.runs_root
             html_form_route = (
                 parts == ["", "runs"]
                 or (
@@ -444,9 +466,10 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 self._redirect(f"/runs/{self._run_id(parts[2])}")
                 return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "approval":
+                run_id = self._run_id(parts[2])
                 payload = self._form(
                     {"_token", "decision", "implementer_profile", "reviewer_profile", "reviser_profile", "repair_profile"}
-                    | {f"step_profile__{step_id}" for step_id in ALL_STEP_IDS},
+                    | _step_profile_fields(root / run_id),
                     exact=False,
                 )
                 self._authorized_form(payload.get("_token"))
@@ -468,7 +491,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     raise WebAPIError(400, "decision must be APPROVE or REJECT")
                 approve_run(
                     self.server.config.runs_root,
-                    self._run_id(parts[2]),
+                    run_id,
                     decision,
                     config=self.server.config,
                     implementer_profile=payload.get("implementer_profile"),
@@ -481,7 +504,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     if decision == "APPROVE" and any(key.startswith("step_profile__") for key in payload)
                     else None,
                 )
-                self._redirect(f"/runs/{self._run_id(parts[2])}")
+                self._redirect(f"/runs/{run_id}")
                 return
             if len(parts) == 5 and parts[1:3] == ["api", "runs"] and parts[4] == "scope-approval":
                 self._authorized()
@@ -499,14 +522,15 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             decision = payload.get("decision")
             if not isinstance(decision, str):
                 raise WebAPIError(400, "decision must be APPROVE or REJECT")
+            run_id = self._run_id(parts[3])
             allowed = {"decision"} if decision == "REJECT" else {
                 "decision", "implementer_profile", "reviewer_profile", "reviser_profile", "repair_profile"
-            } | {key for key in payload if key.startswith("step_profile__")}
+            } | _step_profile_fields(root / run_id)
             if set(payload) - allowed:
                 raise WebAPIError(400, "unknown approval field")
             result = approve_run(
                 self.server.config.runs_root,
-                self._run_id(parts[3]),
+                run_id,
                 decision,
                 config=self.server.config,
                 implementer_profile=payload.get("implementer_profile"),

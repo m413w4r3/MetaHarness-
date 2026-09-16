@@ -297,17 +297,17 @@ validated the same way.
 
 | Limit | Value |
 | --- | --- |
-| Max staged steps (`MAX_STEPS`) | 8 (`STAGED` = 2..8, `SINGLE` = exactly 1) |
-| Allowed step IDs | `S01` .. `S08`, contiguous from `S01` |
-| Max `READ_SET` / `WRITE_SET` / `CREATE_SET` / `DELETE_SET` per step | 8 / 6 / 6 / 6 |
+| Protocol step syntax bound (`PROTOCOL_MAX_STEPS`) | 99 (`SINGLE` = exactly 1; `STAGED` = 2..99) |
+| Allowed step IDs | `S01` .. `S99`, contiguous from `S01` |
+| Fixed path-count caps per step | None; configured mutable union is authoritative |
 | Max mutable union per aggressive STAGED step | 6 (`staged_step_max_mutable_paths`) |
-| Max step contract | 8000 characters (target ~4000) |
-| Max aggregate step contracts | 48000 characters |
-| Execution selection steps (schema 3 and 4) | 8, contiguous from `S01` |
-| Resume step IDs (`initial_step`, `repair_step`) | `S01` .. `S08` |
-| Implementation bundle steps | 1..8, contiguous, each contract hash-bound |
+| Max step contract | 16000 characters (target ~4000-6000) |
+| Max aggregate step contracts | None |
+| Execution selection steps (schema 3 and 4) | Up to 99, contiguous from `S01` |
+| Resume step IDs (`initial_step`, `repair_step`) | `S01` .. `S99` |
+| Implementation bundle steps | 1..99, contiguous, each contract hash-bound |
 | Max diff bytes | 400000 (unchanged) |
-| Replacement plan for `REPLACE PLAN` | 128 KiB |
+| Replacement plan for `REPLACE PLAN` | 2 MiB |
 
 ## Plan recovery: replacing an unexecutable planner answer
 

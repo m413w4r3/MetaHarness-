@@ -133,13 +133,14 @@ SPEC
 - Every new run then uses `execution_selection.json` schema 4 (planner, steps,
   reviser, repair implementer, reviewer), approved in the UI with all four
   families visible. There is no v3 fallback; `state.execution` is only a view.
-- Step capacity has a single authority, `metaharness.step_ids`: `MAX_STEPS = 8`
-  and the step IDs `S01..S08`. The parser, the implementation bundle, the
+- Step capacity has a single syntax authority, `metaharness.step_ids`:
+  `PROTOCOL_MAX_STEPS = 99` and the step IDs `S01..S99`. This is a protocol
+  bound, not a recommended execution size. The parser, the implementation bundle, the
   execution selection (schema 3 and 4), resume checkpoints, usage accounting
   and the UI all import it; no module spells its own step bound. SINGLE is
-  exactly one step, STAGED two to eight. A step contract is at most 8000
-  characters and all step contracts together at most 48000, so eight steps fit
-  only near the ~4000-character target stated in the planner prompt.
+  exactly one step, STAGED two to `MAX_STEPS`. A step contract is at most
+  16000 characters; there is no aggregate contract-size limit. The planner
+  target remains approximately 4000-6000 characters per step.
 - C01 and C02 steps run through the same `_execute_codex_step` primitive, with
   the same ordered gates and failure reasons (`STEP_CONTRACT_DRIFT`,
   `CODEX_AUTH_FAILURE`, `AGENT_COMMITTED`, `AGENT_GIT_VIOLATION`,

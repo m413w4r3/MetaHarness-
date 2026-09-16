@@ -383,26 +383,27 @@ class PlanRecoveryTests(PlanRecoveryHarness):
         self.assertEqual([call["step"] for call in luna.calls], _ids(7))
         self.assertEqual(planner.prompts, [])
 
-    def test_aw002_blocked_planner_recovers_with_eight_step_plan(self) -> None:
-        config, blocked = self.blocked_planner_run("aw-002-blocked-eight")
+    def test_aw002_blocked_planner_recovers_with_twelve_step_plan(self) -> None:
+        config, blocked = self.blocked_planner_run("aw-002-blocked-twelve")
         blocked_raw = (blocked.run_dir / "planner.raw.md").read_bytes()
-        replacement = recovery_plan(8)
+        replacement = recovery_plan(12)
         planner = QueueClient("planner", [], self.events)
-        luna = FakeLuna(luna_behaviors(8))
+        luna = FakeLuna(luna_behaviors(12))
         thread, holder = self.recover_in_thread(
-            config, "aw-002-blocked-eight", replacement, planner=planner, luna=luna, reviews=[PASS],
+            config, "aw-002-blocked-twelve", replacement, planner=planner, luna=luna, reviews=[PASS],
         )
-        self.wait_for_approval_gate("aw-002-blocked-eight", thread, expected_step_count=8)
+        self.wait_for_approval_gate("aw-002-blocked-twelve", thread, expected_step_count=12)
         self.assertNotIn("error", holder)
         self.assert_recovered_awaiting_approval(
-            config, "aw-002-blocked-eight", count=8, replacement=replacement,
+            config, "aw-002-blocked-twelve", count=12, replacement=replacement,
             invalid_raw=blocked_raw, planner=planner, luna=luna,
         )
-        self.approve(config, "aw-002-blocked-eight", 8)
+        self.approve(config, "aw-002-blocked-twelve", 12)
         thread.join(timeout=120)
         self.assertFalse(thread.is_alive())
         self.assertEqual(holder["result"].status, RunStatus.PUBLISHED, holder["result"].state.get("failure"))
-        self.assertEqual([call["step"] for call in luna.calls], _ids(8))
+        self.assertEqual([call["step"] for call in luna.calls], _ids(12))
+        self.assert_approval_binds_replacement("aw-002-blocked-twelve", replacement, 12)
         self.assertEqual(planner.prompts, [])
 
     def test_blocked_without_planner_checkpoint_cannot_recover(self) -> None:
@@ -583,8 +584,8 @@ class PlanRecoveryTests(PlanRecoveryHarness):
               for number in range(2, 10)],
         )
         cases = {
-            "nine steps": nine,
-            "S09 id": recovery_plan(8).replace("STEP S08", "STEP S09"),
+            "100 steps": plan_text(*[step_block(number) for number in range(1, 101)]),
+            "S100 id": recovery_plan(8).replace("BEGIN STEP S08", "BEGIN STEP S100").replace("END STEP S08", "END STEP S100"),
             "blocked": BLOCKED_PLAN,
             "AW-002 blocked with execution metadata": AW002_INVALID_PLAN,
             "unknown implementer": recovery_plan(7).replace("IMPLEMENTER_PROFILE: luna", "IMPLEMENTER_PROFILE: ghost", 1),
@@ -722,7 +723,6 @@ class PlanRecoveryWebTests(PlanRecoveryHarness):
         self.assertEqual(self.post_json(path, {"plan": recovery_plan(7)}, "wrong")[0], 403)
         self.assertEqual(self.post_json(path, {"plan": recovery_plan(7), "spec": "x"}, token)[0], 400)
         self.assertEqual(self.post_json(path, {"plan": "#" * (MAX_REPLACEMENT_PLAN_BYTES + 1)}, token)[0], 400)
-        self.assertEqual(self.post_json(path, {"plan": "#" * (4 * MAX_REPLACEMENT_PLAN_BYTES)}, token)[0], 413)
         self.assertEqual(self.post_json(path, {"plan": BLOCKED_PLAN}, token)[0], 400)
         self.assertEqual(self.post_json("/api/runs/..%2F/recover-plan", {"plan": "x"}, token)[0], 400)
         form = urlencode({"_token": "wrong", "plan": recovery_plan(7)}).encode()

@@ -1,4 +1,4 @@
-"""Execution selection capacity: one implementer selection per step, S01..S08.
+"""Execution selection capacity: one implementer selection per step, S01..S99.
 
 Schema 3 and schema 4 share ``_canonical_step_items``; both must carry the
 authoritative MAX_STEPS and survive a durable write/read/validate cycle.
@@ -58,22 +58,22 @@ class ExecutionSelectionCapacityTests(P28Harness):
         )
 
     def test_capacity_is_the_shared_step_authority(self) -> None:
-        self.assertEqual((_MAX_STEP_SELECTIONS, MAX_STEPS), (8, 8))
+        self.assertEqual((_MAX_STEP_SELECTIONS, MAX_STEPS), (99, 99))
 
-    def test_seven_and_eight_selections_are_accepted_for_v3_and_v4(self) -> None:
-        for count in (7, 8):
+    def test_large_selections_are_accepted_for_v3_and_v4(self) -> None:
+        for count in (9, 16, 32, 99):
             for resolve in (self.v3, self.v4):
                 with self.subTest(count=count, schema=resolve.__name__):
                     selection = resolve(_steps(count))
                     self.assertEqual([item.step_id for item in selection.steps], _ids(count))
         # Canonical order never depends on the request's insertion order.
-        reversed_request = dict(reversed(list(_steps(8).items())))
-        self.assertEqual([item.step_id for item in self.v4(reversed_request).steps], _ids(8))
+        reversed_request = dict(reversed(list(_steps(32).items())))
+        self.assertEqual([item.step_id for item in self.v4(reversed_request).steps], _ids(32))
 
     def test_s09_nine_selections_and_gaps_are_rejected(self) -> None:
         cases = {
-            "S09 id": {"S01": "luna", "S09": "luna"},
-            "nine selections": {**_steps(8), "S09": "luna"},
+            "S100 id": {"S01": "luna", "S100": "luna"},
+            "100 selections": {**_steps(99), "S100": "luna"},
             "gap": {"S01": "luna", "S02": "luna", "S04": "luna"},
             "missing S07": {**_steps(6), "S08": "luna"},
             "no S01": {"S02": "luna"},
@@ -85,19 +85,19 @@ class ExecutionSelectionCapacityTests(P28Harness):
                     with self.assertRaises(ExecutionSelectionError):
                         resolve(steps)
 
-    def test_durable_v4_with_eight_steps_round_trips_and_validates(self) -> None:
+    def test_durable_v4_with_32_steps_round_trips_and_validates(self) -> None:
         run_dir = self.root / "run-v4"
-        selection = self.v4(_steps(8))
+        selection = self.v4(_steps(32))
         ensure_execution_selection_v4(run_dir, selection)
         durable, digest = read_execution_selection_v4_with_sha256(run_dir)
         self.assertEqual(durable, selection)
-        self.assertEqual([item.step_id for item in durable.steps], _ids(8))
+        self.assertEqual([item.step_id for item in durable.steps], _ids(32))
         self.assertEqual(
             digest, hashlib.sha256((run_dir / "execution_selection.json").read_bytes()).hexdigest()
         )
         validate_execution_selection_v4(self.config, durable)
         # Idempotent re-publication (an approval retry or a resume).
-        self.assertEqual(ensure_execution_selection_v4(run_dir, self.v4(_steps(8))), selection)
+        self.assertEqual(ensure_execution_selection_v4(run_dir, self.v4(_steps(32))), selection)
 
     def test_durable_parsers_reject_s09_nine_and_noncontiguous_payloads(self) -> None:
         for schema, ensure, parse, resolve in (
@@ -105,26 +105,26 @@ class ExecutionSelectionCapacityTests(P28Harness):
             (4, ensure_execution_selection_v4, parse_execution_selection_v4, self.v4),
         ):
             run_dir = self.root / f"run-parse-{schema}"
-            ensure(run_dir, resolve(_steps(8)))
+            ensure(run_dir, resolve(_steps(32)))
             valid = json.loads((run_dir / "execution_selection.json").read_text(encoding="utf-8"))
-            self.assertEqual(parse(json.dumps(valid).encode()).steps[-1].step_id, "S08")
+            self.assertEqual(parse(json.dumps(valid).encode()).steps[-1].step_id, "S32")
             implementer = valid["steps"][0]["implementer"]
-            nine = dict(valid, steps=valid["steps"] + [{"step_id": "S09", "implementer": implementer}])
-            s09 = dict(valid, steps=valid["steps"][:-1] + [{"step_id": "S09", "implementer": implementer}])
+            over = dict(valid, steps=valid["steps"] + [{"step_id": "S100", "implementer": implementer}])
+            invalid = dict(valid, steps=valid["steps"][:-1] + [{"step_id": "S100", "implementer": implementer}])
             gap = dict(valid, steps=[item for item in valid["steps"] if item["step_id"] != "S07"])
-            for name, payload in (("nine", nine), ("S09", s09), ("gap", gap)):
+            for name, payload in (("over", over), ("S100", invalid), ("gap", gap)):
                 with self.subTest(schema=schema, case=name):
                     with self.assertRaises(ExecutionSelectionError):
                         parse(json.dumps(payload).encode())
 
     def test_manual_malformed_v3_selections_are_rejected_before_publication(self) -> None:
-        valid = self.v3(_steps(8))
+        valid = self.v3(_steps(32))
         implementer = valid.steps[0].implementer
         cases = {
             "gap": (valid.steps[0], valid.steps[2]),
             "S02 only": (StepExecutionSelection("S02", implementer),),
-            "S09": (StepExecutionSelection("S09", implementer),),
-            "more than MAX_STEPS": valid.steps + (StepExecutionSelection("S09", implementer),),
+            "S100": (StepExecutionSelection("S100", implementer),),
+            "more than MAX_STEPS": valid.steps + (StepExecutionSelection("S100", implementer),),
         }
         for name, steps in cases.items():
             with self.subTest(case=name):

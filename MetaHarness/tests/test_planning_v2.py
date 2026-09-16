@@ -21,7 +21,6 @@ from metaharness.models import (  # noqa: E402
 from metaharness.planning_v2 import (  # noqa: E402
     MAX_STEPS,
     MAX_STEP_CONTRACT_CHARS,
-    MAX_TOTAL_STEP_CONTRACT_CHARS,
     REQUIRE_STAGED_POLICY_TEXT,
     PlannerV2,
     V2PlanParseError,
@@ -116,7 +115,7 @@ def _parse(raw: str):
 
 class PlanningV2Tests(unittest.TestCase):
     def test_single_and_staged_boundaries(self):
-        self.assertEqual(MAX_STEPS, 8)
+        self.assertEqual(MAX_STEPS, 99)
         single = _parse(_plan())
         self.assertEqual(single.execution_mode, ExecutionMode.SINGLE)
         self.assertEqual(single.steps[0].id, "S01")
@@ -125,9 +124,9 @@ class PlanningV2Tests(unittest.TestCase):
         self.assertEqual([step.id for step in staged.steps], ["S01", "S02"])
         six = "\n\n".join(_step(number) for number in range(1, 7))
         self.assertEqual(len(_parse(_plan("STAGED", 6, steps=six)).steps), 6)
-        eight = "\n\n".join(_step(number) for number in range(1, 9))
+        eight = "\n\n".join(_step(number) for number in range(1, 8 + 1))
         self.assertEqual([step.id for step in _parse(_plan("STAGED", 8, steps=eight)).steps],
-                         [f"S{number:02d}" for number in range(1, 9)])
+                         [f"S{number:02d}" for number in range(1, 8 + 1)])
 
     def test_blocked_execution_metadata_is_rejected(self):
         observed = """META PLAN v2
@@ -219,8 +218,7 @@ END META PLAN
         huge = _plan().replace("1. edit the named symbol", "x" * MAX_STEP_CONTRACT_CHARS)
         with self.assertRaises(V2PlanParseError):
             _parse(huge)
-        # Six ~5500-character contracts exceeded the historical 32000 budget;
-        # they fit the 48000 aggregate (bounded in the test below).
+        # Six ~5500-character contracts remain below the individual limit.
         six = "\n\n".join(_step(number, instruction="x" * 5100) for number in range(1, 7))
         self.assertEqual(len(_parse(_plan("STAGED", 6, steps=six)).steps), 6)
         plan = _parse(_plan())
@@ -250,16 +248,25 @@ END META PLAN
                              [f"S{number:02d}" for number in range(1, 8)])
             self.assertTrue((Path(directory) / "implementation_bundle.json").exists())
 
-    def test_nine_steps_and_s09_are_rejected(self):
+    def test_nine_steps_and_s09_are_accepted_but_s100_is_rejected(self):
         nine = "\n\n".join(_step(number) for number in range(1, 10))
+        self.assertEqual(len(_parse(_plan("STAGED", 9, steps=nine)).steps), 9)
+        self.assertTrue(step_id_authority.is_step_id("S09"))
         with self.assertRaises(V2PlanParseError):
-            _parse(_plan("STAGED", 9, steps=nine))
-        with self.assertRaises(V2PlanParseError):
-            _parse(_plan(
-                "STAGED", 8,
-                steps="\n\n".join(_step(number) for number in range(1, 8))
-                + "\n\n" + _step(9),
-            ))
+            _parse(_plan("STAGED", 100, steps="\n\n".join(_step(number) for number in range(1, 100))))
+
+    def test_9_16_and_32_steps_parse_and_write_bundles(self) -> None:
+        for count in (9, 16, 32):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
+                plan = _parse(_plan(
+                    "STAGED", count,
+                    steps="\n\n".join(_step(number) for number in range(1, count + 1)),
+                ))
+                bundle = write_implementation_bundle(directory, plan)
+                payload, _digest = validate_implementation_bundle(
+                    directory, expected_step_ids=[f"S{number:02d}" for number in range(1, count + 1)]
+                )
+                self.assertEqual(payload, bundle)
 
     def test_noncontiguous_eighth_step_is_rejected(self):
         steps = "\n\n".join(_step(number) for number in range(1, 7)) + "\n\n" + _step(8)
@@ -267,8 +274,8 @@ END META PLAN
             _parse(_plan("STAGED", 7, steps=steps))
 
     def test_eight_step_bundle_is_written_read_back_and_hash_validated(self):
-        ids = [f"S{number:02d}" for number in range(1, 9)]
-        plan = _parse(_plan("STAGED", 8, steps="\n\n".join(_step(number) for number in range(1, 9))))
+        ids = [f"S{number:02d}" for number in range(1, 8 + 1)]
+        plan = _parse(_plan("STAGED", 8, steps="\n\n".join(_step(number) for number in range(1, 8 + 1))))
         with tempfile.TemporaryDirectory() as directory:
             bundle = write_implementation_bundle(directory, plan)
             self.assertEqual([entry["id"] for entry in bundle["steps"]], ids)
@@ -287,25 +294,23 @@ END META PLAN
             with self.assertRaises(V2PlanParseError):
                 validate_implementation_bundle(directory, expected_step_ids=ids)
 
-    def test_aggregate_contract_budget_is_48000(self):
-        self.assertEqual((MAX_STEP_CONTRACT_CHARS, MAX_TOTAL_STEP_CONTRACT_CHARS), (8_000, 48_000))
-        within = "\n\n".join(_step(number, instruction="x" * 5400) for number in range(1, 9))
-        plan = _parse(_plan("STAGED", 8, steps=within))
-        total = sum(len(render_step_contract(plan, step)) for step in plan.steps)
-        self.assertTrue(32_000 < total <= MAX_TOTAL_STEP_CONTRACT_CHARS, total)
-        # Every contract stays under 8000 characters; only the sum is too big.
-        over = "\n\n".join(_step(number, instruction="x" * 6000) for number in range(1, 9))
-        with self.assertRaisesRegex(V2PlanParseError, "MAX_TOTAL_STEP_CONTRACT_CHARS"):
-            _parse(_plan("STAGED", 8, steps=over))
+    def test_contract_budget_is_per_step_only(self):
+        self.assertEqual(MAX_STEP_CONTRACT_CHARS, 16_000)
+        steps = "\n\n".join(_step(number, instruction="x" * 6000) for number in range(1, 8 + 1))
+        plan = _parse(_plan("STAGED", 8, steps=steps))
+        self.assertGreater(sum(len(render_step_contract(plan, step)) for step in plan.steps), 48_000)
+        too_large = _plan().replace("1. edit the named symbol", "x" * MAX_STEP_CONTRACT_CHARS)
+        with self.assertRaises(V2PlanParseError):
+            _parse(too_large)
 
     def test_step_capacity_has_one_authority(self):
         self.assertIs(MAX_STEPS, step_id_authority.MAX_STEPS)
-        self.assertEqual(step_id_authority.step_ids(8), tuple(f"S{number:02d}" for number in range(1, 9)))
+        self.assertEqual(step_id_authority.step_ids(8), tuple(f"S{number:02d}" for number in range(1, 8 + 1)))
         for value in ("S01", "S07", "S08"):
             self.assertTrue(step_id_authority.is_step_id(value), value)
-        for value in ("S00", "S09", "S10", "s01", "S1", "S001", " S01", 7, None):
+        for value in ("S00", "S100", "s01", "S1", "S001", " S01", 7, None):
             self.assertFalse(step_id_authority.is_step_id(value), value)
-        for count in (0, 9, True, "8"):
+        for count in (0, 100, True, "8"):
             with self.assertRaises(ValueError):
                 step_id_authority.step_ids(count)
         self.assertIn(f"between 2 and {MAX_STEPS} coherent", REQUIRE_STAGED_POLICY_TEXT)
@@ -313,16 +318,22 @@ END META PLAN
         for name in ("planner_v2.txt", "repair_planner_v2.txt"):
             text = (prompts / name).read_text(encoding="utf-8")
             with self.subTest(prompt=name):
-                self.assertIn(f"STAGED has 2 to {MAX_STEPS} steps", text)
-                self.assertIn(f"S01 through S{MAX_STEPS:02d}", text)
-                self.assertIn(str(MAX_TOTAL_STEP_CONTRACT_CHARS), text)
-                self.assertIn(str(MAX_STEP_CONTRACT_CHARS), text)
+                self.assertIn("STAGED has 2 to {{MAX_STEPS}} steps", text)
+                self.assertIn("S01 through {{LAST_STEP_ID}}", text)
+                self.assertIn("{{MAX_STEP_CONTRACT_CHARS}}", text)
 
     def test_no_hidden_step_bound_remains_in_sources(self):
-        root = Path(__file__).resolve().parents[1] / "src" / "metaharness"
-        hidden = re.compile(r"S0\[1-|range\(1, ?7\)|two and six|at most six steps|S01 through S06")
+        repository = Path(__file__).resolve().parents[1]
+        roots = (repository / "src" / "metaharness", repository / "docs", repository / "examples")
+        hidden = re.compile("|".join((
+            "2 to " + "8", r"2\.\." + "8", "S01 through S" + "08", r"S01\.\.S" + "08",
+            "48" + "000", r"MAX_STEPS\s*=\s*" + "8", r"range\(1,\s*" + r"9\)",
+            "at most " + "8 steps", "eight " + "steps", r"S0\[1-",
+            r"range\(1, ?" + r"7\)", "two and " + "six", "at most " + "six steps",
+            "S01 through S" + "06",
+        )))
         offenders = [
-            str(path.relative_to(root)) for path in sorted(root.rglob("*"))
+            str(path.relative_to(repository)) for root in roots for path in sorted(root.rglob("*"))
             if path.suffix in {".py", ".txt", ".js"} and hidden.search(path.read_text(encoding="utf-8"))
         ]
         self.assertEqual(offenders, [])
@@ -461,13 +472,19 @@ class ChangeSetTests(unittest.TestCase):
             "create wildcard": read + "WRITE_SET\nNONE\n\nCREATE_SET\n- src/*.py\n\nDELETE_SET\nNONE\n",
             "create traversal": read + "WRITE_SET\nNONE\n\nCREATE_SET\n- ../escape.py\n\nDELETE_SET\nNONE\n",
             "create anchor": read + "WRITE_SET\nNONE\n\nCREATE_SET\n- src/new.py :: anchor\n\nDELETE_SET\nNONE\n",
-            "too many creates": read + "WRITE_SET\nNONE\n\nCREATE_SET\n"
-            + "".join(f"- src/n{index}.py\n" for index in range(7)) + "\nDELETE_SET\nNONE\n",
         }
         for name, sets in cases.items():
             with self.subTest(name=name):
                 with self.assertRaises(V2PlanParseError):
                     _parse(_plan(steps=_change_step(sets)))
+
+    def test_read_set_and_structural_sets_have_no_hidden_count_caps(self) -> None:
+        paths = tuple(f"src/read{index}.py" for index in range(1, 10))
+        read = "READ_SET\n" + "".join(f"- {path} :: anchor\n" for path in paths)
+        writes = "WRITE_SET\n" + "".join(f"- {path}\n" for path in paths)
+        raw = _plan(steps=_change_step(read + "\n" + writes + "\nCREATE_SET\nNONE\n\nDELETE_SET\nNONE\n"))
+        self.assertEqual(len(_parse(raw).steps[0].read_set), 9)
+        self.assertEqual(len(_parse(raw).steps[0].write_set), 9)
 
     def test_bundle_validation_binds_step_ids_and_contract_bytes(self) -> None:
         from metaharness.planning_v2 import read_approved_step_contract, validate_implementation_bundle
@@ -494,12 +511,13 @@ class ChangeSetTests(unittest.TestCase):
         for sentence in (
             "The implementation worker is not a discovery agent.",
             "If the supplied context is insufficient to name the required file, symbol, or architectural operation precisely, return BLOCKED instead of delegating discovery to the worker.",
-            "Normal target: keep each step contract under approximately 4000 characters.",
-            "Hard parser limit remains 8000 characters.",
+            "Normal target: keep each step contract concise, approximately 4000-6000 chars.",
+            "Hard per-step parser limit: 16000 characters.",
             "CREATE_SET\nNONE",
             "DELETE_SET\nNONE",
-            "STAGED has 2 to 8 steps. SINGLE has exactly 1 step.",
-            "Step IDs are contiguous S01 through S08",
+            "STAGED has 2 to 99 steps. SINGLE has exactly 1 step.",
+            "Step IDs are contiguous S01 through S99",
+            "There is no aggregate contract-size limit.",
         ):
             self.assertIn(sentence, planner)
         worker = build_implementer_step_prompt("CONTRACT")
@@ -632,6 +650,14 @@ class DecompositionPolicyValidatorTests(unittest.TestCase):
             validate_decomposition_policy(
                 _parse(_staged(write=_paths("w", 3), delete=_paths("d", 1))), planning
             )
+
+    def test_configured_eight_path_boundary_is_checked_only_by_policy(self):
+        planning = _aggressive(staged_step_max_mutable_paths=8)
+        eight = _parse(_staged(write=_paths("w", 8)))
+        validate_decomposition_policy(eight, planning)
+        nine = _parse(_staged(write=_paths("w", 9)))
+        with self.assertRaisesRegex(V2PlanParseError, "at most 8 distinct mutable paths; got 9"):
+            validate_decomposition_policy(nine, planning)
 
     def test_later_step_is_named_in_the_diagnostic(self):
         raw = _plan("STAGED", 2, steps=_step(1) + "\n\n" + _sets_step(2, write=_paths("w", 4)))

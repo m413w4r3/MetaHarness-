@@ -144,7 +144,7 @@ def _canonical_step_items(step_profile_ids: Mapping[str, str]) -> list[tuple[str
 
     The order never depends on the insertion order of the request mapping:
     IDs are validated, sorted numerically, and must then be unique,
-    contiguous from S01, and at most ``MAX_STEPS``.
+    contiguous from S01, and at most the shared protocol syntax bound.
     """
 
     if not isinstance(step_profile_ids, Mapping) or not step_profile_ids:

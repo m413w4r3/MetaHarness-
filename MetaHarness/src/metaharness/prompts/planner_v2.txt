@@ -94,10 +94,9 @@ Each step must leave the repository in a state suitable for the next step.
 The implementation worker must never be asked to discover where a change
 belongs.
 
-Normal target: keep each step contract under approximately 4000 characters.
-Hard parser limit remains 8000 characters.
-Hard aggregate limit: 48000 characters for all step contracts together.
-The parser enforces both limits; eight steps fit only near the normal target.
+Normal target: keep each step contract concise, approximately 4000-6000 chars.
+Hard per-step parser limit: {{MAX_STEP_CONTRACT_CHARS}} characters.
+There is no aggregate contract-size limit.
 
 For every step:
 - include only files actually needed;
@@ -110,7 +109,7 @@ For every step:
 - prefer the minimum number of steps;
 - prefer the minimum READ_SET sufficient for safe implementation.
 
-STAGED has 2 to 8 steps. SINGLE has exactly 1 step.
+STAGED has 2 to {{MAX_STEPS}} steps. SINGLE has exactly 1 step.
 
 Each step declares four path sets:
 - READ_SET: existing files needed to understand the step.
@@ -124,14 +123,17 @@ Every WRITE_SET, CREATE_SET and DELETE_SET line must be exactly:
 - repo/relative/path.py
 Always emit all four sections. Write NONE for an empty WRITE_SET, CREATE_SET
 or DELETE_SET; READ_SET is never empty.
-Use at most 8 READ_SET paths, 6 WRITE_SET paths, 6 CREATE_SET paths and 6
-DELETE_SET paths. Every WRITE_SET and DELETE_SET path must also appear in
-READ_SET. A CREATE_SET path must not appear in READ_SET. A path may appear in
-only one of WRITE_SET, CREATE_SET and DELETE_SET, and each step must write,
-create or delete at least one path. Changing any other path fails the step
-deterministically. Paths must be exact, repo-relative, non-wildcard paths.
-Step IDs are contiguous S01 through S08; a step may depend only on NONE or an
-earlier step.
+READ_SET has no fixed path-count limit, but must contain only paths actually
+needed by the worker.
+WRITE_SET / CREATE_SET / DELETE_SET have no independent numeric cap. The
+configured mutable-path policy below is authoritative over their UNION.
+Every WRITE_SET and DELETE_SET path must also appear in READ_SET. A CREATE_SET
+path must not appear in READ_SET. A path may appear in only one of WRITE_SET,
+CREATE_SET and DELETE_SET, and each step must write, create or delete at least
+one path. Changing any other path fails the step deterministically. Paths must
+be exact, repo-relative, non-wildcard paths.
+Step IDs are contiguous S01 through {{LAST_STEP_ID}}; a step may depend only on
+NONE or an earlier step.
 
 Profiles are recommendations, not human authority. Choose exact IDs from the
 catalogues supplied below. Never output endpoint URLs, API-key environment
