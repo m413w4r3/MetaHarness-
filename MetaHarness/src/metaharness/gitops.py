@@ -90,6 +90,49 @@ def run_branch_web_url(reference: RepositoryReference, branch: str) -> str | Non
     return f"{reference.web_url}/tree/{urllib.parse.quote(branch, safe='/')}"
 
 
+def immutable_commit_web_url(
+    reference: RepositoryReference,
+    commit_sha: str,
+) -> str | None:
+    """Return a credential-free immutable GitHub commit tree URL."""
+
+    if not isinstance(reference, RepositoryReference):
+        raise TypeError("reference must be a RepositoryReference")
+    if not isinstance(commit_sha, str) or _OBJECT_ID.fullmatch(commit_sha) is None:
+        raise GitError("commit SHA is invalid")
+    github_url = (
+        normalize_github_web_url(reference.web_url)
+        if reference.web_url is not None
+        else None
+    )
+    if github_url is None:
+        return None
+    return f"{github_url}/tree/{commit_sha}"
+
+
+def compare_commits_web_url(
+    reference: RepositoryReference,
+    base_sha: str,
+    head_sha: str,
+) -> str | None:
+    """Return a credential-free immutable GitHub comparison URL."""
+
+    if not isinstance(reference, RepositoryReference):
+        raise TypeError("reference must be a RepositoryReference")
+    if not isinstance(base_sha, str) or _OBJECT_ID.fullmatch(base_sha) is None:
+        raise GitError("base SHA is invalid")
+    if not isinstance(head_sha, str) or _OBJECT_ID.fullmatch(head_sha) is None:
+        raise GitError("head SHA is invalid")
+    github_url = (
+        normalize_github_web_url(reference.web_url)
+        if reference.web_url is not None
+        else None
+    )
+    if github_url is None:
+        return None
+    return f"{github_url}/compare/{base_sha}...{head_sha}"
+
+
 def _git(
     repo: Path,
     *args: str,

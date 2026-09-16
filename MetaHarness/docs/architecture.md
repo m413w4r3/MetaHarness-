@@ -156,6 +156,14 @@ SPEC
 - Reviewer #2 receives the original approved plan and the C02 repair plan, the
   C01 and C02 Luna reports, the C01 and C02 Claude revisions, the scope delta,
   and the cycle history.
+- The pushed candidate commit is the reviewer's code authority. When remote
+  exploration is available, MetaHarness sends the BASE SHA, CANDIDATE SHA,
+  immutable candidate URL, compare URL, changed paths, and deterministic
+  evidence; it does not recopy the full diff into the reviewer prompt. The
+  reviewer inspects the immutable candidate when it needs code, while a
+  bounded diff fallback is used only when remote exploration is unavailable.
+  This keeps prompt size independent of the total diff size and Luna step
+  count.
 - Artifacts are per cycle: C01 in `steps/`, `revision/C01/`, `checks/C01/`,
   `review/C01/` (root copies for historical runs); C02 in `repair/C02/`,
   `revision/C02/`, `checks/C02/`, `review/C02/`. The API exposes them as

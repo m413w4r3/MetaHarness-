@@ -802,15 +802,11 @@ class FullPipelineTests(P28Harness):
         self.assertEqual(result.state["cycle"], 2)
         self.assertEqual(result.state["review_iterations"], 2)
         self.assertEqual(git(self.worktree(), "show", "HEAD:src/a.py"), "A = 4")
-        # C01 v2 passes the worker/revision evidence through its dedicated
-        # sections; the legacy AGENT_REPORT slot is explicitly empty.
+        # C01 v2 passes only structural worker history through LUNA REPORTS;
+        # the legacy AGENT_REPORT section is not part of the default template.
         first = reviewer.prompts[0]
-        self.assertIn(
-            "<NON-AUTHORITATIVE IMPLEMENTER REPORT>\nNONE\n"
-            "</NON-AUTHORITATIVE IMPLEMENTER REPORT>",
-            first,
-        )
-        self.assertEqual(first.count("C01 S01 report"), 1)
+        self.assertNotIn("<NON-AUTHORITATIVE IMPLEMENTER REPORT>", first)
+        self.assertNotIn("C01 S01 report", first)
         self.assertEqual(first.count("Claude C01 revision report"), 1)
         repair_prompt = planner.prompts[1]
         self.assertNotIn("REVIEWER #1 RAW", repair_prompt)
@@ -820,12 +816,19 @@ class FullPipelineTests(P28Harness):
         second = reviewer.prompts[1]
         original = (result.run_dir / "planner.raw.md").read_text()
         repair = (result.run_dir / "repair" / "C02" / "planner.raw.md").read_text()
-        self.assertIn(f"ORIGINAL APPROVED PLAN\n{original}\n\nREPAIR PLAN C02\n{repair}", second)
-        for marker in ("C01 LUNA REPORTS", "C02 LUNA REPAIR REPORTS", "C01 S01 report",
+        self.assertIn('"original_approved_plan"', second)
+        self.assertIn('"repair_plan_c02"', second)
+        self.assertIn('"scope_delta"', second)
+        self.assertNotIn(original, second)
+        self.assertNotIn(repair, second)
+        for marker in ("C01 LUNA REPORTS", "C02 LUNA REPAIR REPORTS",
                        "C02 S01 report", "C01 CLAUDE REVISION", "C02 CLAUDE REVISION",
                        "Claude C01 revision report", "Claude C02 revision report",
                        '"deterministic_passed": true'):
-            self.assertIn(marker, second)
+            if marker == "C02 S01 report":
+                self.assertNotIn(marker, second)
+            else:
+                self.assertIn(marker, second)
         usage = result.state["usage"]
         self.assertEqual(usage["luna_c01"]["input_tokens"], 101)
         self.assertEqual(usage["luna_c02"]["input_tokens"], 201)

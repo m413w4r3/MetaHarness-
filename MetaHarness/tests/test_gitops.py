@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.gitops import (  # noqa: E402
     GitError,
+    RepositoryReference,
     assert_agent_did_not_commit,
     assert_clean,
     branch_exists,
@@ -15,6 +16,8 @@ from metaharness.gitops import (  # noqa: E402
     commit_reviewed_tree,
     create_run_worktree,
     current_head,
+    immutable_commit_web_url,
+    compare_commits_web_url,
     delete_run_branch,
     git_root,
     index_tree_sha,
@@ -77,6 +80,42 @@ class GitOpsTests(unittest.TestCase):
         self.assertTrue(status_porcelain(self.repo))
         with self.assertRaises(GitError):
             assert_clean(self.repo)
+
+    def test_immutable_commit_and_compare_urls_use_exact_shas(self) -> None:
+        reference = RepositoryReference(
+            remote_name="origin",
+            web_url="https://github.com/acme/project",
+            base_sha="a" * 40,
+            immutable_url="https://github.com/acme/project/tree/" + "a" * 40,
+        )
+
+        self.assertEqual(
+            immutable_commit_web_url(reference, "b" * 40),
+            "https://github.com/acme/project/tree/" + "b" * 40,
+        )
+        self.assertEqual(
+            compare_commits_web_url(reference, "a" * 40, "b" * 40),
+            "https://github.com/acme/project/compare/"
+            + "a" * 40
+            + "..."
+            + "b" * 40,
+        )
+
+    def test_immutable_urls_are_unavailable_without_github_exploration(self) -> None:
+        reference = RepositoryReference("origin", None, "a" * 40, None)
+        self.assertIsNone(immutable_commit_web_url(reference, "b" * 40))
+        self.assertIsNone(compare_commits_web_url(reference, "a" * 40, "b" * 40))
+
+    def test_immutable_urls_reject_invalid_shas(self) -> None:
+        reference = RepositoryReference("origin", "https://github.com/acme/project", "a" * 40, None)
+        for invalid in ("HEAD", "", "abc", "z" * 40):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(GitError):
+                    immutable_commit_web_url(reference, invalid)
+                with self.assertRaises(GitError):
+                    compare_commits_web_url(reference, invalid, "b" * 40)
+                with self.assertRaises(GitError):
+                    compare_commits_web_url(reference, "a" * 40, invalid)
 
     def test_delete_run_branch_is_idempotent_and_exact(self) -> None:
         bare = self.root / "origin.git"

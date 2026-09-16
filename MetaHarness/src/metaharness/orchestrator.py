@@ -88,6 +88,8 @@ from .gitops import (
     index_tree_sha,
     local_branches,
     build_repository_reference,
+    immutable_commit_web_url,
+    compare_commits_web_url,
     render_repository_reference,
     path_exists_in_tree,
     push_run_branch,
@@ -270,6 +272,8 @@ _LEGACY_DIRECT_FAILURES = _DIRECT_FAILURES | frozenset({DIFF_TOO_LARGE})
 _COMMIT_SUBJECT_LIMIT = 72
 _MAX_AGENT_REPORT_BYTES = 32_000
 _MAX_STEP_REPORT_BYTES = 2_048
+_MAX_REVIEW_FALLBACK_DIFF_BYTES = 32 * 1024
+_MAX_REVIEW_CONTEXT_BYTES = 24 * 1024
 _AGENT_ARTIFACTS = (
     "agent.events.jsonl",
     "agent.stderr.log",
@@ -361,6 +365,137 @@ def _step_reports_text(results: list[dict[str, Any]]) -> str:
         ]) + "\n"
         chunks.append(chunk)
     return "\n".join(chunks)
+
+
+def _review_step_reports_text(results: list[dict[str, Any]]) -> str:
+    """Compact structural Luna history for the independent reviewer."""
+
+    records: list[dict[str, Any]] = []
+
+    for item in results:
+        record: dict[str, Any] = {
+            "id": item.get("id"),
+            "status": item.get("status", "COMPLETED"),
+            "changed_paths": list(item.get("changed_paths") or []),
+        }
+
+        if item.get("mismatch"):
+            record["mismatch"] = _bounded_v2_report(str(item.get("mismatch") or ""))
+
+        if item.get("initial_mismatch"):
+            record["initial_mismatch"] = _bounded_v2_report(
+                str(item.get("initial_mismatch") or "")
+            )
+
+        if item.get("mismatch_retry_count"):
+            record["mismatch_retry_count"] = item["mismatch_retry_count"]
+
+        if item.get("deferred_verify"):
+            record["deferred_verify"] = _bounded_v2_report(
+                str(item.get("deferred_verify") or "")
+            )
+
+        records.append(record)
+
+    return _json_text(records)
+
+
+def _review_plan_payload(plan: TaskPlanV2) -> dict[str, Any]:
+    return {
+        "title": plan.title,
+        "objective": plan.objective,
+        "constraints": plan.constraints,
+        "required_checks": list(plan.required_checks),
+        "acceptance": plan.acceptance,
+        "tests": plan.tests,
+        "risks": plan.risks,
+        "steps": [
+            {
+                "id": step.id,
+                "title": step.title,
+                "depends_on": step.depends_on,
+                "objective": step.objective,
+                "mutation_scope": {
+                    "write": list(step.write_set),
+                    "create": list(step.create_set),
+                    "delete": list(step.delete_set),
+                },
+                "instructions": step.instructions,
+                "verify": step.verify,
+                "forbidden": step.forbidden,
+            }
+            for step in plan.steps
+        ],
+    }
+
+
+def _review_plan_text(plan: TaskPlanV2) -> str:
+    return _json_text(_review_plan_payload(plan))
+
+
+def _review_code_evidence(
+    *,
+    repository_reference: RepositoryReference,
+    base_sha: str,
+    candidate_sha: str,
+    evidence: EvidenceBundle,
+) -> str:
+    diff_bytes = evidence.diff.encode("utf-8", errors="replace")
+
+    candidate_url = immutable_commit_web_url(
+        repository_reference,
+        candidate_sha,
+    )
+    compare_url = compare_commits_web_url(
+        repository_reference,
+        base_sha,
+        candidate_sha,
+    )
+
+    remote_available = candidate_url is not None and compare_url is not None
+
+    payload: dict[str, Any] = {
+        "authority": "immutable_candidate_commit",
+        "base_sha": base_sha,
+        "candidate_sha": candidate_sha,
+        "candidate_tree_sha": evidence.staged_tree_sha,
+        "candidate_url": candidate_url,
+        "compare_url": compare_url,
+        "remote_exploration": "ALLOWED" if remote_available else "UNAVAILABLE",
+        "full_diff_bytes": len(diff_bytes),
+        "full_diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
+        "inline_full_diff": False,
+    }
+
+    if not remote_available:
+        excerpt, truncated, full_bytes = bounded_semantic_diff(
+            evidence.diff,
+            _MAX_REVIEW_FALLBACK_DIFF_BYTES,
+        )
+        payload["inline_fallback"] = {
+            "truncated": truncated,
+            "full_diff_bytes": full_bytes,
+            "excerpt": excerpt,
+        }
+
+    return _json_text(payload)
+
+
+def _bounded_review_context(text: str) -> str:
+    data = text.encode("utf-8", errors="replace")
+    if len(data) <= _MAX_REVIEW_CONTEXT_BYTES:
+        return text
+
+    marker = (
+        "\n[... project context truncated for reviewer; "
+        "inspect the immutable candidate repository for source details ...]\n"
+    ).encode("utf-8")
+
+    head = data[: max(0, _MAX_REVIEW_CONTEXT_BYTES - len(marker))].decode(
+        "utf-8", errors="ignore"
+    )
+
+    return head + marker.decode("utf-8")
 
 
 def _deferred_contract_mismatches(
@@ -1035,7 +1170,8 @@ _PLANNER_ATTEMPT_ARTIFACTS = (
     "implementation_bundle.json", "planner.usage.json",
 )
 _REVIEW_ATTEMPT_ARTIFACTS = (
-    "reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json", "review.json",
+    "reviewer.request.txt", "reviewer.request.meta.json", "reviewer.raw.md",
+    "reviewer.usage.json", "review.json",
 )
 _CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "evidence.json")
 # The historical root aliases of the C01 evidence.  ``checks/C01`` is the
@@ -3358,8 +3494,8 @@ class Orchestrator:
                     repository_reference=repository_reference, evidence=evidence,
                     input=ReviewCycleInput(
                         iteration=1,
-                        plan_text=plan.raw,
-                        luna_reports=_step_reports_text(self._last_v2_step_results),
+                        plan_text=_review_plan_text(plan),
+                        luna_reports=_review_step_reports_text(self._last_v2_step_results),
                         deferred_mismatches=deferred_mismatches,
                         revision_report=revision_report_c01,
                         cycle_history="C01 is the initial implementation cycle.",
@@ -4056,8 +4192,14 @@ class Orchestrator:
         re-parsed instead of asking again; the call is always a fresh one.
         """
 
+        candidate_sha = candidate_commit.get("commit_sha")
+        if not _is_object_id(candidate_sha):
+            raise OrchestrationError(
+                "candidate commit SHA is missing before reviewer"
+            )
+
         if reuse_accepted:
-            accepted = _accepted_review(artifacts_dir, evidence, candidate_commit.get("commit_sha"))
+            accepted = _accepted_review(artifacts_dir, evidence, candidate_sha)
             if accepted is not None:
                 return accepted
         gate = _json_text({
@@ -4075,13 +4217,16 @@ class Orchestrator:
             "GIT_STATUS": status_porcelain(worktree),
         })
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        semantic_diff, diff_truncated, _full_diff_bytes = _semantic_diff_payload(
-            evidence.diff, self.config.max_diff_bytes
+        code_evidence = _review_code_evidence(
+            repository_reference=repository_reference,
+            base_sha=base_sha,
+            candidate_sha=candidate_sha,
+            evidence=evidence,
         )
         review = reviewer.review(
-            spec, input.plan_text, context, gate,
+            spec, input.plan_text, _bounded_review_context(context), gate,
             "\n".join(evidence.changed_files),
-            semantic_diff,
+            "",
             _json_text(_check_payload(evidence)),
             "NONE",
             deterministic_passed=evidence.deterministic_passed,
@@ -4094,6 +4239,7 @@ class Orchestrator:
             iteration=input.iteration,
             cycle_history=input.cycle_history,
             deferred_mismatches=input.deferred_mismatches,
+            code_evidence=code_evidence,
         )
         # planner_thread != reviewer_thread: a driver that reports the
         # planner's own conversation for a review breaks independence.
@@ -4879,6 +5025,7 @@ class Orchestrator:
                 "final_checks": _check_payload(evidence),
             },
         })
+        scope_delta_text = _json_text(scope_delta)
         store.update(status=RunStatus.REVIEWING, current_step=None)
         # Reviewer #2 checks original SPEC <-> original approved architecture
         # <-> bounded repair <-> final cumulative diff, with every report.
@@ -4890,16 +5037,18 @@ class Orchestrator:
                 repository_reference=repository_reference, evidence=evidence,
                 input=ReviewCycleInput(
                     iteration=2,
-                    plan_text=(
-                        f"ORIGINAL APPROVED PLAN\n{original_plan.raw}\n\n"
-                        f"REPAIR PLAN C02\n{repair_plan.raw}\n\n"
-                        f"SCOPE DELTA C02\n{_json_text(scope_delta)}"
+                    plan_text=_json_text(
+                        {
+                            "original_approved_plan": _review_plan_payload(original_plan),
+                            "repair_plan_c02": _review_plan_payload(repair_plan),
+                            "scope_delta": scope_delta_text,
+                        }
                     ),
                     luna_reports=(
                         "C01 LUNA REPORTS\n"
-                        f"{_step_reports_text(self._last_v2_step_results)}\n\n"
+                        f"{_review_step_reports_text(self._last_v2_step_results)}\n\n"
                         "C02 LUNA REPAIR REPORTS\n"
-                        f"{_step_reports_text(self._repair_v2_step_results)}"
+                        f"{_review_step_reports_text(self._repair_v2_step_results)}"
                     ),
                     revision_report=(
                         "C01 CLAUDE REVISION\n"
@@ -4908,7 +5057,7 @@ class Orchestrator:
                         f"{revision_report_c02 or 'NONE'}"
                     ),
                     cycle_history=cycle_history,
-                    scope_delta=_json_text(scope_delta),
+                    scope_delta=scope_delta_text,
                     deferred_mismatches=(
                         "C01 DEFERRED CONTRACT MISMATCHES\n"
                         f"{_deferred_contract_mismatches(original_plan, self._last_v2_step_results)}\n"

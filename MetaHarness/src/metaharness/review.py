@@ -7,6 +7,7 @@ validates that document before it can influence the run state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -84,7 +85,7 @@ def _replace_placeholders(template: str, values: dict[str, str]) -> str:
     """Replace known placeholders once, preserving placeholders in evidence."""
 
     return re.sub(
-        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|DIFF|CHECKS|AGENT_REPORT|REPOSITORY|LUNA_REPORTS|REVISION_REPORT|REPOSITORY_STATE|CANDIDATE_COMMIT|ITERATION|CYCLE_HISTORY)\}\}",
+        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|CODE_EVIDENCE|DIFF|CHECKS|AGENT_REPORT|REPOSITORY|LUNA_REPORTS|REVISION_REPORT|REPOSITORY_STATE|CANDIDATE_COMMIT|ITERATION|CYCLE_HISTORY|DEFERRED_CONTRACT_MISMATCHES)\}\}",
         lambda match: values[match.group(0)],
         template,
     )
@@ -114,6 +115,7 @@ def build_reviewer_prompt(
     iteration: int = 1,
     cycle_history: str = "",
     deferred_mismatches: str = "",
+    code_evidence: str | None = None,
     template: str | None = None,
 ) -> str:
     """Build the reviewer's single user message.
@@ -123,12 +125,18 @@ def build_reviewer_prompt(
     prompt section.
     """
 
+    effective_code_evidence = (
+        _require_text("code_evidence", code_evidence)
+        if code_evidence is not None
+        else _require_text("diff", diff)
+    )
     values = {
         "{{SPEC}}": _require_text("spec", spec),
         "{{PLAN}}": _require_text("plan", plan),
         "{{CONTEXT}}": _require_text("context", context),
         "{{GATE}}": _require_text("gate", gate),
         "{{CHANGED_FILES}}": _require_text("changed_files", changed_files),
+        "{{CODE_EVIDENCE}}": effective_code_evidence,
         "{{DIFF}}": _require_text("diff", diff),
         "{{CHECKS}}": _require_text("checks", checks),
         "{{AGENT_REPORT}}": _require_text("agent_report", agent_report),
@@ -146,7 +154,19 @@ def build_reviewer_prompt(
     if template is None:
         template = _prompt_template_path().read_text(encoding="utf-8")
     template = _require_text("template", template)
-    return _replace_placeholders(template, values)
+    expected_placeholders = set(re.findall(r"\{\{[A-Z0-9_]+\}\}", template))
+    missing = expected_placeholders.difference(values)
+    if missing:
+        raise ReviewError(
+            "reviewer template contains unresolved placeholders: "
+            + ", ".join(sorted(missing))
+        )
+    rendered = _replace_placeholders(template, values)
+    if code_evidence is None and agent_report not in {"", "NONE"}:
+        # Keep historical standalone callers' report data available without
+        # restoring the removed default V2 template section.
+        rendered += "\n\n[LEGACY AGENT REPORT DATA]\n" + values["{{AGENT_REPORT}}"]
+    return rendered
 
 
 def _normalise_scalar(value: str) -> str:
@@ -498,6 +518,7 @@ class Reviewer:
         iteration: int = 1,
         cycle_history: str = "",
         deferred_mismatches: str = "",
+        code_evidence: str | None = None,
     ) -> ReviewResult:
         request = build_reviewer_prompt(
             spec,
@@ -516,13 +537,29 @@ class Reviewer:
             iteration=iteration,
             cycle_history=cycle_history,
             deferred_mismatches=deferred_mismatches,
+            code_evidence=code_evidence,
             template=self.template,
         )
         target = Path(artifacts_dir) if artifacts_dir is not None else None
+        encoded_request = request.encode("utf-8")
         # Persist the exchange before parsing: an unparseable or rejected
         # review must remain inspectable.
         if target is not None:
             _atomic_write_text(target / "reviewer.request.txt", request)
+            _atomic_write_text(
+                target / "reviewer.request.meta.json",
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "bytes": len(encoded_request),
+                        "sha256": hashlib.sha256(encoded_request).hexdigest(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+            )
         # Always a fresh completion: a reviewer never continues a planner
         # conversation, so it cannot judge its own planning.
         first_result = self.client.complete(request)
@@ -584,6 +621,8 @@ def run_reviewer(
     candidate_commit: str = "",
     iteration: int = 1,
     cycle_history: str = "",
+    deferred_mismatches: str = "",
+    code_evidence: str | None = None,
 ) -> ReviewResult:
     """Functional convenience wrapper around :class:`Reviewer`."""
 
@@ -601,10 +640,12 @@ def run_reviewer(
         repository=repository,
         luna_reports=luna_reports,
         revision_report=revision_report,
-            repository_state=repository_state,
-            candidate_commit=candidate_commit,
+        repository_state=repository_state,
+        candidate_commit=candidate_commit,
         iteration=iteration,
         cycle_history=cycle_history,
+        deferred_mismatches=deferred_mismatches,
+        code_evidence=code_evidence,
     )
 
 
