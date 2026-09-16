@@ -26,6 +26,7 @@ from metaharness.execution_selection import (  # noqa: E402
     resolve_execution_selection_v4,
     validate_execution_selection_v4,
 )
+from metaharness.models import ExecutionSelectionV3, StepExecutionSelection  # noqa: E402
 from metaharness.step_ids import MAX_STEPS  # noqa: E402
 from tests.test_p28_full_pipeline import P28Harness  # noqa: E402
 
@@ -115,6 +116,25 @@ class ExecutionSelectionCapacityTests(P28Harness):
                 with self.subTest(schema=schema, case=name):
                     with self.assertRaises(ExecutionSelectionError):
                         parse(json.dumps(payload).encode())
+
+    def test_manual_malformed_v3_selections_are_rejected_before_publication(self) -> None:
+        valid = self.v3(_steps(8))
+        implementer = valid.steps[0].implementer
+        cases = {
+            "gap": (valid.steps[0], valid.steps[2]),
+            "S02 only": (StepExecutionSelection("S02", implementer),),
+            "S09": (StepExecutionSelection("S09", implementer),),
+            "more than MAX_STEPS": valid.steps + (StepExecutionSelection("S09", implementer),),
+        }
+        for name, steps in cases.items():
+            with self.subTest(case=name):
+                run_dir = self.root / f"run-manual-v3-{name.replace(' ', '-')}"
+                malformed = ExecutionSelectionV3(
+                    valid.schema_version, valid.planner, steps, valid.reviewer, valid.reviser,
+                )
+                with self.assertRaises(ExecutionSelectionError):
+                    ensure_execution_selection_v3(run_dir, malformed)
+                self.assertFalse((run_dir / "execution_selection.json").exists())
 
 
 if __name__ == "__main__":

@@ -314,6 +314,8 @@ def _payload_v3(selection: ExecutionSelectionV3) -> dict[str, Any]:
         steps.append({"step_id": item.step_id, "implementer": implementer_fields})
     if not steps:
         raise ExecutionSelectionError("execution selection steps are missing")
+    if not _contiguous([item["step_id"] for item in steps]):
+        raise ExecutionSelectionError("execution selection step IDs are not contiguous")
     for name, profile in (("planner", selection.planner), ("reviewer", selection.reviewer)):
         if profile.config_sha256 is None or _SHA256.fullmatch(profile.config_sha256) is None:
             raise ExecutionSelectionError(f"execution selection {name}.config_sha256 is invalid")

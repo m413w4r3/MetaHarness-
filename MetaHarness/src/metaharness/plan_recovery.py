@@ -32,8 +32,17 @@ from .step_ids import is_step_id
 PLAN_RECOVERY_ARTIFACT = "planner_recovery.json"
 PLAN_RECOVERY_SCHEMA_VERSION = 1
 MAX_REPLACEMENT_PLAN_BYTES = 128 * 1024
-# Failures whose PLANNER checkpoint proves that no plan was ever published.
-RECOVERABLE_PLANNER_FAILURES = frozenset({"PLANNER_OUTPUT_INVALID", "LLM_FAILURE"})
+# State/failure pairs whose PLANNER checkpoint proves that no executable plan
+# crossed the approval boundary.  The pair is authoritative: a
+# ``PLANNER_BLOCKED`` failure in any other state is not recoverable here.
+RECOVERABLE_PLANNER_STATE_PAIRS = frozenset({
+    ("failed", "PLANNER_OUTPUT_INVALID"),
+    ("failed", "LLM_FAILURE"),
+    ("blocked", "PLANNER_BLOCKED"),
+})
+RECOVERABLE_PLANNER_FAILURES = frozenset(
+    reason for _status, reason in RECOVERABLE_PLANNER_STATE_PAIRS
+)
 PLAN_SOURCE_OPERATOR = "operator_recovery"
 PLAN_SOURCE_PLANNER = "planner_model"
 _MAX_RECORD_BYTES = 16 * 1024
@@ -89,10 +98,8 @@ def plan_recovery_info(run_dir: str | Path, state: Mapping[str, Any]) -> PlanRec
     directory = Path(run_dir)
     if state.get("planning_protocol") != "v2":
         return PlanRecoveryInfo(False, "only META PLAN v2 runs can recover a plan")
-    if state.get("status") != "failed":
-        return PlanRecoveryInfo(False, "run has not failed")
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-    if failure.get("reason") not in RECOVERABLE_PLANNER_FAILURES:
+    if (state.get("status"), failure.get("reason")) not in RECOVERABLE_PLANNER_STATE_PAIRS:
         return PlanRecoveryInfo(False, "failure is not a recoverable planner failure")
     try:
         record = read_checkpoint_record(directory)
@@ -107,6 +114,14 @@ def plan_recovery_info(run_dir: str | Path, state: Mapping[str, Any]) -> PlanRec
     if _step_directory_has_execution(directory):
         return PlanRecoveryInfo(False, "run already has step execution artifacts")
     return PlanRecoveryInfo(True)
+
+
+def recoverable_plan_source_status(state: Mapping[str, Any]) -> str | None:
+    """Return the exact source status for a recoverable planner failure."""
+
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    pair = (state.get("status"), failure.get("reason"))
+    return pair[0] if pair in RECOVERABLE_PLANNER_STATE_PAIRS else None
 
 
 def validate_replacement_text(value: object) -> str:
@@ -184,8 +199,10 @@ __all__ = [
     "PlanRecoveryError",
     "PlanRecoveryInfo",
     "RECOVERABLE_PLANNER_FAILURES",
+    "RECOVERABLE_PLANNER_STATE_PAIRS",
     "plan_recovery_info",
     "plan_source",
+    "recoverable_plan_source_status",
     "read_plan_recovery_record",
     "validate_replacement_text",
     "write_plan_recovery_record",

@@ -860,6 +860,7 @@ _FAILURE_MESSAGES = {
     "REVIEWER_TRANSPORT_FAILURE": "Reviewer could not be reached",
     "REVIEWER_OUTPUT_INVALID": "Reviewer answer is invalid",
     "LLM_FAILURE": "Model call failed",
+    "PLANNER_BLOCKED": "Planner could not safely produce a plan",
     "PUSH_FAILED": "Publication push failed",
     "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
@@ -940,10 +941,11 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = str(state.get("status", run.get("status", "")) or "")
     failure = run.get("failure", state.get("failure"))
-    if status not in {"failed", "interrupted"} or not isinstance(failure, dict):
+    if status not in {"failed", "blocked", "interrupted"} or not isinstance(failure, dict):
         return ""
     reason = str(failure.get("reason") or "")
     resume = overview.get("resume") if isinstance(overview.get("resume"), dict) else {}
+    recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
     note = (
         "Reviewer requested one bounded implementation correction loop."
         if reason == "REVIEW_REVISE" else
@@ -967,9 +969,8 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
             if token else f'<p><strong>{label}</strong></p>'
         )
         action = f'<p class="label">NEXT ACTION</p>{checkpoint_detail}{button}'
-    elif resume.get("reason"):
+    elif resume.get("reason") and not (status == "blocked" and recovery.get("eligible")):
         action = f'<p class="danger small">RESUME REFUSED: {_e(resume.get("reason"))}</p>'
-    recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
     if recovery.get("eligible") and token:
         # The only operator input is the raw replacement plan; SPEC, context,
         # BASE, run options and catalogues are the run's own.
@@ -985,10 +986,10 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
         )
     detail = failure.get("detail")
     return (
-        '<div class="card fail failure-card"><p class="label">FAILED</p>'
+        f'<div class="card fail failure-card"><p class="label">{_e(status.upper())}</p>'
         f'<p class="failure-title"><strong>{_e(_FAILURE_MESSAGES.get(reason, reason or "Run failed"))}</strong></p>'
         f'{action}'
-        f'<p class="danger small"><strong>FAILED: {_e(reason)}</strong>'
+        f'<p class="danger small"><strong>{_e(status.upper())}: {_e(reason)}</strong>'
         f'{"<br>" + _e(note) if note else ""}{"<br>" + _e(detail) if detail is not None else ""}</p></div>'
     )
 

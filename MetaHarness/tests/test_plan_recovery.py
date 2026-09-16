@@ -116,10 +116,27 @@ class PlanRecoveryHarness(P29Harness):
         self.assertEqual(len(planner.prompts), 1)
         return config, failed
 
+    def blocked_planner_run(self, run_id: str):
+        config = self.make_config()
+        planner = QueueClient("planner", [BLOCKED_PLAN], self.events)
+        blocked = Orchestrator(
+            config, planner_client=planner,
+            reviewer_client=QueueClient("reviewer", [], self.events),
+            agent=FakeLuna({}), reviser=FakeClaude(log=self.events),
+        ).run_text(SPEC, run_id=run_id)
+        self.assertEqual(blocked.status, RunStatus.BLOCKED)
+        self.assertEqual(blocked.state["status"], RunStatus.BLOCKED.value)
+        self.assertEqual(blocked.state["failure"]["reason"], "PLANNER_BLOCKED")
+        self.assertEqual(read_checkpoint(blocked.run_dir).phase, ResumePhase.PLANNER)
+        self.assertEqual(len(planner.prompts), 1)
+        return config, blocked
+
     def state(self, run_id: str) -> dict[str, Any]:
         return RunStateStore(self.runs / run_id / "state.json").load()
 
-    def wait_for_approval_gate(self, run_id: str, thread: threading.Thread) -> None:
+    def wait_for_approval_gate(
+        self, run_id: str, thread: threading.Thread, *, expected_step_count: int | None = None,
+    ) -> None:
         """Wait for the settled approval gate, not the transient resume claim.
 
         A PLAN_APPROVAL resume claims the run as ``awaiting_plan_approval``,
@@ -131,7 +148,14 @@ class PlanRecoveryHarness(P29Harness):
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             state = self.state(run_id)
-            if state["status"] == "awaiting_plan_approval" and state.get("cycles"):
+            cycles = state.get("cycles") if isinstance(state.get("cycles"), list) else []
+            cycle = cycles[0] if cycles and isinstance(cycles[0], dict) else {}
+            steps = cycle.get("steps_summary") if isinstance(cycle.get("steps_summary"), list) else []
+            if (
+                state["status"] == "awaiting_plan_approval"
+                and state.get("cycles")
+                and (expected_step_count is None or len(steps) == expected_step_count)
+            ):
                 return
             if not thread.is_alive():
                 self.fail(f"run {run_id} stopped before the approval gate: {state.get('failure')}")
@@ -243,6 +267,122 @@ class PlanRecoveryHarness(P29Harness):
 
 
 class PlanRecoveryTests(PlanRecoveryHarness):
+    def test_aw002_blocked_planner_recovers_with_seven_step_plan_without_planner(self) -> None:
+        config, blocked = self.blocked_planner_run("aw-002-blocked-seven")
+        run_dir = blocked.run_dir
+        blocked_raw = (run_dir / "planner.raw.md").read_bytes()
+        self.assertTrue(plan_recovery_info(run_dir, blocked.state).eligible)
+        page = render_run(get_run(self.runs, "aw-002-blocked-seven", config=config), "tok", config=config)
+        self.assertIn("REPLACE PLAN", page)
+        self.assertNotIn("Retry planner", page)
+
+        replacement = recovery_plan(7)
+        planner = QueueClient("planner", [], self.events)
+        luna = FakeLuna(luna_behaviors(7))
+        thread, holder = self.recover_in_thread(
+            config, "aw-002-blocked-seven", replacement, planner=planner, luna=luna, reviews=[PASS],
+        )
+        self.wait_for_approval_gate("aw-002-blocked-seven", thread, expected_step_count=7)
+        self.assertNotIn("error", holder)
+        self.assert_recovered_awaiting_approval(
+            config, "aw-002-blocked-seven", count=7, replacement=replacement,
+            invalid_raw=blocked_raw, planner=planner, luna=luna,
+        )
+        self.assertEqual(self.state("aw-002-blocked-seven")["status"], RunStatus.AWAITING_PLAN_APPROVAL.value)
+        self.approve(config, "aw-002-blocked-seven", 7)
+        thread.join(timeout=120)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(holder["result"].status, RunStatus.PUBLISHED, holder["result"].state.get("failure"))
+        self.assertEqual([call["step"] for call in luna.calls], _ids(7))
+        self.assertEqual(planner.prompts, [])
+
+    def test_aw002_blocked_planner_recovers_with_eight_step_plan(self) -> None:
+        config, blocked = self.blocked_planner_run("aw-002-blocked-eight")
+        blocked_raw = (blocked.run_dir / "planner.raw.md").read_bytes()
+        replacement = recovery_plan(8)
+        planner = QueueClient("planner", [], self.events)
+        luna = FakeLuna(luna_behaviors(8))
+        thread, holder = self.recover_in_thread(
+            config, "aw-002-blocked-eight", replacement, planner=planner, luna=luna, reviews=[PASS],
+        )
+        self.wait_for_approval_gate("aw-002-blocked-eight", thread, expected_step_count=8)
+        self.assertNotIn("error", holder)
+        self.assert_recovered_awaiting_approval(
+            config, "aw-002-blocked-eight", count=8, replacement=replacement,
+            invalid_raw=blocked_raw, planner=planner, luna=luna,
+        )
+        self.approve(config, "aw-002-blocked-eight", 8)
+        thread.join(timeout=120)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(holder["result"].status, RunStatus.PUBLISHED, holder["result"].state.get("failure"))
+        self.assertEqual([call["step"] for call in luna.calls], _ids(8))
+        self.assertEqual(planner.prompts, [])
+
+    def test_blocked_without_planner_checkpoint_cannot_recover(self) -> None:
+        config, blocked = self.blocked_planner_run("aw-002-blocked-no-checkpoint")
+        run_dir = blocked.run_dir
+        before = (run_dir / "state.json").read_bytes()
+        (run_dir / "resume_checkpoint.json").unlink()
+        self.assertFalse(plan_recovery_info(run_dir, self.state("aw-002-blocked-no-checkpoint")).eligible)
+        with self.assertRaises(PlanRecoveryError):
+            Orchestrator(config, planner_client=QueueClient("planner", [], self.events)).recover_plan(
+                "aw-002-blocked-no-checkpoint", recovery_plan(7)
+            )
+        self.assertEqual((run_dir / "state.json").read_bytes(), before)
+
+    def test_blocked_with_approval_worktree_or_execution_artifact_cannot_recover(self) -> None:
+        cases = {
+            "approval": "plan_approval.json",
+            "execution": "execution_selection.json",
+            "reviewer": "review.json",
+        }
+        for suffix, artifact in cases.items():
+            with self.subTest(case=suffix):
+                config, blocked = self.blocked_planner_run(f"aw-002-blocked-{suffix}")
+                run_dir = blocked.run_dir
+                write(run_dir / artifact, "{}\n")
+                try:
+                    self.assertFalse(plan_recovery_info(run_dir, self.state(f"aw-002-blocked-{suffix}")).eligible)
+                    with self.assertRaises(PlanRecoveryError):
+                        Orchestrator(config, planner_client=QueueClient("planner", [], self.events)).recover_plan(
+                            f"aw-002-blocked-{suffix}", recovery_plan(7)
+                        )
+                    self.assertEqual(self.state(f"aw-002-blocked-{suffix}")["status"], RunStatus.BLOCKED.value)
+                    self.assertTrue((run_dir / artifact).is_file())
+                finally:
+                    (run_dir / artifact).unlink()
+
+        config, blocked = self.blocked_planner_run("aw-002-blocked-worktree")
+        worktree = self.root / "worktrees" / "aw-002-blocked-worktree"
+        worktree.mkdir(parents=True)
+        try:
+            with self.assertRaises(PlanRecoveryError):
+                Orchestrator(config, planner_client=QueueClient("planner", [], self.events)).recover_plan(
+                    "aw-002-blocked-worktree", recovery_plan(7)
+                )
+            self.assertEqual(self.state("aw-002-blocked-worktree")["status"], RunStatus.BLOCKED.value)
+        finally:
+            worktree.rmdir()
+
+    def test_invalid_blocked_replacement_leaves_state_and_artifacts_intact(self) -> None:
+        config, blocked = self.blocked_planner_run("aw-002-blocked-invalid")
+        run_dir = blocked.run_dir
+
+        def snapshot() -> dict[str, bytes]:
+            return {
+                path.relative_to(run_dir).as_posix(): path.read_bytes()
+                for path in sorted(run_dir.rglob("*")) if path.is_file()
+            }
+
+        before = snapshot()
+        with self.assertRaises(PlanRecoveryError):
+            Orchestrator(config, planner_client=QueueClient("planner", [], self.events)).recover_plan(
+                "aw-002-blocked-invalid", BLOCKED_PLAN
+            )
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(self.state("aw-002-blocked-invalid")["status"], RunStatus.BLOCKED.value)
+        self.assertEqual(read_checkpoint(run_dir).phase, ResumePhase.PLANNER)
+
     def test_aw002_failed_planner_recovers_with_seven_step_plan_without_planner(self) -> None:
         config, failed = self.failed_planner_run("aw-002")
         run_dir = failed.run_dir

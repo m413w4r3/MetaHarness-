@@ -156,6 +156,7 @@ from .plan_recovery import (
     PlanRecoveryError,
     plan_recovery_info,
     plan_source,
+    recoverable_plan_source_status,
     validate_replacement_text,
     write_plan_recovery_record,
 )
@@ -4625,8 +4626,11 @@ class Orchestrator:
             refuse(f"replacement plan is invalid: {exc}")
 
         replacement_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        source_status = recoverable_plan_source_status(state)
+        if source_status is None:
+            refuse("run is not in an exact recoverable planner state")
         claimed = store.transition_if(
-            RunStatus.FAILED, state.get("updated_at"), status=RunStatus.FAILED,
+            source_status, state.get("updated_at"), status=RunStatus.FAILED,
             plan_recovery={"status": "persisting", "replacement_raw_sha256": replacement_sha},
         )
         if claimed is None:
