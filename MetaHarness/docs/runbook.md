@@ -155,8 +155,11 @@ claude --print --verbose --output-format stream-json --model <model>
 `20260914T124017Z-7b74467062`). `doctor` requires `--print`, `--verbose`,
 `--output-format`, `--safe-mode`, `--restricted`, `--tools`,
 `--no-session-persistence`, `--no-chrome`, `--disable-slash-commands`,
-`--max-turns`, `--model`, `--effort`, `--permission-mode`, `--settings`,
+`--model`, `--effort`, `--permission-mode`, `--settings`,
 `--mcp-config` and `--strict-mcp-config` in `claude --help`.
+
+Claude revision lifetime is bounded by the selected profile timeout, not by
+a model turn count.
 
 `--safe-mode` is intentional for subscription authentication: unlike
 `--bare`, it keeps OAuth credentials available from the managed

@@ -7,14 +7,14 @@ import os
 import signal
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from ..gitops import GitError, current_head
 from ..models import ModelProfile, ProfileDriver
 from ..procutil import run_bounded
 from ..usage import normalize_usage
 from ..agent.base import AgentError
-from ..agent.events import extract_final, extract_usage, parse_event
+from ..agent.events import extract_final, extract_terminal_result, extract_usage, parse_event
 
 
 class ClaudeAgentError(AgentError):
@@ -37,12 +37,18 @@ class ClaudeResult:
     final_message: str
     usage: dict[str, int]
     stderr_tail: str
+    terminal_type: str | None = None
+    terminal_subtype: str | None = None
+    terminal_is_error: bool | None = None
+    terminal_num_turns: int | None = None
+    terminal_stop_reason: str | None = None
+    terminal_errors: tuple[str, ...] = ()
 
 
 _DEFAULT_TAIL_BYTES = 16 * 1024
 _MAX_EVENT_LINE_BYTES = 8 * 1024 * 1024
 _REVISION_TOOLS = "Read,Edit,Write,Grep,Glob"
-# Revision lifetime is bounded by profile.timeout_seconds through run_bounded,k
+# Revision lifetime is bounded by profile.timeout_seconds through run_bounded,
 # not by an arbitrary Claude turn count.
 # Only these names are inherited; HOME, TMPDIR and XDG_CACHE_HOME are forced
 # below the managed Claude home and never taken from the parent process.
@@ -116,11 +122,12 @@ def _tail(path: Path, limit: int) -> str:
         return stream.read(limit).decode("utf-8", errors="replace")
 
 
-def _scan_events(path: Path) -> tuple[dict[str, int], str | None]:
+def _scan_events(path: Path) -> tuple[dict[str, int], str | None, dict[str, Any] | None]:
     usage: dict[str, int] = {}
     final: str | None = None
+    terminal: dict[str, Any] | None = None
     if not path.exists():
-        return usage, final
+        return usage, final, terminal
     with path.open("rb") as stream:
         skipping = False
         while True:
@@ -140,7 +147,10 @@ def _scan_events(path: Path) -> tuple[dict[str, int], str | None]:
             found_final = extract_final(event)
             if found_final is not None:
                 final = found_final
-    return usage, final
+            found_terminal = extract_terminal_result(event)
+            if found_terminal is not None:
+                terminal = found_terminal
+    return usage, final, terminal
 
 
 class ClaudeCodeAgent:
@@ -255,7 +265,7 @@ class ClaudeCodeAgent:
             raise ClaudeAgentError(f"cannot establish worktree HEAD: {exc}") from exc
         if actual_head != expected_head:
             raise ClaudeCommittedError(expected_head, actual_head)
-        usage, event_final = _scan_events(events_path)
+        usage, event_final, terminal = _scan_events(events_path)
         if final_path.exists():
             final_message = final_path.read_text(encoding="utf-8", errors="replace")
         else:
@@ -267,6 +277,12 @@ class ClaudeCodeAgent:
             final_message=final_message,
             usage=usage,
             stderr_tail=_tail(stderr_path, self.stderr_tail_bytes),
+            terminal_type=terminal["type"] if terminal is not None else None,
+            terminal_subtype=terminal["subtype"] if terminal is not None else None,
+            terminal_is_error=terminal["is_error"] if terminal is not None else None,
+            terminal_num_turns=terminal["num_turns"] if terminal is not None else None,
+            terminal_stop_reason=terminal["stop_reason"] if terminal is not None else None,
+            terminal_errors=terminal["errors"] if terminal is not None else (),
         )
         result_path.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return result

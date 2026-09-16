@@ -11,6 +11,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -187,9 +188,92 @@ class ClaudeTests(unittest.TestCase):
              "--permission-mode", "acceptEdits", "--settings", str(home / "settings.json"),
              "--strict-mcp-config", "--mcp-config", str(home / "empty-mcp.json")],
         )
+        self.assertNotIn("--max-turns", recorded["argv"])
+        for option in ("--model", "--effort", "--permission-mode", "--restricted", "--safe-mode"):
+            self.assertIn(option, recorded["argv"])
+        self.assertIn("--tools", recorded["argv"])
+        self.assertEqual(
+            recorded["argv"][recorded["argv"].index("--tools") + 1],
+            "Read,Edit,Write,Grep,Glob",
+        )
         self.assertEqual(result.final_message, "revised")
         self.assertEqual(result.usage["cached_input_tokens"], 2)
         self.assertTrue((self.root / "run/revision/agent.events.jsonl").exists())
+
+    def test_terminal_error_max_turns_is_persisted(self) -> None:
+        executable = self._executable(
+            "claude-terminal-error",
+            """
+            import json
+            print(json.dumps({
+                "type": "result",
+                "subtype": "error_max_turns",
+                "is_error": True,
+                "num_turns": 13,
+                "stop_reason": "max_turns",
+                "errors": ["turn limit reached", 17],
+                "unknown": "not persisted",
+            }))
+            """,
+        )
+        profile = ModelProfile(
+            id="claude",
+            display_name="Claude",
+            roles=(ExecutionRole.REVISER,),
+            driver=ProfileDriver.CLAUDE_CODE,
+            model="opus",
+            selection_mode=SelectionMode.CLI,
+            effort="medium",
+            permission_mode="acceptEdits",
+            timeout_seconds=5,
+            retries=0,
+        )
+        home = prepare_claude_home(self._config())
+
+        result = ClaudeCodeAgent(executable=str(executable)).run_revision(
+            "inspect this", self.repo, artifacts_dir=self.root / "terminal-error-run",
+            profile=profile,
+            environment=build_claude_environment({"PATH": "/usr/bin"}, claude_home=home),
+        )
+
+        persisted = json.loads(
+            (self.root / "terminal-error-run/revision/agent.result.json").read_text()
+        )
+        self.assertEqual(result.terminal_type, "result")
+        self.assertEqual(result.terminal_subtype, "error_max_turns")
+        self.assertTrue(result.terminal_is_error)
+        self.assertEqual(result.terminal_num_turns, 13)
+        self.assertEqual(result.terminal_stop_reason, "max_turns")
+        self.assertEqual(result.terminal_errors, ("turn limit reached",))
+        self.assertEqual(persisted["terminal_subtype"], "error_max_turns")
+        self.assertEqual(persisted["terminal_num_turns"], 13)
+        self.assertEqual(persisted["terminal_errors"], ["turn limit reached"])
+        self.assertNotIn("unknown", persisted)
+
+    def test_profile_timeout_is_passed_to_run_bounded(self) -> None:
+        profile = ModelProfile(
+            id="claude",
+            display_name="Claude",
+            roles=(ExecutionRole.REVISER,),
+            driver=ProfileDriver.CLAUDE_CODE,
+            model="opus",
+            selection_mode=SelectionMode.CLI,
+            effort="medium",
+            permission_mode="acceptEdits",
+            timeout_seconds=37,
+            retries=0,
+        )
+        home = prepare_claude_home(self._config())
+        environment = build_claude_environment({"PATH": "/usr/bin"}, claude_home=home)
+
+        with patch("metaharness.claude.agent.run_bounded", return_value=(9, False)) as bounded:
+            result = ClaudeCodeAgent().run_revision(
+                "inspect this", self.repo, artifacts_dir=self.root / "timeout-run",
+                profile=profile, environment=environment,
+            )
+
+        self.assertEqual(result.exit_code, 9)
+        self.assertEqual(bounded.call_args.kwargs["timeout_seconds"], 37)
 
     def test_subscription_auth_uses_safe_mode_without_copying_credentials(self) -> None:
         capture = self.root / "subscription-capture.json"

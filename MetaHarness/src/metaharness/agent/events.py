@@ -7,6 +7,11 @@ from collections.abc import Iterable, Iterator
 from typing import Any
 
 
+_MAX_TERMINAL_FIELD_CHARS = 256
+_MAX_TERMINAL_ERRORS = 32
+_MAX_TERMINAL_ERROR_CHARS = 4096
+
+
 def parse_event(line: str) -> dict[str, Any] | None:
     """Parse une ligne JSONL; les lignes non JSON ou non-object sont ignorées."""
 
@@ -82,6 +87,43 @@ def extract_usage(event: dict[str, Any]) -> dict[str, int] | None:
             if usage is not None:
                 return usage
     return None
+
+
+def _bounded_string(value: Any, limit: int = _MAX_TERMINAL_FIELD_CHARS) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value[:limit]
+
+
+def _terminal_errors(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(
+        error[:_MAX_TERMINAL_ERROR_CHARS]
+        for error in value[:_MAX_TERMINAL_ERRORS]
+        if isinstance(error, str)
+    )
+
+
+def extract_terminal_result(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract bounded metadata from a Claude terminal ``result`` event.
+
+    Claude emits many event types during a revision.  Only the top-level
+    ``result`` event represents the terminal outcome; malformed fields are
+    ignored without making event scanning fail.
+    """
+
+    if not isinstance(event, dict) or event.get("type") != "result":
+        return None
+    num_turns = event.get("num_turns")
+    return {
+        "type": _bounded_string(event.get("type")),
+        "subtype": _bounded_string(event.get("subtype")),
+        "is_error": event.get("is_error") if isinstance(event.get("is_error"), bool) else None,
+        "num_turns": num_turns if isinstance(num_turns, int) and not isinstance(num_turns, bool) else None,
+        "stop_reason": _bounded_string(event.get("stop_reason")),
+        "errors": _terminal_errors(event.get("errors")),
+    }
 
 
 def _text(value: Any) -> str | None:
@@ -225,6 +267,7 @@ def summarize_step_event(event: dict[str, Any]) -> str | None:
 
 __all__ = [
     "extract_final",
+    "extract_terminal_result",
     "extract_usage",
     "iter_events",
     "parse_event",
