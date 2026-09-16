@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import unittest
 from unittest import mock
 from pathlib import Path
 
 from metaharness.config import load_config
-from metaharness.approval import PlanIdentity
+from metaharness.approval import PlanIdentity, write_scope_approval
+from metaharness.models import RunStatus
 from metaharness.orchestrator import Orchestrator
+from metaharness.run_options import RunOptions
 import metaharness.orchestrator as orchestrator_module
 from metaharness.resume import (
     ResumeCheckpoint,
@@ -22,10 +25,61 @@ from metaharness.resume import (
 )
 from metaharness.state import RunStateStore
 
-from tests.test_p29 import FakeClaude, FakeLuna, P29Harness, PASS, QueueClient, SINGLE_PLAN, SPEC, writer
+from tests.test_p29 import (
+    FakeClaude, FakeLuna, P29Harness, PASS, QueueClient, REVISE_IMPLEMENTATION,
+    SINGLE_PLAN, SPEC, plan_text, step_block, write, writer,
+)
 
 
 class P31ResumeTests(P29Harness):
+    def test_auto_bounded_scope_waiting_restarts_without_replanning(self) -> None:
+        config = self.make_config()
+        paths = tuple(f"repair/restart-{number:02d}.txt" for number in range(1, 8))
+        repair_plan = plan_text(
+            step_block(1, create=paths, operation="Expand repair scope"),
+            title="Restarted oversized repair scope",
+        )
+        options = RunOptions.from_config(
+            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=6,
+        )
+
+        def repair(root: Path) -> None:
+            write(root / "src/a.py", "A = 4\n")
+            for number in range(1, 8):
+                write(root / f"repair/restart-{number:02d}.txt", f"repair {number}\n")
+
+        planner = QueueClient("planner", [SINGLE_PLAN, repair_plan], self.events)
+        reviewer = QueueClient("reviewer", [REVISE_IMPLEMENTATION, PASS], self.events)
+        first = Orchestrator(
+            config, planner_client=planner, reviewer_client=reviewer,
+            agent=FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"), (2, "S01"): repair}),
+            reviser=FakeClaude(log=self.events),
+        )
+        waiting = self.run_approved(config, first, "scope-restart", run_options=options)
+        self.assertEqual(waiting.status, RunStatus.WAITING_SCOPE_APPROVAL)
+        delta_path = waiting.run_dir / "repair/C02/scope_delta.json"
+        before = delta_path.read_bytes()
+        delta_sha = hashlib.sha256(before).hexdigest()
+        paused = read_checkpoint(waiting.run_dir)
+        self.assertEqual(paused.phase, ResumePhase.SCOPE_APPROVAL)
+        write_scope_approval(
+            waiting.run_dir / "repair/C02", decision="APPROVE",
+            scope_delta_sha256=delta_sha, source="test",
+        )
+
+        fresh_config = load_config(self.config_path())
+        fresh_planner = QueueClient("planner", [], self.events)
+        fresh_luna = FakeLuna({(2, "S01"): repair})
+        resumed = Orchestrator(
+            fresh_config, planner_client=fresh_planner,
+            reviewer_client=QueueClient("reviewer", [PASS], self.events),
+            agent=fresh_luna, reviser=FakeClaude(log=self.events),
+        ).resume("scope-restart")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(fresh_planner.prompts, [])
+        self.assertEqual([(call["cycle"], call["step"]) for call in fresh_luna.calls], [(2, "S01")])
+        self.assertEqual(delta_path.read_bytes(), before)
+
     def test_pre_approval_checkpoint_does_not_require_approval_or_worktree(self) -> None:
         run_dir = self.runs / "pre-approval"
         run_dir.mkdir(parents=True)

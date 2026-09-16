@@ -8,6 +8,7 @@ Planner, Luna, Claude and reviewers are in-process fakes: no network, no LLM.
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
 import os
 import re
@@ -30,7 +31,7 @@ from metaharness import cli  # noqa: E402
 from metaharness import orchestrator as orchestrator_module  # noqa: E402
 from metaharness.agent.base import AgentResult  # noqa: E402
 from metaharness.agent.diagnostics import token_diagnostics  # noqa: E402
-from metaharness.approval import PlanIdentity  # noqa: E402
+from metaharness.approval import PlanIdentity, write_scope_approval  # noqa: E402
 from metaharness.claude.agent import ClaudeCodeAgent, ClaudeResult, build_claude_environment  # noqa: E402
 from metaharness.claude.runtime import prepare_claude_home  # noqa: E402
 from metaharness.config import ConfigError, load_config  # noqa: E402
@@ -47,6 +48,7 @@ from metaharness.models import (  # noqa: E402
     SelectionMode,
 )
 from metaharness.orchestrator import Orchestrator  # noqa: E402
+from metaharness.run_options import RunOptions  # noqa: E402
 from metaharness.planning_v2 import (  # noqa: E402
     MAX_STEPS,
     REQUIRE_STAGED_POLICY_TEXT,
@@ -69,7 +71,7 @@ from metaharness.resume import (  # noqa: E402
     write_checkpoint,
 )
 from metaharness.state import RunStateStore  # noqa: E402
-from metaharness.web.api import approve_run, get_run, live_status  # noqa: E402
+from metaharness.web.api import approve_repair_scope, approve_run, get_run, live_status  # noqa: E402
 from metaharness.web.pages import render_new_run, render_run  # noqa: E402
 from metaharness.web.server import create_server  # noqa: E402
 from tests.test_p28_full_pipeline import (  # noqa: E402
@@ -208,6 +210,90 @@ class P29Harness(P28Harness):
 
     def commits_on_run_branch(self, run_id: str) -> str:
         return git(self.worktree(run_id), "rev-list", "--count", f"{self.base_sha}..HEAD")
+
+
+class AutoBoundedScopeTests(P29Harness):
+    def repair_plan_with_added_paths(self, count: int) -> str:
+        paths = tuple(f"repair/new-{number:02d}.txt" for number in range(1, count + 1))
+        return plan_text(
+            step_block(1, create=paths, operation="Expand repair scope"),
+            title=f"Repair with {count} additional paths",
+        )
+
+    @staticmethod
+    def repair_writer(count: int) -> Callable[[Path], None]:
+        def apply(root: Path) -> None:
+            write(root / "src/a.py", "A = 4\n")
+            for number in range(1, count + 1):
+                write(root / f"repair/new-{number:02d}.txt", f"repair {number}\n")
+        return apply
+
+    def run_scope_case(self, count: int, run_id: str):
+        config = self.make_config()
+        options = RunOptions.from_config(
+            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=6,
+        )
+        luna = FakeLuna({
+            (1, "S01"): writer("src/a.py", "A = 2\n"),
+            (2, "S01"): self.repair_writer(count),
+        })
+        orchestrator, planner, reviewer, _luna, _claude = self.orchestrator(
+            config, plans=[SINGLE_PLAN, self.repair_plan_with_added_paths(count)],
+            reviews=[REVISE_IMPLEMENTATION, PASS], luna=luna,
+        )
+        result = self.run_approved(config, orchestrator, run_id, run_options=options)
+        return config, result, planner, reviewer, luna
+
+    def test_auto_bounded_six_added_paths_is_auto_approved(self) -> None:
+        _config, result, planner, _reviewer, luna = self.run_scope_case(6, "scope-six")
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(len(planner.prompts), 2)
+        self.assertEqual([(call["cycle"], call["step"]) for call in luna.calls], [(1, "S01"), (2, "S01")])
+        delta = json.loads((result.run_dir / "repair/C02/scope_delta.json").read_text())
+        self.assertEqual(len(delta["added_paths"]), 6)
+
+    def test_auto_bounded_seven_added_paths_waits_and_ui_shows_exact_delta(self) -> None:
+        config, waiting, planner, _reviewer, luna = self.run_scope_case(7, "scope-seven")
+        self.assertEqual(waiting.status, RunStatus.WAITING_SCOPE_APPROVAL)
+        self.assertEqual(len(planner.prompts), 2)
+        self.assertEqual([(call["cycle"], call["step"]) for call in luna.calls], [(1, "S01")])
+        delta = json.loads((waiting.run_dir / "repair/C02/scope_delta.json").read_text())
+        self.assertEqual(len(delta["added_paths"]), 7)
+        page = render_run(get_run(self.runs, "scope-seven", config=config), "tok", config=config)
+        self.assertIn("Repair requires additional mutable scope beyond automatic limit.", page)
+        self.assertIn("Automatic limit: 6", page)
+        self.assertIn("Requested additional paths: 7", page)
+        self.assertIn("APPROVE REPAIR SCOPE", page)
+        self.assertIn("REJECT", page)
+        self.assertNotIn("FAILED", page)
+
+    def test_auto_bounded_seven_approval_executes_c02(self) -> None:
+        config, waiting, planner, _reviewer, _luna = self.run_scope_case(7, "scope-seven-approve")
+        delta_path = waiting.run_dir / "repair/C02/scope_delta.json"
+        before = delta_path.read_bytes()
+        delta_sha = hashlib.sha256(before).hexdigest()
+        write_scope_approval(
+            waiting.run_dir / "repair/C02", decision="APPROVE",
+            scope_delta_sha256=delta_sha, source="test",
+        )
+        second, second_planner, _second_reviewer, second_luna, _second_claude = self.orchestrator(
+            config, reviews=[PASS], luna=FakeLuna({(2, "S01"): self.repair_writer(7)}),
+        )
+        resumed = second.resume("scope-seven-approve")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(second_planner.prompts, [])
+        self.assertEqual([call["cycle"] for call in second_luna.calls], [2])
+        self.assertEqual(delta_path.read_bytes(), before)
+        self.assertEqual(len(planner.prompts), 2)
+
+    def test_auto_bounded_seven_rejection_does_not_execute_c02(self) -> None:
+        config, waiting, _planner, _reviewer, luna = self.run_scope_case(7, "scope-seven-reject")
+        decision = approve_repair_scope(self.runs, "scope-seven-reject", "REJECT")
+        self.assertEqual(decision["decision"], "REJECT")
+        state = RunStateStore(waiting.run_dir / "state.json").load()
+        self.assertEqual(state["status"], RunStatus.FAILED.value)
+        self.assertEqual(state["failure"]["reason"], "HUMAN_REQUIRED")
+        self.assertEqual([(call["cycle"], call["step"]) for call in luna.calls], [(1, "S01")])
 
 
 class ClaudeCliTests(unittest.TestCase):

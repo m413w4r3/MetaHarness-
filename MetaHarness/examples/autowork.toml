@@ -5,7 +5,7 @@ base_ref = "main"
 runs_root = "../../MetaHarness-runs"
 worktrees_root = "../../MetaHarness-worktrees"
 require_clean_base = true
-max_diff_bytes = 400000
+max_diff_bytes = 2000000
 allow_no_required_checks = false
 default_check_ids = ["lint", "typecheck", "test"]
 

@@ -999,9 +999,13 @@ def _scope_approval_card(run: dict[str, Any], token: str | None) -> str:
     if state.get("status") != "waiting_scope_approval":
         return ""
     delta = run.get("scope_delta") if isinstance(run.get("scope_delta"), dict) else {}
+    snapshot = state.get("run_options") if isinstance(state.get("run_options"), dict) else {}
+    pipeline = snapshot.get("pipeline") if isinstance(snapshot.get("pipeline"), dict) else {}
+    automatic_limit = pipeline.get("repair_scope_max_added_paths", "—")
+    added_paths = delta.get("added_paths") if isinstance(delta.get("added_paths"), list) else []
     reasons = delta.get("added_path_reasons") if isinstance(delta.get("added_path_reasons"), dict) else {}
     rows = []
-    for path in delta.get("added_paths") if isinstance(delta.get("added_paths"), list) else []:
+    for path in added_paths:
         item = reasons.get(path) if isinstance(reasons.get(path), dict) else {}
         rows.append(
             f'<tr><td class="mono">{_e(path)}</td><td>{_e(item.get("reason"))}</td>'
@@ -1016,6 +1020,9 @@ def _scope_approval_card(run: dict[str, Any], token: str | None) -> str:
     )
     return (
         '<section class="card"><h2>REQUESTED ADDITIONAL MUTABLE SCOPE</h2>'
+        '<p>Repair requires additional mutable scope beyond automatic limit.</p>'
+        f'<p>Automatic limit: {_e(automatic_limit)}<br>'
+        f'Requested additional paths: {_e(len(added_paths))}</p>'
         '<table><thead><tr><th>path</th><th>reason</th><th>review finding</th></tr></thead>'
         f'<tbody>{"".join(rows)}</tbody></table>{actions}'
         '<p class="muted">Approval is bound to this exact scope delta; paths cannot be edited here.</p></section>'

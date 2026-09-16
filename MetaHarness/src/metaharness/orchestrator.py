@@ -3586,17 +3586,15 @@ class Orchestrator:
         added_paths = scope_delta["added_paths"]
         policy = self._run_options.repair_scope_policy
         bound = self._run_options.repair_scope_max_added_paths
-        if len(added_paths) > bound:
-            self._cycle_update(
-                store, 2, status="failed", failure="REPAIR_SCOPE_BOUND_EXCEEDED",
-                repair_mutable_scope=repair_scope, scope_delta=scope_delta,
-            )
-            raise OrchestrationError("HUMAN_REQUIRED: repair scope bound exceeded")
         if added_paths and policy == "deny-expansion":
             self._cycle_update(store, 2, status="failed", failure="REPAIR_SCOPE_EXPANSION",
                                repair_mutable_scope=repair_scope, scope_delta=scope_delta)
             raise OrchestrationError("REPAIR_SCOPE_EXPANSION")
-        if added_paths and policy == "require-approval":
+        requires_scope_approval = bool(added_paths) and (
+            policy == "require-approval"
+            or (policy == "auto-bounded" and len(added_paths) > bound)
+        )
+        if requires_scope_approval:
             approval = read_scope_approval(repair_dir, expected_sha256=scope_delta_sha)
             if approval is None:
                 self._checkpoint(run_dir, ResumePhase.SCOPE_APPROVAL, cycle=2,
@@ -5252,12 +5250,16 @@ class Orchestrator:
             refuse("the C02 scope delta does not match the repair plan")
         if added:
             options = self._run_options
-            if (
-                options.repair_scope_policy == "deny-expansion"
-                or len(added) > options.repair_scope_max_added_paths
-            ):
+            if options.repair_scope_policy == "deny-expansion":
                 refuse("the C02 scope delta is not allowed by the run scope policy")
-            if options.repair_scope_policy == "require-approval":
+            requires_scope_approval = (
+                options.repair_scope_policy == "require-approval"
+                or (
+                    options.repair_scope_policy == "auto-bounded"
+                    and len(added) > options.repair_scope_max_added_paths
+                )
+            )
+            if requires_scope_approval:
                 try:
                     approval = read_scope_approval(
                         repair_dir, expected_sha256=checkpoint.scope_delta_sha256
