@@ -46,7 +46,8 @@ from .gitops import (
 )
 from .llm.chat import validate_endpoint
 from .models import HarnessConfig, ProfileDriver, PublishMode, RunStatus
-from .orchestrator import OrchestrationError, resume_run, run_orchestrator
+from .orchestrator import OrchestrationError, recover_plan_run, resume_run, run_orchestrator
+from .plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
 from .profiles import profiles_for_config
 from .redaction import config_secret_values, redact
 from .result import RunResult
@@ -120,6 +121,20 @@ def _resume(config_path: Path, run_id: str) -> int:
 
     try:
         result = resume_run(config_path, run_id)
+    except (ConfigError, ResumeError, OrchestrationError, OSError, UnicodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return _report_result(result)
+
+
+def _recover_plan(config_path: Path, run_id: str, plan_path: Path) -> int:
+    """Replace a failed planner answer with an operator plan; no model call."""
+
+    try:
+        with plan_path.expanduser().open("rb") as stream:
+            # One byte over the bound lets the recovery report the exact limit.
+            data = stream.read(MAX_REPLACEMENT_PLAN_BYTES + 1)
+        result = recover_plan_run(config_path, run_id, data.decode("utf-8"))
     except (ConfigError, ResumeError, OrchestrationError, OSError, UnicodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -736,6 +751,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume.add_argument("--config", required=True, type=Path)
     resume.add_argument("--run-id", required=True, type=str)
+    recover = subparsers.add_parser(
+        "recover-plan",
+        help="replace a failed planner answer with a READY META PLAN v2 (no planner call)",
+    )
+    recover.add_argument("--config", required=True, type=Path)
+    recover.add_argument("--run-id", required=True, type=str)
+    recover.add_argument("--plan", required=True, type=Path)
     status = subparsers.add_parser("status", help="show a run status")
     status.add_argument("--run", required=True, type=Path)
     show = subparsers.add_parser("show", help="show run state and artifacts")
@@ -768,6 +790,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run(args.config, args.spec, args.run_id)
     if args.command == "resume":
         return _resume(args.config, args.run_id)
+    if args.command == "recover-plan":
+        return _recover_plan(args.config, args.run_id, args.plan)
     if args.command == "status":
         return _status(args.run)
     if args.command == "show":

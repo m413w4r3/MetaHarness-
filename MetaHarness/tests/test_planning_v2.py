@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -31,10 +32,13 @@ from metaharness.planning_v2 import (  # noqa: E402
     parse_task_plan_v2,
     render_plan_summary_v2,
     render_repair_plan_summary,
+    read_approved_step_contract,
     render_safe_profile_catalogue,
     render_step_contract,
+    validate_implementation_bundle,
     write_implementation_bundle,
 )
+from metaharness import step_ids as step_id_authority  # noqa: E402
 
 
 def _step(number: int, *, instruction: str = "1. edit the named symbol") -> str:
@@ -215,9 +219,10 @@ END META PLAN
         huge = _plan().replace("1. edit the named symbol", "x" * MAX_STEP_CONTRACT_CHARS)
         with self.assertRaises(V2PlanParseError):
             _parse(huge)
+        # Six ~5500-character contracts exceeded the historical 32000 budget;
+        # they fit the 48000 aggregate (bounded in the test below).
         six = "\n\n".join(_step(number, instruction="x" * 5100) for number in range(1, 7))
-        with self.assertRaises(V2PlanParseError):
-            _parse(_plan("STAGED", 6, steps=six))
+        self.assertEqual(len(_parse(_plan("STAGED", 6, steps=six)).steps), 6)
         plan = _parse(_plan())
         with tempfile.TemporaryDirectory() as directory:
             bundle = write_implementation_bundle(directory, plan)
@@ -260,6 +265,85 @@ END META PLAN
         steps = "\n\n".join(_step(number) for number in range(1, 7)) + "\n\n" + _step(8)
         with self.assertRaises(V2PlanParseError):
             _parse(_plan("STAGED", 7, steps=steps))
+
+    def test_eight_step_bundle_is_written_read_back_and_hash_validated(self):
+        ids = [f"S{number:02d}" for number in range(1, 9)]
+        plan = _parse(_plan("STAGED", 8, steps="\n\n".join(_step(number) for number in range(1, 9))))
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = write_implementation_bundle(directory, plan)
+            self.assertEqual([entry["id"] for entry in bundle["steps"]], ids)
+            payload, digest = validate_implementation_bundle(directory, expected_step_ids=ids)
+            self.assertEqual(payload, bundle)
+            self.assertEqual(
+                digest,
+                hashlib.sha256((Path(directory) / "implementation_bundle.json").read_bytes()).hexdigest(),
+            )
+            for step in plan.steps:
+                self.assertEqual(
+                    read_approved_step_contract(directory, payload, step.id),
+                    render_step_contract(plan, step),
+                )
+            (Path(directory) / "steps/S08/contract.md").write_text("tampered\n", encoding="utf-8")
+            with self.assertRaises(V2PlanParseError):
+                validate_implementation_bundle(directory, expected_step_ids=ids)
+
+    def test_aggregate_contract_budget_is_48000(self):
+        self.assertEqual((MAX_STEP_CONTRACT_CHARS, MAX_TOTAL_STEP_CONTRACT_CHARS), (8_000, 48_000))
+        within = "\n\n".join(_step(number, instruction="x" * 5400) for number in range(1, 9))
+        plan = _parse(_plan("STAGED", 8, steps=within))
+        total = sum(len(render_step_contract(plan, step)) for step in plan.steps)
+        self.assertTrue(32_000 < total <= MAX_TOTAL_STEP_CONTRACT_CHARS, total)
+        # Every contract stays under 8000 characters; only the sum is too big.
+        over = "\n\n".join(_step(number, instruction="x" * 6000) for number in range(1, 9))
+        with self.assertRaisesRegex(V2PlanParseError, "MAX_TOTAL_STEP_CONTRACT_CHARS"):
+            _parse(_plan("STAGED", 8, steps=over))
+
+    def test_step_capacity_has_one_authority(self):
+        self.assertIs(MAX_STEPS, step_id_authority.MAX_STEPS)
+        self.assertEqual(step_id_authority.step_ids(8), tuple(f"S{number:02d}" for number in range(1, 9)))
+        for value in ("S01", "S07", "S08"):
+            self.assertTrue(step_id_authority.is_step_id(value), value)
+        for value in ("S00", "S09", "S10", "s01", "S1", "S001", " S01", 7, None):
+            self.assertFalse(step_id_authority.is_step_id(value), value)
+        for count in (0, 9, True, "8"):
+            with self.assertRaises(ValueError):
+                step_id_authority.step_ids(count)
+        self.assertIn(f"between 2 and {MAX_STEPS} coherent", REQUIRE_STAGED_POLICY_TEXT)
+        prompts = Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts"
+        for name in ("planner_v2.txt", "repair_planner_v2.txt"):
+            text = (prompts / name).read_text(encoding="utf-8")
+            with self.subTest(prompt=name):
+                self.assertIn(f"STAGED has 2 to {MAX_STEPS} steps", text)
+                self.assertIn(f"S01 through S{MAX_STEPS:02d}", text)
+                self.assertIn(str(MAX_TOTAL_STEP_CONTRACT_CHARS), text)
+                self.assertIn(str(MAX_STEP_CONTRACT_CHARS), text)
+
+    def test_no_hidden_step_bound_remains_in_sources(self):
+        root = Path(__file__).resolve().parents[1] / "src" / "metaharness"
+        hidden = re.compile(r"S0\[1-|range\(1, ?7\)|two and six|at most six steps|S01 through S06")
+        offenders = [
+            str(path.relative_to(root)) for path in sorted(root.rglob("*"))
+            if path.suffix in {".py", ".txt", ".js"} and hidden.search(path.read_text(encoding="utf-8"))
+        ]
+        self.assertEqual(offenders, [])
+
+    def test_blocked_protocol_is_documented_in_both_planner_prompts(self):
+        prompts = Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts"
+        template = "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: <title>\n\nOBJECTIVE\n<text>\n\nBLOCKERS\n<real concrete blockers>\n\nEND META PLAN"
+        for name in ("planner_v2.txt", "repair_planner_v2.txt"):
+            text = (prompts / name).read_text(encoding="utf-8")
+            with self.subTest(prompt=name):
+                self.assertIn(template, text)
+                self.assertIn(
+                    "For BLOCKED, do not emit CONSTRAINTS, REQUIRED_CHECKS, EXECUTION_MODE,\n"
+                    "STEP_COUNT, REVIEWER_PROFILE, BEGIN/END STEP, ACCEPTANCE, TESTS, or RISKS.",
+                    text,
+                )
+        # The documented template itself is accepted by the unchanged parser.
+        filled = template.replace("<title>", "Blocked").replace("<text>", "Cannot plan.").replace(
+            "<real concrete blockers>", "The API contract is absent."
+        )
+        self.assertEqual(_parse(filled).decision, PlanDecision.BLOCKED)
 
     def test_prompt_and_safe_catalogue(self):
         profile = ModelProfile(

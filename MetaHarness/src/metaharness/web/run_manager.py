@@ -8,6 +8,7 @@ from typing import Callable
 
 from ..config import HarnessConfig
 from ..orchestrator import Orchestrator, OrchestrationError, _safe_run_id, generate_run_id
+from ..plan_recovery import PlanRecoveryError
 from ..resume import ResumeNotAllowedError
 from ..run_options import RunOptions
 
@@ -113,6 +114,34 @@ class RunManager:
     def resume_run(self, run_id: str) -> str:
         """Resume the same ``run_id`` in the background at its checkpoint."""
 
+        return self._run_until_claimed(
+            run_id,
+            lambda orchestrator, run, on_claimed: orchestrator.resume(run, on_claimed=on_claimed),
+            failure="run could not be resumed",
+        )
+
+    def recover_plan(self, run_id: str, replacement_raw: str) -> str:
+        """Publish an operator plan for ``run_id``, then resume it to approval.
+
+        Validation, persistence and the resume claim happen in the worker
+        before this returns; no planner is ever called.
+        """
+
+        return self._run_until_claimed(
+            run_id,
+            lambda orchestrator, run, on_claimed: orchestrator.recover_plan(
+                run, replacement_raw, on_claimed=on_claimed
+            ),
+            failure="plan could not be recovered",
+        )
+
+    def _run_until_claimed(
+        self,
+        run_id: str,
+        action: Callable[[Orchestrator, str, Callable[[object], None]], object],
+        *,
+        failure: str,
+    ) -> str:
         try:
             selected_run_id = _safe_run_id(run_id)
         except (OrchestrationError, TypeError) as exc:
@@ -137,9 +166,7 @@ class RunManager:
         def worker() -> None:
             try:
                 orchestrator = self._orchestrator_factory(self._config)
-                orchestrator.resume(
-                    selected_run_id, on_claimed=lambda _run_dir: notify(claimed_event)
-                )
+                action(orchestrator, selected_run_id, lambda _run_dir: notify(claimed_event))
             except BaseException as exc:  # recorded, never escapes the thread
                 errors.append(exc)
             finally:
@@ -154,9 +181,11 @@ class RunManager:
                 timeout=_RESUME_VALIDATION_TIMEOUT_SECONDS,
             )
         if not claimed_event.is_set() and finished_event.is_set() and errors:
+            if isinstance(errors[0], PlanRecoveryError):
+                raise RunPlanRecoveryError(str(errors[0]))
             if isinstance(errors[0], ResumeNotAllowedError):
                 raise RunResumeNotAllowedError(str(errors[0]))
-            raise RunManagerError("run could not be resumed")
+            raise RunManagerError(failure)
         return selected_run_id
 
 
@@ -177,6 +206,10 @@ class RunResumeNotAllowedError(RunManagerError):
     pass
 
 
+class RunPlanRecoveryError(RunManagerError):
+    """The operator plan or the run was refused; the run is unchanged."""
+
+
 # Resume validation reads Git trees (no model call); allow it more time than
 # a creation before answering the browser, which then shows durable state.
 _RESUME_VALIDATION_TIMEOUT_SECONDS = 60.0
@@ -187,5 +220,6 @@ __all__ = [
     "RunCollisionError",
     "RunManager",
     "RunManagerError",
+    "RunPlanRecoveryError",
     "RunResumeNotAllowedError",
 ]

@@ -22,6 +22,7 @@ from .models import (
     StepExecutionSelection,
 )
 from .profiles import ProfileError, profile_execution_fingerprint, profile_for_role
+from .step_ids import MAX_STEPS, STEP_ID_RE, step_ids
 
 
 class ExecutionSelectionError(ValueError):
@@ -37,7 +38,7 @@ SCHEMA_VERSION = 2
 SCHEMA_VERSION_V3 = 3
 SCHEMA_VERSION_V4 = 4
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_STEP_ID = re.compile(r"S0[1-8]\Z")
+_STEP_ID = STEP_ID_RE
 _ROLES = (
     ("planner", ExecutionRole.PLANNER),
     ("implementer", ExecutionRole.IMPLEMENTER),
@@ -130,7 +131,12 @@ def resolve_execution_selection(
     return ExecutionSelection(schema_version=SCHEMA_VERSION, **selected, reviser=reviser)
 
 
-_MAX_V3_STEPS = 8
+# Shared by schema 3 and schema 4: one implementer selection per plan step.
+_MAX_STEP_SELECTIONS = MAX_STEPS
+
+
+def _contiguous(ids: list[str]) -> bool:
+    return 1 <= len(ids) <= _MAX_STEP_SELECTIONS and ids == list(step_ids(len(ids)))
 
 
 def _canonical_step_items(step_profile_ids: Mapping[str, str]) -> list[tuple[str, str]]:
@@ -138,7 +144,7 @@ def _canonical_step_items(step_profile_ids: Mapping[str, str]) -> list[tuple[str
 
     The order never depends on the insertion order of the request mapping:
     IDs are validated, sorted numerically, and must then be unique,
-    contiguous from S01, and at most eight.
+    contiguous from S01, and at most ``MAX_STEPS``.
     """
 
     if not isinstance(step_profile_ids, Mapping) or not step_profile_ids:
@@ -148,13 +154,15 @@ def _canonical_step_items(step_profile_ids: Mapping[str, str]) -> list[tuple[str
         if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None or not isinstance(profile_id, str):
             raise ExecutionSelectionError("v3 step selection is invalid")
         items.append((step_id, profile_id))
-    if len(items) > _MAX_V3_STEPS:
-        raise ExecutionSelectionError("v3 selection may contain at most eight steps")
+    if len(items) > _MAX_STEP_SELECTIONS:
+        raise ExecutionSelectionError(
+            f"step selection may contain at most {_MAX_STEP_SELECTIONS} steps"
+        )
     ordered = sorted(items, key=lambda item: int(item[0][1:]))
     ids = [step_id for step_id, _profile_id in ordered]
     if len(set(ids)) != len(ids):
         raise ExecutionSelectionError("v3 step IDs must be unique")
-    if ids != [f"S{index:02d}" for index in range(1, len(ids) + 1)]:
+    if not _contiguous(ids):
         raise ExecutionSelectionError("v3 step IDs must be contiguous from S01")
     return ordered
 
@@ -344,7 +352,7 @@ def _payload_v4(selection: ExecutionSelectionV4) -> dict[str, Any]:
             raise ExecutionSelectionError("execution selection implementer is invalid")
         seen.add(item.step_id)
         steps.append({"step_id": item.step_id, "implementer": _selected_payload(item.implementer)})
-    if [item["step_id"] for item in steps] != [f"S{index:02d}" for index in range(1, len(steps) + 1)]:
+    if not _contiguous([item["step_id"] for item in steps]):
         raise ExecutionSelectionError("execution selection step IDs are not contiguous")
     for name, profile in (("planner", selection.planner), ("reviser", selection.reviser),
                           ("repair_implementer", selection.repair_implementer), ("reviewer", selection.reviewer)):
@@ -542,7 +550,7 @@ def parse_execution_selection_v3(data: bytes) -> ExecutionSelectionV3:
             raise ExecutionSelectionError("execution selection step IDs are invalid")
         seen.add(step_id)
         steps.append(StepExecutionSelection(step_id, _selected_v3(item.get("implementer"), f"step {step_id}")))
-    if [item.step_id for item in steps] != [f"S{index:02d}" for index in range(1, len(steps) + 1)]:
+    if not _contiguous([item.step_id for item in steps]):
         raise ExecutionSelectionError("execution selection step IDs are not contiguous")
     reviser = _selected_v3(payload["reviser"], "reviser") if "reviser" in payload else None
     return ExecutionSelectionV3(
@@ -573,7 +581,7 @@ def parse_execution_selection_v4(data: bytes) -> ExecutionSelectionV4:
         if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None:
             raise ExecutionSelectionError("execution selection step IDs are invalid")
         steps.append(StepExecutionSelection(step_id, _selected_v3(item.get("implementer"), f"step {step_id}")))
-    if [item.step_id for item in steps] != [f"S{index:02d}" for index in range(1, len(steps) + 1)]:
+    if not _contiguous([item.step_id for item in steps]):
         raise ExecutionSelectionError("execution selection step IDs are not contiguous")
     return ExecutionSelectionV4(
         SCHEMA_VERSION_V4,

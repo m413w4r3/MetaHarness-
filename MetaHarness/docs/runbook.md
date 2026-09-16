@@ -245,6 +245,7 @@ repair planner/steps, and publish. Corruptions, identity violations and
 | After | Checkpoint |
 | --- | --- |
 | plan approval, worktree + setup | `initial_step` S01, base tree |
+| operator plan recovery (no planner call) | `plan_approval`, base tree |
 | Luna step Sxx | next step, or `checks_c01` (pre-revision checks with Claude, final checks without), with the step's tree |
 | pre-revision checks | `claude_c01`, post-Luna tree |
 | Claude complete | `final_checks_c01`, post-Claude tree (resume runs only the final checks) |
@@ -291,6 +292,69 @@ of any workspace). The previous attempt's agent artifacts move to
 `attempts/NN/` before the retry. A historical run without a checkpoint (Claude
 C01 or Codex step failure) gets one inferred from its artifacts and is then
 validated the same way.
+
+## META PLAN v2 execution limits
+
+| Limit | Value |
+| --- | --- |
+| Max staged steps (`MAX_STEPS`) | 8 (`STAGED` = 2..8, `SINGLE` = exactly 1) |
+| Allowed step IDs | `S01` .. `S08`, contiguous from `S01` |
+| Max `READ_SET` / `WRITE_SET` / `CREATE_SET` / `DELETE_SET` per step | 8 / 6 / 6 / 6 |
+| Max mutable union per aggressive STAGED step | 6 (`staged_step_max_mutable_paths`) |
+| Max step contract | 8000 characters (target ~4000) |
+| Max aggregate step contracts | 48000 characters |
+| Execution selection steps (schema 3 and 4) | 8, contiguous from `S01` |
+| Resume step IDs (`initial_step`, `repair_step`) | `S01` .. `S08` |
+| Implementation bundle steps | 1..8, contiguous, each contract hash-bound |
+| Max diff bytes | 400000 (unchanged) |
+| Replacement plan for `REPLACE PLAN` | 128 KiB |
+
+## Plan recovery: replacing an unexecutable planner answer
+
+A META PLAN v2 run that failed at its PLANNER checkpoint
+(`PLANNER_OUTPUT_INVALID`, or `LLM_FAILURE` of the planner) can be continued
+with a corrected plan written by the operator, without calling the planner
+again:
+
+```bash
+metaharness recover-plan --config examples/autowork.toml \
+  --run-id <RUN_ID> --plan corrected-plan.md
+```
+
+The run page offers the same action as `REPLACE PLAN` (a textarea posting to
+`/runs/<run_id>/recover-plan`, with the same exact-Host, origin and
+mutation-token policy as the approval and resume forms; the replacement text
+is bounded to 128 KiB). The JSON route is
+`POST /api/runs/<run_id>/recover-plan` with `{"plan": "..."}`.
+
+Only the raw replacement plan is supplied. SPEC, `context.txt`, the
+repository reference, BASE SHA, run options, profile catalogue and check
+catalogue remain the run's own and cannot be edited.
+
+The action is refused, changing nothing, unless: the protocol is v2; the
+pending checkpoint is `planner`; the failure is a recoverable planner
+failure; no plan approval, execution selection, branch, worktree, or
+Luna/Claude/reviewer execution artifact exists; and the stored BASE SHA and
+BASE tree are still exactly those of the run. Local `main` may have moved:
+the run stays bound to its immutable stored BASE.
+
+The replacement must be `STATUS: READY` and must pass, unchanged, the strict
+parser, the execution-mode and decomposition policies, the profile
+allowlists, the trusted check catalogue and the step/bundle bounds. BLOCKED
+is not accepted, and nothing is normalized or repaired: an invalid
+replacement leaves the current run authority byte-for-byte unchanged.
+
+On success the previous planner artifacts (including `planner.raw.md`, the
+planner usage of the failed attempt and any planner conversation handle) move
+to `attempts/NN/`, the replacement becomes `planner.raw.md`,
+`task_plan_v2.json` / `task_plan.json`, `implementation_contract.md`,
+`implementation_bundle.json` and the exact `steps/Sxx/contract.md` files,
+`planner_recovery.json` records the exchange, and the checkpoint becomes
+`plan_approval`. No worktree is created and no worker starts before the
+human approval; afterwards the run continues through the normal workflow
+(`plan_approval` -> `worktree_setup` -> Luna S01...) and the planner is never
+called again. Diagnostics then report `plan source: operator recovery`
+instead of `plan source: planner model completion`.
 
 ## Plan approval
 

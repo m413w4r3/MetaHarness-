@@ -40,6 +40,7 @@ interrupted worktrees are intentionally retained for inspection.
 | `revision/Cxx/tree_after_failure.txt` | Tree left by a failed Claude attempt; lets a resume restore `tree_before.txt` exactly (in-scope paths only) |
 | `steps/Sxx/attempts/NN/`, `revision/Cxx/attempts/NN/` | Artifacts of a failed attempt, moved aside before a resumed retry of the same operation |
 | `planner.conversation.json` | Only when the driver officially returned a planner conversation handle (never simulated) |
+| `planner_recovery.json` | Operator plan recovery: `schema_version`, `source: operator`, `previous_raw_sha256`, `replacement_raw_sha256`, `recovered_at`, `archived_attempt`, `planner_called: false`. Its presence means the current plan is an operator replacement, not a planner completion |
 | `publish.json` (fast-forward-base) | `mode`, `target`, `remote`, `base_sha`, `commit_sha`, `run_branch` (local only), `local_base_updated`, `base_checked_out_in` |
 
 Historic P20 runs stored contracts as `steps/Sxx.contract.md`; the UI can

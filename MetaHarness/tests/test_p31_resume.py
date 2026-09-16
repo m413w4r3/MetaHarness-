@@ -13,6 +13,7 @@ from metaharness.orchestrator import Orchestrator
 import metaharness.orchestrator as orchestrator_module
 from metaharness.resume import (
     ResumeCheckpoint,
+    ResumeCheckpointError,
     ResumePhase,
     checkpoint_payload,
     read_checkpoint,
@@ -132,6 +133,38 @@ class P31CheckpointCompatibilityTests(unittest.TestCase):
                 payload["schema_version"] = 1
                 (path / "resume_checkpoint.json").write_text(json.dumps(payload), encoding="utf-8")
                 self.assertEqual(read_checkpoint(path), checkpoint)
+
+    def test_step_checkpoints_accept_s07_s08_and_reject_s09(self) -> None:
+        import tempfile
+
+        identity = PlanIdentity("a" * 64, "b" * 64, "c" * 64, "d" * 64)
+        phases = (
+            (ResumePhase.INITIAL_STEP, 1, {}),
+            (ResumePhase.REPAIR_STEP, 2, {"repair_bundle_sha256": "e" * 64}),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for phase, cycle, extra in phases:
+                for step_id in ("S07", "S08"):
+                    with self.subTest(phase=phase.value, step=step_id):
+                        checkpoint = ResumeCheckpoint(
+                            phase, cycle, step_id, "1" * 40, "2" * 40, "d" * 64, identity, **extra
+                        )
+                        write_checkpoint(path, checkpoint)
+                        self.assertEqual(read_checkpoint(path), checkpoint)
+                for step_id in ("S09", "S00", "S10"):
+                    with self.subTest(phase=phase.value, step=step_id):
+                        with self.assertRaises(ResumeCheckpointError):
+                            ResumeCheckpoint(
+                                phase, cycle, step_id, "1" * 40, "2" * 40, "d" * 64, identity, **extra
+                            )
+                payload = checkpoint_payload(ResumeCheckpoint(
+                    phase, cycle, "S08", "1" * 40, "2" * 40, "d" * 64, identity, **extra
+                ))
+                payload["step_id"] = "S09"
+                (path / "resume_checkpoint.json").write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(ResumeCheckpointError):
+                    read_checkpoint(path)
 
 
 if __name__ == "__main__":

@@ -54,6 +54,7 @@ from ..planning_v2 import V2PlanParseError, step_contract_path, validate_impleme
 from ..profiles import ProfileError, profile_for_role, profiles_for_config, safe_profile_metadata
 from ..run_options import RunOptions, RunOptionsError, legacy_or_durable_run_options
 from ..state import RunStateStore
+from ..step_ids import STEP_ID_PATTERN, STEP_ID_RE
 from ..usage import (
     PLANNER_USAGE_ARTIFACT,
     REVIEWER_USAGE_ARTIFACT,
@@ -62,11 +63,20 @@ from ..usage import (
     phase_usage_summary,
     read_usage_artifact,
 )
+from ..plan_recovery import (
+    MAX_REPLACEMENT_PLAN_BYTES,
+    PLAN_RECOVERY_ARTIFACT,
+    PlanRecoveryError,
+    plan_recovery_info,
+    read_plan_recovery_record,
+    validate_replacement_text,
+)
 from .run_manager import (
     RunCapacityError,
     RunCollisionError,
     RunManager,
     RunManagerError,
+    RunPlanRecoveryError,
     RunResumeNotAllowedError,
 )
 
@@ -153,6 +163,7 @@ ARTIFACT_ALLOWLIST = frozenset(
         "changed-files.txt",
         "diff.patch",
         "plan_approval.json",
+        PLAN_RECOVERY_ARTIFACT,
         "publish.json",
         DIAGNOSTICS_NAME,
         DIAGNOSTICS_ERROR_NAME,
@@ -166,7 +177,7 @@ MAX_STEP_CONTRACT_BYTES = 64 * 1024
 STEP_EVENTS_MAX = 30
 # Worker input above this many tokens is flagged (advisory only).
 HIGH_WORKER_INPUT_TOKENS = 100_000
-_STEP_ID = re.compile(r"S0[1-8]\Z")
+_STEP_ID = STEP_ID_RE
 # Window of complete JSONL lines returned by one progress request.
 PROGRESS_MAX_BYTES = 256 * 1024
 # A longer single event is omitted from the UI (the artifact keeps it; the
@@ -310,7 +321,7 @@ def _run_dir(runs_root: Path, run_id: str) -> Path:
 
 def _artifact_path(run_dir: Path, name: str) -> Path:
     cycle_artifact = re.fullmatch(
-        r"(?:repair/C02/steps/S0[1-8]|revision/C0[12]|review/C0[12])/[A-Za-z0-9_.-]+",
+        rf"(?:repair/C02/steps/{STEP_ID_PATTERN}|revision/C0[12]|review/C0[12])/[A-Za-z0-9_.-]+",
         name,
     )
     if name not in ARTIFACT_ALLOWLIST and cycle_artifact is None:
@@ -482,6 +493,7 @@ def get_run(
         "failure": state.get("failure"),
         "publish": _load_json(_artifact_path(directory, "publish.json")),
         "approval": {"recorded": approval_decision is not None, "decision": approval_decision},
+        "plan_recovery": _plan_recovery_payload(directory, state),
         "agent_diagnostics": agent_diagnostics,
         "progress_tail": progress_tail(runs_root, safe_id, max_events=50),
         "candidate": {
@@ -1331,10 +1343,24 @@ def _token_diagnostics(step_dir: Path) -> dict[str, Any] | None:
     return result
 
 
+def _plan_recovery_payload(directory: Path, state: Mapping[str, Any]) -> dict[str, Any]:
+    info = plan_recovery_info(directory, state)
+    return {
+        "eligible": info.eligible,
+        "reason": info.reason,
+        "recovered": read_plan_recovery_record(directory) is not None,
+        "max_bytes": MAX_REPLACEMENT_PLAN_BYTES,
+    }
+
+
 def _resume_payload(directory: Path, state: Mapping[str, Any]) -> dict[str, Any]:
     info = resume_info(directory, state)
+    label = info.label
+    if info.phase == "plan_approval" and read_plan_recovery_record(directory) is not None:
+        # Never "Retry planner": the plan authority is the operator's.
+        label = "Resume recovered plan approval"
     return {
-        "resumable": info.resumable, "phase": info.phase, "label": info.label,
+        "resumable": info.resumable, "phase": info.phase, "label": label,
         "expected_tree": info.expected_tree, "cycle": info.cycle,
         "step_id": info.step_id, "reason": info.reason,
     }
@@ -1395,10 +1421,11 @@ def run_pipeline(
         return failed and cycle == at_cycle and reason.startswith(prefixes)
 
     decision = planner.get("decision")
+    recovered = read_plan_recovery_record(directory) is not None
     if resume_phase in {"context", "planner"}:
         add("planner", "Planner", "resumable")
     elif decision == "READY":
-        add("planner", "Planner", "complete")
+        add("planner", "Planner · operator recovery" if recovered else "Planner", "complete")
     elif decision == "BLOCKED" or status == "blocked" or failed:
         add("planner", "Planner", "failed")
     elif status in {"created", "planning"}:
@@ -1417,9 +1444,9 @@ def run_pipeline(
     elif approval_decision == "REJECT" or status == "plan_rejected":
         add("approval", "Approval", "failed")
     elif resume_phase == "plan_approval":
-        add("approval", "Approval", "resumable")
+        add("approval", "Recovered plan — awaiting approval" if recovered else "Approval", "resumable")
     elif status == AWAITING_APPROVAL:
-        add("approval", "Approval", "running")
+        add("approval", "Recovered plan — awaiting approval" if recovered else "Approval", "running")
     elif failed and reason.startswith(("PLAN_APPROVAL", "EXECUTION_SELECTION")):
         add("approval", "Approval", "failed")
     else:
@@ -1730,6 +1757,39 @@ def resume_run_request(manager: RunManager, runs_root: Path, run_id: str) -> dic
     return {"ok": True, "run_id": safe_id, "location": f"/runs/{safe_id}"}
 
 
+def recover_plan_request(
+    manager: RunManager, runs_root: Path, run_id: str, replacement: object,
+) -> dict[str, Any]:
+    """REPLACE PLAN: publish an operator META PLAN v2, then await approval.
+
+    Only the raw replacement text is accepted: SPEC, context, BASE, run
+    options and catalogues stay those of the run.  No planner is called.
+    """
+
+    directory = _run_dir(runs_root, run_id)
+    safe_id = validate_run_id(run_id)
+    try:
+        text = validate_replacement_text(replacement)
+    except PlanRecoveryError as exc:
+        raise WebAPIError(400, str(exc)) from exc
+    info = plan_recovery_info(directory, _load_state(directory))
+    if not info.eligible:
+        raise WebAPIError(409, f"plan recovery refused: {info.reason}")
+    try:
+        manager.recover_plan(safe_id, text)
+    except RunPlanRecoveryError as exc:
+        raise WebAPIError(400, f"plan recovery refused: {exc}") from exc
+    except RunResumeNotAllowedError as exc:
+        raise WebAPIError(409, "recovered run could not be resumed") from exc
+    except RunCollisionError as exc:
+        raise WebAPIError(409, "run is already active") from exc
+    except RunCapacityError as exc:
+        raise WebAPIError(409, "maximum active runs reached") from exc
+    except RunManagerError as exc:
+        raise WebAPIError(503, "plan could not be recovered") from exc
+    return {"ok": True, "run_id": safe_id, "location": f"/runs/{safe_id}"}
+
+
 def approve_repair_scope(
     runs_root: Path, run_id: str, decision: str,
 ) -> dict[str, Any]:
@@ -1776,6 +1836,7 @@ __all__ = [
     "context_level",
     "live_status",
     "publish_target",
+    "recover_plan_request",
     "resume_run_request",
     "approve_repair_scope",
     "run_overview",

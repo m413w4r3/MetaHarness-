@@ -17,6 +17,8 @@ from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 from ..config import load_config
 from ..models import HarnessConfig
+from ..plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
+from ..step_ids import ALL_STEP_IDS
 from .api import (
     WebAPIError,
     approve_run,
@@ -27,6 +29,7 @@ from .api import (
     live_status,
     model_profiles,
     progress,
+    recover_plan_request,
     resume_run_request,
     validate_run_id,
 )
@@ -35,6 +38,9 @@ from .run_manager import RunManager
 
 HOST = "127.0.0.1"
 _MAX_BODY_BYTES = 64 * 1024
+# Only the REPLACE PLAN routes accept more: room for a 128 KiB plan after
+# form/JSON encoding.  The decoded text is bounded again, exactly.
+_MAX_RECOVERY_BODY_BYTES = 4 * MAX_REPLACEMENT_PLAN_BYTES
 _LOCAL_HOST_NAMES = ("127.0.0.1", "localhost")
 _SECURITY_HEADERS = (
     ("X-Content-Type-Options", "nosniff"),
@@ -244,7 +250,9 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
         if token is None or not secrets.compare_digest(token, self.server.token):
             raise WebAPIError(403, "mutation token required")
 
-    def _form(self, expected: set[str], *, exact: bool = True) -> dict[str, str]:
+    def _form(
+        self, expected: set[str], *, exact: bool = True, max_bytes: int = _MAX_BODY_BYTES,
+    ) -> dict[str, str]:
         content_type = self.headers.get("Content-Type")
         if (
             content_type is None
@@ -257,7 +265,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             length = int(raw_length) if raw_length is not None else 0
         except ValueError as exc:
             raise WebAPIError(400, "invalid request body") from exc
-        if length < 0 or length > _MAX_BODY_BYTES:
+        if length < 0 or length > max_bytes:
             raise WebAPIError(413, "request body is too large")
         try:
             raw = self.rfile.read(length)
@@ -293,13 +301,13 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", _API_CSP)
         self.end_headers()
 
-    def _body(self) -> dict[str, Any]:
+    def _body(self, *, max_bytes: int = _MAX_BODY_BYTES) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length")
         try:
             length = int(raw_length) if raw_length is not None else 0
         except ValueError as exc:
             raise WebAPIError(400, "invalid request body") from exc
-        if length < 0 or length > _MAX_BODY_BYTES:
+        if length < 0 or length > max_bytes:
             raise WebAPIError(413, "request body is too large")
         try:
             raw = self.rfile.read(length)
@@ -319,7 +327,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 or (
                     len(parts) == 4
                     and parts[1] == "runs"
-                    and parts[3] in {"approval", "scope-approval", "resume"}
+                    and parts[3] in {"approval", "scope-approval", "resume", "recover-plan"}
                 )
             )
             self._check_origin(allow_opaque=html_form_route)
@@ -402,6 +410,31 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._redirect(result["location"])
                 return
+            if len(parts) == 4 and parts[1] == "runs" and parts[3] == "recover-plan":
+                # REPLACE PLAN: same Host/origin/token policy as resume.  The
+                # replacement META PLAN v2 is the only operator-supplied field.
+                payload = self._form({"_token", "plan"}, max_bytes=_MAX_RECOVERY_BODY_BYTES)
+                self._authorized_form(payload.get("_token"))
+                result = recover_plan_request(
+                    self.server.run_manager,
+                    self.server.config.runs_root,
+                    self._run_id(parts[2]),
+                    payload["plan"],
+                )
+                self._redirect(result["location"])
+                return
+            if len(parts) == 5 and parts[1:3] == ["api", "runs"] and parts[4] == "recover-plan":
+                self._authorized()
+                payload = self._body(max_bytes=_MAX_RECOVERY_BODY_BYTES)
+                if set(payload) != {"plan"} or not isinstance(payload.get("plan"), str):
+                    raise WebAPIError(400, "body must contain exactly one plan string")
+                self._json(202, recover_plan_request(
+                    self.server.run_manager,
+                    self.server.config.runs_root,
+                    self._run_id(parts[3]),
+                    payload["plan"],
+                ))
+                return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "scope-approval":
                 payload = self._form({"_token", "decision"})
                 self._authorized_form(payload.get("_token"))
@@ -413,7 +446,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "approval":
                 payload = self._form(
                     {"_token", "decision", "implementer_profile", "reviewer_profile", "reviser_profile", "repair_profile"}
-                    | {f"step_profile__S{index:02d}" for index in range(1, 7)},
+                    | {f"step_profile__{step_id}" for step_id in ALL_STEP_IDS},
                     exact=False,
                 )
                 self._authorized_form(payload.get("_token"))

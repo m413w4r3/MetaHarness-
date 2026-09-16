@@ -135,6 +135,29 @@ class WebServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 409)
 
+    def post_form(self, path: str, fields: dict[str, str]) -> int:
+        from urllib.parse import urlencode
+
+        body = urlencode(fields).encode()
+        connection = HTTPConnection("127.0.0.1", self.server.server_port)
+        connection.request("POST", path, body=body, headers={
+            "Content-Type": "application/x-www-form-urlencoded", "Content-Length": str(len(body)),
+        })
+        response = connection.getresponse()
+        response.read()
+        connection.close()
+        return response.status
+
+    def test_html_approval_form_accepts_step_profiles_through_s08_only(self) -> None:
+        self.create_run("form-steps", "committed")
+        fields = {"_token": self.server.token, "decision": "APPROVE", "reviewer_profile": "r"}
+        eight = {f"step_profile__S{number:02d}": "luna" for number in range(1, 9)}
+        # The form parser accepts S07/S08; the gate then refuses the state.
+        self.assertEqual(self.post_form("/runs/form-steps/approval", {**fields, **eight}), 409)
+        self.assertEqual(
+            self.post_form("/runs/form-steps/approval", {**fields, **eight, "step_profile__S09": "luna"}), 400
+        )
+
     def test_wrong_state_is_conflict(self) -> None:
         self.create_run("done", "committed")
         status, _payload, _ = self.request(

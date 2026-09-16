@@ -142,10 +142,22 @@ from .planning_v2 import (
     TaskPlanV2,
     V2PlanParseError,
     parse_task_plan_v2,
+    persist_recovered_plan_artifacts,
     read_approved_step_contract,
     read_set_paths,
+    validate_decomposition_policy,
+    validate_execution_mode_policy,
     validate_implementation_bundle,
     render_repair_plan_summary,
+)
+from .plan_recovery import (
+    PLAN_RECOVERY_ARTIFACT,
+    PLAN_SOURCE_OPERATOR,
+    PlanRecoveryError,
+    plan_recovery_info,
+    plan_source,
+    validate_replacement_text,
+    write_plan_recovery_record,
 )
 from .resume import (
     PHASE_STATUS,
@@ -722,6 +734,12 @@ _CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "e
 _PRE_CHECK_ATTEMPT_ARTIFACTS = _CHECK_ATTEMPT_ARTIFACTS + ("pre_checks.json",)
 _REVISION_ATTEMPT_ARTIFACTS = _AGENT_ARTIFACTS + ("tree_after_failure.txt",)
 _PLANNER_CONVERSATION = "planner.conversation.json"
+# An operator recovery also retires the previous plan summary, the planner
+# conversation (the repair planner must never continue a conversation whose
+# answer was replaced) and any earlier recovery record.
+_RECOVERY_ATTEMPT_ARTIFACTS = _PLANNER_ATTEMPT_ARTIFACTS + (
+    "implementation_contract.md", _PLANNER_CONVERSATION, PLAN_RECOVERY_ARTIFACT,
+)
 
 
 class ReviewerTransportError(OrchestrationError):
@@ -835,20 +853,28 @@ def _record_failure_tree(artifact_dir: Path, worktree: Path) -> None:
         pass
 
 
-def _archive_attempt(directory: Path, *, names: tuple[str, ...] = _ATTEMPT_ARTIFACTS) -> None:
+def _archive_attempt(directory: Path, *, names: tuple[str, ...] = _ATTEMPT_ARTIFACTS) -> Path | None:
     """Move a failed attempt's artifacts aside before retrying that operation."""
 
     present = [name for name in names if (directory / name).exists()]
     if not present:
-        return
+        return None
+    target = _archive_attempt_target(directory)
+    for name in present:
+        os.replace(directory / name, target / name)
+    return target
+
+
+def _archive_attempt_target(directory: Path) -> Path:
+    """Create and return the next free ``attempts/NN/`` directory."""
+
     root = directory / "attempts"
     index = 1
     while (root / f"{index:02d}").exists():
         index += 1
     target = root / f"{index:02d}"
     target.mkdir(parents=True)
-    for name in present:
-        os.replace(directory / name, target / name)
+    return target
 
 
 def _archive_attempt_tree(directory: Path) -> None:
@@ -2162,6 +2188,9 @@ class Orchestrator:
                 "model": planner_profile.model,
                 "profile_id": planner_profile.id,
                 "selection_mode": planner_profile.selection_mode.value,
+                # operator_recovery: the plan was pasted by the operator and
+                # no planner completion produced it.
+                "source": plan_source(run_dir),
                 "execution_mode": plan.execution_mode.value if plan.execution_mode else None,
                 "required_checks": list(plan.required_checks),
                 "steps": [
@@ -4488,6 +4517,175 @@ class Orchestrator:
             )
             return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
 
+    # -- operator plan recovery ----------------------------------------------
+
+    def recover_plan(
+        self, run_id: str, replacement_raw: str, *,
+        on_claimed: Callable[[Path], None] | None = None,
+    ) -> RunResult:
+        """Replace a failed planner answer with an operator META PLAN v2.
+
+        No model is called.  The replacement is validated exactly like a
+        planner answer, published as the run's plan authority, and the
+        checkpoint moves to PLAN_APPROVAL.  The run then continues through the
+        normal resume workflow: plan approval, worktree setup, Luna S01...
+        A refusal raises :class:`PlanRecoveryError` and changes nothing.
+        """
+
+        self._persist_recovered_plan(run_id, replacement_raw)
+        return self.resume(run_id, on_claimed=on_claimed)
+
+    def _persist_recovered_plan(self, run_id: str, replacement_raw: str) -> None:
+        def refuse(message: str) -> NoReturn:
+            raise PlanRecoveryError(message)
+
+        raw = validate_replacement_text(replacement_raw)
+        try:
+            selected = _safe_run_id(run_id)
+        except OrchestrationError as exc:
+            refuse(str(exc))
+        run_dir = (self.config.runs_root / selected).expanduser().resolve()
+        if not (run_dir / "state.json").is_file():
+            refuse("run state does not exist")
+        store = RunStateStore(run_dir / "state.json")
+        try:
+            state = store.load()
+        except (OSError, ValueError) as exc:
+            refuse(f"run state is unreadable: {exc}")
+        eligibility = plan_recovery_info(run_dir, state)
+        if not eligibility.eligible:
+            refuse(eligibility.reason or "run is not eligible for plan recovery")
+        try:
+            options, _ = legacy_or_durable_run_options(
+                self.config, run_dir,
+                expected_sha256=state.get("run_options_sha256")
+                if isinstance(state.get("run_options_sha256"), str) else None,
+            )
+            # The run's frozen options decide the policies and catalogues,
+            # never the current defaults.
+            config = effective_run_config(self.config, options)
+        except RunOptionsError:
+            refuse("run options are missing or invalid")
+        checkpoint = read_checkpoint(run_dir)
+        if checkpoint is None or checkpoint.phase is not ResumePhase.PLANNER:
+            refuse("run is not at its PLANNER checkpoint")
+        for name in ("spec.md", "context.txt"):
+            if not (run_dir / name).is_file():
+                refuse(f"{name} is missing")
+
+        # The run is bound to its immutable stored BASE, not to where
+        # base_ref points today.
+        base_sha = state.get("base_sha")
+        if not _is_object_id(base_sha):
+            refuse("run base SHA is missing or invalid")
+        if checkpoint.expected_head_sha is None or checkpoint.expected_tree_sha is None:
+            refuse("PLANNER checkpoint has no BASE identity")
+        try:
+            repo = git_root(config.repo)
+            if state.get("repo") not in {None, str(repo), str(config.repo)}:
+                refuse("the configured repository is not the run repository")
+            if resolve_commit(repo, base_sha) != base_sha:
+                refuse("run base SHA does not resolve to itself")
+            base_tree = resolve_tree(repo, base_sha)
+            if checkpoint.expected_head_sha != base_sha:
+                refuse("PLANNER checkpoint base SHA does not match the run")
+            if checkpoint.expected_tree_sha != base_tree:
+                refuse("PLANNER checkpoint base tree does not match the run")
+            reference = _read_repository_reference(run_dir)
+            if reference is None or reference.base_sha != base_sha:
+                refuse("repository reference does not match the run base SHA")
+            worktree_path = (config.worktrees_root / selected).expanduser().resolve()
+            if worktree_path.exists() or str(worktree_path) in registered_worktrees(repo):
+                refuse("a run worktree already exists")
+            if any(
+                ref.startswith("refs/heads/harness/") and ref.endswith(f"/{selected}")
+                for ref in local_branches(repo)
+            ):
+                refuse("a run branch already exists")
+        except GitError as exc:
+            refuse(f"run Git identity cannot be verified: {exc}")
+
+        try:
+            profiles = tuple(profiles_for_config(config).values())
+        except ProfileError as exc:
+            refuse(f"profile catalogue is unavailable: {exc}")
+        try:
+            plan = parse_task_plan_v2(
+                raw,
+                implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
+                reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
+                check_catalog=config.check_catalog,
+                default_check_ids=config.default_check_ids,
+            )
+            if plan.decision is not PlanDecision.READY:
+                refuse("replacement plan must be STATUS: READY")
+            validate_execution_mode_policy(plan, config.planning)
+            validate_decomposition_policy(plan, config.planning)
+        except V2PlanParseError as exc:
+            refuse(f"replacement plan is invalid: {exc}")
+
+        replacement_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        claimed = store.transition_if(
+            RunStatus.FAILED, state.get("updated_at"), status=RunStatus.FAILED,
+            plan_recovery={"status": "persisting", "replacement_raw_sha256": replacement_sha},
+        )
+        if claimed is None:
+            refuse("run state changed while the plan recovery was validated")
+        try:
+            raw_path = run_dir / "planner.raw.md"
+            previous_sha = hashlib.sha256(raw_path.read_bytes()).hexdigest() if raw_path.is_file() else None
+            archived = _archive_attempt(run_dir, names=_RECOVERY_ATTEMPT_ARTIFACTS)
+            if (run_dir / "steps").is_dir():
+                # Only planning-time contracts can be there (eligibility):
+                # retire them with the plan they belong to.
+                if archived is None:
+                    archived = _archive_attempt_target(run_dir)
+                os.replace(run_dir / "steps", archived / "steps")
+            persist_recovered_plan_artifacts(run_dir, plan)
+            validate_implementation_bundle(run_dir, expected_step_ids=[step.id for step in plan.steps])
+            identity = compute_plan_identity_from_run(run_dir)
+            if identity.raw_sha256 != replacement_sha or identity.execution_sha256 is not None:
+                raise ApprovalError("recovered plan identity does not match the replacement")
+            record = write_plan_recovery_record(
+                run_dir, previous_raw_sha256=previous_sha,
+                replacement_raw_sha256=replacement_sha,
+                archived_attempt=archived.relative_to(run_dir).as_posix() if archived else None,
+            )
+            self._write_phase_checkpoint(
+                run_dir, ResumePhase.PLAN_APPROVAL, head=base_sha, tree=base_tree,
+                plan_identity=identity,
+            )
+        except Exception as exc:
+            store.update(
+                status=RunStatus.FAILED,
+                plan_recovery={"status": "failed", "replacement_raw_sha256": replacement_sha,
+                               "detail": redact(str(exc), self._secrets_or_empty())},
+            )
+            raise
+        planner_state = state.get("planner") if isinstance(state.get("planner"), dict) else {}
+        store.update(
+            status=RunStatus.FAILED,
+            plan_identity=asdict(identity),
+            plan_recovery={**record, "status": "awaiting_approval"},
+            planner={
+                **planner_state,
+                "decision": plan.decision.value,
+                "title": plan.title,
+                "source": PLAN_SOURCE_OPERATOR,
+                "execution_mode": plan.execution_mode.value if plan.execution_mode else None,
+                "required_checks": list(plan.required_checks),
+                "steps": [
+                    {"id": step.id, "title": step.title,
+                     "recommended_profile": step.implementer_profile, "status": "waiting"}
+                    for step in plan.steps
+                ],
+                "reviewer_recommendation": plan.reviewer_profile,
+            },
+        )
+
+    def _secrets_or_empty(self) -> tuple[str, ...]:
+        return tuple(getattr(self, "_secrets", ()) or ())
+
     def _resume_pre_execution(
         self,
         store: RunStateStore,
@@ -5354,6 +5552,13 @@ def resume_run(config: HarnessConfig | str | Path, run_id: str) -> RunResult:
     return Orchestrator(loaded).resume(run_id)
 
 
+def recover_plan_run(config: HarnessConfig | str | Path, run_id: str, replacement_raw: str) -> RunResult:
+    """Recover a failed planner run with an operator META PLAN v2 (no model call)."""
+
+    loaded = load_config(config) if not isinstance(config, HarnessConfig) else config
+    return Orchestrator(loaded).recover_plan(run_id, replacement_raw)
+
+
 __all__ = [
     "CommitBoundaryError",
     "OrchestrationError",
@@ -5362,6 +5567,7 @@ __all__ = [
     "ResumeNotAllowedError",
     "authorize_commit",
     "generate_run_id",
+    "recover_plan_run",
     "resume_run",
     "run_orchestrator",
 ]

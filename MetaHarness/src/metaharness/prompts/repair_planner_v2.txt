@@ -35,7 +35,9 @@ REQUIRED_CHECKS. It may add trusted IDs when the reviewer requires additional
 evidence. Select IDs only; never output commands or argv.
 
 STAGED has 2 to 8 steps. SINGLE has exactly 1 step. Step IDs are contiguous
-S01 through S08; a step may depend only on NONE or an earlier step.
+S01 through S08; a step may depend only on NONE or an earlier step. Keep each
+step contract near 4000 characters; the parser rejects a contract over 8000
+characters and step contracts over 48000 characters in total.
 
 When returning BLOCKED, use exactly this wire format:
 

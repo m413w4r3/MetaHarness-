@@ -27,12 +27,14 @@ from .models import (
 )
 from .planning import PlanDecision, PlanParseError
 from .result import atomic_write_text
+from .step_ids import LAST_STEP_ID, MAX_STEPS, STEP_ID_RE, step_ids
 from .usage import PLANNER_USAGE_ARTIFACT, completion_usage, write_usage_artifact
 
 
-MAX_STEPS = 8
 MAX_STEP_CONTRACT_CHARS = 8_000
-MAX_TOTAL_STEP_CONTRACT_CHARS = 32_000
+# Eight steps at the ~4000-character target fit with margin; eight contracts
+# at the 8000-character hard limit do not.
+MAX_TOTAL_STEP_CONTRACT_CHARS = 48_000
 MAX_READ_SET = 8
 MAX_WRITE_SET = 6
 MAX_CREATE_SET = 6
@@ -45,7 +47,8 @@ _HEADER = "META PLAN v2"
 _END = "END META PLAN"
 _STEP_BEGIN = re.compile(r"^BEGIN STEP (.+)$")
 _STEP_END = re.compile(r"^END STEP (.+)$")
-_STEP_ID = re.compile(r"S0[1-8]")
+_STEP_ID = STEP_ID_RE
+_STEP_ID_RANGE = f"S01 through {LAST_STEP_ID}"
 _INLINE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*:\s*(.*)$")
 _PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
@@ -153,7 +156,7 @@ def _extract_step_blocks(lines: list[str], start: int, end: int) -> tuple[list[t
             continue
         step_id = begin.group(1)
         if _STEP_ID.fullmatch(step_id) is None:
-            raise V2PlanParseError("step ID must be exactly S01 through S08")
+            raise V2PlanParseError(f"step ID must be exactly {_STEP_ID_RANGE}")
         close: int | None = None
         for candidate in range(index + 1, end):
             candidate_line = lines[candidate].strip()
@@ -456,15 +459,14 @@ def parse_task_plan_v2(
     if mode == ExecutionMode.SINGLE.value and step_count != 1:
         raise V2PlanParseError("SINGLE requires exactly one step")
     if mode == ExecutionMode.STAGED.value and not 2 <= step_count <= MAX_STEPS:
-        raise V2PlanParseError("STAGED requires between two and eight steps")
+        raise V2PlanParseError(f"STAGED requires between 2 and {MAX_STEPS} steps")
     reviewer = inline.get("REVIEWER_PROFILE", "")
     if not _PROFILE.fullmatch(reviewer) or reviewer not in reviewer_ids:
         raise V2PlanParseError("unknown reviewer profile")
     if len(blocks) != step_count:
         raise V2PlanParseError("STEP_COUNT does not match step blocks")
-    expected = [f"S{index:02d}" for index in range(1, step_count + 1)]
-    if [step_id for step_id, _ in blocks] != expected:
-        raise V2PlanParseError("step IDs must be contiguous S01 through S08")
+    if [step_id for step_id, _ in blocks] != list(step_ids(step_count)):
+        raise V2PlanParseError(f"step IDs must be contiguous {_STEP_ID_RANGE}")
     steps: list[ImplementationStep] = []
     for step_id, body in blocks:
         steps.append(_parse_step(step_id, body, implementer_ids, frozenset(step.id for step in steps)))
@@ -580,9 +582,9 @@ def render_safe_check_catalogue(checks: Sequence[CheckConfig]) -> str:
     return "\n\n".join(output) or "NONE"
 
 
-REQUIRE_STAGED_POLICY_TEXT = """This run REQUIRES STAGED execution.
+REQUIRE_STAGED_POLICY_TEXT = f"""This run REQUIRES STAGED execution.
 
-You must return between 2 and 6 coherent implementation steps.
+You must return between 2 and {MAX_STEPS} coherent implementation steps.
 
 Do not create artificial "implementation then tests" steps when tests belong
 to the same local behavior.
@@ -878,7 +880,7 @@ def step_contract_path(directory: str | Path, step_id: str) -> Path:
     """Canonical path of one step contract: ``steps/<STEP>/contract.md``."""
 
     if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None:
-        raise V2PlanParseError("step ID must be exactly S01 through S08")
+        raise V2PlanParseError(f"step ID must be exactly {_STEP_ID_RANGE}")
     return Path(directory) / "steps" / step_id / STEP_CONTRACT_NAME
 
 
@@ -938,7 +940,7 @@ def validate_implementation_bundle(
     steps = payload.get("steps")
     if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_STEPS:
         raise V2PlanParseError("implementation bundle steps are invalid")
-    expected_ids = [f"S{index:02d}" for index in range(1, len(steps) + 1)]
+    expected_ids = list(step_ids(len(steps)))
     actual_ids: list[str] = []
     for entry in steps:
         if not isinstance(entry, dict) or set(entry) != {"id", "title", "implementer_profile", "depends_on", "contract_sha256"}:
@@ -985,6 +987,21 @@ def persist_planning_v2_artifacts(
     atomic_write_text(target / "context.txt", context)
     atomic_write_text(target / "planner.request.txt", request)
     atomic_write_text(target / "planner.raw.md", plan.raw)
+    _write_task_plan_v2(target, plan)
+    # The unsuffixed artifact is the v2 approval surface.
+    if plan.decision is PlanDecision.BLOCKED:
+        atomic_write_text(
+            target / "task_plan.json",
+            json.dumps({**asdict(plan), "decision": plan.decision.value, "execution_mode": None}, ensure_ascii=False, indent=2) + "\n",
+        )
+    if plan.decision is PlanDecision.READY:
+        write_implementation_bundle(target, plan)
+
+
+persist_planning_artifacts_v2 = persist_planning_v2_artifacts
+
+
+def _write_task_plan_v2(target: Path, plan: TaskPlanV2) -> None:
     atomic_write_text(
         target / "task_plan_v2.json",
         json.dumps(
@@ -1000,17 +1017,22 @@ def persist_planning_v2_artifacts(
         )
         + "\n",
     )
-    # The unsuffixed artifact is the v2 approval surface.
-    if plan.decision is PlanDecision.BLOCKED:
-        atomic_write_text(
-            target / "task_plan.json",
-            json.dumps({**asdict(plan), "decision": plan.decision.value, "execution_mode": None}, ensure_ascii=False, indent=2) + "\n",
-        )
-    if plan.decision is PlanDecision.READY:
-        write_implementation_bundle(target, plan)
 
 
-persist_planning_artifacts_v2 = persist_planning_v2_artifacts
+def persist_recovered_plan_artifacts(directory: str | Path, plan: TaskPlanV2) -> dict[str, Any]:
+    """Publish an operator-supplied READY plan as the run's plan authority.
+
+    Unlike :func:`persist_planning_v2_artifacts` this never touches
+    ``spec.md``, ``context.txt`` or ``planner.request.txt``: no planner
+    request exists for an operator recovery, and the run inputs are immutable.
+    """
+
+    if not isinstance(plan, TaskPlanV2) or plan.decision is not PlanDecision.READY:
+        raise V2PlanParseError("plan recovery requires a READY v2 plan")
+    target = Path(directory)
+    atomic_write_text(target / "planner.raw.md", plan.raw)
+    _write_task_plan_v2(target, plan)
+    return write_implementation_bundle(target, plan)
 
 
 class TextCompletionClient(Protocol):
@@ -1218,7 +1240,7 @@ __all__ = [
     "PlanDecision", "PlanParseError",
     "build_planner_prompt_v2", "parse_task_plan_v2", "persist_implementation_bundle",
     "build_repair_planner_prompt", "RepairPlannerV2",
-    "persist_planning_artifacts_v2", "persist_planning_v2_artifacts",
+    "persist_planning_artifacts_v2", "persist_planning_v2_artifacts", "persist_recovered_plan_artifacts",
     "read_approved_step_contract", "read_set_paths",
     "render_plan_summary_v2", "render_repair_plan_summary", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract",
     "run_planner_v2", "step_contract_path", "validate_decomposition_policy", "validate_implementation_bundle", "write_implementation_bundle",

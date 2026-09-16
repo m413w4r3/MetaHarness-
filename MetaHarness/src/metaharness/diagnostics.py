@@ -17,11 +17,13 @@ from typing import Any, Iterable, Mapping
 
 from .agent.events import parse_event, summarize_step_event
 from .config import HarnessConfig
+from .plan_recovery import PLAN_RECOVERY_ARTIFACT, PLAN_SOURCE_OPERATOR, plan_source
 from .profiles import profiles_for_config, safe_profile_metadata
 from .redaction import config_secret_values, redact
 from .result import atomic_write_text
 from .resume import ResumeCheckpointError, resume_info, read_checkpoint_record
 from .run_options import RunOptionsError, read_run_options_with_sha256
+from .step_ids import is_step_id
 from .usage import normalize_usage, phase_usage_summary, read_usage_artifact
 
 REPORT_SCHEMA_VERSION = 1
@@ -189,7 +191,7 @@ def _safe_state(state: Mapping[str, Any]) -> dict[str, Any]:
     }
     result["planner"] = {
         key: state.get("planner", {}).get(key)
-        for key in ("decision", "title", "profile_id", "model", "execution_mode", "steps", "reviewer_recommendation")
+        for key in ("decision", "title", "profile_id", "model", "source", "execution_mode", "steps", "reviewer_recommendation")
         if isinstance(state.get("planner"), Mapping) and key in state["planner"]
     }
     cycles = state.get("cycles")
@@ -362,7 +364,7 @@ def _prompt_footprint(run_dir: Path) -> str:
         try:
             step_dirs = sorted(
                 path for path in base.iterdir()
-                if path.is_dir() and re.fullmatch(r"S0[1-8]", path.name)
+                if path.is_dir() and is_step_id(path.name)
             )
         except OSError:
             step_dirs = []
@@ -640,7 +642,15 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
     body += _section("REPOSITORY / CONTEXT SUMMARY", _artifact_header(ref) + _clean(_json(repository_meta), secrets) + "\n" + _artifact_header(_artifact(directory, "context.txt")))
     body += _section("PROMPT FOOTPRINT", _prompt_footprint(directory))
     body += _section("PLANNER REQUEST", _artifact_text(directory, "planner.request.txt", secrets, MAX_PLANNER_REQUEST_BYTES))
+    recovered = plan_source(directory) == PLAN_SOURCE_OPERATOR
     body += _section("PLANNER RESPONSE", "\n".join([
+        # An operator recovery replaces the planner answer without any model
+        # call; the planner usage below belongs to the archived attempt.
+        "plan source: operator recovery" if recovered else "plan source: planner model completion",
+        *([_safe_json_artifact(directory, PLAN_RECOVERY_ARTIFACT, secrets, (
+            "schema_version", "source", "previous_raw_sha256", "replacement_raw_sha256",
+            "recovered_at", "archived_attempt", "planner_called",
+        ))] if recovered else []),
         _artifact_text(directory, "planner.raw.md", secrets),
         _plan_summary(directory, secrets, "task_plan_v2.json"),
         _artifact_json(directory, "planner.usage.json", secrets),

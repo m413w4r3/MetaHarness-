@@ -96,6 +96,8 @@ belongs.
 
 Normal target: keep each step contract under approximately 4000 characters.
 Hard parser limit remains 8000 characters.
+Hard aggregate limit: 48000 characters for all step contracts together.
+The parser enforces both limits; eight steps fit only near the normal target.
 
 For every step:
 - include only files actually needed;

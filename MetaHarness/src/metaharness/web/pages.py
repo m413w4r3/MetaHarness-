@@ -969,6 +969,20 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
         action = f'<p class="label">NEXT ACTION</p>{checkpoint_detail}{button}'
     elif resume.get("reason"):
         action = f'<p class="danger small">RESUME REFUSED: {_e(resume.get("reason"))}</p>'
+    recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
+    if recovery.get("eligible") and token:
+        # The only operator input is the raw replacement plan; SPEC, context,
+        # BASE, run options and catalogues are the run's own.
+        action += (
+            f'<form class="recover-plan" action="/runs/{_e(run.get("run_id"))}/recover-plan" method="post">'
+            f'<input type="hidden" name="_token" value="{_e(token)}">'
+            '<p class="label">OR RECOVER WITH A CORRECTED PLAN</p>'
+            '<label for="replacement-plan">Replacement META PLAN v2 (STATUS: READY only). '
+            'Validated locally by the strict parser; the planner is not called. '
+            'The plan then waits for the normal approval.</label>'
+            f'<textarea id="replacement-plan" name="plan" rows="14" maxlength="{_e(recovery.get("max_bytes"))}" required></textarea>'
+            '<button class="resume" type="submit">REPLACE PLAN</button></form>'
+        )
     detail = failure.get("detail")
     return (
         '<div class="card fail failure-card"><p class="label">FAILED</p>'
@@ -1077,8 +1091,14 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
         recommendation_note = f'<p>Recommended implementer: {_e(names.get(impl_selected, impl_selected))}<br>Recommended reviewer: {_e(names.get(review_selected, review_selected))}</p><p><strong>Rationale:</strong> {_e(recommendation.get("rationale"))}</p>'
     approval_forms = ""
     is_v2 = state.get("planning_protocol") == "v2"
+    recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
     if can_decide and is_v2:
-        approval_forms = _v2_approval_form(run_id, token or "", state, config, run.get("step_artifacts"))
+        approval_forms = (
+            '<div class="card recovered-plan"><p class="label">Recovered plan — awaiting approval</p>'
+            '<p class="small">plan source: operator recovery · no planner call · this approval binds '
+            'the replacement plan, its contract and its bundle</p></div>'
+            if recovery.get("recovered") else ""
+        ) + _v2_approval_form(run_id, token or "", state, config, run.get("step_artifacts"))
     elif can_decide:
         approval_forms = f'''<section class="card"><h2>Plan approval</h2>
 {recommendation_note}

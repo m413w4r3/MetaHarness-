@@ -48,6 +48,7 @@ from metaharness.models import (  # noqa: E402
 )
 from metaharness.orchestrator import Orchestrator  # noqa: E402
 from metaharness.planning_v2 import (  # noqa: E402
+    MAX_STEPS,
     REQUIRE_STAGED_POLICY_TEXT,
     PlannerV2,
     V2PlanParseError,
@@ -886,7 +887,9 @@ class ExecutionPolicyTests(P29Harness):
     def test_prompt_carries_the_policy_only_when_required(self) -> None:
         required = build_planner_prompt_v2("SPEC", "CTX", execution_mode_policy="require-staged")
         self.assertIn("This run REQUIRES STAGED execution.", required)
-        self.assertIn("You must return between 2 and 6 coherent implementation steps.", required)
+        self.assertIn(
+            f"You must return between 2 and {MAX_STEPS} coherent implementation steps.", required
+        )
         self.assertLess(required.index(REQUIRE_STAGED_POLICY_TEXT), required.index("The answer must use exactly this protocol."))
         self.assertNotIn("REQUIRES STAGED", build_planner_prompt_v2("SPEC", "CTX"))
 

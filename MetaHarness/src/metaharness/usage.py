@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .result import atomic_write_text
+from .step_ids import STEP_ID_RE
 
 USAGE_FIELDS = (
     "input_tokens",
@@ -129,7 +130,7 @@ def read_usage_artifact(path: str | Path) -> dict[str, int] | None:
     return normalize_usage(payload)
 
 
-_STEP_DIRECTORY = re.compile(r"S0[1-8]\Z")
+_STEP_DIRECTORY = STEP_ID_RE
 _MAX_STEP_RECORD_BYTES = 128 * 1024
 
 
