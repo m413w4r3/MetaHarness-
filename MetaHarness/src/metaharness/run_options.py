@@ -24,6 +24,68 @@ class RunOptionsConflict(RunOptionsError):
 SCHEMA_VERSION = 1
 RUN_OPTIONS_NAME = "run_options.json"
 REPAIR_SCOPE_POLICIES = frozenset({"auto-bounded", "require-approval", "deny-expansion"})
+REPAIR_SCOPE_OVERRIDE_NAME = "repair_scope_override.json"
+REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION = 1
+REPAIR_SCOPE_OVERRIDE_POLICY = "auto-bounded"
+REPAIR_SCOPE_OVERRIDE_REASON = "operator-enabled historical test-scope recovery"
+REPAIR_SCOPE_MAX_ADDED_PATHS = 100
+
+
+@dataclass(frozen=True)
+class RepairScopeOverride:
+    """The explicit operator opt-in for bounded expansion of an old run."""
+
+    schema_version: int
+    policy: str
+    max_added_paths: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION
+        ):
+            raise RunOptionsError("repair scope override schema_version is unsupported")
+        if self.policy != REPAIR_SCOPE_OVERRIDE_POLICY:
+            raise RunOptionsError("repair scope override policy is invalid")
+        if (
+            isinstance(self.max_added_paths, bool)
+            or not isinstance(self.max_added_paths, int)
+            or not 0 < self.max_added_paths <= REPAIR_SCOPE_MAX_ADDED_PATHS
+        ):
+            raise RunOptionsError("repair scope override max_added_paths must be between 1 and 100")
+        if self.reason != REPAIR_SCOPE_OVERRIDE_REASON:
+            raise RunOptionsError("repair scope override reason is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "policy": self.policy,
+            "max_added_paths": self.max_added_paths,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class EffectiveRepairScopePolicy:
+    """The scope policy actually authoritative for orchestration."""
+
+    policy: str
+    max_added_paths: int
+    source: str
+
+    def __post_init__(self) -> None:
+        if self.policy not in REPAIR_SCOPE_POLICIES:
+            raise RunOptionsError("effective repair scope policy is invalid")
+        if (
+            isinstance(self.max_added_paths, bool)
+            or not isinstance(self.max_added_paths, int)
+            or self.max_added_paths <= 0
+        ):
+            raise RunOptionsError("effective repair scope max_added_paths must be greater than zero")
+        if self.source not in {"run-options", "historical-default", "operator-override"}:
+            raise RunOptionsError("effective repair scope policy source is invalid")
 
 
 @dataclass(frozen=True)
@@ -234,6 +296,15 @@ def _json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _override_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RunOptionsError("duplicate repair scope override field")
+        result[key] = value
+    return result
+
+
 def canonical_run_options_bytes(options: RunOptions) -> bytes:
     return (json.dumps(options.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
@@ -261,9 +332,102 @@ def write_run_options(run_dir: str | Path, options: RunOptions) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def read_run_options_with_sha256(
+def canonical_repair_scope_override_bytes(override: RepairScopeOverride) -> bytes:
+    if not isinstance(override, RepairScopeOverride):
+        raise TypeError("override must be RepairScopeOverride")
+    return (json.dumps(override.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+
+
+def write_repair_scope_override(
+    run_dir: str | Path, override: RepairScopeOverride,
+) -> str:
+    """Claim the immutable operator override, allowing exact idempotence."""
+
+    data = canonical_repair_scope_override_bytes(override)
+    path = Path(run_dir).expanduser().resolve() / REPAIR_SCOPE_OVERRIDE_NAME
+    if path.exists():
+        try:
+            existing = path.read_bytes()
+        except OSError as exc:
+            raise RunOptionsError("repair scope override is unreadable") from exc
+        if existing != data:
+            raise RunOptionsConflict("repair_scope_override.json is immutable")
+    else:
+        atomic_write_text(path, data.decode("utf-8"))
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_repair_scope_override(
+    run_dir: str | Path,
+) -> RepairScopeOverride | None:
+    """Read the immutable operator override, or ``None`` when absent."""
+
+    path = Path(run_dir).expanduser().resolve() / REPAIR_SCOPE_OVERRIDE_NAME
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_override_json_pairs
+        )
+    except RunOptionsError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RunOptionsError("repair_scope_override.json is missing or malformed") from exc
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "schema_version", "policy", "max_added_paths", "reason",
+    }:
+        raise RunOptionsError("repair scope override schema is invalid")
+    try:
+        return RepairScopeOverride(
+            schema_version=payload["schema_version"],
+            policy=payload["policy"],
+            max_added_paths=payload["max_added_paths"],
+            reason=payload["reason"],
+        )
+    except (KeyError, TypeError) as exc:
+        raise RunOptionsError("repair scope override schema is invalid") from exc
+
+
+def effective_repair_scope_policy(
+    options: RunOptions,
+    *,
+    raw_run_options: Mapping[str, Any] | None,
+    override: RepairScopeOverride | None,
+) -> EffectiveRepairScopePolicy:
+    """Resolve scope authority while preserving the historical default."""
+
+    if not isinstance(options, RunOptions):
+        raise TypeError("options must be RunOptions")
+    pipeline = raw_run_options.get("pipeline") if isinstance(raw_run_options, Mapping) else None
+    if pipeline is not None and not isinstance(pipeline, Mapping):
+        raise RunOptionsError("run options pipeline schema is invalid")
+    explicit_keys = set(pipeline or ()) & {
+        "repair_scope_policy", "repair_scope_max_added_paths",
+    }
+    if override is not None:
+        if not isinstance(override, RepairScopeOverride):
+            raise TypeError("override must be RepairScopeOverride")
+        if explicit_keys:
+            raise RunOptionsError(
+                "repair scope override is only allowed for historical run options"
+            )
+        return EffectiveRepairScopePolicy(
+            override.policy, override.max_added_paths, "operator-override"
+        )
+    if not explicit_keys:
+        return EffectiveRepairScopePolicy(
+            "deny-expansion", 4, "historical-default"
+        )
+    return EffectiveRepairScopePolicy(
+        options.repair_scope_policy,
+        options.repair_scope_max_added_paths,
+        "run-options",
+    )
+
+
+def read_run_options_with_sha256_and_raw(
     run_dir: str | Path, expected_sha256: str | Mapping[str, Any] | None = None,
-) -> tuple[RunOptions, str]:
+) -> tuple[RunOptions, str, Mapping[str, Any]]:
     if isinstance(expected_sha256, Mapping):
         expected_sha256 = expected_sha256.get("run_options_sha256")
     if expected_sha256 is not None and not isinstance(expected_sha256, str):
@@ -271,7 +435,8 @@ def read_run_options_with_sha256(
     path = Path(run_dir).expanduser().resolve() / RUN_OPTIONS_NAME
     try:
         data = path.read_bytes()
-        options = RunOptions.from_mapping(json.loads(data.decode("utf-8"), object_pairs_hook=_json_pairs))
+        raw = json.loads(data.decode("utf-8"), object_pairs_hook=_json_pairs)
+        options = RunOptions.from_mapping(raw)
     except RunOptionsError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -279,6 +444,17 @@ def read_run_options_with_sha256(
     digest = hashlib.sha256(data).hexdigest()
     if expected_sha256 is not None and digest != expected_sha256:
         raise RunOptionsError("run_options.json hash mismatch")
+    if not isinstance(raw, Mapping):  # pragma: no cover - guarded by from_mapping
+        raise RunOptionsError("run options must be a JSON object")
+    return options, digest, raw
+
+
+def read_run_options_with_sha256(
+    run_dir: str | Path, expected_sha256: str | Mapping[str, Any] | None = None,
+) -> tuple[RunOptions, str]:
+    options, digest, _raw = read_run_options_with_sha256_and_raw(
+        run_dir, expected_sha256
+    )
     return options, digest
 
 
@@ -296,7 +472,24 @@ def legacy_or_durable_run_options(
         # auto-bounded default through the normal creation path.
         options = RunOptions.from_config(config, repair_scope_policy="deny-expansion")
         return options, None
-    return read_run_options_with_sha256(run_dir, expected_sha256)
+    options, digest, _raw = read_run_options_with_sha256_and_raw(
+        run_dir, expected_sha256
+    )
+    return options, digest
+
+
+def legacy_or_durable_run_options_with_raw(
+    config: HarnessConfig, run_dir: str | Path, *, expected_sha256: str | None = None,
+) -> tuple[RunOptions, str | None, Mapping[str, Any] | None]:
+    """Read options with the original JSON shape needed for policy decisions."""
+
+    path = Path(run_dir).expanduser().resolve() / RUN_OPTIONS_NAME
+    if not path.exists():
+        options, digest = legacy_or_durable_run_options(
+            config, run_dir, expected_sha256=expected_sha256
+        )
+        return options, digest, None
+    return read_run_options_with_sha256_and_raw(run_dir, expected_sha256)
 
 
 def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessConfig:
@@ -324,8 +517,14 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
 
 
 __all__ = [
-    "RUN_OPTIONS_NAME", "SCHEMA_VERSION", "REPAIR_SCOPE_POLICIES", "RunOptions", "RunOptionsConflict",
-    "RunOptionsError", "canonical_run_options_bytes", "effective_run_config",
-    "legacy_or_durable_run_options", "read_run_options_with_sha256",
-    "run_options_sha256", "write_run_options",
+    "RUN_OPTIONS_NAME", "REPAIR_SCOPE_OVERRIDE_NAME", "REPAIR_SCOPE_OVERRIDE_REASON",
+    "REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION", "REPAIR_SCOPE_MAX_ADDED_PATHS",
+    "SCHEMA_VERSION", "REPAIR_SCOPE_POLICIES", "RunOptions", "RunOptionsConflict",
+    "RunOptionsError", "RepairScopeOverride", "EffectiveRepairScopePolicy",
+    "canonical_run_options_bytes", "canonical_repair_scope_override_bytes",
+    "effective_repair_scope_policy", "effective_run_config",
+    "legacy_or_durable_run_options", "legacy_or_durable_run_options_with_raw",
+    "read_run_options_with_sha256", "read_run_options_with_sha256_and_raw",
+    "read_repair_scope_override", "run_options_sha256", "write_run_options",
+    "write_repair_scope_override",
 ]

@@ -13,12 +13,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.run_options import (  # noqa: E402
+    REPAIR_SCOPE_OVERRIDE_REASON,
+    REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION,
+    RepairScopeOverride,
     RunOptions,
     RunOptionsConflict,
     RunOptionsError,
+    effective_repair_scope_policy,
     effective_run_config,
     legacy_or_durable_run_options,
+    read_repair_scope_override,
     read_run_options_with_sha256,
+    write_repair_scope_override,
     write_run_options,
 )
 from metaharness.web.api import WebAPIError, create_run  # noqa: E402
@@ -74,6 +80,59 @@ class RunOptionsTests(unittest.TestCase):
             RunOptions.from_mapping(payload)
         with self.assertRaises(RunOptionsError):
             RunOptions.from_config(self.config, reviewer_profile="luna")
+
+    def test_historical_scope_override_is_explicit_and_immutable(self):
+        options = RunOptions.from_config(self.config)
+        raw = options.to_dict()
+        raw["pipeline"].pop("repair_scope_policy")
+        raw["pipeline"].pop("repair_scope_max_added_paths")
+        historical = RunOptions.from_mapping(raw)
+        effective_default = effective_repair_scope_policy(
+            historical, raw_run_options=raw, override=None
+        )
+        self.assertEqual(
+            (effective_default.policy, effective_default.max_added_paths, effective_default.source),
+            ("deny-expansion", 4, "historical-default"),
+        )
+        override = RepairScopeOverride(
+            REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION,
+            "auto-bounded",
+            7,
+            REPAIR_SCOPE_OVERRIDE_REASON,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            write_repair_scope_override(run_dir, override)
+            self.assertEqual(read_repair_scope_override(run_dir), override)
+            write_repair_scope_override(run_dir, override)
+            with self.assertRaises(RunOptionsConflict):
+                write_repair_scope_override(
+                    run_dir,
+                    RepairScopeOverride(1, "auto-bounded", 8, REPAIR_SCOPE_OVERRIDE_REASON),
+                )
+        effective = effective_repair_scope_policy(
+            historical, raw_run_options=raw, override=override
+        )
+        self.assertEqual((effective.policy, effective.max_added_paths, effective.source),
+                         ("auto-bounded", 7, "operator-override"))
+
+        explicit = options.to_dict()
+        with self.assertRaises(RunOptionsError):
+            effective_repair_scope_policy(
+                options, raw_run_options=explicit, override=override
+            )
+
+    def test_malformed_scope_override_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "repair_scope_override.json"
+            path.write_text(
+                '{"schema_version": 1, "schema_version": 1, '
+                '"policy": "auto-bounded", "max_added_paths": 4, '
+                '"reason": "operator-enabled historical test-scope recovery"}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(RunOptionsError):
+                read_repair_scope_override(directory)
 
     def test_effective_config_isolated_and_legacy_fallback(self):
         options = RunOptions.from_config(

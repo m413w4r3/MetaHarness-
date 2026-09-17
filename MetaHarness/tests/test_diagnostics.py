@@ -149,6 +149,13 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("Claude revision enabled by run options, but no revision artifact was produced/reached.", report)
         self.assertNotIn("Claude revision disabled for this run.", report)
 
+    def test_repair_scope_policy_reports_historical_default(self) -> None:
+        report = build_run_diagnostics(self.config, self.run_dir)
+        self.assertIn("durable run option: historical/missing", report)
+        self.assertIn("effective policy: deny-expansion", report)
+        self.assertIn("max added paths: 4", report)
+        self.assertIn("source: historical-default", report)
+
     def test_prompt_footprint_is_deterministic_and_reports_usage(self) -> None:
         (self.run_dir / "spec.md").write_text("spec", encoding="utf-8")
         (self.run_dir / "context.txt").write_text("context", encoding="utf-8")

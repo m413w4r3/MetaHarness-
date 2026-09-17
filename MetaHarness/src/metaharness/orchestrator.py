@@ -214,10 +214,14 @@ from .validation import ValidationError, check_result_json
 from .workspace import WorkspaceSetupError, prepare_workspace
 from .result import ResultArtifactError, atomic_write_text
 from .run_options import (
+    EffectiveRepairScopePolicy,
     RunOptions,
     RunOptionsError,
+    effective_repair_scope_policy,
     effective_run_config,
     legacy_or_durable_run_options,
+    legacy_or_durable_run_options_with_raw,
+    read_repair_scope_override,
     write_run_options,
 )
 
@@ -1322,15 +1326,15 @@ def _read_check_repair_scope(
     directory: Path,
     *,
     fallback_base: Sequence[str],
-    options: Any,
+    policy_config: EffectiveRepairScopePolicy,
 ) -> CheckRepairScope:
     payload = _read_json_artifact(directory / "scope.json", 64 * 1024)
     base = tuple(sorted(set(fallback_base)))
     if not isinstance(payload, dict) or payload.get("schema_version") != 2:
         return CheckRepairScope(
             base_paths=base, added_paths=(), effective_paths=base,
-            policy=options.repair_scope_policy,
-            bound=options.repair_scope_max_added_paths,
+            policy=policy_config.policy,
+            bound=policy_config.max_added_paths,
             source="human-approved mutable scope",
         )
     raw_base = payload.get("base_mutable_scope")
@@ -1348,7 +1352,7 @@ def _read_check_repair_scope(
     policy = payload.get("policy")
     bound = payload.get("bound")
     source = payload.get("source")
-    if policy != options.repair_scope_policy or bound != options.repair_scope_max_added_paths or not isinstance(source, str):
+    if policy != policy_config.policy or bound != policy_config.max_added_paths or not isinstance(source, str):
         raise ResumeIntegrityError("check-repair scope policy changed")
     if parsed_added and source != "auto-bounded failing-test evidence":
         raise ResumeIntegrityError("check-repair added paths have an invalid provenance")
@@ -1361,10 +1365,10 @@ def _validate_expanded_check_repair_scope(
     repo: Path,
     tree_sha: str,
     base_scope: Sequence[str],
-    options: Any,
+    policy_config: EffectiveRepairScopePolicy,
 ) -> CheckRepairScope:
     scope = _read_check_repair_scope(
-        directory, fallback_base=base_scope, options=options
+        directory, fallback_base=base_scope, policy_config=policy_config
     )
     if not scope.added_paths:
         raise ResumeIntegrityError("expanded check-repair scope has no added paths")
@@ -2138,6 +2142,9 @@ class Orchestrator:
         self._injected_reviser = reviser
         self._secrets: tuple[str, ...] = ()
         self._legacy_run_options = True
+        self._effective_repair_scope = EffectiveRepairScopePolicy(
+            "deny-expansion", 4, "historical-default"
+        )
         # Loaded production configs always contain a process-environment
         # mapping.  The fallback only preserves direct construction of the
         # legacy HarnessConfig dataclass by embedding callers/tests.
@@ -2487,6 +2494,11 @@ class Orchestrator:
             # caller's HarnessConfig object is never mutated.
             self._run_options = run_options
             self._legacy_run_options = legacy_run_options
+            self._effective_repair_scope = effective_repair_scope_policy(
+                run_options,
+                raw_run_options=run_options.to_dict() if not legacy_run_options else None,
+                override=None,
+            )
             self.config = effective_run_config(original_config, run_options)
             store.update(
                 status=RunStatus.CREATED,
@@ -3674,7 +3686,7 @@ class Orchestrator:
                 check_repair_scope_c01 = _read_check_repair_scope(
                     run_dir / "revision" / "check-repair" / "C01",
                     fallback_base=base_repair_scope_c01,
-                    options=self._run_options,
+                    policy_config=self._effective_repair_scope,
                 )
             self._cycle_update(
                 store, 1, status="check_repair_attempted",
@@ -3782,14 +3794,15 @@ class Orchestrator:
                             if check_repair_scope_c01 is not None else base_repair_scope_c01
                         ),
                     )
+                    scope_policy = self._effective_repair_scope
                     may_expand = (
                         bool(_soft_check_failures(evidence))
                         and not _hard_integrity_failures(evidence)
                         and not prior_added
                         and not (expanded_dir / "report.json").exists()
-                        and self._run_options.repair_scope_policy == "auto-bounded"
+                        and scope_policy.policy == "auto-bounded"
                         and bool(candidates)
-                        and len(candidates) <= self._run_options.repair_scope_max_added_paths
+                        and len(candidates) <= scope_policy.max_added_paths
                     )
                     if may_expand:
                         _archive_attempt(run_dir / "checks" / "C01", names=_CHECK_ATTEMPT_ARTIFACTS)
@@ -3803,8 +3816,8 @@ class Orchestrator:
                                 (check_repair_scope_c01.base_paths
                                  if check_repair_scope_c01 is not None else base_repair_scope_c01)
                             ) | set(candidates))),
-                            policy=self._run_options.repair_scope_policy,
-                            bound=self._run_options.repair_scope_max_added_paths,
+                            policy=scope_policy.policy,
+                            bound=scope_policy.max_added_paths,
                             source="auto-bounded failing-test evidence",
                         )
                         store.update(
@@ -3920,7 +3933,7 @@ class Orchestrator:
                     check_repair_scope_c01.base_paths
                     if check_repair_scope_c01 is not None else base_repair_scope_c01
                 ),
-                options=self._run_options,
+                policy_config=self._effective_repair_scope,
             )
             if at <= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01):
                 expanded_check_repair_result_c01, repair_error = self._run_v2_revision_cycle(
@@ -4869,8 +4882,9 @@ class Orchestrator:
         base_mutable_scope: Sequence[str],
     ) -> CheckRepairScope:
         base_paths = tuple(sorted(set(base_mutable_scope)))
-        policy = self._run_options.repair_scope_policy
-        bound = self._run_options.repair_scope_max_added_paths
+        scope_policy = self._effective_repair_scope
+        policy = scope_policy.policy
+        bound = scope_policy.max_added_paths
         candidates = (
             _check_repair_scope_candidates(
                 repo=repo,
@@ -4952,8 +4966,8 @@ class Orchestrator:
             check_repair_scope = check_repair_scope or CheckRepairScope(
                 base_paths=tuple(mutable_scope), added_paths=(),
                 effective_paths=tuple(mutable_scope),
-                policy=self._run_options.repair_scope_policy,
-                bound=self._run_options.repair_scope_max_added_paths,
+                policy=scope_policy.policy,
+                bound=scope_policy.max_added_paths,
                 source="human-approved mutable scope",
             )
             atomic_write_text(artifact_dir / "scope.json", _json_text({
@@ -5313,8 +5327,9 @@ class Orchestrator:
             }),
         )
         added_paths = scope_delta["added_paths"]
-        policy = self._run_options.repair_scope_policy
-        bound = self._run_options.repair_scope_max_added_paths
+        scope_policy = self._effective_repair_scope
+        policy = scope_policy.policy
+        bound = scope_policy.max_added_paths
         if added_paths and policy == "deny-expansion":
             self._cycle_update(store, 2, status="failed", failure="REPAIR_SCOPE_EXPANSION",
                                repair_mutable_scope=repair_scope, scope_delta=scope_delta)
@@ -5543,7 +5558,7 @@ class Orchestrator:
                 check_repair_scope_c02 = _read_check_repair_scope(
                     run_dir / "revision" / "check-repair" / "C02",
                     fallback_base=base_repair_scope_c02,
-                    options=self._run_options,
+                    policy_config=self._effective_repair_scope,
                 )
             self._cycle_update(
                 store, 2, status="check_repair_attempted",
@@ -5639,14 +5654,15 @@ class Orchestrator:
                             if check_repair_scope_c02 is not None else base_repair_scope_c02
                         ),
                     )
+                    scope_policy = self._effective_repair_scope
                     may_expand = (
                         bool(_soft_check_failures(evidence))
                         and not _hard_integrity_failures(evidence)
                         and not prior_added
                         and not (expanded_dir / "report.json").exists()
-                        and self._run_options.repair_scope_policy == "auto-bounded"
+                        and scope_policy.policy == "auto-bounded"
                         and bool(candidates)
-                        and len(candidates) <= self._run_options.repair_scope_max_added_paths
+                        and len(candidates) <= scope_policy.max_added_paths
                     )
                     if may_expand:
                         _archive_attempt(checks_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
@@ -5660,8 +5676,8 @@ class Orchestrator:
                                 (check_repair_scope_c02.base_paths
                                  if check_repair_scope_c02 is not None else base_repair_scope_c02)
                             ) | set(candidates))),
-                            policy=self._run_options.repair_scope_policy,
-                            bound=self._run_options.repair_scope_max_added_paths,
+                            policy=scope_policy.policy,
+                            bound=scope_policy.max_added_paths,
                             source="auto-bounded failing-test evidence",
                         )
                         store.update(
@@ -5758,7 +5774,7 @@ class Orchestrator:
                     check_repair_scope_c02.base_paths
                     if check_repair_scope_c02 is not None else base_repair_scope_c02
                 ),
-                options=self._run_options,
+                policy_config=self._effective_repair_scope,
             )
             if at <= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02):
                 expanded_check_repair_result_c02, repair_error = self._run_v2_revision_cycle(
@@ -6483,13 +6499,17 @@ class Orchestrator:
             raise ResumeError(f"run state is unreadable: {exc}") from exc
         try:
             self._legacy_run_options = not bool(state.get("run_options_explicit", False))
-            options, _ = legacy_or_durable_run_options(
+            options, _, raw_run_options = legacy_or_durable_run_options_with_raw(
                 self.config,
                 run_dir,
                 expected_sha256=state.get("run_options_sha256")
                 if isinstance(state.get("run_options_sha256"), str) else None,
             )
+            override = read_repair_scope_override(run_dir)
             self._run_options = options
+            self._effective_repair_scope = effective_repair_scope_policy(
+                options, raw_run_options=raw_run_options, override=override
+            )
             self.config = effective_run_config(self.config, options)
         except RunOptionsError as exc:
             raise ResumeNotAllowedError("run options are missing or invalid") from exc
@@ -7201,7 +7221,7 @@ class Orchestrator:
             expanded = _validate_expanded_check_repair_scope(
                 run_dir / "revision" / "check-repair-expanded" / "C01",
                 repo=repo, tree_sha=checkpoint.expected_tree_sha,
-                base_scope=scope, options=self._run_options,
+                base_scope=scope, policy_config=self._effective_repair_scope,
             )
             scope = sorted(set(scope) | set(expanded.effective_paths))
         elif checkpoint.phase in expanded_c02_phases and (
@@ -7214,7 +7234,7 @@ class Orchestrator:
             expanded = _validate_expanded_check_repair_scope(
                 run_dir / "revision" / "check-repair-expanded" / "C02",
                 repo=repo, tree_sha=checkpoint.expected_tree_sha,
-                base_scope=c02_repair_scope, options=self._run_options,
+                base_scope=c02_repair_scope, policy_config=self._effective_repair_scope,
             )
             scope = sorted(set(scope) | set(expanded.effective_paths))
         try:
@@ -7664,14 +7684,14 @@ class Orchestrator:
         ):
             refuse("the C02 scope delta does not match the repair plan")
         if added:
-            options = self._run_options
-            if options.repair_scope_policy == "deny-expansion":
+            scope_policy = self._effective_repair_scope
+            if scope_policy.policy == "deny-expansion":
                 refuse("the C02 scope delta is not allowed by the run scope policy")
             requires_scope_approval = (
-                options.repair_scope_policy == "require-approval"
+                scope_policy.policy == "require-approval"
                 or (
-                    options.repair_scope_policy == "auto-bounded"
-                    and len(added) > options.repair_scope_max_added_paths
+                    scope_policy.policy == "auto-bounded"
+                    and len(added) > scope_policy.max_added_paths
                 )
             )
             if requires_scope_approval:
@@ -7801,14 +7821,14 @@ class Orchestrator:
                     path for step in resumed.plan.steps
                     for path in (*step.write_set, *step.create_set, *step.delete_set)
                 }),
-                options=self._run_options,
+                policy_config=self._effective_repair_scope,
             )
             _validate_expanded_check_repair_scope(
                 expanded_c01_dir,
                 repo=resumed.info.source_repo,
                 tree_sha=c01_tree,
                 base_scope=normal_scope.base_paths,
-                options=self._run_options,
+                policy_config=self._effective_repair_scope,
             )
             if at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01):
                 expanded_revision = _load_revision(expanded_c01_dir)
@@ -8003,14 +8023,14 @@ class Orchestrator:
                     path for step in repair_plan.steps
                     for path in (*step.write_set, *step.create_set, *step.delete_set)
                 }),
-                options=self._run_options,
+                policy_config=self._effective_repair_scope,
             )
             _validate_expanded_check_repair_scope(
                 expanded_c02_dir,
                 repo=resumed.info.source_repo,
                 tree_sha=c02_tree,
                 base_scope=normal_scope.base_paths,
-                options=self._run_options,
+                policy_config=self._effective_repair_scope,
             )
             if at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02):
                 expanded_revision = _load_revision(expanded_c02_dir)

@@ -22,7 +22,13 @@ from .profiles import profiles_for_config, safe_profile_metadata
 from .redaction import config_secret_values, redact
 from .result import atomic_write_text
 from .resume import ResumeCheckpointError, resume_info, read_checkpoint_record
-from .run_options import RunOptionsError, read_run_options_with_sha256
+from .run_options import (
+    RunOptionsError,
+    effective_repair_scope_policy,
+    legacy_or_durable_run_options_with_raw,
+    read_repair_scope_override,
+    read_run_options_with_sha256,
+)
 from .step_ids import is_step_id
 from .usage import normalize_usage, phase_usage_summary, read_usage_artifact
 
@@ -515,6 +521,36 @@ def _claude_status(config: HarnessConfig, run_dir: Path, revision_exists: bool) 
     return "Claude revision artifacts present (legacy configuration fallback)."
 
 
+def _repair_scope_policy_status(config: HarnessConfig, run_dir: Path) -> str:
+    """Render the durable and effective scope authorities without ambiguity."""
+
+    try:
+        options, _digest, raw = legacy_or_durable_run_options_with_raw(config, run_dir)
+        override = read_repair_scope_override(run_dir)
+        effective = effective_repair_scope_policy(
+            options, raw_run_options=raw, override=override
+        )
+    except RunOptionsError as exc:
+        return "\n".join([
+            "Repair scope policy:",
+            "  durable run option: unavailable",
+            "  effective policy: unavailable",
+            f"  error: {type(exc).__name__}",
+        ])
+    pipeline = raw.get("pipeline") if isinstance(raw, Mapping) else None
+    historical = not isinstance(pipeline, Mapping) or not (
+        {"repair_scope_policy", "repair_scope_max_added_paths"} & set(pipeline)
+    )
+    durable = "historical/missing" if historical else "explicit"
+    return "\n".join([
+        "Repair scope policy:",
+        f"  durable run option: {durable}",
+        f"  effective policy: {effective.policy}",
+        f"  max added paths: {effective.max_added_paths}",
+        f"  source: {effective.source}",
+    ])
+
+
 def _event_artifact(run_dir: Path, relative: str, secrets: tuple[str, ...]) -> str:
     item = _artifact(run_dir, relative)
     return _artifact_header(item) + "Summarized events (tool arguments omitted):\n" + (
@@ -763,6 +799,12 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
         summary_body += f"\n[TRUNCATED: original {_state_size} bytes]\n"
     body += _section("RUN SUMMARY", summary_body)
     body += _section("RUN OPTIONS", _safe_json_artifact(directory, "run_options.json", secrets, ("schema_version", "planning", "pipeline", "profiles")))
+    body += _section(
+        "REPAIR SCOPE POLICY",
+        _repair_scope_policy_status(config, directory)
+        + "\n"
+        + _artifact_json(directory, "repair_scope_override.json", secrets),
+    )
     try:
         checkpoint_record = read_checkpoint_record(directory)
         checkpoint_text = _artifact_json(directory, "resume_checkpoint.json", secrets)

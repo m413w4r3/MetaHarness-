@@ -52,6 +52,14 @@ from .redaction import config_secret_values, redact
 from .result import RunResult
 from .resume import ResumeError
 from .resume import resume_info
+from .run_options import (
+    REPAIR_SCOPE_OVERRIDE_REASON,
+    REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION,
+    RepairScopeOverride,
+    RunOptionsError,
+    read_run_options_with_sha256_and_raw,
+    write_repair_scope_override,
+)
 from .state import STATE_LOCK_NAME, RunStateStore
 
 _SANDBOX_PROBE_ARGV = ("sandbox", "--", "/bin/true")
@@ -115,7 +123,47 @@ def _run(config_path: Path, spec_path: Path, run_id: str | None) -> int:
     return _report_result(result)
 
 
-def _resume(config_path: Path, run_id: str, revalidate_integrity: bool = False) -> int:
+def _enable_historical_scope_expansion(
+    config_path: Path, run_id: str, max_added_paths: int,
+) -> Path:
+    config = load_config(config_path)
+    if not run_id or Path(run_id).name != run_id or run_id in {".", ".."}:
+        raise RunOptionsError("run id is invalid")
+    run_dir = (config.runs_root / run_id).expanduser().resolve()
+    if run_dir.parent != config.runs_root.expanduser().resolve():
+        raise RunOptionsError("run id is invalid")
+    state_path = run_dir / "state.json"
+    if not run_dir.is_dir() or not state_path.is_file():
+        raise RunOptionsError("run directory or state does not exist")
+    state = RunStateStore(state_path).load()
+    expected_sha = state.get("run_options_sha256")
+    if expected_sha is not None and not isinstance(expected_sha, str):
+        raise RunOptionsError("run options hash is invalid")
+    _options, _digest, raw = read_run_options_with_sha256_and_raw(
+        run_dir, expected_sha256=expected_sha
+    )
+    pipeline = raw.get("pipeline")
+    if not isinstance(pipeline, Mapping):
+        raise RunOptionsError("run options pipeline schema is invalid")
+    if {"repair_scope_policy", "repair_scope_max_added_paths"} & set(pipeline):
+        raise RunOptionsError(
+            "bounded scope expansion is only available for historical run options"
+        )
+    override = RepairScopeOverride(
+        schema_version=REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION,
+        policy="auto-bounded",
+        max_added_paths=max_added_paths,
+        reason=REPAIR_SCOPE_OVERRIDE_REASON,
+    )
+    write_repair_scope_override(run_dir, override)
+    return run_dir
+
+
+def _resume(
+    config_path: Path, run_id: str, revalidate_integrity: bool = False,
+    allow_bounded_test_scope_expansion: bool = False,
+    bounded_test_scope_max_paths: int | None = None,
+) -> int:
     """Resume one run at its durable checkpoint; never replays a phase.
 
     ``--revalidate-integrity`` is an operator-only intent: it re-opens the
@@ -126,10 +174,20 @@ def _resume(config_path: Path, run_id: str, revalidate_integrity: bool = False) 
     """
 
     try:
+        if allow_bounded_test_scope_expansion:
+            _enable_historical_scope_expansion(
+                config_path, run_id, bounded_test_scope_max_paths or 4
+            )
+        elif bounded_test_scope_max_paths is not None:
+            raise RunOptionsError(
+                "--bounded-test-scope-max-paths requires "
+                "--allow-bounded-test-scope-expansion"
+            )
         result = resume_run(
             config_path, run_id, revalidate_integrity=revalidate_integrity
         )
-    except (ConfigError, ResumeError, OrchestrationError, OSError, UnicodeError) as exc:
+    except (ConfigError, ResumeError, OrchestrationError, RunOptionsError,
+            OSError, UnicodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return _report_result(result)
@@ -764,6 +822,14 @@ def build_parser() -> argparse.ArgumentParser:
             "RESUME_INTEGRITY_FAILURE (bypasses no invariant)"
         ),
     )
+    resume.add_argument(
+        "--allow-bounded-test-scope-expansion", action="store_true",
+        help="enable bounded test-scope recovery for a historical run",
+    )
+    resume.add_argument(
+        "--bounded-test-scope-max-paths", type=int,
+        help="maximum number of operator-added test paths (1..100)",
+    )
     recover = subparsers.add_parser(
         "recover-plan",
         help="replace a failed planner answer with a READY META PLAN v2 (no planner call)",
@@ -802,7 +868,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         return _run(args.config, args.spec, args.run_id)
     if args.command == "resume":
-        return _resume(args.config, args.run_id, args.revalidate_integrity)
+        if args.bounded_test_scope_max_paths is not None and not 1 <= args.bounded_test_scope_max_paths <= 100:
+            parser = build_parser()
+            parser.error("--bounded-test-scope-max-paths must be between 1 and 100")
+        return _resume(
+            args.config, args.run_id, args.revalidate_integrity,
+            args.allow_bounded_test_scope_expansion,
+            args.bounded_test_scope_max_paths,
+        )
     if args.command == "recover-plan":
         return _recover_plan(args.config, args.run_id, args.plan)
     if args.command == "status":

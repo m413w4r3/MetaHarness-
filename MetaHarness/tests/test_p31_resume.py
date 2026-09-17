@@ -594,6 +594,15 @@ class IntegrityRevalidationEligibilityTests(unittest.TestCase):
                     resume_run.call_args.kwargs, {"revalidate_integrity": expected}
                 )
 
+    def test_bounded_scope_cli_options_are_parsed(self) -> None:
+        args = cli.build_parser().parse_args([
+            "resume", "--config", "c.toml", "--run-id", "r",
+            "--allow-bounded-test-scope-expansion",
+            "--bounded-test-scope-max-paths", "9",
+        ])
+        self.assertTrue(args.allow_bounded_test_scope_expansion)
+        self.assertEqual(args.bounded_test_scope_max_paths, 9)
+
 
 class RepairPlannerRequestArtifactsTests(P29Harness):
     """The C02 request is durable before any transport is attempted."""

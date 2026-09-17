@@ -268,3 +268,11 @@ apply atomically; production, generated, untracked and ambiguous paths are
 never added. Model output never decides the scope. A cycle permits at most one
 expanded check-repair pass, and production paths remain the responsibility of
 the approved plan and reviewer/C02 process.
+
+Historical snapshots whose `pipeline` predates the repair-scope fields keep
+the historical `deny-expansion` default. An operator may explicitly opt in on
+resume with `--allow-bounded-test-scope-expansion`; this writes the immutable,
+write-once `repair_scope_override.json` artifact and can only select
+`auto-bounded` with a bound from 1 through 100. The override is refused for
+snapshots containing either current repair-scope field, and it does not alter
+`run_options.json` or any other resume authority.
