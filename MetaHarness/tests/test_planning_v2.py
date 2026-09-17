@@ -28,9 +28,12 @@ from metaharness.planning_v2 import (  # noqa: E402
     REPAIR_PLANNER_INLINE_TARGET_BYTES,
     build_repair_planner_prompt,
     build_repair_planner_prompt_bundle,
+    RepairPlannerV2,
     render_decomposition_policy_text,
+    render_repair_decomposition_policy_text,
     render_repair_step_index,
     validate_decomposition_policy,
+    validate_repair_decomposition_policy,
     parse_task_plan_v2,
     render_plan_summary_v2,
     render_repair_plan_summary,
@@ -885,6 +888,306 @@ class PlannerV2RequestPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(V2PlanParseError, "at most 3 distinct mutable paths; got 6"):
             planner.plan("SPEC", "CTX")
         self.assertIn("Every STAGED step may modify at most 3 distinct mutable paths", client.prompts[0])
+
+
+_REPAIR_POLICY_HEADING = "REPAIR DECOMPOSITION POLICY"
+_REPAIR_PROTOCOL = (
+    "The answer must use exactly the existing META PLAN v2 wire protocol."
+)
+
+
+def _single(**sets: tuple[str, ...]) -> str:
+    return _plan(steps=_sets_step(1, **sets))
+
+
+class RepairDecompositionPolicyValidatorTests(unittest.TestCase):
+    """A C02 step is bounded by the staged per-worker maximum, never by SINGLE."""
+
+    PLANNING = _aggressive(
+        single_step_max_mutable_paths=4, staged_step_max_mutable_paths=6
+    )
+
+    def test_the_initial_single_limit_is_not_relaxed(self) -> None:
+        plan = _parse(_single(write=_paths("w", 6)))
+        with self.assertRaises(V2PlanParseError) as caught:
+            validate_decomposition_policy(plan, self.PLANNING)
+        message = str(caught.exception)
+        for fragment in ("aggressive SINGLE", "at most 4", "got 6"):
+            self.assertIn(fragment, message, fragment)
+
+    def test_a_repair_single_at_the_staged_maximum_is_accepted(self) -> None:
+        plan = _parse(_single(write=_paths("w", 6)))
+        self.assertEqual(plan.execution_mode, ExecutionMode.SINGLE)
+        validate_repair_decomposition_policy(plan, self.PLANNING)
+
+    def test_a_repair_single_above_the_staged_maximum_is_refused(self) -> None:
+        plan = _parse(_single(write=_paths("w", 4), create=_paths("c", 3)))
+        with self.assertRaisesRegex(
+            V2PlanParseError,
+            "^aggressive repair step S01 may modify at most 6 "
+            "distinct mutable paths; got 7$",
+        ):
+            validate_repair_decomposition_policy(plan, self.PLANNING)
+
+    def test_the_repair_limit_is_per_step_and_never_aggregate(self) -> None:
+        both_six = _plan(
+            "STAGED", 2,
+            steps=_sets_step(1, write=_paths("w", 6))
+            + "\n\n"
+            + _sets_step(2, write=_paths("x", 6)),
+        )
+        validate_repair_decomposition_policy(_parse(both_six), self.PLANNING)
+        second_seven = _plan(
+            "STAGED", 2,
+            steps=_sets_step(1, write=_paths("w", 6))
+            + "\n\n"
+            + _sets_step(2, write=_paths("x", 7)),
+        )
+        with self.assertRaisesRegex(
+            V2PlanParseError, "^aggressive repair step S02 .*at most 6 .*got 7$"
+        ):
+            validate_repair_decomposition_policy(_parse(second_seven), self.PLANNING)
+
+    def test_balanced_and_blocked_plans_are_untouched(self) -> None:
+        seven = _parse(_single(write=_paths("w", 7)))
+        validate_repair_decomposition_policy(seven, PlanningConfig(protocol="v2"))
+        blocked = _parse(
+            "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: Blocked\n\nOBJECTIVE\n"
+            "Cannot plan.\n\nBLOCKERS\nThe contract is absent.\n\nEND META PLAN\n"
+        )
+        validate_repair_decomposition_policy(blocked, self.PLANNING)
+
+    def test_non_model_values_are_refused(self) -> None:
+        with self.assertRaises(TypeError):
+            validate_repair_decomposition_policy("plan", self.PLANNING)
+        with self.assertRaises(TypeError):
+            validate_repair_decomposition_policy(
+                _parse(_single(write=_paths("w", 1))), "planning"
+            )
+
+
+class RepairDecompositionPolicyPromptTests(unittest.TestCase):
+    def test_the_repair_prompt_carries_its_own_numeric_limit(self) -> None:
+        prompt = build_repair_planner_prompt(
+            **_repair_inputs(), staged_step_max_mutable_paths=6
+        )
+
+        self.assertIn(
+            "Every repair implementation step, including a SINGLE S01", prompt
+        )
+        self.assertIn("at most 6 distinct mutable\npaths", prompt)
+        self.assertNotIn("{{REPAIR_DECOMPOSITION_POLICY}}", prompt)
+        # The initial planner's SINGLE threshold is never quoted to C02.
+        self.assertNotIn("at most 4", prompt)
+        self.assertNotIn("A READY SINGLE plan may modify", prompt)
+        self.assertLess(
+            prompt.index(_REPAIR_POLICY_HEADING), prompt.index(_REPAIR_PROTOCOL)
+        )
+        self.assertIn(
+            "The REPAIR DECOMPOSITION POLICY above is\nauthoritative over the "
+            "union of WRITE_SET, CREATE_SET and DELETE_SET.",
+            prompt,
+        )
+        self.assertNotIn("the configured mutable-path policy is", prompt)
+
+    def test_the_limit_is_an_instruction_and_not_repair_evidence(self) -> None:
+        bundle = build_repair_planner_prompt_bundle(
+            **_repair_inputs(), staged_step_max_mutable_paths=9
+        )
+
+        self.assertNotIn(_REPAIR_POLICY_HEADING, bundle.evidence_text)
+        for prompt in (bundle.inline_prompt, bundle.fallback_prompt):
+            self.assertIn("at most 9 distinct mutable\npaths", prompt)
+        # The number appears exactly where the policy states it.
+        self.assertEqual(bundle.inline_prompt.count("at most 9"), 1)
+
+    def test_the_rendered_limit_must_be_a_positive_integer(self) -> None:
+        for value in (0, -1, True, 6.0, "6", None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    render_repair_decomposition_policy_text(value)
+
+
+class MustNotBeCalled:
+    """A transport that proves local recovery never pays for a second answer."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, prompt: str) -> str:
+        self.calls += 1
+        raise AssertionError("LLM MUST NOT BE CALLED")
+
+    def complete_with_file_fallback(self, *args, **kwargs):
+        self.calls += 1
+        raise AssertionError("LLM MUST NOT BE CALLED")
+
+
+class RepairPlanLocalRecoveryTests(unittest.TestCase):
+    """An already produced ``planner.raw.md`` is revalidated, never replanned."""
+
+    PLANNING = _aggressive(
+        single_step_max_mutable_paths=4, staged_step_max_mutable_paths=6
+    )
+    SIX_PATH_REPAIR = _plan(steps=_sets_step(1, write=_paths("w", 6)))
+    ONE_PATH_REPAIR = _plan(steps=_sets_step(1, write=_paths("w", 1)))
+
+    def evidence(self) -> str:
+        return build_repair_planner_prompt_bundle(
+            **_repair_inputs(),
+            staged_step_max_mutable_paths=(
+                self.PLANNING.staged_step_max_mutable_paths
+            ),
+        ).evidence_text
+
+    def prepare(self, directory: str, *, raw: str, evidence: str) -> Path:
+        target = Path(directory) / "repair" / "C02"
+        target.mkdir(parents=True)
+        (target / "planner.raw.md").write_text(raw, encoding="utf-8")
+        (target / "planner.evidence.md").write_text(evidence, encoding="utf-8")
+        return target
+
+    def planner(self, client) -> RepairPlannerV2:
+        return RepairPlannerV2(
+            client,
+            implementer_ids=frozenset({"impl-a"}),
+            reviewer_ids=frozenset({"review-a"}),
+            planning=self.PLANNING,
+        )
+
+    def test_an_identical_evidence_packet_recovers_the_plan_without_a_call(self) -> None:
+        client = MustNotBeCalled()
+        with tempfile.TemporaryDirectory() as directory:
+            target = self.prepare(
+                directory, raw=self.SIX_PATH_REPAIR, evidence=self.evidence()
+            )
+            plan = self.planner(client).plan(
+                **_repair_inputs(), artifacts_dir=target
+            )
+
+            self.assertEqual(client.calls, 0)
+            self.assertEqual(plan.decision, PlanDecision.READY)
+            self.assertEqual(plan.execution_mode, ExecutionMode.SINGLE)
+            step = plan.steps[0]
+            union = set(step.write_set) | set(step.create_set) | set(step.delete_set)
+            self.assertEqual(len(union), 6)
+            for name in ("implementation_bundle.json", "task_plan_v2.json",
+                         "steps/S01/contract.md", "spec.md", "context.txt"):
+                self.assertTrue((target / name).is_file(), name)
+            validate_implementation_bundle(target, expected_step_ids=["S01"])
+            # The paid exchange is provenance: recovery rewrites none of it.
+            self.assertEqual(
+                (target / "planner.raw.md").read_text(encoding="utf-8"),
+                self.SIX_PATH_REPAIR,
+            )
+            self.assertEqual(
+                (target / "planner.evidence.md").read_text(encoding="utf-8"),
+                self.evidence(),
+            )
+            for absent in ("planner.request.txt", "planner.request.fallback.txt",
+                           "planner.request.meta.json", "planner.usage.json"):
+                self.assertFalse((target / absent).exists(), absent)
+
+    def test_a_stale_evidence_packet_is_never_recovered(self) -> None:
+        client = _CapturingClient(self.ONE_PATH_REPAIR)
+        with tempfile.TemporaryDirectory() as directory:
+            target = self.prepare(
+                directory, raw=self.SIX_PATH_REPAIR, evidence="OLD EVIDENCE"
+            )
+            plan = self.planner(client).plan(
+                **_repair_inputs(), artifacts_dir=target
+            )
+
+        self.assertEqual(len(client.prompts), 1)
+        self.assertEqual(plan.raw, self.ONE_PATH_REPAIR)
+        self.assertEqual(len(plan.steps[0].write_set), 1)
+
+    def test_an_evidence_packet_differing_only_in_one_datum_is_stale(self) -> None:
+        client = _CapturingClient(self.ONE_PATH_REPAIR)
+        with tempfile.TemporaryDirectory() as directory:
+            target = self.prepare(
+                directory, raw=self.SIX_PATH_REPAIR, evidence=self.evidence()
+            )
+            plan = self.planner(client).plan(
+                **_repair_inputs(candidate_code_evidence="OTHER_CANDIDATE"),
+                artifacts_dir=target,
+            )
+
+        self.assertEqual(len(client.prompts), 1)
+        self.assertEqual(plan.raw, self.ONE_PATH_REPAIR)
+
+    def test_a_structurally_invalid_or_out_of_policy_raw_is_never_recovered(self) -> None:
+        anchored = "READ_SET\n- src/example.py :: anchor\n\n"
+        cases = {
+            "duplicate write path": _plan(
+                steps=_change_step(anchored + "WRITE_SET\n- src/example.py\n- src/example.py\n")
+            ),
+            "unknown profile": self.SIX_PATH_REPAIR.replace(
+                "IMPLEMENTER_PROFILE: impl-a", "IMPLEMENTER_PROFILE: impl-z"
+            ),
+            "traversal path": _plan(
+                steps=_change_step("READ_SET\n- ../escape.py :: anchor\n\nWRITE_SET\n- ../escape.py\n")
+            ),
+            "above the repair limit": _plan(steps=_sets_step(1, write=_paths("w", 7))),
+            "empty answer": "",
+        }
+        for name, raw in cases.items():
+            with self.subTest(case=name):
+                client = _CapturingClient(self.ONE_PATH_REPAIR)
+                with tempfile.TemporaryDirectory() as directory:
+                    target = self.prepare(
+                        directory, raw=raw, evidence=self.evidence()
+                    )
+                    plan = self.planner(client).plan(
+                        **_repair_inputs(), artifacts_dir=target
+                    )
+                self.assertEqual(len(client.prompts), 1)
+                self.assertEqual(plan.raw, self.ONE_PATH_REPAIR)
+
+    def test_a_missing_artifact_falls_back_to_the_transport(self) -> None:
+        for missing in ("planner.raw.md", "planner.evidence.md"):
+            with self.subTest(missing=missing):
+                client = _CapturingClient(self.ONE_PATH_REPAIR)
+                with tempfile.TemporaryDirectory() as directory:
+                    target = self.prepare(
+                        directory, raw=self.SIX_PATH_REPAIR, evidence=self.evidence()
+                    )
+                    (target / missing).unlink()
+                    self.planner(client).plan(
+                        **_repair_inputs(), artifacts_dir=target
+                    )
+                self.assertEqual(len(client.prompts), 1)
+
+    def test_an_archived_retry_attempt_is_recovered_without_a_call(self) -> None:
+        """A resume archives ``repair/C02`` before the planner is entered again."""
+
+        client = MustNotBeCalled()
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "repair" / "C02"
+            attempt = target / "attempts" / "01"
+            attempt.mkdir(parents=True)
+            (attempt / "planner.raw.md").write_text(
+                self.SIX_PATH_REPAIR, encoding="utf-8"
+            )
+            (attempt / "planner.evidence.md").write_text(
+                self.evidence(), encoding="utf-8"
+            )
+            plan = self.planner(client).plan(
+                **_repair_inputs(), artifacts_dir=target
+            )
+
+            self.assertEqual(client.calls, 0)
+            self.assertEqual(plan.execution_mode, ExecutionMode.SINGLE)
+            # The archived copy stays; the run's own provenance is restored.
+            self.assertEqual(
+                (attempt / "planner.raw.md").read_text(encoding="utf-8"),
+                self.SIX_PATH_REPAIR,
+            )
+            self.assertEqual(
+                (target / "planner.raw.md").read_text(encoding="utf-8"),
+                self.SIX_PATH_REPAIR,
+            )
+            self.assertTrue((target / "implementation_bundle.json").is_file())
 
 
 if __name__ == "__main__":

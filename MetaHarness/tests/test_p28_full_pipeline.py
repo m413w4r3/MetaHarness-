@@ -71,6 +71,7 @@ from metaharness.models import (  # noqa: E402
     SelectionMode,
 )
 from metaharness.orchestrator import Orchestrator  # noqa: E402
+from metaharness import planning_v2  # noqa: E402
 from metaharness.resume import (  # noqa: E402
     ResumeNotAllowedError,
     ResumePhase,
@@ -2242,6 +2243,53 @@ class ClaudeIsolationTests(unittest.TestCase):
                          str(home / "empty-mcp.json"))
         self.assertEqual(sorted(path.name for path in home.iterdir()),
                          ["cache", "empty-mcp.json", "home", "settings.json", "tmp"])
+
+
+class RepairDecompositionPolicyPipelineTests(P28Harness):
+    """The real C02 request states the one limit that actually binds it."""
+
+    def test_the_repair_request_carries_the_staged_per_worker_limit(self) -> None:
+        luna = FakeLuna({
+            (1, "S01"): writer("src/a.py", "A = 2\n"),
+            (2, "S01"): writer("src/a.py", "A = 4\n"),
+        })
+        result, planner, _r, _c, _pushed = self.run_pipeline(
+            luna=luna, reviews=[REVISE_IMPLEMENTATION, PASS],
+            repair_plan=REPAIR_PLAN, run_id="p28-repair-policy",
+        )
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+
+        initial, repair = planner.prompts
+        self.assertNotIn("REPAIR DECOMPOSITION POLICY", initial)
+        self.assertIn("REPAIR DECOMPOSITION POLICY", repair)
+        self.assertIn(
+            "Every repair implementation step, including a SINGLE S01", repair
+        )
+        # The run's staged per-step maximum, not its initial SINGLE threshold.
+        self.assertEqual(self.config_value.planning.staged_step_max_mutable_paths, 6)
+        self.assertIn("at most 6 distinct mutable\npaths", repair)
+        self.assertEqual(repair.count("at most 6"), 1)
+        self.assertLess(
+            repair.index("REPAIR DECOMPOSITION POLICY"),
+            repair.index(
+                "The answer must use exactly the existing META PLAN v2 wire protocol."
+            ),
+        )
+        # An authoritative instruction, never part of the evidence packet.
+        evidence = (
+            result.run_dir / "repair" / "C02" / "planner.evidence.md"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("REPAIR DECOMPOSITION POLICY", evidence)
+        self.assertNotIn("{{REPAIR_DECOMPOSITION_POLICY}}", repair)
+
+    def test_each_planner_keeps_its_own_decomposition_authority(self) -> None:
+        initial = inspect.getsource(planning_v2.PlannerV2.plan)
+        repair = inspect.getsource(planning_v2.RepairPlannerV2.plan)
+        self.assertIn("validate_decomposition_policy(plan, self.planning)", initial)
+        self.assertNotIn("validate_repair_decomposition_policy", initial)
+        self.assertIn("validate_repair_decomposition_policy(plan, self.planning)", repair)
+        # The repair planner is never told the initial SINGLE threshold.
+        self.assertNotIn("single_step_max_mutable_paths", repair)
 
 
 class StructuralTests(unittest.TestCase):

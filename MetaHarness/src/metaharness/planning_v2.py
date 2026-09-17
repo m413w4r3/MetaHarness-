@@ -677,6 +677,44 @@ of an invalid plan or a plan that asks the worker to discover a solution.
 """
 
 
+def render_repair_decomposition_policy_text(
+    staged_step_max_mutable_paths: int,
+) -> str:
+    """Render the C02 repair mutable-scope policy from its one real limit.
+
+    A bounded repair step is bounded by what a single Luna worker is already
+    allowed to touch, so the STAGED per-step maximum is the authority here --
+    for a SINGLE ``S01`` exactly as for a STAGED step.
+    """
+
+    if (
+        isinstance(staged_step_max_mutable_paths, bool)
+        or not isinstance(staged_step_max_mutable_paths, int)
+        or staged_step_max_mutable_paths <= 0
+    ):
+        raise ValueError(
+            "staged_step_max_mutable_paths "
+            "must be an integer greater than zero"
+        )
+
+    return f"""REPAIR DECOMPOSITION POLICY
+
+This is a bounded C02 repair plan.
+
+Every repair implementation step, including a SINGLE S01,
+may modify at most {staged_step_max_mutable_paths} distinct mutable
+paths across the UNION of WRITE_SET, CREATE_SET and DELETE_SET.
+
+A path counts once in that union.
+
+If one corrective step requires more than
+{staged_step_max_mutable_paths} mutable paths, decompose it into
+multiple ordered STAGED steps.
+
+Do not return a READY repair plan containing any step above this limit.
+"""
+
+
 def _insert_before_protocol(prompt: str, text: str) -> str:
     index = prompt.find(_PROTOCOL_ANCHOR)
     if index < 0:
@@ -851,6 +889,7 @@ def build_repair_planner_prompt_bundle(
     template: str | None = None,
     check_catalog: Sequence[CheckConfig] = (),
     original_required_check_ids: Sequence[str] = (),
+    staged_step_max_mutable_paths: int = PlanningConfig.staged_step_max_mutable_paths,
 ) -> RepairPlannerPromptBundle:
     """Build the compact corrective planner request in both transport shapes."""
 
@@ -880,11 +919,16 @@ def build_repair_planner_prompt_bundle(
         "{{MAX_STEPS}}": str(MAX_STEPS),
         "{{LAST_STEP_ID}}": LAST_STEP_ID,
         "{{MAX_STEP_CONTRACT_CHARS}}": str(MAX_STEP_CONTRACT_CHARS),
+        # An authoritative MetaHarness instruction, so it belongs to the
+        # control prompt and never to the repair evidence packet.
+        "{{REPAIR_DECOMPOSITION_POLICY}}": render_repair_decomposition_policy_text(
+            staged_step_max_mutable_paths
+        ),
     }
     if template is None:
         template = (Path(__file__).with_name("prompts") / "repair_planner_v2.txt").read_text(encoding="utf-8")
 
-    pattern = r"\{\{(?:EVIDENCE_DELIVERY|REPAIR_EVIDENCE|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|ORIGINAL_REQUIRED_CHECKS|MAX_STEPS|LAST_STEP_ID|MAX_STEP_CONTRACT_CHARS)\}\}"
+    pattern = r"\{\{(?:EVIDENCE_DELIVERY|REPAIR_EVIDENCE|REPAIR_DECOMPOSITION_POLICY|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|ORIGINAL_REQUIRED_CHECKS|MAX_STEPS|LAST_STEP_ID|MAX_STEP_CONTRACT_CHARS)\}\}"
 
     def render(delivery: str, evidence: str) -> str:
         values = {
@@ -918,6 +962,7 @@ def build_repair_planner_prompt(
     template: str | None = None,
     check_catalog: Sequence[CheckConfig] = (),
     original_required_check_ids: Sequence[str] = (),
+    staged_step_max_mutable_paths: int = PlanningConfig.staged_step_max_mutable_paths,
 ) -> str:
     """Build the bounded corrective planner request delivered inline."""
 
@@ -937,6 +982,7 @@ def build_repair_planner_prompt(
         template=template,
         check_catalog=check_catalog,
         original_required_check_ids=original_required_check_ids,
+        staged_step_max_mutable_paths=staged_step_max_mutable_paths,
     ).inline_prompt
 
 
@@ -964,6 +1010,52 @@ def validate_decomposition_policy(
         if count > limit:
             raise V2PlanParseError(
                 f"aggressive {mode} step {step.id} may modify at most {limit} "
+                f"distinct mutable paths; got {count}"
+            )
+
+
+def validate_repair_decomposition_policy(
+    plan: TaskPlanV2,
+    planning: PlanningConfig,
+) -> None:
+    """Bound every C02 repair step by the normal staged worker limit.
+
+    The SINGLE limit of :func:`validate_decomposition_policy` decides when an
+    *initial* task must be decomposed.  A C02 repair is already bounded to one
+    corrective cycle, to the approved repair scope, to a reviewed immutable
+    candidate and to the deterministic gates plus reviewer #2 that follow it,
+    so the only remaining question is whether one worker may touch that many
+    paths -- and ``staged_step_max_mutable_paths`` already answers it.  The
+    execution mode therefore does not change this limit.
+    """
+
+    if not isinstance(plan, TaskPlanV2) or not isinstance(
+        planning,
+        PlanningConfig,
+    ):
+        raise TypeError(
+            "plan and planning must be v2 model values"
+        )
+
+    if (
+        plan.decision is not PlanDecision.READY
+        or planning.decomposition != "aggressive"
+    ):
+        return
+
+    limit = planning.staged_step_max_mutable_paths
+
+    for step in plan.steps:
+        count = len(
+            set(step.write_set)
+            | set(step.create_set)
+            | set(step.delete_set)
+        )
+
+        if count > limit:
+            raise V2PlanParseError(
+                f"aggressive repair step {step.id} "
+                f"may modify at most {limit} "
                 f"distinct mutable paths; got {count}"
             )
 
@@ -1235,6 +1327,113 @@ class PlannerV2:
         return plan
 
 
+def _repair_plan_recovery_sources(target: Path) -> list[Path]:
+    """The C02 directories that may hold an already paid planner answer.
+
+    ``target`` first, then its archived retry attempts newest-first: a resume
+    archives ``repair/C02`` into ``attempts/NN`` before the repair planner is
+    entered again, so the raw response that was already paid for and rejected
+    only by local validation is found there rather than at the top level.
+    """
+
+    sources = [target]
+    attempts = target / "attempts"
+    if attempts.is_dir():
+        sources.extend(
+            sorted((path for path in attempts.iterdir() if path.is_dir()), reverse=True)
+        )
+    return sources
+
+
+def _recover_existing_repair_plan(
+    *,
+    target: Path,
+    current_evidence_text: str,
+    original_spec: str,
+    current_repository_state: str,
+    implementer_ids: frozenset[str],
+    reviewer_ids: frozenset[str],
+    check_catalog: Sequence[CheckConfig],
+    inherited_check_ids: Sequence[str],
+    planning: PlanningConfig,
+) -> TaskPlanV2 | None:
+    """Revalidate an already produced C02 answer locally, or return ``None``.
+
+    A durable ``planner.raw.md`` is reusable only next to a
+    ``planner.evidence.md`` byte-identical to *current_evidence_text*: the
+    answer then belongs to exactly this candidate commit, reviewer #1 result
+    and approved mutable scope.  The strict parser and the repair policy are
+    applied unchanged, no existing artifact is deleted, and the model is never
+    called.  A structurally invalid or still out-of-policy answer is refused.
+    """
+
+    # Accepted for symmetry with the persistence step; a recovery decision
+    # depends only on the evidence packet and on the raw answer itself.
+    del original_spec, current_repository_state
+
+    for source in _repair_plan_recovery_sources(target):
+        try:
+            raw = (source / "planner.raw.md").read_text(encoding="utf-8")
+            evidence = (source / "planner.evidence.md").read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if evidence != current_evidence_text:
+            continue
+        try:
+            plan = parse_task_plan_v2(
+                raw,
+                implementer_ids=implementer_ids,
+                reviewer_ids=reviewer_ids,
+                check_catalog=check_catalog,
+                inherited_check_ids=inherited_check_ids,
+            )
+            validate_repair_decomposition_policy(plan, planning)
+        except V2PlanParseError:
+            continue
+        if source is not target:
+            # The retry archived the provenance of the answer being reused, so
+            # restore it where the run expects it -- never over a present copy.
+            for name, text in (
+                ("planner.raw.md", raw),
+                ("planner.evidence.md", evidence),
+            ):
+                if not (target / name).exists():
+                    atomic_write_text(target / name, text)
+        return plan
+    return None
+
+
+def _persist_recovered_repair_plan(
+    target: Path,
+    *,
+    original_spec: str,
+    current_repository_state: str,
+    plan: TaskPlanV2,
+) -> None:
+    """Publish a locally revalidated repair plan without rewriting its call.
+
+    ``planner.request.txt``, ``planner.request.fallback.txt``,
+    ``planner.evidence.md``, ``planner.request.meta.json``, ``planner.raw.md``
+    and ``planner.usage.json`` describe the one exchange that really produced
+    this answer, so they stay exactly as they are; the already durable raw
+    response remains the authority of provenance.
+    """
+
+    atomic_write_text(target / "spec.md", original_spec)
+    atomic_write_text(target / "context.txt", current_repository_state)
+    _write_task_plan_v2(target, plan)
+    if plan.decision is PlanDecision.READY:
+        write_implementation_bundle(target, plan)
+    else:
+        atomic_write_text(
+            target / "task_plan.json",
+            json.dumps(
+                {**asdict(plan), "decision": plan.decision.value, "execution_mode": None},
+                ensure_ascii=False, indent=2,
+            ) + "\n",
+        )
+
+
 class RepairPlannerV2:
     """Planner facade for one P26 corrective cycle.
 
@@ -1297,9 +1496,34 @@ class RepairPlannerV2:
             template=self.template,
             check_catalog=self.check_catalog,
             original_required_check_ids=self.original_required_check_ids,
+            staged_step_max_mutable_paths=(
+                self.planning.staged_step_max_mutable_paths
+            ),
         )
         request = bundle.inline_prompt
         target = Path(artifacts_dir)
+
+        # A resume after a purely local rejection must not pay for the same
+        # answer twice: revalidate the durable one before any transport.
+        recovered = _recover_existing_repair_plan(
+            target=target,
+            current_evidence_text=bundle.evidence_text,
+            original_spec=original_spec,
+            current_repository_state=current_repository_state,
+            implementer_ids=self.implementer_ids,
+            reviewer_ids=self.reviewer_ids,
+            check_catalog=self.check_catalog,
+            inherited_check_ids=self.original_required_check_ids,
+            planning=self.planning,
+        )
+        if recovered is not None:
+            _persist_recovered_repair_plan(
+                target,
+                original_spec=original_spec,
+                current_repository_state=current_repository_state,
+                plan=recovered,
+            )
+            return recovered
 
         attachments = [
             TextFileAttachment(
@@ -1372,7 +1596,7 @@ class RepairPlannerV2:
             raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids,
             check_catalog=self.check_catalog, inherited_check_ids=self.original_required_check_ids,
         )
-        validate_decomposition_policy(plan, self.planning)
+        validate_repair_decomposition_policy(plan, self.planning)
         if plan.decision is PlanDecision.READY:
             persist_planning_v2_artifacts(
                 target, spec=original_spec, context=current_repository_state,
@@ -1430,4 +1654,6 @@ __all__ = [
     "run_planner_v2", "step_contract_path", "validate_decomposition_policy", "validate_implementation_bundle", "write_implementation_bundle",
     "REQUIRE_STAGED_POLICY_TEXT", "validate_execution_mode_policy",
     "render_decomposition_policy_text",
+    "render_repair_decomposition_policy_text",
+    "validate_repair_decomposition_policy",
 ]

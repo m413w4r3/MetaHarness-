@@ -250,6 +250,18 @@ transport, `repair/C02/` durably records `planner.request.txt`,
 attachment is a transport mode only: it carries data and grants no authority
 over the META PLAN v2 protocol.
 
+Initial planning keeps the SINGLE vs STAGED decomposition thresholds:
+`planning.single_step_max_mutable_paths` decides when an initial task must be
+decomposed, and it is never relaxed. A bounded C02 repair step is instead
+bounded by `planning.staged_step_max_mutable_paths`, the maximum a single Luna
+worker may already touch, for a SINGLE `S01` exactly as for a STAGED step. The
+repair request states that one number itself, and the bound is per step, never
+aggregate. An already produced repair planner raw response may be locally
+revalidated on resume when its `planner.evidence.md` is byte-identical to the
+current evidence packet; local recovery never calls the model, never deletes an
+artifact, never rewrites the plan, and refuses any answer the strict parser or
+the repair policy still rejects.
+
 All run-state writes go through `RunStateStore`, which replaces JSON files
 atomically. The plan approval artifact is atomically published without
 replacement, so a second decision fails. In v2, the candidate commit is

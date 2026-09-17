@@ -21,6 +21,7 @@ from metaharness.models import RunStatus
 from metaharness.orchestrator import Orchestrator
 from metaharness.run_options import RunOptions
 import metaharness.orchestrator as orchestrator_module
+import metaharness.planning_v2 as planning_v2
 from metaharness.resume import (
     ResumeCheckpoint,
     ResumeCheckpointError,
@@ -1307,6 +1308,140 @@ class C02RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
         )
         self.assertEqual(len(reviewer.prompts), 1)
         self.assert_c02_identity_preserved(run_dir, checkpoint)
+
+
+class AggressiveRepairRecoveryTests(P29Harness):
+    """AW-003: a C02 answer rejected only locally is revalidated on resume.
+
+    The run's initial SINGLE threshold is 4 and its STAGED per-step maximum is
+    6.  The repair planner answered with a SINGLE ``S01`` touching exactly 6
+    mutable paths: refused by the initial planner's limit, allowed for one
+    bounded repair worker.  The resume must revalidate that already paid
+    ``planner.raw.md`` instead of calling the model again.
+    """
+
+    REPAIR_PATHS = tuple(f"repair/aw003-{number:02d}.txt" for number in range(1, 6))
+    REPAIR_PLAN_SIX_PATHS = plan_text(
+        step_block(1, create=REPAIR_PATHS, operation="Repair"),
+        title="AW-003 bounded six-path repair",
+    )
+
+    class RefusingPlanner:
+        """A planner transport that fails the test if it is ever called."""
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete(self, prompt: str):
+            self.prompts.append(prompt)
+            raise AssertionError("the repair planner LLM MUST NOT BE CALLED")
+
+    def aggressive_config(self):
+        text = self.config_text(require_approval=True).replace(
+            'protocol = "v2"',
+            'protocol = "v2"\ndecomposition = "aggressive"\n'
+            "single_step_max_mutable_paths = 4\nstaged_step_max_mutable_paths = 6",
+        )
+        path = self.root / "aw003.toml"
+        path.write_text(text, encoding="utf-8")
+        return load_config(path)
+
+    @staticmethod
+    def repair_writer(root: Path) -> None:
+        write(root / "src/a.py", "A = 4\n")
+        for path in AggressiveRepairRecoveryTests.REPAIR_PATHS:
+            write(root / path, "repair\n")
+
+    def test_a_locally_rejected_repair_plan_resumes_without_replanning(self) -> None:
+        config = self.aggressive_config()
+        self.assertEqual(config.planning.single_step_max_mutable_paths, 4)
+        self.assertEqual(config.planning.staged_step_max_mutable_paths, 6)
+        options = RunOptions.from_config(
+            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=6,
+        )
+        planner = QueueClient(
+            "planner", [SINGLE_PLAN, self.REPAIR_PLAN_SIX_PATHS], self.events
+        )
+        first, _p, _r, luna, claude = self.orchestrator(
+            config, planner=planner, reviews=[REVISE_IMPLEMENTATION],
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")}),
+        )
+        # Exactly the durable state AW-003 reached: the repair planner answer
+        # is durable and was rejected by the *initial* SINGLE limit.
+        with mock.patch.object(
+            planning_v2, "validate_repair_decomposition_policy",
+            planning_v2.validate_decomposition_policy,
+        ):
+            failed = self.run_approved(
+                config, first, "aw003-recovery", run_options=options,
+            )
+
+        self.assertEqual(failed.state["failure"]["reason"], "PLANNER_OUTPUT_INVALID")
+        run_dir = failed.run_dir
+        repair_dir = run_dir / "repair" / "C02"
+        raw_before = (repair_dir / "planner.raw.md").read_bytes()
+        self.assertTrue((repair_dir / "planner.evidence.md").is_file())
+        self.assertFalse((repair_dir / "implementation_bundle.json").exists())
+        self.assertEqual(read_checkpoint(run_dir).phase, ResumePhase.REPAIR_PLANNER)
+        self.assertEqual(len(planner.prompts), 2)
+        self.assertEqual([call["cycle"] for call in luna.calls], [1])
+        self.assertEqual([call["cycle"] for call in claude.calls], [1])
+
+        refusing = self.RefusingPlanner()
+        fresh_luna = FakeLuna({(2, "S01"): self.repair_writer})
+        fresh, _p2, reviewer2, _l2, claude2 = self.orchestrator(
+            load_config(self.root / "aw003.toml"), planner=refusing,
+            reviews=[PASS], luna=fresh_luna,
+        )
+        resumed = fresh.resume("aw003-recovery")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(refusing.prompts, [])
+        # The recovered plan is the exact answer that was already paid for.
+        self.assertEqual((repair_dir / "planner.raw.md").read_bytes(), raw_before)
+        self.assertEqual(
+            (repair_dir / "attempts" / "01" / "planner.raw.md").read_bytes(), raw_before
+        )
+        bundle = json.loads((repair_dir / "implementation_bundle.json").read_text())
+        self.assertEqual(bundle["execution_mode"], "SINGLE")
+        self.assertTrue((repair_dir / "steps" / "S01" / "contract.md").is_file())
+        delta = json.loads((repair_dir / "scope_delta.json").read_text())
+        self.assertEqual(len(delta["added_paths"]), len(self.REPAIR_PATHS))
+        # C02 really ran: Luna repaired, Claude revised, reviewer #2 passed.
+        self.assertEqual([call["cycle"] for call in fresh_luna.calls], [2])
+        self.assertEqual([call["cycle"] for call in claude2.calls], [2])
+        self.assertEqual(len(reviewer2.prompts), 1)
+
+    def test_a_missing_durable_answer_still_calls_the_repair_planner(self) -> None:
+        """No local recovery is invented when nothing durable exists."""
+
+        config = self.aggressive_config()
+        options = RunOptions.from_config(
+            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=6,
+        )
+        planner = QueueClient(
+            "planner", [SINGLE_PLAN, self.REPAIR_PLAN_SIX_PATHS], self.events
+        )
+        orchestrator, _p, reviewer, _l, _c = self.orchestrator(
+            config, planner=planner, reviews=[REVISE_IMPLEMENTATION, PASS],
+            luna=FakeLuna({
+                (1, "S01"): writer("src/a.py", "A = 2\n"),
+                (2, "S01"): self.repair_writer,
+            }),
+        )
+        result = self.run_approved(
+            config, orchestrator, "aw003-direct", run_options=options,
+        )
+
+        # The same 6-path SINGLE repair is now accepted on the first pass.
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(len(planner.prompts), 2)
+        self.assertIn(
+            "Every repair implementation step, including a SINGLE S01",
+            planner.prompts[1],
+        )
+        self.assertIn("at most 6 distinct mutable\npaths", planner.prompts[1])
+        self.assertEqual(len(reviewer.prompts), 2)
 
 
 if __name__ == "__main__":
