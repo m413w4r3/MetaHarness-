@@ -269,6 +269,23 @@ never added. Model output never decides the scope. A cycle permits at most one
 expanded check-repair pass, and production paths remain the responsibility of
 the approved plan and reviewer/C02 process.
 
+`FINAL_CHECKS_RETRY_C01` and `FINAL_CHECKS_RETRY_C02` are resumable boundaries
+of their own, and the durable checkpoint — never `state.failure` — decides
+what still has to happen there. The normal check repair already succeeded at
+that boundary, so neither the implementer steps, nor the initial reviser pass,
+nor that repair is ever replayed. Three durable states are legitimate. With no
+retry bundle yet, those retry checks run exactly once on the checkpointed
+tree. With a red retry bundle for that tree, the bundle is already the
+complete result of a retry and is reused rather than re-earned; it is what the
+single bounded expansion decision reads, so the resume can still reach
+`CHECK_REPAIR_EXPANDED_C0x`. With a green retry bundle for that tree, the
+resume reconciles straight into the candidate commit without a check, a model
+call or an expansion. If `check-repair-expanded/C0x/scope.json` is already
+published, that durable scope outranks any recomputation: the reviser is never
+recalled with a scope different from the one already published for it, and a
+divergent or malformed artifact is a `RESUME_INTEGRITY_FAILURE`. There is
+still at most one expanded pass per cycle.
+
 Historical snapshots whose `pipeline` predates the repair-scope fields keep
 the historical `deny-expansion` default. An operator may explicitly opt in on
 resume with `--allow-bounded-test-scope-expansion`; this writes the immutable,

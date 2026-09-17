@@ -1512,15 +1512,15 @@ class CheckRepairRetryResumeTests(P28Harness):
 
         before = self.checks_ran()
         second, planner, reviewer, claude, luna = self.resume("retry-red-c01")
-        # The refusal is gone: the retry checks were re-executed on the
-        # repaired tree and stayed red on their own evidence.
+        # The refusal is gone.  The retry's own red bundle for the repaired
+        # tree is already the durable result of a complete retry, so it is
+        # reused instead of paying for the same checks twice; its output names
+        # no tracked test path, so no expansion is earned and the gate is
+        # final with the archive left exactly as the first run wrote it.
         self.assertEqual(second.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
-        self.assertGreater(self.checks_ran(), before)
+        self.assertEqual(self.checks_ran(), before)
         self.assert_no_agent_ran(planner, reviewer, claude, luna)
-        self.assertEqual(
-            self.evidence(checks / "attempts" / "02" / "evidence.json")["staged_tree_sha"],
-            repaired_tree,
-        )
+        self.assertFalse((checks / "attempts" / "02").exists())
         self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
                          repaired_tree)
 
@@ -1632,12 +1632,12 @@ class CheckRepairRetryResumeTests(P28Harness):
         second, planner, reviewer, claude, luna = self.resume("retry-red-c02")
         self.assertEqual(second.status, RunStatus.FAILED)
         self.assertNotEqual(second.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-        self.assertGreater(self.checks_ran(), before)
+        # Same reuse as C01: the durable red retry bundle is the authority.
+        self.assertEqual(self.checks_ran(), before)
         self.assert_no_agent_ran(planner, reviewer, claude, luna)
-        self.assertEqual(
-            self.evidence(checks / "attempts" / "02" / "evidence.json")["staged_tree_sha"],
-            repaired_tree,
-        )
+        self.assertFalse((checks / "attempts" / "02").exists())
+        self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
+                         repaired_tree)
 
     def test_w_a_c02_retry_crash_before_its_evidence_still_resumes(self) -> None:
         luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
@@ -1749,13 +1749,14 @@ class CheckRepairRetryResumeTests(P28Harness):
         )
 
         # 4. Once the invariant holds again, the same checkpoint is resumed
-        #    and its pending operation -- the retry checks -- executes.
+        #    and its restored durable bundle -- not a fresh check run -- is
+        #    what closes the deterministic gate.
         (checks / "evidence.json").write_text(json.dumps(intact), encoding="utf-8")
         resumed, planner, reviewer, claude, luna = self.resume(
             "revalidate-c01", revalidate_integrity=True,
         )
         self.assertEqual(resumed.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
-        self.assertGreater(self.checks_ran(), before)
+        self.assertEqual(self.checks_ran(), before)
         self.assert_no_agent_ran(planner, reviewer, claude, luna)
         self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
                          repaired_tree)

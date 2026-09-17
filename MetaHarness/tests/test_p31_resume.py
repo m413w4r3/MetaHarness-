@@ -11,6 +11,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 from pathlib import Path
+from typing import Any
 
 from metaharness import cli
 from metaharness.config import load_config
@@ -28,7 +29,9 @@ from metaharness.resume import (
     checkpoint_payload,
     integrity_revalidation_allowed,
     mark_checkpoint_completed,
+    phase_index,
     read_checkpoint,
+    read_checkpoint_record,
     resume_info,
     write_checkpoint,
 )
@@ -38,7 +41,7 @@ from tests.test_p29 import (
     FakeClaude, FakeLuna, P29Harness, PASS, QueueClient, REVISE_IMPLEMENTATION,
     SINGLE_PLAN, SPEC, plan_text, step_block, write, writer,
 )
-from tests.test_p28_full_pipeline import REPAIR_PLAN
+from tests.test_p28_full_pipeline import REPAIR_PLAN, git
 
 
 TWO_STEP_PLAN = plan_text(
@@ -665,6 +668,645 @@ class RepairPlannerRequestArtifactsTests(P29Harness):
         self.assertEqual(
             json.loads((run_dir / "candidate/C01/commit.json").read_text()), c01
         )
+
+
+SERVICE_PLAN = plan_text(
+    step_block(1, read=("src/service.py",), write_set=("src/service.py",)),
+    title="P31 service plan",
+)
+EXPANDED_C01 = "revision/check-repair-expanded/C01"
+EXPANDED_C02 = "revision/check-repair-expanded/C02"
+
+
+class RetryCheckpointPhaseOrderTests(unittest.TestCase):
+    """``FINAL_CHECKS_RETRY`` sits *before* its expanded repair, not after."""
+
+    def test_the_expanded_repair_phases_follow_the_retry_checks(self) -> None:
+        self.assertLess(
+            phase_index(ResumePhase.FINAL_CHECKS_RETRY_C01),
+            phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01),
+        )
+        self.assertLess(
+            phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01),
+            phase_index(ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01),
+        )
+        self.assertLess(
+            phase_index(ResumePhase.FINAL_CHECKS_RETRY_C02),
+            phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02),
+        )
+        self.assertLess(
+            phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02),
+            phase_index(ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02),
+        )
+
+
+class ExpandedCheckRepairResumeHarness(P29Harness):
+    """A repository whose failing check names a tracked test file."""
+
+    def stage_service_repo(self) -> None:
+        write(self.repo / "src/service.py", "SERVICE = 1\n")
+        write(self.repo / "tests/test_service.py",
+              "def test_fake_uow():  # stale\n    pass\n")
+        # A second tracked test the gate never names: it can only ever enter a
+        # mutable scope through a durable artifact, never through the detector.
+        write(self.repo / "tests/test_other.py", "def test_other():\n    pass\n")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "-qm", "add the service and its stale fixture")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        # Red on a production path while the service is broken; once it is
+        # repaired the same gate names the stale *tracked test* instead, which
+        # is the only failure family a bounded expansion may ever answer to.
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "open(sys.argv[1], 'a').write('ran\\n')\n"
+            "source = pathlib.Path('src/service.py').read_text()\n"
+            "fixture = pathlib.Path('tests/test_service.py').read_text()\n"
+            "if 'BUG' in source:\n"
+            "    print('FAILED src/other_production.py')\n"
+            "    sys.exit(1)\n"
+            "print('FAILED tests/test_service.py::test_fake_uow')\n"
+            "print('AttributeError: FakeUnitOfWork has no attribute commit')\n"
+            "sys.exit(1 if 'stale' in fixture else 0)\n",
+            encoding="utf-8",
+        )
+
+    def bounded_options(self, config: Any, *, max_added_paths: int = 4) -> RunOptions:
+        return RunOptions.from_config(
+            config, repair_scope_policy="auto-bounded",
+            repair_scope_max_added_paths=max_added_paths,
+        )
+
+    def fix_the_fixture(self) -> FakeClaude:
+        """A fresh Claude double whose only action repairs the fixture."""
+
+        return FakeClaude(log=self.events, stage_actions={
+            (1, "check-repair"): writer(
+                "tests/test_service.py", "def test_fake_uow():\n    pass\n"
+            ),
+            (2, "check-repair"): writer(
+                "tests/test_service.py", "def test_fake_uow():\n    pass\n"
+            ),
+        })
+
+    def crash_before_the_expansion(self, cycle: str):
+        """Stop exactly between the red retry evidence and the expansion."""
+
+        real = orchestrator_module._archive_attempt
+        seen: list[int] = []
+
+        def archive(directory: Any, **kwargs: Any) -> Any:
+            path = Path(directory)
+            if path.name == cycle and path.parent.name == "checks":
+                seen.append(1)
+                if len(seen) == 2:
+                    raise RuntimeError("simulated crash before the expansion")
+            return real(directory, **kwargs)
+
+        return mock.patch.object(
+            orchestrator_module, "_archive_attempt", side_effect=archive
+        )
+
+    def crash_inside_the_nth_checks(self, ordinal: int):
+        real = Orchestrator._final_evidence
+        calls: list[int] = []
+
+        def evidence(self_: Any, *args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            if len(calls) == ordinal:
+                raise RuntimeError("simulated crash inside the checks")
+            return real(self_, *args, **kwargs)
+
+        return mock.patch.object(Orchestrator, "_final_evidence", evidence)
+
+    def crash_before_the_phase(self, phase: ResumePhase):
+        real = Orchestrator._checkpoint
+        crashed: list[int] = []
+
+        def checkpoint(self_: Any, run_dir: Any, written: Any, **kwargs: Any) -> Any:
+            if written is phase and not crashed:
+                crashed.append(1)
+                raise RuntimeError("simulated crash before the boundary moved")
+            return real(self_, run_dir, written, **kwargs)
+
+        return mock.patch.object(Orchestrator, "_checkpoint", checkpoint)
+
+    def scope_of(self, run_dir: Path, relative: str) -> dict:
+        return json.loads((run_dir / relative / "scope.json").read_text())
+
+
+class C01RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
+    """``FINAL_CHECKS_RETRY_C01`` is resumable, and is not a dead end.
+
+    The normal check repair already succeeded at this boundary, so Luna, the
+    initial Claude revision and that repair are durable and are never
+    replayed.  Three durable states are legitimate and each has exactly one
+    correct continuation: no retry evidence yet (run those checks once), red
+    retry evidence (decide the single bounded expansion), and green retry
+    evidence (reconcile straight into the candidate commit).
+    """
+
+    def red_retry_c01(self, run_id: str):
+        """A crash between the red retry evidence and the expansion."""
+
+        self.stage_service_repo()
+        config = self.make_config()
+        luna = FakeLuna({(1, "S01"): writer("src/service.py", "SERVICE = BUG\n")})
+        claude = FakeClaude(log=self.events, stage_actions={
+            (1, "check-repair"): writer("src/service.py", "SERVICE = 3\n"),
+        })
+        orchestrator, _planner, _reviewer, _luna, _claude = self.orchestrator(
+            config, plans=[SERVICE_PLAN], reviews=[PASS], luna=luna, claude=claude,
+        )
+        with self.crash_before_the_expansion("C01"):
+            failed = self.run_approved(
+                config, orchestrator, run_id,
+                run_options=self.bounded_options(config),
+            )
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        checkpoint = read_checkpoint(failed.run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.FINAL_CHECKS_RETRY_C01)
+        return config, failed, checkpoint, claude
+
+    def test_a_red_retry_checkpoint_resumes_into_the_expanded_repair(self) -> None:
+        """The exact AW-003 state: red retry evidence naming a tracked test."""
+
+        config, failed, checkpoint, first_claude = self.red_retry_c01("aw003-red")
+        run_dir = failed.run_dir
+        # The durable facts the resume must work from, and nothing else.
+        self.assertTrue((run_dir / "revision/check-repair/C01/report.json").is_file())
+        normal_scope = self.scope_of(run_dir, "revision/check-repair/C01")
+        self.assertEqual(normal_scope["base_mutable_scope"], ["src/service.py"])
+        self.assertEqual(normal_scope["added_paths"], [])
+        evidence = json.loads((run_dir / "checks/C01/evidence.json").read_text())
+        self.assertFalse(evidence["deterministic_passed"])
+        self.assertEqual(evidence["failures"], ["CHECK_FAILED:gate"])
+        self.assertEqual(evidence["staged_tree_sha"], checkpoint.expected_tree_sha)
+        self.assertFalse((run_dir / EXPANDED_C01).exists())
+        self.assertEqual([call["stage"] for call in first_claude.calls],
+                         ["initial-revision", "check-repair"])
+
+        before = self.checks_ran()
+        fresh_luna = FakeLuna({})
+        fresh_claude = self.fix_the_fixture()
+        fresh, planner, reviewer, _l, _c = self.orchestrator(
+            config, reviews=[PASS], luna=fresh_luna, claude=fresh_claude,
+        )
+        resumed = fresh.resume("aw003-red")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        # Nothing before the boundary is replayed: no Luna, no normal Claude
+        # revision, no normal check repair.  Exactly one expanded pass.
+        self.assertEqual(fresh_luna.calls, [])
+        self.assertEqual(planner.prompts, [])
+        self.assertEqual([call["stage"] for call in fresh_claude.calls], ["check-repair"])
+        self.assertEqual(
+            fresh_claude.calls[0]["revision_dir"].relative_to(run_dir).as_posix(),
+            EXPANDED_C01,
+        )
+        # The already durable red bundle is the authority, so the only checks
+        # this resume pays for are the expanded retry checks.
+        self.assertEqual(self.checks_ran() - before, 1)
+        # The red retry bundle is archived as attempt #2; attempt #1 stays the
+        # first, pre-normal-repair red evidence.
+        self.assertTrue((run_dir / "checks/C01/attempts/02/evidence.json").is_file())
+        self.assertEqual(
+            json.loads(
+                (run_dir / "checks/C01/attempts/02/evidence.json").read_text()
+            )["staged_tree_sha"],
+            checkpoint.expected_tree_sha,
+        )
+        self.assertFalse(
+            json.loads(
+                (run_dir / "checks/C01/attempts/01/evidence.json").read_text()
+            )["deterministic_passed"]
+        )
+        expanded = self.scope_of(run_dir, EXPANDED_C01)
+        self.assertEqual(expanded["added_paths"], ["tests/test_service.py"])
+        self.assertEqual(expanded["base_mutable_scope"], ["src/service.py"])
+        self.assertEqual(expanded["effective_mutable_scope"],
+                         ["src/service.py", "tests/test_service.py"])
+        self.assertTrue((run_dir / EXPANDED_C01 / "report.json").is_file())
+        # Green expanded retry, immutable candidate, then reviewer #1.
+        self.assertTrue(json.loads(
+            (run_dir / "checks/C01/evidence.json").read_text()
+        )["deterministic_passed"])
+        candidate = json.loads((run_dir / "candidate/C01/commit.json").read_text())
+        self.assertEqual(
+            candidate["tree_sha"],
+            json.loads((run_dir / "checks/C01/evidence.json").read_text())
+            ["staged_tree_sha"],
+        )
+        self.assertEqual(len(reviewer.prompts), 1)
+
+    def test_b_a_red_retry_checkpoint_is_not_an_implicit_terminal(self) -> None:
+        """The phase hole itself: the boundary continues, without duplicates.
+
+        On the broken build this same durable state fell through to the
+        candidate gate, so the retry checks were paid for twice before any
+        expansion could be decided.
+        """
+
+        config, failed, _checkpoint, _claude = self.red_retry_c01("aw003-hole")
+        before = self.checks_ran()
+        fresh, _planner, _reviewer, fresh_luna, _c = self.orchestrator(
+            config, reviews=[PASS], luna=FakeLuna({}), claude=self.fix_the_fixture(),
+        )
+        resumed = fresh.resume("aw003-hole")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertNotEqual(resumed.state.get("failure"), "DETERMINISTIC_GATE_FAILED")
+        # One check execution only: the expanded retry.  The durable red retry
+        # bundle is never re-earned.
+        self.assertEqual(self.checks_ran() - before, 1)
+        self.assertTrue((failed.run_dir / EXPANDED_C01 / "scope.json").is_file())
+
+    def test_c_a_durable_expanded_scope_is_reused_not_recomputed(self) -> None:
+        """A crash between ``scope.json`` and the expanded Claude pass."""
+
+        config, failed, _checkpoint, _claude = self.red_retry_c01("aw003-durable")
+        run_dir = failed.run_dir
+        # Publish an expanded scope the detector would never produce, then
+        # leave the checkpoint where it is.  A recomputation would pick
+        # ``tests/test_service.py``; only the durable artifact names the other.
+        expanded_dir = run_dir / EXPANDED_C01
+        expanded_dir.mkdir(parents=True, exist_ok=True)
+        (expanded_dir / "scope.json").write_text(json.dumps({
+            "schema_version": 2,
+            "base_mutable_scope": ["src/service.py"],
+            "added_paths": ["tests/test_other.py"],
+            "effective_mutable_scope": ["src/service.py", "tests/test_other.py"],
+            "policy": "auto-bounded",
+            "bound": 4,
+            "source": "auto-bounded failing-test evidence",
+        }), encoding="utf-8")
+
+        # The durable scope cannot repair the stale fixture, so this pass is
+        # deliberately a no-op edit-wise.
+        fresh_claude = FakeClaude(log=self.events)
+        fresh, _planner, reviewer, _l, _c = self.orchestrator(
+            config, reviews=[PASS], luna=FakeLuna({}), claude=fresh_claude,
+        )
+        resumed = fresh.resume("aw003-durable")
+
+        # The model is recalled with exactly the durable scope, never a
+        # recomputed one, and the already archived attempt is not archived a
+        # second time.  That scope cannot repair the gate, so it stays red --
+        # and there is still no third repair.
+        self.assertEqual([call["stage"] for call in fresh_claude.calls], ["check-repair"])
+        prompt = fresh_claude.calls[0]["prompt"]
+        self.assertIn("tests/test_other.py", prompt)
+        self.assertNotIn("tests/test_service.py\"", prompt.split(
+            "EFFECTIVE REPAIR MUTABLE SCOPE:", 1
+        )[1].split("Previous Claude report", 1)[0])
+        self.assertEqual(
+            self.scope_of(run_dir, EXPANDED_C01)["added_paths"],
+            ["tests/test_other.py"],
+        )
+        self.assertFalse((run_dir / "checks/C01/attempts/02").exists())
+        self.assertEqual(resumed.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertEqual(reviewer.prompts, [])
+
+    def test_d_a_malformed_durable_expanded_scope_fails_closed(self) -> None:
+        config, failed, _checkpoint, _claude = self.red_retry_c01("aw003-malformed")
+        expanded_dir = failed.run_dir / EXPANDED_C01
+        expanded_dir.mkdir(parents=True, exist_ok=True)
+        (expanded_dir / "scope.json").write_text(json.dumps({
+            "schema_version": 2,
+            "base_mutable_scope": ["src/service.py"],
+            "added_paths": ["src/other_production.py"],
+            "effective_mutable_scope": ["src/other_production.py", "src/service.py"],
+            "policy": "auto-bounded",
+            "bound": 4,
+            "source": "auto-bounded failing-test evidence",
+        }), encoding="utf-8")
+        fresh_claude = self.fix_the_fixture()
+        fresh, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, reviews=[PASS], luna=FakeLuna({}), claude=fresh_claude,
+        )
+        resumed = fresh.resume("aw003-malformed")
+        self.assertEqual(resumed.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(fresh_claude.calls, [])
+
+    def test_e_a_crash_before_the_retry_evidence_runs_those_checks_once(self) -> None:
+        """No current bundle is legitimate here, and never an integrity failure."""
+
+        self.stage_service_repo()
+        config = self.make_config()
+        luna = FakeLuna({(1, "S01"): writer("src/service.py", "SERVICE = BUG\n")})
+        claude = FakeClaude(log=self.events, stage_actions={
+            (1, "check-repair"): writer("src/service.py", "SERVICE = 3\n"),
+        })
+        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SERVICE_PLAN], reviews=[PASS], luna=luna, claude=claude,
+        )
+        # The C01 final checks, then the retry checks that never finish.
+        with self.crash_inside_the_nth_checks(2):
+            failed = self.run_approved(
+                config, orchestrator, "aw003-missing",
+                run_options=self.bounded_options(config),
+            )
+        run_dir = failed.run_dir
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.FINAL_CHECKS_RETRY_C01)
+        self.assertTrue((run_dir / "revision/check-repair/C01/report.json").is_file())
+        self.assertFalse((run_dir / "checks/C01/evidence.json").exists())
+        self.assertFalse(json.loads(
+            (run_dir / "checks/C01/attempts/01/evidence.json").read_text()
+        )["deterministic_passed"])
+
+        before = self.checks_ran()
+        fresh_luna = FakeLuna({})
+        fresh_claude = self.fix_the_fixture()
+        fresh, planner, reviewer, _l, _c = self.orchestrator(
+            config, reviews=[PASS], luna=fresh_luna, claude=fresh_claude,
+        )
+        resumed = fresh.resume("aw003-missing")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        # The normal Claude repair is not replayed; the retry checks run once
+        # and stay red on the tracked test, which earns the single expansion.
+        self.assertEqual((fresh_luna.calls, planner.prompts), ([], []))
+        self.assertEqual([call["stage"] for call in fresh_claude.calls], ["check-repair"])
+        self.assertEqual(
+            fresh_claude.calls[0]["revision_dir"].relative_to(run_dir).as_posix(),
+            EXPANDED_C01,
+        )
+        # Exactly the retry checks plus the expanded retry checks.
+        self.assertEqual(self.checks_ran() - before, 2)
+        self.assertEqual(
+            self.scope_of(run_dir, EXPANDED_C01)["added_paths"],
+            ["tests/test_service.py"],
+        )
+        self.assertTrue((run_dir / "candidate/C01/commit.json").is_file())
+        self.assertEqual(len(reviewer.prompts), 1)
+
+    def test_f_a_green_retry_evidence_is_reconciled_not_repeated(self) -> None:
+        """The crash landed after a green retry and before the boundary moved."""
+
+        config = self.make_config()
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(log=self.events, stage_actions={
+            (1, "check-repair"): writer("src/a.py", "A = 3\n"),
+        })
+        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SINGLE_PLAN], reviews=[PASS], luna=luna, claude=claude,
+        )
+        with self.crash_before_the_phase(ResumePhase.CANDIDATE_COMMIT_C01):
+            failed = self.run_approved(
+                config, orchestrator, "aw003-green",
+                run_options=self.bounded_options(config),
+            )
+        run_dir = failed.run_dir
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.FINAL_CHECKS_RETRY_C01)
+        green = json.loads((run_dir / "checks/C01/evidence.json").read_text())
+        self.assertTrue(green["deterministic_passed"])
+        self.assertEqual(green["staged_tree_sha"], checkpoint.expected_tree_sha)
+        self.assertFalse((run_dir / "candidate/C01/commit.json").exists())
+
+        before = self.checks_ran()
+        fresh_luna, fresh_claude = FakeLuna({}), FakeClaude(log=self.events)
+        fresh, planner, reviewer, _l, _c = self.orchestrator(
+            config, reviews=[PASS], luna=fresh_luna, claude=fresh_claude,
+        )
+        resumed = fresh.resume("aw003-green")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        # A durable green retry is a reconciliation, not a bypass: no check,
+        # no model call and no expansion -- straight to the candidate commit.
+        self.assertEqual(self.checks_ran(), before)
+        self.assertEqual((fresh_luna.calls, fresh_claude.calls, planner.prompts),
+                         ([], [], []))
+        self.assertFalse((run_dir / EXPANDED_C01).exists())
+        self.assertEqual(
+            json.loads((run_dir / "candidate/C01/commit.json").read_text())["tree_sha"],
+            green["staged_tree_sha"],
+        )
+        self.assertEqual(json.loads(
+            (run_dir / "checks/C01/evidence.json").read_text()
+        ), green)
+        self.assertEqual(len(reviewer.prompts), 1)
+
+    def test_g_a_red_retry_without_any_candidate_stays_red(self) -> None:
+        """Nothing to expand to: the deterministic gate is final."""
+
+        config = self.make_config()
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(log=self.events, stage_actions={
+            (1, "check-repair"): writer("src/a.py", "A = STILL BUG\n"),
+        })
+        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SINGLE_PLAN], reviews=[PASS], luna=luna, claude=claude,
+        )
+        failed = self.run_approved(
+            config, orchestrator, "aw003-nocandidate",
+            run_options=self.bounded_options(config),
+        )
+        run_dir = failed.run_dir
+        self.assertEqual(failed.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertEqual(read_checkpoint(run_dir).phase,
+                         ResumePhase.FINAL_CHECKS_RETRY_C01)
+
+        before = self.checks_ran()
+        fresh_claude = FakeClaude(log=self.events)
+        fresh, planner, reviewer, fresh_luna, _c = self.orchestrator(
+            config, reviews=[PASS], luna=FakeLuna({}), claude=fresh_claude,
+        )
+        resumed = fresh.resume("aw003-nocandidate")
+
+        self.assertEqual(resumed.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertEqual(self.checks_ran(), before)
+        self.assertEqual((fresh_claude.calls, fresh_luna.calls, planner.prompts,
+                          reviewer.prompts), ([], [], [], []))
+        self.assertFalse((run_dir / EXPANDED_C01).exists())
+        self.assertFalse((run_dir / "candidate/C01/commit.json").exists())
+
+
+class C02RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
+    """Exact C02 parity for the same three durable retry states."""
+
+    C02_PLAN = plan_text(
+        step_block(1, operation="Repair"), title="P31 C02 repair",
+    )
+
+    def stage_c02_repo(self) -> None:
+        write(self.repo / "tests/test_service.py",
+              "def test_fake_uow():  # stale\n    pass\n")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "-qm", "add the stale fixture")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        # C01 is green while ``src/a.py`` is neither BUG nor FIXED; C02 turns
+        # it red on a production path, and only the C02 normal repair makes
+        # the same gate name the stale tracked test.
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "open(sys.argv[1], 'a').write('ran\\n')\n"
+            "source = pathlib.Path('src/a.py').read_text()\n"
+            "fixture = pathlib.Path('tests/test_service.py').read_text()\n"
+            "if 'BUG' in source:\n"
+            "    print('FAILED src/other_production.py')\n"
+            "    sys.exit(1)\n"
+            "if 'FIXED' in source:\n"
+            "    print('FAILED tests/test_service.py::test_fake_uow')\n"
+            "    print('AttributeError: FakeUnitOfWork has no attribute commit')\n"
+            "    sys.exit(1 if 'stale' in fixture else 0)\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+
+    def start_c02(self, run_id: str, *, c02_repair: str):
+        """Run up to the C02 retry checks with *c02_repair* in ``src/a.py``."""
+
+        self.stage_c02_repo()
+        config = self.make_config()
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
+                         (2, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(log=self.events, stage_actions={
+            (2, "check-repair"): writer("src/a.py", c02_repair),
+        })
+        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SINGLE_PLAN, self.C02_PLAN],
+            reviews=[REVISE_IMPLEMENTATION, PASS], luna=luna, claude=claude,
+        )
+        return config, orchestrator, luna, claude
+
+    def assert_c02_identity_preserved(self, run_dir: Path, before) -> None:
+        """Every C02 boundary the resume wrote keeps the cycle's identity."""
+
+        after = read_checkpoint_record(run_dir)[0]
+        self.assertGreaterEqual(
+            phase_index(after.phase), phase_index(ResumePhase.CANDIDATE_COMMIT_C02)
+        )
+        self.assertEqual(after.repair_bundle_sha256, before.repair_bundle_sha256)
+        self.assertEqual(after.scope_delta_sha256, before.scope_delta_sha256)
+        self.assertEqual(
+            before.expected_head_sha,
+            json.loads((run_dir / "candidate/C01/commit.json").read_text())["commit_sha"],
+        )
+
+    def test_a_red_c02_retry_checkpoint_resumes_into_the_expanded_repair(self) -> None:
+        config, orchestrator, _luna, claude = self.start_c02(
+            "c02-red", c02_repair="A = FIXED\n",
+        )
+        with self.crash_before_the_expansion("C02"):
+            failed = self.run_approved(
+                config, orchestrator, "c02-red",
+                run_options=self.bounded_options(config),
+            )
+        run_dir = failed.run_dir
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.FINAL_CHECKS_RETRY_C02)
+        self.assertIsNotNone(checkpoint.repair_bundle_sha256)
+        self.assertIsNotNone(checkpoint.scope_delta_sha256)
+        evidence = json.loads((run_dir / "checks/C02/evidence.json").read_text())
+        self.assertFalse(evidence["deterministic_passed"])
+        self.assertEqual(evidence["staged_tree_sha"], checkpoint.expected_tree_sha)
+        self.assertFalse((run_dir / EXPANDED_C02).exists())
+        self.assertEqual([(call["cycle"], call["stage"]) for call in claude.calls],
+                         [(1, "initial-revision"), (2, "initial-revision"),
+                          (2, "check-repair")])
+
+        before = self.checks_ran()
+        fresh_luna = FakeLuna({})
+        fresh_claude = self.fix_the_fixture()
+        fresh, planner, reviewer, _l, _c = self.orchestrator(
+            config, reviews=[PASS], luna=fresh_luna, claude=fresh_claude,
+        )
+        resumed = fresh.resume("c02-red")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual((fresh_luna.calls, planner.prompts), ([], []))
+        self.assertEqual([(call["cycle"], call["stage"]) for call in fresh_claude.calls],
+                         [(2, "check-repair")])
+        self.assertEqual(
+            fresh_claude.calls[0]["revision_dir"].relative_to(run_dir).as_posix(),
+            EXPANDED_C02,
+        )
+        self.assertEqual(self.checks_ran() - before, 1)
+        self.assertTrue((run_dir / "checks/C02/attempts/02/evidence.json").is_file())
+        self.assertEqual(
+            self.scope_of(run_dir, EXPANDED_C02)["added_paths"],
+            ["tests/test_service.py"],
+        )
+        self.assertTrue((run_dir / "candidate/C02/commit.json").is_file())
+        # Only reviewer #2 ran on this resume; reviewer #1 stays accepted.
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assert_c02_identity_preserved(run_dir, checkpoint)
+
+    def test_b_a_crash_before_the_c02_retry_evidence_runs_those_checks_once(self) -> None:
+        config, orchestrator, _luna, _claude = self.start_c02(
+            "c02-missing", c02_repair="A = FIXED\n",
+        )
+        # C01 final checks, C02 final checks, then the C02 retry checks.
+        with self.crash_inside_the_nth_checks(3):
+            failed = self.run_approved(
+                config, orchestrator, "c02-missing",
+                run_options=self.bounded_options(config),
+            )
+        run_dir = failed.run_dir
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.FINAL_CHECKS_RETRY_C02)
+        self.assertFalse((run_dir / "checks/C02/evidence.json").exists())
+        self.assertTrue((run_dir / "revision/check-repair/C02/report.json").is_file())
+
+        before = self.checks_ran()
+        fresh_claude = self.fix_the_fixture()
+        fresh, planner, reviewer, fresh_luna, _c = self.orchestrator(
+            config, reviews=[PASS], luna=FakeLuna({}), claude=fresh_claude,
+        )
+        resumed = fresh.resume("c02-missing")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual((fresh_luna.calls, planner.prompts), ([], []))
+        self.assertEqual([(call["cycle"], call["stage"]) for call in fresh_claude.calls],
+                         [(2, "check-repair")])
+        self.assertEqual(self.checks_ran() - before, 2)
+        self.assertEqual(
+            self.scope_of(run_dir, EXPANDED_C02)["added_paths"],
+            ["tests/test_service.py"],
+        )
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assert_c02_identity_preserved(run_dir, checkpoint)
+
+    def test_c_a_green_c02_retry_evidence_is_reconciled_not_repeated(self) -> None:
+        config, orchestrator, _luna, _claude = self.start_c02(
+            "c02-green", c02_repair="A = 4\n",
+        )
+        with self.crash_before_the_phase(ResumePhase.CANDIDATE_COMMIT_C02):
+            failed = self.run_approved(
+                config, orchestrator, "c02-green",
+                run_options=self.bounded_options(config),
+            )
+        run_dir = failed.run_dir
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.FINAL_CHECKS_RETRY_C02)
+        green = json.loads((run_dir / "checks/C02/evidence.json").read_text())
+        self.assertTrue(green["deterministic_passed"])
+        self.assertEqual(green["staged_tree_sha"], checkpoint.expected_tree_sha)
+        self.assertFalse((run_dir / "candidate/C02/commit.json").exists())
+
+        before = self.checks_ran()
+        fresh_claude, fresh_luna = FakeClaude(log=self.events), FakeLuna({})
+        fresh, planner, reviewer, _l, _c = self.orchestrator(
+            config, reviews=[PASS], luna=fresh_luna, claude=fresh_claude,
+        )
+        resumed = fresh.resume("c02-green")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(self.checks_ran(), before)
+        self.assertEqual((fresh_claude.calls, fresh_luna.calls, planner.prompts),
+                         ([], [], []))
+        self.assertFalse((run_dir / EXPANDED_C02).exists())
+        self.assertEqual(
+            json.loads((run_dir / "candidate/C02/commit.json").read_text())["tree_sha"],
+            green["staged_tree_sha"],
+        )
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assert_c02_identity_preserved(run_dir, checkpoint)
 
 
 if __name__ == "__main__":
