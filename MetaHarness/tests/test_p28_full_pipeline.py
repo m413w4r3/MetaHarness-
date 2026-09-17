@@ -51,7 +51,10 @@ from metaharness.gitops import (  # noqa: E402
     build_repository_reference,
     run_branch_web_url,
 )
-from metaharness.llm.chat import TextLLMResult  # noqa: E402
+from metaharness.llm.chat import (  # noqa: E402
+    LLMConversationHandle,
+    TextLLMResult,
+)
 from metaharness.models import (  # noqa: E402
     AgentConfig,
     ClaudeRuntimeConfig,
@@ -374,7 +377,10 @@ class P28Harness(unittest.TestCase):
         self.temp.cleanup()
 
     def config_text(self, *, revision: bool = True, publish: bool = True,
-                    require_approval: bool = False) -> str:
+                    require_approval: bool = False, web_url: str | None = None) -> str:
+        self._web_url_section = (
+            f'\n[repository]\nweb_url = "{web_url}"\n' if web_url else ""
+        )
         return textwrap.dedent(
             f"""
             repo = {str(self.repo)!r}
@@ -461,7 +467,7 @@ class P28Harness(unittest.TestCase):
             argv = [{sys.executable!r}, {str(self.check)!r}, {str(self.counter)!r}]
             timeout_seconds = 30
             """
-        )
+        ) + self._web_url_section
 
     def load(self, **kwargs: Any) -> HarnessConfig:
         path = self.root / "p28.toml"
@@ -471,10 +477,11 @@ class P28Harness(unittest.TestCase):
     def run_pipeline(
         self, *, luna: FakeLuna, reviews: list[str], plan: str = SINGLE_PLAN,
         repair_plan: str | None = None, claude: FakeClaude | None = None,
-        run_id: str = "p28", revision: bool = True,
+        run_id: str = "p28", revision: bool = True, web_url: str | None = None,
+        planner: Any = None,
     ):
-        config = self.load(revision=revision)
-        planner = QueueClient("planner", [plan] + ([repair_plan] if repair_plan else []), self.events)
+        config = self.load(revision=revision, web_url=web_url)
+        planner = planner or QueueClient("planner", [plan] + ([repair_plan] if repair_plan else []), self.events)
         reviewer = QueueClient("reviewer", reviews, self.events)
         claude = claude or FakeClaude(log=self.events)
         claude.log = self.events
@@ -811,7 +818,7 @@ class FullPipelineTests(P28Harness):
         repair_prompt = planner.prompts[1]
         self.assertNotIn("REVIEWER #1 RAW", repair_prompt)
         self.assertNotIn("META REVIEW v1", repair_prompt)
-        self.assertIn("REVIEWER REQUIRED FIXES\nCorrect src/a.py.", repair_prompt)
+        self.assertIn('"required_fixes": "Correct src/a.py."', repair_prompt)
         # Reviewer #2 evidence: both plans, all worker reports, both revisions.
         second = reviewer.prompts[1]
         original = (result.run_dir / "planner.raw.md").read_text()
@@ -833,6 +840,120 @@ class FullPipelineTests(P28Harness):
         self.assertEqual(usage["luna_c01"]["input_tokens"], 101)
         self.assertEqual(usage["luna_c02"]["input_tokens"], 201)
         self.assertEqual(usage["grand_total"]["input_tokens"], 10 + 101 + 7 + 10 + 10 + 201 + 14 + 10)
+
+    def _staged_repair_run(self, *, run_id: str, web_url: str | None, planner: Any = None):
+        luna = FakeLuna({
+            (1, "S01"): writer("src/a.py", "A = C01_DIFF_SENTINEL\n"),
+            (1, "S02"): writer("src/b.py", "B = C01_DIFF_SENTINEL\n"),
+            (1, "S03"): writer("src/c.py", "C = C01_DIFF_SENTINEL\n"),
+            (2, "S01"): writer("src/a.py", "A = 4\n"),
+        })
+        return self.run_pipeline(
+            luna=luna, reviews=[REVISE_IMPLEMENTATION, PASS], plan=STAGED_PLAN,
+            repair_plan=REPAIR_PLAN, run_id=run_id, web_url=web_url, planner=planner,
+        )
+
+    def test_d2_repair_request_is_compact_around_the_immutable_candidate(self) -> None:
+        result, planner, _r, _c, _pushed = self._staged_repair_run(
+            run_id="p28-compact", web_url="https://github.com/example/p28",
+        )
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+
+        repair_dir = result.run_dir / "repair" / "C02"
+        request = (repair_dir / "planner.request.txt").read_text(encoding="utf-8")
+        fallback = (repair_dir / "planner.request.fallback.txt").read_text(encoding="utf-8")
+        evidence = (repair_dir / "planner.evidence.md").read_text(encoding="utf-8")
+        meta = json.loads((repair_dir / "planner.request.meta.json").read_text())
+
+        self.assertEqual(request, planner.prompts[1])
+        candidate_sha = json.loads(
+            (result.run_dir / "candidate" / "C01" / "commit.json").read_text()
+        )["commit_sha"]
+
+        # Present: SPEC, compact plan summary, compact step index, the exact
+        # candidate identity and the structured reviewer answer.
+        for present in (
+            SPEC.strip(),
+            "TITLE: P28 feature",
+            '"id": "S01"',
+            '"mutation_scope"',
+            candidate_sha,
+            f'"candidate_url": "https://github.com/example/p28/tree/{candidate_sha}"',
+            f'"compare_url": "https://github.com/example/p28/compare/'
+            f'{self.base_sha}...{candidate_sha}"',
+            "src/a.py",
+            '"verdict": "REVISE"',
+            '"required_fixes": "Correct src/a.py."',
+            '"deterministic_passed": true',
+        ):
+            self.assertIn(present, request, present)
+
+        # Absent: the full C01 diff, the raw step contracts and token counters.
+        for absent in (
+            "C01_DIFF_SENTINEL",
+            "Perform operation 1 exactly.",
+            "Perform operation 3 exactly.",
+            "META IMPLEMENTATION STEP v1",
+            "C01 S01 report",
+            "LUNA REPORTS",
+            '"argv"',
+            '"stdout_tail"',
+            '"duration_seconds"',
+        ):
+            self.assertNotIn(absent, request, absent)
+
+        # The full diff stays durable in the normal Git evidence artifacts.
+        self.assertIn("C01_DIFF_SENTINEL", (result.run_dir / "diff.patch").read_text())
+
+        self.assertIn("repair-evidence.md", fallback)
+        self.assertNotIn(evidence, fallback)
+        self.assertIn(evidence, request)
+        self.assertEqual(meta["schema_version"], 1)
+        self.assertEqual(meta["inline_bytes"], len(request.encode("utf-8")))
+        self.assertEqual(meta["evidence_bytes"], len(evidence.encode("utf-8")))
+        self.assertEqual(meta["file_fallback_attempt"], 3)
+        # Remote exploration is available, so no candidate.diff is ever offered.
+        self.assertEqual(meta["candidate_diff_attachment_bytes"], 0)
+
+    def test_d3_without_a_remote_the_candidate_diff_is_attachment_only(self) -> None:
+        result, _p, _r, _c, _pushed = self._staged_repair_run(
+            run_id="p28-no-remote", web_url=None,
+        )
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        repair_dir = result.run_dir / "repair" / "C02"
+        meta = json.loads((repair_dir / "planner.request.meta.json").read_text())
+        request = (repair_dir / "planner.request.txt").read_text(encoding="utf-8")
+
+        self.assertGreater(meta["candidate_diff_attachment_bytes"], 0)
+        # Even without a remote the full diff is never inlined in the request.
+        self.assertNotIn("C01_DIFF_SENTINEL\n+", request)
+
+    def test_d4_the_repair_planner_never_continues_the_planner_conversation(self) -> None:
+        class ConversationPlanner(QueueClient):
+            def __init__(self, responses, log):
+                super().__init__("planner", responses, log)
+                self.conversation_calls = 0
+
+            def complete(self, prompt: str) -> TextLLMResult:
+                result = super().complete(prompt)
+                return TextLLMResult(
+                    result.text, result.model, result.usage, {},
+                    conversation=LLMConversationHandle("bridge", "conv-planner-1"),
+                )
+
+            def complete_in_conversation(self, handle, prompt: str) -> TextLLMResult:
+                self.conversation_calls += 1
+                return super().complete(prompt)
+
+        planner = ConversationPlanner([STAGED_PLAN, REPAIR_PLAN], self.events)
+        result, planner, _r, _c, _pushed = self._staged_repair_run(
+            run_id="p28-fresh-c02", web_url=None, planner=planner,
+        )
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        # The historical artifact still exists; the repair planner ignores it.
+        self.assertTrue((result.run_dir / "planner.conversation.json").exists())
+        self.assertEqual(planner.conversation_calls, 0)
+        self.assertEqual(len(planner.prompts), 2)
 
     def test_e_c02_red_gate_with_reviewer_pass_is_invalid(self) -> None:
         _luna, result, planner, reviewer, _claude, pushed = self._c01_then_repair(

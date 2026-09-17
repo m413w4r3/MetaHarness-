@@ -9,14 +9,17 @@ artefact.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -40,9 +43,10 @@ class LLMConversationHandle:
     """A stable conversation identifier officially exposed by a driver.
 
     MetaHarness never fabricates one and never scrapes a UI to guess it: a
-    handle exists only when the driver/bridge returns it.  The only allowed
-    conversational reuse is the C02 repair planner continuing the initial
-    planner conversation; reviewers are always fresh.
+    handle exists only when the driver/bridge returns it.  A handle may be
+    exposed by a driver for explicitly conversation-aware workflows.
+    MetaHarness repair planning does not reuse the initial planner
+    conversation; C02 starts from a fresh bounded request.
     """
 
     provider_id: str
@@ -65,6 +69,60 @@ def conversation_handle(result: object) -> LLMConversationHandle | None:
 
     handle = getattr(result, "conversation", None)
     return handle if isinstance(handle, LLMConversationHandle) else None
+
+
+@dataclass(frozen=True)
+class TextFileAttachment:
+    """One bounded UTF-8 text file offered to the endpoint as an attachment.
+
+    An attachment is a transport mode for evidence that is already durable in
+    the run artifacts; it never carries protocol authority.
+    """
+
+    filename: str
+    text: str
+    media_type: str = "text/markdown"
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.filename, str)
+            or not self.filename
+            or len(self.filename) > 128
+            or "/" in self.filename
+            or "\\" in self.filename
+            or "\x00" in self.filename
+        ):
+            raise ValueError("attachment filename is invalid")
+
+        if not isinstance(self.text, str):
+            raise TypeError("attachment text must be a string")
+
+        if (
+            not isinstance(self.media_type, str)
+            or not re.fullmatch(
+                r"[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+",
+                self.media_type,
+            )
+        ):
+            raise ValueError("attachment media type is invalid")
+
+
+def _attachment_part(
+    attachment: TextFileAttachment,
+) -> dict[str, Any]:
+    encoded = base64.b64encode(
+        attachment.text.encode("utf-8")
+    ).decode("ascii")
+
+    return {
+        "type": "input_file",
+        "file": {
+            "filename": attachment.filename,
+            "file_data": (
+                f"data:{attachment.media_type};base64,{encoded}"
+            ),
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -141,13 +199,76 @@ class OpenAIChatTextClient:
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
 
+        request = self._build_request(prompt)
+        response_data = self._request_json(request)
+        return _parse_completion_response(response_data)
+
+    def complete_with_file_fallback(
+        self,
+        prompt: str,
+        *,
+        fallback_prompt: str,
+        attachments: tuple[TextFileAttachment, ...],
+        fallback_attempt: int = 3,
+    ) -> TextLLMResult:
+        """Send *prompt* inline, moving evidence to files only late.
+
+        The attachments are used exactly when the existing retry loop reaches
+        *fallback_attempt*; no extra attempt is ever added, and a non-retryable
+        status still fails on its own attempt.
+        """
+
+        if not isinstance(prompt, str):
+            raise TypeError("prompt must be a string")
+        if not isinstance(fallback_prompt, str):
+            raise TypeError("fallback_prompt must be a string")
+        if not isinstance(attachments, tuple) or not attachments:
+            raise TypeError("attachments must be a non-empty tuple")
+        if any(not isinstance(item, TextFileAttachment) for item in attachments):
+            raise TypeError("attachments must contain TextFileAttachment values")
+        if (
+            isinstance(fallback_attempt, bool)
+            or not isinstance(fallback_attempt, int)
+            or fallback_attempt < 2
+        ):
+            raise ValueError("fallback_attempt must be an integer of at least 2")
+
+        response_data = self._request_json_with_factory(
+            lambda attempt: (
+                self._build_request(prompt)
+                if attempt < fallback_attempt
+                else self._build_request(
+                    [
+                        {
+                            "type": "text",
+                            "text": fallback_prompt,
+                        },
+                        *[
+                            _attachment_part(item)
+                            for item in attachments
+                        ],
+                    ]
+                )
+            )
+        )
+        return _parse_completion_response(response_data)
+
+    def _build_request(
+        self,
+        content: str | list[dict[str, Any]],
+    ) -> urllib.request.Request:
         payload: dict[str, Any] = dict(self.config.extra_body)
         # Protected keys are written last: even a mutated extra_body cannot
         # replace the single user message or the non-streaming contract.
         payload.update(
             {
                 "model": self.config.model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": content,
+                    }
+                ],
                 "stream": False,
             }
         )
@@ -159,18 +280,24 @@ class OpenAIChatTextClient:
         if self.config.api_key_env is not None:
             headers["Authorization"] = f"Bearer {_api_key(self.config.api_key_env, self._environment)}"
 
-        request = urllib.request.Request(
+        return urllib.request.Request(
             self._url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers=headers,
             method="POST",
         )
-        response_data = self._request_json(request)
-        return _parse_completion_response(response_data)
 
     def _request_json(self, request: urllib.request.Request) -> dict[str, Any]:
+        return self._request_json_with_factory(lambda _attempt: request)
+
+    def _request_json_with_factory(
+        self,
+        request_factory: Callable[[int], urllib.request.Request],
+    ) -> dict[str, Any]:
         attempts = self.config.retries + 1
         for attempt in range(attempts):
+            # 1-based: the factory decides what attempt #N carries.
+            request = request_factory(attempt + 1)
             try:
                 deadline = time.monotonic() + self.config.timeout_seconds
                 with self._opener.open(

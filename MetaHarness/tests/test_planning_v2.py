@@ -25,8 +25,11 @@ from metaharness.planning_v2 import (  # noqa: E402
     PlannerV2,
     V2PlanParseError,
     build_planner_prompt_v2,
+    REPAIR_PLANNER_INLINE_TARGET_BYTES,
     build_repair_planner_prompt,
+    build_repair_planner_prompt_bundle,
     render_decomposition_policy_text,
+    render_repair_step_index,
     validate_decomposition_policy,
     parse_task_plan_v2,
     render_plan_summary_v2,
@@ -374,47 +377,151 @@ END META PLAN
         self.assertIn("contract", worker)
         self.assertNotIn("{{STEP_CONTRACT}}", worker)
 
-    def test_repair_planner_prompt_keeps_required_fixes_without_raw_review(self):
-        prompt = build_repair_planner_prompt(
-            repository_reference="repository",
-            original_spec="original spec",
-            original_meta_plan="original plan",
-            original_step_contracts="original contracts",
-            current_repository_state="current state",
-            current_cumulative_diff="cumulative diff",
-            final_checks_cycle_1="checks C01",
-            claude_revision_report_cycle_1="Claude C01 report",
-            reviewer_required_fixes="Fix the concrete defect.",
-            original_approved_mutable_scope="[\"src/example.py\"]",
-        )
+    def test_repair_planner_prompt_keeps_the_structured_review_without_raw_review(self):
+        prompt = build_repair_planner_prompt(**_repair_inputs())
 
         self.assertNotIn("REVIEWER_1_RAW", prompt)
         self.assertNotIn("REVIEWER #1 RAW", prompt)
-        self.assertIn("REVIEWER REQUIRED FIXES\nFix the concrete defect.", prompt)
+        self.assertIn("<REVIEWER #1 STRUCTURED RESULT>\nREVIEW\n", prompt)
         self.assertIn("STATUS: BLOCKED", prompt)
         self.assertIn("For BLOCKED, do not emit CONSTRAINTS, REQUIRED_CHECKS, EXECUTION_MODE,", prompt)
 
-    def test_repair_prompt_uses_compact_summary_and_one_canonical_instruction(self):
+    def test_repair_prompt_uses_compact_summary_and_no_step_contracts(self):
         plan = _parse(_plan())
         summary = render_repair_plan_summary(plan)
-        contracts = "INSTRUCTIONS\n1. DISTINCTIVE_CANONICAL_STEP_INSTRUCTION\n"
         prompt = build_repair_planner_prompt(
-            repository_reference="repository",
-            original_spec="original spec",
-            original_plan_summary=summary,
-            original_step_contracts=contracts,
-            current_repository_state="current state",
-            current_cumulative_diff="cumulative diff",
-            final_checks_cycle_1="checks C01",
-            claude_revision_report_cycle_1="Claude C01 report",
-            reviewer_required_fixes="Fix the concrete defect.",
-            original_approved_mutable_scope="[\"src/example.py\"]",
+            **{**_repair_inputs(), "original_plan_summary": summary}
         )
         self.assertIn("ORIGINAL PLAN SUMMARY", prompt)
         self.assertNotIn("ORIGINAL META PLAN", prompt)
-        self.assertEqual(prompt.count("DISTINCTIVE_CANONICAL_STEP_INSTRUCTION"), 1)
         self.assertNotIn("READ_SET", summary)
         self.assertNotIn("INSTRUCTIONS", summary)
+
+
+def _repair_inputs(**overrides):
+    values = {
+        "repository_reference": "REPOSITORY",
+        "original_spec": "SPEC",
+        "original_plan_summary": "PLAN_SUMMARY",
+        "original_step_index": "STEP_INDEX",
+        "current_repository_state": "STATE",
+        "candidate_code_evidence": "CODE_EVIDENCE",
+        "final_checks_cycle_1": "CHECKS",
+        "claude_revision_report_cycle_1": "CLAUDE",
+        "original_approved_mutable_scope": "SCOPE",
+        "reviewer_result": "REVIEW",
+    }
+    values.update(overrides)
+    return values
+
+
+class RepairPlannerPromptBundleTests(unittest.TestCase):
+    SENTINELS = (
+        "SPEC", "PLAN_SUMMARY", "STEP_INDEX", "STATE", "CODE_EVIDENCE",
+        "CHECKS", "CLAUDE", "SCOPE", "REVIEW",
+    )
+
+    def test_inline_prompt_carries_every_datum_and_no_removed_section(self):
+        bundle = build_repair_planner_prompt_bundle(**_repair_inputs())
+
+        for sentinel in self.SENTINELS:
+            self.assertIn(sentinel, bundle.inline_prompt, sentinel)
+        for removed in ("ORIGINAL STEP CONTRACTS", "CURRENT CUMULATIVE DIFF",
+                        "REVIEWER REQUIRED FIXES", "REVIEWER #1 MISSING TESTS"):
+            self.assertNotIn(removed, bundle.inline_prompt, removed)
+        self.assertIn("The bounded repair evidence follows inline below.",
+                      bundle.inline_prompt)
+        self.assertIn(bundle.evidence_text, bundle.inline_prompt)
+
+    def test_fallback_prompt_points_at_the_attachment_and_carries_no_evidence(self):
+        bundle = build_repair_planner_prompt_bundle(**_repair_inputs())
+
+        self.assertIn("repair-evidence.md", bundle.fallback_prompt)
+        self.assertIn("[repair evidence intentionally moved to attachment]",
+                      bundle.fallback_prompt)
+        for sentinel in ("SPEC", "STEP_INDEX", "CODE_EVIDENCE"):
+            self.assertNotIn(sentinel, bundle.fallback_prompt, sentinel)
+        # "REVIEW" alone appears in the control prompt's REVIEWER PROFILES
+        # heading, so the reviewer datum is checked through its evidence tag.
+        self.assertNotIn("<REVIEWER #1 STRUCTURED RESULT>", bundle.fallback_prompt)
+        self.assertNotIn(bundle.evidence_text, bundle.fallback_prompt)
+
+    def test_evidence_text_has_the_exact_envelope_and_every_section(self):
+        bundle = build_repair_planner_prompt_bundle(**_repair_inputs())
+        evidence = bundle.evidence_text
+
+        self.assertTrue(evidence.startswith("REPAIR PLANNER EVIDENCE v1\n"))
+        self.assertTrue(evidence.endswith("END REPAIR PLANNER EVIDENCE\n"))
+        for name, value in (
+            ("REPOSITORY REFERENCE", "REPOSITORY"),
+            ("ORIGINAL SPEC", "SPEC"),
+            ("ORIGINAL PLAN SUMMARY", "PLAN_SUMMARY"),
+            ("ORIGINAL STEP INDEX", "STEP_INDEX"),
+            ("CURRENT REPOSITORY STATE", "STATE"),
+            ("CANDIDATE CODE EVIDENCE", "CODE_EVIDENCE"),
+            ("FINAL CHECKS CYCLE 1", "CHECKS"),
+            ("CLAUDE REVISION REPORT CYCLE 1", "CLAUDE"),
+            ("ORIGINAL APPROVED MUTABLE SCOPE", "SCOPE"),
+            ("REVIEWER #1 STRUCTURED RESULT", "REVIEW"),
+        ):
+            self.assertIn(f"<{name}>\n{value}\n</{name}>", evidence, name)
+
+    def test_step_index_is_compact_and_omits_worker_detail(self):
+        steps = "\n\n".join(_step(number) for number in range(1, 4))
+        plan = _parse(_plan("STAGED", 3, steps=steps))
+        index = render_repair_step_index(plan)
+        payload = json.loads(index)
+
+        self.assertEqual([entry["id"] for entry in payload], ["S01", "S02", "S03"])
+        for key in ("id", "title", "depends_on", "objective", "mutation_scope",
+                    "verify", "forbidden"):
+            self.assertIn(key, payload[0], key)
+        self.assertEqual(payload[0]["mutation_scope"],
+                         {"write": ["src/example.py"], "create": [], "delete": []})
+        for absent in ("read_set", "instructions", "implementer_profile"):
+            self.assertNotIn(absent, payload[0], absent)
+        self.assertNotIn("edit the named symbol", index)
+        self.assertNotIn("impl-a", index)
+
+    def test_an_aw_002_sized_request_stays_under_the_inline_target(self):
+        steps = "\n\n".join(_step(number) for number in range(1, 19))
+        plan = _parse(_plan("STAGED", 18, steps=steps))
+        # A 500 KB candidate diff exists in the run artifacts and is
+        # deliberately never handed to the prompt builder.
+        huge_diff = "D" * 500_000
+
+        bundle = build_repair_planner_prompt_bundle(
+            repository_reference="REPOSITORY",
+            original_spec="S" * 30_000,
+            original_plan_summary=render_repair_plan_summary(plan),
+            original_step_index=render_repair_step_index(plan),
+            current_repository_state=json.dumps(
+                {"CHANGED_FILES": [f"src/module_{n:03d}.py" for n in range(100)]}
+            ),
+            candidate_code_evidence=json.dumps({
+                "authority": "immutable_candidate_commit",
+                "base_sha": "a" * 40,
+                "candidate_sha": "b" * 40,
+                "candidate_url": "https://example.invalid/commit/" + "b" * 40,
+                "compare_url": "https://example.invalid/compare/a...b",
+                "full_diff_bytes": len(huge_diff),
+                "full_diff_sha256": "c" * 64,
+                "inline_full_diff": False,
+            }),
+            final_checks_cycle_1=json.dumps({"deterministic_passed": True}),
+            claude_revision_report_cycle_1="C" * (16 * 1024),
+            original_approved_mutable_scope=json.dumps(
+                [f"src/module_{n:03d}.py" for n in range(100)]
+            ),
+            reviewer_result="R" * 8_192,
+        )
+
+        self.assertLess(
+            len(bundle.inline_prompt.encode("utf-8")),
+            REPAIR_PLANNER_INLINE_TARGET_BYTES,
+        )
+        self.assertNotIn("D" * 10_000, bundle.inline_prompt)
+        self.assertLess(len(bundle.fallback_prompt.encode("utf-8")), 24 * 1024)
 
 
 def _change_step(sets: str) -> str:

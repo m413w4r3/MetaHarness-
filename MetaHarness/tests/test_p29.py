@@ -1051,7 +1051,7 @@ class ReusingReviewer(QueueClient):
 class ConversationPolicyTests(P29Harness):
     HANDLE = LLMConversationHandle("chatgpt-bridge", "conv-planner-1")
 
-    def test_only_the_repair_planner_reuses_an_official_planner_handle(self) -> None:
+    def test_no_role_reuses_the_official_planner_handle(self) -> None:
         config = self.make_config()
         planner = RecordingPlanner([SINGLE_PLAN, REPAIR_PLAN], self.events, self.HANDLE)
         reviewer = ReusingReviewer([REVISE_IMPLEMENTATION, PASS], self.events,
@@ -1062,7 +1062,8 @@ class ConversationPolicyTests(P29Harness):
             result = self.run_approved(config, orchestrator, "conversation")
         self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
         self.assertEqual(len(planner.prompts), 2)
-        self.assertEqual(planner.resumed, [self.HANDLE])       # repair planner only
+        # The C02 repair planner is a fresh bounded request, not a continuation.
+        self.assertEqual(planner.resumed, [])
         self.assertEqual(len(reviewer.prompts), 2)              # two fresh reviews
         persisted = json.loads((result.run_dir / "planner.conversation.json").read_text())
         self.assertEqual(persisted, {"provider_id": "chatgpt-bridge", "conversation_id": "conv-planner-1"})

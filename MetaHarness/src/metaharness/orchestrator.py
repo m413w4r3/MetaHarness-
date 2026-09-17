@@ -161,6 +161,7 @@ from .planning_v2 import (
     validate_execution_mode_policy,
     validate_implementation_bundle,
     render_repair_plan_summary,
+    render_repair_step_index,
 )
 from .plan_recovery import (
     PLAN_RECOVERY_ARTIFACT,
@@ -274,6 +275,7 @@ _MAX_AGENT_REPORT_BYTES = 32_000
 _MAX_STEP_REPORT_BYTES = 2_048
 _MAX_REVIEW_FALLBACK_DIFF_BYTES = 32 * 1024
 _MAX_REVIEW_CONTEXT_BYTES = 24 * 1024
+_MAX_REPAIR_CLAUDE_REPORT_BYTES = 16 * 1024
 _AGENT_ARTIFACTS = (
     "agent.events.jsonl",
     "agent.stderr.log",
@@ -337,6 +339,68 @@ def _bounded_report(text: str) -> str:
     head = encoded[:_MAX_AGENT_REPORT_BYTES].decode("utf-8", errors="ignore")
     omitted = len(encoded) - _MAX_AGENT_REPORT_BYTES
     return f"{head}\n[... {omitted} bytes truncated; full report in agent.final.md ...]"
+
+
+def _bounded_repair_claude_report(text: str) -> str:
+    """Bound the advisory Claude C01 report handed to the repair planner.
+
+    The report is consultative; the immutable candidate commit is the code
+    authority, so truncating it can never hide a fact the planner must know.
+    """
+
+    data = text.encode("utf-8", errors="replace")
+
+    if len(data) <= _MAX_REPAIR_CLAUDE_REPORT_BYTES:
+        return text
+
+    marker = (
+        "\n[... Claude report truncated for repair planner; "
+        "candidate commit is authoritative ...]\n"
+    ).encode("utf-8")
+
+    head = data[
+        : max(
+            0,
+            _MAX_REPAIR_CLAUDE_REPORT_BYTES - len(marker),
+        )
+    ].decode("utf-8", errors="ignore")
+
+    return head + marker.decode("utf-8")
+
+
+def _repair_checks_payload(bundle: EvidenceBundle) -> dict[str, Any]:
+    """Summarize the accepted C01 deterministic gate for the repair planner.
+
+    Reviewer #1 only exists because the C01 gate was accepted, so argv, cwd,
+    durations and log tails add no decision value here; they stay in the
+    durable check artifacts.
+    """
+
+    checks: list[dict[str, Any]] = []
+
+    for check in bundle.checks:
+        payload = (
+            dict(check)
+            if isinstance(check, Mapping)
+            else check_result_json(check)
+        )
+
+        checks.append(
+            {
+                "name": payload.get("name"),
+                "exit_code": payload.get("exit_code"),
+                "timed_out": bool(payload.get("timed_out", False)),
+                "workspace_mutated": bool(
+                    payload.get("workspace_mutated", False)
+                ),
+            }
+        )
+
+    return {
+        "deterministic_passed": bundle.deterministic_passed,
+        "failures": list(bundle.failures),
+        "checks": checks,
+    }
 
 
 def _bounded_v2_report(text: str) -> str:
@@ -4572,10 +4636,6 @@ class Orchestrator:
             path for step in original_plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
         })
-        original_contracts = "\n\n".join(
-            read_approved_step_contract(run_dir, original_bundle, step.id)
-            for step in original_plan.steps
-        )
         tree_before = candidate_tree_sha(info.worktree)
         if start is None and current_head(info.worktree) != cycle_parent_sha:
             raise ResumeIntegrityError("C02 does not start from the C01 candidate commit")
@@ -4600,26 +4660,41 @@ class Orchestrator:
                 check_catalog=self.config.check_catalog,
                 original_required_check_ids=original_plan.required_checks,
             )
-            semantic_diff, diff_truncated, _full_diff_bytes = _semantic_diff_payload(
-                cycle_1_evidence.diff, self.config.max_diff_bytes
+            # The C01 candidate commit is the code authority: the planner gets
+            # its immutable candidate/compare URLs instead of an inline diff.
+            repair_code_evidence = _review_code_evidence(
+                repository_reference=repository_reference,
+                base_sha=base_sha,
+                candidate_sha=cycle_parent_sha,
+                evidence=cycle_1_evidence,
+            )
+            remote_available = (
+                immutable_commit_web_url(repository_reference, cycle_parent_sha)
+                is not None
+                and compare_commits_web_url(
+                    repository_reference, base_sha, cycle_parent_sha
+                )
+                is not None
             )
             repair_plan = repair_planner.plan(
                 repository_reference=render_repository_reference(repository_reference),
                 original_spec=spec,
                 original_plan_summary=render_repair_plan_summary(original_plan),
-                original_step_contracts=original_contracts,
+                original_step_index=render_repair_step_index(original_plan),
                 current_repository_state=current_state,
-                current_cumulative_diff=semantic_diff,
-                final_checks_cycle_1=_json_text(_check_payload(cycle_1_evidence)),
-                claude_revision_report_cycle_1=cycle_1_revision_report or "NONE",
-                reviewer_required_fixes=cycle_1_review.required_fixes,
+                candidate_code_evidence=repair_code_evidence,
+                final_checks_cycle_1=_json_text(
+                    _repair_checks_payload(cycle_1_evidence)
+                ),
+                claude_revision_report_cycle_1=_bounded_repair_claude_report(
+                    cycle_1_revision_report or "NONE"
+                ),
                 original_approved_mutable_scope=_json_text(original_scope),
-                candidate_commit_sha=cycle_parent_sha,
-                candidate_immutable_url=str(c01_candidate_record.get("immutable_commit_url") or ""),
                 reviewer_result=_json_text(_review_payload(cycle_1_review)),
-                reviewer_missing_tests=cycle_1_review.missing_tests,
                 artifacts_dir=repair_dir,
-                conversation=_read_planner_conversation(run_dir),
+                fallback_candidate_diff=(
+                    "" if remote_available else cycle_1_evidence.diff
+                ),
             )
             self._cycle_update(
                 store, 2, status="planning", kind="repair",

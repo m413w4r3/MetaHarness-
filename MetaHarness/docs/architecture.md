@@ -216,10 +216,39 @@ connection and external-ui model are reused. `LLMConversationHandle`
 (`provider_id`, `conversation_id`) exists only when a driver officially
 returns one — the OpenAI-compatible bridge client does not, and MetaHarness
 never fabricates or scrapes one. When a handle exists it is persisted in
-`planner.conversation.json` and the C02 repair planner may continue that
-conversation (`complete_in_conversation`); this is the only allowed reuse. A
+`planner.conversation.json` purely as run history: no MetaHarness call
+consumes it, and the C02 repair planner is always a fresh completion. A
 reviewer reporting the planner's handle is rejected as
 `REVIEWER_OUTPUT_INVALID`.
+
+## Compact C02 repair planning
+
+The pushed C01 candidate commit is the code authority for repair planning.
+The repair planner receives a compact index of the original plan — per step,
+its ID, title, dependency, objective, approved mutation scope, VERIFY and
+FORBIDDEN — never the full approved step contracts, and never the Luna
+reports, token counters or tree SHAs. The full candidate diff is not inlined
+when Git remote exploration is available: the planner gets the BASE SHA, the
+C01 candidate SHA, the immutable candidate URL, the `BASE...CANDIDATE`
+compare URL, the changed paths, the diff byte size and the diff SHA256, and
+inspects the immutable commit whenever it needs source-level evidence. C02
+always starts in a fresh conversation; it never continues the initial
+planner thread.
+
+Transport has exactly three attempts, the client's configured
+`retries = 2` plus the first try — no fourth attempt is ever added. The first
+and second HTTP attempts send the same compact inline request. Only when the
+retry loop actually reaches the third attempt, after two retryable HTTP
+responses, does the request move its evidence into an attached
+`repair-evidence.md` and keep a small control prompt inline. A non-retryable
+status, a malformed 200, a parser failure or a network error never triggers
+the file mode. `candidate.diff` is attached to that third attempt only when
+remote exploration is unavailable; the full diff is never inline. Before any
+transport, `repair/C02/` durably records `planner.request.txt`,
+`planner.request.fallback.txt`, `planner.evidence.md` and
+`planner.request.meta.json`, so a transport failure stays diagnosable. The
+attachment is a transport mode only: it carries data and grants no authority
+over the META PLAN v2 protocol.
 
 All run-state writes go through `RunStateStore`, which replaces JSON files
 atomically. The plan approval artifact is atomically published without

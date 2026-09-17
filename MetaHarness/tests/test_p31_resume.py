@@ -14,6 +14,7 @@ from pathlib import Path
 
 from metaharness import cli
 from metaharness.config import load_config
+from metaharness.llm.chat import LLMHTTPError
 from metaharness.approval import PlanIdentity, write_scope_approval
 from metaharness.models import RunStatus
 from metaharness.orchestrator import Orchestrator
@@ -592,6 +593,69 @@ class IntegrityRevalidationEligibilityTests(unittest.TestCase):
                 self.assertEqual(
                     resume_run.call_args.kwargs, {"revalidate_integrity": expected}
                 )
+
+
+class RepairPlannerRequestArtifactsTests(P29Harness):
+    """The C02 request is durable before any transport is attempted."""
+
+    class TransportFailsOnRepair(QueueClient):
+        def complete(self, prompt: str):
+            if self.prompts:
+                self.prompts.append(prompt)
+                raise LLMHTTPError("LLM endpoint returned HTTP 502 after 3 attempt(s)")
+            return super().complete(prompt)
+
+    def test_a_repair_transport_failure_leaves_every_request_artifact(self) -> None:
+        config = self.make_config()
+        planner = self.TransportFailsOnRepair("planner", [SINGLE_PLAN], self.events)
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")})
+        orchestrator, _p, reviewer, _l, claude = self.orchestrator(
+            config, planner=planner, reviews=[REVISE_IMPLEMENTATION], luna=luna,
+        )
+        failed = self.run_approved(config, orchestrator, "repair-artifacts")
+        self.assertEqual(failed.state["failure"]["reason"], "LLM_FAILURE")
+
+        run_dir = failed.run_dir
+        repair_dir = run_dir / "repair" / "C02"
+        for name in ("planner.request.txt", "planner.request.fallback.txt",
+                     "planner.evidence.md", "planner.request.meta.json"):
+            self.assertTrue((repair_dir / name).exists(), name)
+        meta = json.loads((repair_dir / "planner.request.meta.json").read_text())
+        self.assertEqual(
+            meta["inline_sha256"],
+            hashlib.sha256(
+                (repair_dir / "planner.request.txt").read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            meta["evidence_sha256"],
+            hashlib.sha256(
+                (repair_dir / "planner.evidence.md").read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(meta["file_fallback_attempt"], 3)
+
+        c01 = json.loads((run_dir / "candidate/C01/commit.json").read_text())
+        self.assertEqual(read_checkpoint(run_dir).phase, ResumePhase.REPAIR_PLANNER)
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertEqual([call["cycle"] for call in luna.calls], [1])
+        self.assertEqual([call["cycle"] for call in claude.calls], [1])
+
+        fresh, planner2, reviewer2, luna2, claude2 = self.orchestrator(
+            config, plans=[REPAIR_PLAN], reviews=[PASS],
+            luna=FakeLuna({(2, "S01"): writer("src/a.py", "A = 4\n")}),
+        )
+        resumed = fresh.resume("repair-artifacts")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        # Only the repair planner is replayed; C01 keeps its exact candidate.
+        self.assertEqual(len(planner2.prompts), 1)
+        self.assertEqual([call["cycle"] for call in luna2.calls], [2])
+        self.assertEqual([call["cycle"] for call in claude2.calls], [2])
+        self.assertEqual(len(reviewer2.prompts), 1)
+        self.assertEqual(
+            json.loads((run_dir / "candidate/C01/commit.json").read_text()), c01
+        )
 
 
 if __name__ == "__main__":

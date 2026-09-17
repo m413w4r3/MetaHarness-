@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import socket
@@ -14,6 +15,7 @@ from metaharness.llm.chat import (  # noqa: E402
     LLMHTTPError,
     LLMProtocolError,
     OpenAIChatTextClient,
+    TextFileAttachment,
 )
 from metaharness.models import LLMEndpointConfig  # noqa: E402
 
@@ -236,6 +238,129 @@ class ChatClientTests(unittest.TestCase):
         with ServerHarness(responder) as server:
             with self.assertRaisesRegex(LLMProtocolError, "empty"):
                 OpenAIChatTextClient(config(server)).complete("prompt")
+
+
+def _completion(text="ok"):
+    return {"choices": [{"message": {"content": text}}]}
+
+
+def _content(request):
+    return request["payload"]["messages"][0]["content"]
+
+
+class FileFallbackTests(unittest.TestCase):
+    EVIDENCE = TextFileAttachment(
+        filename="repair-evidence.md",
+        text="EVIDENCE_SENTINEL",
+    )
+
+    def call(self, client):
+        return client.complete_with_file_fallback(
+            "INLINE_SENTINEL",
+            fallback_prompt="FALLBACK_CONTROL",
+            attachments=(self.EVIDENCE,),
+            fallback_attempt=3,
+        )
+
+    def test_file_fallback_is_used_only_on_third_retryable_attempt(self):
+        attempts = 0
+
+        def responder(_handler, _request):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                return 502, {"error": "bad gateway"}
+            return 200, _completion("repaired")
+
+        with ServerHarness(responder) as server:
+            result = self.call(OpenAIChatTextClient(config(server, retries=2)))
+
+        self.assertEqual(result.text, "repaired")
+        self.assertEqual(len(server.requests), 3)
+        self.assertEqual(_content(server.requests[0]), "INLINE_SENTINEL")
+        self.assertEqual(_content(server.requests[1]), "INLINE_SENTINEL")
+
+        content = _content(server.requests[2])
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0], {"type": "text", "text": "FALLBACK_CONTROL"})
+        self.assertEqual(content[1]["type"], "input_file")
+        self.assertEqual(content[1]["file"]["filename"], "repair-evidence.md")
+
+        prefix, encoded = content[1]["file"]["file_data"].split(",", 1)
+        self.assertEqual(prefix, "data:text/markdown;base64")
+        self.assertEqual(base64.b64decode(encoded).decode("utf-8"), "EVIDENCE_SENTINEL")
+        # The evidence travels only as a file, never as inline control text.
+        self.assertNotIn("EVIDENCE_SENTINEL", content[0]["text"])
+
+    def test_a_second_attempt_that_succeeds_never_attaches_a_file(self):
+        attempts = 0
+
+        def responder(_handler, _request):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return 502, {"error": "bad gateway"}
+            return 200, _completion()
+
+        with ServerHarness(responder) as server:
+            self.call(OpenAIChatTextClient(config(server, retries=2)))
+
+        self.assertEqual(len(server.requests), 2)
+        for request in server.requests:
+            self.assertEqual(_content(request), "INLINE_SENTINEL")
+        self.assertNotIn("input_file", json.dumps(server.requests))
+
+    def test_a_non_retryable_status_never_attaches_a_file(self):
+        def responder(_handler, _request):
+            return 401, {"error": "unauthorized"}
+
+        with ServerHarness(responder) as server:
+            with self.assertRaises(LLMHTTPError):
+                self.call(OpenAIChatTextClient(config(server, retries=2)))
+
+        self.assertEqual(len(server.requests), 1)
+        self.assertEqual(_content(server.requests[0]), "INLINE_SENTINEL")
+        self.assertNotIn("input_file", json.dumps(server.requests))
+
+    def test_the_fallback_attempt_is_never_added_beyond_configured_retries(self):
+        def responder(_handler, _request):
+            return 502, {"error": "bad gateway"}
+
+        with ServerHarness(responder) as server:
+            with self.assertRaisesRegex(LLMHTTPError, r"HTTP 502 after 2 attempt\(s\)"):
+                self.call(OpenAIChatTextClient(config(server, retries=1)))
+
+        self.assertEqual(len(server.requests), 2)
+        self.assertNotIn("input_file", json.dumps(server.requests))
+
+    def test_standard_complete_is_unchanged_by_the_file_fallback_feature(self):
+        def responder(_handler, _request):
+            return 502, {"error": "bad gateway"}
+
+        with ServerHarness(responder) as server:
+            with self.assertRaises(LLMHTTPError):
+                OpenAIChatTextClient(config(server, retries=2)).complete("prompt")
+
+        self.assertEqual(len(server.requests), 3)
+        for request in server.requests:
+            self.assertEqual(
+                request["payload"],
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "prompt"}],
+                    "stream": False,
+                },
+            )
+
+    def test_attachment_validation_rejects_unsafe_values(self):
+        for filename in ("", "a/b.md", "a\\b.md", "a\x00b", "x" * 129):
+            with self.subTest(filename=filename):
+                with self.assertRaises(ValueError):
+                    TextFileAttachment(filename=filename, text="x")
+        with self.assertRaises(ValueError):
+            TextFileAttachment(filename="a.md", text="x", media_type="not a type")
+        with self.assertRaises(TypeError):
+            TextFileAttachment(filename="a.md", text=None)
 
 
 if __name__ == "__main__":
