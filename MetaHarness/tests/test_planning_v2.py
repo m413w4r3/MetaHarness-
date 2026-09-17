@@ -197,7 +197,6 @@ END META PLAN
             "unknown reviewer": _plan().replace("REVIEWER_PROFILE: review-a", "REVIEWER_PROFILE: other"),
             "unsafe path": _plan().replace("src/example.py ::", "../example.py ::"),
             "write not read": _plan().replace("- src/example.py\n\nINSTRUCTIONS", "- src/other.py\n\nINSTRUCTIONS"),
-            "duplicate path": _plan().replace("- src/example.py :: function example()", "- src/example.py :: one\n- src/example.py :: two"),
             "missing VERIFY": _plan().replace("VERIFY\n- python -m unittest tests.test_planning_v2", "VERIFY\n"),
             "fuzzy profile": _plan().replace("REVIEWER_PROFILE: review-a", "REVIEWER_PROFILE: REVIEW-A"),
         }
@@ -592,6 +591,52 @@ class ChangeSetTests(unittest.TestCase):
         raw = _plan(steps=_change_step(read + "\n" + writes + "\nCREATE_SET\nNONE\n\nDELETE_SET\nNONE\n"))
         self.assertEqual(len(_parse(raw).steps[0].read_set), 9)
         self.assertEqual(len(_parse(raw).steps[0].write_set), 9)
+
+    def test_read_set_duplicate_path_merges_distinct_anchors(self) -> None:
+        sets = (
+            "READ_SET\n- src/example.py :: SymbolA\n- src/example.py :: SymbolB\n\n"
+            "WRITE_SET\n- src/example.py\n"
+        )
+        step = _parse(_plan(steps=_change_step(sets))).steps[0]
+        self.assertEqual(step.read_set, ("src/example.py :: SymbolA; SymbolB",))
+        self.assertEqual(step.write_set, ("src/example.py",))
+
+    def test_read_set_duplicate_identical_anchor_is_deduplicated(self) -> None:
+        sets = (
+            "READ_SET\n- src/example.py :: SymbolA\n- src/example.py :: SymbolA\n\n"
+            "WRITE_SET\n- src/example.py\n"
+        )
+        step = _parse(_plan(steps=_change_step(sets))).steps[0]
+        self.assertEqual(step.read_set, ("src/example.py :: SymbolA",))
+
+    def test_read_set_merge_keeps_first_appearance_order_of_paths(self) -> None:
+        sets = (
+            "READ_SET\n- src/b.py :: B1\n- src/a.py :: A1\n- src/b.py :: B2\n\n"
+            "WRITE_SET\n- src/a.py\n"
+        )
+        step = _parse(_plan(steps=_change_step(sets))).steps[0]
+        self.assertEqual(step.read_set, ("src/b.py :: B1; B2", "src/a.py :: A1"))
+
+    def test_read_set_merge_does_not_relax_other_validations(self) -> None:
+        cases = {
+            "missing anchor on repeat": (
+                "READ_SET\n- src/example.py :: SymbolA\n- src/example.py :: \n\n"
+                "WRITE_SET\n- src/example.py\n"
+            ),
+            "create path merged into read set": (
+                "READ_SET\n- src/example.py :: SymbolA\n- src/new.py :: SymbolB\n"
+                "- src/new.py :: SymbolC\n\n"
+                "WRITE_SET\n- src/example.py\n\nCREATE_SET\n- src/new.py\n\nDELETE_SET\nNONE\n"
+            ),
+            "unsafe path on repeat": (
+                "READ_SET\n- src/example.py :: SymbolA\n- ../escape.py :: SymbolB\n\n"
+                "WRITE_SET\n- src/example.py\n"
+            ),
+        }
+        for name, sets in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(V2PlanParseError):
+                    _parse(_plan(steps=_change_step(sets)))
 
     def test_bundle_validation_binds_step_ids_and_contract_bytes(self) -> None:
         from metaharness.planning_v2 import read_approved_step_contract, validate_implementation_bundle

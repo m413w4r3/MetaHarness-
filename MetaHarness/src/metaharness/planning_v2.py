@@ -190,8 +190,7 @@ def _repo_path(value: str, *, kind: str) -> str:
 def _read_set(value: str) -> tuple[str, ...]:
     if not value.strip():
         raise V2PlanParseError("READ_SET is missing")
-    result: list[str] = []
-    paths: set[str] = set()
+    anchors_by_path: dict[str, list[str]] = {}
     for line in value.splitlines():
         if not line.strip():
             continue
@@ -202,13 +201,14 @@ def _read_set(value: str) -> tuple[str, ...]:
         anchor = anchor.strip()
         if not anchor:
             raise V2PlanParseError("READ_SET anchor must not be empty")
-        if path in paths:
-            raise V2PlanParseError("duplicate READ_SET path")
-        paths.add(path)
-        result.append(path + " :: " + anchor)
-    if not result:
+        # Repeated paths merge their anchors instead of failing: the scope is
+        # unchanged, only the serialisation was split across lines.
+        anchors = anchors_by_path.setdefault(path, [])
+        if anchor not in anchors:
+            anchors.append(anchor)
+    if not anchors_by_path:
         raise V2PlanParseError("READ_SET is missing")
-    return tuple(result)
+    return tuple(path + " :: " + "; ".join(anchors) for path, anchors in anchors_by_path.items())
 
 
 def read_set_paths(read_set: Sequence[str]) -> tuple[str, ...]:
