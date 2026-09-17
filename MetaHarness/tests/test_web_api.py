@@ -12,9 +12,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unittest.mock import patch
 
-from metaharness.approval import compute_plan_identity
+from metaharness.approval import compute_plan_identity, compute_plan_identity_from_run, write_check_authority
 from metaharness.models import (
     AgentConfig,
+    CheckConfig,
     ContextConfig,
     HarnessConfig,
     LLMEndpointConfig,
@@ -134,6 +135,78 @@ class WebServerTests(unittest.TestCase):
             self.server.token,
         )
         self.assertEqual(status, 409)
+
+    def _create_v2_approval_run(self, run_id: str, *, stored_checks_sha256: str | None = None) -> Path:
+        run_dir = self.create_run(run_id, "awaiting_plan_approval")
+        raw = "META PLAN v2\nSTATUS: READY\n"
+        contract = "# v2 contract\n"
+        (run_dir / "planner.raw.md").write_text(raw, encoding="utf-8")
+        (run_dir / "implementation_contract.md").write_text(contract, encoding="utf-8")
+        step_contract = run_dir / "steps" / "S01" / "contract.md"
+        step_contract.parent.mkdir(parents=True)
+        step_contract.write_text("step contract\n", encoding="utf-8")
+        import hashlib
+
+        (run_dir / "implementation_bundle.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "execution_mode": "SINGLE",
+                    "reviewer_profile": "legacy-reviewer",
+                    "required_checks": [],
+                    "steps": [{
+                        "id": "S01",
+                        "title": "One",
+                        "implementer_profile": "legacy-implementer",
+                        "depends_on": None,
+                        "contract_sha256": hashlib.sha256(step_contract.read_bytes()).hexdigest(),
+                    }],
+                },
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        write_check_authority(run_dir, [CheckConfig("lint", ("python", "-c", "pass"))])
+        actual = compute_plan_identity_from_run(run_dir)
+        stored = actual.__dict__.copy()
+        stored["checks_sha256"] = stored_checks_sha256
+        RunStateStore(run_dir / "state.json").update(
+            status="awaiting_plan_approval",
+            planning_protocol="v2",
+            plan_identity=stored,
+            execution={"planner": {"profile_id": "legacy-planner"}},
+        )
+        return run_dir
+
+    def _approve_v2(self, run_id: str):
+        return self.request(
+            "POST",
+            f"/api/runs/{run_id}/approval",
+            {
+                "decision": "APPROVE",
+                "reviewer_profile": "legacy-reviewer",
+                "step_profile__S01": "legacy-implementer",
+            },
+            self.server.token,
+        )
+
+    def test_v2_approval_publishes_the_complete_same_plan_identity(self) -> None:
+        run_dir = self._create_v2_approval_run("v2-checks")
+
+        status, _payload, _ = self._approve_v2("v2-checks")
+        self.assertEqual(status, 200)
+        approval = json.loads((run_dir / "plan_approval.json").read_text(encoding="utf-8"))
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        for field in ("raw_sha256", "contract_sha256", "bundle_sha256", "execution_sha256", "checks_sha256"):
+            self.assertEqual(state["plan_identity"][field], approval[field])
+        self.assertIsNotNone(approval["checks_sha256"])
+
+    def test_v2_approval_rejects_a_different_durable_checks_hash(self) -> None:
+        run_dir = self._create_v2_approval_run("v2-check-conflict", stored_checks_sha256="f" * 64)
+
+        status, _payload, _ = self._approve_v2("v2-check-conflict")
+        self.assertEqual(status, 409)
+        self.assertFalse((run_dir / "plan_approval.json").exists())
 
     def post_form(self, path: str, fields: dict[str, str]) -> int:
         from urllib.parse import urlencode

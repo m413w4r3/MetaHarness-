@@ -988,6 +988,7 @@ def approve_run(
             contract_sha256=stored["contract_sha256"],
             execution_sha256=stored.get("execution_sha256"),
             bundle_sha256=stored.get("bundle_sha256"),
+            checks_sha256=stored.get("checks_sha256"),
         )
         actual = compute_plan_identity_from_run(directory)
     except (KeyError, TypeError, ValueError, ApprovalError, OSError, UnicodeError) as exc:
@@ -1007,6 +1008,12 @@ def approve_run(
         matches = actual == expected
     if not matches:
         raise WebAPIError(409, "plan artifacts do not match run state")
+
+    if v2:
+        if (directory / "check_authority.json").is_file() and actual.checks_sha256 is None:
+            raise WebAPIError(409, "check authority hash is missing from the plan identity")
+        if expected.checks_sha256 is not None and expected.checks_sha256 != actual.checks_sha256:
+            raise WebAPIError(409, "check authority does not match the durable plan identity")
 
     if v2 and selected is ApprovalDecision.REJECT:
         _publish_decision(directory, selected, expected)
@@ -1059,6 +1066,7 @@ def approve_run(
             contract_sha256=expected.contract_sha256,
             execution_sha256=execution_sha256,
             bundle_sha256=expected.bundle_sha256,
+            checks_sha256=actual.checks_sha256,
         )
         _publish_decision(directory, selected, identity)
         # Compare-and-set: once the orchestrator has left the gate it owns the
