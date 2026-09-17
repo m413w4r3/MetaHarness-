@@ -794,6 +794,69 @@ class ExpandedCheckRepairResumeHarness(P29Harness):
     def scope_of(self, run_dir: Path, relative: str) -> dict:
         return json.loads((run_dir / relative / "scope.json").read_text())
 
+    def crash_inside_the_publication(self):
+        """Stop with the ``PUBLISH`` boundary durable and unconsumed."""
+
+        real = orchestrator_module.atomic_write_text
+
+        def write_text(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if Path(path).name == "publish.json":
+                raise RuntimeError("simulated crash inside the publication")
+            return real(path, *args, **kwargs)
+
+        return mock.patch.object(
+            orchestrator_module, "atomic_write_text", side_effect=write_text,
+        )
+
+    C02_PLAN = plan_text(
+        step_block(1, operation="Repair"), title="P31 C02 repair",
+    )
+
+    def stage_c02_repo(self) -> None:
+        write(self.repo / "tests/test_service.py",
+              "def test_fake_uow():  # stale\n    pass\n")
+        # A second tracked test the gate never names, exactly as in the C01
+        # repository: it can only ever enter a scope through a durable
+        # artifact.
+        write(self.repo / "tests/test_other.py", "def test_other():\n    pass\n")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "-qm", "add the stale fixture")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        # C01 is green while ``src/a.py`` is neither BUG nor FIXED; C02 turns
+        # it red on a production path, and only the C02 normal repair makes
+        # the same gate name the stale tracked test.
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "open(sys.argv[1], 'a').write('ran\\n')\n"
+            "source = pathlib.Path('src/a.py').read_text()\n"
+            "fixture = pathlib.Path('tests/test_service.py').read_text()\n"
+            "if 'BUG' in source:\n"
+            "    print('FAILED src/other_production.py')\n"
+            "    sys.exit(1)\n"
+            "if 'FIXED' in source:\n"
+            "    print('FAILED tests/test_service.py::test_fake_uow')\n"
+            "    print('AttributeError: FakeUnitOfWork has no attribute commit')\n"
+            "    sys.exit(1 if 'stale' in fixture else 0)\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+
+    def start_c02(self, run_id: str, *, c02_repair: str):
+        """Run up to the C02 retry checks with *c02_repair* in ``src/a.py``."""
+
+        self.stage_c02_repo()
+        config = self.make_config()
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
+                         (2, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(log=self.events, stage_actions={
+            (2, "check-repair"): writer("src/a.py", c02_repair),
+        })
+        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SINGLE_PLAN, self.C02_PLAN],
+            reviews=[REVISE_IMPLEMENTATION, PASS], luna=luna, claude=claude,
+        )
+        return config, orchestrator, luna, claude
+
 
 class C01RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
     """``FINAL_CHECKS_RETRY_C01`` is resumable, and is not a dead end.
@@ -1127,51 +1190,6 @@ class C01RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
 class C02RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
     """Exact C02 parity for the same three durable retry states."""
 
-    C02_PLAN = plan_text(
-        step_block(1, operation="Repair"), title="P31 C02 repair",
-    )
-
-    def stage_c02_repo(self) -> None:
-        write(self.repo / "tests/test_service.py",
-              "def test_fake_uow():  # stale\n    pass\n")
-        git(self.repo, "add", "--all")
-        git(self.repo, "commit", "-qm", "add the stale fixture")
-        self.base_sha = git(self.repo, "rev-parse", "HEAD")
-        # C01 is green while ``src/a.py`` is neither BUG nor FIXED; C02 turns
-        # it red on a production path, and only the C02 normal repair makes
-        # the same gate name the stale tracked test.
-        self.check.write_text(
-            "import pathlib, sys\n"
-            "open(sys.argv[1], 'a').write('ran\\n')\n"
-            "source = pathlib.Path('src/a.py').read_text()\n"
-            "fixture = pathlib.Path('tests/test_service.py').read_text()\n"
-            "if 'BUG' in source:\n"
-            "    print('FAILED src/other_production.py')\n"
-            "    sys.exit(1)\n"
-            "if 'FIXED' in source:\n"
-            "    print('FAILED tests/test_service.py::test_fake_uow')\n"
-            "    print('AttributeError: FakeUnitOfWork has no attribute commit')\n"
-            "    sys.exit(1 if 'stale' in fixture else 0)\n"
-            "sys.exit(0)\n",
-            encoding="utf-8",
-        )
-
-    def start_c02(self, run_id: str, *, c02_repair: str):
-        """Run up to the C02 retry checks with *c02_repair* in ``src/a.py``."""
-
-        self.stage_c02_repo()
-        config = self.make_config()
-        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
-                         (2, "S01"): writer("src/a.py", "A = BUG\n")})
-        claude = FakeClaude(log=self.events, stage_actions={
-            (2, "check-repair"): writer("src/a.py", c02_repair),
-        })
-        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
-            config, plans=[SINGLE_PLAN, self.C02_PLAN],
-            reviews=[REVISE_IMPLEMENTATION, PASS], luna=luna, claude=claude,
-        )
-        return config, orchestrator, luna, claude
-
     def assert_c02_identity_preserved(self, run_dir: Path, before) -> None:
         """Every C02 boundary the resume wrote keeps the cycle's identity."""
 
@@ -1308,6 +1326,320 @@ class C02RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
         )
         self.assertEqual(len(reviewer.prompts), 1)
         self.assert_c02_identity_preserved(run_dir, checkpoint)
+
+
+SERVICE_REPAIR_PLAN = plan_text(
+    step_block(1, read=("src/service.py",), write_set=("src/service.py",),
+               operation="Repair"),
+    title="P31 service repair",
+)
+
+
+class ExpandedScopeDownstreamAuthorityTests(ExpandedCheckRepairResumeHarness):
+    """AW-003: a validated expanded check-repair scope is cumulative.
+
+    The auto-bounded test path a C01 expansion added is part of the candidate
+    tree from that moment on.  Its authority therefore has to survive every
+    later phase -- the repair planner, all of C02, the commit and the
+    publication -- otherwise the very tree reviewer #1 accepted becomes
+    "unapproved" as soon as the run leaves ``REVIEWER_C01``.
+    """
+
+    @staticmethod
+    def repair_then_fix_the_fixture(root: Path) -> None:
+        """One Claude double for both C01 repair passes, in call order.
+
+        The normal repair may only touch ``src/service.py`` and the expanded
+        one only adds the stale tracked fixture, so each pass writes strictly
+        inside the scope it was given.
+        """
+
+        if "BUG" in (root / "src/service.py").read_text():
+            write(root / "src/service.py", "SERVICE = 3\n")
+        else:
+            write(root / "tests/test_service.py",
+                  "def test_fake_uow():\n    pass\n")
+
+    def crash_in_the_repair_cycle(self):
+        return mock.patch.object(
+            Orchestrator, "_execute_v2_repair_cycle",
+            side_effect=RuntimeError("simulated crash at the repair planner"),
+        )
+
+    def run_to_the_repair_planner(self, run_id: str, *, expand: bool = True):
+        """Reach the exact AW-003 checkpoint: ``REPAIR_PLANNER``, cycle 2.
+
+        With *expand*, C01 needs both a normal and an auto-bounded expanded
+        check repair before its candidate is green; that candidate is then
+        committed, pushed and routed back by reviewer #1.
+        """
+
+        self.stage_service_repo()
+        config = self.make_config()
+        luna = FakeLuna({
+            (1, "S01"): writer(
+                "src/service.py", "SERVICE = BUG\n" if expand else "SERVICE = 3\n"
+            ),
+        })
+        claude = FakeClaude(log=self.events, stage_actions={
+            (1, "check-repair"): self.repair_then_fix_the_fixture,
+        })
+        if not expand:
+            # The fixture is already fresh, so the gate is green on the first
+            # C01 evidence and no check repair of any kind is decided.
+            write(self.repo / "tests/test_service.py",
+                  "def test_fake_uow():\n    pass\n")
+            git(self.repo, "commit", "-qam", "a fresh fixture")
+            self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SERVICE_PLAN, SERVICE_REPAIR_PLAN],
+            reviews=[REVISE_IMPLEMENTATION], luna=luna, claude=claude,
+        )
+        with self.crash_in_the_repair_cycle():
+            failed = self.run_approved(
+                config, orchestrator, run_id,
+                run_options=self.bounded_options(config),
+            )
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        checkpoint = read_checkpoint(failed.run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.REPAIR_PLANNER)
+        self.assertEqual(checkpoint.cycle, 2)
+        self.assertEqual(
+            checkpoint.expected_head_sha,
+            json.loads(
+                (failed.run_dir / "candidate/C01/commit.json").read_text()
+            )["commit_sha"],
+        )
+        return config, failed, checkpoint
+
+    def resume_service_run(self, config, run_id: str, *, c02: str = "SERVICE = 5\n"):
+        fresh, planner, reviewer, luna, claude = self.orchestrator(
+            config, plans=[SERVICE_REPAIR_PLAN], reviews=[PASS],
+            luna=FakeLuna({(2, "S01"): writer("src/service.py", c02)}),
+            claude=FakeClaude(log=self.events),
+        )
+        return fresh.resume(run_id), planner, reviewer, luna, claude
+
+    def test_a_an_expanded_c01_scope_still_authorizes_the_repair_planner(self) -> None:
+        """The exact AW-003 regression, at the exact failing boundary.
+
+        Before the fix this resume refused with ``RESUME_INTEGRITY_FAILURE``:
+        the auto-added test path was authority only up to ``REVIEWER_C01``.
+        """
+
+        config, failed, checkpoint = self.run_to_the_repair_planner("aw003-planner")
+        run_dir = failed.run_dir
+        # The durable expansion, exactly as the real run recorded it.
+        expanded = self.scope_of(run_dir, EXPANDED_C01)
+        self.assertEqual(expanded["base_mutable_scope"], ["src/service.py"])
+        self.assertEqual(expanded["added_paths"], ["tests/test_service.py"])
+        self.assertEqual(expanded["effective_mutable_scope"],
+                         ["src/service.py", "tests/test_service.py"])
+        # The reviewed C01 candidate really carries both paths.
+        self.assertEqual(
+            sorted(git(self.repo, "diff", "--name-only", self.base_sha,
+                       checkpoint.expected_tree_sha).split()),
+            ["src/service.py", "tests/test_service.py"],
+        )
+
+        resumed, planner, reviewer, luna, _claude = self.resume_service_run(
+            config, "aw003-planner",
+        )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertNotEqual(
+            (resumed.state.get("failure") or {}).get("reason"),
+            "RESUME_INTEGRITY_FAILURE",
+        )
+        # C02 really ran from the reviewed C01 candidate.
+        self.assertEqual(len(planner.prompts), 1)
+        self.assertEqual([call["cycle"] for call in luna.calls], [2])
+        self.assertEqual(len(reviewer.prompts), 1)
+
+    def test_b_the_expansion_authority_reaches_the_publication(self) -> None:
+        """The same authority is still live at ``COMMIT`` and ``PUBLISH``."""
+
+        config, failed, _checkpoint = self.run_to_the_repair_planner("aw003-publish")
+        with self.crash_inside_the_publication():
+            self.resume_service_run(config, "aw003-publish")
+        run_dir = failed.run_dir
+        publish_checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(publish_checkpoint.phase, ResumePhase.PUBLISH)
+        self.assertIn(
+            "tests/test_service.py",
+            git(self.repo, "diff", "--name-only", self.base_sha,
+                publish_checkpoint.expected_tree_sha).split(),
+        )
+
+        fresh, planner, reviewer, luna, claude = self.orchestrator(
+            config, reviews=[], luna=FakeLuna({}), claude=FakeClaude(log=self.events),
+        )
+        resumed = fresh.resume("aw003-publish")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual((planner.prompts, reviewer.prompts, luna.calls, claude.calls),
+                         ([], [], [], []))
+
+    def test_c_a_candidate_path_no_durable_scope_covers_is_refused(self) -> None:
+        """Fail closed: the authority is the union, never a blanket pass.
+
+        The expansion stays structurally valid -- it names another tracked,
+        auto-expandable test path -- so only the union is narrowed, and the
+        path the candidate really carries is no longer covered.
+        """
+
+        config, failed, _checkpoint = self.run_to_the_repair_planner("aw003-outside")
+        (failed.run_dir / EXPANDED_C01 / "scope.json").write_text(json.dumps({
+            "schema_version": 2,
+            "base_mutable_scope": ["src/service.py"],
+            "added_paths": ["tests/test_other.py"],
+            "effective_mutable_scope": ["src/service.py", "tests/test_other.py"],
+            "policy": "auto-bounded",
+            "bound": 4,
+            "source": "auto-bounded failing-test evidence",
+        }), encoding="utf-8")
+
+        resumed, planner, _reviewer, luna, _claude = self.resume_service_run(
+            config, "aw003-outside",
+        )
+
+        self.assertEqual(resumed.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertIn(
+            "the candidate contains a path outside the approved scope",
+            resumed.state["failure"]["detail"],
+        )
+        self.assertEqual((planner.prompts, luna.calls), ([], []))
+
+    def test_d_a_malformed_durable_expansion_is_refused_downstream(self) -> None:
+        """Durable JSON is never trusted, at ``REPAIR_PLANNER`` either.
+
+        ``src/production.py`` is not an auto-expandable test path, so the
+        strict validator rejects the artifact instead of widening the scope.
+        """
+
+        config, failed, _checkpoint = self.run_to_the_repair_planner("aw003-bad-json")
+        (failed.run_dir / EXPANDED_C01 / "scope.json").write_text(json.dumps({
+            "schema_version": 2,
+            "base_mutable_scope": ["src/service.py"],
+            "added_paths": ["src/production.py"],
+            "effective_mutable_scope": ["src/production.py", "src/service.py"],
+            "policy": "auto-bounded",
+            "bound": 4,
+            "source": "auto-bounded failing-test evidence",
+        }), encoding="utf-8")
+
+        resumed, planner, _reviewer, luna, _claude = self.resume_service_run(
+            config, "aw003-bad-json",
+        )
+
+        self.assertEqual(resumed.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual((planner.prompts, luna.calls), ([], []))
+
+    def test_e_a_run_without_any_expansion_gains_no_authority(self) -> None:
+        """No artifact, no extra authority: the historical behavior stands."""
+
+        config, failed, _checkpoint = self.run_to_the_repair_planner(
+            "aw003-noexpansion", expand=False,
+        )
+        run_dir = failed.run_dir
+        self.assertFalse((run_dir / EXPANDED_C01).exists())
+        self.assertFalse((run_dir / EXPANDED_C02).exists())
+        c01_tree = read_checkpoint(run_dir).expected_tree_sha
+        self.assertEqual(
+            git(self.repo, "diff", "--name-only", self.base_sha, c01_tree).split(),
+            ["src/service.py"],
+        )
+
+        resumed, planner, reviewer, luna, _claude = self.resume_service_run(
+            config, "aw003-noexpansion",
+        )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual((len(planner.prompts), len(reviewer.prompts)), (1, 1))
+        self.assertEqual([call["cycle"] for call in luna.calls], [2])
+
+
+class ExpandedC02ScopeDownstreamAuthorityTests(ExpandedCheckRepairResumeHarness):
+    """The same cumulative rule for a C02 expansion, up to publication."""
+
+    @staticmethod
+    def repair_then_fix_the_fixture(root: Path) -> None:
+        """One Claude double for both C02 repair passes, in call order."""
+
+        if "BUG" in (root / "src/a.py").read_text():
+            write(root / "src/a.py", "A = FIXED\n")
+        else:
+            write(root / "tests/test_service.py",
+                  "def test_fake_uow():\n    pass\n")
+
+    def reach_the_publication(self, run_id: str):
+        """A green C02 whose candidate only exists thanks to the expansion."""
+
+        self.stage_c02_repo()
+        config = self.make_config()
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
+                         (2, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(log=self.events, stage_actions={
+            (2, "check-repair"): self.repair_then_fix_the_fixture,
+        })
+        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SINGLE_PLAN, self.C02_PLAN],
+            reviews=[REVISE_IMPLEMENTATION, PASS], luna=luna, claude=claude,
+        )
+        with self.crash_inside_the_publication():
+            failed = self.run_approved(
+                config, orchestrator, run_id,
+                run_options=self.bounded_options(config),
+            )
+        run_dir = failed.run_dir
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.PUBLISH)
+        self.assertEqual(
+            self.scope_of(run_dir, EXPANDED_C02)["added_paths"],
+            ["tests/test_service.py"],
+        )
+        self.assertIn(
+            "tests/test_service.py",
+            git(self.repo, "diff", "--name-only", self.base_sha,
+                checkpoint.expected_tree_sha).split(),
+        )
+        return config, failed, checkpoint
+
+    def test_a_an_expanded_c02_scope_still_authorizes_the_publication(self) -> None:
+        """Reviewer #2 passed; ``PUBLISH`` must not re-litigate that tree."""
+
+        config, failed, _checkpoint = self.reach_the_publication("c02-publish")
+        fresh, planner, reviewer, luna, claude = self.orchestrator(
+            config, reviews=[], luna=FakeLuna({}), claude=FakeClaude(log=self.events),
+        )
+        resumed = fresh.resume("c02-publish")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual((planner.prompts, reviewer.prompts, luna.calls, claude.calls),
+                         ([], [], [], []))
+
+    def test_b_a_final_path_no_durable_scope_covers_is_refused(self) -> None:
+        config, failed, _checkpoint = self.reach_the_publication("c02-publish-outside")
+        (failed.run_dir / EXPANDED_C02 / "scope.json").write_text(json.dumps({
+            "schema_version": 2,
+            "base_mutable_scope": ["src/a.py"],
+            "added_paths": ["tests/test_other.py"],
+            "effective_mutable_scope": ["src/a.py", "tests/test_other.py"],
+            "policy": "auto-bounded",
+            "bound": 4,
+            "source": "auto-bounded failing-test evidence",
+        }), encoding="utf-8")
+        fresh, _planner, _reviewer, _luna, _claude = self.orchestrator(
+            config, reviews=[], luna=FakeLuna({}), claude=FakeClaude(log=self.events),
+        )
+        resumed = fresh.resume("c02-publish-outside")
+
+        self.assertEqual(resumed.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertIn(
+            "the candidate contains a path outside the approved scope",
+            resumed.state["failure"]["detail"],
+        )
 
 
 class AggressiveRepairRecoveryTests(P29Harness):

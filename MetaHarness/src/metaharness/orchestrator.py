@@ -1385,6 +1385,33 @@ def _validate_expanded_check_repair_scope(
     return scope
 
 
+def _expanded_scope_is_applicable(
+    *,
+    checkpoint_phase: ResumePhase,
+    expansion_phase: ResumePhase,
+    scope_path: Path,
+) -> bool:
+    """Whether an expanded check-repair scope still carries authority.
+
+    A validated expanded scope is cumulative: it stays part of the candidate
+    tree's authority for every phase at or after the expansion, up to
+    publication.  Applicability is decided from the canonical phase order and
+    the durable artifact, never from a hand-maintained list of downstream
+    phases -- such a list silently forgets every phase added later.
+    """
+
+    if phase_index(checkpoint_phase) < phase_index(expansion_phase):
+        # The expansion has not happened yet: no additional authority.
+        return False
+    if checkpoint_phase is expansion_phase:
+        # At the expansion phase itself the artifact is mandatory; its absence
+        # must surface as a strict validation failure, not as a silent skip.
+        return True
+    # Downstream, only a durable expansion carries authority.  A run that
+    # never expanded gains nothing.
+    return scope_path.is_file()
+
+
 def _step_result_record(outcome: StepExecutionOutcome) -> dict[str, Any]:
     status = getattr(outcome, "status", "COMPLETED")
     return {
@@ -7609,60 +7636,62 @@ class Orchestrator:
                     resolve_check_cwd(worktree, frozen_check)
         except (ValidationError, ValueError) as exc:
             refuse(f"check authority is invalid: {exc}")
-        scope = sorted({
+        # The approved authority is strictly cumulative:
+        #     original C01 plan scope
+        #     UNION durable valid C01 expanded check-repair scope
+        #     UNION validated C02 repair scope
+        #     UNION durable valid C02 expanded check-repair scope
+        # Each term is still validated exactly as before; only the
+        # composition changed, so a path outside all of them stays a
+        # fail-closed integrity failure below.
+        original_plan_scope = sorted({
             path for step in plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
         })
+        scope = list(original_plan_scope)
+        expanded_c01_dir = run_dir / "revision" / "check-repair-expanded" / "C01"
+        if _expanded_scope_is_applicable(
+            checkpoint_phase=checkpoint.phase,
+            expansion_phase=ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+            scope_path=expanded_c01_dir / "scope.json",
+        ):
+            # The expansion's base is the C01 check-repair scope, exactly as
+            # the run recorded it; the added test paths must still exist in
+            # the checkpoint tree, which always carries the C01 candidate.
+            normal_scope_c01 = _read_check_repair_scope(
+                run_dir / "revision" / "check-repair" / "C01",
+                fallback_base=original_plan_scope,
+                policy_config=self._effective_repair_scope,
+            )
+            expanded_c01 = _validate_expanded_check_repair_scope(
+                expanded_c01_dir,
+                repo=repo, tree_sha=checkpoint.expected_tree_sha,
+                base_scope=normal_scope_c01.base_paths,
+                policy_config=self._effective_repair_scope,
+            )
+            scope = sorted(set(scope) | set(expanded_c01.effective_paths))
         c02_repair_scope: list[str] = []
         if checkpoint.cycle == 2 and checkpoint.phase not in {
             ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL,
         }:
-            # After repair planning and scope validation the cumulative
-            # authority is C01 scope UNION the validated C02 repair scope.
+            # The C02 scope delta is bound to the original plan scope, never
+            # to an expansion, so it is validated against that exact base.
             c02_repair_scope = self._validated_repair_scope(
-                run_dir, checkpoint, plan, selection, scope
+                run_dir, checkpoint, plan, selection, original_plan_scope
             )
             scope = sorted(set(scope) | set(c02_repair_scope))
-        expanded_c01_phases = {
-            ResumePhase.CHECK_REPAIR_EXPANDED_C01,
-            ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
-            ResumePhase.CANDIDATE_COMMIT_C01,
-            ResumePhase.CANDIDATE_PUSH_C01,
-            ResumePhase.REVIEWER_C01,
-        }
-        expanded_c02_phases = {
-            ResumePhase.CHECK_REPAIR_EXPANDED_C02,
-            ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02,
-            ResumePhase.CANDIDATE_COMMIT_C02,
-            ResumePhase.CANDIDATE_PUSH_C02,
-            ResumePhase.REVIEWER_C02,
-        }
-        if checkpoint.phase in expanded_c01_phases and (
-            checkpoint.phase in {
-                ResumePhase.CHECK_REPAIR_EXPANDED_C01,
-                ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
-            }
-            or (run_dir / "revision" / "check-repair-expanded" / "C01" / "scope.json").is_file()
+        expanded_c02_dir = run_dir / "revision" / "check-repair-expanded" / "C02"
+        if _expanded_scope_is_applicable(
+            checkpoint_phase=checkpoint.phase,
+            expansion_phase=ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+            scope_path=expanded_c02_dir / "scope.json",
         ):
-            expanded = _validate_expanded_check_repair_scope(
-                run_dir / "revision" / "check-repair-expanded" / "C01",
-                repo=repo, tree_sha=checkpoint.expected_tree_sha,
-                base_scope=scope, policy_config=self._effective_repair_scope,
-            )
-            scope = sorted(set(scope) | set(expanded.effective_paths))
-        elif checkpoint.phase in expanded_c02_phases and (
-            checkpoint.phase in {
-                ResumePhase.CHECK_REPAIR_EXPANDED_C02,
-                ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02,
-            }
-            or (run_dir / "revision" / "check-repair-expanded" / "C02" / "scope.json").is_file()
-        ):
-            expanded = _validate_expanded_check_repair_scope(
-                run_dir / "revision" / "check-repair-expanded" / "C02",
+            expanded_c02 = _validate_expanded_check_repair_scope(
+                expanded_c02_dir,
                 repo=repo, tree_sha=checkpoint.expected_tree_sha,
                 base_scope=c02_repair_scope, policy_config=self._effective_repair_scope,
             )
-            scope = sorted(set(scope) | set(expanded.effective_paths))
+            scope = sorted(set(scope) | set(expanded_c02.effective_paths))
         try:
             if str(worktree) not in registered_worktrees(repo):
                 refuse("run worktree is not registered in the repository")

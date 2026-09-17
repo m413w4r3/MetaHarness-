@@ -298,6 +298,27 @@ recalled with a scope different from the one already published for it, and a
 divergent or malformed artifact is a `RESUME_INTEGRITY_FAILURE`. There is
 still at most one expanded pass per cycle.
 
+A validated expanded scope is **cumulative authority over the candidate
+tree**. The test path it added is part of every tree from that moment on, so
+it stays approved for every phase at or after its own — the repair planner,
+scope approval, all of C02, the commit and the publication. Applicability is
+decided from the canonical `ResumePhase` order and the existence of the
+durable `scope.json`, never from a list of downstream phase names: such a list
+silently forgets each phase added later, which is exactly how a reviewed C01
+candidate once became "unapproved" the moment the run left `REVIEWER_C01`. A
+run that never expanded gains nothing, each term is still validated strictly
+against the checkpoint tree, and the approved authority a resume enforces is
+exactly
+
+```
+original plan scope
+  ∪ durable valid C01 expanded scope
+  ∪ validated C02 repair scope
+  ∪ durable valid C02 expanded scope
+```
+
+Any candidate path outside that union remains a `RESUME_INTEGRITY_FAILURE`.
+
 Historical snapshots whose `pipeline` predates the repair-scope fields keep
 the historical `deny-expansion` default. An operator may explicitly opt in on
 resume with `--allow-bounded-test-scope-expansion`; this writes the immutable,
