@@ -257,3 +257,14 @@ created after final deterministic checks and before semantic review; the exact
 candidate tree SHA is verified again immediately before that commit. Final
 publication still requires reviewer approval. A changed index, HEAD, or
 worktree causes the candidate boundary to fail.
+
+## Bounded test-scope expansion during check repair
+
+The final deterministic gate remains mandatory. When an ordinary
+`CHECK_FAILED:*` output names a path, MetaHarness treats it only as a
+candidate: the path must exist in the exact Git tree, be tracked, and be a
+test or fixture path. The run's `auto-bounded` policy and configured maximum
+apply atomically; production, generated, untracked and ambiguous paths are
+never added. Model output never decides the scope. A cycle permits at most one
+expanded check-repair pass, and production paths remain the responsibility of
+the approved plan and reviewer/C02 process.

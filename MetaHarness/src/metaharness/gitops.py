@@ -547,6 +547,39 @@ def resolve_tree(repo: Path, ref: str) -> str:
     return tree_sha
 
 
+def tracked_files_in_tree(repo: Path, tree_sha: str) -> tuple[str, ...]:
+    """Return the exact regular paths present in a Git tree."""
+
+    if not isinstance(tree_sha, str) or _OBJECT_ID.fullmatch(tree_sha) is None:
+        raise GitError("tree SHA is invalid")
+    output = _git(
+        repo,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "-z",
+        tree_sha,
+        timeout=600,
+    ).stdout
+    records = output.split("\0")
+    if records and records[-1] == "":
+        records.pop()
+    if any(not path for path in records):
+        raise GitError("git ls-tree returned an empty path")
+    paths: set[str] = set()
+    for path in records:
+        if (
+            path.startswith("/")
+            or "\x00" in path
+            or "\\" in path
+            or any(part == ".." for part in path.split("/"))
+            or path in paths
+        ):
+            raise GitError("git ls-tree returned an invalid or duplicate path")
+        paths.add(path)
+    return tuple(sorted(paths))
+
+
 def current_head(repo: Path) -> str:
     """Return the complete commit object ID currently checked out."""
 

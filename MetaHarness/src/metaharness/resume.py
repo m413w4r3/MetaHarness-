@@ -51,6 +51,8 @@ class ResumePhase(StrEnum):
     FINAL_CHECKS_C01 = "final_checks_c01"
     CHECK_REPAIR_C01 = "check_repair_c01"
     FINAL_CHECKS_RETRY_C01 = "final_checks_retry_c01"
+    CHECK_REPAIR_EXPANDED_C01 = "check_repair_expanded_c01"
+    FINAL_CHECKS_RETRY_EXPANDED_C01 = "final_checks_retry_expanded_c01"
     CANDIDATE_COMMIT_C01 = "candidate_commit_c01"
     CANDIDATE_PUSH_C01 = "candidate_push_c01"
     REVIEWER_C01 = "reviewer_c01"
@@ -62,6 +64,8 @@ class ResumePhase(StrEnum):
     FINAL_CHECKS_C02 = "final_checks_c02"
     CHECK_REPAIR_C02 = "check_repair_c02"
     FINAL_CHECKS_RETRY_C02 = "final_checks_retry_c02"
+    CHECK_REPAIR_EXPANDED_C02 = "check_repair_expanded_c02"
+    FINAL_CHECKS_RETRY_EXPANDED_C02 = "final_checks_retry_expanded_c02"
     CANDIDATE_COMMIT_C02 = "candidate_commit_c02"
     CANDIDATE_PUSH_C02 = "candidate_push_c02"
     REVIEWER_C02 = "reviewer_c02"
@@ -76,6 +80,8 @@ _PHASE_CYCLE = {
     ResumePhase.FINAL_CHECKS_C01: 1,
     ResumePhase.CHECK_REPAIR_C01: 1,
     ResumePhase.FINAL_CHECKS_RETRY_C01: 1,
+    ResumePhase.CHECK_REPAIR_EXPANDED_C01: 1,
+    ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01: 1,
     ResumePhase.CANDIDATE_COMMIT_C01: 1,
     ResumePhase.CANDIDATE_PUSH_C01: 1,
     ResumePhase.REVIEWER_C01: 1,
@@ -86,6 +92,8 @@ _PHASE_CYCLE = {
     ResumePhase.FINAL_CHECKS_C02: 2,
     ResumePhase.CHECK_REPAIR_C02: 2,
     ResumePhase.FINAL_CHECKS_RETRY_C02: 2,
+    ResumePhase.CHECK_REPAIR_EXPANDED_C02: 2,
+    ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02: 2,
     ResumePhase.CANDIDATE_COMMIT_C02: 2,
     ResumePhase.CANDIDATE_PUSH_C02: 2,
     ResumePhase.REVIEWER_C02: 2,
@@ -303,6 +311,7 @@ def mark_checkpoint_completed(run_dir: str | Path) -> None:
 _CLAUDE_PHASES = frozenset({
     ResumePhase.CLAUDE_C01, ResumePhase.CLAUDE_C02,
     ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_C02,
+    ResumePhase.CHECK_REPAIR_EXPANDED_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
 })
 _CODEX_PHASES = _STEP_PHASES
 _REVIEWER_PHASES = frozenset({ResumePhase.REVIEWER_C01, ResumePhase.REVIEWER_C02})
@@ -348,6 +357,8 @@ PHASE_STATUS = {
     ResumePhase.FINAL_CHECKS_C01: "revalidating",
     ResumePhase.CHECK_REPAIR_C01: "revising",
     ResumePhase.FINAL_CHECKS_RETRY_C01: "revalidating",
+    ResumePhase.CHECK_REPAIR_EXPANDED_C01: "revising",
+    ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01: "revalidating",
     ResumePhase.CANDIDATE_COMMIT_C01: "approved",
     ResumePhase.CANDIDATE_PUSH_C01: "approved",
     ResumePhase.REVIEWER_C01: "reviewing",
@@ -359,6 +370,8 @@ PHASE_STATUS = {
     ResumePhase.FINAL_CHECKS_C02: "revalidating",
     ResumePhase.CHECK_REPAIR_C02: "revising",
     ResumePhase.FINAL_CHECKS_RETRY_C02: "revalidating",
+    ResumePhase.CHECK_REPAIR_EXPANDED_C02: "revising",
+    ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02: "revalidating",
     ResumePhase.CANDIDATE_COMMIT_C02: "approved",
     ResumePhase.CANDIDATE_PUSH_C02: "approved",
     ResumePhase.REVIEWER_C02: "reviewing",
@@ -387,6 +400,10 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         return "Repair failed checks C01"
     if phase is ResumePhase.FINAL_CHECKS_RETRY_C01:
         return "Retry final checks C01"
+    if phase is ResumePhase.CHECK_REPAIR_EXPANDED_C01:
+        return "Repair checks with expanded test scope C01"
+    if phase is ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01:
+        return "Retry checks after expanded repair C01"
     if phase is ResumePhase.REPAIR_STEP:
         return f"Retry C02 {checkpoint.step_id}"
     if phase is ResumePhase.CLAUDE_C01:
@@ -401,6 +418,10 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         return "Repair failed checks C02"
     if phase is ResumePhase.FINAL_CHECKS_RETRY_C02:
         return "Retry final checks C02"
+    if phase is ResumePhase.CHECK_REPAIR_EXPANDED_C02:
+        return "Repair checks with expanded test scope C02"
+    if phase is ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02:
+        return "Retry checks after expanded repair C02"
     if phase is ResumePhase.CANDIDATE_COMMIT_C02:
         return "Create candidate commit C02"
     if phase is ResumePhase.CANDIDATE_PUSH_C02:

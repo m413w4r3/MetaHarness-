@@ -78,6 +78,7 @@ from metaharness.resume import (  # noqa: E402
     read_checkpoint_record,
     resume_info,
 )
+from metaharness.run_options import RunOptions  # noqa: E402
 from metaharness.web.api import (  # noqa: E402
     WebAPIError,
     approve_run,
@@ -313,7 +314,9 @@ class FakeClaude:
                      revision_dir: Path | None = None) -> ClaudeResult:
         target = Path(revision_dir) if revision_dir is not None else Path(artifacts_dir) / "revision"
         cycle = 2 if "C02" in target.parts else 1
-        stage = "check-repair" if "check-repair" in target.parts else "initial-revision"
+        stage = "check-repair" if any(
+            part in {"check-repair", "check-repair-expanded"} for part in target.parts
+        ) else "initial-revision"
         self.calls.append({"cycle": cycle, "stage": stage, "prompt": prompt,
                            "environment": dict(environment), "revision_dir": target})
         if self.log is not None:
@@ -479,6 +482,7 @@ class P28Harness(unittest.TestCase):
         repair_plan: str | None = None, claude: FakeClaude | None = None,
         run_id: str = "p28", revision: bool = True, web_url: str | None = None,
         planner: Any = None,
+        run_options: RunOptions | None = None,
     ):
         config = self.load(revision=revision, web_url=web_url)
         planner = planner or QueueClient("planner", [plan] + ([repair_plan] if repair_plan else []), self.events)
@@ -494,7 +498,7 @@ class P28Harness(unittest.TestCase):
             return real_push(*args, **kwargs)
 
         with mock.patch.object(orchestrator_module, "push_run_branch", side_effect=push) as pushed:
-            result = orchestrator.run_text(SPEC, run_id=run_id)
+            result = orchestrator.run_text(SPEC, run_id=run_id, run_options=run_options)
         self.config_value = config
         return result, planner, reviewer, claude, pushed
 
@@ -696,6 +700,85 @@ class FullPipelineTests(P28Harness):
         self.assertEqual(claude.calls[1]["revision_dir"].relative_to(result.run_dir).as_posix(), "revision/check-repair/C01")
         self.assertTrue((result.run_dir / "revision/check-repair/C01/agent.prompt.txt").exists())
         self.assertIn("CHECK_FAILED:gate", (result.run_dir / "revision/check-repair/C01/agent.prompt.txt").read_text())
+
+    def test_bounded_scope_expands_for_a_tracked_failing_test(self) -> None:
+        write(self.repo / "tests/test_service.py", "def test_fake_uow():  # stale\n    pass\n")
+        git(self.repo, "add", "tests/test_service.py")
+        git(self.repo, "commit", "-qm", "add stale fixture")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "print('FAILED tests/test_service.py::test_fake_uow')\n"
+            "sys.exit(1 if 'stale' in pathlib.Path('tests/test_service.py').read_text() else 0)\n",
+            encoding="utf-8",
+        )
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")})
+        claude = FakeClaude(
+            stage_actions={(1, "check-repair"): writer(
+                "tests/test_service.py", "def test_fake_uow():\n    pass\n"
+            )}
+        )
+        result, _planner, reviewer, _claude, pushed = self.run_pipeline(
+            luna=luna, reviews=[PASS], claude=claude,
+            run_options=RunOptions.from_config(
+                self.config_value if hasattr(self, "config_value") else self.load(),
+                repair_scope_policy="auto-bounded", repair_scope_max_added_paths=4,
+            ),
+        )
+        self.assert_published_once(result, pushed)
+        self.assertEqual(len(claude.calls), 2)
+        scope = json.loads(
+            (result.run_dir / "revision/check-repair/C01/scope.json").read_text()
+        )
+        self.assertEqual(scope["base_mutable_scope"], ["src/a.py"])
+        self.assertEqual(scope["added_paths"], ["tests/test_service.py"])
+        self.assertEqual(scope["effective_mutable_scope"], ["src/a.py", "tests/test_service.py"])
+        self.assertIsNone(result.state.get("failure"))
+        self.assertEqual(len(reviewer.prompts), 1)
+
+    def test_one_expanded_repair_is_used_when_the_test_appears_on_retry(self) -> None:
+        write(self.repo / "tests/test_service.py", "def test_fake_uow():  # stale\n    pass\n")
+        git(self.repo, "add", "tests/test_service.py")
+        git(self.repo, "commit", "-qm", "add stale fixture")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "source = pathlib.Path('src/a.py').read_text()\n"
+            "fixture = pathlib.Path('tests/test_service.py').read_text()\n"
+            "if 'BUG' in source:\n"
+            "    print('FAILED src/other_production.py')\n"
+            "    sys.exit(1)\n"
+            "print('FAILED tests/test_service.py::test_fake_uow')\n"
+            "sys.exit(1 if 'stale' in fixture else 0)\n",
+            encoding="utf-8",
+        )
+        repair_calls = 0
+        claude: FakeClaude
+
+        def repair_action(root: Path) -> None:
+            nonlocal repair_calls
+            repair_calls += 1
+            if repair_calls == 1:
+                write(root / "src/a.py", "A = 3\n")
+            else:
+                write(root / "tests/test_service.py", "def test_fake_uow():\n    pass\n")
+
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(stage_actions={(1, "check-repair"): repair_action})
+        result, _planner, _reviewer, _claude, pushed = self.run_pipeline(
+            luna=luna, reviews=[PASS], claude=claude,
+            run_options=RunOptions.from_config(
+                self.load(), repair_scope_policy="auto-bounded", repair_scope_max_added_paths=4,
+            ),
+        )
+        self.assert_published_once(result, pushed)
+        self.assertEqual(repair_calls, 2)
+        self.assertTrue((result.run_dir / "revision/check-repair-expanded/C01/report.json").exists())
+        self.assertTrue((result.run_dir / "checks/C01/attempts/02/evidence.json").exists())
+        expanded_scope = json.loads(
+            (result.run_dir / "revision/check-repair-expanded/C01/scope.json").read_text()
+        )
+        self.assertEqual(expanded_scope["added_paths"], ["tests/test_service.py"])
 
     def test_j_automatic_check_repair_c01_is_bounded_and_stays_red(self) -> None:
         luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})

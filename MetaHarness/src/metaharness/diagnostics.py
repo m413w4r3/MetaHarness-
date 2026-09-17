@@ -601,11 +601,33 @@ def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str,
         ])
     parts.append(_section(f"CLAUDE C0{cycle}", claude_body))
     check_repair = run_dir / "revision" / "check-repair" / f"C0{cycle}"
-    if check_repair.is_dir():
+    expanded_check_repair = run_dir / "revision" / "check-repair-expanded" / f"C0{cycle}"
+    if check_repair.is_dir() or expanded_check_repair.is_dir():
         before = f"checks/C0{cycle}/attempts/01/evidence.json"
         current = f"checks/C0{cycle}/evidence.json"
+        scope_path = check_repair / "scope.json"
+        try:
+            scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            scope = {}
+        if isinstance(scope, Mapping):
+            base_values = scope.get("base_mutable_scope", scope.get("approved_mutable_scope", []))
+            base_count = len(base_values) if isinstance(base_values, list) else 0
+            added = scope.get("added_paths", [])
+            added = added if isinstance(added, list) else []
+            scope_text = "\n".join([
+                "Scope:",
+                f"  base paths: {base_count}",
+                f"  auto-added paths: {len(added)}",
+                f"  policy: {scope.get('policy', '—')}",
+                f"  bound: {scope.get('bound', '—')}",
+                *(f"  - {path}" for path in added),
+            ])
+        else:
+            scope_text = "Scope: unavailable"
         parts.append(_section("AUTOMATIC CHECK REPAIR", "\n".join([
             "automatic check repair attempted",
+            scope_text,
             _artifact_text(run_dir, f"revision/check-repair/C0{cycle}/agent.prompt.txt", secrets),
             _claude_result_artifact(run_dir, f"revision/check-repair/C0{cycle}/agent.result.json", secrets),
             _artifact_text(run_dir, f"revision/check-repair/C0{cycle}/agent.final.md", secrets),
@@ -614,6 +636,13 @@ def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str,
             _safe_json_artifact(run_dir, before, secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
             "Checks after correction:",
             _safe_json_artifact(run_dir, current, secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
+        ])))
+    if expanded_check_repair.is_dir():
+        parts.append(_section("EXPANDED AUTOMATIC CHECK REPAIR", "\n".join([
+            "Automatic expanded check repair attempted",
+            _artifact_json(run_dir, "revision/check-repair-expanded/C0" + str(cycle) + "/scope.json", secrets),
+            _artifact_json(run_dir, "revision/check-repair-expanded/C0" + str(cycle) + "/report.json", secrets),
+            _safe_json_artifact(run_dir, f"checks/C0{cycle}/attempts/02/evidence.json", secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
         ])))
     review = f"review/C0{cycle}/"
     if cycle == 1 and not (run_dir / review).is_dir() and (run_dir / "review.json").exists():

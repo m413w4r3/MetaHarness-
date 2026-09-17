@@ -104,6 +104,7 @@ from .gitops import (
     stage_all,
     repository_remote_url,
     run_branch_web_url,
+    tracked_files_in_tree,
     validate_run_branch,
 )
 from .llm.chat import LLMConversationHandle, LLMError, OpenAIChatTextClient
@@ -708,6 +709,158 @@ def _soft_check_failures(bundle: EvidenceBundle) -> list[str]:
     return failures
 
 
+_MAX_CHECK_SCOPE_LOG_BYTES = 256 * 1024
+_CHECK_SCOPE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:file://)?"
+    r"(?:/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*|"
+    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)"
+    r"\.(?:py|pyi|ts|tsx|js|jsx|java|go|rs|rb|php|c|cc|cpp|h|hpp|json|yaml|yml|toml|ini)"
+    r"(?::[0-9]+(?::[0-9]+)?)?(?![A-Za-z0-9_.-])"
+)
+
+
+def _read_log_tail(path: Path) -> str:
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - _MAX_CHECK_SCOPE_LOG_BYTES))
+            return stream.read(_MAX_CHECK_SCOPE_LOG_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _failed_check_text(
+    *,
+    run_dir: Path,
+    evidence: EvidenceBundle,
+) -> str:
+    """Return only bounded output belonging to failed ordinary checks."""
+
+    failed_names = {
+        failure.split(":", 1)[1]
+        for failure in _soft_check_failures(evidence)
+        if ":" in failure
+    }
+    root = run_dir.resolve()
+    chunks: list[str] = []
+    for check in evidence.checks:
+        payload = dict(check) if isinstance(check, Mapping) else check_result_json(check)
+        if payload.get("name") not in failed_names:
+            continue
+        if not isinstance(check, Mapping):
+            for key in ("stdout_log", "stderr_log"):
+                value = getattr(check, key, None)
+                if isinstance(value, str):
+                    chunks.append(value[-_MAX_CHECK_SCOPE_LOG_BYTES:])
+        for key in ("stdout_tail", "stderr_tail"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                chunks.append(value)
+        for key in ("stdout_log_path", "stderr_log_path"):
+            raw_path = payload.get(key)
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            try:
+                candidate = (root / raw_path).resolve()
+                candidate.relative_to(root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            chunks.append(_read_log_tail(candidate))
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def _resolve_check_path_candidate(
+    raw_path: str,
+    *,
+    worktree: Path,
+    tracked_files: frozenset[str],
+) -> str | None:
+    """Normalize one path-shaped check-output token without guessing."""
+
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    path = raw_path.strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in "'\"":
+        path = path[1:-1]
+    if path.startswith("file://"):
+        path = path[7:]
+    path = re.sub(r":\d+(?::\d+)?$", "", path)
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in "'\"":
+        path = path[1:-1]
+    if not path or "\x00" in path or "\\" in path:
+        return None
+    try:
+        candidate_path = Path(path)
+        if candidate_path.is_absolute():
+            resolved = candidate_path.resolve()
+            resolved.relative_to(worktree.resolve())
+            candidate = resolved.relative_to(worktree.resolve()).as_posix()
+        else:
+            if ".." in candidate_path.parts:
+                return None
+            candidate = candidate_path.as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if candidate in tracked_files:
+        return candidate
+    matches = sorted(
+        tracked for tracked in tracked_files
+        if tracked.endswith("/" + candidate)
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _is_auto_expandable_test_path(path: str) -> bool:
+    if not isinstance(path, str) or not path:
+        return False
+    parts = PurePosixPath(path).parts
+    forbidden = {
+        ".git", ".venv", "venv", "node_modules", "dist", "build", "coverage",
+        "test-results", "playwright-report",
+    }
+    if any(part in forbidden for part in parts):
+        return False
+    basename = parts[-1] if parts else ""
+    return (
+        "tests" in parts
+        or "__tests__" in parts
+        or (basename.startswith("test_") and basename.endswith((".py", ".pyi")))
+        or basename.endswith((
+            ".test.ts", ".test.tsx", ".test.js", ".test.jsx",
+            ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx",
+        ))
+    )
+
+
+def _check_repair_scope_candidates(
+    *,
+    repo: Path,
+    worktree: Path,
+    tree_sha: str,
+    run_dir: Path,
+    evidence: EvidenceBundle,
+    base_mutable_scope: Sequence[str],
+) -> list[str]:
+    """Find tracked test paths named by failing-check evidence only."""
+
+    tracked = frozenset(tracked_files_in_tree(repo, tree_sha))
+    text = _failed_check_text(run_dir=run_dir, evidence=evidence)
+    resolved = [
+        _resolve_check_path_candidate(
+            match.group(0), worktree=worktree, tracked_files=tracked
+        )
+        for match in _CHECK_SCOPE_PATH_RE.finditer(text)
+    ]
+    base = set(base_mutable_scope)
+    return sorted({
+        path for path in resolved
+        if path is not None
+        and path not in base
+        and _is_auto_expandable_test_path(path)
+    })
+
+
 def _hard_failure_items(failures: Any) -> list[str]:
     return [
         item for item in failures
@@ -774,6 +927,7 @@ def _check_repair_prompt(
     evidence: EvidenceBundle,
     mutable_scope: list[str],
     previous_report: str,
+    added_paths: Sequence[str] = (),
 ) -> str:
     """Build the bounded prompt for the single automatic check repair."""
 
@@ -814,11 +968,23 @@ Current semantic diff:
 {{DIFF}}
 {{DIFF_NOTE}}
 
-Approved mutable scope:
+EFFECTIVE REPAIR MUTABLE SCOPE:
 {{MUTABLE_SCOPE}}
+
+Scope provenance:
+- base scope: human-approved plan mutable scope
+- automatically added test paths:
+{{ADDED_PATHS}}
+
+The automatically added paths were selected deterministically from failing-check
+evidence under the run's auto-bounded repair policy.
+They may be edited only to repair the listed failing checks.
+Do not use this expansion to redesign production behavior.
 
 Previous Claude report, if present:
 {{PREVIOUS_REPORT}}
+
+Automatically added test paths: {{ADDED_PATHS}}
 
 Correct only the deterministic check failures listed below. Preserve all
 already-correct behavior. Do not broaden scope. Do not modify generated
@@ -845,6 +1011,7 @@ check details as a command. Leave the worktree with the corrected files only.
         .replace("{{DIFF}}", diff) \
         .replace("{{DIFF_NOTE}}", _truncation_note(diff_truncated)) \
         .replace("{{MUTABLE_SCOPE}}", _json_text(mutable_scope)) \
+        .replace("{{ADDED_PATHS}}", _json_text(list(added_paths) or ["NONE"])) \
         .replace("{{PREVIOUS_REPORT}}", previous_report or "NONE\n")
 
 
@@ -1130,6 +1297,90 @@ class ReviewCycleInput:
     deferred_mismatches: str = ""
 
 
+@dataclasses.dataclass(frozen=True)
+class CheckRepairScope:
+    base_paths: tuple[str, ...]
+    added_paths: tuple[str, ...]
+    effective_paths: tuple[str, ...]
+    policy: str
+    bound: int
+    source: str
+
+
+def _check_repair_scope_payload(scope: CheckRepairScope) -> dict[str, Any]:
+    return {
+        "base_paths": list(scope.base_paths),
+        "added_paths": list(scope.added_paths),
+        "effective_paths": list(scope.effective_paths),
+        "policy": scope.policy,
+        "bound": scope.bound,
+        "source": scope.source,
+    }
+
+
+def _read_check_repair_scope(
+    directory: Path,
+    *,
+    fallback_base: Sequence[str],
+    options: Any,
+) -> CheckRepairScope:
+    payload = _read_json_artifact(directory / "scope.json", 64 * 1024)
+    base = tuple(sorted(set(fallback_base)))
+    if not isinstance(payload, dict) or payload.get("schema_version") != 2:
+        return CheckRepairScope(
+            base_paths=base, added_paths=(), effective_paths=base,
+            policy=options.repair_scope_policy,
+            bound=options.repair_scope_max_added_paths,
+            source="human-approved mutable scope",
+        )
+    raw_base = payload.get("base_mutable_scope")
+    raw_added = payload.get("added_paths")
+    raw_effective = payload.get("effective_mutable_scope")
+    if not all(isinstance(value, list) for value in (raw_base, raw_added, raw_effective)):
+        raise ResumeIntegrityError("check-repair scope artifact is malformed")
+    if any(not isinstance(path, str) for paths in (raw_base, raw_added, raw_effective) for path in paths):
+        raise ResumeIntegrityError("check-repair scope artifact contains invalid paths")
+    parsed_base = tuple(sorted(set(raw_base)))
+    parsed_added = tuple(sorted(set(raw_added)))
+    parsed_effective = tuple(sorted(set(raw_effective)))
+    if parsed_base != base or parsed_effective != tuple(sorted(set(parsed_base) | set(parsed_added))):
+        raise ResumeIntegrityError("check-repair scope artifact does not match its base scope")
+    policy = payload.get("policy")
+    bound = payload.get("bound")
+    source = payload.get("source")
+    if policy != options.repair_scope_policy or bound != options.repair_scope_max_added_paths or not isinstance(source, str):
+        raise ResumeIntegrityError("check-repair scope policy changed")
+    if parsed_added and source != "auto-bounded failing-test evidence":
+        raise ResumeIntegrityError("check-repair added paths have an invalid provenance")
+    return CheckRepairScope(parsed_base, parsed_added, parsed_effective, policy, bound, source)
+
+
+def _validate_expanded_check_repair_scope(
+    directory: Path,
+    *,
+    repo: Path,
+    tree_sha: str,
+    base_scope: Sequence[str],
+    options: Any,
+) -> CheckRepairScope:
+    scope = _read_check_repair_scope(
+        directory, fallback_base=base_scope, options=options
+    )
+    if not scope.added_paths:
+        raise ResumeIntegrityError("expanded check-repair scope has no added paths")
+    if scope.policy != "auto-bounded" or len(scope.added_paths) > scope.bound:
+        raise ResumeIntegrityError("expanded check-repair scope violates its bound")
+    tracked = frozenset(tracked_files_in_tree(repo, tree_sha))
+    if any(
+        path in scope.base_paths
+        or path not in tracked
+        or not _is_auto_expandable_test_path(path)
+        for path in scope.added_paths
+    ):
+        raise ResumeIntegrityError("expanded check-repair scope contains an invalid path")
+    return scope
+
+
 def _step_result_record(outcome: StepExecutionOutcome) -> dict[str, Any]:
     status = getattr(outcome, "status", "COMPLETED")
     return {
@@ -1308,6 +1559,7 @@ class _ResumedRun:
     mismatch_retries: dict[str, str] = dataclasses.field(default_factory=dict)
     c01_revision: _PersistedRevision | None = None
     c01_check_repair_revision: _PersistedRevision | None = None
+    c01_expanded_check_repair_revision: _PersistedRevision | None = None
     c01_evidence: EvidenceBundle | None = None
     c01_review: ReviewResult | None = None
     repair_plan: TaskPlanV2 | None = None
@@ -1316,6 +1568,7 @@ class _ResumedRun:
     c02_steps: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     c02_revision: _PersistedRevision | None = None
     c02_check_repair_revision: _PersistedRevision | None = None
+    c02_expanded_check_repair_revision: _PersistedRevision | None = None
     c02_evidence: EvidenceBundle | None = None
     c02_review: ReviewResult | None = None
     existing_commit_sha: str | None = None
@@ -3305,6 +3558,8 @@ class Orchestrator:
         revision_result = None
         revision_report_c01 = ""
         check_repair_result_c01 = None
+        check_repair_scope_c01: CheckRepairScope | None = None
+        expanded_check_repair_result_c01 = None
         if revision_enabled:
             if at <= phase_index(ResumePhase.CLAUDE_C01):
                 if resumed is not None and phase is ResumePhase.CHECKS_C01:
@@ -3394,7 +3649,14 @@ class Orchestrator:
                 raise ResumeIntegrityError("C01 candidate evidence is missing")
 
         soft_failures_c01 = _soft_check_failures(evidence) if revision_enabled else []
-        if not evidence.deterministic_passed and revision_enabled:
+        base_repair_scope_c01 = sorted({
+            path for step in plan.steps
+            for path in (*step.write_set, *step.create_set, *step.delete_set)
+        })
+        if (
+            at < phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01)
+            and not evidence.deterministic_passed and revision_enabled
+        ):
             if not soft_failures_c01:
                 return self._v2_failed(
                     store, run_dir, "DETERMINISTIC_GATE_FAILED", None,
@@ -3402,16 +3664,34 @@ class Orchestrator:
                 )
             check_repair_phase = ResumePhase.CHECK_REPAIR_C01
             retry_checks_phase = ResumePhase.FINAL_CHECKS_RETRY_C01
+            if at <= phase_index(check_repair_phase):
+                check_repair_scope_c01 = self._resolve_check_repair_scope(
+                    repo=repo, worktree=info.worktree,
+                    tree_sha=evidence.staged_tree_sha, run_dir=run_dir,
+                    evidence=evidence, base_mutable_scope=base_repair_scope_c01,
+                )
+            elif resumed is not None:
+                check_repair_scope_c01 = _read_check_repair_scope(
+                    run_dir / "revision" / "check-repair" / "C01",
+                    fallback_base=base_repair_scope_c01,
+                    options=self._run_options,
+                )
             self._cycle_update(
                 store, 1, status="check_repair_attempted",
                 automatic_check_repair={
                     "attempted": True, "failure_ids": soft_failures_c01,
                     "before": _check_payload(evidence),
+                    **(_check_repair_scope_payload(check_repair_scope_c01)
+                       if check_repair_scope_c01 is not None else {}),
                 },
             )
             store.update(
                 status=RunStatus.REVISING,
-                check_repair={"attempted": True, "failure_ids": soft_failures_c01},
+                check_repair={
+                    "attempted": True, "failure_ids": soft_failures_c01,
+                    **(_check_repair_scope_payload(check_repair_scope_c01)
+                       if check_repair_scope_c01 is not None else {}),
+                },
             )
             if at <= phase_index(check_repair_phase):
                 if resumed is not None and phase is check_repair_phase:
@@ -3425,10 +3705,11 @@ class Orchestrator:
                         base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
                         repository_reference=repository_reference, info=info,
                         branch_ref=branch_ref, ownership_before=ownership_before,
-                        selection=selection, mutable_scope=sorted({
-                            path for step in plan.steps
-                            for path in (*step.write_set, *step.create_set, *step.delete_set)
-                        }), check_repair_evidence=evidence, cycle=1,
+                        selection=selection, mutable_scope=list(
+                            check_repair_scope_c01.effective_paths
+                            if check_repair_scope_c01 is not None else base_repair_scope_c01
+                        ), check_repair_evidence=evidence, cycle=1,
+                        check_repair_scope=check_repair_scope_c01,
                     )
                 except ClaudeCommittedError as exc:
                     self._redact_revision_artifacts(
@@ -3486,10 +3767,134 @@ class Orchestrator:
                         ", ".join(retry_integrity),
                     )
                 if not evidence.deterministic_passed:
-                    return self._v2_failed(
-                        store, run_dir, "DETERMINISTIC_GATE_FAILED", None,
-                        ", ".join(evidence.failures),
+                    expanded_phase = ResumePhase.CHECK_REPAIR_EXPANDED_C01
+                    expanded_retry_phase = ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01
+                    expanded_dir = run_dir / "revision" / "check-repair-expanded" / "C01"
+                    prior_added = (
+                        check_repair_scope_c01.added_paths
+                        if check_repair_scope_c01 is not None else ()
                     )
+                    candidates = _check_repair_scope_candidates(
+                        repo=repo, worktree=info.worktree,
+                        tree_sha=evidence.staged_tree_sha, run_dir=run_dir,
+                        evidence=evidence, base_mutable_scope=(
+                            check_repair_scope_c01.base_paths
+                            if check_repair_scope_c01 is not None else base_repair_scope_c01
+                        ),
+                    )
+                    may_expand = (
+                        bool(_soft_check_failures(evidence))
+                        and not _hard_integrity_failures(evidence)
+                        and not prior_added
+                        and not (expanded_dir / "report.json").exists()
+                        and self._run_options.repair_scope_policy == "auto-bounded"
+                        and bool(candidates)
+                        and len(candidates) <= self._run_options.repair_scope_max_added_paths
+                    )
+                    if may_expand:
+                        _archive_attempt(run_dir / "checks" / "C01", names=_CHECK_ATTEMPT_ARTIFACTS)
+                        expanded_scope = CheckRepairScope(
+                            base_paths=(
+                                check_repair_scope_c01.base_paths
+                                if check_repair_scope_c01 is not None else tuple(base_repair_scope_c01)
+                            ),
+                            added_paths=tuple(candidates),
+                            effective_paths=tuple(sorted(set(
+                                (check_repair_scope_c01.base_paths
+                                 if check_repair_scope_c01 is not None else base_repair_scope_c01)
+                            ) | set(candidates))),
+                            policy=self._run_options.repair_scope_policy,
+                            bound=self._run_options.repair_scope_max_added_paths,
+                            source="auto-bounded failing-test evidence",
+                        )
+                        store.update(
+                            status=RunStatus.REVISING,
+                            check_repair={
+                                "attempted": True,
+                                "failure_ids": soft_failures_c01,
+                                "after": list(evidence.failures),
+                                "expanded_attempted": True,
+                                **_check_repair_scope_payload(expanded_scope),
+                            },
+                        )
+                        self._cycle_update(
+                            store, 1, status="expanded_check_repair_attempted",
+                            automatic_check_repair={
+                                "attempted": True,
+                                "expanded_attempted": True,
+                                "after": _check_payload(evidence),
+                                **_check_repair_scope_payload(expanded_scope),
+                            },
+                        )
+                        if at <= phase_index(expanded_phase):
+                            expanded_check_repair_result_c01, repair_error = self._run_v2_revision_cycle(
+                                store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                                base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
+                                repository_reference=repository_reference, info=info,
+                                branch_ref=branch_ref, ownership_before=ownership_before,
+                                selection=selection,
+                                mutable_scope=list(expanded_scope.effective_paths),
+                                check_repair_evidence=evidence, cycle=1,
+                                artifact_dir=expanded_dir,
+                                check_repair_scope=expanded_scope,
+                                check_repair_phase_override=expanded_phase,
+                                check_repair_next_phase_override=expanded_retry_phase,
+                            )
+                            if repair_error is not None:
+                                return self._v2_failed(store, run_dir, repair_error, None)
+                        elif resumed is not None:
+                            expanded_check_repair_result_c01 = resumed.c01_expanded_check_repair_revision
+                        if at <= phase_index(expanded_retry_phase):
+                            store.update(status=RunStatus.REVALIDATING, current_step=None)
+                            retry_tree = candidate_tree_sha(info.worktree)
+                            try:
+                                evidence = self._final_evidence(
+                                    info.worktree, base_sha, run_dir / "checks" / "C01",
+                                    check_failures_hard=False, reuse=False,
+                                    expected_head_sha=base_sha,
+                                    required_check_ids=plan.required_checks or None,
+                                    enforce_diff_size=False,
+                                )
+                            except Exception:
+                                self._write_phase_checkpoint(
+                                    run_dir, expanded_retry_phase, cycle=1,
+                                    head=base_sha, tree=retry_tree,
+                                )
+                                raise
+                            store.update(
+                                status=RunStatus.REVALIDATING,
+                                checks=_check_payload(evidence),
+                                staged_tree_sha=evidence.staged_tree_sha,
+                                changed_files=list(evidence.changed_files),
+                                deterministic_gate={
+                                    "passed": evidence.deterministic_passed,
+                                    "required_check_ids": list(evidence.required_check_ids),
+                                    "failures": list(evidence.failures),
+                                },
+                                check_repair={
+                                    "attempted": True,
+                                    "failure_ids": soft_failures_c01,
+                                    "after": list(evidence.failures),
+                                    "expanded_attempted": True,
+                                    **_check_repair_scope_payload(expanded_scope),
+                                },
+                            )
+                            expanded_integrity = _hard_integrity_failures(evidence)
+                            if expanded_integrity:
+                                return self._v2_failed(
+                                    store, run_dir, expanded_integrity[0].split(":", 1)[0], None,
+                                    ", ".join(expanded_integrity),
+                                )
+                        if not evidence.deterministic_passed:
+                            return self._v2_failed(
+                                store, run_dir, "DETERMINISTIC_GATE_FAILED", None,
+                                ", ".join(evidence.failures),
+                            )
+                    else:
+                        return self._v2_failed(
+                            store, run_dir, "DETERMINISTIC_GATE_FAILED", None,
+                            ", ".join(evidence.failures),
+                        )
             if check_repair_result_c01 is not None:
                 revision_report_c01 = _json_text({
                     "initial_revision": revision_report_c01,
@@ -3497,7 +3902,102 @@ class Orchestrator:
                         check_repair_result_c01,
                         run_dir / "revision" / "check-repair" / "C01",
                     ),
+                    **({"expanded_check_repair": _revision_report_text(
+                        expanded_check_repair_result_c01,
+                        run_dir / "revision" / "check-repair-expanded" / "C01",
+                    )} if expanded_check_repair_result_c01 is not None else {}),
                 })
+
+        if at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01) and at <= phase_index(
+            ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01
+        ):
+            expanded_dir = run_dir / "revision" / "check-repair-expanded" / "C01"
+            expanded_scope = _validate_expanded_check_repair_scope(
+                expanded_dir,
+                repo=repo,
+                tree_sha=candidate_tree_sha(info.worktree),
+                base_scope=(
+                    check_repair_scope_c01.base_paths
+                    if check_repair_scope_c01 is not None else base_repair_scope_c01
+                ),
+                options=self._run_options,
+            )
+            if at <= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01):
+                expanded_check_repair_result_c01, repair_error = self._run_v2_revision_cycle(
+                    store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                    base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
+                    repository_reference=repository_reference, info=info,
+                    branch_ref=branch_ref, ownership_before=ownership_before,
+                    selection=selection,
+                    mutable_scope=list(expanded_scope.effective_paths),
+                    check_repair_evidence=evidence, cycle=1,
+                    artifact_dir=expanded_dir, check_repair_scope=expanded_scope,
+                    check_repair_phase_override=ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+                    check_repair_next_phase_override=ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
+                )
+                if repair_error is not None:
+                    return self._v2_failed(store, run_dir, repair_error, None)
+            elif resumed is not None:
+                expanded_check_repair_result_c01 = resumed.c01_expanded_check_repair_revision
+            if at <= phase_index(ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01):
+                retry_tree = candidate_tree_sha(info.worktree)
+                try:
+                    evidence = self._final_evidence(
+                        info.worktree, base_sha, run_dir / "checks" / "C01",
+                        check_failures_hard=False, reuse=False,
+                        expected_head_sha=base_sha,
+                        required_check_ids=plan.required_checks or None,
+                        enforce_diff_size=False,
+                    )
+                    self._publish_check_aliases(run_dir, run_dir / "checks" / "C01")
+                except Exception:
+                    self._write_phase_checkpoint(
+                        run_dir, ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
+                        cycle=1, head=base_sha, tree=retry_tree,
+                    )
+                    raise
+                store.update(
+                    status=RunStatus.REVALIDATING,
+                    checks=_check_payload(evidence),
+                    staged_tree_sha=evidence.staged_tree_sha,
+                    changed_files=list(evidence.changed_files),
+                    deterministic_gate={
+                        "passed": evidence.deterministic_passed,
+                        "required_check_ids": list(evidence.required_check_ids),
+                        "failures": list(evidence.failures),
+                    },
+                    check_repair={
+                        "attempted": True,
+                        "expanded_attempted": True,
+                        "after": list(evidence.failures),
+                        **_check_repair_scope_payload(expanded_scope),
+                    },
+                )
+                expanded_integrity = _hard_integrity_failures(evidence)
+                if expanded_integrity:
+                    return self._v2_failed(
+                        store, run_dir, expanded_integrity[0].split(":", 1)[0], None,
+                        ", ".join(expanded_integrity),
+                    )
+                if not evidence.deterministic_passed:
+                    return self._v2_failed(
+                        store, run_dir, "DETERMINISTIC_GATE_FAILED", None,
+                        ", ".join(evidence.failures),
+                    )
+            revision_report_c01 = _json_text({
+                "initial_revision": revision_report_c01,
+                "automatic_check_repair": (
+                    _revision_report_text(
+                        check_repair_result_c01,
+                        run_dir / "revision" / "check-repair" / "C01",
+                    ) if check_repair_result_c01 is not None else ""
+                ),
+                "expanded_check_repair": (
+                    _revision_report_text(
+                        expanded_check_repair_result_c01, expanded_dir,
+                    ) if expanded_check_repair_result_c01 is not None else ""
+                ),
+            })
 
         if at <= phase_index(ResumePhase.CANDIDATE_COMMIT_C01):
             # The deterministic gate is the only gate before the immutable
@@ -4358,6 +4858,43 @@ class Orchestrator:
             enforce_diff_size=enforce_diff_size,
         )
 
+    def _resolve_check_repair_scope(
+        self,
+        *,
+        repo: Path,
+        worktree: Path,
+        tree_sha: str,
+        run_dir: Path,
+        evidence: EvidenceBundle,
+        base_mutable_scope: Sequence[str],
+    ) -> CheckRepairScope:
+        base_paths = tuple(sorted(set(base_mutable_scope)))
+        policy = self._run_options.repair_scope_policy
+        bound = self._run_options.repair_scope_max_added_paths
+        candidates = (
+            _check_repair_scope_candidates(
+                repo=repo,
+                worktree=worktree,
+                tree_sha=tree_sha,
+                run_dir=run_dir,
+                evidence=evidence,
+                base_mutable_scope=base_paths,
+            )
+            if policy == "auto-bounded" else []
+        )
+        added = tuple(candidates) if len(candidates) <= bound else ()
+        return CheckRepairScope(
+            base_paths=base_paths,
+            added_paths=added,
+            effective_paths=tuple(sorted(set(base_paths) | set(added))),
+            policy=policy,
+            bound=bound,
+            source=(
+                "auto-bounded failing-test evidence"
+                if added else "human-approved mutable scope"
+            ),
+        )
+
     def _run_v2_revision_cycle(
         self,
         *,
@@ -4382,6 +4919,9 @@ class Orchestrator:
         deferred_mismatch_present: bool = False,
         check_repair_evidence: EvidenceBundle | None = None,
         cycle: int = 1,
+        check_repair_scope: CheckRepairScope | None = None,
+        check_repair_phase_override: ResumePhase | None = None,
+        check_repair_next_phase_override: ResumePhase | None = None,
     ) -> tuple[Any | None, str | None]:
         """Run one Claude pre-check/revision/scope cycle.
 
@@ -4408,14 +4948,41 @@ class Orchestrator:
             path for step in plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
         })
-        atomic_write_text(artifact_dir / "scope.json", _json_text({
-            "approved_mutable_scope": mutable_scope,
-            "source": "human-approved mutable scope",
-        }))
+        if is_check_repair:
+            check_repair_scope = check_repair_scope or CheckRepairScope(
+                base_paths=tuple(mutable_scope), added_paths=(),
+                effective_paths=tuple(mutable_scope),
+                policy=self._run_options.repair_scope_policy,
+                bound=self._run_options.repair_scope_max_added_paths,
+                source="human-approved mutable scope",
+            )
+            atomic_write_text(artifact_dir / "scope.json", _json_text({
+                "schema_version": 2,
+                "base_mutable_scope": list(check_repair_scope.base_paths),
+                "added_paths": list(check_repair_scope.added_paths),
+                "effective_mutable_scope": list(check_repair_scope.effective_paths),
+                "policy": check_repair_scope.policy,
+                "bound": check_repair_scope.bound,
+                "source": check_repair_scope.source,
+                "bound_exceeded": (
+                    check_repair_scope.policy == "auto-bounded"
+                    and not check_repair_scope.added_paths
+                    and len(_check_repair_scope_candidates(
+                        repo=repo, worktree=info.worktree, tree_sha=tree_before,
+                        run_dir=run_dir, evidence=check_repair_evidence,
+                        base_mutable_scope=check_repair_scope.base_paths,
+                    )) > check_repair_scope.bound
+                ),
+            }))
+        else:
+            atomic_write_text(artifact_dir / "scope.json", _json_text({
+                "approved_mutable_scope": mutable_scope,
+                "source": "human-approved mutable scope",
+            }))
         if is_check_repair:
             # This boundary is deliberately written before invoking Claude so
             # a timeout/transport failure resumes this exact corrective pass.
-            repair_phase = (
+            repair_phase = check_repair_phase_override or (
                 ResumePhase.CHECK_REPAIR_C01 if cycle == 1
                 else ResumePhase.CHECK_REPAIR_C02
             )
@@ -4490,6 +5057,7 @@ class Orchestrator:
                 evidence=check_repair_evidence,
                 mutable_scope=mutable_scope,
                 previous_report=previous_report,
+                added_paths=(check_repair_scope.added_paths if check_repair_scope else ()),
             )
         else:
             revision_prompt = _revision_prompt(
@@ -4576,7 +5144,10 @@ class Orchestrator:
         # Claude complete and durable: the next operation is the final checks
         # followed by candidate commit/push and then the reviewer.
         next_revision_phase = (
-            (ResumePhase.FINAL_CHECKS_RETRY_C01 if cycle == 1 else ResumePhase.FINAL_CHECKS_RETRY_C02)
+            check_repair_next_phase_override or (
+                ResumePhase.FINAL_CHECKS_RETRY_C01 if cycle == 1
+                else ResumePhase.FINAL_CHECKS_RETRY_C02
+            )
             if is_check_repair
             else (ResumePhase.FINAL_CHECKS_C01 if cycle == 1 else ResumePhase.FINAL_CHECKS_C02)
         )
@@ -4907,6 +5478,8 @@ class Orchestrator:
             if cycle_2_revision is not None else ""
         )
         check_repair_result_c02 = None
+        check_repair_scope_c02: CheckRepairScope | None = None
+        expanded_check_repair_result_c02 = None
         checks_dir = run_dir / "checks" / "C02"
         checks_dir.mkdir(parents=True, exist_ok=True)
         store.update(status=RunStatus.REVALIDATING, current_step=None)
@@ -4949,23 +5522,45 @@ class Orchestrator:
                 raise ResumeIntegrityError("C02 candidate evidence is missing")
 
         soft_failures_c02 = _soft_check_failures(evidence) if claude_revision_enabled else []
-        if not evidence.deterministic_passed and claude_revision_enabled:
+        base_repair_scope_c02 = list(repair_scope)
+        if (
+            at < phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02)
+            and not evidence.deterministic_passed and claude_revision_enabled
+        ):
             if not soft_failures_c02:
                 raise OrchestrationError(
                     "DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures)
                 )
             check_repair_phase = ResumePhase.CHECK_REPAIR_C02
             retry_checks_phase = ResumePhase.FINAL_CHECKS_RETRY_C02
+            if at <= phase_index(check_repair_phase):
+                check_repair_scope_c02 = self._resolve_check_repair_scope(
+                    repo=repo, worktree=info.worktree,
+                    tree_sha=evidence.staged_tree_sha, run_dir=run_dir,
+                    evidence=evidence, base_mutable_scope=base_repair_scope_c02,
+                )
+            elif resumed is not None:
+                check_repair_scope_c02 = _read_check_repair_scope(
+                    run_dir / "revision" / "check-repair" / "C02",
+                    fallback_base=base_repair_scope_c02,
+                    options=self._run_options,
+                )
             self._cycle_update(
                 store, 2, status="check_repair_attempted",
                 automatic_check_repair={
                     "attempted": True, "failure_ids": soft_failures_c02,
                     "before": _check_payload(evidence),
+                    **(_check_repair_scope_payload(check_repair_scope_c02)
+                       if check_repair_scope_c02 is not None else {}),
                 },
             )
             store.update(
                 status=RunStatus.REVISING,
-                check_repair={"attempted": True, "failure_ids": soft_failures_c02},
+                check_repair={
+                    "attempted": True, "failure_ids": soft_failures_c02,
+                    **(_check_repair_scope_payload(check_repair_scope_c02)
+                       if check_repair_scope_c02 is not None else {}),
+                },
             )
             if at <= phase_index(check_repair_phase):
                 if start is not None and start.phase is check_repair_phase:
@@ -4980,8 +5575,12 @@ class Orchestrator:
                     branch_ref=branch_ref, ownership_before=ownership_before,
                     selection=selection, artifact_dir=(
                         run_dir / "revision" / "check-repair" / "C02"
-                    ), contract_dir=repair_dir, mutable_scope=repair_scope,
+                    ), contract_dir=repair_dir, mutable_scope=list(
+                        check_repair_scope_c02.effective_paths
+                        if check_repair_scope_c02 is not None else repair_scope
+                    ),
                     check_repair_evidence=evidence, cycle=2,
+                    check_repair_scope=check_repair_scope_c02,
                 )
                 if repair_error is not None:
                     raise OrchestrationError(
@@ -5025,9 +5624,115 @@ class Orchestrator:
                         + ", ".join(retry_integrity)
                     )
                 if not evidence.deterministic_passed:
-                    raise OrchestrationError(
-                        "DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures)
+                    expanded_phase = ResumePhase.CHECK_REPAIR_EXPANDED_C02
+                    expanded_retry_phase = ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02
+                    expanded_dir = run_dir / "revision" / "check-repair-expanded" / "C02"
+                    prior_added = (
+                        check_repair_scope_c02.added_paths
+                        if check_repair_scope_c02 is not None else ()
                     )
+                    candidates = _check_repair_scope_candidates(
+                        repo=repo, worktree=info.worktree,
+                        tree_sha=evidence.staged_tree_sha, run_dir=run_dir,
+                        evidence=evidence, base_mutable_scope=(
+                            check_repair_scope_c02.base_paths
+                            if check_repair_scope_c02 is not None else base_repair_scope_c02
+                        ),
+                    )
+                    may_expand = (
+                        bool(_soft_check_failures(evidence))
+                        and not _hard_integrity_failures(evidence)
+                        and not prior_added
+                        and not (expanded_dir / "report.json").exists()
+                        and self._run_options.repair_scope_policy == "auto-bounded"
+                        and bool(candidates)
+                        and len(candidates) <= self._run_options.repair_scope_max_added_paths
+                    )
+                    if may_expand:
+                        _archive_attempt(checks_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
+                        expanded_scope = CheckRepairScope(
+                            base_paths=(
+                                check_repair_scope_c02.base_paths
+                                if check_repair_scope_c02 is not None else tuple(base_repair_scope_c02)
+                            ),
+                            added_paths=tuple(candidates),
+                            effective_paths=tuple(sorted(set(
+                                (check_repair_scope_c02.base_paths
+                                 if check_repair_scope_c02 is not None else base_repair_scope_c02)
+                            ) | set(candidates))),
+                            policy=self._run_options.repair_scope_policy,
+                            bound=self._run_options.repair_scope_max_added_paths,
+                            source="auto-bounded failing-test evidence",
+                        )
+                        store.update(
+                            status=RunStatus.REVISING,
+                            check_repair={
+                                "attempted": True,
+                                "failure_ids": soft_failures_c02,
+                                "after": list(evidence.failures),
+                                "expanded_attempted": True,
+                                **_check_repair_scope_payload(expanded_scope),
+                            },
+                        )
+                        self._cycle_update(
+                            store, 2, status="expanded_check_repair_attempted",
+                            automatic_check_repair={
+                                "attempted": True,
+                                "expanded_attempted": True,
+                                "after": _check_payload(evidence),
+                                **_check_repair_scope_payload(expanded_scope),
+                            },
+                        )
+                        if at <= phase_index(expanded_phase):
+                            expanded_check_repair_result_c02, repair_error = self._run_v2_revision_cycle(
+                                store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                                base_tree_sha=resolve_tree(repo, base_sha), spec=spec,
+                                plan=repair_plan, bundle=repair_bundle,
+                                repository_reference=repository_reference, info=info,
+                                branch_ref=branch_ref, ownership_before=ownership_before,
+                                selection=selection, artifact_dir=expanded_dir,
+                                contract_dir=repair_dir,
+                                mutable_scope=list(expanded_scope.effective_paths),
+                                check_repair_evidence=evidence, cycle=2,
+                                check_repair_scope=expanded_scope,
+                                check_repair_phase_override=expanded_phase,
+                                check_repair_next_phase_override=expanded_retry_phase,
+                            )
+                            if repair_error is not None:
+                                raise OrchestrationError(repair_error)
+                        elif resumed is not None:
+                            expanded_check_repair_result_c02 = resumed.c02_expanded_check_repair_revision
+                        if at <= phase_index(expanded_retry_phase):
+                            retry_tree = candidate_tree_sha(info.worktree)
+                            try:
+                                evidence = self._final_evidence(
+                                    info.worktree, base_sha, checks_dir,
+                                    check_failures_hard=False, reuse=False,
+                                    expected_head_sha=cycle_parent_sha,
+                                    required_check_ids=repair_plan.required_checks or None,
+                                    enforce_diff_size=False,
+                                )
+                            except Exception:
+                                self._write_phase_checkpoint(
+                                    run_dir, expanded_retry_phase, cycle=2,
+                                    head=cycle_parent_sha, tree=retry_tree,
+                                    repair_bundle_sha256=repair_bundle_sha,
+                                )
+                                raise
+                            expanded_integrity = _hard_integrity_failures(evidence)
+                            if expanded_integrity:
+                                raise OrchestrationError(
+                                    expanded_integrity[0].split(":", 1)[0] + ": "
+                                    + ", ".join(expanded_integrity)
+                                )
+                        if not evidence.deterministic_passed:
+                            raise OrchestrationError(
+                                "DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures)
+                            )
+                    else:
+                        raise OrchestrationError(
+                            "DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures)
+                        )
             if check_repair_result_c02 is not None:
                 revision_report_c02 = _json_text({
                     "initial_revision": revision_report_c02,
@@ -5035,7 +5740,85 @@ class Orchestrator:
                         check_repair_result_c02,
                         run_dir / "revision" / "check-repair" / "C02",
                     ),
+                    **({"expanded_check_repair": _revision_report_text(
+                        expanded_check_repair_result_c02,
+                        run_dir / "revision" / "check-repair-expanded" / "C02",
+                    )} if expanded_check_repair_result_c02 is not None else {}),
                 })
+
+        if at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02) and at <= phase_index(
+            ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02
+        ):
+            expanded_dir = run_dir / "revision" / "check-repair-expanded" / "C02"
+            expanded_scope = _validate_expanded_check_repair_scope(
+                expanded_dir,
+                repo=repo,
+                tree_sha=candidate_tree_sha(info.worktree),
+                base_scope=(
+                    check_repair_scope_c02.base_paths
+                    if check_repair_scope_c02 is not None else base_repair_scope_c02
+                ),
+                options=self._run_options,
+            )
+            if at <= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02):
+                expanded_check_repair_result_c02, repair_error = self._run_v2_revision_cycle(
+                    store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                    base_tree_sha=resolve_tree(repo, base_sha), spec=spec,
+                    plan=repair_plan, bundle=repair_bundle,
+                    repository_reference=repository_reference, info=info,
+                    branch_ref=branch_ref, ownership_before=ownership_before,
+                    selection=selection, artifact_dir=expanded_dir,
+                    contract_dir=repair_dir,
+                    mutable_scope=list(expanded_scope.effective_paths),
+                    check_repair_evidence=evidence, cycle=2,
+                    check_repair_scope=expanded_scope,
+                    check_repair_phase_override=ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+                    check_repair_next_phase_override=ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02,
+                )
+                if repair_error is not None:
+                    raise OrchestrationError(repair_error)
+            elif resumed is not None:
+                expanded_check_repair_result_c02 = resumed.c02_expanded_check_repair_revision
+            if at <= phase_index(ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02):
+                retry_tree = candidate_tree_sha(info.worktree)
+                try:
+                    evidence = self._final_evidence(
+                        info.worktree, base_sha, checks_dir,
+                        check_failures_hard=False, reuse=False,
+                        expected_head_sha=cycle_parent_sha,
+                        required_check_ids=repair_plan.required_checks or None,
+                        enforce_diff_size=False,
+                    )
+                except Exception:
+                    self._write_phase_checkpoint(
+                        run_dir, ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02,
+                        cycle=2, head=cycle_parent_sha, tree=retry_tree,
+                        repair_bundle_sha256=repair_bundle_sha,
+                    )
+                    raise
+                expanded_integrity = _hard_integrity_failures(evidence)
+                if expanded_integrity:
+                    raise OrchestrationError(
+                        expanded_integrity[0].split(":", 1)[0] + ": "
+                        + ", ".join(expanded_integrity)
+                    )
+                if not evidence.deterministic_passed:
+                    raise OrchestrationError(
+                        "DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures)
+                    )
+            revision_report_c02 = _json_text({
+                "initial_revision": revision_report_c02,
+                "automatic_check_repair": (
+                    _revision_report_text(
+                        check_repair_result_c02,
+                        run_dir / "revision" / "check-repair" / "C02",
+                    ) if check_repair_result_c02 is not None else ""
+                ),
+                "expanded_check_repair": (
+                    _revision_report_text(expanded_check_repair_result_c02, expanded_dir)
+                    if expanded_check_repair_result_c02 is not None else ""
+                ),
+            })
 
         c01_candidate = _read_json_artifact(_candidate_commit_path(run_dir, 1))
         if not isinstance(c01_candidate, dict) or not _is_object_id(c01_candidate.get("commit_sha")):
@@ -6384,14 +7167,56 @@ class Orchestrator:
             path for step in plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
         })
+        c02_repair_scope: list[str] = []
         if checkpoint.cycle == 2 and checkpoint.phase not in {
             ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL,
         }:
             # After repair planning and scope validation the cumulative
             # authority is C01 scope UNION the validated C02 repair scope.
-            scope = sorted(set(scope) | set(
-                self._validated_repair_scope(run_dir, checkpoint, plan, selection, scope)
-            ))
+            c02_repair_scope = self._validated_repair_scope(
+                run_dir, checkpoint, plan, selection, scope
+            )
+            scope = sorted(set(scope) | set(c02_repair_scope))
+        expanded_c01_phases = {
+            ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+            ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
+            ResumePhase.CANDIDATE_COMMIT_C01,
+            ResumePhase.CANDIDATE_PUSH_C01,
+            ResumePhase.REVIEWER_C01,
+        }
+        expanded_c02_phases = {
+            ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+            ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02,
+            ResumePhase.CANDIDATE_COMMIT_C02,
+            ResumePhase.CANDIDATE_PUSH_C02,
+            ResumePhase.REVIEWER_C02,
+        }
+        if checkpoint.phase in expanded_c01_phases and (
+            checkpoint.phase in {
+                ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+                ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
+            }
+            or (run_dir / "revision" / "check-repair-expanded" / "C01" / "scope.json").is_file()
+        ):
+            expanded = _validate_expanded_check_repair_scope(
+                run_dir / "revision" / "check-repair-expanded" / "C01",
+                repo=repo, tree_sha=checkpoint.expected_tree_sha,
+                base_scope=scope, options=self._run_options,
+            )
+            scope = sorted(set(scope) | set(expanded.effective_paths))
+        elif checkpoint.phase in expanded_c02_phases and (
+            checkpoint.phase in {
+                ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+                ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02,
+            }
+            or (run_dir / "revision" / "check-repair-expanded" / "C02" / "scope.json").is_file()
+        ):
+            expanded = _validate_expanded_check_repair_scope(
+                run_dir / "revision" / "check-repair-expanded" / "C02",
+                repo=repo, tree_sha=checkpoint.expected_tree_sha,
+                base_scope=c02_repair_scope, options=self._run_options,
+            )
+            scope = sorted(set(scope) | set(expanded.effective_paths))
         try:
             if str(worktree) not in registered_worktrees(repo):
                 refuse("run worktree is not registered in the repository")
@@ -6405,7 +7230,10 @@ class Orchestrator:
                 ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL, ResumePhase.REPAIR_STEP,
                 ResumePhase.CHECKS_C02, ResumePhase.CLAUDE_C02,
                 ResumePhase.FINAL_CHECKS_C02, ResumePhase.CHECK_REPAIR_C02,
-                ResumePhase.FINAL_CHECKS_RETRY_C02, ResumePhase.CANDIDATE_COMMIT_C02,
+                ResumePhase.FINAL_CHECKS_RETRY_C02,
+                ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+                ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02,
+                ResumePhase.CANDIDATE_COMMIT_C02,
                 ResumePhase.CANDIDATE_PUSH_C02, ResumePhase.REVIEWER_C02,
             }
             phase_expected_head = base_sha
@@ -6872,11 +7700,17 @@ class Orchestrator:
 
         phase = checkpoint.phase
         if phase in (ResumePhase.CLAUDE_C01, ResumePhase.CLAUDE_C02,
-                     ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_C02):
+                     ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_C02,
+                     ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+                     ResumePhase.CHECK_REPAIR_EXPANDED_C02):
             if phase is ResumePhase.CHECK_REPAIR_C01:
                 directory = run_dir / "revision" / "check-repair" / "C01"
             elif phase is ResumePhase.CHECK_REPAIR_C02:
                 directory = run_dir / "revision" / "check-repair" / "C02"
+            elif phase is ResumePhase.CHECK_REPAIR_EXPANDED_C01:
+                directory = run_dir / "revision" / "check-repair-expanded" / "C01"
+            elif phase is ResumePhase.CHECK_REPAIR_EXPANDED_C02:
+                directory = run_dir / "revision" / "check-repair-expanded" / "C02"
             else:
                 directory = run_dir / "revision" / ("C02" if phase is ResumePhase.CLAUDE_C02 else "")
             failure_tree = _read_tree_file(directory / "tree_after_failure.txt")
@@ -6953,6 +7787,35 @@ class Orchestrator:
                 refuse("the C01 check-repair record is missing or not based on the red checks tree")
             resumed.c01_check_repair_revision = repair_revision
             c01_tree = repair_revision.tree_after
+        expanded_c01_dir = run_dir / "revision" / "check-repair-expanded" / "C01"
+        if revision_enabled and at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01) and (
+            checkpoint.phase in {
+                ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+                ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
+            }
+            or expanded_c01_dir.joinpath("scope.json").is_file()
+        ):
+            normal_scope = _read_check_repair_scope(
+                check_repair_dir_c01,
+                fallback_base=sorted({
+                    path for step in resumed.plan.steps
+                    for path in (*step.write_set, *step.create_set, *step.delete_set)
+                }),
+                options=self._run_options,
+            )
+            _validate_expanded_check_repair_scope(
+                expanded_c01_dir,
+                repo=resumed.info.source_repo,
+                tree_sha=c01_tree,
+                base_scope=normal_scope.base_paths,
+                options=self._run_options,
+            )
+            if at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01):
+                expanded_revision = _load_revision(expanded_c01_dir)
+                if expanded_revision is None or expanded_revision.tree_before != c01_tree:
+                    refuse("the expanded C01 check-repair record is missing or not based on the red checks tree")
+                resumed.c01_expanded_check_repair_revision = expanded_revision
+                c01_tree = expanded_revision.tree_after
         if at <= phase_index(ResumePhase.REVIEWER_C01) and expected != c01_tree:
             refuse(
                 "the checkpoint tree is not the Claude C01 tree" if resumed.c01_revision is not None
@@ -6998,6 +7861,22 @@ class Orchestrator:
             if refusal is not None:
                 refuse(refusal)
             resumed.c01_evidence = evidence
+            return
+        if checkpoint.phase is ResumePhase.CHECK_REPAIR_EXPANDED_C01:
+            evidence = _load_evidence(run_dir / "checks" / "C01")
+            if evidence is None or evidence.staged_tree_sha != initial_c01_tree:
+                refuse("the C01 expanded repair evidence is missing or not for the red retry tree")
+            resumed.c01_evidence = evidence
+            return
+        if checkpoint.phase is ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01:
+            current = _load_evidence(run_dir / "checks" / "C01")
+            if current is not None and current.staged_tree_sha != c01_tree:
+                refuse("the C01 expanded retry evidence is not for the repaired tree")
+            if current is None:
+                current = _load_evidence(run_dir / "checks" / "C01" / "attempts" / "02")
+                if current is None or current.staged_tree_sha != initial_c01_tree:
+                    refuse("the C01 expanded retry red evidence is missing")
+            resumed.c01_evidence = current
             return
         if at <= phase_index(ResumePhase.CANDIDATE_COMMIT_C01):
             evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
@@ -7110,6 +7989,35 @@ class Orchestrator:
                 refuse("the C02 check-repair record is missing or not based on the red checks tree")
             resumed.c02_check_repair_revision = repair_revision
             c02_tree = repair_revision.tree_after
+        expanded_c02_dir = run_dir / "revision" / "check-repair-expanded" / "C02"
+        if revision_enabled and at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02) and (
+            checkpoint.phase in {
+                ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+                ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02,
+            }
+            or expanded_c02_dir.joinpath("scope.json").is_file()
+        ):
+            normal_scope = _read_check_repair_scope(
+                check_repair_dir_c02,
+                fallback_base=sorted({
+                    path for step in repair_plan.steps
+                    for path in (*step.write_set, *step.create_set, *step.delete_set)
+                }),
+                options=self._run_options,
+            )
+            _validate_expanded_check_repair_scope(
+                expanded_c02_dir,
+                repo=resumed.info.source_repo,
+                tree_sha=c02_tree,
+                base_scope=normal_scope.base_paths,
+                options=self._run_options,
+            )
+            if at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02):
+                expanded_revision = _load_revision(expanded_c02_dir)
+                if expanded_revision is None or expanded_revision.tree_before != c02_tree:
+                    refuse("the expanded C02 check-repair record is missing or not based on the red checks tree")
+                resumed.c02_expanded_check_repair_revision = expanded_revision
+                c02_tree = expanded_revision.tree_after
         if expected != c02_tree:
             refuse(
                 "the checkpoint tree is not the Claude C02 tree" if resumed.c02_revision is not None
@@ -7134,6 +8042,22 @@ class Orchestrator:
             if refusal is not None:
                 refuse(refusal)
             resumed.c02_evidence = evidence
+            return
+        if checkpoint.phase is ResumePhase.CHECK_REPAIR_EXPANDED_C02:
+            evidence = _load_evidence(run_dir / "checks" / "C02")
+            if evidence is None or evidence.staged_tree_sha != initial_c02_tree:
+                refuse("the C02 expanded repair evidence is missing or not for the red retry tree")
+            resumed.c02_evidence = evidence
+            return
+        if checkpoint.phase is ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02:
+            current = _load_evidence(run_dir / "checks" / "C02")
+            if current is not None and current.staged_tree_sha != c02_tree:
+                refuse("the C02 expanded retry evidence is not for the repaired tree")
+            if current is None:
+                current = _load_evidence(run_dir / "checks" / "C02" / "attempts" / "02")
+                if current is None or current.staged_tree_sha != initial_c02_tree:
+                    refuse("the C02 expanded retry red evidence is missing")
+            resumed.c02_evidence = current
             return
         if checkpoint.phase in {
             ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,

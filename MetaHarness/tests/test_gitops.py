@@ -32,6 +32,7 @@ from metaharness.gitops import (  # noqa: E402
     staged_diff,
     status_porcelain,
     symbolic_head,
+    tracked_files_in_tree,
 )
 
 
@@ -246,6 +247,24 @@ class GitOpsTests(unittest.TestCase):
             "harness commit",
         )
         self.assertEqual(status_porcelain(worktree), ())
+
+    def test_tracked_files_in_tree_is_exact_sorted_and_supports_spaces(self) -> None:
+        (self.repo / "dir with spaces").mkdir()
+        (self.repo / "dir with spaces" / "file name.txt").write_text(
+            "tracked\n", encoding="utf-8"
+        )
+        run_git(self.repo, "add", "--all")
+        run_git(self.repo, "commit", "-qm", "space")
+        tree = run_git(self.repo, "rev-parse", "HEAD^{tree}").stdout.strip()
+        expected = (
+            "README.md", "delete me.txt", "dir with spaces/file name.txt", "rename me.txt"
+        )
+        self.assertEqual(tracked_files_in_tree(self.repo, tree), expected)
+        self.assertEqual(tracked_files_in_tree(self.repo, tree), tuple(sorted(expected)))
+        for invalid in ("HEAD", "", "z" * 40):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(GitError):
+                    tracked_files_in_tree(self.repo, invalid)
 
     def test_commit_reviewed_tree_rejects_empty_tree_and_bad_subjects(self) -> None:
         worktree = self.root / "run empty commit"

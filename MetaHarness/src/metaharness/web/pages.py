@@ -357,9 +357,19 @@ def _check_repair_notice(run: dict[str, Any]) -> str:
         return ""
     failure_ids = repair.get("failure_ids") if isinstance(repair.get("failure_ids"), list) else []
     detail = ", ".join(str(item) for item in failure_ids) or "ordinary CHECK_FAILED failures"
+    added_paths = repair.get("added_paths") if isinstance(repair.get("added_paths"), list) else []
+    expansion = ""
+    if added_paths:
+        paths = "".join(f"<li>{_e(path)}</li>" for path in added_paths)
+        expansion = (
+            '<p><strong>automatic check repair scope expanded</strong></p>'
+            f'<p>Added test paths:</p><ul>{paths}</ul>'
+        )
+    if repair.get("expanded_attempted"):
+        expansion += '<p><strong>second bounded check repair attempted with expanded test scope</strong></p>'
     return (
         '<div class="card fail"><p><strong>automatic check repair attempted</strong></p>'
-        f'<p>Failed checks: {_e(detail)}</p></div>'
+        f'<p>Failed checks: {_e(detail)}</p>{expansion}</div>'
     )
 
 
