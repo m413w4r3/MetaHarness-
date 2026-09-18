@@ -17,9 +17,10 @@ from metaharness import cli
 from metaharness.config import load_config
 from metaharness.llm.chat import LLMHTTPError
 from metaharness.approval import PlanIdentity, write_scope_approval
+from metaharness.evidence import EvidenceBundle
 from metaharness.models import RunStatus
 from metaharness.orchestrator import Orchestrator
-from metaharness.run_options import RunOptions
+from metaharness.run_options import EffectiveRepairScopePolicy, RunOptions
 import metaharness.orchestrator as orchestrator_module
 import metaharness.planning_v2 as planning_v2
 from metaharness.resume import (
@@ -1152,8 +1153,16 @@ class C01RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
         ), green)
         self.assertEqual(len(reviewer.prompts), 1)
 
-    def test_g_a_red_retry_without_any_candidate_stays_red(self) -> None:
-        """Nothing to expand to: the deterministic gate is final."""
+    def test_g_a_red_retry_without_any_candidate_still_gets_one_same_scope_pass(
+        self,
+    ) -> None:
+        """No new path to add is not the same as no repair left to try.
+
+        The failing check names nothing outside the approved scope, so the
+        second bounded pass runs with *exactly* the scope the first repair
+        held.  Once that pass is spent the gate is final: the budget is two
+        corrective passes and a resume never earns a third.
+        """
 
         config = self.make_config()
         luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
@@ -1169,10 +1178,16 @@ class C01RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
         )
         run_dir = failed.run_dir
         self.assertEqual(failed.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertEqual([call["stage"] for call in claude.calls],
+                         ["initial-revision", "check-repair", "check-repair"])
+        scope = self.scope_of(run_dir, EXPANDED_C01)
+        self.assertEqual(scope["source"], "bounded same-scope retry")
+        self.assertEqual(scope["added_paths"], [])
+        self.assertEqual(scope["effective_mutable_scope"], ["src/a.py"])
+        self.assertTrue((run_dir / EXPANDED_C01 / "report.json").is_file())
         self.assertEqual(read_checkpoint(run_dir).phase,
-                         ResumePhase.FINAL_CHECKS_RETRY_C01)
+                         ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01)
 
-        before = self.checks_ran()
         fresh_claude = FakeClaude(log=self.events)
         fresh, planner, reviewer, fresh_luna, _c = self.orchestrator(
             config, reviews=[PASS], luna=FakeLuna({}), claude=fresh_claude,
@@ -1180,10 +1195,9 @@ class C01RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
         resumed = fresh.resume("aw003-nocandidate")
 
         self.assertEqual(resumed.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
-        self.assertEqual(self.checks_ran(), before)
+        # No third pass, from any agent, and no candidate for the reviewer.
         self.assertEqual((fresh_claude.calls, fresh_luna.calls, planner.prompts,
                           reviewer.prompts), ([], [], [], []))
-        self.assertFalse((run_dir / EXPANDED_C01).exists())
         self.assertFalse((run_dir / "candidate/C01/commit.json").exists())
 
 
@@ -1253,6 +1267,111 @@ class C02RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
         # Only reviewer #2 ran on this resume; reviewer #1 stays accepted.
         self.assertEqual(len(reviewer.prompts), 1)
         self.assert_c02_identity_preserved(run_dir, checkpoint)
+
+    def test_a2_a_red_c02_retry_inside_the_scope_gets_a_same_scope_repair(self) -> None:
+        """C02 parity for the same-scope second pass: no new path, one repair."""
+
+        self.stage_c02_repo()
+        # The C02 gate only ever names ``src/a.py``, which the C02 repair plan
+        # already authorizes: there is nothing to expand to, ever.
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "open(sys.argv[1], 'a').write('ran\\n')\n"
+            "source = pathlib.Path('src/a.py').read_text()\n"
+            "if 'STILL' in source or 'BUG' in source:\n"
+            "    print('src/a.py:1:1: E999 broken')\n"
+            "    sys.exit(1)\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        config = self.make_config()
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
+                         (2, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(log=self.events, stage_actions={
+            (2, "check-repair"): writer("src/a.py", "A = STILL BUG\n"),
+        })
+        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SINGLE_PLAN, self.C02_PLAN],
+            reviews=[REVISE_IMPLEMENTATION, PASS], luna=luna, claude=claude,
+        )
+        with self.crash_before_the_expansion("C02"):
+            failed = self.run_approved(
+                config, orchestrator, "c02-same-scope",
+                run_options=self.bounded_options(config),
+            )
+        run_dir = failed.run_dir
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.FINAL_CHECKS_RETRY_C02)
+        self.assertFalse((run_dir / EXPANDED_C02).exists())
+
+        before = self.checks_ran()
+        fresh_luna = FakeLuna({})
+        fresh_claude = FakeClaude(log=self.events, stage_actions={
+            (2, "check-repair"): writer("src/a.py", "A = 3\n"),
+        })
+        fresh, planner, reviewer, _l, _c = self.orchestrator(
+            config, reviews=[PASS], luna=fresh_luna, claude=fresh_claude,
+        )
+        resumed = fresh.resume("c02-same-scope")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual((fresh_luna.calls, planner.prompts), ([], []))
+        self.assertEqual([(call["cycle"], call["stage"]) for call in fresh_claude.calls],
+                         [(2, "check-repair")])
+        self.assertEqual(self.checks_ran() - before, 1)
+        scope = self.scope_of(run_dir, EXPANDED_C02)
+        self.assertEqual(scope["source"], "bounded same-scope retry")
+        self.assertEqual(scope["added_paths"], [])
+        self.assertEqual(scope["effective_mutable_scope"], ["src/a.py"])
+        self.assertTrue((run_dir / "candidate/C02/commit.json").is_file())
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assert_c02_identity_preserved(run_dir, checkpoint)
+
+    def test_a3_a_spent_c02_second_pass_never_earns_a_third(self) -> None:
+        """C02 parity for the budget: two corrective passes, never three."""
+
+        self.stage_c02_repo()
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "open(sys.argv[1], 'a').write('ran\\n')\n"
+            "source = pathlib.Path('src/a.py').read_text()\n"
+            "if 'STILL' in source or 'BUG' in source:\n"
+            "    print('src/a.py:1:1: E999 broken')\n"
+            "    sys.exit(1)\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        config = self.make_config()
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
+                         (2, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = FakeClaude(log=self.events, stage_actions={
+            (2, "check-repair"): writer("src/a.py", "A = STILL BUG\n"),
+        })
+        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SINGLE_PLAN, self.C02_PLAN],
+            reviews=[REVISE_IMPLEMENTATION, PASS], luna=luna, claude=claude,
+        )
+        failed = self.run_approved(
+            config, orchestrator, "c02-no-third",
+            run_options=self.bounded_options(config),
+        )
+        run_dir = failed.run_dir
+        self.assertEqual(failed.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertEqual([(call["cycle"], call["stage"]) for call in claude.calls],
+                         [(1, "initial-revision"), (2, "initial-revision"),
+                          (2, "check-repair"), (2, "check-repair")])
+        self.assertTrue((run_dir / EXPANDED_C02 / "report.json").is_file())
+        self.assertFalse((run_dir / "candidate/C02/commit.json").exists())
+
+        fresh_claude = FakeClaude(log=self.events)
+        fresh, planner, reviewer, fresh_luna, _c = self.orchestrator(
+            config, reviews=[PASS], luna=FakeLuna({}), claude=fresh_claude,
+        )
+        resumed = fresh.resume("c02-no-third")
+        self.assertEqual(resumed.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertEqual((fresh_claude.calls, fresh_luna.calls, planner.prompts,
+                          reviewer.prompts), ([], [], [], []))
 
     def test_b_a_crash_before_the_c02_retry_evidence_runs_those_checks_once(self) -> None:
         config, orchestrator, _luna, _claude = self.start_c02(
@@ -1326,6 +1445,353 @@ class C02RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
         )
         self.assertEqual(len(reviewer.prompts), 1)
         self.assert_c02_identity_preserved(run_dir, checkpoint)
+
+
+class SameScopeSecondCheckRepairTests(ExpandedCheckRepairResumeHarness):
+    """A soft deterministic failure earns the second pass without expanding.
+
+    The scope expansion and the repair budget are independent.  ``lint``,
+    ``typecheck`` and ``test`` all fail *inside* the approved mutable scope
+    here: nothing may be added, and the second bounded pass must still run
+    with exactly the scope the first repair already held.  On the broken
+    build every test below ended in ``DETERMINISTIC_GATE_FAILED`` because no
+    new test path existed to expand to.
+    """
+
+    def config_for(self, check_name: str) -> Any:
+        """The harness config with its single check renamed to *check_name*.
+
+        The failure ID the gate publishes is ``CHECK_FAILED:<check name>``,
+        so the check's name is what makes these the exact ``lint``,
+        ``typecheck`` and ``test`` failures the real run reported.
+        """
+
+        text = self.config_text(require_approval=True, publish=True, revision=True)
+        text = text.replace('name = "gate"', f'name = "{check_name}"')
+        path = self.root / f"p31-{check_name}.toml"
+        path.write_text(text, encoding="utf-8")
+        return load_config(path)
+
+    def stage_in_scope_failure(self, *, first_failure: str = "") -> None:
+        """A repository whose gate names only in-scope production paths.
+
+        ``tests/test_other.py`` is tracked and is never named by the gate, so
+        the detector can never propose it: any second pass here is a
+        same-scope retry, not an expansion.  When *first_failure* is given,
+        the *first* red gate names that path instead, which is what makes the
+        normal repair earn an auto-bounded expansion of its own.
+        """
+
+        write(self.repo / "src/service.py", "SERVICE = 1\n")
+        write(self.repo / "tests/test_other.py", "def test_other():\n    pass\n")
+        if first_failure:
+            write(self.repo / first_failure, "def test_old():  # stale\n    pass\n")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "-qm", "add the service")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        first_red = (
+            f"    print('FAILED {first_failure}::test_old')\n" if first_failure
+            else "    print('src/service.py:1:1: E999 broken')\n"
+        )
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "open(sys.argv[1], 'a').write('ran\\n')\n"
+            "source = pathlib.Path('src/service.py').read_text()\n"
+            "if 'STILL' in source:\n"
+            # The retry failure only ever names a path already in the scope.
+            "    print('src/service.py:1:1: E999 still broken')\n"
+            "    sys.exit(1)\n"
+            "if 'BUG' in source:\n"
+            + first_red +
+            "    sys.exit(1)\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+
+    def red_retry(self, run_id: str, *, check_name: str, first_failure: str = "") -> Any:
+        """Park a run on ``FINAL_CHECKS_RETRY_C01`` with red in-scope evidence."""
+
+        self.stage_in_scope_failure(first_failure=first_failure)
+        config = self.config_for(check_name)
+        luna = FakeLuna({(1, "S01"): writer("src/service.py", "SERVICE = BUG\n")})
+        claude = FakeClaude(log=self.events, stage_actions={
+            (1, "check-repair"): writer("src/service.py", "SERVICE = STILL BUG\n"),
+        })
+        orchestrator, _planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SERVICE_PLAN], reviews=[PASS], luna=luna, claude=claude,
+        )
+        with self.crash_before_the_expansion("C01"):
+            failed = self.run_approved(
+                config, orchestrator, run_id,
+                run_options=self.bounded_options(config),
+            )
+        run_dir = failed.run_dir
+        self.assertEqual(failed.state["failure"]["reason"], "RUNTIMEERROR")
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.FINAL_CHECKS_RETRY_C01)
+        evidence = json.loads((run_dir / "checks/C01/evidence.json").read_text())
+        self.assertFalse(evidence["deterministic_passed"])
+        self.assertEqual(evidence["failures"], [f"CHECK_FAILED:{check_name}"])
+        self.assertEqual(evidence["staged_tree_sha"], checkpoint.expected_tree_sha)
+        # The first repair is durable and there is no second pass yet.
+        self.assertTrue((run_dir / "revision/check-repair/C01/report.json").is_file())
+        self.assertFalse((run_dir / EXPANDED_C01).exists())
+        self.assertEqual([call["stage"] for call in claude.calls],
+                         ["initial-revision", "check-repair"])
+        return config, failed
+
+    def resume_into_the_second_pass(self, config: Any, run_id: str, run_dir: Path):
+        """Resume with a Claude double whose only action makes the gate green."""
+
+        fresh_luna = FakeLuna({})
+        fresh_claude = FakeClaude(log=self.events, stage_actions={
+            (1, "check-repair"): writer("src/service.py", "SERVICE = 3\n"),
+        })
+        fresh, planner, reviewer, _l, _c = self.orchestrator(
+            config, reviews=[PASS], luna=fresh_luna, claude=fresh_claude,
+        )
+        resumed = fresh.resume(run_id)
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        # Nothing before the boundary is replayed: no Luna, no planner, no
+        # initial Claude revision and no first check repair.
+        self.assertEqual((fresh_luna.calls, planner.prompts), ([], []))
+        self.assertEqual([call["stage"] for call in fresh_claude.calls], ["check-repair"])
+        self.assertEqual(
+            fresh_claude.calls[0]["revision_dir"].relative_to(run_dir).as_posix(),
+            EXPANDED_C01,
+        )
+        # The green second retry earns the candidate, and only then the
+        # reviewer: a deterministic-red candidate never reaches it.
+        self.assertTrue((run_dir / "candidate/C01/commit.json").is_file())
+        self.assertEqual(len(reviewer.prompts), 1)
+        return fresh_claude, reviewer
+
+    def assert_same_scope(self, run_dir: Path, effective: list[str]) -> None:
+        scope = self.scope_of(run_dir, EXPANDED_C01)
+        self.assertEqual(scope["source"], "bounded same-scope retry")
+        self.assertEqual(scope["added_paths"], [])
+        self.assertEqual(scope["base_mutable_scope"], ["src/service.py"])
+        self.assertEqual(scope["effective_mutable_scope"], effective)
+
+    def test_a_a_red_lint_retry_inside_the_scope_gets_a_same_scope_repair(self) -> None:
+        """The exact reported run: ``CHECK_FAILED:lint``, fix already in scope."""
+
+        config, failed = self.red_retry("same-scope-lint", check_name="lint")
+        run_dir = failed.run_dir
+        before = self.checks_ran()
+        claude, _reviewer = self.resume_into_the_second_pass(
+            config, "same-scope-lint", run_dir,
+        )
+        # The durable red bundle is the authority, so the only checks this
+        # resume pays for are the second pass's own retry -- the same lint is
+        # never re-run before the decision.
+        self.assertEqual(self.checks_ran() - before, 1)
+        self.assert_same_scope(run_dir, ["src/service.py"])
+        prompt = (run_dir / EXPANDED_C01 / "agent.prompt.txt").read_text()
+        self.assertIn("second and final bounded automatic check-repair pass", prompt)
+        self.assertIn("No mutable-scope expansion was required", prompt)
+        self.assertIn("CHECK_FAILED:lint", prompt)
+        del claude
+
+    def test_b_a_red_typecheck_retry_inside_the_scope_gets_a_same_scope_repair(
+        self,
+    ) -> None:
+        config, failed = self.red_retry("same-scope-typecheck", check_name="typecheck")
+        self.resume_into_the_second_pass(
+            config, "same-scope-typecheck", failed.run_dir,
+        )
+        self.assert_same_scope(failed.run_dir, ["src/service.py"])
+
+    def test_c_a_red_test_retry_inside_the_scope_gets_a_same_scope_repair(self) -> None:
+        """A failing *test* whose fix is in scope needs no new test path.
+
+        The absence of an expandable candidate is exactly what used to make
+        this gate terminal.
+        """
+
+        config, failed = self.red_retry("same-scope-test", check_name="test")
+        self.resume_into_the_second_pass(config, "same-scope-test", failed.run_dir)
+        self.assert_same_scope(failed.run_dir, ["src/service.py"])
+
+    def test_d_a_first_repair_that_already_expanded_still_gets_a_second_pass(
+        self,
+    ) -> None:
+        """An expansion already spent is not a reason to refuse the retry.
+
+        The normal repair earned ``tests/test_old.py``; the retry then fails
+        on an in-scope path only.  The second pass must run with exactly
+        ``base + tests/test_old.py`` -- no more, and nothing lost.
+        """
+
+        config, failed = self.red_retry(
+            "same-scope-expanded", check_name="lint",
+            first_failure="tests/test_old.py",
+        )
+        run_dir = failed.run_dir
+        normal = self.scope_of(run_dir, "revision/check-repair/C01")
+        self.assertEqual(normal["added_paths"], ["tests/test_old.py"])
+
+        self.resume_into_the_second_pass(config, "same-scope-expanded", run_dir)
+        scope = self.scope_of(run_dir, EXPANDED_C01)
+        self.assertEqual(scope["source"], "bounded same-scope retry")
+        self.assertEqual(scope["added_paths"], ["tests/test_old.py"])
+        self.assertEqual(scope["effective_mutable_scope"],
+                         ["src/service.py", "tests/test_old.py"])
+        # The path the gate never named stays out of every scope.
+        self.assertNotIn("tests/test_other.py", scope["effective_mutable_scope"])
+
+
+class SecondCheckRepairDecisionTests(unittest.TestCase):
+    """The decision itself: soft failures earn a pass, hard ones never do."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        # A real (empty) repository: the auto-bounded detector reads the
+        # checkpoint tree's tracked files, and must find nothing to add.
+        git(self.root, "init", "-q", "-b", "main")
+        git(self.root, "config", "user.email", "test@example.invalid")
+        git(self.root, "config", "user.name", "test")
+        write(self.root / "src/service.py", "SERVICE = 1\n")
+        git(self.root, "add", "--all")
+        git(self.root, "commit", "-qm", "base")
+        self.tree_sha = git(self.root, "rev-parse", "HEAD^{tree}")
+        self.orchestrator = object.__new__(Orchestrator)
+        self.orchestrator._effective_repair_scope = EffectiveRepairScopePolicy(
+            policy="auto-bounded", max_added_paths=4, source="run-options",
+        )
+        self.normal = orchestrator_module.CheckRepairScope(
+            base_paths=("src/service.py",), added_paths=(),
+            effective_paths=("src/service.py",),
+            policy="auto-bounded", bound=4,
+            source="human-approved mutable scope",
+        )
+
+    def evidence(self, failures: tuple[str, ...]) -> EvidenceBundle:
+        return EvidenceBundle(
+            base_sha="a" * 40, staged_tree_sha=self.tree_sha, changed_files=(),
+            diff="", checks=(), deterministic_passed=False, failures=failures,
+        )
+
+    def decide(self, failures: tuple[str, ...], *, policy: str = "auto-bounded"):
+        self.orchestrator._effective_repair_scope = EffectiveRepairScopePolicy(
+            policy=policy, max_added_paths=4, source="run-options",
+        )
+        return self.orchestrator._second_check_repair_scope(
+            repo=self.root, worktree=self.root, tree_sha=self.tree_sha,
+            run_dir=self.root, evidence=self.evidence(failures),
+            normal_scope=self.normal, expanded_dir=self.root / "absent",
+        )
+
+    def test_a_hard_integrity_failures_never_earn_a_second_repair(self) -> None:
+        for failure in ("CHECK_TIMEOUT:lint", "CHECK_MUTATED:lint", "SECRET_IN_DIFF"):
+            with self.subTest(failure=failure):
+                self.assertIsNone(self.decide((failure,)))
+        # A hard failure alongside a soft one is still terminal.
+        self.assertIsNone(self.decide(("CHECK_FAILED:lint", "CHECK_MUTATED:lint")))
+
+    def test_b_a_soft_failure_earns_a_same_scope_pass_under_every_policy(self) -> None:
+        """An expansion policy bounds new paths, never the retry itself."""
+
+        for policy in ("auto-bounded", "deny-expansion", "require-approval"):
+            with self.subTest(policy=policy):
+                scope = self.decide(("CHECK_FAILED:lint",), policy=policy)
+                self.assertIsNotNone(scope)
+                self.assertEqual(scope.source, "bounded same-scope retry")
+                self.assertEqual(scope.added_paths, ())
+                self.assertEqual(scope.effective_paths, ("src/service.py",))
+
+    def test_c_a_green_gate_earns_nothing(self) -> None:
+        self.assertIsNone(self.decide(()))
+
+    def test_d_a_spent_second_pass_is_never_retried(self) -> None:
+        spent = self.root / "spent"
+        spent.mkdir()
+        (spent / "report.json").write_text("{}", encoding="utf-8")
+        self.assertIsNone(self.orchestrator._second_check_repair_scope(
+            repo=self.root, worktree=self.root, tree_sha=self.tree_sha,
+            run_dir=self.root, evidence=self.evidence(("CHECK_FAILED:lint",)),
+            normal_scope=self.normal, expanded_dir=spent,
+        ))
+
+
+class SecondCheckRepairScopeValidationTests(unittest.TestCase):
+    """A same-scope retry artifact may not smuggle in a single extra path."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.policy = EffectiveRepairScopePolicy(
+            policy="auto-bounded", max_added_paths=4, source="run-options",
+        )
+        self.normal = orchestrator_module.CheckRepairScope(
+            base_paths=("src/service.py",), added_paths=(),
+            effective_paths=("src/service.py",),
+            policy="auto-bounded", bound=4,
+            source="human-approved mutable scope",
+        )
+
+    def publish(self, **overrides: Any) -> None:
+        payload = {
+            "schema_version": 2,
+            "base_mutable_scope": ["src/service.py"],
+            "added_paths": [],
+            "effective_mutable_scope": ["src/service.py"],
+            "policy": "auto-bounded",
+            "bound": 4,
+            "source": "bounded same-scope retry",
+        }
+        payload.update(overrides)
+        (self.directory / "scope.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    def validate(self):
+        return orchestrator_module._validate_expanded_check_repair_scope(
+            self.directory, repo=self.directory, tree_sha="b" * 40,
+            normal_scope=self.normal, policy_config=self.policy,
+        )
+
+    def test_a_an_exact_same_scope_artifact_is_valid(self) -> None:
+        self.publish()
+        scope = self.validate()
+        self.assertEqual(scope.source, "bounded same-scope retry")
+        self.assertEqual(scope.effective_paths, ("src/service.py",))
+
+    def test_b_an_extra_path_fails_closed(self) -> None:
+        self.publish(
+            added_paths=["tests/test_smuggled.py"],
+            effective_mutable_scope=["src/service.py", "tests/test_smuggled.py"],
+        )
+        with self.assertRaises(ResumeIntegrityError):
+            self.validate()
+
+    def test_c_the_first_repair_scope_is_the_reference_not_the_base(self) -> None:
+        """Inheriting the first repair's added paths is valid; adding is not."""
+
+        self.normal = orchestrator_module.CheckRepairScope(
+            base_paths=("src/service.py",), added_paths=("tests/test_old.py",),
+            effective_paths=("src/service.py", "tests/test_old.py"),
+            policy="auto-bounded", bound=4,
+            source="auto-bounded failing-test evidence",
+        )
+        self.publish(
+            added_paths=["tests/test_old.py"],
+            effective_mutable_scope=["src/service.py", "tests/test_old.py"],
+        )
+        self.assertEqual(
+            self.validate().effective_paths, ("src/service.py", "tests/test_old.py")
+        )
+        self.publish(
+            added_paths=["tests/test_old.py", "tests/test_new.py"],
+            effective_mutable_scope=[
+                "src/service.py", "tests/test_new.py", "tests/test_old.py",
+            ],
+        )
+        with self.assertRaises(ResumeIntegrityError):
+            self.validate()
 
 
 SERVICE_REPAIR_PLAN = plan_text(

@@ -782,6 +782,13 @@ class FullPipelineTests(P28Harness):
         self.assertEqual(expanded_scope["added_paths"], ["tests/test_service.py"])
 
     def test_j_automatic_check_repair_c01_is_bounded_and_stays_red(self) -> None:
+        """The repair budget is bounded at two passes, and stops there.
+
+        A soft ``CHECK_FAILED`` earns the second bounded pass even when no
+        mutable-scope expansion is needed, so the budget is the initial
+        revision plus two corrective passes -- and never a third.
+        """
+
         luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
         claude = FakeClaude()
         result, _planner, reviewer, claude, pushed = self.run_pipeline(
@@ -789,7 +796,15 @@ class FullPipelineTests(P28Harness):
         )
         self.assertEqual(result.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
         self.assert_no_commit_no_push(result, pushed, run_id="check-repair-red")
-        self.assertEqual(len(claude.calls), 2)
+        self.assertEqual([call["stage"] for call in claude.calls],
+                         ["initial-revision", "check-repair", "check-repair"])
+        # The second pass ran inside the exact scope the first one held.
+        scope = json.loads(
+            (result.run_dir / "revision/check-repair-expanded/C01/scope.json").read_text()
+        )
+        self.assertEqual(scope["source"], "bounded same-scope retry")
+        self.assertEqual(scope["added_paths"], [])
+        self.assertEqual(scope["effective_mutable_scope"], ["src/a.py"])
         self.assertEqual(reviewer.prompts, [])
         self.assertIn("CHECK_FAILED:gate", result.state["failure"]["detail"])
 
@@ -1469,6 +1484,38 @@ class CheckRepairRetryResumeTests(P28Harness):
         self.assertEqual(claude.calls, [])
         self.assertEqual(luna.calls, [])
 
+    def assert_only_the_second_repair_ran(self, planner, reviewer, claude, luna) -> None:
+        """The retry bridge spends exactly the one remaining bounded repair."""
+
+        self.assertEqual(planner.prompts, [])
+        self.assertEqual(reviewer.prompts, [])
+        self.assertEqual([call["stage"] for call in claude.calls], ["check-repair"])
+        self.assertEqual(luna.calls, [])
+
+    def crash_before_the_second_repair(self, cycle: str):
+        """Stop exactly between the red retry evidence and the second repair.
+
+        The archive of the red retry bundle is the first write the second
+        bounded pass performs, so failing it parks the run on the
+        ``FINAL_CHECKS_RETRY_C0x`` boundary with that bundle durable and the
+        second pass entirely unspent -- the state these resumes are about.
+        """
+
+        real = orchestrator_module._archive_attempt
+        seen: list[int] = []
+
+        def archive(directory: Any, **kwargs: Any) -> Any:
+            path = Path(directory)
+            if path.name == cycle and path.parent.name == "checks":
+                seen.append(1)
+                if len(seen) == 2:
+                    raise RuntimeError("simulated crash before the second repair")
+            return real(directory, **kwargs)
+
+        return mock.patch.object(
+            orchestrator_module, "_archive_attempt", side_effect=archive
+        )
+
     # -- C01 ---------------------------------------------------------------
 
     def _red_retry_c01(self, run_id: str) -> Any:
@@ -1478,12 +1525,15 @@ class CheckRepairRetryResumeTests(P28Harness):
         claude = FakeClaude(stage_actions={
             (1, "check-repair"): writer("src/a.py", "A = STILL BUG\n"),
         })
-        result, _planner, reviewer, claude, pushed = self.run_pipeline(
-            luna=luna, reviews=[PASS], claude=claude, run_id=run_id,
-        )
-        self.assertEqual(result.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        with self.crash_before_the_second_repair("C01"):
+            result, _planner, reviewer, claude, pushed = self.run_pipeline(
+                luna=luna, reviews=[PASS], claude=claude, run_id=run_id,
+            )
+        self.assertEqual(result.state["failure"]["reason"], "RUNTIMEERROR")
         self.assertEqual([call["stage"] for call in claude.calls],
                          ["initial-revision", "check-repair"])
+        self.assertEqual(read_checkpoint(result.run_dir).phase,
+                         ResumePhase.FINAL_CHECKS_RETRY_C01)
         self.assert_no_commit_no_push(result, pushed, run_id=run_id)
         self.assertEqual(reviewer.prompts, [])
         return result
@@ -1515,15 +1565,25 @@ class CheckRepairRetryResumeTests(P28Harness):
         second, planner, reviewer, claude, luna = self.resume("retry-red-c01")
         # The refusal is gone.  The retry's own red bundle for the repaired
         # tree is already the durable result of a complete retry, so it is
-        # reused instead of paying for the same checks twice; its output names
-        # no tracked test path, so no expansion is earned and the gate is
-        # final with the archive left exactly as the first run wrote it.
+        # reused instead of paying for the same checks twice -- it *is* the
+        # authority that earns the one remaining bounded repair.  Its output
+        # names no tracked test path, so nothing is added to the scope; the
+        # second pass runs inside the same scope and the gate is then final.
         self.assertEqual(second.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
-        self.assertEqual(self.checks_ran(), before)
-        self.assert_no_agent_ran(planner, reviewer, claude, luna)
-        self.assertFalse((checks / "attempts" / "02").exists())
-        self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
-                         repaired_tree)
+        self.assert_only_the_second_repair_ran(planner, reviewer, claude, luna)
+        scope = json.loads(
+            (run_dir / "revision/check-repair-expanded/C01/scope.json").read_text()
+        )
+        self.assertEqual(scope["source"], "bounded same-scope retry")
+        self.assertEqual(scope["added_paths"], [])
+        # The red retry bundle is archived as attempt #2, and the only checks
+        # this resume pays for are the second pass's own retry.
+        self.assertEqual(self.checks_ran() - before, 1)
+        self.assertEqual(
+            self.evidence(checks / "attempts" / "02" / "evidence.json")["staged_tree_sha"],
+            repaired_tree,
+        )
+        self.assertFalse((checks / "attempts" / "03").exists())
 
     def test_s_a_c01_retry_crash_before_its_evidence_still_resumes(self) -> None:
         luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
@@ -1566,8 +1626,10 @@ class CheckRepairRetryResumeTests(P28Harness):
         before = self.checks_ran()
         second, planner, reviewer, claude, luna = self.resume("retry-crash-c01")
         self.assertEqual(second.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
-        self.assertGreater(self.checks_ran(), before)
-        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+        # The retry checks this crash never finished, then the one remaining
+        # bounded repair and its own retry.
+        self.assertEqual(self.checks_ran() - before, 2)
+        self.assert_only_the_second_repair_ran(planner, reviewer, claude, luna)
         self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
                          repaired_tree)
 
@@ -1601,14 +1663,17 @@ class CheckRepairRetryResumeTests(P28Harness):
         claude = FakeClaude(stage_actions={
             (2, "check-repair"): writer("src/a.py", "A = STILL BUG\n"),
         })
-        result, _planner, reviewer, claude, pushed = self.run_pipeline(
-            luna=luna, reviews=[REVISE_IMPLEMENTATION, PASS], repair_plan=REPAIR_PLAN,
-            claude=claude, run_id=run_id,
-        )
+        with self.crash_before_the_second_repair("C02"):
+            result, _planner, reviewer, claude, pushed = self.run_pipeline(
+                luna=luna, reviews=[REVISE_IMPLEMENTATION, PASS], repair_plan=REPAIR_PLAN,
+                claude=claude, run_id=run_id,
+            )
         self.assertEqual(result.status, RunStatus.FAILED)
         self.assertEqual([(call["cycle"], call["stage"]) for call in claude.calls], [
             (1, "initial-revision"), (2, "initial-revision"), (2, "check-repair"),
         ])
+        self.assertEqual(read_checkpoint(result.run_dir).phase,
+                         ResumePhase.FINAL_CHECKS_RETRY_C02)
         # Only reviewer #1 ran: C02 never reached its own reviewer.
         self.assertEqual(len(reviewer.prompts), 1)
         self.assertEqual(pushed.call_count, 1)
@@ -1633,12 +1698,20 @@ class CheckRepairRetryResumeTests(P28Harness):
         second, planner, reviewer, claude, luna = self.resume("retry-red-c02")
         self.assertEqual(second.status, RunStatus.FAILED)
         self.assertNotEqual(second.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-        # Same reuse as C01: the durable red retry bundle is the authority.
-        self.assertEqual(self.checks_ran(), before)
-        self.assert_no_agent_ran(planner, reviewer, claude, luna)
-        self.assertFalse((checks / "attempts" / "02").exists())
-        self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
-                         repaired_tree)
+        # Same reuse as C01: the durable red retry bundle is the authority,
+        # and it earns exactly one same-scope second repair -- never a third.
+        self.assertEqual(self.checks_ran() - before, 1)
+        self.assert_only_the_second_repair_ran(planner, reviewer, claude, luna)
+        scope = json.loads(
+            (run_dir / "revision/check-repair-expanded/C02/scope.json").read_text()
+        )
+        self.assertEqual(scope["source"], "bounded same-scope retry")
+        self.assertEqual(scope["added_paths"], [])
+        self.assertEqual(
+            self.evidence(checks / "attempts" / "02" / "evidence.json")["staged_tree_sha"],
+            repaired_tree,
+        )
+        self.assertFalse((checks / "attempts" / "03").exists())
 
     def test_w_a_c02_retry_crash_before_its_evidence_still_resumes(self) -> None:
         luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"),
@@ -1679,8 +1752,10 @@ class CheckRepairRetryResumeTests(P28Harness):
         second, planner, reviewer, claude, luna = self.resume("retry-crash-c02")
         self.assertEqual(second.status, RunStatus.FAILED)
         self.assertNotEqual(second.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-        self.assertGreater(self.checks_ran(), before)
-        self.assert_no_agent_ran(planner, reviewer, claude, luna)
+        # The retry checks this crash never finished, then the one remaining
+        # bounded repair and its own retry.
+        self.assertEqual(self.checks_ran() - before, 2)
+        self.assert_only_the_second_repair_ran(planner, reviewer, claude, luna)
         self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
                          repaired_tree)
 
@@ -1751,21 +1826,24 @@ class CheckRepairRetryResumeTests(P28Harness):
 
         # 4. Once the invariant holds again, the same checkpoint is resumed
         #    and its restored durable bundle -- not a fresh check run -- is
-        #    what closes the deterministic gate.
+        #    the authority that spends the one remaining bounded repair
+        #    before the deterministic gate closes.
         (checks / "evidence.json").write_text(json.dumps(intact), encoding="utf-8")
         resumed, planner, reviewer, claude, luna = self.resume(
             "revalidate-c01", revalidate_integrity=True,
         )
         self.assertEqual(resumed.state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
-        self.assertEqual(self.checks_ran(), before)
-        self.assert_no_agent_ran(planner, reviewer, claude, luna)
-        self.assertEqual(self.evidence(checks / "evidence.json")["staged_tree_sha"],
-                         repaired_tree)
+        self.assertEqual(self.checks_ran() - before, 1)
+        self.assert_only_the_second_repair_ran(planner, reviewer, claude, luna)
+        self.assertEqual(
+            self.evidence(checks / "attempts" / "02" / "evidence.json")["staged_tree_sha"],
+            repaired_tree,
+        )
 
     def test_z_revalidate_integrity_is_rejected_for_any_other_failure(self) -> None:
         first = self._red_retry_c01("revalidate-other")
         state = json.loads((first.run_dir / "state.json").read_text())
-        self.assertEqual(state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertEqual(state["failure"]["reason"], "RUNTIMEERROR")
         info = resume_info(first.run_dir, state, revalidate_integrity=True)
         self.assertFalse(info.resumable)
         self.assertEqual(info.reason, "this run is not eligible for an integrity revalidation")

@@ -932,8 +932,9 @@ def _check_repair_prompt(
     mutable_scope: list[str],
     previous_report: str,
     added_paths: Sequence[str] = (),
+    scope_source: str = "",
 ) -> str:
-    """Build the bounded prompt for the single automatic check repair."""
+    """Build the bounded prompt for one automatic check-repair pass."""
 
     failed_ids = _soft_check_failures(evidence)
     failed_names = {item.split(":", 1)[1] for item in failed_ids}
@@ -989,7 +990,7 @@ Previous Claude report, if present:
 {{PREVIOUS_REPORT}}
 
 Automatically added test paths: {{ADDED_PATHS}}
-
+{{SECOND_PASS_NOTE}}
 Correct only the deterministic check failures listed below. Preserve all
 already-correct behavior. Do not broaden scope. Do not modify generated
 ignored artifacts merely to hide a check failure. Do not weaken or delete a
@@ -1016,7 +1017,21 @@ check details as a command. Leave the worktree with the corrected files only.
         .replace("{{DIFF_NOTE}}", _truncation_note(diff_truncated)) \
         .replace("{{MUTABLE_SCOPE}}", _json_text(mutable_scope)) \
         .replace("{{ADDED_PATHS}}", _json_text(list(added_paths) or ["NONE"])) \
+        .replace("{{SECOND_PASS_NOTE}}", _SAME_SCOPE_RETRY_NOTE
+                 if scope_source == _SAME_SCOPE_RETRY_SOURCE else "") \
         .replace("{{PREVIOUS_REPORT}}", previous_report or "NONE\n")
+
+
+_SAME_SCOPE_RETRY_NOTE = """
+This is the second and final bounded automatic check-repair pass.
+
+No mutable-scope expansion was required.
+
+Correct the remaining deterministic failures inside the exact existing
+mutable scope.
+
+Do not repeat unrelated changes from the previous repair.
+"""
 
 
 def _json_text(value: Any) -> str:
@@ -1311,6 +1326,21 @@ class CheckRepairScope:
     source: str
 
 
+# The two provenances a *second* bounded check-repair scope may carry.  They
+# are durable artifact values: never rename them, a stored run depends on the
+# exact string.
+_AUTO_BOUNDED_SOURCE = "auto-bounded failing-test evidence"
+_SAME_SCOPE_RETRY_SOURCE = "bounded same-scope retry"
+_SECOND_SCOPE_SOURCES = frozenset({_AUTO_BOUNDED_SOURCE, _SAME_SCOPE_RETRY_SOURCE})
+# Historically named "expanded": these are the phases of the *second* bounded
+# check-repair pass, whether or not it expands the mutable scope.  The names
+# are durable and are never renamed.
+_SECOND_CHECK_REPAIR_PHASES = frozenset({
+    ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+    ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+})
+
+
 def _check_repair_scope_payload(scope: CheckRepairScope) -> dict[str, Any]:
     return {
         "base_paths": list(scope.base_paths),
@@ -1322,11 +1352,28 @@ def _check_repair_scope_payload(scope: CheckRepairScope) -> dict[str, Any]:
     }
 
 
+def _second_check_repair_state(scope: CheckRepairScope) -> dict[str, Any]:
+    """State/diagnostics facts about the second bounded check-repair pass.
+
+    ``expanded_attempted`` is kept for durable compatibility with runs and
+    UIs that predate the same-scope retry; ``scope_expanded`` is the fact
+    that actually distinguishes a true expansion from a same-scope retry.
+    """
+
+    return {
+        "expanded_attempted": True,
+        "second_check_repair_attempted": True,
+        "scope_expanded": scope.source != _SAME_SCOPE_RETRY_SOURCE,
+        **_check_repair_scope_payload(scope),
+    }
+
+
 def _read_check_repair_scope(
     directory: Path,
     *,
     fallback_base: Sequence[str],
     policy_config: EffectiveRepairScopePolicy,
+    allowed_added_sources: frozenset[str] = frozenset({_AUTO_BOUNDED_SOURCE}),
 ) -> CheckRepairScope:
     payload = _read_json_artifact(directory / "scope.json", 64 * 1024)
     base = tuple(sorted(set(fallback_base)))
@@ -1354,7 +1401,7 @@ def _read_check_repair_scope(
     source = payload.get("source")
     if policy != policy_config.policy or bound != policy_config.max_added_paths or not isinstance(source, str):
         raise ResumeIntegrityError("check-repair scope policy changed")
-    if parsed_added and source != "auto-bounded failing-test evidence":
+    if parsed_added and source not in allowed_added_sources:
         raise ResumeIntegrityError("check-repair added paths have an invalid provenance")
     return CheckRepairScope(parsed_base, parsed_added, parsed_effective, policy, bound, source)
 
@@ -1364,12 +1411,37 @@ def _validate_expanded_check_repair_scope(
     *,
     repo: Path,
     tree_sha: str,
-    base_scope: Sequence[str],
+    normal_scope: CheckRepairScope,
     policy_config: EffectiveRepairScopePolicy,
 ) -> CheckRepairScope:
+    """Validate the durable scope of the second bounded check-repair pass.
+
+    Two forms are legitimate, and each is validated strictly.
+
+    Form A, a true expansion (``auto-bounded failing-test evidence``): every
+    added path must be tracked in the checkpoint tree, must be an
+    auto-expandable test path, must not already be in the base scope, and the
+    policy and its bound must still hold.
+
+    Form B, a same-scope retry (``bounded same-scope retry``): the scope must
+    be *exactly* the one the first repair already held.  One extra path, or
+    any other difference, is a resume integrity failure: the second pass
+    never creates authority.
+    """
+
     scope = _read_check_repair_scope(
-        directory, fallback_base=base_scope, policy_config=policy_config
+        directory, fallback_base=normal_scope.base_paths,
+        policy_config=policy_config, allowed_added_sources=_SECOND_SCOPE_SOURCES,
     )
+    if scope.source == _SAME_SCOPE_RETRY_SOURCE:
+        if (
+            scope.added_paths != tuple(sorted(set(normal_scope.added_paths)))
+            or scope.effective_paths != tuple(sorted(set(normal_scope.effective_paths)))
+        ):
+            raise ResumeIntegrityError(
+                "same-scope check-repair retry scope is not the first repair scope"
+            )
+        return scope
     if not scope.added_paths:
         raise ResumeIntegrityError("expanded check-repair scope has no added paths")
     if scope.policy != "auto-bounded" or len(scope.added_paths) > scope.bound:
@@ -3826,7 +3898,7 @@ class Orchestrator:
                     expanded_phase = ResumePhase.CHECK_REPAIR_EXPANDED_C01
                     expanded_retry_phase = ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01
                     expanded_dir = run_dir / "revision" / "check-repair-expanded" / "C01"
-                    expanded_scope = self._expanded_check_repair_scope(
+                    expanded_scope = self._second_check_repair_scope(
                         repo=repo,
                         worktree=info.worktree,
                         tree_sha=evidence.staged_tree_sha,
@@ -3846,17 +3918,15 @@ class Orchestrator:
                                 "attempted": True,
                                 "failure_ids": soft_failures_c01,
                                 "after": list(evidence.failures),
-                                "expanded_attempted": True,
-                                **_check_repair_scope_payload(expanded_scope),
+                                **_second_check_repair_state(expanded_scope),
                             },
                         )
                         self._cycle_update(
                             store, 1, status="expanded_check_repair_attempted",
                             automatic_check_repair={
                                 "attempted": True,
-                                "expanded_attempted": True,
                                 "after": _check_payload(evidence),
-                                **_check_repair_scope_payload(expanded_scope),
+                                **_second_check_repair_state(expanded_scope),
                             },
                         )
                         if at <= phase_index(expanded_phase):
@@ -3908,8 +3978,7 @@ class Orchestrator:
                                     "attempted": True,
                                     "failure_ids": soft_failures_c01,
                                     "after": list(evidence.failures),
-                                    "expanded_attempted": True,
-                                    **_check_repair_scope_payload(expanded_scope),
+                                    **_second_check_repair_state(expanded_scope),
                                 },
                             )
                             expanded_integrity = _hard_integrity_failures(evidence)
@@ -4015,7 +4084,7 @@ class Orchestrator:
                 )
             if not evidence.deterministic_passed:
                 expanded_scope, archive_required = (
-                    self._durable_expanded_check_repair_scope(
+                    self._durable_second_check_repair_scope(
                         repo=repo, worktree=info.worktree, run_dir=run_dir,
                         evidence=evidence, normal_scope=check_repair_scope_c01,
                         expanded_dir=expanded_dir,
@@ -4034,17 +4103,15 @@ class Orchestrator:
                         "attempted": True,
                         "failure_ids": soft_failures_c01,
                         "after": list(evidence.failures),
-                        "expanded_attempted": True,
-                        **_check_repair_scope_payload(expanded_scope),
+                        **_second_check_repair_state(expanded_scope),
                     },
                 )
                 self._cycle_update(
                     store, 1, status="expanded_check_repair_attempted",
                     automatic_check_repair={
                         "attempted": True,
-                        "expanded_attempted": True,
                         "after": _check_payload(evidence),
-                        **_check_repair_scope_payload(expanded_scope),
+                        **_second_check_repair_state(expanded_scope),
                     },
                 )
                 expanded_check_repair_result_c01, repair_error = self._run_v2_revision_cycle(
@@ -4095,8 +4162,7 @@ class Orchestrator:
                         "attempted": True,
                         "failure_ids": soft_failures_c01,
                         "after": list(evidence.failures),
-                        "expanded_attempted": True,
-                        **_check_repair_scope_payload(expanded_scope),
+                        **_second_check_repair_state(expanded_scope),
                     },
                 )
                 expanded_integrity = _hard_integrity_failures(evidence)
@@ -4132,9 +4198,9 @@ class Orchestrator:
                 expanded_dir,
                 repo=repo,
                 tree_sha=candidate_tree_sha(info.worktree),
-                base_scope=(
-                    check_repair_scope_c01.base_paths
-                    if check_repair_scope_c01 is not None else base_repair_scope_c01
+                normal_scope=self._durable_normal_check_repair_scope(
+                    run_dir, cycle=1, base_paths=base_repair_scope_c01,
+                    scope=check_repair_scope_c01,
                 ),
                 policy_config=self._effective_repair_scope,
             )
@@ -4184,9 +4250,8 @@ class Orchestrator:
                     },
                     check_repair={
                         "attempted": True,
-                        "expanded_attempted": True,
                         "after": list(evidence.failures),
-                        **_check_repair_scope_payload(expanded_scope),
+                        **_second_check_repair_state(expanded_scope),
                     },
                 )
                 expanded_integrity = _hard_integrity_failures(evidence)
@@ -5107,12 +5172,12 @@ class Orchestrator:
             policy=policy,
             bound=bound,
             source=(
-                "auto-bounded failing-test evidence"
+                _AUTO_BOUNDED_SOURCE
                 if added else "human-approved mutable scope"
             ),
         )
 
-    def _expanded_check_repair_scope(
+    def _second_check_repair_scope(
         self,
         *,
         repo: Path,
@@ -5123,49 +5188,92 @@ class Orchestrator:
         normal_scope: CheckRepairScope,
         expanded_dir: Path,
     ) -> CheckRepairScope | None:
-        """The one bounded expanded scope a red retry may still earn.
+        """The scope of the one second bounded check-repair pass, or ``None``.
 
         This is the single decision point for "may the corrective Claude pass
-        run once more with the failing test file added to its mutable scope".
-        It is deliberately model-free and fail-closed: every condition below
-        is a durable fact -- the failure family, the normal scope already
-        used, the operator's policy and its bound, and whether an expanded
-        pass already produced a report.  ``None`` means the deterministic gate
-        is final.
+        run once more", and the retry budget is deliberately independent from
+        the mutable scope.  A scope expansion is one possible *outcome* of
+        this decision, never its precondition: a soft deterministic failure
+        whose fix already lives inside the authorized paths earns a second
+        pass with exactly that scope.
+
+        It stays model-free and fail-closed; every condition is a durable
+        fact -- the failure family, the scope the first repair already held,
+        the operator's policy and its bound, and whether a second pass
+        already produced a report.  ``None`` means the deterministic gate is
+        final.
         """
 
         if not _soft_check_failures(evidence):
             return None
         if _hard_integrity_failures(evidence):
             return None
-        # The normal repair already got the expansion: there is no second one.
-        if normal_scope.added_paths:
-            return None
+        # One second pass per cycle, even across a crash: never a third.
         if (expanded_dir / "report.json").exists():
             return None
-        if self._effective_repair_scope.policy != "auto-bounded":
-            return None
+        policy_config = self._effective_repair_scope
+        # No new path, no new authority: exactly what the first repair held.
+        same_scope = CheckRepairScope(
+            base_paths=normal_scope.base_paths,
+            added_paths=normal_scope.added_paths,
+            effective_paths=normal_scope.effective_paths,
+            policy=policy_config.policy,
+            bound=policy_config.max_added_paths,
+            source=_SAME_SCOPE_RETRY_SOURCE,
+        )
+        if policy_config.policy != "auto-bounded":
+            # ``deny-expansion`` and ``require-approval`` forbid *growing* the
+            # mutable scope.  Neither forbids one more bounded correction
+            # inside the scope a human already approved.
+            return same_scope
         candidates = _check_repair_scope_candidates(
             repo=repo,
             worktree=worktree,
             tree_sha=tree_sha,
             run_dir=run_dir,
             evidence=evidence,
-            base_mutable_scope=normal_scope.base_paths,
+            # Only genuinely new paths are candidates; the paths the first
+            # repair already earned are never re-added, and never lost.
+            base_mutable_scope=normal_scope.effective_paths,
         )
         if not candidates:
-            return None
-        if len(candidates) > self._effective_repair_scope.max_added_paths:
-            return None
+            return same_scope
+        added = tuple(sorted(set(normal_scope.added_paths) | set(candidates)))
+        if len(added) > policy_config.max_added_paths:
+            # The bound caps the expansion, not the retry.
+            return same_scope
         return CheckRepairScope(
             base_paths=normal_scope.base_paths,
-            added_paths=tuple(candidates),
+            added_paths=added,
             effective_paths=tuple(sorted(
-                set(normal_scope.base_paths) | set(candidates)
+                set(normal_scope.base_paths) | set(added)
             )),
-            policy=self._effective_repair_scope.policy,
-            bound=self._effective_repair_scope.max_added_paths,
-            source="auto-bounded failing-test evidence",
+            policy=policy_config.policy,
+            bound=policy_config.max_added_paths,
+            source=_AUTO_BOUNDED_SOURCE,
+        )
+
+    def _durable_normal_check_repair_scope(
+        self,
+        run_dir: Path,
+        *,
+        cycle: int,
+        base_paths: Sequence[str],
+        scope: CheckRepairScope | None = None,
+    ) -> CheckRepairScope:
+        """The first repair's scope, from memory or from its durable artifact.
+
+        A resume that starts at the second repair has no in-band scope, so the
+        artifact the first repair published is the authority for what that
+        pass was allowed to touch.
+        """
+
+        if scope is not None:
+            return scope
+        return _read_check_repair_scope(
+            run_dir / "revision" / "check-repair" / f"C0{cycle}",
+            fallback_base=base_paths,
+            policy_config=self._effective_repair_scope,
         )
 
     @staticmethod
@@ -5184,7 +5292,7 @@ class Orchestrator:
             source="human-approved mutable scope",
         )
 
-    def _durable_expanded_check_repair_scope(
+    def _durable_second_check_repair_scope(
         self,
         *,
         repo: Path,
@@ -5194,27 +5302,28 @@ class Orchestrator:
         normal_scope: CheckRepairScope,
         expanded_dir: Path,
     ) -> tuple[CheckRepairScope | None, bool]:
-        """Reuse a durable expanded scope, or decide a new one.
+        """Reuse a durable second-pass scope, or decide a new one.
 
-        A crash may have landed between ``scope.json`` and the expanded
-        Claude pass while the checkpoint still names the retry checks.  The
-        durable scope then outranks any recomputation: the model is never
-        recalled with a scope different from the one already published for
-        it.  Returns ``(scope, archive_required)``; ``archive_required`` is
-        false for a reused scope, whose attempt was already archived.
+        A crash may have landed between ``scope.json`` and the second
+        corrective Claude pass while the checkpoint still names the retry
+        checks.  The durable scope then outranks any recomputation: the model
+        is never recalled with a scope different from the one already
+        published for it.  Returns ``(scope, archive_required)``;
+        ``archive_required`` is false for a reused scope, whose attempt was
+        already archived.
         """
 
         if (expanded_dir / "scope.json").is_file():
             scope = _validate_expanded_check_repair_scope(
                 expanded_dir, repo=repo, tree_sha=evidence.staged_tree_sha,
-                base_scope=normal_scope.base_paths,
+                normal_scope=normal_scope,
                 policy_config=self._effective_repair_scope,
             )
-            # One expanded pass per cycle, even across a crash.
+            # One second pass per cycle, even across a crash.
             if (expanded_dir / "report.json").exists():
                 return None, False
             return scope, False
-        return self._expanded_check_repair_scope(
+        return self._second_check_repair_scope(
             repo=repo, worktree=worktree, tree_sha=evidence.staged_tree_sha,
             run_dir=run_dir, evidence=evidence, normal_scope=normal_scope,
             expanded_dir=expanded_dir,
@@ -5277,8 +5386,8 @@ class Orchestrator:
             check_repair_scope = check_repair_scope or CheckRepairScope(
                 base_paths=tuple(mutable_scope), added_paths=(),
                 effective_paths=tuple(mutable_scope),
-                policy=scope_policy.policy,
-                bound=scope_policy.max_added_paths,
+                policy=self._effective_repair_scope.policy,
+                bound=self._effective_repair_scope.max_added_paths,
                 source="human-approved mutable scope",
             )
             atomic_write_text(artifact_dir / "scope.json", _json_text({
@@ -5370,6 +5479,10 @@ class Orchestrator:
         )
         if is_check_repair:
             previous_dir = run_dir / "revision" / (f"C0{cycle}" if cycle == 2 else "")
+            if check_repair_phase_override in _SECOND_CHECK_REPAIR_PHASES:
+                # The second pass must read the *first repair's* report, not
+                # the initial revision it already superseded.
+                previous_dir = run_dir / "revision" / "check-repair" / f"C0{cycle}"
             previous_report = _read_bounded_text(previous_dir / "agent.final.md")
             revision_prompt = _check_repair_prompt(
                 repository_reference=repository_reference,
@@ -5383,6 +5496,7 @@ class Orchestrator:
                 mutable_scope=mutable_scope,
                 previous_report=previous_report,
                 added_paths=(check_repair_scope.added_paths if check_repair_scope else ()),
+                scope_source=(check_repair_scope.source if check_repair_scope else ""),
             )
         else:
             revision_prompt = _revision_prompt(
@@ -5966,7 +6080,7 @@ class Orchestrator:
                     expanded_phase = ResumePhase.CHECK_REPAIR_EXPANDED_C02
                     expanded_retry_phase = ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02
                     expanded_dir = run_dir / "revision" / "check-repair-expanded" / "C02"
-                    expanded_scope = self._expanded_check_repair_scope(
+                    expanded_scope = self._second_check_repair_scope(
                         repo=repo,
                         worktree=info.worktree,
                         tree_sha=evidence.staged_tree_sha,
@@ -5986,17 +6100,15 @@ class Orchestrator:
                                 "attempted": True,
                                 "failure_ids": soft_failures_c02,
                                 "after": list(evidence.failures),
-                                "expanded_attempted": True,
-                                **_check_repair_scope_payload(expanded_scope),
+                                **_second_check_repair_state(expanded_scope),
                             },
                         )
                         self._cycle_update(
                             store, 2, status="expanded_check_repair_attempted",
                             automatic_check_repair={
                                 "attempted": True,
-                                "expanded_attempted": True,
                                 "after": _check_payload(evidence),
-                                **_check_repair_scope_payload(expanded_scope),
+                                **_second_check_repair_state(expanded_scope),
                             },
                         )
                         if at <= phase_index(expanded_phase):
@@ -6126,7 +6238,7 @@ class Orchestrator:
                 )
             if not evidence.deterministic_passed:
                 expanded_scope, archive_required = (
-                    self._durable_expanded_check_repair_scope(
+                    self._durable_second_check_repair_scope(
                         repo=repo, worktree=info.worktree, run_dir=run_dir,
                         evidence=evidence, normal_scope=check_repair_scope_c02,
                         expanded_dir=expanded_dir,
@@ -6144,17 +6256,15 @@ class Orchestrator:
                         "attempted": True,
                         "failure_ids": soft_failures_c02,
                         "after": list(evidence.failures),
-                        "expanded_attempted": True,
-                        **_check_repair_scope_payload(expanded_scope),
+                        **_second_check_repair_state(expanded_scope),
                     },
                 )
                 self._cycle_update(
                     store, 2, status="expanded_check_repair_attempted",
                     automatic_check_repair={
                         "attempted": True,
-                        "expanded_attempted": True,
                         "after": _check_payload(evidence),
-                        **_check_repair_scope_payload(expanded_scope),
+                        **_second_check_repair_state(expanded_scope),
                     },
                 )
                 expanded_check_repair_result_c02, repair_error = self._run_v2_revision_cycle(
@@ -6223,9 +6333,9 @@ class Orchestrator:
                 expanded_dir,
                 repo=repo,
                 tree_sha=candidate_tree_sha(info.worktree),
-                base_scope=(
-                    check_repair_scope_c02.base_paths
-                    if check_repair_scope_c02 is not None else base_repair_scope_c02
+                normal_scope=self._durable_normal_check_repair_scope(
+                    run_dir, cycle=2, base_paths=base_repair_scope_c02,
+                    scope=check_repair_scope_c02,
                 ),
                 policy_config=self._effective_repair_scope,
             )
@@ -7666,7 +7776,7 @@ class Orchestrator:
             expanded_c01 = _validate_expanded_check_repair_scope(
                 expanded_c01_dir,
                 repo=repo, tree_sha=checkpoint.expected_tree_sha,
-                base_scope=normal_scope_c01.base_paths,
+                normal_scope=normal_scope_c01,
                 policy_config=self._effective_repair_scope,
             )
             scope = sorted(set(scope) | set(expanded_c01.effective_paths))
@@ -7686,10 +7796,18 @@ class Orchestrator:
             expansion_phase=ResumePhase.CHECK_REPAIR_EXPANDED_C02,
             scope_path=expanded_c02_dir / "scope.json",
         ):
+            # Same-scope parity with C01: the second pass is validated against
+            # the exact scope the C02 check repair recorded for itself.
+            normal_scope_c02 = _read_check_repair_scope(
+                run_dir / "revision" / "check-repair" / "C02",
+                fallback_base=c02_repair_scope,
+                policy_config=self._effective_repair_scope,
+            )
             expanded_c02 = _validate_expanded_check_repair_scope(
                 expanded_c02_dir,
                 repo=repo, tree_sha=checkpoint.expected_tree_sha,
-                base_scope=c02_repair_scope, policy_config=self._effective_repair_scope,
+                normal_scope=normal_scope_c02,
+                policy_config=self._effective_repair_scope,
             )
             scope = sorted(set(scope) | set(expanded_c02.effective_paths))
         try:
@@ -8282,7 +8400,7 @@ class Orchestrator:
                 expanded_c01_dir,
                 repo=resumed.info.source_repo,
                 tree_sha=c01_tree,
-                base_scope=normal_scope.base_paths,
+                normal_scope=normal_scope,
                 policy_config=self._effective_repair_scope,
             )
             if at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01):
@@ -8484,7 +8602,7 @@ class Orchestrator:
                 expanded_c02_dir,
                 repo=resumed.info.source_repo,
                 tree_sha=c02_tree,
-                base_scope=normal_scope.base_paths,
+                normal_scope=normal_scope,
                 policy_config=self._effective_repair_scope,
             )
             if at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02):

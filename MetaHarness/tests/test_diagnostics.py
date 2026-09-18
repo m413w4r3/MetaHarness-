@@ -156,6 +156,70 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("max added paths: 4", report)
         self.assertIn("source: historical-default", report)
 
+    def _publish_second_check_repair(self, scope: dict) -> None:
+        directory = self.run_dir / "revision" / "check-repair-expanded" / "C01"
+        directory.mkdir(parents=True)
+        (directory / "scope.json").write_text(json.dumps(scope), encoding="utf-8")
+
+    def test_a_same_scope_second_repair_is_not_reported_as_an_expansion(self) -> None:
+        """"expanded check repair" is misleading when no path was added."""
+
+        self._publish_second_check_repair({
+            "schema_version": 2,
+            "base_mutable_scope": ["src/service.py"],
+            "added_paths": [],
+            "effective_mutable_scope": ["src/service.py"],
+            "policy": "deny-expansion",
+            "bound": 4,
+            "source": "bounded same-scope retry",
+        })
+        report = build_run_diagnostics(self.config, self.run_dir)
+        self.assertIn("SECOND AUTOMATIC CHECK REPAIR", report)
+        self.assertIn("second bounded check repair attempted", report)
+        self.assertIn("scope expanded: no", report)
+        self.assertIn("source: bounded same-scope retry", report)
+        self.assertIn("added paths: 0", report)
+
+    def test_b_a_true_expansion_still_reports_its_added_paths(self) -> None:
+        self._publish_second_check_repair({
+            "schema_version": 2,
+            "base_mutable_scope": ["src/service.py"],
+            "added_paths": ["tests/test_service.py"],
+            "effective_mutable_scope": ["src/service.py", "tests/test_service.py"],
+            "policy": "auto-bounded",
+            "bound": 4,
+            "source": "auto-bounded failing-test evidence",
+        })
+        report = build_run_diagnostics(self.config, self.run_dir)
+        self.assertIn("scope expanded: yes", report)
+        self.assertIn("added paths: 1", report)
+        self.assertIn("- tests/test_service.py", report)
+
+    def test_c_the_run_page_says_whether_the_scope_changed(self) -> None:
+        store = RunStateStore(self.run_dir / "state.json")
+        store.update(status="failed", check_repair={
+            "attempted": True,
+            "failure_ids": ["CHECK_FAILED:lint"],
+            "second_check_repair_attempted": True,
+            "scope_expanded": False,
+            "added_paths": [],
+        })
+        page = render_run(get_run(self.runs, "diagnostic-run", config=self.config))
+        self.assertIn("second bounded check repair attempted", page)
+        self.assertIn("scope unchanged", page)
+        self.assertNotIn("Added test paths", page)
+
+        store.update(status="failed", check_repair={
+            "attempted": True,
+            "failure_ids": ["CHECK_FAILED:test"],
+            "second_check_repair_attempted": True,
+            "scope_expanded": True,
+            "added_paths": ["tests/test_service.py"],
+        })
+        page = render_run(get_run(self.runs, "diagnostic-run", config=self.config))
+        self.assertIn("scope expanded", page)
+        self.assertIn("tests/test_service.py", page)
+
     def test_prompt_footprint_is_deterministic_and_reports_usage(self) -> None:
         (self.run_dir / "spec.md").write_text("spec", encoding="utf-8")
         (self.run_dir / "context.txt").write_text("context", encoding="utf-8")

@@ -558,6 +558,32 @@ def _event_artifact(run_dir: Path, relative: str, secrets: tuple[str, ...]) -> s
     )
 
 
+def _second_check_repair_scope_text(scope_path: Path) -> str:
+    """Say whether the second bounded repair expanded the scope, or not.
+
+    "expanded check repair" used to be printed for every second pass, which
+    is misleading whenever no path was added: the second pass then ran inside
+    exactly the scope the first repair already held.
+    """
+
+    try:
+        scope = json.loads(scope_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        scope = None
+    if not isinstance(scope, Mapping):
+        return "  scope: unavailable"
+    added = scope.get("added_paths", [])
+    added = added if isinstance(added, list) else []
+    source = scope.get("source", "—")
+    expanded = source != "bounded same-scope retry"
+    return "\n".join([
+        f"  scope expanded: {'yes' if expanded else 'no'}",
+        f"  source: {source}",
+        f"  added paths: {len(added)}",
+        *(f"  - {path}" for path in added),
+    ])
+
+
 def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
     prefix = "" if cycle == 1 else "repair/C02/"
     label = f"CYCLE C0{cycle}"
@@ -674,8 +700,9 @@ def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str,
             _safe_json_artifact(run_dir, current, secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
         ])))
     if expanded_check_repair.is_dir():
-        parts.append(_section("EXPANDED AUTOMATIC CHECK REPAIR", "\n".join([
-            "Automatic expanded check repair attempted",
+        parts.append(_section("SECOND AUTOMATIC CHECK REPAIR", "\n".join([
+            "second bounded check repair attempted",
+            _second_check_repair_scope_text(expanded_check_repair / "scope.json"),
             _artifact_json(run_dir, "revision/check-repair-expanded/C0" + str(cycle) + "/scope.json", secrets),
             _artifact_json(run_dir, "revision/check-repair-expanded/C0" + str(cycle) + "/report.json", secrets),
             _safe_json_artifact(run_dir, f"checks/C0{cycle}/attempts/02/evidence.json", secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),

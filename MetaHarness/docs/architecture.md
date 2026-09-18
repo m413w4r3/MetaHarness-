@@ -270,16 +270,46 @@ candidate tree SHA is verified again immediately before that commit. Final
 publication still requires reviewer approval. A changed index, HEAD, or
 worktree causes the candidate boundary to fail.
 
-## Bounded test-scope expansion during check repair
+## The second bounded check-repair pass
 
-The final deterministic gate remains mandatory. When an ordinary
+The repair budget and the mutable scope are **independent decisions**. A
+cycle permits at most two corrective reviser passes — the first check repair
+and one second bounded pass — and a still-red gate after the second is
+final. Whether that second pass *expands* the mutable scope is a separate
+question with its own, stricter answer.
+
+A second pass is earned when the retry evidence contains only soft
+deterministic failures (`CHECK_FAILED:<check id>`), no hard integrity failure,
+and no second pass has already produced a report. That is the whole
+condition: a `lint`, `typecheck` or `test` failure whose fix already lives
+inside the authorized paths earns a second pass with **exactly** the scope the
+first repair held. Its durable scope records
+`source = "bounded same-scope retry"`, no path is added, and no authority is
+created; an artifact with that provenance and one extra path is a
+`RESUME_INTEGRITY_FAILURE`. The `deny-expansion` and `require-approval`
+policies forbid *growing* the scope; neither forbids this retry, and neither
+does an exhausted bound.
+
+Conflating the two decisions is what made a red `lint` inside the approved
+scope terminate the run immediately: with no new test path to expand to, the
+single helper answering both questions returned "no second pass".
+
+Expansion, when it happens, stays as strict as before. When an ordinary
 `CHECK_FAILED:*` output names a path, MetaHarness treats it only as a
 candidate: the path must exist in the exact Git tree, be tracked, and be a
 test or fixture path. The run's `auto-bounded` policy and configured maximum
 apply atomically; production, generated, untracked and ambiguous paths are
-never added. Model output never decides the scope. A cycle permits at most one
-expanded check-repair pass, and production paths remain the responsibility of
-the approved plan and reviewer/C02 process.
+never added. Model output never decides the scope. Paths the first repair
+already earned are carried into the second pass and are never lost, never
+re-added, and never counted twice against the bound. Production paths remain
+the responsibility of the approved plan and reviewer/C02 process.
+
+The `CHECK_REPAIR_EXPANDED_C0x` and `FINAL_CHECKS_RETRY_EXPANDED_C0x` phases
+are historically named "expanded"; they are the phases of the second bounded
+pass whether or not it expands the scope, and they are never renamed, because
+stored runs depend on those exact names. `state`, diagnostics and the run page
+report `second_check_repair_attempted` and `scope_expanded` separately, so a
+same-scope retry is no longer described as an expansion.
 
 `FINAL_CHECKS_RETRY_C01` and `FINAL_CHECKS_RETRY_C02` are resumable boundaries
 of their own, and the durable checkpoint — never `state.failure` — decides
@@ -288,15 +318,17 @@ that boundary, so neither the implementer steps, nor the initial reviser pass,
 nor that repair is ever replayed. Three durable states are legitimate. With no
 retry bundle yet, those retry checks run exactly once on the checkpointed
 tree. With a red retry bundle for that tree, the bundle is already the
-complete result of a retry and is reused rather than re-earned; it is what the
-single bounded expansion decision reads, so the resume can still reach
-`CHECK_REPAIR_EXPANDED_C0x`. With a green retry bundle for that tree, the
-resume reconciles straight into the candidate commit without a check, a model
-call or an expansion. If `check-repair-expanded/C0x/scope.json` is already
-published, that durable scope outranks any recomputation: the reviser is never
-recalled with a scope different from the one already published for it, and a
-divergent or malformed artifact is a `RESUME_INTEGRITY_FAILURE`. There is
-still at most one expanded pass per cycle.
+complete result of a retry and is reused rather than re-earned — the same
+checks are never re-run before the decision. That red bundle is the authority
+the second-pass decision reads, so the resume can still reach
+`CHECK_REPAIR_EXPANDED_C0x`, with or without an expansion. With a green retry
+bundle for that tree, the resume reconciles straight into the candidate commit
+without a check, a model call or a second pass. If
+`check-repair-expanded/C0x/scope.json` is already published, that durable
+scope outranks any recomputation: the reviser is never recalled with a scope
+different from the one already published for it, and a divergent or malformed
+artifact is a `RESUME_INTEGRITY_FAILURE`. There is still at most one second
+pass per cycle.
 
 A validated expanded scope is **cumulative authority over the candidate
 tree**. The test path it added is part of every tree from that moment on, so
