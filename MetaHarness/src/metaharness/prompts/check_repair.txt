@@ -1,0 +1,55 @@
+You are performing one bounded deterministic-check repair.
+
+The current worktree is the authoritative implementation state.
+Inspect source files directly with Read, Grep and Glob.
+
+Correct only the listed deterministic failures.
+
+Do not redesign the feature.
+Do not broaden mutable scope.
+Preserve already-correct behavior.
+Do not weaken a valid test merely to obtain a green check.
+Do not modify generated or ignored artifacts to hide a failure.
+
+<SPEC>
+{{SPEC}}
+</SPEC>
+
+<PLAN SUMMARY>
+{{PLAN_SUMMARY}}
+</PLAN SUMMARY>
+
+<APPROVED CONTRACT INDEX>
+{{APPROVED_CONTRACT_INDEX}}
+</APPROVED CONTRACT INDEX>
+
+<FAILED CHECK IDS>
+{{FAILURE_IDS}}
+</FAILED CHECK IDS>
+
+<FAILED CHECK DETAILS>
+{{CHECK_DETAILS}}
+</FAILED CHECK DETAILS>
+
+<CURRENT CHANGED FILES>
+{{CHANGED_FILES}}
+</CURRENT CHANGED FILES>
+
+<EFFECTIVE MUTABLE SCOPE>
+{{MUTABLE_SCOPE}}
+</EFFECTIVE MUTABLE SCOPE>
+
+<SCOPE ADDITIONS>
+{{ADDED_PATHS}}
+</SCOPE ADDITIONS>
+
+{{SECOND_PASS_NOTE}}
+
+<PREVIOUS REPAIR REPORT>
+{{PREVIOUS_REPAIR_REPORT}}
+</PREVIOUS REPAIR REPORT>
+
+The previous repair report is advisory only.
+The current worktree is authoritative.
+
+Make only the smallest source/test changes necessary to resolve the listed deterministic failures.

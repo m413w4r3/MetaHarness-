@@ -574,8 +574,9 @@ class FullPipelineTests(P28Harness):
         )
         self.assertEqual(archived["status"], "DEFERRED_CONTRACT_MISMATCH")
         self.assertNotIn("mismatch_retry_count", archived)
-        self.assertIn("DEFERRED LUNA CONTRACT MISMATCHES", claude.calls[0]["prompt"])
+        self.assertIn("<DEFERRED CONTRACT MISMATCHES>", claude.calls[0]["prompt"])
         self.assertIn("S01", claude.calls[0]["prompt"])
+        self.assertIn("local contract is stale", claude.calls[0]["prompt"])
         self.assertIn("DEFERRED CONTRACT MISMATCHES", reviewer.prompts[0])
         self.assertIn("S01", reviewer.prompts[0])
 
@@ -594,7 +595,7 @@ class FullPipelineTests(P28Harness):
 
     def test_v2_large_diff_uses_excerpt_but_still_revises_commits_pushes_and_reviews(self) -> None:
         config = dataclasses.replace(self.load(), max_diff_bytes=400)
-        large = "A = " + ("1" * 100_000) + "\n"
+        large = "A = " + ("1" * 300_000) + "\n# CLAUDE_DIFF_MUST_NOT_BE_PROMPTED\n"
         luna = FakeLuna({(1, "S01"): writer("src/a.py", large)})
         planner = QueueClient("planner", [SINGLE_PLAN], self.events)
         reviewer = QueueClient("reviewer", [PASS], self.events)
@@ -616,7 +617,10 @@ class FullPipelineTests(P28Harness):
         self.assert_published_once(result, pushed, run_id="large-v2")
         self.assertEqual(len(claude.calls), 1)
         self.assertEqual(len(reviewer.prompts), 1)
-        self.assertIn("TRUNCATED: true", claude.calls[0]["prompt"])
+        self.assertNotIn("TRUNCATED: true", claude.calls[0]["prompt"])
+        self.assertNotIn("1" * 10_000, claude.calls[0]["prompt"])
+        self.assertNotIn("CLAUDE_DIFF_MUST_NOT_BE_PROMPTED", claude.calls[0]["prompt"])
+        self.assertLess(len(claude.calls[0]["prompt"].encode("utf-8")), 100_000)
         self.assertIn("TRUNCATED: true", reviewer.prompts[0])
         self.assertNotIn("DIFF_TOO_LARGE", result.state["deterministic_gate"]["failures"])
         candidate = json.loads((result.run_dir / "candidate/C01/commit.json").read_text())
@@ -626,6 +630,7 @@ class FullPipelineTests(P28Harness):
         else:
             self.assertIn('"immutable_commit_url": null', reviewer.prompts[0])
         self.assertIn("1" * 100_000, (result.run_dir / "diff.patch").read_text())
+        self.assertIn("CLAUDE_DIFF_MUST_NOT_BE_PROMPTED", (result.run_dir / "diff.patch").read_text())
 
     def test_a_staged_c01_pass_commits_and_pushes_once(self) -> None:
         luna = FakeLuna({
@@ -690,7 +695,12 @@ class FullPipelineTests(P28Harness):
         self.assertFalse(reviewer.prompts)
 
     def test_i_automatic_check_repair_c01_fixes_red_final_check(self) -> None:
-        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        luna = FakeLuna({
+            (1, "S01"): writer(
+                "src/a.py",
+                "A = BUG\nCLAUDE_DIFF_MUST_NOT_BE_PROMPTED\n",
+            )
+        })
         claude = FakeClaude(stage_actions={(1, "check-repair"): writer("src/a.py", "A = 3\n")})
         result, _planner, reviewer, claude, pushed = self.run_pipeline(
             luna=luna, reviews=[PASS], claude=claude, run_id="check-repair-c01",
@@ -700,7 +710,17 @@ class FullPipelineTests(P28Harness):
         self.assertEqual(len(reviewer.prompts), 1)
         self.assertEqual(claude.calls[1]["revision_dir"].relative_to(result.run_dir).as_posix(), "revision/check-repair/C01")
         self.assertTrue((result.run_dir / "revision/check-repair/C01/agent.prompt.txt").exists())
-        self.assertIn("CHECK_FAILED:gate", (result.run_dir / "revision/check-repair/C01/agent.prompt.txt").read_text())
+        repair_prompt = claude.calls[1]["prompt"]
+        self.assertNotIn("CLAUDE_DIFF_MUST_NOT_BE_PROMPTED", claude.calls[0]["prompt"])
+        self.assertNotIn("CLAUDE_DIFF_MUST_NOT_BE_PROMPTED", repair_prompt)
+        self.assertIn("CHECK_FAILED:gate", repair_prompt)
+        self.assertIn("src/a.py", repair_prompt)
+        self.assertIn(
+            "CLAUDE_DIFF_MUST_NOT_BE_PROMPTED",
+            (result.run_dir / "revision/diff.patch").read_text(),
+        )
+        self.assertIn("<PREVIOUS REPAIR REPORT>\nNONE", repair_prompt)
+        self.assertNotIn("Claude C01 revision report", repair_prompt)
 
     def test_bounded_scope_expands_for_a_tracked_failing_test(self) -> None:
         write(self.repo / "tests/test_service.py", "def test_fake_uow():  # stale\n    pass\n")
@@ -798,6 +818,8 @@ class FullPipelineTests(P28Harness):
         self.assert_no_commit_no_push(result, pushed, run_id="check-repair-red")
         self.assertEqual([call["stage"] for call in claude.calls],
                          ["initial-revision", "check-repair", "check-repair"])
+        self.assertIn("<PREVIOUS REPAIR REPORT>", claude.calls[2]["prompt"])
+        self.assertIn("Claude C01 check-repair report", claude.calls[2]["prompt"])
         # The second pass ran inside the exact scope the first one held.
         scope = json.loads(
             (result.run_dir / "revision/check-repair-expanded/C01/scope.json").read_text()
@@ -905,6 +927,8 @@ class FullPipelineTests(P28Harness):
         ])
         self.assertEqual([(call["cycle"], call["step"]) for call in luna.calls], [(1, "S01"), (2, "S01")])
         self.assertEqual([call["cycle"] for call in claude.calls], [1, 2])
+        self.assertNotIn("C01 S01 report", claude.calls[0]["prompt"])
+        self.assertNotIn("C02 S01 report", claude.calls[1]["prompt"])
         self.assertEqual(result.state["cycle"], 2)
         self.assertEqual(result.state["review_iterations"], 2)
         self.assertEqual(git(self.worktree(), "show", "HEAD:src/a.py"), "A = 4")
@@ -953,10 +977,15 @@ class FullPipelineTests(P28Harness):
         )
 
     def test_d2_repair_request_is_compact_around_the_immutable_candidate(self) -> None:
-        result, planner, _r, _c, _pushed = self._staged_repair_run(
+        result, planner, _r, claude, _pushed = self._staged_repair_run(
             run_id="p28-compact", web_url="https://github.com/example/p28",
         )
         self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        c02_revision_call = next(
+            call for call in claude.calls
+            if call["cycle"] == 2 and call["stage"] == "initial-revision"
+        )
+        self.assertNotIn("C01_DIFF_SENTINEL", c02_revision_call["prompt"])
 
         repair_dir = result.run_dir / "repair" / "C02"
         request = (repair_dir / "planner.request.txt").read_text(encoding="utf-8")

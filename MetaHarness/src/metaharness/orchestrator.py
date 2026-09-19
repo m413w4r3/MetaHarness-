@@ -436,6 +436,74 @@ def _step_reports_text(results: list[dict[str, Any]]) -> str:
     return "\n".join(chunks)
 
 
+def _revision_execution_anomalies(results: list[dict[str, Any]]) -> str:
+    """Render only exceptional Luna execution facts for Claude.
+
+    The resulting worktree is the authority for successful implementation
+    details.  Reports are retained for reviewer/audit flows, but normal Luna
+    narration, usage and tree metadata do not belong in Claude's task prompt.
+    """
+
+    records: list[dict[str, Any]] = []
+    for item in results:
+        status = item.get("status", "COMPLETED")
+        exceptional = (
+            status != "COMPLETED"
+            or bool(item.get("mismatch"))
+            or bool(item.get("initial_mismatch"))
+            or bool(item.get("deferred_verify"))
+            or bool(item.get("mismatch_retry_count"))
+        )
+        if not exceptional:
+            continue
+
+        record: dict[str, Any] = {
+            "id": item.get("id"),
+            "status": status,
+            "changed_paths": list(item.get("changed_paths") or []),
+        }
+        for key in ("mismatch", "initial_mismatch", "deferred_verify"):
+            if item.get(key):
+                record[key] = _bounded_v2_report(str(item[key]))
+        if item.get("mismatch_retry_count"):
+            record["mismatch_retry_count"] = item["mismatch_retry_count"]
+        records.append(record)
+
+    return _json_text(records) if records else "NONE\n"
+
+
+def _revision_contract_index(plan: TaskPlanV2) -> str:
+    """Render only the approved behavioral and mutation contract index."""
+
+    return _json_text([
+        {
+            "id": step.id,
+            "title": step.title,
+            "depends_on": step.depends_on,
+            "objective": step.objective,
+            "mutation_scope": {
+                "write": list(step.write_set),
+                "create": list(step.create_set),
+                "delete": list(step.delete_set),
+            },
+            "verify": step.verify,
+            "forbidden": step.forbidden,
+        }
+        for step in plan.steps
+    ])
+
+
+def _revision_plan_summary(plan: TaskPlanV2) -> str:
+    return _json_text({
+        "title": plan.title,
+        "objective": plan.objective,
+        "constraints": plan.constraints,
+        "acceptance": plan.acceptance,
+        "tests": plan.tests,
+        "risks": plan.risks,
+    })
+
+
 def _review_step_reports_text(results: list[dict[str, Any]]) -> str:
     """Compact structural Luna history for the independent reviewer."""
 
@@ -633,23 +701,6 @@ def _has_deferred_contract_mismatches(results: list[dict[str, Any]]) -> bool:
     return any(item.get("status") == "DEFERRED_CONTRACT_MISMATCH" for item in results)
 
 
-def _semantic_diff_payload(diff: str, max_bytes: int) -> tuple[str, bool, int]:
-    """Return the model-facing diff plus its truncation facts."""
-
-    return bounded_semantic_diff(diff, max_bytes)
-
-
-def _truncation_note(truncated: bool) -> str:
-    if not truncated:
-        return ""
-    return (
-        "\n\nThe inline diff is abbreviated.\n"
-        "Inspect the current worktree with your allowed read tools when additional\n"
-        "context is required.\n"
-        "Do not infer that omitted diff text means an unchanged file.\n"
-    )
-
-
 def _compact_step_history(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep C02 history structural; reports live in ``luna_reports``."""
 
@@ -681,6 +732,62 @@ def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
             item["required"] = item.get("name") in bundle.required_check_ids
         payload.append(item)
     return payload
+
+
+_REVISION_CHECK_LOG_BYTES = 16 * 1024
+
+
+def _revision_check_context(payload: Mapping[str, Any]) -> str:
+    """Render compact pre-revision check state for Claude.
+
+    Successful checks contribute status only.  Output tails are decision
+    evidence only for failed checks and stay bounded for prompt safety; the
+    complete logs remain in the durable check artifacts.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("check payload must be a mapping")
+
+    failures = [
+        item for item in payload.get("failures", [])
+        if isinstance(item, str)
+    ]
+    failed_names = {
+        item.split(":", 1)[1]
+        for item in failures
+        if item.startswith("CHECK_FAILED:")
+    }
+    checks: list[dict[str, Any]] = []
+    raw_checks = payload.get("checks", [])
+    if not isinstance(raw_checks, Sequence) or isinstance(raw_checks, (str, bytes)):
+        raw_checks = []
+    for raw_check in raw_checks:
+        if not isinstance(raw_check, Mapping):
+            continue
+        name = raw_check.get("name")
+        failed = name in failed_names
+        check: dict[str, Any] = {
+            "name": name,
+            "required": bool(raw_check.get("required", False)),
+            "exit_code": raw_check.get("exit_code"),
+            "timed_out": bool(raw_check.get("timed_out", False)),
+            "workspace_mutated": bool(raw_check.get("workspace_mutated", False)),
+        }
+        if failed:
+            for key in ("stdout_tail", "stderr_tail"):
+                value = raw_check.get(key)
+                if isinstance(value, str) and value:
+                    data = value.encode("utf-8", errors="replace")
+                    if len(data) > _REVISION_CHECK_LOG_BYTES:
+                        data = data[-_REVISION_CHECK_LOG_BYTES:]
+                    check[key] = data.decode("utf-8", errors="replace")
+        checks.append(check)
+
+    return _json_text({
+        "deterministic_passed": bool(payload.get("deterministic_passed", False)),
+        "failure_ids": failures,
+        "checks": checks,
+    })
 
 
 def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
@@ -879,55 +986,57 @@ def _persist_revision_tree(run_dir: Path, name: str, tree: str) -> None:
     atomic_write_text(run_dir / "revision" / name, tree.rstrip() + "\n")
 
 
+def _render_revision_template(
+    template: str, values: Mapping[str, str], *, name: str,
+) -> str:
+    """Render one Claude template with one non-recursive substitution pass."""
+
+    expected = set(re.findall(r"\{\{[A-Z0-9_]+\}\}", template))
+    missing = expected.difference(values)
+    if missing:
+        raise OrchestrationError(
+            f"{name} template contains unresolved placeholders: "
+            + ", ".join(sorted(missing))
+        )
+    return re.sub(
+        r"\{\{[A-Z0-9_]+\}\}",
+        lambda match: values[match.group(0)],
+        template,
+    )
+
+
 def _revision_prompt(
     *,
     repository_reference: RepositoryReference,
     spec: str,
     plan: TaskPlanV2,
-    contracts: str,
-    luna_reports: str,
     changed_files: str,
-    diff: str,
-    diff_truncated: bool,
+    execution_anomalies: str,
     pre_checks: str,
     mutable_scope: str,
     deferred_mismatches: str,
 ) -> str:
     template = (Path(__file__).with_name("prompts") / "reviser.txt").read_text(encoding="utf-8")
-    values = {
+    values: dict[str, str] = {
         "{{REPOSITORY_REFERENCE}}": json.dumps(repository_reference_dict(repository_reference), ensure_ascii=False, indent=2),
         "{{SPEC}}": spec,
-        "{{PLAN_SUMMARY}}": _json_text({
-            "title": plan.title,
-            "objective": plan.objective,
-            "constraints": plan.constraints,
-            "acceptance": plan.acceptance,
-            "tests": plan.tests,
-            "risks": plan.risks,
-        }),
-        "{{ALL_STEP_CONTRACTS}}": contracts,
-        "{{LUNA_STEP_REPORTS}}": luna_reports,
+        "{{PLAN_SUMMARY}}": _revision_plan_summary(plan),
+        "{{APPROVED_CONTRACT_INDEX}}": _revision_contract_index(plan),
+        "{{EXECUTION_ANOMALIES}}": execution_anomalies,
         "{{CURRENT_CHANGED_FILES}}": changed_files,
-        "{{CURRENT_CUMULATIVE_DIFF}}": diff,
-        "{{SEMANTIC_DIFF_NOTE}}": _truncation_note(diff_truncated),
         "{{PRE_REVISION_CHECKS}}": pre_checks,
         "{{APPROVED_MUTABLE_SCOPE}}": mutable_scope,
         "{{DEFERRED_LUNA_CONTRACT_MISMATCHES}}": deferred_mismatches,
     }
-    for placeholder, value in values.items():
-        template = template.replace(placeholder, value)
-    return template
+    return _render_revision_template(template, values, name="reviser")
 
 
 def _check_repair_prompt(
     *,
-    repository_reference: RepositoryReference,
     spec: str,
     plan: TaskPlanV2,
-    contracts: str,
+    approved_contract_index: str,
     changed_files: str,
-    diff: str,
-    diff_truncated: bool,
     evidence: EvidenceBundle,
     mutable_scope: list[str],
     previous_report: str,
@@ -937,89 +1046,28 @@ def _check_repair_prompt(
     """Build the bounded prompt for one automatic check-repair pass."""
 
     failed_ids = _soft_check_failures(evidence)
-    failed_names = {item.split(":", 1)[1] for item in failed_ids}
-    checks: list[dict[str, Any]] = []
-    for check in evidence.checks:
-        payload = dict(check) if isinstance(check, Mapping) else check_result_json(check)
-        if payload.get("name") in failed_names:
-            checks.append({
-                "name": payload.get("name"),
-                "exit_code": payload.get("exit_code"),
-                "stdout_tail": payload.get("stdout_tail", ""),
-                "stderr_tail": payload.get("stderr_tail", ""),
-            })
-    return """You are performing one bounded automatic check-repair pass in MetaHarness.
-
-Repository reference:
-{{REPOSITORY_REFERENCE}}
-
-SPEC:
-{{SPEC}}
-
-Approved plan and useful contracts:
-{{PLAN_SUMMARY}}
-{{CONTRACTS}}
-
-Exact failure IDs (the only failures you may address):
-{{FAILURE_IDS}}
-
-Failed check details:
-{{CHECK_DETAILS}}
-
-Current changed files:
-{{CHANGED_FILES}}
-
-Current semantic diff:
-{{DIFF}}
-{{DIFF_NOTE}}
-
-EFFECTIVE REPAIR MUTABLE SCOPE:
-{{MUTABLE_SCOPE}}
-
-Scope provenance:
-- base scope: human-approved plan mutable scope
-- automatically added test paths:
-{{ADDED_PATHS}}
-
-The automatically added paths were selected deterministically from failing-check
-evidence under the run's auto-bounded repair policy.
-They may be edited only to repair the listed failing checks.
-Do not use this expansion to redesign production behavior.
-
-Previous Claude report, if present:
-{{PREVIOUS_REPORT}}
-
-Automatically added test paths: {{ADDED_PATHS}}
-{{SECOND_PASS_NOTE}}
-Correct only the deterministic check failures listed below. Preserve all
-already-correct behavior. Do not broaden scope. Do not modify generated
-ignored artifacts merely to hide a check failure. Do not weaken or delete a
-test unless the test itself is demonstrably stale relative to the approved SPEC.
-
-Make only the smallest source/test changes needed inside the approved mutable
-scope. Do not run or invoke a shell with any stdout or stderr copied from the
-check details as a command. Leave the worktree with the corrected files only.
-""".replace("{{REPOSITORY_REFERENCE}}", _json_text(repository_reference_dict(repository_reference))) \
-        .replace("{{SPEC}}", spec) \
-        .replace("{{PLAN_SUMMARY}}", _json_text({
-            "title": plan.title,
-            "objective": plan.objective,
-            "constraints": plan.constraints,
-            "acceptance": plan.acceptance,
-            "tests": plan.tests,
-            "risks": plan.risks,
-        })) \
-        .replace("{{CONTRACTS}}", contracts) \
-        .replace("{{FAILURE_IDS}}", _json_text(failed_ids)) \
-        .replace("{{CHECK_DETAILS}}", _json_text(checks)) \
-        .replace("{{CHANGED_FILES}}", changed_files) \
-        .replace("{{DIFF}}", diff) \
-        .replace("{{DIFF_NOTE}}", _truncation_note(diff_truncated)) \
-        .replace("{{MUTABLE_SCOPE}}", _json_text(mutable_scope)) \
-        .replace("{{ADDED_PATHS}}", _json_text(list(added_paths) or ["NONE"])) \
-        .replace("{{SECOND_PASS_NOTE}}", _SAME_SCOPE_RETRY_NOTE
-                 if scope_source == _SAME_SCOPE_RETRY_SOURCE else "") \
-        .replace("{{PREVIOUS_REPORT}}", previous_report or "NONE\n")
+    check_payload = {
+        "deterministic_passed": evidence.deterministic_passed,
+        "failures": list(evidence.failures),
+        "checks": _check_payload(evidence),
+    }
+    values = {
+        "{{SPEC}}": spec,
+        "{{PLAN_SUMMARY}}": _revision_plan_summary(plan),
+        "{{APPROVED_CONTRACT_INDEX}}": approved_contract_index,
+        "{{FAILURE_IDS}}": _json_text(failed_ids),
+        "{{CHECK_DETAILS}}": _revision_check_context(check_payload),
+        "{{CHANGED_FILES}}": changed_files,
+        "{{MUTABLE_SCOPE}}": _json_text(mutable_scope),
+        "{{ADDED_PATHS}}": _json_text(list(added_paths) or ["NONE"]),
+        "{{SECOND_PASS_NOTE}}": _SAME_SCOPE_RETRY_NOTE
+        if scope_source == _SAME_SCOPE_RETRY_SOURCE else "",
+        "{{PREVIOUS_REPAIR_REPORT}}": previous_report or "NONE\n",
+    }
+    template = (Path(__file__).with_name("prompts") / "check_repair.txt").read_text(
+        encoding="utf-8"
+    )
+    return _render_revision_template(template, values, name="check_repair")
 
 
 _SAME_SCOPE_RETRY_NOTE = """
@@ -1797,7 +1845,7 @@ def _archive_attempt_tree(directory: Path) -> None:
         os.replace(source, destination)
 
 
-def _reusable_pre_checks(artifact_dir: Path, tree: str) -> tuple[dict[str, Any], str] | None:
+def _reusable_pre_checks(artifact_dir: Path, tree: str) -> dict[str, Any] | None:
     """Durable pre-revision evidence frozen for exactly *tree*, if any."""
 
     payload = _read_json_artifact(artifact_dir / "pre_checks.json")
@@ -1812,10 +1860,12 @@ def _reusable_pre_checks(artifact_dir: Path, tree: str) -> tuple[dict[str, Any],
     if not isinstance(evidence, dict) or evidence.get("staged_tree_sha") != tree:
         return None
     try:
-        diff = (artifact_dir / "diff.patch").read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+        # Keep the durable evidence existence check, but never return its
+        # contents to a Claude prompt.
+        (artifact_dir / "diff.patch").read_bytes()
+    except OSError:
         return None
-    return payload, diff
+    return payload
 
 
 def _load_evidence(directory: Path) -> EvidenceBundle | None:
@@ -3680,7 +3730,7 @@ class Orchestrator:
                 try:
                     revision_result, revision_error = self._run_v2_revision_cycle(
                         store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
-                        base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
+                        base_tree_sha=base_tree_sha, spec=spec, plan=plan,
                         repository_reference=repository_reference, info=info,
                         branch_ref=branch_ref, ownership_before=ownership_before,
                         selection=selection,
@@ -3830,7 +3880,7 @@ class Orchestrator:
                 try:
                     check_repair_result_c01, repair_error = self._run_v2_revision_cycle(
                         store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
-                        base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
+                        base_tree_sha=base_tree_sha, spec=spec, plan=plan,
                         repository_reference=repository_reference, info=info,
                         branch_ref=branch_ref, ownership_before=ownership_before,
                         selection=selection, mutable_scope=list(
@@ -3932,7 +3982,7 @@ class Orchestrator:
                         if at <= phase_index(expanded_phase):
                             expanded_check_repair_result_c01, repair_error = self._run_v2_revision_cycle(
                                 store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
-                                base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
+                                base_tree_sha=base_tree_sha, spec=spec, plan=plan,
                                 repository_reference=repository_reference, info=info,
                                 branch_ref=branch_ref, ownership_before=ownership_before,
                                 selection=selection,
@@ -4116,7 +4166,7 @@ class Orchestrator:
                 )
                 expanded_check_repair_result_c01, repair_error = self._run_v2_revision_cycle(
                     store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
-                    base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
+                    base_tree_sha=base_tree_sha, spec=spec, plan=plan,
                     repository_reference=repository_reference, info=info,
                     branch_ref=branch_ref, ownership_before=ownership_before,
                     selection=selection,
@@ -4207,7 +4257,7 @@ class Orchestrator:
             if at <= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01):
                 expanded_check_repair_result_c01, repair_error = self._run_v2_revision_cycle(
                     store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
-                    base_tree_sha=base_tree_sha, spec=spec, plan=plan, bundle=bundle,
+                    base_tree_sha=base_tree_sha, spec=spec, plan=plan,
                     repository_reference=repository_reference, info=info,
                     branch_ref=branch_ref, ownership_before=ownership_before,
                     selection=selection,
@@ -5339,16 +5389,13 @@ class Orchestrator:
         base_tree_sha: str,
         spec: str,
         plan: TaskPlanV2,
-        bundle: Mapping[str, Any],
         repository_reference: RepositoryReference,
         info: Any,
         branch_ref: str,
         ownership_before: Any,
         selection: ExecutionSelectionV4,
         artifact_dir: Path | None = None,
-        contract_dir: Path | None = None,
         mutable_scope: list[str] | None = None,
-        luna_reports: str | None = None,
         deferred_mismatches: str | None = None,
         deferred_mismatch_present: bool = False,
         check_repair_evidence: EvidenceBundle | None = None,
@@ -5423,8 +5470,12 @@ class Orchestrator:
             self._checkpoint(
                 run_dir, repair_phase, cycle=cycle, head=expected_head, tree=tree_before,
             )
-            pre_payload = {"checks": _check_payload(check_repair_evidence)}
-            pre_diff = check_repair_evidence.diff
+            pre_payload = {
+                "checks": _check_payload(check_repair_evidence),
+                "failures": list(check_repair_evidence.failures),
+                "deterministic_passed": check_repair_evidence.deterministic_passed,
+                "staged_tree_sha": check_repair_evidence.staged_tree_sha,
+            }
         else:
             reused = _reusable_pre_checks(artifact_dir, tree_before)
             if reused is None:
@@ -5463,35 +5514,24 @@ class Orchestrator:
                     pre_hard = [item for item in pre_hard if item != "EMPTY_DIFF"]
                 if pre_hard:
                     return None, pre_hard[0].split(":", 1)[0]
-                pre_diff = pre_evidence.diff
                 # Pre-revision checks complete: the next operation is Claude.  The
                 # authorized HEAD is the worktree HEAD (base for C01, the C01
                 # candidate commit for C02), exactly as _validate_resume expects.
                 self._checkpoint(run_dir, claude_phase, cycle=cycle, head=expected_head, tree=tree_before)
             else:
-                pre_payload, pre_diff = reused
-        contracts = "\n\n".join(
-            read_approved_step_contract(contract_dir or run_dir, bundle, step.id)
-            for step in plan.steps
-        )
-        semantic_diff, diff_truncated, _full_diff_bytes = _semantic_diff_payload(
-            pre_diff, self.config.max_diff_bytes
-        )
+                pre_payload = reused
         if is_check_repair:
-            previous_dir = run_dir / "revision" / (f"C0{cycle}" if cycle == 2 else "")
+            previous_report = ""
             if check_repair_phase_override in _SECOND_CHECK_REPAIR_PHASES:
                 # The second pass must read the *first repair's* report, not
                 # the initial revision it already superseded.
                 previous_dir = run_dir / "revision" / "check-repair" / f"C0{cycle}"
-            previous_report = _read_bounded_text(previous_dir / "agent.final.md")
+                previous_report = _read_bounded_text(previous_dir / "agent.final.md")
             revision_prompt = _check_repair_prompt(
-                repository_reference=repository_reference,
                 spec=spec,
                 plan=plan,
-                contracts=contracts,
+                approved_contract_index=_revision_contract_index(plan),
                 changed_files="\n".join(check_repair_evidence.changed_files),
-                diff=semantic_diff,
-                diff_truncated=diff_truncated,
                 evidence=check_repair_evidence,
                 mutable_scope=mutable_scope,
                 previous_report=previous_report,
@@ -5503,12 +5543,12 @@ class Orchestrator:
                 repository_reference=repository_reference,
                 spec=spec,
                 plan=plan,
-                contracts=contracts,
-                luna_reports=luna_reports if luna_reports is not None else _step_reports_text(self._last_v2_step_results),
                 changed_files="\n".join(changed_paths_between_trees(repo, base_tree_sha, tree_before)),
-                diff=semantic_diff,
-                diff_truncated=diff_truncated,
-                pre_checks=_json_text(pre_payload),
+                execution_anomalies=_revision_execution_anomalies(
+                    self._repair_v2_step_results if cycle == 2
+                    else self._last_v2_step_results
+                ),
+                pre_checks=_revision_check_context(pre_payload),
                 mutable_scope=_json_text(mutable_scope),
                 deferred_mismatches=deferred_mismatches or "NONE\n",
             )
@@ -5887,17 +5927,11 @@ class Orchestrator:
             cycle_2_revision, revision_error = self._run_v2_revision_cycle(
                 store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
                 base_tree_sha=resolve_tree(repo, base_sha), spec=spec, plan=repair_plan,
-                bundle=repair_bundle, repository_reference=repository_reference, info=info,
+                repository_reference=repository_reference, info=info,
                 branch_ref=branch_ref, ownership_before=ownership_before, selection=selection,
-                artifact_dir=run_dir / "revision" / "C02", contract_dir=repair_dir,
+                artifact_dir=run_dir / "revision" / "C02",
                 mutable_scope=repair_scope,
-                luna_reports=_step_reports_text(self._repair_v2_step_results),
-                deferred_mismatches=(
-                    "C01 DEFERRED CONTRACT MISMATCHES\n"
-                    f"{_deferred_contract_mismatches(original_plan, self._last_v2_step_results)}\n"
-                    "C02 DEFERRED CONTRACT MISMATCHES\n"
-                    f"{deferred_mismatches}"
-                ),
+                deferred_mismatches=deferred_mismatches,
                 deferred_mismatch_present=(
                     _has_deferred_contract_mismatches(self._last_v2_step_results)
                     or _has_deferred_contract_mismatches(self._repair_v2_step_results)
@@ -6023,12 +6057,12 @@ class Orchestrator:
                 check_repair_result_c02, repair_error = self._run_v2_revision_cycle(
                     store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
                     base_tree_sha=resolve_tree(repo, base_sha), spec=spec,
-                    plan=repair_plan, bundle=repair_bundle,
+                    plan=repair_plan,
                     repository_reference=repository_reference, info=info,
                     branch_ref=branch_ref, ownership_before=ownership_before,
                     selection=selection, artifact_dir=(
                         run_dir / "revision" / "check-repair" / "C02"
-                    ), contract_dir=repair_dir, mutable_scope=list(
+                    ), mutable_scope=list(
                         check_repair_scope_c02.effective_paths
                         if check_repair_scope_c02 is not None else repair_scope
                     ),
@@ -6115,11 +6149,10 @@ class Orchestrator:
                             expanded_check_repair_result_c02, repair_error = self._run_v2_revision_cycle(
                                 store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
                                 base_tree_sha=resolve_tree(repo, base_sha), spec=spec,
-                                plan=repair_plan, bundle=repair_bundle,
+                                plan=repair_plan,
                                 repository_reference=repository_reference, info=info,
                                 branch_ref=branch_ref, ownership_before=ownership_before,
                                 selection=selection, artifact_dir=expanded_dir,
-                                contract_dir=repair_dir,
                                 mutable_scope=list(expanded_scope.effective_paths),
                                 check_repair_evidence=evidence, cycle=2,
                                 check_repair_scope=expanded_scope,
@@ -6270,11 +6303,10 @@ class Orchestrator:
                 expanded_check_repair_result_c02, repair_error = self._run_v2_revision_cycle(
                     store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
                     base_tree_sha=resolve_tree(repo, base_sha), spec=spec,
-                    plan=repair_plan, bundle=repair_bundle,
+                    plan=repair_plan,
                     repository_reference=repository_reference, info=info,
                     branch_ref=branch_ref, ownership_before=ownership_before,
                     selection=selection, artifact_dir=expanded_dir,
-                    contract_dir=repair_dir,
                     mutable_scope=list(expanded_scope.effective_paths),
                     check_repair_evidence=evidence, cycle=2,
                     check_repair_scope=expanded_scope,
@@ -6343,11 +6375,10 @@ class Orchestrator:
                 expanded_check_repair_result_c02, repair_error = self._run_v2_revision_cycle(
                     store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
                     base_tree_sha=resolve_tree(repo, base_sha), spec=spec,
-                    plan=repair_plan, bundle=repair_bundle,
+                    plan=repair_plan,
                     repository_reference=repository_reference, info=info,
                     branch_ref=branch_ref, ownership_before=ownership_before,
                     selection=selection, artifact_dir=expanded_dir,
-                    contract_dir=repair_dir,
                     mutable_scope=list(expanded_scope.effective_paths),
                     check_repair_evidence=evidence, cycle=2,
                     check_repair_scope=expanded_scope,

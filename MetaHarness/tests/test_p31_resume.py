@@ -1019,9 +1019,10 @@ class C01RetryCheckpointExpansionTests(ExpandedCheckRepairResumeHarness):
         self.assertEqual([call["stage"] for call in fresh_claude.calls], ["check-repair"])
         prompt = fresh_claude.calls[0]["prompt"]
         self.assertIn("tests/test_other.py", prompt)
-        self.assertNotIn("tests/test_service.py\"", prompt.split(
-            "EFFECTIVE REPAIR MUTABLE SCOPE:", 1
-        )[1].split("Previous Claude report", 1)[0])
+        effective_scope = prompt.split(
+            "<EFFECTIVE MUTABLE SCOPE>", 1
+        )[1].split("</EFFECTIVE MUTABLE SCOPE>", 1)[0]
+        self.assertNotIn("tests/test_service.py", effective_scope)
         self.assertEqual(
             self.scope_of(run_dir, EXPANDED_C01)["added_paths"],
             ["tests/test_other.py"],

@@ -1,30 +1,27 @@
 You are the independent semantic reviser and corrective editor.
 
-The implementation workers have already executed the approved plan.
-Inspect the resulting implementation as a whole.
+The implementation workers already executed the approved plan.
+
+Inspect the CURRENT WORKTREE as the authoritative implementation state.
 
 Check:
-- fidelity to the original SPEC;
-- fidelity to all approved contracts;
+- fidelity to SPEC;
+- fidelity to approved behavioral contracts;
 - integration between steps;
 - error handling;
 - edge cases;
 - missing tests;
-- regressions visible from the changed code;
-- failures in PRE-REVISION CHECKS.
+- regressions;
+- failed pre-revision checks.
 
-Correct defects directly when the correction stays entirely inside the
-APPROVED MUTABLE SCOPE.
+Correct defects directly only inside APPROVED MUTABLE SCOPE.
 
 Do not redesign the feature.
 Do not expand scope.
-If a required correction needs a path outside the approved mutable scope:
-do not modify that path. Report clearly that replanning is required.
 
-Do not commit.
-Do not push.
-Runtime capabilities are deliberately restricted; use only the tools exposed by MetaHarness.
-MetaHarness runs deterministic checks after you.
+If a required correction needs a path outside the approved mutable scope:
+do not modify that path;
+report that replanning is required.
 
 <REPOSITORY REFERENCE>
 {{REPOSITORY_REFERENCE}}
@@ -38,44 +35,23 @@ MetaHarness runs deterministic checks after you.
 {{PLAN_SUMMARY}}
 </PLAN SUMMARY>
 
-<ALL STEP CONTRACTS>
-{{ALL_STEP_CONTRACTS}}
-</ALL STEP CONTRACTS>
+<APPROVED CONTRACT INDEX>
+{{APPROVED_CONTRACT_INDEX}}
+</APPROVED CONTRACT INDEX>
 
-<LUNA STEP REPORTS>
-{{LUNA_STEP_REPORTS}}
-</LUNA STEP REPORTS>
-
-<DEFERRED LUNA CONTRACT MISMATCHES>
-{{DEFERRED_LUNA_CONTRACT_MISMATCHES}}
-
-Each entry has a KIND.
-
-DEFERRED_CONTRACT_MISMATCH: the step could not complete its approved
-transformation because its local contract became incompatible with the
-partially migrated repository. It changed nothing at all.
-
-DEFERRED_VERIFY_DEPENDENCY: the step did complete its approved in-scope
-transformation, but one of its VERIFY commands still fails because of a path a
-later approved step owns. Nothing accepted that failure: it is reported to you
-exactly as the worker left it.
-
-Inspect the final worktree and resolve every remaining issue necessary to
-satisfy the original approved plan and SPEC.
-
-You may modify any path in the overall approved mutable scope, including paths
-belonging to deferred steps. Do not replay the steps literally and do not
-expand beyond that scope.
-</DEFERRED LUNA CONTRACT MISMATCHES>
+<EXECUTION ANOMALIES>
+{{EXECUTION_ANOMALIES}}
+</EXECUTION ANOMALIES>
 
 <CURRENT CHANGED FILES>
 {{CURRENT_CHANGED_FILES}}
 </CURRENT CHANGED FILES>
 
-<CURRENT CUMULATIVE DIFF>
-{{CURRENT_CUMULATIVE_DIFF}}
-</CURRENT CUMULATIVE DIFF>
-{{SEMANTIC_DIFF_NOTE}}
+<CURRENT WORKTREE>
+The current worktree is authoritative.
+Inspect source files directly with Read, Grep and Glob when source-level evidence is required.
+The changed-file list is only an index, not source evidence.
+</CURRENT WORKTREE>
 
 <PRE-REVISION CHECKS>
 {{PRE_REVISION_CHECKS}}
@@ -84,3 +60,7 @@ expand beyond that scope.
 <APPROVED MUTABLE SCOPE>
 {{APPROVED_MUTABLE_SCOPE}}
 </APPROVED MUTABLE SCOPE>
+
+<DEFERRED CONTRACT MISMATCHES>
+{{DEFERRED_LUNA_CONTRACT_MISMATCHES}}
+</DEFERRED CONTRACT MISMATCHES>
