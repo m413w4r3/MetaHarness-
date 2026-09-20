@@ -19,6 +19,7 @@ from metaharness.claude.agent import (  # noqa: E402
     ClaudeCodeAgent,
     build_claude_environment,
     build_revision_prompt,
+    parse_scope_request,
 )
 from metaharness.claude.auth import check_claude_authentication  # noqa: E402
 from metaharness.claude.runtime import (  # noqa: E402
@@ -394,6 +395,132 @@ class ClaudeTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "sandbox is not allowed"):
             load_config(config)
+
+
+class ScopeRequestParserTests(unittest.TestCase):
+    """``META SCOPE REQUEST v1`` syntax, tested away from the pipeline.
+
+    The parser is a Claude primitive: a malformed block must be
+    indistinguishable from no block at all, and no input may raise.
+    """
+
+    VALID = """META SCOPE REQUEST v1
+
+REASON
+The failing correction requires the existing test.
+
+PATHS
+- frontend/e2e/example.spec.ts
+
+EVIDENCE
+- CHECK_FAILED:test | locator no longer matches
+
+END META SCOPE REQUEST
+"""
+
+    def parse(self, text: str):
+        try:
+            return parse_scope_request(text)
+        except Exception as exc:  # pragma: no cover - the assertion is the test
+            self.fail(f"parse_scope_request raised {exc!r}")
+
+    def test_a_valid_block_yields_the_exact_reason_paths_and_evidence(self) -> None:
+        request = self.parse(self.VALID)
+
+        self.assertIsNotNone(request)
+        self.assertEqual(request.reason, "The failing correction requires the existing test.")
+        self.assertEqual(request.paths, ("frontend/e2e/example.spec.ts",))
+        self.assertEqual(
+            request.evidence, ("CHECK_FAILED:test | locator no longer matches",)
+        )
+
+    def test_a_valid_block_survives_surrounding_prose(self) -> None:
+        request = self.parse("Report intro.\n\n" + self.VALID + "\nTrailing prose.\n")
+
+        self.assertIsNotNone(request)
+        self.assertEqual(request.paths, ("frontend/e2e/example.spec.ts",))
+
+    def replace_paths(self, *paths: str) -> str:
+        return self.VALID.replace(
+            "- frontend/e2e/example.spec.ts",
+            "\n".join(f"- {path}" for path in paths),
+        )
+
+    def test_every_rejected_path_shape_is_indistinguishable_from_no_request(self) -> None:
+        cases = {
+            "duplicate": self.replace_paths("src/a.py", "src/a.py"),
+            "absolute": self.replace_paths("/etc/passwd"),
+            "traversal": self.replace_paths("../outside.py"),
+            "dot slash": self.replace_paths("./foo.py"),
+            "directory": self.replace_paths("src/"),
+            "backslash": self.replace_paths("src\\a.py"),
+            "glob star": self.replace_paths("src/*.py"),
+            "glob question": self.replace_paths("src/a?.py"),
+            "glob bracket": self.replace_paths("src/[ab].py"),
+            "glob brace": self.replace_paths("src/{a,b}.py"),
+            "empty path entry": self.replace_paths(" "),
+            "more than 32 paths": self.replace_paths(
+                *[f"src/module_{index}.py" for index in range(33)]
+            ),
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(self.parse(text), name)
+
+    def test_exactly_32_paths_are_still_accepted(self) -> None:
+        request = self.parse(
+            self.replace_paths(*[f"src/module_{index}.py" for index in range(32)])
+        )
+
+        self.assertIsNotNone(request)
+        self.assertEqual(len(request.paths), 32)
+
+    def test_every_malformed_envelope_is_indistinguishable_from_no_request(self) -> None:
+        cases = {
+            "duplicate header": self.VALID.replace(
+                "META SCOPE REQUEST v1",
+                "META SCOPE REQUEST v1\n\nMETA SCOPE REQUEST v1",
+                1,
+            ),
+            "missing footer": self.VALID.replace("END META SCOPE REQUEST\n", ""),
+            "duplicate footer": self.VALID + "END META SCOPE REQUEST\n",
+            "missing REASON": self.VALID.replace("REASON\n", ""),
+            "missing PATHS": self.VALID.replace(
+                "PATHS\n- frontend/e2e/example.spec.ts\n\n", ""
+            ),
+            "missing EVIDENCE": self.VALID.replace(
+                "EVIDENCE\n- CHECK_FAILED:test | locator no longer matches\n\n", ""
+            ),
+            "blank evidence": self.VALID.replace(
+                "- CHECK_FAILED:test | locator no longer matches", "- "
+            ),
+            "blank reason": self.VALID.replace(
+                "The failing correction requires the existing test.", "   "
+            ),
+            "prose inside PATHS": self.VALID.replace(
+                "- frontend/e2e/example.spec.ts",
+                "the spec file below is required\n- frontend/e2e/example.spec.ts",
+            ),
+            "prose inside EVIDENCE": self.VALID.replace(
+                "- CHECK_FAILED:test | locator no longer matches",
+                "the locator drifted\n- CHECK_FAILED:test | locator no longer matches",
+            ),
+            "footer before header": (
+                "END META SCOPE REQUEST\n" + self.VALID.replace(
+                    "END META SCOPE REQUEST\n", ""
+                )
+            ),
+            "no block at all": "Plain revision report with no structured block.\n",
+            "empty": "",
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(self.parse(text), name)
+
+    def test_a_non_string_input_returns_none_without_raising(self) -> None:
+        for value in (None, 17, [], {"reason": "x"}, object()):
+            with self.subTest(repr(value)):
+                self.assertIsNone(self.parse(value))
 
 
 if __name__ == "__main__":

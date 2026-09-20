@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.agent.codex import build_implementer_step_prompt  # noqa: E402
 from metaharness.models import (  # noqa: E402
+    CheckConfig,
     ExecutionMode,
     ExecutionRole,
     ModelProfile,
@@ -20,6 +21,9 @@ from metaharness.models import (  # noqa: E402
 )
 from metaharness.planning_v2 import (  # noqa: E402
     MAX_STEPS,
+    CheckScopeRepairPlannerV2,
+    SCOPE_REPAIR_EVIDENCE_FILENAME,
+    build_scope_repair_planner_prompt_bundle,
     MAX_STEP_CONTRACT_CHARS,
     REQUIRE_STAGED_POLICY_TEXT,
     PlannerV2,
@@ -1006,6 +1010,211 @@ class RepairDecompositionPolicyPromptTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     render_repair_decomposition_policy_text(value)
+
+
+def _scope_repair_inputs(**overrides):
+    values = {
+        "repository_reference": "REPOSITORY",
+        "original_spec": "SPEC",
+        "original_plan_summary": "PLAN_SUMMARY",
+        "original_step_index": "STEP_INDEX",
+        "current_repository_state": "STATE",
+        "failed_checks": "FAILED_CHECKS",
+        "current_authorized_mutable_scope": "AUTHORIZED_SCOPE",
+        "failed_claude_repair_report": "CLAUDE_REPORT",
+        "outside_scope_paths_observed": "OUTSIDE_PATHS",
+        "claude_scope_request": "CLAUDE_REQUEST",
+    }
+    values.update(overrides)
+    return values
+
+
+class _FileFallbackClient:
+    """Bridge double exposing the optional file-fallback transport API."""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.calls: list[dict] = []
+
+    def complete(self, prompt: str) -> str:  # pragma: no cover - must not win
+        raise AssertionError("the file-fallback transport must be preferred")
+
+    def complete_with_file_fallback(self, prompt, *, fallback_prompt, attachments,
+                                    fallback_attempt):
+        self.calls.append({
+            "prompt": prompt, "fallback_prompt": fallback_prompt,
+            "attachments": attachments, "fallback_attempt": fallback_attempt,
+        })
+        return self.answer
+
+
+class CheckScopeRepairPlannerTests(unittest.TestCase):
+    """The strong planner that answers one recovered scope violation.
+
+    It proposes; it never authorizes.  Everything asserted here is either the
+    durable provenance of that proposal or a gate that stays applied to it.
+    """
+
+    CATALOG = (
+        CheckConfig("lint", ("make", "lint")),
+        CheckConfig("test", ("make", "test")),
+    )
+    REQUIRED = ("lint", "test")
+    SENTINELS = (
+        "SPEC", "PLAN_SUMMARY", "STEP_INDEX", "STATE", "FAILED_CHECKS",
+        "AUTHORIZED_SCOPE", "CLAUDE_REPORT", "OUTSIDE_PATHS", "CLAUDE_REQUEST",
+    )
+
+    def answer(self, *, write=("src/example.py",)) -> str:
+        plan = _plan(steps=_sets_step(1, write=tuple(write)))
+        section = "REQUIRED_CHECKS\n" + "".join(f"- {name}\n" for name in self.REQUIRED)
+        return plan.replace("CONSTRAINTS\nNONE\n", f"CONSTRAINTS\nNONE\n\n{section}", 1)
+
+    def planner(self, client, *, planning=None) -> CheckScopeRepairPlannerV2:
+        return CheckScopeRepairPlannerV2(
+            client,
+            implementer_ids=frozenset({"impl-a"}),
+            reviewer_ids=frozenset({"review-a"}),
+            planning=planning or PlanningConfig(protocol="v2"),
+            check_catalog=self.CATALOG,
+            original_required_check_ids=self.REQUIRED,
+        )
+
+    def plan_once(self, client, *, planning=None, **overrides):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        target = Path(directory.name) / "scope-repair" / "C01"
+        plan = self.planner(client, planning=planning).plan(
+            **_scope_repair_inputs(**overrides), artifacts_dir=target
+        )
+        return plan, target
+
+    def test_a_every_request_artifact_is_durable_and_hash_bound(self) -> None:
+        client = _FileFallbackClient(self.answer())
+        plan, target = self.plan_once(client)
+
+        for name in ("planner.request.txt", "planner.request.fallback.txt",
+                     "planner.evidence.md", "planner.request.meta.json",
+                     "planner.raw.md"):
+            self.assertTrue((target / name).is_file(), name)
+        meta = json.loads((target / "planner.request.meta.json").read_text(encoding="utf-8"))
+
+        def digest(name: str) -> str:
+            return hashlib.sha256(
+                (target / name).read_text(encoding="utf-8").encode("utf-8")
+            ).hexdigest()
+
+        self.assertEqual(meta["inline_sha256"], digest("planner.request.txt"))
+        self.assertEqual(
+            meta["fallback_prompt_sha256"], digest("planner.request.fallback.txt")
+        )
+        self.assertEqual(meta["evidence_sha256"], digest("planner.evidence.md"))
+        self.assertEqual(meta["file_fallback_attempt"], 3)
+        self.assertEqual(plan.decision, PlanDecision.READY)
+
+    def test_b_the_inline_prompt_carries_the_bounded_evidence(self) -> None:
+        client = _FileFallbackClient(self.answer())
+        _plan_value, target = self.plan_once(client)
+        inline = (target / "planner.request.txt").read_text(encoding="utf-8")
+        evidence = (target / "planner.evidence.md").read_text(encoding="utf-8")
+
+        self.assertEqual(client.calls[0]["prompt"], inline)
+        for sentinel in self.SENTINELS:
+            self.assertIn(sentinel, inline, sentinel)
+        self.assertIn(evidence, inline)
+        self.assertTrue(evidence.startswith("CHECK SCOPE REPAIR PLANNER EVIDENCE v1\n"))
+        self.assertTrue(evidence.endswith("END CHECK SCOPE REPAIR PLANNER EVIDENCE\n"))
+
+    def test_c_the_fallback_prompt_names_the_attachment_instead_of_repeating_it(self) -> None:
+        client = _FileFallbackClient(self.answer())
+        _plan_value, target = self.plan_once(client)
+        fallback = (target / "planner.request.fallback.txt").read_text(encoding="utf-8")
+        evidence = (target / "planner.evidence.md").read_text(encoding="utf-8")
+
+        self.assertEqual(client.calls[0]["fallback_prompt"], fallback)
+        self.assertIn(SCOPE_REPAIR_EVIDENCE_FILENAME, fallback)
+        self.assertEqual(SCOPE_REPAIR_EVIDENCE_FILENAME, "scope-repair-evidence.md")
+        self.assertIn(
+            "[scope-repair evidence intentionally moved to attachment]", fallback
+        )
+        self.assertNotIn(evidence, fallback)
+        for sentinel in ("STEP_INDEX", "CLAUDE_REPORT", "OUTSIDE_PATHS",
+                         "CLAUDE_REQUEST", "FAILED_CHECKS", "AUTHORIZED_SCOPE"):
+            self.assertNotIn(sentinel, fallback, sentinel)
+
+    def test_d_the_third_attempt_attaches_the_complete_evidence(self) -> None:
+        client = _FileFallbackClient(self.answer())
+        _plan_value, target = self.plan_once(client)
+        evidence = (target / "planner.evidence.md").read_text(encoding="utf-8")
+        [call] = client.calls
+
+        self.assertEqual(call["fallback_attempt"], 3)
+        attachment = call["attachments"][0]
+        self.assertEqual(attachment.filename, SCOPE_REPAIR_EVIDENCE_FILENAME)
+        self.assertEqual(attachment.text, evidence)
+        for sentinel in self.SENTINELS:
+            self.assertIn(sentinel, attachment.text, sentinel)
+
+    def test_e_an_optional_current_diff_is_attached_separately_and_declared(self) -> None:
+        client = _FileFallbackClient(self.answer())
+        _plan_value, target = self.plan_once(client, fallback_current_diff="diff --git a b\n")
+        [call] = client.calls
+
+        self.assertEqual(
+            [attachment.filename for attachment in call["attachments"]],
+            [SCOPE_REPAIR_EVIDENCE_FILENAME, "current-worktree.diff"],
+        )
+        meta = json.loads((target / "planner.request.meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["current_diff_attachment_bytes"], len("diff --git a b\n"))
+
+    def test_f_the_answer_stays_meta_plan_v2_with_the_original_required_checks(self) -> None:
+        client = _FileFallbackClient(self.answer())
+        plan, target = self.plan_once(client)
+
+        self.assertEqual(plan.raw, (target / "planner.raw.md").read_text(encoding="utf-8"))
+        self.assertEqual(plan.execution_mode, ExecutionMode.SINGLE)
+        self.assertEqual(plan.required_checks, self.REQUIRED)
+        inline = (target / "planner.request.txt").read_text(encoding="utf-8")
+        self.assertIn("ORIGINAL REQUIRED CHECK IDS\n- lint\n- test", inline)
+        self.assertIn("Preserve every\nORIGINAL_REQUIRED_CHECKS ID in REQUIRED_CHECKS.", inline)
+        # The proposal is only durable through the shared bundle authority.
+        validate_implementation_bundle(target, expected_step_ids=["S01"])
+
+    def test_g_a_dropped_original_required_check_is_rejected(self) -> None:
+        answer = self.answer().replace("- test\n", "", 1)
+        with self.assertRaises(V2PlanParseError):
+            self.plan_once(_FileFallbackClient(answer))
+
+    def test_h_the_repair_decomposition_policy_still_bounds_the_proposal(self) -> None:
+        planning = _aggressive(
+            single_step_max_mutable_paths=2, staged_step_max_mutable_paths=3
+        )
+        client = _FileFallbackClient(self.answer(write=_paths("w", 6)))
+        with self.assertRaisesRegex(V2PlanParseError, "at most 3 distinct mutable paths"):
+            self.plan_once(client, planning=planning)
+        self.assertIn(
+            "may modify at most 3 distinct mutable\npaths across the UNION of",
+            client.calls[0]["prompt"],
+        )
+
+    def test_i_a_bridge_without_the_fallback_api_still_gets_the_inline_request(self) -> None:
+        client = _CapturingClient(self.answer())
+        _plan_value, target = self.plan_once(client)
+
+        self.assertEqual(
+            client.prompts,
+            [(target / "planner.request.txt").read_text(encoding="utf-8")],
+        )
+
+    def test_j_the_prompt_bundle_is_a_pure_function_of_its_evidence(self) -> None:
+        first = build_scope_repair_planner_prompt_bundle(**_scope_repair_inputs())
+        again = build_scope_repair_planner_prompt_bundle(**_scope_repair_inputs())
+        other = build_scope_repair_planner_prompt_bundle(
+            **_scope_repair_inputs(outside_scope_paths_observed="OTHER_PATHS")
+        )
+
+        self.assertEqual(first.evidence_text, again.evidence_text)
+        self.assertNotEqual(first.evidence_text, other.evidence_text)
 
 
 class MustNotBeCalled:

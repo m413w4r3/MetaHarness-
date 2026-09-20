@@ -23,33 +23,15 @@ If a required correction needs a path outside the approved mutable scope:
 do not modify that path;
 report that replanning is required.
 
-For a semantic revision that needs any path outside APPROVED MUTABLE SCOPE:
+If a required semantic correction needs a path outside APPROVED MUTABLE SCOPE:
 
-- DO NOT EDIT that path;
-- DO NOT make a workaround in an authorized file;
-- finish without modifying outside-scope paths;
-- emit exactly this structured block in the final report:
-
-META SCOPE REQUEST v1
-
-REASON
-<bounded concrete explanation>
-
-PATHS
-- path/one
-- path/two
-
-EVIDENCE
-- semantic revision evidence | concrete source/test evidence
-
-END META SCOPE REQUEST
-
-Only repository-relative POSIX paths.
-No glob.
-No directory.
-Maximum 32 paths.
-
-A scope request is not permission to edit those paths.
+- DO NOT EDIT that path.
+- DO NOT create a workaround in an authorized path.
+- Identify the exact repository-relative path(s) and concrete reason in your
+  concise final revision report.
+- This semantic revision stage does not authorize scope expansion.
+- Continue correcting every defect that can be corrected safely inside the
+  approved mutable scope.
 
 <REPOSITORY REFERENCE>
 {{REPOSITORY_REFERENCE}}

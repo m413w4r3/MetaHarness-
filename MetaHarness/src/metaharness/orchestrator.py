@@ -3897,9 +3897,6 @@ class Orchestrator:
                     return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None,
                                            redact(str(exc), self._secrets))
                 if revision_error is not None:
-                    if revision_error == _SCOPE_REQUEST_ROUTE:
-                        self._v2_failed(store, run_dir, "REVISION_SCOPE_VIOLATION", None)
-                        return self.resume(run_id)
                     return self._v2_failed(store, run_dir, revision_error, None)
                 self._cycle_update(
                     store, 1, status="completed",
@@ -5768,6 +5765,9 @@ class Orchestrator:
         atomic_write_text(artifact_dir / "tree_after.txt", tree_after.rstrip() + "\n")
         changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
         outside_scope = [path for path in changed_paths if path not in set(mutable_scope)]
+        # META SCOPE REQUEST is a check-repair-only machine protocol.
+        # Semantic revision may report an out-of-scope dependency in prose, but
+        # must not enter the bounded check-repair scope state machine.
         scope_request = (
             parse_scope_request(result.final_message)
             if is_check_repair else None

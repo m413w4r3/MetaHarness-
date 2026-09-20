@@ -183,6 +183,48 @@ def _safe_json_payload(path: Path) -> Any:
         return None
 
 
+_SCOPE_RECOVERY_SOURCES = ("check-repair", "check-repair-expanded")
+
+
+def _scope_violation_recovery_artifact(
+    run_dir: Path,
+    cycle: int,
+) -> tuple[Mapping[str, Any], str | None]:
+    """Locate the durable scope-violation recovery proof for one cycle.
+
+    A violation may have been produced by the normal check repair or by the
+    expanded one, so both directories are examined.  When both hold a valid
+    recovery artifact the caller is told the situation is ambiguous instead of
+    being handed a silently chosen winner.
+    """
+
+    found: list[tuple[str, Mapping[str, Any]]] = []
+    for source in _SCOPE_RECOVERY_SOURCES:
+        payload = _safe_json_payload(
+            run_dir / "revision" / source / f"C0{cycle}" / "scope_violation_recovery.json"
+        )
+        if isinstance(payload, Mapping):
+            found.append((source, payload))
+    if not found:
+        return {}, None
+    if len(found) == 1:
+        source, payload = found[0]
+        return payload, source
+    return {
+        "ambiguous": True,
+        "candidates": [
+            {
+                "artifact": f"revision/{source}/C0{cycle}/scope_violation_recovery.json",
+                "outside_scope_paths": (
+                    len(payload["outside_scope_paths"])
+                    if isinstance(payload.get("outside_scope_paths"), list) else 0
+                ),
+            }
+            for source, payload in found
+        ],
+    }, "ambiguous"
+
+
 _MAX_TERMINAL_ERRORS = 8
 _MAX_TERMINAL_FIELD_CHARS = 500
 
@@ -725,22 +767,38 @@ def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str,
         delta = _safe_json_payload(scope_repair / "scope_delta.json")
         delta = delta if isinstance(delta, Mapping) else {}
         added = delta.get("added_paths", []) if isinstance(delta.get("added_paths"), list) else []
-        recovery = _safe_json_payload(
-            run_dir / "revision" / "check-repair" / f"C0{cycle}" / "scope_violation_recovery.json"
-        )
-        recovery = recovery if isinstance(recovery, Mapping) else {}
+        recovery, recovery_source = _scope_violation_recovery_artifact(run_dir, cycle)
+        ambiguous = recovery_source == "ambiguous"
+        candidates = recovery.get("candidates", []) if ambiguous else []
+        candidates = candidates if isinstance(candidates, list) else []
         scope_meta = _safe_json_payload(scope_repair / "scope.json")
         scope_meta = scope_meta if isinstance(scope_meta, Mapping) else {}
         lines = [
             "Check repair scope escalation:",
             "  trigger: REVISION_SCOPE_VIOLATION",
+            "  source attempt: " + (recovery_source or "unavailable"),
             "  failed attempt rolled back: " + ("YES" if recovery else "NO"),
-            f"  observed outside-scope paths: {len(recovery.get('outside_scope_paths', [])) if isinstance(recovery.get('outside_scope_paths'), list) else 0}",
+            "  observed outside-scope paths: " + (
+                "ambiguous" if ambiguous
+                else str(
+                    len(recovery["outside_scope_paths"])
+                    if isinstance(recovery.get("outside_scope_paths"), list) else 0
+                )
+            ),
             "  planner: planner-chatgpt",
             f"  scope added: {len(added)}",
             "  policy: " + str(scope_meta.get("policy", "auto-bounded")),
             "  implementer: codex-luna-high",
             "  residual Claude pass: " + ("YES" if (scope_repair / "residual-claude").is_dir() else "NO"),
+            *([
+                "  no authoritative recovery artifact selected",
+                "  ambiguous recovery artifacts:",
+                *[
+                    f"  - {entry.get('artifact', '—')}"
+                    f" (outside-scope paths: {entry.get('outside_scope_paths', 0)})"
+                    for entry in candidates if isinstance(entry, Mapping)
+                ],
+            ] if ambiguous else []),
             *[f"  - {path}" for path in added],
         ]
         parts.append(_section("CHECK REPAIR SCOPE ESCALATION", "\n".join(lines)))

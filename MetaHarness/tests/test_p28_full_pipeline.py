@@ -1396,6 +1396,110 @@ END META SCOPE REQUEST
         self.assertIsNone(parse_scope_request(self.REQUEST.replace("- src/a.py", paths)))
 
 
+class SemanticRevisionScopeProtocolTests(P28Harness):
+    """``META SCOPE REQUEST v1`` is a check-repair-only machine protocol.
+
+    The semantic reviser is taught prose reporting instead, and the harness
+    refuses to enter the bounded scope state machine from that stage even if
+    the model emits the block spontaneously.  A semantic Claude that really
+    writes outside its scope still fails closed.
+    """
+
+    SPONTANEOUS = """The revision is complete inside the approved scope.
+
+META SCOPE REQUEST v1
+
+REASON
+A further correction would need the readme.
+
+PATHS
+- README.md
+
+EVIDENCE
+- semantic revision evidence | the readme documents the old behavior
+
+END META SCOPE REQUEST
+"""
+
+    def test_the_semantic_reviser_prompt_never_teaches_the_machine_protocol(self) -> None:
+        result, _planner, _reviewer, claude, pushed = self.run_pipeline(
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")}),
+            reviews=[PASS], run_id="semantic-prompt",
+        )
+        self.assert_published_once(result, pushed, run_id="semantic-prompt")
+
+        [call] = [one for one in claude.calls if one["stage"] == "initial-revision"]
+        prompt = call["prompt"]
+        self.assertNotIn("META SCOPE REQUEST v1", prompt)
+        self.assertNotIn("END META SCOPE REQUEST", prompt)
+        self.assertIn("does not authorize scope expansion", prompt)
+        self.assertIn("DO NOT EDIT", prompt)
+        self.assertIn("DO NOT create a workaround in an authorized path", prompt)
+        self.assertEqual(
+            prompt, (result.run_dir / "revision/agent.prompt.txt").read_text()
+        )
+
+    def test_a_spontaneous_block_in_a_semantic_report_is_not_a_machine_route(self) -> None:
+        """Prose is prose: the normal pipeline continues, nothing is rolled back."""
+
+        claude = FakeClaude(
+            actions={1: writer("src/a.py", "A = 3\n")},
+            reports={(1, "initial-revision"): self.SPONTANEOUS},
+        )
+        result, planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")}),
+            reviews=[PASS], claude=claude, run_id="semantic-spontaneous",
+        )
+
+        self.assert_published_once(result, pushed, run_id="semantic-spontaneous")
+        # The in-scope semantic edit is kept: no scope-request rollback ran.
+        self.assertEqual(
+            git(self.worktree("semantic-spontaneous"), "show", "HEAD:src/a.py"), "A = 3"
+        )
+        self.assertEqual([one["stage"] for one in claude.calls], ["initial-revision"])
+        # No bridge audit, no scope repair, no second planner answer.
+        self.assertEqual(len(planner.prompts), 1)
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertFalse((result.run_dir / "scope-repair").exists())
+        self.assertFalse((result.run_dir / "revision/tree_after_failure.txt").exists())
+        self.assertNotIn("check_repair", result.state)
+        report = json.loads((result.run_dir / "revision/report.json").read_text())
+        self.assertNotIn("scope_request", report)
+        self.assertNotIn("scope_request_warning", report)
+        self.assertEqual(report["outside_scope_paths"], [])
+        self.assertNotIn("scope_request", result.state["revision"])
+        # The block itself stays visible as ordinary evidence for the reviewer.
+        self.assertIn("META SCOPE REQUEST v1", (result.run_dir / "revision/agent.final.md").read_text())
+
+    def test_a_semantic_claude_that_really_writes_outside_scope_fails_closed(self) -> None:
+        """An ignored instruction is still a terminal violation, never a route."""
+
+        claude = FakeClaude(
+            actions={1: writer("README.md", "outside\n")},
+            reports={(1, "initial-revision"): self.SPONTANEOUS},
+        )
+        result, planner, reviewer, claude, pushed = self.run_pipeline(
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")}),
+            reviews=[PASS], claude=claude, run_id="semantic-outside",
+        )
+
+        self.assertEqual(result.state["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
+        self.assert_no_commit_no_push(result, pushed, run_id="semantic-outside")
+        self.assertEqual([one["stage"] for one in claude.calls], ["initial-revision"])
+        self.assertEqual(reviewer.prompts, [])
+        self.assertEqual(len(planner.prompts), 1)
+        # Fail closed at the semantic stage: the failed tree is durable proof,
+        # and no bounded scope recovery is offered for it.
+        self.assertTrue((result.run_dir / "revision/tree_after_failure.txt").is_file())
+        self.assertFalse((result.run_dir / "scope-repair").exists())
+        self.assertFalse(
+            (result.run_dir / "revision/scope_violation_recovery.json").exists()
+        )
+        report = json.loads((result.run_dir / "revision/report.json").read_text())
+        self.assertEqual(report["outside_scope_paths"], ["README.md"])
+        self.assertNotIn("scope_request", report)
+
+
 class CheckAuthorityPipelineTests(P28Harness):
     """``checks/C01`` is canonical, and the frozen catalogue is the only argv."""
 

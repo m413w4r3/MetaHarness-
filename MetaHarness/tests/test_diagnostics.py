@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.diagnostics import (  # noqa: E402
     MAX_ARTIFACT_BYTES,
+    _scope_violation_recovery_artifact,
     MAX_PLANNER_REQUEST_BYTES,
     MAX_REPORT_BYTES,
     build_run_diagnostics,
@@ -219,6 +220,108 @@ class DiagnosticsTests(unittest.TestCase):
         page = render_run(get_run(self.runs, "diagnostic-run", config=self.config))
         self.assertIn("scope expanded", page)
         self.assertIn("tests/test_service.py", page)
+
+    def _publish_scope_repair(self, *, added: list[str] | None = None) -> None:
+        directory = self.run_dir / "scope-repair" / "C01"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "scope_delta.json").write_text(
+            json.dumps({"added_paths": added if added is not None else ["tests/test_service.py"]}),
+            encoding="utf-8",
+        )
+        (directory / "scope.json").write_text(
+            json.dumps({"policy": "auto-bounded"}), encoding="utf-8"
+        )
+
+    def _publish_recovery(self, source: str, *, outside: list[str] | None = None) -> None:
+        directory = self.run_dir / "revision" / source / "C01"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "scope_violation_recovery.json").write_text(
+            json.dumps({
+                "restored_paths": ["src/service.py"],
+                "outside_scope_paths": outside if outside is not None else ["tests/test_service.py"],
+            }),
+            encoding="utf-8",
+        )
+
+    def test_d_a_normal_check_repair_recovery_names_its_source(self) -> None:
+        self._publish_scope_repair()
+        self._publish_recovery("check-repair")
+        report = build_run_diagnostics(self.config, self.run_dir)
+
+        self.assertIn("CHECK REPAIR SCOPE ESCALATION", report)
+        self.assertIn("trigger: REVISION_SCOPE_VIOLATION", report)
+        self.assertIn("source attempt: check-repair\n", report)
+        self.assertIn("failed attempt rolled back: YES", report)
+        self.assertIn("observed outside-scope paths: 1", report)
+        self.assertIn("scope added: 1", report)
+        self.assertIn("- tests/test_service.py", report)
+
+    def test_e_an_expanded_check_repair_recovery_is_found_and_named(self) -> None:
+        """The violation happened in the second pass; nothing is in the first."""
+
+        self._publish_scope_repair()
+        self._publish_recovery("check-repair-expanded")
+        self.assertFalse(
+            (self.run_dir / "revision/check-repair/C01/scope_violation_recovery.json").exists()
+        )
+        report = build_run_diagnostics(self.config, self.run_dir)
+
+        self.assertIn("source attempt: check-repair-expanded", report)
+        self.assertIn("failed attempt rolled back: YES", report)
+        self.assertIn("observed outside-scope paths: 1", report)
+
+    def test_f_two_recovery_artifacts_are_reported_as_ambiguous(self) -> None:
+        """No artifact is invented as authoritative when both exist."""
+
+        self._publish_scope_repair()
+        self._publish_recovery("check-repair", outside=[])
+        self._publish_recovery("check-repair-expanded", outside=["tests/test_service.py"])
+        report = build_run_diagnostics(self.config, self.run_dir)
+
+        self.assertIn("source attempt: ambiguous", report)
+        self.assertIn("no authoritative recovery artifact selected", report)
+        self.assertIn("ambiguous recovery artifacts:", report)
+        self.assertIn(
+            "- revision/check-repair/C01/scope_violation_recovery.json"
+            " (outside-scope paths: 0)",
+            report,
+        )
+        self.assertIn(
+            "- revision/check-repair-expanded/C01/scope_violation_recovery.json"
+            " (outside-scope paths: 1)",
+            report,
+        )
+        self.assertNotIn("source attempt: check-repair\n", report)
+        self.assertNotIn("observed outside-scope paths: 0", report)
+
+    def test_g_a_missing_recovery_artifact_is_reported_unavailable(self) -> None:
+        self._publish_scope_repair(added=[])
+        report = build_run_diagnostics(self.config, self.run_dir)
+
+        self.assertIn("source attempt: unavailable", report)
+        self.assertIn("failed attempt rolled back: NO", report)
+        self.assertIn("observed outside-scope paths: 0", report)
+
+    def test_h_the_recovery_helper_never_chooses_between_two_artifacts(self) -> None:
+        self.assertEqual(_scope_violation_recovery_artifact(self.run_dir, 1), ({}, None))
+        self._publish_recovery("check-repair-expanded")
+        payload, source = _scope_violation_recovery_artifact(self.run_dir, 1)
+        self.assertEqual(source, "check-repair-expanded")
+        self.assertEqual(payload["restored_paths"], ["src/service.py"])
+        self._publish_recovery("check-repair")
+        payload, source = _scope_violation_recovery_artifact(self.run_dir, 1)
+        self.assertEqual(source, "ambiguous")
+        self.assertEqual(
+            [entry["artifact"] for entry in payload["candidates"]],
+            [
+                "revision/check-repair/C01/scope_violation_recovery.json",
+                "revision/check-repair-expanded/C01/scope_violation_recovery.json",
+            ],
+        )
+        # A read-only projection never edits the evidence it reports on.
+        self.assertTrue(
+            (self.run_dir / "revision/check-repair/C01/scope_violation_recovery.json").is_file()
+        )
 
     def test_prompt_footprint_is_deterministic_and_reports_usage(self) -> None:
         (self.run_dir / "spec.md").write_text("spec", encoding="utf-8")

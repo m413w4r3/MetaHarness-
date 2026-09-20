@@ -2243,5 +2243,493 @@ class AggressiveRepairRecoveryTests(P29Harness):
         self.assertEqual(len(reviewer.prompts), 2)
 
 
+SCOPE_REPAIR_PLAN = plan_text(
+    step_block(1, operation="Scope repair"), title="P31 scope repair",
+)
+SCOPE_REPAIR_SERVICE_PLAN = plan_text(
+    step_block(1, read=("tests/test_service.py",),
+               write_set=("tests/test_service.py",), operation="Scope repair"),
+    title="P31 scope repair service",
+)
+RECOVERY_C01 = "revision/check-repair/C01/scope_violation_recovery.json"
+RECOVERY_EXPANDED_C01 = "revision/check-repair-expanded/C01/scope_violation_recovery.json"
+RECOVERY_C02 = "revision/check-repair/C02/scope_violation_recovery.json"
+
+
+class OutsideScopeClaude(FakeClaude):
+    """A Claude double whose repair pass writes outside its mutable scope.
+
+    ``action`` is chosen from the live worktree, so the same double can serve
+    the normal repair and the expanded one in call order.
+    """
+
+    def __init__(self, action, *, log=None):
+        super().__init__(log=log)
+        self.action = action
+
+    def run_revision(self, prompt, worktree, *, artifacts_dir, profile,
+                     environment, revision_dir=None):
+        target = Path(revision_dir) if revision_dir is not None else Path(artifacts_dir) / "revision"
+        if any(part in {"check-repair", "check-repair-expanded"} for part in target.parts):
+            self.action(Path(worktree))
+        return super().run_revision(
+            prompt, worktree, artifacts_dir=artifacts_dir, profile=profile,
+            environment=environment, revision_dir=revision_dir,
+        )
+
+
+class ScopeViolationResumeHarness(ExpandedCheckRepairResumeHarness):
+    """Crash/resume boundaries of the bounded scope-repair recovery.
+
+    Every scenario starts from a real ``REVISION_SCOPE_VIOLATION``: Claude
+    wrote a path it was never authorized to touch, the exact failed tree is
+    still on disk, and only a resume may roll it back and hand the evidence
+    to the strong planner.
+    """
+
+    def violate_c01(self, run_id: str):
+        """A C01 normal check repair that really wrote ``README.md``."""
+
+        config = self.make_config()
+        luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")})
+        claude = OutsideScopeClaude(writer("README.md", "outside\n"), log=self.events)
+        orchestrator, planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SINGLE_PLAN], reviews=[PASS], luna=luna, claude=claude,
+        )
+        failed = self.run_approved(
+            config, orchestrator, run_id, run_options=self.bounded_options(config),
+        )
+        self.assertEqual(failed.state["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
+        checkpoint = read_checkpoint(failed.run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.CHECK_REPAIR_C01)
+        self.assertEqual(len(planner.prompts), 1)
+        self.assertEqual(luna.calls and luna.calls[0]["step"], "S01")
+        return config, failed, checkpoint
+
+    def violate_expanded_c01(self, run_id: str):
+        """A C01 *expanded* check repair that really wrote ``README.md``."""
+
+        self.stage_service_repo()
+        config = self.make_config()
+
+        def repair_then_leave_scope(root: Path) -> None:
+            if "BUG" in (root / "src/service.py").read_text():
+                write(root / "src/service.py", "SERVICE = 3\n")
+            else:
+                write(root / "README.md", "outside\n")
+
+        luna = FakeLuna({(1, "S01"): writer("src/service.py", "SERVICE = BUG\n")})
+        claude = OutsideScopeClaude(repair_then_leave_scope, log=self.events)
+        orchestrator, planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SERVICE_PLAN], reviews=[PASS], luna=luna, claude=claude,
+        )
+        failed = self.run_approved(
+            config, orchestrator, run_id, run_options=self.bounded_options(config),
+        )
+        self.assertEqual(failed.state["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
+        checkpoint = read_checkpoint(failed.run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.CHECK_REPAIR_EXPANDED_C01)
+        self.assertEqual(len(planner.prompts), 1)
+        return config, failed, checkpoint
+
+    def violate_c02(self, run_id: str):
+        """A C02 normal check repair that really wrote ``README.md``."""
+
+        config = self.make_config()
+        luna = FakeLuna({
+            (1, "S01"): writer("src/a.py", "A = 2\n"),
+            (2, "S01"): writer("src/a.py", "A = BUG\n"),
+        })
+        claude = OutsideScopeClaude(writer("README.md", "outside\n"), log=self.events)
+        orchestrator, planner, _reviewer, _l, _c = self.orchestrator(
+            config, plans=[SINGLE_PLAN, REPAIR_PLAN],
+            reviews=[REVISE_IMPLEMENTATION, PASS], luna=luna, claude=claude,
+        )
+        failed = self.run_approved(
+            config, orchestrator, run_id, run_options=self.bounded_options(config),
+        )
+        self.assertEqual(failed.state["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
+        checkpoint = read_checkpoint(failed.run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.CHECK_REPAIR_C02)
+        self.assertEqual(checkpoint.cycle, 2)
+        return config, failed, checkpoint
+
+    def blocked_planner(self):
+        """A bridge whose transport fails: the planner boundary is durable."""
+
+        client = mock.Mock()
+        client.complete.side_effect = LLMHTTPError("scope-repair planner is down")
+        client.complete_with_file_fallback.side_effect = LLMHTTPError(
+            "scope-repair planner is down"
+        )
+        return client
+
+    def resume_with(self, config, run_id: str, *, plans=None, reviews=None,
+                    luna=None, claude=None, planner=None):
+        orchestrator, planner_client, reviewer, luna_used, claude_used = self.orchestrator(
+            config, plans=plans or [], reviews=reviews if reviews is not None else [PASS],
+            luna=luna or FakeLuna({}), claude=claude or FakeClaude(log=self.events),
+            planner=planner,
+        )
+        with self.count_pushes() as pushed:
+            resumed = orchestrator.resume(run_id)
+        return resumed, planner_client, reviewer, luna_used, claude_used, pushed
+
+    def assert_clean_rollback(self, run_dir: Path, run_id: str, checkpoint, relative: str):
+        """The failed tree is gone and its recovery proof is exact."""
+
+        worktree = self.worktree(run_id)
+        recovery = json.loads((run_dir / relative).read_text())
+        self.assertEqual(recovery["restored_paths"], ["README.md"])
+        self.assertEqual(recovery["outside_scope_paths"], ["README.md"])
+        self.assertEqual(recovery["tree_before"], checkpoint.expected_tree_sha)
+        self.assertEqual(
+            git(worktree, "write-tree"), checkpoint.expected_tree_sha,
+        )
+        self.assertEqual((worktree / "README.md").read_text(), "P28 readme\n")
+        # The rolled-back state is the staged candidate tree, so staged entries
+        # are expected; nothing may be left unstaged or untracked.
+        self.assertEqual(
+            [line for line in git(worktree, "status", "--porcelain").splitlines()
+             if line[1] != " "],
+            [],
+        )
+        return recovery
+
+
+class ScopeViolationResumeTests(ScopeViolationResumeHarness):
+    def test_a_a_c01_violation_rolls_back_exactly_and_enters_the_planner(self) -> None:
+        """The failed tree is durable proof until the resume replaces it."""
+
+        config, failed, checkpoint = self.violate_c01("scope-resume-a")
+        run_dir = failed.run_dir
+        worktree = self.worktree("scope-resume-a")
+        # Nothing is repaired in place: the exact failed attempt is still here.
+        self.assertEqual((worktree / "README.md").read_text(), "outside\n")
+        self.assertTrue((run_dir / "revision/check-repair/C01/report.json").is_file())
+        self.assertTrue((run_dir / "revision/check-repair/C01/tree_after_failure.txt").is_file())
+        self.assertFalse((run_dir / RECOVERY_C01).exists())
+        report = json.loads((run_dir / "revision/check-repair/C01/report.json").read_text())
+        self.assertEqual(report["outside_scope_paths"], ["README.md"])
+        self.assertTrue(resume_info(run_dir, failed.state).resumable)
+
+        # The bridge is unreachable, so this resume stops exactly on the new
+        # planner boundary -- after the rollback, before any authority.
+        before = self.checks_ran()
+        blocked, _planner, reviewer, fresh_luna, fresh_claude, pushed = self.resume_with(
+            config, "scope-resume-a", planner=self.blocked_planner(),
+        )
+
+        self.assertEqual(blocked.state["failure"]["reason"], "LLM_FAILURE")
+        moved = read_checkpoint(run_dir)
+        self.assertEqual(moved.phase, ResumePhase.CHECK_SCOPE_PLANNER_C01)
+        self.assertEqual(moved.expected_tree_sha, checkpoint.expected_tree_sha)
+        self.assert_clean_rollback(run_dir, "scope-resume-a", checkpoint, RECOVERY_C01)
+        # No durable work before the boundary is paid for a second time.
+        self.assertEqual(fresh_luna.calls, [])
+        self.assertEqual(fresh_claude.calls, [])
+        self.assertEqual(reviewer.prompts, [])
+        self.assertEqual(self.checks_ran(), before)
+        self.assertEqual(pushed.call_count, 0)
+
+        # The planner comes back: Luna implements the bounded plan once.
+        resumed, planner, reviewer, scope_luna, _c, pushed = self.resume_with(
+            config, "scope-resume-a", plans=[SCOPE_REPAIR_PLAN], reviews=[PASS],
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")}),
+        )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(len(planner.prompts), 1)
+        self.assertIn("strong bounded scope-repair planner", planner.prompts[0])
+        self.assertEqual([(call["cycle"], call["step"]) for call in scope_luna.calls],
+                         [(1, "S01")])
+        self.assertEqual(
+            scope_luna.calls[0]["dir"].relative_to(run_dir).as_posix(),
+            "scope-repair/C01/steps/S01",
+        )
+        self.assertEqual(git(self.worktree("scope-resume-a"), "show", "HEAD:src/a.py"), "A = 3")
+        self.assertEqual(git(self.worktree("scope-resume-a"), "show", "HEAD:README.md"), "P28 readme")
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertEqual(pushed.call_count, 1)
+        delta = json.loads((run_dir / "scope-repair/C01/scope_delta.json").read_text())
+        self.assertEqual(delta["added_paths"], [])
+        self.assertEqual(delta["observed_outside_scope_paths"], ["README.md"])
+
+    def test_b_an_expanded_violation_recovers_from_the_expanded_directory(self) -> None:
+        """The second pass owns the violation, so it owns the recovery proof."""
+
+        config, failed, checkpoint = self.violate_expanded_c01("scope-resume-b")
+        run_dir = failed.run_dir
+        self.assertTrue((run_dir / EXPANDED_C01 / "report.json").is_file())
+        self.assertTrue((run_dir / EXPANDED_C01 / "tree_after_failure.txt").is_file())
+        self.assertEqual(
+            json.loads((run_dir / EXPANDED_C01 / "report.json").read_text())["outside_scope_paths"],
+            ["README.md"],
+        )
+        # The normal pass succeeded and is untouched evidence.
+        self.assertEqual(
+            json.loads((run_dir / "revision/check-repair/C01/report.json").read_text())["outside_scope_paths"],
+            [],
+        )
+
+        resumed, _planner, _reviewer, fresh_luna, fresh_claude, pushed = self.resume_with(
+            config, "scope-resume-b", planner=self.blocked_planner(),
+        )
+
+        # Exactly one recovery artifact, in the directory that failed: the
+        # normal directory is never written to by mistake.
+        self.assertTrue((run_dir / RECOVERY_EXPANDED_C01).is_file())
+        self.assertFalse((run_dir / RECOVERY_C01).exists())
+        recovery = self.assert_clean_rollback(
+            run_dir, "scope-resume-b", checkpoint, RECOVERY_EXPANDED_C01,
+        )
+        self.assertEqual(
+            recovery["tree_after_failure"],
+            (run_dir / EXPANDED_C01 / "tree_after_failure.txt").read_text().strip(),
+        )
+        # Nothing durable is replayed while the recovery is decided.
+        self.assertEqual(fresh_luna.calls, [])
+        self.assertEqual(fresh_claude.calls, [])
+        self.assertEqual(pushed.call_count, 0)
+
+    @unittest.expectedFailure
+    def test_b2_an_expanded_violation_should_continue_into_the_bounded_planner(self) -> None:
+        """Known gap: an expanded violation cannot leave its own recovery.
+
+        The rollback and the recovery proof above are correct, but
+        ``Orchestrator._load_resumed_results`` skips the *normal* C01
+        check-repair record whenever a scope recovery exists.  For a violation
+        produced by the expanded pass that record is still valid history, so
+        the C01 tree chain no longer reaches the checkpoint tree and the
+        resume refuses with ``RESUME_INTEGRITY_FAILURE`` instead of entering
+        ``CHECK_SCOPE_PLANNER_C01``.  Failing closed is safe; it is not the
+        intended bounded recovery.
+        """
+
+        config, failed, _checkpoint = self.violate_expanded_c01("scope-resume-b2")
+        blocked, _planner, _reviewer, _l, _c, _pushed = self.resume_with(
+            config, "scope-resume-b2", planner=self.blocked_planner(),
+        )
+
+        self.assertEqual(blocked.state["failure"]["reason"], "LLM_FAILURE")
+        self.assertEqual(
+            read_checkpoint(failed.run_dir).phase, ResumePhase.CHECK_SCOPE_PLANNER_C01
+        )
+
+    def test_c_a_durable_planner_answer_is_reused_not_bought_again(self) -> None:
+        """A crash after the bundle: the hash-bound answer is authoritative."""
+
+        config, failed, _checkpoint = self.violate_c01("scope-resume-c")
+        run_dir = failed.run_dir
+        with self.crash_before_the_phase(ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01):
+            crashed, first_planner, _reviewer, crashed_luna, _c, _pushed = self.resume_with(
+                config, "scope-resume-c", plans=[SCOPE_REPAIR_PLAN],
+                luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")}),
+            )
+
+        self.assertEqual(crashed.state["failure"]["reason"], "RUNTIMEERROR")
+        self.assertEqual(len(first_planner.prompts), 1)
+        self.assertEqual(crashed_luna.calls, [])
+        for name in ("planner.raw.md", "implementation_bundle.json", "scope_delta.json",
+                     "planner.evidence.md"):
+            self.assertTrue((run_dir / "scope-repair/C01" / name).is_file(), name)
+        durable = {
+            name: (run_dir / "scope-repair/C01" / name).read_text()
+            for name in ("planner.raw.md", "implementation_bundle.json", "scope_delta.json")
+        }
+
+        # An empty queue would raise on any call: the planner must stay silent.
+        resumed, planner, _reviewer, scope_luna, _c, _pushed = self.resume_with(
+            config, "scope-resume-c", plans=[], reviews=[PASS],
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")}),
+        )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(planner.prompts, [])
+        self.assertEqual([(call["cycle"], call["step"]) for call in scope_luna.calls],
+                         [(1, "S01")])
+        for name, text in durable.items():
+            self.assertEqual((run_dir / "scope-repair/C01" / name).read_text(), text, name)
+
+    @unittest.expectedFailure
+    def test_d_a_completed_scope_repair_step_is_reconciled_not_replayed(self) -> None:
+        """Known gap: a durable scope-repair step cannot be reconciled.
+
+        The step record is written and the checkpoint moves, but the C01 tree
+        chain in ``Orchestrator._load_resumed_results`` still ends at the
+        Claude C01 tree, so any checkpoint at or after
+        ``CHECK_SCOPE_REPAIR_STEP_C01`` is refused with
+        ``RESUME_INTEGRITY_FAILURE``.  The scope-repair evidence is only
+        consulted for the candidate phases.  The durable step is therefore
+        never replayed -- the run simply cannot continue.
+        """
+
+        config, failed, _checkpoint = self.violate_c01("scope-resume-d")
+        run_dir = failed.run_dir
+        with self.crash_before_the_phase(ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01):
+            crashed, _planner, _reviewer, crashed_luna, _c, _pushed = self.resume_with(
+                config, "scope-resume-d", plans=[SCOPE_REPAIR_PLAN],
+                luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")}),
+            )
+
+        self.assertEqual(crashed.state["failure"]["reason"], "RUNTIMEERROR")
+        self.assertEqual([call["step"] for call in crashed_luna.calls], ["S01"])
+        step = json.loads((run_dir / "scope-repair/C01/steps/S01/step.json").read_text())
+        self.assertEqual(step["status"], "COMPLETED")
+        self.assertEqual(self.worktree("scope-resume-d").joinpath("src/a.py").read_text(), "A = 3\n")
+
+        # A replay would be a second Luna call on an already durable step.
+        replay_luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = REPLAYED\n")})
+        resumed, planner, reviewer, replay_luna, _c, pushed = self.resume_with(
+            config, "scope-resume-d", plans=[], reviews=[PASS], luna=replay_luna,
+        )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(replay_luna.calls, [])
+        self.assertEqual(planner.prompts, [])
+        self.assertEqual(
+            json.loads((run_dir / "scope-repair/C01/steps/S01/step.json").read_text()),
+            step,
+        )
+        self.assertEqual(git(self.worktree("scope-resume-d"), "show", "HEAD:src/a.py"), "A = 3")
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertEqual(pushed.call_count, 1)
+
+    def test_e_a_c02_violation_keeps_the_c01_candidate_as_its_exact_parent(self) -> None:
+        """C02 parity: nothing durable from C01 or C02 is ever replayed."""
+
+        config, failed, checkpoint = self.violate_c02("scope-resume-e")
+        run_dir = failed.run_dir
+        c01_commit = json.loads((run_dir / "candidate/C01/commit.json").read_text())
+        c02_step = json.loads((run_dir / "repair/C02/steps/S01/step.json").read_text())
+        self.assertEqual(c02_step["status"], "COMPLETED")
+
+        resumed, planner, reviewer, scope_luna, _c, pushed = self.resume_with(
+            config, "scope-resume-e", plans=[SCOPE_REPAIR_PLAN], reviews=[PASS],
+            luna=FakeLuna({(2, "S01"): writer("src/a.py", "A = 5\n")}),
+        )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        # The C02 scope repair is the only worker call of this resume.
+        self.assertEqual([(call["cycle"], call["step"]) for call in scope_luna.calls],
+                         [(2, "S01")])
+        self.assertEqual(
+            scope_luna.calls[0]["dir"].relative_to(run_dir).as_posix(),
+            "scope-repair/C02/steps/S01",
+        )
+        # Neither the C01 Luna nor the durable C02 repair step is re-executed.
+        self.assertEqual(
+            json.loads((run_dir / "repair/C02/steps/S01/step.json").read_text()), c02_step
+        )
+        self.assertEqual(
+            json.loads((run_dir / "candidate/C01/commit.json").read_text()), c01_commit
+        )
+        self.assertTrue((run_dir / RECOVERY_C02).is_file())
+        self.assertFalse((run_dir / "revision/check-repair/C01/scope_violation_recovery.json").exists())
+        # The C02 candidate is a child of the exact C01 candidate commit.
+        worktree = self.worktree("scope-resume-e")
+        c02_commit = json.loads((run_dir / "candidate/C02/commit.json").read_text())
+        self.assertEqual(git(worktree, "rev-parse", c02_commit["commit_sha"] + "^"),
+                         c01_commit["commit_sha"])
+        self.assertEqual(git(worktree, "rev-parse", "HEAD"), c02_commit["commit_sha"])
+        self.assertEqual(git(worktree, "show", "HEAD:src/a.py"), "A = 5")
+        self.assertEqual(git(worktree, "show", "HEAD:README.md"), "P28 readme")
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertEqual(pushed.call_count, 1)
+        self.assertEqual(checkpoint.cycle, 2)
+        self.assertEqual(len(planner.prompts), 1)
+
+
+class ScopeRepairCorruptionTests(ScopeViolationResumeHarness):
+    """Persisted proof is immutable: a divergence is never repaired for us."""
+
+    FAIL_CLOSED = {"RESUME_INTEGRITY_FAILURE", "RESUME_REQUIRES_OPERATOR"}
+
+    def at_the_planner_boundary(self, run_id: str):
+        """A durable ``CHECK_SCOPE_PLANNER_C01`` with its recovery proof."""
+
+        config, failed, _checkpoint = self.violate_c01(run_id)
+        blocked, _planner, _reviewer, _l, _c, _pushed = self.resume_with(
+            config, run_id, planner=self.blocked_planner(),
+        )
+        self.assertEqual(read_checkpoint(blocked.run_dir).phase,
+                         ResumePhase.CHECK_SCOPE_PLANNER_C01)
+        return config, blocked.run_dir
+
+    def after_the_planner(self, run_id: str):
+        """A durable scope-repair plan, bundle and delta, before the step."""
+
+        config, failed, _checkpoint = self.violate_c01(run_id)
+        with self.crash_before_the_phase(ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01):
+            crashed, _planner, _reviewer, _l, _c, _pushed = self.resume_with(
+                config, run_id, plans=[SCOPE_REPAIR_PLAN],
+                luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")}),
+            )
+        self.assertEqual(crashed.state["failure"]["reason"], "RUNTIMEERROR")
+        return config, crashed.run_dir
+
+    def assert_fails_closed(self, config, run_id: str, detail: str):
+        resumed, _planner, _reviewer, luna, claude, pushed = self.resume_with(
+            config, run_id, plans=[SCOPE_REPAIR_PLAN], reviews=[PASS],
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")}),
+        )
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertIn(resumed.state["failure"]["reason"], self.FAIL_CLOSED,
+                      resumed.state["failure"])
+        self.assertIn(detail, resumed.state["failure"]["detail"])
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(pushed.call_count, 0)
+        return resumed
+
+    def test_a_a_tampered_recovery_artifact_is_never_trusted(self) -> None:
+        config, run_dir = self.at_the_planner_boundary("corrupt-recovery")
+        path = run_dir / RECOVERY_C01
+        payload = json.loads(path.read_text())
+        payload["tree_before"] = "z" * 40
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        self.assert_fails_closed(config, "corrupt-recovery", "scope-repair rollback tree is malformed")
+
+    def test_b_a_truncated_recovery_artifact_is_never_rebuilt(self) -> None:
+        config, run_dir = self.at_the_planner_boundary("corrupt-recovery-json")
+        (run_dir / RECOVERY_C01).write_text("{not json", encoding="utf-8")
+
+        self.assert_fails_closed(config, "corrupt-recovery-json", "scope-repair recovery artifact is missing")
+
+    def test_c_a_diverging_scope_delta_is_never_re_published(self) -> None:
+        config, run_dir = self.after_the_planner("corrupt-delta")
+        path = run_dir / "scope-repair/C01/scope_delta.json"
+        payload = json.loads(path.read_text())
+        payload["added_paths"] = ["src/b.py"]
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        self.assert_fails_closed(config, "corrupt-delta", "scope delta changed")
+
+    def test_d_a_diverging_implementation_bundle_is_never_adopted(self) -> None:
+        config, run_dir = self.after_the_planner("corrupt-bundle")
+        path = run_dir / "scope-repair/C01/implementation_bundle.json"
+        payload = json.loads(path.read_text())
+        payload["steps"][0]["contract_sha256"] = "0" * 64
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        self.assert_fails_closed(config, "corrupt-bundle", "contract hash mismatch for S01")
+
+    def test_e_a_tree_that_left_the_recovered_checkpoint_fails_closed(self) -> None:
+        config, run_dir = self.at_the_planner_boundary("corrupt-tree")
+        write(self.worktree("corrupt-tree") / "src/a.py", "A = TAMPERED\n")
+
+        self.assert_fails_closed(config, "corrupt-tree", "the worktree differs from the checkpoint tree")
+
+    def test_f_an_agent_owned_commit_requires_an_operator(self) -> None:
+        config, run_dir = self.at_the_planner_boundary("corrupt-ownership")
+        worktree = self.worktree("corrupt-ownership")
+        write(worktree / "src/a.py", "A = COMMITTED\n")
+        git(worktree, "add", "--all")
+        git(worktree, "commit", "-qm", "an unowned commit")
+
+        self.assert_fails_closed(config, "corrupt-ownership", "HEAD moved since the checkpoint")
+
+
 if __name__ == "__main__":
     unittest.main()
