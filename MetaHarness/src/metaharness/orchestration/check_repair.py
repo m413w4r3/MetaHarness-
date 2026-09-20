@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 
@@ -60,14 +61,6 @@ _DIRECT_FAILURES = frozenset(
 
 
 _LEGACY_DIRECT_FAILURES = _DIRECT_FAILURES | frozenset({DIFF_TOO_LARGE})
-
-
-
-
-
-
-
-
 
 
 def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
@@ -315,8 +308,6 @@ Do not repeat unrelated changes from the previous repair.
 """
 
 
-
-
 # The two provenances a *second* bounded check-repair scope may carry.  They
 # are durable artifact values: never rename them, a stored run depends on the
 # exact string.
@@ -327,8 +318,6 @@ _SAME_SCOPE_RETRY_SOURCE = "bounded same-scope retry"
 
 
 _SECOND_SCOPE_SOURCES = frozenset({_AUTO_BOUNDED_SOURCE, _SAME_SCOPE_RETRY_SOURCE})
-
-
 
 
 def _check_repair_scope_payload(scope: CheckRepairScope) -> dict[str, Any]:
@@ -472,3 +461,208 @@ def _expanded_scope_is_applicable(
     # Downstream, only a durable expansion carries authority.  A run that
     # never expanded gains nothing.
     return scope_path.is_file()
+
+
+@dataclasses.dataclass(frozen=True)
+class CheckRepairCoordinator:
+    """Owns every bounded check-repair scope decision of one cycle.
+
+    The operator's repair-scope policy is the only state it holds, injected
+    explicitly: it never sees the ``Orchestrator``.  It decides the normal
+    scope, the one second bounded pass (auto-bounded expansion or the
+    same-scope retry) and which durable scope outranks a recomputation.  It
+    owns neither candidate publication nor the reviewer, and it never widens
+    a scope beyond the injected policy's bound.
+    """
+
+    effective_repair_scope: EffectiveRepairScopePolicy
+
+    def resolve_scope(
+        self,
+        *,
+        repo: Path,
+        worktree: Path,
+        tree_sha: str,
+        run_dir: Path,
+        evidence: EvidenceBundle,
+        base_mutable_scope: Sequence[str],
+    ) -> CheckRepairScope:
+        base_paths = tuple(sorted(set(base_mutable_scope)))
+        scope_policy = self.effective_repair_scope
+        policy = scope_policy.policy
+        bound = scope_policy.max_added_paths
+        candidates = (
+            _check_repair_scope_candidates(
+                repo=repo,
+                worktree=worktree,
+                tree_sha=tree_sha,
+                run_dir=run_dir,
+                evidence=evidence,
+                base_mutable_scope=base_paths,
+            )
+            if policy == "auto-bounded" else []
+        )
+        added = tuple(candidates) if len(candidates) <= bound else ()
+        return CheckRepairScope(
+            base_paths=base_paths,
+            added_paths=added,
+            effective_paths=tuple(sorted(set(base_paths) | set(added))),
+            policy=policy,
+            bound=bound,
+            source=(
+                _AUTO_BOUNDED_SOURCE
+                if added else "human-approved mutable scope"
+            ),
+        )
+
+    def second_scope(
+        self,
+        *,
+        repo: Path,
+        worktree: Path,
+        tree_sha: str,
+        run_dir: Path,
+        evidence: EvidenceBundle,
+        normal_scope: CheckRepairScope,
+        expanded_dir: Path,
+    ) -> CheckRepairScope | None:
+        """The scope of the one second bounded check-repair pass, or ``None``.
+
+        This is the single decision point for "may the corrective Claude pass
+        run once more", and the retry budget is deliberately independent from
+        the mutable scope.  A scope expansion is one possible *outcome* of
+        this decision, never its precondition: a soft deterministic failure
+        whose fix already lives inside the authorized paths earns a second
+        pass with exactly that scope.
+
+        It stays model-free and fail-closed; every condition is a durable
+        fact -- the failure family, the scope the first repair already held,
+        the operator's policy and its bound, and whether a second pass
+        already produced a report.  ``None`` means the deterministic gate is
+        final.
+        """
+
+        if not _soft_check_failures(evidence):
+            return None
+        if _hard_integrity_failures(evidence):
+            return None
+        # One second pass per cycle, even across a crash: never a third.
+        if (expanded_dir / "report.json").exists():
+            return None
+        policy_config = self.effective_repair_scope
+        # No new path, no new authority: exactly what the first repair held.
+        same_scope = CheckRepairScope(
+            base_paths=normal_scope.base_paths,
+            added_paths=normal_scope.added_paths,
+            effective_paths=normal_scope.effective_paths,
+            policy=policy_config.policy,
+            bound=policy_config.max_added_paths,
+            source=_SAME_SCOPE_RETRY_SOURCE,
+        )
+        if policy_config.policy != "auto-bounded":
+            # ``deny-expansion`` and ``require-approval`` forbid *growing* the
+            # mutable scope.  Neither forbids one more bounded correction
+            # inside the scope a human already approved.
+            return same_scope
+        candidates = _check_repair_scope_candidates(
+            repo=repo,
+            worktree=worktree,
+            tree_sha=tree_sha,
+            run_dir=run_dir,
+            evidence=evidence,
+            # Only genuinely new paths are candidates; the paths the first
+            # repair already earned are never re-added, and never lost.
+            base_mutable_scope=normal_scope.effective_paths,
+        )
+        if not candidates:
+            return same_scope
+        added = tuple(sorted(set(normal_scope.added_paths) | set(candidates)))
+        if len(added) > policy_config.max_added_paths:
+            # The bound caps the expansion, not the retry.
+            return same_scope
+        return CheckRepairScope(
+            base_paths=normal_scope.base_paths,
+            added_paths=added,
+            effective_paths=tuple(sorted(
+                set(normal_scope.base_paths) | set(added)
+            )),
+            policy=policy_config.policy,
+            bound=policy_config.max_added_paths,
+            source=_AUTO_BOUNDED_SOURCE,
+        )
+
+    def durable_normal_scope(
+        self,
+        run_dir: Path,
+        *,
+        cycle: int,
+        base_paths: Sequence[str],
+        scope: CheckRepairScope | None = None,
+    ) -> CheckRepairScope:
+        """The first repair's scope, from memory or from its durable artifact.
+
+        A resume that starts at the second repair has no in-band scope, so the
+        artifact the first repair published is the authority for what that
+        pass was allowed to touch.
+        """
+
+        if scope is not None:
+            return scope
+        return _read_check_repair_scope(
+            run_dir / "revision" / "check-repair" / f"C0{cycle}",
+            fallback_base=base_paths,
+            policy_config=self.effective_repair_scope,
+        )
+
+    @staticmethod
+    def normal_scope(
+        scope: CheckRepairScope | None, base_paths: Sequence[str],
+        policy: EffectiveRepairScopePolicy,
+    ) -> CheckRepairScope:
+        """The normal check-repair scope, defaulted to the approved base."""
+
+        if scope is not None:
+            return scope
+        base = tuple(sorted(set(base_paths)))
+        return CheckRepairScope(
+            base_paths=base, added_paths=(), effective_paths=base,
+            policy=policy.policy, bound=policy.max_added_paths,
+            source="human-approved mutable scope",
+        )
+
+    def durable_second_scope(
+        self,
+        *,
+        repo: Path,
+        worktree: Path,
+        run_dir: Path,
+        evidence: EvidenceBundle,
+        normal_scope: CheckRepairScope,
+        expanded_dir: Path,
+    ) -> tuple[CheckRepairScope | None, bool]:
+        """Reuse a durable second-pass scope, or decide a new one.
+
+        A crash may have landed between ``scope.json`` and the second
+        corrective Claude pass while the checkpoint still names the retry
+        checks.  The durable scope then outranks any recomputation: the model
+        is never recalled with a scope different from the one already
+        published for it.  Returns ``(scope, archive_required)``;
+        ``archive_required`` is false for a reused scope, whose attempt was
+        already archived.
+        """
+
+        if (expanded_dir / "scope.json").is_file():
+            scope = _validate_expanded_check_repair_scope(
+                expanded_dir, repo=repo, tree_sha=evidence.staged_tree_sha,
+                normal_scope=normal_scope,
+                policy_config=self.effective_repair_scope,
+            )
+            # One second pass per cycle, even across a crash.
+            if (expanded_dir / "report.json").exists():
+                return None, False
+            return scope, False
+        return self.second_scope(
+            repo=repo, worktree=worktree, tree_sha=evidence.staged_tree_sha,
+            run_dir=run_dir, evidence=evidence, normal_scope=normal_scope,
+            expanded_dir=expanded_dir,
+        ), True
