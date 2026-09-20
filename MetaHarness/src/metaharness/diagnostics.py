@@ -172,6 +172,17 @@ def _safe_json_artifact(run_dir: Path, relative: str, secrets: tuple[str, ...], 
     return result + "JSON (bounded):\n" + text + "\n"
 
 
+def _safe_json_payload(path: Path) -> Any:
+    """Read a small local diagnostic payload without making it authoritative."""
+
+    try:
+        if path.stat().st_size > MAX_ARTIFACT_BYTES:
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
 _MAX_TERMINAL_ERRORS = 8
 _MAX_TERMINAL_FIELD_CHARS = 500
 
@@ -476,6 +487,8 @@ def _prompt_footprint(run_dir: Path) -> str:
     add("revision/check-repair/C01/agent.prompt.txt", "revision/check-repair/C01/usage.json")
     add("review/C01/reviewer.request.txt", "review/C01/reviewer.usage.json")
     add("repair/C02/planner.request.txt", "repair/C02/planner.usage.json")
+    add("scope-repair/C01/planner.request.txt", "scope-repair/C01/planner.usage.json")
+    add("scope-repair/C02/planner.request.txt", "scope-repair/C02/planner.usage.json")
     add("revision/C02/agent.prompt.txt", "revision/C02/usage.json")
     add("revision/check-repair/C02/agent.prompt.txt", "revision/check-repair/C02/usage.json")
     add("review/C02/reviewer.request.txt", "review/C02/reviewer.usage.json")
@@ -707,6 +720,30 @@ def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str,
             _artifact_json(run_dir, "revision/check-repair-expanded/C0" + str(cycle) + "/report.json", secrets),
             _safe_json_artifact(run_dir, f"checks/C0{cycle}/attempts/02/evidence.json", secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
         ])))
+    scope_repair = run_dir / "scope-repair" / f"C0{cycle}"
+    if scope_repair.is_dir():
+        delta = _safe_json_payload(scope_repair / "scope_delta.json")
+        delta = delta if isinstance(delta, Mapping) else {}
+        added = delta.get("added_paths", []) if isinstance(delta.get("added_paths"), list) else []
+        recovery = _safe_json_payload(
+            run_dir / "revision" / "check-repair" / f"C0{cycle}" / "scope_violation_recovery.json"
+        )
+        recovery = recovery if isinstance(recovery, Mapping) else {}
+        scope_meta = _safe_json_payload(scope_repair / "scope.json")
+        scope_meta = scope_meta if isinstance(scope_meta, Mapping) else {}
+        lines = [
+            "Check repair scope escalation:",
+            "  trigger: REVISION_SCOPE_VIOLATION",
+            "  failed attempt rolled back: " + ("YES" if recovery else "NO"),
+            f"  observed outside-scope paths: {len(recovery.get('outside_scope_paths', [])) if isinstance(recovery.get('outside_scope_paths'), list) else 0}",
+            "  planner: planner-chatgpt",
+            f"  scope added: {len(added)}",
+            "  policy: " + str(scope_meta.get("policy", "auto-bounded")),
+            "  implementer: codex-luna-high",
+            "  residual Claude pass: " + ("YES" if (scope_repair / "residual-claude").is_dir() else "NO"),
+            *[f"  - {path}" for path in added],
+        ]
+        parts.append(_section("CHECK REPAIR SCOPE ESCALATION", "\n".join(lines)))
     review = f"review/C0{cycle}/"
     if cycle == 1 and not (run_dir / review).is_dir() and (run_dir / "review.json").exists():
         review = ""

@@ -910,6 +910,108 @@ class FullPipelineTests(P28Harness):
         self.assertEqual(len(claude.calls), 2)
         self.assertEqual(reviewer.prompts, [])
 
+    def test_p_scope_violation_rolls_back_and_replans_bounded_repair(self) -> None:
+        config = self.load()
+        options = RunOptions.from_config(
+            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=4,
+        )
+        claude = FakeClaude(
+            stage_actions={(1, "check-repair"): writer("README.md", "outside\n")}
+        )
+        first, planner, _reviewer, _claude, pushed = self.run_pipeline(
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")}),
+            reviews=[PASS], repair_plan=REPAIR_PLAN, claude=claude,
+            run_id="check-repair-scope-recovery", run_options=options,
+        )
+        self.assertEqual(first.state["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
+        self.assertEqual(pushed.call_count, 0)
+        self.assertTrue((self.worktree("check-repair-scope-recovery") / "README.md").exists())
+
+        repair_luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")})
+        real_push = orchestrator_module.push_run_branch
+
+        def push(*args: Any, **kwargs: Any) -> Any:
+            self.events.append("push")
+            return real_push(*args, **kwargs)
+
+        with mock.patch.object(orchestrator_module, "push_run_branch", side_effect=push) as resumed_pushed:
+            resumed = Orchestrator(
+                self.config_value,
+                planner_client=planner,
+                reviewer_client=QueueClient("reviewer", [PASS], self.events),
+                agent=repair_luna,
+                reviser=FakeClaude(log=self.events),
+            ).resume("check-repair-scope-recovery")
+
+        self.assert_published_once(
+            resumed, resumed_pushed, run_id="check-repair-scope-recovery",
+        )
+        self.assertEqual(
+            (self.worktree("check-repair-scope-recovery") / "README.md").read_text(),
+            "P28 readme\n",
+        )
+        recovery = json.loads(
+            (resumed.run_dir / "revision/check-repair/C01/scope_violation_recovery.json").read_text()
+        )
+        self.assertEqual(recovery["restored_paths"], ["README.md"])
+        self.assertEqual(recovery["outside_scope_paths"], ["README.md"])
+        self.assertEqual([(call["cycle"], call["step"]) for call in repair_luna.calls], [(1, "S01")])
+        self.assertEqual(len(planner.prompts), 2)
+        self.assertIn("strong bounded scope-repair planner", planner.prompts[1])
+        scope_delta = json.loads(
+            (resumed.run_dir / "scope-repair/C01/scope_delta.json").read_text()
+        )
+        self.assertEqual(scope_delta["observed_outside_scope_paths"], ["README.md"])
+        self.assertEqual(scope_delta["added_paths"], [])
+
+    def test_q_scope_violation_has_c02_parity_without_replaying_c02_luna(self) -> None:
+        config = self.load()
+        options = RunOptions.from_config(
+            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=4,
+        )
+        planner = QueueClient(
+            "planner", [SINGLE_PLAN, REPAIR_PLAN, REPAIR_PLAN], self.events,
+        )
+        first, _planner, _reviewer, _claude, _pushed = self.run_pipeline(
+            luna=FakeLuna({
+                (1, "S01"): writer("src/a.py", "A = 2\n"),
+                (2, "S01"): writer("src/a.py", "A = BUG\n"),
+            }),
+            reviews=[REVISE_IMPLEMENTATION, PASS],
+            claude=FakeClaude(
+                stage_actions={(2, "check-repair"): writer("README.md", "outside\n")}
+            ),
+            run_id="check-repair-scope-c02-recovery",
+            planner=planner,
+            run_options=options,
+        )
+        self.assertEqual(first.state["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
+        self.assertEqual(read_checkpoint(first.run_dir).cycle, 2)
+
+        repair_luna = FakeLuna({(2, "S01"): writer("src/a.py", "A = 5\n")})
+        real_push = orchestrator_module.push_run_branch
+
+        def push(*args: Any, **kwargs: Any) -> Any:
+            self.events.append("push")
+            return real_push(*args, **kwargs)
+
+        with mock.patch.object(orchestrator_module, "push_run_branch", side_effect=push) as resumed_pushed:
+            resumed = Orchestrator(
+                self.config_value,
+                planner_client=planner,
+                reviewer_client=QueueClient("reviewer", [PASS], self.events),
+                agent=repair_luna,
+                reviser=FakeClaude(log=self.events),
+            ).resume("check-repair-scope-c02-recovery")
+
+        self.assert_published_once(
+            resumed, resumed_pushed,
+            run_id="check-repair-scope-c02-recovery", expected_commits=2,
+        )
+        self.assertEqual([(call["cycle"], call["step"]) for call in repair_luna.calls], [(2, "S01")])
+        self.assertEqual(len(planner.prompts), 3)
+        self.assertTrue((resumed.run_dir / "scope-repair/C02/scope_delta.json").exists())
+
     def _c01_then_repair(self, c02_behavior: Any, reviews: list[str], *,
                          claude: FakeClaude | None = None, run_id: str = "p28"):
         luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n"), (2, "S01"): c02_behavior})

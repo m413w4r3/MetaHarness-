@@ -53,6 +53,12 @@ class ResumePhase(StrEnum):
     FINAL_CHECKS_RETRY_C01 = "final_checks_retry_c01"
     CHECK_REPAIR_EXPANDED_C01 = "check_repair_expanded_c01"
     FINAL_CHECKS_RETRY_EXPANDED_C01 = "final_checks_retry_expanded_c01"
+    CHECK_SCOPE_PLANNER_C01 = "check_scope_planner_c01"
+    CHECK_SCOPE_APPROVAL_C01 = "check_scope_approval_c01"
+    CHECK_SCOPE_REPAIR_STEP_C01 = "check_scope_repair_step_c01"
+    CHECK_SCOPE_REPAIR_CHECKS_C01 = "check_scope_repair_checks_c01"
+    CHECK_SCOPE_REPAIR_CLAUDE_C01 = "check_scope_repair_claude_c01"
+    CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01 = "check_scope_repair_final_checks_c01"
     CANDIDATE_COMMIT_C01 = "candidate_commit_c01"
     CANDIDATE_PUSH_C01 = "candidate_push_c01"
     REVIEWER_C01 = "reviewer_c01"
@@ -66,6 +72,12 @@ class ResumePhase(StrEnum):
     FINAL_CHECKS_RETRY_C02 = "final_checks_retry_c02"
     CHECK_REPAIR_EXPANDED_C02 = "check_repair_expanded_c02"
     FINAL_CHECKS_RETRY_EXPANDED_C02 = "final_checks_retry_expanded_c02"
+    CHECK_SCOPE_PLANNER_C02 = "check_scope_planner_c02"
+    CHECK_SCOPE_APPROVAL_C02 = "check_scope_approval_c02"
+    CHECK_SCOPE_REPAIR_STEP_C02 = "check_scope_repair_step_c02"
+    CHECK_SCOPE_REPAIR_CHECKS_C02 = "check_scope_repair_checks_c02"
+    CHECK_SCOPE_REPAIR_CLAUDE_C02 = "check_scope_repair_claude_c02"
+    CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02 = "check_scope_repair_final_checks_c02"
     CANDIDATE_COMMIT_C02 = "candidate_commit_c02"
     CANDIDATE_PUSH_C02 = "candidate_push_c02"
     REVIEWER_C02 = "reviewer_c02"
@@ -82,6 +94,12 @@ _PHASE_CYCLE = {
     ResumePhase.FINAL_CHECKS_RETRY_C01: 1,
     ResumePhase.CHECK_REPAIR_EXPANDED_C01: 1,
     ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01: 1,
+    ResumePhase.CHECK_SCOPE_PLANNER_C01: 1,
+    ResumePhase.CHECK_SCOPE_APPROVAL_C01: 1,
+    ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01: 1,
+    ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01: 1,
+    ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01: 1,
+    ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01: 1,
     ResumePhase.CANDIDATE_COMMIT_C01: 1,
     ResumePhase.CANDIDATE_PUSH_C01: 1,
     ResumePhase.REVIEWER_C01: 1,
@@ -94,6 +112,12 @@ _PHASE_CYCLE = {
     ResumePhase.FINAL_CHECKS_RETRY_C02: 2,
     ResumePhase.CHECK_REPAIR_EXPANDED_C02: 2,
     ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02: 2,
+    ResumePhase.CHECK_SCOPE_PLANNER_C02: 2,
+    ResumePhase.CHECK_SCOPE_APPROVAL_C02: 2,
+    ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02: 2,
+    ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02: 2,
+    ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02: 2,
+    ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02: 2,
     ResumePhase.CANDIDATE_COMMIT_C02: 2,
     ResumePhase.CANDIDATE_PUSH_C02: 2,
     ResumePhase.REVIEWER_C02: 2,
@@ -101,7 +125,11 @@ _PHASE_CYCLE = {
 _PRE_PLAN_PHASES = frozenset({ResumePhase.CONTEXT, ResumePhase.PLANNER})
 _PRE_APPROVAL_PHASES = frozenset({ResumePhase.CONTEXT, ResumePhase.PLANNER, ResumePhase.PLAN_APPROVAL})
 _NO_WORKTREE_PHASES = _PRE_APPROVAL_PHASES | frozenset({ResumePhase.WORKTREE_SETUP})
-_STEP_PHASES = frozenset({ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP})
+_STEP_PHASES = frozenset({
+    ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP,
+    ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01,
+    ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02,
+})
 
 
 def phase_index(phase: ResumePhase) -> int:
@@ -178,7 +206,8 @@ class ResumeCheckpoint:
             raise ResumeCheckpointError("checkpoint scope_delta_sha256 is invalid")
         if self.cycle == 2 and phase not in {
             ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL,
-            ResumePhase.REPAIR_STEP, ResumePhase.PUBLISH,
+            ResumePhase.REPAIR_STEP, ResumePhase.CHECK_SCOPE_PLANNER_C02,
+            ResumePhase.PUBLISH,
         }:
             if self.repair_bundle_sha256 is None:
                 raise ResumeCheckpointError("C02 checkpoint requires the repair bundle hash")
@@ -312,6 +341,7 @@ _CLAUDE_PHASES = frozenset({
     ResumePhase.CLAUDE_C01, ResumePhase.CLAUDE_C02,
     ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_C02,
     ResumePhase.CHECK_REPAIR_EXPANDED_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+    ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01, ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02,
 })
 _CODEX_PHASES = _STEP_PHASES
 _REVIEWER_PHASES = frozenset({ResumePhase.REVIEWER_C01, ResumePhase.REVIEWER_C02})
@@ -324,14 +354,24 @@ RESUMABLE_FAILURES: Mapping[str, frozenset[ResumePhase]] = {
     "AGENT_TIMEOUT": _CODEX_PHASES,
     "AGENT_FAILED": _CODEX_PHASES,
     "REVIEWER_TRANSPORT_FAILURE": _REVIEWER_PHASES,
-    "LLM_FAILURE": frozenset({ResumePhase.REPAIR_PLANNER}),
-    "WAITING_SCOPE_APPROVAL": frozenset({ResumePhase.SCOPE_APPROVAL}),
+    "LLM_FAILURE": frozenset({
+        ResumePhase.REPAIR_PLANNER,
+        ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_PLANNER_C02,
+    }),
+    "WAITING_SCOPE_APPROVAL": frozenset({
+        ResumePhase.SCOPE_APPROVAL,
+        ResumePhase.CHECK_SCOPE_APPROVAL_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+    }),
     "PUSH_FAILED": frozenset({
         ResumePhase.CANDIDATE_PUSH_C01,
         ResumePhase.CANDIDATE_PUSH_C02,
         ResumePhase.PUBLISH,
     }),
     "AGENT_CONTRACT_MISMATCH": _STEP_PHASES,
+    "REVISION_SCOPE_VIOLATION": frozenset({
+        ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+        ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+    }),
 }
 # These are not ordinary retryable operation failures.  They mean that the
 # authority needed to prove a retry has been lost (or an agent crossed a Git
@@ -341,8 +381,8 @@ _NON_RESUMABLE_FAILURES = frozenset({
     "BASE_MOVED_SINCE_RUN", "TOCTOU_FAILURE", "RESUME_INTEGRITY_FAILURE",
     "RESUME_REQUIRES_OPERATOR",
     "STEP_WRITE_SET_VIOLATION", "STEP_CONTRACT_DRIFT", "AGENT_NO_CHANGE",
-    "REVISION_SCOPE_VIOLATION",
     "HUMAN_REQUIRED", "REPAIR_SCOPE_EXPANSION", "REPAIR_SCOPE_BOUND_EXCEEDED",
+    "SCOPE_REPAIR_PLANNER_BLOCKED", "SCOPE_REPAIR_FAILED",
 })
 _RESUMABLE_STATUSES = frozenset({"failed", "interrupted", "waiting_scope_approval"})
 # Status a claimed resume starts in (the orchestrator refines it afterwards).
@@ -359,6 +399,12 @@ PHASE_STATUS = {
     ResumePhase.FINAL_CHECKS_RETRY_C01: "revalidating",
     ResumePhase.CHECK_REPAIR_EXPANDED_C01: "revising",
     ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01: "revalidating",
+    ResumePhase.CHECK_SCOPE_PLANNER_C01: "planning",
+    ResumePhase.CHECK_SCOPE_APPROVAL_C01: "waiting_scope_approval",
+    ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01: "implementing",
+    ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01: "revalidating",
+    ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01: "revising",
+    ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01: "revalidating",
     ResumePhase.CANDIDATE_COMMIT_C01: "approved",
     ResumePhase.CANDIDATE_PUSH_C01: "approved",
     ResumePhase.REVIEWER_C01: "reviewing",
@@ -372,6 +418,12 @@ PHASE_STATUS = {
     ResumePhase.FINAL_CHECKS_RETRY_C02: "revalidating",
     ResumePhase.CHECK_REPAIR_EXPANDED_C02: "revising",
     ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02: "revalidating",
+    ResumePhase.CHECK_SCOPE_PLANNER_C02: "planning",
+    ResumePhase.CHECK_SCOPE_APPROVAL_C02: "waiting_scope_approval",
+    ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02: "implementing",
+    ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02: "revalidating",
+    ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02: "revising",
+    ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02: "revalidating",
     ResumePhase.CANDIDATE_COMMIT_C02: "approved",
     ResumePhase.CANDIDATE_PUSH_C02: "approved",
     ResumePhase.REVIEWER_C02: "reviewing",
@@ -404,6 +456,18 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         return "Repair checks with expanded test scope C01"
     if phase is ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01:
         return "Retry checks after expanded repair C01"
+    if phase is ResumePhase.CHECK_SCOPE_PLANNER_C01:
+        return "Recover check-repair scope C01"
+    if phase is ResumePhase.CHECK_SCOPE_APPROVAL_C01:
+        return "Approve check-repair scope C01"
+    if phase is ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01:
+        return f"Retry scope repair C01 {checkpoint.step_id}"
+    if phase is ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01:
+        return "Retry scope repair checks C01"
+    if phase is ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01:
+        return "Retry residual Claude C01"
+    if phase is ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01:
+        return "Retry final scope repair checks C01"
     if phase is ResumePhase.REPAIR_STEP:
         return f"Retry C02 {checkpoint.step_id}"
     if phase is ResumePhase.CLAUDE_C01:
@@ -422,6 +486,18 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         return "Repair checks with expanded test scope C02"
     if phase is ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02:
         return "Retry checks after expanded repair C02"
+    if phase is ResumePhase.CHECK_SCOPE_PLANNER_C02:
+        return "Recover check-repair scope C02"
+    if phase is ResumePhase.CHECK_SCOPE_APPROVAL_C02:
+        return "Approve check-repair scope C02"
+    if phase is ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02:
+        return f"Retry scope repair C02 {checkpoint.step_id}"
+    if phase is ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02:
+        return "Retry scope repair checks C02"
+    if phase is ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02:
+        return "Retry residual Claude C02"
+    if phase is ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02:
+        return "Retry final scope repair checks C02"
     if phase is ResumePhase.CANDIDATE_COMMIT_C02:
         return "Create candidate commit C02"
     if phase is ResumePhase.CANDIDATE_PUSH_C02:
@@ -636,12 +712,19 @@ def resume_info(
         worktree = state.get("worktree")
         if not isinstance(worktree, str) or not Path(worktree).is_dir():
             return ResumeInfo(False, reason="run worktree is missing")
+    scope_recovery_label = (
+        "Recover check-repair scope C01"
+        if failure_reason == "REVISION_SCOPE_VIOLATION" and checkpoint.cycle == 1
+        else "Recover check-repair scope C02"
+        if failure_reason == "REVISION_SCOPE_VIOLATION" and checkpoint.cycle == 2
+        else None
+    )
     return ResumeInfo(
         True, checkpoint.phase.value,
-        _clean_mismatch_label(directory, checkpoint) if clean_mismatch
+        scope_recovery_label or (_clean_mismatch_label(directory, checkpoint) if clean_mismatch
         else _dirty_mismatch_label(checkpoint)
         if dirty_mismatch
-        else resume_label(checkpoint),
+        else resume_label(checkpoint)),
         expected_tree=checkpoint.expected_tree_sha, cycle=checkpoint.cycle,
         step_id=checkpoint.step_id,
     )

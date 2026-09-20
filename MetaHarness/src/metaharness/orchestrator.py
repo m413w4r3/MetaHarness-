@@ -150,10 +150,12 @@ from .planning import (
     render_implementation_contract,
 )
 from .planning_v2 import (
+    CheckScopeRepairPlannerV2,
     PlannerV2,
     RepairPlannerV2,
     TaskPlanV2,
     V2PlanParseError,
+    build_scope_repair_planner_prompt_bundle,
     parse_task_plan_v2,
     persist_recovered_plan_artifacts,
     read_approved_step_contract,
@@ -161,6 +163,7 @@ from .planning_v2 import (
     validate_decomposition_policy,
     validate_execution_mode_policy,
     validate_implementation_bundle,
+    validate_repair_decomposition_policy,
     render_repair_plan_summary,
     render_repair_step_index,
 )
@@ -236,7 +239,7 @@ class CommitBoundaryError(OrchestrationError):
 
 
 class ScopeApprovalRequired(OrchestrationError):
-    """C02 is durably paused until its exact scope delta is approved."""
+    """A scope expansion is durably paused until its exact delta is approved."""
 
     code = "WAITING_SCOPE_APPROVAL"
 
@@ -1709,6 +1712,7 @@ class _ResumedRun:
     restore_paths: tuple[str, ...] = ()
     mismatch_recovery: dict[str, Any] | None = None
     mismatch_recovery_path: Path | None = None
+    scope_violation_recovery: dict[str, Any] | None = None
     c01_steps: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     # step id -> the clean mismatch its first attempt returned, for the single
     # bounded retry this resume owes that step.
@@ -2226,6 +2230,37 @@ def _ensure_scope_delta(
     if existing != expected:
         raise ResumeIntegrityError("the C02 scope delta changed")
     return digest
+
+
+def _build_scope_repair_delta(
+    repair_dir: Path, *, original_scope: Sequence[str], plan: TaskPlanV2,
+    failure_ids: Sequence[str], observed_outside_scope_paths: Sequence[str],
+    repair_bundle_sha: str,
+) -> tuple[dict[str, Any], str]:
+    """Build the scope-repair authority from plan mutation sets only."""
+
+    writes, creates, deletes = _repair_mutation_sets(plan)
+    requested = sorted(set(writes) | set(creates) | set(deletes))
+    original = sorted(set(original_scope))
+    added = sorted(set(requested) - set(original))
+    try:
+        raw_plan = (repair_dir / "planner.raw.md").read_bytes()
+    except OSError as exc:
+        raise OrchestrationError("SCOPE_REPAIR_PLAN_UNREADABLE") from exc
+    payload = {
+        "schema_version": 1,
+        "trigger": "revision_scope_violation",
+        "original_mutable_paths": original,
+        "requested_write_paths": writes,
+        "requested_create_paths": creates,
+        "requested_delete_paths": deletes,
+        "added_paths": added,
+        "failure_ids": sorted(set(failure_ids)),
+        "observed_outside_scope_paths": sorted(set(observed_outside_scope_paths)),
+        "repair_plan_sha256": hashlib.sha256(raw_plan).hexdigest(),
+        "repair_bundle_sha256": repair_bundle_sha,
+    }
+    return payload, _json_text(payload)
 
 
 def _candidate_chain_parent(
@@ -3558,16 +3593,34 @@ class Orchestrator:
         if record is None or record[1] != "pending" or head is None or tree is None:
             return
         previous = record[0]
-        if phase_index(phase) <= phase_index(ResumePhase.REPAIR_PLANNER):
+        scope_repair_phase = phase in {
+            ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01, ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01,
+            ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02, ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02,
+        }
+        scope_repair_planner_phase = phase in {
+            ResumePhase.CHECK_SCOPE_PLANNER_C01,
+            ResumePhase.CHECK_SCOPE_PLANNER_C02,
+        }
+        if scope_repair_planner_phase and repair_bundle_sha256 is None:
+            repair = None
+        elif phase_index(phase) <= phase_index(ResumePhase.REPAIR_PLANNER) and not scope_repair_phase:
             repair = None
         else:
             repair = repair_bundle_sha256 or previous.repair_bundle_sha256
+        if scope_repair_planner_phase and scope_delta_sha256 is None:
+            scope_delta = None
+        else:
+            scope_delta = scope_delta_sha256 or previous.scope_delta_sha256
         if cycle is None:
             cycle = 2 if phase_index(ResumePhase.REPAIR_PLANNER) <= phase_index(phase) < phase_index(ResumePhase.PUBLISH) else 1
         write_checkpoint(run_dir, ResumeCheckpoint(
             phase, cycle, step_id, head, tree,
             previous.execution_selection_sha256, previous.plan_identity, repair,
-            scope_delta_sha256 or previous.scope_delta_sha256,
+            scope_delta,
         ))
 
     def _execute_v2(
@@ -3647,6 +3700,40 @@ class Orchestrator:
         self._v2_usage_rows: list[dict[str, Any]] = [
             {"id": record["id"], **record["usage"]} for record in completed_steps
         ]
+        if resumed is not None and resumed.scope_violation_recovery is not None and phase in {
+            ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+            ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01, ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01,
+            ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+            ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02, ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02,
+            ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,
+            ResumePhase.REVIEWER_C02,
+        }:
+            try:
+                return self._execute_scope_repair_cycle(
+                    store=store, run_dir=run_dir, run_id=run_id, spec=spec,
+                    repo=repo, base_sha=base_sha, repository_reference=repository_reference,
+                    info=info, branch_ref=branch_ref,
+                    ownership_before=ownership_before, selection=selection,
+                    original_plan=plan, original_bundle=bundle, resumed=resumed,
+                    cycle=1 if resumed.checkpoint.cycle == 1 else 2,
+                )
+            except ScopeApprovalRequired:
+                return RunResult(run_dir, RunStatus.WAITING_SCOPE_APPROVAL, store.load())
+            except StepExecutionFailure as failure:
+                return self._step_failed(
+                    store, run_dir, failure,
+                    run_dir / "scope-repair" / ("C01" if resumed.checkpoint.cycle == 1 else "C02")
+                    / "steps" / failure.step_id,
+                )
+            except LLMError as exc:
+                return self._v2_failed(store, run_dir, "LLM_FAILURE", None, _bounded_parse_detail(exc))
+            except OrchestrationError as exc:
+                reason = str(exc).split(":", 1)[0].strip() or "SCOPE_REPAIR_FAILED"
+                return self._v2_failed(store, run_dir, reason, None, _bounded_parse_detail(exc))
         if resumed is not None and at <= phase_index(ResumePhase.REVIEWER_C01):
             store.update(status=store.load().get("status", RunStatus.IMPLEMENTING),
                          steps=state_steps, current_step=None, cycle=1)
@@ -5621,11 +5708,16 @@ class Orchestrator:
             "final": _bounded_report(result.final_message),
             "stderr_tail": result.stderr_tail,
             "changed_paths": list(changed_paths),
+            "outside_scope_paths": list(outside_scope),
             **({"failure_ids": _soft_check_failures(check_repair_evidence)}
                if is_check_repair else {}),
         }))
         store.update(status=RunStatus.REVISING, revision=revision_state)
         if outside_scope:
+            # This is a successful Claude transport with an unsafe candidate,
+            # so the exact failed tree must remain durable for the fail-closed
+            # rollback proof used by deterministic check-repair recovery.
+            _record_failure_tree(artifact_dir, info.worktree)
             return result, "REVISION_SCOPE_VIOLATION"
         # Claude complete and durable: the next operation is the final checks
         # followed by candidate commit/push and then the reviewer.
@@ -5641,6 +5733,667 @@ class Orchestrator:
             run_dir, next_revision_phase, cycle=cycle, head=expected_head, tree=tree_after,
         )
         return result, None
+
+    def _execute_scope_repair_cycle(
+        self,
+        *,
+        store: RunStateStore,
+        run_dir: Path,
+        run_id: str,
+        spec: str,
+        repo: Path,
+        base_sha: str,
+        repository_reference: RepositoryReference,
+        info: WorktreeInfo,
+        branch_ref: str,
+        ownership_before: GitOwnership,
+        selection: ExecutionSelectionV4,
+        original_plan: TaskPlanV2,
+        original_bundle: Mapping[str, Any],
+        resumed: _ResumedRun,
+        cycle: int,
+    ) -> RunResult:
+        """Execute the bounded Luna repair created after scope recovery.
+
+        The method is shared by C01 and C02.  It is deliberately entered only
+        after :meth:`_recover_failed_revision_scope_violation` has restored
+        the failed candidate exactly; no failed Claude edit is carried into
+        this state machine.
+        """
+
+        del original_bundle
+        phase = resumed.checkpoint.phase
+        at = phase_index(phase)
+        scope_dir = run_dir / "scope-repair" / f"C0{cycle}"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        normal_old_dir = run_dir / "revision" / "check-repair" / f"C0{cycle}"
+        expanded_old_dir = run_dir / "revision" / "check-repair-expanded" / f"C0{cycle}"
+        old_dir = (
+            expanded_old_dir
+            if phase in {ResumePhase.CHECK_REPAIR_EXPANDED_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C02}
+            or (
+                not (normal_old_dir / "scope_violation_recovery.json").is_file()
+                and (expanded_old_dir / "scope_violation_recovery.json").is_file()
+            )
+            else normal_old_dir
+        )
+        recovery = resumed.scope_violation_recovery
+        if not isinstance(recovery, Mapping):
+            raise ResumeIntegrityError("scope-repair recovery evidence is missing")
+        outside_paths = recovery.get("outside_scope_paths")
+        if not isinstance(outside_paths, list) or any(not isinstance(path, str) for path in outside_paths):
+            raise ResumeIntegrityError("scope-repair outside-scope evidence is malformed")
+
+        if cycle == 1:
+            failed_plan = original_plan
+            failed_evidence = resumed.c01_evidence
+        else:
+            failed_plan = resumed.repair_plan
+            failed_evidence = resumed.c02_evidence
+        if failed_plan is None:
+            raise ResumeIntegrityError("scope-repair source plan is missing")
+        if failed_evidence is None:
+            raise ResumeIntegrityError("scope-repair failed-check evidence is missing")
+
+        fallback_scope = sorted({
+            path for step in failed_plan.steps
+            for path in (*step.write_set, *step.create_set, *step.delete_set)
+        })
+        failed_scope = _read_check_repair_scope(
+            old_dir, fallback_base=fallback_scope,
+            policy_config=self._effective_repair_scope,
+            allowed_added_sources=_SECOND_SCOPE_SOURCES,
+        )
+        original_scope = list(failed_scope.effective_paths)
+        planner_profile = profile_for_role(
+            self.config, selection.planner.profile_id, ExecutionRole.PLANNER
+        )
+        repair_profile = profile_for_role(
+            self.config, selection.repair_implementer.profile_id, ExecutionRole.REPAIR
+        )
+        reviewer_profile = profile_for_role(
+            self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER
+        )
+        planner_dir = scope_dir
+        current_tree = candidate_tree_sha(info.worktree)
+        if current_tree != resumed.checkpoint.expected_tree_sha and phase in {
+            ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+            ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+        }:
+            raise ResumeIntegrityError("scope-repair did not start from the rolled-back checkpoint tree")
+
+        current_state = _json_text({
+            "BASE_SHA": base_sha,
+            "CURRENT_TREE_SHA": current_tree,
+            "HEAD_SHA": current_head(info.worktree),
+            "GIT_STATUS": status_porcelain(info.worktree),
+            "REMOTE_REPOSITORY_IS_EVIDENCE": True,
+            "IMMUTABLE_BASE_SHA": base_sha,
+            "CURRENT_WORKTREE_DIFF": bounded_semantic_diff(
+                failed_evidence.diff, _MAX_REVIEW_FALLBACK_DIFF_BYTES
+            )[0],
+        })
+        report = _read_json_artifact(old_dir / "report.json", 1024 * 1024)
+        if not isinstance(report, dict):
+            raise ResumeIntegrityError("failed Claude scope report is missing")
+        failed_report = _json_text({
+            "tree_before": report.get("tree_before"),
+            "tree_after": report.get("tree_after"),
+            "changed_paths": report.get("changed_paths"),
+            "outside_scope_paths": report.get("outside_scope_paths"),
+            "failure_ids": report.get("failure_ids", list(failed_evidence.failures)),
+            "final": _bounded_report(_read_bounded_text(old_dir / "agent.final.md")),
+        })
+
+        def parse_scope_plan() -> tuple[TaskPlanV2, dict[str, Any], str]:
+            try:
+                raw = (scope_dir / "planner.raw.md").read_text(encoding="utf-8")
+                plan_candidate = parse_task_plan_v2(
+                    raw,
+                    implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+                    reviewer_ids=frozenset({selection.reviewer.profile_id}),
+                    check_catalog=self.config.check_catalog,
+                    inherited_check_ids=failed_plan.required_checks,
+                )
+                validate_repair_decomposition_policy(plan_candidate, self.config.planning)
+                if plan_candidate.decision is not PlanDecision.READY:
+                    raise OrchestrationError("SCOPE_REPAIR_PLANNER_BLOCKED")
+                bundle_candidate, bundle_sha_candidate = validate_implementation_bundle(
+                    scope_dir, expected_step_ids=[step.id for step in plan_candidate.steps]
+                )
+            except (OSError, UnicodeError, V2PlanParseError, ValueError, AttributeError) as exc:
+                raise ResumeIntegrityError(f"scope-repair plan is unreadable: {exc}") from exc
+            return plan_candidate, bundle_candidate, bundle_sha_candidate
+
+        repair_plan: TaskPlanV2
+        repair_bundle: dict[str, Any]
+        repair_bundle_sha: str
+        if phase in {
+            ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+            ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+        }:
+            # Publish the new operation boundary before the strong planner is
+            # invoked.  A transport crash is therefore a planner resume, not
+            # a replay of Claude's failed check-repair.
+            self._checkpoint(
+                run_dir, phase_planner if "phase_planner" in locals() else (
+                    ResumePhase.CHECK_SCOPE_PLANNER_C01 if cycle == 1 else ResumePhase.CHECK_SCOPE_PLANNER_C02
+                ), cycle=cycle, head=current_head(info.worktree), tree=current_tree,
+            )
+        # A crash after the bridge wrote its bundle but before the phase moved
+        # must reuse the exact answer.  Evidence bytes are the binding, so a
+        # stale planner response cannot be accidentally adopted.
+        planner_bundle = build_scope_repair_planner_prompt_bundle(
+            repository_reference=render_repository_reference(repository_reference),
+            original_spec=spec,
+            original_plan_summary=render_repair_plan_summary(failed_plan),
+            original_step_index=render_repair_step_index(failed_plan),
+            current_repository_state=current_state,
+            failed_checks=_json_text(_check_payload(failed_evidence)),
+            current_authorized_mutable_scope=_json_text(original_scope),
+            failed_claude_repair_report=failed_report,
+            outside_scope_paths_observed=_json_text(outside_paths),
+            implementer_profiles=(repair_profile,),
+            reviewer_profiles=(reviewer_profile,),
+            check_catalog=self.config.check_catalog,
+            original_required_check_ids=failed_plan.required_checks,
+            staged_step_max_mutable_paths=self.config.planning.staged_step_max_mutable_paths,
+        )
+        reusable = False
+        if at <= phase_index(ResumePhase.CHECK_SCOPE_PLANNER_C01 if cycle == 1 else ResumePhase.CHECK_SCOPE_PLANNER_C02):
+            try:
+                reusable = (
+                    (scope_dir / "planner.evidence.md").read_bytes()
+                    == planner_bundle.evidence_text.encode("utf-8")
+                    and (scope_dir / "planner.raw.md").is_file()
+                    and (scope_dir / "implementation_bundle.json").is_file()
+                )
+            except OSError:
+                reusable = False
+        if reusable:
+            repair_plan, repair_bundle, repair_bundle_sha = parse_scope_plan()
+        elif at <= phase_index(ResumePhase.CHECK_SCOPE_PLANNER_C01 if cycle == 1 else ResumePhase.CHECK_SCOPE_PLANNER_C02):
+            planner = CheckScopeRepairPlannerV2(
+                self._planner_client or _chat_client(
+                    build_llm_endpoint(planner_profile), self._runtime_environment
+                ),
+                implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+                reviewer_ids=frozenset({selection.reviewer.profile_id}),
+                implementer_profiles=(repair_profile,), reviewer_profiles=(reviewer_profile,),
+                planning=self.config.planning, check_catalog=self.config.check_catalog,
+                original_required_check_ids=failed_plan.required_checks,
+            )
+            try:
+                repair_plan = planner.plan(
+                    repository_reference=render_repository_reference(repository_reference),
+                    original_spec=spec,
+                    original_plan_summary=render_repair_plan_summary(failed_plan),
+                    original_step_index=render_repair_step_index(failed_plan),
+                    current_repository_state=current_state,
+                    failed_checks=_json_text(_check_payload(failed_evidence)),
+                    current_authorized_mutable_scope=_json_text(original_scope),
+                    failed_claude_repair_report=failed_report,
+                    outside_scope_paths_observed=_json_text(outside_paths),
+                    artifacts_dir=scope_dir,
+                    fallback_current_diff=failed_evidence.diff,
+                )
+                _persist_planner_conversation(
+                    scope_dir, getattr(planner, "last_conversation", None)
+                )
+            except LLMError as exc:
+                raise OrchestrationError("LLM_FAILURE: scope-repair planner") from exc
+            if repair_plan.decision is PlanDecision.BLOCKED:
+                raise OrchestrationError("SCOPE_REPAIR_PLANNER_BLOCKED")
+            repair_bundle, repair_bundle_sha = validate_implementation_bundle(
+                scope_dir, expected_step_ids=[step.id for step in repair_plan.steps]
+            )
+        else:
+            repair_plan, repair_bundle, repair_bundle_sha = parse_scope_plan()
+
+        requested_scope = sorted({
+            path for step in repair_plan.steps
+            for path in (*step.write_set, *step.create_set, *step.delete_set)
+        })
+        repair_base_tree = recovery.get("tree_before")
+        if not isinstance(repair_base_tree, str) or not _is_object_id(repair_base_tree):
+            raise ResumeIntegrityError("scope-repair rollback tree is malformed")
+        writes, creates, deletes = _repair_mutation_sets(repair_plan)
+        for path in (*writes, *deletes):
+            if not path_exists_in_tree(repo, repair_base_tree, path):
+                raise OrchestrationError("REPAIR_SCOPE_EXISTING_PATH_MISSING")
+        for path in creates:
+            if path_exists_in_tree(repo, repair_base_tree, path):
+                raise OrchestrationError("REPAIR_SCOPE_CREATE_PATH_EXISTS")
+        scope_delta, scope_delta_content = _build_scope_repair_delta(
+            scope_dir, original_scope=original_scope, plan=repair_plan,
+            failure_ids=failed_evidence.failures,
+            observed_outside_scope_paths=outside_paths,
+            repair_bundle_sha=repair_bundle_sha,
+        )
+        scope_delta_expected_sha = resumed.checkpoint.scope_delta_sha256
+        if phase in {
+            ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+            ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+            ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_PLANNER_C02,
+        }:
+            # C02's old check-repair checkpoint is bound to the ordinary C02
+            # repair delta.  The new scope-repair planner starts a distinct
+            # authority chain and must create its own delta hash.
+            scope_delta_expected_sha = None
+        scope_delta_sha = _ensure_scope_delta(
+            scope_dir, scope_delta_content,
+            expected_sha256=scope_delta_expected_sha,
+        )
+        scope_payload = {
+            "schema_version": 1,
+            "original_mutable_paths": original_scope,
+            "requested_mutable_paths": requested_scope,
+            "effective_mutable_paths": sorted(set(original_scope) | set(requested_scope)),
+            "added_paths": scope_delta["added_paths"],
+            "scope_delta_sha256": scope_delta_sha,
+            "repair_bundle_sha256": repair_bundle_sha,
+            "policy": self._effective_repair_scope.policy,
+            "bound": self._effective_repair_scope.max_added_paths,
+        }
+        scope_text = _json_text(scope_payload)
+        scope_path = scope_dir / "scope.json"
+        if scope_path.exists():
+            if scope_path.read_text(encoding="utf-8") != scope_text:
+                raise ResumeIntegrityError("scope-repair scope artifact diverges")
+        else:
+            atomic_write_text(scope_path, scope_text)
+
+        phase_planner = ResumePhase.CHECK_SCOPE_PLANNER_C01 if cycle == 1 else ResumePhase.CHECK_SCOPE_PLANNER_C02
+        phase_approval = ResumePhase.CHECK_SCOPE_APPROVAL_C01 if cycle == 1 else ResumePhase.CHECK_SCOPE_APPROVAL_C02
+        phase_step = ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01 if cycle == 1 else ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02
+        phase_checks = ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01 if cycle == 1 else ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02
+        phase_claude = ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01 if cycle == 1 else ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02
+        phase_final = ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01 if cycle == 1 else ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02
+        if scope_delta["added_paths"] and self._effective_repair_scope.policy == "deny-expansion":
+            raise OrchestrationError("REPAIR_SCOPE_EXPANSION")
+        requires_approval = bool(scope_delta["added_paths"]) and (
+            self._effective_repair_scope.policy == "require-approval"
+            or (
+                self._effective_repair_scope.policy == "auto-bounded"
+                and len(scope_delta["added_paths"]) > self._effective_repair_scope.max_added_paths
+            )
+        )
+        if requires_approval:
+            approval = read_scope_approval(scope_dir, expected_sha256=scope_delta_sha)
+            if approval is None:
+                self._checkpoint(
+                    run_dir, phase_approval, cycle=cycle, head=current_head(info.worktree),
+                    tree=candidate_tree_sha(info.worktree), repair_bundle_sha256=repair_bundle_sha,
+                    scope_delta_sha256=scope_delta_sha,
+                )
+                store.update(
+                    status=RunStatus.WAITING_SCOPE_APPROVAL,
+                    scope_delta=scope_delta,
+                    scope_repair_scope_escalation={
+                        "trigger": "REVISION_SCOPE_VIOLATION",
+                        "added_paths": scope_delta["added_paths"],
+                        "policy": self._effective_repair_scope.policy,
+                    },
+                )
+                raise ScopeApprovalRequired()
+            if approval.decision is not ApprovalDecision.APPROVE:
+                raise OrchestrationError("HUMAN_REQUIRED: scope-repair scope rejected")
+        elif scope_delta["added_paths"]:
+            store.update(
+                scope_repair_scope_escalation={
+                    "trigger": "REVISION_SCOPE_VIOLATION",
+                    "added_paths": scope_delta["added_paths"],
+                    "policy": self._effective_repair_scope.policy,
+                    "auto_authorized": True,
+                }
+            )
+
+        ids = [step.id for step in repair_plan.steps]
+        completed: list[dict[str, Any]] = []
+        for step_id in ids:
+            record = _load_completed_step(scope_dir / "steps" / step_id, step_id)
+            if record is not None:
+                completed.append(record)
+        start_tree = resumed.checkpoint.expected_tree_sha
+        chain_end = _verify_step_chain(completed, recovery.get("tree_before", start_tree))
+        if chain_end is None:
+            raise ResumeIntegrityError("scope-repair Luna step chain is broken")
+        pending_steps = [
+            step for step in repair_plan.steps
+            if step.id not in {record["id"] for record in completed}
+        ]
+        if pending_steps and (
+            at <= phase_index(phase_step)
+            or phase in {phase_planner, phase_approval}
+        ):
+            # Establish the exact step boundary before starting Luna.  A
+            # crash in the worker is therefore resumable at Sxx, not at the
+            # planner boundary that produced its contract.
+            self._checkpoint(
+                run_dir, phase_step, cycle=cycle, step_id=pending_steps[0].id,
+                head=current_head(info.worktree), tree=candidate_tree_sha(info.worktree),
+                repair_bundle_sha256=repair_bundle_sha, scope_delta_sha256=scope_delta_sha,
+            )
+        # The old check-repair checkpoint and the new planner/approval/step
+        # checkpoints all begin from the exact rolled-back candidate.  Only
+        # the later checks/Claude phases resume from the completed Luna chain.
+        expected_tree = (
+            start_tree
+            if phase in {phase_step, phase_planner, phase_approval}
+            or phase in {
+                ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+                ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+            }
+            else chain_end
+        )
+        done = {record["id"] for record in completed}
+        if at <= phase_index(phase_step) or phase in {phase_planner, phase_approval}:
+            repair_codex_home = prepare_codex_home(self.config)
+            forbidden_env_names = (
+                planner_profile.api_key_env,
+                reviewer_profile.api_key_env,
+            )
+            for index, step in enumerate(repair_plan.steps):
+                if step.id in done:
+                    continue
+                contract = read_approved_step_contract(scope_dir, repair_bundle, step.id)
+                step_dir = scope_dir / "steps" / step.id
+                store.update(status=RunStatus.IMPLEMENTING, current_step=step.id)
+                try:
+                    outcome = self._execute_codex_step(
+                        repo=repo, worktree=info.worktree, base_sha=current_head(info.worktree),
+                        branch_ref=branch_ref, ownership_before=ownership_before,
+                        expected_tree=expected_tree, step=step, contract=contract,
+                        profile_id=selection.repair_implementer.profile_id,
+                        artifact_dir=step_dir, codex_home=repair_codex_home,
+                        forbidden_env_names=forbidden_env_names,
+                        future_ownership=_future_step_ownership(repair_plan.steps, index),
+                        pending_mismatch_retry=None,
+                    )
+                except StepExecutionFailure as failure:
+                    return self._step_failed(store, run_dir, failure, step_dir)
+                expected_tree = outcome.tree_after
+                completed.append(_step_result_record(outcome))
+                self._v2_usage_rows.append({"id": step.id, **outcome.usage})
+                following = ids[index + 1] if index + 1 < len(ids) else None
+                self._checkpoint(
+                    run_dir, phase_step if following else phase_checks, cycle=cycle,
+                    step_id=following, head=current_head(info.worktree), tree=expected_tree,
+                    repair_bundle_sha256=repair_bundle_sha, scope_delta_sha256=scope_delta_sha,
+                )
+            done = {record["id"] for record in completed}
+            chain_end = expected_tree
+        if len(done) != len(ids):
+            raise ResumeIntegrityError("scope-repair did not complete every Luna step")
+
+        checks_dir = scope_dir / "checks"
+        checks_dir.mkdir(parents=True, exist_ok=True)
+        evidence = _load_evidence(checks_dir)
+        if at <= phase_index(phase_checks) or phase in {phase_planner, phase_approval, phase_step}:
+            if evidence is None or evidence.staged_tree_sha != candidate_tree_sha(info.worktree):
+                check_tree = candidate_tree_sha(info.worktree)
+                self._checkpoint(
+                    run_dir, phase_checks, cycle=cycle, head=current_head(info.worktree),
+                    tree=check_tree, repair_bundle_sha256=repair_bundle_sha,
+                    scope_delta_sha256=scope_delta_sha,
+                )
+                evidence = self._final_evidence(
+                    info.worktree, base_sha, checks_dir, check_failures_hard=False,
+                    reuse=False, expected_head_sha=current_head(info.worktree),
+                    required_check_ids=failed_plan.required_checks or None,
+                    enforce_diff_size=False,
+                )
+        if evidence is None:
+            raise ResumeIntegrityError("scope-repair checks evidence is missing")
+        hard = _hard_integrity_failures(evidence)
+        if hard:
+            raise OrchestrationError(hard[0].split(":", 1)[0])
+        effective_scope = sorted(set(original_scope) | set(requested_scope))
+        residual_result = None
+        if not evidence.deterministic_passed:
+            soft = _soft_check_failures(evidence)
+            if not soft:
+                raise OrchestrationError("DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures))
+            residual_dir = scope_dir / "residual-claude"
+            if at <= phase_index(phase_claude) or phase in {phase_planner, phase_approval, phase_step, phase_checks}:
+                self._checkpoint(
+                    run_dir, phase_claude, cycle=cycle, head=current_head(info.worktree),
+                    tree=candidate_tree_sha(info.worktree), repair_bundle_sha256=repair_bundle_sha,
+                    scope_delta_sha256=scope_delta_sha,
+                )
+                persisted = _load_revision(residual_dir)
+                if persisted is not None and persisted.tree_before == candidate_tree_sha(info.worktree):
+                    residual_result = persisted
+                else:
+                    residual_scope = CheckRepairScope(
+                        base_paths=tuple(original_scope),
+                        added_paths=tuple(sorted(set(effective_scope) - set(original_scope))),
+                        effective_paths=tuple(effective_scope),
+                        policy=self._effective_repair_scope.policy,
+                        bound=self._effective_repair_scope.max_added_paths,
+                        source="scope-repair planner authorized scope",
+                    )
+                    try:
+                        residual_result, residual_error = self._run_v2_revision_cycle(
+                            store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                            base_tree_sha=resolve_tree(repo, base_sha), spec=spec,
+                            plan=failed_plan, repository_reference=repository_reference,
+                            info=info, branch_ref=branch_ref, ownership_before=ownership_before,
+                            selection=selection, artifact_dir=residual_dir,
+                            mutable_scope=effective_scope, check_repair_evidence=evidence,
+                            cycle=cycle, check_repair_scope=residual_scope,
+                            check_repair_phase_override=phase_claude,
+                            check_repair_next_phase_override=phase_final,
+                        )
+                    except (ClaudeAgentError, ClaudeRuntimeError, ClaudeCommittedError) as exc:
+                        raise OrchestrationError("CLAUDE_FAILED: residual scope repair") from exc
+                    if residual_error is not None:
+                        raise OrchestrationError(residual_error)
+            if residual_result is not None:
+                _archive_attempt(checks_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
+                evidence = None
+        if evidence is None or not evidence.deterministic_passed:
+            if at <= phase_index(phase_final) or phase in {phase_claude}:
+                self._checkpoint(
+                    run_dir, phase_final, cycle=cycle, head=current_head(info.worktree),
+                    tree=candidate_tree_sha(info.worktree), repair_bundle_sha256=repair_bundle_sha,
+                    scope_delta_sha256=scope_delta_sha,
+                )
+                evidence = self._final_evidence(
+                    info.worktree, base_sha, checks_dir, check_failures_hard=False,
+                    reuse=False, expected_head_sha=current_head(info.worktree),
+                    required_check_ids=failed_plan.required_checks or None,
+                    enforce_diff_size=False,
+                )
+            if evidence is None or not evidence.deterministic_passed:
+                raise OrchestrationError(
+                    "DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures if evidence else ())
+                )
+        self._update_v2_usage(store, run_dir)
+        if cycle == 1:
+            resumed_next = dataclasses.replace(resumed, checkpoint=ResumeCheckpoint(
+                ResumePhase.CANDIDATE_COMMIT_C01, 1, None, base_sha,
+                evidence.staged_tree_sha, resumed.checkpoint.execution_selection_sha256,
+                resumed.checkpoint.plan_identity, repair_bundle_sha, scope_delta_sha,
+            ), c01_evidence=evidence)
+        else:
+            c01 = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+            if not isinstance(c01, dict) or not _is_object_id(c01.get("commit_sha")):
+                raise ResumeIntegrityError("C01 candidate commit is missing for C02 scope repair")
+            resumed_next = dataclasses.replace(resumed, checkpoint=ResumeCheckpoint(
+                ResumePhase.CANDIDATE_COMMIT_C02, 2, None, c01["commit_sha"],
+                evidence.staged_tree_sha, resumed.checkpoint.execution_selection_sha256,
+                resumed.checkpoint.plan_identity, repair_bundle_sha, scope_delta_sha,
+            ), c02_evidence=evidence)
+        write_checkpoint(run_dir, resumed_next.checkpoint)
+        if cycle == 2:
+            return self._complete_scope_repair_c02_candidate(
+                store=store, run_dir=run_dir, run_id=run_id, spec=spec,
+                repository_reference=repository_reference, info=info,
+                branch_ref=branch_ref, selection=selection,
+                original_plan=original_plan, resumed=resumed_next,
+                scope_evidence=evidence, scope_delta=scope_delta,
+                scope_delta_sha=scope_delta_sha, scope_bundle_sha=repair_bundle_sha,
+            )
+        return self._execute_v2(
+            store, run_dir, run_id, spec, repo, base_sha,
+            resumed.context, repository_reference, resumed=resumed_next,
+        )
+
+    def _complete_scope_repair_c02_candidate(
+        self,
+        *,
+        store: RunStateStore,
+        run_dir: Path,
+        run_id: str,
+        spec: str,
+        repository_reference: RepositoryReference,
+        info: WorktreeInfo,
+        branch_ref: str,
+        selection: ExecutionSelectionV4,
+        original_plan: TaskPlanV2,
+        resumed: _ResumedRun,
+        scope_evidence: EvidenceBundle,
+        scope_delta: Mapping[str, Any],
+        scope_delta_sha: str,
+        scope_bundle_sha: str,
+    ) -> RunResult:
+        """Commit/review a green C02 scope-repair candidate directly.
+
+        C02's ordinary repair bundle and this recovery bundle are separate
+        authorities.  Once the scope-repair checks are green, this helper
+        performs only the candidate/reviewer tail and never re-enters the
+        ordinary C02 repair planner.
+        """
+
+        if not scope_evidence.deterministic_passed:
+            raise OrchestrationError(
+                "DETERMINISTIC_GATE_FAILED: " + ", ".join(scope_evidence.failures)
+            )
+        c01_candidate = _read_json_artifact(_candidate_commit_path(run_dir, 1))
+        if not isinstance(c01_candidate, dict) or not _is_object_id(c01_candidate.get("commit_sha")):
+            raise ResumeIntegrityError("C01 candidate commit is missing for C02 scope repair")
+        start = resumed.checkpoint
+        if phase_index(start.phase) <= phase_index(ResumePhase.CANDIDATE_COMMIT_C02):
+            self._checkpoint(
+                run_dir, ResumePhase.CANDIDATE_COMMIT_C02, cycle=2,
+                head=c01_candidate["commit_sha"], tree=scope_evidence.staged_tree_sha,
+                repair_bundle_sha256=scope_bundle_sha, scope_delta_sha256=scope_delta_sha,
+            )
+            if current_head(info.worktree) == c01_candidate["commit_sha"]:
+                self._authorize_candidate_tree(
+                    scope_evidence, info.worktree, c01_candidate["commit_sha"], branch_ref
+                )
+            elif not (
+                resumed.existing_commit_sha is not None
+                and commit_parents(info.worktree, resumed.existing_commit_sha) == (c01_candidate["commit_sha"],)
+                and resolve_tree(info.worktree, resumed.existing_commit_sha) == scope_evidence.staged_tree_sha
+            ):
+                raise ResumeIntegrityError("C02 scope candidate commit exists with the wrong identity")
+            c02_candidate = self._ensure_candidate_commit(
+                run_dir=run_dir, info=info, cycle=2, tree_sha=scope_evidence.staged_tree_sha,
+                parent_sha=c01_candidate["commit_sha"], title=resumed.repair_plan.title,
+                repository_reference=repository_reference, store=store, run_id=run_id,
+            )
+        else:
+            c02_candidate = _read_json_artifact(_candidate_commit_path(run_dir, 2))
+            if not isinstance(c02_candidate, dict):
+                raise ResumeIntegrityError("C02 scope candidate commit is missing")
+        if phase_index(start.phase) <= phase_index(ResumePhase.CANDIDATE_PUSH_C02):
+            self._checkpoint(
+                run_dir, ResumePhase.CANDIDATE_PUSH_C02, cycle=2,
+                head=c02_candidate["commit_sha"], tree=scope_evidence.staged_tree_sha,
+                repair_bundle_sha256=scope_bundle_sha, scope_delta_sha256=scope_delta_sha,
+            )
+            c02_candidate = self._push_candidate(
+                run_dir=run_dir, info=info, cycle=2, candidate=c02_candidate, store=store,
+            )
+        self._checkpoint(
+            run_dir, ResumePhase.REVIEWER_C02, cycle=2,
+            head=c02_candidate["commit_sha"], tree=scope_evidence.staged_tree_sha,
+            repair_bundle_sha256=scope_bundle_sha, scope_delta_sha256=scope_delta_sha,
+        )
+        cycle_1_evidence = resumed.c01_evidence
+        cycle_1_review = resumed.c01_review
+        if cycle_1_evidence is None or cycle_1_review is None:
+            raise ResumeIntegrityError("C01 review evidence is missing for C02 scope repair")
+        scope_dir = run_dir / "scope-repair" / "C02"
+        scope_revision = _load_revision(scope_dir / "residual-claude")
+        normal_repair_plan = resumed.repair_plan
+        if normal_repair_plan is None:
+            raise ResumeIntegrityError("C02 repair plan is missing for scope candidate review")
+        scope_plan = parse_task_plan_v2(
+            (scope_dir / "planner.raw.md").read_text(encoding="utf-8"),
+            implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+            reviewer_ids=frozenset({selection.reviewer.profile_id}),
+            check_catalog=self.config.check_catalog,
+            inherited_check_ids=normal_repair_plan.required_checks,
+        )
+        scope_records = [
+            record for step in scope_plan.steps
+            for record in [_load_completed_step(scope_dir / "steps" / step.id, step.id)]
+            if record is not None
+        ]
+        self._repair_v2_step_results = scope_records
+        scope_delta_text = _json_text(dict(scope_delta))
+        cycle_history = _json_text({
+            "C01": {
+                "planner_summary": original_plan.title,
+                "checks": _check_payload(cycle_1_evidence),
+                "reviewer_1_conclusion": _review_payload(cycle_1_review),
+            },
+            "C02": {
+                "repair_planner_summary": normal_repair_plan.title,
+                "scope_repair_planner": "bounded scope-repair planner",
+                "final_checks": _check_payload(scope_evidence),
+            },
+        })
+        reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
+        try:
+            if start.phase is ResumePhase.REVIEWER_C02:
+                _archive_attempt(run_dir / "review" / "C02", names=_REVIEW_ATTEMPT_ARTIFACTS)
+            review = self._run_v2_reviewer(
+                reviewer=reviewer, spec=spec, context=resumed.context,
+                repository_reference=repository_reference, evidence=scope_evidence,
+                input=ReviewCycleInput(
+                    iteration=2,
+                    plan_text=_json_text({
+                        "original_approved_plan": _review_plan_payload(original_plan),
+                        "repair_plan_c02": _review_plan_payload(normal_repair_plan),
+                        "scope_delta": scope_delta_text,
+                    }),
+                    luna_reports=(
+                        "C02 SCOPE REPAIR LUNA REPORTS\n"
+                        + _review_step_reports_text(scope_records)
+                    ),
+                    revision_report=(
+                        "C02 RESIDUAL CLAUDE\n"
+                        + (_revision_report_text(scope_revision, scope_dir / "residual-claude")
+                           if scope_revision is not None else "NONE")
+                    ),
+                    cycle_history=cycle_history,
+                    scope_delta=scope_delta_text,
+                ),
+                artifacts_dir=run_dir / "review" / "C02",
+                worktree=info.worktree, base_sha=resumed.info.base_sha,
+                candidate_commit=c02_candidate,
+                reuse_accepted=start.phase is ResumePhase.REVIEWER_C02,
+            )
+        except LLMError as exc:
+            raise ReviewerTransportError(
+                f"REVIEWER_TRANSPORT_FAILURE: {_bounded_parse_detail(exc)}"
+            ) from exc
+        store.update(status=RunStatus.REVIEWING, review=_review_payload(review), review_iterations=2)
+        if review.verdict is not ReviewVerdict.PASS or review.route is not ReviewRoute.NONE:
+            return self._v2_failed(store, run_dir, "REVIEW_FAILED", None)
+        self._cycle_update(store, 2, status="reviewed", reviewer_conclusion=_review_payload(review))
+        store.update(status=RunStatus.APPROVED, approved_tree_sha=scope_evidence.staged_tree_sha)
+        return self._complete_candidate_publication(
+            store=store, run_dir=run_dir, info=info,
+            approved_tree=scope_evidence.staged_tree_sha,
+            commit_sha=c02_candidate["commit_sha"],
+            repository_reference=repository_reference, cycle=2,
+        )
 
     def _execute_v2_repair_cycle(
         self,
@@ -7861,8 +8614,19 @@ class Orchestrator:
             )
             scope = sorted(set(scope) | set(expanded_c01.effective_paths))
         c02_repair_scope: list[str] = []
-        if checkpoint.cycle == 2 and checkpoint.phase not in {
+        c02_scope_recovery_phases = {
+            ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02,
+        }
+        scope_recovery_artifact_exists = any(
+            (run_dir / "revision" / directory / f"C0{checkpoint.cycle}" / "scope_violation_recovery.json").is_file()
+            for directory in ("check-repair", "check-repair-expanded")
+        )
+        if checkpoint.cycle == 2 and not scope_recovery_artifact_exists and checkpoint.phase not in {
             ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL,
+            *c02_scope_recovery_phases,
         }:
             # The C02 scope delta is bound to the original plan scope, never
             # to an expansion, so it is validated against that exact base.
@@ -7890,6 +8654,54 @@ class Orchestrator:
                 policy_config=self._effective_repair_scope,
             )
             scope = sorted(set(scope) | set(expanded_c02.effective_paths))
+        scope_repair_phases = {
+            ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01, ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01,
+            ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02, ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02,
+        }
+        if checkpoint.phase in scope_repair_phases - {
+            ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C01,
+            ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+        }:
+            scope = sorted(set(scope) | set(self._validated_scope_repair_scope(
+                run_dir, checkpoint, plan, selection
+            )))
+        if checkpoint.cycle == 2 and (
+            checkpoint.phase in c02_scope_recovery_phases or scope_recovery_artifact_exists
+        ):
+            try:
+                c02_plan = parse_task_plan_v2(
+                    (run_dir / "repair" / "C02" / "planner.raw.md").read_text(encoding="utf-8"),
+                    implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+                    reviewer_ids=frozenset({selection.reviewer.profile_id}),
+                    check_catalog=self.config.check_catalog,
+                    inherited_check_ids=plan.required_checks,
+                )
+                _bundle, _sha = validate_implementation_bundle(
+                    run_dir / "repair" / "C02",
+                    expected_step_ids=[step.id for step in c02_plan.steps],
+                )
+                c02_writes, c02_creates, c02_deletes = _repair_mutation_sets(c02_plan)
+                scope = sorted(set(scope) | set(c02_writes) | set(c02_creates) | set(c02_deletes))
+            except (OSError, UnicodeError, V2PlanParseError, ValueError, AttributeError) as exc:
+                refuse(f"the prior C02 repair scope is unreadable: {exc}")
+        scope_repair_dir = run_dir / "scope-repair" / f"C0{checkpoint.cycle}"
+        scope_repair_waiting = {
+            ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C01,
+            ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+        }
+        if (
+            checkpoint.phase not in scope_repair_waiting
+            and (scope_repair_dir / "scope_delta.json").is_file()
+            and checkpoint.repair_bundle_sha256 is not None
+            and checkpoint.scope_delta_sha256 is not None
+        ):
+            scope = sorted(set(scope) | set(self._validated_scope_repair_scope(
+                run_dir, checkpoint, plan, selection
+            )))
         failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
         clean_mismatch_shape = (
             failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
@@ -7915,6 +8727,10 @@ class Orchestrator:
                 ResumePhase.FINAL_CHECKS_RETRY_C02,
                 ResumePhase.CHECK_REPAIR_EXPANDED_C02,
                 ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02,
+                ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+                ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02,
+                ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02,
+                ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02,
                 ResumePhase.CANDIDATE_COMMIT_C02,
                 ResumePhase.CANDIDATE_PUSH_C02, ResumePhase.REVIEWER_C02,
             }
@@ -8028,7 +8844,11 @@ class Orchestrator:
             # That exact shape is reconciled here, before any drift verdict,
             # so the step is never executed twice.
             reconciled_retries: dict[str, str] = {}
-            if checkpoint.phase in {ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP}:
+            if checkpoint.phase in {
+                ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP,
+                ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01,
+                ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02,
+            }:
                 step_ids = (
                     [step.id for step in plan.steps]
                     if checkpoint.phase is ResumePhase.INITIAL_STEP
@@ -8045,6 +8865,56 @@ class Orchestrator:
             restore: tuple[str, ...] = ()
             mismatch_recovery: dict[str, Any] | None = None
             mismatch_recovery_path: Path | None = None
+            scope_violation_recovery: dict[str, Any] | None = None
+            if failure.get("reason") == "REVISION_SCOPE_VIOLATION" and checkpoint.phase in {
+                ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+                ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+            }:
+                if checkpoint.phase is ResumePhase.CHECK_REPAIR_C01:
+                    fallback = original_plan_scope
+                    scope_dir = run_dir / "revision" / "check-repair" / "C01"
+                elif checkpoint.phase is ResumePhase.CHECK_REPAIR_EXPANDED_C01:
+                    fallback = original_plan_scope
+                    scope_dir = run_dir / "revision" / "check-repair-expanded" / "C01"
+                elif checkpoint.phase is ResumePhase.CHECK_REPAIR_C02:
+                    fallback = c02_repair_scope or original_plan_scope
+                    scope_dir = run_dir / "revision" / "check-repair" / "C02"
+                else:
+                    fallback = c02_repair_scope or original_plan_scope
+                    scope_dir = run_dir / "revision" / "check-repair-expanded" / "C02"
+                failed_scope = _read_check_repair_scope(
+                    scope_dir, fallback_base=fallback,
+                    policy_config=self._effective_repair_scope,
+                    allowed_added_sources=_SECOND_SCOPE_SOURCES,
+                )
+                self._recover_failed_revision_scope_violation(
+                    repo=repo, worktree=worktree, run_dir=run_dir,
+                    checkpoint=checkpoint, mutable_scope=failed_scope.effective_paths,
+                )
+                scope_violation_recovery = _read_json_artifact(
+                    scope_dir / "scope_violation_recovery.json", 64 * 1024
+                )
+                # The rollback above changes the live Git observations used by
+                # the generic drift classifier below.  Refresh them before
+                # that classifier runs; otherwise it would inspect the
+                # already-replaced failed tree and reject its own recovery.
+                candidate = candidate_tree_sha(worktree)
+                index_tree = index_tree_sha(worktree)
+                dirty = _status_has_unstaged_or_untracked(status_porcelain(worktree))
+            if checkpoint.phase in scope_repair_phases:
+                recovery_cycle = "C01" if checkpoint.cycle == 1 else "C02"
+                normal_recovery_dir = run_dir / "revision" / "check-repair" / recovery_cycle
+                expanded_recovery_dir = run_dir / "revision" / "check-repair-expanded" / recovery_cycle
+                recovery_dir = (
+                    normal_recovery_dir
+                    if (normal_recovery_dir / "scope_violation_recovery.json").is_file()
+                    else expanded_recovery_dir
+                )
+                scope_violation_recovery = _read_json_artifact(
+                    recovery_dir / "scope_violation_recovery.json", 64 * 1024
+                )
+                if not isinstance(scope_violation_recovery, dict):
+                    refuse("scope-repair recovery artifact is missing")
             if dirty_mismatch_shape:
                 step_id = checkpoint.step_id
                 if step_id is None:
@@ -8215,11 +9085,16 @@ class Orchestrator:
                 if following:
                     next_phase = checkpoint.phase
                 else:
-                    next_phase = (
-                        ResumePhase.CHECKS_C01
-                        if checkpoint.phase is ResumePhase.INITIAL_STEP
-                        else ResumePhase.CHECKS_C02
-                    )
+                    if checkpoint.phase is ResumePhase.INITIAL_STEP:
+                        next_phase = ResumePhase.CHECKS_C01
+                    elif checkpoint.phase is ResumePhase.REPAIR_STEP:
+                        next_phase = ResumePhase.CHECKS_C02
+                    else:
+                        next_phase = (
+                            ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01
+                            if checkpoint.phase is ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01
+                            else ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02
+                        )
                 checkpoint = ResumeCheckpoint(
                     next_phase, checkpoint.cycle, following, checkpoint.expected_head_sha,
                     record["tree_before"], checkpoint.execution_selection_sha256,
@@ -8234,6 +9109,8 @@ class Orchestrator:
         # creates a normal first attempt, and never a second semantic retry.
         if not mismatch_retries and checkpoint.phase in {
             ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02,
         }:
             pending = self._pending_mismatch_retry_mode(run_dir, checkpoint)
             if pending:
@@ -8251,6 +9128,7 @@ class Orchestrator:
             mismatch_recovery=mismatch_recovery,
             mismatch_recovery_path=mismatch_recovery_path,
             mismatch_retries=mismatch_retries,
+            scope_violation_recovery=scope_violation_recovery,
             existing_commit_sha=existing_commit,
         )
         if checkpoint.phase is not ResumePhase.PUBLISH:
@@ -8269,6 +9147,13 @@ class Orchestrator:
 
         return (
             run_dir if checkpoint.phase is ResumePhase.INITIAL_STEP
+            else run_dir / "scope-repair" / (
+                "C01" if checkpoint.phase is ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01
+                else "C02"
+            ) if checkpoint.phase in {
+                ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01,
+                ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02,
+            }
             else run_dir / "repair" / "C02"
         )
 
@@ -8307,7 +9192,16 @@ class Orchestrator:
     ) -> list[str] | None:
         """The C02 step ids of the hash-bound repair bundle, or ``None``."""
 
-        repair_dir = run_dir / "repair" / "C02"
+        repair_dir = (
+            run_dir / "scope-repair" / (
+                "C01" if checkpoint.phase is ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01 else "C02"
+            )
+            if checkpoint.phase in {
+                ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01,
+                ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02,
+            }
+            else run_dir / "repair" / "C02"
+        )
         try:
             repair_plan = parse_task_plan_v2(
                 (repair_dir / "planner.raw.md").read_text(encoding="utf-8"),
@@ -8343,8 +9237,21 @@ class Orchestrator:
         """
 
         candidate_plan = plan
-        if checkpoint.phase is ResumePhase.REPAIR_STEP:
-            repair_dir = run_dir / "repair" / "C02"
+        if checkpoint.phase in {
+            ResumePhase.REPAIR_STEP,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02,
+        }:
+            repair_dir = (
+                run_dir / "scope-repair" / (
+                    "C01" if checkpoint.phase is ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01 else "C02"
+                )
+                if checkpoint.phase in {
+                    ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01,
+                    ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02,
+                }
+                else run_dir / "repair" / "C02"
+            )
             try:
                 candidate_plan = parse_task_plan_v2(
                     (repair_dir / "planner.raw.md").read_text(encoding="utf-8"),
@@ -8434,8 +9341,13 @@ class Orchestrator:
         index = step_ids.index(step_id)
         following = step_ids[index + 1] if index + 1 < len(step_ids) else None
         checks_phase = (
-            ResumePhase.CHECKS_C01 if checkpoint.phase is ResumePhase.INITIAL_STEP
+            ResumePhase.CHECKS_C01
+            if checkpoint.phase is ResumePhase.INITIAL_STEP
             else ResumePhase.CHECKS_C02
+            if checkpoint.phase is ResumePhase.REPAIR_STEP
+            else ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01
+            if checkpoint.phase is ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01
+            else ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02
         )
         return ResumeCheckpoint(
             checkpoint.phase if following else checks_phase,
@@ -8487,7 +9399,16 @@ class Orchestrator:
         except (V2PlanParseError, OrchestrationError, OSError, UnicodeError, ValueError,
                 AttributeError) as exc:
             refuse(f"the C02 repair scope is unreadable: {exc}")
-        if repair_plan.decision is not PlanDecision.READY or repair_sha != checkpoint.repair_bundle_sha256:
+        scope_c02_phases = {
+            ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02,
+        }
+        if repair_plan.decision is not PlanDecision.READY or (
+            checkpoint.phase not in scope_c02_phases
+            and repair_sha != checkpoint.repair_bundle_sha256
+        ):
             refuse("the C02 repair bundle changed")
         if hashlib.sha256(delta_bytes).hexdigest() != checkpoint.scope_delta_sha256:
             refuse("the C02 scope delta changed")
@@ -8523,6 +9444,68 @@ class Orchestrator:
                     refuse(f"the C02 scope approval is invalid: {exc}")
                 if approval is None or approval.decision is not ApprovalDecision.APPROVE:
                     refuse("the C02 scope expansion was not approved")
+        return requested
+
+    def _validated_scope_repair_scope(
+        self, run_dir: Path, checkpoint: ResumeCheckpoint, plan: TaskPlanV2,
+        selection: Any,
+    ) -> list[str]:
+        """Validate the hash-bound scope-repair bundle and return its sets."""
+
+        if checkpoint.phase in {
+            ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C01,
+            ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+        }:
+            return []
+        if checkpoint.repair_bundle_sha256 is None or checkpoint.scope_delta_sha256 is None:
+            raise ResumeIntegrityError("scope-repair checkpoint is missing its bundle or delta hash")
+        cycle = 1 if checkpoint.cycle == 1 else 2
+        directory = run_dir / "scope-repair" / f"C0{cycle}"
+        try:
+            parsed = parse_task_plan_v2(
+                (directory / "planner.raw.md").read_text(encoding="utf-8"),
+                implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+                reviewer_ids=frozenset({selection.reviewer.profile_id}),
+                check_catalog=self.config.check_catalog,
+                inherited_check_ids=plan.required_checks,
+            )
+            _bundle, bundle_sha = validate_implementation_bundle(
+                directory, expected_step_ids=[step.id for step in parsed.steps]
+            )
+            delta_path = directory / "scope_delta.json"
+            delta_bytes = delta_path.read_bytes()
+            delta = json.loads(delta_bytes.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError, V2PlanParseError, AttributeError) as exc:
+            raise ResumeIntegrityError(f"scope-repair artifacts are unreadable: {exc}") from exc
+        if parsed.decision is not PlanDecision.READY or bundle_sha != checkpoint.repair_bundle_sha256:
+            raise ResumeIntegrityError("scope-repair bundle changed")
+        if hashlib.sha256(delta_bytes).hexdigest() != checkpoint.scope_delta_sha256:
+            raise ResumeIntegrityError("scope-repair scope delta changed")
+        writes, creates, deletes = _repair_mutation_sets(parsed)
+        requested = sorted(set(writes) | set(creates) | set(deletes))
+        if (
+            not isinstance(delta, dict)
+            or delta.get("schema_version") != 1
+            or delta.get("trigger") != "revision_scope_violation"
+            or delta.get("requested_write_paths") != writes
+            or delta.get("requested_create_paths") != creates
+            or delta.get("requested_delete_paths") != deletes
+            or delta.get("repair_bundle_sha256") != bundle_sha
+        ):
+            raise ResumeIntegrityError("scope-repair scope delta does not match the plan")
+        added = sorted(set(requested) - set(delta.get("original_mutable_paths", [])))
+        if delta.get("added_paths") != added:
+            raise ResumeIntegrityError("scope-repair added paths changed")
+        if added:
+            policy = self._effective_repair_scope
+            if policy.policy == "deny-expansion":
+                raise ResumeIntegrityError("scope-repair expansion is denied")
+            if policy.policy == "require-approval" or (
+                policy.policy == "auto-bounded" and len(added) > policy.max_added_paths
+            ):
+                approval = read_scope_approval(directory, expected_sha256=checkpoint.scope_delta_sha256)
+                if approval is None or approval.decision is not ApprovalDecision.APPROVE:
+                    raise ResumeIntegrityError("scope-repair scope approval is missing or not approved")
         return requested
 
     @staticmethod
@@ -8561,8 +9544,12 @@ class Orchestrator:
                         "the failed Claude attempt changed paths outside the approved scope"
                     )
                 return tuple(changed)
-        elif phase in (ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP):
+        elif phase in (ResumePhase.INITIAL_STEP, ResumePhase.REPAIR_STEP,
+                       ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01,
+                       ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02):
             root = run_dir if phase is ResumePhase.INITIAL_STEP else run_dir / "repair" / "C02"
+            if phase in {ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02}:
+                root = run_dir / "scope-repair" / ("C01" if phase is ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01 else "C02")
             record = _read_json_artifact(root / "steps" / str(checkpoint.step_id) / "step.json")
             if (
                 isinstance(record, dict) and record.get("status") == "FAILED"
@@ -8579,6 +9566,131 @@ class Orchestrator:
                 )
         raise ResumeIntegrityError("the worktree differs from the checkpoint tree")
 
+    def _recover_failed_revision_scope_violation(
+        self,
+        *,
+        repo: Path,
+        worktree: Path,
+        run_dir: Path,
+        checkpoint: ResumeCheckpoint,
+        mutable_scope: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Validate, roll back, and archive an unsafe check-repair attempt.
+
+        The failed Claude tree is treated as evidence only.  Every changed
+        path is restored from the checkpoint tree, including paths that were
+        inside the previous scope; keeping a partial attempt would make the
+        subsequent strong planner reason from an unauthorised candidate.
+        """
+
+        state = _read_json_artifact(run_dir / "state.json", 256 * 1024)
+        failure = state.get("failure") if isinstance(state, Mapping) else None
+        if not isinstance(failure, Mapping) or failure.get("reason") != "REVISION_SCOPE_VIOLATION":
+            raise ResumeIntegrityError("scope-violation recovery requires REVISION_SCOPE_VIOLATION")
+        if checkpoint.phase not in {
+            ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+            ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+        }:
+            raise ResumeIntegrityError("scope-violation recovery is only valid for check-repair phases")
+        if checkpoint.expected_head_sha is None or checkpoint.expected_tree_sha is None:
+            raise ResumeIntegrityError("scope-violation checkpoint has no Git identity")
+
+        if checkpoint.phase is ResumePhase.CHECK_REPAIR_C01:
+            directory = run_dir / "revision" / "check-repair" / "C01"
+        elif checkpoint.phase is ResumePhase.CHECK_REPAIR_EXPANDED_C01:
+            directory = run_dir / "revision" / "check-repair-expanded" / "C01"
+        elif checkpoint.phase is ResumePhase.CHECK_REPAIR_C02:
+            directory = run_dir / "revision" / "check-repair" / "C02"
+        else:
+            directory = run_dir / "revision" / "check-repair-expanded" / "C02"
+        report_path = directory / "report.json"
+        failure_tree_path = directory / "tree_after_failure.txt"
+        report = _read_json_artifact(report_path, 1024 * 1024)
+        failure_tree = _read_tree_file(failure_tree_path)
+        if not isinstance(report, dict) or failure_tree is None:
+            raise ResumeIntegrityError("scope-violation report or failure tree is missing")
+        if report.get("tree_before") != checkpoint.expected_tree_sha:
+            raise ResumeIntegrityError("scope-violation report tree_before does not match the checkpoint")
+        if report.get("tree_after") != failure_tree:
+            raise ResumeIntegrityError("scope-violation report tree_after does not match the failure tree")
+
+        try:
+            ownership_before = _ownership_from_payload(state.get("git_ownership"))
+            current_ownership = _git_ownership(repo, worktree)
+            if ownership_before is None:
+                raise ResumeIntegrityError("scope-violation Git ownership proof is missing")
+            if _git_ownership_payload(current_ownership) != _git_ownership_payload(ownership_before):
+                raise ResumeRequiresOperatorError("scope-violation Git ownership changed after failure")
+            if current_ownership.head != checkpoint.expected_head_sha:
+                raise ResumeRequiresOperatorError("scope-violation HEAD changed after failure")
+            branch = state.get("branch")
+            if not isinstance(branch, str) or current_ownership.head_ref != f"refs/heads/{branch}":
+                raise ResumeRequiresOperatorError("scope-violation branch changed after failure")
+            candidate = candidate_tree_sha(worktree)
+            index_tree = index_tree_sha(worktree)
+            if candidate not in {failure_tree, checkpoint.expected_tree_sha}:
+                raise ResumeIntegrityError("current candidate is neither the failure tree nor the checkpoint tree")
+            if candidate == failure_tree and index_tree != failure_tree:
+                raise ResumeRequiresOperatorError("scope-violation index changed after failure")
+            if _status_has_unstaged_or_untracked(status_porcelain(worktree)):
+                raise ResumeRequiresOperatorError("scope-violation worktree has new unstaged or untracked changes")
+        except GitError as exc:
+            raise ResumeIntegrityError(f"scope-violation Git state is unreadable: {exc}") from exc
+
+        changed = tuple(changed_paths_between_trees(repo, checkpoint.expected_tree_sha, failure_tree))
+        recorded_changed = report.get("changed_paths")
+        if recorded_changed != list(changed):
+            raise ResumeIntegrityError("scope-violation report changed_paths do not match the Git delta")
+        if not changed:
+            raise ResumeIntegrityError("scope-violation report has no changed paths")
+        scope = set(mutable_scope)
+        expected_outside = tuple(sorted(set(changed) - scope))
+        recorded_outside = report.get("outside_scope_paths")
+        if recorded_outside is None:
+            outside = expected_outside
+        elif isinstance(recorded_outside, list) and all(isinstance(path, str) for path in recorded_outside):
+            outside = tuple(recorded_outside)
+        else:
+            raise ResumeIntegrityError("scope-violation outside_scope_paths is malformed")
+        if tuple(outside) != expected_outside:
+            raise ResumeIntegrityError("scope-violation outside_scope_paths do not match the mutable scope")
+        if not outside:
+            raise ResumeIntegrityError("scope-violation has no observed outside-scope path")
+
+        recovery = {
+            "schema_version": 1,
+            "tree_before": checkpoint.expected_tree_sha,
+            "tree_after_failure": failure_tree,
+            "restored_paths": list(changed),
+            "outside_scope_paths": list(outside),
+        }
+        recovery_path = directory / "scope_violation_recovery.json"
+        expected_bytes = _json_text(recovery).encode("utf-8")
+        try:
+            if recovery_path.exists():
+                if recovery_path.read_bytes() != expected_bytes:
+                    raise ResumeIntegrityError("scope-violation recovery artifact diverges")
+            elif candidate_tree_sha(worktree) == failure_tree:
+                restore_paths_from_tree(worktree, checkpoint.expected_tree_sha, list(changed))
+                _create_file_once(recovery_path, expected_bytes)
+            else:
+                raise ResumeIntegrityError("scope-violation recovery artifact is missing after rollback")
+        except FileExistsError:
+            if recovery_path.read_bytes() != expected_bytes:
+                raise ResumeIntegrityError("scope-violation recovery artifact diverges")
+        except (OSError, GitError) as exc:
+            raise ResumeRequiresOperatorError(f"scope-violation rollback failed: {exc}") from exc
+        try:
+            if (
+                candidate_tree_sha(worktree) != checkpoint.expected_tree_sha
+                or index_tree_sha(worktree) != checkpoint.expected_tree_sha
+                or _status_has_unstaged_or_untracked(status_porcelain(worktree))
+            ):
+                raise ResumeRequiresOperatorError("scope-violation rollback did not restore the exact checkpoint tree")
+        except GitError as exc:
+            raise ResumeRequiresOperatorError(f"scope-violation rollback proof failed: {exc}") from exc
+        return changed
+
     def _load_resumed_results(
         self, run_dir: Path, resumed: "_ResumedRun", base_tree: str,
         revision_enabled: bool, repair_enabled: bool,
@@ -8590,6 +9702,12 @@ class Orchestrator:
 
         checkpoint = resumed.checkpoint
         at = phase_index(checkpoint.phase)
+        scope_c02_phases = {
+            ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02,
+        }
         expected = checkpoint.expected_tree_sha
         ids = [step.id for step in resumed.plan.steps]
         if checkpoint.phase is ResumePhase.INITIAL_STEP:
@@ -8617,7 +9735,7 @@ class Orchestrator:
             c01_tree = revision.tree_after
         initial_c01_tree = c01_tree
         check_repair_dir_c01 = run_dir / "revision" / "check-repair" / "C01"
-        if revision_enabled and at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_C01) and (
+        if revision_enabled and resumed.scope_violation_recovery is None and at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_C01) and (
             check_repair_dir_c01 / "report.json"
         ).exists():
             repair_revision = _load_revision(
@@ -8628,7 +9746,7 @@ class Orchestrator:
             resumed.c01_check_repair_revision = repair_revision
             c01_tree = repair_revision.tree_after
         expanded_c01_dir = run_dir / "revision" / "check-repair-expanded" / "C01"
-        if revision_enabled and at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01) and (
+        if revision_enabled and resumed.scope_violation_recovery is None and at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01) and (
             checkpoint.phase in {
                 ResumePhase.CHECK_REPAIR_EXPANDED_C01,
                 ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
@@ -8656,6 +9774,14 @@ class Orchestrator:
                     refuse("the expanded C01 check-repair record is missing or not based on the red checks tree")
                 resumed.c01_expanded_check_repair_revision = expanded_revision
                 c01_tree = expanded_revision.tree_after
+        if resumed.scope_violation_recovery is not None and checkpoint.phase in {
+            ResumePhase.CANDIDATE_COMMIT_C01, ResumePhase.CANDIDATE_PUSH_C01,
+            ResumePhase.REVIEWER_C01,
+        }:
+            scope_evidence = _load_evidence(run_dir / "scope-repair" / "C01" / "checks")
+            if scope_evidence is None:
+                refuse("the C01 scope-repair candidate evidence is missing")
+            c01_tree = scope_evidence.staged_tree_sha
         if at <= phase_index(ResumePhase.REVIEWER_C01) and expected != c01_tree:
             refuse(
                 "the checkpoint tree is not the Claude C01 tree" if resumed.c01_revision is not None
@@ -8689,6 +9815,19 @@ class Orchestrator:
                 refuse("the C01 final evidence is missing or not for the expected checks tree")
             resumed.c01_evidence = evidence
             return
+        if checkpoint.phase in {
+            ResumePhase.CHECK_SCOPE_PLANNER_C01,
+            ResumePhase.CHECK_SCOPE_APPROVAL_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01,
+        } and resumed.scope_violation_recovery is not None:
+            evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
+            if evidence is None or evidence.staged_tree_sha != initial_c01_tree:
+                refuse("the C01 scope-repair evidence is missing or not for the rolled-back tree")
+            resumed.c01_evidence = evidence
+            return
         if checkpoint.phase is ResumePhase.FINAL_CHECKS_RETRY_C01:
             # The repair Claude did succeed, so ``c01_tree`` is the repaired
             # tree and the canonical bundle is either absent (the first retry
@@ -8719,12 +9858,24 @@ class Orchestrator:
             resumed.c01_evidence = current
             return
         if at <= phase_index(ResumePhase.CANDIDATE_COMMIT_C01):
+            scope_evidence = (
+                _load_evidence(run_dir / "scope-repair" / "C01" / "checks")
+                if resumed.scope_violation_recovery is not None else None
+            )
+            if scope_evidence is not None:
+                if scope_evidence.staged_tree_sha != c01_tree:
+                    refuse("the C01 scope-repair evidence is not for the candidate tree")
+                resumed.c01_evidence = scope_evidence
+                return
             evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
             if evidence is None or evidence.staged_tree_sha != c01_tree:
                 refuse("the C01 candidate evidence is missing or not for the candidate tree")
             resumed.c01_evidence = evidence
             return
-        evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
+        evidence = (
+            _load_evidence(run_dir / "scope-repair" / "C01" / "checks")
+            if resumed.scope_violation_recovery is not None else None
+        ) or _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
         if evidence is None or evidence.staged_tree_sha != c01_tree:
             refuse("the C01 candidate evidence is missing or not for the candidate tree")
         resumed.c01_evidence = evidence
@@ -8782,7 +9933,10 @@ class Orchestrator:
             )
         except (V2PlanParseError, OSError, UnicodeError, AttributeError) as exc:
             refuse(f"the C02 repair plan is unreadable: {exc}")
-        if repair_plan.decision is not PlanDecision.READY or repair_sha != checkpoint.repair_bundle_sha256:
+        if repair_plan.decision is not PlanDecision.READY or (
+            resumed.scope_violation_recovery is None
+            and repair_sha != checkpoint.repair_bundle_sha256
+        ):
             refuse("the C02 repair bundle changed")
         resumed.repair_plan, resumed.repair_bundle, resumed.repair_bundle_sha = repair_plan, repair_bundle, repair_sha
         if checkpoint.phase is ResumePhase.SCOPE_APPROVAL:
@@ -8819,7 +9973,7 @@ class Orchestrator:
             c02_tree = revision.tree_after
         initial_c02_tree = c02_tree
         check_repair_dir_c02 = run_dir / "revision" / "check-repair" / "C02"
-        if revision_enabled and at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_C02) and (
+        if revision_enabled and resumed.scope_violation_recovery is None and at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_C02) and (
             check_repair_dir_c02 / "report.json"
         ).exists():
             repair_revision = _load_revision(
@@ -8830,7 +9984,7 @@ class Orchestrator:
             resumed.c02_check_repair_revision = repair_revision
             c02_tree = repair_revision.tree_after
         expanded_c02_dir = run_dir / "revision" / "check-repair-expanded" / "C02"
-        if revision_enabled and at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02) and (
+        if revision_enabled and resumed.scope_violation_recovery is None and at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02) and (
             checkpoint.phase in {
                 ResumePhase.CHECK_REPAIR_EXPANDED_C02,
                 ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02,
@@ -8858,17 +10012,44 @@ class Orchestrator:
                     refuse("the expanded C02 check-repair record is missing or not based on the red checks tree")
                 resumed.c02_expanded_check_repair_revision = expanded_revision
                 c02_tree = expanded_revision.tree_after
+        if resumed.scope_violation_recovery is not None and checkpoint.phase in {
+            ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,
+            ResumePhase.REVIEWER_C02,
+        }:
+            scope_evidence = _load_evidence(run_dir / "scope-repair" / "C02" / "checks")
+            if scope_evidence is None:
+                refuse("the C02 scope-repair candidate evidence is missing")
+            c02_tree = scope_evidence.staged_tree_sha
         if expected != c02_tree:
             refuse(
                 "the checkpoint tree is not the Claude C02 tree" if resumed.c02_revision is not None
                 else "the checkpoint tree is not the last completed C02 tree"
             )
+        if checkpoint.phase in scope_c02_phases and resumed.scope_violation_recovery is not None:
+            evidence = _load_evidence(run_dir / "checks" / "C02")
+            if evidence is None or evidence.staged_tree_sha != c02_tree:
+                refuse("the C02 scope-repair evidence is missing or not for the rolled-back tree")
+            resumed.c02_evidence = evidence
+            return
         if checkpoint.phase is ResumePhase.CHECK_REPAIR_C02:
             # C02 parity with ``CHECK_REPAIR_C01``: the red pre-repair bundle
             # is mandatory and must be for the pre-repair C02 tree.
             evidence = _load_evidence(run_dir / "checks" / "C02")
             if evidence is None or evidence.staged_tree_sha != initial_c02_tree:
                 refuse("the C02 final evidence is missing or not for the expected checks tree")
+            resumed.c02_evidence = evidence
+            return
+        if checkpoint.phase in {
+            ResumePhase.CHECK_SCOPE_PLANNER_C02,
+            ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C02,
+            ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02,
+        } and resumed.scope_violation_recovery is not None:
+            evidence = _load_evidence(run_dir / "checks" / "C02")
+            if evidence is None or evidence.staged_tree_sha != initial_c02_tree:
+                refuse("the C02 scope-repair evidence is missing or not for the rolled-back tree")
             resumed.c02_evidence = evidence
             return
         if checkpoint.phase is ResumePhase.FINAL_CHECKS_RETRY_C02:
@@ -8903,7 +10084,10 @@ class Orchestrator:
             ResumePhase.CANDIDATE_COMMIT_C02, ResumePhase.CANDIDATE_PUSH_C02,
             ResumePhase.REVIEWER_C02,
         }:
-            evidence = _load_evidence(run_dir / "checks" / "C02")
+            evidence = (
+                _load_evidence(run_dir / "scope-repair" / "C02" / "checks")
+                if resumed.scope_violation_recovery is not None else None
+            ) or _load_evidence(run_dir / "checks" / "C02")
             if evidence is None or evidence.staged_tree_sha != expected:
                 refuse("the C02 candidate evidence is missing or not for the candidate tree")
             resumed.c02_evidence = evidence

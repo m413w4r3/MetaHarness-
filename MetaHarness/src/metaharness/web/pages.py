@@ -923,6 +923,7 @@ _FAILURE_MESSAGES = {
     "REVIEW_LOOP_EXHAUSTED": "Automatic correction budget exhausted",
     "REPAIR_EXHAUSTED": "Repair budget exhausted",
     "WAITING_SCOPE_APPROVAL": "Additional repair scope needs approval",
+    "REVISION_SCOPE_VIOLATION": "Check-repair scope needs bounded recovery",
     "INTERRUPTED": "Run interrupted",
 }
 
@@ -1017,10 +1018,14 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
             f' · cycle={_e(resume.get("cycle") or "—")}'
             f' · step={_e(resume.get("step_id") or "—")}</p>'
         )
+        button_label = (
+            "RECOVER CHECK-REPAIR SCOPE"
+            if reason == "REVISION_SCOPE_VIOLATION" else label
+        )
         button = (
             f'<form action="/runs/{_e(run.get("run_id"))}/resume" method="post">'
             f'<input type="hidden" name="_token" value="{_e(token)}">'
-            f'<button class="resume" type="submit">{label}</button></form>'
+            f'<button class="resume" type="submit">{button_label}</button></form>'
             if token else f'<p><strong>{label}</strong></p>'
         )
         action = f'<p class="label">NEXT ACTION</p>{checkpoint_detail}{button}'
