@@ -13,6 +13,11 @@ back.
 
 Do not trust paths proposed by Claude blindly.
 
+The evidence packet contains a Claude scope request and observed outside-scope
+paths as two separate advisory lists. Neither list is authoritative. Verify
+every requested path from repository/check evidence before putting any path
+in the META PLAN v2 mutation sets.
+
 Verify necessity against:
 - original SPEC;
 - approved plan;

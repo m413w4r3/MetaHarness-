@@ -39,6 +39,7 @@ from metaharness.claude.agent import (  # noqa: E402
     ClaudeCodeAgent,
     ClaudeResult,
     build_claude_environment,
+    parse_scope_request,
 )
 from metaharness.claude.runtime import prepare_claude_home  # noqa: E402
 from metaharness.config import ConfigError, load_config  # noqa: E402
@@ -304,10 +305,12 @@ class FakeClaude:
     def __init__(self, actions: dict[int, Callable[[Path], None]] | None = None,
                  log: list[str] | None = None,
                  stage_actions: dict[tuple[int, str], Callable[[Path], None]] | None = None,
-                 failures: dict[tuple[int, str], str] | None = None):
+                 failures: dict[tuple[int, str], str] | None = None,
+                 reports: dict[tuple[int, str], str] | None = None):
         self.actions = actions or {}
         self.stage_actions = stage_actions or {}
         self.failures = failures or {}
+        self.reports = reports or {}
         self.calls: list[dict[str, Any]] = []
         self.log = log
 
@@ -335,7 +338,7 @@ class FakeClaude:
             (target / "agent.events.jsonl").write_text("", encoding="utf-8")
             (target / "agent.stderr.log").write_text("timeout\n", encoding="utf-8")
             return ClaudeResult(124, True, "", {}, "timeout")
-        final = (
+        final = self.reports.get((cycle, stage)) or (
             f"Claude C0{cycle} revision report\n"
             if stage == "initial-revision"
             else f"Claude C0{cycle} check-repair report\n"
@@ -1324,6 +1327,73 @@ class FullPipelineTests(P28Harness):
 def required_checks_section(plan: str, *check_ids: str) -> str:
     section = "REQUIRED_CHECKS\n" + "".join(f"- {check_id}\n" for check_id in check_ids)
     return plan.replace("CONSTRAINTS\nNONE\n", f"CONSTRAINTS\nNONE\n\n{section}", 1)
+
+
+class StructuredScopeRequestPipelineTests(P28Harness):
+    REQUEST = """Claude completed the bounded attempt.
+
+META SCOPE REQUEST v1
+
+REASON
+The failing correction needs the existing source file.
+
+PATHS
+- src/a.py
+
+EVIDENCE
+- CHECK_FAILED:gate | src/a.py still contains BUG
+
+END META SCOPE REQUEST
+"""
+
+    def test_valid_request_rolls_back_and_routes_advisory_evidence_to_bridge(self) -> None:
+        config = self.load()
+        options = RunOptions.from_config(
+            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=4,
+        )
+        claude = FakeClaude(
+            stage_actions={(1, "check-repair"): writer("src/a.py", "A = REQUESTED\n")},
+            reports={(1, "check-repair"): self.REQUEST},
+        )
+        first, planner, _reviewer, _claude, _pushed = self.run_pipeline(
+            luna=FakeLuna({
+                (1, "S01", 1): writer("src/a.py", "A = BUG\n"),
+                (1, "S01", 2): writer("src/a.py", "A = 3\n"),
+            }),
+            reviews=[PASS], repair_plan=REPAIR_PLAN, claude=claude,
+            run_id="structured-scope-request", run_options=options,
+        )
+
+        self.assertEqual(first.status, RunStatus.PUBLISHED, first.state.get("failure"))
+        self.assertEqual(git(self.worktree("structured-scope-request"), "show", "HEAD:src/a.py"), "A = 3")
+        self.assertEqual(
+            first.state["check_repair"]["scope_request_diagnostic"],
+            "Claude requested scope expansion:\n"
+            "  paths: 1\n"
+            "  authoritative: NO\n"
+            "  routed to bridge audit: YES",
+        )
+        self.assertEqual(len(planner.prompts), 2)
+        bridge_prompt = planner.prompts[1]
+        self.assertIn("<CLAUDE SCOPE REQUEST>", bridge_prompt)
+        self.assertIn("<OBSERVED OUTSIDE SCOPE PATHS>", bridge_prompt)
+        self.assertIn("src/a.py", bridge_prompt)
+        recovery = json.loads(
+            (first.run_dir / "revision/check-repair/C01/scope_violation_recovery.json").read_text()
+        )
+        self.assertEqual(recovery["restored_paths"], ["src/a.py"])
+        self.assertEqual(recovery["outside_scope_paths"], [])
+        scope_delta = json.loads(
+            (first.run_dir / "scope-repair/C01/scope_delta.json").read_text()
+        )
+        self.assertEqual(scope_delta["added_paths"], [])
+
+    def test_scope_request_parser_rejects_duplicates_globs_and_more_than_32_paths(self) -> None:
+        base = self.REQUEST.replace("- src/a.py", "- src/a.py\n- src/a.py")
+        self.assertIsNone(parse_scope_request(base))
+        self.assertIsNone(parse_scope_request(self.REQUEST.replace("src/a.py", "src/*.py")))
+        paths = "\n".join(f"- src/{index}.py" for index in range(50))
+        self.assertIsNone(parse_scope_request(self.REQUEST.replace("- src/a.py", paths)))
 
 
 class CheckAuthorityPipelineTests(P28Harness):

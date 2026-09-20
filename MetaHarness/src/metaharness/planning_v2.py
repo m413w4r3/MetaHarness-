@@ -1009,6 +1009,7 @@ def build_scope_repair_planner_prompt_bundle(
     current_authorized_mutable_scope: str,
     failed_claude_repair_report: str,
     outside_scope_paths_observed: str,
+    claude_scope_request: str = "NONE",
     implementer_profiles: Sequence[ModelProfile] = (),
     reviewer_profiles: Sequence[ModelProfile] = (),
     template: str | None = None,
@@ -1032,7 +1033,8 @@ def build_scope_repair_planner_prompt_bundle(
         ("FAILED CHECKS", failed_checks),
         ("CURRENT AUTHORIZED MUTABLE SCOPE", current_authorized_mutable_scope),
         ("FAILED CLAUDE REPAIR REPORT", failed_claude_repair_report),
-        ("OUTSIDE SCOPE PATHS OBSERVED", outside_scope_paths_observed),
+        ("CLAUDE SCOPE REQUEST", claude_scope_request),
+        ("OBSERVED OUTSIDE SCOPE PATHS", outside_scope_paths_observed),
     )
     for name, value in evidence_values:
         if not isinstance(value, str):
@@ -1755,6 +1757,7 @@ class CheckScopeRepairPlannerV2:
         current_authorized_mutable_scope: str,
         failed_claude_repair_report: str,
         outside_scope_paths_observed: str,
+        claude_scope_request: str = "NONE",
         artifacts_dir: str | Path,
         fallback_current_diff: str = "",
     ) -> TaskPlanV2:
@@ -1768,6 +1771,7 @@ class CheckScopeRepairPlannerV2:
             current_authorized_mutable_scope=current_authorized_mutable_scope,
             failed_claude_repair_report=failed_claude_repair_report,
             outside_scope_paths_observed=outside_scope_paths_observed,
+            claude_scope_request=claude_scope_request,
             implementer_profiles=self.implementer_profiles,
             reviewer_profiles=self.reviewer_profiles,
             template=self.template,

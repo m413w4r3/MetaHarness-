@@ -32,9 +32,11 @@ from .claude.agent import (
     ClaudeAgentError,
     ClaudeCodeAgent,
     ClaudeCommittedError,
+    ScopeRequest,
     build_claude_environment,
     build_revision_prompt,
     classify_claude_failure,
+    parse_scope_request,
 )
 from .claude.runtime import ClaudeRuntimeError, prepare_claude_home
 from .approval import (
@@ -285,6 +287,8 @@ _MAX_STEP_REPORT_BYTES = 2_048
 _MAX_REVIEW_FALLBACK_DIFF_BYTES = 32 * 1024
 _MAX_REVIEW_CONTEXT_BYTES = 24 * 1024
 _MAX_REPAIR_CLAUDE_REPORT_BYTES = 16 * 1024
+_SCOPE_REQUEST_HEADER = "META SCOPE REQUEST v1"
+_SCOPE_REQUEST_ROUTE = "CLAUDE_SCOPE_REQUEST"
 _AGENT_ARTIFACTS = (
     "agent.events.jsonl",
     "agent.stderr.log",
@@ -375,6 +379,58 @@ def _bounded_repair_claude_report(text: str) -> str:
     ].decode("utf-8", errors="ignore")
 
     return head + marker.decode("utf-8")
+
+
+def _scope_request_payload(request: ScopeRequest) -> dict[str, Any]:
+    return {
+        "reason": request.reason,
+        "paths": list(request.paths),
+        "evidence": list(request.evidence),
+        "authoritative": False,
+        "routed_to_bridge_audit": True,
+    }
+
+
+def _scope_request_evidence(request: ScopeRequest | None) -> str:
+    if request is None:
+        return "NONE\n"
+    return "\n".join([
+        "REASON",
+        request.reason,
+        "",
+        "PATHS",
+        *(f"- {path}" for path in request.paths),
+        "",
+        "EVIDENCE",
+        *(f"- {item}" for item in request.evidence),
+        "",
+    ])
+
+
+def _scope_request_diagnostic(request: ScopeRequest) -> str:
+    return "\n".join([
+        "Claude requested scope expansion:",
+        f"  paths: {len(request.paths)}",
+        "  authoritative: NO",
+        "  routed to bridge audit: YES",
+    ])
+
+
+def _scope_request_from_payload(payload: Any) -> ScopeRequest | None:
+    if not isinstance(payload, Mapping):
+        return None
+    reason = payload.get("reason")
+    paths = payload.get("paths")
+    evidence = payload.get("evidence")
+    if (
+        not isinstance(reason, str)
+        or not isinstance(paths, list)
+        or not isinstance(evidence, list)
+        or any(not isinstance(path, str) for path in paths)
+        or any(not isinstance(item, str) for item in evidence)
+    ):
+        return None
+    return ScopeRequest(reason=reason, paths=tuple(paths), evidence=tuple(evidence))
 
 
 def _repair_checks_payload(bundle: EvidenceBundle) -> dict[str, Any]:
@@ -3841,6 +3897,9 @@ class Orchestrator:
                     return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None,
                                            redact(str(exc), self._secrets))
                 if revision_error is not None:
+                    if revision_error == _SCOPE_REQUEST_ROUTE:
+                        self._v2_failed(store, run_dir, "REVISION_SCOPE_VIOLATION", None)
+                        return self.resume(run_id)
                     return self._v2_failed(store, run_dir, revision_error, None)
                 self._cycle_update(
                     store, 1, status="completed",
@@ -3995,6 +4054,9 @@ class Orchestrator:
                     return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None,
                                            redact(str(exc), self._secrets))
                 if repair_error is not None:
+                    if repair_error == _SCOPE_REQUEST_ROUTE:
+                        self._v2_failed(store, run_dir, "REVISION_SCOPE_VIOLATION", None)
+                        return self.resume(run_id)
                     return self._v2_failed(
                         store, run_dir, repair_error, None, ", ".join(soft_failures_c01)
                     )
@@ -4086,6 +4148,9 @@ class Orchestrator:
                                 check_repair_next_phase_override=expanded_retry_phase,
                             )
                             if repair_error is not None:
+                                if repair_error == _SCOPE_REQUEST_ROUTE:
+                                    self._v2_failed(store, run_dir, "REVISION_SCOPE_VIOLATION", None)
+                                    return self.resume(run_id)
                                 return self._v2_failed(store, run_dir, repair_error, None)
                         elif resumed is not None:
                             expanded_check_repair_result_c01 = resumed.c01_expanded_check_repair_revision
@@ -4272,6 +4337,9 @@ class Orchestrator:
                     ),
                 )
                 if repair_error is not None:
+                    if repair_error == _SCOPE_REQUEST_ROUTE:
+                        self._v2_failed(store, run_dir, "REVISION_SCOPE_VIOLATION", None)
+                        return self.resume(run_id)
                     return self._v2_failed(store, run_dir, repair_error, None)
                 store.update(status=RunStatus.REVALIDATING, current_step=None)
                 retry_tree = candidate_tree_sha(info.worktree)
@@ -4360,6 +4428,9 @@ class Orchestrator:
                     check_repair_next_phase_override=ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
                 )
                 if repair_error is not None:
+                    if repair_error == _SCOPE_REQUEST_ROUTE:
+                        self._v2_failed(store, run_dir, "REVISION_SCOPE_VIOLATION", None)
+                        return self.resume(run_id)
                     return self._v2_failed(store, run_dir, repair_error, None)
             elif resumed is not None:
                 expanded_check_repair_result_c01 = resumed.c01_expanded_check_repair_revision
@@ -4584,6 +4655,9 @@ class Orchestrator:
                         _failure_reason(exc) if str(exc).startswith("CHECK_PREFLIGHT_FAILED:")
                         else str(exc).split(":", 1)[0].strip()
                     ) or "REPAIR_FAILED"
+                    if reason == _SCOPE_REQUEST_ROUTE:
+                        self._v2_failed(store, run_dir, "REVISION_SCOPE_VIOLATION", None)
+                        return self.resume(run_id)
                     return self._v2_failed(store, run_dir, reason, None)
                 if review.verdict is ReviewVerdict.REVISE and review.route in {
                     ReviewRoute.IMPLEMENTATION, ReviewRoute.REPLAN,
@@ -5694,6 +5768,15 @@ class Orchestrator:
         atomic_write_text(artifact_dir / "tree_after.txt", tree_after.rstrip() + "\n")
         changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
         outside_scope = [path for path in changed_paths if path not in set(mutable_scope)]
+        scope_request = (
+            parse_scope_request(result.final_message)
+            if is_check_repair else None
+        )
+        malformed_scope_request = (
+            is_check_repair
+            and _SCOPE_REQUEST_HEADER in result.final_message
+            and scope_request is None
+        )
         usage = normalize_usage(result.usage)
         revision_state = {
             "profile_id": selection.reviser.profile_id,
@@ -5701,6 +5784,17 @@ class Orchestrator:
             "tree_before": tree_before,
             "tree_after": tree_after,
             "usage": usage,
+            **(
+                {
+                    "scope_request": _scope_request_payload(scope_request),
+                    "scope_request_diagnostic": _scope_request_diagnostic(scope_request),
+                }
+                if scope_request is not None else {}
+            ),
+            **(
+                {"scope_request_warning": "malformed scope request ignored as authority"}
+                if malformed_scope_request else {}
+            ),
         }
         atomic_write_text(artifact_dir / "usage.json", _json_text(usage))
         atomic_write_text(artifact_dir / "report.json", _json_text({
@@ -5713,12 +5807,48 @@ class Orchestrator:
                if is_check_repair else {}),
         }))
         store.update(status=RunStatus.REVISING, revision=revision_state)
+        if scope_request is not None:
+            store.update(
+                status=RunStatus.REVISING,
+                check_repair={
+                    "attempted": True,
+                    "scope_request": _scope_request_payload(scope_request),
+                    "scope_request_diagnostic": _scope_request_diagnostic(scope_request),
+                },
+            )
+        elif malformed_scope_request:
+            store.update(
+                status=RunStatus.REVISING,
+                check_repair={
+                    "attempted": True,
+                    "scope_request_warning": "malformed scope request ignored as authority",
+                },
+            )
         if outside_scope:
             # This is a successful Claude transport with an unsafe candidate,
             # so the exact failed tree must remain durable for the fail-closed
             # rollback proof used by deterministic check-repair recovery.
             _record_failure_tree(artifact_dir, info.worktree)
             return result, "REVISION_SCOPE_VIOLATION"
+        if scope_request is not None:
+            # A valid request is advisory evidence, never an authorization
+            # delta.  Even an in-scope/no-op attempt is rolled back atomically
+            # before the durable bridge path is allowed to inspect it.
+            _record_failure_tree(artifact_dir, info.worktree)
+            try:
+                restore_paths_from_tree(info.worktree, tree_before, list(changed_paths))
+                stage_all(info.worktree)
+                if (
+                    candidate_tree_sha(info.worktree) != tree_before
+                    or index_tree_sha(info.worktree) != tree_before
+                    or _status_has_unstaged_or_untracked(status_porcelain(info.worktree))
+                ):
+                    raise GitError("scope-request rollback did not restore the exact tree")
+            except (GitError, OSError):
+                # Keep the existing dirty-violation recovery as the fail-safe
+                # owner of a rollback that could not be proven immediately.
+                pass
+            return result, _SCOPE_REQUEST_ROUTE
         # Claude complete and durable: the next operation is the final checks
         # followed by candidate commit/push and then the reviewer.
         next_revision_phase = (
@@ -5783,6 +5913,17 @@ class Orchestrator:
         outside_paths = recovery.get("outside_scope_paths")
         if not isinstance(outside_paths, list) or any(not isinstance(path, str) for path in outside_paths):
             raise ResumeIntegrityError("scope-repair outside-scope evidence is malformed")
+        scope_request = _scope_request_from_payload(recovery.get("scope_request"))
+        if recovery.get("scope_request") is not None and scope_request is None:
+            raise ResumeIntegrityError("scope-repair Claude scope request is malformed")
+        if scope_request is not None:
+            store.update(
+                status=RunStatus.REVISING,
+                check_repair={
+                    "scope_request": _scope_request_payload(scope_request),
+                    "scope_request_diagnostic": _scope_request_diagnostic(scope_request),
+                },
+            )
 
         if cycle == 1:
             failed_plan = original_plan
@@ -5892,6 +6033,7 @@ class Orchestrator:
             failed_checks=_json_text(_check_payload(failed_evidence)),
             current_authorized_mutable_scope=_json_text(original_scope),
             failed_claude_repair_report=failed_report,
+            claude_scope_request=_scope_request_evidence(scope_request),
             outside_scope_paths_observed=_json_text(outside_paths),
             implementer_profiles=(repair_profile,),
             reviewer_profiles=(reviewer_profile,),
@@ -5933,6 +6075,7 @@ class Orchestrator:
                     failed_checks=_json_text(_check_payload(failed_evidence)),
                     current_authorized_mutable_scope=_json_text(original_scope),
                     failed_claude_repair_report=failed_report,
+                    claude_scope_request=_scope_request_evidence(scope_request),
                     outside_scope_paths_observed=_json_text(outside_paths),
                     artifacts_dir=scope_dir,
                     fallback_current_diff=failed_evidence.diff,
@@ -8866,7 +9009,7 @@ class Orchestrator:
             mismatch_recovery: dict[str, Any] | None = None
             mismatch_recovery_path: Path | None = None
             scope_violation_recovery: dict[str, Any] | None = None
-            if failure.get("reason") == "REVISION_SCOPE_VIOLATION" and checkpoint.phase in {
+            if failure.get("reason") in {"REVISION_SCOPE_VIOLATION", _SCOPE_REQUEST_ROUTE} and checkpoint.phase in {
                 ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
                 ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
             }:
@@ -9585,8 +9728,10 @@ class Orchestrator:
 
         state = _read_json_artifact(run_dir / "state.json", 256 * 1024)
         failure = state.get("failure") if isinstance(state, Mapping) else None
-        if not isinstance(failure, Mapping) or failure.get("reason") != "REVISION_SCOPE_VIOLATION":
-            raise ResumeIntegrityError("scope-violation recovery requires REVISION_SCOPE_VIOLATION")
+        if not isinstance(failure, Mapping) or failure.get("reason") not in {
+            "REVISION_SCOPE_VIOLATION", _SCOPE_REQUEST_ROUTE,
+        }:
+            raise ResumeIntegrityError("scope-violation recovery requires a Claude scope route")
         if checkpoint.phase not in {
             ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
             ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
@@ -9613,6 +9758,15 @@ class Orchestrator:
             raise ResumeIntegrityError("scope-violation report tree_before does not match the checkpoint")
         if report.get("tree_after") != failure_tree:
             raise ResumeIntegrityError("scope-violation report tree_after does not match the failure tree")
+        recorded_scope_request = report.get("scope_request")
+        if recorded_scope_request is not None:
+            if not isinstance(recorded_scope_request, Mapping):
+                raise ResumeIntegrityError("scope-violation scope request is malformed")
+            parsed_scope_request = parse_scope_request(
+                _read_bounded_text(directory / "agent.final.md")
+            )
+            if parsed_scope_request is None or _scope_request_payload(parsed_scope_request) != dict(recorded_scope_request):
+                raise ResumeIntegrityError("scope-violation scope request does not match the final report")
 
         try:
             ownership_before = _ownership_from_payload(state.get("git_ownership"))
@@ -9641,7 +9795,7 @@ class Orchestrator:
         recorded_changed = report.get("changed_paths")
         if recorded_changed != list(changed):
             raise ResumeIntegrityError("scope-violation report changed_paths do not match the Git delta")
-        if not changed:
+        if not changed and recorded_scope_request is None:
             raise ResumeIntegrityError("scope-violation report has no changed paths")
         scope = set(mutable_scope)
         expected_outside = tuple(sorted(set(changed) - scope))
@@ -9654,7 +9808,7 @@ class Orchestrator:
             raise ResumeIntegrityError("scope-violation outside_scope_paths is malformed")
         if tuple(outside) != expected_outside:
             raise ResumeIntegrityError("scope-violation outside_scope_paths do not match the mutable scope")
-        if not outside:
+        if not outside and recorded_scope_request is None:
             raise ResumeIntegrityError("scope-violation has no observed outside-scope path")
 
         recovery = {
@@ -9663,6 +9817,18 @@ class Orchestrator:
             "tree_after_failure": failure_tree,
             "restored_paths": list(changed),
             "outside_scope_paths": list(outside),
+            **(
+                {
+                    "scope_request": dict(recorded_scope_request),
+                    "scope_request_diagnostic": (
+                        "Claude requested scope expansion:\n"
+                        f"  paths: {len(recorded_scope_request.get('paths', []))}\n"
+                        "  authoritative: NO\n"
+                        "  routed to bridge audit: YES"
+                    ),
+                }
+                if isinstance(recorded_scope_request, Mapping) else {}
+            ),
         }
         recovery_path = directory / "scope_violation_recovery.json"
         expected_bytes = _json_text(recovery).encode("utf-8")
@@ -9672,6 +9838,12 @@ class Orchestrator:
                     raise ResumeIntegrityError("scope-violation recovery artifact diverges")
             elif candidate_tree_sha(worktree) == failure_tree:
                 restore_paths_from_tree(worktree, checkpoint.expected_tree_sha, list(changed))
+                _create_file_once(recovery_path, expected_bytes)
+            elif candidate_tree_sha(worktree) == checkpoint.expected_tree_sha:
+                # A structured Claude request may have been rolled back
+                # immediately after the successful attempt.  The recovery
+                # proof is still required, even though there is no live dirty
+                # tree left for this resume to restore.
                 _create_file_once(recovery_path, expected_bytes)
             else:
                 raise ResumeIntegrityError("scope-violation recovery artifact is missing after rollback")

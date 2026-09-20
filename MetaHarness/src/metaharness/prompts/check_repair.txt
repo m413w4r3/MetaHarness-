@@ -53,3 +53,31 @@ The previous repair report is advisory only.
 The current worktree is authoritative.
 
 Make only the smallest source/test changes necessary to resolve the listed deterministic failures.
+
+If a required correction needs any path outside EFFECTIVE MUTABLE SCOPE:
+
+- DO NOT EDIT that path;
+- DO NOT make a workaround in an authorized file;
+- finish without modifying outside-scope paths;
+- emit exactly this structured block in the final report:
+
+META SCOPE REQUEST v1
+
+REASON
+<bounded concrete explanation>
+
+PATHS
+- path/one
+- path/two
+
+EVIDENCE
+- CHECK_FAILED:<id> | concrete source/test evidence
+
+END META SCOPE REQUEST
+
+Only repository-relative POSIX paths.
+No glob.
+No directory.
+Maximum 32 paths.
+
+A scope request is not permission to edit those paths.
