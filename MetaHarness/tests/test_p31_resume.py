@@ -9,7 +9,7 @@ import hashlib
 import shutil
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from unittest import mock
 from pathlib import Path
 from typing import Any
@@ -20,6 +20,7 @@ from metaharness.llm.chat import LLMHTTPError
 from metaharness.approval import PlanIdentity, write_scope_approval
 from metaharness.evidence import EvidenceBundle
 from metaharness.models import RunStatus
+from metaharness.orchestration.resume_validation import _scope_repair_checkpoint_tree
 from metaharness.orchestrator import Orchestrator
 from metaharness.run_options import EffectiveRepairScopePolicy, RunOptions
 import metaharness.orchestrator as orchestrator_module
@@ -2635,17 +2636,14 @@ class ScopeViolationResumeTests(ScopeViolationResumeHarness):
         for name, text in durable.items():
             self.assertEqual((run_dir / "scope-repair/C01" / name).read_text(), text, name)
 
-    @unittest.expectedFailure
     def test_d_a_completed_scope_repair_step_is_reconciled_not_replayed(self) -> None:
-        """Known gap: a durable scope-repair step cannot be reconciled.
+        """A durable scope-repair step is reconciled, never replayed.
 
-        The step record is written and the checkpoint moves, but the C01 tree
-        chain in ``Orchestrator._load_resumed_results`` still ends at the
-        Claude C01 tree, so any checkpoint at or after
-        ``CHECK_SCOPE_REPAIR_STEP_C01`` is refused with
-        ``RESUME_INTEGRITY_FAILURE``.  The scope-repair evidence is only
-        consulted for the candidate phases.  The durable step is therefore
-        never replayed -- the run simply cannot continue.
+        The step record is written and the checkpoint moves to
+        ``CHECK_SCOPE_REPAIR_CHECKS_C01`` carrying the tree that step
+        produced.  That tree is proved by the scope-repair chain --
+        the rolled-back failed-check tree followed by the completed Luna
+        steps -- and never by the Claude C01 tree the cycle answers to.
         """
 
         config, failed, _checkpoint = self.violate_c01("scope-resume-d")
@@ -3152,6 +3150,533 @@ class ScopeRepairCorruptionTests(ScopeViolationResumeHarness):
         git(worktree, "commit", "-qm", "an unowned commit")
 
         self.assert_fails_closed(config, "corrupt-ownership", "HEAD moved since the checkpoint")
+
+
+def object_id(marker: int) -> str:
+    """A syntactically valid, deliberately distinguishable tree SHA."""
+
+    return f"{marker:040x}"
+
+
+T0, T1, T2, T_BAD, OTHER_TREE = (object_id(value) for value in (0xA0, 0xA1, 0xA2, 0xBAD, 0x0DD))
+
+
+class ScopeRepairCheckpointAuthorityTests(unittest.TestCase):
+    """``_scope_repair_checkpoint_tree`` is the scope-repair phase authority.
+
+    The chain is built from the rolled-back failed-check tree, never from the
+    Claude C01/C02 tree the cycle answers to.  Every phase has exactly one
+    authority and a chain that does not prove it is refused.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temp.name) / "scope-repair" / "C01"
+        self.directory.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def step(self, step_id: str, before: str, after: str, *, status: str = "COMPLETED") -> None:
+        path = self.directory / "steps" / step_id
+        path.mkdir(parents=True, exist_ok=True)
+        write(path / "step.json", json.dumps({
+            "id": step_id, "status": status, "profile_id": "luna",
+            "tree_before": before, "tree_after": after,
+            "changed_paths": ["src/a.py"], "usage": {},
+        }))
+
+    def residual(self, before: str, after: str) -> None:
+        path = self.directory / "residual-claude"
+        path.mkdir(parents=True, exist_ok=True)
+        write(path / "report.json", json.dumps({
+            "status": "COMPLETED", "profile_id": "claude",
+            "tree_before": before, "tree_after": after, "usage": {},
+        }))
+
+    def checkpoint(self, phase: ResumePhase, tree: str, *, cycle: int = 1,
+                   step_id: str | None = None) -> ResumeCheckpoint:
+        return ResumeCheckpoint(
+            phase, cycle, step_id, object_id(0xE), tree, "0" * 64,
+            PlanIdentity("1" * 64, "2" * 64, "3" * 64, "0" * 64, "4" * 64),
+            "5" * 64, "6" * 64,
+        )
+
+    def authority(self, phase: ResumePhase, tree: str, *, step_id: str | None = None,
+                  step_ids: tuple[str, ...] = ("S01",), recovery_tree: str = T0):
+        return _scope_repair_checkpoint_tree(
+            directory=self.directory, checkpoint=self.checkpoint(phase, tree, step_id=step_id),
+            recovery_tree=recovery_tree, step_ids=step_ids,
+        )
+
+    # -- planner / approval ----------------------------------------------
+    def test_a_the_planner_authority_is_the_rolled_back_recovery_tree(self) -> None:
+        """Nothing has run yet, so only the recovery tree may be carried."""
+
+        for phase in (ResumePhase.CHECK_SCOPE_PLANNER_C01,
+                      ResumePhase.CHECK_SCOPE_APPROVAL_C01):
+            with self.subTest(phase=phase):
+                self.assertEqual(self.authority(phase, T0), (T0, None))
+
+    # -- partial step chain ----------------------------------------------
+    def test_b_a_partial_step_chain_proves_the_next_step_boundary(self) -> None:
+        """``S02`` resumes from exactly the tree ``S01`` durably produced."""
+
+        self.step("S01", T0, T1)
+        self.assertEqual(
+            self.authority(ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, T1,
+                           step_id="S02", step_ids=("S01", "S02", "S03")),
+            (T1, None),
+        )
+
+    def test_b_b_an_unknown_step_is_never_resumed(self) -> None:
+        self.step("S01", T0, T1)
+        tree, refusal = self.authority(
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, T1,
+            step_id="S09", step_ids=("S01", "S02", "S03"),
+        )
+        self.assertIsNone(tree)
+        self.assertIn("not in the scope-repair plan", refusal)
+
+    def test_b_c_a_step_not_based_on_the_recovery_tree_is_refused(self) -> None:
+        """``S01`` must start at the tree the rollback actually restored."""
+
+        self.step("S01", OTHER_TREE, T1)
+        tree, refusal = self.authority(
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, T1,
+            step_id="S02", step_ids=("S01", "S02", "S03"),
+        )
+        self.assertIsNone(tree)
+        self.assertIn("unbroken chain", refusal)
+
+    def test_b_d_a_checkpoint_tree_that_is_not_the_chain_end_is_refused(self) -> None:
+        self.step("S01", T0, T1)
+        tree, _refusal = self.authority(
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, T_BAD,
+            step_id="S02", step_ids=("S01", "S02", "S03"),
+        )
+        # The helper returns the durable authority; the caller compares it to
+        # the checkpoint tree and refuses the divergence.
+        self.assertEqual(tree, T1)
+        self.assertNotEqual(tree, T_BAD)
+
+    # -- checks / residual Claude ----------------------------------------
+    def test_c_the_checks_authority_is_the_completed_luna_chain(self) -> None:
+        self.step("S01", T0, T1)
+        self.assertEqual(
+            self.authority(ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01, T1), (T1, None)
+        )
+
+    def test_c_b_a_missing_luna_step_record_fails_closed(self) -> None:
+        tree, refusal = self.authority(ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01, T1)
+        self.assertIsNone(tree)
+        self.assertIn("missing or invalid", refusal)
+
+    def test_c_c_a_broken_luna_chain_fails_closed(self) -> None:
+        self.step("S01", T0, T1)
+        self.step("S02", OTHER_TREE, T2)
+        tree, refusal = self.authority(
+            ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01, T2, step_ids=("S01", "S02"),
+        )
+        self.assertIsNone(tree)
+        self.assertIn("unbroken chain", refusal)
+
+    def test_d_the_residual_claude_phase_still_answers_to_the_luna_tree(self) -> None:
+        """The residual pass has not acquired the checkpoint authority yet."""
+
+        self.step("S01", T0, T1)
+        self.residual(T1, T2)
+        self.assertEqual(
+            self.authority(ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01, T1), (T1, None)
+        )
+
+    # -- final checks -----------------------------------------------------
+    def test_e_the_final_checks_authority_is_the_residual_claude_tree(self) -> None:
+        self.step("S01", T0, T1)
+        self.residual(T1, T2)
+        self.assertEqual(
+            self.authority(ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01, T2), (T2, None)
+        )
+
+    def test_e_b_a_residual_claude_on_another_parent_is_refused(self) -> None:
+        """Even a live tree equal to ``tree_after`` never repairs the parent."""
+
+        self.step("S01", T0, T1)
+        self.residual(OTHER_TREE, T2)
+        tree, refusal = self.authority(
+            ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01, T2,
+        )
+        self.assertIsNone(tree)
+        self.assertIn("residual Claude is not based on the completed Luna tree", refusal)
+
+    def test_e_c_a_missing_residual_claude_record_fails_closed(self) -> None:
+        self.step("S01", T0, T1)
+        tree, refusal = self.authority(
+            ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01, T2,
+        )
+        self.assertIsNone(tree)
+        self.assertIn("residual Claude record is missing", refusal)
+
+    def test_f_the_helper_is_cycle_agnostic(self) -> None:
+        """C02 uses the same reconstruction, only the directory differs."""
+
+        self.step("S01", T0, T1)
+        self.residual(T1, T2)
+        checkpoint = self.checkpoint(
+            ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02, T2, cycle=2,
+        )
+        self.assertEqual(
+            _scope_repair_checkpoint_tree(
+                directory=self.directory, checkpoint=checkpoint,
+                recovery_tree=T0, step_ids=("S01",),
+            ),
+            (T2, None),
+        )
+
+
+class ResidualScopeRepairClaude(FakeClaude):
+    """A Claude double that tells the residual scope-repair pass apart.
+
+    ``scope-repair/C0X/residual-claude`` is not a ``check-repair`` directory,
+    so the inherited stage classification would call it an initial revision.
+    """
+
+    def __init__(self, residual=None, *, log=None):
+        super().__init__(log=log)
+        self.residual = residual
+        self.residual_calls: list[Path] = []
+
+    def run_revision(self, prompt, worktree, *, artifacts_dir, profile,
+                     environment, revision_dir=None):
+        target = Path(revision_dir) if revision_dir is not None else Path(artifacts_dir) / "revision"
+        if "residual-claude" in target.parts:
+            self.residual_calls.append(target)
+            if self.residual is not None:
+                self.residual(Path(worktree))
+        return super().run_revision(
+            prompt, worktree, artifacts_dir=artifacts_dir, profile=profile,
+            environment=environment, revision_dir=revision_dir,
+        )
+
+
+class ResidualScopeRepairHarness(ScopeViolationResumeHarness):
+    """A scope-repair whose bounded Luna pass is honest but still red.
+
+    The deterministic gate then routes one residual Claude pass inside the
+    scope-repair cycle, which is the shape every test below resumes from.
+    """
+
+    @contextmanager
+    def scope_checks(self, *, crash_on: int | None = None, cycle: str = "C01"):
+        """Count -- and optionally crash inside -- the scope-repair checks."""
+
+        real = Orchestrator._final_evidence
+        seen: list[Path] = []
+
+        def evidence(self_, worktree, base_sha, evidence_dir, *args, **kwargs):
+            path = Path(evidence_dir)
+            if path.name == "checks" and path.parent.name == cycle and (
+                path.parent.parent.name == "scope-repair"
+            ):
+                seen.append(path)
+                if crash_on is not None and len(seen) == crash_on:
+                    raise RuntimeError("simulated crash inside the scope-repair checks")
+            return real(self_, worktree, base_sha, evidence_dir, *args, **kwargs)
+
+        with mock.patch.object(Orchestrator, "_final_evidence", evidence):
+            yield seen
+
+    def scope_luna(self, cycle: int = 1) -> FakeLuna:
+        """A bounded repair that is honest but still red on the gate."""
+
+        return FakeLuna({(cycle, "S01"): writer("src/a.py", "A = BUG_STILL\n")})
+
+
+class ResidualScopeRepairResumeTests(ResidualScopeRepairHarness):
+    """The real run: a scope-repair whose residual Claude already succeeded.
+
+    ``20260919T193005Z-c462e8e5b4`` stopped on
+    ``CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01`` carrying the residual Claude tree
+    and was refused because the checkpoint was compared to the *initial*
+    Claude C01 tree.  The durable scope-repair chain is the only authority
+    that may prove such a checkpoint.
+    """
+
+    def reach(self, run_id: str, *, crash_on: int):
+        """A durable C01 scope-repair stopped inside its *crash_on*-th checks."""
+
+        config, _failed, _checkpoint = self.violate_c01(run_id)
+        claude = ResidualScopeRepairClaude(writer("src/a.py", "A = 3\n"), log=self.events)
+        with self.scope_checks(crash_on=crash_on):
+            crashed, _planner, _reviewer, luna, _c, _pushed = self.resume_with(
+                config, run_id, plans=[SCOPE_REPAIR_PLAN], reviews=[PASS],
+                luna=self.scope_luna(), claude=claude,
+            )
+        self.assertEqual(crashed.state["failure"]["reason"], "RUNTIMEERROR")
+        self.assertEqual([call["step"] for call in luna.calls], ["S01"])
+        return config, crashed.run_dir, claude
+
+    def trees(self, run_dir: Path) -> tuple[str, str, str]:
+        """``(T0, T1, T2)``: recovery, completed Luna, residual Claude."""
+
+        recovery = json.loads((run_dir / RECOVERY_C01).read_text())
+        step = json.loads((run_dir / "scope-repair/C01/steps/S01/step.json").read_text())
+        residual = json.loads((run_dir / "scope-repair/C01/residual-claude/report.json").read_text())
+        self.assertEqual(step["tree_before"], recovery["tree_before"])
+        self.assertEqual(residual["tree_before"], step["tree_after"])
+        return recovery["tree_before"], step["tree_after"], residual["tree_after"]
+
+    def test_a_the_final_checks_boundary_replays_nothing_before_it(self) -> None:
+        """The exact shape of the real run, resumed without any replay."""
+
+        config, run_dir, first = self.reach("residual-final", crash_on=2)
+        self.assertEqual(len(first.residual_calls), 1)
+        t0, t1, t2 = self.trees(run_dir)
+        self.assertNotEqual(t0, t1)
+        self.assertNotEqual(t1, t2)
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01)
+        self.assertEqual(checkpoint.expected_tree_sha, t2)
+        # The checkpoint is emphatically *not* the Claude C01 tree.
+        self.assertNotEqual(
+            t2, json.loads((run_dir / "revision/report.json").read_text())["tree_after"],
+        )
+
+        claude = ResidualScopeRepairClaude(log=self.events)
+        with self.scope_checks() as ran:
+            resumed, planner, reviewer, luna, _c, pushed = self.resume_with(
+                config, "residual-final", plans=[], reviews=[PASS],
+                luna=FakeLuna({}), claude=claude,
+            )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(len(planner.prompts), 0)
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(claude.residual_calls, [])
+        self.assertEqual(len(ran), 1)
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertEqual(pushed.call_count, 1)
+        self.assertEqual(git(self.worktree("residual-final"), "show", "HEAD:src/a.py"), "A = 3")
+
+    def test_b_a_failed_run_is_accepted_under_integrity_revalidation(self) -> None:
+        """The real run is already ``RESUME_INTEGRITY_FAILURE``; no artifact
+        is edited to make the new validation accept it."""
+
+        config, run_dir, _claude = self.reach("residual-revalidate", crash_on=2)
+        before = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in sorted((run_dir / "scope-repair").rglob("*")) if path.is_file()
+        }
+        checkpoint = read_checkpoint(run_dir)
+        store = RunStateStore(run_dir / "state.json")
+        store.update(
+            status=RunStatus.FAILED,
+            failure={"reason": "RESUME_INTEGRITY_FAILURE",
+                     "detail": "the checkpoint tree is not the Claude C01 tree"},
+        )
+        self.assertEqual(read_checkpoint(run_dir), checkpoint)
+
+        resumed, _planner, _reviewer, luna, claude, _pushed = self.resume_with(
+            config, "residual-revalidate", plans=[], reviews=[PASS],
+            luna=FakeLuna({}), claude=ResidualScopeRepairClaude(log=self.events),
+            revalidate_integrity=True,
+        )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(
+            {path.relative_to(run_dir).as_posix(): path.read_bytes()
+             for path in sorted((run_dir / "scope-repair").rglob("*"))
+             if path.is_file() and path.relative_to(run_dir).as_posix() in before},
+            before,
+        )
+
+    def test_c_a_corrupted_residual_parent_is_refused_on_the_live_tree(self) -> None:
+        """The live tree is ``T2``; an unproven parent still fails closed."""
+
+        config, run_dir, _claude = self.reach("residual-corrupt", crash_on=2)
+        _t0, _t1, t2 = self.trees(run_dir)
+        self.assertEqual(read_checkpoint(run_dir).expected_tree_sha, t2)
+        path = run_dir / "scope-repair/C01/residual-claude/report.json"
+        payload = json.loads(path.read_text())
+        payload["tree_before"] = "0" * 40
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        resumed, _planner, _reviewer, luna, claude, pushed = self.resume_with(
+            config, "residual-corrupt", plans=[], reviews=[PASS],
+            luna=FakeLuna({}), claude=ResidualScopeRepairClaude(log=self.events),
+        )
+
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(resumed.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertIn(
+            "residual Claude is not based on the completed Luna tree",
+            resumed.state["failure"]["detail"],
+        )
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(pushed.call_count, 0)
+
+    def test_d_the_checks_boundary_is_proved_by_the_luna_chain(self) -> None:
+        """``CHECK_SCOPE_REPAIR_CHECKS_C01`` carries the completed Luna tree."""
+
+        config, run_dir, claude = self.reach("residual-checks", crash_on=1)
+        self.assertEqual(claude.residual_calls, [])
+        recovery = json.loads((run_dir / RECOVERY_C01).read_text())
+        step = json.loads((run_dir / "scope-repair/C01/steps/S01/step.json").read_text())
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01)
+        self.assertEqual(checkpoint.expected_tree_sha, step["tree_after"])
+        self.assertEqual(step["tree_before"], recovery["tree_before"])
+
+        resumed, _planner, _reviewer, luna, fresh, pushed = self.resume_with(
+            config, "residual-checks", plans=[], reviews=[PASS], luna=FakeLuna({}),
+            claude=ResidualScopeRepairClaude(writer("src/a.py", "A = 3\n"), log=self.events),
+        )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        # Luna's durable step is never replayed; only the residual pass runs.
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(len(fresh.residual_calls), 1)
+        self.assertEqual(pushed.call_count, 1)
+
+    def test_e_a_checks_checkpoint_off_the_luna_chain_fails_closed(self) -> None:
+        """``T_BAD`` instead of ``T1`` is refused, even before Git is read."""
+
+        config, run_dir, _claude = self.reach("residual-checks-bad", crash_on=1)
+        step = json.loads((run_dir / "scope-repair/C01/steps/S01/step.json").read_text())
+        step["tree_after"] = "1" * 40
+        write(run_dir / "scope-repair/C01/steps/S01/step.json", json.dumps(step))
+
+        resumed, _planner, _reviewer, luna, claude, pushed = self.resume_with(
+            config, "residual-checks-bad", plans=[], reviews=[PASS],
+            luna=FakeLuna({}), claude=ResidualScopeRepairClaude(log=self.events),
+        )
+
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertIn(resumed.state["failure"]["reason"],
+                      {"RESUME_INTEGRITY_FAILURE", "RESUME_REQUIRES_OPERATOR"})
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(pushed.call_count, 0)
+
+    def test_f_the_candidate_authority_is_still_the_scope_repair_evidence(self) -> None:
+        """Deterministic checks, never the residual report, commit the tree."""
+
+        config, run_dir, _claude = self.reach("residual-candidate", crash_on=2)
+        _t0, _t1, t2 = self.trees(run_dir)
+
+        resumed, _planner, _reviewer, _l, _c, _pushed = self.resume_with(
+            config, "residual-candidate", plans=[], reviews=[PASS],
+            luna=FakeLuna({}), claude=ResidualScopeRepairClaude(log=self.events),
+        )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        evidence = json.loads((run_dir / "scope-repair/C01/checks/evidence.json").read_text())
+        candidate = json.loads((run_dir / "candidate/C01/commit.json").read_text())
+        self.assertTrue(evidence["deterministic_passed"])
+        self.assertEqual(evidence["staged_tree_sha"], t2)
+        self.assertEqual(
+            git(self.worktree("residual-candidate"), "rev-parse", "HEAD^{tree}"),
+            evidence["staged_tree_sha"],
+        )
+        self.assertEqual(candidate["tree_sha"], evidence["staged_tree_sha"])
+
+
+class ResidualScopeRepairC02ParityTests(ResidualScopeRepairHarness):
+    """C02 reconstructs the same chain, from its own recovery tree.
+
+    The C01 candidate is already immutable, so a C02 scope-repair resume may
+    never replay a C01 phase; only the C02 chain proves the checkpoint.
+    """
+
+    def reach(self, run_id: str, *, crash_on: int):
+        """A durable C02 scope-repair stopped inside its *crash_on*-th checks."""
+
+        config, _failed, _checkpoint = self.violate_c02(run_id)
+        claude = ResidualScopeRepairClaude(writer("src/a.py", "A = 5\n"), log=self.events)
+        with self.scope_checks(crash_on=crash_on, cycle="C02"):
+            crashed, _planner, _reviewer, luna, _c, _pushed = self.resume_with(
+                config, run_id, plans=[SCOPE_REPAIR_PLAN], reviews=[PASS],
+                luna=self.scope_luna(2), claude=claude,
+            )
+        self.assertEqual(crashed.state["failure"]["reason"], "RUNTIMEERROR")
+        self.assertEqual([(call["cycle"], call["step"]) for call in luna.calls], [(2, "S01")])
+        return config, crashed.run_dir, claude
+
+    def trees(self, run_dir: Path) -> tuple[str, str, str]:
+        recovery = json.loads((run_dir / RECOVERY_C02).read_text())
+        step = json.loads((run_dir / "scope-repair/C02/steps/S01/step.json").read_text())
+        residual = json.loads((run_dir / "scope-repair/C02/residual-claude/report.json").read_text())
+        self.assertEqual(step["tree_before"], recovery["tree_before"])
+        self.assertEqual(residual["tree_before"], step["tree_after"])
+        return recovery["tree_before"], step["tree_after"], residual["tree_after"]
+
+    def test_a_the_final_checks_boundary_replays_nothing_before_it(self) -> None:
+        """``R0 -> R1 -> R2``: the C02 chain alone proves the checkpoint."""
+
+        config, run_dir, first = self.reach("residual-c02", crash_on=2)
+        self.assertEqual(len(first.residual_calls), 1)
+        c01_commit = json.loads((run_dir / "candidate/C01/commit.json").read_text())
+        c01_step = json.loads((run_dir / "steps/S01/step.json").read_text())
+        r0, r1, r2 = self.trees(run_dir)
+        self.assertNotEqual(r0, r1)
+        self.assertNotEqual(r1, r2)
+        checkpoint = read_checkpoint(run_dir)
+        self.assertEqual(checkpoint.phase, ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02)
+        self.assertEqual(checkpoint.cycle, 2)
+        self.assertEqual(checkpoint.expected_tree_sha, r2)
+        self.assertNotEqual(
+            r2, json.loads((run_dir / "revision/C02/report.json").read_text())["tree_after"],
+        )
+
+        claude = ResidualScopeRepairClaude(log=self.events)
+        with self.scope_checks(cycle="C02") as ran:
+            resumed, planner, reviewer, luna, _c, pushed = self.resume_with(
+                config, "residual-c02", plans=[], reviews=[PASS],
+                luna=FakeLuna({}), claude=claude,
+            )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(len(planner.prompts), 0)
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(claude.residual_calls, [])
+        self.assertEqual(len(ran), 1)
+        # Reviewer #2 only; no C01 phase is ever replayed.
+        self.assertEqual(len(reviewer.prompts), 1)
+        self.assertEqual(pushed.call_count, 1)
+        self.assertEqual(
+            json.loads((run_dir / "candidate/C01/commit.json").read_text()), c01_commit,
+        )
+        self.assertEqual(json.loads((run_dir / "steps/S01/step.json").read_text()), c01_step)
+        worktree = self.worktree("residual-c02")
+        self.assertEqual(git(worktree, "show", "HEAD:src/a.py"), "A = 5")
+        self.assertEqual(git(worktree, "rev-parse", "HEAD^"), c01_commit["commit_sha"])
+
+    def test_f_the_candidate_authority_is_still_the_scope_repair_evidence(self) -> None:
+        """C02 parity: the deterministic checks commit the C02 candidate."""
+
+        config, run_dir, _claude = self.reach("residual-c02-candidate", crash_on=2)
+        _r0, _r1, r2 = self.trees(run_dir)
+
+        resumed, _planner, _reviewer, _l, _c, _pushed = self.resume_with(
+            config, "residual-c02-candidate", plans=[], reviews=[PASS],
+            luna=FakeLuna({}), claude=ResidualScopeRepairClaude(log=self.events),
+        )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        evidence = json.loads((run_dir / "scope-repair/C02/checks/evidence.json").read_text())
+        candidate = json.loads((run_dir / "candidate/C02/commit.json").read_text())
+        self.assertTrue(evidence["deterministic_passed"])
+        self.assertEqual(evidence["staged_tree_sha"], r2)
+        self.assertEqual(candidate["tree_sha"], evidence["staged_tree_sha"])
+        self.assertEqual(
+            git(self.worktree("residual-c02-candidate"), "rev-parse", "HEAD^{tree}"),
+            evidence["staged_tree_sha"],
+        )
 
 
 if __name__ == "__main__":

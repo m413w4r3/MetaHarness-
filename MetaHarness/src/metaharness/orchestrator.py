@@ -359,6 +359,7 @@ from .orchestration.candidate import (  # noqa: F401  (facade re-exports)
 from .orchestration.resume_validation import (  # noqa: F401  (facade re-exports)
     _PersistedRevision,
     _ResumedRun,
+    _SCOPE_REPAIR_RECOVERY_TREE_PHASES,
     _accepted_review,
     _load_accepted_c01_review,
     _load_c01_review,
@@ -370,6 +371,7 @@ from .orchestration.resume_validation import (  # noqa: F401  (facade re-exports
     _read_repository_reference,
     _retry_checks_evidence,
     _reusable_pre_checks,
+    _scope_repair_checkpoint_tree,
     _state_cycle_value,
     _verify_step_chain,
 )
@@ -4223,14 +4225,21 @@ class Orchestrator:
                     required_check_ids=failed_plan.required_checks or None,
                     enforce_diff_size=False,
                 )
-        if evidence is None:
+        # A resume at the final-checks boundary legitimately finds no current
+        # bundle: the red pre-residual one was archived at the exact moment
+        # the residual Claude superseded it.  That archived bundle is the
+        # proof this state is the expected one; the final checks below are
+        # then re-run for the residual tree.  Every other phase still
+        # requires the current bundle.
+        archived_red = _load_evidence(checks_dir / "attempts" / "01")
+        if evidence is None and not (phase is phase_final and archived_red is not None):
             raise ResumeIntegrityError("scope-repair checks evidence is missing")
-        hard = _hard_integrity_failures(evidence)
+        hard = _hard_integrity_failures(evidence) if evidence is not None else []
         if hard:
             raise OrchestrationError(hard[0].split(":", 1)[0])
         effective_scope = sorted(set(original_scope) | set(requested_scope))
         residual_result = None
-        if not evidence.deterministic_passed:
+        if evidence is not None and not evidence.deterministic_passed:
             soft = _soft_check_failures(evidence)
             if not soft:
                 raise OrchestrationError("DETERMINISTIC_GATE_FAILED: " + ", ".join(evidence.failures))
@@ -7587,6 +7596,53 @@ class Orchestrator:
                     raise ResumeIntegrityError("scope-repair scope approval is missing or not approved")
         return requested
 
+    def _scope_repair_authority_tree(
+        self, run_dir: Path, resumed: "_ResumedRun", *, cycle: int,
+        inherited_check_ids: Any,
+    ) -> tuple[str | None, str | None]:
+        """The durable tree a scope-repair checkpoint must carry.
+
+        The authority of a scope-repair phase is its own chain -- the rolled
+        back failed-check tree, the bounded Luna steps, then the residual
+        Claude pass -- and never the C01/C02 Claude tree the cycle answers
+        to.  The bounded plan is re-derived from the hash-bound bundle so a
+        checkpoint can never name a step the approved plan does not contain.
+        Returns ``(tree, refusal)``.
+        """
+
+        checkpoint = resumed.checkpoint
+        recovery = resumed.scope_violation_recovery or {}
+        recovery_tree = recovery.get("tree_before")
+        if not _is_object_id(recovery_tree):
+            return None, "scope-repair rollback tree is malformed"
+        directory = run_dir / "scope-repair" / f"C0{cycle}"
+        step_ids: tuple[str, ...] = ()
+        if checkpoint.phase not in _SCOPE_REPAIR_RECOVERY_TREE_PHASES:
+            selection = resumed.selection
+            try:
+                parsed = parse_task_plan_v2(
+                    (directory / "planner.raw.md").read_text(encoding="utf-8"),
+                    implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+                    reviewer_ids=frozenset({selection.reviewer.profile_id}),
+                    check_catalog=self.config.check_catalog,
+                    inherited_check_ids=inherited_check_ids,
+                )
+                _bundle, bundle_sha = validate_implementation_bundle(
+                    directory, expected_step_ids=[step.id for step in parsed.steps]
+                )
+            except (OSError, UnicodeError, V2PlanParseError, OrchestrationError,
+                    ValueError, AttributeError) as exc:
+                return None, f"the scope-repair plan is unreadable: {exc}"
+            if parsed.decision is not PlanDecision.READY:
+                return None, "the scope-repair plan is not READY"
+            if bundle_sha != checkpoint.repair_bundle_sha256:
+                return None, "the scope-repair bundle changed"
+            step_ids = tuple(step.id for step in parsed.steps)
+        return _scope_repair_checkpoint_tree(
+            directory=directory, checkpoint=checkpoint,
+            recovery_tree=recovery_tree, step_ids=step_ids,
+        )
+
     @staticmethod
     def _explain_tree_drift(
         repo: Path, run_dir: Path, checkpoint: ResumeCheckpoint, candidate: str,
@@ -7874,6 +7930,15 @@ class Orchestrator:
 
         checkpoint = resumed.checkpoint
         at = phase_index(checkpoint.phase)
+        # A checkpoint taken inside a scope-repair cycle has its own durable
+        # authority chain; the historical C01/C02 Claude tree only explains
+        # *why* that cycle exists.  The two identities are never mixed.
+        scope_c01_phases = {
+            ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_CLAUDE_C01,
+            ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01,
+        }
         scope_c02_phases = {
             ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
             ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C02,
@@ -7954,7 +8019,16 @@ class Orchestrator:
             if scope_evidence is None:
                 refuse("the C01 scope-repair candidate evidence is missing")
             c01_tree = scope_evidence.staged_tree_sha
-        if at <= phase_index(ResumePhase.REVIEWER_C01) and expected != c01_tree:
+        if checkpoint.phase in scope_c01_phases and resumed.scope_violation_recovery is not None:
+            authority, refusal = self._scope_repair_authority_tree(
+                run_dir, resumed, cycle=1,
+                inherited_check_ids=resumed.plan.required_checks,
+            )
+            if refusal is not None:
+                refuse(refusal)
+            if expected != authority:
+                refuse("the checkpoint tree is not the C01 scope-repair chain tree")
+        elif at <= phase_index(ResumePhase.REVIEWER_C01) and expected != c01_tree:
             refuse(
                 "the checkpoint tree is not the Claude C01 tree" if resumed.c01_revision is not None
                 else "the checkpoint tree is not the last completed Luna tree"
@@ -8192,7 +8266,16 @@ class Orchestrator:
             if scope_evidence is None:
                 refuse("the C02 scope-repair candidate evidence is missing")
             c02_tree = scope_evidence.staged_tree_sha
-        if expected != c02_tree:
+        if checkpoint.phase in scope_c02_phases and resumed.scope_violation_recovery is not None:
+            authority, refusal = self._scope_repair_authority_tree(
+                run_dir, resumed, cycle=2,
+                inherited_check_ids=repair_plan.required_checks,
+            )
+            if refusal is not None:
+                refuse(refusal)
+            if expected != authority:
+                refuse("the checkpoint tree is not the C02 scope-repair chain tree")
+        elif expected != c02_tree:
             refuse(
                 "the checkpoint tree is not the Claude C02 tree" if resumed.c02_revision is not None
                 else "the checkpoint tree is not the last completed C02 tree"

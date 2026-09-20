@@ -32,7 +32,10 @@ from ..gitops import (
 )
 from ..planning_v2 import TaskPlanV2
 from ..result import atomic_write_text
-from ..resume import ResumeCheckpoint
+from ..resume import (
+    ResumeCheckpoint,
+    ResumePhase,
+)
 from ..review import (
     ReviewParseError,
     ReviewResult,
@@ -306,6 +309,73 @@ def _load_revision(directory: Path) -> _PersistedRevision | None:
         final = report["final"]
     usage = read_usage_artifact(directory / "usage.json") or normalize_usage(report.get("usage"))
     return _PersistedRevision(final, usage, report["tree_before"], report["tree_after"])
+
+
+# The scope-repair checkpoint authority, by phase.  A scope-repair cycle has
+# its own durable chain, so a checkpoint taken inside it is never proved by
+# the historical C01/C02 Claude tree -- see
+# :func:`_scope_repair_checkpoint_tree`.
+_SCOPE_REPAIR_RECOVERY_TREE_PHASES = frozenset({
+    ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C01,
+    ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+})
+_SCOPE_REPAIR_STEP_PHASES = frozenset({
+    ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02,
+})
+_SCOPE_REPAIR_RESIDUAL_PHASES = frozenset({
+    ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01,
+    ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02,
+})
+
+def _scope_repair_checkpoint_tree(
+    *,
+    directory: Path,
+    checkpoint: ResumeCheckpoint,
+    recovery_tree: str,
+    step_ids: tuple[str, ...],
+) -> tuple[str | None, str | None]:
+    """The tree a scope-repair checkpoint must carry, from durable artifacts.
+
+    A scope-repair cycle starts from *recovery_tree* -- the failed-check tree
+    the rollback restored before the strong planner ran -- and advances
+    through its own durable chain: the bounded Luna steps in *directory*,
+    then the residual Claude pass.  Each phase has exactly one authority:
+
+    * planner/approval: nothing has run yet, so *recovery_tree* itself;
+    * step: the completed steps strictly before ``checkpoint.step_id``;
+    * checks and residual Claude: the whole completed Luna chain -- the
+      residual pass has not acquired the checkpoint authority yet;
+    * final checks: the residual Claude ``tree_after``, and only when its
+      ``tree_before`` is exactly the completed Luna chain end.
+
+    The function is cycle-agnostic: C01 and C02 differ only by *directory*.
+    Returns ``(tree, refusal)`` and never a partially trusted tree.
+    """
+
+    phase = checkpoint.phase
+    if phase in _SCOPE_REPAIR_RECOVERY_TREE_PHASES:
+        return recovery_tree, None
+    if phase in _SCOPE_REPAIR_STEP_PHASES:
+        step_id = checkpoint.step_id
+        if step_id is None or step_id not in step_ids:
+            return None, "the scope-repair checkpoint step is not in the scope-repair plan"
+        prior = step_ids[: step_ids.index(step_id)]
+    else:
+        prior = step_ids
+    records = [_load_completed_step(directory / "steps" / item, item) for item in prior]
+    if any(record is None for record in records):
+        return None, "a completed scope-repair Luna step record is missing or invalid"
+    chain_end = _verify_step_chain(records, recovery_tree)
+    if chain_end is None:
+        return None, "scope-repair Luna step trees do not form an unbroken chain"
+    if phase not in _SCOPE_REPAIR_RESIDUAL_PHASES:
+        return chain_end, None
+    residual = _load_revision(directory / "residual-claude")
+    if residual is None:
+        return None, "the scope-repair residual Claude record is missing"
+    if residual.tree_before != chain_end:
+        return None, "scope-repair residual Claude is not based on the completed Luna tree"
+    return residual.tree_after, None
 
 
 def _read_repository_reference(run_dir: Path) -> RepositoryReference | None:
