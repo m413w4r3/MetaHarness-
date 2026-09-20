@@ -18,6 +18,7 @@ from typing import (
     Any,
     Mapping,
 )
+from ..evidence import EvidenceBundle
 from ..gitops import (
     GitError,
     candidate_tree_sha,
@@ -33,6 +34,8 @@ from ..result import (
     ResultArtifactError,
     atomic_write_text,
 )
+from ..resume import ResumePhase
+from ..validation import check_result_json
 from ..agent.diagnostics import TOKEN_DIAGNOSTICS_NAME
 
 
@@ -526,3 +529,92 @@ def _create_file_once(path: Path, data: bytes) -> None:
 # ``orchestrator.py`` used to resolve it, so the template files read are
 # byte-for-byte the same ones.
 _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+
+
+def _repair_checks_payload(bundle: EvidenceBundle) -> dict[str, Any]:
+    """Summarize the accepted C01 deterministic gate for the repair planner.
+
+    Reviewer #1 only exists because the C01 gate was accepted, so argv, cwd,
+    durations and log tails add no decision value here; they stay in the
+    durable check artifacts.
+    """
+
+    checks: list[dict[str, Any]] = []
+
+    for check in bundle.checks:
+        payload = (
+            dict(check)
+            if isinstance(check, Mapping)
+            else check_result_json(check)
+        )
+
+        checks.append(
+            {
+                "name": payload.get("name"),
+                "exit_code": payload.get("exit_code"),
+                "timed_out": bool(payload.get("timed_out", False)),
+                "workspace_mutated": bool(
+                    payload.get("workspace_mutated", False)
+                ),
+            }
+        )
+
+    return {
+        "deterministic_passed": bundle.deterministic_passed,
+        "failures": list(bundle.failures),
+        "checks": checks,
+    }
+
+
+def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
+    # A bundle rebuilt from ``evidence.json`` on resume carries the persisted
+    # reviewer-safe payloads instead of CheckResult objects.
+    payload: list[dict[str, Any]] = []
+    for check in bundle.checks:
+        item = dict(check) if isinstance(check, Mapping) else check_result_json(check)
+        if bundle.required_check_ids:
+            item["required"] = item.get("name") in bundle.required_check_ids
+        payload.append(item)
+    return payload
+
+
+@dataclasses.dataclass(frozen=True)
+class CheckRepairScope:
+    base_paths: tuple[str, ...]
+    added_paths: tuple[str, ...]
+    effective_paths: tuple[str, ...]
+    policy: str
+    bound: int
+    source: str
+
+
+# Historically named "expanded": these are the phases of the *second* bounded
+# check-repair pass, whether or not it expands the mutable scope.  The names
+# are durable and are never renamed.
+_SECOND_CHECK_REPAIR_PHASES = frozenset({
+    ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+    ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+})
+
+
+def _status_has_unstaged_or_untracked(status: tuple[str, ...]) -> list[str]:
+    problems: list[str] = []
+    for line in status:
+        if line.startswith("?? "):
+            problems.append(f"new untracked file: {line[3:]}")
+        elif len(line) >= 2 and line[1] != " ":
+            problems.append(f"unstaged change: {line}")
+    return problems
+
+
+def _artifact_tail(path: Path, limit: int = 64 * 1024) -> str:
+    """Read only the tail needed for deterministic failure classification."""
+
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(max(0, size - limit))
+            return stream.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import re
 
@@ -17,10 +16,13 @@ from typing import (
 )
 from .revision import (
     _render_revision_template,
+    _revision_check_context,
     _revision_plan_summary,
 )
 from .shared import (
+    CheckRepairScope,
     _PROMPTS_DIR,
+    _check_payload,
     _json_text,
     _read_json_artifact,
 )
@@ -60,107 +62,12 @@ _DIRECT_FAILURES = frozenset(
 _LEGACY_DIRECT_FAILURES = _DIRECT_FAILURES | frozenset({DIFF_TOO_LARGE})
 
 
-def _repair_checks_payload(bundle: EvidenceBundle) -> dict[str, Any]:
-    """Summarize the accepted C01 deterministic gate for the repair planner.
-
-    Reviewer #1 only exists because the C01 gate was accepted, so argv, cwd,
-    durations and log tails add no decision value here; they stay in the
-    durable check artifacts.
-    """
-
-    checks: list[dict[str, Any]] = []
-
-    for check in bundle.checks:
-        payload = (
-            dict(check)
-            if isinstance(check, Mapping)
-            else check_result_json(check)
-        )
-
-        checks.append(
-            {
-                "name": payload.get("name"),
-                "exit_code": payload.get("exit_code"),
-                "timed_out": bool(payload.get("timed_out", False)),
-                "workspace_mutated": bool(
-                    payload.get("workspace_mutated", False)
-                ),
-            }
-        )
-
-    return {
-        "deterministic_passed": bundle.deterministic_passed,
-        "failures": list(bundle.failures),
-        "checks": checks,
-    }
 
 
-def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
-    # A bundle rebuilt from ``evidence.json`` on resume carries the persisted
-    # reviewer-safe payloads instead of CheckResult objects.
-    payload: list[dict[str, Any]] = []
-    for check in bundle.checks:
-        item = dict(check) if isinstance(check, Mapping) else check_result_json(check)
-        if bundle.required_check_ids:
-            item["required"] = item.get("name") in bundle.required_check_ids
-        payload.append(item)
-    return payload
 
 
-_REVISION_CHECK_LOG_BYTES = 16 * 1024
 
 
-def _revision_check_context(payload: Mapping[str, Any]) -> str:
-    """Render compact pre-revision check state for Claude.
-
-    Successful checks contribute status only.  Output tails are decision
-    evidence only for failed checks and stay bounded for prompt safety; the
-    complete logs remain in the durable check artifacts.
-    """
-
-    if not isinstance(payload, Mapping):
-        raise TypeError("check payload must be a mapping")
-
-    failures = [
-        item for item in payload.get("failures", [])
-        if isinstance(item, str)
-    ]
-    failed_names = {
-        item.split(":", 1)[1]
-        for item in failures
-        if item.startswith("CHECK_FAILED:")
-    }
-    checks: list[dict[str, Any]] = []
-    raw_checks = payload.get("checks", [])
-    if not isinstance(raw_checks, Sequence) or isinstance(raw_checks, (str, bytes)):
-        raw_checks = []
-    for raw_check in raw_checks:
-        if not isinstance(raw_check, Mapping):
-            continue
-        name = raw_check.get("name")
-        failed = name in failed_names
-        check: dict[str, Any] = {
-            "name": name,
-            "required": bool(raw_check.get("required", False)),
-            "exit_code": raw_check.get("exit_code"),
-            "timed_out": bool(raw_check.get("timed_out", False)),
-            "workspace_mutated": bool(raw_check.get("workspace_mutated", False)),
-        }
-        if failed:
-            for key in ("stdout_tail", "stderr_tail"):
-                value = raw_check.get(key)
-                if isinstance(value, str) and value:
-                    data = value.encode("utf-8", errors="replace")
-                    if len(data) > _REVISION_CHECK_LOG_BYTES:
-                        data = data[-_REVISION_CHECK_LOG_BYTES:]
-                    check[key] = data.decode("utf-8", errors="replace")
-        checks.append(check)
-
-    return _json_text({
-        "deterministic_passed": bool(payload.get("deterministic_passed", False)),
-        "failure_ids": failures,
-        "checks": checks,
-    })
 
 
 def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
@@ -408,14 +315,6 @@ Do not repeat unrelated changes from the previous repair.
 """
 
 
-@dataclasses.dataclass(frozen=True)
-class CheckRepairScope:
-    base_paths: tuple[str, ...]
-    added_paths: tuple[str, ...]
-    effective_paths: tuple[str, ...]
-    policy: str
-    bound: int
-    source: str
 
 
 # The two provenances a *second* bounded check-repair scope may carry.  They
@@ -430,13 +329,6 @@ _SAME_SCOPE_RETRY_SOURCE = "bounded same-scope retry"
 _SECOND_SCOPE_SOURCES = frozenset({_AUTO_BOUNDED_SOURCE, _SAME_SCOPE_RETRY_SOURCE})
 
 
-# Historically named "expanded": these are the phases of the *second* bounded
-# check-repair pass, whether or not it expands the mutable scope.  The names
-# are durable and are never renamed.
-_SECOND_CHECK_REPAIR_PHASES = frozenset({
-    ResumePhase.CHECK_REPAIR_EXPANDED_C01,
-    ResumePhase.CHECK_REPAIR_EXPANDED_C02,
-})
 
 
 def _check_repair_scope_payload(scope: CheckRepairScope) -> dict[str, Any]:

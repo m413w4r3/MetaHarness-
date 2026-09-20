@@ -2,31 +2,68 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Mapping,
     Sequence,
 )
 from .shared import (
+    CheckRepairScope,
     OrchestrationError,
     _PROMPTS_DIR,
+    _SECOND_CHECK_REPAIR_PHASES,
+    _artifact_tail,
     _bounded_report,
     _bounded_v2_report,
+    _check_payload,
+    _git_ownership,
     _json_text,
+    _ownership_violations,
+    _read_bounded_text,
+    _record_failure_tree,
+    _status_has_unstaged_or_untracked,
+)
+from ..evidence import (
+    EvidenceBundle,
+    collect_evidence,
 )
 from ..gitops import (
+    GitError,
     RepositoryReference,
+    candidate_tree_sha,
+    changed_paths_between_trees,
+    current_head,
+    index_tree_sha,
     repository_reference_dict,
+    restore_paths_from_tree,
+    stage_all,
+    status_porcelain,
 )
-from ..models import ImplementationStep
+from ..models import (
+    ExecutionSelectionV4,
+    HarnessConfig,
+    ImplementationStep,
+    RunStatus,
+)
 from ..planning_v2 import TaskPlanV2
+from ..redaction import redact
 from ..result import atomic_write_text
+from ..resume import ResumePhase
+from ..run_options import EffectiveRepairScopePolicy
+from ..state import RunStateStore
 from ..usage import normalize_usage
-from ..claude.agent import ScopeRequest
+from ..validation import config_with_check_authority
+from ..claude.agent import (
+    ScopeRequest,
+    classify_claude_failure,
+    parse_scope_request,
+)
 
 
 _MAX_REPAIR_CLAUDE_REPORT_BYTES = 16 * 1024
@@ -352,3 +389,415 @@ def _revision_report_text(result: Any, artifact_dir: Path) -> str:
         "tree_after": tree("tree_after.txt"),
         "usage": normalize_usage(result.usage),
     })
+
+
+_REVISION_CHECK_LOG_BYTES = 16 * 1024
+
+
+def _revision_check_context(payload: Mapping[str, Any]) -> str:
+    """Render compact pre-revision check state for Claude.
+
+    Successful checks contribute status only.  Output tails are decision
+    evidence only for failed checks and stay bounded for prompt safety; the
+    complete logs remain in the durable check artifacts.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("check payload must be a mapping")
+
+    failures = [
+        item for item in payload.get("failures", [])
+        if isinstance(item, str)
+    ]
+    failed_names = {
+        item.split(":", 1)[1]
+        for item in failures
+        if item.startswith("CHECK_FAILED:")
+    }
+    checks: list[dict[str, Any]] = []
+    raw_checks = payload.get("checks", [])
+    if not isinstance(raw_checks, Sequence) or isinstance(raw_checks, (str, bytes)):
+        raw_checks = []
+    for raw_check in raw_checks:
+        if not isinstance(raw_check, Mapping):
+            continue
+        name = raw_check.get("name")
+        failed = name in failed_names
+        check: dict[str, Any] = {
+            "name": name,
+            "required": bool(raw_check.get("required", False)),
+            "exit_code": raw_check.get("exit_code"),
+            "timed_out": bool(raw_check.get("timed_out", False)),
+            "workspace_mutated": bool(raw_check.get("workspace_mutated", False)),
+        }
+        if failed:
+            for key in ("stdout_tail", "stderr_tail"):
+                value = raw_check.get(key)
+                if isinstance(value, str) and value:
+                    data = value.encode("utf-8", errors="replace")
+                    if len(data) > _REVISION_CHECK_LOG_BYTES:
+                        data = data[-_REVISION_CHECK_LOG_BYTES:]
+                    check[key] = data.decode("utf-8", errors="replace")
+        checks.append(check)
+
+    return _json_text({
+        "deterministic_passed": bool(payload.get("deterministic_passed", False)),
+        "failure_ids": failures,
+        "checks": checks,
+    })
+
+
+def _claude_auth_failure(
+    run_dir: Path, stderr: str, *, revision_dir: Path | None = None
+) -> bool:
+    events_path = (revision_dir or (run_dir / "revision")) / "agent.events.jsonl"
+    return classify_claude_failure(stderr, _artifact_tail(events_path)) == "CLAUDE_AUTH_FAILURE"
+
+
+@dataclasses.dataclass(frozen=True)
+class RevisionRunner:
+    """Runs one Claude pre-check / revision / scope-request cycle.
+
+    Every dependency is injected explicitly: the runner never receives the
+    ``Orchestrator`` instance.  ``config``/``secrets``/``effective_repair_scope``
+    are the live values of the run; the callables are the minimal set of
+    operations the runner does not own -- checkpoint writers, the Claude
+    executor, artifact redaction, the durable pre-check reader, and the
+    check-repair classification and prompt (owned by ``check_repair``, injected
+    to keep this module below it in the import order).
+    """
+
+    config: HarnessConfig
+    secrets: tuple[str, ...]
+    effective_repair_scope: EffectiveRepairScopePolicy
+    checkpoint: Callable[..., None]
+    write_phase_checkpoint: Callable[..., None]
+    approved_check_authority_sha256: Callable[[Path], str | None]
+    run_revision: Callable[..., Any]
+    ensure_revision_artifacts: Callable[[Path, Any], None]
+    redact_revision_artifacts: Callable[..., None]
+    step_results_for_cycle: Callable[[int], list[dict[str, Any]]]
+    reusable_pre_checks: Callable[[Path, str], dict[str, Any] | None]
+    hard_integrity_failures: Callable[[EvidenceBundle], list[str]]
+    soft_check_failures: Callable[[EvidenceBundle], list[str]]
+    check_repair_scope_candidates: Callable[..., list[str]]
+    check_repair_prompt: Callable[..., str]
+
+    def run(
+        self,
+        *,
+        store: RunStateStore,
+        run_dir: Path,
+        repo: Path,
+        base_sha: str,
+        base_tree_sha: str,
+        spec: str,
+        plan: TaskPlanV2,
+        repository_reference: RepositoryReference,
+        info: Any,
+        branch_ref: str,
+        ownership_before: Any,
+        selection: ExecutionSelectionV4,
+        artifact_dir: Path | None = None,
+        mutable_scope: list[str] | None = None,
+        deferred_mismatches: str | None = None,
+        deferred_mismatch_present: bool = False,
+        check_repair_evidence: EvidenceBundle | None = None,
+        cycle: int = 1,
+        check_repair_scope: CheckRepairScope | None = None,
+        check_repair_phase_override: ResumePhase | None = None,
+        check_repair_next_phase_override: ResumePhase | None = None,
+    ) -> tuple[Any | None, str | None]:
+        """Run one Claude pre-check/revision/scope cycle.
+
+        Pre-revision checks already durable for the exact current tree are
+        reused (a resume never replays them); Claude runs once per attempt.
+        """
+
+        claude_phase, review_phase = (
+            (ResumePhase.CLAUDE_C01, ResumePhase.REVIEWER_C01) if cycle == 1
+            else (ResumePhase.CLAUDE_C02, ResumePhase.REVIEWER_C02)
+        )
+        is_check_repair = check_repair_evidence is not None
+        artifact_dir = artifact_dir or (
+            run_dir / "revision" / "check-repair" / f"C0{cycle}"
+            if is_check_repair else run_dir / "revision"
+        )
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        expected_head = current_head(info.worktree)
+        stage_all(info.worktree)
+        tree_before = candidate_tree_sha(info.worktree)
+        if is_check_repair and check_repair_evidence.staged_tree_sha != tree_before:
+            return None, "TOCTOU_FAILURE"
+        mutable_scope = mutable_scope or sorted({
+            path for step in plan.steps
+            for path in (*step.write_set, *step.create_set, *step.delete_set)
+        })
+        if is_check_repair:
+            check_repair_scope = check_repair_scope or CheckRepairScope(
+                base_paths=tuple(mutable_scope), added_paths=(),
+                effective_paths=tuple(mutable_scope),
+                policy=self.effective_repair_scope.policy,
+                bound=self.effective_repair_scope.max_added_paths,
+                source="human-approved mutable scope",
+            )
+            atomic_write_text(artifact_dir / "scope.json", _json_text({
+                "schema_version": 2,
+                "base_mutable_scope": list(check_repair_scope.base_paths),
+                "added_paths": list(check_repair_scope.added_paths),
+                "effective_mutable_scope": list(check_repair_scope.effective_paths),
+                "policy": check_repair_scope.policy,
+                "bound": check_repair_scope.bound,
+                "source": check_repair_scope.source,
+                "bound_exceeded": (
+                    check_repair_scope.policy == "auto-bounded"
+                    and not check_repair_scope.added_paths
+                    and len(self.check_repair_scope_candidates(
+                        repo=repo, worktree=info.worktree, tree_sha=tree_before,
+                        run_dir=run_dir, evidence=check_repair_evidence,
+                        base_mutable_scope=check_repair_scope.base_paths,
+                    )) > check_repair_scope.bound
+                ),
+            }))
+        else:
+            atomic_write_text(artifact_dir / "scope.json", _json_text({
+                "approved_mutable_scope": mutable_scope,
+                "source": "human-approved mutable scope",
+            }))
+        if is_check_repair:
+            # This boundary is deliberately written before invoking Claude so
+            # a timeout/transport failure resumes this exact corrective pass.
+            repair_phase = check_repair_phase_override or (
+                ResumePhase.CHECK_REPAIR_C01 if cycle == 1
+                else ResumePhase.CHECK_REPAIR_C02
+            )
+            self.checkpoint(
+                run_dir, repair_phase, cycle=cycle, head=expected_head, tree=tree_before,
+            )
+            pre_payload = {
+                "checks": _check_payload(check_repair_evidence),
+                "failures": list(check_repair_evidence.failures),
+                "deterministic_passed": check_repair_evidence.deterministic_passed,
+                "staged_tree_sha": check_repair_evidence.staged_tree_sha,
+            }
+        else:
+            reused = self.reusable_pre_checks(artifact_dir, tree_before)
+            if reused is None:
+                self.write_phase_checkpoint(
+                    run_dir,
+                    ResumePhase.CHECKS_C01 if cycle == 1 else ResumePhase.CHECKS_C02,
+                    cycle=cycle, head=expected_head, tree=tree_before,
+                )
+                store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
+                check_config, check_ids = config_with_check_authority(
+                    self.config, run_dir, requested_check_ids=plan.required_checks or None,
+                    expected_sha256=self.approved_check_authority_sha256(run_dir),
+                )
+                pre_evidence = collect_evidence(
+                    info.worktree, base_sha, check_config,
+                    required_check_ids=check_ids,
+                    evidence_dir=artifact_dir, secrets=self.secrets,
+                    check_failures_hard=False,
+                    expected_head_sha=expected_head,
+                    enforce_diff_size=False,
+                )
+                pre_payload = {
+                    "checks": _check_payload(pre_evidence),
+                    "failures": list(pre_evidence.failures),
+                    "deterministic_passed": pre_evidence.deterministic_passed,
+                    "staged_tree_sha": pre_evidence.staged_tree_sha,
+                }
+                atomic_write_text(artifact_dir / "pre_checks.json", _json_text(pre_payload))
+                pre_hard = self.hard_integrity_failures(pre_evidence)
+                # A clean deferred mismatch intentionally leaves no candidate
+                # delta for the pre-revision gate.  Claude is the recovery owner,
+                # so EMPTY_DIFF is evidence for Claude here, not a terminal gate.
+                # A deferred *verify* dependency is not this case: that step did
+                # change the candidate, so the normal gate applies.
+                if deferred_mismatch_present:
+                    pre_hard = [item for item in pre_hard if item != "EMPTY_DIFF"]
+                if pre_hard:
+                    return None, pre_hard[0].split(":", 1)[0]
+                # Pre-revision checks complete: the next operation is Claude.  The
+                # authorized HEAD is the worktree HEAD (base for C01, the C01
+                # candidate commit for C02), exactly as _validate_resume expects.
+                self.checkpoint(run_dir, claude_phase, cycle=cycle, head=expected_head, tree=tree_before)
+            else:
+                pre_payload = reused
+        if is_check_repair:
+            previous_report = ""
+            if check_repair_phase_override in _SECOND_CHECK_REPAIR_PHASES:
+                # The second pass must read the *first repair's* report, not
+                # the initial revision it already superseded.
+                previous_dir = run_dir / "revision" / "check-repair" / f"C0{cycle}"
+                previous_report = _read_bounded_text(previous_dir / "agent.final.md")
+            revision_prompt = self.check_repair_prompt(
+                spec=spec,
+                plan=plan,
+                approved_contract_index=_revision_contract_index(plan),
+                changed_files="\n".join(check_repair_evidence.changed_files),
+                evidence=check_repair_evidence,
+                mutable_scope=mutable_scope,
+                previous_report=previous_report,
+                added_paths=(check_repair_scope.added_paths if check_repair_scope else ()),
+                scope_source=(check_repair_scope.source if check_repair_scope else ""),
+            )
+        else:
+            revision_prompt = _revision_prompt(
+                repository_reference=repository_reference,
+                spec=spec,
+                plan=plan,
+                changed_files="\n".join(changed_paths_between_trees(repo, base_tree_sha, tree_before)),
+                execution_anomalies=_revision_execution_anomalies(
+                    self.step_results_for_cycle(cycle)
+                ),
+                pre_checks=_revision_check_context(pre_payload),
+                mutable_scope=_json_text(mutable_scope),
+                deferred_mismatches=deferred_mismatches or "NONE\n",
+            )
+        store.update(status=RunStatus.REVISING, current_step=None)
+        atomic_write_text(artifact_dir / "tree_before.txt", tree_before.rstrip() + "\n")
+        result = self.run_revision(
+            selection, info.worktree, run_dir, revision_prompt,
+            revision_dir=artifact_dir,
+        )
+        self.ensure_revision_artifacts(artifact_dir, result)
+        claude_auth_failure = _claude_auth_failure(
+            run_dir, result.stderr_tail, revision_dir=artifact_dir
+        )
+        self.redact_revision_artifacts(run_dir, revision_dir=artifact_dir)
+        result = dataclasses.replace(
+            result,
+            final_message=redact(result.final_message, self.secrets),
+            stderr_tail=redact(result.stderr_tail, self.secrets),
+        )
+        if result.timed_out:
+            _record_failure_tree(artifact_dir, info.worktree)
+            return result, "CLAUDE_TIMEOUT"
+        terminal_is_error = getattr(result, "terminal_is_error", None) is True
+        terminal_subtype = getattr(result, "terminal_subtype", None)
+        # A structured terminal marked ``is_error`` is a failure on its own.
+        # Some CLI versions and wrappers still exit 0 after one, so exit code
+        # is the last signal consulted, never the gate for the others.
+        if terminal_is_error or result.exit_code != 0:
+            _record_failure_tree(artifact_dir, info.worktree)
+            if claude_auth_failure:
+                return result, "CLAUDE_AUTH_FAILURE"
+            # Claude's terminal result is authoritative when available.  The
+            # textual fallback above remains for older CLI versions and old
+            # artifacts that do not expose terminal metadata.
+            if terminal_subtype == "error_max_turns":
+                return result, "CLAUDE_MAX_TURNS"
+            return result, "CLAUDE_FAILED"
+        revision_ownership = _git_ownership(repo, info.worktree)
+        if revision_ownership.head != expected_head:
+            return result, "CLAUDE_COMMITTED"
+        violations = _ownership_violations(
+            ownership_before, revision_ownership,
+            branch_ref=branch_ref, base_sha=expected_head,
+        )
+        if violations:
+            return result, "AGENT_GIT_VIOLATION"
+        stage_all(info.worktree)
+        tree_after = candidate_tree_sha(info.worktree)
+        atomic_write_text(artifact_dir / "tree_after.txt", tree_after.rstrip() + "\n")
+        changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
+        outside_scope = [path for path in changed_paths if path not in set(mutable_scope)]
+        # META SCOPE REQUEST is a check-repair-only machine protocol.
+        # Semantic revision may report an out-of-scope dependency in prose, but
+        # must not enter the bounded check-repair scope state machine.
+        scope_request = (
+            parse_scope_request(result.final_message)
+            if is_check_repair else None
+        )
+        malformed_scope_request = (
+            is_check_repair
+            and _SCOPE_REQUEST_HEADER in result.final_message
+            and scope_request is None
+        )
+        usage = normalize_usage(result.usage)
+        revision_state = {
+            "profile_id": selection.reviser.profile_id,
+            "status": "NO_CHANGE" if tree_after == tree_before else "COMPLETED",
+            "tree_before": tree_before,
+            "tree_after": tree_after,
+            "usage": usage,
+            **(
+                {
+                    "scope_request": _scope_request_payload(scope_request),
+                    "scope_request_diagnostic": _scope_request_diagnostic(scope_request),
+                }
+                if scope_request is not None else {}
+            ),
+            **(
+                {"scope_request_warning": "malformed scope request ignored as authority"}
+                if malformed_scope_request else {}
+            ),
+        }
+        atomic_write_text(artifact_dir / "usage.json", _json_text(usage))
+        atomic_write_text(artifact_dir / "report.json", _json_text({
+            **revision_state,
+            "final": _bounded_report(result.final_message),
+            "stderr_tail": result.stderr_tail,
+            "changed_paths": list(changed_paths),
+            "outside_scope_paths": list(outside_scope),
+            **({"failure_ids": self.soft_check_failures(check_repair_evidence)}
+               if is_check_repair else {}),
+        }))
+        store.update(status=RunStatus.REVISING, revision=revision_state)
+        if scope_request is not None:
+            store.update(
+                status=RunStatus.REVISING,
+                check_repair={
+                    "attempted": True,
+                    "scope_request": _scope_request_payload(scope_request),
+                    "scope_request_diagnostic": _scope_request_diagnostic(scope_request),
+                },
+            )
+        elif malformed_scope_request:
+            store.update(
+                status=RunStatus.REVISING,
+                check_repair={
+                    "attempted": True,
+                    "scope_request_warning": "malformed scope request ignored as authority",
+                },
+            )
+        if outside_scope:
+            # This is a successful Claude transport with an unsafe candidate,
+            # so the exact failed tree must remain durable for the fail-closed
+            # rollback proof used by deterministic check-repair recovery.
+            _record_failure_tree(artifact_dir, info.worktree)
+            return result, "REVISION_SCOPE_VIOLATION"
+        if scope_request is not None:
+            # A valid request is advisory evidence, never an authorization
+            # delta.  Even an in-scope/no-op attempt is rolled back atomically
+            # before the durable bridge path is allowed to inspect it.
+            _record_failure_tree(artifact_dir, info.worktree)
+            try:
+                restore_paths_from_tree(info.worktree, tree_before, list(changed_paths))
+                stage_all(info.worktree)
+                if (
+                    candidate_tree_sha(info.worktree) != tree_before
+                    or index_tree_sha(info.worktree) != tree_before
+                    or _status_has_unstaged_or_untracked(status_porcelain(info.worktree))
+                ):
+                    raise GitError("scope-request rollback did not restore the exact tree")
+            except (GitError, OSError):
+                # Keep the existing dirty-violation recovery as the fail-safe
+                # owner of a rollback that could not be proven immediately.
+                pass
+            return result, _SCOPE_REQUEST_ROUTE
+        # Claude complete and durable: the next operation is the final checks
+        # followed by candidate commit/push and then the reviewer.
+        next_revision_phase = (
+            check_repair_next_phase_override or (
+                ResumePhase.FINAL_CHECKS_RETRY_C01 if cycle == 1
+                else ResumePhase.FINAL_CHECKS_RETRY_C02
+            )
+            if is_check_repair
+            else (ResumePhase.FINAL_CHECKS_C01 if cycle == 1 else ResumePhase.FINAL_CHECKS_C02)
+        )
+        self.checkpoint(
+            run_dir, next_revision_phase, cycle=cycle, head=expected_head, tree=tree_after,
+        )
+        return result, None

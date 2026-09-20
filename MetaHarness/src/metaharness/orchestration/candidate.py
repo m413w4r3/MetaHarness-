@@ -8,6 +8,7 @@ from .shared import (
     CommitBoundaryError,
     _is_object_id,
     _read_json_artifact,
+    _status_has_unstaged_or_untracked,
 )
 from ..evidence import EvidenceBundle
 from ..gitops import (
@@ -37,16 +38,6 @@ from ..review import (
     parse_review,
 )
 from ..agent.base import AgentResult
-
-
-def _status_has_unstaged_or_untracked(status: tuple[str, ...]) -> list[str]:
-    problems: list[str] = []
-    for line in status:
-        if line.startswith("?? "):
-            problems.append(f"new untracked file: {line[3:]}")
-        elif len(line) >= 2 and line[1] != " ":
-            problems.append(f"unstaged change: {line}")
-    return problems
 
 
 def authorize_commit(
