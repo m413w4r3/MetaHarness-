@@ -4114,13 +4114,18 @@ class Orchestrator:
             if approval.decision is not ApprovalDecision.APPROVE:
                 raise OrchestrationError("HUMAN_REQUIRED: scope-repair scope rejected")
         elif scope_delta["added_paths"]:
+            # The auto-bounded authorization is an annotation, not a phase
+            # change: this cycle can be resumed from a later phase, so the
+            # durable status is carried over instead of being regressed.
+            current_status = store.load().get("status", PHASE_STATUS[phase_planner])
             store.update(
+                status=current_status,
                 scope_repair_scope_escalation={
                     "trigger": "REVISION_SCOPE_VIOLATION",
                     "added_paths": scope_delta["added_paths"],
                     "policy": self._effective_repair_scope.policy,
                     "auto_authorized": True,
-                }
+                },
             )
 
         ids = [step.id for step in repair_plan.steps]

@@ -2247,6 +2247,11 @@ class AggressiveRepairRecoveryTests(P29Harness):
 SCOPE_REPAIR_PLAN = plan_text(
     step_block(1, operation="Scope repair"), title="P31 scope repair",
 )
+SCOPE_REPAIR_EXPANSION_PLAN = plan_text(
+    step_block(1, read=("src/a.py", "src/b.py"), write_set=("src/a.py", "src/b.py"),
+               operation="Scope repair"),
+    title="P31 scope repair expansion",
+)
 SCOPE_REPAIR_SERVICE_PLAN = plan_text(
     step_block(1, read=("tests/test_service.py",),
                write_set=("tests/test_service.py",), operation="Scope repair"),
@@ -2458,6 +2463,81 @@ class ScopeViolationResumeTests(ScopeViolationResumeHarness):
         delta = json.loads((run_dir / "scope-repair/C01/scope_delta.json").read_text())
         self.assertEqual(delta["added_paths"], [])
         self.assertEqual(delta["observed_outside_scope_paths"], ["README.md"])
+
+    def test_a_b_auto_bounded_expansion_resumes_without_regressing_the_status(self) -> None:
+        """A durable ``planning`` state stays ``planning`` through the bound.
+
+        The resume starts on ``CHECK_SCOPE_PLANNER_C01``.  The planner asks
+        for one path more than the failed scope held, which the bound
+        authorizes without a human; recording that authorization is an
+        annotation, so the run may only leave ``planning`` on the ordinary
+        transition into the first Luna repair step.
+        """
+
+        config, failed, _checkpoint = self.violate_c01("scope-resume-a-b")
+        run_dir = failed.run_dir
+        blocked, *_rest = self.resume_with(
+            config, "scope-resume-a-b", planner=self.blocked_planner(),
+        )
+        self.assertEqual(blocked.state["failure"]["reason"], "LLM_FAILURE")
+        self.assertEqual(
+            read_checkpoint(run_dir).phase, ResumePhase.CHECK_SCOPE_PLANNER_C01
+        )
+        # A transport crash on that boundary, rather than a recorded failure:
+        # the claimed resume starts the phase back in ``planning``.
+        RunStateStore(run_dir / "state.json").update(status=RunStatus.INTERRUPTED)
+
+        real_update = RunStateStore.update
+        updates: list[dict[str, Any]] = []
+
+        def recording_update(inner_self: Any, *, status: Any, **fields: Any) -> Any:
+            updates.append({"status": RunStatus(status).value, "fields": set(fields)})
+            return real_update(inner_self, status=status, **fields)
+
+        with mock.patch.object(RunStateStore, "update", recording_update):
+            resumed, planner, _reviewer, scope_luna, _c, pushed = self.resume_with(
+                config, "scope-resume-a-b", plans=[SCOPE_REPAIR_EXPANSION_PLAN],
+                reviews=[PASS],
+                luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")}),
+            )
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(len(planner.prompts), 1)
+        self.assertEqual(pushed.call_count, 1)
+        delta = json.loads((run_dir / "scope-repair/C01/scope_delta.json").read_text())
+        self.assertEqual(delta["added_paths"], ["src/b.py"])
+
+        escalation = resumed.state["scope_repair_scope_escalation"]
+        self.assertEqual(escalation["trigger"], "REVISION_SCOPE_VIOLATION")
+        self.assertIs(escalation["auto_authorized"], True)
+        self.assertEqual(escalation["added_paths"], ["src/b.py"])
+        self.assertNotIn(
+            RunStatus.WAITING_SCOPE_APPROVAL.value,
+            [record["status"] for record in updates],
+        )
+
+        # Nothing before or at the authorization left ``planning`` behind;
+        # the first Luna repair step is what moves the run forward.
+        index = [
+            position for position, record in enumerate(updates)
+            if "scope_repair_scope_escalation" in record["fields"]
+        ]
+        self.assertEqual(len(index), 1)
+        self.assertEqual(
+            {record["status"] for record in updates[: index[0] + 1]},
+            {RunStatus.PLANNING.value},
+        )
+        self.assertEqual(
+            [(call["cycle"], call["step"]) for call in scope_luna.calls], [(1, "S01")]
+        )
+        self.assertEqual(
+            scope_luna.calls[0]["dir"].relative_to(run_dir).as_posix(),
+            "scope-repair/C01/steps/S01",
+        )
+        self.assertIn(
+            RunStatus.IMPLEMENTING.value,
+            [record["status"] for record in updates[index[0] + 1:]],
+        )
 
     def test_b_an_expanded_violation_recovers_from_the_expanded_directory(self) -> None:
         """The second pass owns the violation, so it owns the recovery proof."""

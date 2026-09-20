@@ -7,6 +7,7 @@ Luna (Codex), Claude and reviewers are in-process fakes: no network, no LLM.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import inspect
 import io
@@ -970,6 +971,110 @@ class FullPipelineTests(P28Harness):
         )
         self.assertEqual(scope_delta["observed_outside_scope_paths"], ["README.md"])
         self.assertEqual(scope_delta["added_paths"], [])
+
+    def test_p_auto_bounded_scope_expansion_keeps_the_durable_status(self) -> None:
+        """One added path under the bound is authorized without a human.
+
+        The escalation record is an annotation on the run state, so the
+        durable status must survive it untouched: the scope-repair cycle can
+        be resumed from a later phase and must never be pushed backwards.
+        """
+
+        write(self.repo / "tests/test_service.py", "def test_service():\n    pass\n")
+        git(self.repo, "add", "tests/test_service.py")
+        git(self.repo, "commit", "-qm", "add repairable fixture")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+
+        config = self.load()
+        options = RunOptions.from_config(
+            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=4,
+        )
+        scope_repair_plan = plan_text(
+            step_block(
+                1,
+                read=("src/a.py", "tests/test_service.py"),
+                write_set=("src/a.py", "tests/test_service.py"),
+                operation="Repair",
+            ),
+            title="P28 scope repair",
+        )
+        claude = FakeClaude(
+            stage_actions={(1, "check-repair"): writer("README.md", "outside\n")}
+        )
+        first, planner, _reviewer, _claude, pushed = self.run_pipeline(
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = BUG\n")}),
+            reviews=[PASS], repair_plan=scope_repair_plan, claude=claude,
+            run_id="scope-repair-auto-bounded", run_options=options,
+        )
+        self.assertEqual(first.state["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
+        self.assertEqual(pushed.call_count, 0)
+
+        # Record the status carried by every state write of the resumed run,
+        # together with the status durably stored just before it.
+        real_update = orchestrator_module.RunStateStore.update
+        updates: list[dict[str, Any]] = []
+
+        def recording_update(inner_self: Any, *, status: Any, **fields: Any) -> Any:
+            updates.append({
+                "before": inner_self.load().get("status"),
+                "status": RunStatus(status).value,
+                "fields": set(fields),
+            })
+            return real_update(inner_self, status=status, **fields)
+
+        repair_luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")})
+        with mock.patch.object(
+            orchestrator_module.RunStateStore, "update", recording_update
+        ):
+            resumed = Orchestrator(
+                self.config_value,
+                planner_client=planner,
+                reviewer_client=QueueClient("reviewer", [PASS], self.events),
+                agent=repair_luna,
+                reviser=FakeClaude(log=self.events),
+            ).resume("scope-repair-auto-bounded")
+
+        self.assertIsNone(resumed.state.get("failure"))
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED)
+
+        # Exactly one added path, under the bound, authorized without a human.
+        scope_delta = json.loads(
+            (resumed.run_dir / "scope-repair/C01/scope_delta.json").read_text()
+        )
+        self.assertEqual(scope_delta["added_paths"], ["tests/test_service.py"])
+        self.assertLessEqual(
+            len(scope_delta["added_paths"]), options.repair_scope_max_added_paths
+        )
+        escalation = resumed.state["scope_repair_scope_escalation"]
+        self.assertEqual(escalation["trigger"], "REVISION_SCOPE_VIOLATION")
+        self.assertEqual(escalation["policy"], "auto-bounded")
+        self.assertIs(escalation["auto_authorized"], True)
+        self.assertEqual(escalation["added_paths"], ["tests/test_service.py"])
+        self.assertFalse((resumed.run_dir / "scope-repair/C01/approval.json").exists())
+        self.assertNotIn(
+            RunStatus.WAITING_SCOPE_APPROVAL.value,
+            [record["status"] for record in updates],
+        )
+
+        # The escalating write happened, carried an explicit status, and left
+        # the durable status exactly as it found it.
+        escalations = [
+            record for record in updates
+            if "scope_repair_scope_escalation" in record["fields"]
+        ]
+        self.assertEqual(len(escalations), 1)
+        self.assertEqual(escalations[0]["status"], escalations[0]["before"])
+
+        # The bounded Luna repair really ran inside the expanded scope.
+        self.assertEqual(
+            [(call["cycle"], call["step"]) for call in repair_luna.calls], [(1, "S01")]
+        )
+        step_record = json.loads(
+            (resumed.run_dir / "scope-repair/C01/steps/S01/step.json").read_text()
+        )
+        self.assertEqual(step_record["status"], "COMPLETED")
+        scope = json.loads((resumed.run_dir / "scope-repair/C01/scope.json").read_text())
+        self.assertIn("tests/test_service.py", scope["effective_mutable_paths"])
 
     def test_q_scope_violation_has_c02_parity_without_replaying_c02_luna(self) -> None:
         config = self.load()
@@ -2693,6 +2798,37 @@ class StructuralTests(unittest.TestCase):
             source = inspect.getsource(getattr(Orchestrator, name))
             self.assertEqual(source.count("self._run_v2_reviewer("), 1, name)
             self.assertNotIn("reviewer.review(", source, name)
+
+    def test_every_store_update_call_passes_an_explicit_status(self) -> None:
+        """``RunStateStore.update`` makes ``status`` mandatory on purpose.
+
+        Only receivers literally named ``store`` are inspected: no type is
+        resolved, so the guard is exactly as narrow as the convention it
+        protects, and a missing ``status=`` becomes a test failure instead of
+        a ``TypeError`` raised in the middle of a run.
+        """
+
+        offenders: list[str] = []
+        for path in sorted((ROOT / "src" / "metaharness").rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "update"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "store"
+                ):
+                    continue
+                keywords = {keyword.arg for keyword in node.keywords}
+                if "status" in keywords or None in keywords:
+                    continue
+                offenders.append(
+                    f"{path.relative_to(ROOT).as_posix()}:{node.lineno}"
+                )
+        self.assertEqual(offenders, [])
 
     def test_one_authoritative_codex_step_executor(self) -> None:
         module = inspect.getsource(orchestrator_module)
