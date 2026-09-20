@@ -926,6 +926,10 @@ class FullPipelineTests(P28Harness):
         self.assertEqual(first.state["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
         self.assertEqual(pushed.call_count, 0)
         self.assertTrue((self.worktree("check-repair-scope-recovery") / "README.md").exists())
+        historical_report = first.run_dir / "revision/check-repair/C01/report.json"
+        report = json.loads(historical_report.read_text())
+        report.pop("outside_scope_paths", None)
+        historical_report.write_text(json.dumps(report) + "\n")
 
         repair_luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")})
         real_push = orchestrator_module.push_run_branch
