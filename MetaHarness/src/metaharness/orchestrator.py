@@ -631,6 +631,59 @@ def _bounded_parse_detail(exc: Exception) -> str:
     return " ".join(str(exc).split())[:500]
 
 
+# The two failures that route a check-repair attempt into the bounded
+# scope-repair recovery.  Both are produced by the *same* check-repair phase
+# and share the same durable evidence.
+_SCOPE_VIOLATION_ORIGINS = frozenset({"REVISION_SCOPE_VIOLATION", _SCOPE_REQUEST_ROUTE})
+# The check-repair phases that may own a scope violation.  A violation is
+# never inferred for any other phase.
+_SCOPE_VIOLATION_PHASES = frozenset({
+    ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+    ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+})
+# A refused resume overwrites ``state.failure`` with its own verdict.  The
+# original cause is then only reachable through the durable history below.
+_RESUME_REFUSAL_REASONS = frozenset({
+    "RESUME_INTEGRITY_FAILURE", "RESUME_REQUIRES_OPERATOR",
+})
+
+
+def _scope_violation_origin(
+    state: Mapping[str, Any], checkpoint: ResumeCheckpoint,
+) -> str | None:
+    """The scope-violation cause this checkpoint was closed by, if any.
+
+    ``state.failure`` is the first authority.  When a previous resume already
+    refused this run, its verdict replaced that failure, so the original cause
+    is recovered from the resume record it preserved and -- after several
+    ``--revalidate-integrity`` attempts have replaced that record too -- from
+    the durable cycle the checkpoint names.  The cycle fallback is deliberately
+    the weakest evidence: it is only ever consulted for the check-repair phases
+    that can own a violation, and it can only ever yield the one reason a cycle
+    record actually stores.
+    """
+
+    if checkpoint.phase not in _SCOPE_VIOLATION_PHASES:
+        return None
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    reason = failure.get("reason")
+    if reason in _SCOPE_VIOLATION_ORIGINS:
+        return str(reason)
+    if reason not in _RESUME_REFUSAL_REASONS:
+        return None
+    resume = state.get("resume") if isinstance(state.get("resume"), Mapping) else {}
+    previous = resume.get("previous_failure")
+    if isinstance(previous, Mapping) and previous.get("reason") in _SCOPE_VIOLATION_ORIGINS:
+        return str(previous["reason"])
+    cycles = state.get("cycles")
+    for cycle in cycles if isinstance(cycles, list) else ():
+        if isinstance(cycle, Mapping) and cycle.get("number") == checkpoint.cycle:
+            if cycle.get("failure") == "REVISION_SCOPE_VIOLATION":
+                return "REVISION_SCOPE_VIOLATION"
+            return None
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class _V2Setup:
     """A planned, approved and prepared v2 run, ready for its first step."""
@@ -6888,10 +6941,8 @@ class Orchestrator:
             mismatch_recovery: dict[str, Any] | None = None
             mismatch_recovery_path: Path | None = None
             scope_violation_recovery: dict[str, Any] | None = None
-            if failure.get("reason") in {"REVISION_SCOPE_VIOLATION", _SCOPE_REQUEST_ROUTE} and checkpoint.phase in {
-                ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
-                ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
-            }:
+            scope_violation_origin = _scope_violation_origin(state, checkpoint)
+            if scope_violation_origin is not None:
                 if checkpoint.phase is ResumePhase.CHECK_REPAIR_C01:
                     fallback = original_plan_scope
                     scope_dir = run_dir / "revision" / "check-repair" / "C01"
@@ -6912,6 +6963,7 @@ class Orchestrator:
                 self._recover_failed_revision_scope_violation(
                     repo=repo, worktree=worktree, run_dir=run_dir,
                     checkpoint=checkpoint, mutable_scope=failed_scope.effective_paths,
+                    origin_reason=scope_violation_origin,
                 )
                 scope_violation_recovery = _read_json_artifact(
                     scope_dir / "scope_violation_recovery.json", 64 * 1024
@@ -7596,6 +7648,7 @@ class Orchestrator:
         run_dir: Path,
         checkpoint: ResumeCheckpoint,
         mutable_scope: Sequence[str],
+        origin_reason: str,
     ) -> tuple[str, ...]:
         """Validate, roll back, and archive an unsafe check-repair attempt.
 
@@ -7603,13 +7656,17 @@ class Orchestrator:
         path is restored from the checkpoint tree, including paths that were
         inside the previous scope; keeping a partial attempt would make the
         subsequent strong planner reason from an unauthorised candidate.
+
+        *origin_reason* is the cause :func:`_scope_violation_origin` recovered
+        for this checkpoint.  It is the provenance authority: ``state.failure``
+        may already carry a later refusal verdict, which says nothing about the
+        attempt this directory recorded.
         """
 
         state = _read_json_artifact(run_dir / "state.json", 256 * 1024)
-        failure = state.get("failure") if isinstance(state, Mapping) else None
-        if not isinstance(failure, Mapping) or failure.get("reason") not in {
-            "REVISION_SCOPE_VIOLATION", _SCOPE_REQUEST_ROUTE,
-        }:
+        if not isinstance(state, Mapping):
+            raise ResumeIntegrityError("scope-violation run state is unreadable")
+        if origin_reason not in _SCOPE_VIOLATION_ORIGINS:
             raise ResumeIntegrityError("scope-violation recovery requires a Claude scope route")
         if checkpoint.phase not in {
             ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
@@ -7630,11 +7687,53 @@ class Orchestrator:
         report_path = directory / "report.json"
         failure_tree_path = directory / "tree_after_failure.txt"
         report = _read_json_artifact(report_path, 1024 * 1024)
-        failure_tree = _read_tree_file(failure_tree_path)
-        if not isinstance(report, dict) or failure_tree is None:
+        if not isinstance(report, dict):
             raise ResumeIntegrityError("scope-violation report or failure tree is missing")
         if report.get("tree_before") != checkpoint.expected_tree_sha:
             raise ResumeIntegrityError("scope-violation report tree_before does not match the checkpoint")
+        failure_tree = _read_tree_file(failure_tree_path)
+        # Runs created before ``tree_after_failure.txt`` became durable carry
+        # their failed tree only inside ``report.json``.  That record is
+        # promoted to the canonical artifact below, but only when Git still
+        # holds the exact tree it names: this reconstructs a lost artifact from
+        # live proof, it never asserts a past the harness can no longer see.
+        synthesized_failure_tree = failure_tree is None
+        if synthesized_failure_tree:
+            if failure_tree_path.exists():
+                raise ResumeIntegrityError("scope-violation failure tree is malformed")
+            legacy_tree_after = report.get("tree_after")
+            if not _is_object_id(legacy_tree_after):
+                raise ResumeIntegrityError("scope-violation report tree_after is not a Git object id")
+            if (
+                legacy_tree_after == checkpoint.expected_tree_sha
+                and report.get("scope_request") is None
+            ):
+                raise ResumeIntegrityError("scope-violation report tree_after is the checkpoint tree")
+            existing_recovery = _read_json_artifact(
+                directory / "scope_violation_recovery.json", 64 * 1024
+            )
+            # A recovery artifact from a previous resume already proved this
+            # exact failed tree; the rollback it records is why the live
+            # worktree is no longer that tree.
+            proven_by_recovery = (
+                isinstance(existing_recovery, dict)
+                and existing_recovery.get("tree_before") == checkpoint.expected_tree_sha
+                and existing_recovery.get("tree_after_failure") == legacy_tree_after
+            )
+            if not proven_by_recovery:
+                try:
+                    live_candidate = candidate_tree_sha(worktree)
+                    live_index = index_tree_sha(worktree)
+                except GitError as exc:
+                    raise ResumeIntegrityError(
+                        f"scope-violation Git state is unreadable: {exc}"
+                    ) from exc
+                if live_candidate != legacy_tree_after or live_index != legacy_tree_after:
+                    raise ResumeIntegrityError(
+                        "scope-violation failure tree is missing and the worktree is no "
+                        "longer the tree_after the report recorded"
+                    )
+            failure_tree = legacy_tree_after
         if report.get("tree_after") != failure_tree:
             raise ResumeIntegrityError("scope-violation report tree_after does not match the failure tree")
         recorded_scope_request = report.get("scope_request")
@@ -7689,6 +7788,23 @@ class Orchestrator:
             raise ResumeIntegrityError("scope-violation outside_scope_paths do not match the mutable scope")
         if not outside and recorded_scope_request is None:
             raise ResumeIntegrityError("scope-violation has no observed outside-scope path")
+        if synthesized_failure_tree:
+            if origin_reason == "REVISION_SCOPE_VIOLATION" and not outside:
+                raise ResumeIntegrityError("scope-violation has no observed outside-scope path")
+            # Every invariant above held against the live tree, so the report's
+            # ``tree_after`` is now durable proof in its own right.  Write-once:
+            # a concurrent writer that disagrees is a divergence, never a merge.
+            try:
+                _create_file_once(failure_tree_path, (failure_tree + "\n").encode("utf-8"))
+            except FileExistsError:
+                if _read_tree_file(failure_tree_path) != failure_tree:
+                    raise ResumeIntegrityError(
+                        "scope-violation failure tree diverges"
+                    ) from None
+            except OSError as exc:
+                raise ResumeIntegrityError(
+                    f"scope-violation failure tree cannot be recorded: {exc}"
+                ) from exc
 
         recovery = {
             "schema_version": 1,

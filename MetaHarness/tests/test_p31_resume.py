@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import hashlib
@@ -2365,14 +2366,17 @@ class ScopeViolationResumeHarness(ExpandedCheckRepairResumeHarness):
         return client
 
     def resume_with(self, config, run_id: str, *, plans=None, reviews=None,
-                    luna=None, claude=None, planner=None):
+                    luna=None, claude=None, planner=None,
+                    revalidate_integrity: bool = False):
         orchestrator, planner_client, reviewer, luna_used, claude_used = self.orchestrator(
             config, plans=plans or [], reviews=reviews if reviews is not None else [PASS],
             luna=luna or FakeLuna({}), claude=claude or FakeClaude(log=self.events),
             planner=planner,
         )
         with self.count_pushes() as pushed:
-            resumed = orchestrator.resume(run_id)
+            resumed = orchestrator.resume(
+                run_id, revalidate_integrity=revalidate_integrity
+            )
         return resumed, planner_client, reviewer, luna_used, claude_used, pushed
 
     def assert_clean_rollback(self, run_dir: Path, run_id: str, checkpoint, relative: str):
@@ -2638,6 +2642,345 @@ class ScopeViolationResumeTests(ScopeViolationResumeHarness):
         self.assertEqual(pushed.call_count, 1)
         self.assertEqual(checkpoint.cycle, 2)
         self.assertEqual(len(planner.prompts), 1)
+
+
+class LegacyScopeViolationResumeTests(ScopeViolationResumeHarness):
+    """Runs that violated their scope before ``tree_after_failure.txt`` existed.
+
+    Their only record of the failed Claude tree is ``report.json``.  A resume
+    may promote that record to the canonical artifact, but only while Git still
+    holds exactly the tree it names: this reconstructs a proof the harness lost,
+    it never asserts a past the harness can no longer observe.  Every other
+    invariant -- HEAD, branch, ownership, index, residue, ``tree_before``,
+    ``changed_paths``, outside-scope paths -- is enforced unchanged.
+    """
+
+    LEGACY_DETAIL = "scope-violation report or failure tree is missing"
+
+    def strip_failure_tree(self, run_dir: Path, relative: str) -> str:
+        """Drop the modern artifact and return the tree it recorded."""
+
+        path = run_dir / relative / "tree_after_failure.txt"
+        tree = path.read_text(encoding="utf-8").strip()
+        self.assertEqual(
+            json.loads((run_dir / relative / "report.json").read_text())["tree_after"],
+            tree,
+        )
+        path.unlink()
+        return tree
+
+    def close_as_refused(self, run_dir: Path, *, previous_failure: str) -> dict:
+        """Rewrite the run as one a first resume already refused.
+
+        This is the shape ``--revalidate-integrity`` actually meets: the
+        original cause no longer lives in ``state.failure``.
+        """
+
+        path = run_dir / "state.json"
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["resume"] = {
+            "phase": ResumePhase.CHECK_REPAIR_C01.value,
+            "attempts": 1,
+            "previous_status": "failed",
+            "previous_failure": {
+                "reason": previous_failure, "detail": "recorded by the previous attempt"
+            },
+            "status": "refused",
+        }
+        state["failure"] = {
+            "reason": "RESUME_INTEGRITY_FAILURE", "detail": self.LEGACY_DETAIL,
+        }
+        path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        self.assertTrue(integrity_revalidation_allowed(run_dir, state))
+        self.assertTrue(
+            resume_info(run_dir, state, revalidate_integrity=True).resumable
+        )
+        return state
+
+    def assert_cycle_records_the_violation(self, run_dir: Path, cycle: int) -> None:
+        state = json.loads((run_dir / "state.json").read_text())
+        record = next(
+            item for item in state["cycles"] if item.get("number") == cycle
+        )
+        self.assertEqual(record["failure"], "REVISION_SCOPE_VIOLATION")
+
+    def recover_at_the_planner_boundary(self, config, run_id: str):
+        """Resume a legacy run up to the durable scope-planner boundary."""
+
+        before = self.checks_ran()
+        blocked, _planner, reviewer, luna, claude, pushed = self.resume_with(
+            config, run_id, planner=self.blocked_planner(), revalidate_integrity=True,
+        )
+        self.assertEqual(blocked.state["failure"]["reason"], "LLM_FAILURE",
+                         blocked.state["failure"])
+        # Nothing durable from before the boundary is paid for a second time.
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(reviewer.prompts, [])
+        self.assertEqual(self.checks_ran(), before)
+        self.assertEqual(pushed.call_count, 0)
+        return blocked
+
+    # 7 -- the exact shape of run 20260919T193005Z-c462e8e5b4.
+    def test_a_a_legacy_c01_violation_is_recovered_from_its_report(self) -> None:
+        config, failed, checkpoint = self.violate_c01("legacy-scope-a")
+        run_dir = failed.run_dir
+        tree_after = self.strip_failure_tree(run_dir, "revision/check-repair/C01")
+        self.assertNotEqual(tree_after, checkpoint.expected_tree_sha)
+        self.assert_cycle_records_the_violation(run_dir, 1)
+        self.close_as_refused(run_dir, previous_failure="REVISION_SCOPE_VIOLATION")
+        # The live worktree is still exactly the tree the report named.
+        self.assertEqual(git(self.worktree("legacy-scope-a"), "write-tree"), tree_after)
+
+        self.recover_at_the_planner_boundary(config, "legacy-scope-a")
+
+        # The lost artifact is now durable, and it is the tree the report named.
+        path = run_dir / "revision/check-repair/C01/tree_after_failure.txt"
+        self.assertEqual(path.read_text(encoding="utf-8"), tree_after + "\n")
+        recovery = self.assert_clean_rollback(
+            run_dir, "legacy-scope-a", checkpoint, RECOVERY_C01,
+        )
+        self.assertEqual(recovery["tree_after_failure"], tree_after)
+        self.assertEqual(read_checkpoint(run_dir).phase,
+                         ResumePhase.CHECK_SCOPE_PLANNER_C01)
+
+    # 8 -- several --revalidate-integrity attempts lost ``previous_failure``.
+    def test_b_a_lost_previous_failure_falls_back_to_the_durable_cycle(self) -> None:
+        config, failed, checkpoint = self.violate_c01("legacy-scope-b")
+        run_dir = failed.run_dir
+        tree_after = self.strip_failure_tree(run_dir, "revision/check-repair/C01")
+        self.assert_cycle_records_the_violation(run_dir, 1)
+        # The resume record now only remembers the *previous refusal*.
+        self.close_as_refused(run_dir, previous_failure="RESUME_INTEGRITY_FAILURE")
+
+        self.recover_at_the_planner_boundary(config, "legacy-scope-b")
+
+        self.assertEqual(
+            (run_dir / "revision/check-repair/C01/tree_after_failure.txt").read_text(),
+            tree_after + "\n",
+        )
+        self.assert_clean_rollback(
+            run_dir, "legacy-scope-b", checkpoint, RECOVERY_C01,
+        )
+        self.assertEqual(read_checkpoint(run_dir).phase,
+                         ResumePhase.CHECK_SCOPE_PLANNER_C01)
+
+    def test_c_an_unrelated_phase_is_never_inferred_from_a_cycle(self) -> None:
+        """The cycle fallback only ever speaks for a check-repair checkpoint."""
+
+        _config, failed, checkpoint = self.violate_c01("legacy-scope-c")
+        state = json.loads((failed.run_dir / "state.json").read_text())
+        state["failure"] = {"reason": "RESUME_INTEGRITY_FAILURE", "detail": "x"}
+        for phase in (ResumePhase.CHECKS_C01, ResumePhase.CLAUDE_C01,
+                      ResumePhase.FINAL_CHECKS_C01,
+                      ResumePhase.FINAL_CHECKS_RETRY_C01):
+            self.assertIsNone(
+                orchestrator_module._scope_violation_origin(
+                    state, dataclasses.replace(checkpoint, phase=phase)
+                ),
+                phase,
+            )
+        self.assertEqual(
+            orchestrator_module._scope_violation_origin(state, checkpoint),
+            "REVISION_SCOPE_VIOLATION",
+        )
+
+    # 9 -- the operator already moved the tree: there is no live proof left.
+    def test_d_a_divergent_live_tree_is_refused_without_writing_anything(self) -> None:
+        config, failed, _checkpoint = self.violate_c01("legacy-scope-d")
+        run_dir = failed.run_dir
+        self.strip_failure_tree(run_dir, "revision/check-repair/C01")
+        self.close_as_refused(run_dir, previous_failure="REVISION_SCOPE_VIOLATION")
+        worktree = self.worktree("legacy-scope-d")
+        write(worktree / "README.md", "an operator edited this\n")
+        git(worktree, "add", "--all")
+
+        refused, _planner, _reviewer, luna, claude, pushed = self.resume_with(
+            config, "legacy-scope-d", plans=[SCOPE_REPAIR_PLAN],
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")}),
+            revalidate_integrity=True,
+        )
+
+        self.assertEqual(refused.status, RunStatus.FAILED)
+        self.assertEqual(refused.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertIn("no longer the tree_after", refused.state["failure"]["detail"])
+        self.assertFalse(
+            (run_dir / "revision/check-repair/C01/tree_after_failure.txt").exists()
+        )
+        self.assertFalse((run_dir / RECOVERY_C01).exists())
+        # No rollback: the operator's own edit is left exactly as it is.
+        self.assertEqual((worktree / "README.md").read_text(), "an operator edited this\n")
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(pushed.call_count, 0)
+
+    # 10 -- the report disagrees with the Git delta it claims to describe.
+    def test_e_divergent_report_changed_paths_are_refused(self) -> None:
+        config, failed, _checkpoint = self.violate_c01("legacy-scope-e")
+        run_dir = failed.run_dir
+        self.strip_failure_tree(run_dir, "revision/check-repair/C01")
+        report_path = run_dir / "revision/check-repair/C01/report.json"
+        report = json.loads(report_path.read_text())
+        report["changed_paths"] = [*report["changed_paths"], "src/a.py"]
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        self.close_as_refused(run_dir, previous_failure="REVISION_SCOPE_VIOLATION")
+
+        refused, _planner, _reviewer, luna, claude, pushed = self.resume_with(
+            config, "legacy-scope-e", plans=[SCOPE_REPAIR_PLAN],
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")}),
+            revalidate_integrity=True,
+        )
+
+        self.assertEqual(refused.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertIn("changed_paths do not match", refused.state["failure"]["detail"])
+        self.assertFalse(
+            (run_dir / "revision/check-repair/C01/tree_after_failure.txt").exists()
+        )
+        self.assertFalse((run_dir / RECOVERY_C01).exists())
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(pushed.call_count, 0)
+
+    # 11 -- a present artifact is always the authority.
+    def test_f_a_modern_run_recovers_exactly_as_it_did_before(self) -> None:
+        config, modern, modern_checkpoint = self.violate_c01("legacy-scope-f-modern")
+        self.resume_with(
+            config, "legacy-scope-f-modern", planner=self.blocked_planner(),
+        )
+        modern_recovery = self.assert_clean_rollback(
+            modern.run_dir, "legacy-scope-f-modern", modern_checkpoint, RECOVERY_C01,
+        )
+
+        config, legacy, legacy_checkpoint = self.violate_c01("legacy-scope-f-legacy")
+        tree_after = self.strip_failure_tree(
+            legacy.run_dir, "revision/check-repair/C01"
+        )
+        self.close_as_refused(
+            legacy.run_dir, previous_failure="REVISION_SCOPE_VIOLATION"
+        )
+        self.recover_at_the_planner_boundary(config, "legacy-scope-f-legacy")
+        legacy_recovery = self.assert_clean_rollback(
+            legacy.run_dir, "legacy-scope-f-legacy", legacy_checkpoint, RECOVERY_C01,
+        )
+
+        # Same repository, same plan, same violation: the reconstructed proof
+        # and the recovery it produces are identical to the modern ones.
+        self.assertEqual(legacy_recovery, modern_recovery)
+        self.assertEqual(legacy_checkpoint.expected_tree_sha,
+                         modern_checkpoint.expected_tree_sha)
+        self.assertEqual(
+            (legacy.run_dir / "revision/check-repair/C01/tree_after_failure.txt").read_bytes(),
+            (modern.run_dir / "revision/check-repair/C01/tree_after_failure.txt").read_bytes(),
+        )
+        self.assertEqual(tree_after, modern_recovery["tree_after_failure"])
+
+    def test_g_a_present_failure_tree_is_never_overruled_by_the_report(self) -> None:
+        """The historical fallback never outranks a durable modern artifact."""
+
+        config, failed, _checkpoint = self.violate_c01("legacy-scope-g")
+        run_dir = failed.run_dir
+        path = run_dir / "revision/check-repair/C01/tree_after_failure.txt"
+        path.write_text("0" * 40 + "\n", encoding="utf-8")
+        self.close_as_refused(run_dir, previous_failure="REVISION_SCOPE_VIOLATION")
+
+        refused, _planner, _reviewer, luna, claude, pushed = self.resume_with(
+            config, "legacy-scope-g", plans=[SCOPE_REPAIR_PLAN],
+            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 3\n")}),
+            revalidate_integrity=True,
+        )
+
+        self.assertEqual(refused.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertIn("tree_after does not match the failure tree",
+                      refused.state["failure"]["detail"])
+        self.assertEqual(path.read_text(encoding="utf-8"), "0" * 40 + "\n")
+        self.assertFalse((run_dir / RECOVERY_C01).exists())
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(pushed.call_count, 0)
+
+    # 12 -- the same rule for the expanded pass and for C02.
+    def test_h_a_legacy_expanded_c01_violation_is_recovered_too(self) -> None:
+        """Parity with the modern expanded recovery of ``test_b``.
+
+        That recovery cannot reach the bounded planner yet -- the known gap
+        recorded by ``test_b2`` -- so this asserts exactly what ``test_b``
+        asserts: the reconstructed proof, the rollback, and that nothing
+        durable is replayed while the recovery is decided.
+        """
+
+        config, failed, checkpoint = self.violate_expanded_c01("legacy-scope-h")
+        run_dir = failed.run_dir
+        tree_after = self.strip_failure_tree(run_dir, EXPANDED_C01)
+        self.assert_cycle_records_the_violation(run_dir, 1)
+        self.close_as_refused(run_dir, previous_failure="REVISION_SCOPE_VIOLATION")
+
+        _blocked, _planner, _reviewer, luna, claude, pushed = self.resume_with(
+            config, "legacy-scope-h", planner=self.blocked_planner(),
+            revalidate_integrity=True,
+        )
+        self.assertEqual(luna.calls, [])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(pushed.call_count, 0)
+
+        self.assertEqual(
+            (run_dir / EXPANDED_C01 / "tree_after_failure.txt").read_text(),
+            tree_after + "\n",
+        )
+        # Exactly one recovery artifact, in the directory that failed.
+        self.assertTrue((run_dir / RECOVERY_EXPANDED_C01).is_file())
+        self.assertFalse((run_dir / RECOVERY_C01).exists())
+        self.assertFalse(
+            (run_dir / "revision/check-repair/C01/tree_after_failure.txt").exists()
+        )
+        recovery = self.assert_clean_rollback(
+            run_dir, "legacy-scope-h", checkpoint, RECOVERY_EXPANDED_C01,
+        )
+        self.assertEqual(recovery["tree_after_failure"], tree_after)
+
+    def test_i_a_legacy_c02_violation_is_recovered_too(self) -> None:
+        config, failed, checkpoint = self.violate_c02("legacy-scope-i")
+        run_dir = failed.run_dir
+        tree_after = self.strip_failure_tree(run_dir, "revision/check-repair/C02")
+        self.assertEqual(checkpoint.cycle, 2)
+        self.assert_cycle_records_the_violation(run_dir, 2)
+        self.close_as_refused(run_dir, previous_failure="REVISION_SCOPE_VIOLATION")
+
+        c01_commit = json.loads((run_dir / "candidate/C01/commit.json").read_text())
+        c02_step = json.loads((run_dir / "repair/C02/steps/S01/step.json").read_text())
+        self.recover_at_the_planner_boundary(config, "legacy-scope-i")
+
+        self.assertEqual(
+            (run_dir / "revision/check-repair/C02/tree_after_failure.txt").read_text(),
+            tree_after + "\n",
+        )
+        recovery = self.assert_clean_rollback(
+            run_dir, "legacy-scope-i", checkpoint, RECOVERY_C02,
+        )
+        self.assertEqual(recovery["tree_after_failure"], tree_after)
+        self.assertEqual(read_checkpoint(run_dir).phase,
+                         ResumePhase.CHECK_SCOPE_PLANNER_C02)
+        # Nothing durable from C01 or from the C02 repair is replayed.
+        self.assertEqual(
+            json.loads((run_dir / "candidate/C01/commit.json").read_text()), c01_commit
+        )
+        self.assertEqual(
+            json.loads((run_dir / "repair/C02/steps/S01/step.json").read_text()), c02_step
+        )
+
+    def test_j_the_phase_mapping_covers_every_check_repair_directory(self) -> None:
+        """Every phase the recovery accepts maps to its own artifact directory."""
+
+        self.assertEqual(
+            orchestrator_module._SCOPE_VIOLATION_PHASES,
+            frozenset({
+                ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_EXPANDED_C01,
+                ResumePhase.CHECK_REPAIR_C02, ResumePhase.CHECK_REPAIR_EXPANDED_C02,
+            }),
+        )
+        self.assertEqual(
+            orchestrator_module._SCOPE_VIOLATION_ORIGINS,
+            frozenset({"REVISION_SCOPE_VIOLATION", "CLAUDE_SCOPE_REQUEST"}),
+        )
 
 
 class ScopeRepairCorruptionTests(ScopeViolationResumeHarness):
