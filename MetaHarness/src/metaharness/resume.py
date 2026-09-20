@@ -331,7 +331,7 @@ RESUMABLE_FAILURES: Mapping[str, frozenset[ResumePhase]] = {
         ResumePhase.CANDIDATE_PUSH_C02,
         ResumePhase.PUBLISH,
     }),
-    "AGENT_CONTRACT_MISMATCH": frozenset({ResumePhase.INITIAL_STEP}),
+    "AGENT_CONTRACT_MISMATCH": _STEP_PHASES,
 }
 # These are not ordinary retryable operation failures.  They mean that the
 # authority needed to prove a retry has been lost (or an agent crossed a Git
@@ -617,8 +617,12 @@ def resume_info(
         failure_reason == "AGENT_CONTRACT_MISMATCH"
         and is_clean_contract_mismatch_artifact(directory, state, checkpoint)
     )
+    dirty_mismatch = (
+        failure_reason == "AGENT_CONTRACT_MISMATCH"
+        and is_recoverable_dirty_contract_mismatch_artifact(directory, state, checkpoint)
+    )
     if (failure_reason in _NON_RESUMABLE_FAILURES and not revalidating) or (
-        failure_reason == "AGENT_CONTRACT_MISMATCH" and not clean_mismatch
+        failure_reason == "AGENT_CONTRACT_MISMATCH" and not (clean_mismatch or dirty_mismatch)
     ):
         return ResumeInfo(False, reason="failure requires operator intervention")
     # Requirements are deliberately phase-specific.  In particular, context
@@ -635,6 +639,8 @@ def resume_info(
     return ResumeInfo(
         True, checkpoint.phase.value,
         _clean_mismatch_label(directory, checkpoint) if clean_mismatch
+        else _dirty_mismatch_label(checkpoint)
+        if dirty_mismatch
         else resume_label(checkpoint),
         expected_tree=checkpoint.expected_tree_sha, cycle=checkpoint.cycle,
         step_id=checkpoint.step_id,
@@ -649,6 +655,12 @@ def _clean_mismatch_label(run_dir: Path, checkpoint: ResumeCheckpoint) -> str:
         if mismatch_retry_spent(run_dir, checkpoint.step_id)
         else f"RETRY {checkpoint.step_id} AFTER CLEAN MISMATCH"
     )
+
+
+def _dirty_mismatch_label(checkpoint: ResumeCheckpoint) -> str:
+    """The explicit operator-visible action for a bounded dirty recovery."""
+
+    return f"RECOVER {checkpoint.step_id} AFTER CONTRACT MISMATCH"
 
 
 def mismatch_retry_spent(run_dir: str | Path, step_id: str | None) -> bool:
@@ -700,6 +712,48 @@ def is_clean_contract_mismatch_artifact(
     return isinstance(mismatch, str) and bool(mismatch.strip()) and len(mismatch.encode("utf-8", errors="replace")) <= 32_000
 
 
+def is_recoverable_dirty_contract_mismatch_artifact(
+    run_dir: str | Path, state: Mapping[str, Any], checkpoint: ResumeCheckpoint,
+) -> bool:
+    """Cheap proof that a dirty mismatch has the durable recovery shape.
+
+    This intentionally performs no Git reads.  The orchestrator must still
+    prove the current worktree, index, ownership and exact per-step scope
+    before restoring anything.
+    """
+
+    if checkpoint.phase not in _STEP_PHASES or checkpoint.step_id is None:
+        return False
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    if failure.get("reason") != "AGENT_CONTRACT_MISMATCH":
+        return False
+    root = (
+        Path(run_dir)
+        if checkpoint.phase is ResumePhase.INITIAL_STEP
+        else Path(run_dir) / "repair" / "C02"
+    )
+    record = _read_json(root / "steps" / checkpoint.step_id / "step.json", 128 * 1024)
+    if not isinstance(record, dict) or record.get("id") != checkpoint.step_id:
+        return False
+    if record.get("status") != "FAILED":
+        return False
+    before, after = record.get("tree_before"), record.get("tree_after")
+    if (
+        not isinstance(before, str) or not _OBJECT_ID.fullmatch(before)
+        or not isinstance(after, str) or not _OBJECT_ID.fullmatch(after)
+        or before == after
+    ):
+        return False
+    if record.get("mismatch_clean") is not False:
+        return False
+    mismatch = record.get("mismatch")
+    return (
+        isinstance(mismatch, str)
+        and bool(mismatch.strip())
+        and len(mismatch.encode("utf-8", errors="replace")) <= 32_000
+    )
+
+
 class ResumeError(RuntimeError):
     """A resume could not start; the run state was not modified."""
 
@@ -744,6 +798,7 @@ __all__ = [
     "resume_info",
     "resume_label",
     "is_clean_contract_mismatch_artifact",
+    "is_recoverable_dirty_contract_mismatch_artifact",
     "mismatch_retry_spent",
     "write_checkpoint",
 ]

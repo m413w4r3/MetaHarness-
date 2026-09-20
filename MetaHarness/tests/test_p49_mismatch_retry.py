@@ -1,4 +1,4 @@
-"""P49: one bounded retry of a clean META CONTRACT MISMATCH.
+"""P49: one bounded retry and safe recovery of META CONTRACT MISMATCH.
 
 A step whose first worker changed nothing at all and returned a structural
 mismatch is retried exactly once, with the same approved contract, the same
@@ -69,6 +69,12 @@ DEFERRED_REPORT = (
     "- later step that owns it: S04\n"
 )
 
+
+def modify_create_delete(root: Path) -> None:
+    write(root / "src/b.py", "B = 3\n")
+    write(root / "src/c.py", "C = 3\n")
+    (root / "src/future.py").unlink()
+
 # S01 modifies A, S02 modifies B, S03 creates its own file, S04 owns future.py.
 FOUR_STEP_PLAN = plan_text(
     step_block(1),
@@ -78,6 +84,19 @@ FOUR_STEP_PLAN = plan_text(
     title="P49 staged migration",
 )
 FOUR_STEPS = ("S01", "S02", "S03", "S04")
+DIRTY_MUTATION_PLAN = plan_text(
+    step_block(1),
+    step_block(2, read=("src/a.py", "src/b.py"), write_set=("src/b.py",)),
+    step_block(
+        3,
+        read=("src/a.py", "src/b.py", "src/future.py"),
+        write_set=("src/b.py",),
+        create=("src/c.py",),
+        delete=("src/future.py",),
+        operation="Modify, create and delete",
+    ),
+    title="P49 dirty mismatch recovery",
+)
 # Two C02 repair steps, both inside the C01 mutable scope.
 REPAIR_TWO_STEP_PLAN = plan_text(
     step_block(1, operation="Repair"),
@@ -103,6 +122,19 @@ class ReportingLuna(CleanMismatchLuna):
             return result
         Path(artifacts_dir, "agent.final.md").write_text(report, encoding="utf-8")
         return dataclasses.replace(result, final_message=report)
+
+
+class C02DirtyLuna(ReportingLuna):
+    """Report a dirty mismatch on the first C02 repair-step attempt."""
+
+    def run_step(self, contract: str, worktree: Any, artifacts_dir: Any, **kwargs: Any) -> AgentResult:
+        result = super().run_step(contract, worktree, artifacts_dir, **kwargs)
+        call = self.calls[-1]
+        if call["cycle"] == 2 and call["step"] == "S01" and call["attempt"] == 1:
+            message = "META CONTRACT MISMATCH v1\nC02 tentative mismatch\n"
+            Path(artifacts_dir, "agent.final.md").write_text(message, encoding="utf-8")
+            return dataclasses.replace(result, final_message=message)
+        return result
 
 
 class LegacyMismatchOrchestrator(Orchestrator):
@@ -499,7 +531,7 @@ class BoundedRetryTests(MismatchRetryHarness):
         self.assertIn("DEFERRED CONTRACT MISMATCHES", reviewer.prompts[0])
         self.assertIn("S03", reviewer.prompts[0])
 
-    def test_a_dirty_retry_is_terminal(self) -> None:
+    def test_a_dirty_mismatch_is_recoverable_after_the_bounded_retry(self) -> None:
         config = self.make_config()
         luna = self.migration_luna(
             behaviors={(1, "S03", 2): writer("src/c.py", "C = 3\n")},
@@ -521,8 +553,189 @@ class BoundedRetryTests(MismatchRetryHarness):
         self.assertEqual(step["mismatch_retry_count"], 1)
         self.assertIs(step["mismatch_clean"], False)
         self.assertEqual((claude.calls, reviewer.prompts, pushed.call_count), ([], [], 0))
-        # A dirty retry is not resumable: the operator owns it.
-        self.assertFalse(resume_info(result.run_dir, result.state).resumable)
+        info = resume_info(result.run_dir, result.state)
+        self.assertTrue(info.resumable, info.reason)
+        self.assertEqual(info.label, "RECOVER S03 AFTER CONTRACT MISMATCH")
+
+        retry = ReportingLuna(
+            {(1, "S04"): writer("src/future.py", "from src.c import present\n")}, set(),
+        )
+        second, _planner, _reviewer, _l, _claude = self.orchestrator(
+            config, reviews=[PASS], luna=retry,
+        )
+        with self.count_pushes() as retry_push:
+            resumed = second.resume("retry-dirty")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual([call["step"] for call in retry.calls], ["S04"])
+        recovery = json.loads(
+            (resumed.run_dir / "steps/S03/mismatch_recovery.json").read_text()
+        )
+        self.assertEqual(recovery["mode"], "rollback_in_scope_dirty_mismatch")
+        self.assertEqual(recovery["restored_paths"], ["src/c.py"])
+        self.assertEqual(recovery["mismatch_retry_count_before"], 1)
+        self.assertEqual(retry_push.call_count, 1)
+
+    def test_dirty_mismatch_rolls_back_only_the_failed_step_and_retries_once(self) -> None:
+        config = self.make_config()
+        first = ReportingLuna(
+            {
+                (1, "S01"): writer("src/a.py", "A = 2\n"),
+                (1, "S02"): writer("src/b.py", "B = 2\n"),
+                (1, "S03"): writer("src/c.py", "C = tentative\n"),
+            },
+            {"S03"},
+        )
+        initial, _planner, _reviewer, _l, _claude = self.orchestrator(
+            config, plans=[FOUR_STEP_PLAN], reviews=[PASS], luna=first,
+        )
+        failed = self.run_approved(config, initial, "dirty-recover", FOUR_STEPS)
+        self.assertEqual(failed.state["failure"]["reason"], "AGENT_CONTRACT_MISMATCH")
+        before_s03 = json.loads(
+            (failed.run_dir / "steps/S02/step.json").read_text()
+        )["tree_after"]
+
+        retry = ReportingLuna(
+            {
+                (1, "S03"): writer("src/c.py", "C = final\n"),
+                (1, "S04"): writer("src/future.py", "from src.c import present\n"),
+            },
+            set(),
+        )
+        second, planner, _reviewer, _l, _claude = self.orchestrator(
+            config, reviews=[PASS], luna=retry,
+        )
+        with self.count_pushes() as pushed:
+            resumed = second.resume("dirty-recover")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual([call["step"] for call in retry.calls], ["S03", "S04"])
+        self.assertIn("<MISMATCH RETRY ADDENDUM>", retry.calls[0]["retry_addendum"])
+        self.assertEqual(planner.prompts, [])
+        self.assertEqual(
+            json.loads((resumed.run_dir / "steps/S01/step.json").read_text())["status"],
+            "COMPLETED",
+        )
+        self.assertEqual(
+            json.loads((resumed.run_dir / "steps/S02/step.json").read_text())["tree_after"],
+            before_s03,
+        )
+        recovery = json.loads(
+            (resumed.run_dir / "steps/S03/mismatch_recovery.json").read_text()
+        )
+        self.assertEqual(recovery["restored_paths"], ["src/c.py"])
+        self.assertEqual(recovery["mismatch_retry_count_before"], 0)
+        self.assertEqual(pushed.call_count, 1)
+
+    def test_dirty_mismatch_restores_write_create_and_delete_sets(self) -> None:
+        config = self.make_config()
+        first = ReportingLuna(
+            {
+                (1, "S01"): writer("src/a.py", "A = 2\n"),
+                (1, "S02"): writer("src/b.py", "B = 2\n"),
+                (1, "S03"): modify_create_delete,
+            },
+            {"S03"},
+        )
+        initial, *_rest = self.orchestrator(
+            config, plans=[DIRTY_MUTATION_PLAN], reviews=[PASS], luna=first,
+        )
+        failed = self.run_approved(config, initial, "dirty-mutations", ("S01", "S02", "S03"))
+
+        retry = ReportingLuna({(1, "S03"): modify_create_delete}, set())
+        second, *_rest = self.orchestrator(config, reviews=[PASS], luna=retry)
+        with self.count_pushes() as pushed:
+            resumed = second.resume("dirty-mutations")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual([call["step"] for call in retry.calls], ["S03"])
+        recovery = json.loads(
+            (resumed.run_dir / "steps/S03/mismatch_recovery.json").read_text()
+        )
+        self.assertEqual(
+            recovery["restored_paths"], ["src/b.py", "src/c.py", "src/future.py"]
+        )
+        worktree = Path(resumed.state["worktree"])
+        self.assertEqual((worktree / "src/b.py").read_text(), "B = 3\n")
+        self.assertEqual((worktree / "src/c.py").read_text(), "C = 3\n")
+        self.assertFalse((worktree / "src/future.py").exists())
+        self.assertEqual(pushed.call_count, 1)
+
+    def test_dirty_mismatch_recovery_uses_the_hash_bound_c02_step_scope(self) -> None:
+        config = self.make_config()
+        first = C02DirtyLuna(
+            {
+                (1, "S01"): writer("src/a.py", "A = 2\n"),
+                (2, "S01"): writer("src/a.py", "A = tentative\n"),
+                (2, "S02"): writer("src/a.py", "A = 4\n"),
+            },
+            set(),
+        )
+        initial, *_rest = self.orchestrator(
+            config,
+            plans=[SINGLE_PLAN, REPAIR_TWO_STEP_PLAN],
+            reviews=[REVISE_IMPLEMENTATION, PASS],
+            luna=first,
+        )
+        failed = self.run_approved(config, initial, "dirty-c02", ("S01",))
+        self.assertEqual(failed.state["failure"]["reason"], "AGENT_CONTRACT_MISMATCH")
+        self.assertEqual(resume_info(failed.run_dir, failed.state).label,
+                         "RECOVER S01 AFTER CONTRACT MISMATCH")
+
+        retry = ReportingLuna(
+            {
+                (2, "S01"): writer("src/a.py", "A = 3\n"),
+                (2, "S02"): writer("src/a.py", "A = 4\n"),
+            },
+            set(),
+        )
+        second, *_rest = self.orchestrator(config, reviews=[PASS], luna=retry)
+        with self.count_pushes() as pushed:
+            resumed = second.resume("dirty-c02")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual([(call["cycle"], call["step"]) for call in retry.calls],
+                         [(2, "S01"), (2, "S02")])
+        recovery = json.loads(
+            (resumed.run_dir / "repair/C02/steps/S01/mismatch_recovery.json").read_text()
+        )
+        self.assertEqual(recovery["restored_paths"], ["src/a.py"])
+        self.assertEqual(pushed.call_count, 1)
+
+    def test_dirty_mismatch_outside_current_step_scope_fails_closed_without_restore(self) -> None:
+        config = self.make_config()
+
+        def write_two_paths(root: Path) -> None:
+            write(root / "src/c.py", "C = tentative\n")
+            write(root / "src/future.py", "future = tentative\n")
+
+        first = ReportingLuna(
+            {
+                (1, "S01"): writer("src/a.py", "A = 2\n"),
+                (1, "S02"): writer("src/b.py", "B = 2\n"),
+                (1, "S03"): write_two_paths,
+            },
+            {"S03"},
+        )
+        initial, *_rest = self.orchestrator(
+            config, plans=[FOUR_STEP_PLAN], reviews=[PASS], luna=first,
+        )
+        failed = self.run_approved(config, initial, "dirty-outside", FOUR_STEPS)
+        worktree = Path(failed.state["worktree"])
+        c_before = (worktree / "src/c.py").read_text()
+        future_before = (worktree / "src/future.py").read_text()
+        self.assertTrue(resume_info(failed.run_dir, failed.state).resumable)
+
+        retry = ReportingLuna({}, set())
+        second, *_rest = self.orchestrator(config, reviews=[PASS], luna=retry)
+        resumed = second.resume("dirty-outside")
+
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(resumed.state["failure"]["reason"], "RESUME_REQUIRES_OPERATOR")
+        self.assertEqual(retry.calls, [])
+        self.assertEqual((worktree / "src/c.py").read_text(), c_before)
+        self.assertEqual((worktree / "src/future.py").read_text(), future_before)
+        self.assertFalse((failed.run_dir / "steps/S03/mismatch_recovery.json").exists())
 
     def test_the_retry_cannot_write_a_future_step_path(self) -> None:
         config = self.make_config()
@@ -711,7 +924,7 @@ class PersistedRecoveryTests(MismatchRetryHarness):
         self.assertEqual(resumed.state["failure"]["reason"], "AGENT_CONTRACT_MISMATCH")
         self.assertEqual([call["step"] for call in retry.calls], ["S03"])
         self.assertEqual((claude.calls, reviewer.prompts, pushed.call_count), ([], [], 0))
-        self.assertFalse(resume_info(resumed.run_dir, resumed.state).resumable)
+        self.assertTrue(resume_info(resumed.run_dir, resumed.state).resumable)
 
     def test_a_spent_retry_budget_is_deferred_instead_of_retried_again(self) -> None:
         config, failed, _first = self.historical_run("legacy-spent")

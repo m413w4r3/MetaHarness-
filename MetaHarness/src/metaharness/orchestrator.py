@@ -184,6 +184,7 @@ from .resume import (
     ResumePhase,
     ResumeRequiresOperatorError,
     is_clean_contract_mismatch_artifact,
+    is_recoverable_dirty_contract_mismatch_artifact,
     load_resume_checkpoint,
     mark_checkpoint_completed,
     mismatch_retry_spent,
@@ -1336,6 +1337,7 @@ class StepExecutionFailure(OrchestrationError):
         clean_contract_mismatch: bool = False,
         mismatch_retry_count: int = 0,
         initial_mismatch: str | None = None,
+        index_tree_after: str | None = None,
     ) -> None:
         super().__init__(f"{reason}: step={step_id}")
         self.reason = reason
@@ -1349,6 +1351,7 @@ class StepExecutionFailure(OrchestrationError):
         self.clean_contract_mismatch = clean_contract_mismatch
         self.mismatch_retry_count = mismatch_retry_count
         self.initial_mismatch = initial_mismatch
+        self.index_tree_after = index_tree_after
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1704,6 +1707,8 @@ class _ResumedRun:
     spec: str
     context: str
     restore_paths: tuple[str, ...] = ()
+    mismatch_recovery: dict[str, Any] | None = None
+    mismatch_recovery_path: Path | None = None
     c01_steps: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     # step id -> the clean mismatch its first attempt returned, for the single
     # bounded retry this resume owes that step.
@@ -4892,6 +4897,7 @@ class Orchestrator:
                     _bounded_v2_report(initial_mismatch)
                     if mismatch_retry_count and initial_mismatch else None
                 ),
+                index_tree_after=index_after,
             )
         # 8-9. Git ownership: HEAD, branch, branches and worktrees.
         if ownership_after.head != base_sha:
@@ -4972,6 +4978,7 @@ class Orchestrator:
             mismatch_clean=failure.clean_contract_mismatch,
             mismatch_retry_count=failure.mismatch_retry_count,
             initial_mismatch=failure.initial_mismatch,
+            index_tree_after=failure.index_tree_after,
             step_dir=step_dir,
         )
 
@@ -5682,6 +5689,15 @@ class Orchestrator:
         if not isinstance(c01_candidate_record, dict) or not _is_object_id(c01_candidate_record.get("commit_sha")):
             raise ResumeIntegrityError("C01 candidate commit is missing for C02")
         cycle_parent_sha = c01_candidate_record["commit_sha"]
+        # C02 has a different immutable Git boundary from C01: its worker
+        # starts on the reviewed C01 candidate commit.  Refresh the durable
+        # ownership proof before the first C02 worker so a later resume can
+        # compare the current branch/worktree set to the exact C02 boundary.
+        ownership_before = _git_ownership(repo, info.worktree)
+        store.update(
+            status=store.load().get("status", RunStatus.IMPLEMENTING),
+            git_ownership=_git_ownership_payload(ownership_before),
+        )
         original_scope = sorted({
             path for step in original_plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
@@ -6600,6 +6616,7 @@ class Orchestrator:
         mismatch_clean: bool = False,
         mismatch_retry_count: int = 0,
         initial_mismatch: str | None = None,
+        index_tree_after: str | None = None,
         step_dir: Path | None = None,
     ) -> RunResult:
         try:
@@ -6650,6 +6667,8 @@ class Orchestrator:
                        if mismatch_retry_count else {}),
                     **({"initial_mismatch": _bounded_v2_report(initial_mismatch)}
                        if initial_mismatch else {}),
+                    **({"index_tree_after": index_tree_after}
+                       if index_tree_after else {}),
                     "usage": step_usage,
                 }))
         return RunResult(run_dir, RunStatus.FAILED,
@@ -7168,7 +7187,7 @@ class Orchestrator:
             on_claimed(run_dir)
         try:
             if resumed.restore_paths:
-                self._restore_revision_tree(resumed)
+                self._restore_revision_tree(run_dir, resumed)
             if checkpoint.phase is ResumePhase.PUBLISH:
                 candidate_path = _candidate_commit_path(run_dir, checkpoint.cycle)
                 if _read_json_artifact(candidate_path) is not None:
@@ -7640,8 +7659,8 @@ class Orchestrator:
             raise ResumeIntegrityError(f"partial worktree is unreadable: {exc}") from exc
         return WorktreeInfo(repo, path, expected_branch, base_ref, base_sha)
 
-    def _restore_revision_tree(self, resumed: "_ResumedRun") -> None:
-        """Undo a failed Claude attempt's in-scope edits, exactly and boundedly."""
+    def _restore_revision_tree(self, run_dir: Path, resumed: "_ResumedRun") -> None:
+        """Undo a failed attempt's in-scope edits, exactly and boundedly."""
 
         worktree = resumed.info.worktree
         expected = resumed.checkpoint.expected_tree_sha
@@ -7658,6 +7677,36 @@ class Orchestrator:
             raise ResumeRequiresOperatorError(
                 "the tree recorded in tree_before.txt could not be restored exactly"
             )
+        if resumed.mismatch_recovery is not None:
+            self._write_mismatch_recovery_artifact(run_dir, resumed)
+
+    @staticmethod
+    def _write_mismatch_recovery_artifact(run_dir: Path, resumed: "_ResumedRun") -> None:
+        """Persist the exact, idempotent proof of a dirty mismatch rollback."""
+
+        payload = resumed.mismatch_recovery
+        if payload is None:
+            return
+        step_id = resumed.checkpoint.step_id
+        if resumed.mismatch_recovery_path is None and not isinstance(step_id, str):
+            raise ResumeIntegrityError("dirty mismatch recovery has no step id")
+        path = resumed.mismatch_recovery_path or (
+            Orchestrator._step_root(run_dir, resumed.checkpoint)
+            / "steps" / step_id / "mismatch_recovery.json"
+        )
+        expected = _json_text(payload)
+        try:
+            if path.exists():
+                if path.read_text(encoding="utf-8") != expected:
+                    raise ResumeIntegrityError(
+                        "dirty mismatch recovery artifact is divergent"
+                    )
+                return
+            atomic_write_text(path, expected)
+        except (OSError, UnicodeError, ResultArtifactError) as exc:
+            raise ResumeIntegrityError(
+                "dirty mismatch recovery artifact could not be written"
+            ) from exc
 
     def _validate_resume(
         self, run_dir: Path, state: Mapping[str, Any], checkpoint: ResumeCheckpoint,
@@ -7841,6 +7890,15 @@ class Orchestrator:
                 policy_config=self._effective_repair_scope,
             )
             scope = sorted(set(scope) | set(expanded_c02.effective_paths))
+        failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+        clean_mismatch_shape = (
+            failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
+            and is_clean_contract_mismatch_artifact(run_dir, state, checkpoint)
+        )
+        dirty_mismatch_shape = (
+            failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
+            and is_recoverable_dirty_contract_mismatch_artifact(run_dir, state, checkpoint)
+        )
         try:
             if str(worktree) not in registered_worktrees(repo):
                 refuse("run worktree is not registered in the repository")
@@ -7985,7 +8043,92 @@ class Orchestrator:
                 if reconciled is not None:
                     checkpoint, reconciled_retries = reconciled
             restore: tuple[str, ...] = ()
-            if candidate != checkpoint.expected_tree_sha or index_tree != checkpoint.expected_tree_sha or dirty:
+            mismatch_recovery: dict[str, Any] | None = None
+            mismatch_recovery_path: Path | None = None
+            if dirty_mismatch_shape:
+                step_id = checkpoint.step_id
+                if step_id is None:
+                    refuse("dirty contract mismatch has no step id")
+                step_root = self._step_root(run_dir, checkpoint)
+                record = _read_json_artifact(
+                    step_root / "steps" / step_id / "step.json", 128 * 1024
+                )
+                if not isinstance(record, dict):
+                    refuse("dirty contract mismatch artifact is missing")
+                before, after = record.get("tree_before"), record.get("tree_after")
+                if before != checkpoint.expected_tree_sha:
+                    refuse("dirty contract mismatch tree_before does not match the checkpoint")
+                changed = changed_paths_between_trees(repo, before, after)
+                if not changed:
+                    refuse("dirty contract mismatch has no changed paths")
+                step_scope = self._step_mutable_scope(
+                    run_dir=run_dir, checkpoint=checkpoint, plan=plan,
+                    selection=selection,
+                )
+                outside = [path for path in changed if path not in step_scope]
+                if outside:
+                    raise ResumeRequiresOperatorError(
+                        "dirty contract mismatch changed paths outside the failed step scope: "
+                        + _paths_detail(outside)
+                    )
+                failure_tree = _read_tree_file(
+                    step_root / "steps" / step_id / "tree_after_failure.txt"
+                )
+                if failure_tree is not None and failure_tree != after:
+                    refuse("dirty contract mismatch failure tree does not match step.json")
+                recorded_index = record.get("index_tree_after")
+                if recorded_index is not None:
+                    if not _is_object_id(recorded_index) or recorded_index != index_tree:
+                        raise ResumeRequiresOperatorError(
+                            "dirty contract mismatch proof no longer matches the current index"
+                        )
+                recorded_ownership = _ownership_from_payload(state.get("git_ownership"))
+                if recorded_ownership is None:
+                    raise ResumeRequiresOperatorError(
+                        "dirty contract mismatch Git ownership proof is missing or invalid"
+                    )
+                current_ownership = _git_ownership(repo, worktree)
+                if _git_ownership_payload(current_ownership) != _git_ownership_payload(recorded_ownership):
+                    raise ResumeRequiresOperatorError(
+                        "dirty contract mismatch proof no longer matches Git ownership"
+                    )
+                mismatch_recovery = {
+                    "schema_version": 1,
+                    "mode": "rollback_in_scope_dirty_mismatch",
+                    "tree_before": before,
+                    "tree_after_failure": after,
+                    "restored_paths": list(changed),
+                    "mismatch_retry_count_before": (
+                        record.get("mismatch_retry_count")
+                        if isinstance(record.get("mismatch_retry_count"), int)
+                        and not isinstance(record.get("mismatch_retry_count"), bool)
+                        else 0
+                    ),
+                }
+                mismatch_recovery_path = (
+                    step_root / "steps" / step_id / "mismatch_recovery.json"
+                )
+                if mismatch_recovery_path.is_file():
+                    try:
+                        if mismatch_recovery_path.read_text(encoding="utf-8") != _json_text(mismatch_recovery):
+                            refuse("dirty mismatch recovery artifact is divergent")
+                    except (OSError, UnicodeError) as exc:
+                        refuse(f"dirty mismatch recovery artifact is unreadable: {exc}")
+                already_restored = (
+                    candidate == before
+                    and index_tree == before
+                    and not dirty
+                    and mismatch_recovery_path.is_file()
+                )
+                if already_restored:
+                    pass
+                else:
+                    if candidate != after:
+                        raise ResumeRequiresOperatorError(
+                            "dirty contract mismatch proof no longer matches the current candidate tree"
+                        )
+                    restore = tuple(changed)
+            elif candidate != checkpoint.expected_tree_sha or index_tree != checkpoint.expected_tree_sha or dirty:
                 restore = self._explain_tree_drift(
                     repo, run_dir, checkpoint, candidate, scope,
                     restore_failed_steps=not self._legacy_run_options,
@@ -8004,22 +8147,24 @@ class Orchestrator:
         # earlier approved steps are legitimate and are never a gate; nor are
         # ignored files.  Any real residual evidence remains an
         # operator-required failure.
-        failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
         mismatch_retries: dict[str, str] = dict(reconciled_retries)
-        if (
-            failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
-            and is_clean_contract_mismatch_artifact(run_dir, state, checkpoint)
-        ):
+        if clean_mismatch_shape or dirty_mismatch_shape:
             step_id = checkpoint.step_id
-            record = _read_json_artifact(run_dir / "steps" / step_id / "step.json")
+            root = self._step_root(run_dir, checkpoint)
+            record = _read_json_artifact(root / "steps" / step_id / "step.json")
             if not isinstance(record, dict):
-                raise ResumeIntegrityError("clean mismatch artifact is missing")
-            if candidate != record.get("tree_before") or index_tree != candidate or dirty:
+                raise ResumeIntegrityError("contract mismatch artifact is missing")
+            if clean_mismatch_shape and (
+                candidate != record.get("tree_before") or index_tree != candidate or dirty
+            ):
                 raise ResumeRequiresOperatorError(
                     "clean contract mismatch proof no longer matches the current worktree"
                 )
-            recorded_ownership = state.get("git_ownership")
-            if isinstance(recorded_ownership, Mapping):
+            if clean_mismatch_shape:
+                recorded_ownership = state.get("git_ownership")
+            else:
+                recorded_ownership = None
+            if clean_mismatch_shape and isinstance(recorded_ownership, Mapping):
                 current_ownership = _git_ownership(repo, worktree)
                 if _git_ownership_payload(current_ownership) != dict(recorded_ownership):
                     raise ResumeRequiresOperatorError(
@@ -8043,7 +8188,7 @@ class Orchestrator:
                 # The retry was already spent: the clean mismatch becomes the
                 # deferred outcome and the chain continues.  Never a third
                 # attempt.
-                atomic_write_text(run_dir / "steps" / step_id / "step.json", _json_text({
+                atomic_write_text(root / "steps" / step_id / "step.json", _json_text({
                     "id": step_id, "status": "DEFERRED_CONTRACT_MISMATCH",
                     "profile_id": record.get("profile_id"),
                     "tree_before": record["tree_before"], "tree_after": record["tree_before"],
@@ -8054,12 +8199,29 @@ class Orchestrator:
                        and record["initial_mismatch"].strip() else {}),
                     "usage": normalize_usage(record.get("usage")),
                 }))
-                ids = [step.id for step in plan.steps]
+                ids = (
+                    [step.id for step in plan.steps]
+                    if checkpoint.phase is ResumePhase.INITIAL_STEP
+                    else self._repair_step_ids(
+                        run_dir, checkpoint, selection, plan.required_checks
+                    ) or []
+                )
+                if step_id not in ids:
+                    raise ResumeIntegrityError(
+                        "contract mismatch step is missing from the approved step plan"
+                    )
                 index = ids.index(step_id)
                 following = ids[index + 1] if index + 1 < len(ids) else None
-                next_phase = ResumePhase.INITIAL_STEP if following else ResumePhase.CHECKS_C01
+                if following:
+                    next_phase = checkpoint.phase
+                else:
+                    next_phase = (
+                        ResumePhase.CHECKS_C01
+                        if checkpoint.phase is ResumePhase.INITIAL_STEP
+                        else ResumePhase.CHECKS_C02
+                    )
                 checkpoint = ResumeCheckpoint(
-                    next_phase, 1, following, checkpoint.expected_head_sha,
+                    next_phase, checkpoint.cycle, following, checkpoint.expected_head_sha,
                     record["tree_before"], checkpoint.execution_selection_sha256,
                     checkpoint.plan_identity, checkpoint.repair_bundle_sha256,
                     checkpoint.scope_delta_sha256,
@@ -8086,6 +8248,8 @@ class Orchestrator:
             ),
             repository_reference=reference, spec=spec, context=context,
             restore_paths=restore,
+            mismatch_recovery=mismatch_recovery,
+            mismatch_recovery_path=mismatch_recovery_path,
             mismatch_retries=mismatch_retries,
             existing_commit_sha=existing_commit,
         )
@@ -8161,6 +8325,58 @@ class Orchestrator:
         if repair_plan.decision is not PlanDecision.READY or repair_sha != checkpoint.repair_bundle_sha256:
             return None
         return [step.id for step in repair_plan.steps]
+
+    def _step_mutable_scope(
+        self,
+        *,
+        run_dir: Path,
+        checkpoint: ResumeCheckpoint,
+        plan: TaskPlanV2,
+        selection: Any,
+    ) -> tuple[str, ...]:
+        """Return only the mutable paths owned by the checkpointed step.
+
+        A dirty mismatch is rolled back against this exact step contract.  In
+        particular, the original plan's union is deliberately not used here:
+        a path owned by a later step is still out of scope for the failed
+        step, even when it is approved elsewhere in the run.
+        """
+
+        candidate_plan = plan
+        if checkpoint.phase is ResumePhase.REPAIR_STEP:
+            repair_dir = run_dir / "repair" / "C02"
+            try:
+                candidate_plan = parse_task_plan_v2(
+                    (repair_dir / "planner.raw.md").read_text(encoding="utf-8"),
+                    implementer_ids=frozenset({selection.repair_implementer.profile_id}),
+                    reviewer_ids=frozenset({selection.reviewer.profile_id}),
+                    check_catalog=self.config.check_catalog,
+                    inherited_check_ids=plan.required_checks,
+                )
+                _bundle, repair_sha = validate_implementation_bundle(
+                    repair_dir, expected_step_ids=[step.id for step in candidate_plan.steps]
+                )
+            except (
+                V2PlanParseError, OrchestrationError, OSError, UnicodeError,
+                ValueError, AttributeError,
+            ):
+                return ()
+            if (
+                candidate_plan.decision is not PlanDecision.READY
+                or repair_sha != checkpoint.repair_bundle_sha256
+            ):
+                return ()
+        step = next(
+            (item for item in candidate_plan.steps if item.id == checkpoint.step_id),
+            None,
+        )
+        if step is None:
+            return ()
+        return tuple(sorted({
+            *step.write_set,
+            *step.create_set,
+            *step.delete_set,
+        }))
 
     def _reconcile_durable_step(
         self, run_dir: Path, checkpoint: ResumeCheckpoint, step_ids: list[str], *,

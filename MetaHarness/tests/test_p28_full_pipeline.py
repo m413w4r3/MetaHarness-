@@ -127,6 +127,7 @@ def step_block(
     read: tuple[str, ...] = ("src/a.py",),
     write_set: tuple[str, ...] = ("src/a.py",),
     create: tuple[str, ...] = (),
+    delete: tuple[str, ...] = (),
     operation: str = "Perform",
 ) -> str:
     step_id = f"S{number:02d}"
@@ -149,7 +150,7 @@ def step_block(
         *([f"- {path}" for path in create] or ["NONE"]),
         "",
         "DELETE_SET",
-        "NONE",
+        *([f"- {path}" for path in delete] or ["NONE"]),
         "",
         "INSTRUCTIONS",
         f"1. {operation} operation {number} exactly.",
