@@ -61,8 +61,12 @@ class ModelProfile:
     strengths: tuple[str, ...] = ()
     cost_tier: str = "standard"
     latency_tier: str = "standard"
+    # Provider metadata is independent from the execution driver/harness.
+    provider: str = "openai"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.provider, str) or not self.provider.strip():
+            raise ValueError("profile provider must be a non-empty string")
         if not isinstance(self.description, str) or len(self.description) > 300:
             raise ValueError("profile description must be at most 300 characters")
         if not isinstance(self.strengths, tuple) or len(self.strengths) > 8:
@@ -237,22 +241,46 @@ class PlanningConfig:
             raise ValueError("planning execution_mode_policy must be 'auto' or 'require-staged'")
 
 
+MAX_REVISION_BUDGET = 10
+
+
+def validate_revision_budget(value: int, name: str) -> int:
+    """Validate one bounded correction budget in one central place."""
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= MAX_REVISION_BUDGET
+    ):
+        raise ValueError(
+            f"{name} must be an integer between 0 and {MAX_REVISION_BUDGET}"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class RevisionConfig:
-    """Bounded automatic correction-loop configuration.
-
-    ``enabled`` is the only authority for the P25/P26 Claude revision and
-    C02 repair cycle; profiles present in the catalogue never enable it.
-    """
+    """Independent, bounded semantic-revision and check-repair budgets."""
 
     enabled: bool = False
-    max_cycles: int = 2
+    max_review_repair_cycles: int = 1
+    max_check_repair_attempts: int = 2
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ValueError("revision.enabled must be a boolean")
-        if isinstance(self.max_cycles, bool) or self.max_cycles != 2:
-            raise ValueError("revision.max_cycles must be exactly 2")
+        validate_revision_budget(
+            self.max_review_repair_cycles, "revision.max_review_repair_cycles"
+        )
+        validate_revision_budget(
+            self.max_check_repair_attempts, "revision.max_check_repair_attempts"
+        )
+
+    @property
+    def max_cycles(self) -> int:
+        """Historical read-only alias; new contracts use explicit budgets."""
+
+        return self.max_review_repair_cycles
 
 
 @dataclass(frozen=True)
@@ -435,6 +463,7 @@ class SelectedProfile:
     permission_mode: str | None = None
     # SHA-256 of the execution-relevant profile configuration (schema 2).
     config_sha256: str | None = None
+    provider: str = "openai"
 
 
 @dataclass(frozen=True)
@@ -467,7 +496,7 @@ class ExecutionSelectionV3:
 
 @dataclass(frozen=True)
 class ExecutionSelectionV4:
-    """Immutable execution authority for new META PLAN v2 runs."""
+    """Historical schema-4 execution authority."""
 
     schema_version: int
     planner: SelectedProfile
@@ -478,13 +507,41 @@ class ExecutionSelectionV4:
 
 
 @dataclass(frozen=True)
+class ExecutionSelectionV5:
+    """Immutable, role-shaped execution authority for new META PLAN v2 runs."""
+
+    schema_version: int
+    planner: SelectedProfile
+    steps: tuple[StepExecutionSelection, ...]
+    check_repair: SelectedProfile | None
+    semantic_reviser: SelectedProfile | None
+    final_reviewer: SelectedProfile
+
+    # These aliases let the still-shared orchestration/reporting code consume
+    # the new role-shaped snapshot while historical V4 artifacts remain
+    # untouched.  They are not serialized fields or new authorities.
+    @property
+    def reviewer(self) -> SelectedProfile:
+        return self.final_reviewer
+
+    @property
+    def reviser(self) -> SelectedProfile | None:
+        return self.semantic_reviser
+
+    @property
+    def repair_implementer(self) -> SelectedProfile | None:
+        return self.check_repair
+
+
+@dataclass(frozen=True)
 class RunCycle:
-    """One bounded orchestration cycle."""
+    """One generic orchestration cycle; its budget is configured elsewhere."""
 
     number: int
     kind: str
 
     def __post_init__(self) -> None:
-        expected = {1: "initial", 2: "repair"}
-        if self.number not in expected or self.kind != expected[self.number]:
-            raise ValueError("run cycle must be initial cycle 1 or repair cycle 2")
+        if isinstance(self.number, bool) or not isinstance(self.number, int) or self.number < 1:
+            raise ValueError("run cycle number must be a positive integer")
+        if not isinstance(self.kind, str) or not self.kind.strip():
+            raise ValueError("run cycle kind must be a non-empty string")

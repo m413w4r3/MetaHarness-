@@ -47,6 +47,7 @@ from ..gitops import (
 )
 from ..models import (
     ExecutionSelectionV4,
+    ExecutionSelectionV5,
     ExecutionRole,
     HarnessConfig,
     ImplementationStep,
@@ -463,7 +464,7 @@ def _agent_auth_failure(
 
 @dataclasses.dataclass(frozen=True)
 class RevisionRunner:
-    """Runs one Claude pre-check / revision / scope-request cycle.
+    """Runs one semantic-revision or check-repair executor cycle.
 
     Every dependency is injected explicitly: the runner never receives the
     ``Orchestrator`` instance.  ``config``/``secrets``/``effective_repair_scope``
@@ -506,7 +507,7 @@ class RevisionRunner:
         info: Any,
         branch_ref: str,
         ownership_before: Any,
-        selection: ExecutionSelectionV4,
+        selection: ExecutionSelectionV4 | ExecutionSelectionV5,
         artifact_dir: Path | None = None,
         mutable_scope: list[str] | None = None,
         deferred_mismatches: str | None = None,
@@ -666,11 +667,35 @@ class RevisionRunner:
             )
         store.update(status=RunStatus.REVISING, current_step=None)
         atomic_write_text(artifact_dir / "tree_before.txt", tree_before.rstrip() + "\n")
+        legacy_injected_check_repair = is_check_repair and self.legacy_failure_names
+        active_selected = (
+            getattr(selection, "reviser", None)
+            if legacy_injected_check_repair
+            else getattr(selection, "check_repair", None)
+            if is_check_repair
+            else getattr(selection, "semantic_reviser", None)
+        )
+        # Historical V4 snapshots expose only ``reviser``; V5 uses the
+        # role-specific fields above.  This fallback is read-only compatibility
+        # for old artifacts and is never used to choose a new V5 role.
+        if active_selected is None and not hasattr(selection, "semantic_reviser"):
+            active_selected = getattr(selection, "reviser", None)
+        if active_selected is None:
+            return None, (
+                "CHECK_REPAIR_PROFILE_MISSING"
+                if is_check_repair else "SEMANTIC_REVISER_PROFILE_MISSING"
+            )
+        active_role = (
+            ExecutionRole.REPAIR
+            if is_check_repair and hasattr(selection, "semantic_reviser")
+            and not legacy_injected_check_repair
+            else ExecutionRole.REVISER
+        )
         if self.agent_executor is not None:
             result = self.agent_executor.run(
                 AgentRunRequest(
-                    role=ExecutionRole.REVISER,
-                    profile_id=selection.reviser.profile_id,
+                    role=active_role,
+                    profile_id=active_selected.profile_id,
                     prompt=revision_prompt,
                     worktree=Path(info.worktree),
                     artifact_dir=artifact_dir,
@@ -682,6 +707,9 @@ class RevisionRunner:
             result = self.run_revision(
                 selection, info.worktree, run_dir, revision_prompt,
                 revision_dir=artifact_dir,
+                profile_id=active_selected.profile_id,
+                role=active_role,
+                mutable_paths=tuple(mutable_scope),
             )
         self.ensure_revision_artifacts(artifact_dir, result)
         agent_auth_failure = _agent_auth_failure(
@@ -758,7 +786,7 @@ class RevisionRunner:
         )
         usage = normalize_usage(result.usage)
         revision_state = {
-            "profile_id": selection.reviser.profile_id,
+            "profile_id": active_selected.profile_id,
             "status": "NO_CHANGE" if tree_after == tree_before else "COMPLETED",
             "tree_before": tree_before,
             "tree_after": tree_after,

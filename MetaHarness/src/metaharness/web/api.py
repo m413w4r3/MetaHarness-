@@ -41,11 +41,16 @@ from ..execution_selection import (
     read_execution_selection_v4_with_sha256,
     resolve_execution_selection_v4,
     validate_execution_selection_v4,
+    ensure_execution_selection_v5,
+    read_execution_selection_v5_with_sha256,
+    resolve_execution_selection_v5,
+    validate_execution_selection_v5,
 )
 from ..models import (
     ExecutionRole,
     ExecutionSelection,
     ExecutionSelectionV4,
+    ExecutionSelectionV5,
     HarnessConfig,
     PublishMode,
     RunStatus,
@@ -923,12 +928,23 @@ def approve_run(
     *,
     config: HarnessConfig | None = None,
     implementer_profile: object = None,
+    final_reviewer_profile: object = None,
+    semantic_reviser_profile: object = None,
+    check_repair_profile: object = None,
+    # Historical request aliases remain accepted below.
     reviewer_profile: object = None,
     reviser_profile: object = None,
     repair_profile: object = None,
     step_profiles: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Perform the only web mutation through the core approval API."""
+
+    if final_reviewer_profile is not None:
+        reviewer_profile = final_reviewer_profile
+    if semantic_reviser_profile is not None:
+        reviser_profile = semantic_reviser_profile
+    if check_repair_profile is not None:
+        repair_profile = check_repair_profile
 
     try:
         selected = ApprovalDecision(decision)
@@ -951,9 +967,10 @@ def approve_run(
         raise WebAPIError(409, "run options are invalid") from exc
     # A reviser or repair field is never accepted to enable a pipeline
     # implicitly: only the immutable creation snapshot decides this.
-    claude_revision_enabled = bool(snapshot and snapshot.claude_revision_enabled)
-    repair_enabled = bool(snapshot and snapshot.repair_cycles == 1)
-    pipeline_enabled = claude_revision_enabled or repair_enabled
+    semantic_revision_enabled = bool(snapshot and snapshot.semantic_revision_enabled)
+    check_repair_enabled = bool(snapshot and snapshot.max_check_repair_attempts > 0)
+    review_repair_enabled = bool(snapshot and snapshot.max_review_repair_cycles > 0)
+    pipeline_enabled = semantic_revision_enabled or check_repair_enabled or review_repair_enabled
     if selected is ApprovalDecision.APPROVE and not pipeline_enabled and (
         reviser_profile is not None or repair_profile is not None
     ):
@@ -967,13 +984,13 @@ def approve_run(
         if selected is ApprovalDecision.APPROVE and pipeline_enabled:
             # Each default comes from its own configured key: the repair
             # implementer is never derived from the reviser.
-            if reviser_profile is None:
-                reviser_profile = snapshot.reviser_profile if snapshot is not None else config.ui.default_reviser_profile
-            elif not isinstance(reviser_profile, str) or not reviser_profile:
+            if semantic_revision_enabled and reviser_profile is None:
+                reviser_profile = snapshot.semantic_reviser_profile if snapshot is not None else config.ui.default_reviser_profile
+            elif reviser_profile is not None and (not isinstance(reviser_profile, str) or not reviser_profile):
                 raise WebAPIError(400, "reviser_profile is invalid")
-            if repair_profile is None:
-                repair_profile = snapshot.repair_profile if snapshot is not None else config.ui.default_repair_profile
-            elif not isinstance(repair_profile, str) or not repair_profile:
+            if check_repair_enabled and repair_profile is None:
+                repair_profile = snapshot.check_repair_profile if snapshot is not None else config.ui.default_repair_profile
+            elif repair_profile is not None and (not isinstance(repair_profile, str) or not repair_profile):
                 raise WebAPIError(400, "repair_profile is invalid")
     if selected is ApprovalDecision.APPROVE and profile_aware and not v2:
         if config is None or not isinstance(implementer_profile, str) or not isinstance(reviewer_profile, str):
@@ -1028,14 +1045,26 @@ def approve_run(
         if set(step_profiles) != set(expected_ids):
             raise WebAPIError(400, "missing or unknown step profile field")
         try:
-            if pipeline_enabled:
+            if pipeline_enabled and snapshot is not None and snapshot.schema_version == 1:
                 requested = resolve_execution_selection_v4(
                     config,
                     planner_profile_id=state["execution"]["planner"]["profile_id"],
                     step_profile_ids={key: value for key, value in step_profiles.items()},
-                    reviser_profile_id=reviser_profile,
-                    repair_implementer_profile_id=repair_profile,
+                    reviser_profile_id=reviser_profile or config.ui.default_reviser_profile or "",
+                    repair_implementer_profile_id=repair_profile or config.ui.default_repair_profile or "",
                     reviewer_profile_id=reviewer_profile,
+                )
+            elif pipeline_enabled:
+                requested = resolve_execution_selection_v5(
+                    config,
+                    planner_profile_id=state["execution"]["planner"]["profile_id"],
+                    step_profile_ids={key: value for key, value in step_profiles.items()},
+                    semantic_reviser_profile_id=reviser_profile if semantic_revision_enabled else None,
+                    check_repair_profile_id=(
+                        repair_profile
+                        if check_repair_enabled or review_repair_enabled else None
+                    ),
+                    final_reviewer_profile_id=reviewer_profile,
                 )
             else:
                 requested = resolve_execution_selection_v3(
@@ -1047,7 +1076,11 @@ def approve_run(
         except (ProfileError, ExecutionSelectionError) as exc:
             raise WebAPIError(400, "selected profile is invalid") from exc
         try:
-            if isinstance(requested, ExecutionSelectionV4):
+            if isinstance(requested, ExecutionSelectionV5):
+                ensure_execution_selection_v5(directory, requested)
+                durable, execution_sha256 = read_execution_selection_v5_with_sha256(directory)
+                validate_execution_selection_v5(config, durable)
+            elif isinstance(requested, ExecutionSelectionV4):
                 ensure_execution_selection_v4(directory, requested)
                 durable, execution_sha256 = read_execution_selection_v4_with_sha256(directory)
                 validate_execution_selection_v4(config, durable)
@@ -1074,7 +1107,13 @@ def approve_run(
         RunStateStore(directory / "state.json").update_if_status(
             RunStatus.AWAITING_PLAN_APPROVAL,
             plan_identity=asdict(identity),
-            execution=_execution_state_v4(durable) if isinstance(durable, ExecutionSelectionV4) else _execution_state_v3(durable),
+            execution=(
+                _execution_state_v5(durable)
+                if isinstance(durable, ExecutionSelectionV5)
+                else _execution_state_v4(durable)
+                if isinstance(durable, ExecutionSelectionV4)
+                else _execution_state_v3(durable)
+            ),
         )
         return {"ok": True, "decision": selected.value}
 
@@ -1191,6 +1230,22 @@ def _execution_state_v4(selection: ExecutionSelectionV4) -> dict[str, Any]:
     }
 
 
+def _execution_state_v5(selection: ExecutionSelectionV5) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "planner": asdict(selection.planner),
+        "steps": [
+            {"step_id": item.step_id, "implementer": asdict(item.implementer)}
+            for item in selection.steps
+        ],
+        "final_reviewer": asdict(selection.final_reviewer),
+    }
+    if selection.check_repair is not None:
+        state["check_repair"] = asdict(selection.check_repair)
+    if selection.semantic_reviser is not None:
+        state["semantic_reviser"] = asdict(selection.semantic_reviser)
+    return state
+
+
 def model_profiles(config: HarnessConfig) -> dict[str, Any]:
     profiles = profiles_for_config(config)
     defaults = {
@@ -1199,6 +1254,11 @@ def model_profiles(config: HarnessConfig) -> dict[str, Any]:
         "reviewer": config.ui.default_reviewer_profile or "legacy-reviewer",
         "reviser": config.ui.default_reviser_profile,
         "repair_implementer": config.ui.default_repair_profile,
+        "planner_profile": config.ui.default_planner_profile or "legacy-planner",
+        "default_implementer_profile": config.ui.default_implementer_profile or "legacy-implementer",
+        "final_reviewer_profile": config.ui.default_reviewer_profile or "legacy-reviewer",
+        "semantic_reviser_profile": config.ui.default_reviser_profile,
+        "check_repair_profile": config.ui.default_repair_profile,
     }
     return {
         "profiles": [safe_profile_metadata(profile) for profile in profiles.values()],
@@ -1213,6 +1273,13 @@ def create_run(
     run_id: object = None,
     planner_profile: object = None,
     default_implementer_profile: object = None,
+    final_reviewer_profile: object = None,
+    semantic_reviser_profile: object = None,
+    check_repair_profile: object = None,
+    semantic_revision_enabled: object = None,
+    max_check_repair_attempts: object = None,
+    max_review_repair_cycles: object = None,
+    # Historical request aliases.  They remain accepted for old clients.
     reviewer_profile: object = None,
     reviser_profile: object = None,
     repair_profile: object = None,
@@ -1262,6 +1329,12 @@ def create_run(
         overrides = {
             "planner_profile": profile(planner_profile, "planner_profile"),
             "default_implementer_profile": profile(default_implementer_profile, "default_implementer_profile"),
+            "final_reviewer_profile": profile(final_reviewer_profile, "final_reviewer_profile"),
+            "semantic_reviser_profile": optional_profile(semantic_reviser_profile, "semantic_reviser_profile"),
+            "check_repair_profile": optional_profile(check_repair_profile, "check_repair_profile"),
+            "semantic_revision_enabled": boolean(semantic_revision_enabled, "semantic_revision_enabled"),
+            "max_check_repair_attempts": integer(max_check_repair_attempts, "max_check_repair_attempts"),
+            "max_review_repair_cycles": integer(max_review_repair_cycles, "max_review_repair_cycles"),
             "reviewer_profile": profile(reviewer_profile, "reviewer_profile"),
             "reviser_profile": optional_profile(reviser_profile, "reviser_profile"),
             "repair_profile": optional_profile(repair_profile, "repair_profile"),
@@ -1451,10 +1524,24 @@ def run_pipeline(
     snapshot = state.get("run_options") if isinstance(state.get("run_options"), Mapping) else {}
     pipeline_snapshot = snapshot.get("pipeline") if isinstance(snapshot.get("pipeline"), Mapping) else {}
     revision_enabled = bool(
-        pipeline_snapshot.get("claude_revision_enabled")
-        if pipeline_snapshot else (config.revision.enabled if config is not None else "reviser" in execution)
+        pipeline_snapshot.get(
+            "semantic_revision_enabled",
+            pipeline_snapshot.get("claude_revision_enabled"),
+        )
+        if pipeline_snapshot
+        else (config.revision.enabled if config is not None else "reviser" in execution)
     )
-    pipeline_enabled = revision_enabled or pipeline_snapshot.get("repair_cycles") == 1
+    pipeline_enabled = revision_enabled or bool(
+        pipeline_snapshot.get(
+            "max_check_repair_attempts",
+            0,
+        )
+    ) or bool(
+        pipeline_snapshot.get(
+            "max_review_repair_cycles",
+            pipeline_snapshot.get("repair_cycles", 0),
+        )
+    )
     items: list[dict[str, str]] = []
 
     def add(key: str, label: str, value: str) -> None:

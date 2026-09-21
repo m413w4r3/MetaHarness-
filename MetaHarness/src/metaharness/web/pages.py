@@ -165,7 +165,15 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
         "reviser": _new_profile_options(config, "reviser", defaults.reviser_profile, optional=True),
         "repair": _new_profile_options(config, "repair", defaults.repair_profile, optional=True),
     }
-    claude = "enabled" if defaults.claude_revision_enabled else "disabled"
+    semantic_revision = "enabled" if defaults.semantic_revision_enabled else "disabled"
+    check_attempt_options = "".join(
+        f'<option value="{value}"{" selected" if defaults.max_check_repair_attempts == value else ""}>{value}</option>'
+        for value in range(11)
+    )
+    review_cycle_options = "".join(
+        f'<option value="{value}"{" selected" if defaults.max_review_repair_cycles == value else ""}>{value}</option>'
+        for value in range(11)
+    )
     body = f'''<main><p><a href="/">← Tous les runs</a></p><h1>New Run</h1>
 <dl><dt>Repository</dt><dd class="mono">{_e(config.repo)}</dd><dt>Base ref</dt><dd class="mono">{_e(config.base_ref)}</dd>
 <dt>Execution policy</dt><dd>{_e(_execution_policy_label(config))}</dd>
@@ -177,10 +185,11 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
 <h3>Planner</h3><select id="planner-profile" name="planner_profile" required>{options["planner"]}</select>
 <label for="implementer-profile">Default implementer</label><select id="implementer-profile" name="default_implementer_profile" required>{options["implementer"]}</select>
 <label for="reviewer-profile">Final reviewer</label><select id="reviewer-profile" name="reviewer_profile" required>{options["reviewer"]}</select>
-<label for="claude-revision">Claude revision</label><select id="claude-revision" name="claude_revision_enabled" required><option value="enabled"{" selected" if claude == "enabled" else ""}>enabled</option><option value="disabled"{" selected" if claude == "disabled" else ""}>disabled</option></select>
-<label for="reviser-profile">Claude reviser profile</label><select id="reviser-profile" name="reviser_profile" aria-describedby="reviser-help">{options["reviser"]}</select><p id="reviser-help" class="muted">Ce choix est validé côté serveur même si Claude est désactivé.</p>
-<label for="repair-cycles">Automatic repair cycles</label><select id="repair-cycles" name="repair_cycles" required><option value="0"{" selected" if defaults.repair_cycles == 0 else ""}>0</option><option value="1"{" selected" if defaults.repair_cycles == 1 else ""}>1</option></select>
-<label for="repair-profile">Repair implementer profile</label><select id="repair-profile" name="repair_profile">{options["repair"]}</select>
+<label for="claude-revision">Semantic revision</label><select id="claude-revision" name="claude_revision_enabled" required><option value="enabled"{" selected" if semantic_revision == "enabled" else ""}>enabled</option><option value="disabled"{" selected" if semantic_revision == "disabled" else ""}>disabled</option></select>
+<label for="reviser-profile">Semantic reviser profile</label><select id="reviser-profile" name="reviser_profile" aria-describedby="reviser-help">{options["reviser"]}</select><p id="reviser-help" class="muted">The profile's declared role and executor determine compatibility.</p>
+<label for="check-repair-attempts">Maximum check-repair attempts</label><select id="check-repair-attempts" name="max_check_repair_attempts" required>{check_attempt_options}</select>
+<label for="repair-cycles">Maximum review-repair cycles</label><select id="repair-cycles" name="repair_cycles" required>{review_cycle_options}</select>
+<label for="repair-profile">Check-repair profile</label><select id="repair-profile" name="repair_profile">{options["repair"]}</select>
 <label for="decomposition">Decomposition</label><select id="decomposition" name="decomposition" required><option value="balanced"{" selected" if defaults.decomposition == "balanced" else ""}>balanced</option><option value="aggressive"{" selected" if defaults.decomposition == "aggressive" else ""}>aggressive</option></select>
 <label for="execution-mode-policy">Execution mode</label><select id="execution-mode-policy" name="execution_mode_policy" required><option value="auto"{" selected" if defaults.execution_mode_policy == "auto" else ""}>auto</option><option value="require-staged"{" selected" if defaults.execution_mode_policy == "require-staged" else ""}>require-staged</option></select>
 <label for="single-limit">SINGLE mutable paths</label><input id="single-limit" name="single_step_max_mutable_paths" type="number" min="1" step="1" value="{_e(defaults.single_step_max_mutable_paths)}" required>
@@ -501,30 +510,38 @@ def _v2_approval_form(
             f'{_profile_options(config, "implementer", selected)}</select>'
             f'{_contract_block(artifact_map.get(step_id, {}))}</section>'
         )
-    reviewer = requested_profiles.get("reviewer_profile") or planner.get("reviewer_recommendation")
-    # Revision is shown (and selectable) only when revision.enabled: all four
-    # execution families are then visible before APPROVE.  The repair
-    # implementer is its own configured default, never derived from the
-    # reviser, and only Codex profiles are offered for it.
+    reviewer = (
+        requested_profiles.get("final_reviewer_profile")
+        or requested_profiles.get("reviewer_profile")
+        or planner.get("reviewer_recommendation")
+    )
+    # Each optional role is shown according to the durable V2 budgets.  The
+    # profile catalogue, not a driver-name convention, determines options.
     cycle_profiles = ""
     pipeline = options.get("pipeline") if isinstance(options.get("pipeline"), dict) else {}
-    cycle_enabled = bool(pipeline.get("claude_revision_enabled")) or pipeline.get("repair_cycles") == 1
+    cycle_enabled = bool(
+        pipeline.get("semantic_revision_enabled", pipeline.get("claude_revision_enabled"))
+    ) or pipeline.get("max_check_repair_attempts", 0) > 0 or pipeline.get(
+        "max_review_repair_cycles", pipeline.get("repair_cycles", 0)
+    ) > 0
     if config is not None and cycle_enabled:
-        reviser = requested_profiles.get("reviser_profile")
-        repair = requested_profiles.get("repair_profile")
+        reviser = requested_profiles.get("semantic_reviser_profile") or requested_profiles.get("reviser_profile")
+        repair = requested_profiles.get("check_repair_profile") or requested_profiles.get("repair_profile")
         reviser_meta = metadata.get(reviser, {})
         repair_meta = metadata.get(repair, {})
         cycle_profiles = (
             '<section class="card revision-profile"><h3>Reviser</h3>'
-            f'<p>Claude <span class="mono">{_e(reviser_meta.get("model_label"))}</span> · '
+            f'<p><span class="mono">{_e(reviser_meta.get("driver"))}</span> / '
+            f'<span class="mono">{_e(reviser_meta.get("model_label"))}</span> · '
             f'recommended {_profile_triplet(reviser, reviser_meta.get("model_label"), reviser_meta.get("effort"))}</p>'
-            '<label for="reviser-profile">Reviser (selected)</label>'
-            f'<select id="reviser-profile" name="reviser_profile" required>{_profile_options(config, "reviser", reviser, driver="claude-code")}</select></section>'
+            '<label for="reviser-profile">Semantic reviser (selected)</label>'
+            f'<select id="reviser-profile" name="reviser_profile" required>{_profile_options(config, "reviser", reviser)}</select></section>'
             '<section class="card repair-profile"><h3>Repair implementer</h3>'
-            f'<p>Codex <span class="mono">{_e(repair_meta.get("model_label"))}</span> · '
+            f'<p><span class="mono">{_e(repair_meta.get("driver"))}</span> / '
+            f'<span class="mono">{_e(repair_meta.get("model_label"))}</span> · '
             f'recommended {_profile_triplet(repair, repair_meta.get("model_label"), repair_meta.get("effort"))}</p>'
-            '<label for="repair-profile">Repair implementer (selected)</label>'
-            f'<select id="repair-profile" name="repair_profile" required>{_profile_options(config, "repair", repair, driver="codex")}</select></section>'
+            '<label for="repair-profile">Check-repair profile (selected)</label>'
+            f'<select id="repair-profile" name="repair_profile" required>{_profile_options(config, "repair", repair)}</select></section>'
         )
     execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
     planner_selected = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
@@ -832,7 +849,7 @@ def _execution_card_v2(
     execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
     planner_state = state.get("planner") if isinstance(state.get("planner"), dict) else {}
     selection = run.get("execution_selection")
-    approved = selection if isinstance(selection, dict) and selection.get("schema_version") in (3, 4) else {}
+    approved = selection if isinstance(selection, dict) and selection.get("schema_version") in (3, 4, 5) else {}
     planner = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
     planner_mode = planner.get("selection_mode")
     planner_warning = '<p class="danger">external-ui: le modèle est sélectionné dans le fournisseur externe.</p>' if planner_mode == "external-ui" else ""
@@ -841,7 +858,13 @@ def _execution_card_v2(
         f'<dt>model</dt><dd>{_e(planner.get("model") or "—")}</dd><dt>selection mode</dt><dd>{_e(planner_mode or "—")}</dd></dl>{planner_warning}</article>'
     )
     reviewer_recommended = planner_state.get("reviewer_recommendation")
-    reviewer_approved = approved.get("reviewer") if isinstance(approved.get("reviewer"), dict) else {}
+    reviewer_approved = (
+        approved.get("final_reviewer")
+        if isinstance(approved.get("final_reviewer"), dict)
+        else approved.get("reviewer")
+        if isinstance(approved.get("reviewer"), dict)
+        else {}
+    )
     recommended_meta = metadata.get(reviewer_recommended, {})
     reviewer_card = (
         f'<article class="card"><h3>Reviewer</h3><dl>'
@@ -969,23 +992,43 @@ def _run_configuration(state: dict[str, Any], config: HarnessConfig | None = Non
     steps = execution.get("steps") if isinstance(execution.get("steps"), list) else []
     if steps and isinstance(steps[0], dict) and isinstance(steps[0].get("implementer"), dict):
         final["default_implementer_profile"] = steps[0]["implementer"].get("profile_id")
-    for key, role in (("reviewer_profile", "reviewer"), ("reviser_profile", "reviser"), ("repair_profile", "repair_implementer")):
-        item = execution.get(role)
+    execution_roles = (
+        ("final_reviewer_profile", "final_reviewer", "reviewer_profile", "reviewer"),
+        ("semantic_reviser_profile", "semantic_reviser", "reviser_profile", "reviser"),
+        ("check_repair_profile", "check_repair", "repair_profile", "repair_implementer"),
+    )
+    for canonical_key, canonical_role, historical_key, historical_role in execution_roles:
+        item = execution.get(canonical_role) or execution.get(historical_role)
         if isinstance(item, dict):
-            final[key] = item.get("profile_id")
+            final[canonical_key] = item.get("profile_id")
     rows = [
         ("decomposition", planning.get("decomposition")),
         ("execution mode", planning.get("execution_mode_policy")),
         ("SINGLE mutable limit", planning.get("single_step_max_mutable_paths")),
         ("STAGED mutable limit", planning.get("staged_step_max_mutable_paths")),
-        ("Claude revision", "on" if pipeline.get("claude_revision_enabled") else "off"),
-        ("repair cycles", pipeline.get("repair_cycles")),
+        ("Semantic revision", "on" if pipeline.get("semantic_revision_enabled", pipeline.get("claude_revision_enabled")) else "off"),
+        ("check-repair attempts", pipeline.get("max_check_repair_attempts", 0)),
+        ("review-repair cycles", pipeline.get("max_review_repair_cycles", pipeline.get("repair_cycles"))),
         ("repair scope policy", pipeline.get("repair_scope_policy")),
         ("repair scope max added paths", pipeline.get("repair_scope_max_added_paths")),
     ]
-    for key, label in (("planner_profile", "planner"), ("default_implementer_profile", "implementer"), ("reviewer_profile", "reviewer"), ("reviser_profile", "reviser"), ("repair_profile", "repair")):
-        rows.append((f"requested {label}", requested.get(key)))
-        if key in final and final.get(key) != requested.get(key):
+    requested_roles = (
+        ("planner_profile", "planner"),
+        ("default_implementer_profile", "implementer"),
+        ("final_reviewer_profile", "reviewer"),
+        ("semantic_reviser_profile", "reviser"),
+        ("check_repair_profile", "repair"),
+    )
+    for key, label in requested_roles:
+        value = requested.get(key)
+        if value is None:
+            value = {
+                "final_reviewer_profile": requested.get("reviewer_profile"),
+                "semantic_reviser_profile": requested.get("reviser_profile"),
+                "check_repair_profile": requested.get("repair_profile"),
+            }.get(key, value)
+        rows.append((f"requested {label}", value))
+        if key in final and final.get(key) != value:
             rows.append((f"effective/final {label}", final.get(key)))
     return '<section class="card"><h2>RUN CONFIGURATION</h2><dl>' + "".join(
         f'<dt>{_e(label)}</dt><dd class="mono">{_e(value if value is not None else "—")}</dd>'

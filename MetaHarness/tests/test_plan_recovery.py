@@ -264,7 +264,7 @@ class PlanRecoveryHarness(P29Harness):
         self.assertEqual(approval["bundle_sha256"], _sha((run_dir / "implementation_bundle.json").read_bytes()))
         self.assertEqual(approval["execution_sha256"], _sha((run_dir / "execution_selection.json").read_bytes()))
         selection = json.loads((run_dir / "execution_selection.json").read_text(encoding="utf-8"))
-        self.assertEqual(selection["schema_version"], 4)
+        self.assertEqual(selection["schema_version"], 5)
         self.assertEqual([item["step_id"] for item in selection["steps"]], _ids(count))
 
 

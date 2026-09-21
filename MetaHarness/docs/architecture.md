@@ -1,9 +1,10 @@
 # Architecture
 
-MetaHarness V0 is a single-task state machine. It creates one
-planner decision, one Codex implementation run, an optional Claude Code
-revision, one deterministic evidence snapshot, and one independent semantic
-review. There is no repair loop or behavior mock in V0.
+MetaHarness V0 is a single-task state machine. It creates one planner
+decision, profile-selected implementation and correction cycles, deterministic
+evidence snapshots, and an independent final review. The executor/backend is
+selected by each profile; business roles do not imply a particular vendor or
+driver.
 
 ## Source-of-truth boundaries
 
@@ -14,8 +15,8 @@ review. There is no repair loop or behavior mock in V0.
 | Parsed plan | Machine control metadata and source for the canonical contract | Harness control/rendering |
 | Implementation contract | Canonical executor input rendered from the parsed READY plan | Planner decisions, mechanically rendered |
 | Human plan approval | Explicit decision on the exact presented plan artifacts | APPROVE/REJECT |
-| Codex | Executor of the plan in an isolated worktree | Cannot change the plan or commit |
-| Claude Code | Semantic reviser/corrector after Luna | Isolated managed config; cannot run checks or commit |
+| Execution profiles | Planner, implementer, correction and reviewer selections | Declared roles plus immutable runtime metadata |
+| Agent executors/backends | Execute the selected profile in an isolated worktree | Cannot change the plan or commit |
 | Deterministic gates | Checks, diff, HEAD, and mutation evidence | Mechanical evidence |
 | Reviewer | Semantic critic of SPEC, PLAN, diff, and evidence | PASS/REVISE/FAIL decision |
 | Git tree SHA | Identity of the exact candidate tree submitted to checks and review | Candidate commit and publication gates |
@@ -116,23 +117,21 @@ SPEC
           └ otherwise → STOP / operator
 ```
 
-- Maximum automatic cycles = 2. Reviewer #1 `REVISE / IMPLEMENTATION` and
-  `REVISE / REPLAN` both enter the single bounded C02 repair cycle. `HUMAN`
-  remains operator-controlled. Any new semantic REVISE after C02 is
-  `REPAIR_EXHAUSTED / HUMAN_REQUIRED`.
+- Correction budgets are independent: `max_check_repair_attempts` bounds
+  check-repair attempts and `max_review_repair_cycles` bounds review-driven
+  correction cycles. `semantic_revision_enabled` only controls semantic
+  revision. The runtime represents each cycle generically; the configured
+  budget, not the reviewer, decides whether another cycle is allowed.
 - C02 writes `repair/C02/scope_delta.json`, derived from parsed plan mutation
   sets. New paths are governed by durable `repair_scope_policy` and
   `repair_scope_max_added_paths` options. `auto-bounded` is recommended for
   AutoWork with a bound of 4; `require-approval` writes an exact-hash
   `scope_approval.json` and pauses without allowing path editing.
-- `revision.enabled` is the only activation authority. It is cross-validated
-  at load time: protocol v2, an explicit `ui.default_reviser_profile` using the
-  `claude-code` driver, an explicit `ui.default_repair_profile` using the
-  `codex` driver, `max_cycles = 2`. Without it no Claude process and no C02
-  ever start, whatever profiles exist in the catalogue.
-- Every new run then uses `execution_selection.json` schema 4 (planner, steps,
-  reviser, repair implementer, reviewer), approved in the UI with all four
-  families visible. There is no v3 fallback; `state.execution` is only a view.
+- Every new V2 run freezes its role-shaped execution authority in
+  `execution_selection.json` schema 5: planner, per-step implementers,
+  optional check-repair, optional semantic-reviser, and final reviewer.
+  Driver/harness, provider, model and effort are independent profile fields;
+  the profile's declared roles determine compatibility.
 - Step capacity has a single syntax authority, `metaharness.step_ids`:
   `PROTOCOL_MAX_STEPS = 99` and the step IDs `S01..S99`. This is a protocol
   bound, not a recommended execution size. The parser, the implementation bundle, the

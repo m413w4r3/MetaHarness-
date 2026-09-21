@@ -752,15 +752,21 @@ def _doctor(config_path: Path) -> int:
                 "codex authentication could not be verified for managed CODEX_HOME\n"
                 f'hint: run CODEX_HOME="{codex_home}" codex login'
             )
-    if config.revision.enabled:
+    if (
+        config.revision.enabled
+        or config.revision.max_check_repair_attempts > 0
+        or config.revision.max_review_repair_cycles > 0
+    ):
         print(
-            "OK revision: enabled "
-            f"(max_cycles={config.revision.max_cycles}, "
+            "OK correction pipeline: "
+            f"semantic_revision={'enabled' if config.revision.enabled else 'disabled'}, "
+            f"max_check_repair_attempts={config.revision.max_check_repair_attempts}, "
+            f"max_review_repair_cycles={config.revision.max_review_repair_cycles}, "
             f"reviser={config.ui.default_reviser_profile}, "
             f"repair={config.ui.default_repair_profile})"
         )
     else:
-        print("OK revision: disabled")
+        print("OK correction pipeline: disabled")
     claude_profiles = tuple(
         profile for profile in profiles_for_config(config).values()
         if profile.driver is ProfileDriver.CLAUDE_CODE

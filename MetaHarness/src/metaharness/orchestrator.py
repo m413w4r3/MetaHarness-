@@ -131,10 +131,15 @@ from .execution_selection import (
     validate_execution_selection_v3,
     read_execution_selection_v4_with_sha256,
     validate_execution_selection_v4,
+    resolve_execution_selection_v5,
+    ensure_execution_selection_v5,
+    read_execution_selection_v5_with_sha256,
+    validate_execution_selection_v5,
 )
 from .models import (
     ExecutionRole,
     ExecutionSelectionV4,
+    ExecutionSelectionV5,
     ModelProfile,
     ExecutionSelectionV3,
     HarnessConfig,
@@ -914,21 +919,31 @@ class Orchestrator:
         run_dir: Path,
         prompt: str,
         revision_dir: Path | None = None,
+        profile_id: str | None = None,
+        role: ExecutionRole = ExecutionRole.REVISER,
+        mutable_paths: tuple[str, ...] = (),
     ) -> Any | None:
-        selected = getattr(selection, "reviser", None)
-        if selected is None:
+        is_check_repair = revision_dir is not None and "check-repair" in revision_dir.parts
+        selected = (
+            getattr(selection, "check_repair", None)
+            if is_check_repair else getattr(selection, "semantic_reviser", None)
+        )
+        if selected is None and not hasattr(selection, "semantic_reviser"):
+            selected = getattr(selection, "reviser", None)
+        if selected is None and profile_id is None:
             return None
-        profile = profile_for_role(self.config, selected.profile_id, ExecutionRole.REVISER)
+        selected_profile_id = profile_id or selected.profile_id
+        profile = profile_for_role(self.config, selected_profile_id, role)
         artifact_path = revision_dir or (run_dir / "revision")
-        executor = self._executor_for_profile(profile.id, ExecutionRole.REVISER)
+        executor = self._executor_for_profile(profile.id, role)
         return executor.run(
             AgentRunRequest(
-                role=ExecutionRole.REVISER,
+                role=role,
                 profile_id=profile.id,
                 prompt=redact(prompt, self._secrets),
                 worktree=Path(worktree),
                 artifact_dir=Path(artifact_path),
-                mutable_paths=(),
+                mutable_paths=mutable_paths,
                 prompt_mode="revision",
             )
         )
@@ -1709,8 +1724,10 @@ class Orchestrator:
         of this is ever replayed by a resume.
         """
 
-        revision_enabled = self._run_options.claude_revision_enabled
-        pipeline_enabled = revision_enabled or self._run_options.repair_cycles == 1
+        revision_enabled = self._run_options.semantic_revision_enabled
+        repair_enabled = self._run_options.max_review_repair_cycles > 0
+        check_repair_enabled = self._run_options.max_check_repair_attempts > 0
+        pipeline_enabled = revision_enabled or repair_enabled or check_repair_enabled
         planner_profile_id = planner_profile.id
         implementers = tuple(
             p for p in profiles_for_config(self.config).values()
@@ -1823,9 +1840,8 @@ class Orchestrator:
                 return RunResult(run_dir, RunStatus.PLAN_REJECTED, state)
             try:
                 if pipeline_enabled:
-                    # Schema 4 only: a v3 approval is never a fallback.
-                    selection, execution_sha = read_execution_selection_v4_with_sha256(run_dir)
-                    validate_execution_selection_v4(self.config, selection)
+                    selection, execution_sha = read_execution_selection_v5_with_sha256(run_dir)
+                    validate_execution_selection_v5(self.config, selection)
                 else:
                     selection, execution_sha = read_execution_selection_v3_with_sha256(run_dir)
                     validate_execution_selection_v3(self.config, selection)
@@ -1840,18 +1856,24 @@ class Orchestrator:
                 raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
         else:
             if pipeline_enabled:
-                requested = resolve_execution_selection_v4(
+                requested = resolve_execution_selection_v5(
                     self.config,
                     planner_profile_id=planner_profile_id,
                     step_profile_ids={
                         step.id: self.config.ui.default_implementer_profile or step.implementer_profile
                         for step in plan.steps
                     },
-                    reviser_profile_id=self.config.ui.default_reviser_profile or "",
-                    repair_implementer_profile_id=self.config.ui.default_repair_profile or "",
-                    reviewer_profile_id=self.config.ui.default_reviewer_profile or "legacy-reviewer",
+                    semantic_reviser_profile_id=(
+                        self._run_options.semantic_reviser_profile
+                        if revision_enabled else None
+                    ),
+                    check_repair_profile_id=(
+                        self._run_options.check_repair_profile
+                        if check_repair_enabled or repair_enabled else None
+                    ),
+                    final_reviewer_profile_id=self.config.ui.default_reviewer_profile or "legacy-reviewer",
                 )
-                selection = ensure_execution_selection_v4(run_dir, requested)
+                selection = ensure_execution_selection_v5(run_dir, requested)
             else:
                 requested = resolve_execution_selection_v3(
                     self.config,
@@ -1883,9 +1905,9 @@ class Orchestrator:
         if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
             raise ExecutionSelectionError("execution selection steps do not match the plan")
         if pipeline_enabled:
-            if not isinstance(selection, ExecutionSelectionV4) or selection.schema_version != 4:
-                raise ExecutionSelectionError("revision.enabled requires execution selection schema 4")
-            validate_execution_selection_v4(self.config, selection)
+            if not isinstance(selection, ExecutionSelectionV5) or selection.schema_version != 5:
+                raise ExecutionSelectionError("v2 execution requires execution selection schema 5")
+            validate_execution_selection_v5(self.config, selection)
         else:
             validate_execution_selection_v3(self.config, selection)
             if selection.reviser is not None:
@@ -1902,10 +1924,18 @@ class Orchestrator:
                 for item in selection.steps
             ],
         }
-        if isinstance(selection, ExecutionSelectionV4):
+        if isinstance(selection, ExecutionSelectionV5):
+            if selection.semantic_reviser is not None:
+                execution_state["semantic_reviser"] = asdict(selection.semantic_reviser)
+            if selection.check_repair is not None:
+                execution_state["check_repair"] = asdict(selection.check_repair)
+            execution_state["final_reviewer"] = asdict(selection.final_reviewer)
+        elif isinstance(selection, ExecutionSelectionV4):
             execution_state["reviser"] = asdict(selection.reviser)
             execution_state["repair_implementer"] = asdict(selection.repair_implementer)
-        execution_state["reviewer"] = asdict(selection.reviewer)
+            execution_state["reviewer"] = asdict(selection.reviewer)
+        else:
+            execution_state["reviewer"] = asdict(selection.reviewer)
         store.update(status=RunStatus.PLANNING, execution=execution_state,
                      plan_identity=asdict(durable_identity))
         base_tree_sha = resolve_tree(repo, base_sha)
@@ -2131,8 +2161,9 @@ class Orchestrator:
         # The configuration is the only authority for P25/P26.  It was fully
         # cross-validated at load time; profiles in the catalogue never
         # enable Claude or C02 implicitly.
-        revision_enabled = self._run_options.claude_revision_enabled
-        repair_enabled = self._run_options.repair_cycles == 1
+        revision_enabled = self._run_options.semantic_revision_enabled
+        repair_enabled = self._run_options.max_review_repair_cycles > 0
+        check_repair_enabled = self._run_options.max_check_repair_attempts > 0
 
         planner_profile_id = store.load()["execution"]["planner"]["profile_id"]
         planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
@@ -3922,7 +3953,7 @@ class Orchestrator:
         info: WorktreeInfo,
         branch_ref: str,
         ownership_before: GitOwnership,
-        selection: ExecutionSelectionV4,
+        selection: ExecutionSelectionV4 | ExecutionSelectionV5,
         original_plan: TaskPlanV2,
         original_bundle: Mapping[str, Any],
         resumed: _ResumedRun,
@@ -4450,7 +4481,7 @@ class Orchestrator:
         repository_reference: RepositoryReference,
         info: WorktreeInfo,
         branch_ref: str,
-        selection: ExecutionSelectionV4,
+        selection: ExecutionSelectionV4 | ExecutionSelectionV5,
         original_plan: TaskPlanV2,
         resumed: _ResumedRun,
         scope_evidence: EvidenceBundle,
@@ -4609,7 +4640,7 @@ class Orchestrator:
         info: Any,
         branch_ref: str,
         ownership_before: Any,
-        selection: ExecutionSelectionV4,
+        selection: ExecutionSelectionV4 | ExecutionSelectionV5,
         original_plan: TaskPlanV2,
         original_bundle: Mapping[str, Any],
         cycle_1_evidence: EvidenceBundle,
@@ -6588,7 +6619,14 @@ class Orchestrator:
                         refuse(str(exc))
                 if checkpoint.phase is ResumePhase.WORKTREE_SETUP:
                     try:
-                        if self._run_options.claude_revision_enabled or self._run_options.repair_cycles == 1:
+                        if self._run_options.schema_version >= 2 and (
+                            self._run_options.semantic_revision_enabled
+                            or self._run_options.max_review_repair_cycles > 0
+                            or self._run_options.max_check_repair_attempts > 0
+                        ):
+                            _selection, selection_sha = read_execution_selection_v5_with_sha256(run_dir)
+                            validate_execution_selection_v5(self.config, _selection)
+                        elif self._run_options.claude_revision_enabled or self._run_options.repair_cycles == 1:
                             _selection, selection_sha = read_execution_selection_v4_with_sha256(run_dir)
                             validate_execution_selection_v4(self.config, _selection)
                         else:
@@ -6731,8 +6769,9 @@ class Orchestrator:
             raise ResumeIntegrityError(message)
 
         original_checkpoint = checkpoint
-        revision_enabled = self._run_options.claude_revision_enabled
-        repair_enabled = self._run_options.repair_cycles == 1
+        revision_enabled = self._run_options.semantic_revision_enabled
+        repair_enabled = self._run_options.max_review_repair_cycles > 0
+        check_repair_enabled = self._run_options.max_check_repair_attempts > 0
         durable_pipeline_version = pipeline_version_from_state(state)
         if durable_pipeline_version != getattr(self, "_active_pipeline_version", 2):
             refuse("resume pipeline dispatch does not match durable pipeline_version")
@@ -6794,7 +6833,12 @@ class Orchestrator:
             refuse("plan approval artifact is not APPROVE")
         # The approved execution selection, against today's configuration.
         try:
-            if revision_enabled or repair_enabled:
+            if self._run_options.schema_version >= 2 and (
+                revision_enabled or repair_enabled or check_repair_enabled
+            ):
+                selection, execution_sha = read_execution_selection_v5_with_sha256(run_dir)
+                validate_execution_selection_v5(self.config, selection)
+            elif revision_enabled or repair_enabled:
                 selection, execution_sha = read_execution_selection_v4_with_sha256(run_dir)
                 validate_execution_selection_v4(self.config, selection)
             else:

@@ -663,12 +663,12 @@ class FullPipelineTests(P28Harness):
         self.assertEqual(self.events, ["planner:META PLAN v2", "claude:C01",
                                        "push", "reviewer:VERDICT: PASS"])
         selection = json.loads((result.run_dir / "execution_selection.json").read_text())
-        self.assertEqual(selection["schema_version"], 4)
+        self.assertEqual(selection["schema_version"], 5)
         self.assertEqual(
             list(result.state["execution"]),
-            ["planner", "steps", "reviser", "repair_implementer", "reviewer"],
+            ["planner", "steps", "semantic_reviser", "check_repair", "final_reviewer"],
         )
-        self.assertEqual(result.state["execution"]["repair_implementer"]["profile_id"], "luna")
+        self.assertEqual(result.state["execution"]["check_repair"]["profile_id"], "luna")
         # The Claude process environment is the managed one.
         environment = claude.calls[0]["environment"]
         home = (self.root / "claude-home").resolve()
@@ -2278,7 +2278,7 @@ class CheckRepairRetryResumeTests(P28Harness):
         self.assertTrue(resume_info(first.run_dir, state).resumable)
 
 
-class ApprovalV4Tests(P28Harness):
+class ApprovalV5Tests(P28Harness):
     def _await(self, config: HarnessConfig, luna: FakeLuna, run_id: str):
         planner = QueueClient("planner", [SINGLE_PLAN], self.events)
         reviewer = QueueClient("reviewer", [PASS], self.events)
@@ -2296,7 +2296,7 @@ class ApprovalV4Tests(P28Harness):
             time.sleep(0.01)
         return thread, holder
 
-    def test_web_approval_uses_v4_and_shows_four_families(self) -> None:
+    def test_web_approval_uses_v5_and_shows_role_families(self) -> None:
         config = load_config(self._write(require_approval=True))
         luna = FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")})
         thread, holder = self._await(config, luna, "approve")
@@ -2309,23 +2309,19 @@ class ApprovalV4Tests(P28Harness):
         repair_select = page[page.index('name="repair_profile"'):]
         repair_select = repair_select[:repair_select.index("</select>")]
         self.assertIn('value="luna" selected', repair_select)
-        self.assertNotIn('value="claude"', repair_select)
-        with self.assertRaises(WebAPIError) as refused:
-            approve_run(config.runs_root, "approve", "APPROVE", config=config,
-                        reviewer_profile="reviewer", step_profiles={"S01": "luna"},
-                        repair_profile="claude")
-        self.assertEqual(refused.exception.status, 400)
+        self.assertIn('value="claude"', repair_select)
         approve_run(config.runs_root, "approve", "APPROVE", config=config,
-                    reviewer_profile="reviewer", step_profiles={"S01": "luna"})
+                    reviewer_profile="reviewer", step_profiles={"S01": "luna"},
+                    repair_profile="claude")
         thread.join(timeout=30)
         self.assertFalse(thread.is_alive())
         result = holder["result"]
         self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
         selection = json.loads((self.runs / "approve" / "execution_selection.json").read_text())
-        self.assertEqual(selection["schema_version"], 4)
-        self.assertEqual(selection["repair_implementer"]["profile_id"], "luna")
-        self.assertEqual(selection["reviser"]["profile_id"], "claude")
-        self.assertIn("repair_implementer", result.state["execution"])
+        self.assertEqual(selection["schema_version"], 5)
+        self.assertEqual(selection["check_repair"]["profile_id"], "claude")
+        self.assertEqual(selection["semantic_reviser"]["profile_id"], "claude")
+        self.assertIn("check_repair", result.state["execution"])
 
     def test_disabled_revision_rejects_reviser_fields(self) -> None:
         config = load_config(self._write(require_approval=True, revision=False))
@@ -2364,9 +2360,6 @@ class ConfigActivationTests(P28Harness):
             ('protocol = "v2"', 'protocol = "v1"', "planning.protocol"),
             ('default_repair_profile = "luna"\n', "", "default_repair_profile"),
             ('default_reviser_profile = "claude"\n', "", "default_reviser_profile"),
-            ('default_repair_profile = "luna"', 'default_repair_profile = "claude"',
-             "revision repair profile must use codex driver"),
-            ("max_cycles = 2", "max_cycles = 3", "max_cycles must be exactly 2"),
             ("enabled = true\nmax_cycles", 'enabled = "yes"\nmax_cycles', "revision.enabled"),
         )
         for old, new, message in cases:
@@ -2398,7 +2391,8 @@ class ConfigActivationTests(P28Harness):
         self.assertEqual(raw["planning"]["protocol"], "v2")
         self.assertEqual(raw["planning"]["decomposition"], "aggressive")
         self.assertIs(raw["revision"]["enabled"], True)
-        self.assertEqual(raw["revision"]["max_cycles"], 2)
+        self.assertEqual(raw["revision"]["max_check_repair_attempts"], 2)
+        self.assertEqual(raw["revision"]["max_review_repair_cycles"], 1)
         self.assertEqual(raw["ui"]["default_reviser_profile"], "claude-opus-medium")
         self.assertEqual(raw["ui"]["default_repair_profile"], "codex-luna-high")
         self.assertIs(raw["publish"]["enabled"], True)

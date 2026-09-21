@@ -7,7 +7,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -16,6 +16,7 @@ from .models import (
     ExecutionSelection,
     ExecutionSelectionV3,
     ExecutionSelectionV4,
+    ExecutionSelectionV5,
     HarnessConfig,
     ProfileDriver,
     SelectedProfile,
@@ -37,6 +38,7 @@ _FILENAME = "execution_selection.json"
 SCHEMA_VERSION = 2
 SCHEMA_VERSION_V3 = 3
 SCHEMA_VERSION_V4 = 4
+SCHEMA_VERSION_V5 = 5
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _STEP_ID = STEP_ID_RE
 _ROLES = (
@@ -46,6 +48,7 @@ _ROLES = (
 )
 _V1_FIELDS = frozenset({"profile_id", "driver", "model", "selection_mode", "effort", "sandbox"})
 _V2_FIELDS = _V1_FIELDS | {"config_sha256"}
+_V5_FIELDS = _V2_FIELDS | {"provider"}
 _OPTIONAL_PROFILE_FIELDS = frozenset({"permission_mode"})
 
 
@@ -82,6 +85,7 @@ def _selected(
         driver=profile.driver.value,
         model=profile.model,
         selection_mode=profile.selection_mode.value,
+        provider=profile.provider,
         effort=profile.effort,
         sandbox=profile.sandbox,
         permission_mode=profile.permission_mode,
@@ -266,6 +270,78 @@ def resolve_execution_selection_v4(
     )
 
 
+def _profile_runtime_kwargs(config: HarnessConfig, profile: Any) -> dict[str, Any]:
+    """Select runtime identity by backend, never by business role."""
+
+    if profile.driver is ProfileDriver.CODEX:
+        return {"codex_home": config.codex_runtime.home}
+    if profile.driver is ProfileDriver.CLAUDE_CODE:
+        return {"claude_config_home": config.claude_runtime.home}
+    return {}
+
+
+def resolve_execution_selection_v5(
+    config: HarnessConfig,
+    *,
+    planner_profile_id: str,
+    step_profile_ids: Mapping[str, str],
+    check_repair_profile_id: str | None = None,
+    semantic_reviser_profile_id: str | None = None,
+    final_reviewer_profile_id: str,
+) -> ExecutionSelectionV5:
+    """Resolve the role-shaped execution authority for a new v2 run."""
+
+    planner_profile = profile_for_role(config, planner_profile_id, ExecutionRole.PLANNER)
+    reviewer_profile = profile_for_role(
+        config, final_reviewer_profile_id, ExecutionRole.REVIEWER
+    )
+    check_repair = None
+    if check_repair_profile_id is not None:
+        profile = profile_for_role(config, check_repair_profile_id, ExecutionRole.REPAIR)
+        check_repair = _selected(
+            profile,
+            agent_env_allowlist=_env_allowlist(config, ExecutionRole.REPAIR),
+            **_profile_runtime_kwargs(config, profile),
+        )
+    semantic_reviser = None
+    if semantic_reviser_profile_id is not None:
+        profile = profile_for_role(config, semantic_reviser_profile_id, ExecutionRole.REVISER)
+        semantic_reviser = _selected(
+            profile,
+            agent_env_allowlist=_env_allowlist(config, ExecutionRole.REVISER),
+            **_profile_runtime_kwargs(config, profile),
+        )
+    step_selections: list[StepExecutionSelection] = []
+    for step_id, profile_id in _canonical_step_items(step_profile_ids):
+        profile = profile_for_role(config, profile_id, ExecutionRole.IMPLEMENTER)
+        step_selections.append(
+            StepExecutionSelection(
+                step_id=step_id,
+                implementer=_selected(
+                    profile,
+                    agent_env_allowlist=_env_allowlist(config, ExecutionRole.IMPLEMENTER),
+                    **_profile_runtime_kwargs(config, profile),
+                ),
+            )
+        )
+    return ExecutionSelectionV5(
+        schema_version=SCHEMA_VERSION_V5,
+        planner=_selected(
+            planner_profile,
+            agent_env_allowlist=_env_allowlist(config, ExecutionRole.PLANNER),
+            **_profile_runtime_kwargs(config, planner_profile),
+        ),
+        steps=tuple(step_selections),
+        check_repair=check_repair,
+        semantic_reviser=semantic_reviser,
+        final_reviewer=_selected(
+            reviewer_profile,
+            agent_env_allowlist=_env_allowlist(config, ExecutionRole.REVIEWER),
+            **_profile_runtime_kwargs(config, reviewer_profile),
+        ),
+    )
+
+
 def _payload(selection: ExecutionSelection) -> dict[str, Any]:
     if not isinstance(selection, ExecutionSelection) or selection.schema_version not in (1, 2):
         raise ExecutionSelectionError("execution selection schema_version is unsupported")
@@ -275,6 +351,7 @@ def _payload(selection: ExecutionSelection) -> dict[str, Any]:
         if not isinstance(value, SelectedProfile):
             raise ExecutionSelectionError(f"execution selection {name} is invalid")
         fields = asdict(value)
+        fields.pop("provider", None)
         if fields.get("permission_mode") is None:
             fields.pop("permission_mode", None)
         if selection.schema_version == 1:
@@ -309,6 +386,7 @@ def _payload_v3(selection: ExecutionSelectionV3) -> dict[str, Any]:
             raise ExecutionSelectionError("execution selection implementer.config_sha256 is invalid")
         seen.add(item.step_id)
         implementer_fields = asdict(item.implementer)
+        implementer_fields.pop("provider", None)
         if implementer_fields.get("permission_mode") is None:
             implementer_fields.pop("permission_mode", None)
         steps.append({"step_id": item.step_id, "implementer": implementer_fields})
@@ -370,8 +448,73 @@ def _payload_v4(selection: ExecutionSelectionV4) -> dict[str, Any]:
     }
 
 
+def _payload_v5(selection: ExecutionSelectionV5) -> dict[str, Any]:
+    if not isinstance(selection, ExecutionSelectionV5) or selection.schema_version != SCHEMA_VERSION_V5:
+        raise ExecutionSelectionError("execution selection schema_version is unsupported")
+    if not isinstance(selection.planner, SelectedProfile) or not isinstance(selection.final_reviewer, SelectedProfile):
+        raise ExecutionSelectionError("execution selection profile is invalid")
+    if not selection.steps:
+        raise ExecutionSelectionError("execution selection steps are missing")
+    steps: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in selection.steps:
+        if not isinstance(item, StepExecutionSelection) or _STEP_ID.fullmatch(item.step_id) is None or item.step_id in seen:
+            raise ExecutionSelectionError("execution selection steps are invalid")
+        if not isinstance(item.implementer, SelectedProfile):
+            raise ExecutionSelectionError("execution selection implementer is invalid")
+        seen.add(item.step_id)
+        steps.append({
+            "step_id": item.step_id,
+            "implementer": _selected_v5_payload(item.implementer),
+        })
+    if not _contiguous([item["step_id"] for item in steps]):
+        raise ExecutionSelectionError("execution selection step IDs are not contiguous")
+    for name, profile in (
+        ("planner", selection.planner),
+        ("final_reviewer", selection.final_reviewer),
+    ):
+        _validate_selected_v5(profile, name)
+    for name, profile in (
+        ("check_repair", selection.check_repair),
+        ("semantic_reviser", selection.semantic_reviser),
+    ):
+        if profile is not None:
+            _validate_selected_v5(profile, name)
+    return {
+        "schema_version": SCHEMA_VERSION_V5,
+        "planner": _selected_v5_payload(selection.planner),
+        "steps": steps,
+        "check_repair": (
+            _selected_v5_payload(selection.check_repair)
+            if selection.check_repair is not None else None
+        ),
+        "semantic_reviser": (
+            _selected_v5_payload(selection.semantic_reviser)
+            if selection.semantic_reviser is not None else None
+        ),
+        "final_reviewer": _selected_v5_payload(selection.final_reviewer),
+    }
+
+
+def _validate_selected_v5(value: SelectedProfile | None, name: str) -> None:
+    if not isinstance(value, SelectedProfile):
+        raise ExecutionSelectionError(f"execution selection {name} is invalid")
+    if value.config_sha256 is None or _SHA256.fullmatch(value.config_sha256) is None:
+        raise ExecutionSelectionError(f"execution selection {name}.config_sha256 is invalid")
+    if not isinstance(value.provider, str) or not value.provider.strip():
+        raise ExecutionSelectionError(f"execution selection {name}.provider is invalid")
+
+
+def _selected_v5_payload(value: SelectedProfile) -> dict[str, Any]:
+    fields = asdict(value)
+    if fields.get("permission_mode") is None:
+        fields.pop("permission_mode", None)
+    return fields
+
+
 def _selected_payload(value: SelectedProfile) -> dict[str, Any]:
     fields = asdict(value)
+    fields.pop("provider", None)
     if fields.get("permission_mode") is None:
         fields.pop("permission_mode", None)
     return fields
@@ -423,6 +566,8 @@ def ensure_execution_selection(
     a different one raises :class:`ExecutionSelectionConflict`.
     """
 
+    if isinstance(selection, ExecutionSelectionV5):
+        return ensure_execution_selection_v5(run_dir, selection)  # type: ignore[return-value]
     if isinstance(selection, ExecutionSelectionV4):
         return ensure_execution_selection_v4(run_dir, selection)  # type: ignore[return-value]
     if isinstance(selection, ExecutionSelectionV3):
@@ -469,16 +614,37 @@ def ensure_execution_selection_v4(run_dir: Path, selection: ExecutionSelectionV4
     return existing
 
 
+def ensure_execution_selection_v5(run_dir: Path, selection: ExecutionSelectionV5) -> ExecutionSelectionV5:
+    """Publish the v5 selection once, idempotently and exclusively."""
+
+    content = json.dumps(_payload_v5(selection), ensure_ascii=False, indent=2) + "\n"
+    directory = Path(run_dir).expanduser().resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    if _publish_exclusive(directory / _FILENAME, content):
+        return selection
+    existing = read_execution_selection_v5(directory)
+    if existing != selection:
+        raise ExecutionSelectionConflict("a different execution selection is already published")
+    return existing
+
+
 def _selected_from(value: Any, name: str, schema_version: int) -> SelectedProfile:
     if not isinstance(value, dict):
         raise ExecutionSelectionError(f"execution selection {name} must be an object")
-    required = _V2_FIELDS if schema_version == 2 else _V1_FIELDS
+    required = _V5_FIELDS if schema_version == SCHEMA_VERSION_V5 else (
+        _V2_FIELDS if schema_version == 2 else _V1_FIELDS
+    )
+    optional = _OPTIONAL_PROFILE_FIELDS if schema_version != SCHEMA_VERSION_V5 else frozenset({"permission_mode"})
     accepted = set(value)
-    if accepted != required and accepted != required | _OPTIONAL_PROFILE_FIELDS:
+    if accepted != required and accepted != required | optional:
         raise ExecutionSelectionError(f"execution selection {name} has invalid fields")
     strings = ("profile_id", "driver", "model", "selection_mode")
     if any(not isinstance(value[key], str) for key in strings):
         raise ExecutionSelectionError(f"execution selection {name} has invalid metadata")
+    if schema_version == SCHEMA_VERSION_V5 and (
+        not isinstance(value.get("provider"), str) or not value["provider"].strip()
+    ):
+        raise ExecutionSelectionError(f"execution selection {name}.provider is invalid")
     for key in ("effort", "sandbox", "permission_mode"):
         if value.get(key) is not None and not isinstance(value.get(key), str):
             raise ExecutionSelectionError(f"execution selection {name}.{key} is invalid")
@@ -487,7 +653,9 @@ def _selected_from(value: Any, name: str, schema_version: int) -> SelectedProfil
         or _SHA256.fullmatch(value["config_sha256"]) is None
     ):
         raise ExecutionSelectionError(f"execution selection {name}.config_sha256 is invalid")
-    return SelectedProfile(**value)
+    selected = dict(value)
+    selected.setdefault("provider", "openai")
+    return SelectedProfile(**selected)
 
 
 def parse_execution_selection(data: bytes) -> ExecutionSelection:
@@ -500,6 +668,8 @@ def parse_execution_selection(data: bytes) -> ExecutionSelection:
     if not isinstance(payload, dict):
         raise ExecutionSelectionError("execution selection must contain an object")
     schema_version = payload.get("schema_version")
+    if schema_version == SCHEMA_VERSION_V5:
+        return parse_execution_selection_v5(data)  # type: ignore[return-value]
     if schema_version == SCHEMA_VERSION_V4:
         return parse_execution_selection_v4(data)  # type: ignore[return-value]
     if schema_version == SCHEMA_VERSION_V3:
@@ -595,6 +765,62 @@ def parse_execution_selection_v4(data: bytes) -> ExecutionSelectionV4:
     )
 
 
+def _selected_v5(value: Any, name: str) -> SelectedProfile:
+    if not isinstance(value, dict) or set(value) not in (
+        _V5_FIELDS, _V5_FIELDS | _OPTIONAL_PROFILE_FIELDS
+    ):
+        raise ExecutionSelectionError(f"execution selection {name} is invalid")
+    return _selected_from(value, name, SCHEMA_VERSION_V5)
+
+
+def parse_execution_selection_v5(data: bytes) -> ExecutionSelectionV5:
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ExecutionSelectionError("execution selection is missing or invalid") from exc
+    expected_fields = {
+        "schema_version", "planner", "steps", "check_repair",
+        "semantic_reviser", "final_reviewer",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields or payload.get("schema_version") != SCHEMA_VERSION_V5:
+        raise ExecutionSelectionError("execution selection schema_version is unsupported")
+    raw_steps = payload.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ExecutionSelectionError("execution selection steps are invalid")
+    steps: list[StepExecutionSelection] = []
+    for index, item in enumerate(raw_steps):
+        if not isinstance(item, dict) or set(item) != {"step_id", "implementer"}:
+            raise ExecutionSelectionError(f"execution selection step {index} is invalid")
+        step_id = item.get("step_id")
+        if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None:
+            raise ExecutionSelectionError("execution selection step IDs are invalid")
+        steps.append(
+            StepExecutionSelection(step_id, _selected_v5(item.get("implementer"), f"step {step_id}"))
+        )
+    if not _contiguous([item.step_id for item in steps]):
+        raise ExecutionSelectionError("execution selection step IDs are not contiguous")
+    check_repair = payload["check_repair"]
+    semantic_reviser = payload["semantic_reviser"]
+    if check_repair is not None and not isinstance(check_repair, dict):
+        raise ExecutionSelectionError("execution selection check_repair is invalid")
+    if semantic_reviser is not None and not isinstance(semantic_reviser, dict):
+        raise ExecutionSelectionError("execution selection semantic_reviser is invalid")
+    return ExecutionSelectionV5(
+        schema_version=SCHEMA_VERSION_V5,
+        planner=_selected_v5(payload["planner"], "planner"),
+        steps=tuple(steps),
+        check_repair=(
+            _selected_v5(check_repair, "check_repair")
+            if check_repair is not None else None
+        ),
+        semantic_reviser=(
+            _selected_v5(semantic_reviser, "semantic_reviser")
+            if semantic_reviser is not None else None
+        ),
+        final_reviewer=_selected_v5(payload["final_reviewer"], "final_reviewer"),
+    )
+
+
 def read_execution_selection_with_sha256(
     run_dir: Path,
 ) -> tuple[ExecutionSelection, str]:
@@ -640,6 +866,19 @@ def read_execution_selection_v4(run_dir: Path) -> ExecutionSelectionV4:
     return read_execution_selection_v4_with_sha256(run_dir)[0]
 
 
+def read_execution_selection_v5_with_sha256(run_dir: Path) -> tuple[ExecutionSelectionV5, str]:
+    path = Path(run_dir).expanduser().resolve() / _FILENAME
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ExecutionSelectionError("execution selection is missing or invalid") from exc
+    return parse_execution_selection_v5(data), hashlib.sha256(data).hexdigest()
+
+
+def read_execution_selection_v5(run_dir: Path) -> ExecutionSelectionV5:
+    return read_execution_selection_v5_with_sha256(run_dir)[0]
+
+
 def validate_execution_selection(
     config: HarnessConfig,
     selection: ExecutionSelection,
@@ -653,6 +892,9 @@ def validate_execution_selection(
 
     if isinstance(selection, ExecutionSelectionV4):
         validate_execution_selection_v4(config, selection)
+        return
+    if isinstance(selection, ExecutionSelectionV5):
+        validate_execution_selection_v5(config, selection)
         return
     if isinstance(selection, ExecutionSelectionV3):
         validate_execution_selection_v3(config, selection)
@@ -669,13 +911,13 @@ def validate_execution_selection(
             raise ExecutionSelectionError(f"execution selection {name}.config_sha256 is missing")
         try:
             profile = profile_for_role(config, selected.profile_id, role)
-            expected = _selected(
+            expected = replace(_selected(
                 profile,
                 schema_version=selection.schema_version,
                 agent_env_allowlist=_env_allowlist(config, role),
                 codex_home=(config.codex_runtime.home if role is ExecutionRole.IMPLEMENTER else None),
                 claude_config_home=(config.claude_runtime.home if role is ExecutionRole.REVISER else None),
-            )
+            ), provider=selected.provider)
         except ProfileError as exc:
             raise ExecutionSelectionError(
                 f"execution selection {name} profile is no longer available: {exc}"
@@ -690,7 +932,10 @@ def validate_execution_selection(
             profile = profile_for_role(config, selection.reviser.profile_id, ExecutionRole.REVISER)
         except ProfileError as exc:
             raise ExecutionSelectionError(f"execution selection reviser profile is no longer available: {exc}") from exc
-        expected = _selected(profile, claude_config_home=config.claude_runtime.home)
+        expected = replace(
+            _selected(profile, claude_config_home=config.claude_runtime.home),
+            provider=selection.reviser.provider,
+        )
         if selection.reviser != expected:
             raise ExecutionSelectionError("execution selection reviser profile no longer matches the configured profile")
 
@@ -706,7 +951,10 @@ def validate_execution_selection_v3(config: HarnessConfig, selection: ExecutionS
             profile = profile_for_role(config, selected.profile_id, role)
         except ProfileError as exc:
             raise ExecutionSelectionError(f"execution selection {name} profile is unavailable") from exc
-        expected = _selected(profile, agent_env_allowlist=_env_allowlist(config, role))
+        expected = replace(
+            _selected(profile, agent_env_allowlist=_env_allowlist(config, role)),
+            provider=selected.provider,
+        )
         if selected != expected:
             raise ExecutionSelectionError(f"execution selection {name} profile no longer matches config")
     if selection.reviser is not None:
@@ -714,7 +962,10 @@ def validate_execution_selection_v3(config: HarnessConfig, selection: ExecutionS
             profile = profile_for_role(config, selection.reviser.profile_id, ExecutionRole.REVISER)
         except ProfileError as exc:
             raise ExecutionSelectionError("execution selection reviser profile is unavailable") from exc
-        expected = _selected(profile, claude_config_home=config.claude_runtime.home)
+        expected = replace(
+            _selected(profile, claude_config_home=config.claude_runtime.home),
+            provider=selection.reviser.provider,
+        )
         if selection.reviser != expected:
             raise ExecutionSelectionError("execution selection reviser profile no longer matches config")
     if not selection.steps:
@@ -724,7 +975,10 @@ def validate_execution_selection_v3(config: HarnessConfig, selection: ExecutionS
             profile = profile_for_role(config, item.implementer.profile_id, ExecutionRole.IMPLEMENTER)
         except ProfileError as exc:
             raise ExecutionSelectionError(f"execution selection {item.step_id} profile is unavailable") from exc
-        expected = _selected(profile, agent_env_allowlist=_env_allowlist(config, ExecutionRole.IMPLEMENTER), codex_home=config.codex_runtime.home)
+        expected = replace(
+            _selected(profile, agent_env_allowlist=_env_allowlist(config, ExecutionRole.IMPLEMENTER), codex_home=config.codex_runtime.home),
+            provider=item.implementer.provider,
+        )
         if item.implementer != expected:
             raise ExecutionSelectionError(f"execution selection {item.step_id} profile no longer matches config")
 
@@ -742,12 +996,12 @@ def validate_execution_selection_v4(config: HarnessConfig, selection: ExecutionS
             profile = profile_for_role(config, selected.profile_id, role)
         except ProfileError as exc:
             raise ExecutionSelectionError(f"execution selection {name} profile is unavailable") from exc
-        expected = _selected(
+        expected = replace(_selected(
             profile,
             agent_env_allowlist=_env_allowlist(config, role),
             codex_home=config.codex_runtime.home if role is ExecutionRole.REPAIR else None,
             claude_config_home=config.claude_runtime.home if role is ExecutionRole.REVISER else None,
-        )
+        ), provider=selected.provider)
         if selected != expected:
             raise ExecutionSelectionError(f"execution selection {name} profile no longer matches config")
     _require_cycle_drivers(
@@ -761,39 +1015,94 @@ def validate_execution_selection_v4(config: HarnessConfig, selection: ExecutionS
             profile = profile_for_role(config, item.implementer.profile_id, ExecutionRole.IMPLEMENTER)
         except ProfileError as exc:
             raise ExecutionSelectionError(f"execution selection {item.step_id} profile is unavailable") from exc
-        expected = _selected(
+        expected = replace(_selected(
             profile,
             agent_env_allowlist=_env_allowlist(config, ExecutionRole.IMPLEMENTER),
             codex_home=config.codex_runtime.home,
-        )
+        ), provider=item.implementer.provider)
         if item.implementer != expected:
             raise ExecutionSelectionError(f"execution selection {item.step_id} profile no longer matches config")
 
 
+def validate_execution_selection_v5(config: HarnessConfig, selection: ExecutionSelectionV5) -> None:
+    """Validate V5 by declared profile roles and execution metadata only."""
+
+    if not isinstance(config, HarnessConfig) or not isinstance(selection, ExecutionSelectionV5) or selection.schema_version != SCHEMA_VERSION_V5:
+        raise ExecutionSelectionError("execution selection schema_version is unsupported")
+
+    def check(name: str, selected: SelectedProfile, role: ExecutionRole) -> None:
+        try:
+            profile = profile_for_role(config, selected.profile_id, role)
+        except ProfileError as exc:
+            raise ExecutionSelectionError(f"execution selection {name} profile is unavailable") from exc
+        expected = _selected(
+            profile,
+            agent_env_allowlist=_env_allowlist(config, role),
+            **_profile_runtime_kwargs(config, profile),
+        )
+        if selected != expected:
+            raise ExecutionSelectionError(f"execution selection {name} profile no longer matches config")
+
+    check("planner", selection.planner, ExecutionRole.PLANNER)
+    check("final_reviewer", selection.final_reviewer, ExecutionRole.REVIEWER)
+    if selection.check_repair is not None:
+        check("check_repair", selection.check_repair, ExecutionRole.REPAIR)
+    if selection.semantic_reviser is not None:
+        check("semantic_reviser", selection.semantic_reviser, ExecutionRole.REVISER)
+    if not selection.steps:
+        raise ExecutionSelectionError("execution selection steps are missing")
+    for item in selection.steps:
+        try:
+            profile = profile_for_role(
+                config, item.implementer.profile_id, ExecutionRole.IMPLEMENTER
+            )
+        except ProfileError as exc:
+            raise ExecutionSelectionError(
+                f"execution selection {item.step_id} profile is unavailable"
+            ) from exc
+        expected = _selected(
+            profile,
+            agent_env_allowlist=_env_allowlist(config, ExecutionRole.IMPLEMENTER),
+            **_profile_runtime_kwargs(config, profile),
+        )
+        if item.implementer != expected:
+            raise ExecutionSelectionError(
+                f"execution selection {item.step_id} profile no longer matches config"
+            )
+
+
 __all__ = [
     "ExecutionSelectionV4",
+    "ExecutionSelectionV5",
     "ExecutionSelectionConflict",
     "ExecutionSelectionError",
     "SCHEMA_VERSION",
     "SCHEMA_VERSION_V3",
     "SCHEMA_VERSION_V4",
+    "SCHEMA_VERSION_V5",
     "ensure_execution_selection",
     "ensure_execution_selection_v3",
     "ensure_execution_selection_v4",
+    "ensure_execution_selection_v5",
     "is_profile_aware_run",
     "parse_execution_selection",
     "parse_execution_selection_v3",
     "parse_execution_selection_v4",
+    "parse_execution_selection_v5",
     "read_execution_selection",
     "read_execution_selection_with_sha256",
     "read_execution_selection_v3",
     "read_execution_selection_v3_with_sha256",
     "read_execution_selection_v4",
     "read_execution_selection_v4_with_sha256",
+    "read_execution_selection_v5",
+    "read_execution_selection_v5_with_sha256",
     "resolve_execution_selection",
     "resolve_execution_selection_v3",
     "resolve_execution_selection_v4",
+    "resolve_execution_selection_v5",
     "validate_execution_selection",
     "validate_execution_selection_v3",
     "validate_execution_selection_v4",
+    "validate_execution_selection_v5",
 ]

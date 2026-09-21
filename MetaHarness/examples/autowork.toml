@@ -26,13 +26,14 @@ staged_step_max_mutable_paths = 6
 # -> optional C02 -> candidate commit C02 (parent = C01), pushed -> reviewer.
 # The final PASS publishes the exact approved candidate chain tip (no new
 # commit): CAS fast-forward of local main BASE->tip -> push origin/main.
-# [revision] supplies legacy defaults/fallbacks; durable UI runs freeze Claude
-# revision and repair_cycles independently in run_options.json.
+# [revision] supplies independent defaults; durable UI runs freeze semantic
+# revision, check-repair attempts and review-repair cycles in run_options.json.
 # AutoWork recommendation: repair_scope_policy = "auto-bounded" and
 # repair_scope_max_added_paths = 4 (captured durably per run).
 [revision]
 enabled = true
-max_cycles = 2
+max_check_repair_attempts = 2
+max_review_repair_cycles = 1
 
 [repository]
 remote = "origin"
@@ -89,6 +90,7 @@ require_locator_head_at_base = true
 display_name = "ChatGPT UI Planner"
 roles = ["planner", "reviewer"]
 driver = "openai-chat"
+provider = "openai"
 model = "chatgpt-web"
 selection_mode = "external-ui"
 base_url = "http://127.0.0.1:8001"
@@ -105,6 +107,7 @@ latency_tier = "standard"
 display_name = "Codex Luna High"
 roles = ["implementer", "repair"]
 driver = "codex"
+provider = "openai"
 model = "gpt-5.6-luna"
 effort = "high"
 sandbox = "workspace-write"
@@ -115,10 +118,22 @@ strengths = ["implementation", "unit tests", "repository navigation"]
 cost_tier = "standard"
 latency_tier = "fast"
 
+# Future provider example (inactive until an exact configured model is chosen):
+# [model_profiles."codex-deepseek-high"]
+# display_name = "Codex DeepSeek High"
+# roles = ["implementer", "repair"]
+# driver = "codex"
+# provider = "deepseek"
+# model = "<configure-exact-model>"
+# effort = "high"
+# sandbox = "workspace-write"
+# selection_mode = "cli"
+
 [model_profiles."claude-opus-medium"]
 display_name = "Claude Opus Medium RevisER"
 roles = ["reviser", "repair"]
 driver = "claude-code"
+provider = "anthropic"
 model = "opus"
 effort = "medium"
 permission_mode = "acceptEdits"

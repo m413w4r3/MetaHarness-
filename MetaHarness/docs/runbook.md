@@ -39,9 +39,11 @@ metaharness run \
 ### Pipeline configuration
 
 `[revision]` supplies defaults and the legacy fallback. Every new durable UI
-run captures its effective choices in `run_options.json`; the captured
-`claude_revision_enabled` and `repair_cycles` values are independent. The
-currently supported values for `repair_cycles` are only `0` and `1`.
+run captures its effective choices in `run_options.json`: the semantic
+revision switch, check-repair attempt budget, review-repair cycle budget, and
+role-specific profiles. The historical `claude_revision_enabled` and
+`repair_cycles` names remain read-only compatibility aliases; new budgets are
+validated independently in the inclusive range `0..10`.
 For AutoWork, use `repair_scope_policy = "auto-bounded"` and
 `repair_scope_max_added_paths = 4`. Use `require-approval` when an operator
 must explicitly accept an exact planner-derived scope delta; use
@@ -95,14 +97,15 @@ HOME/TMPDIR, `CODEX_HOME` or API key is passed, and no user file is copied.
 Claude Code is configuration-isolated and Git-scope-enforced; it is not an
 independent network sandbox.
 
-## Two-cycle pipeline and publication
+## Configurable correction pipeline and publication
 
 `examples/autowork.toml` enables the full target workflow:
 
 ```toml
 [revision]
 enabled = true
-max_cycles = 2
+max_check_repair_attempts = 2
+max_review_repair_cycles = 1
 
 [publish]
 enabled = true
@@ -444,17 +447,14 @@ metaharness run --config examples/autowork.toml --spec my-spec.md
 With `[planning] protocol = "v2"`, the approval card shows the execution mode,
 the step count and, for every step, the recommended implementer, a profile
 dropdown and the exact `steps/Sxx/contract.md` bytes hashed in
-`implementation_bundle.json` — the same bytes each fresh Codex process
-receives. With `revision.enabled` the card also shows, before APPROVE, the
-Claude reviser and the Codex repair implementer (recommended and selected)
-next to the planner, the initial step implementers and the reviewer. After
-approval the run page renders `CYCLE 1 — INITIAL` and, only when it exists,
-`CYCLE 2 — REPAIR`, each with its own steps, Claude revision, checks and
-reviewer, read from that cycle's artifacts only. Each step card shows its
-status (✓ ✗ ▶ …), recent events (messages and tool names, never tool
-arguments) and token usage; the header summary and the CHECKS/REVIEW
-sections describe the final cycle. The TOKEN USAGE table is computed from the
-persisted `step.json` and usage artifacts of both cycles.
+`implementation_bundle.json` — the same bytes each fresh executor receives.
+With correction enabled, the card also shows the planner, initial
+implementers, optional semantic-reviser and check-repair profiles, and final
+reviewer. After approval the run page renders each durable `CYCLE n` with its
+own steps, corrections, checks and review, read from that cycle's artifacts
+only. Each step card shows its status (✓ ✗ ▶ …), recent events (messages and
+tool names, never tool arguments) and token usage; the header summary and the
+CHECKS/REVIEW sections describe the final cycle.
 
 Open the created run, read the canonical plan, then approve or reject it and
 observe Codex progress, checks and review. The UI never runs Codex or checks,

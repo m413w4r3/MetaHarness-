@@ -34,6 +34,7 @@ from .models import (
     SelectionMode,
     UIConfig,
     WorkspaceSetupCommand,
+    validate_revision_budget,
 )
 
 
@@ -53,6 +54,7 @@ _PROFILE_COMMON_KEYS = frozenset({
     "display_name",
     "roles",
     "driver",
+    "provider",
     "model",
     "selection_mode",
     "timeout_seconds",
@@ -69,19 +71,6 @@ _PROFILE_DRIVER_KEYS = {
     ProfileDriver.CODEX: frozenset({"effort", "sandbox"}),
     ProfileDriver.CLAUDE_CODE: frozenset({"effort", "permission_mode"}),
 }
-_PROFILE_ROLE_COMPATIBILITY = {
-    ProfileDriver.OPENAI_CHAT: frozenset({
-        ExecutionRole.PLANNER, ExecutionRole.REVIEWER, ExecutionRole.AUDITOR,
-    }),
-    ProfileDriver.CODEX: frozenset({
-        ExecutionRole.IMPLEMENTER, ExecutionRole.REPAIR,
-    }),
-    ProfileDriver.CLAUDE_CODE: frozenset({
-        ExecutionRole.REVISER, ExecutionRole.REPAIR,
-    }),
-}
-
-
 def _expand_string(value: str, environment: Mapping[str, str]) -> str:
     """Expand ``${NAME}`` references in one non-recursive pass.
 
@@ -237,6 +226,18 @@ def _bounded_int(
     if value > maximum:
         raise ConfigError(f"{where}.{key} must be at most {maximum}")
     return value
+
+
+def _revision_budget(
+    data: Mapping[str, Any], key: str, default: int, where: str
+) -> int:
+    """Read one correction budget through the shared model validator."""
+
+    value = data.get(key, default)
+    try:
+        return validate_revision_budget(value, f"{where}.{key}")
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from None
 
 
 def _string_array(data: Mapping[str, Any], key: str, default: tuple[str, ...], where: str,
@@ -396,9 +397,9 @@ def _model_profiles(
             selection_mode = SelectionMode(profile_data.get("selection_mode"))
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"{where}.selection_mode is invalid") from exc
-        incompatible = set(roles) - _PROFILE_ROLE_COMPATIBILITY[driver]
-        if incompatible:
-            raise ConfigError(f"{where}: driver/role mismatch")
+        provider = profile_data.get("provider", "openai")
+        if not isinstance(provider, str) or not provider.strip():
+            raise ConfigError(f"{where}.provider must be a non-empty string")
         if driver is ProfileDriver.OPENAI_CHAT:
             if selection_mode is SelectionMode.CLI:
                 raise ConfigError(f"{where}.selection_mode must not be cli")
@@ -410,6 +411,7 @@ def _model_profiles(
                 driver=driver,
                 model=model,
                 selection_mode=selection_mode,
+                provider=provider,
                 base_url=endpoint.base_url,
                 endpoint_path=endpoint.endpoint_path,
                 api_key_env=endpoint.api_key_env,
@@ -440,6 +442,7 @@ def _model_profiles(
                 driver=driver,
                 model=model,
                 selection_mode=selection_mode,
+                provider=provider,
                 timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
                 retries=0 if driver is ProfileDriver.CLAUDE_CODE else 2,
                 effort=effort,
@@ -462,7 +465,9 @@ def _check_default(
     if profile is None:
         raise ConfigError(f"default profile {value!r} does not exist")
     if role not in profile.roles:
-        raise ConfigError(f"default profile {value!r} is incompatible with {role.value}")
+        raise ConfigError(
+            f"default profile {value!r} is incompatible with {role.value}"
+        )
     return value
 
 
@@ -472,32 +477,34 @@ def _validate_revision(
     ui: UIConfig,
     profiles: Mapping[str, ModelProfile],
 ) -> None:
-    """Cross-validate the two-cycle architecture at load time, never mid-run."""
+    """Validate role/profile presence without coupling roles to drivers."""
 
     if not revision.enabled:
+        if revision.max_check_repair_attempts <= 0 and revision.max_review_repair_cycles <= 0:
+            return
+        value = ui.default_repair_profile
+        if not profiles or not isinstance(value, str) or not value.strip():
+            raise ConfigError("revision repair budget requires ui.default_repair_profile")
+        repair = profiles.get(value)
+        if repair is None or ExecutionRole.REPAIR not in repair.roles:
+            raise ConfigError("revision repair profile must resolve for repair")
         return
     if planning.protocol != "v2":
         raise ConfigError("revision.enabled requires planning.protocol = 'v2'")
-    if revision.max_cycles != 2:
-        raise ConfigError("revision.max_cycles must be exactly 2")
-    for key, value in (
-        ("default_reviser_profile", ui.default_reviser_profile),
-        ("default_repair_profile", ui.default_repair_profile),
-    ):
+    if revision.enabled:
+        value = ui.default_reviser_profile
         if not isinstance(value, str) or not value.strip():
-            raise ConfigError(f"revision.enabled requires ui.{key}")
-    reviser = profiles.get(ui.default_reviser_profile or "")
-    if reviser is None or ExecutionRole.REVISER not in reviser.roles:
-        raise ConfigError("revision reviser profile must resolve for reviser")
-    if reviser.driver is not ProfileDriver.CLAUDE_CODE:
-        raise ConfigError("revision reviser profile must use claude-code driver")
-    repair = profiles.get(ui.default_repair_profile or "")
-    if repair is None or ExecutionRole.REPAIR not in repair.roles:
-        raise ConfigError("revision repair profile must resolve for repair")
-    # C02 is "repair planner -> Luna repair step(s)": a Claude profile may
-    # carry the repair role in the catalogue, but never as this default.
-    if repair.driver is not ProfileDriver.CODEX:
-        raise ConfigError("revision repair profile must use codex driver")
+            raise ConfigError("revision.enabled requires ui.default_reviser_profile")
+        reviser = profiles.get(value)
+        if reviser is None or ExecutionRole.REVISER not in reviser.roles:
+            raise ConfigError("revision reviser profile must resolve for reviser")
+    if revision.max_check_repair_attempts > 0 or revision.max_review_repair_cycles > 0:
+        value = ui.default_repair_profile
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError("revision repair budget requires ui.default_repair_profile")
+        repair = profiles.get(value)
+        if repair is None or ExecutionRole.REPAIR not in repair.roles:
+            raise ConfigError("revision repair profile must resolve for repair")
 
 
 def _checks(value: Any, *, catalogue: bool = False) -> tuple[CheckConfig, ...]:
@@ -663,15 +670,60 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     )
 
     revision_data = _table(expanded, "revision")
-    unknown_revision = sorted(set(revision_data) - {"enabled", "max_cycles"})
+    allowed_revision = {
+        "enabled", "max_review_repair_cycles", "max_check_repair_attempts",
+        # Input-only compatibility for historical TOML files.
+        "max_cycles",
+    }
+    unknown_revision = sorted(set(revision_data) - allowed_revision)
     if unknown_revision:
         raise ConfigError(f"revision.{unknown_revision[0]} is not allowed")
-    revision_max_cycles = revision_data.get("max_cycles", 2)
-    if isinstance(revision_max_cycles, bool) or revision_max_cycles != 2:
-        raise ConfigError("revision.max_cycles must be exactly 2")
+    legacy_review_budget: int | None = None
+    if "max_cycles" in revision_data:
+        # Historical TOML used a total-cycle count.  Keep accepting it as a
+        # read-time alias, but translate it to the generic number of review
+        # repair cycles instead of preserving the old two-cycle contract.
+        legacy_max_cycles = revision_data["max_cycles"]
+        if isinstance(legacy_max_cycles, bool) or not isinstance(legacy_max_cycles, int):
+            raise ConfigError("revision.max_cycles must be an integer")
+        try:
+            legacy_review_budget = validate_revision_budget(
+                max(0, legacy_max_cycles - 1),
+                "revision.max_review_repair_cycles",
+            )
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from None
+    revision_enabled = _bool(revision_data, "enabled", False, "revision")
+    explicit_budgets = {
+        "max_review_repair_cycles", "max_check_repair_attempts"
+    }.intersection(revision_data)
+    review_budget = _revision_budget(
+        revision_data, "max_review_repair_cycles", 1, "revision"
+    )
+    if "max_review_repair_cycles" not in revision_data and legacy_review_budget is not None:
+        review_budget = legacy_review_budget
+    check_budget = _revision_budget(
+        revision_data, "max_check_repair_attempts", 2, "revision"
+    )
+    if not revision_data:
+        # A config with no [revision] section is historical and has no
+        # correction pipeline.  RevisionConfig's explicit defaults remain
+        # available to new callers that construct it directly.
+        review_budget = check_budget = 0
+    elif (
+        not revision_enabled
+        and legacy_review_budget is not None
+        and not explicit_budgets
+    ):
+        # ``enabled = false`` plus the historical total-cycle alias means an
+        # old run with no correction pipeline.  New explicit budget keys are
+        # independent and are deliberately not covered by this compatibility
+        # branch.
+        review_budget = check_budget = 0
     revision = RevisionConfig(
-        enabled=_bool(revision_data, "enabled", False, "revision"),
-        max_cycles=revision_max_cycles,
+        enabled=revision_enabled,
+        max_review_repair_cycles=review_budget,
+        max_check_repair_attempts=check_budget,
     )
 
     repository_data = _table(expanded, "repository")
@@ -808,6 +860,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
                 roles=(ExecutionRole.PLANNER,),
                 driver=ProfileDriver.OPENAI_CHAT,
                 model=planner.model,
+                provider="openai",
                 selection_mode=_legacy_selection_mode(planner_data, "planner"),
                 base_url=planner.base_url,
                 endpoint_path=planner.endpoint_path,
@@ -822,6 +875,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
                 roles=(ExecutionRole.IMPLEMENTER,),
                 driver=ProfileDriver.CODEX,
                 model=agent.model,
+                provider="openai",
                 selection_mode=SelectionMode.CLI,
                 effort=agent.effort,
                 sandbox=agent.sandbox,
@@ -833,6 +887,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
                 roles=(ExecutionRole.REVIEWER,),
                 driver=ProfileDriver.OPENAI_CHAT,
                 model=reviewer.model,
+                provider="openai",
                 selection_mode=_legacy_selection_mode(reviewer_data, "reviewer"),
                 base_url=reviewer.base_url,
                 endpoint_path=reviewer.endpoint_path,

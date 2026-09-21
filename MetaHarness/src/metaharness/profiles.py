@@ -30,6 +30,7 @@ def _legacy_profiles(config: HarnessConfig) -> dict[str, ModelProfile]:
             roles=(ExecutionRole.PLANNER,),
             driver=ProfileDriver.OPENAI_CHAT,
             model=config.planner.model,
+            provider="openai",
             selection_mode=SelectionMode.REQUEST,
             base_url=config.planner.base_url,
             endpoint_path=config.planner.endpoint_path,
@@ -44,6 +45,7 @@ def _legacy_profiles(config: HarnessConfig) -> dict[str, ModelProfile]:
             roles=(ExecutionRole.IMPLEMENTER,),
             driver=ProfileDriver.CODEX,
             model=config.agent.model,
+            provider="openai",
             selection_mode=SelectionMode.CLI,
             effort=config.agent.effort,
             sandbox=config.agent.sandbox,
@@ -55,6 +57,7 @@ def _legacy_profiles(config: HarnessConfig) -> dict[str, ModelProfile]:
             roles=(ExecutionRole.REVIEWER,),
             driver=ProfileDriver.OPENAI_CHAT,
             model=config.reviewer.model,
+            provider="openai",
             selection_mode=SelectionMode.REQUEST,
             base_url=config.reviewer.base_url,
             endpoint_path=config.reviewer.endpoint_path,
@@ -109,6 +112,7 @@ def safe_profile_metadata(profile: ModelProfile) -> dict[str, Any]:
         "display_name": profile.display_name,
         "roles": [role.value for role in profile.roles],
         "driver": profile.driver.value,
+        "provider": profile.provider,
         "model_label": profile.model,
         "selection_mode": profile.selection_mode.value,
         "effort": profile.effort,
@@ -141,9 +145,8 @@ def profile_execution_fingerprint(
     ):
         raise ProfileError("agent_env_allowlist must contain variable names")
     payload: dict[str, Any] = {
-        "id": profile.id,
-        "roles": [role.value for role in profile.roles],
         "driver": profile.driver.value,
+        "provider": profile.provider,
         "model": profile.model,
         "selection_mode": profile.selection_mode.value,
         "timeout_seconds": profile.timeout_seconds,

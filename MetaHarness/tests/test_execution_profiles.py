@@ -308,11 +308,16 @@ class ProfileConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, rf"\.{name} is not allowed"):
                     self.load(**kwargs)
 
-    def test_wrong_driver_or_role_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "driver/role mismatch"):
+    def test_role_validation_is_independent_from_driver(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "incompatible with implementer"):
             self.load(replace=('roles = ["implementer"]', 'roles = ["reviewer"]'))
-        with self.assertRaisesRegex(ConfigError, "driver/role mismatch"):
-            self.load(replace=('roles = ["planner", "reviewer"]', 'roles = ["planner", "implementer"]'))
+        config = self.load(
+            replace=(
+                'roles = ["planner", "reviewer"]',
+                'roles = ["planner", "reviewer", "implementer"]',
+            )
+        )
+        self.assertIn(ExecutionRole.IMPLEMENTER, config.model_profiles["chat"].roles)
         with self.assertRaisesRegex(ConfigError, "driver is invalid"):
             self.load(replace=('driver = "codex"', 'driver = "claude"'))
 

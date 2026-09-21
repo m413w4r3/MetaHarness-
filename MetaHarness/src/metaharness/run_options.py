@@ -8,7 +8,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from .models import ExecutionRole, HarnessConfig, ProfileDriver
+from .models import (
+    ExecutionRole,
+    HarnessConfig,
+    validate_revision_budget,
+)
 from .profiles import ProfileError, profile_for_role
 from .result import atomic_write_text
 
@@ -21,7 +25,8 @@ class RunOptionsConflict(RunOptionsError):
     """An immutable run-options artifact already contains different bytes."""
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+HISTORICAL_SCHEMA_VERSION = 1
 RUN_OPTIONS_NAME = "run_options.json"
 REPAIR_SCOPE_POLICIES = frozenset({"auto-bounded", "require-approval", "deny-expansion"})
 REPAIR_SCOPE_OVERRIDE_NAME = "repair_scope_override.json"
@@ -90,11 +95,7 @@ class EffectiveRepairScopePolicy:
 
 @dataclass(frozen=True)
 class RunOptions:
-    """The operator's requested, per-run configuration.
-
-    Only validated profile IDs are stored.  Endpoint, model, credential and
-    provider configuration remains exclusively in the trusted TOML catalogue.
-    """
+    """Immutable per-run options, with schema 1 read compatibility."""
 
     schema_version: int
     protocol: str
@@ -102,19 +103,44 @@ class RunOptions:
     execution_mode_policy: str
     single_step_max_mutable_paths: int
     staged_step_max_mutable_paths: int
-    claude_revision_enabled: bool
-    repair_cycles: int
-    planner_profile: str
-    default_implementer_profile: str
-    reviewer_profile: str
-    reviser_profile: str | None
-    repair_profile: str | None
+    pipeline_version: int = 2
+    semantic_revision_enabled: bool = False
+    max_check_repair_attempts: int = 0
+    max_review_repair_cycles: int = 0
+    planner_profile: str = ""
+    default_implementer_profile: str = ""
+    check_repair_profile: str | None = None
+    semantic_reviser_profile: str | None = None
+    final_reviewer_profile: str = ""
     repair_scope_policy: str = "auto-bounded"
     repair_scope_max_added_paths: int = 4
 
+    # Constructor/read aliases for callers that still build historical v1
+    # snapshots directly.  They are never emitted by a new schema-2 artifact.
+    claude_revision_enabled: bool | None = None
+    repair_cycles: int | None = None
+    reviewer_profile: str | None = None
+    reviser_profile: str | None = None
+    repair_profile: str | None = None
+
     def __post_init__(self) -> None:
-        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int) or self.schema_version != SCHEMA_VERSION:
+        if self.claude_revision_enabled is not None:
+            object.__setattr__(self, "semantic_revision_enabled", self.claude_revision_enabled)
+        if self.repair_cycles is not None:
+            object.__setattr__(self, "max_review_repair_cycles", self.repair_cycles)
+        if self.reviewer_profile is not None:
+            object.__setattr__(self, "final_reviewer_profile", self.reviewer_profile)
+        if self.reviser_profile is not None:
+            object.__setattr__(self, "semantic_reviser_profile", self.reviser_profile)
+        if self.repair_profile is not None:
+            object.__setattr__(self, "check_repair_profile", self.repair_profile)
+
+        if isinstance(self.schema_version, bool) or self.schema_version not in {
+            HISTORICAL_SCHEMA_VERSION, SCHEMA_VERSION
+        }:
             raise RunOptionsError("run options schema_version is unsupported")
+        if isinstance(self.pipeline_version, bool) or self.pipeline_version not in {1, 2}:
+            raise RunOptionsError("run options pipeline_version is unsupported")
         if not isinstance(self.protocol, str) or self.protocol not in {"v1", "v2"}:
             raise RunOptionsError("run options protocol is invalid")
         if not isinstance(self.decomposition, str) or self.decomposition not in {"balanced", "aggressive"}:
@@ -125,15 +151,18 @@ class RunOptions:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise RunOptionsError(f"run options {name} must be greater than zero")
-        if not isinstance(self.claude_revision_enabled, bool):
-            raise RunOptionsError("run options claude_revision_enabled must be boolean")
-        if isinstance(self.repair_cycles, bool) or self.repair_cycles not in {0, 1}:
-            raise RunOptionsError("run options repair_cycles must be 0 or 1")
-        for name in ("planner_profile", "default_implementer_profile", "reviewer_profile"):
+        if not isinstance(self.semantic_revision_enabled, bool):
+            raise RunOptionsError("run options semantic_revision_enabled must be boolean")
+        for name in ("max_check_repair_attempts", "max_review_repair_cycles"):
+            try:
+                validate_revision_budget(getattr(self, name), f"run options {name}")
+            except ValueError as exc:
+                raise RunOptionsError(str(exc)) from None
+        for name in ("planner_profile", "default_implementer_profile", "final_reviewer_profile"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise RunOptionsError(f"run options {name} is invalid")
-        for name in ("reviser_profile", "repair_profile"):
+        for name in ("check_repair_profile", "semantic_reviser_profile"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise RunOptionsError(f"run options {name} is invalid")
@@ -144,74 +173,132 @@ class RunOptions:
                 or self.repair_scope_max_added_paths <= 0):
             raise RunOptionsError("run options repair_scope_max_added_paths must be greater than zero")
 
+        # Keep old attribute reads deterministic without making them durable
+        # authorities.  A positive generic review budget means the old binary
+        # switch was enabled.
+        object.__setattr__(self, "claude_revision_enabled", self.semantic_revision_enabled)
+        object.__setattr__(self, "repair_cycles", int(self.max_review_repair_cycles > 0))
+        object.__setattr__(self, "reviewer_profile", self.final_reviewer_profile)
+        object.__setattr__(self, "reviser_profile", self.semantic_reviser_profile)
+        object.__setattr__(self, "repair_profile", self.check_repair_profile)
+
     @classmethod
     def from_config(cls, config: HarnessConfig, **overrides: Any) -> "RunOptions":
-        """Build and validate a snapshot from trusted config plus overrides."""
+        """Build and validate a schema-2 snapshot from trusted config."""
 
         allowed = {
             "protocol", "decomposition", "execution_mode_policy",
             "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
-            "claude_revision_enabled", "repair_cycles", "planner_profile",
-            "default_implementer_profile", "reviewer_profile", "reviser_profile",
-            "repair_profile", "repair_scope_policy", "repair_scope_max_added_paths",
+            "semantic_revision_enabled", "max_check_repair_attempts",
+            "max_review_repair_cycles", "planner_profile",
+            "default_implementer_profile", "check_repair_profile",
+            "semantic_reviser_profile", "final_reviewer_profile",
+            "repair_scope_policy", "repair_scope_max_added_paths",
+            # Historical request aliases.
+            "claude_revision_enabled", "repair_cycles", "reviewer_profile",
+            "reviser_profile", "repair_profile",
         }
         unknown = set(overrides) - allowed
         if unknown:
             raise RunOptionsError(f"unknown run option: {sorted(unknown)[0]}")
-        historical_repair = 1 if config.revision.enabled and config.revision.max_cycles == 2 else 0
+        check_profile = config.ui.default_repair_profile
+        reviser_profile = config.ui.default_reviser_profile
+        # Both correction budgets use the independently selected repair
+        # backend.  Semantic revision is a separate switch/profile pair.
+        check_budget = config.revision.max_check_repair_attempts if check_profile else 0
+        review_budget = config.revision.max_review_repair_cycles if check_profile else 0
         values: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
+            "pipeline_version": 2,
             "protocol": config.planning.protocol,
             "decomposition": config.planning.decomposition,
             "execution_mode_policy": config.planning.execution_mode_policy,
             "single_step_max_mutable_paths": config.planning.single_step_max_mutable_paths,
             "staged_step_max_mutable_paths": config.planning.staged_step_max_mutable_paths,
-            "claude_revision_enabled": config.revision.enabled,
-            "repair_cycles": historical_repair,
+            "semantic_revision_enabled": config.revision.enabled,
+            "max_check_repair_attempts": check_budget,
+            "max_review_repair_cycles": review_budget,
             "planner_profile": config.ui.default_planner_profile or "legacy-planner",
             "default_implementer_profile": config.ui.default_implementer_profile or "legacy-implementer",
-            "reviewer_profile": config.ui.default_reviewer_profile or "legacy-reviewer",
-            "reviser_profile": config.ui.default_reviser_profile,
-            "repair_profile": config.ui.default_repair_profile,
+            "check_repair_profile": check_profile,
+            "semantic_reviser_profile": reviser_profile,
+            "final_reviewer_profile": config.ui.default_reviewer_profile or "legacy-reviewer",
             "repair_scope_policy": "auto-bounded",
             "repair_scope_max_added_paths": 4,
         }
-        values.update(overrides)
+        aliases = {
+            "claude_revision_enabled": "semantic_revision_enabled",
+            "repair_cycles": "max_review_repair_cycles",
+            "reviewer_profile": "final_reviewer_profile",
+            "reviser_profile": "semantic_reviser_profile",
+            "repair_profile": "check_repair_profile",
+        }
+        for old_name, new_name in aliases.items():
+            if old_name in overrides:
+                values[new_name] = overrides[old_name]
+        values.update({key: value for key, value in overrides.items() if key not in aliases})
         result = cls(**values)
         result.validate_profiles(config)
-        if result.claude_revision_enabled and result.reviser_profile is None:
-            raise RunOptionsError("Claude revision requires a reviser profile")
-        if result.repair_cycles == 1 and result.repair_profile is None:
-            raise RunOptionsError("automatic repair requires a repair profile")
+        if result.semantic_revision_enabled and result.semantic_reviser_profile is None:
+            raise RunOptionsError("semantic revision requires a semantic reviser profile")
+        if (
+            result.max_check_repair_attempts > 0
+            or result.max_review_repair_cycles > 0
+        ) and result.check_repair_profile is None:
+            raise RunOptionsError("correction budget requires a check-repair profile")
         return result
 
     def validate_profiles(self, config: HarnessConfig) -> None:
         roles = (
             ("planner_profile", ExecutionRole.PLANNER),
             ("default_implementer_profile", ExecutionRole.IMPLEMENTER),
-            ("reviewer_profile", ExecutionRole.REVIEWER),
+            ("final_reviewer_profile", ExecutionRole.REVIEWER),
         )
         for name, role in roles:
             try:
                 profile_for_role(config, getattr(self, name), role)
             except ProfileError as exc:
                 raise RunOptionsError(f"{name} is invalid or incompatible") from exc
-        for name, role in (("reviser_profile", ExecutionRole.REVISER), ("repair_profile", ExecutionRole.REPAIR)):
+        for name, role in (
+            ("semantic_reviser_profile", ExecutionRole.REVISER),
+            ("check_repair_profile", ExecutionRole.REPAIR),
+        ):
             value = getattr(self, name)
             if value is None:
                 continue
             try:
-                resolved = profile_for_role(config, value, role)
+                profile_for_role(config, value, role)
             except ProfileError as exc:
                 raise RunOptionsError(f"{name} is invalid or incompatible") from exc
-            if role is ExecutionRole.REVISER and resolved.driver is not ProfileDriver.CLAUDE_CODE:
-                raise RunOptionsError("reviser_profile must use claude-code")
-            if role is ExecutionRole.REPAIR and resolved.driver is not ProfileDriver.CODEX:
-                raise RunOptionsError("repair_profile must use codex")
 
     def to_dict(self) -> dict[str, Any]:
+        if self.schema_version == HISTORICAL_SCHEMA_VERSION:
+            return {
+                "schema_version": HISTORICAL_SCHEMA_VERSION,
+                "planning": {
+                    "protocol": self.protocol,
+                    "decomposition": self.decomposition,
+                    "execution_mode_policy": self.execution_mode_policy,
+                    "single_step_max_mutable_paths": self.single_step_max_mutable_paths,
+                    "staged_step_max_mutable_paths": self.staged_step_max_mutable_paths,
+                },
+                "pipeline": {
+                    "claude_revision_enabled": self.semantic_revision_enabled,
+                    "repair_cycles": self.repair_cycles,
+                    "repair_scope_policy": self.repair_scope_policy,
+                    "repair_scope_max_added_paths": self.repair_scope_max_added_paths,
+                },
+                "profiles": {
+                    "planner_profile": self.planner_profile,
+                    "default_implementer_profile": self.default_implementer_profile,
+                    "reviewer_profile": self.final_reviewer_profile,
+                    "reviser_profile": self.semantic_reviser_profile,
+                    "repair_profile": self.check_repair_profile,
+                },
+            }
         return {
-            "schema_version": self.schema_version,
+            "schema_version": SCHEMA_VERSION,
+            "pipeline_version": self.pipeline_version,
             "planning": {
                 "protocol": self.protocol,
                 "decomposition": self.decomposition,
@@ -220,17 +307,18 @@ class RunOptions:
                 "staged_step_max_mutable_paths": self.staged_step_max_mutable_paths,
             },
             "pipeline": {
-                "claude_revision_enabled": self.claude_revision_enabled,
-                "repair_cycles": self.repair_cycles,
+                "semantic_revision_enabled": self.semantic_revision_enabled,
+                "max_check_repair_attempts": self.max_check_repair_attempts,
+                "max_review_repair_cycles": self.max_review_repair_cycles,
                 "repair_scope_policy": self.repair_scope_policy,
                 "repair_scope_max_added_paths": self.repair_scope_max_added_paths,
             },
             "profiles": {
                 "planner_profile": self.planner_profile,
                 "default_implementer_profile": self.default_implementer_profile,
-                "reviewer_profile": self.reviewer_profile,
-                "reviser_profile": self.reviser_profile,
-                "repair_profile": self.repair_profile,
+                "check_repair_profile": self.check_repair_profile,
+                "semantic_reviser_profile": self.semantic_reviser_profile,
+                "final_reviewer_profile": self.final_reviewer_profile,
             },
         }
 
@@ -238,53 +326,101 @@ class RunOptions:
     def from_mapping(cls, value: Any) -> "RunOptions":
         if not isinstance(value, Mapping):
             raise RunOptionsError("run options must be a JSON object")
-        if set(value) != {"schema_version", "planning", "pipeline", "profiles"}:
+        if value.get("schema_version") == HISTORICAL_SCHEMA_VERSION:
+            if set(value) != {"schema_version", "planning", "pipeline", "profiles"}:
+                raise RunOptionsError("historical run options contains unknown or missing fields")
+            planning, pipeline, profiles = value["planning"], value["pipeline"], value["profiles"]
+            if not isinstance(planning, Mapping) or set(planning) != {
+                "protocol", "decomposition", "execution_mode_policy",
+                "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
+            }:
+                raise RunOptionsError("historical run options planning schema is invalid")
+            if (not isinstance(pipeline, Mapping)
+                    or not {"claude_revision_enabled", "repair_cycles"}.issubset(set(pipeline))
+                    or set(pipeline) - {"claude_revision_enabled", "repair_cycles",
+                                        "repair_scope_policy", "repair_scope_max_added_paths"}):
+                raise RunOptionsError("historical run options pipeline schema is invalid")
+            if not isinstance(profiles, Mapping) or set(profiles) != {
+                "planner_profile", "default_implementer_profile", "reviewer_profile",
+                "reviser_profile", "repair_profile",
+            }:
+                raise RunOptionsError("historical run options profiles schema is invalid")
+            try:
+                result = cls(
+                    schema_version=HISTORICAL_SCHEMA_VERSION,
+                    protocol=planning["protocol"],
+                    decomposition=planning["decomposition"],
+                    execution_mode_policy=planning["execution_mode_policy"],
+                    single_step_max_mutable_paths=planning["single_step_max_mutable_paths"],
+                    staged_step_max_mutable_paths=planning["staged_step_max_mutable_paths"],
+                    semantic_revision_enabled=pipeline["claude_revision_enabled"],
+                    max_review_repair_cycles=pipeline["repair_cycles"],
+                    planner_profile=profiles["planner_profile"],
+                    default_implementer_profile=profiles["default_implementer_profile"],
+                    final_reviewer_profile=profiles["reviewer_profile"],
+                    semantic_reviser_profile=profiles["reviser_profile"],
+                    check_repair_profile=profiles["repair_profile"],
+                    repair_scope_policy=pipeline.get("repair_scope_policy", "deny-expansion"),
+                    repair_scope_max_added_paths=pipeline.get("repair_scope_max_added_paths", 4),
+                )
+            except (KeyError, TypeError) as exc:
+                raise RunOptionsError("historical run options schema is invalid") from exc
+            if result.semantic_revision_enabled and result.semantic_reviser_profile is None:
+                raise RunOptionsError("semantic revision requires a semantic reviser profile")
+            if result.repair_cycles == 1 and result.check_repair_profile is None:
+                raise RunOptionsError("check repair requires a check-repair profile")
+            return result
+
+        if set(value) != {"schema_version", "pipeline_version", "planning", "pipeline", "profiles"}:
             raise RunOptionsError("run options contains unknown or missing fields")
-        planning = value["planning"]
-        pipeline = value["pipeline"]
-        profiles = value["profiles"]
+        planning, pipeline, profiles = value["planning"], value["pipeline"], value["profiles"]
         if not isinstance(planning, Mapping) or set(planning) != {
             "protocol", "decomposition", "execution_mode_policy",
             "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
         }:
             raise RunOptionsError("run options planning schema is invalid")
         if (not isinstance(pipeline, Mapping)
-                or not {"claude_revision_enabled", "repair_cycles"}.issubset(set(pipeline))
-                or set(pipeline) - {"claude_revision_enabled", "repair_cycles",
-                                    "repair_scope_policy", "repair_scope_max_added_paths"}):
+                or not {"semantic_revision_enabled", "max_check_repair_attempts",
+                        "max_review_repair_cycles"}.issubset(set(pipeline))
+                or set(pipeline) - {"semantic_revision_enabled", "max_check_repair_attempts",
+                                    "max_review_repair_cycles", "repair_scope_policy",
+                                    "repair_scope_max_added_paths"}):
             raise RunOptionsError("run options pipeline schema is invalid")
         if not isinstance(profiles, Mapping) or set(profiles) != {
-            "planner_profile", "default_implementer_profile", "reviewer_profile",
-            "reviser_profile", "repair_profile",
+            "planner_profile", "default_implementer_profile", "check_repair_profile",
+            "semantic_reviser_profile", "final_reviewer_profile",
         }:
             raise RunOptionsError("run options profiles schema is invalid")
         try:
             result = cls(
                 schema_version=value["schema_version"],
+                pipeline_version=value["pipeline_version"],
                 protocol=planning["protocol"],
                 decomposition=planning["decomposition"],
                 execution_mode_policy=planning["execution_mode_policy"],
                 single_step_max_mutable_paths=planning["single_step_max_mutable_paths"],
                 staged_step_max_mutable_paths=planning["staged_step_max_mutable_paths"],
-                claude_revision_enabled=pipeline["claude_revision_enabled"],
-                repair_cycles=pipeline["repair_cycles"],
+                semantic_revision_enabled=pipeline["semantic_revision_enabled"],
+                max_check_repair_attempts=pipeline["max_check_repair_attempts"],
+                max_review_repair_cycles=pipeline["max_review_repair_cycles"],
                 planner_profile=profiles["planner_profile"],
                 default_implementer_profile=profiles["default_implementer_profile"],
-                reviewer_profile=profiles["reviewer_profile"],
-                reviser_profile=profiles["reviser_profile"],
-                repair_profile=profiles["repair_profile"],
-                # Old snapshots intentionally retain the historical
-                # no-expansion behavior when resumed.
+                check_repair_profile=profiles["check_repair_profile"],
+                semantic_reviser_profile=profiles["semantic_reviser_profile"],
+                final_reviewer_profile=profiles["final_reviewer_profile"],
                 repair_scope_policy=pipeline.get("repair_scope_policy", "deny-expansion"),
                 repair_scope_max_added_paths=pipeline.get("repair_scope_max_added_paths", 4),
             )
-            if result.claude_revision_enabled and result.reviser_profile is None:
-                raise RunOptionsError("Claude revision requires a reviser profile")
-            if result.repair_cycles == 1 and result.repair_profile is None:
-                raise RunOptionsError("automatic repair requires a repair profile")
-            return result
-        except (KeyError, TypeError) as exc:  # pragma: no cover - guarded by exact keys above
+        except (KeyError, TypeError) as exc:
             raise RunOptionsError("run options schema is invalid") from exc
+        if result.semantic_revision_enabled and result.semantic_reviser_profile is None:
+            raise RunOptionsError("semantic revision requires a semantic reviser profile")
+        if (
+            result.max_check_repair_attempts > 0
+            or result.max_review_repair_cycles > 0
+        ) and result.check_repair_profile is None:
+            raise RunOptionsError("correction budget requires a check-repair profile")
+        return result
 
 
 def _json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -495,7 +631,7 @@ def legacy_or_durable_run_options_with_raw(
 def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessConfig:
     """Return an immutable per-run view without mutating the shared config."""
 
-    from .models import PlanningConfig, UIConfig
+    from .models import PlanningConfig, RevisionConfig, UIConfig
 
     options.validate_profiles(config)
     planning = PlanningConfig(
@@ -513,13 +649,18 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
         default_reviser_profile=options.reviser_profile,
         default_repair_profile=options.repair_profile,
     )
-    return replace(config, planning=planning, ui=ui)
+    revision = RevisionConfig(
+        enabled=options.semantic_revision_enabled,
+        max_check_repair_attempts=options.max_check_repair_attempts,
+        max_review_repair_cycles=options.max_review_repair_cycles,
+    )
+    return replace(config, planning=planning, ui=ui, revision=revision)
 
 
 __all__ = [
     "RUN_OPTIONS_NAME", "REPAIR_SCOPE_OVERRIDE_NAME", "REPAIR_SCOPE_OVERRIDE_REASON",
     "REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION", "REPAIR_SCOPE_MAX_ADDED_PATHS",
-    "SCHEMA_VERSION", "REPAIR_SCOPE_POLICIES", "RunOptions", "RunOptionsConflict",
+    "SCHEMA_VERSION", "HISTORICAL_SCHEMA_VERSION", "REPAIR_SCOPE_POLICIES", "RunOptions", "RunOptionsConflict",
     "RunOptionsError", "RepairScopeOverride", "EffectiveRepairScopePolicy",
     "canonical_run_options_bytes", "canonical_repair_scope_override_bytes",
     "effective_repair_scope_policy", "effective_run_config",
