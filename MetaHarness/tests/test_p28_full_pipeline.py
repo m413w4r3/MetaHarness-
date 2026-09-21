@@ -579,9 +579,9 @@ class FullPipelineTests(P28Harness):
         )
         self.assertEqual(archived["status"], "DEFERRED_CONTRACT_MISMATCH")
         self.assertNotIn("mismatch_retry_count", archived)
-        self.assertIn("<DEFERRED CONTRACT MISMATCHES>", claude.calls[0]["prompt"])
-        self.assertIn("S01", claude.calls[0]["prompt"])
-        self.assertIn("local contract is stale", claude.calls[0]["prompt"])
+        self.assertIn("<SPEC>", claude.calls[0]["prompt"])
+        self.assertNotIn("DEFERRED CONTRACT MISMATCHES", claude.calls[0]["prompt"])
+        self.assertNotIn("local contract is stale", claude.calls[0]["prompt"])
         self.assertIn("DEFERRED CONTRACT MISMATCHES", reviewer.prompts[0])
         self.assertIn("S01", reviewer.prompts[0])
 
@@ -625,6 +625,13 @@ class FullPipelineTests(P28Harness):
         self.assertNotIn("TRUNCATED: true", claude.calls[0]["prompt"])
         self.assertNotIn("1" * 10_000, claude.calls[0]["prompt"])
         self.assertNotIn("CLAUDE_DIFF_MUST_NOT_BE_PROMPTED", claude.calls[0]["prompt"])
+        for removed_section in (
+            "<PLANNER PLAN>",
+            "<PROJECT CONTEXT>",
+            "<PRE-REVISION CHECKS>",
+            "<DEFERRED CONTRACT MISMATCHES>",
+        ):
+            self.assertNotIn(removed_section, claude.calls[0]["prompt"])
         self.assertLess(len(claude.calls[0]["prompt"].encode("utf-8")), 100_000)
         self.assertIn("TRUNCATED: true", reviewer.prompts[0])
         self.assertNotIn("DIFF_TOO_LARGE", result.state["deterministic_gate"]["failures"])
@@ -720,11 +727,14 @@ class FullPipelineTests(P28Harness):
         self.assertNotIn("CLAUDE_DIFF_MUST_NOT_BE_PROMPTED", repair_prompt)
         self.assertIn("CHECK_FAILED:gate", repair_prompt)
         self.assertIn("src/a.py", repair_prompt)
+        self.assertNotIn("<SPEC>", repair_prompt)
+        self.assertNotIn("<PLAN SUMMARY>", repair_prompt)
+        self.assertNotIn("<APPROVED CONTRACT INDEX>", repair_prompt)
         self.assertIn(
             "CLAUDE_DIFF_MUST_NOT_BE_PROMPTED",
             (result.run_dir / "revision/diff.patch").read_text(),
         )
-        self.assertIn("<PREVIOUS REPAIR REPORT>\nNONE", repair_prompt)
+        self.assertNotIn("PREVIOUS REPAIR REPORT", repair_prompt)
         self.assertNotIn("Claude C01 revision report", repair_prompt)
 
     def test_bounded_scope_expands_for_a_tracked_failing_test(self) -> None:
@@ -823,8 +833,8 @@ class FullPipelineTests(P28Harness):
         self.assert_no_commit_no_push(result, pushed, run_id="check-repair-red")
         self.assertEqual([call["stage"] for call in claude.calls],
                          ["initial-revision", "check-repair", "check-repair"])
-        self.assertIn("<PREVIOUS REPAIR REPORT>", claude.calls[2]["prompt"])
-        self.assertIn("Claude C01 check-repair report", claude.calls[2]["prompt"])
+        self.assertNotIn("PREVIOUS REPAIR REPORT", claude.calls[2]["prompt"])
+        self.assertNotIn("Claude C01 check-repair report", claude.calls[2]["prompt"])
         # The second pass ran inside the exact scope the first one held.
         scope = json.loads(
             (result.run_dir / "revision/check-repair-expanded/C01/scope.json").read_text()

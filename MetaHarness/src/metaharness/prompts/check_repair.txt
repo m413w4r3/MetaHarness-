@@ -1,83 +1,28 @@
-You are performing one bounded deterministic-check repair.
+You are Claude Code correcting a deterministic check failure.
 
-The current worktree is the authoritative implementation state.
-Inspect source files directly with Read, Grep and Glob.
+Inspect the current worktree and correct only the reported problem in the
+listed files. Preserve correct behavior. Do not redesign the feature, broaden
+the scope, weaken a test, or edit generated/ignored artifacts to hide a
+failure.
 
-Correct only the listed deterministic failures.
-
-Do not redesign the feature.
-Do not broaden mutable scope.
-Preserve already-correct behavior.
-Do not weaken a valid test merely to obtain a green check.
-Do not modify generated or ignored artifacts to hide a failure.
-
-<SPEC>
-{{SPEC}}
-</SPEC>
-
-<PLAN SUMMARY>
-{{PLAN_SUMMARY}}
-</PLAN SUMMARY>
-
-<APPROVED CONTRACT INDEX>
-{{APPROVED_CONTRACT_INDEX}}
-</APPROVED CONTRACT INDEX>
-
-<FAILED CHECK IDS>
-{{FAILURE_IDS}}
-</FAILED CHECK IDS>
-
-<FAILED CHECK DETAILS>
+<PROBLEM>
 {{CHECK_DETAILS}}
-</FAILED CHECK DETAILS>
+</PROBLEM>
 
-<CURRENT CHANGED FILES>
+<FILES CONCERNED>
 {{CHANGED_FILES}}
-</CURRENT CHANGED FILES>
+</FILES CONCERNED>
 
 <EFFECTIVE MUTABLE SCOPE>
 {{MUTABLE_SCOPE}}
 </EFFECTIVE MUTABLE SCOPE>
 
-<SCOPE ADDITIONS>
-{{ADDED_PATHS}}
-</SCOPE ADDITIONS>
-
 {{SECOND_PASS_NOTE}}
 
-<PREVIOUS REPAIR REPORT>
-{{PREVIOUS_REPAIR_REPORT}}
-</PREVIOUS REPAIR REPORT>
-
-The previous repair report is advisory only.
-The current worktree is authoritative.
-
-Make only the smallest source/test changes necessary to resolve the listed deterministic failures.
-
-If a required correction needs any path outside EFFECTIVE MUTABLE SCOPE:
+If the correction needs a path outside EFFECTIVE MUTABLE SCOPE:
 
 - DO NOT EDIT that path;
-- DO NOT make a workaround in an authorized file;
-- finish without modifying outside-scope paths;
-- emit exactly this structured block in the final report:
-
-META SCOPE REQUEST v1
-
-REASON
-<bounded concrete explanation>
-
-PATHS
-- path/one
-- path/two
-
-EVIDENCE
-- CHECK_FAILED:<id> | concrete source/test evidence
-
-END META SCOPE REQUEST
-
-Only repository-relative POSIX paths.
-No glob.
-No directory.
-Maximum 32 paths.
-
-A scope request is not permission to edit those paths.
+- DO NOT create a workaround in an authorized path;
+- finish without changing outside-scope paths;
+- emit exactly the structured META SCOPE REQUEST v1 block required by the
+  harness, naming the paths and the failed-check evidence.

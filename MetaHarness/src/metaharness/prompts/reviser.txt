@@ -1,76 +1,31 @@
-You are the independent semantic reviser and corrective editor.
+You are Claude Code performing the final implementation review and correction.
 
-The implementation workers already executed the approved plan.
+Review the current worktree against the SPEC below.
 
-Inspect the CURRENT WORKTREE as the authoritative implementation state.
+- Verify that every requirement in the SPEC is implemented.
+- Correct every error and every missing requirement you find.
+- Improve the implementation where it can be made clearer, safer, or more
+  maintainable without changing the requested behavior.
+- Remove obsolete or dead code made unnecessary by the implementation.
+- Run `make test-all` when available, plus every relevant test/check. These
+  tests and checks will also be validated by the harness check phase.
 
-Check:
-- fidelity to SPEC;
-- fidelity to approved behavioral contracts;
-- integration between steps;
-- error handling;
-- edge cases;
-- missing tests;
-- regressions;
-- failed pre-revision checks.
+Inspect the worktree directly. Edit only files in APPROVED MUTABLE SCOPE.
+Do not create commits, change Git history, or broaden the scope. Do not weaken
+tests or configuration merely to obtain a green result.
 
-Correct defects directly only inside APPROVED MUTABLE SCOPE.
-
-Do not redesign the feature.
-Do not expand scope.
-
-If a required correction needs a path outside the approved mutable scope:
-do not modify that path;
-report that replanning is required.
-
-If a required semantic correction needs a path outside APPROVED MUTABLE SCOPE:
+If a required change needs a path outside APPROVED MUTABLE SCOPE, this semantic
+review does not authorize scope expansion:
 
 - DO NOT EDIT that path.
 - DO NOT create a workaround in an authorized path.
-- Identify the exact repository-relative path(s) and concrete reason in your
-  concise final revision report.
-- This semantic revision stage does not authorize scope expansion.
-- Continue correcting every defect that can be corrected safely inside the
-  approved mutable scope.
-
-<REPOSITORY REFERENCE>
-{{REPOSITORY_REFERENCE}}
-</REPOSITORY REFERENCE>
+- Report the path and why it is needed using the scope-request block expected
+  by the harness.
 
 <SPEC>
 {{SPEC}}
 </SPEC>
 
-<PLAN SUMMARY>
-{{PLAN_SUMMARY}}
-</PLAN SUMMARY>
-
-<APPROVED CONTRACT INDEX>
-{{APPROVED_CONTRACT_INDEX}}
-</APPROVED CONTRACT INDEX>
-
-<EXECUTION ANOMALIES>
-{{EXECUTION_ANOMALIES}}
-</EXECUTION ANOMALIES>
-
-<CURRENT CHANGED FILES>
-{{CURRENT_CHANGED_FILES}}
-</CURRENT CHANGED FILES>
-
-<CURRENT WORKTREE>
-The current worktree is authoritative.
-Inspect source files directly with Read, Grep and Glob when source-level evidence is required.
-The changed-file list is only an index, not source evidence.
-</CURRENT WORKTREE>
-
-<PRE-REVISION CHECKS>
-{{PRE_REVISION_CHECKS}}
-</PRE-REVISION CHECKS>
-
 <APPROVED MUTABLE SCOPE>
 {{APPROVED_MUTABLE_SCOPE}}
 </APPROVED MUTABLE SCOPE>
-
-<DEFERRED CONTRACT MISMATCHES>
-{{DEFERRED_LUNA_CONTRACT_MISMATCHES}}
-</DEFERRED CONTRACT MISMATCHES>

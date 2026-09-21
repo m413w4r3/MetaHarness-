@@ -348,7 +348,8 @@ class BoundedRetryTests(MismatchRetryHarness):
                          ("DEFERRED_CONTRACT_MISMATCH", step["tree_before"],
                           step["tree_before"], [], 1))
         self.assertIn("No in-scope change remained necessary after bounded retry", step["mismatch"])
-        self.assertIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
+        self.assertIn("<SPEC>", claude.calls[0]["prompt"])
+        self.assertNotIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
 
     def test_successful_no_change_twice_without_claude_is_unresolved(self) -> None:
         config = self.make_config(revision=False)
@@ -493,12 +494,14 @@ class BoundedRetryTests(MismatchRetryHarness):
         s04 = json.loads((result.run_dir / "steps/S04/step.json").read_text())
         self.assertEqual(s04["changed_paths"], ["src/future.py"])
 
-        # Claude and the reviewer both receive the deferred verify dependency.
+        # The reviewer receives the deferred verify dependency; Claude gets the
+        # compact SPEC-only revision request.
         self.assertEqual(len(claude.calls), 1)
         prompt = claude.calls[0]["prompt"]
-        self.assertIn("DEFERRED_VERIFY_DEPENDENCY", prompt)
+        self.assertIn("<SPEC>", prompt)
+        self.assertNotIn("DEFERRED_VERIFY_DEPENDENCY", prompt)
         self.assertIn("src/future.py", prompt)
-        self.assertIn("pytest tests/test_future.py", prompt)
+        self.assertNotIn("pytest tests/test_future.py", prompt)
         self.assertEqual(len(planner.prompts), 1)
         self.assertEqual(pushed.call_count, 1)
 
@@ -527,7 +530,8 @@ class BoundedRetryTests(MismatchRetryHarness):
         self.assertIn(MISMATCH_TEXT, step["initial_mismatch"])
         self.assertEqual([item["status"] for item in result.state["steps"]],
                          ["completed", "completed", "deferred", "completed"])
-        self.assertIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
+        self.assertIn("<SPEC>", claude.calls[0]["prompt"])
+        self.assertNotIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
         self.assertIn("DEFERRED CONTRACT MISMATCHES", reviewer.prompts[0])
         self.assertIn("S03", reviewer.prompts[0])
 
@@ -885,7 +889,8 @@ class PersistedRecoveryTests(MismatchRetryHarness):
         self.assertEqual(step["mismatch_retry_count"], 1)
         self.assertEqual(step["changed_paths"], ["src/c.py"])
         self.assertIn("src/future.py", step["deferred_verify"])
-        self.assertIn("DEFERRED_VERIFY_DEPENDENCY", claude.calls[0]["prompt"])
+        self.assertIn("<SPEC>", claude.calls[0]["prompt"])
+        self.assertNotIn("DEFERRED_VERIFY_DEPENDENCY", claude.calls[0]["prompt"])
         self.assertEqual(pushed.call_count, 1)
 
     def test_resume_defers_when_the_retry_mismatches_again(self) -> None:
@@ -906,7 +911,8 @@ class PersistedRecoveryTests(MismatchRetryHarness):
         step = json.loads((resumed.run_dir / "steps/S03/step.json").read_text())
         self.assertEqual(step["status"], "DEFERRED_CONTRACT_MISMATCH")
         self.assertEqual(step["mismatch_retry_count"], 1)
-        self.assertIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
+        self.assertIn("<SPEC>", claude.calls[0]["prompt"])
+        self.assertNotIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
         self.assertIn("S03", reviewer.prompts[0])
 
     def test_a_dirty_resume_retry_stops_without_a_third_attempt(self) -> None:
@@ -955,7 +961,8 @@ class PersistedRecoveryTests(MismatchRetryHarness):
         step = json.loads((resumed.run_dir / "steps/S03/step.json").read_text())
         self.assertEqual(step["status"], "DEFERRED_CONTRACT_MISMATCH")
         self.assertEqual(step["initial_mismatch"], "the first attempt mismatch")
-        self.assertIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
+        self.assertIn("<SPEC>", claude.calls[0]["prompt"])
+        self.assertNotIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
 
 
 class TransientRetryPersistenceTests(MismatchRetryHarness):
@@ -1182,7 +1189,8 @@ class DurableStepCrashTests(MismatchRetryHarness):
             (step["status"], step["mismatch_retry_count"]),
             ("DEFERRED_CONTRACT_MISMATCH", 1),
         )
-        self.assertIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
+        self.assertIn("<SPEC>", claude.calls[0]["prompt"])
+        self.assertNotIn("DEFERRED_CONTRACT_MISMATCH", claude.calls[0]["prompt"])
         self.assertEqual(pushed.call_count, 1)
 
     def test_a_completed_c02_step_is_not_replayed_after_a_crash(self) -> None:

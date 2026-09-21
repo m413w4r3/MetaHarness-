@@ -361,15 +361,8 @@ def _revision_prompt(
 ) -> str:
     template = (_PROMPTS_DIR / "reviser.txt").read_text(encoding="utf-8")
     values: dict[str, str] = {
-        "{{REPOSITORY_REFERENCE}}": json.dumps(repository_reference_dict(repository_reference), ensure_ascii=False, indent=2),
         "{{SPEC}}": spec,
-        "{{PLAN_SUMMARY}}": _revision_plan_summary(plan),
-        "{{APPROVED_CONTRACT_INDEX}}": _revision_contract_index(plan),
-        "{{EXECUTION_ANOMALIES}}": execution_anomalies,
-        "{{CURRENT_CHANGED_FILES}}": changed_files,
-        "{{PRE_REVISION_CHECKS}}": pre_checks,
         "{{APPROVED_MUTABLE_SCOPE}}": mutable_scope,
-        "{{DEFERRED_LUNA_CONTRACT_MISMATCHES}}": deferred_mismatches,
     }
     return _render_revision_template(template, values, name="reviser")
 

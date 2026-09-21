@@ -17,8 +17,6 @@ from typing import (
 )
 from .revision import (
     _render_revision_template,
-    _revision_check_context,
-    _revision_plan_summary,
 )
 from .shared import (
     CheckRepairScope,
@@ -257,6 +255,43 @@ def _hard_failure_items(failures: Any) -> list[str]:
     ]
 
 
+_CHECK_REPAIR_LOG_BYTES = 4 * 1024
+
+
+def _check_repair_problem_context(evidence: EvidenceBundle) -> str:
+    """Render only the failed checks for Claude's corrective prompt."""
+
+    failures = _soft_check_failures(evidence)
+    failed_names = {
+        item.split(":", 1)[1]
+        for item in failures
+        if ":" in item
+    }
+    failed_checks: list[dict[str, Any]] = []
+    for raw_check in _check_payload(evidence):
+        if not isinstance(raw_check, Mapping):
+            continue
+        name = raw_check.get("name")
+        if name not in failed_names:
+            continue
+        check: dict[str, Any] = {
+            "name": name,
+            "exit_code": raw_check.get("exit_code"),
+            "timed_out": bool(raw_check.get("timed_out", False)),
+            "workspace_mutated": bool(raw_check.get("workspace_mutated", False)),
+        }
+        for key in ("stdout_tail", "stderr_tail"):
+            value = raw_check.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            data = value.encode("utf-8", errors="replace")
+            if len(data) > _CHECK_REPAIR_LOG_BYTES:
+                data = data[-_CHECK_REPAIR_LOG_BYTES:]
+            check[key] = data.decode("utf-8", errors="replace")
+        failed_checks.append(check)
+    return _json_text({"failure_ids": failures, "checks": failed_checks})
+
+
 def _check_repair_prompt(
     *,
     spec: str,
@@ -271,24 +306,12 @@ def _check_repair_prompt(
 ) -> str:
     """Build the bounded prompt for one automatic check-repair pass."""
 
-    failed_ids = _soft_check_failures(evidence)
-    check_payload = {
-        "deterministic_passed": evidence.deterministic_passed,
-        "failures": list(evidence.failures),
-        "checks": _check_payload(evidence),
-    }
     values = {
-        "{{SPEC}}": spec,
-        "{{PLAN_SUMMARY}}": _revision_plan_summary(plan),
-        "{{APPROVED_CONTRACT_INDEX}}": approved_contract_index,
-        "{{FAILURE_IDS}}": _json_text(failed_ids),
-        "{{CHECK_DETAILS}}": _revision_check_context(check_payload),
+        "{{CHECK_DETAILS}}": _check_repair_problem_context(evidence),
         "{{CHANGED_FILES}}": changed_files,
         "{{MUTABLE_SCOPE}}": _json_text(mutable_scope),
-        "{{ADDED_PATHS}}": _json_text(list(added_paths) or ["NONE"]),
         "{{SECOND_PASS_NOTE}}": _SAME_SCOPE_RETRY_NOTE
         if scope_source == _SAME_SCOPE_RETRY_SOURCE else "",
-        "{{PREVIOUS_REPAIR_REPORT}}": previous_report or "NONE\n",
     }
     template = (_PROMPTS_DIR / "check_repair.txt").read_text(
         encoding="utf-8"
