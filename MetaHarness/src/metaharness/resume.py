@@ -171,6 +171,10 @@ class ResumeCheckpoint:
     # only binding between a resumed C02 phase and the repair plan it runs.
     repair_bundle_sha256: str | None = None
     scope_delta_sha256: str | None = None
+    # Durable ordinal of the direct check-repair worker attempt.  Historical
+    # checkpoints leave it absent; new v2 checkpoints use it for both the
+    # worker boundary and the checks-after-repair boundary.
+    check_repair_attempt: int | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -219,6 +223,21 @@ class ResumeCheckpoint:
             or _SHA256.fullmatch(self.scope_delta_sha256) is None
         ):
             raise ResumeCheckpointError("checkpoint scope_delta_sha256 is invalid")
+        if self.check_repair_attempt is not None and (
+            isinstance(self.check_repair_attempt, bool)
+            or not isinstance(self.check_repair_attempt, int)
+            or self.check_repair_attempt < 1
+        ):
+            raise ResumeCheckpointError("checkpoint check_repair_attempt is invalid")
+        if self.check_repair_attempt is not None and phase not in {
+            ResumePhase.CHECK_REPAIR_C01,
+            ResumePhase.FINAL_CHECKS_RETRY_C01,
+            ResumePhase.CHECK_REPAIR_C02,
+            ResumePhase.FINAL_CHECKS_RETRY_C02,
+        }:
+            raise ResumeCheckpointError(
+                "checkpoint check_repair_attempt is only valid for direct check repair"
+            )
         if self.cycle == 2 and phase not in {
             ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL,
             ResumePhase.REPAIR_STEP, ResumePhase.CHECK_SCOPE_PLANNER_C02,
@@ -268,6 +287,7 @@ def checkpoint_payload(checkpoint: ResumeCheckpoint, *, status: str = "pending")
         "plan_identity": _identity_payload(checkpoint.plan_identity) if checkpoint.plan_identity else None,
         "repair_bundle_sha256": checkpoint.repair_bundle_sha256,
         "scope_delta_sha256": checkpoint.scope_delta_sha256,
+        "check_repair_attempt": checkpoint.check_repair_attempt,
     }
 
 
@@ -301,6 +321,7 @@ def _parse(payload: Any) -> tuple[ResumeCheckpoint, str]:
         ),
         repair_bundle_sha256=payload.get("repair_bundle_sha256"),
         scope_delta_sha256=payload.get("scope_delta_sha256"),
+        check_repair_attempt=payload.get("check_repair_attempt"),
     )
     return checkpoint, status
 
@@ -368,6 +389,12 @@ RESUMABLE_FAILURES: Mapping[str, frozenset[ResumePhase]] = {
     "CODEX_AUTH_FAILURE": _CODEX_PHASES,
     "AGENT_TIMEOUT": _CODEX_PHASES,
     "AGENT_FAILED": _CODEX_PHASES,
+    # V2 uses backend-neutral infrastructure reasons.  A runtime/start/
+    # protocol failure is retryable at the exact worker boundary; it is not a
+    # deterministic check failure and must never be consumed by check-repair.
+    "AGENT_RUNTIME_FAILED": _CLAUDE_PHASES | _CODEX_PHASES,
+    "AGENT_START_FAILED": _CLAUDE_PHASES | _CODEX_PHASES,
+    "AGENT_PROTOCOL_FAILED": _CLAUDE_PHASES | _CODEX_PHASES,
     "REVIEWER_TRANSPORT_FAILURE": _REVIEWER_PHASES,
     "LLM_FAILURE": frozenset({
         ResumePhase.REPAIR_PLANNER,
@@ -464,9 +491,17 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
     if phase in {ResumePhase.CHECKS_C01, ResumePhase.FINAL_CHECKS_C01}:
         return "Retry checks C01"
     if phase is ResumePhase.CHECK_REPAIR_C01:
-        return "Repair failed checks C01"
+        return (
+            f"Repair failed checks C01 attempt {checkpoint.check_repair_attempt}"
+            if checkpoint.check_repair_attempt is not None
+            else "Repair failed checks C01"
+        )
     if phase is ResumePhase.FINAL_CHECKS_RETRY_C01:
-        return "Retry final checks C01"
+        return (
+            f"Run checks after repair C01 attempt {checkpoint.check_repair_attempt}"
+            if checkpoint.check_repair_attempt is not None
+            else "Retry final checks C01"
+        )
     if phase is ResumePhase.CHECK_REPAIR_EXPANDED_C01:
         return "Repair checks with expanded test scope C01"
     if phase is ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01:
@@ -494,9 +529,17 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
     if phase is ResumePhase.CLAUDE_C02:
         return "Reprendre à partir de Claude C02"
     if phase is ResumePhase.CHECK_REPAIR_C02:
-        return "Repair failed checks C02"
+        return (
+            f"Repair failed checks C02 attempt {checkpoint.check_repair_attempt}"
+            if checkpoint.check_repair_attempt is not None
+            else "Repair failed checks C02"
+        )
     if phase is ResumePhase.FINAL_CHECKS_RETRY_C02:
-        return "Retry final checks C02"
+        return (
+            f"Run checks after repair C02 attempt {checkpoint.check_repair_attempt}"
+            if checkpoint.check_repair_attempt is not None
+            else "Retry final checks C02"
+        )
     if phase is ResumePhase.CHECK_REPAIR_EXPANDED_C02:
         return "Repair checks with expanded test scope C02"
     if phase is ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02:

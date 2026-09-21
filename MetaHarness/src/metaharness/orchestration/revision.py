@@ -517,6 +517,7 @@ class RevisionRunner:
         check_repair_scope: CheckRepairScope | None = None,
         check_repair_phase_override: ResumePhase | None = None,
         check_repair_next_phase_override: ResumePhase | None = None,
+        check_repair_attempt: int | None = None,
     ) -> tuple[Any | None, str | None]:
         """Run one Claude pre-check/revision/scope cycle.
 
@@ -583,6 +584,7 @@ class RevisionRunner:
             )
             self.checkpoint(
                 run_dir, repair_phase, cycle=cycle, head=expected_head, tree=tree_before,
+                check_repair_attempt=check_repair_attempt,
             )
             pre_payload = {
                 "checks": _check_payload(check_repair_evidence),
@@ -651,6 +653,7 @@ class RevisionRunner:
                 previous_report=previous_report,
                 added_paths=(check_repair_scope.added_paths if check_repair_scope else ()),
                 scope_source=(check_repair_scope.source if check_repair_scope else ""),
+                legacy=self.legacy_failure_names,
             )
         else:
             revision_prompt = _revision_prompt(
@@ -868,5 +871,6 @@ class RevisionRunner:
         )
         self.checkpoint(
             run_dir, next_revision_phase, cycle=cycle, head=expected_head, tree=tree_after,
+            check_repair_attempt=check_repair_attempt,
         )
         return result, None

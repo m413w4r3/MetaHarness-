@@ -45,6 +45,31 @@ from ..run_options import EffectiveRepairScopePolicy
 from ..validation import check_result_json
 
 
+@dataclasses.dataclass(frozen=True)
+class CheckRepairAttempt:
+    """Durable summary of one deterministic check-repair worker attempt."""
+
+    number: int
+    failed_check_ids_before: tuple[str, ...]
+    tree_before: str
+    tree_after: str
+    mutable_scope: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class CheckRepairResult:
+    """The result of the direct CHECK FAIL -> REPAIR -> CHECK loop."""
+
+    status: str
+    attempts: tuple[CheckRepairAttempt, ...]
+
+    def __post_init__(self) -> None:
+        if self.status not in {
+            "passed", "exhausted", "scope-required", "agent-failed", "integrity-failed",
+        }:
+            raise ValueError("unknown check-repair result status")
+
+
 # Gate failures for which a semantic review is pointless or unsafe: the
 # candidate is empty, unreviewable, not the agent's output, or leaks a secret.
 _DIRECT_FAILURES = frozenset(
@@ -60,6 +85,42 @@ _DIRECT_FAILURES = frozenset(
 
 
 _LEGACY_DIRECT_FAILURES = _DIRECT_FAILURES | frozenset({DIFF_TOO_LARGE})
+
+# These names are deliberately broader than the historical evidence enum.
+# Evidence produced by a newer check runner must never become a repair task
+# merely because this module has not learned its exact spelling yet.
+_HARD_FAILURE_CODES = frozenset(
+    {
+        "UNEXPECTED_HEAD",
+        "UNEXPECTED_TREE",
+        "TREE_MISMATCH",
+        "INTEGRITY_MISMATCH",
+        "INTEGRITY_FAILURE",
+        "DURABLE_ARTIFACT_CORRUPTED",
+        "CORRUPTED_DURABLE_ARTIFACT",
+        "RESUME_INTEGRITY_FAILURE",
+        "SECRET_SECURITY_VIOLATION",
+        "SECURITY_VIOLATION",
+        "AGENT_INFRASTRUCTURE_FAILURE",
+        "AGENT_START_FAILED",
+        "AGENT_RUNTIME_FAILED",
+        "AGENT_PROTOCOL_FAILED",
+        "AGENT_SCOPE_VIOLATION",
+        "AGENT_GIT_VIOLATION",
+    }
+)
+_HARD_FAILURE_PREFIXES = (
+    "UNEXPECTED_HEAD:",
+    "UNEXPECTED_TREE:",
+    "TREE_MISMATCH:",
+    "INTEGRITY_MISMATCH:",
+    "DURABLE_ARTIFACT_CORRUPTED:",
+    "CORRUPTED_DURABLE_ARTIFACT:",
+    "RESUME_INTEGRITY_FAILURE:",
+    "CHECK_MUTATED_FORBIDDEN_FILES:",
+    "SECRET_SECURITY_VIOLATION:",
+    "SECURITY_VIOLATION:",
+)
 
 
 def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
@@ -249,10 +310,13 @@ def _check_repair_scope_candidates(
 def _hard_failure_items(failures: Any) -> list[str]:
     return [
         item for item in failures
+        if isinstance(item, str)
         if item in _DIRECT_FAILURES
+        or item in _HARD_FAILURE_CODES
         or any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES)
         or item.startswith("CHECK_MUTATED:")
         or item.startswith("CHECK_TIMEOUT:")
+        or any(item.startswith(prefix) for prefix in _HARD_FAILURE_PREFIXES)
     ]
 
 
@@ -304,44 +368,56 @@ def _check_repair_prompt(
     previous_report: str,
     added_paths: Sequence[str] = (),
     scope_source: str = "",
+    legacy: bool = False,
 ) -> str:
     """Build the bounded prompt for one automatic check-repair pass."""
 
+    if legacy:
+        note = (
+            "This is the second and final bounded automatic check-repair pass.\n\n"
+            "No mutable-scope expansion was required.\n\n"
+            "Correct the remaining deterministic failures inside the exact existing\n"
+            "mutable scope.\n\n"
+            "Do not repeat unrelated changes from the previous repair.\n"
+            if scope_source == _SAME_SCOPE_RETRY_SOURCE else ""
+        )
+        return "\n".join([
+            "You are Claude Code correcting a deterministic check failure.", "",
+            "Inspect the current worktree and correct only the reported problem in the",
+            "listed files. Preserve correct behavior. Do not redesign the feature, broaden",
+            "the scope, weaken a test, or edit generated/ignored artifacts to hide a",
+            "failure.", "", "<PROBLEM>", _check_repair_problem_context(evidence),
+            "</PROBLEM>", "", "<FILES CONCERNED>", changed_files,
+            "</FILES CONCERNED>", "", "<EFFECTIVE MUTABLE SCOPE>",
+            _json_text(mutable_scope), "</EFFECTIVE MUTABLE SCOPE>", "", note,
+            "", "If the correction needs a path outside EFFECTIVE MUTABLE SCOPE:",
+            "", "- DO NOT EDIT that path;",
+            "- DO NOT create a workaround in an authorized path;",
+            "- finish without changing outside-scope paths;",
+            "- emit exactly the structured META SCOPE REQUEST v1 block required by the",
+            "  harness, naming the paths and the failed-check evidence.", "",
+        ])
+
     values = {
+        "{{SPEC}}": spec,
         "{{CHECK_DETAILS}}": _check_repair_problem_context(evidence),
         "{{CHANGED_FILES}}": changed_files,
         "{{MUTABLE_SCOPE}}": _json_text(mutable_scope),
-        "{{SECOND_PASS_NOTE}}": _SAME_SCOPE_RETRY_NOTE
-        if scope_source == _SAME_SCOPE_RETRY_SOURCE else "",
+        "{{CONTRACT_INVARIANTS}}": approved_contract_index,
     }
     template = (_PROMPTS_DIR / "check_repair.txt").read_text(
         encoding="utf-8"
     )
     return _render_revision_template(template, values, name="check_repair")
 
-
-_SAME_SCOPE_RETRY_NOTE = """
-This is the second and final bounded automatic check-repair pass.
-
-No mutable-scope expansion was required.
-
-Correct the remaining deterministic failures inside the exact existing
-mutable scope.
-
-Do not repeat unrelated changes from the previous repair.
-"""
-
-
-# The two provenances a *second* bounded check-repair scope may carry.  They
-# are durable artifact values: never rename them, a stored run depends on the
-# exact string.
 _AUTO_BOUNDED_SOURCE = "auto-bounded failing-test evidence"
 
 
+# Kept as a read-only compatibility set for historical scope artifacts.  New
+# attempts never use a special retry provenance; their scope is evaluated
+# independently from the configured attempt budget.
 _SAME_SCOPE_RETRY_SOURCE = "bounded same-scope retry"
-
-
-_SECOND_SCOPE_SOURCES = frozenset({_AUTO_BOUNDED_SOURCE, _SAME_SCOPE_RETRY_SOURCE})
+_SECOND_SCOPE_SOURCES = frozenset({_AUTO_BOUNDED_SOURCE, "bounded same-scope retry"})
 
 
 def _check_repair_scope_payload(scope: CheckRepairScope) -> dict[str, Any]:

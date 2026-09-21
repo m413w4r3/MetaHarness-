@@ -69,6 +69,7 @@ from .models import (
     StepExecutionSelection,
 )
 from .orchestrator import Orchestrator, run_orchestrator
+from .orchestration.check_repair import CheckRepairAttempt, CheckRepairResult
 from .review import Reviewer, ReviewParseError, ReviewResult, parse_review
 from .result import RunResult
 from .run_options import (
@@ -100,6 +101,8 @@ __all__ = [
     "ClaudeRuntimeError",
     "CodexRuntimeConfig",
     "CheckResult",
+    "CheckRepairAttempt",
+    "CheckRepairResult",
     "CodexAgent",
     "CodexAuthStatus",
     "ConfigError",

@@ -330,13 +330,14 @@ from .orchestration.revision import (  # noqa: F401  (facade re-exports)
     _step_reports_text,
 )
 from .orchestration.check_repair import (  # noqa: F401  (facade re-exports)
+    CheckRepairAttempt,
     CheckRepairCoordinator,
+    CheckRepairResult,
     _AUTO_BOUNDED_SOURCE,
     _CHECK_SCOPE_PATH_RE,
     _DIRECT_FAILURES,
     _LEGACY_DIRECT_FAILURES,
     _MAX_CHECK_SCOPE_LOG_BYTES,
-    _SAME_SCOPE_RETRY_NOTE,
     _SAME_SCOPE_RETRY_SOURCE,
     _SECOND_SCOPE_SOURCES,
     _check_repair_prompt,
@@ -2054,6 +2055,7 @@ class Orchestrator:
         cycle: int | None = None,
         repair_bundle_sha256: str | None = None,
         scope_delta_sha256: str | None = None,
+        check_repair_attempt: int | None = None,
     ) -> None:
         """Write a new-schema boundary without changing the old hook API."""
 
@@ -2079,6 +2081,7 @@ class Orchestrator:
                 step_id, head, tree, execution, identity,
                 repair_bundle_sha256 or previous.repair_bundle_sha256,
                 scope_delta_sha256 or previous.scope_delta_sha256,
+                check_repair_attempt,
             ),
         )
 
@@ -2093,6 +2096,7 @@ class Orchestrator:
         step_id: str | None = None,
         repair_bundle_sha256: str | None = None,
         scope_delta_sha256: str | None = None,
+        check_repair_attempt: int | None = None,
     ) -> None:
         """Persist the next operation that has not yet succeeded.
 
@@ -2135,6 +2139,7 @@ class Orchestrator:
             phase, cycle, step_id, head, tree,
             previous.execution_selection_sha256, previous.plan_identity, repair,
             scope_delta,
+            check_repair_attempt,
         ))
 
     def _execute_v2(
@@ -2373,7 +2378,7 @@ class Orchestrator:
         # may legitimately have produced no evidence at all.  The checkpoint,
         # never ``state.failure``, decides; the bridge below owns the phase.
         retry_bridge_c01 = (
-            revision_enabled and resumed is not None
+            self._legacy_run_options and revision_enabled and resumed is not None
             and phase is ResumePhase.FINAL_CHECKS_RETRY_C01
         )
         if at <= phase_index(ResumePhase.FINAL_CHECKS_C01):
@@ -2426,7 +2431,10 @@ class Orchestrator:
             # is allowed to carry no current bundle, because its retry checks
             # are exactly the operation that has not succeeded yet.  Every
             # later phase keeps the existing mandatory-evidence validation.
-            if evidence is None and not retry_bridge_c01:
+            if evidence is None and not retry_bridge_c01 and not (
+                not self._legacy_run_options
+                and phase is ResumePhase.FINAL_CHECKS_RETRY_C01
+            ):
                 raise ResumeIntegrityError("C01 candidate evidence is missing")
 
         soft_failures_c01 = (
@@ -2437,7 +2445,60 @@ class Orchestrator:
             path for step in plan.steps
             for path in (*step.write_set, *step.create_set, *step.delete_set)
         })
+        if not self._legacy_run_options and evidence is not None:
+            direct_result_c01, evidence = self._run_direct_check_repair_loop(
+                store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                base_tree_sha=base_tree_sha, spec=spec, plan=plan,
+                repository_reference=repository_reference, info=info,
+                branch_ref=branch_ref, ownership_before=ownership_before,
+                selection=selection, cycle=1, evidence=evidence,
+                base_scope=base_repair_scope_c01,
+                required_check_ids=plan.required_checks or None,
+                expected_head_sha=base_sha, resumed=resumed,
+            )
+            check_repair_result_c01 = direct_result_c01
+            self._cycle_update(
+                store, 1, status="check_repair_completed",
+                automatic_check_repair=self._check_repair_attempt_state(direct_result_c01),
+            )
+            if direct_result_c01.status == "integrity-failed":
+                failures = _hard_integrity_failures(evidence)
+                return self._v2_failed(
+                    store, run_dir,
+                    failures[0].split(":", 1)[0] if failures else "INTEGRITY_FAILED",
+                    None, ", ".join(failures or evidence.failures),
+                )
+            if direct_result_c01.status == "scope-required":
+                self._v2_failed(store, run_dir, "REVISION_SCOPE_VIOLATION", None)
+                return self.resume(run_id)
+            if direct_result_c01.status == "agent-failed":
+                return self._v2_failed(
+                    store, run_dir, AGENT_RUNTIME_FAILED, None,
+                    "check-repair worker failed",
+                )
+            if direct_result_c01.status == "exhausted":
+                remaining = [
+                    item.split(":", 1)[1]
+                    for item in _soft_check_failures(evidence) if ":" in item
+                ]
+                return self._v2_failed(
+                    store, run_dir, "CHECK_REPAIR_EXHAUSTED", None,
+                    _json_text({
+                        "remaining_failed_check_ids": remaining,
+                        "attempts": len(direct_result_c01.attempts),
+                        "repair_profile_id": (
+                            getattr(selection, "check_repair", None)
+                            or getattr(selection, "repair_implementer", None)
+                        ).profile_id
+                        if (
+                            getattr(selection, "check_repair", None)
+                            or getattr(selection, "repair_implementer", None)
+                        ) is not None else None,
+                    }),
+                )
         if (
+            self._legacy_run_options
+            and
             not retry_bridge_c01
             and at < phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01)
             and evidence is not None and not evidence.deterministic_passed
@@ -2857,7 +2918,7 @@ class Orchestrator:
                 )} if expanded_check_repair_result_c01 is not None else {}),
             })
 
-        if at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01) and at <= phase_index(
+        if self._legacy_run_options and at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C01) and at <= phase_index(
             ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01
         ):
             expanded_dir = run_dir / "revision" / "check-repair-expanded" / "C01"
@@ -3913,7 +3974,7 @@ class Orchestrator:
             else self._last_v2_step_results
         )
 
-    def _revision_runner(self) -> RevisionRunner:
+    def _revision_runner(self, *, legacy_failure_names: bool | None = None) -> RevisionRunner:
         """Build the revision runner with this run's live dependencies."""
 
         return RevisionRunner(
@@ -3932,13 +3993,492 @@ class Orchestrator:
             soft_check_failures=_soft_check_failures,
             check_repair_scope_candidates=_check_repair_scope_candidates,
             check_repair_prompt=_check_repair_prompt,
-            legacy_failure_names=self._legacy_backend_injection,
+            legacy_failure_names=(
+                self._legacy_backend_injection
+                if legacy_failure_names is None else legacy_failure_names
+            ),
         )
 
     def _run_v2_revision_cycle(self, **cycle: Any) -> tuple[Any | None, str | None]:
         """Run one Claude revision cycle -- see ``RevisionRunner.run``."""
+        legacy_failure_names = cycle.pop("_legacy_failure_names", None)
+        return self._revision_runner(legacy_failure_names=legacy_failure_names).run(**cycle)
 
-        return self._revision_runner().run(**cycle)
+    @staticmethod
+    def _check_repair_attempt_root(run_dir: Path, cycle: int, number: int) -> Path:
+        return (
+            run_dir / "revision" / "check-repair" / f"C0{cycle}"
+            / "attempts" / f"{number:02d}"
+        )
+
+    @staticmethod
+    def _check_repair_attempt_records(
+        run_dir: Path, cycle: int,
+    ) -> tuple[CheckRepairAttempt, ...]:
+        root = run_dir / "revision" / "check-repair" / f"C0{cycle}" / "attempts"
+        records: list[CheckRepairAttempt] = []
+        if not root.is_dir():
+            return ()
+        for directory in sorted(root.iterdir(), key=lambda path: path.name):
+            if not directory.is_dir() or not directory.name.isdigit():
+                continue
+            record_path = directory / "attempt.json"
+            if not record_path.is_file():
+                # A worker can be interrupted after its prompt was persisted
+                # but before the successful attempt record.  That boundary is
+                # retryable; a present but malformed record is not.
+                continue
+            payload = _read_json_artifact(record_path, 128 * 1024)
+            if not isinstance(payload, dict):
+                raise ResumeIntegrityError("check-repair attempt record is malformed")
+            number = payload.get("number")
+            failed = payload.get("failed_check_ids_before")
+            scope = payload.get("mutable_scope")
+            before, after = payload.get("tree_before"), payload.get("tree_after")
+            if (
+                isinstance(number, bool) or not isinstance(number, int) or number < 1
+                or number != int(directory.name)
+                or not isinstance(failed, list) or any(not isinstance(item, str) for item in failed)
+                or not isinstance(scope, list) or any(not isinstance(item, str) for item in scope)
+                or not _is_object_id(before) or not _is_object_id(after)
+            ):
+                raise ResumeIntegrityError("check-repair attempt record is invalid")
+            records.append(CheckRepairAttempt(
+                number=number,
+                failed_check_ids_before=tuple(failed),
+                tree_before=before,
+                tree_after=after,
+                mutable_scope=tuple(scope),
+            ))
+        records.sort(key=lambda item: item.number)
+        if any(item.number != index for index, item in enumerate(records, start=1)):
+            raise ResumeIntegrityError("check-repair attempt records are not contiguous")
+        return tuple(records)
+
+    def _read_durable_check_repair_scope(
+        self, run_dir: Path, cycle: int, number: int, base_scope: Sequence[str],
+    ) -> CheckRepairScope:
+        return _read_check_repair_scope(
+            self._check_repair_attempt_root(run_dir, cycle, number),
+            fallback_base=base_scope,
+            policy_config=self._effective_repair_scope,
+            allowed_added_sources=frozenset({_AUTO_BOUNDED_SOURCE}),
+        )
+
+    def _check_repair_scope_union(
+        self, run_dir: Path, cycle: int, base_scope: Sequence[str],
+    ) -> list[str]:
+        records = self._check_repair_attempt_records(run_dir, cycle)
+        paths = set(base_scope)
+        for record in records:
+            scope = self._read_durable_check_repair_scope(
+                run_dir, cycle, record.number, base_scope,
+            )
+            paths.update(scope.effective_paths)
+        return sorted(paths)
+
+    @staticmethod
+    def _check_repair_chain_tree(
+        run_dir: Path, cycle: int, initial_tree: str,
+        checkpoint: ResumeCheckpoint,
+    ) -> str:
+        records = Orchestrator._check_repair_attempt_records(run_dir, cycle)
+        if checkpoint.check_repair_attempt is None:
+            completed = len(records)
+        elif checkpoint.phase in {
+            ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_C02,
+        }:
+            completed = checkpoint.check_repair_attempt - 1
+        else:
+            completed = checkpoint.check_repair_attempt
+        expected = initial_tree
+        for number in range(1, completed + 1):
+            record = next((item for item in records if item.number == number), None)
+            if record is None or record.tree_before != expected:
+                raise ResumeIntegrityError(
+                    f"C0{cycle} check-repair attempt chain is incomplete"
+                )
+            expected = record.tree_after
+        return expected
+
+    @staticmethod
+    def _check_repair_attempt_state(result: CheckRepairResult) -> dict[str, Any]:
+        return {
+            "status": result.status,
+            "attempt_count": len(result.attempts),
+            "attempts": [asdict(item) for item in result.attempts],
+        }
+
+    def _write_check_repair_attempt_alias(
+        self, run_dir: Path, cycle: int, attempt_dir: Path,
+    ) -> None:
+        """Publish compact latest-attempt metadata for old readers.
+
+        Complete agent logs stay in ``attempts/NN``.  Only bounded metadata is
+        mirrored at the historical cycle root so old resume/diagnostic readers
+        can still inspect a run without duplicating large logs.
+        """
+
+        root = attempt_dir.parent.parent
+        for name in ("report.json", "scope.json", "tree_before.txt", "tree_after.txt"):
+            source = attempt_dir / name
+            if not source.is_file():
+                continue
+            if name.endswith(".txt"):
+                value = _read_bounded_text(source, 4096)
+                atomic_write_text(root / name, value)
+            else:
+                payload = _read_json_artifact(source, 1024 * 1024)
+                if payload is not None:
+                    atomic_write_text(root / name, _json_text(payload))
+
+    def _check_repair_scope_for_attempt(
+        self, *, repo: Path, worktree: Path, run_dir: Path,
+        evidence: EvidenceBundle, base_scope: Sequence[str],
+        previous_scope: CheckRepairScope | None,
+    ) -> CheckRepairScope:
+        """Resolve scope for this attempt independently of retry budget."""
+
+        policy = self._effective_repair_scope
+        if previous_scope is None:
+            return self._resolve_check_repair_scope(
+                repo=repo, worktree=worktree, tree_sha=evidence.staged_tree_sha,
+                run_dir=run_dir, evidence=evidence, base_mutable_scope=base_scope,
+            )
+        base_paths = tuple(sorted(set(previous_scope.base_paths)))
+        added = set(previous_scope.added_paths)
+        if policy.policy == "auto-bounded":
+            candidates = _check_repair_scope_candidates(
+                repo=repo, worktree=worktree, tree_sha=evidence.staged_tree_sha,
+                run_dir=run_dir, evidence=evidence,
+                base_mutable_scope=previous_scope.effective_paths,
+            )
+            proposed = added | set(candidates)
+            if len(proposed) <= policy.max_added_paths:
+                added = proposed
+        effective = tuple(sorted(set(base_paths) | added))
+        return CheckRepairScope(
+            base_paths=base_paths,
+            added_paths=tuple(sorted(added)),
+            effective_paths=effective,
+            policy=policy.policy,
+            bound=policy.max_added_paths,
+            source=(
+                _AUTO_BOUNDED_SOURCE
+                if added else "human-approved mutable scope"
+            ),
+        )
+
+    def _run_direct_check_repair_loop(
+        self, *, store: RunStateStore, run_dir: Path, repo: Path,
+        base_sha: str, base_tree_sha: str, spec: str, plan: TaskPlanV2,
+        repository_reference: RepositoryReference, info: WorktreeInfo,
+        branch_ref: str, ownership_before: GitOwnership,
+        selection: ExecutionSelectionV4 | ExecutionSelectionV5,
+        cycle: int, evidence: EvidenceBundle, base_scope: Sequence[str],
+        required_check_ids: Sequence[str] | None,
+        expected_head_sha: str, resumed: _ResumedRun | None = None,
+    ) -> tuple[CheckRepairResult, EvidenceBundle]:
+        """Run the sole v2 mechanical correction policy.
+
+        A successful worker is followed by exactly one authoritative check
+        run.  A red result consumes no scope authority; it only advances the
+        durable attempt ordinal until the configured budget is exhausted.
+        """
+
+        check_dir = run_dir / "checks" / f"C0{cycle}"
+        repair_root = run_dir / "revision" / "check-repair" / f"C0{cycle}"
+        repair_root.mkdir(parents=True, exist_ok=True)
+        max_attempts = self._run_options.max_check_repair_attempts
+        records = list(self._check_repair_attempt_records(run_dir, cycle))
+        checkpoint = resumed.checkpoint if resumed is not None else None
+        direct_phases = {
+            ResumePhase.CHECK_REPAIR_C01, ResumePhase.FINAL_CHECKS_RETRY_C01,
+            ResumePhase.CHECK_REPAIR_C02, ResumePhase.FINAL_CHECKS_RETRY_C02,
+        }
+        phase = checkpoint.phase if checkpoint is not None else None
+        attempt_number = (
+            checkpoint.check_repair_attempt
+            if checkpoint is not None and phase in direct_phases
+            and checkpoint.check_repair_attempt is not None
+            else len(records) + 1
+        )
+
+        # A resume after the worker has completed but before its checks must
+        # re-run only the checks.  The current evidence is authoritative only
+        # when it belongs to the checkpointed repaired tree.
+        if phase in {
+            ResumePhase.FINAL_CHECKS_RETRY_C01,
+            ResumePhase.FINAL_CHECKS_RETRY_C02,
+        }:
+            current = _load_evidence(check_dir)
+            current_tree = candidate_tree_sha(info.worktree)
+            if current is not None and current.staged_tree_sha == current_tree:
+                evidence = current
+
+        if evidence.deterministic_passed:
+            result = CheckRepairResult("passed", tuple(records))
+            return result, evidence
+
+        hard = _hard_integrity_failures(evidence)
+        if hard:
+            return CheckRepairResult("integrity-failed", tuple(records)), evidence
+
+        if max_attempts <= 0:
+            return CheckRepairResult("exhausted", tuple(records)), evidence
+
+        selected_profile = (
+            getattr(selection, "check_repair", None)
+            or getattr(selection, "repair_implementer", None)
+        )
+        if selected_profile is None:
+            return CheckRepairResult("agent-failed", tuple(records)), evidence
+
+        previous_scope: CheckRepairScope | None = None
+        if records:
+            previous_scope = self._read_durable_check_repair_scope(
+                run_dir, cycle, records[-1].number, base_scope,
+            )
+
+        while not evidence.deterministic_passed:
+            hard = _hard_integrity_failures(evidence)
+            if hard:
+                result = CheckRepairResult("integrity-failed", tuple(records))
+                return result, evidence
+            soft = _soft_check_failures(evidence)
+            if not soft:
+                result = CheckRepairResult("integrity-failed", tuple(records))
+                return result, evidence
+            if attempt_number > max_attempts or max_attempts <= 0:
+                result = CheckRepairResult("exhausted", tuple(records))
+                return result, evidence
+
+            attempt_dir = self._check_repair_attempt_root(run_dir, cycle, attempt_number)
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            attempt_record = next(
+                (item for item in records if item.number == attempt_number), None
+            )
+            if attempt_record is not None:
+                # A durable attempt already owns the worker result.  This is
+                # the resume-after-worker boundary; never call the worker
+                # again, even if the check artifact was not written yet.
+                tree_after = attempt_record.tree_after
+            else:
+                if _load_evidence(check_dir) is not None:
+                    _archive_attempt(check_dir, names=_CHECK_ATTEMPT_ARTIFACTS)
+                failed_ids = tuple(
+                    item.split(":", 1)[1] for item in soft if ":" in item
+                )
+                scope = self._check_repair_scope_for_attempt(
+                    repo=repo, worktree=info.worktree, run_dir=run_dir,
+                    evidence=evidence, base_scope=base_scope,
+                    previous_scope=previous_scope,
+                )
+                previous_scope = scope
+                atomic_write_text(
+                    attempt_dir / "failed_check_evidence_before.json",
+                    _json_text(_check_payload(evidence)),
+                )
+                atomic_write_text(
+                    attempt_dir / "profile.json",
+                    _json_text({
+                        "profile_id": selected_profile.profile_id,
+                        "profile_fingerprint": selected_profile.config_sha256,
+                        "selected_profile": asdict(selected_profile),
+                    }),
+                )
+                self._cycle_update(
+                    store, cycle, status="check_repair_attempted",
+                    automatic_check_repair={
+                        "status": "running", "attempt_number": attempt_number,
+                        "before": _check_payload(evidence),
+                        "repair_profile_id": selected_profile.profile_id,
+                        "repair_profile_fingerprint": selected_profile.config_sha256,
+                        "mutable_scope": list(scope.effective_paths),
+                    },
+                )
+                store.update(
+                    status=RunStatus.REVISING,
+                    check_repair={
+                        "status": "running", "attempt_count": len(records),
+                        "attempt_number": attempt_number,
+                        "failure_ids": list(soft),
+                        "repair_profile_id": selected_profile.profile_id,
+                        "repair_profile_fingerprint": selected_profile.config_sha256,
+                        "mutable_scope": list(scope.effective_paths),
+                    },
+                )
+                try:
+                    _result, repair_error = self._run_v2_revision_cycle(
+                        store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                        base_tree_sha=base_tree_sha, spec=spec, plan=plan,
+                        repository_reference=repository_reference, info=info,
+                        branch_ref=branch_ref, ownership_before=ownership_before,
+                        selection=selection, mutable_scope=list(scope.effective_paths),
+                        check_repair_evidence=evidence, cycle=cycle,
+                        artifact_dir=attempt_dir,
+                        check_repair_scope=scope,
+                        check_repair_phase_override=(
+                            ResumePhase.CHECK_REPAIR_C01
+                            if cycle == 1 else ResumePhase.CHECK_REPAIR_C02
+                        ),
+                        check_repair_next_phase_override=(
+                            ResumePhase.FINAL_CHECKS_RETRY_C01
+                            if cycle == 1 else ResumePhase.FINAL_CHECKS_RETRY_C02
+                        ),
+                        check_repair_attempt=attempt_number,
+                        _legacy_failure_names=False,
+                    )
+                except (AgentError, GitError, OSError) as exc:
+                    repair_error = redact(str(exc), self._secrets) or AGENT_RUNTIME_FAILED
+                    _result = None
+                if repair_error is not None:
+                    status = (
+                        "scope-required" if repair_error == _SCOPE_REQUEST_ROUTE
+                        else "integrity-failed"
+                        if repair_error in {"TOCTOU_FAILURE", "AGENT_GIT_VIOLATION", AGENT_SCOPE_VIOLATION}
+                        else "agent-failed"
+                    )
+                    # The worker boundary itself is durable even when the
+                    # worker did not produce a successful revision report.
+                    # This keeps the attempt ledger useful for diagnostics and
+                    # prevents a runtime failure from being confused with a
+                    # deterministic check failure on resume.
+                    tree_after = _safe_candidate_tree(info.worktree) or evidence.staged_tree_sha or ""
+                    failed_record = CheckRepairAttempt(
+                        number=attempt_number,
+                        failed_check_ids_before=tuple(failed_ids),
+                        tree_before=evidence.staged_tree_sha or "",
+                        tree_after=tree_after,
+                        mutable_scope=tuple(scope.effective_paths),
+                    )
+                    atomic_write_text(
+                        attempt_dir / "failure.json",
+                        _json_text({
+                            "schema_version": 1,
+                            **asdict(failed_record),
+                            "profile_id": selected_profile.profile_id,
+                            "profile_fingerprint": selected_profile.config_sha256,
+                            "status": status,
+                            "error": repair_error,
+                        }),
+                    )
+                    # A structured scope request already has an authoritative
+                    # RevisionRunner report (including changed/outside paths).
+                    # Preserve it for the existing scope-recovery route; a
+                    # synthetic summary is only needed for infrastructure
+                    # failures that produced no report of their own.
+                    report_path = attempt_dir / "report.json"
+                    if not report_path.is_file():
+                        atomic_write_text(
+                            report_path,
+                            _json_text({
+                                "status": status,
+                                "failure_ids": list(soft),
+                                "error": repair_error,
+                                "profile_id": selected_profile.profile_id,
+                                "tree_before": failed_record.tree_before,
+                                "tree_after": failed_record.tree_after,
+                                "changed_paths": [],
+                            }),
+                        )
+                    self._write_check_repair_attempt_alias(run_dir, cycle, attempt_dir)
+                    store.update(
+                        status=RunStatus.REVISING,
+                        check_repair={
+                            "status": status,
+                            "attempt_count": attempt_number,
+                            "failure_ids": list(soft),
+                            "repair_profile_id": selected_profile.profile_id,
+                            "repair_profile_fingerprint": selected_profile.config_sha256,
+                            "error": repair_error,
+                        },
+                    )
+                    return CheckRepairResult(status, tuple(records)), evidence
+                tree_after = candidate_tree_sha(info.worktree)
+                record = CheckRepairAttempt(
+                    number=attempt_number,
+                    failed_check_ids_before=failed_ids,
+                    tree_before=evidence.staged_tree_sha or "",
+                    tree_after=tree_after,
+                    mutable_scope=tuple(scope.effective_paths),
+                )
+                records.append(record)
+                atomic_write_text(
+                    attempt_dir / "attempt.json",
+                    _json_text({
+                        "schema_version": 1,
+                        **asdict(record),
+                        "profile_id": selected_profile.profile_id,
+                        "profile_fingerprint": selected_profile.config_sha256,
+                        "status": "completed",
+                    }),
+                )
+                self._write_check_repair_attempt_alias(run_dir, cycle, attempt_dir)
+
+            self._checkpoint(
+                run_dir,
+                ResumePhase.FINAL_CHECKS_RETRY_C01 if cycle == 1 else ResumePhase.FINAL_CHECKS_RETRY_C02,
+                cycle=cycle, head=expected_head_sha, tree=tree_after,
+                check_repair_attempt=attempt_number,
+            )
+            store.update(status=RunStatus.REVALIDATING, current_step=None)
+            try:
+                evidence = self._final_evidence(
+                    info.worktree, base_sha, check_dir, check_failures_hard=False,
+                    reuse=False, expected_head_sha=expected_head_sha,
+                    required_check_ids=required_check_ids, enforce_diff_size=False,
+                )
+            except Exception:
+                self._checkpoint(
+                    run_dir,
+                    ResumePhase.FINAL_CHECKS_RETRY_C01 if cycle == 1 else ResumePhase.FINAL_CHECKS_RETRY_C02,
+                    cycle=cycle, head=expected_head_sha, tree=tree_after,
+                    check_repair_attempt=attempt_number,
+                )
+                raise
+            atomic_write_text(
+                attempt_dir / "checks_after.json",
+                _json_text(_check_payload(evidence)),
+            )
+            self._write_check_repair_attempt_alias(run_dir, cycle, attempt_dir)
+            store.update(
+                status=RunStatus.REVALIDATING,
+                checks=_check_payload(evidence),
+                staged_tree_sha=evidence.staged_tree_sha,
+                changed_files=list(evidence.changed_files),
+                deterministic_gate={
+                    "passed": evidence.deterministic_passed,
+                    "required_check_ids": list(evidence.required_check_ids),
+                    "failures": list(evidence.failures),
+                },
+                check_repair={
+                    "status": "passed" if evidence.deterministic_passed else "running",
+                    "attempt_count": len(records),
+                    "attempts": [asdict(item) for item in records],
+                    "remaining_failed_check_ids": [
+                        item.split(":", 1)[1] for item in _soft_check_failures(evidence)
+                        if ":" in item
+                    ],
+                    "repair_profile_id": selected_profile.profile_id,
+                    "repair_profile_fingerprint": selected_profile.config_sha256,
+                },
+            )
+            hard = _hard_integrity_failures(evidence)
+            if hard:
+                return CheckRepairResult("integrity-failed", tuple(records)), evidence
+            if evidence.deterministic_passed:
+                return CheckRepairResult("passed", tuple(records)), evidence
+            attempt_number += 1
+            self._checkpoint(
+                run_dir,
+                ResumePhase.CHECK_REPAIR_C01 if cycle == 1 else ResumePhase.CHECK_REPAIR_C02,
+                cycle=cycle, head=expected_head_sha,
+                tree=evidence.staged_tree_sha,
+                check_repair_attempt=attempt_number,
+            )
+
+        return CheckRepairResult("passed", tuple(records)), evidence
 
     def _execute_scope_repair_cycle(
         self,
@@ -4960,7 +5500,7 @@ class Orchestrator:
         # C02 parity with ``FINAL_CHECKS_RETRY_C01``: its own durable boundary,
         # owned by the bridge below and not by the normal repair path.
         retry_bridge_c02 = (
-            claude_revision_enabled and resumed is not None and start is not None
+            self._legacy_run_options and claude_revision_enabled and resumed is not None and start is not None
             and start.phase is ResumePhase.FINAL_CHECKS_RETRY_C02
         )
         if start is None or phase_index(start.phase) <= phase_index(ResumePhase.FINAL_CHECKS_C02):
@@ -5000,7 +5540,11 @@ class Orchestrator:
             evidence = resumed.c02_evidence
             # Phase-dependent, exactly like C01: only the C02 retry checks may
             # legitimately have produced no bundle before the crash.
-            if evidence is None and not retry_bridge_c02:
+            if evidence is None and not retry_bridge_c02 and not (
+                not self._legacy_run_options
+                and start is not None
+                and start.phase is ResumePhase.FINAL_CHECKS_RETRY_C02
+            ):
                 raise ResumeIntegrityError("C02 candidate evidence is missing")
 
         soft_failures_c02 = (
@@ -5008,7 +5552,51 @@ class Orchestrator:
             if claude_revision_enabled and evidence is not None else []
         )
         base_repair_scope_c02 = list(repair_scope)
+        if not self._legacy_run_options and evidence is not None:
+            direct_result_c02, evidence = self._run_direct_check_repair_loop(
+                store=store, run_dir=run_dir, repo=repo, base_sha=base_sha,
+                base_tree_sha=resolve_tree(repo, base_sha), spec=spec,
+                plan=repair_plan, repository_reference=repository_reference,
+                info=info, branch_ref=branch_ref,
+                ownership_before=ownership_before, selection=selection,
+                cycle=2, evidence=evidence, base_scope=base_repair_scope_c02,
+                required_check_ids=repair_plan.required_checks or None,
+                expected_head_sha=cycle_parent_sha, resumed=resumed,
+            )
+            check_repair_result_c02 = direct_result_c02
+            self._cycle_update(
+                store, 2, status="check_repair_completed",
+                automatic_check_repair=self._check_repair_attempt_state(direct_result_c02),
+            )
+            if direct_result_c02.status == "integrity-failed":
+                failures = _hard_integrity_failures(evidence)
+                raise OrchestrationError(
+                    (failures[0].split(":", 1)[0] if failures else "INTEGRITY_FAILED")
+                    + ": " + ", ".join(failures or evidence.failures)
+                )
+            if direct_result_c02.status == "scope-required":
+                raise OrchestrationError(_SCOPE_REQUEST_ROUTE)
+            if direct_result_c02.status == "agent-failed":
+                raise OrchestrationError(AGENT_RUNTIME_FAILED)
+            if direct_result_c02.status == "exhausted":
+                remaining = [
+                    item.split(":", 1)[1]
+                    for item in _soft_check_failures(evidence) if ":" in item
+                ]
+                profile = (
+                    getattr(selection, "check_repair", None)
+                    or getattr(selection, "repair_implementer", None)
+                )
+                raise OrchestrationError(
+                    "CHECK_REPAIR_EXHAUSTED: " + _json_text({
+                        "remaining_failed_check_ids": remaining,
+                        "attempts": len(direct_result_c02.attempts),
+                        "repair_profile_id": profile.profile_id if profile is not None else None,
+                    })
+                )
         if (
+            self._legacy_run_options
+            and
             not retry_bridge_c02
             and at < phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02)
             and evidence is not None and not evidence.deterministic_passed
@@ -5357,7 +5945,7 @@ class Orchestrator:
                 )} if expanded_check_repair_result_c02 is not None else {}),
             })
 
-        if at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02) and at <= phase_index(
+        if self._legacy_run_options and at >= phase_index(ResumePhase.CHECK_REPAIR_EXPANDED_C02) and at <= phase_index(
             ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C02
         ):
             expanded_dir = run_dir / "revision" / "check-repair-expanded" / "C02"
@@ -6781,7 +7369,7 @@ class Orchestrator:
             refuse("only META PLAN v2 runs can be resumed by pipeline v2")
         if durable_pipeline_version == 1 and state.get("planning_protocol") != "v2":
             refuse("historical pipeline v1 requires its historical META PLAN artifacts")
-        if not revision_enabled and not repair_enabled and checkpoint.phase not in (
+        if not revision_enabled and not repair_enabled and not check_repair_enabled and checkpoint.phase not in (
             ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01,
             ResumePhase.FINAL_CHECKS_C01, ResumePhase.CANDIDATE_COMMIT_C01,
             ResumePhase.CANDIDATE_PUSH_C01, ResumePhase.REVIEWER_C01,
@@ -6966,6 +7554,20 @@ class Orchestrator:
                 policy_config=self._effective_repair_scope,
             )
             scope = sorted(set(scope) | set(expanded_c02.effective_paths))
+        if (
+            checkpoint.check_repair_attempt is not None
+            or self._check_repair_attempt_records(run_dir, 1)
+        ):
+            scope = sorted(set(scope) | set(self._check_repair_scope_union(
+                run_dir, 1, original_plan_scope,
+            )))
+        if checkpoint.cycle == 2 and (
+            checkpoint.check_repair_attempt is not None
+            or self._check_repair_attempt_records(run_dir, 2)
+        ):
+            scope = sorted(set(scope) | set(self._check_repair_scope_union(
+                run_dir, 2, c02_repair_scope or original_plan_scope,
+            )))
         scope_repair_phases = {
             ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C01,
             ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, ResumePhase.CHECK_SCOPE_REPAIR_CHECKS_C01,
@@ -7180,7 +7782,17 @@ class Orchestrator:
             scope_violation_recovery: dict[str, Any] | None = None
             scope_violation_origin = _scope_violation_origin(state, checkpoint)
             if scope_violation_origin is not None:
-                if checkpoint.phase is ResumePhase.CHECK_REPAIR_C01:
+                if checkpoint.check_repair_attempt is not None:
+                    fallback = (
+                        original_plan_scope if checkpoint.cycle == 1
+                        else c02_repair_scope or original_plan_scope
+                    )
+                    scope_dir = (
+                        run_dir / "revision" / "check-repair"
+                        / f"C0{checkpoint.cycle}" / "attempts"
+                        / f"{checkpoint.check_repair_attempt:02d}"
+                    )
+                elif checkpoint.phase is ResumePhase.CHECK_REPAIR_C01:
                     fallback = original_plan_scope
                     scope_dir = run_dir / "revision" / "check-repair" / "C01"
                 elif checkpoint.phase is ResumePhase.CHECK_REPAIR_EXPANDED_C01:
@@ -7884,7 +8496,11 @@ class Orchestrator:
                      ResumePhase.CHECK_REPAIR_C01, ResumePhase.CHECK_REPAIR_C02,
                      ResumePhase.CHECK_REPAIR_EXPANDED_C01,
                      ResumePhase.CHECK_REPAIR_EXPANDED_C02):
-            if phase is ResumePhase.CHECK_REPAIR_C01:
+            if checkpoint.check_repair_attempt is not None:
+                directory = run_dir / "revision" / "check-repair" / (
+                    "C01" if checkpoint.cycle == 1 else "C02"
+                ) / "attempts" / f"{checkpoint.check_repair_attempt:02d}"
+            elif phase is ResumePhase.CHECK_REPAIR_C01:
                 directory = run_dir / "revision" / "check-repair" / "C01"
             elif phase is ResumePhase.CHECK_REPAIR_C02:
                 directory = run_dir / "revision" / "check-repair" / "C02"
@@ -7960,7 +8576,13 @@ class Orchestrator:
         if checkpoint.expected_head_sha is None or checkpoint.expected_tree_sha is None:
             raise ResumeIntegrityError("scope-violation checkpoint has no Git identity")
 
-        if checkpoint.phase is ResumePhase.CHECK_REPAIR_C01:
+        if checkpoint.check_repair_attempt is not None:
+            directory = (
+                run_dir / "revision" / "check-repair"
+                / f"C0{checkpoint.cycle}" / "attempts"
+                / f"{checkpoint.check_repair_attempt:02d}"
+            )
+        elif checkpoint.phase is ResumePhase.CHECK_REPAIR_C01:
             directory = run_dir / "revision" / "check-repair" / "C01"
         elif checkpoint.phase is ResumePhase.CHECK_REPAIR_EXPANDED_C01:
             directory = run_dir / "revision" / "check-repair-expanded" / "C01"
@@ -8195,9 +8817,19 @@ class Orchestrator:
             c01_tree = revision.tree_after
         initial_c01_tree = c01_tree
         check_repair_dir_c01 = run_dir / "revision" / "check-repair" / "C01"
-        if revision_enabled and resumed.scope_violation_recovery is None and at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_C01) and (
+        generic_c01_attempts = self._check_repair_attempt_records(run_dir, 1)
+        generic_c01 = bool(generic_c01_attempts) or checkpoint.check_repair_attempt is not None
+        if generic_c01:
+            c01_tree = self._check_repair_chain_tree(
+                run_dir, 1, initial_c01_tree, checkpoint,
+            )
+        if (
+            not generic_c01 and revision_enabled
+            and resumed.scope_violation_recovery is None
+            and at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_C01) and (
             check_repair_dir_c01 / "report.json"
-        ).exists():
+            ).exists()
+        ):
             repair_revision = _load_revision(
                 check_repair_dir_c01
             )
@@ -8257,6 +8889,27 @@ class Orchestrator:
                 else "the checkpoint tree is not the last completed Luna tree"
             )
         if checkpoint.phase is ResumePhase.INITIAL_STEP:
+            return
+        if generic_c01 and checkpoint.phase in {
+            ResumePhase.CHECK_REPAIR_C01,
+            ResumePhase.FINAL_CHECKS_RETRY_C01,
+        }:
+            if checkpoint.phase is ResumePhase.CHECK_REPAIR_C01:
+                evidence = _load_evidence(run_dir / "checks" / "C01") or _load_evidence(run_dir)
+            else:
+                evidence = _load_evidence(run_dir / "checks" / "C01")
+                if evidence is None and checkpoint.check_repair_attempt is not None:
+                    evidence = _load_evidence(
+                        run_dir / "checks" / "C01" / "attempts"
+                        / f"{checkpoint.check_repair_attempt:02d}"
+                    )
+            if checkpoint.phase is ResumePhase.CHECK_REPAIR_C01 and (
+                evidence is None or evidence.staged_tree_sha != expected
+            ):
+                refuse("the durable check-repair evidence is missing or not for the checkpoint tree")
+            if checkpoint.phase is ResumePhase.FINAL_CHECKS_RETRY_C01 and evidence is None:
+                refuse("the durable check-repair attempt evidence is missing")
+            resumed.c01_evidence = evidence
             return
         if checkpoint.phase in {
             ResumePhase.CHECKS_C01,
@@ -8442,9 +9095,19 @@ class Orchestrator:
             c02_tree = revision.tree_after
         initial_c02_tree = c02_tree
         check_repair_dir_c02 = run_dir / "revision" / "check-repair" / "C02"
-        if revision_enabled and resumed.scope_violation_recovery is None and at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_C02) and (
+        generic_c02_attempts = self._check_repair_attempt_records(run_dir, 2)
+        generic_c02 = bool(generic_c02_attempts) or checkpoint.check_repair_attempt is not None
+        if generic_c02:
+            c02_tree = self._check_repair_chain_tree(
+                run_dir, 2, initial_c02_tree, checkpoint,
+            )
+        if (
+            not generic_c02 and revision_enabled
+            and resumed.scope_violation_recovery is None
+            and at >= phase_index(ResumePhase.FINAL_CHECKS_RETRY_C02) and (
             check_repair_dir_c02 / "report.json"
-        ).exists():
+            ).exists()
+        ):
             repair_revision = _load_revision(
                 check_repair_dir_c02
             )
@@ -8507,6 +9170,27 @@ class Orchestrator:
             evidence = _load_evidence(run_dir / "checks" / "C02")
             if evidence is None or evidence.staged_tree_sha != c02_tree:
                 refuse("the C02 scope-repair evidence is missing or not for the rolled-back tree")
+            resumed.c02_evidence = evidence
+            return
+        if generic_c02 and checkpoint.phase in {
+            ResumePhase.CHECK_REPAIR_C02,
+            ResumePhase.FINAL_CHECKS_RETRY_C02,
+        }:
+            if checkpoint.phase is ResumePhase.CHECK_REPAIR_C02:
+                evidence = _load_evidence(run_dir / "checks" / "C02")
+            else:
+                evidence = _load_evidence(run_dir / "checks" / "C02")
+                if evidence is None and checkpoint.check_repair_attempt is not None:
+                    evidence = _load_evidence(
+                        run_dir / "checks" / "C02" / "attempts"
+                        / f"{checkpoint.check_repair_attempt:02d}"
+                    )
+            if checkpoint.phase is ResumePhase.CHECK_REPAIR_C02 and (
+                evidence is None or evidence.staged_tree_sha != expected
+            ):
+                refuse("the durable C02 check-repair evidence is missing or not for the checkpoint tree")
+            if checkpoint.phase is ResumePhase.FINAL_CHECKS_RETRY_C02 and evidence is None:
+                refuse("the durable C02 check-repair attempt evidence is missing")
             resumed.c02_evidence = evidence
             return
         if checkpoint.phase is ResumePhase.CHECK_REPAIR_C02:
