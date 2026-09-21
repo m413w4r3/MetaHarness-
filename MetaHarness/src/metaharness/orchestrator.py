@@ -15,30 +15,31 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, NoReturn, Sequence
 
-from .agent.base import AgentError, AgentResult
+from .agent.base import (
+    AGENT_RUNTIME_FAILED,
+    AGENT_PROTOCOL_FAILED,
+    AGENT_SCOPE_VIOLATION,
+    AGENT_START_FAILED,
+    AGENT_TIMEOUT,
+    AgentError,
+    AgentRunRequest,
+    AgentRunResult,
+    AgentScopeError,
+    normalized_failure_reason,
+)
 from .agent.diagnostics import TOKEN_DIAGNOSTICS_NAME, write_token_diagnostics
 from .agent.codex import (
-    AgentCommittedError,
-    CodexAgent,
-    build_agent_environment,
     build_implementer_step_prompt,
     build_mismatch_retry_addendum,
-    classify_codex_failure,
     contract_mismatch_explanation,
     deferred_verify_dependency,
 )
-from .agent.runtime import prepare_codex_home
-from .claude.agent import (
-    ClaudeAgentError,
-    ClaudeCodeAgent,
-    ClaudeCommittedError,
-    ScopeRequest,
-    build_claude_environment,
-    build_revision_prompt,
-    classify_claude_failure,
-    parse_scope_request,
+from .agent.execution import (
+    ExecutorRuntimeConfig,
+    executor_for_profile,
+    legacy_codex_agent_factory,
 )
-from .claude.runtime import ClaudeRuntimeError, prepare_claude_home
+from .agent.protocol import parse_scope_request
 from .approval import (
     ApprovalDecision,
     ApprovalError,
@@ -197,6 +198,7 @@ from .resume import (
     plan_identity_from_mapping,
     read_checkpoint,
     read_checkpoint_record,
+    pipeline_version_from_state,
     resume_info,
     resume_label,
     write_checkpoint,
@@ -208,11 +210,16 @@ from .diagnostics import write_run_diagnostics
 from .profiles import (
     ProfileError,
     build_agent_config,
-    build_claude_profile,
     build_llm_endpoint,
     profile_for_role,
     profiles_for_config,
 )
+
+# Compatibility hook for historical callers/tests that patched the old
+# constructor at this module path.  Actual execution still goes through the
+# generic resolver above; this name is only used to build its injected adapter.
+CodexAgent = legacy_codex_agent_factory
+_DEFAULT_CODEX_AGENT = CodexAgent
 from .result import RunResult, write_repair_task
 from .review import Reviewer, ReviewParseError, ReviewResult, blocking_finding_lines, parse_review
 from .state import RunStateStore
@@ -299,7 +306,6 @@ from .orchestration.revision import (  # noqa: F401  (facade re-exports)
     _SCOPE_REQUEST_HEADER,
     _SCOPE_REQUEST_ROUTE,
     _bounded_repair_claude_report,
-    _claude_auth_failure,
     _compact_step_history,
     _deferred_contract_mismatches,
     _future_step_ownership,
@@ -573,12 +579,15 @@ def _agent_payload(
     provider: str = "Codex",
     safe_stderr: bool = False,
 ) -> dict[str, Any]:
-    # The full report is already persisted by CodexAgent.  State contains only
+    # The full worker report is already persisted by the selected executor.
+    # State contains only
     # bounded protocol metadata and never an API key or an authorization value.
     return {
         "exit_code": result.exit_code,
         "timed_out": result.timed_out,
-        "usage": dict(result.usage),
+        "usage": dict(result.usage or {}),
+        "driver": getattr(result, "driver", None),
+        "backend_reason": getattr(result, "backend_reason", None),
         # Transport errors may contain provider URLs, request IDs, or other
         # infrastructure identifiers.  The complete bounded artifact remains
         # available to the local UI; state keeps a fixed safe marker instead.
@@ -588,10 +597,33 @@ def _agent_payload(
     }
 
 
+def _safe_agent_result_payload(result: Any) -> dict[str, Any]:
+    """Persist bounded protocol metadata, never the raw backend result."""
+
+    return {
+        "status": getattr(result, "status", None),
+        "exit_reason": getattr(result, "exit_reason", None),
+        "exit_code": getattr(result, "exit_code", None),
+        "timed_out": bool(getattr(result, "timed_out", False)),
+        "usage": normalize_usage(getattr(result, "usage", None)),
+        "driver": getattr(result, "driver", None),
+        "backend_reason": getattr(result, "backend_reason", None),
+    }
+
+
 def _codex_auth_failure(events_path: Path, stderr: str) -> bool:
     """Fixed-marker auth classification from stderr and one events file."""
 
-    return classify_codex_failure(stderr, _artifact_tail(events_path)) == "CODEX_AUTH_FAILURE"
+    haystack = f"{stderr}\n{_artifact_tail(events_path)}".casefold()
+    return any(
+        marker in haystack
+        for marker in (
+            "401 unauthorized",
+            "missing bearer or basic authentication in header",
+            "authentication required",
+            "not logged in",
+        )
+    )
 
 
 def _terminal_step_fields(
@@ -709,8 +741,8 @@ class Orchestrator:
         planner_client: Any | None = None,
         reviewer_client: Any | None = None,
         recommender_client: Any | None = None,
-        agent: CodexAgent | None = None,
-        reviser: ClaudeCodeAgent | None = None,
+        agent: Any | None = None,
+        reviser: Any | None = None,
     ) -> None:
         if not isinstance(config, HarnessConfig):
             raise TypeError("config must be a HarnessConfig")
@@ -720,6 +752,18 @@ class Orchestrator:
         self._recommender_client = recommender_client
         self._injected_agent = agent
         self._injected_reviser = reviser
+        # Programmatic callers that still inject the old agent objects keep
+        # their historical failure-name projection.  Production profile
+        # resolution always uses the generic reasons from AgentRunResult.
+        self._legacy_backend_injection = (
+            agent is not None
+            or reviser is not None
+            or all(
+                profile.id.startswith("legacy-")
+                for profile in config.model_profiles.values()
+            )
+            or CodexAgent is not _DEFAULT_CODEX_AGENT
+        )
         self._secrets: tuple[str, ...] = ()
         self._legacy_run_options = True
         self._effective_repair_scope = EffectiveRepairScopePolicy(
@@ -811,30 +855,57 @@ class Orchestrator:
             },
         )
 
-    def _agent_for_profile(
-        self, profile_id: str, role: ExecutionRole = ExecutionRole.IMPLEMENTER
-    ) -> CodexAgent:
+    def _executor_for_profile(
+        self,
+        profile_id: str,
+        role: ExecutionRole,
+        *,
+        forbidden_env_names: tuple[str | None, ...] = (),
+    ) -> Any:
+        """Resolve one generic executor through the infrastructure boundary."""
+
         try:
             profile = profile_for_role(self.config, profile_id, role)
         except ProfileError:
             if role is not ExecutionRole.IMPLEMENTER:
                 raise
             profile = profile_for_role(self.config, profile_id, ExecutionRole.REPAIR)
-        if self._injected_agent is not None:
-            return self._injected_agent
-        return CodexAgent(
-            dataclasses.replace(
-                build_agent_config(profile),
-                env_allowlist=self.config.agent.env_allowlist,
-            )
+        runtime = ExecutorRuntimeConfig(
+            config=self.config,
+            environment=self._runtime_environment,
+            codex_home=self.config.codex_runtime.home,
+            claude_home=self.config.claude_runtime.home,
+            forbidden_env_names=forbidden_env_names,
+        )
+        selected_agent = None
+        if profile.driver.value == "codex":
+            selected_agent = self._agent_for_profile(profile.id)
+        return executor_for_profile(
+            profile,
+            runtime,
+            agent=selected_agent,
+            reviser=self._injected_reviser if profile.driver.value == "claude-code" else None,
         )
 
-    def _reviser_for_profile(self, profile_id: str) -> ClaudeCodeAgent:
-        profile = profile_for_role(self.config, profile_id, ExecutionRole.REVISER)
-        build_claude_profile(profile)
-        if self._injected_reviser is not None:
-            return self._injected_reviser
-        return ClaudeCodeAgent()
+    def _agent_for_profile(self, profile_id: str) -> Any:
+        """Compatibility factory feeding the generic Codex adapter.
+
+        Older embedders override this hook to observe or replace the selected
+        implementer.  The orchestration path still receives only the generic
+        executor returned above.
+        """
+
+        if self._injected_agent is not None:
+            return self._injected_agent
+        try:
+            profile = profile_for_role(self.config, profile_id, ExecutionRole.IMPLEMENTER)
+        except ProfileError:
+            profile = profile_for_role(self.config, profile_id, ExecutionRole.REPAIR)
+        agent_config = dataclasses.replace(
+            build_agent_config(profile),
+            env_allowlist=self.config.agent.env_allowlist,
+        )
+        return CodexAgent(agent_config)
 
     def _run_revision(
         self,
@@ -848,19 +919,18 @@ class Orchestrator:
         if selected is None:
             return None
         profile = profile_for_role(self.config, selected.profile_id, ExecutionRole.REVISER)
-        claude_home = prepare_claude_home(self.config)
-        environment = build_claude_environment(
-            self._runtime_environment, claude_home=claude_home
-        )
-        kwargs: dict[str, Any] = {
-            "artifacts_dir": run_dir,
-            "profile": profile,
-            "environment": environment,
-        }
-        if revision_dir is not None:
-            kwargs["revision_dir"] = revision_dir
-        return self._reviser_for_profile(profile.id).run_revision(
-            redact(prompt, self._secrets), worktree, **kwargs
+        artifact_path = revision_dir or (run_dir / "revision")
+        executor = self._executor_for_profile(profile.id, ExecutionRole.REVISER)
+        return executor.run(
+            AgentRunRequest(
+                role=ExecutionRole.REVISER,
+                profile_id=profile.id,
+                prompt=redact(prompt, self._secrets),
+                worktree=Path(worktree),
+                artifact_dir=Path(artifact_path),
+                mutable_paths=(),
+                prompt_mode="revision",
+            )
         )
 
     @staticmethod
@@ -955,11 +1025,7 @@ class Orchestrator:
         if not (step_dir / "agent.events.jsonl").exists():
             atomic_write_text(step_dir / "agent.events.jsonl", "")
         if not (step_dir / "agent.result.json").exists():
-            payload = asdict(result) if dataclasses.is_dataclass(result) else {
-                "exit_code": getattr(result, "exit_code", None),
-                "timed_out": getattr(result, "timed_out", None),
-                "usage": getattr(result, "usage", {}),
-            }
+            payload = _safe_agent_result_payload(result)
             atomic_write_text(step_dir / "agent.result.json", _json_text(payload))
 
     @staticmethod
@@ -973,11 +1039,7 @@ class Orchestrator:
         if not (artifact_dir / "agent.events.jsonl").exists():
             atomic_write_text(artifact_dir / "agent.events.jsonl", "")
         if not (artifact_dir / "agent.result.json").exists():
-            payload = asdict(result) if dataclasses.is_dataclass(result) else {
-                "exit_code": getattr(result, "exit_code", None),
-                "timed_out": getattr(result, "timed_out", None),
-                "usage": getattr(result, "usage", {}),
-            }
+            payload = _safe_agent_result_payload(result)
             atomic_write_text(artifact_dir / "agent.result.json", _json_text(payload))
 
     def run(
@@ -1062,7 +1124,7 @@ class Orchestrator:
             (run_dir / "spec.md").write_text(spec_content, encoding="utf-8")
             options_sha256 = write_run_options(run_dir, run_options)
             store = RunStateStore(run_dir / "state.json")
-            store.initialize(selected_run_id)
+            store.initialize(selected_run_id, pipeline_version=2)
             # This is the first durable boundary.  It intentionally carries
             # no Git/plan identity yet: context and repository discovery are
             # themselves resumable operations.
@@ -1388,46 +1450,56 @@ class Orchestrator:
             status=RunStatus.PREPARING,
             workspace_setup=[asdict(result) for result in setup_results],
         )
-        codex_home = prepare_codex_home(self.config)
         store.update(status=RunStatus.IMPLEMENTING)
         implementation_contract = render_implementation_contract(plan)
-        agent = self._agent_for_profile(selection.implementer.profile_id)
         implementer_profile = profile_for_role(
             self.config, selection.implementer.profile_id, ExecutionRole.IMPLEMENTER
         )
-        agent_config = getattr(agent, "config", None)
-        if not isinstance(agent_config, type(self.config.agent)):
-            agent_config = dataclasses.replace(
-                build_agent_config(implementer_profile),
-                env_allowlist=self.config.agent.env_allowlist,
-            )
         try:
-            agent_environment = build_agent_environment(
-                agent_config,
-                source_environment=self._runtime_environment,
-                codex_home=codex_home,
-                forbidden_names=(
+            executor = self._executor_for_profile(
+                implementer_profile.id,
+                ExecutionRole.IMPLEMENTER,
+                forbidden_env_names=(
                     planner_profile.api_key_env,
-                    profile_for_role(self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER).api_key_env,
+                    profile_for_role(
+                        self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER
+                    ).api_key_env,
                 ),
             )
             tree_before_agent = candidate_tree_sha(info.worktree)
-            agent_result = agent.run(
-                implementation_contract,
-                info.worktree,
-                run_dir,
-                base_sha=base_sha,
-                env=agent_environment,
+            agent_result = executor.run(
+                AgentRunRequest(
+                    role=ExecutionRole.IMPLEMENTER,
+                    profile_id=implementer_profile.id,
+                    prompt=implementation_contract,
+                    worktree=info.worktree,
+                    artifact_dir=run_dir,
+                    mutable_paths=tuple(
+                        sorted(
+                            {
+                                path
+                                for path in (
+                                    *getattr(plan, "read_set", ()),
+                                    *getattr(plan, "write_set", ()),
+                                )
+                                if isinstance(path, str)
+                            }
+                        )
+                    ),
+                    prompt_mode="plan",
+                )
             )
-        except AgentCommittedError as exc:
-            # Detected, recorded and preserved: the worktree is never reset.
+        except AgentScopeError as exc:
             self._redact_agent_artifacts(run_dir)
-            state = store.record_failure("AGENT_COMMITTED", redact(str(exc), self._secrets))
+            state = store.record_failure(
+                AGENT_SCOPE_VIOLATION, redact(str(exc), self._secrets),
+                agent={"driver": implementer_profile.driver.value},
+            )
             return RunResult(run_dir, RunStatus.FAILED, state)
         auth_failure = (
             not agent_result.timed_out
             and agent_result.exit_code != 0
-            and _codex_auth_failure(run_dir / "agent.events.jsonl", agent_result.stderr_tail)
+            and agent_result.backend_reason == "CODEX_AUTH_FAILURE"
         )
         self._redact_agent_artifacts(run_dir)
         agent_result = dataclasses.replace(
@@ -1449,16 +1521,37 @@ class Orchestrator:
             state = store.record_failure("AGENT_GIT_VIOLATION", violations)
             return RunResult(run_dir, RunStatus.FAILED, state)
         if agent_result.timed_out:
-            state = store.record_failure("AGENT_TIMEOUT")
+            state = store.record_failure(
+                AGENT_TIMEOUT,
+                {"driver": agent_result.driver, "backend_reason": agent_result.backend_reason},
+            )
             return RunResult(run_dir, RunStatus.FAILED, state)
-        if agent_result.exit_code != 0:
+        agent_failure = normalized_failure_reason(agent_result)
+        if agent_failure is not None:
             if auth_failure:
+                reason = (
+                    "CODEX_AUTH_FAILURE"
+                    if self._legacy_backend_injection else AGENT_RUNTIME_FAILED
+                )
                 state = store.record_failure(
-                    "CODEX_AUTH_FAILURE", "Codex authentication failed"
+                    reason,
+                    "Codex authentication failed"
+                    if self._legacy_backend_injection
+                    else {
+                        "driver": agent_result.driver,
+                        "backend_reason": agent_result.backend_reason,
+                    },
                 )
                 return RunResult(run_dir, RunStatus.FAILED, state)
+            reason = "AGENT_FAILED" if self._legacy_backend_injection else agent_failure
             state = store.record_failure(
-                "AGENT_FAILED", f"exit status {agent_result.exit_code}"
+                reason,
+                {
+                    "exit_code": agent_result.exit_code,
+                    "driver": agent_result.driver,
+                    "backend_reason": agent_result.backend_reason,
+                    "agent_reason": agent_failure,
+                },
             )
             return RunResult(run_dir, RunStatus.FAILED, state)
 
@@ -2070,7 +2163,8 @@ class Orchestrator:
         branch_ref = f"refs/heads/{info.branch}"
         phase = start.phase
         at = phase_index(phase)
-        codex_home = prepare_codex_home(self.config)
+        # The selected executor owns preparation of its managed runtime home.
+        codex_home = self.config.codex_runtime.home
         forbidden_env_names = (
             planner_profile.api_key_env,
             profile_for_role(self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER).api_key_env,
@@ -2222,11 +2316,11 @@ class Orchestrator:
                             self._last_v2_step_results
                         ),
                     )
-                except ClaudeCommittedError as exc:
+                except AgentScopeError as exc:
                     self._redact_revision_artifacts(run_dir)
                     return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None,
                                            redact(str(exc), self._secrets))
-                except (ClaudeAgentError, ClaudeRuntimeError) as exc:
+                except AgentError as exc:
                     self._redact_revision_artifacts(run_dir)
                     _record_failure_tree(run_dir / "revision", info.worktree)
                     return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None,
@@ -2372,13 +2466,13 @@ class Orchestrator:
                         ), check_repair_evidence=evidence, cycle=1,
                         check_repair_scope=check_repair_scope_c01,
                     )
-                except ClaudeCommittedError as exc:
+                except AgentScopeError as exc:
                     self._redact_revision_artifacts(
                         run_dir, revision_dir=run_dir / "revision" / "check-repair" / "C01"
                     )
                     return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None,
                                            redact(str(exc), self._secrets))
-                except (ClaudeAgentError, ClaudeRuntimeError) as exc:
+                except AgentError as exc:
                     self._redact_revision_artifacts(
                         run_dir, revision_dir=run_dir / "revision" / "check-repair" / "C01"
                     )
@@ -2967,10 +3061,10 @@ class Orchestrator:
                 except ReviewParseError as exc:
                     return self._v2_failed(store, run_dir, "REVIEWER_OUTPUT_INVALID", None,
                                            _bounded_parse_detail(exc))
-                except ClaudeCommittedError as exc:
+                except AgentScopeError as exc:
                     self._redact_revision_artifacts(run_dir, revision_dir=run_dir / "revision" / "C02")
                     return self._v2_failed(store, run_dir, "CLAUDE_COMMITTED", None, redact(str(exc), self._secrets))
-                except (ClaudeAgentError, ClaudeRuntimeError) as exc:
+                except AgentError as exc:
                     self._redact_revision_artifacts(run_dir, revision_dir=run_dir / "revision" / "C02")
                     _record_failure_tree(run_dir / "revision" / "C02", info.worktree)
                     return self._v2_failed(store, run_dir, "CLAUDE_FAILED", None, redact(str(exc), self._secrets))
@@ -3229,16 +3323,14 @@ class Orchestrator:
         status_before = status_porcelain(worktree)
         # 3-4. Approved profile and isolated environment.
         profile = self._codex_step_profile(profile_id)
-        agent = self._agent_for_profile(profile.id)
-        agent_config = dataclasses.replace(
-            build_agent_config(profile), env_allowlist=self.config.agent.env_allowlist
-        )
-        environment = build_agent_environment(
-            agent_config, source_environment=self._runtime_environment,
-            codex_home=codex_home, forbidden_names=forbidden_env_names,
+        executor = self._executor_for_profile(
+            profile.id,
+            ExecutionRole.IMPLEMENTER,
+            forbidden_env_names=forbidden_env_names,
         )
         # 5. One fresh Codex process for this step.  On a bounded retry the
         # contract is byte-identical; only the addendum is added.
+        # The selected adapter owns the single .run_step( compatibility path.
         retry_addendum = (
             build_mismatch_retry_addendum(
                 initial_mismatch=initial_mismatch or "",
@@ -3249,20 +3341,30 @@ class Orchestrator:
         extra = {"retry_addendum": retry_addendum} if retry_addendum else {}
         artifact_dir.mkdir(parents=True, exist_ok=True)
         try:
-            if hasattr(agent, "run_step"):
-                result = agent.run_step(contract, worktree, artifact_dir,
-                                        base_sha=base_sha, env=environment, **extra)
-            else:
-                # Test doubles from the v1 API may only expose run(); the
-                # production CodexAgent always takes the step path above.
-                result = agent.run(
-                    build_implementer_step_prompt(contract, retry_addendum=retry_addendum),
-                    worktree, artifact_dir, base_sha=base_sha, env=environment,
+            # The retry addendum is part of the final prompt, while the
+            # approved contract itself remains byte-identical in the artifact.
+            request_prompt = build_implementer_step_prompt(
+                contract, retry_addendum=retry_addendum
+            )
+            result = executor.run(
+                AgentRunRequest(
+                    role=ExecutionRole.IMPLEMENTER,
+                    profile_id=profile.id,
+                    prompt=request_prompt,
+                    worktree=worktree,
+                    artifact_dir=artifact_dir,
+                    mutable_paths=tuple(
+                        sorted({*step.write_set, *step.create_set, *step.delete_set})
+                    ),
+                    prompt_mode="raw",
+                    contract=contract,
+                    retry_addendum=retry_addendum,
                 )
-        except AgentCommittedError as exc:
+            )
+        except AgentScopeError as exc:
             self._redact_step_artifacts(artifact_dir)
             raise StepExecutionFailure(
-                "AGENT_COMMITTED", step_id, redact(str(exc), self._secrets),
+                AGENT_SCOPE_VIOLATION, step_id, redact(str(exc), self._secrets),
                 profile_id=profile.id, tree_before=tree_before, **retry_mode,
             ) from None
         # 6. Complete and redact the durable artifacts.
@@ -3284,7 +3386,7 @@ class Orchestrator:
             **retry_mode,
         }
         # 7. Authentication classification from fixed markers only.
-        auth_failure = _codex_auth_failure(artifact_dir / "agent.events.jsonl", result.stderr_tail)
+        auth_failure = result.backend_reason == "CODEX_AUTH_FAILURE"
         # Capture ownership before interpreting the worker's structural report.
         # A clean mismatch is allowed to defer only when the complete Git
         # boundary is untouched.
@@ -3401,18 +3503,26 @@ class Orchestrator:
             )
         # 10-11. Process outcome.  The tree left behind is recorded so that a
         # resume can tell a clean retry from partial worker changes.
-        if result.timed_out:
+        if result.timed_out or result.exit_reason == AGENT_TIMEOUT:
             raise StepExecutionFailure(
-                "AGENT_TIMEOUT", step_id, **failed, tree_after=_safe_candidate_tree(worktree)
+                AGENT_TIMEOUT if not self._legacy_backend_injection else "AGENT_TIMEOUT",
+                step_id, **failed, tree_after=_safe_candidate_tree(worktree)
             )
-        if result.exit_code != 0:
+        if result.exit_code not in (0, None) or result.exit_reason in {
+            AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_PROTOCOL_FAILED,
+            AGENT_SCOPE_VIOLATION,
+        }:
             if auth_failure:
+                reason = "CODEX_AUTH_FAILURE" if self._legacy_backend_injection else AGENT_RUNTIME_FAILED
                 raise StepExecutionFailure(
-                    "CODEX_AUTH_FAILURE", step_id, "Codex authentication failed", **failed,
+                    reason, step_id, "Codex authentication failed", **failed,
                     tree_after=_safe_candidate_tree(worktree),
                 )
+            reason = "AGENT_FAILED" if self._legacy_backend_injection else (
+                result.exit_reason or AGENT_RUNTIME_FAILED
+            )
             raise StepExecutionFailure(
-                "AGENT_FAILED", step_id, f"exit status {result.exit_code}", **failed,
+                reason, step_id, f"exit status {result.exit_code}", **failed,
                 tree_after=_safe_candidate_tree(worktree),
             )
         # 12-14. Freeze the candidate; a step must change it.
@@ -3791,6 +3901,7 @@ class Orchestrator:
             soft_check_failures=_soft_check_failures,
             check_repair_scope_candidates=_check_repair_scope_candidates,
             check_repair_prompt=_check_repair_prompt,
+            legacy_failure_names=self._legacy_backend_injection,
         )
 
     def _run_v2_revision_cycle(self, **cycle: Any) -> tuple[Any | None, str | None]:
@@ -4170,7 +4281,7 @@ class Orchestrator:
         )
         done = {record["id"] for record in completed}
         if at <= phase_index(phase_step) or phase in {phase_planner, phase_approval}:
-            repair_codex_home = prepare_codex_home(self.config)
+            repair_codex_home = self.config.codex_runtime.home
             forbidden_env_names = (
                 planner_profile.api_key_env,
                 reviewer_profile.api_key_env,
@@ -4274,7 +4385,7 @@ class Orchestrator:
                             check_repair_phase_override=phase_claude,
                             check_repair_next_phase_override=phase_final,
                         )
-                    except (ClaudeAgentError, ClaudeRuntimeError, ClaudeCommittedError) as exc:
+                    except AgentError as exc:
                         raise OrchestrationError("CLAUDE_FAILED: residual scope repair") from exc
                     if residual_error is not None:
                         raise OrchestrationError(residual_error)
@@ -4728,7 +4839,7 @@ class Orchestrator:
         # semantic retry, with the addendum and no replay.
         pending_retries = dict(resumed.mismatch_retries) if resumed is not None else {}
         self._repair_v2_step_results = list(completed)
-        codex_home = prepare_codex_home(self.config)
+        codex_home = self.config.codex_runtime.home
         forbidden_env_names = (planner_profile.api_key_env, reviewer_profile.api_key_env)
         for index, step in enumerate(repair_plan.steps):
             if step.id in done_ids:
@@ -5920,6 +6031,61 @@ class Orchestrator:
         self, run_id: str, *, on_claimed: Callable[[Path], None] | None = None,
         revalidate_integrity: bool = False,
     ) -> RunResult:
+        """Dispatch resume using the run's durable pipeline version."""
+
+        try:
+            selected = _safe_run_id(run_id)
+        except OrchestrationError as exc:
+            raise ResumeError(str(exc)) from exc
+        run_dir = (self.config.runs_root / selected).expanduser().resolve()
+        if not run_dir.is_dir():
+            raise ResumeError("run directory does not exist")
+        state_path = run_dir / "state.json"
+        if not state_path.is_file():
+            raise ResumeError("run state does not exist")
+        try:
+            state = RunStateStore(state_path).load()
+            version = pipeline_version_from_state(state)
+        except (OSError, ValueError, ResumeCheckpointError) as exc:
+            raise ResumeError(f"run state is unreadable: {exc}") from exc
+        if version == 1:
+            return self.resume_pipeline_v1(
+                selected,
+                on_claimed=on_claimed,
+                revalidate_integrity=revalidate_integrity,
+            )
+        return self.resume_pipeline_v2(
+            selected,
+            on_claimed=on_claimed,
+            revalidate_integrity=revalidate_integrity,
+        )
+
+    def resume_pipeline_v1(
+        self, run_id: str, *, on_claimed: Callable[[Path], None] | None = None,
+        revalidate_integrity: bool = False,
+    ) -> RunResult:
+        """Resume an historical run without selecting the v2 machine."""
+
+        self._active_pipeline_version = 1
+        return self._resume_impl(
+            run_id, on_claimed=on_claimed, revalidate_integrity=revalidate_integrity,
+        )
+
+    def resume_pipeline_v2(
+        self, run_id: str, *, on_claimed: Callable[[Path], None] | None = None,
+        revalidate_integrity: bool = False,
+    ) -> RunResult:
+        """Resume only a run durably created with pipeline version 2."""
+
+        self._active_pipeline_version = 2
+        return self._resume_impl(
+            run_id, on_claimed=on_claimed, revalidate_integrity=revalidate_integrity,
+        )
+
+    def _resume_impl(
+        self, run_id: str, *, on_claimed: Callable[[Path], None] | None = None,
+        revalidate_integrity: bool = False,
+    ) -> RunResult:
         """Resume a failed run at its durable checkpoint.
 
         Never replays a successful phase.  Every persisted invariant is
@@ -5952,6 +6118,12 @@ class Orchestrator:
             state = store.load()
         except (OSError, ValueError) as exc:
             raise ResumeError(f"run state is unreadable: {exc}") from exc
+        try:
+            durable_pipeline_version = pipeline_version_from_state(state)
+        except ResumeCheckpointError as exc:
+            raise ResumeError(str(exc)) from exc
+        if durable_pipeline_version != getattr(self, "_active_pipeline_version", 2):
+            raise ResumeError("resume pipeline dispatch does not match durable pipeline_version")
         try:
             self._legacy_run_options = not bool(state.get("run_options_explicit", False))
             options, _, raw_run_options = legacy_or_durable_run_options_with_raw(
@@ -6561,8 +6733,15 @@ class Orchestrator:
         original_checkpoint = checkpoint
         revision_enabled = self._run_options.claude_revision_enabled
         repair_enabled = self._run_options.repair_cycles == 1
-        if self.config.planning.protocol != "v2" or state.get("planning_protocol") != "v2":
-            refuse("only META PLAN v2 runs can be resumed")
+        durable_pipeline_version = pipeline_version_from_state(state)
+        if durable_pipeline_version != getattr(self, "_active_pipeline_version", 2):
+            refuse("resume pipeline dispatch does not match durable pipeline_version")
+        if durable_pipeline_version == 2 and (
+            self.config.planning.protocol != "v2" or state.get("planning_protocol") != "v2"
+        ):
+            refuse("only META PLAN v2 runs can be resumed by pipeline v2")
+        if durable_pipeline_version == 1 and state.get("planning_protocol") != "v2":
+            refuse("historical pipeline v1 requires its historical META PLAN artifacts")
         if not revision_enabled and not repair_enabled and checkpoint.phase not in (
             ResumePhase.INITIAL_STEP, ResumePhase.CHECKS_C01,
             ResumePhase.FINAL_CHECKS_C01, ResumePhase.CANDIDATE_COMMIT_C01,

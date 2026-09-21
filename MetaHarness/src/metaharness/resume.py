@@ -32,6 +32,21 @@ from .result import atomic_write_text
 from .step_ids import STEP_ID_PATTERN, STEP_ID_RE
 
 CHECKPOINT_NAME = "resume_checkpoint.json"
+
+
+def pipeline_version_from_state(state: Mapping[str, Any]) -> int:
+    """Read the durable pipeline authority.
+
+    Runs created before the field existed are intentionally historical v1;
+    the current configuration is never consulted to infer this value.
+    """
+
+    if not isinstance(state, Mapping):
+        raise ResumeCheckpointError("run state must be a mapping")
+    value = state.get("pipeline_version", 1)
+    if isinstance(value, bool) or value not in (1, 2):
+        raise ResumeCheckpointError("pipeline_version must be 1 or 2")
+    return int(value)
 _SCHEMA_VERSION = 2
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -875,6 +890,7 @@ __all__ = [
     "load_resume_checkpoint",
     "mark_checkpoint_completed",
     "phase_index",
+    "pipeline_version_from_state",
     "plan_identity_from_mapping",
     "read_checkpoint",
     "read_checkpoint_record",

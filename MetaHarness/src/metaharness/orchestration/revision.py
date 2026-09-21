@@ -47,6 +47,7 @@ from ..gitops import (
 )
 from ..models import (
     ExecutionSelectionV4,
+    ExecutionRole,
     HarnessConfig,
     ImplementationStep,
     RunStatus,
@@ -59,11 +60,16 @@ from ..run_options import EffectiveRepairScopePolicy
 from ..state import RunStateStore
 from ..usage import normalize_usage
 from ..validation import config_with_check_authority
-from ..claude.agent import (
-    ScopeRequest,
-    classify_claude_failure,
-    parse_scope_request,
+from ..agent.base import (
+    AGENT_PROTOCOL_FAILED,
+    AGENT_RUNTIME_FAILED,
+    AGENT_SCOPE_VIOLATION,
+    AGENT_START_FAILED,
+    AGENT_TIMEOUT,
+    AgentExecutor,
+    AgentRunRequest,
 )
+from ..agent.protocol import ScopeRequest, parse_scope_request
 
 
 _MAX_REPAIR_CLAUDE_REPORT_BYTES = 16 * 1024
@@ -440,11 +446,19 @@ def _revision_check_context(payload: Mapping[str, Any]) -> str:
     })
 
 
-def _claude_auth_failure(
+def _agent_auth_failure(
     run_dir: Path, stderr: str, *, revision_dir: Path | None = None
 ) -> bool:
     events_path = (revision_dir or (run_dir / "revision")) / "agent.events.jsonl"
-    return classify_claude_failure(stderr, _artifact_tail(events_path)) == "CLAUDE_AUTH_FAILURE"
+    haystack = f"{stderr}\n{_artifact_tail(events_path)}".casefold()
+    return any(
+        marker in haystack
+        for marker in (
+            "401 unauthorized", "unauthorized", "authentication required",
+            "not logged in", "not authenticated", "please log in",
+            "authentication failed", "login required",
+        )
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -475,6 +489,8 @@ class RevisionRunner:
     soft_check_failures: Callable[[EvidenceBundle], list[str]]
     check_repair_scope_candidates: Callable[..., list[str]]
     check_repair_prompt: Callable[..., str]
+    agent_executor: AgentExecutor | None = None
+    legacy_failure_names: bool = False
 
     def run(
         self,
@@ -650,12 +666,25 @@ class RevisionRunner:
             )
         store.update(status=RunStatus.REVISING, current_step=None)
         atomic_write_text(artifact_dir / "tree_before.txt", tree_before.rstrip() + "\n")
-        result = self.run_revision(
-            selection, info.worktree, run_dir, revision_prompt,
-            revision_dir=artifact_dir,
-        )
+        if self.agent_executor is not None:
+            result = self.agent_executor.run(
+                AgentRunRequest(
+                    role=ExecutionRole.REVISER,
+                    profile_id=selection.reviser.profile_id,
+                    prompt=revision_prompt,
+                    worktree=Path(info.worktree),
+                    artifact_dir=artifact_dir,
+                    mutable_paths=tuple(mutable_scope),
+                    prompt_mode="revision",
+                )
+            )
+        else:
+            result = self.run_revision(
+                selection, info.worktree, run_dir, revision_prompt,
+                revision_dir=artifact_dir,
+            )
         self.ensure_revision_artifacts(artifact_dir, result)
-        claude_auth_failure = _claude_auth_failure(
+        agent_auth_failure = _agent_auth_failure(
             run_dir, result.stderr_tail, revision_dir=artifact_dir
         )
         self.redact_revision_artifacts(run_dir, revision_dir=artifact_dir)
@@ -664,27 +693,46 @@ class RevisionRunner:
             final_message=redact(result.final_message, self.secrets),
             stderr_tail=redact(result.stderr_tail, self.secrets),
         )
-        if result.timed_out:
+        def failure_reason(generic: str) -> str:
+            if not self.legacy_failure_names:
+                return generic
+            backend = getattr(result, "backend_reason", None)
+            if generic == AGENT_TIMEOUT:
+                return "CLAUDE_TIMEOUT"
+            if backend == "CLAUDE_AUTH_FAILURE" or agent_auth_failure:
+                return "CLAUDE_AUTH_FAILURE"
+            if generic == AGENT_PROTOCOL_FAILED and getattr(result, "terminal_subtype", None) == "error_max_turns":
+                return "CLAUDE_MAX_TURNS"
+            if generic == AGENT_SCOPE_VIOLATION:
+                return "CLAUDE_COMMITTED"
+            return "CLAUDE_FAILED"
+
+        if getattr(result, "timed_out", False) or getattr(result, "exit_reason", None) == AGENT_TIMEOUT:
             _record_failure_tree(artifact_dir, info.worktree)
-            return result, "CLAUDE_TIMEOUT"
+            return result, failure_reason(AGENT_TIMEOUT)
         terminal_is_error = getattr(result, "terminal_is_error", None) is True
         terminal_subtype = getattr(result, "terminal_subtype", None)
         # A structured terminal marked ``is_error`` is a failure on its own.
         # Some CLI versions and wrappers still exit 0 after one, so exit code
         # is the last signal consulted, never the gate for the others.
-        if terminal_is_error or result.exit_code != 0:
+        if terminal_is_error or getattr(result, "exit_code", None) not in (None, 0) or getattr(result, "exit_reason", None) in {
+            AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_PROTOCOL_FAILED,
+            AGENT_SCOPE_VIOLATION,
+        }:
             _record_failure_tree(artifact_dir, info.worktree)
-            if claude_auth_failure:
-                return result, "CLAUDE_AUTH_FAILURE"
+            if agent_auth_failure or getattr(result, "backend_reason", None) == "CLAUDE_AUTH_FAILURE":
+                return result, failure_reason(AGENT_RUNTIME_FAILED)
             # Claude's terminal result is authoritative when available.  The
             # textual fallback above remains for older CLI versions and old
             # artifacts that do not expose terminal metadata.
             if terminal_subtype == "error_max_turns":
-                return result, "CLAUDE_MAX_TURNS"
-            return result, "CLAUDE_FAILED"
+                return result, failure_reason(AGENT_PROTOCOL_FAILED)
+            return result, failure_reason(
+                getattr(result, "exit_reason", None) or AGENT_RUNTIME_FAILED
+            )
         revision_ownership = _git_ownership(repo, info.worktree)
         if revision_ownership.head != expected_head:
-            return result, "CLAUDE_COMMITTED"
+            return result, failure_reason(AGENT_SCOPE_VIOLATION)
         violations = _ownership_violations(
             ownership_before, revision_ownership,
             branch_ref=branch_ref, base_sha=expected_head,

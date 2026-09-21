@@ -421,6 +421,23 @@ class CodexAgent:
             base_sha=base_sha, env=env,
         )
 
+    def run_prompt(
+        self,
+        prompt: str,
+        worktree: str | Path,
+        artifacts_dir: str | Path,
+        *,
+        base_sha: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> AgentResult:
+        """Execute an already-rendered prompt through the same safe runtime."""
+
+        if not isinstance(prompt, str):
+            raise TypeError("prompt must be a string")
+        return self._run_with_prompt(
+            prompt, worktree, artifacts_dir, base_sha=base_sha, env=env,
+        )
+
     def run_step(
         self,
         step_contract: str,

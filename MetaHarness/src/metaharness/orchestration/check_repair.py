@@ -33,6 +33,7 @@ from ..evidence import (
     UNREVIEWABLE_TEXT_DIFF,
     UNSCANNABLE_STAGED_BLOB,
 )
+from ..agent.base import AgentExecutor, AgentRunRequest, AgentRunResult
 from ..gitops import tracked_files_in_tree
 from ..planning_v2 import TaskPlanV2
 from ..resume import (
@@ -499,6 +500,14 @@ class CheckRepairCoordinator:
     """
 
     effective_repair_scope: EffectiveRepairScopePolicy
+    agent_executor: AgentExecutor | None = None
+
+    def run_agent(self, request: AgentRunRequest) -> AgentRunResult:
+        """Run a corrective worker through the injected generic contract."""
+
+        if self.agent_executor is None:
+            raise RuntimeError("check-repair executor is not configured")
+        return self.agent_executor.run(request)
 
     def resolve_scope(
         self,
