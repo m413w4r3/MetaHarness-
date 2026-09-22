@@ -85,7 +85,6 @@ from ..gitops import (
 )
 from ..models import (
     CycleKind,
-    ExecutionRole,
     ExecutionSelection,
     GateStage,
     HarnessConfig,
@@ -94,13 +93,13 @@ from ..models import (
     ReviewVerdict,
     RunCycle,
 )
+from ..profiles import ProfileError
 from ..planning_v2 import (
     TaskPlanV2,
     V2PlanParseError,
     parse_task_plan_v2,
     validate_implementation_bundle,
 )
-from ..profiles import ProfileError, profiles_for_config
 from ..result import atomic_write_text
 from ..resume import (
     ResumeCheckpoint,
@@ -449,15 +448,10 @@ def load_correction_plan(
     """Parse the durable correction plan of cycle *number* (> 1)."""
 
     directory = correction_dir(run_dir, number)
-    implementer_ids = frozenset(
-        profile.id for profile in profiles_for_config(config).values()
-        if ExecutionRole.IMPLEMENTER in profile.roles
-    )
     try:
         plan = parse_task_plan_v2(
             (directory / "planner.raw.md").read_text(encoding="utf-8"),
-            implementer_ids=implementer_ids,
-            reviewer_ids=frozenset({selection.final_reviewer.profile_id}),
+            planning=config.planning,
             check_catalog=config.check_catalog,
             inherited_check_ids=inherited_check_ids,
         )
@@ -478,12 +472,6 @@ def load_correction_plan(
     if [item.step_id for item in cycle_selection.steps] != [step.id for step in plan.steps]:
         raise ResumeIntegrityError(
             f"cycle {number:03d} execution selection does not match the plan"
-        )
-    if {
-        item.step_id: item.implementer.profile_id for item in cycle_selection.steps
-    } != {step.id: step.implementer_profile for step in plan.steps}:
-        raise ResumeIntegrityError(
-            f"cycle {number:03d} execution selection profiles do not match the plan"
         )
     return plan, bundle, bundle_sha
 
@@ -732,12 +720,10 @@ def validate_resume(
         _refuse("execution selection planner is not the run planner")
 
     # The approved plan and its exact bundle.
-    profiles = profiles_for_config(config).values()
     try:
         plan = parse_task_plan_v2(
             (run_dir / "planner.raw.md").read_text(encoding="utf-8"),
-            implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
-            reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
+            planning=config.planning,
             check_catalog=config.check_catalog,
             default_check_ids=config.default_check_ids,
         )

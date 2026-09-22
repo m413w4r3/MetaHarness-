@@ -152,12 +152,11 @@ class WebServerTests(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "execution_mode": "SINGLE",
-                    "reviewer_profile": "reviewer",
                     "required_checks": [],
                     "steps": [{
                         "id": "S01",
                         "title": "One",
-                        "implementer_profile": "implementer",
+                        "execution_class": "MECHANICAL",
                         "depends_on": None,
                         "contract_sha256": hashlib.sha256(step_contract.read_bytes()).hexdigest(),
                     }],

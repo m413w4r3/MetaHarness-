@@ -79,6 +79,14 @@ class ExecutionMode(StrEnum):
     STAGED = "STAGED"
 
 
+class ExecutionClass(StrEnum):
+    """Planner classification consumed by the execution router."""
+
+    MECHANICAL = "MECHANICAL"
+    REASONING = "REASONING"
+    AGENTIC = "AGENTIC"
+
+
 @dataclass(frozen=True)
 class ModelProfile:
     id: str
@@ -142,7 +150,7 @@ class ModelProfile:
 class ImplementationStep:
     id: str
     title: str
-    implementer_profile: str
+    execution_class: ExecutionClass
     depends_on: str | None
     objective: str
     read_set: tuple[str, ...]
@@ -163,7 +171,6 @@ class TaskPlanV2:
     objective: str
     constraints: str
     execution_mode: ExecutionMode | None
-    reviewer_profile: str | None
     steps: tuple[ImplementationStep, ...]
     acceptance: str
     tests: str
@@ -171,6 +178,7 @@ class TaskPlanV2:
     blockers: str
     raw: str
     required_checks: tuple[str, ...] = ()
+    max_step_contract_chars: int = 5000
 
 
 class RunStatus(StrEnum):
@@ -337,10 +345,13 @@ class PublishConfig:
 @dataclass(frozen=True)
 class PlanningConfig:
     protocol: str = "v2"
-    decomposition: str = "balanced"
+    decomposition: str = "aggressive"
     single_step_max_mutable_paths: int = 2
-    staged_step_max_mutable_paths: int = 6
+    staged_step_max_mutable_paths: int = 5
     execution_mode_policy: str = "auto"
+    max_steps_per_plan: int = 8
+    max_read_paths_per_step: int = 8
+    max_step_contract_chars: int = 5000
 
     def __post_init__(self) -> None:
         if self.protocol != "v2":
@@ -351,6 +362,12 @@ class PlanningConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be an integer greater than zero")
+        for name in ("max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be an integer greater than zero")
+        if self.max_steps_per_plan > 99:
+            raise ValueError("max_steps_per_plan must not exceed the protocol maximum of 99")
         if self.execution_mode_policy not in {item.value for item in ExecutionModePolicy}:
             raise ValueError("planning execution_mode_policy must be 'auto' or 'require-staged'")
 

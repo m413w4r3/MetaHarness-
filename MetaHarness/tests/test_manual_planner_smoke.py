@@ -16,7 +16,7 @@ from tests.pipeline_support import plan  # noqa: E402
 
 READY = plan(("S01", "src/client.py", "Add bounded HTTP retry")).replace(
     "{implementer}", "smoke-implementer"
-).replace("REVIEWER_PROFILE: reviewer", "REVIEWER_PROFILE: smoke-reviewer")
+)
 
 BLOCKED = """META PLAN v2
 

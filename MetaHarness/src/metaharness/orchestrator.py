@@ -1532,21 +1532,9 @@ class Orchestrator:
         repair_enabled = self._run_options.max_review_repair_cycles > 0
         check_repair_enabled = self._run_options.max_check_repair_attempts > 0
         planner_profile_id = planner_profile.id
-        implementers = tuple(
-            p for p in profiles_for_config(self.config).values()
-            if ExecutionRole.IMPLEMENTER in p.roles
-        )
-        reviewers = tuple(
-            p for p in profiles_for_config(self.config).values()
-            if ExecutionRole.REVIEWER in p.roles
-        )
         if existing_plan is None:
             planner = PlannerV2(
                 self._planner_client or _chat_client(build_llm_endpoint(planner_profile), self._runtime_environment),
-                implementer_ids=frozenset(p.id for p in implementers),
-                reviewer_ids=frozenset(p.id for p in reviewers),
-                implementer_profiles=implementers,
-                reviewer_profiles=reviewers,
                 repository_reference=repository_reference,
                 planning=self.config.planning,
                 check_catalog=self.config.check_catalog,
@@ -1628,15 +1616,18 @@ class Orchestrator:
                 "execution_mode": plan.execution_mode.value if plan.execution_mode else None,
                 "required_checks": list(plan.required_checks),
                 "steps": [
-                    {"id": step.id, "title": step.title, "recommended_profile": step.implementer_profile,
+                    {"id": step.id, "title": step.title,
+                     "execution_class": step.execution_class.value,
+                     "recommended_profile": self._run_options.default_implementer_profile,
                      "status": "waiting"}
                     for step in plan.steps
                 ],
-                "reviewer_recommendation": plan.reviewer_profile,
+                "reviewer_recommendation": self._run_options.final_reviewer_profile,
             },
             steps=[
                 {"id": step.id, "title": step.title, "status": "waiting",
-                 "profile_id": step.implementer_profile}
+                 "execution_class": step.execution_class.value,
+                 "profile_id": self._run_options.default_implementer_profile}
                 for step in plan.steps
             ],
             current_step=None,
@@ -1700,7 +1691,7 @@ class Orchestrator:
                 self.config,
                 planner_profile_id=planner_profile_id,
                 step_profile_ids={
-                    step.id: self._run_options.default_implementer_profile or step.implementer_profile
+                    step.id: self._run_options.default_implementer_profile
                     for step in plan.steps
                 },
                 semantic_reviser_profile_id=(
@@ -2106,7 +2097,9 @@ class Orchestrator:
     ) -> CyclePlan:
         if cycle.kind is not CycleKind.REVIEW_REPLAN:
             raise PipelineFailure("REPLAN_CYCLE_REQUIRED")
-        planned_profile_ids = {step.id: step.implementer_profile for step in plan.steps}
+        planned_profile_ids = {
+            step.id: self._run_options.default_implementer_profile for step in plan.steps
+        }
         try:
             if creating:
                 cycle_selection = ensure_cycle_execution_selection(
@@ -2205,9 +2198,6 @@ class Orchestrator:
                 f"cycle {cycle.number:03d} does not start from the reviewed candidate"
             )
         tree_before = candidate_tree_sha(ctx.info.worktree)
-        reviewer_profile = profile_for_role(
-            self.config, ctx.selection.final_reviewer.profile_id, ExecutionRole.REVIEWER
-        )
         planner_profile = profile_for_role(
             self.config, ctx.selection.planner.profile_id, ExecutionRole.PLANNER
         )
@@ -2220,18 +2210,10 @@ class Orchestrator:
             "CHANGED_FILES": changed_paths_between_trees(ctx.repo, ctx.base_tree_sha, tree_before),
             "GIT_STATUS": status_porcelain(ctx.info.worktree),
         })
-        implementers = tuple(
-            profile for profile in profiles_for_config(self.config).values()
-            if ExecutionRole.IMPLEMENTER in profile.roles
-        )
         planner = RepairPlannerV2(
             self._planner_client or _chat_client(
                 build_llm_endpoint(planner_profile), self._runtime_environment
             ),
-            implementer_ids=frozenset(profile.id for profile in implementers),
-            reviewer_ids=frozenset({ctx.selection.final_reviewer.profile_id}),
-            implementer_profiles=implementers,
-            reviewer_profiles=(reviewer_profile,),
             planning=self.config.planning,
             check_catalog=self.config.check_catalog,
             original_required_check_ids=ctx.plan.required_checks,
@@ -4754,8 +4736,7 @@ class Orchestrator:
         try:
             plan = parse_task_plan_v2(
                 raw,
-                implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
-                reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
+                planning=config.planning,
                 check_catalog=config.check_catalog,
                 default_check_ids=config.default_check_ids,
             )
@@ -4834,10 +4815,12 @@ class Orchestrator:
                 "required_checks": list(plan.required_checks),
                 "steps": [
                     {"id": step.id, "title": step.title,
-                     "recommended_profile": step.implementer_profile, "status": "waiting"}
+                     "execution_class": step.execution_class.value,
+                     "recommended_profile": self._run_options.default_implementer_profile,
+                     "status": "waiting"}
                     for step in plan.steps
                 ],
-                "reviewer_recommendation": plan.reviewer_profile,
+                "reviewer_recommendation": self._run_options.final_reviewer_profile,
             },
         )
 
@@ -4931,17 +4914,12 @@ class Orchestrator:
             if not isinstance(planner_profile_id, str):
                 refuse("run planner profile is missing")
             planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
-            profiles = profiles_for_config(self.config).values()
             if checkpoint.phase is ResumePhase.PLANNER:
                 _archive_attempt(run_dir, names=_PLANNER_ATTEMPT_ARTIFACTS)
                 planner = PlannerV2(
                     self._planner_client or _chat_client(
                         build_llm_endpoint(planner_profile), self._runtime_environment
                     ),
-                    implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
-                    reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
-                    implementer_profiles=tuple(p for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
-                    reviewer_profiles=tuple(p for p in profiles if ExecutionRole.REVIEWER in p.roles),
                     repository_reference=reference, planning=self.config.planning,
                     check_catalog=self.config.check_catalog,
                     default_check_ids=self.config.default_check_ids,
@@ -4953,8 +4931,7 @@ class Orchestrator:
                 raw = (run_dir / "planner.raw.md").read_text(encoding="utf-8")
                 plan = parse_task_plan_v2(
                     raw,
-                    implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
-                    reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
+                    planning=self.config.planning,
                     check_catalog=self.config.check_catalog,
                     default_check_ids=self.config.default_check_ids,
                 )

@@ -195,7 +195,10 @@ protocol = "v2"
 decomposition = "aggressive"
 execution_mode_policy = "require-staged"
 single_step_max_mutable_paths = 2
-staged_step_max_mutable_paths = 6
+staged_step_max_mutable_paths = 5
+max_steps_per_plan = 8
+max_read_paths_per_step = 8
+max_step_contract_chars = 5000
 
 [publish]
 enabled = true
@@ -204,7 +207,7 @@ mode = "fast-forward-base"
 ```
 
 With `decomposition = "aggressive"`, `single_step_max_mutable_paths` bounds a
-READY SINGLE plan and `staged_step_max_mutable_paths` (default 6) bounds every
+READY SINGLE plan and `staged_step_max_mutable_paths` (default 5) bounds every
 STAGED step. Mutable paths are the distinct union of WRITE_SET, CREATE_SET and
 DELETE_SET. Both limits are written into `planner.request.txt` and enforced
 after parsing with the same values (`PLANNER_OUTPUT_INVALID` otherwise).
@@ -346,9 +349,9 @@ recovered only when its current artifacts prove the next operation exactly.
 | --- | --- |
 | Protocol step syntax bound (`PROTOCOL_MAX_STEPS`) | 99 (`SINGLE` = exactly 1; `STAGED` = 2..99) |
 | Allowed step IDs | `S01` .. `S99`, contiguous from `S01` |
-| Fixed path-count caps per step | None; configured mutable union is authoritative |
-| Max mutable union per aggressive STAGED step | 6 (`staged_step_max_mutable_paths`) |
-| Max step contract | 16000 characters (target ~4000-6000) |
+| Max READ_SET paths per step | 8 (`max_read_paths_per_step`) |
+| Max mutable union per aggressive STAGED step | 5 (`staged_step_max_mutable_paths`) |
+| Max step contract | 5000 characters (target ~1000-2200) |
 | Max aggregate step contracts | None |
 | Execution selection steps (schema 3 and 4) | Up to 99, contiguous from `S01` |
 | Resume step IDs (`initial_step`, `repair_step`) | `S01` .. `S99` |

@@ -158,9 +158,10 @@ PLAN → implementation step → accepted step commit → …
   bound, not a recommended execution size. The parser, the implementation bundle, the
   execution selection (schema 3 and 4), resume checkpoints, usage accounting
   and the UI all import it; no module spells its own step bound. SINGLE is
-  exactly one step, STAGED two to `MAX_STEPS`. A step contract is at most
-  16000 characters; there is no aggregate contract-size limit. The planner
-  target remains approximately 4000-6000 characters per step.
+  exactly one step, STAGED two to `PlanningConfig.max_steps_per_plan`. A step
+  contract is at most `max_step_contract_chars` (default 5000), and each step
+  has at most `max_read_paths_per_step` unique READ_SET paths (default 8).
+  The planner target is approximately 1000-2200 characters per step.
 - Initial and correction-cycle steps run through the same generic step executor, with
   the same ordered gates and failure reasons (`STEP_CONTRACT_DRIFT`,
   `AGENT_AUTH_FAILURE`, `AGENT_GIT_VIOLATION`,

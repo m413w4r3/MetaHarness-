@@ -357,7 +357,7 @@ def _plan_summary(run_dir: Path, secrets: tuple[str, ...], relative: str) -> str
     if not isinstance(payload, Mapping):
         return _artifact_header(item) + "Summary unavailable; bounded JSON follows:\n" + text + "\n"
     safe: dict[str, Any] = {
-        key: payload[key] for key in ("schema_version", "decision", "title", "objective", "execution_mode", "reviewer_profile", "constraints", "acceptance", "tests", "risks") if key in payload
+        key: payload[key] for key in ("schema_version", "decision", "title", "objective", "execution_mode", "constraints", "acceptance", "tests", "risks") if key in payload
     }
     steps = payload.get("steps")
     if isinstance(steps, list):
@@ -365,7 +365,7 @@ def _plan_summary(run_dir: Path, secrets: tuple[str, ...], relative: str) -> str
         for step in steps:
             if not isinstance(step, Mapping):
                 continue
-            safe["steps"].append({key: step.get(key) for key in ("id", "title", "implementer_profile", "depends_on", "read_set", "write_set", "create_set", "delete_set", "contract_sha256") if key in step})
+                safe["steps"].append({key: step.get(key) for key in ("id", "title", "execution_class", "depends_on", "read_set", "write_set", "create_set", "delete_set", "contract_sha256") if key in step})
     return _artifact_header(item) + "Structured summary:\n" + redact(_json(safe), secrets)
 
 
@@ -380,11 +380,11 @@ def _bundle_summary(run_dir: Path, secrets: tuple[str, ...], relative: str) -> s
         payload = None
     safe: dict[str, Any] = {}
     if isinstance(payload, Mapping):
-        safe = {key: payload[key] for key in ("schema_version", "execution_mode", "reviewer_profile") if key in payload}
+        safe = {key: payload[key] for key in ("schema_version", "execution_mode") if key in payload}
         safe["steps"] = []
         for step in payload.get("steps", []) if isinstance(payload.get("steps"), list) else []:
             if isinstance(step, Mapping):
-                safe["steps"].append({key: step.get(key) for key in ("id", "title", "implementer_profile", "depends_on", "contract_sha256")})
+                safe["steps"].append({key: step.get(key) for key in ("id", "title", "execution_class", "depends_on", "contract_sha256")})
     return _artifact_header(item) + "Bundle summary:\n" + redact(_json(safe), secrets)
 
 

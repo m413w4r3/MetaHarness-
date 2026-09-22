@@ -57,11 +57,10 @@ Keep the change local.
 
 EXECUTION_MODE: SINGLE
 STEP_COUNT: 1
-REVIEWER_PROFILE: reviewer
 
 BEGIN STEP S01
 TITLE: {step_title}
-IMPLEMENTER_PROFILE: implementer
+EXECUTION_CLASS: MECHANICAL
 DEPENDS_ON: NONE
 
 OBJECTIVE
@@ -322,6 +321,7 @@ class OrchestratorE2ETests(unittest.TestCase):
         check_cwd: str = ".",
         key_env: str | None = None,
         require_plan_approval: bool = False,
+        planning_decomposition: str | None = None,
     ) -> Path:
         config = self.root / "config.toml"
         key_line = f"\napi_key_env = {key_env!r}" if key_env else ""
@@ -333,6 +333,7 @@ class OrchestratorE2ETests(unittest.TestCase):
                 f"worktrees_root = {str(self.root / 'worktrees')!r}",
                 "require_clean_base = true",
                 f"max_diff_bytes = {max_diff}",
+                *(["", "[planning]", f'decomposition = "{planning_decomposition}"'] if planning_decomposition else []),
                 "",
                 "[repository]\nremote = \"origin\"\nplanner_remote_exploration = true",
                 "",
@@ -369,11 +370,13 @@ class OrchestratorE2ETests(unittest.TestCase):
         check_cwd: str = ".",
         key_env: str | None = None,
         env: dict[str, str] | None = None,
+        planning_decomposition: str | None = None,
     ) -> tuple[Any, FakeLLM, Path]:
         worktree = self.root / "worktrees" / run_id
         llm = FakeLLM(planner=planner, review=review, mutate=mutate, worktree=worktree)
         config = self.config_file(
-            llm, run_id=run_id, max_diff=max_diff, check_cwd=check_cwd, key_env=key_env
+            llm, run_id=run_id, max_diff=max_diff, check_cwd=check_cwd,
+            key_env=key_env, planning_decomposition=planning_decomposition,
         )
         overrides = {
             "PATH": str(self.root) + os.pathsep + os.environ.get("PATH", ""),
@@ -758,10 +761,9 @@ class OrchestratorE2ETests(unittest.TestCase):
     def test_long_step_title_still_commits_with_a_bounded_subject(self) -> None:
         planner = v2_plan(step_title="Very long title " * 10)
         _, _, state = self.run_case(planner=planner, run_id="long-title")
-        self.assertEqual(state["status"], RunStatus.COMMITTED.value)
-        subject = git(self.root / "worktrees" / "long-title", "log", "-1", "--format=%s")
-        self.assertLessEqual(len(subject), 72)
-        self.assertTrue(subject.startswith("metaharness(S01): Very long title"))
+        self.assertEqual(state["status"], RunStatus.FAILED.value)
+        self.assertEqual(state["failure"]["reason"], "PLANNER_OUTPUT_INVALID")
+        self.assertFalse((self.root / "worktrees" / "long-title").exists())
 
     def test_text_from_plan_or_agent_report_is_never_executed(self) -> None:
         marker_plan = self.root / "plan-command-ran"
@@ -805,6 +807,7 @@ class OrchestratorE2ETests(unittest.TestCase):
             key_env="META_E2E_KEY",
             env={"META_E2E_KEY": secret, "FAKE_STAGED_SECRET": secret},
             run_id="staged-secret",
+            planning_decomposition="balanced",
         )
         self.assertEqual(state["failure"]["reason"], "COMMIT_GATE_FAILED")
         self.assertEqual(llm.reviewer_calls, 0)

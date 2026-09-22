@@ -311,8 +311,7 @@ def build_planner_payload(
     repository_identity: str,
     discovery_context: str,
     trusted_check_catalogue: str,
-    available_profile_catalogue: str,
-    planning_constraints: str,
+    planning_constraints: str = "NONE",
     template: str | None = None,
     budget_bytes: int = 0,
 ) -> PromptPayload:
@@ -326,9 +325,10 @@ def build_planner_payload(
     # know the v2 parser limits.
     template = (
         template.replace("{{DEFAULT_CHECK_IDS}}", "NONE")
-        .replace("{{MAX_STEPS}}", "32")
-        .replace("{{LAST_STEP_ID}}", "S32")
-        .replace("{{MAX_STEP_CONTRACT_CHARS}}", "16000")
+        .replace("{{MAX_STEPS}}", "8")
+        .replace("{{LAST_STEP_ID}}", "S08")
+        .replace("{{MAX_STEP_CONTRACT_CHARS}}", "5000")
+        .replace("{{MAX_READ_PATHS_PER_STEP}}", "8")
     )
     if using_default_template:
         template = template.replace("{{PLANNING_CONSTRAINTS}}", "NONE")
@@ -337,27 +337,19 @@ def build_planner_payload(
         _section("repository_identity", repository_identity, True),
         _section("discovery_context", discovery_context, False),
         _section("trusted_check_catalogue", trusted_check_catalogue, True),
-        _section("available_profile_catalogue", available_profile_catalogue, False),
         _section("planning_constraints", planning_constraints, False),
     )
-    # The planner template has separate implementer/reviewer catalogue slots;
-    # the combined catalogue is deliberately inserted once into CONTEXT-like
-    # data by callers that need role labels.  These aliases keep the builder
-    # useful for both the shipped and small test templates.
     placeholders = {
         "{{SPEC}}": "spec",
         "{{REPOSITORY}}": "repository_identity",
         "{{CONTEXT}}": "discovery_context",
         "{{CHECK_CATALOG}}": "trusted_check_catalogue",
-        "{{AVAILABLE_PROFILES}}": "available_profile_catalogue",
-        "{{IMPLEMENTER_PROFILES}}": "available_profile_catalogue",
-        "{{REVIEWER_PROFILES}}": "available_profile_catalogue",
         "{{PLANNING_CONSTRAINTS}}": "planning_constraints",
     }
     return _payload_from_template(
         role="planner", template=template, sections=sections,
         placeholders=placeholders, budget_bytes=budget_bytes,
-        secondary_order=("discovery_context", "available_profile_catalogue", "planning_constraints"),
+        secondary_order=("discovery_context", "planning_constraints"),
     )
 
 

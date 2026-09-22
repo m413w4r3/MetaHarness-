@@ -203,8 +203,13 @@ class ConfigTests(unittest.TestCase):
     def test_staged_step_max_mutable_paths_defaults_and_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name)))
-        self.assertEqual(config.planning.staged_step_max_mutable_paths, 6)
+        self.assertEqual(config.planning.decomposition, "aggressive")
+        self.assertEqual(config.planning.execution_mode_policy, "auto")
+        self.assertEqual(config.planning.staged_step_max_mutable_paths, 5)
         self.assertEqual(config.planning.single_step_max_mutable_paths, 2)
+        self.assertEqual(config.planning.max_steps_per_plan, 8)
+        self.assertEqual(config.planning.max_read_paths_per_step, 8)
+        self.assertEqual(config.planning.max_step_contract_chars, 5000)
 
         contents = (
             VALID_CONFIG
@@ -230,12 +235,23 @@ class ConfigTests(unittest.TestCase):
     def test_planning_config_rejects_invalid_mutable_path_limits(self) -> None:
         from metaharness.models import PlanningConfig
 
-        self.assertEqual(PlanningConfig().staged_step_max_mutable_paths, 6)
+        self.assertEqual(PlanningConfig().staged_step_max_mutable_paths, 5)
+        self.assertEqual(PlanningConfig().max_steps_per_plan, 8)
+        self.assertEqual(PlanningConfig().max_read_paths_per_step, 8)
+        self.assertEqual(PlanningConfig().max_step_contract_chars, 5000)
         for name in ("single_step_max_mutable_paths", "staged_step_max_mutable_paths"):
             for value in (0, -1, True, "6"):
                 with self.subTest(name=name, value=value):
                     with self.assertRaisesRegex(ValueError, name):
                         PlanningConfig(**{name: value})
+
+        for name in ("max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars"):
+            for value in (0, -1, True, "8"):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaisesRegex(ValueError, name):
+                        PlanningConfig(**{name: value})
+        with self.assertRaisesRegex(ValueError, "max_steps_per_plan"):
+            PlanningConfig(max_steps_per_plan=100)
 
     def test_plan_approval_config_defaults_and_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:

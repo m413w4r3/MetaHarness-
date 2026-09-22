@@ -700,14 +700,23 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     protocol = planning_data.get("protocol", "v2")
     if protocol != "v2":
         raise ConfigError("planning.protocol must be 'v2'")
-    decomposition = planning_data.get("decomposition", "balanced")
+    decomposition = planning_data.get("decomposition", "aggressive")
     if not isinstance(decomposition, str) or decomposition not in {"balanced", "aggressive"}:
         raise ConfigError("planning.decomposition must be 'balanced' or 'aggressive'")
     single_step_max_mutable_paths = _positive_int(
         planning_data, "single_step_max_mutable_paths", 2, "planning"
     )
     staged_step_max_mutable_paths = _positive_int(
-        planning_data, "staged_step_max_mutable_paths", 6, "planning"
+        planning_data, "staged_step_max_mutable_paths", 5, "planning"
+    )
+    max_steps_per_plan = _bounded_int(
+        planning_data, "max_steps_per_plan", 8, "planning", minimum=1, maximum=99
+    )
+    max_read_paths_per_step = _positive_int(
+        planning_data, "max_read_paths_per_step", 8, "planning"
+    )
+    max_step_contract_chars = _positive_int(
+        planning_data, "max_step_contract_chars", 5000, "planning"
     )
     execution_mode_policy = planning_data.get(
         "execution_mode_policy", ExecutionModePolicy.AUTO.value
@@ -724,6 +733,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         single_step_max_mutable_paths=single_step_max_mutable_paths,
         staged_step_max_mutable_paths=staged_step_max_mutable_paths,
         execution_mode_policy=execution_mode_policy,
+        max_steps_per_plan=max_steps_per_plan,
+        max_read_paths_per_step=max_read_paths_per_step,
+        max_step_contract_chars=max_step_contract_chars,
     )
 
     revision_data = _table(expanded, "revision")

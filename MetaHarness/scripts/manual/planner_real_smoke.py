@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Manual real-provider smoke test for the planner boundary.
 
-It renders the production META PLAN v2 planner request for a fixed smoke
-profile and check catalogue, sends it once, and applies the production v2
+It renders the production META PLAN v2 planner request for a fixed check
+catalogue, sends it once, and applies the production v2
 parser without any format repair.  It measures the natural compatibility of
 each real provider with the real prompt and parser.  It never creates a
 worktree, starts an agent, runs checks, or calls a reviewer.
@@ -31,12 +31,8 @@ if str(SRC_ROOT) not in sys.path:
 from metaharness.llm.chat import OpenAIChatTextClient, validate_endpoint  # noqa: E402
 from metaharness.models import (  # noqa: E402
     CheckConfig,
-    ExecutionRole,
     LLMEndpointConfig,
-    ModelProfile,
     PlanDecision,
-    ProfileDriver,
-    SelectionMode,
     TaskPlanV2,
 )
 from metaharness.planning_v2 import (  # noqa: E402
@@ -57,19 +53,6 @@ API_KEY_ENV_BY_PROVIDER = {
 GEMINI_MODELS_PATH = "/v1/stateless/models"
 PREFLIGHT_TIMEOUT_SECONDS = 15
 PREFLIGHT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-# The fixed, provider-neutral catalogue offered to the planner.  Profiles are
-# selection metadata only: this smoke never runs an implementer or reviewer.
-SMOKE_IMPLEMENTER = ModelProfile(
-    id="smoke-implementer", display_name="Smoke implementer",
-    roles=(ExecutionRole.IMPLEMENTER,), driver=ProfileDriver.EXTERNAL,
-    model="smoke-worker", selection_mode=SelectionMode.CLI, argv=("smoke-worker",),
-)
-SMOKE_REVIEWER = ModelProfile(
-    id="smoke-reviewer", display_name="Smoke reviewer",
-    roles=(ExecutionRole.REVIEWER,), driver=ProfileDriver.OPENAI_CHAT,
-    model="smoke-reviewer", selection_mode=SelectionMode.REQUEST,
-    base_url="http://127.0.0.1:9", endpoint_path="/v1/chat/completions",
-)
 SMOKE_CHECKS = (CheckConfig("test", ("python", "-m", "unittest")),)
 
 
@@ -252,8 +235,6 @@ def build_smoke_request(spec: str, context: str) -> str:
 
     return build_planner_payload_v2(
         spec, context,
-        implementer_profiles=(SMOKE_IMPLEMENTER,),
-        reviewer_profiles=(SMOKE_REVIEWER,),
         check_catalog=SMOKE_CHECKS,
         default_check_ids=("test",),
     ).rendered
@@ -262,8 +243,6 @@ def build_smoke_request(spec: str, context: str) -> str:
 def parse_smoke_plan(raw: str) -> TaskPlanV2:
     return parse_task_plan_v2(
         raw,
-        implementer_ids=frozenset({SMOKE_IMPLEMENTER.id}),
-        reviewer_ids=frozenset({SMOKE_REVIEWER.id}),
         check_catalog=SMOKE_CHECKS,
         default_check_ids=("test",),
     )

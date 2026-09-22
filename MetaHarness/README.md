@@ -14,7 +14,7 @@ BASE
   ↓
 isolated run worktree  (harness/<plan>/<run-id>, jamais le checkout AutoWork/)
   ↓
-PLAN STAGED            (execution_mode_policy = "require-staged")
+PLAN SINGLE or STAGED  (execution_mode_policy = "auto" by default)
   ↓
 implementation steps → accepted step commits
   ↓

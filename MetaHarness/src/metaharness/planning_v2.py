@@ -20,6 +20,7 @@ from .llm.chat import (
     conversation_handle,
 )
 from .models import (
+    ExecutionClass,
     ExecutionMode,
     ExecutionModePolicy,
     ImplementationStep,
@@ -41,7 +42,7 @@ from .step_ids import LAST_STEP_ID, MAX_STEPS, STEP_ID_RE, step_ids
 from .usage import PLANNER_USAGE_ARTIFACT, completion_usage, write_usage_artifact
 
 
-MAX_STEP_CONTRACT_CHARS = 16_000
+MAX_STEP_CONTRACT_CHARS = 5_000
 # Canonical layout of the approved step contracts, written at planning time
 # and executed byte-for-byte: ``steps/<STEP>/contract.md``.
 STEP_CONTRACT_NAME = "contract.md"
@@ -53,14 +54,13 @@ _STEP_END = re.compile(r"^END STEP (.+)$")
 _STEP_ID = STEP_ID_RE
 _STEP_ID_RANGE = f"S01 through {LAST_STEP_ID}"
 _INLINE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*:\s*(.*)$")
-_PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 _TEXT_SECTIONS = frozenset(
     {"OBJECTIVE", "CONSTRAINTS", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS"}
 )
-_ENVELOPE_INLINE = frozenset({"STATUS", "TITLE", "EXECUTION_MODE", "STEP_COUNT", "REVIEWER_PROFILE"})
+_ENVELOPE_INLINE = frozenset({"STATUS", "TITLE", "EXECUTION_MODE", "STEP_COUNT"})
 _ENVELOPE_SECTIONS = frozenset({"OBJECTIVE", "CONSTRAINTS", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS", "REQUIRED_CHECKS"})
-_STEP_INLINE = frozenset({"TITLE", "IMPLEMENTER_PROFILE", "DEPENDS_ON"})
+_STEP_INLINE = frozenset({"TITLE", "EXECUTION_CLASS", "DEPENDS_ON"})
 _STEP_SECTIONS = frozenset({"OBJECTIVE", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN"})
 
 
@@ -81,6 +81,22 @@ def _nonempty(value: str, name: str) -> str:
     if not value or value.casefold() in {"none", "n/a", "na", "-", "—", "nil", "tbd"}:
         raise V2PlanParseError(f"{name} is missing or a placeholder")
     return value
+
+
+def _validate_step_text_limits(step_id: str, values: dict[str, str]) -> None:
+    title = values["TITLE"].strip()
+    if len(title) > 100:
+        raise V2PlanParseError(f"step {step_id} TITLE exceeds 100 characters")
+    instruction_lines = [line for line in values["INSTRUCTIONS"].splitlines() if line.strip()]
+    numbered = [line for line in instruction_lines if re.match(r"^\s*\d+[.)]\s+", line)]
+    if len(numbered) > 6:
+        raise V2PlanParseError(f"step {step_id} INSTRUCTIONS exceeds 6 operations")
+    verify_lines = [line for line in values["VERIFY"].splitlines() if line.strip()]
+    if len(verify_lines) > 3:
+        raise V2PlanParseError(f"step {step_id} VERIFY exceeds 3 lines")
+    forbidden_lines = [line for line in values["FORBIDDEN"].splitlines() if line.strip()]
+    if len(forbidden_lines) > 4:
+        raise V2PlanParseError(f"step {step_id} FORBIDDEN exceeds 4 rules")
 
 
 def _section_name(line: str, allowed: frozenset[str]) -> str | None:
@@ -196,7 +212,7 @@ def _repo_path(value: str, *, kind: str) -> str:
     return value
 
 
-def _read_set(value: str) -> tuple[str, ...]:
+def _read_set(value: str, *, max_paths: int) -> tuple[str, ...]:
     if not value.strip():
         raise V2PlanParseError("READ_SET is missing")
     anchors_by_path: dict[str, list[str]] = {}
@@ -217,6 +233,11 @@ def _read_set(value: str) -> tuple[str, ...]:
             anchors.append(anchor)
     if not anchors_by_path:
         raise V2PlanParseError("READ_SET is missing")
+    if len(anchors_by_path) > max_paths:
+        raise V2PlanParseError(
+            f"READ_SET contains {len(anchors_by_path)} unique paths; "
+            f"maximum is {max_paths}"
+        )
     return tuple(path + " :: " + "; ".join(anchors) for path, anchors in anchors_by_path.items())
 
 
@@ -255,17 +276,8 @@ def _change_sets(
 
     reads = set(read_set_paths(read_set))
     write_set = _path_set(values["WRITE_SET"], name="WRITE_SET")
-    # Plans emitted before CREATE_SET/DELETE_SET existed omit both sections.
-    create_set = (
-        _path_set(values["CREATE_SET"], name="CREATE_SET")
-        if "CREATE_SET" in values
-        else ()
-    )
-    delete_set = (
-        _path_set(values["DELETE_SET"], name="DELETE_SET")
-        if "DELETE_SET" in values
-        else ()
-    )
+    create_set = _path_set(values["CREATE_SET"], name="CREATE_SET")
+    delete_set = _path_set(values["DELETE_SET"], name="DELETE_SET")
     if any(path not in reads for path in write_set):
         raise V2PlanParseError("every WRITE_SET path must also appear in READ_SET")
     if any(path not in reads for path in delete_set):
@@ -286,32 +298,41 @@ def _change_sets(
     return write_set, create_set, delete_set
 
 
-def _parse_step(step_id: str, body: Sequence[str], implementer_ids: frozenset[str], prior_ids: frozenset[str]) -> ImplementationStep:
+def _parse_step(
+    step_id: str,
+    body: Sequence[str],
+    prior_ids: frozenset[str],
+    *,
+    max_read_paths_per_step: int,
+) -> ImplementationStep:
     values, _ = _parse_labeled_body(
         body, inline_names=_STEP_INLINE, section_names=_STEP_SECTIONS, where=f"step {step_id}"
     )
-    for name in ("TITLE", "IMPLEMENTER_PROFILE", "DEPENDS_ON", "OBJECTIVE", "READ_SET", "WRITE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN"):
+    for name in ("TITLE", "EXECUTION_CLASS", "DEPENDS_ON", "OBJECTIVE", "READ_SET", "WRITE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN"):
         if not values.get(name, "").strip():
             raise V2PlanParseError(f"step {step_id} is missing {name}")
     for name in ("CREATE_SET", "DELETE_SET"):
-        if name in values and not values[name].strip():
+        if name not in values:
+            raise V2PlanParseError(f"step {step_id} is missing {name}")
+        if not values[name].strip():
             raise V2PlanParseError(f"step {step_id} has an empty {name}; use NONE")
+    _validate_step_text_limits(step_id, values)
     title = _nonempty(values["TITLE"], f"step {step_id} TITLE")
-    profile = values["IMPLEMENTER_PROFILE"]
-    if not _PROFILE.fullmatch(profile) or profile not in implementer_ids:
-        raise V2PlanParseError(f"unknown implementer profile in {step_id}")
+    execution_class = values["EXECUTION_CLASS"]
+    if execution_class not in {item.value for item in ExecutionClass}:
+        raise V2PlanParseError(f"unknown execution class in {step_id}")
     dependency = values["DEPENDS_ON"]
     if dependency != "NONE":
         if _STEP_ID.fullmatch(dependency) is None or dependency not in prior_ids:
             raise V2PlanParseError(f"invalid or future dependency in {step_id}")
     objective = _nonempty(values["OBJECTIVE"], f"step {step_id} OBJECTIVE")
-    read_set = _read_set(values["READ_SET"])
+    read_set = _read_set(values["READ_SET"], max_paths=max_read_paths_per_step)
     write_set, create_set, delete_set = _change_sets(values, read_set)
     instructions = _nonempty(values["INSTRUCTIONS"], f"step {step_id} INSTRUCTIONS")
     verify = _nonempty(values["VERIFY"], f"step {step_id} VERIFY")
     forbidden = _nonempty(values["FORBIDDEN"], f"step {step_id} FORBIDDEN")
     return ImplementationStep(
-        step_id, title, profile, None if dependency == "NONE" else dependency,
+        step_id, title, ExecutionClass(execution_class), None if dependency == "NONE" else dependency,
         objective, read_set, write_set, instructions, verify, forbidden,
         create_set=create_set, delete_set=delete_set,
     )
@@ -327,6 +348,7 @@ def _render_step_contract_unchecked(plan: TaskPlanV2, step: ImplementationStep) 
             "RUN TITLE\n" + plan.title,
             f"STEP\n{step.id} / {len(plan.steps):02d}",
             "TITLE\n" + step.title,
+            "EXECUTION CLASS\n" + step.execution_class.value,
             "OBJECTIVE\n" + step.objective,
             "READ SET\n" + lines(step.read_set),
             "WRITE SET\n" + lines(step.write_set),
@@ -346,14 +368,14 @@ def render_step_contract(plan: TaskPlanV2, step: ImplementationStep) -> str:
     if plan.decision is not PlanDecision.READY or step not in plan.steps:
         raise V2PlanParseError("step contract requires a step from a READY plan")
     rendered = _render_step_contract_unchecked(plan, step)
-    if len(rendered) > MAX_STEP_CONTRACT_CHARS:
+    if len(rendered) > plan.max_step_contract_chars:
         raise V2PlanParseError("step contract exceeds MAX_STEP_CONTRACT_CHARS")
     return rendered
 
 
 def _validate_bounds(plan: TaskPlanV2) -> None:
     contracts = [_render_step_contract_unchecked(plan, step) for step in plan.steps]
-    if any(len(contract) > MAX_STEP_CONTRACT_CHARS for contract in contracts):
+    if any(len(contract) > plan.max_step_contract_chars for contract in contracts):
         raise V2PlanParseError("step contract exceeds MAX_STEP_CONTRACT_CHARS")
 
 
@@ -399,8 +421,7 @@ def _parse_required_checks(
 def parse_task_plan_v2(
     raw: str,
     *,
-    implementer_ids: frozenset[str],
-    reviewer_ids: frozenset[str],
+    planning: PlanningConfig | None = None,
     check_catalog: Sequence[CheckConfig] = (),
     default_check_ids: Sequence[str] = (),
     inherited_check_ids: Sequence[str] = (),
@@ -411,8 +432,9 @@ def parse_task_plan_v2(
         raise TypeError("raw planner response must be a string")
     if not raw.strip():
         raise V2PlanParseError("planner response is empty")
-    if not isinstance(implementer_ids, frozenset) or not isinstance(reviewer_ids, frozenset):
-        raise TypeError("profile IDs must be frozensets")
+    planning = planning or PlanningConfig()
+    if not isinstance(planning, PlanningConfig):
+        raise TypeError("planning must be a PlanningConfig")
     lines = _lines(raw)
     first = next((index for index, line in enumerate(lines) if line.strip()), None)
     if first is None or lines[first].strip() != _HEADER:
@@ -439,14 +461,19 @@ def parse_task_plan_v2(
     objective = _nonempty(sections.get("OBJECTIVE", ""), "OBJECTIVE")
     blockers = sections.get("BLOCKERS", "").strip()
     if decision is PlanDecision.BLOCKED:
-        if blocks or any(name in inline for name in ("EXECUTION_MODE", "STEP_COUNT", "REVIEWER_PROFILE")):
+        if blocks or any(name in inline for name in ("EXECUTION_MODE", "STEP_COUNT")):
             raise V2PlanParseError("BLOCKED plan must not contain execution metadata or steps")
         if not blockers or blockers.casefold() in {"none", "n/a", "na", "-", "—", "nil"}:
             raise V2PlanParseError("BLOCKED plan requires real BLOCKERS")
         allowed = {"OBJECTIVE", "BLOCKERS"}
         if set(sections) - allowed or "CONSTRAINTS" in sections or "ACCEPTANCE" in sections or "TESTS" in sections or "RISKS" in sections:
             raise V2PlanParseError("BLOCKED plan contains READY-only sections")
-        return TaskPlanV2(decision, title, objective, "", None, None, (), "", "", "", blockers, raw)
+        return TaskPlanV2(
+            decision=decision, title=title, objective=objective, constraints="",
+            execution_mode=None, steps=(), acceptance="", tests="", risks="",
+            blockers=blockers, raw=raw,
+            max_step_contract_chars=planning.max_step_contract_chars,
+        )
 
     mode = inline.get("EXECUTION_MODE")
     if mode not in {item.value for item in ExecutionMode}:
@@ -456,21 +483,29 @@ def parse_task_plan_v2(
         raise V2PlanParseError("STEP_COUNT must be an integer")
     step_count = int(count_text)
     if step_count < 1 or step_count > MAX_STEPS:
-        raise V2PlanParseError("STEP_COUNT exceeds allowed bounds")
+        raise V2PlanParseError("STEP_COUNT exceeds protocol bounds")
+    if step_count > planning.max_steps_per_plan:
+        raise V2PlanParseError(
+            f"STEP_COUNT exceeds planning.max_steps_per_plan ({planning.max_steps_per_plan})"
+        )
     if mode == ExecutionMode.SINGLE.value and step_count != 1:
         raise V2PlanParseError("SINGLE requires exactly one step")
     if mode == ExecutionMode.STAGED.value and not 2 <= step_count <= MAX_STEPS:
         raise V2PlanParseError(f"STAGED requires between 2 and {MAX_STEPS} steps")
-    reviewer = inline.get("REVIEWER_PROFILE", "")
-    if not _PROFILE.fullmatch(reviewer) or reviewer not in reviewer_ids:
-        raise V2PlanParseError("unknown reviewer profile")
     if len(blocks) != step_count:
         raise V2PlanParseError("STEP_COUNT does not match step blocks")
     if [step_id for step_id, _ in blocks] != list(step_ids(step_count)):
         raise V2PlanParseError(f"step IDs must be contiguous {_STEP_ID_RANGE}")
     steps: list[ImplementationStep] = []
     for step_id, body in blocks:
-        steps.append(_parse_step(step_id, body, implementer_ids, frozenset(step.id for step in steps)))
+        steps.append(
+            _parse_step(
+                step_id,
+                body,
+                frozenset(step.id for step in steps),
+                max_read_paths_per_step=planning.max_read_paths_per_step,
+            )
+        )
     for name in ("CONSTRAINTS", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS"):
         if name not in sections or not sections[name].strip():
             raise V2PlanParseError(f"READY plan is missing {name}")
@@ -483,9 +518,19 @@ def parse_task_plan_v2(
         inherited_check_ids=inherited_check_ids,
     )
     plan = TaskPlanV2(
-        decision, title, objective, sections["CONSTRAINTS"].strip(), ExecutionMode(mode), reviewer,
-        tuple(steps), sections["ACCEPTANCE"].strip(), sections["TESTS"].strip(), sections["RISKS"].strip(), blockers or "NONE", raw,
-        required_checks,
+        decision=decision,
+        title=title,
+        objective=objective,
+        constraints=sections["CONSTRAINTS"].strip(),
+        execution_mode=ExecutionMode(mode),
+        steps=tuple(steps),
+        acceptance=sections["ACCEPTANCE"].strip(),
+        tests=sections["TESTS"].strip(),
+        risks=sections["RISKS"].strip(),
+        blockers=blockers or "NONE",
+        raw=raw,
+        required_checks=required_checks,
+        max_step_contract_chars=planning.max_step_contract_chars,
     )
     _validate_bounds(plan)
     return plan
@@ -497,7 +542,7 @@ def render_plan_summary_v2(plan: TaskPlanV2) -> str:
     mode = plan.execution_mode.value if plan.execution_mode is not None else "NONE"
     summaries = []
     for step in plan.steps:
-        summaries.append(f"{step.id} — {step.title} [{step.implementer_profile}]\n{step.objective}")
+        summaries.append(f"{step.id} — {step.title} [{step.execution_class.value}]\n{step.objective}")
     return "\n\n".join(
         (
             "# Implementation contract",
@@ -556,6 +601,7 @@ def render_repair_step_index(plan: TaskPlanV2) -> str:
                 "id": step.id,
                 "title": step.title,
                 "depends_on": step.depends_on,
+                "execution_class": step.execution_class.value,
                 "objective": step.objective,
                 "mutation_scope": {
                     "write": list(step.write_set),
@@ -625,9 +671,14 @@ def render_safe_check_catalogue(checks: Sequence[CheckConfig]) -> str:
     return "\n\n".join(output) or "NONE"
 
 
-REQUIRE_STAGED_POLICY_TEXT = f"""This run REQUIRES STAGED execution.
+def render_require_staged_policy_text(max_steps_per_plan: int = PlanningConfig.max_steps_per_plan) -> str:
+    if isinstance(max_steps_per_plan, bool) or not isinstance(max_steps_per_plan, int):
+        raise ValueError("max_steps_per_plan must be an integer")
+    if not 2 <= max_steps_per_plan <= MAX_STEPS:
+        raise ValueError("max_steps_per_plan must be between 2 and 99 for STAGED policy")
+    return f"""This run REQUIRES STAGED execution.
 
-You must return between 2 and {MAX_STEPS} coherent implementation steps.
+You must return between 2 and {max_steps_per_plan} coherent implementation steps.
 
 Do not create artificial "implementation then tests" steps when tests belong
 to the same local behavior.
@@ -638,6 +689,9 @@ layer, subsystem, or dependency boundary.
 Each worker must receive a mechanically executable contract and must not need
 architectural discovery.
 """
+
+
+REQUIRE_STAGED_POLICY_TEXT = render_require_staged_policy_text()
 _PROTOCOL_ANCHOR = "The answer must use exactly this protocol."
 
 
@@ -731,14 +785,18 @@ def _insert_before_protocol(prompt: str, text: str) -> str:
     return prompt[:index] + text + "\n" + prompt[index:]
 
 
-def _apply_execution_mode_policy(prompt: str, policy: str) -> str:
+def _apply_execution_mode_policy(
+    prompt: str,
+    policy: str,
+    max_steps_per_plan: int = PlanningConfig.max_steps_per_plan,
+) -> str:
     """Insert the configured EXECUTION_MODE policy before the wire protocol."""
 
     if policy == ExecutionModePolicy.AUTO.value:
         return prompt
     if policy != ExecutionModePolicy.REQUIRE_STAGED.value:
         raise ValueError("unknown execution mode policy")
-    return _insert_before_protocol(prompt, REQUIRE_STAGED_POLICY_TEXT)
+    return _insert_before_protocol(prompt, render_require_staged_policy_text(max_steps_per_plan))
 
 
 def _apply_decomposition_policy(
@@ -781,13 +839,14 @@ def build_planner_payload_v2(
     context: str,
     *,
     repository_reference: RepositoryReference | None = None,
-    implementer_profiles: Sequence[ModelProfile] = (),
-    reviewer_profiles: Sequence[ModelProfile] = (),
     template: str | None = None,
     execution_mode_policy: str = ExecutionModePolicy.AUTO.value,
     decomposition: str = PlanningConfig.decomposition,
     single_step_max_mutable_paths: int = PlanningConfig.single_step_max_mutable_paths,
     staged_step_max_mutable_paths: int = PlanningConfig.staged_step_max_mutable_paths,
+    max_steps_per_plan: int = PlanningConfig.max_steps_per_plan,
+    max_read_paths_per_step: int = PlanningConfig.max_read_paths_per_step,
+    max_step_contract_chars: int = PlanningConfig.max_step_contract_chars,
     check_catalog: Sequence[CheckConfig] = (),
     default_check_ids: Sequence[str] = (),
     budget_bytes: int = 0,
@@ -804,20 +863,19 @@ def build_planner_payload_v2(
         "{{REPOSITORY}}": render_repository_reference(repository_reference) if repository_reference else (
             "WEB URL:\nUNAVAILABLE\n\nBASE SHA:\nUNAVAILABLE\n\nIMMUTABLE BASE URL:\nUNAVAILABLE\n\nREMOTE EXPLORATION:\nUNAVAILABLE"
         ),
-        "{{IMPLEMENTER_PROFILES}}": render_safe_profile_catalogue(implementer_profiles),
-        "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
         "{{CHECK_CATALOG}}": render_safe_check_catalogue(check_catalog),
         "{{DEFAULT_CHECK_IDS}}": "\n".join(f"- {check_id}" for check_id in default_check_ids) or "NONE",
-        "{{MAX_STEPS}}": str(MAX_STEPS),
-        "{{LAST_STEP_ID}}": LAST_STEP_ID,
-        "{{MAX_STEP_CONTRACT_CHARS}}": str(MAX_STEP_CONTRACT_CHARS),
+        "{{MAX_STEPS}}": str(max_steps_per_plan),
+        "{{LAST_STEP_ID}}": f"S{max_steps_per_plan:02d}",
+        "{{MAX_STEP_CONTRACT_CHARS}}": str(max_step_contract_chars),
+        "{{MAX_READ_PATHS_PER_STEP}}": str(max_read_paths_per_step),
     }
     # Keep policy text in a named section.  It is still inserted before the
     # wire protocol, but now its exact bytes participate in payload
     # accounting rather than being an unlabelled concatenation.
     policy_parts: list[str] = []
     if execution_mode_policy == ExecutionModePolicy.REQUIRE_STAGED.value:
-        policy_parts.append(REQUIRE_STAGED_POLICY_TEXT)
+        policy_parts.append(render_require_staged_policy_text(max_steps_per_plan))
     elif execution_mode_policy != ExecutionModePolicy.AUTO.value:
         raise ValueError("unknown execution mode policy")
     if decomposition == "aggressive":
@@ -834,22 +892,15 @@ def build_planner_payload_v2(
     # Non-contract control values are fixed by MetaHarness and are substituted
     # before the role payload builder sees user-controlled text.
     template = re.sub(
-        r"\{\{(?:DEFAULT_CHECK_IDS|MAX_STEPS|LAST_STEP_ID|MAX_STEP_CONTRACT_CHARS)\}\}",
+        r"\{\{(?:DEFAULT_CHECK_IDS|MAX_STEPS|LAST_STEP_ID|MAX_STEP_CONTRACT_CHARS|MAX_READ_PATHS_PER_STEP)\}\}",
         lambda match: values[match.group(0)],
         template,
-    )
-    profiles = (
-        "IMPLEMENTER PROFILES\n"
-        + values["{{IMPLEMENTER_PROFILES}}"]
-        + "\nREVIEWER PROFILES\n"
-        + values["{{REVIEWER_PROFILES}}"]
     )
     payload = build_planner_payload(
         spec=spec,
         repository_identity=values["{{REPOSITORY}}"],
         discovery_context=context,
         trusted_check_catalogue=values["{{CHECK_CATALOG}}"],
-        available_profile_catalogue=profiles,
         planning_constraints=planning_constraints,
         template=template,
         budget_bytes=budget_bytes,
@@ -936,12 +987,13 @@ def build_repair_planner_prompt_bundle(
     previous_revision_report: str,
     original_approved_mutable_scope: str,
     reviewer_result: str,
-    implementer_profiles: Sequence[ModelProfile] = (),
-    reviewer_profiles: Sequence[ModelProfile] = (),
     template: str | None = None,
     check_catalog: Sequence[CheckConfig] = (),
     original_required_check_ids: Sequence[str] = (),
     staged_step_max_mutable_paths: int = PlanningConfig.staged_step_max_mutable_paths,
+    max_steps_per_plan: int = PlanningConfig.max_steps_per_plan,
+    max_read_paths_per_step: int = PlanningConfig.max_read_paths_per_step,
+    max_step_contract_chars: int = PlanningConfig.max_step_contract_chars,
 ) -> RepairPlannerPromptBundle:
     """Build the compact corrective planner request in both transport shapes."""
 
@@ -964,13 +1016,12 @@ def build_repair_planner_prompt_bundle(
     evidence_text = _render_repair_evidence(evidence_values)
 
     control = {
-        "{{IMPLEMENTER_PROFILES}}": render_safe_profile_catalogue(implementer_profiles),
-        "{{REVIEWER_PROFILES}}": render_safe_profile_catalogue(reviewer_profiles),
         "{{CHECK_CATALOG}}": render_safe_check_catalogue(check_catalog),
         "{{ORIGINAL_REQUIRED_CHECKS}}": "\n".join(f"- {check_id}" for check_id in original_required_check_ids) or "NONE",
-        "{{MAX_STEPS}}": str(MAX_STEPS),
-        "{{LAST_STEP_ID}}": LAST_STEP_ID,
-        "{{MAX_STEP_CONTRACT_CHARS}}": str(MAX_STEP_CONTRACT_CHARS),
+        "{{MAX_STEPS}}": str(max_steps_per_plan),
+        "{{LAST_STEP_ID}}": f"S{max_steps_per_plan:02d}",
+        "{{MAX_READ_PATHS_PER_STEP}}": str(max_read_paths_per_step),
+        "{{MAX_STEP_CONTRACT_CHARS}}": str(max_step_contract_chars),
         # An authoritative MetaHarness instruction, so it belongs to the
         # control prompt and never to the repair evidence packet.
         "{{REPAIR_DECOMPOSITION_POLICY}}": render_repair_decomposition_policy_text(
@@ -980,7 +1031,7 @@ def build_repair_planner_prompt_bundle(
     if template is None:
         template = (Path(__file__).with_name("prompts") / "review_repair_planner_v2.txt").read_text(encoding="utf-8")
 
-    pattern = r"\{\{(?:EVIDENCE_DELIVERY|REPAIR_EVIDENCE|REPAIR_DECOMPOSITION_POLICY|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|ORIGINAL_REQUIRED_CHECKS|MAX_STEPS|LAST_STEP_ID|MAX_STEP_CONTRACT_CHARS)\}\}"
+    pattern = r"\{\{(?:EVIDENCE_DELIVERY|REPAIR_EVIDENCE|REPAIR_DECOMPOSITION_POLICY|CHECK_CATALOG|ORIGINAL_REQUIRED_CHECKS|MAX_STEPS|LAST_STEP_ID|MAX_READ_PATHS_PER_STEP|MAX_STEP_CONTRACT_CHARS)\}\}"
 
     def render(delivery: str, evidence: str) -> str:
         values = {
@@ -1009,12 +1060,13 @@ def build_repair_planner_prompt(
     previous_revision_report: str,
     original_approved_mutable_scope: str,
     reviewer_result: str,
-    implementer_profiles: Sequence[ModelProfile] = (),
-    reviewer_profiles: Sequence[ModelProfile] = (),
     template: str | None = None,
     check_catalog: Sequence[CheckConfig] = (),
     original_required_check_ids: Sequence[str] = (),
     staged_step_max_mutable_paths: int = PlanningConfig.staged_step_max_mutable_paths,
+    max_steps_per_plan: int = PlanningConfig.max_steps_per_plan,
+    max_read_paths_per_step: int = PlanningConfig.max_read_paths_per_step,
+    max_step_contract_chars: int = PlanningConfig.max_step_contract_chars,
 ) -> str:
     """Build the bounded corrective planner request delivered inline."""
 
@@ -1029,12 +1081,13 @@ def build_repair_planner_prompt(
         previous_revision_report=previous_revision_report,
         original_approved_mutable_scope=original_approved_mutable_scope,
         reviewer_result=reviewer_result,
-        implementer_profiles=implementer_profiles,
-        reviewer_profiles=reviewer_profiles,
         template=template,
         check_catalog=check_catalog,
         original_required_check_ids=original_required_check_ids,
         staged_step_max_mutable_paths=staged_step_max_mutable_paths,
+        max_steps_per_plan=max_steps_per_plan,
+        max_read_paths_per_step=max_read_paths_per_step,
+        max_step_contract_chars=max_step_contract_chars,
     ).inline_prompt
 
 
@@ -1126,7 +1179,7 @@ def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict
             {
                 "id": step.id,
                 "title": step.title,
-                "implementer_profile": step.implementer_profile,
+                "execution_class": step.execution_class.value,
                 "depends_on": step.depends_on,
                 "contract_sha256": hashlib.sha256(contracts[step.id].encode("utf-8")).hexdigest(),
             }
@@ -1134,7 +1187,7 @@ def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict
     bundle = {
         "schema_version": 1,
         "execution_mode": plan.execution_mode.value if plan.execution_mode else None,
-        "reviewer_profile": plan.reviewer_profile,
+        "max_step_contract_chars": plan.max_step_contract_chars,
         "required_checks": list(plan.required_checks),
         "steps": entries,
     }
@@ -1191,7 +1244,10 @@ def read_approved_step_contract(
         text = data.decode("utf-8")
     except UnicodeError as exc:
         raise V2PlanParseError(f"contract for {step_id} is not UTF-8") from exc
-    if len(text) > MAX_STEP_CONTRACT_CHARS:
+    limit = bundle.get("max_step_contract_chars", MAX_STEP_CONTRACT_CHARS)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise V2PlanParseError("implementation bundle contract limit is invalid")
+    if len(text) > limit:
         raise V2PlanParseError("step contract exceeds MAX_STEP_CONTRACT_CHARS")
     return text
 
@@ -1217,18 +1273,22 @@ def validate_implementation_bundle(
         raise V2PlanParseError("implementation bundle is missing or invalid") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise V2PlanParseError("implementation bundle schema_version is invalid")
+    if "reviewer_profile" in payload or "implementer_profiles" in payload:
+        raise V2PlanParseError("implementation bundle contains planner-selected profiles")
     steps = payload.get("steps")
     if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_STEPS:
         raise V2PlanParseError("implementation bundle steps are invalid")
     expected_ids = list(step_ids(len(steps)))
     actual_ids: list[str] = []
     for entry in steps:
-        if not isinstance(entry, dict) or set(entry) != {"id", "title", "implementer_profile", "depends_on", "contract_sha256"}:
+        if not isinstance(entry, dict) or set(entry) != {"id", "title", "execution_class", "depends_on", "contract_sha256"}:
             raise V2PlanParseError("implementation bundle step entry is invalid")
         step_id = entry.get("id")
         if not isinstance(step_id, str) or step_id in actual_ids:
             raise V2PlanParseError("implementation bundle step ID is invalid")
         actual_ids.append(step_id)
+        if entry.get("execution_class") not in {item.value for item in ExecutionClass}:
+            raise V2PlanParseError("implementation bundle execution class is invalid")
         declared = entry.get("contract_sha256")
         if not isinstance(declared, str) or re.fullmatch(r"[0-9a-f]{64}", declared) is None:
             raise V2PlanParseError("implementation bundle contract hash is invalid")
@@ -1236,7 +1296,13 @@ def validate_implementation_bundle(
             raise V2PlanParseError("implementation bundle step ID is invalid")
         contract_path = step_contract_path(target, step_id)
         try:
-            actual = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+            contract_bytes = contract_path.read_bytes()
+            limit = payload.get("max_step_contract_chars", MAX_STEP_CONTRACT_CHARS)
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise V2PlanParseError("implementation bundle contract limit is invalid")
+            if len(contract_bytes.decode("utf-8")) > limit:
+                raise V2PlanParseError("step contract exceeds MAX_STEP_CONTRACT_CHARS")
+            actual = hashlib.sha256(contract_bytes).hexdigest()
         except OSError as exc:
             raise V2PlanParseError(f"missing contract for {step_id}") from exc
         if actual != declared:
@@ -1322,12 +1388,8 @@ class TextCompletionClient(Protocol):
 class PlannerV2:
     """Standalone v2 planner entry point; it never invokes the profile recommender."""
 
-    def __init__(self, client: TextCompletionClient, *, implementer_ids: frozenset[str], reviewer_ids: frozenset[str], implementer_profiles: Sequence[ModelProfile] = (), reviewer_profiles: Sequence[ModelProfile] = (), repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None, check_catalog: Sequence[CheckConfig] = (), default_check_ids: Sequence[str] = (), prompt_budget_bytes: int = 0):
+    def __init__(self, client: TextCompletionClient, *, repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None, check_catalog: Sequence[CheckConfig] = (), default_check_ids: Sequence[str] = (), prompt_budget_bytes: int = 0):
         self.client = client
-        self.implementer_ids = implementer_ids
-        self.reviewer_ids = reviewer_ids
-        self.implementer_profiles = implementer_profiles
-        self.reviewer_profiles = reviewer_profiles
         self.repository_reference = repository_reference
         self.planning = planning or PlanningConfig(protocol="v2")
         self.template = template
@@ -1341,12 +1403,14 @@ class PlannerV2:
         reference = repository_reference if repository_reference is not None else self.repository_reference
         payload = build_planner_payload_v2(
             spec, context, repository_reference=reference,
-            implementer_profiles=self.implementer_profiles,
-            reviewer_profiles=self.reviewer_profiles, template=self.template,
+            template=self.template,
             execution_mode_policy=self.planning.execution_mode_policy,
             decomposition=self.planning.decomposition,
             single_step_max_mutable_paths=self.planning.single_step_max_mutable_paths,
             staged_step_max_mutable_paths=self.planning.staged_step_max_mutable_paths,
+            max_steps_per_plan=self.planning.max_steps_per_plan,
+            max_read_paths_per_step=self.planning.max_read_paths_per_step,
+            max_step_contract_chars=self.planning.max_step_contract_chars,
             check_catalog=self.check_catalog,
             default_check_ids=self.default_check_ids,
             budget_bytes=self.prompt_budget_bytes,
@@ -1367,8 +1431,12 @@ class PlannerV2:
             raise V2PlanParseError("planner client did not return text")
         if target is not None:
             atomic_write_text(target / "planner.raw.md", raw)
-        plan = parse_task_plan_v2(raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids,
-                                  check_catalog=self.check_catalog, default_check_ids=self.default_check_ids)
+        plan = parse_task_plan_v2(
+            raw,
+            planning=self.planning,
+            check_catalog=self.check_catalog,
+            default_check_ids=self.default_check_ids,
+        )
         # Only the initial planner is bound by the execution mode policy; the
         # bounded correction plan keeps its own (possibly single-step) shape.
         validate_execution_mode_policy(plan, self.planning)
@@ -1407,8 +1475,6 @@ def _recover_existing_repair_plan(
     current_evidence_text: str,
     original_spec: str,
     current_repository_state: str,
-    implementer_ids: frozenset[str],
-    reviewer_ids: frozenset[str],
     check_catalog: Sequence[CheckConfig],
     inherited_check_ids: Sequence[str],
     planning: PlanningConfig,
@@ -1438,8 +1504,7 @@ def _recover_existing_repair_plan(
         try:
             plan = parse_task_plan_v2(
                 raw,
-                implementer_ids=implementer_ids,
-                reviewer_ids=reviewer_ids,
+                planning=planning,
                 check_catalog=check_catalog,
                 inherited_check_ids=inherited_check_ids,
             )
@@ -1494,27 +1559,19 @@ class RepairPlannerV2:
     """Planner facade for one review-driven correction cycle.
 
     It deliberately shares the strict META PLAN v2 parser and bundle writer;
-    only its request envelope and implementer catalogue are different.
+    only its bounded repair evidence envelope is different.
     """
 
     def __init__(
         self,
         client: TextCompletionClient,
         *,
-        implementer_ids: frozenset[str],
-        reviewer_ids: frozenset[str],
-        implementer_profiles: Sequence[ModelProfile] = (),
-        reviewer_profiles: Sequence[ModelProfile] = (),
         planning: PlanningConfig | None = None,
         template: str | None = None,
         check_catalog: Sequence[CheckConfig] = (),
         original_required_check_ids: Sequence[str] = (),
     ):
         self.client = client
-        self.implementer_ids = implementer_ids
-        self.reviewer_ids = reviewer_ids
-        self.implementer_profiles = implementer_profiles
-        self.reviewer_profiles = reviewer_profiles
         self.planning = planning or PlanningConfig(protocol="v2")
         self.template = template
         self.check_catalog = tuple(check_catalog)
@@ -1548,14 +1605,15 @@ class RepairPlannerV2:
             previous_revision_report=previous_revision_report,
             original_approved_mutable_scope=original_approved_mutable_scope,
             reviewer_result=reviewer_result,
-            implementer_profiles=self.implementer_profiles,
-            reviewer_profiles=self.reviewer_profiles,
             template=self.template,
             check_catalog=self.check_catalog,
             original_required_check_ids=self.original_required_check_ids,
             staged_step_max_mutable_paths=(
                 self.planning.staged_step_max_mutable_paths
             ),
+            max_steps_per_plan=self.planning.max_steps_per_plan,
+            max_read_paths_per_step=self.planning.max_read_paths_per_step,
+            max_step_contract_chars=self.planning.max_step_contract_chars,
         )
         request = bundle.inline_prompt
         target = Path(artifacts_dir)
@@ -1567,8 +1625,6 @@ class RepairPlannerV2:
             current_evidence_text=bundle.evidence_text,
             original_spec=original_spec,
             current_repository_state=current_repository_state,
-            implementer_ids=self.implementer_ids,
-            reviewer_ids=self.reviewer_ids,
             check_catalog=self.check_catalog,
             inherited_check_ids=self.original_required_check_ids,
             planning=self.planning,
@@ -1654,7 +1710,7 @@ class RepairPlannerV2:
             raise V2PlanParseError("repair planner client did not return text")
         atomic_write_text(target / "planner.raw.md", raw)
         plan = parse_task_plan_v2(
-            raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids,
+            raw, planning=self.planning,
             check_catalog=self.check_catalog, inherited_check_ids=self.original_required_check_ids,
         )
         validate_repair_decomposition_policy(plan, self.planning)
@@ -1676,10 +1732,6 @@ def run_planner_v2(
     spec: str,
     context: str,
     *,
-    implementer_ids: frozenset[str],
-    reviewer_ids: frozenset[str],
-    implementer_profiles: Sequence[ModelProfile] = (),
-    reviewer_profiles: Sequence[ModelProfile] = (),
     repository_reference: RepositoryReference | None = None,
     planning: PlanningConfig | None = None,
     artifacts_dir: str | Path | None = None,
@@ -1689,10 +1741,6 @@ def run_planner_v2(
 ) -> TaskPlanV2:
     return PlannerV2(
         client,
-        implementer_ids=implementer_ids,
-        reviewer_ids=reviewer_ids,
-        implementer_profiles=implementer_profiles,
-        reviewer_profiles=reviewer_profiles,
         repository_reference=repository_reference,
         planning=planning,
         template=template,
@@ -1702,7 +1750,7 @@ def run_planner_v2(
 
 
 __all__ = [
-    "ExecutionMode", "ImplementationStep", "MAX_STEPS", "MAX_STEP_CONTRACT_CHARS",
+    "ExecutionClass", "ExecutionMode", "ImplementationStep", "MAX_STEPS", "MAX_STEP_CONTRACT_CHARS",
     "PlannerV2", "STEP_CONTRACT_NAME", "TaskPlanV2", "V2PlanParseError",
     "PlanDecision", "PlanParseError",
     "build_planner_payload_v2", "build_planner_prompt_v2", "parse_task_plan_v2", "persist_implementation_bundle",

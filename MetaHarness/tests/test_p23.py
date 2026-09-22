@@ -28,7 +28,7 @@ def _step(number: int) -> str:
     dependency = "NONE" if number == 1 else "S01"
     return f"""BEGIN STEP {step_id}
 TITLE: Step {number}
-IMPLEMENTER_PROFILE: impl-a
+EXECUTION_CLASS: MECHANICAL
 DEPENDS_ON: {dependency}
 
 OBJECTIVE
@@ -39,6 +39,12 @@ READ_SET
 
 WRITE_SET
 - src/example.py
+
+CREATE_SET
+NONE
+
+DELETE_SET
+NONE
 
 INSTRUCTIONS
 1. edit the named symbol
@@ -68,7 +74,6 @@ NONE
 
 EXECUTION_MODE: {mode}
 STEP_COUNT: {count}
-REVIEWER_PROFILE: review-a
 
 {steps}
 
@@ -91,8 +96,6 @@ END META PLAN
 def _parse(raw: str):
     return parse_task_plan_v2(
         raw,
-        implementer_ids=frozenset({"impl-a"}),
-        reviewer_ids=frozenset({"review-a"}),
     )
 
 
@@ -196,7 +199,7 @@ class P23DecompositionTests(unittest.TestCase):
             "CREATE_SET\nNONE\n\nDELETE_SET\nNONE\n"
         )
         plan = _parse(_plan("STAGED", 2, steps=_plan_step_with_sets(sets) + "\n\n" + _plan_step_with_sets(sets, 2)))
-        # Four mutable paths fit the default STAGED limit of six ...
+        # Four mutable paths fit the default STAGED limit of five ...
         validate_decomposition_policy(
             plan, PlanningConfig(protocol="v2", decomposition="aggressive")
         )

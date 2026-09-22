@@ -107,7 +107,7 @@ ARTIFACT_ALLOWLIST = frozenset(
         REVIEWER_USAGE_ARTIFACT,
     }
 )
-# The parser caps a step contract at 16000 characters; the UI read bound is
+# The parser caps a step contract at 5000 characters; the UI read bound is
 # deliberately higher so a malformed artifact is reported rather than read
 # without a bound.
 MAX_STEP_CONTRACT_BYTES = 64 * 1024
@@ -526,7 +526,8 @@ def _cycle_steps(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[
             "id": step_id,
             "cycle": cycle,
             "title": item.get("title", entry.get("title")),
-            "profile_id": item.get("profile_id") or step_json.get("profile_id") or entry.get("implementer_profile"),
+            "execution_class": item.get("execution_class") or step_json.get("execution_class") or entry.get("execution_class"),
+            "profile_id": item.get("profile_id") or step_json.get("profile_id"),
             "status": status,
             "failure_reason": step_json.get("reason"),
             "mismatch": step_json.get("mismatch"),

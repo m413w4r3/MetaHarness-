@@ -61,6 +61,9 @@ class RunOptions:
     final_reviewer_profile: str
     repair_scope_policy: str = "auto-bounded"
     repair_scope_max_added_paths: int = 4
+    max_steps_per_plan: int = 8
+    max_read_paths_per_step: int = 8
+    max_step_contract_chars: int = 5000
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION or self.pipeline_version != 2:
@@ -75,6 +78,12 @@ class RunOptions:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise RunOptionsError(f"run options {name} must be greater than zero")
+        for name in ("max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise RunOptionsError(f"run options {name} must be greater than zero")
+        if self.max_steps_per_plan > 99:
+            raise RunOptionsError("run options max_steps_per_plan must not exceed 99")
         if not isinstance(self.semantic_revision_enabled, bool):
             raise RunOptionsError("run options semantic_revision_enabled must be boolean")
         for name in ("max_check_repair_attempts", "max_review_repair_cycles"):
@@ -104,6 +113,7 @@ class RunOptions:
             "max_review_repair_cycles", "planner_profile", "default_implementer_profile",
             "check_repair_profile", "semantic_reviser_profile", "final_reviewer_profile",
             "repair_scope_policy", "repair_scope_max_added_paths",
+            "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
         }
         unknown = set(overrides) - allowed
         if unknown:
@@ -116,6 +126,9 @@ class RunOptions:
             "execution_mode_policy": config.planning.execution_mode_policy,
             "single_step_max_mutable_paths": config.planning.single_step_max_mutable_paths,
             "staged_step_max_mutable_paths": config.planning.staged_step_max_mutable_paths,
+            "max_steps_per_plan": config.planning.max_steps_per_plan,
+            "max_read_paths_per_step": config.planning.max_read_paths_per_step,
+            "max_step_contract_chars": config.planning.max_step_contract_chars,
             "semantic_revision_enabled": config.revision.enabled,
             "max_check_repair_attempts": config.revision.max_check_repair_attempts,
             "max_review_repair_cycles": config.revision.max_review_repair_cycles,
@@ -164,6 +177,9 @@ class RunOptions:
                 "execution_mode_policy": self.execution_mode_policy,
                 "single_step_max_mutable_paths": self.single_step_max_mutable_paths,
                 "staged_step_max_mutable_paths": self.staged_step_max_mutable_paths,
+                "max_steps_per_plan": self.max_steps_per_plan,
+                "max_read_paths_per_step": self.max_read_paths_per_step,
+                "max_step_contract_chars": self.max_step_contract_chars,
             },
             "pipeline": {
                 "semantic_revision_enabled": self.semantic_revision_enabled,
@@ -189,6 +205,7 @@ class RunOptions:
         if not isinstance(planning, Mapping) or set(planning) != {
             "protocol", "decomposition", "execution_mode_policy",
             "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
+            "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
         }:
             raise RunOptionsError("run options planning schema is invalid")
         if not isinstance(pipeline, Mapping) or set(pipeline) != {
@@ -273,6 +290,9 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
         single_step_max_mutable_paths=options.single_step_max_mutable_paths,
         staged_step_max_mutable_paths=options.staged_step_max_mutable_paths,
         execution_mode_policy=options.execution_mode_policy,
+        max_steps_per_plan=options.max_steps_per_plan,
+        max_read_paths_per_step=options.max_read_paths_per_step,
+        max_step_contract_chars=options.max_step_contract_chars,
     )
     ui = replace(
         config.ui,

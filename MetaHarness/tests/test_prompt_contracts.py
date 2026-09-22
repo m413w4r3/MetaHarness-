@@ -135,7 +135,6 @@ class PromptContractTests(unittest.TestCase):
             repository_identity="BASE SHA",
             discovery_context="indexed files",
             trusted_check_catalogue="unit",
-            available_profile_catalogue="luna, claude",
             planning_constraints="NONE",
         )
         implementer = build_implementer_payload(
@@ -181,6 +180,8 @@ class PromptContractTests(unittest.TestCase):
             [planner.role, implementer.role, repair.role, reviser.role, reviewer.role],
             ["planner", "implementer", "check-repair", "semantic-reviser", "final-reviewer"],
         )
+        for forbidden in ("IMPLEMENTER PROFILES", "REVIEWER PROFILES", "cost_tier", "latency_tier", "luna", "claude"):
+            self.assertNotIn(forbidden, planner.rendered)
         self.assertNotIn("worker transcript", reviser.rendered)
         self.assertNotIn("stdout that may be shortened", reviewer.rendered)
         self.assertIn("SPEC", repair.rendered)

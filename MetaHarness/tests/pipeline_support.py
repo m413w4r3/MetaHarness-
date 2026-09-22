@@ -38,7 +38,7 @@ def plan(*steps: tuple[str, str, str], title: str = "Add the feature") -> str:
     for step_id, path, objective in steps:
         blocks.append(f"""BEGIN STEP {step_id}
 TITLE: {objective}
-IMPLEMENTER_PROFILE: {{implementer}}
+EXECUTION_CLASS: MECHANICAL
 DEPENDS_ON: NONE
 
 OBJECTIVE
@@ -81,7 +81,6 @@ Keep the change local.
 
 EXECUTION_MODE: {mode}
 STEP_COUNT: {len(steps)}
-REVIEWER_PROFILE: reviewer
 
 {"".join(blocks)}
 ACCEPTANCE
