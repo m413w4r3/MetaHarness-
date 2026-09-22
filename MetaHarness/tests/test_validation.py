@@ -190,7 +190,7 @@ class CheckAuthorityTests(ValidationTestBase):
         self.assertEqual([check.id for check in frozen.trusted_checks()],
                          ["lint", "test", "integration"])
 
-    def test_a_requested_check_outside_defaults_uses_the_frozen_command(self) -> None:
+    def test_a_requested_check_outside_c01_uses_the_frozen_command(self) -> None:
         run_dir = self.authority_run()
         frozen, ids = config_with_check_authority(
             self.current_config(), run_dir, requested_check_ids=("test", "integration"),

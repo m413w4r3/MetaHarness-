@@ -178,7 +178,7 @@ class PromptContractTests(unittest.TestCase):
             diff_sha256="hash",
             diffstat="1 file",
             bounded_diff_excerpt="bounded excerpt",
-            cycle_summary="Cycle 1 passed",
+            cycle_summary="C01 passed",
         )
         self.assertEqual(
             [planner.role, implementer.role, repair.role, reviser.role, reviewer.role],
