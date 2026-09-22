@@ -378,6 +378,7 @@ class Planner:
         self.client = client
         self.template = template
         self.allow_format_repair = allow_format_repair
+        self.last_usage: dict[str, Any] | None = None
 
     def plan(
         self,
@@ -398,6 +399,7 @@ class Planner:
                 filename="prompt.diagnostics.planner.json",
             )
         first_result = self.client.complete(request)
+        self.last_usage = completion_usage(first_result)
         first_raw = _completion_text(first_result)
         usages = [normalize_usage(completion_usage(first_result))]
         if target is not None:
@@ -417,6 +419,7 @@ class Planner:
                     filename="prompt.diagnostics.planner-repair.json",
                 )
             repaired_result = self.client.complete(repair_request)
+            self.last_usage = completion_usage(repaired_result)
             repaired_raw = _completion_text(repaired_result)
             usages.append(normalize_usage(completion_usage(repaired_result)))
             if target is not None:

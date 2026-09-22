@@ -100,6 +100,7 @@ ARTIFACT_ALLOWLIST = frozenset(
         "execution_recommendation.json",
         "execution_recommendation.error.txt",
         "agent.events.jsonl",
+        "trace/events.v1.jsonl",
         "checks.json",
         "review.json",
         "reviewer.raw.md",

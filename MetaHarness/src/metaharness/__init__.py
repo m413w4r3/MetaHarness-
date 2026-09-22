@@ -89,6 +89,14 @@ from .models import (
     SelectedProfile,
     StepExecutionSelection,
 )
+from .trace import (
+    FanoutTraceSink,
+    JsonlTraceSink,
+    NullTraceSink,
+    TraceEvent,
+    TraceSink,
+    TraceStream,
+)
 from .prompt_contracts import (
     PromptPayload,
     PromptSection,

@@ -1434,6 +1434,7 @@ class PlannerV2:
         self.default_check_ids = tuple(default_check_ids)
         self.prompt_budget_bytes = prompt_budget_bytes
         self.last_conversation: LLMConversationHandle | None = None
+        self.last_usage: dict[str, Any] | None = None
 
     def plan(self, spec: str, context: str, *, repository_reference: RepositoryReference | None = None, artifacts_dir: str | Path | None = None) -> TaskPlanV2:
         reference = repository_reference if repository_reference is not None else self.repository_reference
@@ -1456,6 +1457,7 @@ class PlannerV2:
             write_prompt_diagnostics(target, payload)
         result = self.client.complete(request)
         self.last_conversation = conversation_handle(result)
+        self.last_usage = completion_usage(result)
         raw = result if isinstance(result, str) else getattr(result, "text", None)
         if target is not None:
             # Tokens were consumed whether or not the answer parses.
@@ -1617,6 +1619,7 @@ class RepairPlannerV2:
         self.template = template
         self.check_catalog = tuple(check_catalog)
         self.original_required_check_ids = tuple(original_required_check_ids)
+        self.last_usage: dict[str, Any] | None = None
 
     def plan(
         self,
@@ -1744,6 +1747,7 @@ class RepairPlannerV2:
             )
         else:
             result = self.client.complete(request)
+        self.last_usage = completion_usage(result)
         raw = result if isinstance(result, str) else getattr(result, "text", None)
         write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, completion_usage(result))
         if not isinstance(raw, str):
@@ -1799,6 +1803,7 @@ class CheckScopeRepairPlannerV2:
         self.check_catalog = tuple(check_catalog)
         self.original_required_check_ids = tuple(original_required_check_ids)
         self.last_conversation: LLMConversationHandle | None = None
+        self.last_usage: dict[str, Any] | None = None
 
     def plan(
         self,
@@ -1878,6 +1883,7 @@ class CheckScopeRepairPlannerV2:
             # complete bounded inline request in a fresh completion.
             result = self.client.complete(bundle.inline_prompt)
         self.last_conversation = conversation_handle(result)
+        self.last_usage = completion_usage(result)
         raw = result if isinstance(result, str) else getattr(result, "text", None)
         write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, completion_usage(result))
         if not isinstance(raw, str):

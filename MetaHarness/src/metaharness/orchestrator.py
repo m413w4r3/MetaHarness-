@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -113,6 +114,7 @@ from .gitops import (
     status_porcelain,
     symbolic_head,
     stage_all,
+    staged_diff,
     repository_remote_url,
     run_branch_web_url,
     tracked_files_in_tree,
@@ -232,8 +234,10 @@ from .profiles import (
     build_agent_config,
     build_llm_endpoint,
     profile_for_role,
+    profile_execution_fingerprint,
     profiles_for_config,
 )
+from .trace import TraceSink, TraceStream
 
 # Compatibility hook for historical callers/tests that patched the old
 # constructor at this module path.  Actual execution still goes through the
@@ -865,6 +869,7 @@ class Orchestrator:
         recommender_client: Any | None = None,
         agent: Any | None = None,
         reviser: Any | None = None,
+        trace_sink: TraceSink | None = None,
     ) -> None:
         if not isinstance(config, HarnessConfig):
             raise TypeError("config must be a HarnessConfig")
@@ -874,6 +879,9 @@ class Orchestrator:
         self._recommender_client = recommender_client
         self._injected_agent = agent
         self._injected_reviser = reviser
+        # The local JSONL sink is always created per run.  This optional sink
+        # is an observation-only extension point (for example Nimbalyst).
+        self._trace_sink = trace_sink
         # Programmatic callers that still inject the old agent objects keep
         # their historical failure-name projection.  Production profile
         # resolution always uses the generic reasons from AgentRunResult.
@@ -899,6 +907,274 @@ class Orchestrator:
             if config.runtime_environment
             else os.environ
         )
+
+    def _begin_trace(
+        self, run_dir: Path, run_id: str, *, created: bool, pipeline_version: int = 2,
+    ) -> None:
+        """Attach the observation stream without changing run authority."""
+
+        self._trace = TraceStream(
+            run_dir,
+            run_id,
+            pipeline_version=pipeline_version,
+            sink=getattr(self, "_trace_sink", None),
+            secrets=getattr(self, "_secrets", ()),
+        )
+        if created:
+            self._trace.emit(
+                "run.created",
+                phase="run",
+                cycle=1,
+                data={"status": RunStatus.CREATED.value},
+            )
+
+    def _trace_emit(
+        self,
+        event: str,
+        *,
+        phase: str | None = None,
+        cycle: int | None = None,
+        step_id: str | None = None,
+        data: Mapping[str, Any] | None = None,
+        once: bool = False,
+    ) -> None:
+        stream = getattr(self, "_trace", None)
+        if stream is None:
+            return
+        kwargs = {
+            "phase": phase,
+            "cycle": cycle,
+            "step_id": step_id,
+            "data": data or {},
+        }
+        if once:
+            # Terminal events describe the run, not a cycle.  A resumed
+            # terminal projection must remain idempotent even when the
+            # durable state exposes a different cycle number.
+            if event in {"run.created", "run.failed", "run.completed"}:
+                if stream.has_event(event):
+                    return
+                stream.emit(event, **kwargs)
+            else:
+                stream.emit_once(event, **kwargs)
+        else:
+            stream.emit(event, **kwargs)
+
+    @staticmethod
+    def _trace_time() -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _trace_selected_profile(
+        self, profile_id: str, role: ExecutionRole, *, step_id: str | None = None,
+    ) -> Any | None:
+        selection = getattr(self, "_last_selection", None)
+        if selection is None:
+            return None
+        if step_id is not None:
+            for item in getattr(selection, "steps", ()):
+                if getattr(item, "step_id", None) == step_id:
+                    selected = getattr(item, "implementer", None)
+                    if getattr(selected, "profile_id", None) == profile_id:
+                        return selected
+        names = {
+            ExecutionRole.PLANNER: ("planner",),
+            ExecutionRole.IMPLEMENTER: ("implementer", "repair_implementer"),
+            ExecutionRole.REPAIR: ("check_repair", "repair_implementer"),
+            ExecutionRole.REVIEWER: ("reviewer", "final_reviewer"),
+            ExecutionRole.REVISER: ("reviser", "semantic_reviser"),
+        }.get(role, ())
+        for name in names:
+            selected = getattr(selection, name, None)
+            if getattr(selected, "profile_id", None) == profile_id:
+                return selected
+        return None
+
+    def _trace_session(
+        self,
+        *,
+        profile: ModelProfile | None,
+        selected: Any | None,
+        role: ExecutionRole,
+        prompt_bytes: int | None,
+        started_at: str,
+        started_mono: float,
+        tree_before: str | None = None,
+        result: Any | None = None,
+        exit_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Build session metadata without deriving unavailable metrics."""
+
+        fingerprint = getattr(selected, "config_sha256", None)
+        if fingerprint is None and profile is not None:
+            try:
+                fingerprint = profile_execution_fingerprint(
+                    profile,
+                    agent_env_allowlist=self.config.agent.env_allowlist,
+                    codex_home=(self.config.codex_runtime.home if profile.driver.value == "codex" else None),
+                    claude_config_home=(self.config.claude_runtime.home if profile.driver.value == "claude-code" else None),
+                )
+            except (TypeError, ValueError, AttributeError):
+                fingerprint = None
+        raw_result = getattr(result, "raw_result", None) if result is not None else None
+        raw_usage = getattr(raw_result, "usage", None) if raw_result is not None else None
+        usage = raw_usage if isinstance(raw_usage, Mapping) else (
+            getattr(result, "usage", None)
+            if result is not None and raw_result is None else None
+        )
+
+        aliases = {
+            "input_tokens": ("input_tokens", "prompt_tokens"),
+            "cached_input_tokens": ("cached_input_tokens", "cache_read_input_tokens"),
+            "cache_write_input_tokens": (
+                "cache_write_input_tokens", "cache_creation_input_tokens",
+            ),
+            "output_tokens": ("output_tokens", "completion_tokens"),
+            "reasoning_output_tokens": ("reasoning_output_tokens",),
+        }
+        nested = {
+            "cached_input_tokens": (
+                ("prompt_tokens_details", "cached_tokens"),
+                ("input_tokens_details", "cached_tokens"),
+            ),
+            "cache_write_input_tokens": (
+                ("prompt_tokens_details", "cache_write_tokens"),
+                ("input_tokens_details", "cache_write_tokens"),
+            ),
+            "reasoning_output_tokens": (
+                ("completion_tokens_details", "reasoning_tokens"),
+                ("output_tokens_details", "reasoning_tokens"),
+            ),
+        }
+
+        def metric(name: str) -> int | None:
+            if not isinstance(usage, Mapping):
+                return None
+            for alias in aliases.get(name, (name,)):
+                value = usage.get(alias)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    return value
+            for container, key in nested.get(name, ()):
+                details = usage.get(container)
+                if isinstance(details, Mapping):
+                    value = details.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        return value
+            return None
+
+        return {
+            "driver": (
+                profile.driver.value if profile is not None
+                else getattr(selected, "driver", None)
+                or getattr(result, "driver", None)
+            ),
+            "driver_version": None,
+            "provider": (
+                profile.provider if profile is not None
+                else getattr(selected, "provider", None)
+            ),
+            "model": profile.model if profile is not None else getattr(selected, "model", None),
+            "effort": profile.effort if profile is not None else getattr(selected, "effort", None),
+            "profile_id": getattr(selected, "profile_id", None) or (profile.id if profile is not None else None),
+            "profile_fingerprint": fingerprint,
+            "role": role.value,
+            "started_at": started_at,
+            "finished_at": self._trace_time() if result is not None or exit_reason is not None else None,
+            "wall_time_ms": round((time.perf_counter() - started_mono) * 1000) if result is not None or exit_reason is not None else None,
+            "prompt_bytes": prompt_bytes,
+            "input_tokens": metric("input_tokens"),
+            "cached_input_tokens": metric("cached_input_tokens"),
+            "cache_write_input_tokens": metric("cache_write_input_tokens"),
+            "output_tokens": metric("output_tokens"),
+            "reasoning_output_tokens": metric("reasoning_output_tokens"),
+            "tool_call_count": None,
+            "exit_reason": exit_reason if exit_reason is not None else getattr(result, "exit_reason", None),
+            "tree_before": tree_before or getattr(result, "tree_before", None),
+            "tree_after": getattr(result, "tree_after", None) if result is not None else None,
+            "external_session_id": getattr(result, "external_session_id", None) if result is not None else None,
+        }
+
+    def _trace_finished_model_session(
+        self,
+        *,
+        profile: ModelProfile,
+        selected: Any | None,
+        role: ExecutionRole,
+        prompt_bytes: int | None,
+        started_at: str,
+        started_mono: float,
+        usage: Mapping[str, Any] | None = None,
+        tree_before: str | None = None,
+        tree_after: str | None = None,
+        exit_reason: str | None = None,
+    ) -> dict[str, Any]:
+        session = self._trace_session(
+            profile=profile,
+            selected=selected,
+            role=role,
+            prompt_bytes=prompt_bytes,
+            started_at=started_at,
+            started_mono=started_mono,
+            tree_before=tree_before,
+            result=None,
+            exit_reason=exit_reason,
+        )
+        session.update(
+            finished_at=self._trace_time(),
+            wall_time_ms=round((time.perf_counter() - started_mono) * 1000),
+            tree_after=tree_after,
+        )
+        aliases = {
+            "input_tokens": ("input_tokens", "prompt_tokens"),
+            "cached_input_tokens": ("cached_input_tokens", "cache_read_input_tokens"),
+            "cache_write_input_tokens": (
+                "cache_write_input_tokens", "cache_creation_input_tokens",
+            ),
+            "output_tokens": ("output_tokens", "completion_tokens"),
+            "reasoning_output_tokens": ("reasoning_output_tokens",),
+        }
+        nested = {
+            "cached_input_tokens": (
+                ("prompt_tokens_details", "cached_tokens"),
+                ("input_tokens_details", "cached_tokens"),
+            ),
+            "cache_write_input_tokens": (
+                ("prompt_tokens_details", "cache_write_tokens"),
+                ("input_tokens_details", "cache_write_tokens"),
+            ),
+            "reasoning_output_tokens": (
+                ("completion_tokens_details", "reasoning_tokens"),
+                ("output_tokens_details", "reasoning_tokens"),
+            ),
+        }
+        for name in aliases:
+            value = None
+            if isinstance(usage, Mapping):
+                for alias in aliases[name]:
+                    value = usage.get(alias)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        break
+                    value = None
+                if value is None:
+                    for container, key in nested.get(name, ()):
+                        details = usage.get(container)
+                        if isinstance(details, Mapping):
+                            value = details.get(key)
+                            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                                break
+                            value = None
+            session[name] = value
+        return session
+
+    @staticmethod
+    def _trace_diff_reference(path: Path) -> dict[str, Any]:
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            return {"diff_artifact": str(path), "diff_sha256": None}
+        return {
+            "diff_artifact": str(path),
+            "diff_sha256": hashlib.sha256(payload).hexdigest(),
+        }
 
     def _planner_for_profile(self, profile_id: str) -> Planner:
         profile = profile_for_role(self.config, profile_id, ExecutionRole.PLANNER)
@@ -1258,6 +1534,7 @@ class Orchestrator:
             options_sha256 = write_run_options(run_dir, run_options)
             store = RunStateStore(run_dir / "state.json")
             store.initialize(selected_run_id, pipeline_version=2)
+            self._begin_trace(run_dir, selected_run_id, created=True)
             # This is the first durable boundary.  It intentionally carries
             # no Git/plan identity yet: context and repository discovery are
             # themselves resumable operations.
@@ -1317,6 +1594,35 @@ class Orchestrator:
 
     def _diagnose_result(self, result: RunResult) -> RunResult:
         """Best-effort terminal projection; diagnostics never changes a run result."""
+
+        if result.status in {RunStatus.COMMITTED, RunStatus.PUBLISHED}:
+            state = result.state
+            self._trace_emit(
+                "run.completed",
+                phase="run",
+                cycle=state.get("cycle") if isinstance(state.get("cycle"), int) else None,
+                data={
+                    "status": result.status.value,
+                    "commit_sha": state.get("commit_sha"),
+                    "published": result.status is RunStatus.PUBLISHED,
+                },
+                once=True,
+            )
+        elif result.status in {
+            RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.BLOCKED,
+            RunStatus.PLAN_REJECTED,
+        }:
+            failure = result.state.get("failure") if isinstance(result.state, Mapping) else None
+            self._trace_emit(
+                "run.failed",
+                phase="run",
+                cycle=result.state.get("cycle") if isinstance(result.state.get("cycle"), int) else None,
+                data={
+                    "status": result.status.value,
+                    "reason": failure.get("reason") if isinstance(failure, Mapping) else result.status.value,
+                },
+                once=True,
+            )
 
         if result.status in {
             RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.BLOCKED,
@@ -1422,7 +1728,51 @@ class Orchestrator:
 
         # The planner receives the SPEC. The implementation agent receives only
         # the canonical contract rendered from the parsed READY plan.
+        plan_started_at = self._trace_time()
+        plan_started_mono = time.perf_counter()
+        self._trace_emit(
+            "plan.started",
+            phase="planning",
+            cycle=1,
+            data={
+                "session": self._trace_session(
+                    profile=planner_profile,
+                    selected=None,
+                    role=ExecutionRole.PLANNER,
+                    prompt_bytes=None,
+                    started_at=plan_started_at,
+                    started_mono=plan_started_mono,
+                    tree_before=base_tree_sha,
+                )
+            },
+        )
         plan = planner.plan(spec, context, artifacts_dir=run_dir)
+        plan_usage = getattr(planner, "last_usage", None)
+        if plan_usage is None:
+            plan_usage = read_usage_artifact(run_dir / "planner.usage.json")
+        self._trace_emit(
+            "plan.completed",
+            phase="planning",
+            cycle=1,
+            data={
+                "decision": plan.decision.value,
+                "title": plan.title,
+                "session": self._trace_finished_model_session(
+                    profile=planner_profile,
+                    selected=None,
+                    role=ExecutionRole.PLANNER,
+                    prompt_bytes=(
+                        (run_dir / "planner.request.txt").stat().st_size
+                        if (run_dir / "planner.request.txt").is_file() else None
+                    ),
+                    started_at=plan_started_at,
+                    started_mono=plan_started_mono,
+                    usage=plan_usage,
+                    tree_before=base_tree_sha,
+                    tree_after=base_tree_sha,
+                ),
+            },
+        )
         store.update(
             status=RunStatus.PLANNING,
             planner={
@@ -1539,6 +1889,16 @@ class Orchestrator:
             execution=execution_state,
             plan_identity=dataclasses.asdict(durable_identity),
         )
+        self._trace_emit(
+            "plan.approved",
+            phase="planning",
+            cycle=1,
+            data={
+                "plan_identity": dataclasses.asdict(durable_identity),
+                "execution_selection_sha256": durable_identity.execution_sha256,
+            },
+            once=True,
+        )
 
         branch = f"harness/{_slug(plan.title)}/{run_id}"
         worktree_path = self.config.worktrees_root / run_id
@@ -1555,6 +1915,18 @@ class Orchestrator:
             branch=info.branch,
             worktree=str(info.worktree),
             base_sha=info.base_sha,
+        )
+        self._trace_emit(
+            "worktree.created",
+            phase="setup",
+            cycle=1,
+            data={
+                "branch": info.branch,
+                "worktree": str(info.worktree),
+                "base_sha": info.base_sha,
+                "tree_sha": resolve_tree(info.worktree, info.base_sha),
+            },
+            once=True,
         )
 
         ownership_before = _git_ownership(repo, info.worktree)
@@ -1599,6 +1971,31 @@ class Orchestrator:
         implementer_profile = profile_for_role(
             self.config, selection.implementer.profile_id, ExecutionRole.IMPLEMENTER
         )
+        v1_step_id = "S01"
+        trace_started_at = self._trace_time()
+        trace_started_mono = time.perf_counter()
+        trace_selected = self._trace_selected_profile(
+            implementer_profile.id, ExecutionRole.IMPLEMENTER
+        )
+        tree_before_agent = _safe_candidate_tree(info.worktree)
+
+        def trace_v1_step_failed(reason: str, detail: Any = None) -> None:
+            self._trace_emit(
+                "step.failed",
+                phase="implementation",
+                cycle=1,
+                step_id=v1_step_id,
+                data={
+                    "reason": reason,
+                    "detail": detail,
+                    "profile_id": implementer_profile.id,
+                    "tree_before": tree_before_agent,
+                    "tree_after": _safe_candidate_tree(info.worktree),
+                    "changed_paths": [],
+                    "commit_sha": None,
+                },
+            )
+
         try:
             executor = self._executor_for_profile(
                 implementer_profile.id,
@@ -1611,6 +2008,25 @@ class Orchestrator:
                 ),
             )
             tree_before_agent = candidate_tree_sha(info.worktree)
+            self._trace_emit(
+                "step.started",
+                phase="implementation",
+                cycle=1,
+                step_id=v1_step_id,
+                data={
+                    "attempt": 1,
+                    "tree_before": tree_before_agent,
+                    "session": self._trace_session(
+                        profile=implementer_profile,
+                        selected=trace_selected,
+                        role=ExecutionRole.IMPLEMENTER,
+                        prompt_bytes=len(implementation_contract.encode("utf-8", errors="replace")),
+                        started_at=trace_started_at,
+                        started_mono=trace_started_mono,
+                        tree_before=tree_before_agent,
+                    ),
+                },
+            )
             write_prompt_diagnostics(
                 run_dir,
                 implementation_payload,
@@ -1639,6 +2055,27 @@ class Orchestrator:
                 )
             )
         except AgentScopeError as exc:
+            trace_v1_step_failed(AGENT_SCOPE_VIOLATION, redact(str(exc), self._secrets))
+            self._trace_emit(
+                "step.agent.completed",
+                phase="implementation",
+                cycle=1,
+                step_id=v1_step_id,
+                data={
+                    "attempt": 1,
+                    "status": "failed",
+                    "session": self._trace_session(
+                        profile=implementer_profile,
+                        selected=trace_selected,
+                        role=ExecutionRole.IMPLEMENTER,
+                        prompt_bytes=len(implementation_contract.encode("utf-8", errors="replace")),
+                        started_at=trace_started_at,
+                        started_mono=trace_started_mono,
+                        tree_before=tree_before_agent,
+                        exit_reason=getattr(exc, "code", type(exc).__name__),
+                    ),
+                },
+            )
             self._redact_agent_artifacts(run_dir)
             state = store.record_failure(
                 AGENT_SCOPE_VIOLATION, redact(str(exc), self._secrets),
@@ -1656,6 +2093,26 @@ class Orchestrator:
             final_message=redact(agent_result.final_message, self._secrets),
             stderr_tail=redact(agent_result.stderr_tail, self._secrets),
         )
+        self._trace_emit(
+            "step.agent.completed",
+            phase="implementation",
+            cycle=1,
+            step_id=v1_step_id,
+            data={
+                "attempt": 1,
+                "status": agent_result.status,
+                "session": self._trace_session(
+                    profile=implementer_profile,
+                    selected=trace_selected,
+                    role=ExecutionRole.IMPLEMENTER,
+                    prompt_bytes=len(implementation_contract.encode("utf-8", errors="replace")),
+                    started_at=trace_started_at,
+                    started_mono=trace_started_mono,
+                    tree_before=tree_before_agent,
+                    result=agent_result,
+                ),
+            },
+        )
         store.update(
             status=RunStatus.IMPLEMENTING,
             agent=_agent_payload(agent_result, auth_failure=auth_failure),
@@ -1667,9 +2124,11 @@ class Orchestrator:
             base_sha=base_sha,
         )
         if violations:
+            trace_v1_step_failed("AGENT_GIT_VIOLATION", violations)
             state = store.record_failure("AGENT_GIT_VIOLATION", violations)
             return RunResult(run_dir, RunStatus.FAILED, state)
         if agent_result.timed_out:
+            trace_v1_step_failed(AGENT_TIMEOUT)
             state = store.record_failure(
                 AGENT_TIMEOUT,
                 {"driver": agent_result.driver, "backend_reason": agent_result.backend_reason},
@@ -1677,6 +2136,7 @@ class Orchestrator:
             return RunResult(run_dir, RunStatus.FAILED, state)
         agent_failure = normalized_failure_reason(agent_result)
         if agent_failure is not None:
+            trace_v1_step_failed(agent_failure)
             if auth_failure:
                 reason = (
                     "CODEX_AUTH_FAILURE"
@@ -1711,11 +2171,19 @@ class Orchestrator:
             agent_candidate_tree_after=tree_after_agent,
         )
         if tree_after_agent == tree_before_agent:
+            trace_v1_step_failed("AGENT_NO_CHANGE")
             state = store.record_failure("AGENT_NO_CHANGE")
             return RunResult(run_dir, RunStatus.FAILED, state)
 
         store.update(status=RunStatus.VALIDATING)
         reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
+        self._trace_cycle = 1
+        self._trace_emit(
+            "checks.started",
+            phase="validation",
+            cycle=1,
+            data={"tree_before": _safe_candidate_tree(info.worktree)},
+        )
         evidence = collect_evidence(
             info.worktree,
             base_sha,
@@ -1723,6 +2191,30 @@ class Orchestrator:
             required_check_ids=getattr(plan, "required_checks", ()) or None,
             evidence_dir=run_dir,
             secrets=self._secrets,
+        )
+        self._trace_emit(
+            "checks.completed",
+            phase="validation",
+            cycle=1,
+            data={
+                "passed": evidence.deterministic_passed,
+                "failures": list(evidence.failures),
+                "required_check_ids": list(evidence.required_check_ids),
+                "tree_sha": evidence.staged_tree_sha,
+                "changed_paths": list(evidence.changed_files),
+            },
+        )
+        self._trace_emit(
+            "step.verification.completed",
+            phase="implementation",
+            cycle=1,
+            step_id=v1_step_id,
+            data={
+                "status": "passed" if evidence.deterministic_passed else "failed",
+                "tree_before": tree_before_agent,
+                "tree_after": evidence.staged_tree_sha,
+                "deferred": False,
+            },
         )
         store.update(
             status=RunStatus.VALIDATING,
@@ -1747,6 +2239,7 @@ class Orchestrator:
         ]
         if integrity_failures:
             reason = integrity_failures[0].split(":", 1)[0]
+            trace_v1_step_failed(reason, ", ".join(integrity_failures))
             state = store.record_failure(reason, ", ".join(integrity_failures))
             return RunResult(run_dir, RunStatus.FAILED, state)
 
@@ -1762,6 +2255,31 @@ class Orchestrator:
         store.update(status=RunStatus.REVIEWING)
         # The reviewer receives SPEC and PLAN so it can route a defect to
         # IMPLEMENTATION or REPLAN.  Diff, checks and report are review data.
+        review_started_at = self._trace_time()
+        review_started_mono = time.perf_counter()
+        v1_reviewer_profile = profile_for_role(
+            self.config, selection.reviewer.profile_id, ExecutionRole.REVIEWER
+        )
+        v1_reviewer_selected = self._trace_selected_profile(
+            selection.reviewer.profile_id, ExecutionRole.REVIEWER
+        )
+        self._trace_emit(
+            "review.started",
+            phase="review",
+            cycle=1,
+            data={
+                "tree_sha": evidence.staged_tree_sha,
+                "session": self._trace_session(
+                    profile=v1_reviewer_profile,
+                    selected=v1_reviewer_selected,
+                    role=ExecutionRole.REVIEWER,
+                    prompt_bytes=None,
+                    started_at=review_started_at,
+                    started_mono=review_started_mono,
+                    tree_before=evidence.staged_tree_sha,
+                ),
+            },
+        )
         review = reviewer.review(
             spec,
             plan.raw,
@@ -1777,6 +2295,34 @@ class Orchestrator:
             deterministic_passed=True,
             artifacts_dir=run_dir,
             diagnostics_filename="prompt.diagnostics.final-reviewer.json",
+        )
+        self._trace_emit(
+            "review.completed",
+            phase="review",
+            cycle=1,
+            data={
+                "tree_sha": evidence.staged_tree_sha,
+                "verdict": review.verdict.value,
+                "route": review.route.value,
+                "session": self._trace_finished_model_session(
+                    profile=v1_reviewer_profile,
+                    selected=v1_reviewer_selected,
+                    role=ExecutionRole.REVIEWER,
+                    prompt_bytes=(
+                        (run_dir / "reviewer.request.txt").stat().st_size
+                        if (run_dir / "reviewer.request.txt").is_file() else None
+                    ),
+                    started_at=review_started_at,
+                    started_mono=review_started_mono,
+                    usage=(
+                        getattr(reviewer, "last_usage", None)
+                        if getattr(reviewer, "last_usage", None) is not None
+                        else read_usage_artifact(run_dir / "reviewer.usage.json")
+                    ),
+                    tree_before=evidence.staged_tree_sha,
+                    tree_after=evidence.staged_tree_sha,
+                ),
+            },
         )
         store.update(
             status=RunStatus.REVIEWING,
@@ -1807,6 +2353,8 @@ class Orchestrator:
             return RunResult(run_dir, RunStatus.FAILED, state)
         if review.route is not ReviewRoute.NONE or not evidence.deterministic_passed:
             reason = "REVIEW_ROUTE_NOT_NONE" if review.route is not ReviewRoute.NONE else "DETERMINISTIC_GATE_FAILED"
+            if not evidence.deterministic_passed:
+                trace_v1_step_failed(reason)
             state = store.record_failure(reason)
             return RunResult(run_dir, RunStatus.FAILED, state)
 
@@ -1829,6 +2377,19 @@ class Orchestrator:
             parent_sha=base_sha,
             subject=_commit_subject(plan.title),
             body=f"MetaHarness-Run: {run_id}",
+        )
+        self._trace_emit(
+            "step.committed",
+            phase="implementation",
+            cycle=1,
+            step_id=v1_step_id,
+            data={
+                "parent_sha": base_sha,
+                "commit_sha": commit_sha,
+                "tree_sha": approved_tree,
+                "changed_paths": list(evidence.changed_files),
+                **self._trace_diff_reference(run_dir / "diff.patch"),
+            },
         )
         return self._complete_commit(
             store=store,
@@ -1885,6 +2446,24 @@ class Orchestrator:
                 default_check_ids=self.config.default_check_ids,
                 prompt_budget_bytes=self.config.prompt_budget.planner_max_bytes,
             )
+            plan_started_at = self._trace_time()
+            plan_started_mono = time.perf_counter()
+            self._trace_emit(
+                "plan.started",
+                phase="planning",
+                cycle=1,
+                data={
+                    "session": self._trace_session(
+                        profile=planner_profile,
+                        selected=None,
+                        role=ExecutionRole.PLANNER,
+                        prompt_bytes=None,
+                        started_at=plan_started_at,
+                        started_mono=plan_started_mono,
+                        tree_before=resolve_tree(repo, base_sha),
+                    )
+                },
+            )
             try:
                 plan = planner.plan(spec, context, artifacts_dir=run_dir)
             except Exception:
@@ -1896,6 +2475,33 @@ class Orchestrator:
                 )
                 raise
             _persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
+            self._trace_emit(
+                "plan.completed",
+                phase="planning",
+                cycle=1,
+                data={
+                    "decision": plan.decision.value,
+                    "title": plan.title,
+                    "session": self._trace_finished_model_session(
+                        profile=planner_profile,
+                        selected=None,
+                        role=ExecutionRole.PLANNER,
+                        prompt_bytes=(
+                            (run_dir / "planner.request.txt").stat().st_size
+                            if (run_dir / "planner.request.txt").is_file() else None
+                        ),
+                        started_at=plan_started_at,
+                        started_mono=plan_started_mono,
+                        usage=(
+                            getattr(planner, "last_usage", None)
+                            if getattr(planner, "last_usage", None) is not None
+                            else read_usage_artifact(run_dir / "planner.usage.json")
+                        ),
+                        tree_before=resolve_tree(repo, base_sha),
+                        tree_after=resolve_tree(repo, base_sha),
+                    ),
+                },
+            )
         else:
             # Resume of PLANNER has already produced and durably parsed this
             # plan.  Re-entering setup must never call the planner again.
@@ -2074,6 +2680,16 @@ class Orchestrator:
             execution_state["reviewer"] = asdict(selection.reviewer)
         store.update(status=RunStatus.PLANNING, execution=execution_state,
                      plan_identity=asdict(durable_identity))
+        self._trace_emit(
+            "plan.approved",
+            phase="planning",
+            cycle=1,
+            data={
+                "plan_identity": asdict(durable_identity),
+                "execution_selection_sha256": durable_identity.execution_sha256,
+            },
+            once=True,
+        )
         base_tree_sha = resolve_tree(repo, base_sha)
         self._write_phase_checkpoint(
             run_dir, ResumePhase.WORKTREE_SETUP, head=base_sha,
@@ -2096,6 +2712,19 @@ class Orchestrator:
             info = existing_info
         store.update(status=RunStatus.WORKTREE_READY, branch=info.branch,
                      worktree=str(info.worktree), base_sha=info.base_sha)
+        self._trace_emit(
+            "worktree.created",
+            phase="setup",
+            cycle=1,
+            data={
+                "branch": info.branch,
+                "worktree": str(info.worktree),
+                "base_sha": info.base_sha,
+                "tree_sha": base_tree_sha,
+                "resumed_setup": existing_info is not None,
+            },
+            once=True,
+        )
         ownership_before = _git_ownership(repo, info.worktree)
         # Persisted with an explicit status so a later resume has the stronger
         # durable ownership proof of the pre-execution boundary.
@@ -2372,6 +3001,7 @@ class Orchestrator:
         ]
         self._last_v2_step_results: list[dict[str, Any]] = list(completed_steps)
         self._repair_v2_step_results: list[dict[str, Any]] = []
+        self._trace_cycle = 1
         self._v2_usage_rows: list[dict[str, Any]] = [
             {"id": record["id"], **record["usage"]} for record in completed_steps
         ]
@@ -3667,6 +4297,30 @@ class Orchestrator:
                 ),
             )
             write_prompt_diagnostics(artifact_dir, prompt_payload)
+            trace_started_at = self._trace_time()
+            trace_started_mono = time.perf_counter()
+            trace_selected = self._trace_selected_profile(
+                profile.id, ExecutionRole.IMPLEMENTER, step_id=step_id
+            )
+            self._trace_emit(
+                "step.started",
+                phase="implementation",
+                cycle=getattr(self, "_trace_cycle", 1),
+                step_id=step_id,
+                data={
+                    "attempt": mismatch_retry_count + 1,
+                    "tree_before": tree_before,
+                    "session": self._trace_session(
+                        profile=profile,
+                        selected=trace_selected,
+                        role=ExecutionRole.IMPLEMENTER,
+                        prompt_bytes=len(request_prompt.encode("utf-8", errors="replace")),
+                        started_at=trace_started_at,
+                        started_mono=trace_started_mono,
+                        tree_before=tree_before,
+                    ),
+                },
+            )
             result = executor.run(
                 AgentRunRequest(
                     role=ExecutionRole.IMPLEMENTER,
@@ -3683,6 +4337,26 @@ class Orchestrator:
                 )
             )
         except AgentScopeError as exc:
+            self._trace_emit(
+                "step.agent.completed",
+                phase="implementation",
+                cycle=getattr(self, "_trace_cycle", 1),
+                step_id=step_id,
+                data={
+                    "attempt": mismatch_retry_count + 1,
+                    "status": "failed",
+                    "session": self._trace_session(
+                        profile=profile,
+                        selected=trace_selected,
+                        role=ExecutionRole.IMPLEMENTER,
+                        prompt_bytes=len(request_prompt.encode("utf-8", errors="replace")),
+                        started_at=trace_started_at,
+                        started_mono=trace_started_mono,
+                        tree_before=tree_before,
+                        exit_reason=getattr(exc, "code", type(exc).__name__),
+                    ),
+                },
+            )
             self._redact_step_artifacts(artifact_dir)
             raise StepExecutionFailure(
                 AGENT_SCOPE_VIOLATION, step_id, redact(str(exc), self._secrets),
@@ -3695,6 +4369,26 @@ class Orchestrator:
             result,
             final_message=redact(result.final_message, self._secrets),
             stderr_tail=redact(result.stderr_tail, self._secrets),
+        )
+        self._trace_emit(
+            "step.agent.completed",
+            phase="implementation",
+            cycle=getattr(self, "_trace_cycle", 1),
+            step_id=step_id,
+            data={
+                "attempt": mismatch_retry_count + 1,
+                "status": result.status,
+                "session": self._trace_session(
+                    profile=profile,
+                    selected=trace_selected,
+                    role=ExecutionRole.IMPLEMENTER,
+                    prompt_bytes=len(request_prompt.encode("utf-8", errors="replace")),
+                    started_at=trace_started_at,
+                    started_mono=trace_started_mono,
+                    tree_before=tree_before,
+                    result=result,
+                ),
+            },
         )
         usage = normalize_usage(result.usage)
         # Advisory, argument-free context diagnostics (never a gate).
@@ -3894,6 +4588,21 @@ class Orchestrator:
         self, store: RunStateStore, run_dir: Path, failure: StepExecutionFailure,
         step_dir: Path,
     ) -> RunResult:
+        self._trace_emit(
+            "step.failed",
+            phase="implementation",
+            cycle=getattr(self, "_trace_cycle", 1),
+            step_id=failure.step_id,
+            data={
+                "reason": failure.reason,
+                "detail": failure.detail,
+                "profile_id": failure.profile_id,
+                "tree_before": failure.tree_before,
+                "tree_after": failure.tree_after,
+                "changed_paths": [],
+                "commit_sha": None,
+            },
+        )
         return self._v2_failed(
             store, run_dir, failure.reason, failure.step_id, failure.detail,
             usage=failure.usage, profile_id=failure.profile_id,
@@ -3932,12 +4641,36 @@ class Orchestrator:
         if isinstance(reported_verification, str) and reported_verification.casefold() in {
             "failed", "fail", "red",
         }:
+            self._trace_emit(
+                "step.verification.completed",
+                phase="implementation",
+                cycle=getattr(self, "_trace_cycle", 1),
+                step_id=step.id,
+                data={
+                    "status": "failed",
+                    "tree_before": outcome.tree_before,
+                    "tree_after": outcome.tree_after,
+                    "deferred": False,
+                },
+            )
             raise CommitSafetyError("step VERIFY did not pass")
         if re.search(
             r"^\s*(?:VERIFY|VERIFICATION)\s*(?::|=)\s*(?:FAIL|FAILED|RED)\b",
             outcome.final_report,
             flags=re.IGNORECASE | re.MULTILINE,
         ):
+            self._trace_emit(
+                "step.verification.completed",
+                phase="implementation",
+                cycle=getattr(self, "_trace_cycle", 1),
+                step_id=step.id,
+                data={
+                    "status": "failed",
+                    "tree_before": outcome.tree_before,
+                    "tree_after": outcome.tree_after,
+                    "deferred": False,
+                },
+            )
             raise CommitSafetyError("step VERIFY did not pass")
         verification_status = "passed"
         deferred = None
@@ -3952,6 +4685,19 @@ class Orchestrator:
                     "a deferred step must provide the explicit DEFERRED VERIFY DEPENDENCY contract"
                 )
             verification_status = "deferred"
+
+        self._trace_emit(
+            "step.verification.completed",
+            phase="implementation",
+            cycle=getattr(self, "_trace_cycle", 1),
+            step_id=step.id,
+            data={
+                "status": verification_status,
+                "tree_before": outcome.tree_before,
+                "tree_after": outcome.tree_after,
+                "deferred": deferred is not None,
+            },
+        )
 
         # A no-change deferred mismatch is a traceable worker outcome, not a
         # new Git state.  There is no legal empty commit; the later candidate
@@ -3999,6 +4745,8 @@ class Orchestrator:
             # apply in the shared scanner.
             max_diff_bytes=None,
         )
+        diff_path = run_dir / "steps" / step.id / "diff.patch"
+        atomic_write_text(diff_path, redact(staged_diff(info.worktree), self._secrets))
         commit_sha = commit_step_tree(
             info.worktree,
             tree_sha=gate.tree_sha,
@@ -4042,6 +4790,19 @@ class Orchestrator:
             expected_parent_sha=parent_sha,
             expected_tree_sha=outcome.tree_after,
             next_step_id=following,
+        )
+        self._trace_emit(
+            "step.committed",
+            phase="implementation",
+            cycle=getattr(self, "_trace_cycle", 1),
+            step_id=step.id,
+            data={
+                "parent_sha": parent_sha,
+                "commit_sha": commit_sha,
+                "tree_sha": outcome.tree_after,
+                "changed_paths": list(gate.changed_paths),
+                **self._trace_diff_reference(diff_path),
+            },
         )
         return commit_sha
 
@@ -4156,6 +4917,31 @@ class Orchestrator:
             expected_head_sha=commit_sha, expected_parent_sha=effective_parent_sha,
             expected_tree_sha=tree_sha, next_step_id=None,
         )
+        if commit_kind in {"repair", "revision"}:
+            event_name = (
+                "check_repair.committed" if commit_kind == "repair"
+                else "revision.committed"
+            )
+            diff_path = run_dir / "checks" / f"C{cycle:02d}" / "diff.patch"
+            evidence_record = _read_json_artifact(
+                run_dir / "checks" / f"C{cycle:02d}" / "evidence.json"
+            )
+            self._trace_emit(
+                event_name,
+                phase="repair" if commit_kind == "repair" else "revision",
+                cycle=cycle,
+                data={
+                    "parent_sha": effective_parent_sha,
+                    "commit_sha": commit_sha,
+                    "tree_sha": tree_sha,
+                    "changed_paths": list(
+                        evidence_record.get("changed_files", [])
+                        if isinstance(evidence_record, dict)
+                        else []
+                    ),
+                    **self._trace_diff_reference(diff_path),
+                },
+            )
         return payload
 
     def _push_candidate(
@@ -4194,6 +4980,21 @@ class Orchestrator:
                 candidate=candidate_state,
                 remote_branch=info.branch,
                 remote_sha=candidate["commit_sha"],
+            )
+            self._trace_emit(
+                "candidate.pushed",
+                phase="publication",
+                cycle=cycle,
+                data={
+                    "parent_sha": candidate.get("parent_sha"),
+                    "commit_sha": candidate.get("commit_sha"),
+                    "tree_sha": candidate.get("tree_sha"),
+                    "remote": candidate.get("remote"),
+                    "branch": candidate.get("remote_branch") or info.branch,
+                    "remote_sha": candidate.get("remote_sha"),
+                    "pushed_at": candidate.get("pushed_at"),
+                },
+                once=True,
             )
         return candidate
 
@@ -4296,12 +5097,75 @@ class Orchestrator:
             repository_reference=_json_text(repository_reference_dict(repository_reference)),
             budget_bytes=self.config.prompt_budget.final_review_max_bytes,
         )
+        reviewer_profile_id = getattr(
+            getattr(self, "_last_selection", None), "final_reviewer", None
+        ) or getattr(getattr(self, "_last_selection", None), "reviewer", None)
+        reviewer_profile_id = getattr(reviewer_profile_id, "profile_id", None)
+        reviewer_profile = None
+        reviewer_selected = None
+        if reviewer_profile_id is not None:
+            reviewer_selected = self._trace_selected_profile(
+                reviewer_profile_id, ExecutionRole.REVIEWER
+            )
+            try:
+                reviewer_profile = profile_for_role(
+                    self.config, reviewer_profile_id, ExecutionRole.REVIEWER
+                )
+            except ProfileError:
+                reviewer_profile = None
+        review_started_at = self._trace_time()
+        review_started_mono = time.perf_counter()
+        self._trace_emit(
+            "review.started",
+            phase="review",
+            cycle=getattr(self, "_trace_cycle", 1),
+            data={
+                "candidate_sha": candidate_sha,
+                "tree_sha": evidence.staged_tree_sha,
+                "session": self._trace_session(
+                    profile=reviewer_profile,
+                    selected=reviewer_selected,
+                    role=ExecutionRole.REVIEWER,
+                    prompt_bytes=len(prompt_payload.rendered.encode("utf-8", errors="replace")),
+                    started_at=review_started_at,
+                    started_mono=review_started_mono,
+                    tree_before=evidence.staged_tree_sha,
+                ),
+            },
+        )
         review = reviewer.review(
             spec, input.plan_text, "", gate, "", "", "", "NONE",
             deterministic_passed=evidence.deterministic_passed,
             artifacts_dir=artifacts_dir,
             prompt_payload=prompt_payload,
             iteration=input.iteration,
+        )
+        reviewer_usage = getattr(reviewer, "last_usage", None)
+        if reviewer_usage is None:
+            reviewer_usage = read_usage_artifact(
+                artifacts_dir / "reviewer.usage.json"
+            )
+        self._trace_emit(
+            "review.completed",
+            phase="review",
+            cycle=getattr(self, "_trace_cycle", 1),
+            data={
+                "candidate_sha": candidate_sha,
+                "tree_sha": evidence.staged_tree_sha,
+                "verdict": review.verdict.value,
+                "route": review.route.value,
+                "session": self._trace_finished_model_session(
+                    profile=reviewer_profile,
+                    selected=reviewer_selected,
+                    role=ExecutionRole.REVIEWER,
+                    prompt_bytes=len(prompt_payload.rendered.encode("utf-8", errors="replace")),
+                    started_at=review_started_at,
+                    started_mono=review_started_mono,
+                    usage=reviewer_usage,
+                    tree_before=evidence.staged_tree_sha,
+                    tree_after=evidence.staged_tree_sha,
+                ),
+            },
         )
         # planner_thread != reviewer_thread: a driver that reports the
         # planner's own conversation for a review breaks independence.
@@ -4344,21 +5208,87 @@ class Orchestrator:
                 and stored.staged_tree_sha == index_tree_sha(worktree)
                 and stored.staged_tree_sha == candidate_tree_sha(worktree)
             ):
+                self._trace_emit(
+                    "checks.completed",
+                    phase="validation",
+                    cycle=getattr(self, "_trace_cycle", 1),
+                    data={
+                        "reused": True,
+                        "passed": stored.deterministic_passed,
+                        "failures": list(stored.failures),
+                        "required_check_ids": list(stored.required_check_ids),
+                        "tree_sha": stored.staged_tree_sha,
+                        "changed_paths": list(stored.changed_files),
+                    },
+                )
                 return stored
+        checks_started_at = self._trace_time()
+        checks_started_mono = time.perf_counter()
+        checks_tree_before = _safe_candidate_tree(worktree)
+        self._trace_emit(
+            "checks.started",
+            phase="validation",
+            cycle=getattr(self, "_trace_cycle", 1),
+            data={
+                "required_check_ids": list(required_check_ids or ()),
+                "tree_before": checks_tree_before,
+            },
+        )
         check_config, check_ids = config_with_check_authority(
             self.config, evidence_dir, requested_check_ids=required_check_ids,
             expected_sha256=self._approved_check_authority_sha256(evidence_dir),
         )
-        return collect_evidence(
-            worktree, base_sha, check_config, evidence_dir=evidence_dir,
-            secrets=self._secrets, check_failures_hard=check_failures_hard,
-            expected_head_sha=expected_head_sha, required_check_ids=check_ids,
-            enforce_diff_size=enforce_diff_size,
-            # Accepted step commits make the current HEAD itself the
-            # candidate.  There is no staged diff against that HEAD, but the
-            # authoritative checks still must run and their tree is exact.
-            allow_empty_diff=current_head(worktree) != base_sha,
+        try:
+            evidence = collect_evidence(
+                worktree, base_sha, check_config, evidence_dir=evidence_dir,
+                secrets=self._secrets, check_failures_hard=check_failures_hard,
+                expected_head_sha=expected_head_sha, required_check_ids=check_ids,
+                enforce_diff_size=enforce_diff_size,
+                # Accepted step commits make the current HEAD itself the
+                # candidate.  There is no staged diff against that HEAD, but the
+                # authoritative checks still must run and their tree is exact.
+                allow_empty_diff=current_head(worktree) != base_sha,
+            )
+        except Exception as exc:
+            self._trace_emit(
+                "checks.completed",
+                phase="validation",
+                cycle=getattr(self, "_trace_cycle", 1),
+                data={
+                    "passed": False,
+                    "failures": [type(exc).__name__],
+                    "tree_sha": _safe_candidate_tree(worktree),
+                    "wall_time_ms": round((time.perf_counter() - checks_started_mono) * 1000),
+                },
+            )
+            raise
+        self._trace_emit(
+            "checks.completed",
+            phase="validation",
+            cycle=getattr(self, "_trace_cycle", 1),
+            data={
+                "passed": evidence.deterministic_passed,
+                "failures": list(evidence.failures),
+                "required_check_ids": list(evidence.required_check_ids),
+                "tree_sha": evidence.staged_tree_sha,
+                "changed_paths": list(evidence.changed_files),
+                "wall_time_ms": round((time.perf_counter() - checks_started_mono) * 1000),
+                "started_at": checks_started_at,
+            },
         )
+        if getattr(self, "_trace_check_repair_active", False):
+            self._trace_emit(
+                "check_repair.checks.completed",
+                phase="repair",
+                cycle=getattr(self, "_trace_cycle", 1),
+                data={
+                    "passed": evidence.deterministic_passed,
+                    "failures": list(evidence.failures),
+                    "tree_sha": evidence.staged_tree_sha,
+                },
+            )
+            self._trace_check_repair_active = False
+        return evidence
 
     def _check_repair_coordinator(self) -> CheckRepairCoordinator:
         """Build the check-repair coordinator with the live scope policy."""
@@ -4470,8 +5400,119 @@ class Orchestrator:
 
     def _run_v2_revision_cycle(self, **cycle: Any) -> tuple[Any | None, str | None]:
         """Run one Claude revision cycle -- see ``RevisionRunner.run``."""
+        cycle_number = cycle.get("cycle", getattr(self, "_trace_cycle", 1))
+        is_check_repair = cycle.get("check_repair_evidence") is not None
+        selection = cycle.get("selection")
+        selected = (
+            getattr(selection, "check_repair", None)
+            if is_check_repair else getattr(selection, "semantic_reviser", None)
+        )
+        if selected is None and selection is not None and not hasattr(selection, "semantic_reviser"):
+            selected = getattr(selection, "reviser", None)
+        profile = None
+        role = ExecutionRole.REPAIR if is_check_repair else ExecutionRole.REVISER
+        if selected is not None:
+            try:
+                profile = profile_for_role(self.config, selected.profile_id, role)
+            except ProfileError:
+                profile = None
+        info = cycle.get("info")
+        worktree = getattr(info, "worktree", None)
+        tree_before = _safe_candidate_tree(worktree) if worktree is not None else None
+        started_at = self._trace_time()
+        started_mono = time.perf_counter()
+        event_name = "check_repair.started" if is_check_repair else "revision.started"
+        self._trace_emit(
+            event_name,
+            phase="repair" if is_check_repair else "revision",
+            cycle=cycle_number,
+            data={
+                "tree_before": tree_before,
+                "attempt": cycle.get("check_repair_attempt"),
+                "session": self._trace_session(
+                    profile=profile,
+                    selected=selected,
+                    role=role,
+                    prompt_bytes=None,
+                    started_at=started_at,
+                    started_mono=started_mono,
+                    tree_before=tree_before,
+                ),
+            },
+        )
+        if is_check_repair:
+            self._trace_check_repair_active = True
         legacy_failure_names = cycle.pop("_legacy_failure_names", None)
-        return self._revision_runner(legacy_failure_names=legacy_failure_names).run(**cycle)
+        try:
+            result, error = self._revision_runner(legacy_failure_names=legacy_failure_names).run(**cycle)
+        except Exception as exc:
+            self._trace_emit(
+                "check_repair.agent.completed" if is_check_repair else "revision.agent.completed",
+                phase="repair" if is_check_repair else "revision",
+                cycle=cycle_number,
+                data={
+                    "status": "failed",
+                    "error": type(exc).__name__,
+                    "session": self._trace_session(
+                        profile=profile,
+                        selected=selected,
+                        role=role,
+                        prompt_bytes=None,
+                        started_at=started_at,
+                        started_mono=started_mono,
+                        tree_before=tree_before,
+                        exit_reason=type(exc).__name__,
+                    ),
+                },
+            )
+            raise
+        artifact_dir = cycle.get("artifact_dir")
+        if artifact_dir is not None:
+            artifact_path = Path(artifact_dir)
+        elif is_check_repair:
+            artifact_path = Path(cycle["run_dir"]) / "revision" / "check-repair" / f"C0{cycle_number}"
+        else:
+            artifact_path = Path(cycle["run_dir"]) / "revision"
+        prompt_path = artifact_path / "agent.prompt.txt"
+        prompt_bytes = prompt_path.stat().st_size if prompt_path.is_file() else None
+        self._trace_emit(
+            "check_repair.agent.completed" if is_check_repair else "revision.agent.completed",
+            phase="repair" if is_check_repair else "revision",
+            cycle=cycle_number,
+            data={
+                "status": "completed" if error is None else "failed",
+                "error": error,
+                "session": self._trace_session(
+                    profile=profile,
+                    selected=selected,
+                    role=role,
+                    prompt_bytes=prompt_bytes,
+                    started_at=started_at,
+                    started_mono=started_mono,
+                    tree_before=tree_before,
+                    result=result,
+                    exit_reason=error,
+                ),
+            },
+        )
+        pre_checks = _read_json_artifact(artifact_path / "pre_checks.json")
+        if not isinstance(pre_checks, dict):
+            pre_checks = {}
+        if not is_check_repair or pre_checks:
+            check_event = "check_repair.checks.completed" if is_check_repair else "revision.checks.completed"
+            self._trace_emit(
+                check_event,
+                phase="repair" if is_check_repair else "revision",
+                cycle=cycle_number,
+                data={
+                    "passed": bool(pre_checks.get("deterministic_passed", False)),
+                    "failures": list(pre_checks.get("failures", [])) if isinstance(pre_checks.get("failures", []), list) else [],
+                    "tree_sha": pre_checks.get("staged_tree_sha"),
+                },
+            )
+            if is_check_repair:
+                self._trace_check_repair_active = False
+        return result, error
 
     @staticmethod
     def _check_repair_attempt_root(run_dir: Path, cycle: int, number: int) -> Path:
@@ -4976,6 +6017,8 @@ class Orchestrator:
         this state machine.
         """
 
+        self._trace_cycle = cycle
+
         del original_bundle
         phase = resumed.checkpoint.phase
         at = phase_index(phase)
@@ -5150,6 +6193,28 @@ class Orchestrator:
                 planning=self.config.planning, check_catalog=self.config.check_catalog,
                 original_required_check_ids=failed_plan.required_checks,
             )
+            scope_plan_started_at = self._trace_time()
+            scope_plan_started_mono = time.perf_counter()
+            self._trace_emit(
+                "plan.started",
+                phase="repair",
+                cycle=cycle,
+                data={
+                    "kind": "scope_repair",
+                    "tree_before": current_tree,
+                    "session": self._trace_session(
+                        profile=planner_profile,
+                        selected=self._trace_selected_profile(
+                            selection.planner.profile_id, ExecutionRole.PLANNER
+                        ),
+                        role=ExecutionRole.PLANNER,
+                        prompt_bytes=None,
+                        started_at=scope_plan_started_at,
+                        started_mono=scope_plan_started_mono,
+                        tree_before=current_tree,
+                    ),
+                },
+            )
             try:
                 repair_plan = planner.plan(
                     repository_reference=render_repository_reference(repository_reference),
@@ -5167,6 +6232,32 @@ class Orchestrator:
                 )
                 _persist_planner_conversation(
                     scope_dir, getattr(planner, "last_conversation", None)
+                )
+                self._trace_emit(
+                    "plan.completed",
+                    phase="repair",
+                    cycle=cycle,
+                    data={
+                        "kind": "scope_repair",
+                        "decision": repair_plan.decision.value,
+                        "title": repair_plan.title,
+                        "session": self._trace_finished_model_session(
+                            profile=planner_profile,
+                            selected=self._trace_selected_profile(
+                                selection.planner.profile_id, ExecutionRole.PLANNER
+                            ),
+                            role=ExecutionRole.PLANNER,
+                            prompt_bytes=(
+                                (scope_dir / "planner.request.txt").stat().st_size
+                                if (scope_dir / "planner.request.txt").is_file() else None
+                            ),
+                            started_at=scope_plan_started_at,
+                            started_mono=scope_plan_started_mono,
+                            usage=getattr(planner, "last_usage", None),
+                            tree_before=current_tree,
+                            tree_after=current_tree,
+                        ),
+                    },
                 )
             except LLMError as exc:
                 raise OrchestrationError("LLM_FAILURE: scope-repair planner") from exc
@@ -5665,6 +6756,8 @@ class Orchestrator:
         from the durable ``repair/C02`` artifacts instead of being replayed.
         """
 
+        self._trace_cycle = 2
+
         repair_dir = run_dir / "repair" / "C02"
         repair_dir.mkdir(parents=True, exist_ok=True)
         repair_profile = profile_for_role(
@@ -5735,6 +6828,28 @@ class Orchestrator:
                 )
                 is not None
             )
+            repair_plan_started_at = self._trace_time()
+            repair_plan_started_mono = time.perf_counter()
+            self._trace_emit(
+                "plan.started",
+                phase="planning",
+                cycle=2,
+                data={
+                    "kind": "repair",
+                    "tree_before": tree_before,
+                    "session": self._trace_session(
+                        profile=planner_profile,
+                        selected=self._trace_selected_profile(
+                            selection.planner.profile_id, ExecutionRole.PLANNER
+                        ),
+                        role=ExecutionRole.PLANNER,
+                        prompt_bytes=None,
+                        started_at=repair_plan_started_at,
+                        started_mono=repair_plan_started_mono,
+                        tree_before=tree_before,
+                    ),
+                },
+            )
             repair_plan = repair_planner.plan(
                 repository_reference=render_repository_reference(repository_reference),
                 original_spec=spec,
@@ -5754,6 +6869,32 @@ class Orchestrator:
                 fallback_candidate_diff=(
                     "" if remote_available else cycle_1_evidence.diff
                 ),
+            )
+            self._trace_emit(
+                "plan.completed",
+                phase="planning",
+                cycle=2,
+                data={
+                    "kind": "repair",
+                    "decision": repair_plan.decision.value,
+                    "title": repair_plan.title,
+                    "session": self._trace_finished_model_session(
+                        profile=planner_profile,
+                        selected=self._trace_selected_profile(
+                            selection.planner.profile_id, ExecutionRole.PLANNER
+                        ),
+                        role=ExecutionRole.PLANNER,
+                        prompt_bytes=(
+                            (repair_dir / "planner.request.txt").stat().st_size
+                            if (repair_dir / "planner.request.txt").is_file() else None
+                        ),
+                        started_at=repair_plan_started_at,
+                        started_mono=repair_plan_started_mono,
+                        usage=getattr(repair_planner, "last_usage", None),
+                        tree_before=tree_before,
+                        tree_after=tree_before,
+                    ),
+                },
             )
             self._cycle_update(
                 store, 2, status="planning", kind="repair",
@@ -6668,6 +7809,14 @@ class Orchestrator:
         index_tree_after: str | None = None,
         step_dir: Path | None = None,
     ) -> RunResult:
+        if reason == "CHECK_REPAIR_EXHAUSTED":
+            self._trace_emit(
+                "check_repair.exhausted",
+                phase="repair",
+                cycle=getattr(self, "_trace_cycle", 1),
+                data={"reason": reason, "step_id": step_id},
+                once=True,
+            )
         try:
             self._update_v2_usage(store, run_dir)
         except (OSError, ValueError):
@@ -6895,9 +8044,35 @@ class Orchestrator:
             expected_parent_sha=expected_parent,
             next_step_id=None,
         )
+        publish_cycle = cycle or _state_cycle_value(store.load())
+        self._trace_emit(
+            "publish.started",
+            phase="publication",
+            cycle=publish_cycle,
+            data={
+                "enabled": self.config.publish.enabled,
+                "commit_sha": commit_sha,
+                "tree_sha": approved_tree,
+                "remote": self.config.publish.remote,
+                "target": self.config.publish.mode,
+            },
+            once=True,
+        )
         if not self.config.publish.enabled:
             state = store.update(status=RunStatus.COMMITTED, **fields)
             mark_checkpoint_completed(run_dir)
+            self._trace_emit(
+                "publish.completed",
+                phase="publication",
+                cycle=publish_cycle,
+                data={
+                    "enabled": False,
+                    "status": "committed",
+                    "commit_sha": commit_sha,
+                    "tree_sha": approved_tree,
+                },
+                once=True,
+            )
             return RunResult(run_dir, RunStatus.COMMITTED, state)
 
         store.update(status=RunStatus.PUBLISHING, **fields)
@@ -6968,6 +8143,20 @@ class Orchestrator:
         atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
         state = store.update(status=RunStatus.PUBLISHED, publish=publish_payload, **fields)
         mark_checkpoint_completed(run_dir)
+        self._trace_emit(
+            "publish.completed",
+            phase="publication",
+            cycle=publish_cycle,
+            data={
+                "enabled": True,
+                "status": publish_payload.get("status"),
+                "commit_sha": commit_sha,
+                "tree_sha": approved_tree,
+                "remote": publish_payload.get("remote"),
+                "target": publish_payload.get("target"),
+            },
+            once=True,
+        )
         if fast_forward:
             state = self._persist_published_run_branch_cleanup(
                 store=store, run_dir=run_dir, info=info, commit_sha=commit_sha,
@@ -7046,9 +8235,35 @@ class Orchestrator:
             run_dir, ResumePhase.PUBLISH, cycle=cycle or _state_cycle_value(store.load()),
             head=commit_sha, tree=approved_tree,
         )
+        publish_cycle = cycle or _state_cycle_value(store.load())
+        self._trace_emit(
+            "publish.started",
+            phase="publication",
+            cycle=publish_cycle,
+            data={
+                "enabled": self.config.publish.enabled,
+                "commit_sha": commit_sha,
+                "tree_sha": approved_tree,
+                "remote": self.config.publish.remote,
+                "target": self.config.publish.mode,
+            },
+            once=True,
+        )
         if not self.config.publish.enabled:
             state = store.update(status=RunStatus.COMMITTED, **fields)
             mark_checkpoint_completed(run_dir)
+            self._trace_emit(
+                "publish.completed",
+                phase="publication",
+                cycle=publish_cycle,
+                data={
+                    "enabled": False,
+                    "status": "committed",
+                    "commit_sha": commit_sha,
+                    "tree_sha": approved_tree,
+                },
+                once=True,
+            )
             return RunResult(run_dir, RunStatus.COMMITTED, state)
 
         # PUBLISHING is durable before the first and only push process starts.
@@ -7173,6 +8388,33 @@ class Orchestrator:
             **fields,
         )
         mark_checkpoint_completed(run_dir)
+        self._trace_emit(
+            "candidate.pushed",
+            phase="publication",
+            cycle=publish_cycle,
+            data={
+                "commit_sha": commit_sha,
+                "tree_sha": approved_tree,
+                "remote": self.config.publish.remote,
+                "branch": info.branch,
+                "remote_sha": commit_sha,
+            },
+            once=True,
+        )
+        self._trace_emit(
+            "publish.completed",
+            phase="publication",
+            cycle=publish_cycle,
+            data={
+                "enabled": True,
+                "status": publish_payload.get("status"),
+                "commit_sha": commit_sha,
+                "tree_sha": approved_tree,
+                "remote": publish_payload.get("remote"),
+                "target": publish_payload.get("target"),
+            },
+            once=True,
+        )
         if fast_forward:
             state = self._persist_published_run_branch_cleanup(
                 store=store, run_dir=run_dir, info=info, commit_sha=commit_sha,
@@ -7300,6 +8542,10 @@ class Orchestrator:
                 self.config.runtime_environment if self.config.runtime_environment else os.environ
             )
         self._secrets = config_secret_values(self.config, self._runtime_environment)
+        self._begin_trace(
+            run_dir, selected, created=False,
+            pipeline_version=durable_pipeline_version,
+        )
         eligibility = resume_info(
             run_dir, state, revalidate_integrity=revalidate_integrity
         )
