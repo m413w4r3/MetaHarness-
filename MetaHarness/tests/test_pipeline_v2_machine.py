@@ -8,6 +8,7 @@ from dataclasses import replace
 from unittest import mock
 
 from metaharness.llm.chat import LLMError
+from metaharness.config import load_config
 from metaharness.models import ExecutionRole, RunStatus
 from tests.pipeline_support import (
     PipelineHarness,
@@ -103,6 +104,32 @@ class SingleCycleTests(PipelineHarness):
         self.assertEqual(self.state()["failure"]["reason"], "REVIEW_REPAIR_EXHAUSTED")
         self.assertFalse((self.run_dir() / "repair_task.json").exists())
 
+    def test_human_route_stops_without_automatic_correction_or_publication(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(review_repair=3), planner=[initial_plan(STEP)],
+            reviewer=[review("REVISE", "HUMAN")],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "HUMAN_REQUIRED")
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(len(self.reviewer.requests), 1)
+        self.assertFalse((self.run_dir() / "publish.json").exists())
+
+    def test_reviewer_fail_stops_without_correction_or_publication(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(review_repair=3), planner=[initial_plan(STEP)],
+            reviewer=[review("FAIL", "HUMAN")],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "REVIEW_FAILED")
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(len(self.reviewer.requests), 1)
+        self.assertFalse((self.run_dir() / "publish.json").exists())
+
 
 class CheckRepairTests(PipelineHarness):
     def test_red_gate_is_repaired_then_committed_as_a_repair_candidate(self) -> None:
@@ -177,6 +204,7 @@ class ReviewCorrectionCycleTests(PipelineHarness):
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+        self.assertNotIn("repair", self.workers.roles())
         self.assertEqual(len(self.planner.requests), 2)
         selection = self.run_dir() / "cycles/002/correction/execution_selection.json"
         self.assertTrue(selection.is_file())
@@ -195,6 +223,29 @@ class ReviewCorrectionCycleTests(PipelineHarness):
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(len(self.planner.requests), 2)
         self.assertEqual(self.workers.roles(), ["implementer", "reviser", "implementer"])
+
+    def test_mixed_review_routes_spend_only_the_route_specific_budget(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(
+            ExecutionRole.REVISER,
+            write("feature.txt", "good\n"), write("feature.txt", "good\n"),
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
+        result = self.orchestrator(
+            self.config(review_repair=3),
+            planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
+            reviewer=[
+                review("REVISE", "IMPLEMENTATION"), review("REVISE", "REPLAN"),
+                review("REVISE", "IMPLEMENTATION"), review(),
+            ],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "implementer", "reviser"])
+        self.assertEqual(len(self.planner.requests), 2)
+        self.assertEqual(len(self.reviewer.requests), 4)
+        self.assertEqual(self.state()["cycle"], 4)
+
 
     def test_review_budget_exhaustion_is_exact(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
@@ -255,6 +306,52 @@ class ScopeApprovalTests(PipelineHarness):
 
 
 class SemanticRevisionTests(PipelineHarness):
+    def test_gate_before_revision_has_the_exact_target_order(self) -> None:
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'good', 'good semantic'} else 1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            write("feature.txt", "bad\n"), write("feature.txt", "good\n"),
+        )
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good semantic\n"))
+        result = self.orchestrator(
+            self.config(check_repair=2, semantic_revision=True), planner=[initial_plan(STEP)],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        filtered = [
+            (event["event"], event["data"].get("stage"))
+            for event in self.trace_events()
+            if event["event"] in {
+                "step.agent.completed", "checks.started", "checks.completed",
+                "check_repair.started", "revision.started", "review.started",
+                "review.completed", "publish.completed",
+            }
+        ]
+        self.assertEqual(filtered, [
+            ("step.agent.completed", None),
+            ("checks.started", "POST_IMPLEMENTATION"),
+            ("checks.completed", "POST_IMPLEMENTATION"),
+            ("check_repair.started", None),
+            ("checks.started", "POST_IMPLEMENTATION"),
+            ("checks.completed", "POST_IMPLEMENTATION"),
+            ("check_repair.started", None),
+            ("checks.started", "POST_IMPLEMENTATION"),
+            ("checks.completed", "POST_IMPLEMENTATION"),
+            ("revision.started", None),
+            ("checks.started", "POST_SEMANTIC_REVISION"),
+            ("checks.completed", "POST_SEMANTIC_REVISION"),
+            ("review.started", None),
+            ("review.completed", None),
+            ("publish.completed", None),
+        ])
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair", "reviser"])
+
     def test_initial_gate_runs_before_semantic_revision(self) -> None:
         self.check.write_text(
             "import pathlib, sys\n"
@@ -321,6 +418,261 @@ class SemanticRevisionTests(PipelineHarness):
 
 
 class ResumeTests(PipelineHarness):
+    def test_crash_after_worker_resumes_checks_without_replaying_worker(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        original = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        initial_planner = self.planner
+
+        def crash(_self, *_args):
+            raise RuntimeError("crash after worker before checks")
+
+        with mock.patch.object(type(original), "_run_gate", side_effect=crash):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(self.checkpoint()["phase"], "deterministic_gate")
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+        resumed = self.orchestrator(
+            self.config(), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(
+            [event["event"] for event in self.trace_events() if event["event"] == "checks.started"],
+            ["checks.started"],
+        )
+
+    def test_push_then_crash_resumes_review_with_the_same_remote_candidate(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        original = self.orchestrator(
+            self.config(publish=True), planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        def crash_after_push(owner, *_args, **_kwargs):
+            raise RuntimeError("crash after candidate push")
+
+        with mock.patch.object(type(original), "_review_candidate", side_effect=crash_after_push):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        candidate = json.loads(
+            (self.run_dir() / "cycles/001/candidate/commit.json").read_text(encoding="utf-8")
+        )
+        branch = self.state()["branch"]
+        self.assertEqual(self.remote_tip(branch), candidate["commit_sha"])
+
+        resumed = self.orchestrator(
+            self.config(publish=True), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(self.remote_tip(branch), candidate["commit_sha"])
+        self.assertEqual(git(self.worktree(), "rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(len(self.reviewer.requests), 1)
+
+    def test_cycle_four_resume_is_not_limited_to_two_cycles(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(
+            ExecutionRole.REVISER,
+            write("feature.txt", "good\n"), write("feature.txt", "good\n"),
+            write("feature.txt", "good\n"),
+        )
+        original = self.orchestrator(
+            self.config(review_repair=3), planner=[initial_plan(STEP)],
+            reviewer=[
+                review("REVISE", "IMPLEMENTATION"), review("REVISE", "IMPLEMENTATION"),
+                review("REVISE", "IMPLEMENTATION"), review(),
+            ],
+        )
+        initial_planner = self.planner
+        calls = 0
+        real_review = type(original)._review_candidate
+
+        def crash_on_cycle_four(owner, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                raise RuntimeError("crash at cycle four review")
+            return real_review(original, owner, *args, **kwargs)
+
+        with mock.patch.object(type(original), "_review_candidate", side_effect=crash_on_cycle_four):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(self.checkpoint()["review_cycle"], 4)
+        self.assertEqual(self.checkpoint()["phase"], "final_review")
+
+        resumed = self.orchestrator(
+            self.config(review_repair=3), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.state()["cycle"], 4)
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser", "reviser"])
+        self.assertEqual(len(initial_planner.requests), 1)
+        self.assertEqual(len(self.planner.requests), 0)
+
+    def test_profile_selection_snapshot_survives_live_default_changes(self) -> None:
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'good', 'good semantic'} else 1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
+        self.workers.on(
+            ExecutionRole.REVISER,
+            write("feature.txt", "good semantic\n"), write("feature.txt", "good semantic\n"),
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
+        config = self.config(check_repair=1, review_repair=1, semantic_revision=True)
+
+        def change_live_defaults(_run_dir):
+            text = self.config_path.read_text(encoding="utf-8")
+            for old, new in {
+                'default_planner_profile = "planner"': 'default_planner_profile = "live_planner"',
+                'default_implementer_profile = "worker"': 'default_implementer_profile = "live_worker"',
+                'default_reviewer_profile = "reviewer"': 'default_reviewer_profile = "live_reviewer"',
+                'default_reviser_profile = "reviser"': 'default_reviser_profile = "live_reviser"',
+                'default_repair_profile = "repairer"': 'default_repair_profile = "live_repairer"',
+            }.items():
+                text = text.replace(old, new)
+            self.config_path.write_text(text, encoding="utf-8")
+
+        original = self.orchestrator(
+            config,
+            planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
+            reviewer=[review("REVISE", "REPLAN"), review()],
+        )
+
+        def crash_once(_self, *_args):
+            raise RuntimeError("crash before first checks")
+
+        with mock.patch.object(type(original), "_run_gate", side_effect=crash_once):
+            failed = original.run_text(SPEC, run_id="run", on_created=change_live_defaults)
+        self.assertEqual(failed.status, RunStatus.FAILED)
+
+        resumed = self.orchestrator(
+            load_config(self.config_path),
+            planner=[correction_plan(("S01", "other.txt", "Correct other"))],
+            reviewer=[review("REVISE", "REPLAN"), review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        selection = json.loads((self.run_dir() / "execution_selection.json").read_text())
+        self.assertEqual(selection["planner"]["profile_id"], "planner")
+        self.assertEqual(selection["semantic_reviser"]["profile_id"], "reviser")
+        self.assertEqual(selection["check_repair"]["profile_id"], "repairer")
+        self.assertEqual(selection["final_reviewer"]["profile_id"], "reviewer")
+        correction_selection = json.loads(
+            (self.run_dir() / "cycles/002/correction/execution_selection.json").read_text()
+        )
+        self.assertEqual(correction_selection["steps"][0]["implementer"]["profile_id"], "worker")
+        self.assertEqual(
+            [call.profile_id for call in self.workers.calls],
+            ["worker", "repairer", "reviser", "worker", "reviser"],
+        )
+
+
+class GitChainAndTraceTests(PipelineHarness):
+    def test_accepted_git_chain_contains_only_reviewable_green_trees(self) -> None:
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'good', 'semantic', 'semantic 2', 'semantic 3', 'semantic 4'} else 1)\n",
+            encoding="utf-8",
+        )
+        steps = (
+            ("S01", "feature.txt", "Write the feature"),
+            ("S02", "other.txt", "Write the companion"),
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            write("feature.txt", "good\n"), write("feature.txt", "good\n"),
+        )
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "semantic\n"))
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "bad 2\n"))
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "semantic 4\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "semantic 3\n"))
+        result = self.orchestrator(
+            self.config(check_repair=1, semantic_revision=True, review_repair=2, publish=True),
+            planner=[
+                initial_plan(*steps),
+                correction_plan(("S01", "feature.txt", "Replan the feature")),
+            ],
+            reviewer=[
+                review("REVISE", "IMPLEMENTATION"), review("REVISE", "REPLAN"), review(),
+            ],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        commits = git(self.worktree(), "rev-list", "--reverse", "HEAD").splitlines()
+        self.assertEqual(commits[0], self.base_sha)
+        for commit in commits[1:]:
+            self.assertEqual(git(self.worktree(), "rev-list", "--parents", "-n", "1", commit).split().__len__(), 2)
+        red_trees = {
+            json.loads(path.read_text(encoding="utf-8"))["staged_tree_sha"]
+            for path in self.run_dir().glob("cycles/**/checks/**/attempts/**/evidence.json")
+            if not json.loads(path.read_text(encoding="utf-8")).get("deterministic_passed", True)
+            and "post-implementation" not in path.parts
+        }
+        commit_trees = {git(self.worktree(), "rev-parse", f"{commit}^{{tree}}") for commit in commits}
+        self.assertTrue(red_trees.isdisjoint(commit_trees))
+        candidate = json.loads(
+            (self.run_dir() / "cycles/003/candidate/commit.json").read_text(encoding="utf-8")
+        )
+        review_record = json.loads(
+            (self.run_dir() / "cycles/003/review/review.json").read_text(encoding="utf-8")
+        )
+        published = json.loads((self.run_dir() / "publish.json").read_text(encoding="utf-8"))
+        reviewed_sha = [
+            event["data"]["candidate_sha"]
+            for event in self.trace_events()
+            if event["event"] == "review.completed" and event.get("cycle") == 3
+        ][-1]
+        self.assertEqual(review_record["verdict"], "PASS")
+        self.assertEqual(candidate["commit_sha"], reviewed_sha)
+        self.assertEqual(published["commit_sha"], reviewed_sha)
+        self.assertEqual(git(self.worktree(), "rev-parse", "HEAD"), candidate["commit_sha"])
+        self.assertEqual(self.remote_tip(self.state()["branch"]), candidate["commit_sha"])
+
+    def test_trace_proves_pipeline_order_and_model_metadata(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.orchestrator(
+            self.config(publish=True), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        events = self.trace_events()
+        names = [event["event"] for event in events]
+        positions = {
+            name: names.index(name)
+            for name in (
+                "run.created", "plan.started", "step.started", "checks.started",
+                "checks.completed", "step.committed", "candidate.pushed",
+                "review.started", "publish.completed",
+            )
+        }
+        self.assertLess(positions["run.created"], positions["plan.started"])
+        self.assertLess(positions["plan.started"], positions["step.started"])
+        self.assertLess(positions["step.committed"], positions["checks.started"])
+        self.assertLess(positions["checks.completed"], positions["candidate.pushed"])
+        self.assertLess(positions["candidate.pushed"], positions["review.started"])
+        self.assertLess(positions["review.started"], positions["publish.completed"])
+        for event in events:
+            data = event.get("data", {})
+            session = data.get("session")
+            if session is not None:
+                self.assertTrue(session.get("driver"))
+                self.assertTrue(session.get("provider"))
+                self.assertTrue(session.get("model"))
+                self.assertIn("effort", session)
+                self.assertTrue(session.get("profile_fingerprint"))
+                if event["event"] in {"plan.completed", "step.agent.completed", "review.completed"}:
+                    self.assertIsInstance(session.get("prompt_bytes"), int)
+        stages = [
+            event["data"].get("stage")
+            for event in events
+            if event["event"] == "checks.completed"
+        ]
+        self.assertEqual(stages, ["POST_IMPLEMENTATION"])
     def test_green_evidence_without_acceptance_is_reused_on_resume(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         original = self.orchestrator(

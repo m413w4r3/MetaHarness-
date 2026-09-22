@@ -2961,7 +2961,10 @@ class Orchestrator:
             revision = _load_revision(semantic_revision_dir(ctx.run_dir, cycle_plan.cycle.number))
             recovered_repair = bool(attempts and parent_tree != evidence.staged_tree_sha)
             recovered_revision = bool(
-                stage is GateStage.POST_SEMANTIC_REVISION
+                stage in {
+                    GateStage.POST_SEMANTIC_REVISION,
+                    GateStage.POST_REVIEW_IMPLEMENTATION,
+                }
                 and revision is not None
                 and revision.tree_before != revision.tree_after
                 and revision.tree_after == evidence.staged_tree_sha
@@ -2996,7 +2999,10 @@ class Orchestrator:
                     body=f"MetaHarness-Run: {ctx.run_id}",
                 )
                 acceptance_kind = "repair"
-            elif stage is GateStage.POST_SEMANTIC_REVISION:
+            elif stage in {
+                GateStage.POST_SEMANTIC_REVISION,
+                GateStage.POST_REVIEW_IMPLEMENTATION,
+            }:
                 commit_sha = commit_revision_tree(
                     worktree, tree_sha=evidence.staged_tree_sha,
                     parent_sha=parent_sha, body=f"MetaHarness-Run: {ctx.run_id}",

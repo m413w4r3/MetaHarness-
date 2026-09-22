@@ -144,6 +144,13 @@ never a planner: a failed deterministic signal gets only the configured
 bounded direct repair attempts. Integrity failures are fail-closed and never
 start an LLM/AgentExecutor repair call.
 
+Ne pas confondre réparation de check, révision sémantique et reviewer final.
+`REVISE / IMPLEMENTATION` réutilise le plan et appelle le semantic reviser ;
+`REVISE / REPLAN` appelle un planner correctif puis un implementer ;
+`REVISE / HUMAN` arrête la correction automatique. Les profils et budgets
+proviennent des snapshots durables du run, pas de defaults live modifiés après
+sa création.
+
 Claude Code is invoked with an authoritative, non-configurable argv; the
 prompt is stdin and no shell is used:
 
@@ -273,6 +280,11 @@ repair planner/steps, and publish. Corruptions, identity violations and
 | exact C02 candidate commit | `candidate_push_c02` |
 | exact C02 candidate push | `reviewer_c02` |
 | approved candidate | `publish` (HEAD = candidate commit) |
+
+Ces checkpoints sont idempotents : après le worker les checks reprennent sans
+rejouer le worker ; après une evidence PASS le commit n’est créé qu’une fois ;
+après `candidate push`, la reprise conserve le même SHA et le même tip distant,
+sans nouveau worker ni commit avant la review. Le cycle n’est pas limité à 2.
 
 A `PUBLISHED` (or `COMMITTED`) run marks it `completed`.
 

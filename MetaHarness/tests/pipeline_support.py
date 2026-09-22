@@ -121,12 +121,16 @@ def review(verdict: str = "PASS", route: str = "NONE") -> str:
 class ScriptedChat:
     """A chat client answering from a queue; the last answer repeats."""
 
-    def __init__(self, answers: list[Any]) -> None:
+    def __init__(self, answers: list[Any], *, name: str = "chat", events: list[dict[str, Any]] | None = None) -> None:
         self.answers = list(answers)
         self.requests: list[str] = []
+        self.name = name
+        self.events = events
 
     def complete(self, request: str) -> str:
         self.requests.append(request)
+        if self.events is not None:
+            self.events.append({"kind": f"{self.name} call", "request": request})
         answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
         if isinstance(answer, BaseException):
             raise answer
@@ -149,6 +153,7 @@ class ScriptedWorkers:
     def __init__(self) -> None:
         self.scripts: dict[ExecutionRole, list[Script]] = {}
         self.calls: list[AgentRunRequest] = []
+        self.events: list[dict[str, Any]] = []
 
     def on(self, role: ExecutionRole, *scripts: Script) -> "ScriptedWorkers":
         self.scripts.setdefault(role, []).extend(scripts)
@@ -159,6 +164,12 @@ class ScriptedWorkers:
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         self.calls.append(request)
+        self.events.append({
+            "kind": f"{request.role.value} call",
+            "role": request.role.value,
+            "profile_id": request.profile_id,
+            "prompt": request.prompt,
+        })
         queue = self.scripts.get(request.role) or []
         if not queue:
             raise AssertionError(f"no scripted {request.role.value} worker left")
@@ -205,6 +216,11 @@ class PipelineHarness(unittest.TestCase):
         git(self.repo, "add", "--all")
         git(self.repo, "commit", "-qm", "base")
         self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        self.remote = self.root / "remote.git"
+        self.remote.mkdir()
+        git(self.remote, "init", "--bare", "-q")
+        git(self.repo, "remote", "add", "origin", str(self.remote))
+        git(self.repo, "push", "-q", "-u", "origin", "main")
         self.check = self.root / "check.py"
         # The gate is green only when feature.txt holds exactly "good".
         self.check.write_text(
@@ -213,6 +229,7 @@ class PipelineHarness(unittest.TestCase):
             encoding="utf-8",
         )
         self.workers = ScriptedWorkers()
+        self.events = self.workers.events
         register_executor_driver(
             DRIVER, lambda _profile, _runtime, **_kwargs: _Executor(self.workers), replace=True,
         )
@@ -223,8 +240,10 @@ class PipelineHarness(unittest.TestCase):
     def config(
         self, *, check_repair: int = 0, review_repair: int = 0,
         semantic_revision: bool = False, scope_policy: str | None = None,
+        publish: bool = False,
     ) -> Any:
         path = self.root / "config.toml"
+        self.config_path = path
         reviser = '\ndefault_reviser_profile = "reviser"' if semantic_revision or review_repair else ""
         repair = '\ndefault_repair_profile = "repairer"' if check_repair else ""
         path.write_text(f"""
@@ -252,6 +271,11 @@ always_files = []
 default_planner_profile = "planner"
 default_implementer_profile = "worker"
 default_reviewer_profile = "reviewer"{reviser}{repair}
+
+[publish]
+enabled = {'true' if publish else 'false'}
+remote = "origin"
+mode = "run-branch"
 
 [model_profiles.planner]
 display_name = "Planner"
@@ -299,6 +323,52 @@ provider = "test"
 model = "fake-reviser"
 selection_mode = "cli"
 
+[model_profiles.live_planner]
+display_name = "Live Planner"
+roles = ["planner"]
+driver = "openai-chat"
+provider = "live"
+model = "live-planner"
+selection_mode = "request"
+base_url = "http://127.0.0.1:9"
+endpoint_path = "/v1/chat/completions"
+retries = 0
+
+[model_profiles.live_reviewer]
+display_name = "Live Reviewer"
+roles = ["reviewer"]
+driver = "openai-chat"
+provider = "live"
+model = "live-reviewer"
+selection_mode = "request"
+base_url = "http://127.0.0.1:9"
+endpoint_path = "/v1/chat/completions"
+retries = 0
+
+[model_profiles.live_worker]
+display_name = "Live Worker"
+roles = ["implementer"]
+driver = "{DRIVER}"
+provider = "live"
+model = "live-worker"
+selection_mode = "cli"
+
+[model_profiles.live_repairer]
+display_name = "Live Repairer"
+roles = ["repair"]
+driver = "{DRIVER}"
+provider = "live"
+model = "live-repairer"
+selection_mode = "cli"
+
+[model_profiles.live_reviser]
+display_name = "Live Reviser"
+roles = ["reviser"]
+driver = "{DRIVER}"
+provider = "live"
+model = "live-reviser"
+selection_mode = "cli"
+
 [[checks]]
 name = "test"
 argv = [{sys.executable!r}, {str(self.check)!r}]
@@ -312,8 +382,8 @@ timeout_seconds = 30
     def orchestrator(
         self, config: Any, *, planner: list[Any], reviewer: list[Any],
     ) -> Orchestrator:
-        self.planner = ScriptedChat(planner)
-        self.reviewer = ScriptedChat(reviewer)
+        self.planner = ScriptedChat(planner, name="planner", events=self.events)
+        self.reviewer = ScriptedChat(reviewer, name="reviewer", events=self.events)
         return Orchestrator(config, planner_client=self.planner, reviewer_client=self.reviewer)
 
     def run_dir(self, run_id: str = "run") -> Path:
@@ -329,3 +399,15 @@ timeout_seconds = 30
         return json.loads(
             (self.run_dir(run_id) / "resume_checkpoint.json").read_text(encoding="utf-8")
         )
+
+    def trace_events(self, run_id: str = "run") -> list[dict[str, Any]]:
+        """Return the production trace; tests assert order from this authority."""
+
+        path = self.run_dir(run_id) / "trace" / "events.v1.jsonl"
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def trace_names(self, run_id: str = "run") -> list[str]:
+        return [event["event"] for event in self.trace_events(run_id)]
+
+    def remote_tip(self, branch: str) -> str:
+        return git(self.remote, "rev-parse", f"refs/heads/{branch}")

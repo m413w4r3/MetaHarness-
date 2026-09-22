@@ -63,6 +63,26 @@ preamble/postamble are not sent to that agent.
     diff and checks. The reviewer must return a coherent labeled verdict;
     it does not receive or control the correction budgets.
 
+The normative v2 sequence is:
+
+```text
+SPEC → planner → implementation steps → accepted commits
+→ deterministic gate
+   ├ FAIL → bounded direct check repair → deterministic gate
+   └ PASS → semantic revision (when enabled) → deterministic gate
+→ accepted candidate → exact candidate push → final reviewer
+   ├ PASS → publish the exact reviewed SHA
+   ├ IMPLEMENTATION → direct semantic correction
+   ├ REPLAN → corrective planner → implementer
+   └ HUMAN → operator
+```
+
+These are separate authorities: check repair is not semantic revision;
+semantic revision is not the final reviewer; and `REVISE / IMPLEMENTATION` is
+not `REVISE / REPLAN`. Every run freezes the selected profiles and budgets in
+durable snapshots, so changing live defaults cannot change an existing run or
+its resume path.
+
 Selected executors, checks and the locator run through `procutil.run_bounded`:
 no shell, own process group, file-backed stdin/stdout/stderr, hard deadline, and
 termination of the whole group at the deadline and after exit, so a
@@ -165,6 +185,10 @@ PLAN → implementation step → accepted step commit → …
   an automatic merge of the run branch.
 - Historical snapshots may retain `C01`/`C02` directory names. Those names are
   artifact compatibility labels, not a v2 policy or a review-cycle limit.
+- `trace/events.v1.jsonl` records the workflow in order (`run`, `plan`, `step`,
+  `checks`, `repair`, `revision`, `candidate.pushed`, `review`, `publish`).
+  Session fields include driver, provider, model, effort, profile fingerprint,
+  prompt bytes and tree identities whenever available.
 
 ## Durable checkpoints and resume (P29)
 

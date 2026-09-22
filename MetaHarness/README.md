@@ -44,6 +44,12 @@ delete remote run branch           (fast-forward-base only; after publication)
 
 - `max_check_repair_attempts` et `max_review_repair_cycles` sont deux budgets
   indépendants et configurables ; le reviewer ne connaît pas ces budgets ;
+- une réparation de check corrige uniquement un signal déterministe ; une
+  révision sémantique compare le candidat à la SPEC ; le reviewer final ne
+  corrige jamais directement ;
+- `REVISE / IMPLEMENTATION` réutilise le plan approuvé et appelle le reviser,
+  tandis que `REVISE / REPLAN` appelle un planner correctif puis un nouvel
+  implementer ; `REVISE / HUMAN` arrête toute correction automatique ;
 - `[revision]` fournit les defaults et le fallback legacy ; chaque nouveau run
   capture ses choix effectifs dans `run_options.json` ; les anciens noms
   `claude_revision_enabled` et `repair_cycles` restent des alias de lecture ;
@@ -61,6 +67,10 @@ delete remote run branch           (fast-forward-base only; after publication)
   (ref de suivi locale, sans fetch implicite) a bougé :
   `BASE_MOVED_SINCE_RUN`, sans merge, rebase ni force.
   `mode = "run-branch"` pousse seulement la branche de run ;
+- `trace/events.v1.jsonl` est la preuve chronologique d’observation : plan,
+  steps, checks, réparations, révisions, push, review et publication, avec les
+  SHA/tree et les métadonnées de session disponibles ; il ne remplace jamais
+  `RunStateStore` comme autorité ;
 - aucun force, lease, tag ou merge automatique ; un échec du cleanup après
   publication laisse le run `PUBLISHED` avec un warning diagnostiqué.
 

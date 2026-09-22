@@ -70,6 +70,22 @@ la review finale ; le reviewer reçoit ce SHA et non une branche mobile. Après
 `PASS`, la publication réutilise exactement le SHA approuvé. Elle ne recrée
 pas un commit et ne publie jamais un autre arbre.
 
+### Frontières de correction
+
+Les trois responsabilités ne se substituent pas :
+
+- **check repair** corrige un échec déterministe dans le scope autorisé et
+  consomme `max_check_repair_attempts`, par épisode de gate ;
+- **semantic revision** compare le code à la SPEC et passe à nouveau par le
+  gate déterministe avant le candidat ;
+- **final reviewer** juge un candidat déjà accepté et poussé. Il ne connaît
+  pas les budgets et ne lance pas lui-même de worker.
+
+`REVISE / IMPLEMENTATION` réutilise le plan approuvé et appelle directement le
+semantic reviser. `REVISE / REPLAN` appelle le corrective planner puis exécute
+son nouveau plan avec un implementer. `REVISE / HUMAN` écrit une tâche
+opérateur et publie zéro commit.
+
 ## Responsabilités
 
 - **check repair** corrige un signal déterministe précis (`lint`, `test`,
@@ -144,6 +160,11 @@ peut jamais franchir cette frontière. META TRACE v1 observe les transitions,
 les arbres, les SHA et les métriques disponibles sans devenir une seconde
 autorité. Nimbalyst peut consommer cette trace comme cockpit externe, mais ne
 peut pas autoriser un commit ou une publication.
+
+Le fichier `trace/events.v1.jsonl` permet de vérifier l’ordre
+`run → plan → step → checks → repair → revision → candidate.pushed → review →
+publish`. Les événements incluent, lorsque disponibles, le driver, le provider,
+le modèle, l’effort, l’empreinte du profil, les octets de prompt et les arbres.
 
 ## Matrice de benchmark
 
