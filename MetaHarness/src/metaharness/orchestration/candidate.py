@@ -22,6 +22,7 @@ from ..gitops import (
     resolve_tree,
     status_porcelain,
     symbolic_head,
+    validate_linear_commit_chain,
 )
 from ..models import (
     ReviewRoute,
@@ -143,7 +144,54 @@ def _candidate_commit_payload(
         "tree_sha": tree_sha,
         "parent_sha": parent_sha,
         "branch": branch,
+        "remote_branch": branch,
         "remote": remote,
+        "remote_sha": commit_sha if pushed_at is not None else None,
         "immutable_commit_url": immutable_url,
         "pushed_at": pushed_at,
     }
+
+
+def accepted_chain_records(run_dir: Path) -> tuple[dict[str, Any], ...]:
+    """Read the arbitrary accepted chain, with legacy C01/C02 fallback."""
+
+    chain_path = run_dir / "accepted-chain.json"
+    chain = _read_json_artifact(chain_path)
+    if chain_path.is_file():
+        if isinstance(chain, dict):
+            chain = chain.get("commits")
+        if not isinstance(chain, list) or not chain or not all(
+            isinstance(item, dict) for item in chain
+        ):
+            raise GitError("accepted commit chain artifact is malformed")
+        return tuple(chain)
+    if isinstance(chain, dict):
+        chain = chain.get("commits")
+    if isinstance(chain, list) and all(isinstance(item, dict) for item in chain):
+        return tuple(chain)
+    records: list[dict[str, Any]] = []
+    for cycle in range(1, 33):
+        record = _read_json_artifact(_candidate_commit_path(run_dir, cycle))
+        if not isinstance(record, dict):
+            break
+        records.append(record)
+    return tuple(records)
+
+
+def validate_accepted_chain(
+    worktree: Path,
+    *,
+    run_dir: Path,
+    base_sha: str,
+    tip_sha: str,
+    approved_tree_sha: str,
+) -> tuple[str, ...]:
+    """Validate the exact durable chain used by candidate publication."""
+
+    return validate_linear_commit_chain(
+        worktree,
+        base_sha=base_sha,
+        tip_sha=tip_sha,
+        accepted_commits=accepted_chain_records(run_dir),
+        approved_tree_sha=approved_tree_sha,
+    )

@@ -175,6 +175,11 @@ class ResumeCheckpoint:
     # checkpoints leave it absent; new v2 checkpoints use it for both the
     # worker boundary and the checks-after-repair boundary.
     check_repair_attempt: int | None = None
+    # Explicit accepted-chain authority.  Historical checkpoints may omit
+    # these fields; new checkpoints use them to resume after accepted steps
+    # without replaying a worker.
+    expected_parent_sha: str | None = None
+    next_step_id: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -195,9 +200,14 @@ class ResumeCheckpoint:
         for label, value in (
             ("expected_head_sha", self.expected_head_sha),
             ("expected_tree_sha", self.expected_tree_sha),
+            ("expected_parent_sha", self.expected_parent_sha),
         ):
             if value is not None and (not isinstance(value, str) or _OBJECT_ID.fullmatch(value) is None):
                 raise ResumeCheckpointError(f"checkpoint {label} is invalid")
+        if self.next_step_id is not None and (
+            not isinstance(self.next_step_id, str) or _STEP_ID.fullmatch(self.next_step_id) is None
+        ):
+            raise ResumeCheckpointError("checkpoint next_step_id is invalid")
         if self.execution_selection_sha256 is not None and (
             not isinstance(self.execution_selection_sha256, str)
             or _SHA256.fullmatch(self.execution_selection_sha256) is None
@@ -288,6 +298,8 @@ def checkpoint_payload(checkpoint: ResumeCheckpoint, *, status: str = "pending")
         "repair_bundle_sha256": checkpoint.repair_bundle_sha256,
         "scope_delta_sha256": checkpoint.scope_delta_sha256,
         "check_repair_attempt": checkpoint.check_repair_attempt,
+        "expected_parent_sha": checkpoint.expected_parent_sha,
+        "next_step_id": checkpoint.next_step_id,
     }
 
 
@@ -322,6 +334,8 @@ def _parse(payload: Any) -> tuple[ResumeCheckpoint, str]:
         repair_bundle_sha256=payload.get("repair_bundle_sha256"),
         scope_delta_sha256=payload.get("scope_delta_sha256"),
         check_repair_attempt=payload.get("check_repair_attempt"),
+        expected_parent_sha=payload.get("expected_parent_sha"),
+        next_step_id=payload.get("next_step_id"),
     )
     return checkpoint, status
 

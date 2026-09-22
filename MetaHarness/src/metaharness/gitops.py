@@ -835,13 +835,14 @@ def changed_paths_between_trees(
     return tuple(sorted({path for path in output.split("\0") if path}))
 
 
-def commit_candidate_tree(
+def commit_tree(
     worktree: Path,
     *,
     tree_sha: str,
     parent_sha: str,
     subject: str,
-    body: str,
+    body: str = "",
+    reflog_message: str = "metaharness: commit accepted tree",
 ) -> str:
     """Commit exactly *tree_sha* on top of *parent_sha* and return the commit.
 
@@ -861,10 +862,13 @@ def commit_candidate_tree(
         raise GitError("commit subject must be non-empty")
     if "\n" in clean_subject or len(clean_subject) > 72:
         raise GitError("commit subject must be one line of at most 72 characters")
+    clean_reflog = reflog_message.strip() if isinstance(reflog_message, str) else ""
+    if not clean_reflog or "\n" in clean_reflog:
+        raise GitError("reflog message must be a non-empty single line")
     if _git(worktree, "cat-file", "-t", tree_sha).stdout.strip() != "tree":
-        raise GitError("candidate tree object does not exist")
+        raise GitError("accepted tree object does not exist")
     if _git(worktree, "rev-parse", "--verify", f"{parent_sha}^{{tree}}").stdout.strip() == tree_sha:
-        raise GitError("no changes to commit for candidate tree")
+        raise GitError("no changes to commit for accepted tree")
 
     args = ["commit-tree", tree_sha, "-p", parent_sha, "-m", clean_subject]
     if body:
@@ -876,7 +880,7 @@ def commit_candidate_tree(
         worktree,
         "update-ref",
         "-m",
-        "metaharness: commit candidate tree",
+        clean_reflog,
         "HEAD",
         commit_sha,
         parent_sha,
@@ -889,8 +893,87 @@ def commit_candidate_tree(
     return commit_sha
 
 
-# Compatibility for integrations that imported the pre-P40 name.  New code
-# must use the candidate terminology because this operation precedes review.
+def commit_candidate_tree(
+    worktree: Path,
+    *,
+    tree_sha: str,
+    parent_sha: str,
+    subject: str,
+    body: str = "",
+) -> str:
+    """Compatibility wrapper for the generic accepted-tree primitive."""
+
+    return commit_tree(
+        worktree,
+        tree_sha=tree_sha,
+        parent_sha=parent_sha,
+        subject=subject,
+        body=body,
+        reflog_message="metaharness: commit candidate tree",
+    )
+
+
+def commit_step_tree(
+    worktree: Path,
+    *,
+    tree_sha: str,
+    parent_sha: str,
+    step_id: str,
+    step_title: str,
+    body: str = "",
+) -> str:
+    """Commit one step only after its caller has accepted its gate."""
+
+    return commit_tree(
+        worktree,
+        tree_sha=tree_sha,
+        parent_sha=parent_sha,
+        subject=f"metaharness({step_id}): {step_title}"[:72],
+        body=body,
+        reflog_message=f"metaharness: accept step {step_id}",
+    )
+
+
+def commit_repair_tree(
+    worktree: Path,
+    *,
+    tree_sha: str,
+    parent_sha: str,
+    cycle: int,
+    body: str = "",
+) -> str:
+    """Commit a green check-repair tree; red attempts never call this."""
+
+    return commit_tree(
+        worktree,
+        tree_sha=tree_sha,
+        parent_sha=parent_sha,
+        subject=f"metaharness(check-repair): cycle {cycle}"[:72],
+        body=body,
+        reflog_message=f"metaharness: accept check-repair cycle {cycle}",
+    )
+
+
+def commit_revision_tree(
+    worktree: Path,
+    *,
+    tree_sha: str,
+    parent_sha: str,
+    body: str = "",
+) -> str:
+    """Commit a semantic revision only after deterministic checks pass."""
+
+    return commit_tree(
+        worktree,
+        tree_sha=tree_sha,
+        parent_sha=parent_sha,
+        subject="metaharness(semantic-revision): accepted",
+        body=body,
+        reflog_message="metaharness: accept semantic revision",
+    )
+
+
+# Compatibility for integrations that imported the pre-P40 name.
 commit_reviewed_tree = commit_candidate_tree
 
 
@@ -1058,6 +1141,80 @@ def commit_parents(repo: Path, commit_sha: str) -> tuple[str, ...]:
     return tuple(fields[1:])
 
 
+def is_ancestor(repo: Path, ancestor_sha: str, descendant_sha: str) -> bool:
+    """Return whether *ancestor_sha* is an ancestor of *descendant_sha*."""
+
+    ancestor = _require_object_id(ancestor_sha, "ancestor_sha")
+    descendant = _require_object_id(descendant_sha, "descendant_sha")
+    try:
+        _git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
+    except GitError:
+        return False
+    return True
+
+
+def validate_linear_commit_chain(
+    repo: Path,
+    *,
+    base_sha: str,
+    tip_sha: str,
+    accepted_commits: tuple[dict[str, object], ...] | list[dict[str, object]] = (),
+    approved_tree_sha: str | None = None,
+) -> tuple[str, ...]:
+    """Validate an arbitrary durable, single-parent accepted-commit chain.
+
+    ``accepted_commits`` is optional for compatibility with older callers.  If
+    supplied, records are authoritative in order and each record must agree
+    with the corresponding Git object; no C01/C02 naming convention is used.
+    """
+
+    base = _require_object_id(base_sha, "base_sha")
+    tip = _require_object_id(tip_sha, "tip_sha")
+    if not is_ancestor(repo, base, tip):
+        raise GitError("base commit is not an ancestor of the accepted tip")
+
+    commits: list[str] = []
+    current = tip
+    while current != base:
+        parents = commit_parents(repo, current)
+        if len(parents) != 1:
+            raise GitError("accepted chain contains a merge commit or root")
+        commits.append(current)
+        current = parents[0]
+    commits.reverse()
+
+    if accepted_commits:
+        expected = tuple(commits)
+        recorded: list[str] = []
+        parent = base
+        for item in accepted_commits:
+            if not isinstance(item, dict):
+                raise GitError("accepted commit record is malformed")
+            commit = item.get("commit_sha")
+            tree = item.get("tree_after", item.get("tree_sha"))
+            record_parent = item.get("parent_sha")
+            if not isinstance(commit, str) or not _OBJECT_ID.fullmatch(commit):
+                raise GitError("accepted commit record has an invalid commit SHA")
+            if not isinstance(tree, str) or not _OBJECT_ID.fullmatch(tree):
+                raise GitError("accepted commit record has an invalid tree SHA")
+            if record_parent != parent or commit != (expected[len(recorded)] if len(recorded) < len(expected) else None):
+                raise GitError("accepted commit record does not match the durable chain")
+            if commit_parents(repo, commit) != (parent,) or resolve_tree(repo, commit) != tree:
+                raise GitError("accepted commit record has the wrong parent or tree")
+            tree_before = item.get("tree_before")
+            if tree_before is not None and tree_before != resolve_tree(repo, parent):
+                raise GitError("accepted commit record has the wrong tree_before")
+            recorded.append(commit)
+            parent = commit
+        if tuple(recorded) != expected:
+            raise GitError("durable accepted records do not cover the complete chain")
+    if approved_tree_sha is not None:
+        approved = _require_object_id(approved_tree_sha, "approved_tree_sha")
+        if resolve_tree(repo, tip) != approved:
+            raise GitError("accepted tip tree differs from the approved tree")
+    return tuple(commits)
+
+
 def branch_checkouts(repo: Path, branch: str) -> tuple[str, ...]:
     """Paths of every registered worktree that has *branch* checked out."""
 
@@ -1082,17 +1239,18 @@ def publish_fast_forward_base(
     approved_tree: str,
     run_branch: str,
     expected_parent: str | None = None,
+    accepted_commits: tuple[dict[str, object], ...] | list[dict[str, object]] | None = None,
 ) -> FastForwardResult:
     """Fast-forward ``refs/heads/<base>`` to the reviewed commit, then push it.
 
     No checkout, merge, rebase, force, lease, tag or delete, and no implicit
     fetch: the remote state is the local remote-tracking ref.  Preconditions:
-    local base == remote-tracking base == ``base_sha``; the commit's only
-    parent is *expected_parent* (``base_sha`` when omitted, the historical
-    contract); an explicit *expected_parent* other than the base must itself
-    have ``base_sha`` as its only parent (BASE -> C01 -> C02); the commit's
-    tree is ``approved_tree``; the run branch points to it.  The local ref
-    moves with a compare-and-swap ``update-ref``; a failed swap is
+    local base == remote-tracking base == ``base_sha``; with
+    ``accepted_commits`` supplied, the complete durable chain is linear and
+    every recorded parent/tree agrees with Git.  Without it, the historical
+    direct-parent contract is retained.  The commit's tree is
+    ``approved_tree`` and the run branch points to it.  The local ref moves
+    with a compare-and-swap ``update-ref``; a failed swap is
     :class:`BaseMovedError`.  A retry after a failed push accepts a local
     base that already points to the commit.
     """
@@ -1112,15 +1270,27 @@ def publish_fast_forward_base(
     tracking = _ref_commit(repo, f"refs/remotes/{remote}/{base_branch}")
     if tracking is None:
         raise GitError("remote-tracking base branch is unavailable")
-    if commit_parents(repo, commit_sha) != (parent,):
-        raise GitError(
-            "run commit parent is not the run base" if parent == base_sha
-            else "run commit parent is not the expected candidate parent"
+    if accepted_commits is not None:
+        chain = validate_linear_commit_chain(
+            repo,
+            base_sha=base_sha,
+            tip_sha=commit_sha,
+            accepted_commits=accepted_commits,
+            approved_tree_sha=approved_tree,
         )
-    if parent != base_sha and commit_parents(repo, parent) != (base_sha,):
-        raise GitError("expected candidate parent is not a direct child of the run base")
-    if resolve_tree(repo, commit_sha) != approved_tree:
-        raise GitError("run commit tree is not the approved tree")
+        if not chain:
+            raise GitError("accepted chain is empty")
+        parent = commit_parents(repo, commit_sha)[0]
+    else:
+        if commit_parents(repo, commit_sha) != (parent,):
+            raise GitError(
+                "run commit parent is not the run base" if parent == base_sha
+                else "run commit parent is not the expected candidate parent"
+            )
+        if parent != base_sha and commit_parents(repo, parent) != (base_sha,):
+            raise GitError("expected candidate parent is not a direct child of the run base")
+        if resolve_tree(repo, commit_sha) != approved_tree:
+            raise GitError("run commit tree is not the approved tree")
     if _ref_commit(repo, f"refs/heads/{run_branch}") != commit_sha:
         raise GitError("run branch does not point to the run commit")
     already_local = local == commit_sha

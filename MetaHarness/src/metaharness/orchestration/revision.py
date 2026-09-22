@@ -624,6 +624,7 @@ class RevisionRunner:
                     check_failures_hard=False,
                     expected_head_sha=expected_head,
                     enforce_diff_size=False,
+                    allow_empty_diff=expected_head != base_sha,
                 )
                 pre_payload = {
                     "checks": _check_payload(pre_evidence),

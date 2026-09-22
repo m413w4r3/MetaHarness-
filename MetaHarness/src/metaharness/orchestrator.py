@@ -89,6 +89,9 @@ from .gitops import (
     changed_paths_between_trees,
     commit_reviewed_tree,
     commit_candidate_tree,
+    commit_step_tree,
+    commit_repair_tree,
+    commit_revision_tree,
     create_run_worktree,
     current_head,
     delete_run_branch,
@@ -114,6 +117,13 @@ from .gitops import (
     run_branch_web_url,
     tracked_files_in_tree,
     validate_run_branch,
+)
+from .commit_gate import (
+    CommitSafetyError,
+    accepted_step_record,
+    assert_deferred_verifications_resolved,
+    commit_safety_gate,
+    parse_deferred_verification,
 )
 from .llm.chat import LLMConversationHandle, LLMError, OpenAIChatTextClient
 from .recommendation import (
@@ -368,6 +378,8 @@ from .orchestration.scope_repair import (  # noqa: F401  (facade re-exports)
 )
 from .orchestration.candidate import (  # noqa: F401  (facade re-exports)
     _candidate_chain_parent,
+    accepted_chain_records,
+    validate_accepted_chain,
     _candidate_commit_path,
     _candidate_commit_payload,
     _commit_web_url,
@@ -2179,6 +2191,8 @@ class Orchestrator:
         repair_bundle_sha256: str | None = None,
         scope_delta_sha256: str | None = None,
         check_repair_attempt: int | None = None,
+        expected_parent_sha: str | None = None,
+        next_step_id: str | None = None,
     ) -> None:
         """Write a new-schema boundary without changing the old hook API."""
 
@@ -2200,11 +2214,18 @@ class Orchestrator:
         resume_module.write_checkpoint(
             run_dir,
             ResumeCheckpoint(
-                phase, cycle or (2 if phase_index(phase) >= phase_index(ResumePhase.REPAIR_PLANNER) else 1),
-                step_id, head, tree, execution, identity,
-                repair_bundle_sha256 or previous.repair_bundle_sha256,
-                scope_delta_sha256 or previous.scope_delta_sha256,
-                check_repair_attempt,
+                phase=phase,
+                cycle=cycle or (2 if phase_index(phase) >= phase_index(ResumePhase.REPAIR_PLANNER) else 1),
+                step_id=step_id,
+                expected_head_sha=head,
+                expected_tree_sha=tree,
+                execution_selection_sha256=execution,
+                plan_identity=identity,
+                repair_bundle_sha256=repair_bundle_sha256 or previous.repair_bundle_sha256,
+                scope_delta_sha256=scope_delta_sha256 or previous.scope_delta_sha256,
+                check_repair_attempt=check_repair_attempt,
+                expected_parent_sha=expected_parent_sha or previous.expected_parent_sha,
+                next_step_id=next_step_id,
             ),
         )
 
@@ -2220,6 +2241,8 @@ class Orchestrator:
         repair_bundle_sha256: str | None = None,
         scope_delta_sha256: str | None = None,
         check_repair_attempt: int | None = None,
+        expected_parent_sha: str | None = None,
+        next_step_id: str | None = None,
     ) -> None:
         """Persist the next operation that has not yet succeeded.
 
@@ -2259,10 +2282,18 @@ class Orchestrator:
         if cycle is None:
             cycle = 2 if phase_index(ResumePhase.REPAIR_PLANNER) <= phase_index(phase) < phase_index(ResumePhase.PUBLISH) else 1
         write_checkpoint(run_dir, ResumeCheckpoint(
-            phase, cycle, step_id, head, tree,
-            previous.execution_selection_sha256, previous.plan_identity, repair,
-            scope_delta,
-            check_repair_attempt,
+            phase=phase,
+            cycle=cycle,
+            step_id=step_id,
+            expected_head_sha=head,
+            expected_tree_sha=tree,
+            execution_selection_sha256=previous.execution_selection_sha256,
+            plan_identity=previous.plan_identity,
+            repair_bundle_sha256=repair,
+            scope_delta_sha256=scope_delta,
+            check_repair_attempt=check_repair_attempt,
+            expected_parent_sha=expected_parent_sha or previous.expected_parent_sha,
+            next_step_id=next_step_id,
         ))
 
     def _execute_v2(
@@ -2404,10 +2435,12 @@ class Orchestrator:
             store.update(status=RunStatus.IMPLEMENTING, current_step=step.id,
                          steps=[{**item, "status": "running" if item["id"] == step.id else item["status"]}
                                 for item in state_steps])
+            step_parent_sha = current_head(info.worktree)
+            step_ownership_before = _git_ownership(repo, info.worktree)
             try:
                 outcome = self._execute_codex_step(
-                    repo=repo, worktree=info.worktree, base_sha=base_sha,
-                    branch_ref=branch_ref, ownership_before=ownership_before,
+                    repo=repo, worktree=info.worktree, base_sha=step_parent_sha,
+                    branch_ref=branch_ref, ownership_before=step_ownership_before,
                     expected_tree=expected_tree, step=step, contract=contract,
                     profile_id=selected_step.implementer.profile_id,
                     artifact_dir=run_dir / "steps" / step.id,
@@ -2419,8 +2452,25 @@ class Orchestrator:
                 if failure.usage is not None:
                     self._v2_usage_rows.append({"id": step.id, **failure.usage})
                 return self._step_failed(store, run_dir, failure, run_dir / "steps" / step.id)
+            try:
+                accepted_commit_sha = self._accept_v2_step_tree(
+                    store=store,
+                    run_dir=run_dir,
+                    info=info,
+                    step=step,
+                    outcome=outcome,
+                    parent_sha=step_parent_sha,
+                    future_step_ids=tuple(item.id for item in plan.steps[index + 1:]),
+                    run_id=run_id,
+                )
+            except (CommitSafetyError, GitError) as exc:
+                return self._v2_failed(
+                    store, run_dir, "COMMIT_GATE_FAILED", step.id,
+                    _bounded_parse_detail(exc),
+                )
             self._v2_usage_rows.append({"id": step.id, **outcome.usage})
             expected_tree = outcome.tree_after
+            ownership_before = _git_ownership(repo, info.worktree)
             self._last_v2_step_results.append(_step_result_record(outcome))
             state_steps = [
                 {**item, "status": "deferred" if getattr(outcome, "status", "COMPLETED") == "DEFERRED_CONTRACT_MISMATCH" else "completed", "usage": outcome.usage,
@@ -2432,17 +2482,29 @@ class Orchestrator:
             store.update(status=RunStatus.IMPLEMENTING, current_step=None, steps=state_steps,
                          agent_usage=self._v2_agent_usage())
             following = plan.steps[index + 1].id if index + 1 < len(plan.steps) else None
+            checkpoint_parent_sha = step_parent_sha
+            if accepted_commit_sha is None:
+                # A deferred no-change outcome has no legal empty commit.  Its
+                # durable HEAD is still the step parent, so the checkpoint
+                # records that commit's real parent rather than pretending a
+                # new accepted commit exists.
+                parents = commit_parents(info.worktree, current_head(info.worktree))
+                checkpoint_parent_sha = parents[0] if parents else current_head(info.worktree)
             # Step complete: the next operation is the next step, then the
             # C01 checks (pre-revision checks with Claude, final without).
             self._checkpoint(
                 run_dir,
                 ResumePhase.INITIAL_STEP if following else ResumePhase.CHECKS_C01,
-                step_id=following, head=base_sha, tree=outcome.tree_after,
+                step_id=following, head=current_head(info.worktree), tree=outcome.tree_after,
+                expected_parent_sha=checkpoint_parent_sha, next_step_id=following,
             )
 
         deferred_mismatches = _deferred_contract_mismatches(
             plan, self._last_v2_step_results
         )
+        # Subsequent gates are still evaluated against the immutable run
+        # base for evidence, but their Git authority is the accepted step tip.
+        accepted_head_sha = current_head(info.worktree)
         if _has_deferred_contract_mismatches(self._last_v2_step_results) and not revision_enabled:
             return self._v2_failed(
                 store, run_dir, "UNRESOLVED_CONTRACT_MISMATCH", None,
@@ -2523,6 +2585,7 @@ class Orchestrator:
                     reuse=resumed is not None and phase is ResumePhase.REVIEWER_C01,
                     required_check_ids=plan.required_checks or None,
                     enforce_diff_size=False,
+                    expected_head_sha=accepted_head_sha,
                     # A run created before ``checks/C01`` was canonical kept
                     # its only final evidence at the run root.
                     reuse_fallback_dir=run_dir,
@@ -2530,7 +2593,7 @@ class Orchestrator:
                 self._publish_check_aliases(run_dir, checks_dir_c01)
             except Exception:
                 self._write_phase_checkpoint(
-                    run_dir, final_checks_phase, cycle=1, head=base_sha, tree=checks_tree,
+                    run_dir, final_checks_phase, cycle=1, head=accepted_head_sha, tree=checks_tree,
                 )
                 raise
             store.update(status=RunStatus.VALIDATING, checks=_check_payload(evidence),
@@ -2544,7 +2607,7 @@ class Orchestrator:
                                   item.startswith("CHECK_MUTATED:")]
             if integrity_failures:
                 self._write_phase_checkpoint(
-                    run_dir, final_checks_phase, cycle=1, head=base_sha, tree=checks_tree,
+                    run_dir, final_checks_phase, cycle=1, head=accepted_head_sha, tree=checks_tree,
                 )
                 return self._v2_failed(store, run_dir, integrity_failures[0].split(":", 1)[0], None,
                                         ", ".join(integrity_failures))
@@ -2577,7 +2640,7 @@ class Orchestrator:
                 selection=selection, cycle=1, evidence=evidence,
                 base_scope=base_repair_scope_c01,
                 required_check_ids=plan.required_checks or None,
-                expected_head_sha=base_sha, resumed=resumed,
+                expected_head_sha=accepted_head_sha, resumed=resumed,
             )
             check_repair_result_c01 = direct_result_c01
             self._cycle_update(
@@ -2712,7 +2775,7 @@ class Orchestrator:
                     evidence = self._final_evidence(
                         info.worktree, base_sha, run_dir / "checks" / "C01",
                         check_failures_hard=False, reuse=False,
-                        expected_head_sha=base_sha,
+                        expected_head_sha=accepted_head_sha,
                         required_check_ids=plan.required_checks or None,
                         enforce_diff_size=False,
                     )
@@ -2720,7 +2783,7 @@ class Orchestrator:
                 except Exception:
                     self._write_phase_checkpoint(
                         run_dir, retry_checks_phase, cycle=1,
-                        head=base_sha, tree=retry_tree,
+                        head=accepted_head_sha, tree=retry_tree,
                     )
                     raise
                 store.update(
@@ -2802,14 +2865,14 @@ class Orchestrator:
                                 evidence = self._final_evidence(
                                     info.worktree, base_sha, run_dir / "checks" / "C01",
                                     check_failures_hard=False, reuse=False,
-                                    expected_head_sha=base_sha,
+                                    expected_head_sha=accepted_head_sha,
                                     required_check_ids=plan.required_checks or None,
                                     enforce_diff_size=False,
                                 )
                             except Exception:
                                 self._write_phase_checkpoint(
                                     run_dir, expanded_retry_phase, cycle=1,
-                                    head=base_sha, tree=retry_tree,
+                                    head=accepted_head_sha, tree=retry_tree,
                                 )
                                 raise
                             store.update(
@@ -2901,7 +2964,7 @@ class Orchestrator:
                     retry_evidence = self._final_evidence(
                         info.worktree, base_sha, checks_dir_c01,
                         check_failures_hard=False, reuse=False,
-                        expected_head_sha=base_sha,
+                        expected_head_sha=accepted_head_sha,
                         required_check_ids=plan.required_checks or None,
                         enforce_diff_size=False,
                     )
@@ -2909,7 +2972,7 @@ class Orchestrator:
                 except Exception:
                     self._write_phase_checkpoint(
                         run_dir, ResumePhase.FINAL_CHECKS_RETRY_C01, cycle=1,
-                        head=base_sha, tree=start.expected_tree_sha,
+                        head=accepted_head_sha, tree=start.expected_tree_sha,
                     )
                     raise
             evidence = retry_evidence
@@ -2988,7 +3051,7 @@ class Orchestrator:
                     evidence = self._final_evidence(
                         info.worktree, base_sha, checks_dir_c01,
                         check_failures_hard=False, reuse=False,
-                        expected_head_sha=base_sha,
+                        expected_head_sha=accepted_head_sha,
                         required_check_ids=plan.required_checks or None,
                         enforce_diff_size=False,
                     )
@@ -2996,7 +3059,7 @@ class Orchestrator:
                 except Exception:
                     self._write_phase_checkpoint(
                         run_dir, ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
-                        cycle=1, head=base_sha, tree=retry_tree,
+                        cycle=1, head=accepted_head_sha, tree=retry_tree,
                     )
                     raise
                 store.update(
@@ -3081,7 +3144,7 @@ class Orchestrator:
                     evidence = self._final_evidence(
                         info.worktree, base_sha, run_dir / "checks" / "C01",
                         check_failures_hard=False, reuse=False,
-                        expected_head_sha=base_sha,
+                        expected_head_sha=accepted_head_sha,
                         required_check_ids=plan.required_checks or None,
                         enforce_diff_size=False,
                     )
@@ -3089,7 +3152,7 @@ class Orchestrator:
                 except Exception:
                     self._write_phase_checkpoint(
                         run_dir, ResumePhase.FINAL_CHECKS_RETRY_EXPANDED_C01,
-                        cycle=1, head=base_sha, tree=retry_tree,
+                        cycle=1, head=accepted_head_sha, tree=retry_tree,
                     )
                     raise
                 store.update(
@@ -3142,22 +3205,28 @@ class Orchestrator:
                     store, run_dir, "DETERMINISTIC_GATE_FAILED", None,
                     ", ".join(evidence.failures),
                 )
+            candidate_parent = current_head(info.worktree)
             self._checkpoint(run_dir, ResumePhase.CANDIDATE_COMMIT_C01,
-                             head=base_sha, tree=evidence.staged_tree_sha)
-            if current_head(info.worktree) == base_sha:
-                self._authorize_candidate_tree(
-                    evidence, info.worktree, base_sha, branch_ref
-                )
-            elif not (
-                resumed is not None and resumed.existing_commit_sha is not None
-                and commit_parents(info.worktree, resumed.existing_commit_sha) == (base_sha,)
-                and resolve_tree(info.worktree, resumed.existing_commit_sha) == evidence.staged_tree_sha
-            ):
-                raise ResumeIntegrityError("C01 candidate commit exists with the wrong identity")
+                             head=candidate_parent, tree=evidence.staged_tree_sha,
+                             expected_parent_sha=(
+                                 commit_parents(info.worktree, candidate_parent)[0]
+                                 if candidate_parent != base_sha else None
+                             ))
+            self._authorize_candidate_tree(
+                evidence, info.worktree, candidate_parent, branch_ref
+            )
             c01_candidate = self._ensure_candidate_commit(
                 run_dir=run_dir, info=info, cycle=1, tree_sha=evidence.staged_tree_sha,
-                parent_sha=base_sha, title=plan.title,
+                parent_sha=candidate_parent, title=plan.title,
                 repository_reference=repository_reference, store=store, run_id=run_id,
+                commit_kind=(
+                    "repair" if (
+                        (check_repair_result_c01 is not None and getattr(check_repair_result_c01, "attempts", ()))
+                        or expanded_check_repair_result_c01 is not None
+                    )
+                    else "revision" if revision_result is not None
+                    else "candidate"
+                ),
             )
         else:
             c01_candidate = _read_json_artifact(_candidate_commit_path(run_dir, 1))
@@ -3168,6 +3237,7 @@ class Orchestrator:
             self._checkpoint(
                 run_dir, ResumePhase.CANDIDATE_PUSH_C01,
                 head=c01_candidate["commit_sha"], tree=evidence.staged_tree_sha,
+                expected_parent_sha=c01_candidate["parent_sha"],
             )
             try:
                 c01_candidate = self._push_candidate(
@@ -3182,6 +3252,7 @@ class Orchestrator:
             self._checkpoint(
                 run_dir, ResumePhase.REVIEWER_C01,
                 head=c01_candidate["commit_sha"], tree=evidence.staged_tree_sha,
+                expected_parent_sha=c01_candidate["parent_sha"],
             )
             reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
             store.update(status=RunStatus.REVIEWING)
@@ -3835,6 +3906,145 @@ class Orchestrator:
             step_dir=step_dir,
         )
 
+    def _accept_v2_step_tree(
+        self,
+        *,
+        store: RunStateStore,
+        run_dir: Path,
+        info: WorktreeInfo,
+        step: ImplementationStep,
+        outcome: StepExecutionOutcome,
+        parent_sha: str,
+        future_step_ids: Sequence[str],
+        run_id: str,
+    ) -> str | None:
+        """Run the reusable safety gate and accept one normal step tree.
+
+        Worker attempts never call this method until their structural and
+        scope gates have passed.  A red/failed attempt therefore remains an
+        artifact tree only.  The explicit deferred contract is the sole
+        exception to a passed verification status.
+        """
+
+        if current_head(info.worktree) != parent_sha:
+            raise CommitSafetyError("step parent HEAD changed before acceptance")
+        reported_verification = getattr(outcome, "verification_status", None)
+        if isinstance(reported_verification, str) and reported_verification.casefold() in {
+            "failed", "fail", "red",
+        }:
+            raise CommitSafetyError("step VERIFY did not pass")
+        if re.search(
+            r"^\s*(?:VERIFY|VERIFICATION)\s*(?::|=)\s*(?:FAIL|FAILED|RED)\b",
+            outcome.final_report,
+            flags=re.IGNORECASE | re.MULTILINE,
+        ):
+            raise CommitSafetyError("step VERIFY did not pass")
+        verification_status = "passed"
+        deferred = None
+        if getattr(outcome, "deferred_verify", "") or getattr(outcome, "status", "") == "DEFERRED_CONTRACT_MISMATCH":
+            deferred = parse_deferred_verification(
+                outcome.final_report,
+                current_step_id=step.id,
+                future_step_ids=future_step_ids,
+            )
+            if deferred is None:
+                raise CommitSafetyError(
+                    "a deferred step must provide the explicit DEFERRED VERIFY DEPENDENCY contract"
+                )
+            verification_status = "deferred"
+
+        # A no-change deferred mismatch is a traceable worker outcome, not a
+        # new Git state.  There is no legal empty commit; the later candidate
+        # gate still sees the durable mismatch artifact.
+        if outcome.tree_after == outcome.tree_before:
+            state = store.load()
+            deferred_records = list(state.get("deferred_verifications") or [])
+            deferred_records.append({
+                "step_id": step.id,
+                "verification_status": "deferred",
+                "tree_before": outcome.tree_before,
+                "tree_after": outcome.tree_after,
+                "changed_paths": [],
+                "deferred_reason": deferred.reason,
+                "dependent_step_ids": list(deferred.dependent_step_ids),
+                "deferred_verify_command_or_contract": deferred.command_or_contract,
+                "commit_sha": None,
+            })
+            parents = commit_parents(info.worktree, parent_sha)
+            expected_parent = parents[0] if parents else parent_sha
+            store.update(
+                status=RunStatus.IMPLEMENTING,
+                deferred_verifications=deferred_records,
+                expected_head_sha=parent_sha,
+                expected_parent_sha=expected_parent,
+                expected_tree_sha=outcome.tree_after,
+                next_step_id=(future_step_ids[0] if future_step_ids else None),
+            )
+            return None
+
+        gate = commit_safety_gate(
+            info.worktree,
+            tree_sha=outcome.tree_after,
+            parent_sha=parent_sha,
+            mutable_scope=(*step.write_set, *step.create_set, *step.delete_set),
+            verification_status=verification_status,
+            deferred_reason=deferred.reason if deferred is not None else None,
+            dependent_step_ids=deferred.dependent_step_ids if deferred is not None else (),
+            deferred_command_or_contract=(
+                deferred.command_or_contract if deferred is not None else None
+            ),
+            secrets=self._secrets,
+            # v2 deliberately treats a large diff as bounded review
+            # evidence; the canonical blob-size and binary policies still
+            # apply in the shared scanner.
+            max_diff_bytes=None,
+        )
+        commit_sha = commit_step_tree(
+            info.worktree,
+            tree_sha=gate.tree_sha,
+            parent_sha=gate.parent_sha,
+            step_id=step.id,
+            step_title=step.title,
+            body=f"MetaHarness-Run: {run_id}",
+        )
+        record = accepted_step_record(
+            step_id=step.id,
+            verification_status=verification_status,
+            parent_sha=parent_sha,
+            commit_sha=commit_sha,
+            tree_before=outcome.tree_before,
+            tree_after=outcome.tree_after,
+            changed_paths=gate.changed_paths,
+            deferred=deferred,
+        )
+        step_path = run_dir / "steps" / step.id / "step.json"
+        step_payload = _read_json_artifact(step_path)
+        if not isinstance(step_payload, dict):
+            step_payload = {"id": step.id}
+        step_payload.update(record)
+        step_payload["verification_status"] = verification_status
+        atomic_write_text(step_path, _json_text(step_payload))
+
+        state = store.load()
+        accepted_steps = list(state.get("accepted_steps") or [])
+        accepted_commits = list(state.get("accepted_commits") or [])
+        accepted_steps.append(record)
+        accepted_commits.append(record)
+        chain = list(accepted_chain_records(run_dir))
+        chain.append(record)
+        atomic_write_text(run_dir / "accepted-chain.json", _json_text({"commits": chain}))
+        following = future_step_ids[0] if future_step_ids else None
+        store.update(
+            status=RunStatus.IMPLEMENTING,
+            accepted_steps=accepted_steps,
+            accepted_commits=accepted_commits,
+            expected_head_sha=commit_sha,
+            expected_parent_sha=parent_sha,
+            expected_tree_sha=outcome.tree_after,
+            next_step_id=following,
+        )
+        return commit_sha
+
     def _authorize_candidate_tree(
         self, evidence: EvidenceBundle, worktree: Path, parent_sha: str, branch_ref: str,
     ) -> str:
@@ -3854,43 +4064,97 @@ class Orchestrator:
     def _ensure_candidate_commit(
         self, *, run_dir: Path, info: WorktreeInfo, cycle: int, tree_sha: str,
         parent_sha: str, title: str, repository_reference: RepositoryReference,
-        store: RunStateStore, run_id: str,
+        store: RunStateStore, run_id: str, commit_kind: str = "candidate",
     ) -> dict[str, Any]:
         """Reconcile or create exactly one candidate commit for a cycle."""
 
+        state = store.load()
+        try:
+            assert_deferred_verifications_resolved([
+                *(state.get("accepted_steps") or []),
+                *(state.get("deferred_verifications") or []),
+            ])
+        except CommitSafetyError as exc:
+            raise CommitBoundaryError(str(exc)) from exc
         path = _candidate_commit_path(run_dir, cycle)
         stored = _read_json_artifact(path)
         commit_sha = stored.get("commit_sha") if isinstance(stored, dict) else None
+        effective_parent_sha = parent_sha
         if not _is_object_id(commit_sha):
             commit_sha = None
         if commit_sha is None:
             try:
                 head = current_head(info.worktree)
-                if commit_parents(info.worktree, head) == (parent_sha,) and resolve_tree(info.worktree, head) == tree_sha:
+                if head == parent_sha and resolve_tree(info.worktree, head) == tree_sha:
+                    # The last accepted step is already the candidate tip;
+                    # publication must not manufacture an empty metadata-only
+                    # commit.  Bind the artifact to its real parent.
+                    commit_sha = head
+                    parents = commit_parents(info.worktree, head)
+                    if len(parents) != 1:
+                        raise CommitBoundaryError("candidate tip has no single parent")
+                    effective_parent_sha = parents[0]
+                elif commit_parents(info.worktree, head) == (parent_sha,) and resolve_tree(info.worktree, head) == tree_sha:
                     commit_sha = head
             except GitError:
                 pass
         if commit_sha is None:
-            commit_sha = commit_candidate_tree(
-                info.worktree, tree_sha=tree_sha, parent_sha=parent_sha,
-                subject=_commit_subject(title), body=f"MetaHarness-Run: {run_id}",
-            )
+            try:
+                commit_safety_gate(
+                    info.worktree,
+                    tree_sha=tree_sha,
+                    parent_sha=parent_sha,
+                    mutable_scope=(),
+                    verification_status="passed",
+                    secrets=self._secrets,
+                    max_diff_bytes=None,
+                )
+            except CommitSafetyError as exc:
+                raise CommitBoundaryError(str(exc)) from exc
+            body = f"MetaHarness-Run: {run_id}"
+            if commit_kind == "revision":
+                commit_sha = commit_revision_tree(
+                    info.worktree, tree_sha=tree_sha, parent_sha=parent_sha, body=body,
+                )
+            elif commit_kind == "repair":
+                commit_sha = commit_repair_tree(
+                    info.worktree, tree_sha=tree_sha, parent_sha=parent_sha,
+                    cycle=cycle, body=body,
+                )
+            else:
+                commit_sha = commit_candidate_tree(
+                    info.worktree, tree_sha=tree_sha, parent_sha=parent_sha,
+                    subject=_commit_subject(title), body=body,
+                )
         if current_head(info.worktree) != commit_sha:
             raise CommitBoundaryError("candidate commit is not the run branch tip")
-        if commit_parents(info.worktree, commit_sha) != (parent_sha,) or resolve_tree(info.worktree, commit_sha) != tree_sha:
+        if commit_parents(info.worktree, commit_sha) != (effective_parent_sha,) or resolve_tree(info.worktree, commit_sha) != tree_sha:
             raise CommitBoundaryError("candidate commit identity is not exact")
         payload = _candidate_commit_payload(
-            commit_sha=commit_sha, tree_sha=tree_sha, parent_sha=parent_sha,
+            commit_sha=commit_sha, tree_sha=tree_sha, parent_sha=effective_parent_sha,
             branch=info.branch, remote=self.config.publish.remote,
             immutable_url=_commit_web_url(repository_reference, commit_sha),
             pushed_at=(stored.get("pushed_at") if isinstance(stored, dict) else None),
         )
         atomic_write_text(path, _json_text(payload))
+        chain = list(accepted_chain_records(run_dir))
+        if not any(
+            isinstance(item, dict) and item.get("commit_sha") == commit_sha
+            for item in chain
+        ):
+            chain.append({
+                "commit_sha": commit_sha,
+                "tree_sha": tree_sha,
+                "parent_sha": effective_parent_sha,
+            })
+            atomic_write_text(run_dir / "accepted-chain.json", _json_text({"commits": chain}))
         candidate_state = dict(store.load().get("candidate") or {})
         candidate_state[f"C{cycle:02d}"] = payload
         store.update(
             status=RunStatus.APPROVED, candidate=candidate_state,
             candidate_commit_sha=commit_sha, approved_tree_sha=tree_sha,
+            expected_head_sha=commit_sha, expected_parent_sha=effective_parent_sha,
+            expected_tree_sha=tree_sha, next_step_id=None,
         )
         return payload
 
@@ -3918,10 +4182,19 @@ class Orchestrator:
                 raise CandidatePushError("PUSH_FAILED: candidate push did not complete") from exc
             candidate = dict(candidate)
             candidate["pushed_at"] = candidate.get("pushed_at") or datetime.now(timezone.utc).isoformat()
+            # Persist the exact immutable remote identity alongside the local
+            # candidate identity before the reviewer is called.
+            candidate["remote_branch"] = info.branch
+            candidate["remote_sha"] = candidate["commit_sha"]
             atomic_write_text(_candidate_commit_path(run_dir, cycle), _json_text(candidate))
             candidate_state = dict(store.load().get("candidate") or {})
             candidate_state[f"C{cycle:02d}"] = candidate
-            store.update(status=store.load().get("status", RunStatus.APPROVED), candidate=candidate_state)
+            store.update(
+                status=store.load().get("status", RunStatus.APPROVED),
+                candidate=candidate_state,
+                remote_branch=info.branch,
+                remote_sha=candidate["commit_sha"],
+            )
         return candidate
 
     def _run_v2_reviewer(
@@ -3985,8 +4258,9 @@ class Orchestrator:
         candidate_identity = _json_text({
             key: candidate_commit.get(key)
             for key in (
-                "commit_sha", "tree_sha", "parent_sha", "candidate_url",
-                "compare_url", "immutable_commit_url", "pushed_at",
+                "commit_sha", "tree_sha", "parent_sha", "remote_branch",
+                "remote_sha", "candidate_url", "compare_url",
+                "immutable_commit_url", "pushed_at",
             )
             if candidate_commit.get(key) is not None
             or key == "immutable_commit_url"
@@ -4080,6 +4354,10 @@ class Orchestrator:
             secrets=self._secrets, check_failures_hard=check_failures_hard,
             expected_head_sha=expected_head_sha, required_check_ids=check_ids,
             enforce_diff_size=enforce_diff_size,
+            # Accepted step commits make the current HEAD itself the
+            # candidate.  There is no staged diff against that HEAD, but the
+            # authoritative checks still must run and their tree is exact.
+            allow_empty_diff=current_head(worktree) != base_sha,
         )
 
     def _check_repair_coordinator(self) -> CheckRepairCoordinator:
@@ -6237,6 +6515,12 @@ class Orchestrator:
                 run_dir=run_dir, info=info, cycle=2, tree_sha=evidence.staged_tree_sha,
                 parent_sha=c01_candidate["commit_sha"], title=repair_plan.title,
                 repository_reference=repository_reference, store=store, run_id=run_id,
+                commit_kind=(
+                    "repair" if (
+                        (check_repair_result_c02 is not None and getattr(check_repair_result_c02, "attempts", ()))
+                        or expanded_check_repair_result_c02 is not None
+                    ) else "candidate"
+                ),
             )
         else:
             c02_candidate = _read_json_artifact(_candidate_commit_path(run_dir, 2))
@@ -6247,6 +6531,7 @@ class Orchestrator:
                 run_dir, ResumePhase.CANDIDATE_PUSH_C02, cycle=2,
                 head=c02_candidate["commit_sha"], tree=evidence.staged_tree_sha,
                 repair_bundle_sha256=repair_bundle_sha,
+                expected_parent_sha=c02_candidate["parent_sha"],
             )
             c02_candidate = self._push_candidate(
                 run_dir=run_dir, info=info, cycle=2, candidate=c02_candidate, store=store,
@@ -6255,7 +6540,8 @@ class Orchestrator:
         # C02 candidate push complete: the next operation is reviewer #2.
         self._checkpoint(run_dir, ResumePhase.REVIEWER_C02, cycle=2,
                          head=c02_candidate["commit_sha"], tree=evidence.staged_tree_sha,
-                         repair_bundle_sha256=repair_bundle_sha)
+                         repair_bundle_sha256=repair_bundle_sha,
+                         expected_parent_sha=c02_candidate["parent_sha"])
         reviewer = self._reviewer_for_profile(selection.reviewer.profile_id)
         cycle_history = _json_text({
             "C01": {
@@ -6548,6 +6834,24 @@ class Orchestrator:
         fields: dict[str, Any] = {"commit_sha": commit_sha, "current_step": None}
         if cycle is not None:
             fields["cycle"] = cycle
+        chain_records = accepted_chain_records(run_dir)
+        if chain_records:
+            try:
+                state = store.load()
+                assert_deferred_verifications_resolved([
+                    *(state.get("accepted_steps") or []),
+                    *(state.get("deferred_verifications") or []),
+                ])
+                validate_accepted_chain(
+                    info.worktree,
+                    run_dir=run_dir,
+                    base_sha=info.base_sha,
+                    tip_sha=commit_sha,
+                    approved_tree_sha=approved_tree,
+                )
+            except (CommitSafetyError, GitError) as exc:
+                state = store.record_failure("COMMIT_TREE_MISMATCH", str(exc), **fields)
+                return RunResult(run_dir, RunStatus.FAILED, state)
         try:
             if store.load().get("approved_tree_sha") != approved_tree:
                 raise GitError("durable approved tree differs from candidate tree")
@@ -6555,10 +6859,29 @@ class Orchestrator:
                 raise GitError("candidate commit is not the run branch tip")
             if resolve_tree(info.worktree, commit_sha) != approved_tree:
                 raise GitError("candidate commit tree differs from approved tree")
-            # BASE -> C01 (-> C02): the exact direct parent, never "any descendant".
-            expected_parent = _candidate_chain_parent(
-                info.worktree, run_dir, info.base_sha, cycle or 1, commit_sha,
-            )
+            accepted_steps = store.load().get("accepted_steps") or []
+            if not isinstance(accepted_steps, list):
+                raise GitError("accepted step metadata is malformed")
+            assert_deferred_verifications_resolved([
+                *accepted_steps,
+                *(store.load().get("deferred_verifications") or []),
+            ])
+            chain_records = accepted_chain_records(run_dir)
+            if chain_records:
+                validate_accepted_chain(
+                    info.worktree,
+                    run_dir=run_dir,
+                    base_sha=info.base_sha,
+                    tip_sha=commit_sha,
+                    approved_tree_sha=approved_tree,
+                )
+                expected_parent = commit_parents(info.worktree, commit_sha)[0]
+            else:
+                # Compatibility for historical runs that have no arbitrary
+                # chain artifact yet.
+                expected_parent = _candidate_chain_parent(
+                    info.worktree, run_dir, info.base_sha, cycle or 1, commit_sha,
+                )
             validate_run_branch(info.branch, base_ref=self.config.base_ref)
             if self.config.publish.enabled:
                 repository_remote_url(info.worktree, self.config.publish.remote)
@@ -6569,6 +6892,8 @@ class Orchestrator:
         self._checkpoint(
             run_dir, ResumePhase.PUBLISH, cycle=cycle or _state_cycle_value(store.load()),
             head=commit_sha, tree=approved_tree,
+            expected_parent_sha=expected_parent,
+            next_step_id=None,
         )
         if not self.config.publish.enabled:
             state = store.update(status=RunStatus.COMMITTED, **fields)
@@ -6592,6 +6917,7 @@ class Orchestrator:
                     base_branch=base_branch, base_sha=info.base_sha,
                     commit_sha=commit_sha, approved_tree=approved_tree,
                     run_branch=info.branch, expected_parent=expected_parent,
+                    accepted_commits=chain_records or None,
                 )
                 publish_payload = {
                     "mode": PublishMode.FAST_FORWARD_BASE.value,
@@ -6672,6 +6998,24 @@ class Orchestrator:
         fields: dict[str, Any] = {"commit_sha": commit_sha, "current_step": None}
         if cycle is not None:
             fields["cycle"] = cycle
+        chain_records = accepted_chain_records(run_dir)
+        if chain_records:
+            try:
+                state = store.load()
+                assert_deferred_verifications_resolved([
+                    *(state.get("accepted_steps") or []),
+                    *(state.get("deferred_verifications") or []),
+                ])
+                validate_accepted_chain(
+                    info.worktree,
+                    run_dir=run_dir,
+                    base_sha=info.base_sha,
+                    tip_sha=commit_sha,
+                    approved_tree_sha=approved_tree,
+                )
+            except (CommitSafetyError, GitError) as exc:
+                state = store.record_failure("COMMIT_TREE_MISMATCH", str(exc), **fields)
+                return RunResult(run_dir, RunStatus.FAILED, state)
         if store.load().get("approved_tree_sha") != approved_tree:
             state = store.record_failure(
                 "COMMIT_TREE_MISMATCH",
@@ -6736,6 +7080,7 @@ class Orchestrator:
                     commit_sha=commit_sha,
                     approved_tree=approved_tree,
                     run_branch=info.branch,
+                    accepted_commits=chain_records or None,
                 )
                 web_url = _commit_web_url(repository_reference, commit_sha)
             else:
@@ -7825,6 +8170,41 @@ class Orchestrator:
             if symbolic_head(worktree) != f"refs/heads/{branch}":
                 refuse("worktree HEAD is not the run branch")
             head = current_head(worktree)
+            # The checkpoint is an authority record, not a hint for replay.
+            # Once an accepted boundary was persisted, any other HEAD/tree is
+            # an integrity failure.  In particular, do not let a model or a
+            # best-effort reconciliation choose a replacement commit.
+            if checkpoint.expected_head_sha is not None and head != checkpoint.expected_head_sha:
+                refuse("HEAD moved since the checkpoint")
+            immutable_tree_phases = {
+                ResumePhase.CHECKS_C01, ResumePhase.FINAL_CHECKS_C01,
+                ResumePhase.FINAL_CHECKS_RETRY_C01,
+                ResumePhase.CHECKS_C02, ResumePhase.FINAL_CHECKS_C02,
+                ResumePhase.FINAL_CHECKS_RETRY_C02,
+                ResumePhase.CANDIDATE_COMMIT_C01, ResumePhase.CANDIDATE_PUSH_C01,
+                ResumePhase.REVIEWER_C01, ResumePhase.CANDIDATE_COMMIT_C02,
+                ResumePhase.CANDIDATE_PUSH_C02, ResumePhase.REVIEWER_C02,
+                ResumePhase.COMMIT, ResumePhase.PUBLISH,
+            }
+            if checkpoint.expected_tree_sha is not None and checkpoint.phase in immutable_tree_phases:
+                try:
+                    if candidate_tree_sha(worktree) != checkpoint.expected_tree_sha:
+                        refuse("candidate tree differs from the checkpoint tree")
+                except GitError as exc:
+                    refuse(f"checkpoint candidate tree is unreadable: {exc}")
+            # ``base_sha`` is the sentinel parent recorded before the first
+            # accepted commit.  It is not the actual parent of the BASE
+            # commit; compare a parent only after HEAD has advanced beyond
+            # BASE.
+            if (
+                checkpoint.expected_parent_sha is not None
+                and checkpoint.expected_head_sha != base_sha
+            ):
+                try:
+                    if commit_parents(repo, head) != (checkpoint.expected_parent_sha,):
+                        refuse("HEAD parent differs from the checkpoint parent")
+                except GitError as exc:
+                    refuse(f"checkpoint HEAD parent is unreadable: {exc}")
             existing_commit: str | None = None
             c02_phases = {
                 ResumePhase.REPAIR_PLANNER, ResumePhase.SCOPE_APPROVAL, ResumePhase.REPAIR_STEP,
@@ -7840,12 +8220,13 @@ class Orchestrator:
                 ResumePhase.CANDIDATE_COMMIT_C02,
                 ResumePhase.CANDIDATE_PUSH_C02, ResumePhase.REVIEWER_C02,
             }
-            phase_expected_head = base_sha
+            phase_expected_head = checkpoint.expected_head_sha or base_sha
             if checkpoint.phase in c02_phases:
                 prior = _read_json_artifact(_candidate_commit_path(run_dir, 1))
                 if not isinstance(prior, dict) or not _is_object_id(prior.get("commit_sha")):
                     refuse("C01 candidate commit is missing for C02 resume")
-                phase_expected_head = prior["commit_sha"]
+                if checkpoint.expected_head_sha is None:
+                    phase_expected_head = prior["commit_sha"]
             candidate_phases = {
                 ResumePhase.CANDIDATE_COMMIT_C01, ResumePhase.CANDIDATE_PUSH_C01,
                 ResumePhase.REVIEWER_C01, ResumePhase.CANDIDATE_COMMIT_C02,
@@ -7861,8 +8242,12 @@ class Orchestrator:
                     # A crash before artifact persistence can still be
                     # reconciled from the exact commit object below.
                     candidate_payload = {}
-                expected_parent = base_sha
-                if cycle == 2:
+                expected_parent = (
+                    candidate_payload.get("parent_sha")
+                    if _is_object_id(candidate_payload.get("parent_sha"))
+                    else checkpoint.expected_parent_sha or base_sha
+                )
+                if cycle == 2 and not _is_object_id(candidate_payload.get("parent_sha")):
                     prior = _read_json_artifact(_candidate_commit_path(run_dir, 1))
                     if not isinstance(prior, dict) or not _is_object_id(prior.get("commit_sha")):
                         refuse("C01 candidate commit is missing for C02 ancestry")
@@ -7911,8 +8296,16 @@ class Orchestrator:
             if checkpoint.phase is ResumePhase.PUBLISH:
                 candidate_path = _candidate_commit_path(run_dir, checkpoint.cycle)
                 candidate_record = _read_json_artifact(candidate_path)
-                expected_parent = base_sha
-                if checkpoint.cycle == 2:
+                expected_parent = (
+                    candidate_record.get("parent_sha")
+                    if isinstance(candidate_record, dict)
+                    and _is_object_id(candidate_record.get("parent_sha"))
+                    else checkpoint.expected_parent_sha or base_sha
+                )
+                if checkpoint.cycle == 2 and not (
+                    isinstance(candidate_record, dict)
+                    and _is_object_id(candidate_record.get("parent_sha"))
+                ):
                     prior = _read_json_artifact(_candidate_commit_path(run_dir, 1))
                     if not isinstance(prior, dict) or not _is_object_id(prior.get("commit_sha")):
                         refuse("C01 candidate commit is missing for C02 publication")

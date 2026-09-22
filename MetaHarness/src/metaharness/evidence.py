@@ -338,6 +338,33 @@ def _unreviewable_text_diff_failures(
     ]
 
 
+def scan_staged_security(
+    worktree: str | Path,
+    *,
+    secrets: tuple[str, ...] = (),
+    max_diff_bytes: int | None = None,
+) -> tuple[str, ...]:
+    """Reuse the canonical blob, secret, binary and size policies.
+
+    This is intentionally a scanner over the already frozen index.  It is
+    used by :func:`collect_evidence` and by the reusable commit gate, so a
+    changed blob cannot pass merely because an earlier evidence snapshot was
+    later modified.
+    """
+
+    root = Path(worktree).expanduser().resolve()
+    changed_files = staged_changed_files(root)
+    changes = staged_changes(root)
+    diff = staged_diff(root)
+    failures = _staged_blob_failures(root, changed_files, changes, secrets)
+    failures.extend(_unreviewable_text_diff_failures(root, changed_files, changes))
+    if contains_secret(diff, secrets):
+        failures.append(SECRET_IN_DIFF)
+    if max_diff_bytes is not None and len(diff.encode("utf-8", errors="replace")) > max_diff_bytes:
+        failures.append(DIFF_TOO_LARGE)
+    return tuple(failures)
+
+
 def collect_evidence(
     worktree: str | Path,
     base_sha: str,
@@ -350,6 +377,7 @@ def collect_evidence(
     expected_head_sha: str | None = None,
     required_check_ids: tuple[str, ...] | list[str] | None = None,
     enforce_diff_size: bool = True,
+    allow_empty_diff: bool = False,
 ) -> EvidenceBundle:
     """Run all configured checks, then stage and freeze the submitted tree."""
 
@@ -389,11 +417,15 @@ def collect_evidence(
         changed_files=changed_files,
         max_diff_bytes=config.max_diff_bytes if enforce_diff_size else 2**63 - 1,
     )
-    failures.extend(_staged_blob_failures(root, changed_files, changes, secrets))
-    failures.extend(_unreviewable_text_diff_failures(root, changed_files, changes))
-    if contains_secret(diff, secrets):
-        # The diff would be sent to the reviewer endpoint and persisted.
-        failures.append(SECRET_IN_DIFF)
+    if allow_empty_diff:
+        failures = [failure for failure in failures if failure != "EMPTY_DIFF"]
+    failures.extend(scan_staged_security(
+        root,
+        secrets=secrets,
+        # _gate_failures owns the evidence-level diff-size decision; avoid
+        # duplicating its stable failure code in the existing payload.
+        max_diff_bytes=None,
+    ))
     try:
         selected_configs = config.select_checks(required_check_ids)
     except ValueError as exc:
