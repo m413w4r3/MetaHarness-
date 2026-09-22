@@ -20,6 +20,7 @@ from metaharness.agent.codex import (
     classify_codex_failure,
     contract_mismatch_explanation,
 )
+from metaharness.prompt_contracts import build_implementer_payload
 from metaharness.agent.runtime import (
     CodexRuntimeError,
     _MANAGED_CONFIG,
@@ -95,7 +96,7 @@ class CodexTests(unittest.TestCase):
         self.assertEqual(result.final_message, "final from codex\n")
         self.assertEqual(result.usage["total_tokens"], 7)
         prompt = (artifacts / "agent.prompt.txt").read_text()
-        self.assertIn("<AUTHORITATIVE IMPLEMENTATION CONTRACT>\nSTATUS: READY", prompt)
+        self.assertIn("<STEP OBJECTIVE>\nSTATUS: READY\n</STEP OBJECTIVE>", prompt)
         args = json.loads(args_capture.read_text())
         self.assertIn("--json", args)
         self.assertIn("--strict-config", args)
@@ -111,6 +112,38 @@ class CodexTests(unittest.TestCase):
         self.assertEqual((artifacts / "agent.events.jsonl").read_text().splitlines()[0], "not an event")
         saved = json.loads((artifacts / "agent.result.json").read_text())
         self.assertEqual(saved["exit_code"], 0)
+
+    def test_agent_prompt_is_the_rendered_payload(self) -> None:
+        prompt_capture = self.root / "prompt"
+        executable = self.executable(
+            f"""
+            import pathlib, sys
+            pathlib.Path({str(prompt_capture)!r}).write_bytes(sys.stdin.buffer.read())
+            final = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])
+            final.write_text('done\\n')
+            """
+        )
+        payload = build_implementer_payload(
+            step_identity="S01\\nTITLE\\nWrite the feature",
+            step_objective="write feature.txt",
+            step_invariants="preserve API",
+            read_set="README.md",
+            write_set="feature.txt",
+            mutable_scope='{"write": ["feature.txt"]}',
+            instructions="follow repository instructions",
+            verify_contract="run the required check",
+            forbidden_contract="do not edit README.md",
+        )
+
+        self.agent(executable).run_step(
+            payload.rendered, self.root, self.root / "artifacts",
+            base_sha=self.base_sha,
+        )
+
+        self.assertEqual(
+            prompt_capture.read_bytes(),
+            payload.rendered.encode("utf-8"),
+        )
 
     def test_contract_mismatch_detector_is_exact_and_success_reports_are_free_form(self) -> None:
         self.assertEqual(
@@ -167,11 +200,11 @@ class CodexTests(unittest.TestCase):
     def test_transport_auth_failure_classification_is_strict(self) -> None:
         self.assertEqual(
             classify_codex_failure("401 Unauthorized request-id=req-123"),
-            "CODEX_AUTH_FAILURE",
+            "AGENT_AUTH_FAILURE",
         )
         self.assertEqual(
             classify_codex_failure("", '{"error":"Missing bearer or basic authentication in header"}'),
-            "CODEX_AUTH_FAILURE",
+            "AGENT_AUTH_FAILURE",
         )
         self.assertIsNone(classify_codex_failure("unrelated exit 1"))
 
@@ -217,7 +250,7 @@ class CodexTests(unittest.TestCase):
             """
         )
 
-        with self.assertRaisesRegex(AgentCommittedError, "AGENT_COMMITTED"):
+        with self.assertRaisesRegex(AgentCommittedError, "AGENT_GIT_VIOLATION"):
             self.agent(executable).run("plan", self.root, self.root / "artifacts")
         self.assertNotEqual(
             run_git(self.root, "rev-parse", "HEAD").stdout.strip(), self.base_sha

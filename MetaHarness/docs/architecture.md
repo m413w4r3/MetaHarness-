@@ -138,8 +138,8 @@ PLAN → implementation step → accepted step commit → …
   target remains approximately 4000-6000 characters per step.
 - C01 and C02 steps run through the same `_execute_codex_step` primitive, with
   the same ordered gates and failure reasons (`STEP_CONTRACT_DRIFT`,
-  `CODEX_AUTH_FAILURE`, `AGENT_COMMITTED`, `AGENT_GIT_VIOLATION`,
-  `AGENT_TIMEOUT`, `AGENT_FAILED`, `AGENT_NO_CHANGE`,
+  `AGENT_AUTH_FAILURE`, `AGENT_GIT_VIOLATION`,
+  `AGENT_TIMEOUT`, `AGENT_RUNTIME_FAILED`, `AGENT_NO_CHANGE`,
   `STEP_WRITE_SET_VIOLATION`). The final report never drives a decision.
 - Both reviewers go through `_run_v2_reviewer`, which passes the actual
   `deterministic_passed` to the gate payload, to `parse_review` and to the

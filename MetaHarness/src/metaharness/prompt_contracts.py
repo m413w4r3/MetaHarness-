@@ -368,9 +368,16 @@ def build_implementer_payload(
     step_invariants: str,
     read_set: str,
     mutable_scope: str,
-    repository_instructions: str,
-    verify_instructions: str,
+    repository_instructions: str = "",
+    verify_instructions: str = "",
     step_title: str = "",
+    step_identity: str | None = None,
+    write_set: str = "NONE",
+    create_set: str = "NONE",
+    delete_set: str = "NONE",
+    instructions: str | None = None,
+    verify_contract: str | None = None,
+    forbidden_contract: str | None = None,
     template: str | None = None,
     budget_bytes: int = 0,
     retry_addendum: str = "",
@@ -378,59 +385,47 @@ def build_implementer_payload(
     """Build one worker contract; no full plan or run history is accepted."""
 
     if template is None:
-        template = """You are the implementation executor for one approved step.
-Do not redesign the plan or broaden the task.
-Implement the supplied contract exactly.
-Edit only the exact mutable scope and follow the supplied repository instructions.
-
-META IMPLEMENTATION CONTRACT v1
-TITLE
-{{STEP_TITLE}}
-
-<STEP OBJECTIVE>
-{{STEP_OBJECTIVE}}
-</STEP OBJECTIVE>
-<STEP INVARIANTS>
-{{STEP_INVARIANTS}}
-</STEP INVARIANTS>
-<READ SET>
-{{READ_SET}}
-</READ SET>
-<MUTABLE SCOPE>
-{{MUTABLE_SCOPE}}
-</MUTABLE SCOPE>
-<REPOSITORY INSTRUCTIONS>
-{{REPOSITORY_INSTRUCTIONS}}
-</REPOSITORY INSTRUCTIONS>
-<VERIFY INSTRUCTIONS>
-{{VERIFY_INSTRUCTIONS}}
-</VERIFY INSTRUCTIONS>
-{{RETRY_ADDENDUM}}
-"""
+        template = _default_template("implementer.txt")
+    effective_identity = step_identity if step_identity is not None else step_title
+    effective_instructions = (
+        instructions if instructions is not None else repository_instructions
+    )
+    effective_verify = verify_contract if verify_contract is not None else verify_instructions
+    effective_forbidden = (
+        forbidden_contract if forbidden_contract is not None else step_invariants
+    )
     sections = (
-        _section("step_title", step_title, True),
+        _section("step_identity", effective_identity, True),
         _section("step_objective", step_objective, True),
         _section("step_invariants", step_invariants, True),
         _section("read_set", read_set, True),
+        _section("write_set", write_set, True),
+        _section("create_set", create_set, True),
+        _section("delete_set", delete_set, True),
         _section("mutable_scope", mutable_scope, True),
-        _section("repository_instructions", repository_instructions, False),
-        _section("verify_instructions", verify_instructions, False),
+        _section("instructions", effective_instructions, True),
+        _section("verify_contract", effective_verify, True),
+        _section("forbidden_contract", effective_forbidden, True),
         _section("retry_addendum", retry_addendum, False),
     )
     placeholders = {
-        "{{STEP_TITLE}}": "step_title",
+        "{{STEP_IDENTITY}}": "step_identity",
         "{{STEP_OBJECTIVE}}": "step_objective",
         "{{STEP_INVARIANTS}}": "step_invariants",
         "{{READ_SET}}": "read_set",
+        "{{WRITE_SET}}": "write_set",
+        "{{CREATE_SET}}": "create_set",
+        "{{DELETE_SET}}": "delete_set",
         "{{MUTABLE_SCOPE}}": "mutable_scope",
-        "{{REPOSITORY_INSTRUCTIONS}}": "repository_instructions",
-        "{{VERIFY_INSTRUCTIONS}}": "verify_instructions",
+        "{{INSTRUCTIONS}}": "instructions",
+        "{{VERIFY_CONTRACT}}": "verify_contract",
+        "{{FORBIDDEN_CONTRACT}}": "forbidden_contract",
         "{{RETRY_ADDENDUM}}": "retry_addendum",
     }
     return _payload_from_template(
         role="implementer", template=template, sections=sections,
         placeholders=placeholders, budget_bytes=budget_bytes,
-        secondary_order=("repository_instructions", "verify_instructions", "retry_addendum"),
+        secondary_order=("retry_addendum",),
     )
 
 
@@ -555,93 +550,7 @@ def build_final_review_payload(
             + candidate_remote_reference
         )
     if template is None:
-        template = """You are the final, read-only semantic reviewer.
-
-Classify the immutable candidate against the SPEC, approved plan and
-deterministic check evidence. Do not edit, replan, change Git, publish, or
-make execution-policy decisions.
-
-Use exactly one of these outcomes:
-
-PASS
-No material correction is required for SPEC compliance.
-
-REVISE / IMPLEMENTATION
-The approved architecture and plan remain valid, but implementation or tests
-need semantic correction.
-
-REVISE / REPLAN
-The approved plan or decomposition is materially insufficient or incorrect;
-new implementation steps are required.
-
-REVISE / HUMAN
-A product, security, policy or operator decision is required.
-
-FAIL
-Required evidence or protocol input is invalid or unavailable, so a safe
-review cannot be produced.
-
-The wire protocol encodes these outcomes with VERDICT and ROUTE. PASS
-requires every required deterministic check to be present and passed, with no
-required fix or missing test. Green checks are evidence, not proof. Report
-every required check ID explicitly; a missing, failed, timed-out or mutated
-check forbids PASS. The immutable candidate evidence is authoritative; do not
-infer omitted code.
-
-Return exactly this META REVIEW v1 wire protocol, with no prose before or
-after it:
-META REVIEW v1
-VERDICT: PASS|REVISE|FAIL
-ROUTE: NONE|IMPLEMENTATION|REPLAN|HUMAN
-SUMMARY
-...
-FINDINGS
-...
-REQUIRED FIXES
-...
-MISSING TESTS
-...
-RESIDUAL RISKS
-...
-END META REVIEW
-
-<ORIGINAL SPEC>
-{{SPEC}}
-</ORIGINAL SPEC>
-
-<COMPACT APPROVED PLAN>
-{{COMPACT_APPROVED_PLAN}}
-</COMPACT APPROVED PLAN>
-
-<REQUIRED CHECKS SUMMARY>
-{{REQUIRED_CHECKS_SUMMARY}}
-</REQUIRED CHECKS SUMMARY>
-
-<IMMUTABLE CANDIDATE IDENTITY>
-{{IMMUTABLE_CANDIDATE_IDENTITY}}
-</IMMUTABLE CANDIDATE IDENTITY>
-
-<REPOSITORY REFERENCE>
-{{REPOSITORY_REFERENCE}}
-</REPOSITORY REFERENCE>
-
-<CHANGED FILES>
-{{CHANGED_FILES}}
-</CHANGED FILES>
-
-<DIFF SHA256>
-{{DIFF_SHA256}}
-</DIFF SHA256>
-
-<DIFFSTAT>
-{{DIFFSTAT}}
-</DIFFSTAT>
-
-<BOUNDED DIFF EXCERPT>
-{{BOUNDED_DIFF_EXCERPT}}
-</BOUNDED DIFF EXCERPT>
-
-"""
+        template = _default_template("reviewer.txt")
     sections = (
         _section("spec", spec, True),
         _section("compact_approved_plan", compact_approved_plan, True),

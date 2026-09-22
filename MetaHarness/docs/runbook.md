@@ -280,14 +280,14 @@ A `PUBLISHED` (or `COMMITTED`) run marks it `completed`.
 metaharness resume --config examples/autowork.toml --run-id <RUN_ID>
 ```
 
-Resumable failures: `CLAUDE_FAILED`, `CLAUDE_AUTH_FAILURE`, `CLAUDE_TIMEOUT`
-(same Claude phase), `CODEX_AUTH_FAILURE`, `AGENT_TIMEOUT`, `AGENT_FAILED`
+Resumable failures use provider-neutral reasons such as `AGENT_RUNTIME_FAILED`,
+`AGENT_AUTH_FAILURE`, `AGENT_TIMEOUT`, and `AGENT_PROTOCOL_FAILED`.
 (same step, only if the tree is still the step's `tree_before`),
 `REVIEWER_TRANSPORT_FAILURE` (same exact candidate; Claude and checks are not
 rerun), `LLM_FAILURE` of the repair planner, `PUSH_FAILED` (candidate or
 publication push),
-and `INTERRUPTED`. `STEP_WRITE_SET_VIOLATION`, `AGENT_COMMITTED`,
-`AGENT_GIT_VIOLATION`, invalid reviewer verdicts and `BASE_MOVED_SINCE_RUN`
+and `INTERRUPTED`. `STEP_WRITE_SET_VIOLATION`, `AGENT_GIT_VIOLATION`,
+invalid reviewer verdicts and `BASE_MOVED_SINCE_RUN`
 are never retried automatically.
 
 Before any resume, with no model call, MetaHarness verifies: run directory
@@ -515,8 +515,8 @@ empty diffs, and review-boundary changes do not commit. Legacy v1 also treats
 an oversized diff as a gate; v2 uses `max_diff_bytes` only as the inline
 semantic-model diff budget. Common
 failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,
-`REVIEWER_OUTPUT_INVALID`, `LLM_FAILURE`, `AGENT_TIMEOUT`, `AGENT_FAILED`,
-`AGENT_COMMITTED`, `AGENT_GIT_VIOLATION`, `CHECK_SETUP_INVALID`,
+`REVIEWER_OUTPUT_INVALID`, `LLM_FAILURE`, `AGENT_TIMEOUT`, `AGENT_RUNTIME_FAILED`,
+`AGENT_GIT_VIOLATION`, `CHECK_SETUP_INVALID`,
 `CHECK_MUTATED`, `EMPTY_DIFF`, `DIFF_TOO_LARGE`, `SECRET_IN_DIFF`,
 `DETERMINISTIC_GATE_FAILED`, `REVIEW_REVISE`, `REVIEW_FAIL`,
 `PLAN_APPROVAL_INVALID`, `WORKSPACE_SETUP_FAILED`, `WORKSPACE_SETUP_TIMEOUT`,

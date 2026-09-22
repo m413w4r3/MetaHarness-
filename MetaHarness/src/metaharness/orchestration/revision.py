@@ -60,6 +60,7 @@ from ..agent.base import (
     AGENT_PROTOCOL_FAILED,
     AGENT_RUNTIME_FAILED,
     AGENT_SCOPE_VIOLATION,
+    AGENT_SCOPE_REQUEST,
     AGENT_START_FAILED,
     AGENT_TIMEOUT,
 )
@@ -72,7 +73,7 @@ _MAX_PREVIOUS_REVISION_REPORT_BYTES = 16 * 1024
 _SCOPE_REQUEST_HEADER = "META SCOPE REQUEST v1"
 
 
-_SCOPE_REQUEST_ROUTE = "AGENT_SCOPE_REQUEST"
+_SCOPE_REQUEST_ROUTE = AGENT_SCOPE_REQUEST
 
 
 def _bounded_previous_revision_report(text: str) -> str:
@@ -108,16 +109,16 @@ def _scope_request_payload(request: ScopeRequest) -> dict[str, Any]:
         "paths": list(request.paths),
         "evidence": list(request.evidence),
         "authoritative": False,
-        "routed_to_bridge_audit": True,
+        "requires_scope_decision": True,
     }
 
 
 def _scope_request_diagnostic(request: ScopeRequest) -> str:
     return "\n".join([
-        "The check-repair worker requested scope expansion:",
+        "The revision worker requested scope expansion:",
         f"  paths: {len(request.paths)}",
         "  authoritative: NO",
-        "  routed to bridge audit: YES",
+        "  requires operator decision: YES",
     ])
 
 
@@ -553,16 +554,12 @@ class RevisionRunner:
         atomic_write_text(artifact_dir / "tree_after.txt", tree_after.rstrip() + "\n")
         changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
         outside_scope = [path for path in changed_paths if path not in set(mutable_scope)]
-        # META SCOPE REQUEST is a check-repair-only machine protocol.
-        # Semantic revision may report an out-of-scope dependency in prose, but
-        # must not enter the bounded check-repair scope state machine.
-        scope_request = (
-            parse_scope_request(result.final_message)
-            if is_check_repair else None
-        )
+        # Both revision roles use the same deterministic parser, but only
+        # check-repair scope is governed by its configurable policy. Semantic
+        # revision requests are advisory evidence and can never auto-expand.
+        scope_request = parse_scope_request(result.final_message)
         malformed_scope_request = (
-            is_check_repair
-            and _SCOPE_REQUEST_HEADER in result.final_message
+            _SCOPE_REQUEST_HEADER in result.final_message
             and scope_request is None
         )
         usage = normalize_usage(result.usage)
@@ -600,6 +597,16 @@ class RevisionRunner:
             # tree stays durable as evidence and the run stops for an operator.
             _record_failure_tree(artifact_dir, info.worktree)
             return result, "REVISION_SCOPE_VIOLATION"
+        if malformed_scope_request and not is_check_repair:
+            # A semantic reviser that emits the scope marker without a valid
+            # protocol is not allowed to turn malformed data into authority.
+            _record_failure_tree(artifact_dir, info.worktree)
+            try:
+                restore_paths_from_tree(info.worktree, tree_before, list(changed_paths))
+                stage_all(info.worktree)
+            except (GitError, OSError):
+                pass
+            return result, "HUMAN_REQUIRED"
         if scope_request is not None:
             # A valid request is advisory evidence, never an authorization
             # delta.  Even an in-scope attempt is rolled back atomically, so
@@ -616,5 +623,5 @@ class RevisionRunner:
                     raise GitError("scope-request rollback did not restore the exact tree")
             except (GitError, OSError):
                 pass
-            return result, _SCOPE_REQUEST_ROUTE
+            return result, _SCOPE_REQUEST_ROUTE if is_check_repair else "HUMAN_REQUIRED"
         return result, None

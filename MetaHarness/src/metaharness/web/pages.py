@@ -328,7 +328,7 @@ def _section_open(run: dict[str, Any], names: tuple[str, ...]) -> str:
 
 
 def _agent_auth_failure_notice(run: dict[str, Any], config: HarnessConfig | None) -> str:
-    if _failure_reason(run) != "CODEX_AUTH_FAILURE":
+    if _failure_reason(run) != "AGENT_AUTH_FAILURE":
         return ""
     configured_home = (
         str(config.codex_runtime.home.expanduser().resolve())
@@ -879,9 +879,9 @@ _PIPELINE_SYMBOLS = {
     "complete": "✓", "running": "▶", "failed": "✗", "deferred": "⚠", "waiting": "·", "resumable": "↻", "skipped": "–",
 }
 _FAILURE_MESSAGES = {
-    "CODEX_AUTH_FAILURE": "Codex authentication failed",
+    "AGENT_AUTH_FAILURE": "Agent authentication failed",
     "AGENT_TIMEOUT": "Worker timed out",
-    "AGENT_FAILED": "Worker failed",
+    "AGENT_RUNTIME_FAILED": "Worker failed",
     "AGENT_RUNTIME_FAILED": "Worker failed",
     "AGENT_SCOPE_VIOLATION": "Worker changed Git history or scope",
     "AGENT_NO_CHANGE": "Step changed nothing",

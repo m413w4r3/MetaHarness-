@@ -9,12 +9,13 @@ import stat
 import tempfile
 
 from ..models import HarnessConfig
+from ..agent.base import AGENT_START_FAILED
 
 
 class ClaudeRuntimeError(RuntimeError):
     """The managed Claude Code runtime cannot be safely prepared."""
 
-    code = "CLAUDE_RUNTIME_FAILURE"
+    code = AGENT_START_FAILED
 
 
 _EMPTY_MCP = '{\n  "mcpServers": {}\n}\n'

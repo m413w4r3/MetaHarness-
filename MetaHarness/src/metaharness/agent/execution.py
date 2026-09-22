@@ -270,18 +270,14 @@ class CodexExecutor:
                     base_sha=base_sha, env=environment,
                 )
             elif hasattr(self.agent, "run_step"):
-                # Historical in-process doubles receive the contract and
-                # construct the worker prompt themselves.  The real Codex
-                # adapter uses ``run_prompt`` above and therefore receives
-                # the already-rendered prompt from the orchestrator.
+                # The fallback adapter also receives the exact already-rendered
+                # payload. It must not construct a competing prompt.
                 kwargs = {
                     "base_sha": base_sha,
                     "env": environment,
                 }
-                if request.retry_addendum is not None:
-                    kwargs["retry_addendum"] = request.retry_addendum
                 raw = self.agent.run_step(
-                    request.contract or request.prompt,
+                    request.prompt,
                     request.worktree,
                     request.artifact_dir,
                     **kwargs,

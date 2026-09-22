@@ -205,7 +205,7 @@ class P19WebTests(unittest.TestCase):
     def test_bounded_diagnostics_diff_and_progress(self) -> None:
         run = self.create_waiting("artifacts")
         store = RunStateStore(run / "state.json")
-        store.update(status="failed", failure={"reason": "AGENT_FAILED"})
+        store.update(status="failed", failure={"reason": "AGENT_RUNTIME_FAILED"})
         step = run / "cycles/001/implementation/steps/S01"
         step.mkdir(parents=True)
         (step / "agent.final.md").write_text("x" * (32 * 1024 + 100))

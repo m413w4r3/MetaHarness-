@@ -15,14 +15,14 @@ from ..gitops import GitError, current_head
 from ..models import AgentConfig
 from ..prompt_contracts import build_implementer_payload
 from ..procutil import run_bounded
-from .base import AgentError, AgentResult
+from .base import AGENT_AUTH_FAILURE, AGENT_GIT_VIOLATION, AgentError, AgentResult
 from .events import extract_final, extract_usage, parse_event
 
 
 class AgentCommittedError(AgentError):
     """The agent changed HEAD, which is forbidden for an implementation run."""
 
-    code = "AGENT_COMMITTED"
+    code = AGENT_GIT_VIOLATION
 
     def __init__(self, expected: str, actual: str):
         super().__init__(f"{self.code}: expected HEAD {expected}, got {actual}")
@@ -34,7 +34,7 @@ _DEFAULT_TAIL_BYTES = 16_384
 # Longer JSONL lines are kept in the artifact but not parsed in memory.
 _MAX_EVENT_LINE_BYTES = 8 * 1024 * 1024
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_CODEX_AUTH_FAILURE_SIGNALS = (
+_AUTH_FAILURE_SIGNALS = (
     "401 unauthorized",
     "missing bearer or basic authentication in header",
     "authentication required",
@@ -100,7 +100,6 @@ defer the step safely.
 
 </MISMATCH RETRY ADDENDUM>
 """
-_CLOSING_CONTRACT_TAG = "</STEP CONTRACT>"
 
 
 def deferred_verify_dependency(final_message: str) -> str | None:
@@ -179,8 +178,8 @@ def classify_codex_failure(stderr: str, events: str = "") -> str | None:
     if not isinstance(stderr, str) or not isinstance(events, str):
         raise TypeError("Codex failure diagnostics must be strings")
     haystack = f"{stderr}\n{events}".casefold()
-    if any(signal in haystack for signal in _CODEX_AUTH_FAILURE_SIGNALS):
-        return "CODEX_AUTH_FAILURE"
+    if any(signal in haystack for signal in _AUTH_FAILURE_SIGNALS):
+        return AGENT_AUTH_FAILURE
     return None
 
 
@@ -223,65 +222,6 @@ def build_agent_environment(
     if codex_home is not None:
         environment["CODEX_HOME"] = str(Path(codex_home).expanduser().resolve())
     return environment
-
-
-def _template_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "prompts" / "implementer.txt"
-
-
-def build_implementer_prompt(plan: str, *, template: str | None = None) -> str:
-    """Put the authoritative plan into the fixed implementation prompt."""
-
-    if not isinstance(plan, str):
-        raise TypeError("plan must be a string")
-    if template is None:
-        template = _template_path().read_text(encoding="utf-8")
-    if not isinstance(template, str):
-        raise TypeError("template must be a string")
-    return template.replace("{{PLAN}}", plan)
-
-
-def build_implementer_step_prompt(
-    step_contract: str,
-    *,
-    template: str | None = None,
-    retry_addendum: str | None = None,
-) -> str:
-    """Put one bounded v2 step contract into the mechanical worker prompt.
-
-    *retry_addendum* is appended after the closing contract tag and only on a
-    bounded retry.  The contract itself is never rewritten: it stays the
-    authoritative, hash-bound text of the approved step.
-    """
-
-    if not isinstance(step_contract, str):
-        raise TypeError("step_contract must be a string")
-    if retry_addendum is not None and not isinstance(retry_addendum, str):
-        raise TypeError("retry_addendum must be a string")
-    if template is None:
-        template = (
-            Path(__file__).resolve().parents[1]
-            / "prompts"
-            / "implementer_step.txt"
-        ).read_text(encoding="utf-8")
-    if not isinstance(template, str):
-        raise TypeError("template must be a string")
-    # The addendum is inserted into the template, before the contract text is
-    # substituted, so contract bytes can never be mistaken for the tag.
-    if retry_addendum and retry_addendum.strip():
-        template = _append_after_contract(template, retry_addendum)
-    return template.replace("{{STEP_CONTRACT}}", step_contract)
-
-
-def _append_after_contract(template: str, addendum: str) -> str:
-    """Insert *addendum* right after the closing STEP CONTRACT tag."""
-
-    block = "\n" + addendum.strip("\n") + "\n"
-    index = template.rfind(_CLOSING_CONTRACT_TAG)
-    if index < 0:
-        return template.rstrip("\n") + "\n" + block
-    cut = index + len(_CLOSING_CONTRACT_TAG)
-    return template[:cut] + "\n" + block + template[cut:].lstrip("\n")
 
 
 def _tail(path: Path, limit: int) -> str:
@@ -417,8 +357,23 @@ class CodexAgent:
 
         if not isinstance(plan, str):
             raise TypeError("plan must be a string")
+        payload = build_implementer_payload(
+            step_identity="legacy implementation request",
+            step_objective=plan,
+            step_invariants="NONE",
+            read_set="NONE",
+            mutable_scope="NONE",
+            repository_instructions="NONE",
+            verify_instructions="NONE",
+            write_set="NONE",
+            create_set="NONE",
+            delete_set="NONE",
+            instructions="NONE",
+            verify_contract="NONE",
+            forbidden_contract="NONE",
+        )
         return self._run_with_prompt(
-            build_implementer_prompt(plan), worktree, artifacts_dir,
+            payload.rendered, worktree, artifacts_dir,
             base_sha=base_sha, env=env,
         )
 
@@ -441,7 +396,7 @@ class CodexAgent:
 
     def run_step(
         self,
-        step_contract: str,
+        prompt: str,
         worktree: str | Path,
         artifacts_dir: str | Path,
         *,
@@ -449,12 +404,12 @@ class CodexAgent:
         env: dict[str, str] | None = None,
         retry_addendum: str | None = None,
     ) -> AgentResult:
-        """Execute one fresh Codex process for one v2 step artifact directory."""
+        """Execute one already-rendered implementation prompt."""
 
-        if not isinstance(step_contract, str):
-            raise TypeError("step_contract must be a string")
+        if not isinstance(prompt, str):
+            raise TypeError("prompt must be a string")
         return self._run_with_prompt(
-            build_implementer_step_prompt(step_contract, retry_addendum=retry_addendum),
+            prompt,
             worktree, artifacts_dir, base_sha=base_sha, env=env,
         )
 
@@ -584,9 +539,7 @@ __all__ = [
     "MISMATCH_RETRY_ADDENDUM",
     "contract_mismatch_explanation",
     "deferred_verify_dependency",
-    "build_implementer_prompt",
     "build_implementer_payload",
-    "build_implementer_step_prompt",
     "build_mismatch_retry_addendum",
     "run_codex",
 ]

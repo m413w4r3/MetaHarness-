@@ -549,12 +549,12 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_codex_exit_one_creates_no_harness_commit(self) -> None:
         _, _, state = self.run_case(codex_behavior="fail")
-        self.assertEqual(state["failure"]["reason"], "AGENT_FAILED")
+        self.assertEqual(state["failure"]["reason"], "AGENT_RUNTIME_FAILED")
         self.assertEqual(git(self.root / "worktrees" / "run-1", "rev-list", "--count", "HEAD"), "1")
 
     def test_codex_auth_exit_is_classified_without_sensitive_detail(self) -> None:
         _, _, state = self.run_case(codex_behavior="auth-fail")
-        self.assertEqual(state["failure"]["reason"], "CODEX_AUTH_FAILURE")
+        self.assertEqual(state["failure"]["reason"], "AGENT_AUTH_FAILURE")
         self.assertEqual(state["failure"]["detail"], "step=S01 Codex authentication failed")
         self.assertNotIn("request-id", json.dumps(state))
         self.assertNotIn("https://api.openai.com", json.dumps(state))
@@ -764,7 +764,7 @@ class OrchestratorE2ETests(unittest.TestCase):
         _, llm, state = self.run_case(
             codex_behavior="secret", key_env="META_E2E_KEY", env={"META_E2E_KEY": secret}, run_id="secret-diff"
         )
-        self.assertEqual(state["failure"]["reason"], "AGENT_FAILED")
+        self.assertEqual(state["failure"]["reason"], "AGENT_RUNTIME_FAILED")
         self.assertEqual(llm.reviewer_calls, 0)
         for path in (self.root / "runs" / "secret-diff").rglob("*"):
             if path.is_file():

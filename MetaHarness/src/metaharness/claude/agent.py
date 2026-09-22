@@ -14,16 +14,16 @@ from ..gitops import GitError, current_head
 from ..models import ModelProfile, ProfileDriver
 from ..procutil import run_bounded
 from ..usage import normalize_usage
-from ..agent.base import AgentError
+from ..agent.base import AGENT_AUTH_FAILURE, AGENT_GIT_VIOLATION, AGENT_RUNTIME_FAILED, AgentError
 from ..agent.events import extract_final, extract_terminal_result, extract_usage, parse_event
 
 
 class ClaudeAgentError(AgentError):
-    code = "CLAUDE_FAILED"
+    code = AGENT_RUNTIME_FAILED
 
 
 class ClaudeCommittedError(ClaudeAgentError):
-    code = "CLAUDE_COMMITTED"
+    code = AGENT_GIT_VIOLATION
 
     def __init__(self, expected: str, actual: str):
         super().__init__(f"{self.code}: expected HEAD {expected}, got {actual}")
@@ -198,7 +198,7 @@ def classify_claude_failure(stderr: str, events: str = "") -> str | None:
         raise TypeError("Claude failure diagnostics must be strings")
     haystack = f"{stderr}\n{events}".casefold()
     if any(signal in haystack for signal in _AUTH_FAILURE_SIGNALS):
-        return "CLAUDE_AUTH_FAILURE"
+        return AGENT_AUTH_FAILURE
     return None
 
 

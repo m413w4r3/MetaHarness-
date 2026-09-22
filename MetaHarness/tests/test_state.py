@@ -263,7 +263,7 @@ class StateLockingTests(unittest.TestCase):
             with self.subTest(first=order[0]):
                 store = self.store(f"failure-{order[0]}-first")
                 targets = {
-                    "fail": lambda: store.record_failure("AGENT_FAILED", "exit status 1"),
+                    "fail": lambda: store.record_failure("AGENT_RUNTIME_FAILED", "exit status 1"),
                     "stale": lambda: store.update(status=RunStatus.IMPLEMENTING, extra=order[0]),
                 }
                 self.run_interleaved(
@@ -271,7 +271,7 @@ class StateLockingTests(unittest.TestCase):
                 )
                 final = store.load()
                 self.assertEqual(
-                    final["failure"], {"reason": "AGENT_FAILED", "detail": "exit status 1"}
+                    final["failure"], {"reason": "AGENT_RUNTIME_FAILED", "detail": "exit status 1"}
                 )
                 self.assertEqual(final["extra"], order[0])
 

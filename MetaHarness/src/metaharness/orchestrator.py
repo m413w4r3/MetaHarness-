@@ -28,7 +28,6 @@ from .agent.base import (
 )
 from .agent.diagnostics import write_token_diagnostics
 from .agent.codex import (
-    build_implementer_step_prompt,
     build_mismatch_retry_addendum,
     contract_mismatch_explanation,
     deferred_verify_dependency,
@@ -2595,6 +2594,11 @@ class Orchestrator:
                 getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self._secrets),
             ) from exc
         if error is not None:
+            if error in {_SCOPE_REQUEST_ROUTE, "REVISION_SCOPE_VIOLATION", AGENT_SCOPE_VIOLATION}:
+                raise PipelineFailure(
+                    "HUMAN_REQUIRED",
+                    "semantic revision requested scope outside its approved authority",
+                )
             raise PipelineFailure(error)
         self._cycle_update(
             store, cycle_plan.cycle, status="revised",
@@ -2634,16 +2638,13 @@ class Orchestrator:
             "parent_sha": candidate["parent_sha"],
             "repository_reference": repository_reference_dict(ctx.repository_reference),
         })
-        reviewer_evidence = _json_text({
-            "authority": "corrective_evidence_only",
-            "scope_authority": "approved_mutable_scope",
-            "git_authority": "immutable_candidate_commit",
-            "summary": review.summary,
-            "findings": review.findings,
-            "required_fixes": review.required_fixes,
-            "missing_tests": review.missing_tests,
-            "reviewer_code_evidence": code_evidence,
-        })
+        reviewer_evidence = "\n\n".join((
+            "SUMMARY\n" + review.summary,
+            "FINDINGS\n" + review.findings,
+            "REQUIRED FIXES\n" + review.required_fixes,
+            "MISSING TESTS\n" + review.missing_tests,
+            "CORRECTION EVIDENCE\n" + code_evidence,
+        ))
         artifact_dir = semantic_revision_dir(ctx.run_dir, number)
         _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
         try:
@@ -2676,7 +2677,10 @@ class Orchestrator:
                 getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self._secrets),
             ) from exc
         if error is not None:
-            if error in {"REVISION_SCOPE_VIOLATION", _SCOPE_REQUEST_ROUTE, AGENT_SCOPE_VIOLATION}:
+            if error in {
+                "REVISION_SCOPE_VIOLATION", _SCOPE_REQUEST_ROUTE,
+                "HUMAN_REQUIRED", AGENT_SCOPE_VIOLATION,
+            }:
                 raise PipelineFailure("HUMAN_REQUIRED", "semantic correction requested or changed a path outside approved scope")
             raise PipelineFailure(error)
         self._cycle_update(
@@ -3433,20 +3437,15 @@ class Orchestrator:
         )
         artifact_dir.mkdir(parents=True, exist_ok=True)
         try:
-            # The retry addendum is part of the final prompt, while the
-            # approved contract itself remains byte-identical in the artifact.
-            # The approved step contract is already the narrow implementer
-            # payload.  Keep the exact byte-shaped wrapper used by the
-            # contract hash/resume protocol; diagnostics are recorded as a
-            # separate role payload and never broaden the request.
-            request_prompt = build_implementer_step_prompt(
-                contract, retry_addendum=retry_addendum
-            )
             prompt_payload = build_implementer_payload(
+                step_identity=f"{step.id}\nTITLE\n{step.title}",
                 step_title=step.title,
                 step_objective=step.objective,
                 step_invariants=step.forbidden,
                 read_set="\n".join(step.read_set),
+                write_set="\n".join(step.write_set) or "NONE",
+                create_set="\n".join(step.create_set) or "NONE",
+                delete_set="\n".join(step.delete_set) or "NONE",
                 mutable_scope=_json_text({
                     "write": list(step.write_set),
                     "create": list(step.create_set),
@@ -3454,24 +3453,13 @@ class Orchestrator:
                 }),
                 repository_instructions=step.instructions,
                 verify_instructions=step.verify,
+                instructions=step.instructions,
+                verify_contract=step.verify,
+                forbidden_contract=step.forbidden,
                 retry_addendum=retry_addendum or "",
                 budget_bytes=self.config.prompt_budget.implementer_max_bytes,
             )
-            prompt_payload = dataclasses.replace(
-                prompt_payload,
-                rendered=request_prompt,
-                total_bytes=len(request_prompt.encode("utf-8", errors="replace")),
-                static_prompt_bytes=max(
-                    0,
-                    len(request_prompt.encode("utf-8", errors="replace"))
-                    - prompt_payload.dynamic_payload_bytes,
-                ),
-                budget_overrun=(
-                    bool(self.config.prompt_budget.implementer_max_bytes)
-                    and len(request_prompt.encode("utf-8", errors="replace"))
-                    > self.config.prompt_budget.implementer_max_bytes
-                ),
-            )
+            request_prompt = prompt_payload.rendered
             write_prompt_diagnostics(artifact_dir, prompt_payload)
             trace_started_at = self._trace_time()
             trace_started_mono = time.perf_counter()
@@ -3577,7 +3565,7 @@ class Orchestrator:
             **retry_mode,
         }
         # 7. Authentication classification from fixed markers only.
-        auth_failure = result.backend_reason == "CODEX_AUTH_FAILURE"
+        auth_failure = result.backend_reason == "AGENT_AUTH_FAILURE"
         # Capture ownership before interpreting the worker's structural report.
         # A clean mismatch is allowed to defer only when the complete Git
         # boundary is untouched.
@@ -3687,7 +3675,7 @@ class Orchestrator:
             )
         # 8-9. Git ownership: HEAD, branch, branches and worktrees.
         if ownership_after.head != base_sha:
-            raise StepExecutionFailure("AGENT_COMMITTED", step_id, "worktree HEAD changed", **failed)
+            raise StepExecutionFailure("AGENT_GIT_VIOLATION", step_id, "worktree HEAD changed", **failed)
         if ownership_violations:
             raise StepExecutionFailure(
                 "AGENT_GIT_VIOLATION", step_id, "; ".join(ownership_violations), **failed
@@ -3704,14 +3692,12 @@ class Orchestrator:
             AGENT_SCOPE_VIOLATION,
         }:
             if auth_failure:
-                reason = "CODEX_AUTH_FAILURE" if self._legacy_backend_injection else AGENT_RUNTIME_FAILED
+                reason = "AGENT_AUTH_FAILURE"
                 raise StepExecutionFailure(
                     reason, step_id, "Codex authentication failed", **failed,
                     tree_after=_safe_candidate_tree(worktree),
                 )
-            reason = "AGENT_FAILED" if self._legacy_backend_injection else (
-                result.exit_reason or AGENT_RUNTIME_FAILED
-            )
+            reason = result.exit_reason or AGENT_RUNTIME_FAILED
             raise StepExecutionFailure(
                 reason, step_id, f"exit status {result.exit_code}", **failed,
                 tree_after=_safe_candidate_tree(worktree),
@@ -4129,8 +4115,6 @@ class Orchestrator:
                 _compact_cycle_summary(input.cycle_history)
                 + "\n"
                 + input.step_reports
-                + "\n"
-                + input.revision_report
                 + "\nDEFERRED CONTRACT MISMATCHES\n"
                 + input.deferred_mismatches
             ),

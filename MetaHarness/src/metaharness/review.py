@@ -83,20 +83,6 @@ _CONTROL_FIELDS = frozenset({"verdict", "route"})
 _PASS_FINDING_SEVERITIES = frozenset({"MINOR", "NIT"})
 
 
-def _prompt_template_path() -> Path:
-    return Path(__file__).with_name("prompts") / "reviewer.txt"
-
-
-def _replace_placeholders(template: str, values: dict[str, str]) -> str:
-    """Replace known placeholders once, preserving placeholders in evidence."""
-
-    return re.sub(
-        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|CODE_EVIDENCE|DIFF|CHECKS|AGENT_REPORT|REPOSITORY|LUNA_REPORTS|REVISION_REPORT|REPOSITORY_STATE|CANDIDATE_COMMIT|ITERATION|CYCLE_HISTORY|DEFERRED_CONTRACT_MISMATCHES|ADDITIONAL_EVIDENCE)\}\}",
-        lambda match: values[match.group(0)],
-        template,
-    )
-
-
 def _require_text(name: str, value: object) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{name} must be a string")
@@ -114,7 +100,7 @@ def build_reviewer_prompt(
     agent_report: str,
     *,
     repository: str = "",
-    luna_reports: str = "",
+    step_reports: str = "",
     revision_report: str = "",
     repository_state: str = "",
     candidate_commit: str = "",
@@ -124,60 +110,49 @@ def build_reviewer_prompt(
     code_evidence: str | None = None,
     template: str | None = None,
 ) -> str:
-    """Build the reviewer's single user message.
+    """Build a standalone review request through the same modern payload path.
 
-    All supplied material is evidence.  Substitution is deliberately
-    non-recursive so a diff containing ``{{SPEC}}`` cannot alter another
-    prompt section.
+    The orchestration pipeline supplies a pre-built :class:`PromptPayload`.
+    This helper is intentionally only an adapter for callers that still have
+    the older positional evidence shape; it does not define another template.
     """
 
-    effective_code_evidence = (
+    effective_diff = _require_text("diff", diff)
+    effective_code = (
         _require_text("code_evidence", code_evidence)
-        if code_evidence is not None
-        else _require_text("diff", diff)
+        if code_evidence is not None else effective_diff
     )
-    additional_evidence = "\n\n".join(
-        value for value in (luna_reports, revision_report, deferred_mismatches)
-        if value and value != "NONE"
-    ) or "NONE"
-    values = {
-        "{{SPEC}}": _require_text("spec", spec),
-        "{{PLAN}}": _require_text("plan", plan),
-        "{{CONTEXT}}": _require_text("context", context),
-        "{{GATE}}": _require_text("gate", gate),
-        "{{CHANGED_FILES}}": _require_text("changed_files", changed_files),
-        "{{CODE_EVIDENCE}}": effective_code_evidence,
-        "{{DIFF}}": _require_text("diff", diff),
-        "{{CHECKS}}": _require_text("checks", checks),
-        "{{AGENT_REPORT}}": _require_text("agent_report", agent_report),
-        "{{REPOSITORY}}": _require_text("repository", repository),
-        "{{LUNA_REPORTS}}": _require_text("luna_reports", luna_reports),
-        "{{REVISION_REPORT}}": _require_text("revision_report", revision_report),
-        "{{REPOSITORY_STATE}}": _require_text("repository_state", repository_state),
-        "{{CANDIDATE_COMMIT}}": _require_text("candidate_commit", candidate_commit),
-        "{{ITERATION}}": str(iteration),
-        "{{CYCLE_HISTORY}}": _require_text("cycle_history", cycle_history),
-        "{{DEFERRED_CONTRACT_MISMATCHES}}": _require_text(
-            "deferred_mismatches", deferred_mismatches
-        ),
-        "{{ADDITIONAL_EVIDENCE}}": additional_evidence,
-    }
-    if template is None:
-        template = _prompt_template_path().read_text(encoding="utf-8")
-    template = _require_text("template", template)
-    expected_placeholders = set(re.findall(r"\{\{[A-Z0-9_]+\}\}", template))
-    missing = expected_placeholders.difference(values)
-    if missing:
-        raise ReviewError(
-            "reviewer template contains unresolved placeholders: "
-            + ", ".join(sorted(missing))
-        )
-    rendered = _replace_placeholders(template, values)
-    if code_evidence is None and agent_report not in {"", "NONE"}:
-        # Keep historical standalone callers' report data available without
-        # restoring the removed default V2 template section.
-        rendered += "\n\n[LEGACY AGENT REPORT DATA]\n" + values["{{AGENT_REPORT}}"]
-    return rendered
+    cycle_parts = [
+        _require_text("context", context),
+        _require_text("repository_state", repository_state),
+        _require_text("cycle_history", cycle_history),
+        _require_text("step_reports", step_reports),
+        _require_text("revision_report", revision_report),
+        _require_text("deferred_mismatches", deferred_mismatches),
+        _require_text("agent_report", agent_report),
+    ]
+    cycle_summary = "\n\n".join(part for part in cycle_parts if part and part != "NONE") or "NONE"
+    candidate_identity = _require_text("candidate_commit", candidate_commit) or "UNKNOWN"
+    checks_text = _require_text("checks", checks)
+    gate_text = _require_text("gate", gate)
+    required_checks = checks_text or gate_text or "NONE"
+    repository_text = _require_text("repository", repository)
+    if repository_text and gate_text:
+        repository_text += "\n" + gate_text
+    return build_final_review_payload(
+        spec=_require_text("spec", spec),
+        compact_approved_plan=_require_text("plan", plan),
+        required_checks_summary=required_checks,
+        immutable_candidate_identity=candidate_identity,
+        changed_files=_require_text("changed_files", changed_files),
+        diff_sha256=hashlib.sha256(effective_diff.encode("utf-8", errors="replace")).hexdigest(),
+        diffstat="NONE",
+        bounded_diff_excerpt=effective_code,
+        cycle_summary=cycle_summary,
+        repository_reference=repository_text,
+        template=_require_text("template", template) if template is not None else None,
+        budget_bytes=0,
+    ).rendered
 
 
 def _normalise_scalar(value: str) -> str:
@@ -523,7 +498,7 @@ class Reviewer:
         deterministic_passed: bool = True,
         artifacts_dir: str | Path | None = None,
         repository: str = "",
-        luna_reports: str = "",
+        step_reports: str = "",
         revision_report: str = "",
         repository_state: str = "",
         candidate_commit: str = "",
@@ -549,7 +524,7 @@ class Reviewer:
                 checks,
                 agent_report,
                 repository=repository,
-                luna_reports=luna_reports,
+                step_reports=step_reports,
                 revision_report=revision_report,
                 repository_state=repository_state,
                 candidate_commit=candidate_commit,
@@ -648,7 +623,7 @@ def run_reviewer(
     artifacts_dir: str | Path | None = None,
     template: str | None = None,
     repository: str = "",
-    luna_reports: str = "",
+    step_reports: str = "",
     revision_report: str = "",
     repository_state: str = "",
     candidate_commit: str = "",
@@ -671,7 +646,7 @@ def run_reviewer(
         deterministic_passed=deterministic_passed,
         artifacts_dir=artifacts_dir,
         repository=repository,
-        luna_reports=luna_reports,
+        step_reports=step_reports,
         revision_report=revision_report,
         repository_state=repository_state,
         candidate_commit=candidate_commit,

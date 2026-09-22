@@ -33,14 +33,19 @@ class PromptContractTests(unittest.TestCase):
         prompt = build_reviewer_prompt(
             "SPEC", "PLAN", "CONTEXT", "GATE", "FILES", "DIFF", "CHECKS", "REPORT"
         ).casefold()
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "src" / "metaharness" / "prompts" / "reviewer.txt"
+        ).read_text(encoding="utf-8").casefold()
         v2_prompt = build_final_review_payload(
             spec="SPEC",
             compact_approved_plan="PLAN",
             required_checks_summary="CHECKS",
-            cycle_summary="iteration 1 C02 Claude Luna remaining repair budget",
+            cycle_summary="compact cycle summary",
         ).rendered.casefold()
         for forbidden in ("iteration 1", "iteration 2", "c02", "claude", "luna"):
             with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, template)
                 self.assertNotIn(forbidden, prompt)
                 self.assertNotIn(forbidden, v2_prompt)
 
