@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 from pathlib import Path
 from typing import (
@@ -20,6 +21,7 @@ from .shared import (
     _git_ownership,
     _json_text,
     _ownership_violations,
+    _read_bounded_text,
     _record_failure_tree,
     _status_has_unstaged_or_untracked,
 )
@@ -56,6 +58,13 @@ from ..run_options import EffectiveRepairScopePolicy
 from ..state import RunStateStore
 from ..usage import normalize_usage
 from ..validation import config_with_check_authority
+from ..review import ReviewResult
+from .pipeline_v2 import (
+    check_repair_root,
+    correction_dir,
+    review_dir,
+    semantic_revision_dir,
+)
 from ..agent.base import (
     AGENT_PROTOCOL_FAILED,
     AGENT_RUNTIME_FAILED,
@@ -238,6 +247,159 @@ def _future_step_ownership(
 
 def _has_deferred_contract_mismatches(results: list[dict[str, Any]]) -> bool:
     return any(item.get("status") == "DEFERRED_CONTRACT_MISMATCH" for item in results)
+
+
+def _review_payload(review: ReviewResult) -> dict[str, Any]:
+    payload = dataclasses.asdict(review)
+    payload["verdict"] = review.verdict.value
+    payload["route"] = review.route.value
+    payload.pop("raw", None)
+    return payload
+
+
+def _compact_approved_plan_text(plan: TaskPlanV2) -> str:
+    """Render the reviewer-visible plan index, never worker prompt bodies."""
+
+    return _json_text({
+        "title": plan.title,
+        "objective": plan.objective,
+        "constraints": plan.constraints,
+        "required_checks": list(plan.required_checks),
+        "steps": [
+            {
+                "id": step.id,
+                "title": step.title,
+                "depends_on": step.depends_on,
+                "objective": step.objective,
+                "invariants": step.forbidden,
+                "writes": list(step.write_set),
+                "creates": list(step.create_set),
+                "deletes": list(step.delete_set),
+                "verify": step.verify,
+            }
+            for step in plan.steps
+        ],
+    })
+
+
+def _review_step_reports_text(results: list[dict[str, Any]]) -> str:
+    records: list[dict[str, Any]] = []
+    for item in results:
+        record: dict[str, Any] = {
+            "id": item.get("id"),
+            "status": item.get("status", "COMPLETED"),
+            "changed_paths": list(item.get("changed_paths") or []),
+        }
+        for key in ("mismatch", "initial_mismatch", "deferred_verify"):
+            if item.get(key):
+                record[key] = _bounded_v2_report(str(item.get(key) or ""))
+        if item.get("mismatch_retry_count"):
+            record["mismatch_retry_count"] = item["mismatch_retry_count"]
+        records.append(record)
+    return _json_text(records)
+
+
+@dataclasses.dataclass(frozen=True)
+class ReviewCycleInput:
+    """Durable, bounded context presented to the independent reviewer."""
+
+    iteration: int
+    plan_text: str
+    step_reports: str
+    revision_report: str
+    cycle_history: str
+    scope_delta: str = ""
+    deferred_mismatches: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class ReviewContextBuilder:
+    """Assemble reviewer correction context from cycle artifacts only."""
+
+    cycle_plan: Callable[[Any, int], Any]
+    completed_steps: Callable[[Any, Any], list[dict[str, Any]]]
+    load_revision: Callable[[Path], Any]
+    read_candidate: Callable[[Path, int], Mapping[str, Any]]
+    candidate_evidence: Callable[[Path, int], EvidenceBundle | None]
+    accepted_review: Callable[[Path, EvidenceBundle, str], ReviewResult | None]
+
+    def build(self, ctx: Any, cycle_plan: Any) -> ReviewCycleInput:
+        number = cycle_plan.cycle.number
+        plans = [self.cycle_plan(ctx, item) for item in range(1, number)] + [cycle_plan]
+        if number == 1:
+            plan_text = _compact_approved_plan_text(ctx.plan)
+            cycle_history = "001 is the initial implementation cycle."
+            scope_delta = ""
+        else:
+            scope_delta = _read_bounded_text(
+                correction_dir(ctx.run_dir, number) / "scope_delta.json"
+            )
+            plan_text = _json_text({
+                "original_approved_plan": json.loads(_compact_approved_plan_text(ctx.plan)),
+                "correction_plans": {
+                    f"{item.cycle.number:03d}": json.loads(_compact_approved_plan_text(item.plan))
+                    for item in plans[1:]
+                },
+                "scope_delta": scope_delta,
+            })
+            history: dict[str, Any] = {}
+            for item in plans[:-1]:
+                earlier = item.cycle.number
+                candidate = self.read_candidate(ctx.run_dir, earlier)
+                evidence = self.candidate_evidence(ctx.run_dir, earlier)
+                review = (
+                    self.accepted_review(
+                        review_dir(ctx.run_dir, earlier), evidence, candidate["commit_sha"]
+                    ) if evidence is not None else None
+                )
+                history[f"{earlier:03d}"] = {
+                    "kind": item.cycle.kind.value,
+                    "plan_summary": item.plan.title,
+                    "checks": _check_payload(evidence) if evidence is not None else None,
+                    "reviewer_conclusion": _review_payload(review) if review is not None else None,
+                }
+            cycle_history = _json_text(history)
+        step_reports, revision_reports, mismatches = [], [], []
+        for item in plans:
+            label = f"{item.cycle.number:03d}"
+            steps = self.completed_steps(ctx, item)
+            step_reports.append(f"CYCLE {label} STEP REPORTS\n{_review_step_reports_text(steps)}")
+            revision_reports.append(
+                f"CYCLE {label} REVISION REPORTS\n"
+                f"{review_cycle_revision_report(ctx.run_dir, item.cycle.number, self.load_revision) or 'NONE'}"
+            )
+            mismatches.append(
+                f"CYCLE {label} DEFERRED CONTRACT MISMATCHES\n"
+                f"{_deferred_contract_mismatches(item.plan, steps)}"
+            )
+        return ReviewCycleInput(
+            iteration=number,
+            plan_text=plan_text,
+            step_reports="\n".join(step_reports),
+            revision_report="\n".join(revision_reports),
+            cycle_history=cycle_history,
+            scope_delta=scope_delta,
+            deferred_mismatches="\n".join(mismatches),
+        )
+
+
+
+def review_cycle_revision_report(
+    run_dir: Path, number: int, load_revision: Callable[[Path], Any],
+) -> str:
+    reports: dict[str, Any] = {}
+    revision_dir = semantic_revision_dir(run_dir, number)
+    revision = load_revision(revision_dir)
+    if revision is not None:
+        reports["semantic_revision"] = _revision_report_text(revision, revision_dir)
+    for stage_dir in sorted(check_repair_root(run_dir, number).glob("*")):
+        for attempt_dir in sorted((stage_dir / "attempts").glob("[0-9][0-9][0-9]")):
+            attempt = load_revision(attempt_dir)
+            if attempt is not None:
+                reports[f"check_repair/{stage_dir.name}/{attempt_dir.name}"] = (
+                    _revision_report_text(attempt, attempt_dir)
+                )
+    return _json_text(reports) if reports else ""
 
 
 def _revision_prompt(

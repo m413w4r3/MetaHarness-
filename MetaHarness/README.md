@@ -50,9 +50,8 @@ delete remote run branch           (fast-forward-base only; after publication)
 - `REVISE / IMPLEMENTATION` réutilise le plan approuvé et appelle le reviser,
   tandis que `REVISE / REPLAN` appelle un planner correctif puis un nouvel
   implementer ; `REVISE / HUMAN` arrête toute correction automatique ;
-- `[revision]` fournit les defaults et le fallback legacy ; chaque nouveau run
-  capture ses choix effectifs dans `run_options.json` ; les anciens noms
-  `claude_revision_enabled` et `repair_cycles` restent des alias de lecture ;
+- `[revision]` fournit les valeurs par défaut ; chaque nouveau run capture ses
+  choix effectifs dans `run_options.json` ;
 - pour AutoWork, la portée de réparation recommandée est
   `repair_scope_policy = "auto-bounded"` avec
   `repair_scope_max_added_paths = 4` ;
@@ -79,9 +78,9 @@ delete remote run branch           (fast-forward-base only; after publication)
 Chaque transition durable met à jour `resume_checkpoint.json`, qui décrit
 toujours la prochaine opération non encore réussie. Les phases supportées sont
 conceptuellement : context, planner, plan approval, workspace setup, worker
-steps, checks, Claude, reviewer, repair planner/steps, commit et publish.
+steps, deterministic gates, reviewer, correction planner/steps, commit et publish.
 Un run `failed` dont l’échec est reprenable
-(Claude, Codex avant mutation, transport reviewer, push) se reprend au même
+(avant mutation, transport reviewer, push) se reprend au même
 `run_id`, sans rejouer planner, approbation, setup ni step déjà réussi :
 
 ```bash
@@ -154,7 +153,7 @@ gérés.
 
 Ouvrir `http://127.0.0.1:8765/`, cliquer sur `NEW RUN`, saisir le SPEC puis
 `CREATE RUN`. Le planner, l’approbation des contrats de step exacts, chaque
-step Luna, la révision Claude, les checks, la review et la consommation de
+step, la révision sémantique, les checks, la review et la consommation de
 tokens sont ensuite suivis depuis la page du run.
 
 La CLI reste disponible pour l’automatisation :

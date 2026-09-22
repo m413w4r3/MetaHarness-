@@ -41,9 +41,8 @@ metaharness run \
 `[revision]` supplies defaults and the legacy fallback. Every new durable UI
 run captures its effective choices in `run_options.json`: the semantic
 revision switch, check-repair attempt budget, review-repair cycle budget, and
-role-specific profiles. The historical `claude_revision_enabled` and
-`repair_cycles` names remain read-only compatibility aliases; new budgets are
-validated independently in the inclusive range `0..10`.
+role-specific profiles. The two correction budgets are validated independently
+in the inclusive range `0..10`.
 For AutoWork, use `repair_scope_policy = "auto-bounded"` and
 `repair_scope_max_added_paths = 4`. Use `require-approval` when an operator
 must explicitly accept an exact planner-derived scope delta; use
@@ -132,11 +131,9 @@ It never pushes `base_ref`, never uses force, tags or deletion, and never
 automatically merges the run branch. A published run exposes the branch URL
 (`…/tree/harness/<plan>/<run-id>`).
 Failures specific to this mode include `CHECK_REPAIR_EXHAUSTED`,
-`REVIEW_LOOP_EXHAUSTED`, `REPLAN_REQUIRED`, `HUMAN_REQUIRED`,
+`REVIEW_REPAIR_EXHAUSTED`, `REVIEW_FAILED`, `HUMAN_REQUIRED`,
 `REPAIR_PLANNER_BLOCKED`, `REPAIR_SCOPE_EXPANSION`,
-`REVISION_SCOPE_VIOLATION` and `PUSH_FAILED`. Historical C01/C02 artifact
-names may still appear in diagnostics, but they are compatibility labels, not
-the v2 policy or a fixed two-cycle limit.
+`REVISION_SCOPE_VIOLATION` and `PUSH_FAILED`.
 
 Agent failures are classified through the backend-neutral execution contract;
 the role and profile, not a vendor name, determine the route. Check repair is
@@ -259,26 +256,20 @@ Every durable transition rewrites `resume_checkpoint.json` atomically. It
 always names the next operation that has not yet succeeded:
 
 At the conceptual level, supported phases are context, planner, plan approval,
-workspace setup, worker steps, checks, Claude, candidate commit/push, reviewer,
-repair planner/steps, and publish. Corruptions, identity violations and
+workspace setup, implementation steps, deterministic gates, candidate
+commit/push, final review, correction planning/steps, and publish. Corruptions, identity violations and
 `AGENT_CONTRACT_MISMATCH` are deliberately non-resumable.
 
 | After | Checkpoint |
 | --- | --- |
 | plan approval, worktree + setup | `initial_step` S01, base tree |
 | operator plan recovery (no planner call) | `plan_approval`, base tree |
-| Luna step Sxx | next step, or `checks_c01` (pre-revision checks with Claude, final checks without), with the step's tree |
-| pre-revision checks | `claude_c01`, post-Luna tree |
-| Claude complete | `final_checks_c01`, post-Claude tree (resume runs only the final checks) |
-| final checks C01 | `candidate_commit_c01`, the frozen evidence tree |
-| exact C01 candidate commit | `candidate_push_c01` |
-| exact C01 candidate push | `reviewer_c01` |
-| reviewer #1 REVISE/IMPLEMENTATION or REPLAN | `repair_planner` |
-| repair planner, each repair step | `repair_step` Sxx / `checks_c02` |
-| pre-revision checks C02, Claude C02 complete | `claude_c02`, then `final_checks_c02` (post-Claude tree) |
-| final checks C02 | `candidate_commit_c02`, the frozen evidence tree |
-| exact C02 candidate commit | `candidate_push_c02` |
-| exact C02 candidate push | `reviewer_c02` |
+| implementation step Sxx | next step, or `deterministic_gate`, with the step's tree |
+| deterministic gate | `check_repair` when red, otherwise the next semantic revision or candidate boundary |
+| semantic revision or correction | the next deterministic gate, with the worker tree |
+| accepted gate | `candidate_ready`, then `candidate_push` |
+| exact candidate push | `final_review` |
+| reviewer REVISE/IMPLEMENTATION or REPLAN | the corresponding correction cycle boundary |
 | approved candidate | `publish` (HEAD = candidate commit) |
 
 Ces checkpoints sont idempotents : après le worker les checks reprennent sans
@@ -295,7 +286,7 @@ metaharness resume --config examples/autowork.toml --run-id <RUN_ID>
 Resumable failures use provider-neutral reasons such as `AGENT_RUNTIME_FAILED`,
 `AGENT_AUTH_FAILURE`, `AGENT_TIMEOUT`, and `AGENT_PROTOCOL_FAILED`.
 (same step, only if the tree is still the step's `tree_before`),
-`REVIEWER_TRANSPORT_FAILURE` (same exact candidate; Claude and checks are not
+`REVIEWER_TRANSPORT_FAILURE` (same exact candidate; semantic revision and checks are not
 rerun), `LLM_FAILURE` of the repair planner, `PUSH_FAILED` (candidate or
 publication push),
 and `INTERRUPTED`. `STEP_WRITE_SET_VIOLATION`, `AGENT_GIT_VIOLATION`,
@@ -309,15 +300,11 @@ are unchanged; the staged candidate tree is exactly the checkpoint tree; the
 base SHA is unchanged; there is no untracked or unapproved path and no
 agent-created commit. Any mismatch records `RESUME_INTEGRITY_FAILURE`.
 
-Evidence invariants are phase-specific, and the two automatic check-repair
-phases are opposites. At `check_repair_c0x` the repair Claude has not
-succeeded yet, so the canonical `checks/C0x/evidence.json` must still be the
-red first pass for the pre-repair tree. At `final_checks_retry_c0x` that
-Claude *did* succeed, the checkpoint tree is the **repaired** tree, the red
-first pass has moved to `checks/C0x/attempts/01/`, and the canonical bundle is
-either absent (the first retry crashed) or the retry's own bundle for the
-repaired tree. The retry checks are always re-executed, so a red bundle is
-never read as proof that the new checks are green.
+Evidence invariants are phase-specific. A red deterministic gate keeps its
+failed evidence beside the bounded repair attempt; after repair, the gate is
+re-run against the repaired tree. Resume reuses only evidence whose exact
+HEAD and tree identities still match the checkpoint, and never treats a red
+bundle as proof that a new gate is green.
 
 A run closed by this validation stays non-resumable by default. An operator
 who has fixed the cause can ask for a second *complete* validation of the
@@ -336,15 +323,14 @@ the validation refuses again the run stays `RESUME_INTEGRITY_FAILURE`, with no
 model call, no check and no Git write. It is deliberately CLI-only; the run
 page exposes no such button.
 
-If a failed Claude attempt edited files before failing, its left-over tree is
-recorded in `revision/Cxx/tree_after_failure.txt`. Resume restores exactly
-`revision/Cxx/tree_before.txt` through Git objects, and only for paths inside
+If a failed revision attempt edited files before failing, its left-over tree is
+recorded in the cycle's semantic-revision artifacts. Resume restores exactly
+the recorded `tree_before.txt` through Git objects, and only for paths inside
 the approved scope; otherwise it records `RESUME_REQUIRES_OPERATOR`. A Codex
 step that left partial changes also requires an operator (no unbounded reset
 of any workspace). The previous attempt's agent artifacts move to
-`attempts/NN/` before the retry. A historical run without a checkpoint (Claude
-C01 or Codex step failure) gets one inferred from its artifacts and is then
-validated the same way.
+`attempts/NN/` before the retry. A run without a checkpoint is refused or
+recovered only when its current artifacts prove the next operation exactly.
 
 ## META PLAN v2 execution limits
 
@@ -405,7 +391,7 @@ to `attempts/NN/`, the replacement becomes `planner.raw.md`,
 `planner_recovery.json` records the exchange, and the checkpoint becomes
 `plan_approval`. No worktree is created and no worker starts before the
 human approval; afterwards the run continues through the normal workflow
-(`plan_approval` -> `worktree_setup` -> Luna S01...) and the planner is never
+(`plan_approval` -> `worktree_setup` -> implementation S01...) and the planner is never
 called again. Diagnostics then report `plan source: operator recovery`
 instead of `plan source: planner model completion`.
 

@@ -62,6 +62,14 @@ def implementation_dir(run_dir: Path, cycle: RunCycle | int) -> Path:
     return cycle_dir(run_dir, cycle) / "implementation"
 
 
+def implementation_steps_dir(run_dir: Path, cycle: RunCycle | int) -> Path:
+    return implementation_dir(run_dir, cycle) / "steps"
+
+
+def step_dir(run_dir: Path, cycle: RunCycle | int, step_id: str) -> Path:
+    return implementation_steps_dir(run_dir, cycle) / step_id
+
+
 def correction_dir(run_dir: Path, cycle: RunCycle | int) -> Path:
     return cycle_dir(run_dir, cycle) / "correction"
 
@@ -82,12 +90,22 @@ def check_repair_dir(run_dir: Path, cycle: RunCycle | int, stage: GateStage | st
     return cycle_dir(run_dir, cycle) / "check-repair" / _stage_name(stage)
 
 
+def check_repair_root(run_dir: Path, cycle: RunCycle | int) -> Path:
+    return cycle_dir(run_dir, cycle) / "check-repair"
+
+
+def check_repair_attempts_dir(
+    run_dir: Path, cycle: RunCycle | int, stage: GateStage | str,
+) -> Path:
+    return check_repair_dir(run_dir, cycle, stage) / "attempts"
+
+
 def check_repair_attempt_dir(
     run_dir: Path, cycle: RunCycle | int, stage: GateStage | str, attempt: int,
 ) -> Path:
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
         raise ValueError("check-repair attempt must be a positive integer")
-    return check_repair_dir(run_dir, cycle, stage) / "attempts" / f"{attempt:03d}"
+    return check_repair_attempts_dir(run_dir, cycle, stage) / f"{attempt:03d}"
 
 
 def candidate_dir(run_dir: Path, cycle: RunCycle | int) -> Path:
@@ -558,8 +576,8 @@ class PipelineV2Coordinator:
 __all__ = [
     "CyclePlan", "PipelineFailure", "PipelineV2Context", "PipelineV2Coordinator",
     "PipelineV2Operations", "candidate_dir", "check_repair_attempt_dir",
-    "check_repair_dir", "correction_dir", "correction_kind", "cycle_dir",
-    "cycle_record_path", "final_gate_stage", "gate_acceptance_path", "gate_dir", "implementation_dir",
-    "pre_semantic_gate_stage",
+    "check_repair_attempts_dir", "check_repair_dir", "check_repair_root", "correction_dir", "correction_kind", "cycle_dir",
+    "cycle_record_path", "final_gate_stage", "gate_acceptance_path", "gate_dir", "implementation_dir", "implementation_steps_dir",
+    "pre_semantic_gate_stage", "step_dir",
     "review_dir", "semantic_revision_dir",
 ]

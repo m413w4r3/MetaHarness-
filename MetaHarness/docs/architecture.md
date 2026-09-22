@@ -138,7 +138,7 @@ PLAN → implementation step → accepted step commit → …
 - Check repair fixes a deterministic signal; semantic revision compares the
   immutable candidate to the SPEC; the final reviewer routes a candidate that
   has already passed the mechanical gates.
-- C02 writes `repair/C02/scope_delta.json`, derived from parsed plan mutation
+- A correction cycle writes `cycles/<number>/correction/scope_delta.json`, derived from parsed plan mutation
   sets. New paths are governed by durable `repair_scope_policy` and
   `repair_scope_max_added_paths` options. `auto-bounded` is recommended for
   AutoWork with a bound of 4; `require-approval` writes an exact-hash
@@ -156,7 +156,7 @@ PLAN → implementation step → accepted step commit → …
   exactly one step, STAGED two to `MAX_STEPS`. A step contract is at most
   16000 characters; there is no aggregate contract-size limit. The planner
   target remains approximately 4000-6000 characters per step.
-- C01 and C02 steps run through the same `_execute_codex_step` primitive, with
+- Initial and correction-cycle steps run through the same generic step executor, with
   the same ordered gates and failure reasons (`STEP_CONTRACT_DRIFT`,
   `AGENT_AUTH_FAILURE`, `AGENT_GIT_VIOLATION`,
   `AGENT_TIMEOUT`, `AGENT_RUNTIME_FAILED`, `AGENT_NO_CHANGE`,
@@ -164,7 +164,7 @@ PLAN → implementation step → accepted step commit → …
 - Both reviewers go through `_run_v2_reviewer`, which passes the actual
   `deterministic_passed` to the gate payload, to `parse_review` and to the
   commit gate. A reviewer PASS on a red required check is an invalid answer
-  (`REVIEWER_OUTPUT_INVALID`): no commit, no push, no C02.
+  (`REVIEWER_OUTPUT_INVALID`): no commit, no push, no correction cycle.
 - Deterministic checks are selected by planner IDs from the trusted check
   catalog; MetaHarness owns the commands and arguments, always requires the
   configured defaults, and runs configured preflights before expensive workers.
@@ -176,15 +176,13 @@ PLAN → implementation step → accepted step commit → …
   evidence; it does not recopy the full diff into the reviewer prompt. The
   reviewer inspects the immutable candidate when it needs code, while a
   bounded diff fallback is used only when remote exploration is unavailable.
-  This keeps prompt size independent of the total diff size and Luna step
+  This keeps prompt size independent of the total diff size and step
   count.
 - Every reviewable candidate creates and pushes its exact immutable tree on
   the run branch before the final reviewer. Publication happens only after
   the final reviewer PASS and a green gate, using that already-pushed approved
   candidate: no force, no tag, no delete, never `base_ref`/`main`, and never
   an automatic merge of the run branch.
-- Historical snapshots may retain `C01`/`C02` directory names. Those names are
-  artifact compatibility labels, not a v2 policy or a review-cycle limit.
 - `trace/events.v1.jsonl` records the workflow in order (`run`, `plan`, `step`,
   `checks`, `repair`, `revision`, `candidate.pushed`, `review`, `publish`).
   Session fields include driver, provider, model, effort, profile fingerprint,
@@ -192,20 +190,14 @@ PLAN → implementation step → accepted step commit → …
 
 ## Durable checkpoints and resume (P29)
 
-`resume.py` defines `ResumePhase` (`initial_step`, `checks_c01`, `claude_c01`,
-`final_checks_c01`, `candidate_commit_c01`, `candidate_push_c01`,
-`reviewer_c01`, `repair_planner`, `scope_approval`, `repair_step`,
-`checks_c02`, `claude_c02`, `final_checks_c02`, `candidate_commit_c02`,
-`candidate_push_c02`, `reviewer_c02`, `publish`; with Claude, `checks_cxx` =
-pre-revision checks pending, `claude_cxx` = Claude next, `final_checks_cxx` =
-Claude durably done, final checks next; checkpoint trees are the Luna tree
-before Claude and the Claude record's `tree_after` after it) and
-`ResumeCheckpoint(phase, cycle, step_id,
-expected_head_sha, expected_tree_sha, execution_selection_sha256, plan_identity)`
-(plus the C02
-repair-bundle and scope-delta hashes once repair planning and scope validation
-succeed, since the C02 bundle has no human approval). `resume_checkpoint.json`
-is written atomically after
+`resume.py` defines `ResumePhase` for context, planning, implementation,
+deterministic gates, check repair, semantic revision, candidate push, final
+review, correction planning and publication. A checkpoint always names the
+next operation that has not succeeded and carries the exact expected HEAD and
+tree. `ResumeCheckpoint(phase, cycle, step_id, expected_head_sha,
+expected_tree_sha, execution_selection_sha256, plan_identity)` also carries
+correction-bundle and scope-delta hashes once correction planning and scope
+validation succeed. `resume_checkpoint.json` is written atomically after
 every durable transition and always names the next operation that has not
 yet succeeded; an operation is never marked complete before its artifacts
 are durable.
@@ -215,9 +207,9 @@ are durable.
 identity, execution selection hash, worktree, branch, HEAD, exact candidate
 tree, base SHA and scope before claiming the run with a compare-and-set state
 transition, then re-enters `_execute_v2` at the checkpoint. Nothing critical
-lives only in memory: step records, Claude revisions, evidence and accepted
+lives only in memory: step records, semantic revisions, evidence and accepted
 reviewer answers are read back from `steps/Sxx/step.json`,
-`revision/Cxx/report.json`, `evidence.json` and `review/Cxx/`, and their tree
+`semantic-revision/report.json`, `evidence.json` and `review/`, and their tree
 chain is verified. Durable pre-revision checks and final evidence for the
 exact current tree are reused, and a reviewer answer already accepted for
 that tree is re-parsed rather than requested again.
@@ -233,21 +225,21 @@ connection and external-ui model are reused. `LLMConversationHandle`
 returns one — the OpenAI-compatible bridge client does not, and MetaHarness
 never fabricates or scrapes one. When a handle exists it is persisted in
 `planner.conversation.json` purely as run history: no MetaHarness call
-consumes it, and the C02 repair planner is always a fresh completion. A
+consumes it, and each correction planner is always a fresh completion. A
 reviewer reporting the planner's handle is rejected as
 `REVIEWER_OUTPUT_INVALID`.
 
-## Compact C02 repair planning
+## Compact correction planning
 
-The pushed C01 candidate commit is the code authority for repair planning.
+The pushed candidate commit is the code authority for correction planning.
 The repair planner receives a compact index of the original plan — per step,
 its ID, title, dependency, objective, approved mutation scope, VERIFY and
-FORBIDDEN — never the full approved step contracts, and never the Luna
+FORBIDDEN — never the full approved step contracts, and never worker
 reports, token counters or tree SHAs. The full candidate diff is not inlined
 when Git remote exploration is available: the planner gets the BASE SHA, the
-C01 candidate SHA, the immutable candidate URL, the `BASE...CANDIDATE`
+CANDIDATE SHA, the immutable candidate URL, the `BASE...CANDIDATE`
 compare URL, the changed paths, the diff byte size and the diff SHA256, and
-inspects the immutable commit whenever it needs source-level evidence. C02
+inspects the immutable commit whenever it needs source-level evidence. A correction cycle
 always starts in a fresh conversation; it never continues the initial
 planner thread.
 
@@ -260,7 +252,7 @@ responses, does the request move its evidence into an attached
 status, a malformed 200, a parser failure or a network error never triggers
 the file mode. `candidate.diff` is attached to that third attempt only when
 remote exploration is unavailable; the full diff is never inline. Before any
-transport, `repair/C02/` durably records `planner.request.txt`,
+transport, `cycles/<number>/correction/` durably records `planner.request.txt`,
 `planner.request.fallback.txt`, `planner.evidence.md` and
 `planner.request.meta.json`, so a transport failure stays diagnosable. The
 attachment is a transport mode only: it carries data and grants no authority
@@ -268,8 +260,8 @@ over the META PLAN v2 protocol.
 
 Initial planning keeps the SINGLE vs STAGED decomposition thresholds:
 `planning.single_step_max_mutable_paths` decides when an initial task must be
-decomposed, and it is never relaxed. A bounded C02 repair step is instead
-bounded by `planning.staged_step_max_mutable_paths`, the maximum a single Luna
+decomposed, and it is never relaxed. A bounded correction step is instead
+bounded by `planning.staged_step_max_mutable_paths`, the maximum a single worker
 worker may already touch, for a SINGLE `S01` exactly as for a STAGED step. The
 repair request states that one number itself, and the bound is per step, never
 aggregate. An already produced repair planner raw response may be locally
@@ -308,51 +300,15 @@ apply atomically; production, generated, untracked and ambiguous paths are
 never added. Model output never decides the scope. Paths the first repair
 already earned are carried into later attempts and are never lost, never
 re-added, and never counted twice against the bound. Production paths remain
-the responsibility of the approved plan and reviewer/C02 process.
+the responsibility of the approved plan and reviewer/correction process.
 
-The `CHECK_REPAIR_EXPANDED_C0x` and `FINAL_CHECKS_RETRY_EXPANDED_C0x` phases
-are historically named "expanded"; they are compatibility names for bounded
-attempts whether or not an attempt expands the scope, and they are never renamed, because
-stored runs depend on those exact names. `state`, diagnostics and the run page
-report the attempt ordinal and `scope_expanded` separately, so a same-scope
-retry is no longer described as an expansion.
+Paths already earned by a repair remain cumulative authority for later attempts, and are never re-added or counted twice. The durable scope artifact is checked on every resume; a divergent or malformed artifact is a `RESUME_INTEGRITY_FAILURE`.
 
-`FINAL_CHECKS_RETRY_C01` and `FINAL_CHECKS_RETRY_C02` are resumable boundaries
-of their own, and the durable checkpoint — never `state.failure` — decides
-what still has to happen there. The normal check repair already succeeded at
-that boundary, so neither the implementer steps, nor the initial reviser pass,
-nor that repair is ever replayed. Three durable states are legitimate. With no
-retry bundle yet, those retry checks run exactly once on the checkpointed
-tree. With a red retry bundle for that tree, the bundle is already the
-complete result of a retry and is reused rather than re-earned — the same
-checks are never re-run before the decision. That red bundle is the authority
-the second-pass decision reads, so the resume can still reach
-`CHECK_REPAIR_EXPANDED_C0x`, with or without an expansion. With a green retry
-bundle for that tree, the resume reconciles straight into the next candidate
-boundary without replaying a completed check or model call. If
-`check-repair-expanded/C0x/scope.json` is already published, that durable
-scope outranks any recomputation: the reviser is never recalled with a scope
-different from the one already published for it, and a divergent or malformed
-artifact is a `RESUME_INTEGRITY_FAILURE`. The configured attempt budget is
-the only limit on further direct repairs.
-
-A validated expanded scope is **cumulative authority over the candidate
-tree**. The test path it added is part of every tree from that moment on, so
-it stays approved for every phase at or after its own — the repair planner,
-scope approval, all of C02, the commit and the publication. Applicability is
-decided from the canonical `ResumePhase` order and the existence of the
-durable `scope.json`, never from a list of downstream phase names: such a list
-silently forgets each phase added later, which is exactly how a reviewed C01
-candidate once became "unapproved" the moment the run left `REVIEWER_C01`. A
-run that never expanded gains nothing, each term is still validated strictly
-against the checkpoint tree, and the approved authority a resume enforces is
-exactly
+The complete authority is always the union of the original plan scope and each validated repair scope:
 
 ```
 original plan scope
-  ∪ durable valid C01 expanded scope
-  ∪ validated C02 repair scope
-  ∪ durable valid C02 expanded scope
+  ∪ each validated repair scope
 ```
 
 Any candidate path outside that union remains a `RESUME_INTEGRITY_FAILURE`.

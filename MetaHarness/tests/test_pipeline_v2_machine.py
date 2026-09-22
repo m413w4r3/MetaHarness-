@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from unittest import mock
 
 from metaharness.llm.chat import LLMError
@@ -24,6 +25,13 @@ STEP = ("S01", "feature.txt", "Write the feature")
 
 
 class SingleCycleTests(PipelineHarness):
+    def test_pipeline_v2_stays_backend_neutral(self) -> None:
+        source = Path(__file__).parents[1].joinpath(
+            "src", "metaharness", "orchestration", "pipeline_v2.py"
+        ).read_text(encoding="utf-8")
+        for forbidden in ("CodexAgent", "ClaudeCodeAgent", "C01", "C02"):
+            self.assertNotIn(forbidden, source)
+
     def test_green_pass_commits_the_accepted_step_as_the_candidate(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(
@@ -678,8 +686,8 @@ class GitChainAndTraceTests(PipelineHarness):
         original = self.orchestrator(
             self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
         )
-        with mock.patch.object(
-            type(original), "_accept_gate_state",
+        with mock.patch(
+            "metaharness.orchestration.check_repair.GateAcceptanceService.accept",
             side_effect=RuntimeError("crash after green evidence"),
         ):
             failed = original.run_text(SPEC, run_id="run")

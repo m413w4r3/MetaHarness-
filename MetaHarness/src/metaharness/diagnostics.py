@@ -23,11 +23,13 @@ from .redaction import config_secret_values, redact
 from .result import atomic_write_text
 from .resume import ResumeCheckpointError, resume_info, read_checkpoint_record
 from .orchestration.pipeline_v2 import (
+    check_repair_root,
     correction_dir,
     cycle_dir,
-    implementation_dir,
+    implementation_steps_dir,
     review_dir,
     semantic_revision_dir,
+    step_dir,
 )
 from .run_options import (
     RunOptionsError,
@@ -480,7 +482,8 @@ def _prompt_footprint(run_dir: Path) -> str:
     for cycle_path in _cycle_dirs(run_dir):
         relative = cycle_path.relative_to(run_dir).as_posix()
         add(f"{relative}/correction/planner.request.txt", f"{relative}/correction/planner.usage.json")
-        steps_root = cycle_path / "implementation" / "steps"
+        cycle_number = int(cycle_path.name)
+        steps_root = implementation_steps_dir(run_dir, cycle_number)
         try:
             step_dirs = sorted(
                 path for path in steps_root.iterdir()
@@ -492,7 +495,7 @@ def _prompt_footprint(run_dir: Path) -> str:
             step = f"{relative}/implementation/steps/{step_dir.name}"
             add(f"{step}/agent.prompt.txt", f"{step}/step.json", nested_usage=True)
         add(f"{relative}/semantic-revision/agent.prompt.txt", f"{relative}/semantic-revision/usage.json")
-        for attempt in sorted((cycle_path / "check-repair").glob("*/attempts/[0-9][0-9][0-9]")):
+        for attempt in sorted(check_repair_root(run_dir, cycle_number).glob("*/attempts/[0-9][0-9][0-9]")):
             attempt_relative = attempt.relative_to(run_dir).as_posix()
             add(f"{attempt_relative}/agent.prompt.txt", f"{attempt_relative}/usage.json")
         add(f"{relative}/review/reviewer.request.txt", f"{relative}/review/reviewer.usage.json")
@@ -606,7 +609,7 @@ def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
             _artifact_json(run_dir, f"{correction}/scope_approval.json", secrets),
         ])
     parts.append(_section("Plan", plan_body))
-    steps_root = implementation_dir(run_dir, cycle) / "steps"
+    steps_root = implementation_steps_dir(run_dir, cycle)
     try:
         step_ids = sorted(path.name for path in steps_root.iterdir() if path.is_dir() and is_step_id(path.name))
     except OSError:
@@ -652,7 +655,7 @@ def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
             "Diff artifact metadata (diff omitted from consolidated diagnostics):",
             _artifact_header(_artifact(run_dir, f"{gate_relative}/diff.patch")),
         ])))
-        stage_repairs = cycle_dir(run_dir, cycle) / "check-repair" / gate.name
+        stage_repairs = check_repair_root(run_dir, cycle) / gate.name
         for attempt in sorted((stage_repairs / "attempts").glob("[0-9][0-9][0-9]")):
             attempt_relative = attempt.relative_to(run_dir).as_posix()
             parts.append(_section(f"CHECK REPAIR {cycle:03d} {gate.name} ATTEMPT {attempt.name}", "\n".join([

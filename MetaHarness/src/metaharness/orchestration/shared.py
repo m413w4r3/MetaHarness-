@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Mapping,
 )
 from ..evidence import EvidenceBundle
@@ -34,6 +35,9 @@ from ..result import (
     ResultArtifactError,
     atomic_write_text,
 )
+from ..models import RunStatus, RunCycle
+from ..resume import ResumeIntegrityError
+from .pipeline_v2 import cycle_record_path
 from ..validation import check_result_json
 from ..agent.diagnostics import TOKEN_DIAGNOSTICS_NAME
 
@@ -50,6 +54,43 @@ class ScopeApprovalRequired(OrchestrationError):
     """A scope expansion is durably paused until its exact delta is approved."""
 
     code = "WAITING_SCOPE_APPROVAL"
+
+
+@dataclasses.dataclass(frozen=True)
+class CycleArtifactService:
+    """Own the durable identity and state boundary of one pipeline cycle."""
+
+    cycle_update: Callable[..., None]
+    trace_emit: Callable[..., None]
+    set_trace_cycle: Callable[[int], None]
+
+    def begin(self, store: Any, ctx: Any, cycle: RunCycle, fresh: bool) -> None:
+        self.set_trace_cycle(cycle.number)
+        path = cycle_record_path(ctx.run_dir, cycle)
+        record = _json_text({
+            "schema_version": 1,
+            "number": cycle.number,
+            "kind": cycle.kind.value,
+        })
+        if path.exists():
+            if path.read_text(encoding="utf-8") != record:
+                raise ResumeIntegrityError(f"cycle {cycle.number:03d} record diverges")
+        else:
+            atomic_write_text(path, record)
+        state = store.load()
+        store.update(status=state.get("status", RunStatus.IMPLEMENTING), cycle=cycle.number)
+        self.cycle_update(store, cycle, status="running")
+        if fresh and cycle.number > 1:
+            store.update(
+                status=RunStatus.PLANNING,
+                git_ownership=_git_ownership_payload(
+                    _git_ownership(ctx.repo, ctx.info.worktree)
+                ),
+            )
+            self.trace_emit(
+                "cycle.started", phase="cycle", cycle=cycle.number,
+                data={"kind": cycle.kind.value}, once=True,
+            )
 
 
 _COMMIT_SUBJECT_LIMIT = 72

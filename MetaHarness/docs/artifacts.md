@@ -26,8 +26,8 @@ interrupted worktrees are intentionally retained for inspection.
 | `reviewer.request.txt` | Exact reviewer user message (written before the call) |
 | `reviewer.raw.md` / `review.json` | Raw review (written before parsing) and normalized verdict |
 | `repair_task.md` / `repair_task.json` | REVISE only: route, summary, findings, required fixes, missing tests, branch, worktree, run id |
-| `repair/C02/scope_delta.json` | Versioned deterministic scope delta: original/requested mutation paths, added/unchanged paths, reasons/findings, C01 SHA, repair-plan and bundle hashes |
-| `repair/C02/scope_approval.json` | Optional exclusive approval/rejection bound to the exact scope-delta SHA-256 |
+| `cycles/<number>/correction/scope_delta.json` | Versioned deterministic scope delta: original/requested mutation paths, added/unchanged paths, reasons/findings, candidate SHA, repair-plan and bundle hashes |
+| `cycles/<number>/correction/scope_approval.json` | Optional exclusive approval/rejection bound to the exact scope-delta SHA-256 |
 | `publish.json` | Successful publication: remote name, run branch, commit SHA, optional safe GitHub branch URL |
 | `state.json` | Atomic run state and status transitions |
 | `state.lock` | Internal `flock` file serializing every state write; never served |
@@ -36,8 +36,8 @@ interrupted worktrees are intentionally retained for inspection.
 | `steps/Sxx/contract.md` | v2 only: the single authoritative step contract, written at planning, approved and executed byte-for-byte |
 | `steps/Sxx/agent.*` / `steps/Sxx/step.json` | v2 only: per-step Codex prompt, events, report, trees, changed paths and usage |
 | `steps/Sxx/token_diagnostics.json` | v2 only: input/cached/output/reasoning tokens, event and tool-call counts, at most 100 repository paths read (structured event fields only) and at most 100 command program names — never arguments |
-| `resume_checkpoint.json` | The next operation that has not yet succeeded, including C02 bundle and scope-delta hashes; `scope_approval` resumes only against the same exact delta |
-| `revision/Cxx/tree_after_failure.txt` | Tree left by a failed Claude attempt; lets a resume restore `tree_before.txt` exactly (in-scope paths only) |
+| `resume_checkpoint.json` | The next operation that has not yet succeeded, including correction bundle and scope-delta hashes; `scope_approval` resumes only against the same exact delta |
+| `cycles/<number>/semantic-revision/tree_after_failure.txt` | Tree left by a failed revision attempt; lets a resume restore `tree_before.txt` exactly (in-scope paths only) |
 | `steps/Sxx/attempts/NN/`, `revision/Cxx/attempts/NN/` | Artifacts of a failed attempt, moved aside before a resumed retry of the same operation |
 | `planner.conversation.json` | Only when the driver officially returned a planner conversation handle (never simulated) |
 | `planner_recovery.json` | Operator plan recovery: `schema_version`, `source: operator`, `previous_raw_sha256`, `replacement_raw_sha256`, `recovered_at`, `archived_attempt`, `planner_called: false`. Its presence means the current plan is an operator replacement, not a planner completion |

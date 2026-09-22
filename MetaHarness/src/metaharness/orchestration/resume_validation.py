@@ -22,13 +22,14 @@ from .check_repair import _hard_failure_items, _read_check_repair_scope
 from .pipeline_v2 import (
     candidate_dir,
     check_repair_attempt_dir,
+    check_repair_root,
     correction_dir,
     cycle_record_path,
     gate_acceptance_path,
     gate_dir,
-    implementation_dir,
     review_dir,
     semantic_revision_dir,
+    step_dir,
     final_gate_stage,
     pre_semantic_gate_stage,
 )
@@ -279,7 +280,7 @@ def completed_step_records(
 
     records: list[dict[str, Any]] = []
     for step_id in step_ids:
-        record = _load_completed_step(implementation_dir(run_dir, cycle) / "steps" / step_id, step_id)
+        record = _load_completed_step(step_dir(run_dir, cycle, step_id), step_id)
         if record is None:
             break
         records.append(record)
@@ -503,7 +504,7 @@ def _approved_scope(
         cycle_scopes[number] = sorted(_plan_scope(correction))
         scope |= _plan_scope(correction)
     for number, base in cycle_scopes.items():
-        root = Path(run_dir) / "cycles" / f"{number:03d}" / "check-repair"
+        root = check_repair_root(run_dir, number)
         for scope_file in sorted(root.glob("*/attempts/*/scope.json")):
             attempt = _read_check_repair_scope(
                 scope_file.parent, fallback_base=base, policy_config=policy,
@@ -528,7 +529,7 @@ def _failure_tree_for(
             except ResumeIntegrityError:
                 return None
         record = _read_json_artifact(
-            implementation_dir(run_dir, number) / "steps" / str(checkpoint.step_id) / "step.json",
+            step_dir(run_dir, number, str(checkpoint.step_id)) / "step.json",
             128 * 1024,
         )
         if isinstance(record, dict) and record.get("status") == "FAILED" and _is_object_id(record.get("tree_after")):
