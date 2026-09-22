@@ -138,7 +138,7 @@ class ApprovalTests(unittest.TestCase):
                          ["lint", "test", "integration"])
         required_ids, frozen = read_check_authority(directory)
         self.assertEqual(required_ids, ("lint", "test"))
-        # The catalogue keeps the check C01 did not select, with its argv.
+        # The catalogue keeps the check the plan did not select, with its argv.
         self.assertEqual([check.id for check in frozen], ["lint", "test", "integration"])
         self.assertEqual(frozen[2].argv, ("make", "integration"))
         # Republishing the identical bytes stays idempotent; different bytes do not.
