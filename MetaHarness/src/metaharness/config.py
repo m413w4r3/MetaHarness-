@@ -22,6 +22,7 @@ from .models import (
     EnvironmentConfig,
     ExecutionModePolicy,
     ExecutionRole,
+    GitHubConfig,
     HarnessConfig,
     LLMEndpointConfig,
     ModelProfile,
@@ -842,6 +843,29 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         web_url=_repository_web_url(repository_data),
     )
 
+    github_data = _table(expanded, "github")
+    github_enabled = _bool(github_data, "enabled", False, "github")
+    issue_mode = github_data.get("issue_mode", "off")
+    if not isinstance(issue_mode, str) or issue_mode not in {"off", "link-existing", "create"}:
+        raise ConfigError("github.issue_mode must be 'off', 'link-existing', or 'create'")
+    pull_request_mode = github_data.get("pull_request_mode", "off")
+    if not isinstance(pull_request_mode, str) or pull_request_mode not in {"off", "create"}:
+        raise ConfigError("github.pull_request_mode must be 'off' or 'create'")
+    issue_number = github_data.get("issue_number")
+    if issue_number is not None and (
+        isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0
+    ):
+        raise ConfigError("github.issue_number must be a positive integer or null")
+    if github_enabled and issue_mode == "link-existing" and issue_number is None:
+        raise ConfigError("github.issue_number is required for github.issue_mode = 'link-existing'")
+    github = GitHubConfig(
+        enabled=github_enabled,
+        issue_mode=issue_mode,
+        pull_request_mode=pull_request_mode,
+        issue_number=issue_number,
+        api_key_env=_optional_env_name(github_data, "api_key_env", None, "github"),
+    )
+
     publish_data = _table(expanded, "publish")
     publish_remote = (
         _required_string(publish_data, "remote", "publish")
@@ -863,6 +887,15 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         remote=publish_remote,
         mode=publish_mode,
     )
+    if (
+        github.enabled
+        and github.pull_request_mode == "create"
+        and publish.enabled
+        and publish.mode != PublishMode.RUN_BRANCH.value
+    ):
+        raise ConfigError(
+            "github.pull_request_mode = 'create' requires publish.mode = 'run-branch'"
+        )
 
     agent_data = _table(expanded, "agent")
     provider = agent_data.get("provider", "codex")
@@ -1161,6 +1194,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         revision=revision,
         prompt_budget=prompt_budget,
         repository=repository,
+        github=github,
         publish=publish,
         repository_section_explicit="repository" in expanded,
     )

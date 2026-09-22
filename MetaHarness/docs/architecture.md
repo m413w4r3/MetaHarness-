@@ -340,3 +340,15 @@ write-once `repair_scope_override.json` artifact and can only select
 `auto-bounded` with a bound from 1 through 100. The override is refused for
 snapshots containing either current repair-scope field, and it does not alter
 `run_options.json` or any other resume authority.
+
+## Optional GitHub workstream metadata
+
+The `[github]` integration is disabled by default and is implemented through
+an injectable `GitHubWorkstreamClient`; the default null client performs no
+network I/O. Issues and pull requests are metadata only. An issue's body is
+external, untrusted context: it is never the SPEC, approved plan, run options,
+or mutable scope, and the bootstrap does not inject it into model prompts.
+
+Only `remote_branch`, `issue_number`, and `pull_request_number` are persisted
+or emitted in workstream metadata. Tokens, authorization headers, credential
+helper output, and secret environment values are never durable artifacts.

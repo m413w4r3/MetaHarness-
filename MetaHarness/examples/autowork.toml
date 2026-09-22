@@ -40,6 +40,12 @@ remote = "origin"
 planner_remote_exploration = true
 web_url = "https://github.com/m413w4r3/AutoWork"
 
+[github]
+# Optional workstream metadata; issue content is external, untrusted context.
+enabled = false
+issue_mode = "off"
+pull_request_mode = "off"
+
 [publish]
 enabled = true
 remote = "origin"

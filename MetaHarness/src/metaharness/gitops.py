@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -62,8 +63,39 @@ class RunBranchCleanupResult:
 
 
 _RUN_BRANCH = re.compile(
-    r"harness/[A-Za-z0-9][A-Za-z0-9_.-]{0,59}/[A-Za-z0-9][A-Za-z0-9_.-]*\Z"
+    r"harness/[A-Za-z0-9][A-Za-z0-9_.-]{0,59}/[A-Za-z0-9][A-Za-z0-9_.-]{0,59}\Z"
 )
+
+
+def build_run_branch(plan_slug: str, run_id: str) -> str:
+    """Build the bounded MetaHarness branch name for one run.
+
+    The plan slug is reduced to a conservative Git ref component and the
+    trusted run id is kept as the uniqueness component.  A long run id gets a
+    deterministic digest suffix so the resulting ref remains bounded.
+    """
+
+    if not isinstance(plan_slug, str) or not plan_slug.strip():
+        raise GitError("plan slug must be a non-empty string")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise GitError("run id must be a non-empty string")
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", plan_slug.casefold()).strip("-")
+    slug = slug[:60] or "task"
+    raw_run_id = run_id.strip()
+    component = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_run_id).strip(".-")
+    if not component:
+        component = "run"
+    if (
+        len(component) > 60
+        or component != raw_run_id
+        or component in {".", ".."}
+        or component.endswith(".lock")
+    ):
+        digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
+        component = f"{component[:47].rstrip('.-')}-{digest}"
+        component = component.lstrip(".-") or f"run-{digest}"
+    branch = f"harness/{slug}/{component}"
+    return validate_run_branch(branch)
 
 
 def validate_run_branch(branch: str, *, base_ref: str | None = None) -> str:

@@ -1,5 +1,6 @@
 """Modèles de données de configuration et de contrôle."""
 
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -238,6 +239,61 @@ class RepositoryConfig:
     remote: str = "origin"
     planner_remote_exploration: bool = True
     web_url: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkstreamRef:
+    """Stable references that identify one MetaHarness workstream.
+
+    This is deliberately smaller than the durable Git state.  It is useful at
+    integration boundaries (for example GitHub) without becoming a second
+    state representation.
+    """
+
+    run_id: str
+    base_ref: str
+    base_sha: str
+    local_branch: str
+    worktree: str
+    remote_branch: str | None = None
+    issue_number: int | None = None
+    pull_request_number: int | None = None
+
+
+@dataclass(frozen=True)
+class GitHubConfig:
+    """Optional, credential-free configuration for workstream metadata."""
+
+    enabled: bool = False
+    issue_mode: str = "off"
+    pull_request_mode: str = "off"
+    issue_number: int | None = None
+    # This is only an environment-variable name.  The value is never part of
+    # config serialization, run options, state, trace, or diagnostics.
+    api_key_env: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("github.enabled must be a boolean")
+        if not isinstance(self.issue_mode, str) or self.issue_mode not in {
+            "off", "link-existing", "create"
+        }:
+            raise ValueError("github.issue_mode is invalid")
+        if not isinstance(self.pull_request_mode, str) or self.pull_request_mode not in {
+            "off", "create"
+        }:
+            raise ValueError("github.pull_request_mode is invalid")
+        if self.issue_number is not None and (
+            isinstance(self.issue_number, bool)
+            or not isinstance(self.issue_number, int)
+            or self.issue_number <= 0
+        ):
+            raise ValueError("github.issue_number must be a positive integer or null")
+        if self.api_key_env is not None and (
+            not isinstance(self.api_key_env, str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.api_key_env)
+        ):
+            raise ValueError("github.api_key_env must be an environment variable name or null")
 
 
 class ExecutionModePolicy(StrEnum):
@@ -497,6 +553,7 @@ class HarnessConfig:
     revision: RevisionConfig = field(default_factory=RevisionConfig)
     prompt_budget: PromptBudgetConfig = field(default_factory=PromptBudgetConfig)
     repository: RepositoryConfig = field(default_factory=RepositoryConfig)
+    github: GitHubConfig = field(default_factory=GitHubConfig)
     publish: PublishConfig = field(default_factory=PublishConfig)
     # Compatibility marker for programmatic legacy configurations that do not
     # have a repository TOML section yet.

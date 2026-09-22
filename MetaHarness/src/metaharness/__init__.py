@@ -51,6 +51,7 @@ from .commit_gate import (
     validate_commit_safety,
 )
 from .gitops import (
+    build_run_branch,
     commit_candidate_tree,
     commit_repair_tree,
     commit_revision_tree,
@@ -71,6 +72,7 @@ from .models import (
     ExecutionMode,
     ExecutionSelectionV5,
     ExecutionSelectionV3,
+    GitHubConfig,
     HarnessConfig,
     ImplementationStep,
     LLMEndpointConfig,
@@ -86,6 +88,7 @@ from .models import (
     RunCycle,
     TaskPlanV2,
     WorkspaceSetupCommand,
+    WorkstreamRef,
     SelectedProfile,
     StepExecutionSelection,
 )
@@ -107,6 +110,14 @@ from .prompt_contracts import (
     build_semantic_revision_payload,
 )
 from .orchestrator import Orchestrator, run_orchestrator
+from .integrations.github import (
+    GitHubIntegrationError,
+    GitHubIssue,
+    GitHubPullRequest,
+    GitHubWorkstreamClient,
+    GitHubWorkstreamError,
+    NullGitHubWorkstreamClient,
+)
 from .orchestration.check_repair import CheckRepairAttempt, CheckRepairResult
 from .review import Reviewer, ReviewParseError, ReviewResult, parse_review
 from .result import RunResult
@@ -147,6 +158,12 @@ __all__ = [
     "ContextBundle",
     "ContextConfig",
     "EnvironmentConfig",
+    "GitHubConfig",
+    "GitHubIntegrationError",
+    "GitHubIssue",
+    "GitHubPullRequest",
+    "GitHubWorkstreamClient",
+    "GitHubWorkstreamError",
     "ExecutionMode",
     "ExecutionSelectionV5",
     "ExecutionSelectionV3",
@@ -180,6 +197,8 @@ __all__ = [
     "RunCycle",
     "TaskPlanV2",
     "WorkspaceSetupCommand",
+    "WorkstreamRef",
+    "NullGitHubWorkstreamClient",
     "SelectedProfile",
     "StepExecutionSelection",
     "WorkspaceSetupError",
@@ -202,6 +221,7 @@ __all__ = [
     "unresolved_deferred_verifications",
     "validate_commit_safety",
     "commit_tree",
+    "build_run_branch",
     "commit_candidate_tree",
     "commit_step_tree",
     "commit_repair_tree",

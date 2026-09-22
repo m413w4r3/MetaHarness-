@@ -100,6 +100,7 @@ from .gitops import (
     index_tree_sha,
     local_branches,
     build_repository_reference,
+    build_run_branch,
     immutable_commit_web_url,
     compare_commits_web_url,
     render_repository_reference,
@@ -128,6 +129,12 @@ from .commit_gate import (
     parse_deferred_verification,
 )
 from .llm.chat import LLMConversationHandle, LLMError, OpenAIChatTextClient
+from .integrations.github import (
+    GitHubIntegrationError,
+    GitHubWorkstreamError,
+    GitHubWorkstreamClient,
+    NullGitHubWorkstreamClient,
+)
 from .recommendation import (
     ExecutionRecommender,
     RecommendationError,
@@ -166,6 +173,7 @@ from .models import (
     ReviewVerdict,
     RunCycle,
     RunStatus,
+    WorkstreamRef,
     profile_driver_name,
 )
 from .planning import (
@@ -320,7 +328,6 @@ from .orchestration.shared import (  # noqa: F401  (facade re-exports)
     _safe_index_tree,
     _safe_path_label,
     _safe_status,
-    _slug,
     _status_has_unstaged_or_untracked,
     _step_result_record,
 )
@@ -870,6 +877,7 @@ class Orchestrator:
         recommender_client: Any | None = None,
         agent: Any | None = None,
         reviser: Any | None = None,
+        github_client: GitHubWorkstreamClient | None = None,
         trace_sink: TraceSink | None = None,
     ) -> None:
         if not isinstance(config, HarnessConfig):
@@ -880,6 +888,9 @@ class Orchestrator:
         self._recommender_client = recommender_client
         self._injected_agent = agent
         self._injected_reviser = reviser
+        self._github_client = (
+            github_client if github_client is not None else NullGitHubWorkstreamClient()
+        )
         # The local JSONL sink is always created per run.  This optional sink
         # is an observation-only extension point (for example Nimbalyst).
         self._trace_sink = trace_sink
@@ -989,6 +1000,205 @@ class Orchestrator:
             if getattr(selected, "profile_id", None) == profile_id:
                 return selected
         return None
+
+    @staticmethod
+    def _github_result_number(value: Any, kind: str) -> int:
+        """Extract only the public numeric identifier from an integration result."""
+
+        number = value if isinstance(value, int) and not isinstance(value, bool) else None
+        if number is None and isinstance(value, Mapping):
+            candidate = value.get("number")
+            number = candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else None
+        if number is None:
+            candidate = getattr(value, "number", None)
+            number = candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else None
+        if number is None or number <= 0:
+            raise GitHubWorkstreamError(f"GitHub {kind} response did not contain a valid number")
+        return number
+
+    @staticmethod
+    def _github_issue_title(plan_title: str, run_id: str) -> str:
+        first_line = next((line.strip() for line in plan_title.splitlines() if line.strip()), "MetaHarness run")
+        title = f"MetaHarness: {first_line} ({run_id})"
+        return title[:240]
+
+    @staticmethod
+    def _github_metadata_payload(state: Mapping[str, Any]) -> dict[str, int | str]:
+        payload: dict[str, int | str] = {}
+        for key in ("remote_branch", "issue_number", "pull_request_number"):
+            value = state.get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                payload[key] = value
+        return payload
+
+    def _workstream_ref(
+        self, store: RunStateStore, run_id: str, info: WorktreeInfo,
+    ) -> WorkstreamRef:
+        state = store.load()
+        return WorkstreamRef(
+            run_id=run_id,
+            base_ref=self.config.base_ref,
+            base_sha=info.base_sha,
+            local_branch=info.branch,
+            worktree=str(info.worktree),
+            remote_branch=(state.get("remote_branch") if isinstance(state.get("remote_branch"), str) else None),
+            issue_number=(state.get("issue_number") if isinstance(state.get("issue_number"), int) else None),
+            pull_request_number=(
+                state.get("pull_request_number")
+                if isinstance(state.get("pull_request_number"), int) else None
+            ),
+        )
+
+    def _ensure_github_issue_metadata(
+        self,
+        *,
+        store: RunStateStore,
+        run_id: str,
+        plan_title: str,
+        info: WorktreeInfo,
+    ) -> None:
+        """Resolve optional issue metadata without reading issue content into authority."""
+
+        github = self.config.github
+        if not github.enabled or github.issue_mode == "off":
+            return
+        state = store.load()
+        current = state.get("issue_number")
+        if isinstance(current, int) and not isinstance(current, bool) and current > 0:
+            if github.issue_mode == "link-existing" and github.issue_number not in {None, current}:
+                raise GitHubWorkstreamError(
+                    "configured GitHub issue does not match the persisted workstream issue",
+                    code="GITHUB_CONFIG_INVALID",
+                )
+            return
+        if github.issue_mode == "link-existing":
+            requested = github.issue_number
+            if requested is None:
+                raise GitHubWorkstreamError(
+                    "github.issue_number is required for link-existing",
+                    code="GITHUB_CONFIG_INVALID",
+                )
+            try:
+                issue = self._github_client.read_issue(requested)
+            except Exception:
+                raise GitHubWorkstreamError("GitHub issue operation failed") from None
+            if issue is None:
+                raise GitHubWorkstreamError(
+                    "requested GitHub issue was not found",
+                    code="GITHUB_ISSUE_NOT_FOUND",
+                )
+            number = self._github_result_number(issue, "issue")
+            if number != requested:
+                raise GitHubWorkstreamError(
+                    "GitHub issue response did not match the requested issue",
+                    code="GITHUB_ISSUE_NOT_FOUND",
+                )
+            event = "workstream.issue.linked"
+        else:
+            title = self._github_issue_title(plan_title, run_id)
+            body = (
+                "MetaHarness workstream metadata.\n\n"
+                f"Run ID: {run_id}\n"
+                f"Branch: {info.branch}\n"
+                f"Base ref: {self.config.base_ref}\n"
+            )
+            try:
+                issue = self._github_client.create_issue(title, body)
+            except Exception:
+                raise GitHubWorkstreamError("GitHub issue operation failed") from None
+            number = self._github_result_number(issue, "issue")
+            event = "workstream.issue.created"
+
+        state = store.update(status=state.get("status", RunStatus.CREATED), issue_number=number)
+        self._trace_emit(
+            event,
+            phase="setup",
+            cycle=1,
+            data={"issue_number": number},
+            once=True,
+        )
+        self._trace_emit(
+            "workstream.metadata",
+            phase="setup",
+            cycle=1,
+            data=self._github_metadata_payload(state),
+        )
+
+    def _ensure_github_pull_request_metadata(
+        self,
+        *,
+        store: RunStateStore,
+        run_id: str,
+        info: WorktreeInfo,
+        commit_sha: str,
+        cycle: int | None,
+    ) -> None:
+        """Create the requested PR from the exact reviewed run branch."""
+
+        github = self.config.github
+        if not github.enabled or github.pull_request_mode == "off":
+            return
+        state = store.load()
+        current = state.get("pull_request_number")
+        if isinstance(current, int) and not isinstance(current, bool) and current > 0:
+            return
+        if not self.config.publish.enabled or self.config.publish.mode != PublishMode.RUN_BRANCH.value:
+            raise GitHubWorkstreamError(
+                "GitHub pull-request creation requires a published run branch",
+                code="GITHUB_PR_REQUIRES_RUN_BRANCH",
+            )
+        plan_state = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
+        plan_title = plan_state.get("title") if isinstance(plan_state.get("title"), str) else "MetaHarness run"
+        title = self._github_issue_title(plan_title, run_id)
+        body = (
+            "MetaHarness reviewed workstream metadata.\n\n"
+            f"Run ID: {run_id}\n"
+            f"Reviewed commit: {commit_sha}\n"
+            f"Head branch: {info.branch}\n"
+            f"Base branch: {self.config.base_ref}\n"
+        )
+        try:
+            pull_request = self._github_client.create_pull_request(
+                title, body, self.config.base_ref, info.branch
+            )
+        except Exception:
+            raise GitHubWorkstreamError("GitHub pull-request operation failed") from None
+        number = self._github_result_number(pull_request, "pull request")
+
+        state = store.update(
+            status=state.get("status", RunStatus.CREATED),
+            remote_branch=info.branch,
+            pull_request_number=number,
+        )
+        self._trace_emit(
+            "workstream.pull_request.created",
+            phase="publication",
+            cycle=cycle,
+            data={
+                "remote_branch": info.branch,
+                "pull_request_number": number,
+            },
+            once=True,
+        )
+        self._trace_emit(
+            "workstream.metadata",
+            phase="publication",
+            cycle=cycle,
+            data=self._github_metadata_payload(state),
+        )
+
+    def _validate_github_publication_mode(self) -> None:
+        github = self.config.github
+        if (
+            github.enabled
+            and github.pull_request_mode == "create"
+            and self.config.publish.enabled
+            and self.config.publish.mode != PublishMode.RUN_BRANCH.value
+        ):
+            raise GitHubWorkstreamError(
+                "GitHub pull-request creation requires a published run branch",
+                code="GITHUB_PR_REQUIRES_RUN_BRANCH",
+            )
 
     def _trace_session(
         self,
@@ -1907,7 +2117,7 @@ class Orchestrator:
             once=True,
         )
 
-        branch = f"harness/{_slug(plan.title)}/{run_id}"
+        branch = build_run_branch(plan.title, run_id)
         worktree_path = self.config.worktrees_root / run_id
         info = create_run_worktree(
             repo,
@@ -1922,6 +2132,9 @@ class Orchestrator:
             branch=info.branch,
             worktree=str(info.worktree),
             base_sha=info.base_sha,
+        )
+        self._ensure_github_issue_metadata(
+            store=store, run_id=run_id, plan_title=plan.title, info=info,
         )
         self._trace_emit(
             "worktree.created",
@@ -2708,7 +2921,7 @@ class Orchestrator:
         if checkpoint is not None:
             write_checkpoint(run_dir, checkpoint)
 
-        branch = f"harness/{_slug(plan.title)}/{run_id}"
+        branch = build_run_branch(plan.title, run_id)
         if existing_info is None:
             info = create_run_worktree(
                 repo, base_ref=base_sha, branch=branch,
@@ -2719,6 +2932,9 @@ class Orchestrator:
             info = existing_info
         store.update(status=RunStatus.WORKTREE_READY, branch=info.branch,
                      worktree=str(info.worktree), base_sha=info.base_sha)
+        self._ensure_github_issue_metadata(
+            store=store, run_id=run_id, plan_title=plan.title, info=info,
+        )
         self._trace_emit(
             "worktree.created",
             phase="setup",
@@ -7987,6 +8203,7 @@ class Orchestrator:
     ) -> RunResult:
         """Publish an already pushed candidate, only after reviewer PASS."""
 
+        self._validate_github_publication_mode()
         fields: dict[str, Any] = {"commit_sha": commit_sha, "current_step": None}
         if cycle is not None:
             fields["cycle"] = cycle
@@ -8066,6 +8283,13 @@ class Orchestrator:
             once=True,
         )
         if not self.config.publish.enabled:
+            self._ensure_github_pull_request_metadata(
+                store=store,
+                run_id=str(store.load().get("run_id", "")),
+                info=info,
+                commit_sha=commit_sha,
+                cycle=cycle,
+            )
             state = store.update(status=RunStatus.COMMITTED, **fields)
             mark_checkpoint_completed(run_dir)
             self._trace_emit(
@@ -8147,8 +8371,21 @@ class Orchestrator:
         except (GitError, OSError, ValueError):
             state = store.record_failure("PUSH_FAILED", "publication did not complete", **fields)
             return RunResult(run_dir, RunStatus.FAILED, state)
+        self._ensure_github_pull_request_metadata(
+            store=store,
+            run_id=str(store.load().get("run_id", "")),
+            info=info,
+            commit_sha=commit_sha,
+            cycle=cycle,
+        )
         atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
-        state = store.update(status=RunStatus.PUBLISHED, publish=publish_payload, **fields)
+        metadata_fields = {"remote_branch": info.branch} if self.config.github.enabled else {}
+        state = store.update(
+            status=RunStatus.PUBLISHED,
+            publish=publish_payload,
+            **metadata_fields,
+            **fields,
+        )
         mark_checkpoint_completed(run_dir)
         self._trace_emit(
             "publish.completed",
@@ -8191,6 +8428,7 @@ class Orchestrator:
         base branch: they only ever touched the isolated run worktree.
         """
 
+        self._validate_github_publication_mode()
         fields: dict[str, Any] = {"commit_sha": commit_sha, "current_step": None}
         if cycle is not None:
             fields["cycle"] = cycle
@@ -8257,6 +8495,13 @@ class Orchestrator:
             once=True,
         )
         if not self.config.publish.enabled:
+            self._ensure_github_pull_request_metadata(
+                store=store,
+                run_id=str(store.load().get("run_id", "")),
+                info=info,
+                commit_sha=commit_sha,
+                cycle=cycle,
+            )
             state = store.update(status=RunStatus.COMMITTED, **fields)
             mark_checkpoint_completed(run_dir)
             self._trace_emit(
@@ -8385,6 +8630,13 @@ class Orchestrator:
                 "web_url": web_url,
                 "status": "pushed",
             }
+        self._ensure_github_pull_request_metadata(
+            store=store,
+            run_id=str(store.load().get("run_id", "")),
+            info=info,
+            commit_sha=commit_sha,
+            cycle=cycle,
+        )
         atomic_write_text(
             run_dir / "publish.json",
             _json_text(publish_payload),
@@ -8392,6 +8644,7 @@ class Orchestrator:
         state = store.update(
             status=RunStatus.PUBLISHED,
             publish=publish_payload,
+            **({"remote_branch": info.branch} if self.config.github.enabled else {}),
             **fields,
         )
         mark_checkpoint_completed(run_dir)
@@ -9059,7 +9312,7 @@ class Orchestrator:
     ) -> WorktreeInfo | None:
         """Return only an exactly recognizable partial setup; never delete/repair it."""
 
-        expected_branch = f"harness/{_slug(plan.title)}/{run_id}"
+        expected_branch = build_run_branch(plan.title, run_id)
         raw_path = None
         try:
             raw_state = _read_json_artifact(run_dir / "state.json", 256 * 1024)
@@ -11157,6 +11410,8 @@ def _failure_reason(exc: Exception) -> str:
         return "CHECK_SETUP_INVALID"
     if isinstance(exc, WorkspaceSetupError):
         return exc.code
+    if isinstance(exc, GitHubIntegrationError):
+        return getattr(exc, "code", "GITHUB_WORKSTREAM_FAILURE")
     return exc.__class__.__name__.upper()
 
 
