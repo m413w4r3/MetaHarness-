@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import unittest
 from dataclasses import replace
@@ -417,6 +418,28 @@ class ReviewCorrectionCycleTests(PipelineHarness):
         self.assertEqual(len(self.planner.requests), 2)
         self.assertEqual(len(self.reviewer.requests), 4)
         self.assertEqual(self.state()["cycle"], 4)
+        expected_routes = {
+            2: ("IMPLEMENTATION", "review-implementation"),
+            3: ("REPLAN", "review-replan"),
+            4: ("IMPLEMENTATION", "review-implementation"),
+        }
+        for number, (route, kind) in expected_routes.items():
+            record = json.loads(
+                (self.run_dir() / f"cycles/{number:03d}/cycle.json").read_text()
+            )
+            self.assertEqual(record["schema_version"], 2)
+            self.assertEqual(record["source_review_cycle"], number - 1)
+            self.assertEqual(record["source_route"], route)
+            self.assertEqual(record["kind"], kind)
+            review_path = self.run_dir() / f"cycles/{number - 1:03d}/review/review.json"
+            self.assertEqual(
+                record["source_review_sha256"],
+                hashlib.sha256(review_path.read_bytes()).hexdigest(),
+            )
+            previous_candidate = json.loads(
+                (self.run_dir() / f"cycles/{number - 1:03d}/candidate/commit.json").read_text()
+            )
+            self.assertEqual(record["source_candidate_sha"], previous_candidate["commit_sha"])
 
 
     def test_review_budget_exhaustion_is_exact(self) -> None:
@@ -590,6 +613,22 @@ class SemanticRevisionTests(PipelineHarness):
 
 
 class ResumeTests(PipelineHarness):
+    def _interrupt_before_replan_planner(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        original = self.orchestrator(
+            self.config(review_repair=1),
+            planner=[initial_plan(STEP)],
+            reviewer=[review("REVISE", "REPLAN")],
+        )
+        with mock.patch.object(
+            type(original), "_plan_correction",
+            side_effect=AssertionError("planner must not run in this setup"),
+        ):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(self.checkpoint()["phase"], "review_replan")
+        self.assertEqual(self.checkpoint()["review_cycle"], 2)
+
     def test_crash_after_worker_resumes_checks_without_replaying_worker(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         original = self.orchestrator(
@@ -615,6 +654,57 @@ class ResumeTests(PipelineHarness):
             [event["event"] for event in self.trace_events() if event["event"] == "checks.started"],
             ["checks.started"],
         )
+
+    def test_tampered_correction_kind_fails_before_resume_planner(self) -> None:
+        self._interrupt_before_replan_planner()
+        path = self.run_dir() / "cycles/002/cycle.json"
+        record = json.loads(path.read_text())
+        record["kind"] = "review-implementation"
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+        resumed = self.orchestrator(
+            self.config(review_repair=1), planner=["unused"], reviewer=["unused"],
+        )
+        result = resumed.resume("run")
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.planner.requests, [])
+        self.assertEqual(self.reviewer.requests, [])
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_tampered_previous_reviewer_artifact_fails_before_resume_planner(self) -> None:
+        self._interrupt_before_replan_planner()
+        path = self.run_dir() / "cycles/001/review/review.json"
+        review_payload = json.loads(path.read_text())
+        review_payload["route"] = "IMPLEMENTATION"
+        path.write_text(json.dumps(review_payload), encoding="utf-8")
+
+        resumed = self.orchestrator(
+            self.config(review_repair=1), planner=["unused"], reviewer=["unused"],
+        )
+        result = resumed.resume("run")
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.planner.requests, [])
+        self.assertEqual(self.reviewer.requests, [])
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_cycle_record_route_kind_mismatch_fails_closed_without_repair_or_worker(self) -> None:
+        self._interrupt_before_replan_planner()
+        path = self.run_dir() / "cycles/002/cycle.json"
+        record = json.loads(path.read_text())
+        record["source_route"] = "IMPLEMENTATION"
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+        resumed = self.orchestrator(
+            self.config(review_repair=1), planner=["unused"], reviewer=["unused"],
+        )
+        result = resumed.resume("run")
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.planner.requests, [])
+        self.assertEqual(self.reviewer.requests, [])
+        self.assertEqual(self.workers.roles(), ["implementer"])
 
     def test_push_then_crash_resumes_review_with_the_same_remote_candidate(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))

@@ -67,11 +67,28 @@ class CycleArtifactService:
     def begin(self, store: Any, ctx: Any, cycle: RunCycle, fresh: bool) -> None:
         self.set_trace_cycle(cycle.number)
         path = cycle_record_path(ctx.run_dir, cycle)
-        record = _json_text({
-            "schema_version": 1,
-            "number": cycle.number,
-            "kind": cycle.kind.value,
-        })
+        if cycle.number == 1:
+            record = _json_text({
+                "schema_version": 1,
+                "number": cycle.number,
+                "kind": cycle.kind.value,
+            })
+        else:
+            # The source review is the authority for the correction kind. The
+            # planner is never allowed to choose or repair this binding.
+            from .resume_validation import _correction_binding, validate_correction_bindings
+
+            validate_correction_bindings(ctx.run_dir, cycle.number - 1)
+            binding = _correction_binding(ctx.run_dir, cycle.number)
+            if binding["kind"] != cycle.kind.value:
+                raise ResumeIntegrityError(
+                    f"cycle {cycle.number:03d} kind does not match its review route"
+                )
+            record = _json_text({
+                "schema_version": 2,
+                "number": cycle.number,
+                **binding,
+            })
         if path.exists():
             if path.read_text(encoding="utf-8") != record:
                 raise ResumeIntegrityError(f"cycle {cycle.number:03d} record diverges")

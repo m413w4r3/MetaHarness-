@@ -2195,11 +2195,9 @@ class Orchestrator:
         if evidence is None or evidence.staged_tree_sha != candidate["tree_sha"]:
             raise ResumeIntegrityError(f"cycle {previous:03d} candidate evidence is missing")
         review = _accepted_review(review_dir(ctx.run_dir, previous), evidence, candidate["commit_sha"])
-        if review is None or review.verdict is not ReviewVerdict.REVISE or review.route not in {
-            ReviewRoute.IMPLEMENTATION, ReviewRoute.REPLAN,
-        }:
+        if review is None or review.verdict is not ReviewVerdict.REVISE or review.route is not ReviewRoute.REPLAN:
             raise ResumeIntegrityError(
-                f"cycle {previous:03d} review did not route a correction"
+                f"cycle {previous:03d} review did not route replan correction"
             )
         head = current_head(ctx.info.worktree)
         if head != candidate["commit_sha"]:

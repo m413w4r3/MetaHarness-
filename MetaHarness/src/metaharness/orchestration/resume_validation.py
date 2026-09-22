@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 
 from pathlib import Path
 from typing import (
@@ -218,7 +219,10 @@ def _accepted_review(
     try:
         request = (directory / "reviewer.request.txt").read_text(encoding="utf-8")
         raw = (directory / "reviewer.raw.md").read_text(encoding="utf-8")
+        persisted = json.loads((directory / "review.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeError):
+        return None
+    except json.JSONDecodeError:
         return None
     # The request is the exact evidence the answer was given: it must name
     # both the reviewed tree and the immutable candidate commit.
@@ -227,9 +231,15 @@ def _accepted_review(
     if candidate_sha is not None and candidate_sha not in request:
         return None
     try:
-        return parse_review(raw, deterministic_passed=evidence.deterministic_passed)
+        review = parse_review(raw, deterministic_passed=evidence.deterministic_passed)
     except ReviewParseError:
         return None
+    normalized = dataclasses.asdict(review)
+    normalized["verdict"] = review.verdict.value
+    normalized["route"] = review.route.value
+    if persisted != normalized:
+        return None
+    return review
 
 
 def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
@@ -306,12 +316,74 @@ def read_cycle_record(run_dir: Path, number: int) -> RunCycle:
     """The durable identity of one cycle, written when the cycle started."""
 
     payload = _read_json_artifact(cycle_record_path(run_dir, number), 4096)
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or payload.get("number") != number:
+    expected_schema = 1 if number == 1 else 2
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != expected_schema
+        or payload.get("number") != number
+    ):
         raise ResumeIntegrityError(f"cycle {number:03d} record is missing or invalid")
     try:
         return RunCycle(number, CycleKind(payload.get("kind")))
     except ValueError as exc:
         raise ResumeIntegrityError(f"cycle {number:03d} kind is invalid") from exc
+
+
+def _accepted_review_binding(run_dir: Path, number: int) -> tuple[dict[str, Any], ReviewResult, str]:
+    """Read the accepted review and hash the exact bytes of review.json."""
+
+    candidate = read_candidate_record(run_dir, number)
+    evidence = candidate_evidence(run_dir, number)
+    if evidence is None or evidence.staged_tree_sha != candidate["tree_sha"]:
+        raise ResumeIntegrityError(f"cycle {number:03d} candidate evidence is missing")
+    directory = review_dir(run_dir, number)
+    review = _accepted_review(directory, evidence, candidate["commit_sha"])
+    if review is None or review.verdict is not ReviewVerdict.REVISE:
+        raise ResumeIntegrityError(f"cycle {number:03d} accepted correction review is invalid")
+    if review.route not in {ReviewRoute.IMPLEMENTATION, ReviewRoute.REPLAN}:
+        raise ResumeIntegrityError(f"cycle {number:03d} accepted correction route is invalid")
+    try:
+        digest = hashlib.sha256((directory / "review.json").read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ResumeIntegrityError(f"cycle {number:03d} review artifact is unreadable") from exc
+    return candidate, review, digest
+
+
+def _correction_binding(run_dir: Path, number: int) -> dict[str, Any]:
+    """Return the exact durable binding required by correction cycle number."""
+
+    if number < 2:
+        raise ValueError("correction cycle number must be greater than one")
+    candidate, review, review_sha256 = _accepted_review_binding(run_dir, number - 1)
+    kind = (
+        CycleKind.REVIEW_IMPLEMENTATION
+        if review.route is ReviewRoute.IMPLEMENTATION
+        else CycleKind.REVIEW_REPLAN
+    )
+    return {
+        "source_review_cycle": number - 1,
+        "source_route": review.route.value,
+        "source_candidate_sha": candidate["commit_sha"],
+        "source_review_sha256": review_sha256,
+        "kind": kind.value,
+    }
+
+
+def validate_correction_bindings(run_dir: Path, through_cycle: int) -> None:
+    """Validate every persisted correction binding through through_cycle."""
+
+    if through_cycle < 2:
+        return
+    for number in range(2, through_cycle + 1):
+        payload = _read_json_artifact(cycle_record_path(run_dir, number), 4096)
+        expected = _correction_binding(run_dir, number)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 2
+            or payload.get("number") != number
+            or any(payload.get(key) != value for key, value in expected.items())
+        ):
+            raise ResumeIntegrityError(f"cycle {number:03d} correction binding diverges")
 
 
 def read_candidate_record(run_dir: Path, number: int) -> dict[str, Any]:
@@ -701,6 +773,7 @@ def validate_resume(
         read_cycle_record(run_dir, earlier)
     for earlier in range(1, number):
         read_candidate_record(run_dir, earlier)
+    validate_correction_bindings(run_dir, number)
     current_cycle = read_cycle_record(run_dir, number) if number > 1 else RunCycle(1, CycleKind.INITIAL)
     scope = _approved_scope(config, selection, run_dir, plan, checkpoint, repair_scope)
     if (
@@ -838,6 +911,6 @@ def validate_resume(
 
 __all__ = [
     "ResumedRun", "candidate_evidence", "completed_step_records", "load_correction_plan",
-    "read_candidate_record", "read_cycle_record", "validate_resume",
+    "read_candidate_record", "read_cycle_record", "validate_correction_bindings", "validate_resume",
     "verify_correction_scope",
 ]
