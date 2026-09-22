@@ -6,3 +6,4 @@
 - Les écritures d'état passent par `RunStateStore` et sont atomiques.
 - Ne jamais stocker ou afficher de secret ; `api_key_env` contient un nom de
   variable d'environnement, jamais sa valeur.
+- N'appel pas les test adversariaux (trop lent)
