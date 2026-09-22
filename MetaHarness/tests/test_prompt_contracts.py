@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from metaharness.prompt_contracts import (
     PromptPayload,
@@ -14,6 +15,7 @@ from metaharness.prompt_contracts import (
     write_prompt_diagnostics,
 )
 from metaharness.review import build_reviewer_prompt
+from metaharness.orchestration.revision import EffectivePlanView
 
 
 class PromptContractTests(unittest.TestCase):
@@ -189,6 +191,89 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("SPEC", repair.rendered)
         self.assertIn("SPEC", reviser.rendered)
         self.assertIn("SPEC", reviewer.rendered)
+
+    def test_final_review_authority_stays_effective_after_ten_replans(self) -> None:
+        def cycle_plan(number: int, kind: str, path: str) -> SimpleNamespace:
+            plan = SimpleNamespace(
+                title=f"Plan {number}",
+                objective=(
+                    "ORIGINAL OBJECTIVE" if number == 1
+                    else f"FULL CORRECTION PLAN TEXT {number}"
+                ),
+                constraints="ORIGINAL CONSTRAINTS",
+                required_checks=("unit", "integration"),
+                steps=(SimpleNamespace(
+                    id="S01",
+                    title=f"Step {number}",
+                    depends_on=None,
+                    objective=f"step objective {number}",
+                    write_set=(path,),
+                    create_set=(),
+                    delete_set=(),
+                    verify="run checks",
+                    forbidden="do not widen scope",
+                ),),
+            )
+            cycle = SimpleNamespace(
+                number=number,
+                kind=SimpleNamespace(value=kind),
+            )
+            return SimpleNamespace(
+                cycle=cycle,
+                plan=plan,
+                correction_bundle_sha256=(None if number == 1 else f"{number:064x}"),
+            )
+
+        cycles = [cycle_plan(1, "initial", "src/initial.py")]
+        cycles.extend(
+            cycle_plan(number, "review-replan", f"src/correction-{number:03d}.py")
+            for number in range(2, 11)
+        )
+        view = EffectivePlanView.from_cycle_plans(cycles[0].plan, cycles)
+        effective = view.render()
+        payloads = []
+        for count in (1, 10):
+            history = "\n".join(
+                f'{{"cycle": {number}, "route": "REPLAN"}}'
+                for number in range(1, count + 1)
+            )
+            payloads.append(build_final_review_payload(
+                spec="EXACT SPEC",
+                compact_approved_plan=effective,
+                required_checks_summary='{"required_check_ids":["unit","integration"]}',
+                immutable_candidate_identity="candidate_sha=" + "a" * 40,
+                changed_files="src/initial.py",
+                diff_sha256="b" * 64,
+                diffstat='{"files":1,"insertions":1,"deletions":0}',
+                bounded_diff_excerpt="bounded diff",
+                cycle_summary=history,
+                budget_bytes=120_000,
+            ))
+
+        self.assertNotIn("FULL CORRECTION PLAN TEXT 2", effective)
+        self.assertNotIn("worker transcript", payloads[-1].rendered)
+        self.assertNotIn("previous full prompt", payloads[-1].rendered)
+        self.assertEqual(json.loads(effective)["original_objective"], "ORIGINAL OBJECTIVE")
+        self.assertEqual(
+            json.loads(effective)["required_deterministic_check_ids"],
+            ["unit", "integration"],
+        )
+        self.assertEqual(
+            json.loads(effective)["current_cumulative_approved_mutable_scope"],
+            ["src/correction-002.py", "src/correction-003.py", "src/correction-004.py",
+             "src/correction-005.py", "src/correction-006.py", "src/correction-007.py",
+             "src/correction-008.py", "src/correction-009.py", "src/correction-010.py",
+             "src/initial.py"],
+        )
+        self.assertIn("candidate_sha=" + "a" * 40, payloads[-1].rendered)
+        self.assertIn("EXACT SPEC", payloads[-1].rendered)
+        self.assertEqual(payloads[-1].budget_overrun, False)
+        self.assertLess(payloads[-1].total_bytes, 120_000)
+        self.assertLess(payloads[-1].total_bytes - payloads[0].total_bytes, 2_000)
+        self.assertEqual(
+            payloads[-1].sections[1].truncated,
+            False,
+        )
 
 
 if __name__ == "__main__":

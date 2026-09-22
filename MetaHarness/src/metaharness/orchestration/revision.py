@@ -299,6 +299,146 @@ def _review_step_reports_text(results: list[dict[str, Any]]) -> str:
     return _json_text(records)
 
 
+def _plan_mutable_scope(plan: TaskPlanV2) -> set[str]:
+    return {
+        path
+        for step in plan.steps
+        for path in (*step.write_set, *step.create_set, *step.delete_set)
+    }
+
+
+def _cycle_kind_value(cycle: Any) -> str:
+    kind = getattr(cycle, "kind", "")
+    return str(getattr(kind, "value", kind))
+
+
+@dataclasses.dataclass(frozen=True)
+class EffectivePlanView:
+    """The current plan authority without cumulative historical plan text."""
+
+    original_objective: str
+    original_constraints: str
+    current_cumulative_approved_mutable_scope: tuple[str, ...]
+    current_step_index: tuple[dict[str, Any], ...]
+    required_deterministic_check_ids: tuple[str, ...]
+    accepted_correction_plans: tuple[dict[str, Any], ...]
+    current_cycle_correction_objective: str | None = None
+
+    @classmethod
+    def from_cycle_plans(
+        cls, original_plan: TaskPlanV2, cycle_plans: Sequence[Any],
+        *, correction_plan_hashes: Mapping[int, str] | None = None,
+    ) -> "EffectivePlanView":
+        if not cycle_plans:
+            raise ValueError("at least one cycle plan is required")
+
+        cumulative_scope: set[str] = set()
+        accepted_corrections: list[dict[str, Any]] = []
+        for item in cycle_plans:
+            plan = item.plan
+            before = set(cumulative_scope)
+            current_scope = _plan_mutable_scope(plan)
+            cumulative_scope.update(current_scope)
+            if _cycle_kind_value(item.cycle) != "review-replan":
+                continue
+            plan_sha = (
+                correction_plan_hashes.get(item.cycle.number)
+                if correction_plan_hashes is not None
+                else None
+            )
+            if plan_sha is None:
+                plan_sha = getattr(item, "correction_plan_sha256", None)
+            if plan_sha is None:
+                plan_sha = getattr(item, "correction_bundle_sha256", None)
+            if not isinstance(plan_sha, str) or not plan_sha:
+                plan_sha = "UNAVAILABLE"
+            accepted_corrections.append({
+                "cycle": item.cycle.number,
+                "plan_sha256": plan_sha,
+                "cycle_kind": _cycle_kind_value(item.cycle),
+                "approved_scope_delta": {
+                    "added_paths": sorted(current_scope - before),
+                    "unchanged_paths": sorted(current_scope & before),
+                    "effective_paths": sorted(cumulative_scope),
+                },
+            })
+
+        current = cycle_plans[-1]
+        current_index = tuple(
+            {
+                "id": step.id,
+                "title": step.title,
+                "depends_on": step.depends_on,
+                "objective": step.objective,
+                "mutation_scope": {
+                    "write": list(step.write_set),
+                    "create": list(step.create_set),
+                    "delete": list(step.delete_set),
+                },
+                "verify": step.verify,
+                "invariants": step.forbidden,
+            }
+            for step in current.plan.steps
+        )
+        correction_objective = (
+            current.plan.objective
+            if _cycle_kind_value(current.cycle) == "review-replan"
+            else None
+        )
+        return cls(
+            original_objective=original_plan.objective,
+            original_constraints=original_plan.constraints,
+            current_cumulative_approved_mutable_scope=tuple(sorted(cumulative_scope)),
+            current_step_index=current_index,
+            required_deterministic_check_ids=tuple(current.plan.required_checks),
+            accepted_correction_plans=tuple(accepted_corrections),
+            current_cycle_correction_objective=correction_objective,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "original_objective": self.original_objective,
+            "original_constraints": self.original_constraints,
+            "current_cumulative_approved_mutable_scope": list(
+                self.current_cumulative_approved_mutable_scope
+            ),
+            "current_step_index": list(self.current_step_index),
+            "required_deterministic_check_ids": list(
+                self.required_deterministic_check_ids
+            ),
+            "accepted_correction_plans": list(self.accepted_correction_plans),
+            "current_cycle_correction_objective": self.current_cycle_correction_objective,
+        }
+
+    def render(self) -> str:
+        return _json_text(self.as_dict())
+
+
+def _structural_check_state(bundle: EvidenceBundle) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    required = set(bundle.required_check_ids)
+    for raw in _check_payload(bundle):
+        item = dict(raw)
+        name = item.get("name")
+        checks.append({
+            "id": name,
+            "required": bool(item.get("required", name in required)),
+            "exit_code": item.get("exit_code"),
+            "timed_out": bool(item.get("timed_out", False)),
+            "workspace_mutated": bool(item.get("workspace_mutated", False)),
+            "status": (
+                "timed_out" if item.get("timed_out") else
+                "passed" if item.get("exit_code") == 0 else "failed"
+            ),
+        })
+    return {
+        "required_check_ids": list(bundle.required_check_ids),
+        "deterministic_passed": bundle.deterministic_passed,
+        "failures": list(bundle.failures),
+        "checks": checks,
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class ReviewCycleInput:
     """Durable, bounded context presented to the independent reviewer."""
@@ -323,42 +463,67 @@ class ReviewContextBuilder:
     candidate_evidence: Callable[[Path, int], EvidenceBundle | None]
     accepted_review: Callable[[Path, EvidenceBundle, str], ReviewResult | None]
 
+    @staticmethod
+    def _correction_plan_hashes(
+        run_dir: Path, plans: Sequence[Any],
+    ) -> dict[int, str]:
+        hashes: dict[int, str] = {}
+        for item in plans:
+            if _cycle_kind_value(item.cycle) != "review-replan":
+                continue
+            text = _read_bounded_text(
+                correction_dir(run_dir, item.cycle.number) / "scope_delta.json",
+                limit=256 * 1024,
+            )
+            try:
+                payload = json.loads(text)
+            except (TypeError, ValueError):
+                continue
+            plan_sha = payload.get("repair_plan_sha256") if isinstance(payload, Mapping) else None
+            if isinstance(plan_sha, str) and plan_sha:
+                hashes[item.cycle.number] = plan_sha
+        return hashes
+
     def build(self, ctx: Any, cycle_plan: Any) -> ReviewCycleInput:
         number = cycle_plan.cycle.number
         plans = [self.cycle_plan(ctx, item) for item in range(1, number)] + [cycle_plan]
-        if number == 1:
-            plan_text = _compact_approved_plan_text(ctx.plan)
-            cycle_history = "001 is the initial implementation cycle."
-            scope_delta = ""
-        else:
-            scope_delta = _read_bounded_text(
-                correction_dir(ctx.run_dir, number) / "scope_delta.json"
+        effective_plan = EffectivePlanView.from_cycle_plans(
+            ctx.plan,
+            plans,
+            correction_plan_hashes=self._correction_plan_hashes(ctx.run_dir, plans),
+        )
+        plan_text = effective_plan.render()
+        scope_delta = ""
+        if number > 1 and _cycle_kind_value(cycle_plan.cycle) == "review-replan":
+            scope_delta = _json_text(
+                effective_plan.accepted_correction_plans[-1]["approved_scope_delta"]
             )
-            plan_text = _json_text({
-                "original_approved_plan": json.loads(_compact_approved_plan_text(ctx.plan)),
-                "correction_plans": {
-                    f"{item.cycle.number:03d}": json.loads(_compact_approved_plan_text(item.plan))
-                    for item in plans[1:]
-                },
-                "scope_delta": scope_delta,
-            })
-            history: dict[str, Any] = {}
-            for item in plans[:-1]:
-                earlier = item.cycle.number
-                candidate = self.read_candidate(ctx.run_dir, earlier)
-                evidence = self.candidate_evidence(ctx.run_dir, earlier)
-                review = (
-                    self.accepted_review(
-                        review_dir(ctx.run_dir, earlier), evidence, candidate["commit_sha"]
-                    ) if evidence is not None else None
-                )
-                history[f"{earlier:03d}"] = {
-                    "kind": item.cycle.kind.value,
-                    "plan_summary": item.plan.title,
-                    "checks": _check_payload(evidence) if evidence is not None else None,
-                    "reviewer_conclusion": _review_payload(review) if review is not None else None,
-                }
-            cycle_history = _json_text(history)
+
+        history: dict[str, Any] = {}
+        for item in plans[:-1]:
+            earlier = item.cycle.number
+            candidate = self.read_candidate(ctx.run_dir, earlier)
+            evidence = self.candidate_evidence(ctx.run_dir, earlier)
+            review = (
+                self.accepted_review(
+                    review_dir(ctx.run_dir, earlier), evidence, candidate["commit_sha"]
+                ) if evidence is not None else None
+            )
+            history[f"{earlier:03d}"] = {
+                "cycle_kind": _cycle_kind_value(item.cycle),
+                "previous_route": (
+                    review.route.value if review is not None else None
+                ),
+                "previous_check_state": (
+                    _structural_check_state(evidence) if evidence is not None else None
+                ),
+                "previous_candidate_sha": candidate.get("commit_sha"),
+                "changed_paths": list(evidence.changed_files) if evidence is not None else [],
+            }
+        cycle_history = (
+            _json_text(history)
+            if history else "001 is the initial implementation cycle."
+        )
         step_reports, revision_reports, mismatches = [], [], []
         for item in plans:
             label = f"{item.cycle.number:03d}"
