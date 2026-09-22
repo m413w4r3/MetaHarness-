@@ -98,6 +98,7 @@ class RunStateStore:
             "cycles": [],
             "remote_branch": None,
             "remote_sha": None,
+            "reviewed_candidate_sha": None,
             "issue_number": None,
             "pull_request_number": None,
             "approved_tree_sha": None,

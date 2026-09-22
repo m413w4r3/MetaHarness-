@@ -5,13 +5,17 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.gitops import WorktreeInfo, build_run_branch, validate_run_branch  # noqa: E402
-from metaharness.integrations.github import NullGitHubWorkstreamClient  # noqa: E402
+from metaharness.integrations.github import (  # noqa: E402
+    GitHubWorkstreamError,
+    NullGitHubWorkstreamClient,
+)
 from metaharness.models import GitHubConfig, PublishConfig, RunStatus  # noqa: E402
 from metaharness.orchestrator import Orchestrator  # noqa: E402
 from metaharness.state import RunStateStore  # noqa: E402
@@ -115,13 +119,30 @@ class GitHubWorkstreamTests(unittest.TestCase):
             client,
         )
         self.store.update(status=RunStatus.PUBLISHING, planner={"title": "Approved plan"})
-        owner._ensure_github_pull_request_metadata(
-            store=self.store,
-            run_id="run-1",
-            info=self.info,
-            commit_sha="b" * 40,
-            cycle=1,
+        self.store.update(
+            status=RunStatus.REVIEWING,
+            review={"verdict": "PASS", "route": "NONE"},
+            candidate_commit_sha="b" * 40,
+            reviewed_candidate_sha="b" * 40,
         )
+        with (
+            mock.patch("metaharness.orchestrator.current_head", return_value="b" * 40),
+            mock.patch("metaharness.orchestrator.remote_run_branch_tip", return_value="b" * 40),
+        ):
+            owner._ensure_github_pull_request_metadata(
+                store=self.store,
+                run_id="run-1",
+                info=self.info,
+                commit_sha="b" * 40,
+                cycle=1,
+            )
+            owner._ensure_github_pull_request_metadata(
+                store=self.store,
+                run_id="run-1",
+                info=self.info,
+                commit_sha="b" * 40,
+                cycle=1,
+            )
         self.assertEqual(self.store.load()["pull_request_number"], 456)
         self.assertEqual(client.pull_requests[0][2:], ("main", "harness/plan/run-1"))
         events = [
@@ -131,6 +152,61 @@ class GitHubWorkstreamTests(unittest.TestCase):
         metadata = [event for event in events if event["event"] == "workstream.metadata"][-1]
         self.assertEqual(metadata["data"]["remote_branch"], "harness/plan/run-1")
         self.assertEqual(metadata["data"]["pull_request_number"], 456)
+        self.assertEqual(metadata["data"]["reviewed_candidate_sha"], "b" * 40)
+
+    def test_wrong_remote_sha_does_not_create_pull_request(self) -> None:
+        client = _FakeGitHub()
+        owner = _orchestrator(
+            self.root,
+            GitHubConfig(enabled=True, pull_request_mode="create"),
+            client,
+        )
+        self.store.update(
+            status=RunStatus.REVIEWING,
+            review={"verdict": "PASS", "route": "NONE"},
+            candidate_commit_sha="b" * 40,
+            reviewed_candidate_sha="b" * 40,
+        )
+        with (
+            mock.patch("metaharness.orchestrator.current_head", return_value="b" * 40),
+            mock.patch("metaharness.orchestrator.remote_run_branch_tip", return_value="c" * 40),
+            self.assertRaisesRegex(GitHubWorkstreamError, "remote run branch tip"),
+        ):
+            owner._ensure_github_pull_request_metadata(
+                store=self.store,
+                run_id="run-1",
+                info=self.info,
+                commit_sha="b" * 40,
+                cycle=1,
+            )
+        self.assertEqual(client.pull_requests, [])
+
+    def test_non_pass_review_routes_do_not_create_pull_request(self) -> None:
+        for verdict, route in (("REVISE", "IMPLEMENTATION"), ("REVISE", "HUMAN"), ("FAIL", "HUMAN")):
+            with self.subTest(verdict=verdict, route=route):
+                client = _FakeGitHub()
+                owner = _orchestrator(
+                    self.root,
+                    GitHubConfig(enabled=True, pull_request_mode="create"),
+                    client,
+                )
+                self.store.update(
+                    status=RunStatus.REVIEWING,
+                    review={"verdict": verdict, "route": route},
+                    candidate_commit_sha="b" * 40,
+                    reviewed_candidate_sha="b" * 40,
+                )
+                with self.assertRaisesRegex(
+                    GitHubWorkstreamError, "exact PASS candidate"
+                ):
+                    owner._ensure_github_pull_request_metadata(
+                        store=self.store,
+                        run_id="run-1",
+                        info=self.info,
+                        commit_sha="b" * 40,
+                        cycle=1,
+                    )
+                self.assertEqual(client.pull_requests, [])
 
     def test_null_client_performs_no_network(self) -> None:
         client = NullGitHubWorkstreamClient()

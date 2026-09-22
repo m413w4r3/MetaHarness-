@@ -845,11 +845,14 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     if (
         github.enabled
         and github.pull_request_mode == "create"
-        and publish.enabled
-        and publish.mode != PublishMode.RUN_BRANCH.value
+        and (
+            not publish.enabled
+            or publish.mode != PublishMode.RUN_BRANCH.value
+        )
     ):
         raise ConfigError(
-            "github.pull_request_mode = 'create' requires publish.mode = 'run-branch'"
+            "github.pull_request_mode = 'create' requires publish.enabled = true "
+            "and publish.mode = 'run-branch'"
         )
 
     agent_data = _table(expanded, "agent")

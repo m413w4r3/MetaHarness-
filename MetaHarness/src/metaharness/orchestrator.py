@@ -799,7 +799,10 @@ class Orchestrator:
     @staticmethod
     def _github_metadata_payload(state: Mapping[str, Any]) -> dict[str, int | str]:
         payload: dict[str, int | str] = {}
-        for key in ("remote_branch", "issue_number", "pull_request_number"):
+        for key in (
+            "remote_branch", "issue_number", "pull_request_number",
+            "reviewed_candidate_sha",
+        ):
             value = state.get(key)
             if isinstance(value, (str, int)) and not isinstance(value, bool):
                 payload[key] = value
@@ -898,10 +901,52 @@ class Orchestrator:
         current = state.get("pull_request_number")
         if isinstance(current, int) and not isinstance(current, bool) and current > 0:
             return
-        if not self.config.publish.enabled or self.config.publish.mode != PublishMode.RUN_BRANCH.value:
+        if (
+            not self.config.publish.enabled
+            or self.config.publish.mode != PublishMode.RUN_BRANCH.value
+        ):
             raise GitHubWorkstreamError(
                 "GitHub pull-request creation requires a published run branch",
                 code="GITHUB_PR_REQUIRES_RUN_BRANCH",
+            )
+        review = state.get("review")
+        reviewed_candidate_sha = state.get("reviewed_candidate_sha")
+        accepted_candidate_sha = state.get("candidate_commit_sha")
+        if (
+            not isinstance(review, Mapping)
+            or review.get("verdict") != ReviewVerdict.PASS.value
+            or review.get("route") not in {None, ReviewRoute.NONE.value}
+            or not _is_object_id(reviewed_candidate_sha)
+            or not _is_object_id(accepted_candidate_sha)
+            or reviewed_candidate_sha != accepted_candidate_sha
+            or reviewed_candidate_sha != commit_sha
+        ):
+            raise GitHubWorkstreamError(
+                "GitHub pull-request candidate authority is not an exact PASS candidate",
+                code="GITHUB_PR_CANDIDATE_MISMATCH",
+            )
+        try:
+            if current_head(info.worktree) != accepted_candidate_sha:
+                raise GitHubWorkstreamError(
+                    "local accepted candidate does not match the reviewed candidate",
+                    code="GITHUB_PR_CANDIDATE_MISMATCH",
+                )
+            remote_tip = remote_run_branch_tip(
+                info.source_repo,
+                remote=self.config.publish.remote,
+                branch=info.branch,
+            )
+        except GitHubWorkstreamError:
+            raise
+        except (GitError, OSError, ValueError):
+            raise GitHubWorkstreamError(
+                "remote run branch tip could not be verified",
+                code="GITHUB_PR_CANDIDATE_MISMATCH",
+            ) from None
+        if remote_tip != reviewed_candidate_sha:
+            raise GitHubWorkstreamError(
+                "remote run branch tip does not match the reviewed candidate",
+                code="GITHUB_PR_CANDIDATE_MISMATCH",
             )
         plan_state = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
         plan_title = plan_state.get("title") if isinstance(plan_state.get("title"), str) else "MetaHarness run"
@@ -933,6 +978,7 @@ class Orchestrator:
             data={
                 "remote_branch": info.branch,
                 "pull_request_number": number,
+                "reviewed_candidate_sha": reviewed_candidate_sha,
             },
             once=True,
         )
@@ -948,8 +994,10 @@ class Orchestrator:
         if (
             github.enabled
             and github.pull_request_mode == "create"
-            and self.config.publish.enabled
-            and self.config.publish.mode != PublishMode.RUN_BRANCH.value
+            and (
+                not self.config.publish.enabled
+                or self.config.publish.mode != PublishMode.RUN_BRANCH.value
+            )
         ):
             raise GitHubWorkstreamError(
                 "GitHub pull-request creation requires a published run branch",
@@ -3202,18 +3250,27 @@ class Orchestrator:
         directory = review_dir(ctx.run_dir, cycle_plan.cycle)
         accepted = _accepted_review(directory, evidence, candidate["commit_sha"])
         if accepted is not None:
+            store.update(
+                status=store.load().get("status", RunStatus.REVIEWING),
+                reviewed_candidate_sha=candidate["commit_sha"],
+            )
             return accepted
         _archive_attempt(directory, names=_REVIEW_ATTEMPT_ARTIFACTS)
         reviewer = self._reviewer_for_profile(ctx.selection.final_reviewer.profile_id)
         store.update(status=RunStatus.REVIEWING, current_step=None)
         try:
-            return self._run_v2_reviewer(
+            review = self._run_v2_reviewer(
                 reviewer=reviewer, spec=ctx.spec, run_dir=ctx.run_dir,
                 repository_reference=ctx.repository_reference, evidence=evidence,
                 input=self._review_input(ctx, cycle_plan), artifacts_dir=directory,
                 worktree=ctx.info.worktree, base_sha=ctx.base_sha,
                 candidate_commit=candidate,
             )
+            store.update(
+                status=store.load().get("status", RunStatus.REVIEWING),
+                reviewed_candidate_sha=candidate["commit_sha"],
+            )
+            return review
         except LLMError as exc:
             # Transport only: no reviewer answer was accepted, so the same
             # exact candidate can be reviewed again on resume.

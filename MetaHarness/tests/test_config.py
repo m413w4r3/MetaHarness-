@@ -110,6 +110,36 @@ class ConfigTests(unittest.TestCase):
             raw = tomllib.load(stream)
         self.assertEqual(raw["max_diff_bytes"], 2_000_000)
 
+    def test_pull_request_creation_requires_run_branch_publication(self) -> None:
+        cases = (
+            (
+                '[github]\nenabled = true\npull_request_mode = "create"\n'
+                '\n[publish]\nenabled = false\nmode = "run-branch"\n',
+                True,
+            ),
+            (
+                '[github]\nenabled = true\npull_request_mode = "create"\n'
+                '\n[publish]\nenabled = true\nmode = "fast-forward-base"\n',
+                True,
+            ),
+            (
+                '[github]\nenabled = true\npull_request_mode = "create"\n'
+                '\n[publish]\nenabled = true\nmode = "run-branch"\n',
+                False,
+            ),
+        )
+        for suffix, invalid in cases:
+            with self.subTest(invalid=invalid):
+                with tempfile.TemporaryDirectory() as directory_name:
+                    path = self.write_config(Path(directory_name), VALID_CONFIG + suffix)
+                    if invalid:
+                        with self.assertRaisesRegex(ConfigError, "publish.enabled|publish.mode"):
+                            load_config(path)
+                    else:
+                        config = load_config(path)
+                        self.assertTrue(config.publish.enabled)
+                        self.assertEqual(config.publish.mode, "run-branch")
+
     def test_planning_protocol_defaults_to_v2_and_rejects_other_versions(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name)))
