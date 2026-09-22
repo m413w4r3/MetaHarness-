@@ -457,6 +457,9 @@ def _review_code_evidence(
     base_sha: str,
     candidate_sha: str,
     evidence: EvidenceBundle,
+    remote_sha: str | None = None,
+    remote_branch: str | None = None,
+    remote_name: str | None = None,
 ) -> str:
     diff_bytes = evidence.diff.encode("utf-8", errors="replace")
 
@@ -470,7 +473,19 @@ def _review_code_evidence(
         candidate_sha,
     )
 
-    remote_available = candidate_url is not None and compare_url is not None
+    # A web URL describes where a candidate might be inspectable; it does not
+    # prove that the exact candidate was pushed. Durable remote authority is
+    # required before remote exploration can be offered to a reviewer.
+    remote_pushed = (
+        remote_sha == candidate_sha
+        and isinstance(remote_branch, str)
+        and bool(remote_branch)
+        and isinstance(remote_name, str)
+        and bool(remote_name)
+    )
+    remote_available = (
+        remote_pushed and candidate_url is not None and compare_url is not None
+    )
 
     payload: dict[str, Any] = {
         "authority": "immutable_candidate_commit",
@@ -480,6 +495,12 @@ def _review_code_evidence(
         "candidate_url": candidate_url,
         "compare_url": compare_url,
         "remote_exploration": "ALLOWED" if remote_available else "UNAVAILABLE",
+        "remote_authority": {
+            "remote": remote_name,
+            "remote_branch": remote_branch,
+            "remote_sha": remote_sha,
+            "verified": remote_pushed,
+        },
         "full_diff_bytes": len(diff_bytes),
         "full_diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
         "diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
@@ -851,7 +872,11 @@ class Orchestrator:
                 )
             remote_tip = remote_run_branch_tip(
                 info.source_repo,
-                remote=self.config.publish.remote,
+                remote=getattr(
+                    getattr(self.config, "repository", None),
+                    "remote",
+                    self.config.publish.remote,
+                ),
                 branch=info.branch,
             )
         except GitHubWorkstreamError:
@@ -2042,7 +2067,7 @@ class Orchestrator:
 
         bind = functools.partial
         candidate_lifecycle = CandidateLifecycle(
-            publish_remote=self.config.publish.remote,
+            staging_remote=self.config.repository.remote,
             authorize_tree=self._authorize_candidate_tree,
             gate_mutable_authority=lambda ctx, cycle_plan, stage: gate_mutable_authority(
                 ctx.run_dir, cycle_plan.cycle.number, stage,
@@ -2279,7 +2304,10 @@ class Orchestrator:
         # The reviewed candidate commit is the code authority: the planner
         # gets its immutable candidate/compare URLs instead of an inline diff.
         remote_available = (
-            immutable_commit_web_url(ctx.repository_reference, head) is not None
+            candidate.get("remote_sha") == head
+            and candidate.get("remote_branch") == ctx.info.branch
+            and candidate.get("remote") == self.config.repository.remote
+            and immutable_commit_web_url(ctx.repository_reference, head) is not None
             and compare_commits_web_url(ctx.repository_reference, ctx.base_sha, head) is not None
         )
         started_at, started_mono = self._trace_time(), time.perf_counter()
@@ -2308,6 +2336,9 @@ class Orchestrator:
                 candidate_code_evidence=_review_code_evidence(
                     repository_reference=ctx.repository_reference,
                     base_sha=ctx.base_sha, candidate_sha=head, evidence=evidence,
+                    remote_sha=candidate.get("remote_sha"),
+                    remote_branch=candidate.get("remote_branch"),
+                    remote_name=candidate.get("remote"),
                 ),
                 previous_cycle_checks=_json_text(_repair_checks_payload(evidence)),
                 previous_revision_report=_bounded_previous_revision_report(
@@ -2592,6 +2623,9 @@ class Orchestrator:
             base_sha=ctx.base_sha,
             candidate_sha=candidate["commit_sha"],
             evidence=evidence,
+            remote_sha=candidate.get("remote_sha"),
+            remote_branch=candidate.get("remote_branch"),
+            remote_name=candidate.get("remote"),
         )
         candidate_identity = _json_text({
             "authority": "immutable_candidate_commit",
@@ -2875,6 +2909,7 @@ class Orchestrator:
     ) -> ReviewResult:
         """Review exactly the pushed candidate; an accepted answer is reused."""
 
+        self._assert_candidate_review_authority(ctx, candidate, evidence)
         directory = review_dir(ctx.run_dir, cycle_plan.cycle)
         accepted = _accepted_review(directory, evidence, candidate["commit_sha"])
         if accepted is not None:
@@ -2904,6 +2939,50 @@ class Orchestrator:
             # exact candidate can be reviewed again on resume.
             raise PipelineFailure(
                 "REVIEWER_TRANSPORT_FAILURE", _bounded_parse_detail(exc),
+            ) from exc
+
+    def _assert_candidate_review_authority(
+        self,
+        ctx: PipelineV2Context,
+        candidate: Mapping[str, Any],
+        evidence: EvidenceBundle,
+    ) -> None:
+        """Fail closed unless the reviewer has an exact pushed candidate."""
+
+        candidate_sha = candidate.get("commit_sha")
+        candidate_tree = candidate.get("tree_sha")
+        if not _is_object_id(candidate_sha) or not _is_object_id(candidate_tree):
+            raise PipelineFailure(
+                "CANDIDATE_PUSH_FAILED", "candidate identity is incomplete before review"
+            )
+        try:
+            if symbolic_head(ctx.info.worktree) != ctx.branch_ref:
+                raise GitError("candidate worktree is not on the run branch")
+            if current_head(ctx.info.worktree) != candidate_sha:
+                raise GitError("local HEAD does not equal the candidate commit")
+            if resolve_tree(ctx.info.worktree, candidate_sha) != candidate_tree:
+                raise GitError("candidate tree does not match the candidate commit")
+            if evidence.staged_tree_sha != candidate_tree:
+                raise GitError("candidate tree does not match accepted gate evidence")
+            if candidate.get("remote") != self.config.repository.remote:
+                raise GitError("candidate remote is not the repository staging remote")
+            if candidate.get("remote_branch") != ctx.info.branch:
+                raise GitError("candidate remote branch is not the run branch")
+            if candidate.get("remote_sha") != candidate_sha:
+                raise GitError("candidate record has no exact remote SHA proof")
+            if not isinstance(candidate.get("pushed_at"), str) or not candidate["pushed_at"]:
+                raise GitError("candidate record has no push timestamp")
+            remote_tip = remote_run_branch_tip(
+                ctx.info.source_repo,
+                remote=self.config.repository.remote,
+                branch=ctx.info.branch,
+            )
+            if remote_tip != candidate_sha:
+                raise GitError("remote run branch does not point to the candidate commit")
+        except (GitError, OSError, ValueError) as exc:
+            raise PipelineFailure(
+                "CANDIDATE_PUSH_FAILED",
+                f"candidate remote authority is invalid: {exc}",
             ) from exc
 
     def _record_review(
@@ -3681,52 +3760,72 @@ class Orchestrator:
     ) -> dict[str, Any]:
         """Push the exact candidate commit, once, with no force capability."""
 
-        if self.config.publish.enabled:
-            try:
-                remote_tip = remote_run_branch_tip(
-                    info.source_repo, remote=self.config.publish.remote, branch=info.branch
+        staging_remote = self.config.repository.remote
+        try:
+            previous_candidate_sha = None
+            if cycle > 1:
+                previous = _read_json_artifact(
+                    _candidate_commit_path(run_dir, cycle - 1)
                 )
-                if remote_tip != candidate["commit_sha"]:
-                    push_run_branch(
-                        info.worktree, remote=self.config.publish.remote,
-                        branch=info.branch, commit_sha=candidate["commit_sha"],
-                    )
-                if remote_run_branch_tip(
-                    info.source_repo, remote=self.config.publish.remote, branch=info.branch
-                ) != candidate["commit_sha"]:
-                    raise GitError("remote run branch does not point to the candidate commit")
-            except (GitError, OSError, ValueError) as exc:
-                raise CandidatePushError("PUSH_FAILED: candidate push did not complete") from exc
-            candidate = dict(candidate)
-            candidate["pushed_at"] = candidate.get("pushed_at") or datetime.now(timezone.utc).isoformat()
-            # Persist the exact immutable remote identity alongside the local
-            # candidate identity before the reviewer is called.
-            candidate["remote_branch"] = info.branch
-            candidate["remote_sha"] = candidate["commit_sha"]
-            atomic_write_text(_candidate_commit_path(run_dir, cycle), _json_text(candidate))
-            candidate_state = dict(store.load().get("candidate") or {})
-            candidate_state[f"{cycle:03d}"] = candidate
-            store.update(
-                status=store.load().get("status", RunStatus.APPROVED),
-                candidate=candidate_state,
-                remote_branch=info.branch,
-                remote_sha=candidate["commit_sha"],
+                if isinstance(previous, dict):
+                    previous_candidate_sha = previous.get("commit_sha")
+            remote_tip = remote_run_branch_tip(
+                info.source_repo, remote=staging_remote, branch=info.branch
             )
-            self._trace_emit(
-                "candidate.pushed",
-                phase="publication",
-                cycle=cycle,
-                data={
-                    "parent_sha": candidate.get("parent_sha"),
-                    "commit_sha": candidate.get("commit_sha"),
-                    "tree_sha": candidate.get("tree_sha"),
-                    "remote": candidate.get("remote"),
-                    "branch": candidate.get("remote_branch") or info.branch,
-                    "remote_sha": candidate.get("remote_sha"),
-                    "pushed_at": candidate.get("pushed_at"),
-                },
-                once=True,
+            if remote_tip not in {
+                None, candidate["commit_sha"], previous_candidate_sha
+            }:
+                raise GitError(
+                    "remote run branch points to a different commit "
+                    f"(expected candidate {candidate['commit_sha']} or prior "
+                    f"candidate {previous_candidate_sha}, got {remote_tip})"
+                )
+            if remote_tip != candidate["commit_sha"]:
+                push_run_branch(
+                    info.worktree, remote=staging_remote,
+                    branch=info.branch, commit_sha=candidate["commit_sha"],
+                )
+            verified_tip = remote_run_branch_tip(
+                info.source_repo, remote=staging_remote, branch=info.branch
             )
+            if verified_tip != candidate["commit_sha"]:
+                raise GitError(
+                    "remote run branch does not point to the candidate commit "
+                    f"(expected {candidate['commit_sha']}, got {verified_tip})"
+                )
+        except (GitError, OSError, ValueError) as exc:
+            raise CandidatePushError("PUSH_FAILED: candidate push did not complete") from exc
+        candidate = dict(candidate)
+        candidate["remote"] = staging_remote
+        candidate["remote_branch"] = info.branch
+        candidate["remote_sha"] = candidate["commit_sha"]
+        candidate["pushed_at"] = candidate.get("pushed_at") or datetime.now(timezone.utc).isoformat()
+        # Persist the exact immutable remote identity alongside the local
+        # candidate identity before the reviewer is called.
+        atomic_write_text(_candidate_commit_path(run_dir, cycle), _json_text(candidate))
+        candidate_state = dict(store.load().get("candidate") or {})
+        candidate_state[f"{cycle:03d}"] = candidate
+        store.update(
+            status=store.load().get("status", RunStatus.APPROVED),
+            candidate=candidate_state,
+            remote_branch=info.branch,
+            remote_sha=candidate["commit_sha"],
+        )
+        self._trace_emit(
+            "candidate.pushed",
+            phase="publication",
+            cycle=cycle,
+            data={
+                "parent_sha": candidate.get("parent_sha"),
+                "commit_sha": candidate.get("commit_sha"),
+                "tree_sha": candidate.get("tree_sha"),
+                "remote": candidate.get("remote"),
+                "branch": candidate.get("remote_branch") or info.branch,
+                "remote_sha": candidate.get("remote_sha"),
+                "pushed_at": candidate.get("pushed_at"),
+            },
+            once=True,
+        )
         return candidate
 
     def _run_v2_reviewer(
@@ -3768,6 +3867,9 @@ class Orchestrator:
             base_sha=base_sha,
             candidate_sha=candidate_sha,
             evidence=evidence,
+            remote_sha=candidate_commit.get("remote_sha"),
+            remote_branch=candidate_commit.get("remote_branch"),
+            remote_name=candidate_commit.get("remote"),
         )
         try:
             code_evidence_payload = json.loads(code_evidence)
@@ -4212,7 +4314,7 @@ class Orchestrator:
 
         cleanup: dict[str, Any] = {
             "status": "warning",
-            "remote": self.config.publish.remote,
+            "remote": self.config.repository.remote,
             "branch": info.branch,
             "commit_sha": commit_sha,
             "warning": "run branch cleanup did not complete; branch retained",
@@ -4224,7 +4326,7 @@ class Orchestrator:
             validate_run_branch(persisted_branch, base_ref=self.config.base_ref)
             result = delete_run_branch(
                 info.source_repo,
-                remote=self.config.publish.remote,
+                remote=self.config.repository.remote,
                 branch=persisted_branch,
                 expected_commit_sha=commit_sha,
                 base_ref=self.config.base_ref,
@@ -4309,6 +4411,22 @@ class Orchestrator:
                 raise GitError("candidate commit is not the run branch tip")
             if resolve_tree(info.worktree, commit_sha) != approved_tree:
                 raise GitError("candidate commit tree differs from approved tree")
+            candidate_record = _read_json_artifact(_candidate_commit_path(run_dir, cycle))
+            if (
+                not isinstance(candidate_record, dict)
+                or candidate_record.get("commit_sha") != commit_sha
+                or candidate_record.get("remote") != self.config.repository.remote
+                or candidate_record.get("remote_branch") != info.branch
+                or candidate_record.get("remote_sha") != commit_sha
+                or not isinstance(candidate_record.get("pushed_at"), str)
+                or not candidate_record.get("pushed_at")
+                or remote_run_branch_tip(
+                    info.source_repo,
+                    remote=self.config.repository.remote,
+                    branch=info.branch,
+                ) != commit_sha
+            ):
+                raise GitError("candidate remote authority is not exact")
             expected_parent = commit_parents(info.worktree, commit_sha)[0]
             validate_run_branch(info.branch, base_ref=self.config.base_ref)
             if self.config.publish.enabled:
@@ -4367,7 +4485,7 @@ class Orchestrator:
             if not isinstance(candidate, dict) or candidate.get("commit_sha") != commit_sha:
                 raise GitError("candidate commit artifact does not match publication")
             if remote_run_branch_tip(
-                info.source_repo, remote=self.config.publish.remote, branch=info.branch
+                info.source_repo, remote=self.config.repository.remote, branch=info.branch
             ) != commit_sha:
                 raise GitError("candidate run branch is not pushed")
             if fast_forward:
@@ -4533,9 +4651,7 @@ class Orchestrator:
             resumed = validate_resume(
                 config=self.config, repair_scope=self._effective_repair_scope,
                 run_dir=run_dir, state=state, checkpoint=checkpoint,
-                publish_remote=(
-                    self.config.publish.remote if self.config.publish.enabled else None
-                ),
+                staging_remote=self.config.repository.remote,
             )
         except (ResumeIntegrityError, ResumeRequiresOperatorError) as exc:
             failed = store.record_failure(

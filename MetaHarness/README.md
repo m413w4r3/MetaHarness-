@@ -24,7 +24,9 @@ deterministic checks
   ↓
 accepted candidate D
   ↓
-push exact D on the run branch
+push exact D on the configured repository run branch
+  ↓
+read the remote tip and require tip == D
   ↓
 final reviewer on immutable D
   ↓
@@ -72,6 +74,9 @@ delete remote run branch           (fast-forward-base only; after publication)
   `RunStateStore` comme autorité ;
 - aucun force, lease, tag ou merge automatique ; un échec du cleanup après
   publication laisse le run `PUBLISHED` avec un warning diagnostiqué.
+- tous les candidats reviewables sont poussés sur la branche distante du run
+  avant le reviewer final, même quand `publish.enabled = false`. Ce staging
+  push est distinct de la publication post-PASS contrôlée par `[publish]`.
 
 ### Reprise : failure != lost work
 

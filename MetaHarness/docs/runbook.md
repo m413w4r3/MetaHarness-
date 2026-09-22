@@ -125,8 +125,11 @@ PLAN → implementation step → accepted step commit → …
 ```
 
 `max_check_repair_attempts` and `max_review_repair_cycles` are independent
-budgets. Each reviewable candidate is pushed before its reviewer; publication
-happens only after the final reviewer PASS and the exact-tree candidate gate.
+budgets. Each reviewable candidate is pushed to the `repository.remote` run
+branch before its reviewer, and MetaHarness persists and verifies the exact
+remote SHA. This staging push happens even when `publish.enabled = false`;
+publication happens only after the final reviewer PASS and the exact-tree
+candidate gate.
 It never pushes `base_ref`, never uses force, tags or deletion, and never
 automatically merges the run branch. A published run exposes the branch URL
 (`…/tree/harness/<plan>/<run-id>`).
@@ -238,10 +241,12 @@ the immutable candidate reference.
 - `BASE_MOVED_SINCE_RUN`: main or origin/main moved (or the swap failed).
   Nothing is merged, rebased, forced or pushed; start a new run from the new
   main.
-- `PUSH_FAILED` during candidate push resumes at that candidate push. After
+- `PUSH_FAILED` during candidate staging resumes at that candidate push. After
   the base-branch swap, `state.publish.local_base_updated = true` and the
   failure detail says that local main already points to the commit; resume then
-  retries publication only.
+  retries publication only. A `CANDIDATE_PUSH` resume accepts an absent remote
+  tip for the same candidate push, but refuses an unexpected remote SHA with
+  `RESUME_INTEGRITY_FAILURE`; an exact existing tip is not pushed again.
 - If the user checkout has `main` checked out, its index and files are not
   updated by the ref move (`publish.json.base_checked_out_in`). Synchronize it
   with `git -C <checkout> read-tree -m -u <base_sha> <commit_sha>`, which

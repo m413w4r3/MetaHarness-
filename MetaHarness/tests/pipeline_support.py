@@ -261,6 +261,10 @@ enabled = {'true' if semantic_revision else 'false'}
 max_check_repair_attempts = {check_repair}
 max_review_repair_cycles = {review_repair}
 
+[repository]
+remote = "origin"
+planner_remote_exploration = true
+
 [approval]
 require_plan_approval = false
 

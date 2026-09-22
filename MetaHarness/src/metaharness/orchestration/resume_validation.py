@@ -595,7 +595,7 @@ def validate_resume(
     run_dir: Path,
     state: Mapping[str, Any],
     checkpoint: ResumeCheckpoint,
-    publish_remote: str | None,
+    staging_remote: str,
 ) -> ResumedRun:
     """Fail-closed integrity gate in front of every resumed execution phase."""
 
@@ -764,12 +764,25 @@ def validate_resume(
                 run_dir, number, candidate_stage, tree=expected_tree, head=head,
                 base_scope=cycle_base_scope, policy=repair_scope,
             )
-            if publish_remote is not None:
-                remote_tip = remote_run_branch_tip(repo, remote=publish_remote, branch=branch)
-                if checkpoint.phase is ResumePhase.CANDIDATE_PUSH and remote_tip not in {None, head}:
+            remote_tip = remote_run_branch_tip(repo, remote=staging_remote, branch=branch)
+            if checkpoint.phase is ResumePhase.CANDIDATE_PUSH:
+                previous_candidate_sha = None
+                if number > 1:
+                    previous = read_candidate_record(run_dir, number - 1)
+                    previous_candidate_sha = previous.get("commit_sha")
+                if remote_tip not in {None, head, previous_candidate_sha}:
                     _refuse("remote run branch points to a different commit")
-                if checkpoint.phase is not ResumePhase.CANDIDATE_PUSH and remote_tip != head:
-                    _refuse("remote run branch does not point to the candidate commit")
+            elif remote_tip != head:
+                _refuse("remote run branch does not point to the candidate commit")
+            if checkpoint.phase in {ResumePhase.FINAL_REVIEW, ResumePhase.PUBLISH}:
+                if (
+                    candidate.get("remote") != staging_remote
+                    or candidate.get("remote_branch") != branch
+                    or candidate.get("remote_sha") != head
+                    or not isinstance(candidate.get("pushed_at"), str)
+                    or not candidate.get("pushed_at")
+                ):
+                    _refuse("candidate record does not prove the exact remote authority")
         if checkpoint.phase is ResumePhase.PUBLISH:
             evidence = candidate_evidence(run_dir, number)
             if evidence is None or evidence.staged_tree_sha != expected_tree:

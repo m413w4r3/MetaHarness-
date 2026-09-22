@@ -65,10 +65,13 @@ accepter un arbre. Une mutation du HEAD, de l’index, de l’arbre candidat ou
 d’un état protégé est une erreur d’intégrité : le run se ferme sans nouvel
 appel LLM/AgentExecutor pour « réparer » cette erreur.
 
-Le candidat est un objet immutable. Il est poussé sur la branche du run avant
-la review finale ; le reviewer reçoit ce SHA et non une branche mobile. Après
-`PASS`, la publication réutilise exactement le SHA approuvé. Elle ne recrée
-pas un commit et ne publie jamais un autre arbre.
+Le candidat est un objet immutable. Tous les candidats reviewables sont
+poussés sur le remote configuré par `repository.remote` avant la review finale;
+le tip distant est relu et doit être exactement égal au `commit_sha`. Le
+reviewer reçoit ce SHA et non une branche mobile. Après `PASS`, la publication
+réutilise exactement le SHA approuvé. Elle ne recrée pas un commit et ne
+publie jamais un autre arbre. `publish.enabled` contrôle uniquement cette
+publication post-PASS, jamais le staging push obligatoire.
 
 ### Frontières de correction
 

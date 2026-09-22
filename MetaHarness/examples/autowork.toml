@@ -24,7 +24,8 @@ staged_step_max_mutable_paths = 6
 # Target workflow: generic cycles 001, 002, ... Each cycle runs its approved
 # steps (accepted step commits), the optional semantic revision, one
 # deterministic gate with bounded check-repair attempts, one immutable
-# candidate commit pushed to the run branch, then the final reviewer. A
+# candidate commit pushed to the repository run branch, verified at the exact
+# remote tip, then the final reviewer. A
 # REVISE (IMPLEMENTATION or REPLAN) opens the next correction cycle while
 # max_review_repair_cycles allows it. The final PASS publishes the exact
 # approved candidate chain tip (no new commit): CAS fast-forward of local

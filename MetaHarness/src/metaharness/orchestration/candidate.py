@@ -93,13 +93,13 @@ class CandidateLifecycle:
     def __init__(
         self,
         *,
-        publish_remote: str,
+        staging_remote: str,
         authorize_tree: Callable[..., None],
         gate_mutable_authority: Callable[..., Any],
         push_tree: Callable[..., dict[str, Any]],
         cycle_update: Callable[..., None],
     ) -> None:
-        self._publish_remote = publish_remote
+        self._staging_remote = staging_remote
         self._authorize_tree = authorize_tree
         self._gate_mutable_authority = gate_mutable_authority
         self._push_tree = push_tree
@@ -151,7 +151,7 @@ class CandidateLifecycle:
             tree_sha=evidence.staged_tree_sha,
             parent_sha=parents[0],
             branch=ctx.info.branch,
-            remote=self._publish_remote,
+            remote=self._staging_remote,
             immutable_url=_commit_web_url(ctx.repository_reference, head),
             gate_stage=stage.value,
             pushed_at=stored.get("pushed_at") if isinstance(stored, dict) else None,

@@ -23,6 +23,7 @@ interrupted worktrees are intentionally retained for inspection.
 | `changed-files.txt` | Staged path list |
 | `checks.json` / `checks/` | Check metadata, full stdout, and stderr |
 | `evidence.json` | Frozen tree SHA, checks, gate failures, and diff metadata |
+| `cycles/<number>/candidate/commit.json` | Accepted candidate SHA/tree plus the staging remote, run branch, verified remote SHA, and `pushed_at` proof used before review |
 | `reviewer.request.txt` | Exact reviewer user message (written before the call) |
 | `reviewer.raw.md` / `review.json` | Raw review (written before parsing) and normalized verdict |
 | `repair_task.md` / `repair_task.json` | REVISE only: route, summary, findings, required fixes, missing tests, branch, worktree, run id |

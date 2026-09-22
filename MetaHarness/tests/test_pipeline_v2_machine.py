@@ -10,6 +10,7 @@ from unittest import mock
 
 from metaharness.llm.chat import LLMError
 from metaharness.config import load_config
+from metaharness.gitops import GitError
 from metaharness.models import ExecutionRole, RunStatus
 from metaharness.run_options import RunOptions
 from tests.pipeline_support import (
@@ -26,6 +27,63 @@ STEP = ("S01", "feature.txt", "Write the feature")
 
 
 class SingleCycleTests(PipelineHarness):
+    def test_publish_disabled_still_pushes_exact_candidate_before_review(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(publish=False), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        candidate = json.loads(
+            (self.run_dir() / "cycles/001/candidate/commit.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(candidate["remote"], "origin")
+        self.assertEqual(candidate["remote_branch"], self.state()["branch"])
+        self.assertEqual(candidate["remote_sha"], candidate["commit_sha"])
+        self.assertTrue(candidate["pushed_at"])
+        self.assertEqual(self.remote_tip(self.state()["branch"]), candidate["commit_sha"])
+        self.assertIn(candidate["commit_sha"], self.reviewer.requests[0])
+        self.assertFalse((self.run_dir() / "publish.json").exists())
+
+    def test_candidate_push_failure_never_calls_reviewer(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        with mock.patch(
+            "metaharness.orchestrator.push_run_branch",
+            side_effect=GitError("simulated push failure"),
+        ):
+            result = self.orchestrator(
+                self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+            ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "PUSH_FAILED")
+        self.assertEqual(self.reviewer.requests, [])
+
+    def test_different_remote_tip_fails_closed_before_reviewer(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        with mock.patch(
+            "metaharness.orchestrator.remote_run_branch_tip",
+            return_value="d" * 40,
+        ):
+            result = self.orchestrator(
+                self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+            ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "PUSH_FAILED")
+        self.assertEqual(self.reviewer.requests, [])
+
+    def test_remote_push_without_web_url_uses_bounded_diff_fallback(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(publish=False), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        request = self.reviewer.requests[0]
+        self.assertIn('"remote_exploration": "UNAVAILABLE"', request)
+        self.assertIn("<BOUNDED DIFF EXCERPT>", request)
+
     def test_pipeline_v2_stays_backend_neutral(self) -> None:
         source = Path(__file__).parents[1].joinpath(
             "src", "metaharness", "orchestration", "pipeline_v2.py"
@@ -577,7 +635,12 @@ class ResumeTests(PipelineHarness):
 
         resumed = self.orchestrator(
             self.config(publish=True), planner=["unused"], reviewer=[review()],
-        ).resume("run")
+        )
+        with mock.patch(
+            "metaharness.orchestrator.push_run_branch",
+            side_effect=AssertionError("resume must not repush an exact remote SHA"),
+        ):
+            resumed = resumed.resume("run")
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(self.remote_tip(branch), candidate["commit_sha"])
         self.assertEqual(git(self.worktree(), "rev-list", "--count", "HEAD"), "2")

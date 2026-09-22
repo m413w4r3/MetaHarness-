@@ -35,10 +35,15 @@ class P27Tests(unittest.TestCase):
         root = self.fixture.root
         bare = root / "origin.git"
         subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
-        subprocess.run(
-            ["git", "-C", str(self.fixture.repo), "remote", "add", "origin", str(bare)],
-            check=True,
+        remote = subprocess.run(
+            ["git", "-C", str(self.fixture.repo), "remote", "get-url", "origin"],
+            capture_output=True,
         )
+        if remote.returncode != 0:
+            subprocess.run(
+                ["git", "-C", str(self.fixture.repo), "remote", "add", "origin", str(bare)],
+                check=True,
+            )
         worktree = root / "worktrees" / run_id
         llm = FakeLLM(review=review, worktree=worktree)
         config = self.fixture.config_file(llm, run_id=run_id)
@@ -119,7 +124,7 @@ class P27Tests(unittest.TestCase):
         hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
         subprocess.run(
-            ["git", "-C", str(self.fixture.repo), "remote", "add", "origin", str(bare)],
+            ["git", "-C", str(self.fixture.repo), "remote", "set-url", "origin", str(bare)],
             check=True,
         )
         worktree = root / "worktrees" / "rejected"
@@ -150,11 +155,19 @@ class P27Tests(unittest.TestCase):
         self.assertIsNone(state.get("commit_sha"))
         self.assertEqual(
             subprocess.run(
-                ["git", "-C", str(bare), "show-ref"],
+                ["git", "-C", str(bare), "rev-parse", "refs/heads/main"],
                 capture_output=True,
                 text=True,
-            ).stdout,
-            "",
+            ).stdout.strip(),
+            self.fixture.base_sha,
+        )
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "-C", str(bare), "rev-parse", f"refs/heads/{state['branch']}"],
+                capture_output=True,
+                text=True,
+            ).returncode,
+            0,
         )
 
     def test_publish_mode_and_branch_namespace_are_strict(self) -> None:

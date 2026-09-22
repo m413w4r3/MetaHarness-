@@ -95,8 +95,9 @@ Commit objects are built from the exact candidate tree object
 compare-and-swap `git update-ref HEAD <new> <base>`. Commit hooks therefore
 cannot restage content, and a moved HEAD makes the update fail. In v2, the
 accepted candidate is committed after semantic revision and its deterministic
-checks, then pushed before final review; publication remains gated by the
-final reviewer PASS.
+checks, then pushed to the configured repository run branch before final
+review; the remote tip must equal that candidate SHA. Publication remains
+gated by the final reviewer PASS.
 
 Planner and reviewer answers are free Markdown. The parser is tolerant on
 presentation (headings, bold labels, bracket/colon markers, one whole-answer
@@ -170,16 +171,20 @@ PLAN → implementation step → accepted step commit → …
   configured defaults, and runs configured preflights before expensive workers.
 - The reviewer receives the original approved plan, the bounded repair
   evidence applicable to its route, and the cycle history.
-- The pushed candidate commit is the reviewer's code authority. When remote
-  exploration is available, MetaHarness sends the BASE SHA, CANDIDATE SHA,
+- The pushed candidate commit is the reviewer's code authority. A reviewable
+  candidate is always pushed before review, and the remote tip is verified to
+  equal its SHA. When remote exploration is available, MetaHarness sends the
+  BASE SHA, CANDIDATE SHA,
   immutable candidate URL, compare URL, changed paths, and deterministic
   evidence; it does not recopy the full diff into the reviewer prompt. The
   reviewer inspects the immutable candidate when it needs code, while a
-  bounded diff fallback is used only when remote exploration is unavailable.
+  bounded diff fallback is used when durable push proof or an inspectable web
+  URL is unavailable. URLs alone never authorize remote exploration.
   This keeps prompt size independent of the total diff size and step
   count.
 - Every reviewable candidate creates and pushes its exact immutable tree on
-  the run branch before the final reviewer. Publication happens only after
+  the run branch before the final reviewer, regardless of `publish.enabled`.
+  Publication happens only after
   the final reviewer PASS and a green gate, using that already-pushed approved
   candidate: no force, no tag, no delete, never `base_ref`/`main`, and never
   an automatic merge of the run branch.

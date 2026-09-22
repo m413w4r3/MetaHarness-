@@ -226,6 +226,11 @@ class OrchestratorE2ETests(unittest.TestCase):
         git(self.repo, "add", "--all")
         git(self.repo, "commit", "-qm", "base")
         self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        self.remote = self.root / "origin.git"
+        self.remote.mkdir()
+        git(self.remote, "init", "--bare", "-q")
+        git(self.repo, "remote", "add", "origin", str(self.remote))
+        git(self.repo, "push", "-q", "origin", "HEAD:refs/heads/main")
         self.spec = self.root / "SPEC.md"
         self.spec.write_text("Implement the feature without exposing the original request.\n", encoding="utf-8")
         # CodexAgent invokes the configured V0 executable by the stable name
@@ -321,6 +326,8 @@ class OrchestratorE2ETests(unittest.TestCase):
                 f"worktrees_root = {str(self.root / 'worktrees')!r}",
                 "require_clean_base = true",
                 f"max_diff_bytes = {max_diff}",
+                "",
+                "[repository]\nremote = \"origin\"\nplanner_remote_exploration = true",
                 "",
                 "[approval]",
                 f"require_plan_approval = {'true' if require_plan_approval else 'false'}",
