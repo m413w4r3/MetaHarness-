@@ -9,8 +9,8 @@ candidate commit, a review, the publication) is injected explicitly through
 A run is a sequence of cycles ``001, 002, ...``.  Each cycle executes one
 approved plan (the operator-approved plan for the initial cycle, a
 review-driven correction plan afterwards), optionally a semantic revision,
-one deterministic gate episode with its bounded check-repair attempts, one
-immutable candidate commit, its push and one final review.  The number of
+one or two deterministic gate episodes with their bounded check-repair
+attempts, the accepted candidate HEAD, its push and one final review.  The number of
 cycles is bounded only by the frozen run options, never by this module.
 """
 
@@ -74,6 +74,10 @@ def gate_dir(run_dir: Path, cycle: RunCycle | int, stage: GateStage | str) -> Pa
     return cycle_dir(run_dir, cycle) / "checks" / _stage_name(stage)
 
 
+def gate_acceptance_path(run_dir: Path, cycle: RunCycle | int, stage: GateStage | str) -> Path:
+    return gate_dir(run_dir, cycle, stage) / "accepted.json"
+
+
 def check_repair_dir(run_dir: Path, cycle: RunCycle | int, stage: GateStage | str) -> Path:
     return cycle_dir(run_dir, cycle) / "check-repair" / _stage_name(stage)
 
@@ -98,20 +102,22 @@ def cycle_record_path(run_dir: Path, cycle: RunCycle | int) -> Path:
     return cycle_dir(run_dir, cycle) / "cycle.json"
 
 
-def gate_stage_for(kind: CycleKind, *, semantic_revision: bool) -> GateStage:
-    """The single gate stage of a cycle.
+def pre_semantic_gate_stage(kind: CycleKind) -> GateStage:
+    """Return the gate immediately following implementation work."""
 
-    The semantic revision (when enabled) runs before the gate, so the gate
-    then answers for the revised tree.
-    """
-
-    if semantic_revision:
-        return GateStage.POST_SEMANTIC_REVISION
     return {
         CycleKind.INITIAL: GateStage.POST_IMPLEMENTATION,
-        CycleKind.REVIEW_IMPLEMENTATION: GateStage.POST_REVIEW_IMPLEMENTATION,
         CycleKind.REVIEW_REPLAN: GateStage.POST_REVIEW_REPLAN,
     }[CycleKind(kind)]
+
+
+def final_gate_stage(kind: CycleKind) -> GateStage:
+    """Return the gate which authorizes the candidate HEAD."""
+
+    kind = CycleKind(kind)
+    if kind is CycleKind.REVIEW_IMPLEMENTATION:
+        return GateStage.POST_REVIEW_IMPLEMENTATION
+    return GateStage.POST_SEMANTIC_REVISION
 
 
 def correction_kind(route: ReviewRoute) -> CycleKind:
@@ -200,6 +206,9 @@ class PipelineV2Operations:
     # Deterministic gate episode.
     run_gate: Callable[[PipelineV2Context, CyclePlan, GateStage], EvidenceBundle]
     load_gate_evidence: Callable[[PipelineV2Context, int, GateStage], EvidenceBundle | None]
+    accept_gate_state: Callable[
+        [PipelineV2Context, CyclePlan, GateStage, EvidenceBundle], Mapping[str, Any]
+    ]
     check_repair_attempts: Callable[[PipelineV2Context, int, GateStage], tuple[Any, ...]]
     check_repair_attempt: Callable[
         [PipelineV2Context, CyclePlan, GateStage, int, EvidenceBundle], None
@@ -220,27 +229,6 @@ class PipelineV2Operations:
     publish: Callable[[PipelineV2Context, int, Mapping[str, Any]], RunResult]
 
 
-# Phase rank inside one cycle.  Gate and check-repair share one rank: the
-# gate episode alternates between them and owns its own resume point.
-_RANK = {
-    ResumePhase.REVIEW_REPLAN: 0,
-    ResumePhase.IMPLEMENT_STEP: 1,
-    ResumePhase.REVIEW_IMPLEMENTATION: 1,
-    ResumePhase.SEMANTIC_REVISION: 2,
-    ResumePhase.DETERMINISTIC_GATE: 3,
-    ResumePhase.CHECK_REPAIR: 3,
-    ResumePhase.CANDIDATE_READY: 4,
-    ResumePhase.CANDIDATE_PUSH: 5,
-    ResumePhase.FINAL_REVIEW: 6,
-    ResumePhase.PUBLISH: 7,
-}
-_STEP_RANK = _RANK[ResumePhase.IMPLEMENT_STEP]
-_REVISION_RANK = _RANK[ResumePhase.SEMANTIC_REVISION]
-_GATE_RANK = _RANK[ResumePhase.DETERMINISTIC_GATE]
-_CANDIDATE_RANK = _RANK[ResumePhase.CANDIDATE_READY]
-_PUSH_RANK = _RANK[ResumePhase.CANDIDATE_PUSH]
-
-
 @dataclass(frozen=True)
 class PipelineV2Coordinator:
     """Sequence the generic cycles of one prepared pipeline-v2 run."""
@@ -255,7 +243,10 @@ class PipelineV2Coordinator:
         operations read back what they need from their durable artifacts.
         """
 
-        if start.phase not in _RANK:
+        if start.phase in {
+            ResumePhase.CONTEXT, ResumePhase.PLANNER, ResumePhase.PLAN_APPROVAL,
+            ResumePhase.WORKTREE_SETUP,
+        }:
             raise ValueError(f"{start.phase.value} is not an execution checkpoint")
         cycle = self._cycle_at(start)
         entry: ResumeCheckpoint | None = start
@@ -278,18 +269,14 @@ class PipelineV2Coordinator:
         self, cycle: RunCycle, start: ResumeCheckpoint | None, *, fresh: bool,
     ) -> RunResult | ReviewResult:
         ops, ctx = self.operations, self.context
-        at = _RANK[start.phase] if start is not None else 0
         ops.begin_cycle(ctx, cycle, fresh)
-        stage = gate_stage_for(cycle.kind, semantic_revision=ctx.options.semantic_revision_enabled)
         if start is not None and start.phase is ResumePhase.PUBLISH:
             return ops.publish(ctx, cycle.number, ops.load_candidate(ctx, cycle.number))
 
         if cycle.kind is CycleKind.INITIAL:
             cycle_plan = ops.initial_plan(ctx)
-        elif at == 0:
+        elif start is None or start.phase is ResumePhase.REVIEW_REPLAN:
             if start is None:
-                # The correction planner is the first operation of the cycle;
-                # it starts from the reviewed candidate of the previous one.
                 ops.checkpoint(
                     ctx, ResumePhase.REVIEW_REPLAN, cycle=cycle.number,
                     head=ops.current_head(ctx), tree=ops.candidate_tree(ctx),
@@ -298,40 +285,107 @@ class PipelineV2Coordinator:
         else:
             cycle_plan = ops.load_correction(ctx, cycle, start.correction_bundle_sha256)
 
-        if at <= _STEP_RANK:
-            self._implement(cycle_plan)
-        if ops.unresolved_mismatches(ctx, cycle_plan) and not ctx.options.semantic_revision_enabled:
+        phase = (
+            ResumePhase.IMPLEMENT_STEP if cycle.kind is CycleKind.INITIAL
+            else ResumePhase.REVIEW_IMPLEMENTATION
+        )
+        pre_stage = (
+            pre_semantic_gate_stage(cycle.kind)
+            if cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION else None
+        )
+        final_stage = final_gate_stage(cycle.kind)
+        semantic_enabled = (
+            ctx.options.semantic_revision_enabled
+            and cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION
+        )
+
+        if start is None or start.phase is phase or start.phase is ResumePhase.REVIEW_REPLAN:
+            self._implement(cycle_plan, next_stage=pre_stage or final_stage)
+        if ops.unresolved_mismatches(ctx, cycle_plan) and not semantic_enabled:
             raise PipelineFailure(
                 "UNRESOLVED_CONTRACT_MISMATCH",
                 "HUMAN_REQUIRED: semantic revision is disabled while contract mismatches are deferred",
             )
-        if ctx.options.semantic_revision_enabled and at <= _REVISION_RANK:
-            ops.semantic_revision(ctx, cycle_plan)
-            self._boundary(ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=stage)
 
-        if at <= _GATE_RANK:
-            evidence = self._gate_episode(
-                cycle_plan, stage, start if start is not None and at == _GATE_RANK else None,
+        # Initial and replan cycles have a gate before semantic revision.
+        if pre_stage is not None and (
+            start is None or start.phase in {phase, ResumePhase.REVIEW_REPLAN}
+            or self._is_gate_checkpoint(start, pre_stage)
+        ):
+            self._gate_episode(
+                cycle_plan, pre_stage,
+                start if self._is_gate_checkpoint(start, pre_stage) else None,
             )
-        else:
-            evidence = ops.load_gate_evidence(ctx, cycle.number, stage)
-            if evidence is None:
-                raise PipelineFailure(
-                    "RESUME_INTEGRITY_FAILURE", "the cycle gate evidence is missing"
-                )
 
-        if at <= _CANDIDATE_RANK:
+        if semantic_enabled and (
+            start is None or start.phase in {
+                phase, ResumePhase.REVIEW_REPLAN, ResumePhase.SEMANTIC_REVISION,
+            } or self._is_gate_checkpoint(start, pre_stage)
+        ):
+            self._boundary(ResumePhase.SEMANTIC_REVISION, cycle_plan)
+            ops.semantic_revision(ctx, cycle_plan)
+            self._boundary(ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=final_stage)
+
+        final_start = start if self._is_gate_checkpoint(start, final_stage) else None
+        should_run_final_gate = (
+            final_start is not None
+            or start is None
+            or start.phase is phase
+            or start.phase is ResumePhase.REVIEW_REPLAN
+            or start.phase is ResumePhase.SEMANTIC_REVISION
+            or self._is_gate_checkpoint(start, pre_stage)
+        )
+        if semantic_enabled:
+            # A pre-semantic gate was already consumed above; the final gate is
+            # still needed after the revision.  A final gate checkpoint resumes
+            # its own episode without replaying the revision.
+            evidence = self._gate_episode(cycle_plan, final_stage, final_start) if should_run_final_gate else None
+        elif pre_stage is not None:
+            evidence = ops.load_gate_evidence(ctx, cycle.number, pre_stage)
+        else:
+            evidence = self._gate_episode(cycle_plan, final_stage, final_start) if should_run_final_gate else None
+        if evidence is None:
+            evidence = ops.load_gate_evidence(ctx, cycle.number, final_stage if semantic_enabled else (pre_stage or final_stage))
+        if evidence is None:
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "the final gate evidence is missing")
+
+        stage = final_stage if semantic_enabled else (pre_stage or final_stage)
+        if start is None or start.phase not in {
+            ResumePhase.CANDIDATE_READY, ResumePhase.CANDIDATE_PUSH,
+            ResumePhase.FINAL_REVIEW, ResumePhase.PUBLISH,
+        }:
             self._boundary(ResumePhase.CANDIDATE_READY, cycle_plan, tree=evidence.staged_tree_sha)
             candidate = ops.create_candidate(ctx, cycle_plan, stage, evidence)
         else:
             candidate = ops.load_candidate(ctx, cycle.number)
-        if at <= _PUSH_RANK:
+        if start is None or start.phase in {
+            phase, ResumePhase.REVIEW_REPLAN, ResumePhase.SEMANTIC_REVISION,
+            ResumePhase.DETERMINISTIC_GATE, ResumePhase.CHECK_REPAIR,
+            ResumePhase.CANDIDATE_READY,
+        }:
             self._candidate_boundary(ResumePhase.CANDIDATE_PUSH, cycle_plan, candidate)
             candidate = ops.push_candidate(ctx, cycle.number, candidate)
-        self._candidate_boundary(ResumePhase.FINAL_REVIEW, cycle_plan, candidate)
+        elif start.phase is ResumePhase.CANDIDATE_PUSH:
+            candidate = ops.push_candidate(ctx, cycle.number, candidate)
+        if start is None or start.phase in {
+            phase, ResumePhase.SEMANTIC_REVISION, ResumePhase.DETERMINISTIC_GATE,
+            ResumePhase.CHECK_REPAIR, ResumePhase.CANDIDATE_READY,
+            ResumePhase.CANDIDATE_PUSH, ResumePhase.FINAL_REVIEW,
+        }:
+            self._candidate_boundary(ResumePhase.FINAL_REVIEW, cycle_plan, candidate)
         review = ops.review_candidate(ctx, cycle_plan, candidate, evidence)
         ops.record_review(ctx, cycle.number, review, evidence)
         return self._route(cycle_plan, candidate, evidence, review)
+
+    @staticmethod
+    def _is_gate_checkpoint(
+        start: ResumeCheckpoint | None, stage: GateStage | None,
+    ) -> bool:
+        return bool(
+            start is not None and stage is not None
+            and start.phase in {ResumePhase.DETERMINISTIC_GATE, ResumePhase.CHECK_REPAIR}
+            and start.stage is stage
+        )
 
     def _route(
         self, cycle_plan: CyclePlan, candidate: Mapping[str, Any],
@@ -359,7 +413,7 @@ class PipelineV2Coordinator:
 
     # -- phases ----------------------------------------------------------------
 
-    def _implement(self, cycle_plan: CyclePlan) -> None:
+    def _implement(self, cycle_plan: CyclePlan, *, next_stage: GateStage) -> None:
         ops, ctx = self.operations, self.context
         phase = (
             ResumePhase.IMPLEMENT_STEP if cycle_plan.cycle.kind is CycleKind.INITIAL
@@ -372,17 +426,7 @@ class PipelineV2Coordinator:
                 continue
             self._boundary(phase, cycle_plan, step_id=step.id)
             ops.execute_step(ctx, cycle_plan, index)
-        self._after_implementation(cycle_plan)
-
-    def _after_implementation(self, cycle_plan: CyclePlan) -> None:
-        stage = gate_stage_for(
-            cycle_plan.cycle.kind,
-            semantic_revision=self.context.options.semantic_revision_enabled,
-        )
-        if self.context.options.semantic_revision_enabled:
-            self._boundary(ResumePhase.SEMANTIC_REVISION, cycle_plan)
-        else:
-            self._boundary(ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=stage)
+        self._boundary(ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=next_stage)
 
     def _gate_episode(
         self, cycle_plan: CyclePlan, stage: GateStage, start: ResumeCheckpoint | None,
@@ -410,6 +454,7 @@ class PipelineV2Coordinator:
             if hard:
                 raise PipelineFailure(hard[0].split(":", 1)[0], ", ".join(hard))
             if evidence.deterministic_passed:
+                ops.accept_gate_state(ctx, cycle_plan, stage, evidence)
                 return evidence
             soft = ops.soft_failures(evidence)
             if not soft:
@@ -473,6 +518,7 @@ __all__ = [
     "CyclePlan", "PipelineFailure", "PipelineV2Context", "PipelineV2Coordinator",
     "PipelineV2Operations", "candidate_dir", "check_repair_attempt_dir",
     "check_repair_dir", "correction_dir", "correction_kind", "cycle_dir",
-    "cycle_record_path", "gate_dir", "gate_stage_for", "implementation_dir",
+    "cycle_record_path", "final_gate_stage", "gate_acceptance_path", "gate_dir", "implementation_dir",
+    "pre_semantic_gate_stage",
     "review_dir", "semantic_revision_dir",
 ]

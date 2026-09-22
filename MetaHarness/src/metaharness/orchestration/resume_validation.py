@@ -24,10 +24,13 @@ from .pipeline_v2 import (
     check_repair_attempt_dir,
     correction_dir,
     cycle_record_path,
+    gate_acceptance_path,
     gate_dir,
     implementation_dir,
     review_dir,
     semantic_revision_dir,
+    final_gate_stage,
+    pre_semantic_gate_stage,
 )
 from .shared import (
     _MAX_AGENT_REPORT_BYTES,
@@ -77,6 +80,7 @@ from ..models import (
     CycleKind,
     ExecutionRole,
     ExecutionSelection,
+    GateStage,
     HarnessConfig,
     PlanDecision,
     ReviewRoute,
@@ -327,6 +331,28 @@ def candidate_evidence(run_dir: Path, number: int) -> EvidenceBundle | None:
         return _load_evidence(gate_dir(run_dir, number, stage))
     except ValueError:
         return None
+
+
+def _validate_gate_acceptance(
+    run_dir: Path, number: int, stage: Any, *, tree: str | None, head: str | None,
+) -> None:
+    """Require the durable accepted state for a completed gate boundary."""
+
+    payload = _read_json_artifact(gate_acceptance_path(run_dir, number, stage))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("review_cycle") != number
+        or payload.get("stage") != getattr(stage, "value", stage)
+        or not _is_object_id(payload.get("tree_sha"))
+        or not _is_object_id(payload.get("commit_sha"))
+        or not _is_object_id(payload.get("parent_sha"))
+        or payload.get("tree_sha") != tree
+        or payload.get("commit_sha") != head
+        or payload.get("acceptance_kind") not in {"existing-head", "repair", "semantic-revision"}
+        or not isinstance(payload.get("commit_created"), bool)
+    ):
+        _refuse("the gate acceptance artifact is missing or invalid")
 
 
 def load_correction_plan(
@@ -645,6 +671,13 @@ def validate_resume(
             candidate = read_candidate_record(run_dir, number)
             if candidate["commit_sha"] != head or candidate["tree_sha"] != expected_tree:
                 _refuse("the run branch is not the recorded candidate commit")
+            try:
+                candidate_stage = GateStage(candidate["gate_stage"])
+            except (KeyError, TypeError, ValueError):
+                _refuse("the candidate gate stage is invalid")
+            _validate_gate_acceptance(
+                run_dir, number, candidate_stage, tree=expected_tree, head=head,
+            )
             if publish_remote is not None:
                 remote_tip = remote_run_branch_tip(repo, remote=publish_remote, branch=branch)
                 if checkpoint.phase is ResumePhase.CANDIDATE_PUSH and remote_tip not in {None, head}:

@@ -93,9 +93,8 @@ class CommitPathStructureTests(unittest.TestCase):
                     self.assertLess(gate, first, function.name)
         self.assertEqual(found, {
             "commit_step_tree": ["orchestrator.py:_accept_v2_step_tree"],
-            "commit_candidate_tree": ["orchestrator.py:_ensure_candidate_commit"],
-            "commit_repair_tree": ["orchestrator.py:_ensure_candidate_commit"],
-            "commit_revision_tree": ["orchestrator.py:_ensure_candidate_commit"],
+            "commit_repair_tree": ["orchestrator.py:_accept_gate_state"],
+            "commit_revision_tree": ["orchestrator.py:_accept_gate_state"],
         })
 
 

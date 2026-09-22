@@ -78,7 +78,6 @@ from .gitops import (
     restore_paths_from_tree,
     candidate_tree_sha,
     changed_paths_between_trees,
-    commit_candidate_tree,
     commit_step_tree,
     commit_repair_tree,
     commit_revision_tree,
@@ -300,6 +299,7 @@ from .orchestration.pipeline_v2 import (
     correction_dir,
     cycle_dir,
     cycle_record_path,
+    gate_acceptance_path,
     gate_dir,
     implementation_dir,
     review_dir,
@@ -2093,6 +2093,7 @@ class Orchestrator:
             load_gate_evidence=lambda ctx, number, stage: _load_evidence(
                 gate_dir(ctx.run_dir, number, stage)
             ),
+            accept_gate_state=bind(self._accept_gate_state, store),
             check_repair_attempts=lambda ctx, number, stage: self._check_repair_attempt_records(
                 ctx.run_dir, number, stage
             ),
@@ -2539,7 +2540,7 @@ class Orchestrator:
         store.update(status=RunStatus.VALIDATING, current_step=None)
         evidence = self._final_evidence(
             ctx.info.worktree, ctx.base_sha, directory,
-            check_failures_hard=False, reuse=False,
+            check_failures_hard=False, reuse=True, stage=stage,
             expected_head_sha=current_head(ctx.info.worktree),
             required_check_ids=cycle_plan.plan.required_checks or None,
             enforce_diff_size=False,
@@ -2725,30 +2726,214 @@ class Orchestrator:
         )
         self._update_v2_usage(store, ctx.run_dir)
 
+    def _accept_gate_state(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
+        stage: GateStage, evidence: EvidenceBundle,
+    ) -> dict[str, Any]:
+        """Accept one green gate tree, creating at most its safety commit."""
+
+        if not evidence.deterministic_passed or evidence.staged_tree_sha is None:
+            raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
+        worktree = ctx.info.worktree
+        directory = gate_dir(ctx.run_dir, cycle_plan.cycle, stage)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = gate_acceptance_path(ctx.run_dir, cycle_plan.cycle, stage)
+        stored = _read_json_artifact(path) if path.is_file() else None
+        if path.is_file() and stored is None:
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "gate acceptance is corrupted")
+        if stored is not None:
+            if (
+                not isinstance(stored, dict)
+                or stored.get("schema_version") != 1
+                or stored.get("review_cycle") != cycle_plan.cycle.number
+                or not all(_is_object_id(stored.get(key)) for key in ("tree_sha", "commit_sha", "parent_sha"))
+                or stored.get("stage") != stage.value
+                or stored.get("acceptance_kind") not in {"existing-head", "repair", "semantic-revision"}
+                or not isinstance(stored.get("commit_created"), bool)
+                or stored.get("tree_sha") != evidence.staged_tree_sha
+            ):
+                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "gate acceptance does not match evidence")
+            if current_head(worktree) != stored["commit_sha"]:
+                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted gate HEAD moved")
+            if stored.get("commit_created"):
+                chain = list(accepted_chain_records(ctx.run_dir))
+                if not any(
+                    isinstance(item, dict) and item.get("commit_sha") == stored["commit_sha"]
+                    for item in chain
+                ):
+                    chain.append({
+                        "commit_sha": stored["commit_sha"],
+                        "tree_sha": stored["tree_sha"],
+                        "parent_sha": stored["parent_sha"],
+                    })
+                    atomic_write_text(ctx.run_dir / "accepted-chain.json", _json_text({"commits": chain}))
+            self._trace_emit(
+                "gate.accepted",
+                phase="validation",
+                cycle=cycle_plan.cycle.number,
+                data={
+                    "stage": stage.value,
+                    "parent_sha": stored["parent_sha"],
+                    "commit_sha": stored["commit_sha"],
+                    "tree_sha": stored["tree_sha"],
+                    "commit_created": stored.get("commit_created"),
+                    "acceptance_kind": stored.get("acceptance_kind"),
+                },
+            )
+            return stored
+
+        self._authorize_candidate_tree(
+            evidence, worktree, current_head(worktree), ctx.branch_ref,
+        )
+        head = current_head(worktree)
+        current_tree = resolve_tree(worktree, head)
+        if current_tree == evidence.staged_tree_sha:
+            parents = commit_parents(worktree, head)
+            if len(parents) != 1:
+                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted HEAD has no single parent")
+            commit_sha, parent_sha = head, parents[0]
+            parent_tree = resolve_tree(worktree, parent_sha)
+            attempts = self._check_repair_attempt_records(
+                ctx.run_dir, cycle_plan.cycle.number, stage,
+            )
+            revision = _load_revision(semantic_revision_dir(ctx.run_dir, cycle_plan.cycle.number))
+            recovered_repair = bool(attempts and parent_tree != evidence.staged_tree_sha)
+            recovered_revision = bool(
+                stage is GateStage.POST_SEMANTIC_REVISION
+                and revision is not None
+                and revision.tree_before != revision.tree_after
+                and revision.tree_after == evidence.staged_tree_sha
+                and parent_tree == revision.tree_before
+            )
+            acceptance_kind = (
+                "repair" if recovered_repair else
+                "semantic-revision" if recovered_revision else "existing-head"
+            )
+            commit_created = recovered_repair or recovered_revision
+        else:
+            parent_sha = head
+            try:
+                commit_safety_gate(
+                    worktree,
+                    tree_sha=evidence.staged_tree_sha,
+                    parent_sha=parent_sha,
+                    mutable_scope=cycle_plan.mutable_scope,
+                    verification_status="passed",
+                    secrets=self._secrets,
+                    max_diff_bytes=None,
+                )
+            except CommitSafetyError as exc:
+                raise PipelineFailure("COMMIT_GATE_FAILED", _bounded_parse_detail(exc)) from exc
+            attempts = self._check_repair_attempt_records(
+                ctx.run_dir, cycle_plan.cycle.number, stage,
+            )
+            if attempts:
+                commit_sha = commit_repair_tree(
+                    worktree, tree_sha=evidence.staged_tree_sha,
+                    parent_sha=parent_sha, cycle=cycle_plan.cycle.number,
+                    body=f"MetaHarness-Run: {ctx.run_id}",
+                )
+                acceptance_kind = "repair"
+            elif stage is GateStage.POST_SEMANTIC_REVISION:
+                commit_sha = commit_revision_tree(
+                    worktree, tree_sha=evidence.staged_tree_sha,
+                    parent_sha=parent_sha, body=f"MetaHarness-Run: {ctx.run_id}",
+                )
+                acceptance_kind = "semantic-revision"
+            else:
+                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "gate changed the tree without a repair")
+            commit_created = True
+
+        acceptance = {
+            "schema_version": 1,
+            "review_cycle": cycle_plan.cycle.number,
+            "stage": stage.value,
+            "tree_sha": evidence.staged_tree_sha,
+            "commit_sha": commit_sha,
+            "parent_sha": parent_sha,
+            "commit_created": commit_created,
+            "acceptance_kind": acceptance_kind,
+        }
+        atomic_write_text(path, _json_text(acceptance))
+        if commit_created:
+            chain = list(accepted_chain_records(ctx.run_dir))
+            if not any(item.get("commit_sha") == commit_sha for item in chain if isinstance(item, dict)):
+                chain.append({"commit_sha": commit_sha, "tree_sha": evidence.staged_tree_sha, "parent_sha": parent_sha})
+                atomic_write_text(ctx.run_dir / "accepted-chain.json", _json_text({"commits": chain}))
+        store.update(
+            status=store.load().get("status", RunStatus.VALIDATING),
+            approved_tree_sha=evidence.staged_tree_sha,
+            expected_head_sha=commit_sha,
+            expected_parent_sha=parent_sha,
+            expected_tree_sha=evidence.staged_tree_sha,
+        )
+        self._trace_emit(
+            "gate.accepted",
+            phase="validation",
+            cycle=cycle_plan.cycle.number,
+            data={
+                "stage": stage.value,
+                "parent_sha": parent_sha,
+                "commit_sha": commit_sha,
+                "tree_sha": evidence.staged_tree_sha,
+                "commit_created": commit_created,
+                "acceptance_kind": acceptance_kind,
+            },
+        )
+        return acceptance
+
     def _create_candidate(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
         stage: GateStage, evidence: EvidenceBundle,
     ) -> dict[str, Any]:
-        """Create (or reconcile) the one immutable candidate commit of a cycle."""
+        """Bind the candidate artifact to the already accepted gate HEAD."""
 
         if not evidence.deterministic_passed:
             raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
         worktree = ctx.info.worktree
         head = current_head(worktree)
         self._authorize_candidate_tree(evidence, worktree, head, ctx.branch_ref)
-        if self._check_repair_attempt_records(ctx.run_dir, cycle_plan.cycle.number, stage):
-            kind = "repair"
-        elif resolve_tree(worktree, head) != evidence.staged_tree_sha:
-            kind = "revision"
-        else:
-            kind = "candidate"
-        return self._ensure_candidate_commit(
-            run_dir=ctx.run_dir, info=ctx.info, cycle=cycle_plan.cycle.number,
-            tree_sha=evidence.staged_tree_sha, parent_sha=head,
-            title=cycle_plan.plan.title,
-            repository_reference=ctx.repository_reference, store=store,
-            run_id=ctx.run_id, commit_kind=kind, stage=stage,
+        if resolve_tree(worktree, head) != evidence.staged_tree_sha:
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "candidate HEAD tree differs from gate evidence")
+        acceptance_path = gate_acceptance_path(ctx.run_dir, cycle_plan.cycle, stage)
+        acceptance = _read_json_artifact(acceptance_path)
+        if (
+            not isinstance(acceptance, dict)
+            or acceptance.get("stage") != stage.value
+            or acceptance.get("tree_sha") != evidence.staged_tree_sha
+            or acceptance.get("commit_sha") != head
+        ):
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "final gate acceptance is missing or stale")
+        parents = commit_parents(worktree, head)
+        if len(parents) != 1:
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "candidate HEAD has no single parent")
+        stored = _read_json_artifact(_candidate_commit_path(ctx.run_dir, cycle_plan.cycle.number))
+        if stored is not None and (
+            not isinstance(stored, dict)
+            or stored.get("commit_sha") != head
+            or stored.get("tree_sha") != evidence.staged_tree_sha
+        ):
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "candidate artifact does not match accepted HEAD")
+        payload = _candidate_commit_payload(
+            commit_sha=head,
+            tree_sha=evidence.staged_tree_sha,
+            parent_sha=parents[0],
+            branch=ctx.info.branch,
+            remote=self.config.publish.remote,
+            immutable_url=_commit_web_url(ctx.repository_reference, head),
+            gate_stage=stage.value,
+            pushed_at=(stored.get("pushed_at") if isinstance(stored, dict) else None),
         )
+        atomic_write_text(_candidate_commit_path(ctx.run_dir, cycle_plan.cycle.number), _json_text(payload))
+        candidate_state = dict(store.load().get("candidate") or {})
+        candidate_state[f"{cycle_plan.cycle.number:03d}"] = payload
+        store.update(
+            status=RunStatus.APPROVED, candidate=candidate_state,
+            candidate_commit_sha=head, approved_tree_sha=evidence.staged_tree_sha,
+            expected_head_sha=head, expected_parent_sha=parents[0],
+            expected_tree_sha=evidence.staged_tree_sha, next_step_id=None,
+        )
+        return payload
 
     def _push_cycle_candidate(
         self, store: RunStateStore, ctx: PipelineV2Context, number: int,
@@ -3651,127 +3836,6 @@ class Orchestrator:
             raise CommitBoundaryError("worktree has changes before candidate commit")
         return candidate
 
-    def _ensure_candidate_commit(
-        self, *, run_dir: Path, info: WorktreeInfo, cycle: int, tree_sha: str,
-        parent_sha: str, title: str, repository_reference: RepositoryReference,
-        store: RunStateStore, run_id: str, commit_kind: str, stage: GateStage,
-    ) -> dict[str, Any]:
-        """Reconcile or create exactly one candidate commit for a cycle."""
-
-        state = store.load()
-        try:
-            assert_deferred_verifications_resolved([
-                *(state.get("accepted_steps") or []),
-                *(state.get("deferred_verifications") or []),
-            ])
-        except CommitSafetyError as exc:
-            raise CommitBoundaryError(str(exc)) from exc
-        path = _candidate_commit_path(run_dir, cycle)
-        stored = _read_json_artifact(path)
-        commit_sha = stored.get("commit_sha") if isinstance(stored, dict) else None
-        effective_parent_sha = parent_sha
-        if not _is_object_id(commit_sha):
-            commit_sha = None
-        if commit_sha is None:
-            try:
-                head = current_head(info.worktree)
-                if head == parent_sha and resolve_tree(info.worktree, head) == tree_sha:
-                    # The last accepted step is already the candidate tip;
-                    # publication must not manufacture an empty metadata-only
-                    # commit.  Bind the artifact to its real parent.
-                    commit_sha = head
-                    parents = commit_parents(info.worktree, head)
-                    if len(parents) != 1:
-                        raise CommitBoundaryError("candidate tip has no single parent")
-                    effective_parent_sha = parents[0]
-                elif commit_parents(info.worktree, head) == (parent_sha,) and resolve_tree(info.worktree, head) == tree_sha:
-                    commit_sha = head
-            except GitError:
-                pass
-        if commit_sha is None:
-            try:
-                commit_safety_gate(
-                    info.worktree,
-                    tree_sha=tree_sha,
-                    parent_sha=parent_sha,
-                    mutable_scope=(),
-                    verification_status="passed",
-                    secrets=self._secrets,
-                    max_diff_bytes=None,
-                )
-            except CommitSafetyError as exc:
-                raise CommitBoundaryError(str(exc)) from exc
-            body = f"MetaHarness-Run: {run_id}"
-            if commit_kind == "revision":
-                commit_sha = commit_revision_tree(
-                    info.worktree, tree_sha=tree_sha, parent_sha=parent_sha, body=body,
-                )
-            elif commit_kind == "repair":
-                commit_sha = commit_repair_tree(
-                    info.worktree, tree_sha=tree_sha, parent_sha=parent_sha,
-                    cycle=cycle, body=body,
-                )
-            else:
-                commit_sha = commit_candidate_tree(
-                    info.worktree, tree_sha=tree_sha, parent_sha=parent_sha,
-                    subject=_commit_subject(title), body=body,
-                )
-        if current_head(info.worktree) != commit_sha:
-            raise CommitBoundaryError("candidate commit is not the run branch tip")
-        if commit_parents(info.worktree, commit_sha) != (effective_parent_sha,) or resolve_tree(info.worktree, commit_sha) != tree_sha:
-            raise CommitBoundaryError("candidate commit identity is not exact")
-        payload = _candidate_commit_payload(
-            commit_sha=commit_sha, tree_sha=tree_sha, parent_sha=effective_parent_sha,
-            branch=info.branch, remote=self.config.publish.remote,
-            immutable_url=_commit_web_url(repository_reference, commit_sha),
-            gate_stage=GateStage(stage).value,
-            pushed_at=(stored.get("pushed_at") if isinstance(stored, dict) else None),
-        )
-        atomic_write_text(path, _json_text(payload))
-        chain = list(accepted_chain_records(run_dir))
-        if not any(
-            isinstance(item, dict) and item.get("commit_sha") == commit_sha
-            for item in chain
-        ):
-            chain.append({
-                "commit_sha": commit_sha,
-                "tree_sha": tree_sha,
-                "parent_sha": effective_parent_sha,
-            })
-            atomic_write_text(run_dir / "accepted-chain.json", _json_text({"commits": chain}))
-        candidate_state = dict(store.load().get("candidate") or {})
-        candidate_state[f"{cycle:03d}"] = payload
-        store.update(
-            status=RunStatus.APPROVED, candidate=candidate_state,
-            candidate_commit_sha=commit_sha, approved_tree_sha=tree_sha,
-            expected_head_sha=commit_sha, expected_parent_sha=effective_parent_sha,
-            expected_tree_sha=tree_sha, next_step_id=None,
-        )
-        if commit_kind in {"repair", "revision"}:
-            event_name = (
-                "check_repair.committed" if commit_kind == "repair"
-                else "revision.committed"
-            )
-            diff_path = gate_dir(run_dir, cycle, stage) / "diff.patch"
-            evidence_record = _read_json_artifact(gate_dir(run_dir, cycle, stage) / "evidence.json")
-            self._trace_emit(
-                event_name,
-                phase="repair" if commit_kind == "repair" else "revision",
-                cycle=cycle,
-                data={
-                    "parent_sha": effective_parent_sha,
-                    "commit_sha": commit_sha,
-                    "tree_sha": tree_sha,
-                    "changed_paths": list(
-                        evidence_record.get("changed_files", [])
-                        if isinstance(evidence_record, dict)
-                        else []
-                    ),
-                    **self._trace_diff_reference(diff_path),
-                },
-            )
-        return payload
-
     def _push_candidate(
         self, *, run_dir: Path, info: WorktreeInfo, cycle: int, candidate: dict[str, Any],
         store: RunStateStore,
@@ -4000,6 +4064,7 @@ class Orchestrator:
         expected_head_sha: str | None = None,
         required_check_ids: tuple[str, ...] | None = None,
         enforce_diff_size: bool = False,
+        stage: GateStage | None = None,
     ) -> EvidenceBundle:
         """Final checks for the exact current candidate.
 
@@ -4023,6 +4088,7 @@ class Orchestrator:
                     cycle=getattr(self, "_trace_cycle", 1),
                     data={
                         "reused": True,
+                        "stage": stage.value if stage is not None else None,
                         "passed": stored.deterministic_passed,
                         "failures": list(stored.failures),
                         "required_check_ids": list(stored.required_check_ids),
@@ -4039,6 +4105,7 @@ class Orchestrator:
             phase="validation",
             cycle=getattr(self, "_trace_cycle", 1),
             data={
+                "stage": stage.value if stage is not None else None,
                 "required_check_ids": list(required_check_ids or ()),
                 "tree_before": checks_tree_before,
             },
@@ -4064,6 +4131,7 @@ class Orchestrator:
                 phase="validation",
                 cycle=getattr(self, "_trace_cycle", 1),
                 data={
+                    "stage": stage.value if stage is not None else None,
                     "passed": False,
                     "failures": [type(exc).__name__],
                     "tree_sha": _safe_candidate_tree(worktree),
@@ -4076,6 +4144,7 @@ class Orchestrator:
             phase="validation",
             cycle=getattr(self, "_trace_cycle", 1),
             data={
+                "stage": stage.value if stage is not None else None,
                 "passed": evidence.deterministic_passed,
                 "failures": list(evidence.failures),
                 "required_check_ids": list(evidence.required_check_ids),

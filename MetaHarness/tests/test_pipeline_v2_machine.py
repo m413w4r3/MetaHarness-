@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
+from unittest import mock
 
 from metaharness.llm.chat import LLMError
 from metaharness.models import ExecutionRole, RunStatus
@@ -219,24 +221,114 @@ class ScopeApprovalTests(PipelineHarness):
 
 
 class SemanticRevisionTests(PipelineHarness):
-    def test_revision_runs_before_its_own_gate_stage(self) -> None:
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "almost\n"))
-        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"))
+    def test_initial_gate_runs_before_semantic_revision(self) -> None:
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'good', 'good semantic'} else 1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good semantic\n"))
         result = self.orchestrator(
-            self.config(semantic_revision=True), planner=[initial_plan(STEP)],
+            self.config(check_repair=2, semantic_revision=True), planner=[initial_plan(STEP)],
             reviewer=[review()],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "reviser"])
         run_dir = self.run_dir()
         self.assertTrue((run_dir / "cycles/001/semantic-revision/report.json").is_file())
+        self.assertTrue((run_dir / "cycles/001/checks/post-implementation/accepted.json").is_file())
         self.assertTrue((run_dir / "cycles/001/checks/post-semantic-revision/evidence.json").is_file())
         self.assertEqual(
             git(self.worktree(), "log", "-1", "--format=%s"),
             "metaharness(semantic-revision): accepted",
         )
 
+    def test_semantic_red_tree_is_not_committed_before_repair(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(check_repair=2, semantic_revision=True), planner=[initial_plan(STEP)],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "repair"])
+        accepted = json.loads((self.run_dir() / "accepted-chain.json").read_text())['commits']
+        red_tree = json.loads(
+            (self.run_dir() / "cycles/001/checks/post-semantic-revision/attempts/01/evidence.json").read_text()
+        )["staged_tree_sha"]
+        self.assertNotIn(red_tree, {item.get("tree_sha", item.get("tree_after")) for item in accepted})
+        self.assertEqual(
+            git(self.worktree(), "show", "HEAD:feature.txt").strip(), "good",
+        )
+
+    def test_gate_episode_budgets_are_independent(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            write("feature.txt", "still bad\n"), write("feature.txt", "good\n"),
+        )
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(check_repair=2, semantic_revision=True), planner=[initial_plan(STEP)],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair", "reviser", "repair"])
+        self.assertEqual(
+            len(list((self.run_dir() / "cycles/001/check-repair/post-implementation/attempts").iterdir())), 2,
+        )
+        self.assertEqual(
+            len(list((self.run_dir() / "cycles/001/check-repair/post-semantic-revision/attempts").iterdir())), 1,
+        )
+
 
 class ResumeTests(PipelineHarness):
+    def test_green_evidence_without_acceptance_is_reused_on_resume(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        original = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        with mock.patch.object(
+            type(original), "_accept_gate_state",
+            side_effect=RuntimeError("crash after green evidence"),
+        ):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertFalse(
+            (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").exists()
+        )
+        resumed = self.orchestrator(
+            self.config(), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertTrue(
+            (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").exists()
+        )
+
+    def test_integrity_failure_does_not_start_repair_or_review(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        original = self.orchestrator(
+            self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        real_gate = original._run_gate
+
+        def unexpected_head(_self, store, ctx, cycle_plan, stage):
+            evidence = real_gate(store, ctx, cycle_plan, stage)
+            return replace(
+                evidence, deterministic_passed=False,
+                failures=("UNEXPECTED_HEAD: moved",),
+            )
+
+        with mock.patch.object(type(original), "_run_gate", side_effect=unexpected_head):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(self.reviewer.requests, [])
     def test_reviewer_transport_failure_resumes_at_the_final_review_of_its_cycle(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.REPAIR, write("other.txt", "second\n"))
