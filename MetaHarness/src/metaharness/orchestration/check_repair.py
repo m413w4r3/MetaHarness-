@@ -83,7 +83,7 @@ _DIRECT_FAILURES = frozenset(
 )
 
 
-# These names are deliberately broader than the historical evidence enum.
+# These names are deliberately broader than the evidence enum.
 # Evidence produced by a newer check runner must never become a repair task
 # merely because this module has not learned its exact spelling yet.
 _HARD_FAILURE_CODES = frozenset(

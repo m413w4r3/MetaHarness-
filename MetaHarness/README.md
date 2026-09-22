@@ -1,6 +1,6 @@
 # MetaHarness
 
-MetaHarness V0 transforme un SPEC humain en un run Git contrôlé : un planner
+MetaHarness transforme un SPEC humain en un run Git contrôlé : un planner
 produit un plan texte d’implémentation, un backend sélectionné l’exécute dans un worktree isolé,
 les checks déterministes figent les preuves, puis un reviewer compare SPEC,
 plan et diff pour le candidat final avant publication. L’implémenteur reçoit le plan,
@@ -92,7 +92,7 @@ Un run `failed` dont l’échec est reprenable
 metaharness resume --config examples/autowork.toml --run-id <RUN_ID>
 ```
 
-ou via le bouton unique de la page du run (`REPRENDRE À PARTIR DE CLAUDE`,
+ou via le bouton unique de la page du run (`REPRENDRE LE RUN`,
 `RETRY S02`, `RETRY REVIEWER #1`, `RETRY PUBLISH`…). Avant toute reprise,
 MetaHarness revérifie l’approbation, l’identité du plan, le hash de
 l’execution selection, le worktree, la branche, HEAD, l’arbre candidat exact et
@@ -100,8 +100,9 @@ le scope approuvé ; au moindre écart : `RESUME_INTEGRITY_FAILURE`, sans aucun
 appel LLM. Les corruptions, violations d’identité et
 `AGENT_CONTRACT_MISMATCH` restent volontairement non-resumables.
 
-Sans `revision.enabled`, le chemin historique reste disponible : un planner,
-les steps Codex, les checks, un reviewer et un commit. Les
+Sans `revision.enabled`, la correction sémantique est désactivée : le planner,
+les étapes d’implémentation, les checks, le reviewer et le commit restent
+disponibles. Les
 secrets ne sont jamais mis dans la configuration persistée : `api_key_env`
 contient seulement le nom d’une variable d’environnement. Les écritures d’état
 passent par `RunStateStore` et sont atomiques.
@@ -111,7 +112,7 @@ configuration. Le planner ne sélectionne que leurs IDs dans
 `REQUIRED_CHECKS`; les argv restent exclusivement dans MetaHarness. Les IDs
 `default_check_ids` sont toujours requis, et les preflights configurés sont
 exécutés avant les workers coûteux. Voir [docs/pipeline-v2.md](docs/pipeline-v2.md)
-pour les invariants de chaîne, d’intégrité, de compatibilité et de benchmark.
+pour les invariants de chaîne, d’intégrité et de benchmark.
 
 ## Installation (une seule fois)
 

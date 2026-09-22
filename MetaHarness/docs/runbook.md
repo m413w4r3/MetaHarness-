@@ -38,7 +38,7 @@ metaharness run \
 
 ### Pipeline configuration
 
-`[revision]` supplies defaults and the legacy fallback. Every new durable UI
+`[revision]` supplies defaults. Every new durable UI
 run captures its effective choices in `run_options.json`: the semantic
 revision switch, check-repair attempt budget, review-repair cycle budget, and
 role-specific profiles. The two correction budgets are validated independently
@@ -46,15 +46,15 @@ in the inclusive range `0..10`.
 For AutoWork, use `repair_scope_policy = "auto-bounded"` and
 `repair_scope_max_added_paths = 4`. Use `require-approval` when an operator
 must explicitly accept an exact planner-derived scope delta; use
-`deny-expansion` for historical behavior.
+`deny-expansion` for the default behavior.
 
 `doctor` never contacts a model. Besides local files, Git and executables it
 runs the managed Codex runtime's `codex sandbox -- /bin/true` probe (which
 detects bubblewrap/AppArmor refusals), a Codex `exec` parser/config
-compatibility probe, and, for OpenAI-chat profiles on `127.0.0.1` or
+local health probe, and, for OpenAI-chat profiles on `127.0.0.1` or
 `localhost` only, an unauthenticated `GET <base_url>/health` expecting
 `{"status": "ok"}`. It also validates the managed Claude restricted runtime
-and its parser-only compatibility probe. No probe makes a model call.
+and its parser-only probe. No probe makes a model call.
 
 On first use, authenticate the managed Codex runtime once:
 
@@ -496,7 +496,7 @@ A resumable failed run shows exactly one primary action (`REPRENDRE À PARTIR
 DE CLAUDE`, `RETRY S02`, `RETRY REVIEWER #1`, `RETRY PUBLISH`, …) that posts
 to `/runs/<run_id>/resume` with the same exact-Host, origin and mutation-token
 protections as the approval form; the RunManager resumes the same run id.
-`failed` remains the historical status until the operator clicks it. Worker
+`failed` remains the terminal status until the operator clicks it. Worker
 steps above 100k input tokens are flagged `High worker context usage`, above
 250k `SEVERE CONTEXT USAGE`, with a `Voir diagnostic` link to
 `steps/Sxx/token_diagnostics.json`; this never fails a run.
@@ -514,7 +514,7 @@ server-side and written with `textContent` client-side, never as HTML.
 ## Failure handling
 
 `BLOCKED`, `PLAN_REJECTED`, `REVISE`, `FAIL`, check failures, timeouts, mutations, stale HEAD,
-empty diffs, and review-boundary changes do not commit. Legacy v1 also treats
+empty diffs, and review-boundary changes do not commit. The current pipeline also treats
 an oversized diff as a gate; v2 uses `max_diff_bytes` only as the inline
 semantic-model diff budget. Common
 failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,

@@ -13,7 +13,7 @@ from metaharness.gitops import (  # noqa: E402
     assert_clean,
     branch_exists,
     candidate_tree_sha,
-    commit_reviewed_tree,
+    commit_candidate_tree,
     create_run_worktree,
     current_head,
     immutable_commit_web_url,
@@ -233,7 +233,7 @@ class GitOpsTests(unittest.TestCase):
 
         tree_sha = index_tree_sha(worktree)
         self.assertEqual(tree_sha, index_tree_sha(worktree))
-        commit_sha = commit_reviewed_tree(
+        commit_sha = commit_candidate_tree(
             worktree,
             tree_sha=tree_sha,
             parent_sha=info.base_sha,
@@ -266,7 +266,7 @@ class GitOpsTests(unittest.TestCase):
                 with self.assertRaises(GitError):
                     tracked_files_in_tree(self.repo, invalid)
 
-    def test_commit_reviewed_tree_rejects_empty_tree_and_bad_subjects(self) -> None:
+    def test_commit_candidate_tree_rejects_empty_tree_and_bad_subjects(self) -> None:
         worktree = self.root / "run empty commit"
         info = create_run_worktree(
             self.repo,
@@ -277,7 +277,7 @@ class GitOpsTests(unittest.TestCase):
         )
         base_tree = index_tree_sha(worktree)
         with self.assertRaisesRegex(GitError, "no changes"):
-            commit_reviewed_tree(
+            commit_candidate_tree(
                 worktree, tree_sha=base_tree, parent_sha=info.base_sha, subject="s", body=""
             )
 
@@ -287,11 +287,11 @@ class GitOpsTests(unittest.TestCase):
         for subject in ("x" * 73, "   ", "two\nlines"):
             with self.subTest(subject=subject):
                 with self.assertRaises(GitError):
-                    commit_reviewed_tree(
+                    commit_candidate_tree(
                         worktree, tree_sha=tree, parent_sha=info.base_sha, subject=subject, body=""
                     )
         with self.assertRaises(GitError):
-            commit_reviewed_tree(
+            commit_candidate_tree(
                 worktree, tree_sha="HEAD", parent_sha=info.base_sha, subject="s", body=""
             )
         self.assertEqual(current_head(worktree), info.base_sha)
@@ -309,13 +309,13 @@ class GitOpsTests(unittest.TestCase):
         stage_all(worktree)
         return worktree, info, index_tree_sha(worktree)
 
-    def test_commit_reviewed_tree_commits_the_reviewed_tree_not_the_index(self) -> None:
+    def test_commit_candidate_tree_commits_the_candidate_tree_not_the_index(self) -> None:
         worktree, info, reviewed_tree = self._staged_worktree("exact tree")
         (worktree / "README.md").write_text("tampered after review\n", encoding="utf-8")
         stage_all(worktree)
         self.assertNotEqual(index_tree_sha(worktree), reviewed_tree)
 
-        commit_sha = commit_reviewed_tree(
+        commit_sha = commit_candidate_tree(
             worktree, tree_sha=reviewed_tree, parent_sha=info.base_sha, subject="s", body=""
         )
 
@@ -326,18 +326,18 @@ class GitOpsTests(unittest.TestCase):
             run_git(worktree, "show", f"{commit_sha}:README.md").stdout, "reviewed\n"
         )
 
-    def test_commit_reviewed_tree_refuses_when_head_moved(self) -> None:
+    def test_commit_candidate_tree_refuses_when_head_moved(self) -> None:
         worktree, info, reviewed_tree = self._staged_worktree("moved head")
         run_git(worktree, "commit", "-qm", "someone else")
         moved = current_head(worktree)
 
         with self.assertRaises(GitError):
-            commit_reviewed_tree(
+            commit_candidate_tree(
                 worktree, tree_sha=reviewed_tree, parent_sha=info.base_sha, subject="s", body=""
             )
         self.assertEqual(current_head(worktree), moved)
 
-    def test_commit_reviewed_tree_runs_no_commit_hooks(self) -> None:
+    def test_commit_candidate_tree_runs_no_commit_hooks(self) -> None:
         worktree, info, reviewed_tree = self._staged_worktree("hooks")
         marker = self.root / "hook-ran"
         hooks = self.repo / ".git" / "hooks"
@@ -346,7 +346,7 @@ class GitOpsTests(unittest.TestCase):
             hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n", encoding="utf-8")
             hook.chmod(0o755)
 
-        commit_sha = commit_reviewed_tree(
+        commit_sha = commit_candidate_tree(
             worktree, tree_sha=reviewed_tree, parent_sha=info.base_sha, subject="s", body="b"
         )
 

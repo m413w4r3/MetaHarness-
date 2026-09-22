@@ -188,12 +188,12 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("/compare/", prompt)
         self.assertIn("<CODE REVIEW EVIDENCE>", prompt)
 
-    def test_legacy_diff_without_code_evidence_remains_functional(self):
+    def test_diff_without_code_evidence_remains_functional(self):
         prompt = build_reviewer_prompt(
-            "spec", "plan", "context", "gate", "files", "legacy diff sentinel",
+            "spec", "plan", "context", "gate", "files", "diff sentinel",
             "checks", "report",
         )
-        self.assertIn("legacy diff sentinel", prompt)
+        self.assertIn("diff sentinel", prompt)
 
     def test_deferred_mismatch_is_substituted(self):
         prompt = build_reviewer_prompt(

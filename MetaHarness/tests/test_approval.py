@@ -104,7 +104,7 @@ class ApprovalTests(unittest.TestCase):
         (directory / "planner.raw.md").write_text(self.raw, encoding="utf-8")
         (directory / "implementation_contract.md").write_text(self.contract, encoding="utf-8")
         check = CheckConfig("lint", ("make", "lint"), timeout_seconds=18000)
-        write_check_authority(directory, [check])
+        write_check_authority(directory, [check], required_check_ids=("lint",))
         identity = compute_plan_identity_from_run(directory)
         write_plan_approval(
             directory, decision=ApprovalDecision.APPROVE,
@@ -167,12 +167,12 @@ class ApprovalTests(unittest.TestCase):
         with self.assertRaises(ApprovalError):
             read_check_authority(directory)
 
-    def test_schema_1_stays_readable_and_is_never_rewritten(self) -> None:
-        directory = self._run_dir("authority-schema1")
+    def test_authority_round_trip_uses_the_current_schema(self) -> None:
+        directory = self._run_dir("authority-schema2-round-trip")
         check = CheckConfig("lint", ("make", "lint"))
-        write_check_authority(directory, [check])
+        write_check_authority(directory, [check], required_check_ids=("lint",))
         before = (directory / "check_authority.json").read_bytes()
-        self.assertEqual(json.loads(before)["schema_version"], 1)
+        self.assertEqual(json.loads(before)["schema_version"], 2)
         required_ids, frozen = read_check_authority(directory)
         self.assertEqual((required_ids, [c.id for c in frozen]), (("lint",), ["lint"]))
         read_check_authority(

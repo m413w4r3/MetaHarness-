@@ -27,7 +27,6 @@ from .execution import (
     EXECUTOR_REGISTRY,
     ExternalAgentExecutor,
     executor_for_profile,
-    legacy_codex_agent_factory,
     register_executor_driver,
 )
 from .external import ExternalAgentConfig
@@ -76,7 +75,6 @@ __all__ = [
     "ExternalAgentConfig",
     "ExternalAgentExecutor",
     "executor_for_profile",
-    "legacy_codex_agent_factory",
     "register_executor_driver",
     "extract_final",
     "extract_usage",

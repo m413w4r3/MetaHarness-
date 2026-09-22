@@ -65,7 +65,7 @@ class EvidenceTests(unittest.TestCase):
             reviewer=endpoint,
             context=ContextConfig(),
             agent=AgentConfig(),
-            checks=checks,
+            check_catalog=checks,
             max_diff_bytes=max_diff_bytes,
         )
 

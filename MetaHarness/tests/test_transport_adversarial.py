@@ -283,7 +283,7 @@ class ResponseParsingTests(unittest.TestCase):
         cases = {
             "missing a choices": {"object": "chat.completion"},
             "choices array is empty": {"choices": []},
-            "missing a message": {"choices": [{"text": "legacy"}]},
+            "missing a message": {"choices": [{"text": "plain"}]},
             "missing content": {"choices": [{"message": {"role": "assistant"}}]},
             "null": ok(None),
             "no usable text": ok("   "),

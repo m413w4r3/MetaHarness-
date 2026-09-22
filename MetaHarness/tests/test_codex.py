@@ -272,7 +272,7 @@ class CodexRuntimeTests(unittest.TestCase):
             reviewer=LLMEndpointConfig("https://reviewer.invalid", "/v1", "reviewer"),
             context=ContextConfig(always_files=()),
             agent=AgentConfig(),
-            checks=(),
+            check_catalog=(),
             allow_no_required_checks=True,
             codex_runtime=CodexRuntimeConfig(self.home),
         )

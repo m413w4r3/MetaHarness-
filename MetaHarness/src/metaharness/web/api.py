@@ -1021,11 +1021,11 @@ def _execution_state(selection: ExecutionSelection) -> dict[str, Any]:
 def model_profiles(config: HarnessConfig) -> dict[str, Any]:
     profiles = profiles_for_config(config)
     defaults = {
-        "planner": config.ui.default_planner_profile or "legacy-planner",
-        "implementer": config.ui.default_implementer_profile or "legacy-implementer",
-        "planner_profile": config.ui.default_planner_profile or "legacy-planner",
-        "default_implementer_profile": config.ui.default_implementer_profile or "legacy-implementer",
-        "final_reviewer_profile": config.ui.default_reviewer_profile or "legacy-reviewer",
+        "planner": config.ui.default_planner_profile,
+        "implementer": config.ui.default_implementer_profile,
+        "planner_profile": config.ui.default_planner_profile,
+        "default_implementer_profile": config.ui.default_implementer_profile,
+        "final_reviewer_profile": config.ui.default_reviewer_profile,
         "semantic_reviser_profile": config.ui.default_reviser_profile,
         "check_repair_profile": config.ui.default_repair_profile,
     }

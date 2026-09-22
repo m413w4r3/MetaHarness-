@@ -317,7 +317,7 @@ def build_planner_payload(
     template: str | None = None,
     budget_bytes: int = 0,
 ) -> PromptPayload:
-    """Build the planner contract without any historical run material."""
+    """Build the planner contract from current-run material only."""
 
     using_default_template = template is None
     if using_default_template:

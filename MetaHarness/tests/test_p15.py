@@ -19,6 +19,10 @@ from metaharness.models import (
     ContextConfig,
     HarnessConfig,
     LLMEndpointConfig,
+    ModelProfile,
+    ExecutionRole,
+    ProfileDriver,
+    SelectionMode,
     UIConfig,
 )
 from metaharness.orchestrator import Orchestrator
@@ -30,6 +34,11 @@ from metaharness.web.server import create_server
 
 def config_for(root: Path, *, max_active_runs: int = 1) -> HarnessConfig:
     endpoint = LLMEndpointConfig("https://example.invalid", "/chat", "model")
+    profiles = {
+        "planner": ModelProfile("planner", "Planner", (ExecutionRole.PLANNER,), ProfileDriver.OPENAI_CHAT, "planner", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
+        "implementer": ModelProfile("implementer", "Implementer", (ExecutionRole.IMPLEMENTER,), ProfileDriver.EXTERNAL, "worker", SelectionMode.CLI, argv=("true",)),
+        "reviewer": ModelProfile("reviewer", "Reviewer", (ExecutionRole.REVIEWER,), ProfileDriver.OPENAI_CHAT, "reviewer", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
+    }
     return HarnessConfig(
         repo=root,
         base_ref="HEAD",
@@ -40,9 +49,15 @@ def config_for(root: Path, *, max_active_runs: int = 1) -> HarnessConfig:
         reviewer=endpoint,
         context=ContextConfig(),
         agent=AgentConfig(),
-        checks=(),
+        check_catalog=(),
         allow_no_required_checks=True,
-        ui=UIConfig(max_active_runs),
+        ui=UIConfig(
+            max_active_runs=max_active_runs,
+            default_planner_profile="planner",
+            default_implementer_profile="implementer",
+            default_reviewer_profile="reviewer",
+        ),
+        model_profiles=profiles,
     )
 
 
@@ -235,13 +250,15 @@ class ConfigP15Tests(unittest.TestCase):
             content = (
                 f'repo = "{root}"\nbase_ref = "HEAD"\nruns_root = "{root / "runs"}"\n'
                 f'worktrees_root = "{root / "worktrees"}"\nallow_no_required_checks = true\n'
-                '[planner]\nbase_url = "https://example.invalid"\nendpoint_path = "/chat"\nmodel = "p"\n'
-                '[reviewer]\nbase_url = "https://example.invalid"\nendpoint_path = "/chat"\nmodel = "r"\n'
+                '[ui]\ndefault_planner_profile = "planner"\ndefault_implementer_profile = "worker"\ndefault_reviewer_profile = "reviewer"\n'
+                '[model_profiles.planner]\ndisplay_name = "Planner"\nroles = ["planner"]\ndriver = "openai-chat"\nprovider = "test"\nmodel = "p"\nselection_mode = "request"\nbase_url = "https://example.invalid"\nendpoint_path = "/chat"\n'
+                '[model_profiles.worker]\ndisplay_name = "Worker"\nroles = ["implementer"]\ndriver = "external"\nprovider = "test"\nmodel = "worker"\nselection_mode = "cli"\nargv = ["worker"]\n'
+                '[model_profiles.reviewer]\ndisplay_name = "Reviewer"\nroles = ["reviewer"]\ndriver = "openai-chat"\nprovider = "test"\nmodel = "r"\nselection_mode = "request"\nbase_url = "https://example.invalid"\nendpoint_path = "/chat"\n'
             )
             path = root / "config.toml"
             path.write_text(content, encoding="utf-8")
             self.assertEqual(load_config(path).ui.max_active_runs, 1)
-            path.write_text(content + "\n[ui]\nmax_active_runs = 5\n", encoding="utf-8")
+            path.write_text(content.replace("[ui]\n", "[ui]\nmax_active_runs = 5\n", 1), encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "at most 4"):
                 load_config(path)
 

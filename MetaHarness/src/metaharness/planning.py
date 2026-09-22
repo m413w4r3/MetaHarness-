@@ -363,9 +363,8 @@ def persist_planning_artifacts(
 class Planner:
     """Run one planner request.
 
-    Format repair remains available to callers that explicitly opt into the
-    legacy behavior.  The V0 orchestrator disables it: a run must have one
-    planner task and one planner request.
+    Format repair remains available only when explicitly enabled.  The
+    orchestrator uses one planner task and one planner request.
     """
 
     def __init__(

@@ -183,8 +183,8 @@ class DoctorTests(unittest.TestCase):
                 sandbox = "workspace-write"
                 selection_mode = "cli"
 
-                [[checks]]
-                name = "test"
+                [[check_catalog]]
+                id = "test"
                 argv = [{sys.executable!r}, "-c", "pass"]
                 """
             ),
@@ -206,7 +206,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("OK env BRIDGE_API_KEY: usable", out)
         self.assertIn("OK codex sandbox: usable", out)
-        self.assertIn("OK codex CLI compatibility: supported", out)
+        self.assertIn("OK codex CLI contract: supported", out)
         self.assertIn("OK codex authentication: available", out)
         self.assertIn("OK planner bridge: healthy", out)
         self.assertIn("doctor: PASS", out)
@@ -260,8 +260,8 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(status.available)
         self.assertNotIn(SECRET, status.detail)
 
-    def test_legacy_cli_fallback_checks_only_nonempty_known_state(self) -> None:
-        home = self.root / "legacy-auth-check"
+    def test_cli_authentication_checks_only_nonempty_known_state(self) -> None:
+        home = self.root / "auth-check-help"
         home.mkdir()
         (home / "auth.json").write_text(SECRET, encoding="utf-8")
         help_only = subprocess.CompletedProcess(

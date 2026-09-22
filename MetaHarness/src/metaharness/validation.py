@@ -37,7 +37,7 @@ def config_with_check_authority(
     requested_check_ids: tuple[str, ...] | list[str] | None = None,
     expected_sha256: str | None = None,
 ) -> tuple[HarnessConfig, tuple[str, ...] | None]:
-    """Return the run's frozen check config, or the legacy config.
+    """Return the run's frozen check configuration.
 
     The current TOML is used only to confirm that the requested IDs remain in
     the trusted catalogue.  The command-bearing values (argv, cwd, timeout,
@@ -55,7 +55,7 @@ def config_with_check_authority(
             break
         parent = directory.parent
         if parent == directory:
-            return config, requested_check_ids
+            raise ValidationError("the run has no check authority")
         directory = parent
     try:
         authority = read_check_authority(
@@ -66,7 +66,7 @@ def config_with_check_authority(
     except ApprovalError as exc:
         raise ValidationError(str(exc)) from exc
     if authority is None:
-        return config, requested_check_ids
+        raise ValidationError("the run has no check authority")
     authority_ids, catalogue = authority
     selected_ids = authority_ids
     checks = catalogue
@@ -91,7 +91,6 @@ def config_with_check_authority(
         checks = tuple(resolved)
     frozen = dataclasses.replace(
         config,
-        checks=checks,
         check_catalog=catalogue,
         default_check_ids=selected_ids,
     )

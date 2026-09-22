@@ -435,9 +435,8 @@ def collect_evidence(
         # importance: it always closes the gate.
         if check.workspace_mutated:
             failures.append(f"CHECK_MUTATED:{check.name}")
-        # P42 selection itself is the mandatory contract.  ``required`` only
-        # retains the legacy per-check behavior when no planner selection was
-        # supplied.
+        # P42 selection itself is the mandatory contract.  ``required`` is
+        # metadata for the trusted catalogue and does not alter selection.
         if required_check_ids is None and not check_config.required:
             continue
         if check.timed_out:

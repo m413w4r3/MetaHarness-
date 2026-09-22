@@ -87,6 +87,9 @@ REVIEWER_PROFILE: reviewer
 ACCEPTANCE
 The feature file holds the requested content.
 
+REQUIRED_CHECKS
+- test
+
 TESTS
 The configured test is the final evidence.
 
@@ -373,8 +376,8 @@ provider = "live"
 model = "live-reviser"
 selection_mode = "cli"
 
-[[checks]]
-name = "test"
+[[check_catalog]]
+id = "test"
 argv = [{sys.executable!r}, {str(self.check)!r}]
 timeout_seconds = 30
 """, encoding="utf-8")

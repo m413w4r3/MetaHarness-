@@ -40,7 +40,6 @@ from .prompt_contracts import (
 from .agent.execution import (
     ExecutorRuntimeConfig,
     executor_for_profile,
-    legacy_codex_agent_factory,
 )
 from .approval import (
     ApprovalDecision,
@@ -201,7 +200,6 @@ from .redaction import config_secret_values, redact, redact_file
 from .diagnostics import write_run_diagnostics
 from .profiles import (
     ProfileError,
-    build_agent_config,
     build_llm_endpoint,
     profile_for_role,
     profile_execution_fingerprint,
@@ -330,18 +328,11 @@ from .orchestration.resume_validation import (
     verify_correction_scope,
 )
 
-# Compatibility hook for callers/tests that patch the constructor at this
-# module path.  Actual execution still goes through the generic resolver
-# above; this name is only used to build its injected adapter.
-CodexAgent = legacy_codex_agent_factory
-_DEFAULT_CODEX_AGENT = CodexAgent
-
-
 def _chat_client(endpoint: Any, environment: Mapping[str, str]) -> OpenAIChatTextClient:
     """Construct the production client with the runtime mapping.
 
-    A small signature compatibility branch keeps older test doubles and
-    embedding adapters working while the real client always receives it.
+    The constructor is inspected once so embedded clients can receive the
+    runtime environment when they declare it.
     """
 
     constructor = OpenAIChatTextClient
@@ -593,8 +584,6 @@ class Orchestrator:
         planner_client: Any | None = None,
         reviewer_client: Any | None = None,
         recommender_client: Any | None = None,
-        agent: Any | None = None,
-        reviser: Any | None = None,
         github_client: GitHubWorkstreamClient | None = None,
         trace_sink: TraceSink | None = None,
     ) -> None:
@@ -604,33 +593,16 @@ class Orchestrator:
         self._planner_client = planner_client
         self._reviewer_client = reviewer_client
         self._recommender_client = recommender_client
-        self._injected_agent = agent
-        self._injected_reviser = reviser
         self._github_client = (
             github_client if github_client is not None else NullGitHubWorkstreamClient()
         )
         # The local JSONL sink is always created per run.  This optional sink
         # is an observation-only extension point (for example Nimbalyst).
         self._trace_sink = trace_sink
-        # Programmatic callers that still inject the old agent objects keep
-        # their historical failure-name projection.  Production profile
-        # resolution always uses the generic reasons from AgentRunResult.
-        self._legacy_backend_injection = (
-            agent is not None
-            or reviser is not None
-            or all(
-                profile.id.startswith("legacy-")
-                for profile in config.model_profiles.values()
-            )
-            or CodexAgent is not _DEFAULT_CODEX_AGENT
-        )
         self._secrets: tuple[str, ...] = ()
         self._effective_repair_scope = EffectiveRepairScopePolicy(
             "deny-expansion", 4, "run-options"
         )
-        # Loaded production configs always contain a process-environment
-        # mapping.  The fallback only preserves direct construction of the
-        # legacy HarnessConfig dataclass by embedding callers/tests.
         self._runtime_environment = (
             config.runtime_environment
             if config.runtime_environment
@@ -1221,39 +1193,8 @@ class Orchestrator:
             codex_home=self.config.codex_runtime.home,
             claude_home=self.config.claude_runtime.home,
             forbidden_env_names=forbidden_env_names,
-            legacy_agent_factory=self._agent_for_profile,
         )
-        return executor_for_profile(
-            profile,
-            runtime,
-            reviser=self._injected_reviser,
-        )
-
-    def _agent_for_profile(self, profile_id: str) -> Any:
-        """Compatibility factory feeding the generic Codex adapter.
-
-        Older embedders override this hook to observe or replace the selected
-        implementer.  The orchestration path still receives only the generic
-        executor returned above.
-        """
-
-        if self._injected_agent is not None:
-            return self._injected_agent
-        try:
-            profile = profile_for_role(self.config, profile_id, ExecutionRole.IMPLEMENTER)
-        except ProfileError:
-            profile = profile_for_role(self.config, profile_id, ExecutionRole.REPAIR)
-        try:
-            agent_config = dataclasses.replace(
-                build_agent_config(profile),
-                env_allowlist=self.config.agent.env_allowlist,
-            )
-        except ProfileError:
-            # The compatibility hook is Codex-shaped, but the resolved
-            # executor is not.  Other registered drivers receive no legacy
-            # worker object and own their process boundary themselves.
-            return None
-        return CodexAgent(agent_config)
+        return executor_for_profile(profile, runtime)
 
     def _run_revision(
         self,
@@ -1721,10 +1662,6 @@ class Orchestrator:
             # catalogue.  Materialize those exact trusted definitions before
             # the plan can become approval authority.
             selected_checks = self.config.select_checks(plan.required_checks)
-            if not plan.required_checks and not self.config.check_catalog:
-                # Preserve the historical ``[[checks]]`` selection semantics
-                # for v2 configurations that predate the explicit catalogue.
-                selected_checks = self.config.select_checks(None)
             # Freeze the whole trusted catalogue, not just this selection: a
             # correction plan may legitimately require another approved check,
             # and it must still run the argv approved at this boundary.
@@ -1930,7 +1867,7 @@ class Orchestrator:
         value comes from the checkpoint written before the approval, so a
         rewritten ``check_authority.json`` is rejected on every live use, not
         only on resume.  A run created before the artifact existed has no hash
-        and keeps its legacy behavior.
+        and keeps its current behavior.
         """
 
         directory = Path(run_dir).expanduser().resolve()
@@ -3197,7 +3134,7 @@ class Orchestrator:
         )
         # 5. One fresh worker process for this step.  On a bounded retry the
         # contract is byte-identical; only the addendum is added.
-        # The selected adapter owns the single .run_step( compatibility path.
+        # The selected adapter owns the single execution call.
         retry_addendum = (
             build_mismatch_retry_addendum(
                 initial_mismatch=initial_mismatch or "",
@@ -3454,7 +3391,7 @@ class Orchestrator:
         # resume can tell a clean retry from partial worker changes.
         if result.timed_out or result.exit_reason == AGENT_TIMEOUT:
             raise StepExecutionFailure(
-                AGENT_TIMEOUT if not self._legacy_backend_injection else "AGENT_TIMEOUT",
+                AGENT_TIMEOUT,
                 step_id, **failed, tree_after=_safe_candidate_tree(worktree)
             )
         if result.exit_code not in (0, None) or result.exit_reason in {
@@ -3462,7 +3399,7 @@ class Orchestrator:
             AGENT_SCOPE_VIOLATION,
         }:
             if auth_failure:
-                reason = "AGENT_AUTH_FAILURE"
+                reason = AGENT_START_FAILED
                 raise StepExecutionFailure(
                     reason, step_id, "Codex authentication failed", **failed,
                     tree_after=_safe_candidate_tree(worktree),
@@ -4861,8 +4798,6 @@ class Orchestrator:
             # expects.  The whole trusted catalogue is frozen, not just this
             # selection, so a correction plan still runs approved argv.
             selected_checks = config.select_checks(plan.required_checks)
-            if not plan.required_checks and not config.check_catalog:
-                selected_checks = config.select_checks(None)
             write_check_authority(
                 run_dir, tuple(config.trusted_checks()),
                 required_check_ids=tuple(check.id for check in selected_checks),

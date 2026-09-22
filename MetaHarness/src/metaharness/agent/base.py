@@ -15,8 +15,8 @@ from ..models import AgentExecutorCapabilities, ExecutionRole
 
 AgentUsage = dict[str, int]
 
-# Durable, backend-neutral failure reasons.  Historical backend-specific
-# reasons remain readable in ``resume.py`` and in old artifacts.
+# Durable, backend-neutral failure reasons.  Backend-specific diagnostics stay
+# in ``backend_reason`` and never become pipeline state.
 AGENT_START_FAILED = "AGENT_START_FAILED"
 AGENT_RUNTIME_FAILED = "AGENT_RUNTIME_FAILED"
 AGENT_TIMEOUT = "AGENT_TIMEOUT"
@@ -40,8 +40,7 @@ class AgentRunRequest:
     # This is an infrastructure hint, not a business/backend selection.  It
     # lets the adapter preserve the v1 plan prompt and v2 step prompt bytes.
     prompt_mode: str = "raw"
-    # Optional adapter inputs retained for compatibility with the historical
-    # in-process Codex double.  They do not change the generic contract.
+    # Adapter inputs for retry and prompt-contract handling.
     contract: str | None = None
     retry_addendum: str | None = None
 
@@ -58,8 +57,8 @@ class AgentRunResult:
     external_session_id: str | None
     report_path: str | None
 
-    # Compatibility/projection fields used by the existing artifact and
-    # resume code.  They are intentionally optional in the generic contract.
+    # Normalized execution and diagnostic fields.  They are intentionally
+    # optional in the generic contract.
     exit_code: int | None = None
     timed_out: bool = False
     final_message: str = ""

@@ -187,7 +187,7 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
 <label for="implementer-profile">Default implementer</label><select id="implementer-profile" name="default_implementer_profile" required>{options["implementer"]}</select>
 <label for="reviewer-profile">Final reviewer</label><select id="reviewer-profile" name="final_reviewer_profile" required>{options["reviewer"]}</select>
 <label for="semantic-revision">Semantic revision</label><select id="semantic-revision" name="semantic_revision_enabled" required><option value="enabled"{" selected" if semantic_revision == "enabled" else ""}>enabled</option><option value="disabled"{" selected" if semantic_revision == "disabled" else ""}>disabled</option></select>
-<label for="reviser-profile">Semantic reviser profile</label><select id="reviser-profile" name="semantic_reviser_profile" aria-describedby="reviser-help">{options["reviser"]}</select><p id="reviser-help" class="muted">The profile's declared role and executor determine compatibility.</p>
+<label for="reviser-profile">Semantic reviser profile</label><select id="reviser-profile" name="semantic_reviser_profile" aria-describedby="reviser-help">{options["reviser"]}</select><p id="reviser-help" class="muted">The profile's declared role and executor determine whether the selection is valid.</p>
 <label for="check-repair-attempts">Maximum check-repair attempts</label><select id="check-repair-attempts" name="max_check_repair_attempts" required>{check_attempt_options}</select>
 <label for="repair-cycles">Maximum review-repair cycles</label><select id="repair-cycles" name="max_review_repair_cycles" required>{review_cycle_options}</select>
 <label for="repair-profile">Check-repair profile</label><select id="repair-profile" name="check_repair_profile">{options["repair"]}</select>
@@ -325,21 +325,6 @@ def _fast_forward_publish_section(state: dict[str, Any], publish: dict[str, Any]
 
 def _section_open(run: dict[str, Any], names: tuple[str, ...]) -> str:
     return " open" if any(_failure_reason(run).startswith(name) for name in names) else ""
-
-
-def _agent_auth_failure_notice(run: dict[str, Any], config: HarnessConfig | None) -> str:
-    if _failure_reason(run) != "AGENT_AUTH_FAILURE":
-        return ""
-    configured_home = (
-        str(config.codex_runtime.home.expanduser().resolve())
-        if config is not None
-        else "<configured home>"
-    )
-    return (
-        '<div class="card fail"><p><strong>Codex authentication failed.</strong></p>'
-        "<p>Run once:</p>"
-        f'<pre>CODEX_HOME="{_e(configured_home)}" codex login</pre></div>'
-    )
 
 
 def _check_cards(checks: Any) -> str:
@@ -879,7 +864,6 @@ _PIPELINE_SYMBOLS = {
     "complete": "✓", "running": "▶", "failed": "✗", "deferred": "⚠", "waiting": "·", "resumable": "↻", "skipped": "–",
 }
 _FAILURE_MESSAGES = {
-    "AGENT_AUTH_FAILURE": "Agent authentication failed",
     "AGENT_TIMEOUT": "Worker timed out",
     "AGENT_RUNTIME_FAILED": "Worker failed",
     "AGENT_RUNTIME_FAILED": "Worker failed",
@@ -1131,7 +1115,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
     Sections, in order: run status and next action, execution pipeline,
     approval / model selection, current cycle, checks, token usage, plan,
     changed files, raw artifacts / diagnostics.  ``refresh_seconds`` is kept
-    for compatibility and ignored: the page never reloads itself.
+    for display only: the page never reloads itself.
     """
 
     del refresh_seconds
@@ -1177,7 +1161,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
 {_run_configuration(state, config)}
 {approval_forms}
 <section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config)}</section>
-<section class="current-cycle"><h2>CURRENT CYCLE</h2>{_agent_auth_failure_notice(run, config)}{_live_events_card(polls)}{agent_section}</section>
+<section class="current-cycle"><h2>CURRENT CYCLE</h2>{_live_events_card(polls)}{agent_section}</section>
 <section><h2>CHECKS</h2>{_check_repair_notice(run)}<details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
 <section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details></section>
 {_usage_section(run)}

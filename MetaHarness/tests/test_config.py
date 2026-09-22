@@ -18,29 +18,51 @@ worktrees_root = "../MetaHarness-worktrees"
 require_clean_base = true
 max_diff_bytes = 400000
 
-[agent]
-provider = "codex"
-model = "gpt-5.6-luna"
-effort = "high"
-sandbox = "workspace-write"
-timeout_seconds = 5400
+[codex_runtime]
+home = "codex-home"
 
-[planner]
+[ui]
+default_planner_profile = "planner-chat"
+default_implementer_profile = "implementer-codex"
+default_reviewer_profile = "reviewer-chat"
+
+[model_profiles.planner-chat]
+display_name = "Planner"
+roles = ["planner"]
+driver = "openai-chat"
+provider = "bridge"
+model = "${META_PLANNER_MODEL}"
+selection_mode = "request"
 base_url = "${META_PLANNER_BASE_URL}"
 endpoint_path = "${META_PLANNER_ENDPOINT}"
-model = "${META_PLANNER_MODEL}"
 api_key_env = "META_PLANNER_API_KEY"
 timeout_seconds = 300
 retries = 2
 
-[planner.extra_body]
+[model_profiles.planner-chat.extra_body]
 new_chat = true
 nested = { label = "${META_NESTED}" }
 
-[reviewer]
+[model_profiles.implementer-codex]
+display_name = "Implementer"
+roles = ["implementer"]
+driver = "codex"
+provider = "bridge"
+model = "gpt-5.6-luna"
+effort = "high"
+sandbox = "workspace-write"
+selection_mode = "cli"
+timeout_seconds = 5400
+
+[model_profiles.reviewer-chat]
+display_name = "Reviewer"
+roles = ["reviewer"]
+driver = "openai-chat"
+provider = "bridge"
+model = "review-model"
+selection_mode = "request"
 base_url = "https://review.example"
 endpoint_path = "/v1/chat"
-model = "review-model"
 timeout_seconds = 420
 retries = 2
 
@@ -52,8 +74,8 @@ max_hits = 8
 max_bytes = 160000
 require_locator_head_at_base = true
 
-[[checks]]
-name = "test"
+[[check_catalog]]
+id = "test"
 argv = ["make", "test"]
 """
 
@@ -94,7 +116,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.planner.model, "planner-model")
         self.assertEqual(config.planner.extra_body["nested"]["label"], "nested-value")
         self.assertEqual(config.context.locator_argv[0], "ctx")
-        self.assertEqual(config.checks[0].argv, ("make", "test"))
+        self.assertEqual(config.check_catalog[0].argv, ("make", "test"))
         self.assertEqual(config.planner.api_key_env, "META_PLANNER_API_KEY")
         self.assertEqual(config.agent.env_allowlist, (
             "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR",
@@ -212,19 +234,11 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.approval.require_plan_approval)
         self.assertEqual(config.approval.poll_interval_seconds, 2.0)
 
-    def test_agent_environment_allowlist_is_configurable_and_validated(self) -> None:
-        contents = VALID_CONFIG.replace(
-            'timeout_seconds = 5400\n\n[planner]',
-            'timeout_seconds = 5400\nenv_allowlist = ["PATH", "CUSTOM_VALUE"]\n\n[planner]',
-        )
+    def test_agent_section_is_rejected(self) -> None:
+        contents = VALID_CONFIG + '\n[agent]\nmodel = "not-configurable"\n'
         with tempfile.TemporaryDirectory() as directory_name:
-            config = load_config(self.write_config(Path(directory_name), contents))
-        self.assertEqual(config.agent.env_allowlist, ("PATH", "CUSTOM_VALUE"))
-
-        invalid = contents.replace('"CUSTOM_VALUE"', '"not-valid-name"')
-        with tempfile.TemporaryDirectory() as directory_name:
-            with self.assertRaisesRegex(ConfigError, "environment variable names"):
-                load_config(self.write_config(Path(directory_name), invalid))
+            with self.assertRaisesRegex(ConfigError, r"\[agent\]"):
+                load_config(self.write_config(Path(directory_name), contents))
 
     def test_missing_environment_variable_is_explicit_error(self) -> None:
         os.environ.pop("META_PLANNER_MODEL")
@@ -296,7 +310,7 @@ class ConfigTests(unittest.TestCase):
         for replacement, message in (
             ('max_hits = 8', 'max_hits must be greater'),
             ('max_bytes = 160000', 'max_bytes must be greater'),
-            ('sandbox = "workspace-write"', 'unknown agent.sandbox'),
+            ('sandbox = "workspace-write"', 'unknown model_profiles.implementer-codex.sandbox'),
         ):
             contents = VALID_CONFIG.replace(
                 replacement,
@@ -310,8 +324,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_config_requires_one_required_check_by_default(self) -> None:
         cases = (
-            (VALID_CONFIG.replace("\n[[checks]]\nname = \"test\"\nargv = [\"make\", \"test\"]\n", "\n"), "required check"),
-            (VALID_CONFIG.replace('name = "test"', 'name = "optional"').replace("\n[[checks]]", "\n[[checks]]\nrequired = false"), "required check"),
+            (VALID_CONFIG.replace("\n[[check_catalog]]\nid = \"test\"\nargv = [\"make\", \"test\"]\n", "\n"), "required check"),
+            (VALID_CONFIG.replace('id = "test"', 'id = "optional"').replace("\n[[check_catalog]]", "\n[[check_catalog]]\nrequired = false"), "required check"),
         )
         for contents, message in cases:
             with self.subTest(contents=contents):
@@ -319,16 +333,91 @@ class ConfigTests(unittest.TestCase):
                     with self.assertRaisesRegex(ConfigError, message):
                         load_config(self.write_config(Path(directory_name), contents))
 
-        for checks in ("", "\n[[checks]]\nname = \"optional\"\nargv = [\"make\", \"test\"]\nrequired = false\n"):
+        for checks in ("", "\n[[check_catalog]]\nid = \"optional\"\nargv = [\"make\", \"test\"]\nrequired = false\n"):
             contents = (
                 VALID_CONFIG.replace(
-                    '\n[[checks]]\nname = "test"\nargv = ["make", "test"]\n', checks
+                    '\n[[check_catalog]]\nid = "test"\nargv = ["make", "test"]\n', checks
                 )
                 .replace("max_diff_bytes = 400000\n", "max_diff_bytes = 400000\nallow_no_required_checks = true\n")
             )
             with tempfile.TemporaryDirectory() as directory_name:
                 config = load_config(self.write_config(Path(directory_name), contents))
             self.assertTrue(config.allow_no_required_checks)
+
+    def test_model_profiles_and_ui_defaults_are_required(self) -> None:
+        missing_profiles = VALID_CONFIG.split('[model_profiles.planner-chat]', 1)[0]
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, "model_profiles"):
+                load_config(self.write_config(Path(directory_name), missing_profiles))
+        for key in (
+            "default_planner_profile",
+            "default_implementer_profile",
+            "default_reviewer_profile",
+        ):
+            contents = VALID_CONFIG.replace(f'{key} = "', f'# {key} = "', 1)
+            with tempfile.TemporaryDirectory() as directory_name:
+                with self.assertRaisesRegex(ConfigError, f"ui.{key} is required"):
+                    load_config(self.write_config(Path(directory_name), contents))
+
+    def test_old_sections_and_check_table_are_rejected(self) -> None:
+        for section in ("planner", "reviewer", "agent"):
+            contents = VALID_CONFIG + f"\n[{section}]\nmodel = \"old\"\n"
+            with tempfile.TemporaryDirectory() as directory_name:
+                with self.assertRaisesRegex(ConfigError, rf"\[{section}\]"):
+                    load_config(self.write_config(Path(directory_name), contents))
+        contents = VALID_CONFIG + '\n[[checks]]\nname = "old"\nargv = ["make", "test"]\n'
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, "check_catalog"):
+                load_config(self.write_config(Path(directory_name), contents))
+
+    def test_profile_roles_are_provider_neutral(self) -> None:
+        contents = VALID_CONFIG.replace('provider = "bridge"', 'provider = "arbitrary-provider"')
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), contents))
+        self.assertEqual(config.model_profiles["planner-chat"].provider, "arbitrary-provider")
+
+    def test_modern_role_matrix_accepts_external_repair_and_claude_reviser(self) -> None:
+        contents = VALID_CONFIG.replace(
+            'default_reviewer_profile = "reviewer-chat"',
+            'default_reviewer_profile = "reviewer-chat"\n'
+            'default_reviser_profile = "reviser-claude"\n'
+            'default_repair_profile = "repair-external"',
+        ).replace(
+            'driver = "codex"\nprovider = "bridge"\nmodel = "gpt-5.6-luna"\neffort = "high"\nsandbox = "workspace-write"\nselection_mode = "cli"',
+            'driver = "external"\nprovider = "deepseek"\nmodel = "deepseek-worker"\nselection_mode = "cli"\nargv = ["trusted-worker"]',
+        ) + '''
+[revision]
+enabled = true
+max_check_repair_attempts = 1
+max_review_repair_cycles = 1
+
+[claude_runtime]
+home = "claude-home"
+
+[model_profiles.repair-external]
+display_name = "External repair"
+roles = ["repair"]
+driver = "external"
+provider = "deepseek"
+model = "deepseek-repair"
+selection_mode = "cli"
+argv = ["trusted-repair"]
+
+[model_profiles.reviser-claude]
+display_name = "Claude reviser"
+roles = ["reviser"]
+driver = "claude-code"
+provider = "anthropic"
+model = "opus"
+effort = "medium"
+permission_mode = "acceptEdits"
+selection_mode = "cli"
+'''
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), contents))
+        self.assertEqual(config.model_profiles["implementer-codex"].driver, "external")
+        self.assertEqual(config.ui.default_repair_profile, "repair-external")
+        self.assertEqual(config.ui.default_reviser_profile, "reviser-claude")
 
 
 if __name__ == "__main__":

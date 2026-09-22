@@ -1,8 +1,6 @@
 """Strict META PLAN v2 parsing and bounded implementation contracts.
 
-This module is deliberately parallel to :mod:`metaharness.planning`.  The v1
-parser and its historical artifacts remain the compatibility path; v2 is a
-new protocol that can be selected by a later execution milestone.
+This module contains the active planner protocol and its durable artifacts.
 """
 
 from __future__ import annotations
@@ -856,7 +854,7 @@ def build_planner_payload_v2(
 
 
 def build_planner_prompt_v2(*args: Any, **kwargs: Any) -> str:
-    """Compatibility wrapper returning the exact rendered planner prompt."""
+    """Return the exact rendered planner prompt."""
 
     return build_planner_payload_v2(*args, **kwargs).rendered
 
@@ -1143,7 +1141,6 @@ def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict
         atomic_write_text(step_contract_path(target, step.id), contracts[step.id])
     atomic_write_text(target / "implementation_bundle.json", json.dumps(bundle, ensure_ascii=False, indent=2) + "\n")
     # ``task_plan.json`` is the stable v2 artifact name approved by the human.
-    # Keep the older suffixed name as a compatibility alias for existing tools.
     atomic_write_text(
         target / "task_plan.json",
         json.dumps(

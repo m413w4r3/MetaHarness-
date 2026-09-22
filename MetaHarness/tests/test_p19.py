@@ -14,7 +14,17 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.approval import compute_plan_identity
-from metaharness.models import AgentConfig, ContextConfig, HarnessConfig, LLMEndpointConfig
+from metaharness.models import (
+    AgentConfig,
+    ContextConfig,
+    ExecutionRole,
+    HarnessConfig,
+    LLMEndpointConfig,
+    ModelProfile,
+    ProfileDriver,
+    SelectionMode,
+    UIConfig,
+)
 from metaharness.state import RunStateStore
 from metaharness.web.api import get_run
 from metaharness.web.pages import refresh_seconds_for_run
@@ -28,6 +38,38 @@ class P19WebTests(unittest.TestCase):
         runs = root / "runs"
         runs.mkdir()
         endpoint = LLMEndpointConfig("https://example.invalid", "/chat", "model")
+        profiles = {
+            "planner": ModelProfile(
+                id="planner",
+                display_name="Planner",
+                roles=(ExecutionRole.PLANNER,),
+                driver=ProfileDriver.OPENAI_CHAT,
+                model="planner-model",
+                selection_mode=SelectionMode.REQUEST,
+                base_url=endpoint.base_url,
+                endpoint_path=endpoint.endpoint_path,
+            ),
+            "implementer": ModelProfile(
+                id="implementer",
+                display_name="Implementer",
+                roles=(ExecutionRole.IMPLEMENTER,),
+                driver=ProfileDriver.EXTERNAL,
+                model="worker",
+                selection_mode=SelectionMode.REQUEST,
+                provider="test",
+                argv=("worker",),
+            ),
+            "reviewer": ModelProfile(
+                id="reviewer",
+                display_name="Reviewer",
+                roles=(ExecutionRole.REVIEWER,),
+                driver=ProfileDriver.OPENAI_CHAT,
+                model="reviewer-model",
+                selection_mode=SelectionMode.REQUEST,
+                base_url=endpoint.base_url,
+                endpoint_path=endpoint.endpoint_path,
+            ),
+        }
         config = HarnessConfig(
             repo=root,
             base_ref="HEAD",
@@ -38,8 +80,14 @@ class P19WebTests(unittest.TestCase):
             reviewer=endpoint,
             context=ContextConfig(),
             agent=AgentConfig(),
-            checks=(),
+            check_catalog=(),
             allow_no_required_checks=True,
+            model_profiles=profiles,
+            ui=UIConfig(
+                default_planner_profile="planner",
+                default_implementer_profile="implementer",
+                default_reviewer_profile="reviewer",
+            ),
         )
         self.server = create_server(config, port=0)
         self.thread = threading.Thread(
@@ -109,16 +157,16 @@ class P19WebTests(unittest.TestCase):
     def test_html_create_rejects_bad_form_shape_and_redirects(self) -> None:
         token = self.token_from_new()
         with patch("metaharness.web.server.create_run", return_value={"location": "/runs/new-id"}) as create:
-            body = urlencode({"_token": token, "spec": "do it", "run_id": "", "planner_profile": "legacy-planner"})
+            body = urlencode({"_token": token, "spec": "do it", "run_id": "", "planner_profile": "planner"})
             status, headers, _content = self.request("POST", "/runs", body, Origin=f"http://127.0.0.1:{self.server.server_port}")
             self.assertEqual(status, 303)
             self.assertEqual(headers["Location"], "/runs/new-id")
             create.assert_called_once()
 
-        duplicate = f"_token={token}&spec=do+it&run_id=&planner_profile=legacy-planner&spec=again"
+        duplicate = f"_token={token}&spec=do+it&run_id=&planner_profile=planner&spec=again"
         status, _headers, _content = self.request("POST", "/runs", duplicate)
         self.assertEqual(status, 400)
-        unknown = urlencode({"_token": token, "spec": "do it", "run_id": "", "planner_profile": "legacy-planner", "extra": "x"})
+        unknown = urlencode({"_token": token, "spec": "do it", "run_id": "", "planner_profile": "planner", "extra": "x"})
         status, _headers, _content = self.request("POST", "/runs", unknown)
         self.assertEqual(status, 400)
 

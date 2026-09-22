@@ -1,6 +1,6 @@
 # Architecture
 
-MetaHarness V0 is a single-task state machine. It creates one planner
+MetaHarness is a single-task state machine. It creates one planner
 decision, profile-selected implementation and correction cycles, deterministic
 evidence snapshots, and an independent final review. The executor/backend is
 selected by each profile; business roles do not imply a particular vendor or
@@ -148,7 +148,7 @@ PLAN → implementation step → accepted step commit → …
   `execution_selection.json` schema 5: planner, per-step implementers,
   optional check-repair, optional semantic-reviser, and final reviewer.
   Driver/harness, provider, model and effort are independent profile fields;
-  the profile's declared roles determine compatibility.
+  the profile's declared roles determine whether the selection is valid.
 - Step capacity has a single syntax authority, `metaharness.step_ids`:
   `PROTOCOL_MAX_STEPS = 99` and the step IDs `S01..S99`. This is a protocol
   bound, not a recommended execution size. The parser, the implementation bundle, the
@@ -318,8 +318,8 @@ original plan scope
 
 Any candidate path outside that union remains a `RESUME_INTEGRITY_FAILURE`.
 
-Historical snapshots whose `pipeline` predates the repair-scope fields keep
-the historical `deny-expansion` default. An operator may explicitly opt in on
+Snapshots whose `pipeline` predates the repair-scope fields are not loaded.
+Current runs use the `deny-expansion` default. An operator may explicitly opt in on
 resume with `--allow-bounded-test-scope-expansion`; this writes the immutable,
 write-once `repair_scope_override.json` artifact and can only select
 `auto-bounded` with a bound from 1 through 100. The override is refused for

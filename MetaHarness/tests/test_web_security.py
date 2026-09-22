@@ -17,6 +17,11 @@ from metaharness.models import (
     ContextConfig,
     HarnessConfig,
     LLMEndpointConfig,
+    ModelProfile,
+    ExecutionRole,
+    ProfileDriver,
+    SelectionMode,
+    UIConfig,
 )
 from metaharness.state import RunStateStore
 from metaharness.web.server import create_server
@@ -24,6 +29,11 @@ from metaharness.web.server import create_server
 
 def _config(root: Path, runs: Path) -> HarnessConfig:
     endpoint = LLMEndpointConfig("https://example.invalid", "/chat", "model")
+    profiles = {
+        "planner": ModelProfile("planner", "Planner", (ExecutionRole.PLANNER,), ProfileDriver.OPENAI_CHAT, "planner", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
+        "implementer": ModelProfile("implementer", "Implementer", (ExecutionRole.IMPLEMENTER,), ProfileDriver.EXTERNAL, "worker", SelectionMode.CLI, argv=("true",)),
+        "reviewer": ModelProfile("reviewer", "Reviewer", (ExecutionRole.REVIEWER,), ProfileDriver.OPENAI_CHAT, "reviewer", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
+    }
     return HarnessConfig(
         repo=root,
         base_ref="HEAD",
@@ -34,8 +44,10 @@ def _config(root: Path, runs: Path) -> HarnessConfig:
         reviewer=endpoint,
         context=ContextConfig(),
         agent=AgentConfig(),
-        checks=(),
+        check_catalog=(),
         allow_no_required_checks=True,
+        ui=UIConfig(default_planner_profile="planner", default_implementer_profile="implementer", default_reviewer_profile="reviewer"),
+        model_profiles=profiles,
     )
 
 
@@ -314,20 +326,7 @@ class WebSecurityTests(unittest.TestCase):
                 '{"summary":"<script>window.PWNED=true</script>","findings":"<img src=x onerror=alert(1)>"}',
                 encoding="utf-8",
             )
-            endpoint = LLMEndpointConfig("https://example.invalid", "/chat", "model")
-            config = HarnessConfig(
-                repo=root,
-                base_ref="HEAD",
-                runs_root=runs,
-                worktrees_root=root / "worktrees",
-                require_clean_base=True,
-                planner=endpoint,
-                reviewer=endpoint,
-                context=ContextConfig(),
-                agent=AgentConfig(),
-                checks=(),
-                allow_no_required_checks=True,
-            )
+            config = _config(root, runs)
             server = create_server(config, port=0)
             thread = threading.Thread(
                 target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True

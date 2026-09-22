@@ -1,4 +1,4 @@
-"""Fondations de MetaHarness V0."""
+"""Fondations de MetaHarness."""
 
 from .agent import (
     AgentResult,

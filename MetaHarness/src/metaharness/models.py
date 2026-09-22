@@ -469,7 +469,7 @@ class CheckConfig:
 
     @property
     def id(self) -> str:
-        """Stable trusted catalogue identifier (legacy configs use ``name``)."""
+        """Stable trusted catalogue identifier."""
 
         return self.name
 
@@ -487,6 +487,7 @@ class EnvironmentConfig:
 @dataclass(frozen=True)
 class CodexRuntimeConfig:
     home: Path
+    env_allowlist: tuple[str, ...] = AgentConfig.env_allowlist
 
 
 @dataclass(frozen=True)
@@ -522,7 +523,7 @@ class HarnessConfig:
     reviewer: LLMEndpointConfig
     context: ContextConfig
     agent: AgentConfig
-    checks: tuple[CheckConfig, ...]
+    check_catalog: tuple[CheckConfig, ...]
     max_diff_bytes: int = 400_000
     allow_no_required_checks: bool = False
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
@@ -551,17 +552,11 @@ class HarnessConfig:
     repository: RepositoryConfig = field(default_factory=RepositoryConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
     publish: PublishConfig = field(default_factory=PublishConfig)
-    # Compatibility marker for programmatic legacy configurations that do not
-    # have a repository TOML section yet.
     repository_section_explicit: bool = field(default=False, repr=False, compare=False)
-    # P42 trusted catalogue.  ``checks`` remains a compatibility alias for
-    # programmatic/v1 configurations; TOML v2 stores the explicit catalogue
-    # separately.
-    check_catalog: tuple[CheckConfig, ...] = ()
     default_check_ids: tuple[str, ...] = ()
 
     def trusted_checks(self) -> tuple[CheckConfig, ...]:
-        return self.check_catalog or self.checks
+        return self.check_catalog
 
     def trusted_check_map(self) -> dict[str, CheckConfig]:
         return {check.id: check for check in self.trusted_checks()}
@@ -574,14 +569,8 @@ class HarnessConfig:
 
     def select_checks(self, ids: tuple[str, ...] | list[str] | None = None) -> tuple[CheckConfig, ...]:
         catalogue = self.trusted_check_map()
-        # Historical ``checks`` configurations executed all entries (with
-        # ``required`` controlling the gate).  An explicit P42 catalogue uses
-        # the planner/default selection instead.
         if ids is None:
-            selected = (
-                tuple(check.id for check in self.checks)
-                if not self.check_catalog else self.required_check_ids()
-            )
+            selected = self.required_check_ids()
         else:
             selected = tuple(ids)
         if len(set(selected)) != len(selected):

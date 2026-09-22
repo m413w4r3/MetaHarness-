@@ -56,7 +56,7 @@ STRICT PROHIBITIONS:
 
 - Do not modify any path outside WRITE_SET / CREATE_SET / DELETE_SET.
 - Do not move work into a path assigned to a later step.
-- Do not add compatibility shims merely to make an intermediate verification pass.
+- Do not add temporary shims merely to make an intermediate verification pass.
 - Do not weaken, skip, delete or rewrite a test merely to hide an out-of-scope dependency.
 - Do not return META CONTRACT MISMATCH solely because a VERIFY command reaches
   code that belongs to a later approved step.
@@ -321,7 +321,7 @@ class CodexAgent:
             return self._optional_flags
         # A custom executable is normally a wrapper or a test double; probing
         # it can execute the real workload twice.  The actual ``codex`` binary
-        # is the only command for which the compatibility probe is meaningful.
+        # is the only command for which the feature probe is meaningful.
         if self.executable != "codex":
             self._optional_flags = True
             return True
@@ -358,7 +358,7 @@ class CodexAgent:
         if not isinstance(plan, str):
             raise TypeError("plan must be a string")
         payload = build_implementer_payload(
-            step_identity="legacy implementation request",
+        step_identity="implementation request",
             step_objective=plan,
             step_invariants="NONE",
             read_set="NONE",

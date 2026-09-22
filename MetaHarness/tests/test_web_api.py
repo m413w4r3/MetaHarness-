@@ -19,6 +19,11 @@ from metaharness.models import (
     ContextConfig,
     HarnessConfig,
     LLMEndpointConfig,
+    ModelProfile,
+    ExecutionRole,
+    ProfileDriver,
+    SelectionMode,
+    UIConfig,
 )
 from metaharness.run_options import RunOptions, write_run_options
 from metaharness.state import RunStateStore
@@ -34,6 +39,11 @@ class WebServerTests(unittest.TestCase):
         self.runs = root / "runs"
         self.runs.mkdir()
         endpoint = LLMEndpointConfig("https://example.invalid", "/chat", "model")
+        profiles = {
+            "planner": ModelProfile("planner", "Planner", (ExecutionRole.PLANNER,), ProfileDriver.OPENAI_CHAT, "planner", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
+            "implementer": ModelProfile("implementer", "Implementer", (ExecutionRole.IMPLEMENTER,), ProfileDriver.EXTERNAL, "worker", SelectionMode.CLI, argv=("true",)),
+            "reviewer": ModelProfile("reviewer", "Reviewer", (ExecutionRole.REVIEWER,), ProfileDriver.OPENAI_CHAT, "reviewer", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
+        }
         self.config = HarnessConfig(
             repo=root,
             base_ref="HEAD",
@@ -44,8 +54,14 @@ class WebServerTests(unittest.TestCase):
             reviewer=endpoint,
             context=ContextConfig(),
             agent=AgentConfig(),
-            checks=(),
+            check_catalog=(),
             allow_no_required_checks=True,
+            ui=UIConfig(
+                default_planner_profile="planner",
+                default_implementer_profile="implementer",
+                default_reviewer_profile="reviewer",
+            ),
+            model_profiles=profiles,
         )
         self.server = create_server(self.config, port=0)
         self.thread = threading.Thread(
@@ -141,12 +157,12 @@ class WebServerTests(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "execution_mode": "SINGLE",
-                    "reviewer_profile": "legacy-reviewer",
+                    "reviewer_profile": "reviewer",
                     "required_checks": [],
                     "steps": [{
                         "id": "S01",
                         "title": "One",
-                        "implementer_profile": "legacy-implementer",
+                        "implementer_profile": "implementer",
                         "depends_on": None,
                         "contract_sha256": hashlib.sha256(step_contract.read_bytes()).hexdigest(),
                     }],
@@ -155,7 +171,10 @@ class WebServerTests(unittest.TestCase):
             ) + "\n",
             encoding="utf-8",
         )
-        write_check_authority(run_dir, [CheckConfig("lint", ("python", "-c", "pass"))])
+        write_check_authority(
+            run_dir, [CheckConfig("lint", ("python", "-c", "pass"))],
+            required_check_ids=("lint",),
+        )
         options_sha256 = write_run_options(run_dir, RunOptions.from_config(self.config))
         actual = compute_plan_identity_from_run(run_dir)
         stored = actual.__dict__.copy()
@@ -165,7 +184,7 @@ class WebServerTests(unittest.TestCase):
             planning_protocol="v2",
             plan_identity=stored,
             run_options_sha256=options_sha256,
-            execution={"planner": {"profile_id": "legacy-planner"}},
+            execution={"planner": {"profile_id": "planner"}},
         )
         return run_dir
 
@@ -175,8 +194,8 @@ class WebServerTests(unittest.TestCase):
             f"/api/runs/{run_id}/approval",
             {
                 "decision": "APPROVE",
-                "final_reviewer_profile": "legacy-reviewer",
-                "step_profile__S01": "legacy-implementer",
+                "final_reviewer_profile": "reviewer",
+                "step_profile__S01": "implementer",
             },
             self.server.token,
         )
@@ -215,7 +234,7 @@ class WebServerTests(unittest.TestCase):
     def test_approval_fields_follow_the_actual_12_step_bundle(self) -> None:
         run_dir = self.create_run("form-steps", "committed")
         RunStateStore(run_dir / "state.json").update(
-            status="committed", execution={"planner": {"profile_id": "legacy-planner"}},
+            status="committed", execution={"planner": {"profile_id": "planner"}},
         )
         (run_dir / "implementation_bundle.json").write_text(
             json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),

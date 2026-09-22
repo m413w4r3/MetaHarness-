@@ -100,7 +100,7 @@ def _config_check(config_path: Path) -> int:
     )
     locator = "enabled" if config.context.locator_argv else "disabled"
     print(f"context locator: {locator}")
-    print("checks: " + (", ".join(check.name for check in config.checks) or "none"))
+    print("checks: " + (", ".join(check.id for check in config.check_catalog) or "none"))
     return 0
 
 
@@ -654,7 +654,7 @@ def _doctor(config_path: Path) -> int:
             codex, probe_environment, codex_home, secrets
         )
         if supported:
-            print("OK codex CLI compatibility: supported")
+            print("OK codex CLI contract: supported")
         else:
             problems.append("unsupported Codex CLI for MetaHarness worker")
         detail = _probe_codex_sandbox(codex, probe_environment, codex_home, secrets)
@@ -701,7 +701,7 @@ def _doctor(config_path: Path) -> int:
         problems.extend(_doctor_claude(config, path_value))
     for label, commands in (
         ("workspace setup", config.workspace_setup),
-        ("check", config.checks),
+        ("check", config.check_catalog),
     ):
         for command in commands:
             executable = command.argv[0] if command.argv else ""

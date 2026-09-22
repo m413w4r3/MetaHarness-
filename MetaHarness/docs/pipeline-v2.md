@@ -158,7 +158,7 @@ Nimbalyst
 ```
 
 Un artefact historique sans `pipeline_version` est interprété comme v1 et
-reste dans la machine d’état legacy. Un nouveau run est v2 ; une reprise ne
+reste dans la machine d’état courante. Un nouveau run est v2 ; une reprise ne
 peut jamais franchir cette frontière. META TRACE v1 observe les transitions,
 les arbres, les SHA et les métriques disponibles sans devenir une seconde
 autorité. Nimbalyst peut consommer cette trace comme cockpit externe, mais ne

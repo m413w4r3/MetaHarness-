@@ -245,7 +245,7 @@ def _agent_terminal_summary(
 def _agent_result_artifact(
     run_dir: Path, relative: str, secrets: tuple[str, ...]
 ) -> str:
-    """Keep the legacy result visible without replaying untrusted fields."""
+    """Keep the bounded agent result visible without replaying untrusted fields."""
 
     item = _artifact(run_dir, relative)
     result = _artifact_header(item)

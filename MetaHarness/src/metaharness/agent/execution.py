@@ -60,10 +60,6 @@ class ExecutorRuntimeConfig:
     codex_home: Path | None = None
     claude_home: Path | None = None
     forbidden_env_names: tuple[str | None, ...] = ()
-    # Compatibility hook for the historical in-process Codex double.  It is
-    # consumed by the Codex adapter only; the orchestration layer does not
-    # select a backend from this callback.
-    legacy_agent_factory: Callable[[str], Any] | None = None
 
 
 def _runtime(value: Any) -> ExecutorRuntimeConfig:
@@ -76,7 +72,6 @@ def _runtime(value: Any) -> ExecutorRuntimeConfig:
             environment=environment,
             codex_home=value.codex_runtime.home,
             claude_home=value.claude_runtime.home,
-            legacy_agent_factory=None,
         )
     if isinstance(value, Mapping):
         config = value.get("config")
@@ -86,7 +81,6 @@ def _runtime(value: Any) -> ExecutorRuntimeConfig:
             codex_home=value.get("codex_home"),
             claude_home=value.get("claude_home"),
             forbidden_env_names=tuple(value.get("forbidden_env_names", ())),
-            legacy_agent_factory=value.get("legacy_agent_factory"),
         )
     config = getattr(value, "config", None)
     return ExecutorRuntimeConfig(
@@ -95,7 +89,6 @@ def _runtime(value: Any) -> ExecutorRuntimeConfig:
         codex_home=getattr(value, "codex_home", None),
         claude_home=getattr(value, "claude_home", None),
         forbidden_env_names=tuple(getattr(value, "forbidden_env_names", ())),
-        legacy_agent_factory=getattr(value, "legacy_agent_factory", None),
     )
 
 
@@ -210,24 +203,15 @@ class CodexExecutor:
         if agent is not None:
             self.agent = agent
         else:
-            compatibility_factory = self.runtime.legacy_agent_factory
-            compatibility_agent = (
-                compatibility_factory(profile.id)
-                if callable(compatibility_factory)
-                else None
-            )
-            if compatibility_agent is not None:
-                self.agent = compatibility_agent
+            config = self.runtime.config
+            if config is not None:
+                agent_config = dataclasses.replace(
+                    build_agent_config(profile),
+                    env_allowlist=config.agent.env_allowlist,
+                )
             else:
-                config = self.runtime.config
-                if config is not None:
-                    agent_config = dataclasses.replace(
-                        build_agent_config(profile),
-                        env_allowlist=config.agent.env_allowlist,
-                    )
-                else:
-                    agent_config = build_agent_config(profile)
-                self.agent = CodexAgent(agent_config)
+                agent_config = build_agent_config(profile)
+            self.agent = CodexAgent(agent_config)
         self.capabilities = AgentExecutorCapabilities(
             edits_workspace=True,
             exposes_session_id=False,
@@ -312,11 +296,7 @@ class ClaudeCodeExecutor:
     driver = ProfileDriver.CLAUDE_CODE.value
 
     def __init__(
-        self,
-        profile: ModelProfile,
-        runtime_config: Any = None,
-        *,
-        agent: Any | None = None,
+        self, profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None
     ) -> None:
         self.profile = build_claude_profile(profile)
         self.runtime = _runtime(runtime_config)
@@ -371,35 +351,6 @@ class ClaudeCodeExecutor:
             backend_reason=backend_reason,
             driver_version=self.driver_version,
         )
-
-
-class LegacyAgentExecutor:
-    """Compatibility adapter for callers injecting the pre-v2 agent API."""
-
-    def __init__(self, executor: AgentExecutor, *, legacy_failure_names: bool = True):
-        self.executor = executor
-        self.legacy_failure_names = legacy_failure_names
-
-    def run(self, request: AgentRunRequest) -> AgentRunResult:
-        return self.executor.run(request)
-
-    @property
-    def capabilities(self) -> AgentExecutorCapabilities:
-        return self.executor.capabilities
-
-    @property
-    def driver_version(self) -> str | None:
-        return self.executor.driver_version
-
-
-def legacy_codex_agent_factory(config: AgentConfig) -> Any:
-    """Compatibility seam for callers that patched the old constructor.
-
-    The orchestrator only sees this factory as an injection hook; the concrete
-    constructor remains owned by this infrastructure module.
-    """
-
-    return CodexAgent(config)
 
 
 def _read_artifact_tail(path: Path, limit: int = 256 * 1024) -> str:
@@ -475,20 +426,20 @@ def register_executor_driver(
 
 
 def _codex_factory(
-    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None
+    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None,
 ) -> AgentExecutor:
     del reviser
     return CodexExecutor(profile, runtime_config, agent=agent)
 
 
 def _claude_factory(
-    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None
+    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None,
 ) -> AgentExecutor:
     return ClaudeCodeExecutor(profile, runtime_config, agent=reviser or agent)
 
 
 def _external_factory(
-    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None
+    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None,
 ) -> AgentExecutor:
     del agent, reviser
     return ExternalAgentExecutor(profile, runtime_config)
@@ -522,8 +473,6 @@ __all__ = [
     "ExecutorDriverRegistry",
     "ExecutorRuntimeConfig",
     "ExternalAgentExecutor",
-    "LegacyAgentExecutor",
     "executor_for_profile",
-    "legacy_codex_agent_factory",
     "register_executor_driver",
 ]

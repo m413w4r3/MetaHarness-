@@ -1,4 +1,4 @@
-"""Primitives Git strictes utilisées par MetaHarness V0."""
+"""Primitives Git strictes utilisées par MetaHarness."""
 
 from __future__ import annotations
 
@@ -922,7 +922,7 @@ def commit_candidate_tree(
     subject: str,
     body: str = "",
 ) -> str:
-    """Compatibility wrapper for the generic accepted-tree primitive."""
+    """Commit the accepted candidate tree."""
 
     return commit_tree(
         worktree,
@@ -992,10 +992,6 @@ def commit_revision_tree(
         body=body,
         reflog_message="metaharness: accept semantic revision",
     )
-
-
-# Compatibility for integrations that imported the pre-P40 name.
-commit_reviewed_tree = commit_candidate_tree
 
 
 def push_run_branch(
@@ -1184,8 +1180,8 @@ def validate_linear_commit_chain(
 ) -> tuple[str, ...]:
     """Validate an arbitrary durable, single-parent accepted-commit chain.
 
-    ``accepted_commits`` is optional for compatibility with older callers.  If
-    supplied, records are authoritative in order and each record must agree
+    When ``accepted_commits`` is supplied, records are authoritative in order
+    and each record must agree
     with the corresponding Git object; no 001/002 naming convention is used.
     """
 
@@ -1268,8 +1264,8 @@ def publish_fast_forward_base(
     fetch: the remote state is the local remote-tracking ref.  Preconditions:
     local base == remote-tracking base == ``base_sha``; with
     ``accepted_commits`` supplied, the complete durable chain is linear and
-    every recorded parent/tree agrees with Git.  Without it, the historical
-    direct-parent contract is retained.  The commit's tree is
+    every recorded parent/tree agrees with Git.  Without a chain, the
+    direct-parent contract is checked.  The commit's tree is
     ``approved_tree`` and the run branch points to it.  The local ref moves
     with a compare-and-swap ``update-ref``; a failed swap is
     :class:`BaseMovedError`.  A retry after a failed push accepts a local

@@ -1,6 +1,6 @@
 # Providers
 
-MetaHarness V0 uses one deliberately small, OpenAI-compatible text contract
+MetaHarness uses one deliberately small, OpenAI-compatible text contract
 for planner and reviewer endpoints.
 
 ## Minimal HTTP contract
@@ -44,24 +44,24 @@ Transport rules:
 
 ## ChatGPT bridge
 
-For a ChatGPT-compatible bridge, configure:
+For a ChatGPT-compatible bridge, configure an explicit planner/reviewer profile:
 
 ```toml
-[planner]
+[model_profiles.chat]
+display_name = "Chat bridge"
+roles = ["planner", "reviewer"]
+driver = "openai-chat"
+provider = "openai-compatible"
+model = "${META_PLANNER_MODEL}"
+selection_mode = "request"
 base_url = "${META_PLANNER_BASE_URL}"
 endpoint_path = "/v1/chat/completions"
-model = "${META_PLANNER_MODEL}"
+api_key_env = "BRIDGE_API_KEY"
 
-[planner.extra_body]
-new_chat = true
-
-[reviewer]
-base_url = "${META_REVIEWER_BASE_URL}"
-endpoint_path = "/v1/chat/completions"
-model = "${META_REVIEWER_MODEL}"
-
-[reviewer.extra_body]
-new_chat = true
+[ui]
+default_planner_profile = "chat"
+default_reviewer_profile = "chat"
+default_implementer_profile = "worker"
 ```
 
 The `model` value may be only a label interpreted by the bridge. MetaHarness

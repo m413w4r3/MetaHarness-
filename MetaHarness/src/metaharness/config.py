@@ -335,25 +335,14 @@ def _profile_agent(profile: ModelProfile) -> AgentConfig:
     )
 
 
-def _legacy_selection_mode(data: Mapping[str, Any], name: str) -> SelectionMode:
-    value = data.get("selection_mode", SelectionMode.REQUEST.value)
-    try:
-        mode = SelectionMode(value)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(f"{name}.selection_mode is invalid") from exc
-    if mode is SelectionMode.CLI:
-        raise ConfigError(f"{name}.selection_mode must be request or external-ui")
-    return mode
-
-
 def _model_profiles(
     data: Mapping[str, Any],
-) -> tuple[dict[str, ModelProfile], bool]:
-    raw = data.get("model_profiles", {})
+) -> dict[str, ModelProfile]:
+    raw = data.get("model_profiles")
     if not isinstance(raw, dict):
-        raise ConfigError("model_profiles must be a table")
+        raise ConfigError("model_profiles is required and must be a table")
     if not raw:
-        return {}, False
+        raise ConfigError("model_profiles must contain at least one profile")
     result: dict[str, ModelProfile] = {}
     for profile_id, profile_data in raw.items():
         if not isinstance(profile_id, str) or _PROFILE_ID.fullmatch(profile_id) is None:
@@ -539,7 +528,7 @@ def _model_profiles(
                 cost_tier=cost_tier,
                 latency_tier=latency_tier,
             )
-    return result, True
+    return result
 
 
 def _check_default(
@@ -588,16 +577,15 @@ def _checks(value: Any, *, catalogue: bool = False) -> tuple[CheckConfig, ...]:
     if value is None:
         return ()
     if not isinstance(value, list):
-        raise ConfigError("checks must be an array of tables")
+        raise ConfigError("check_catalog must be an array of tables")
     result: list[CheckConfig] = []
     for index, item in enumerate(value):
-        where = f"{'check_catalog' if catalogue else 'checks'}[{index}]"
+        where = f"check_catalog[{index}]"
         if not isinstance(item, dict):
             raise ConfigError(f"{where} must be a table")
-        name_key = "id" if catalogue else "name"
-        name = _required_string(item, name_key, where)
+        name = _required_string(item, "id", where)
         if name in {entry.name for entry in result}:
-            raise ConfigError(f"{where}.{name_key} must be unique")
+            raise ConfigError(f"{where}.id must be unique")
         argv = _string_array(item, "argv", (), where, allow_empty=False)
         cwd = item.get("cwd", ".")
         if not isinstance(cwd, str) or not cwd.strip():
@@ -635,7 +623,10 @@ def _codex_runtime(
         return CodexRuntimeConfig(
             Path.home() / ".local" / "share" / "metaharness" / "codex"
         )
-    return CodexRuntimeConfig(_path(data["home"], "codex_runtime.home", config_dir))
+    return CodexRuntimeConfig(
+        _path(data["home"], "codex_runtime.home", config_dir),
+        _env_name_array(data, "env_allowlist", AgentConfig.env_allowlist, "codex_runtime"),
+    )
 
 
 def _claude_runtime(
@@ -855,150 +846,46 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             "and publish.mode = 'run-branch'"
         )
 
-    agent_data = _table(expanded, "agent")
-    provider = agent_data.get("provider", "codex")
-    if provider != "codex":
-        raise ConfigError("agent.provider must be 'codex' in V0")
-    agent_model = agent_data.get("model", AgentConfig.model)
-    effort = agent_data.get("effort", AgentConfig.effort)
-    sandbox = agent_data.get("sandbox", AgentConfig.sandbox)
-    for key, value in (("model", agent_model), ("effort", effort), ("sandbox", sandbox)):
-        if not isinstance(value, str) or not value.strip():
-            raise ConfigError(f"agent.{key} must be a non-empty string")
-    if sandbox not in _KNOWN_SANDBOXES:
-        raise ConfigError("unknown agent.sandbox")
-    agent = AgentConfig(
-        provider=provider,
-        model=agent_model,
-        effort=effort,
-        sandbox=sandbox,
-        timeout_seconds=_positive_int(agent_data, "timeout_seconds", 5400, "agent"),
-        env_allowlist=_env_name_array(
-            agent_data, "env_allowlist", AgentConfig.env_allowlist, "agent"
-        ),
-    )
+    unsupported_sections = sorted({"planner", "reviewer", "agent"}.intersection(expanded))
+    if unsupported_sections:
+        raise ConfigError(
+            f"unsupported configuration section [{unsupported_sections[0]}]; "
+            "configure model_profiles and ui defaults"
+        )
 
-    model_profiles, explicit_profiles = _model_profiles(expanded)
+    model_profiles = _model_profiles(expanded)
     has_explicit_codex = any(
         profile.driver is ProfileDriver.CODEX for profile in model_profiles.values()
     )
     has_explicit_claude = any(
         profile.driver is ProfileDriver.CLAUDE_CODE for profile in model_profiles.values()
     )
-    planner_data = _table(expanded, "planner")
-    reviewer_data = _table(expanded, "reviewer")
-    agent_data_present = "agent" in expanded
-    if explicit_profiles:
-        ui_data = _table(expanded, "ui")
-        planner_default = _check_default(
-            model_profiles,
-            ui_data.get("default_planner_profile"),
-            ExecutionRole.PLANNER,
-        )
-        implementer_default = _check_default(
-            model_profiles,
-            ui_data.get("default_implementer_profile"),
-            ExecutionRole.IMPLEMENTER,
-        )
-        reviewer_default = _check_default(
-            model_profiles,
-            ui_data.get("default_reviewer_profile"),
-            ExecutionRole.REVIEWER,
-        )
-        # Reviser and repair defaults are explicit only: a profile present in
-        # the catalogue never becomes a default, and never enables revision.
-        reviser_default = ui_data.get("default_reviser_profile")
-        if reviser_default is not None:
-            reviser_default = _check_default(
-                model_profiles, reviser_default, ExecutionRole.REVISER
-            )
-        repair_default = ui_data.get("default_repair_profile")
-        if repair_default is not None:
-            repair_default = _check_default(
-                model_profiles, repair_default, ExecutionRole.REPAIR
-            )
-        planner_profile = model_profiles[planner_default]
-        reviewer_profile = model_profiles[reviewer_default]
-        implementer_profile = model_profiles[implementer_default]
-        if planner_data:
-            planner = _endpoint(planner_data, "planner")
-        else:
-            planner = _profile_endpoint(planner_profile)
-        if reviewer_data:
-            reviewer = _endpoint(reviewer_data, "reviewer")
-        else:
-            reviewer = _profile_endpoint(reviewer_profile)
-        if agent_data_present:
-            # Keep accepting the P15 section while the profile is the source
-            # of truth for production execution.
-            old_agent_data = _table(expanded, "agent")
-            agent = AgentConfig(
-                model=_required_string(old_agent_data, "model", "agent"),
-                effort=_required_string(old_agent_data, "effort", "agent"),
-                sandbox=_required_string(old_agent_data, "sandbox", "agent"),
-                timeout_seconds=_positive_int(old_agent_data, "timeout_seconds", 5400, "agent"),
-                env_allowlist=_env_name_array(
-                    old_agent_data, "env_allowlist", AgentConfig.env_allowlist, "agent"
-                ),
-            )
-        else:
-            # HarnessConfig keeps the historical AgentConfig projection, but
-            # an external driver owns its own process settings and must not be
-            # forced through the Codex-only legacy section.
-            agent = (
-                _profile_agent(implementer_profile)
-                if implementer_profile.driver is ProfileDriver.CODEX
-                else AgentConfig()
-            )
-    else:
-        planner = _endpoint(planner_data, "planner")
-        reviewer = _endpoint(reviewer_data, "reviewer")
-        # Synthetic profiles deliberately mirror the legacy sections without
-        # being written back to TOML.
-        model_profiles = {
-            "legacy-planner": ModelProfile(
-                id="legacy-planner",
-                display_name="Legacy Planner",
-                roles=(ExecutionRole.PLANNER,),
-                driver=ProfileDriver.OPENAI_CHAT,
-                model=planner.model,
-                provider="openai",
-                selection_mode=_legacy_selection_mode(planner_data, "planner"),
-                base_url=planner.base_url,
-                endpoint_path=planner.endpoint_path,
-                api_key_env=planner.api_key_env,
-                timeout_seconds=planner.timeout_seconds,
-                retries=planner.retries,
-                extra_body=planner.extra_body,
-            ),
-            "legacy-implementer": ModelProfile(
-                id="legacy-implementer",
-                display_name="Legacy Implementer",
-                roles=(ExecutionRole.IMPLEMENTER,),
-                driver=ProfileDriver.CODEX,
-                model=agent.model,
-                provider="openai",
-                selection_mode=SelectionMode.CLI,
-                effort=agent.effort,
-                sandbox=agent.sandbox,
-                timeout_seconds=agent.timeout_seconds,
-            ),
-            "legacy-reviewer": ModelProfile(
-                id="legacy-reviewer",
-                display_name="Legacy Reviewer",
-                roles=(ExecutionRole.REVIEWER,),
-                driver=ProfileDriver.OPENAI_CHAT,
-                model=reviewer.model,
-                provider="openai",
-                selection_mode=_legacy_selection_mode(reviewer_data, "reviewer"),
-                base_url=reviewer.base_url,
-                endpoint_path=reviewer.endpoint_path,
-                api_key_env=reviewer.api_key_env,
-                timeout_seconds=reviewer.timeout_seconds,
-                retries=reviewer.retries,
-                extra_body=reviewer.extra_body,
-            ),
-        }
+    ui_data = _table(expanded, "ui")
+    planner_default = _check_default(
+        model_profiles, ui_data.get("default_planner_profile"), ExecutionRole.PLANNER
+    )
+    implementer_default = _check_default(
+        model_profiles, ui_data.get("default_implementer_profile"), ExecutionRole.IMPLEMENTER
+    )
+    reviewer_default = _check_default(
+        model_profiles, ui_data.get("default_reviewer_profile"), ExecutionRole.REVIEWER
+    )
+    reviser_default = ui_data.get("default_reviser_profile")
+    if reviser_default is not None:
+        reviser_default = _check_default(model_profiles, reviser_default, ExecutionRole.REVISER)
+    repair_default = ui_data.get("default_repair_profile")
+    if repair_default is not None:
+        repair_default = _check_default(model_profiles, repair_default, ExecutionRole.REPAIR)
+    planner_profile = model_profiles[planner_default]
+    reviewer_profile = model_profiles[reviewer_default]
+    implementer_profile = model_profiles[implementer_default]
+    planner = _profile_endpoint(planner_profile)
+    reviewer = _profile_endpoint(reviewer_profile)
+    agent = (
+        _profile_agent(implementer_profile)
+        if implementer_profile.driver is ProfileDriver.CODEX
+        else AgentConfig()
+    )
 
     context_data = _table(expanded, "context")
     context = ContextConfig(
@@ -1040,51 +927,50 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             minimum=1,
             maximum=4,
         ),
-        default_planner_profile=(
-            planner_default if explicit_profiles else "legacy-planner"
-        ),
-        default_implementer_profile=(
-            implementer_default if explicit_profiles else "legacy-implementer"
-        ),
-        default_reviewer_profile=(
-            reviewer_default if explicit_profiles else "legacy-reviewer"
-        ),
-        default_reviser_profile=(reviser_default if explicit_profiles else None),
-        default_repair_profile=(repair_default if explicit_profiles else None),
+        default_planner_profile=planner_default,
+        default_implementer_profile=implementer_default,
+        default_reviewer_profile=reviewer_default,
+        default_reviser_profile=reviser_default,
+        default_repair_profile=repair_default,
         enable_profile_recommendation=_bool(
             ui_data, "enable_profile_recommendation", True, "ui"
         ),
     )
 
-    _validate_revision(revision, planning, ui, model_profiles if explicit_profiles else {})
+    _validate_revision(revision, planning, ui, model_profiles)
 
-    legacy_checks = _checks(expanded.get("checks", []))
+    if "checks" in expanded:
+        raise ConfigError("unsupported configuration key 'checks'; use [[check_catalog]]")
     configured_catalog = _checks(expanded.get("check_catalog", []), catalogue=True)
-    # A trusted catalogue is the v2 source of truth.  Keep the historical
-    # ``checks`` table as a source when no catalogue is configured.
-    checks = configured_catalog or legacy_checks
+    checks = configured_catalog
     default_check_ids = _string_array(
         expanded, "default_check_ids",
         tuple(
-            check.name for check in (
-                configured_catalog or legacy_checks
-            ) if check.required
+            check.id for check in configured_catalog if check.required
         ),
         "root",
     )
-    if configured_catalog:
-        catalogue_ids = {check.name for check in configured_catalog}
-        unknown_defaults = [item for item in default_check_ids if item not in catalogue_ids]
-        if unknown_defaults:
-            raise ConfigError(
-                "default_check_ids contains unknown trusted check ID(s): "
-                + ", ".join(unknown_defaults)
-            )
-        if len(set(default_check_ids)) != len(default_check_ids):
-            raise ConfigError("default_check_ids must not contain duplicates")
+    catalogue_ids = {check.id for check in configured_catalog}
+    unknown_defaults = [item for item in default_check_ids if item not in catalogue_ids]
+    if unknown_defaults:
+        raise ConfigError(
+            "default_check_ids contains unknown trusted check ID(s): "
+            + ", ".join(unknown_defaults)
+        )
+    if len(set(default_check_ids)) != len(default_check_ids):
+        raise ConfigError("default_check_ids must not contain duplicates")
     codex_runtime = _codex_runtime(
         expanded, config_dir, required=has_explicit_codex
     )
+    if implementer_profile.driver is ProfileDriver.CODEX:
+        agent = AgentConfig(
+            provider=agent.provider,
+            model=agent.model,
+            effort=agent.effort,
+            sandbox=agent.sandbox,
+            timeout_seconds=agent.timeout_seconds,
+            env_allowlist=codex_runtime.env_allowlist,
+        )
     claude_runtime = _claude_runtime(
         expanded, config_dir, required=has_explicit_claude
     )
@@ -1135,7 +1021,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         reviewer=reviewer,
         context=context,
         agent=agent,
-        checks=checks,
         check_catalog=configured_catalog,
         default_check_ids=tuple(default_check_ids),
         max_diff_bytes=max_diff_bytes,

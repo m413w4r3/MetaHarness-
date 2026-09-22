@@ -18,6 +18,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.cli import main  # noqa: E402
+from metaharness.agent import AgentExecutorCapabilities, register_executor_driver  # noqa: E402
 from metaharness.config import load_config  # noqa: E402
 from metaharness.models import RunStatus  # noqa: E402
 from metaharness.orchestrator import Orchestrator  # noqa: E402
@@ -40,7 +41,7 @@ def v2_plan(
     *, title: str = "Add the feature", step_title: str = "Create the feature",
     create: tuple[str, ...] = ("feature.txt",), verify: str = "Run the configured test.",
 ) -> str:
-    """One READY SINGLE META PLAN v2 creating *create* for the legacy profiles."""
+    """One READY SINGLE META PLAN v2 creating *create* for configured profiles."""
 
     created = "\n".join(f"- {path}" for path in create)
     return f"""META PLAN v2
@@ -56,11 +57,11 @@ Keep the change local.
 
 EXECUTION_MODE: SINGLE
 STEP_COUNT: 1
-REVIEWER_PROFILE: legacy-reviewer
+REVIEWER_PROFILE: reviewer
 
 BEGIN STEP S01
 TITLE: {step_title}
-IMPLEMENTER_PROFILE: legacy-implementer
+IMPLEMENTER_PROFILE: implementer
 DEPENDS_ON: NONE
 
 OBJECTIVE
@@ -91,6 +92,9 @@ END STEP S01
 
 ACCEPTANCE
 The feature file exists.
+
+REQUIRED_CHECKS
+- test
 
 TESTS
 Run the configured test.
@@ -208,7 +212,10 @@ class FakeLLM:
         self.thread.join(timeout=2)
 
 
-class InterruptingAgent:
+class InterruptingExecutor:
+    capabilities = AgentExecutorCapabilities(edits_workspace=True)
+    driver_version = "test"
+
     def run(self, *_args: Any, **_kwargs: Any) -> Any:
         raise KeyboardInterrupt
 
@@ -333,15 +340,16 @@ class OrchestratorE2ETests(unittest.TestCase):
                 f"require_plan_approval = {'true' if require_plan_approval else 'false'}",
                 "poll_interval_seconds = 0.01",
                 "",
-                f"[planner]\nbase_url = {llm.base_url!r}\nendpoint_path = \"/planner\"\nmodel = \"fake-planner\"\nretries = 0{key_line}",
-                f"[reviewer]\nbase_url = {llm.base_url!r}\nendpoint_path = \"/reviewer\"\nmodel = \"fake-reviewer\"\nretries = 0",
                 "[context]\nalways_files = []",
-                "[agent]\nmodel = \"gpt-5.6-luna\"\neffort = \"high\"\ntimeout_seconds = 3\n"
-                "env_allowlist = [\"PATH\", \"HOME\", \"LANG\", \"LC_ALL\", \"TERM\", "
+                "[codex_runtime]\nhome = \"codex-home\"\nenv_allowlist = [\"PATH\", \"HOME\", \"LANG\", \"LC_ALL\", \"TERM\", "
                 "\"TMPDIR\", \"XDG_CONFIG_HOME\", \"XDG_CACHE_HOME\", \"CODEX_HOME\", "
                 "\"FAKE_CODEX_BEHAVIOR\", \"FAKE_WORKTREE\", \"FAKE_PROMPT\", \"FAKE_FINAL\", "
                 "\"FAKE_CHECK\", \"FAKE_STAGED_SECRET\"]",
-                f"[[checks]]\nname = \"test\"\nargv = [{str(sys.executable)!r}, {str(self.check)!r}]\ntimeout_seconds = 3\ncwd = {check_cwd!r}",
+                "[ui]\ndefault_planner_profile = \"planner\"\ndefault_implementer_profile = \"implementer\"\ndefault_reviewer_profile = \"reviewer\"",
+                f"[model_profiles.planner]\ndisplay_name = \"Planner\"\nroles = [\"planner\"]\ndriver = \"openai-chat\"\nprovider = \"test\"\nmodel = \"fake-planner\"\nselection_mode = \"request\"\nbase_url = {llm.base_url!r}\nendpoint_path = \"/planner\"\nretries = 0{key_line}",
+                f"[model_profiles.reviewer]\ndisplay_name = \"Reviewer\"\nroles = [\"reviewer\"]\ndriver = \"openai-chat\"\nprovider = \"test\"\nmodel = \"fake-reviewer\"\nselection_mode = \"request\"\nbase_url = {llm.base_url!r}\nendpoint_path = \"/reviewer\"\nretries = 0",
+                "[model_profiles.implementer]\ndisplay_name = \"Implementer\"\nroles = [\"implementer\"]\ndriver = \"codex\"\nprovider = \"openai\"\nmodel = \"gpt-5.6-luna\"\neffort = \"high\"\nsandbox = \"workspace-write\"\nselection_mode = \"cli\"\ntimeout_seconds = 3",
+                f"[[check_catalog]]\nid = \"test\"\nargv = [{str(sys.executable)!r}, {str(self.check)!r}]\ntimeout_seconds = 3\ncwd = {check_cwd!r}",
             ]) + "\n",
             encoding="utf-8",
         )
@@ -471,8 +479,8 @@ class OrchestratorE2ETests(unittest.TestCase):
                 run_id,
                 "APPROVE",
                 config=load_config(config),
-                final_reviewer_profile="legacy-reviewer",
-                step_profiles={"S01": "legacy-implementer"},
+                final_reviewer_profile="reviewer",
+                step_profiles={"S01": "implementer"},
             )
             thread.join(timeout=10)
             self.assertFalse(thread.is_alive())
@@ -561,7 +569,7 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_codex_auth_exit_is_classified_without_sensitive_detail(self) -> None:
         _, _, state = self.run_case(codex_behavior="auth-fail")
-        self.assertEqual(state["failure"]["reason"], "AGENT_AUTH_FAILURE")
+        self.assertEqual(state["failure"]["reason"], "AGENT_START_FAILED")
         self.assertEqual(state["failure"]["detail"], "step=S01 Codex authentication failed")
         self.assertNotIn("request-id", json.dumps(state))
         self.assertNotIn("https://api.openai.com", json.dumps(state))
@@ -609,8 +617,22 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_ctrl_c_is_persisted_as_interrupted_without_commit(self) -> None:
         llm = FakeLLM()
-        config = load_config(self.config_file(llm, run_id="interrupt"))
-        result = Orchestrator(config, agent=InterruptingAgent()).run(self.spec, run_id="interrupt")
+        register_executor_driver(
+            "interrupt-driver",
+            lambda _profile, _runtime: InterruptingExecutor(),
+            replace=True,
+        )
+        config_path = self.config_file(llm, run_id="interrupt")
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8").replace(
+                'driver = "codex"', 'driver = "interrupt-driver"'
+            ).replace(
+                'sandbox = "workspace-write"\n', ''
+            ),
+            encoding="utf-8",
+        )
+        config = load_config(config_path)
+        result = Orchestrator(config).run(self.spec, run_id="interrupt")
         llm.close()
         self.assertEqual(result.status, RunStatus.INTERRUPTED)
         self.assertEqual(result.state["failure"]["reason"], "INTERRUPTED")

@@ -136,18 +136,18 @@ class SingleCycleTests(PipelineHarness):
         option_names = set(options) | {
             name for section in ("planning", "pipeline", "profiles") for name in options[section]
         }
-        for legacy in (
+        for forbidden in (
             "claude_revision_enabled", "repair_cycles", "reviser_profile",
             "repair_profile", "reviewer_profile",
         ):
-            self.assertNotIn(legacy, option_names)
+            self.assertNotIn(forbidden, option_names)
         self.assertEqual(self.state()["run_options"], options)
         self.assertEqual(
             set(selection),
             {"schema_version", "planner", "steps", "check_repair", "semantic_reviser", "final_reviewer"},
         )
-        for legacy in ("reviser", "repair_implementer", "reviewer", "implementer"):
-            self.assertNotIn(legacy, selection)
+        for forbidden in ("reviser", "repair_implementer", "reviewer", "implementer"):
+            self.assertNotIn(forbidden, selection)
         self.assertEqual(selection["check_repair"]["profile_id"], "repairer")
         self.assertEqual(selection["final_reviewer"]["profile_id"], "reviewer")
 

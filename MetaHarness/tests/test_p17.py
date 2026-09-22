@@ -161,7 +161,7 @@ class OrchestratorRecommendationTests(unittest.TestCase):
             reviewer=LLMEndpointConfig("https://reviewer.invalid", "/chat", "reviewer"),
             context=ContextConfig(),
             agent=AgentConfig(),
-            checks=(),
+            check_catalog=(),
             allow_no_required_checks=True,
             ui=UIConfig(
                 default_planner_profile="planner",

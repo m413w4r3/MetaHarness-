@@ -3,7 +3,7 @@ BASE SHA: manual-smoke-test
 ### PROJECT INSTRUCTION: AGENTS.md
 - Python 3.12.
 - Use unittest.
-- Preserve public API compatibility.
+- Preserve the current public API behavior.
 - Do not add dependencies.
 
 ### SOURCE: src/client.py:1-40

@@ -154,7 +154,7 @@ class CheckProcessTests(TempRepoCase):
             reviewer=endpoint,
             context=ContextConfig(),
             agent=AgentConfig(),
-            checks=checks,
+            check_catalog=checks,
         )
 
     @staticmethod

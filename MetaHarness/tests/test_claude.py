@@ -67,7 +67,7 @@ class ClaudeTests(unittest.TestCase):
             reviewer=LLMEndpointConfig("https://reviewer.invalid", "/v1", "reviewer"),
             context=ContextConfig(always_files=()),
             agent=AgentConfig(),
-            checks=(),
+            check_catalog=(),
             allow_no_required_checks=True,
             codex_runtime=CodexRuntimeConfig(self.root / "codex-home"),
             claude_runtime=ClaudeRuntimeConfig(self.root / "claude-home"),
@@ -353,14 +353,6 @@ class ClaudeTests(unittest.TestCase):
             runs_root = {str(self.root / 'runs')!r}
             worktrees_root = {str(self.root / 'worktrees')!r}
             allow_no_required_checks = true
-            [planner]
-            base_url = "https://planner.invalid"
-            endpoint_path = "/v1"
-            model = "planner"
-            [reviewer]
-            base_url = "https://reviewer.invalid"
-            endpoint_path = "/v1"
-            model = "reviewer"
             [ui]
             default_planner_profile = "p"
             default_implementer_profile = "i"

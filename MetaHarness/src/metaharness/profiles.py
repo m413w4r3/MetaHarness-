@@ -14,7 +14,6 @@ from .models import (
     LLMEndpointConfig,
     ModelProfile,
     ProfileDriver,
-    SelectionMode,
     profile_driver_name,
 )
 
@@ -23,57 +22,8 @@ class ProfileError(ValueError):
     pass
 
 
-def _legacy_profiles(config: HarnessConfig) -> dict[str, ModelProfile]:
-    return {
-        "legacy-planner": ModelProfile(
-            id="legacy-planner",
-            display_name="Legacy Planner",
-            roles=(ExecutionRole.PLANNER,),
-            driver=ProfileDriver.OPENAI_CHAT,
-            model=config.planner.model,
-            provider="openai",
-            selection_mode=SelectionMode.REQUEST,
-            base_url=config.planner.base_url,
-            endpoint_path=config.planner.endpoint_path,
-            api_key_env=config.planner.api_key_env,
-            timeout_seconds=config.planner.timeout_seconds,
-            retries=config.planner.retries,
-            extra_body=config.planner.extra_body,
-        ),
-        "legacy-implementer": ModelProfile(
-            id="legacy-implementer",
-            display_name="Legacy Implementer",
-            roles=(ExecutionRole.IMPLEMENTER,),
-            driver=ProfileDriver.CODEX,
-            model=config.agent.model,
-            provider="openai",
-            selection_mode=SelectionMode.CLI,
-            effort=config.agent.effort,
-            sandbox=config.agent.sandbox,
-            timeout_seconds=config.agent.timeout_seconds,
-        ),
-        "legacy-reviewer": ModelProfile(
-            id="legacy-reviewer",
-            display_name="Legacy Reviewer",
-            roles=(ExecutionRole.REVIEWER,),
-            driver=ProfileDriver.OPENAI_CHAT,
-            model=config.reviewer.model,
-            provider="openai",
-            selection_mode=SelectionMode.REQUEST,
-            base_url=config.reviewer.base_url,
-            endpoint_path=config.reviewer.endpoint_path,
-            api_key_env=config.reviewer.api_key_env,
-            timeout_seconds=config.reviewer.timeout_seconds,
-            retries=config.reviewer.retries,
-            extra_body=config.reviewer.extra_body,
-        ),
-    }
-
-
 def _profiles(config: HarnessConfig) -> dict[str, ModelProfile]:
-    if config.model_profiles:
-        return dict(config.model_profiles)
-    return _legacy_profiles(config)
+    return dict(config.model_profiles)
 
 
 def profiles_for_config(config: HarnessConfig) -> dict[str, ModelProfile]:

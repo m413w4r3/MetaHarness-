@@ -65,7 +65,7 @@ class ValidationTestBase(unittest.TestCase):
             reviewer=endpoint,
             context=ContextConfig(),
             agent=AgentConfig(),
-            checks=checks,
+            check_catalog=checks,
             max_diff_bytes=400_000,
         )
 
@@ -247,15 +247,12 @@ class CheckAuthorityTests(ValidationTestBase):
         with self.assertRaises(ValidationError):
             config_with_check_authority(config, run_dir, expected_sha256=approved)
 
-    def test_a_run_without_an_authority_keeps_the_legacy_behavior(self) -> None:
-        directory = Path(self.tempdir.name) / "legacy"
+    def test_a_run_without_an_authority_is_rejected(self) -> None:
+        directory = Path(self.tempdir.name) / "missing-authority"
         directory.mkdir()
         config = self.config((CheckConfig("lint", ("make", "lint")),))
-        frozen, ids = config_with_check_authority(
-            config, directory, requested_check_ids=("lint",),
-        )
-        self.assertIs(frozen, config)
-        self.assertEqual(ids, ("lint",))
+        with self.assertRaises(ValidationError):
+            config_with_check_authority(config, directory, requested_check_ids=("lint",))
 
 
 if __name__ == "__main__":

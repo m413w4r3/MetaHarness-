@@ -251,9 +251,9 @@ class ContextTests(unittest.TestCase):
             config = self.config(self.locator(hits), always_files=always)
             return render_context(build_context(self.repo, base_sha, "x", config))
 
-        legacy_always = ("AGENTS.md", "CLAUDE.md", "README.md")
+        always_files = ("AGENTS.md", "CLAUDE.md", "README.md")
         source_hit = [{"path": "backend/src/foo.py", "start": 1, "end": 1}]
-        before = planner_context(legacy_always, source_hit)
+        before = planner_context(always_files, source_hit)
         after = planner_context(example_always, source_hit)
 
         self.assertIn("### PROJECT INSTRUCTION: AGENTS.md", after)
