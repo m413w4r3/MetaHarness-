@@ -97,7 +97,7 @@ HOME/TMPDIR, `CODEX_HOME` or API key is passed, and no user file is copied.
 Claude Code is configuration-isolated and Git-scope-enforced; it is not an
 independent network sandbox.
 
-## Configurable correction pipeline and publication
+## Configurable v2 correction pipeline and publication
 
 `examples/autowork.toml` enables the full target workflow:
 
@@ -114,31 +114,35 @@ mode = "run-branch"
 ```
 
 ```text
-SPEC → indexer + repo-aware planner → human-approved STAGED bundle
-→ Luna → Claude correction C01 → final deterministic checks C01
-→ immutable C01 candidate commit → push exact C01 run-branch candidate
-→ GPT reviewer via bridge #1
-   ├ PASS → publish approved C01 candidate
-   └ REVISE → bounded C02 (repair planner + scope validation)
-       → C02 Luna → C02 Claude correction → final deterministic checks C02
-       → immutable C02 candidate commit → push exact C02 run-branch candidate
-       → GPT reviewer via bridge #2
-          ├ PASS → publish approved C02 candidate
-          └ otherwise → STOP / operator
+PLAN → implementation step → accepted step commit → …
+→ deterministic checks
+   ├ FAIL → bounded direct check-repair loop → deterministic checks
+   └ PASS → semantic revision → deterministic checks
+→ accepted candidate → push run branch → final reviewer
+   ├ PASS → publish exact reviewed SHA
+   ├ REVISE / IMPLEMENTATION → semantic correction
+   ├ REVISE / REPLAN → review repair planner
+   └ REVISE / HUMAN → operator
 ```
 
-Maximum automatic cycles = 2. Each cycle pushes its exact candidate before its
-reviewer; publication happens only after the final reviewer PASS and the
-exact-tree candidate gate. It never pushes `base_ref`, never uses force, tags
-or deletion, and never automatically merges the run branch. A published run
-exposes the branch URL (`…/tree/harness/<plan>/<run-id>`).
-Failures specific to this mode: `REVIEW_LOOP_EXHAUSTED`, `REPLAN_REQUIRED`,
-`HUMAN_REQUIRED`, `REPAIR_PLANNER_BLOCKED`, `REPAIR_SCOPE_EXPANSION`,
-`REVISION_SCOPE_VIOLATION`, `PUSH_FAILED`. A C02 step fails with the same
-reasons as a C01 step.
+`max_check_repair_attempts` and `max_review_repair_cycles` are independent
+budgets. Each reviewable candidate is pushed before its reviewer; publication
+happens only after the final reviewer PASS and the exact-tree candidate gate.
+It never pushes `base_ref`, never uses force, tags or deletion, and never
+automatically merges the run branch. A published run exposes the branch URL
+(`…/tree/harness/<plan>/<run-id>`).
+Failures specific to this mode include `CHECK_REPAIR_EXHAUSTED`,
+`REVIEW_LOOP_EXHAUSTED`, `REPLAN_REQUIRED`, `HUMAN_REQUIRED`,
+`REPAIR_PLANNER_BLOCKED`, `REPAIR_SCOPE_EXPANSION`,
+`REVISION_SCOPE_VIOLATION` and `PUSH_FAILED`. Historical C01/C02 artifact
+names may still appear in diagnostics, but they are compatibility labels, not
+the v2 policy or a fixed two-cycle limit.
 
-Reviser failures are classified as `CLAUDE_AUTH_FAILURE`, `CLAUDE_TIMEOUT`,
-`CLAUDE_FAILED`, or `CLAUDE_COMMITTED`.
+Agent failures are classified through the backend-neutral execution contract;
+the role and profile, not a vendor name, determine the route. Check repair is
+never a planner: a failed deterministic signal gets only the configured
+bounded direct repair attempts. Integrity failures are fail-closed and never
+start an LLM/AgentExecutor repair call.
 
 Claude Code is invoked with an authoritative, non-configurable argv; the
 prompt is stdin and no shell is used:
@@ -197,26 +201,30 @@ after parsing with the same values (`PLANNER_OUTPUT_INVALID` otherwise).
 `balanced` applies neither limit.
 
 ```text
-main A → isolated run worktree → planner STAGED → Luna → Claude C01
-→ final deterministic checks → immutable candidate commit/push → reviewer #1
-→ PASS → publish C01, or REVISE → bounded C02
-→ C02 Luna → Claude C02 → final deterministic checks → candidate commit/push
-→ reviewer #2 → PASS → publish C02, otherwise stop/operator
+BASE → isolated run worktree → PLAN STAGED
+→ implementation steps → accepted step commits
+→ deterministic checks
+   ├ FAIL → bounded direct check-repair loop → deterministic checks
+   └ PASS → semantic revision → deterministic checks
+→ accepted candidate → push exact SHA → final reviewer
+   ├ PASS → publish exact reviewed SHA
+   ├ REVISE / IMPLEMENTATION → semantic correction
+   ├ REVISE / REPLAN → review repair planner
+   └ REVISE / HUMAN → operator
 
 approved candidate (fast-forward-base)
 → CAS fast-forward local main A→B → push origin/main A→B
 ```
 
-Agents never work on `main`: Luna, Claude and the reviewers only ever see the
-isolated worktree `harness/<plan>/<run-id>`; the user checkout is never
+Agents never work on `main`: the selected role profiles and reviewer only see
+the isolated worktree `harness/<plan>/<run-id>`; the user checkout is never
 checked out, reset or written. After the final PASS, publication uses the
 already-created exact candidate commit and re-resolves `refs/heads/main` and
 `refs/remotes/origin/main`
 (no implicit fetch) and requires: local main == remote-tracking main ==
-original `base_sha`, an exact candidate chain (C01 parent == `base_sha`; C02
-parent == the persisted C01 candidate), the final candidate's tree == the
-approved tree, and the run branch pointing to it. Publication fast-forwards
-`base_sha` to the exact approved candidate chain tip (C01, or C02 on top of C01). Local main then moves
+original `base_sha`, an exact accepted candidate chain, the final candidate's
+tree == the approved tree, and the run branch pointing to it. Publication
+fast-forwards `base_sha` to the exact approved candidate chain tip. Local main then moves
 with `git update-ref refs/heads/main <commit> <base>` (compare-and-swap), and
 `git push --porcelain origin <commit>:refs/heads/main` publishes exactly that
 commit — no force, lease, merge, tag or delete. Each exact candidate was

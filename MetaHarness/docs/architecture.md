@@ -41,27 +41,30 @@ preamble/postamble are not sent to that agent.
    `PLAN_REJECTED`. This gate is before worktree creation, so rejection creates
    no worktree, agent execution, or commit. A decision cannot approve another
    plan because both hashes must match the state identity.
-6. Create one worktree at the resolved base SHA and give Codex that contract
-   only.
-   After Codex exits, any commit, branch switch, branch creation/deletion or
-   worktree creation/removal fails the run (`AGENT_COMMITTED` or
-   `AGENT_GIT_VIOLATION`); the worktree is preserved, never reset.
-7. If selected, Claude Code reads the resulting worktree and corrects
-   authorized files without shell commands; a Claude commit fails the run as
-   `CLAUDE_COMMITTED`.
-8. Run configured checks, snapshot the candidate tree before and after each
-   check, stage once, and freeze the full diff plus the index tree SHA as
-   evidence. A check that mutates the candidate (required or not) fails the
-   run before review; an empty, oversized or secret-bearing diff too.
-9. Give the reviewer the original SPEC, raw PLAN, context, diff, checks, and
-   implementer report. The reviewer must return a coherent labeled verdict.
-10. On `PASS` with a green deterministic gate, `authorize_commit` re-derives
-   every precondition (READY plan, agent exit 0, gate, reviewer answer parsed
-   again, HEAD and branch, index tree, unstaged/untracked state, candidate
-   tree) and `commit_reviewed_tree` creates the single harness commit.
+6. Create one worktree at the resolved base SHA and give the selected
+   implementation profile the canonical contract only. Each accepted step is
+   committed by the harness after its gate; a failed attempt keeps durable
+   tree/diff evidence and never enters the accepted chain.
+7. Run the deterministic checks. A red result enters the bounded direct
+   check-repair loop and is checked again; a green result proceeds to the
+   semantic reviser, which compares the candidate with the SPEC and is itself
+   followed by deterministic checks.
+8. Freeze the accepted candidate tree and commit SHA, push that exact commit
+   on the run branch, and give the immutable candidate to the final reviewer.
+   `PASS` publishes that exact reviewed SHA. `REVISE / IMPLEMENTATION` routes
+   to semantic correction, `REVISE / REPLAN` to the review repair planner and
+   `REVISE / HUMAN` to the operator.
+9. Every gate snapshots the candidate tree before and after each check,
+   stages once, and preserves the full diff plus the index tree SHA as
+   evidence. A check that mutates the candidate, an unexpected HEAD, a
+   secret-bearing diff, or a tree mismatch fails closed before any repair
+   agent is called.
+10. The reviewer receives the original SPEC, plan, immutable candidate SHA,
+    diff and checks. The reviewer must return a coherent labeled verdict;
+    it does not receive or control the correction budgets.
 
-Codex, checks and the locator run through `procutil.run_bounded`: no shell,
-own process group, file-backed stdin/stdout/stderr, hard deadline, and
+Selected executors, checks and the locator run through `procutil.run_bounded`:
+no shell, own process group, file-backed stdin/stdout/stderr, hard deadline, and
 termination of the whole group at the deadline and after exit, so a
 background child cannot modify the candidate after its snapshot. A
 descendant that creates its own session escapes this cleanup (no cgroups in
@@ -70,9 +73,10 @@ V0).
 Commit objects are built from the exact candidate tree object
 (`git commit-tree`), not from the index, and the branch is advanced with a
 compare-and-swap `git update-ref HEAD <new> <base>`. Commit hooks therefore
-cannot restage content, and a moved HEAD makes the update fail. In v2, this
-candidate commit is created before semantic review; publication remains gated
-by the final reviewer PASS.
+cannot restage content, and a moved HEAD makes the update fail. In v2, the
+accepted candidate is committed after semantic revision and its deterministic
+checks, then pushed before final review; publication remains gated by the
+final reviewer PASS.
 
 Planner and reviewer answers are free Markdown. The parser is tolerant on
 presentation (headings, bold labels, bracket/colon markers, one whole-answer
@@ -91,37 +95,29 @@ check that the plan preserved the product intent and that the diff followed
 the plan. It also receives the mechanical evidence, so semantic approval
 cannot replace deterministic checks.
 
-## META PLAN v2 with revision (two bounded cycles)
+## META PLAN v2 pipeline
 
-With `[planning] protocol = "v2"` and `[revision] enabled = true`, the run is:
+The normative v2 flow is documented in [pipeline-v2.md](pipeline-v2.md):
 
 ```text
-SPEC
-→ indexer + repo-aware planner
-→ human-approved STAGED bundle
-→ Luna steps
-→ Claude correction C01
-→ final deterministic checks C01
-→ immutable C01 candidate commit
-→ push exact C01 run-branch candidate
-→ GPT reviewer via bridge #1
-   ├ PASS → publish approved C01 candidate
-   └ REVISE → bounded C02 (repair planner + scope validation)
-       → C02 Luna
-       → C02 Claude correction
-       → final deterministic checks C02
-       → immutable C02 candidate commit
-       → push exact C02 run-branch candidate
-       → GPT reviewer via bridge #2
-          ├ PASS → publish approved C02 candidate
-          └ otherwise → STOP / operator
+PLAN → implementation step → accepted step commit → …
+→ deterministic checks
+   ├ FAIL → bounded direct check-repair loop → deterministic checks
+   └ PASS → semantic revision → deterministic checks
+→ accepted candidate → push run branch → final reviewer
+   ├ PASS → publish the exact reviewed SHA
+   ├ REVISE / IMPLEMENTATION → semantic correction
+   ├ REVISE / REPLAN → review repair planner
+   └ REVISE / HUMAN → operator
 ```
 
 - Correction budgets are independent: `max_check_repair_attempts` bounds
   check-repair attempts and `max_review_repair_cycles` bounds review-driven
   correction cycles. `semantic_revision_enabled` only controls semantic
-  revision. The runtime represents each cycle generically; the configured
-  budget, not the reviewer, decides whether another cycle is allowed.
+  revision. The reviewer never owns or receives those budgets.
+- Check repair fixes a deterministic signal; semantic revision compares the
+  immutable candidate to the SPEC; the final reviewer routes a candidate that
+  has already passed the mechanical gates.
 - C02 writes `repair/C02/scope_delta.json`, derived from parsed plan mutation
   sets. New paths are governed by durable `repair_scope_policy` and
   `repair_scope_max_added_paths` options. `auto-bounded` is recommended for
@@ -152,9 +148,8 @@ SPEC
 - Deterministic checks are selected by planner IDs from the trusted check
   catalog; MetaHarness owns the commands and arguments, always requires the
   configured defaults, and runs configured preflights before expensive workers.
-- Reviewer #2 receives the original approved plan and the C02 repair plan, the
-  C01 and C02 Luna reports, the C01 and C02 Claude revisions, the scope delta,
-  and the cycle history.
+- The reviewer receives the original approved plan, the bounded repair
+  evidence applicable to its route, and the cycle history.
 - The pushed candidate commit is the reviewer's code authority. When remote
   exploration is available, MetaHarness sends the BASE SHA, CANDIDATE SHA,
   immutable candidate URL, compare URL, changed paths, and deterministic
@@ -163,15 +158,13 @@ SPEC
   bounded diff fallback is used only when remote exploration is unavailable.
   This keeps prompt size independent of the total diff size and Luna step
   count.
-- Artifacts are per cycle: C01 in `steps/`, `revision/C01/`, `checks/C01/`,
-  `review/C01/` (root copies for historical runs); C02 in `repair/C02/`,
-  `revision/C02/`, `checks/C02/`, `review/C02/`. The API exposes them as
-  `cycle_artifacts`; top-level aliases describe the final cycle.
-- Each cycle creates and pushes its exact immutable candidate on the run branch
-  before semantic review. Publication happens only after the final reviewer
-  PASS and a green gate, using that already-pushed approved candidate: no
-  force, no tag, no delete, never `base_ref`/`main`, and never an automatic
-  merge of the run branch.
+- Every reviewable candidate creates and pushes its exact immutable tree on
+  the run branch before the final reviewer. Publication happens only after
+  the final reviewer PASS and a green gate, using that already-pushed approved
+  candidate: no force, no tag, no delete, never `base_ref`/`main`, and never
+  an automatic merge of the run branch.
+- Historical snapshots may retain `C01`/`C02` directory names. Those names are
+  artifact compatibility labels, not a v2 policy or a review-cycle limit.
 
 ## Durable checkpoints and resume (P29)
 
@@ -263,35 +256,25 @@ the repair policy still rejects.
 
 All run-state writes go through `RunStateStore`, which replaces JSON files
 atomically. The plan approval artifact is atomically published without
-replacement, so a second decision fails. In v2, the candidate commit is
-created after final deterministic checks and before semantic review; the exact
-candidate tree SHA is verified again immediately before that commit. Final
-publication still requires reviewer approval. A changed index, HEAD, or
-worktree causes the candidate boundary to fail.
+replacement, so a second decision fails. In v2, the accepted candidate
+commit is created after semantic revision and its final deterministic checks;
+its exact tree SHA is verified again immediately before the commit and before
+publication. A changed index, HEAD, or worktree causes the candidate boundary
+to fail.
 
-## The second bounded check-repair pass
+## Bounded direct check repair
 
-The repair budget and the mutable scope are **independent decisions**. A
-cycle permits at most two corrective reviser passes — the first check repair
-and one second bounded pass — and a still-red gate after the second is
-final. Whether that second pass *expands* the mutable scope is a separate
-question with its own, stricter answer.
+The repair budget and the mutable scope are **independent decisions**. Each
+red deterministic gate may consume one configured direct check-repair attempt
+until `max_check_repair_attempts` is exhausted. Whether a repair expands the
+scope is a separate question with its own, stricter answer.
 
-A second pass is earned when the retry evidence contains only soft
-deterministic failures (`CHECK_FAILED:<check id>`), no hard integrity failure,
-and no second pass has already produced a report. That is the whole
-condition: a `lint`, `typecheck` or `test` failure whose fix already lives
-inside the authorized paths earns a second pass with **exactly** the scope the
-first repair held. Its durable scope records
-`source = "bounded same-scope retry"`, no path is added, and no authority is
-created; an artifact with that provenance and one extra path is a
-`RESUME_INTEGRITY_FAILURE`. The `deny-expansion` and `require-approval`
-policies forbid *growing* the scope; neither forbids this retry, and neither
-does an exhausted bound.
-
-Conflating the two decisions is what made a red `lint` inside the approved
-scope terminate the run immediately: with no new test path to expand to, the
-single helper answering both questions returned "no second pass".
+Only soft failures such as `CHECK_FAILED:<check id>` enter this loop. A
+`lint`, `typecheck` or `test` failure is retried inside the authorized scope;
+the attempt tree and diff are durable evidence, and the deterministic gate is
+run again. `CHECK_REPAIR_EXHAUSTED` is terminal after the configured bound.
+The `deny-expansion` and `require-approval` policies govern scope growth
+independently.
 
 Expansion, when it happens, stays as strict as before. When an ordinary
 `CHECK_FAILED:*` output names a path, MetaHarness treats it only as a
@@ -299,16 +282,16 @@ candidate: the path must exist in the exact Git tree, be tracked, and be a
 test or fixture path. The run's `auto-bounded` policy and configured maximum
 apply atomically; production, generated, untracked and ambiguous paths are
 never added. Model output never decides the scope. Paths the first repair
-already earned are carried into the second pass and are never lost, never
+already earned are carried into later attempts and are never lost, never
 re-added, and never counted twice against the bound. Production paths remain
 the responsibility of the approved plan and reviewer/C02 process.
 
 The `CHECK_REPAIR_EXPANDED_C0x` and `FINAL_CHECKS_RETRY_EXPANDED_C0x` phases
-are historically named "expanded"; they are the phases of the second bounded
-pass whether or not it expands the scope, and they are never renamed, because
+are historically named "expanded"; they are compatibility names for bounded
+attempts whether or not an attempt expands the scope, and they are never renamed, because
 stored runs depend on those exact names. `state`, diagnostics and the run page
-report `second_check_repair_attempted` and `scope_expanded` separately, so a
-same-scope retry is no longer described as an expansion.
+report the attempt ordinal and `scope_expanded` separately, so a same-scope
+retry is no longer described as an expansion.
 
 `FINAL_CHECKS_RETRY_C01` and `FINAL_CHECKS_RETRY_C02` are resumable boundaries
 of their own, and the durable checkpoint — never `state.failure` — decides
@@ -321,13 +304,13 @@ complete result of a retry and is reused rather than re-earned — the same
 checks are never re-run before the decision. That red bundle is the authority
 the second-pass decision reads, so the resume can still reach
 `CHECK_REPAIR_EXPANDED_C0x`, with or without an expansion. With a green retry
-bundle for that tree, the resume reconciles straight into the candidate commit
-without a check, a model call or a second pass. If
+bundle for that tree, the resume reconciles straight into the next candidate
+boundary without replaying a completed check or model call. If
 `check-repair-expanded/C0x/scope.json` is already published, that durable
 scope outranks any recomputation: the reviser is never recalled with a scope
 different from the one already published for it, and a divergent or malformed
-artifact is a `RESUME_INTEGRITY_FAILURE`. There is still at most one second
-pass per cycle.
+artifact is a `RESUME_INTEGRITY_FAILURE`. The configured attempt budget is
+the only limit on further direct repairs.
 
 A validated expanded scope is **cumulative authority over the candidate
 tree**. The test path it added is part of every tree from that moment on, so

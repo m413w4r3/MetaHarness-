@@ -1,46 +1,37 @@
 # MetaHarness
 
 MetaHarness V0 transforme un SPEC humain en un run Git contrôlé : un planner
-produit un plan texte d’implémentation, Codex l’exécute dans un worktree isolé,
+produit un plan texte d’implémentation, un backend sélectionné l’exécute dans un worktree isolé,
 les checks déterministes figent les preuves, puis un reviewer compare SPEC,
-plan et diff avant l’unique commit autorisé. L’implémenteur reçoit le plan,
+plan et diff pour le candidat final avant publication. L’implémenteur reçoit le plan,
 pas le SPEC original ; le reviewer reçoit les deux. Une approbation humaine
 optionnelle peut être exigée après le planner et avant la création du worktree.
 
-Avec `[planning] protocol = "v2"` et `[revision] enabled = true` (le cas de
-`examples/autowork.toml`), le pipeline complet est :
+Avec `[planning] protocol = "v2"`, le pipeline complet et backend-neutral est :
 
 ```text
-main A
+BASE
   ↓
 isolated run worktree  (harness/<plan>/<run-id>, jamais le checkout AutoWork/)
   ↓
-planner STAGED         (execution_mode_policy = "require-staged")
+PLAN STAGED            (execution_mode_policy = "require-staged")
   ↓
-Luna steps
+implementation steps → accepted step commits
   ↓
-Claude correction C01  (pre-checks → revision)
+deterministic checks
+  ├ FAIL → bounded direct check-repair loop → deterministic checks
+  └ PASS → semantic revision → deterministic checks
   ↓
-final deterministic checks C01
+accepted candidate D
   ↓
-immutable C01 candidate commit
+push exact D on the run branch
   ↓
-push exact C01 run-branch candidate
+final reviewer on immutable D
   ↓
-GPT reviewer via bridge #1
-  ↓
-PASS → publish approved C01 candidate
-REVISE → bounded C02 (repair planner + scope validation)
-  ↓
-  C02 Luna → C02 Claude correction → final deterministic checks C02
-  ↓
-  immutable C02 candidate commit
-  ↓
-  push exact C02 run-branch candidate
-  ↓
-  GPT reviewer via bridge #2
-    PASS → publish approved C02 candidate
-    otherwise → STOP / operator
+PASS → publish exact reviewed SHA
+REVISE / IMPLEMENTATION → semantic correction
+REVISE / REPLAN → review repair planner
+REVISE / HUMAN → operator required
 
 approved candidate (fast-forward-base)
   ↓
@@ -51,15 +42,15 @@ push origin/main A→B              (git push --porcelain origin B:refs/heads/ma
 delete remote run branch           (fast-forward-base only; after publication)
 ```
 
-- maximum automatic cycles = 2 (C01 initial, C02 repair ; jamais de C03) ;
+- `max_check_repair_attempts` et `max_review_repair_cycles` sont deux budgets
+  indépendants et configurables ; le reviewer ne connaît pas ces budgets ;
 - `[revision]` fournit les defaults et le fallback legacy ; chaque nouveau run
-  capture ses choix effectifs dans `run_options.json`. `claude_revision_enabled`
-  et `repair_cycles` sont indépendants ; `repair_cycles` vaut actuellement
-  seulement `0` ou `1` ;
+  capture ses choix effectifs dans `run_options.json` ; les anciens noms
+  `claude_revision_enabled` et `repair_cycles` restent des alias de lecture ;
 - pour AutoWork, la portée de réparation recommandée est
   `repair_scope_policy = "auto-bounded"` avec
   `repair_scope_max_added_paths = 4` ;
-- les agents ne travaillent jamais sur `main` : Luna, Claude et la review
+- les agents ne travaillent jamais sur `main` : les rôles sélectionnés
   n’écrivent que dans le worktree isolé ; le checkout utilisateur n’est jamais
   modifié (ni checkout, ni index, ni fichiers) ;
 - `[publish] mode = "fast-forward-base"` (AutoWork) : chaque candidat exact est
@@ -105,7 +96,8 @@ Les checks v2 proviennent du catalogue trusted `[[check_catalog]]` de la
 configuration. Le planner ne sélectionne que leurs IDs dans
 `REQUIRED_CHECKS`; les argv restent exclusivement dans MetaHarness. Les IDs
 `default_check_ids` sont toujours requis, et les preflights configurés sont
-exécutés avant les workers coûteux.
+exécutés avant les workers coûteux. Voir [docs/pipeline-v2.md](docs/pipeline-v2.md)
+pour les invariants de chaîne, d’intégrité, de compatibilité et de benchmark.
 
 ## Installation (une seule fois)
 
@@ -185,6 +177,7 @@ OpenAI-compatible texte, documenté dans [docs/providers.md](docs/providers.md).
 ```sh
 python -m unittest discover -s tests -v
 python -m compileall -q src tests
+python -m metaharness.cli config-check --config examples/autowork.toml
 ```
 
 Pour l’architecture, les artefacts et l’exploitation, voir
