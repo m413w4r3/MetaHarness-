@@ -46,8 +46,7 @@ from ..gitops import (
     status_porcelain,
 )
 from ..models import (
-    ExecutionSelectionV4,
-    ExecutionSelectionV5,
+    ExecutionSelection,
     ExecutionRole,
     HarnessConfig,
     ImplementationStep,
@@ -87,7 +86,7 @@ _SCOPE_REQUEST_ROUTE = "CLAUDE_SCOPE_REQUEST"
 
 
 def _bounded_repair_claude_report(text: str) -> str:
-    """Bound the advisory Claude C01 report handed to the repair planner.
+    """Bound the advisory Claude 001 report handed to the repair planner.
 
     The report is consultative; the immutable candidate commit is the code
     authority, so truncating it can never hide a fact the planner must know.
@@ -311,7 +310,7 @@ def _has_deferred_contract_mismatches(results: list[dict[str, Any]]) -> bool:
 
 
 def _compact_step_history(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep C02 history structural; reports live in ``luna_reports``."""
+    """Keep 002 history structural; reports live in ``luna_reports``."""
 
     compact: list[dict[str, Any]] = []
     for item in results:
@@ -519,7 +518,7 @@ class RevisionRunner:
         info: Any,
         branch_ref: str,
         ownership_before: Any,
-        selection: ExecutionSelectionV4 | ExecutionSelectionV5,
+        selection: ExecutionSelection,
         artifact_dir: Path | None = None,
         mutable_scope: list[str] | None = None,
         deferred_mismatches: str | None = None,
@@ -537,10 +536,7 @@ class RevisionRunner:
         reused (a resume never replays them); Claude runs once per attempt.
         """
 
-        claude_phase, review_phase = (
-            (ResumePhase.CLAUDE_C01, ResumePhase.REVIEWER_C01) if cycle == 1
-            else (ResumePhase.CLAUDE_C02, ResumePhase.REVIEWER_C02)
-        )
+        claude_phase, review_phase = ResumePhase.SEMANTIC_REVISION, ResumePhase.FINAL_REVIEW
         is_check_repair = check_repair_evidence is not None
         artifact_dir = artifact_dir or (
             run_dir / "revision" / "check-repair" / f"C0{cycle}"
@@ -591,8 +587,7 @@ class RevisionRunner:
             # This boundary is deliberately written before invoking Claude so
             # a timeout/transport failure resumes this exact corrective pass.
             repair_phase = check_repair_phase_override or (
-                ResumePhase.CHECK_REPAIR_C01 if cycle == 1
-                else ResumePhase.CHECK_REPAIR_C02
+                ResumePhase.CHECK_REPAIR
             )
             self.checkpoint(
                 run_dir, repair_phase, cycle=cycle, head=expected_head, tree=tree_before,
@@ -609,7 +604,7 @@ class RevisionRunner:
             if reused is None:
                 self.write_phase_checkpoint(
                     run_dir,
-                    ResumePhase.CHECKS_C01 if cycle == 1 else ResumePhase.CHECKS_C02,
+                    ResumePhase.DETERMINISTIC_GATE,
                     cycle=cycle, head=expected_head, tree=tree_before,
                 )
                 store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
@@ -644,8 +639,8 @@ class RevisionRunner:
                 if pre_hard:
                     return None, pre_hard[0].split(":", 1)[0]
                 # Pre-revision checks complete: the next operation is Claude.  The
-                # authorized HEAD is the worktree HEAD (base for C01, the C01
-                # candidate commit for C02), exactly as _validate_resume expects.
+                # authorized HEAD is the worktree HEAD (base for 001, the 001
+                # candidate commit for 002), exactly as _validate_resume expects.
                 self.checkpoint(run_dir, claude_phase, cycle=cycle, head=expected_head, tree=tree_before)
             else:
                 pre_payload = reused
@@ -886,11 +881,10 @@ class RevisionRunner:
         # followed by candidate commit/push and then the reviewer.
         next_revision_phase = (
             check_repair_next_phase_override or (
-                ResumePhase.FINAL_CHECKS_RETRY_C01 if cycle == 1
-                else ResumePhase.FINAL_CHECKS_RETRY_C02
+                ResumePhase.DETERMINISTIC_GATE
             )
             if is_check_repair
-            else (ResumePhase.FINAL_CHECKS_C01 if cycle == 1 else ResumePhase.FINAL_CHECKS_C02)
+            else ResumePhase.DETERMINISTIC_GATE
         )
         self.checkpoint(
             run_dir, next_revision_phase, cycle=cycle, head=expected_head, tree=tree_after,

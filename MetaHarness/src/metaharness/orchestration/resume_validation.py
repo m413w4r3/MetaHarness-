@@ -220,7 +220,7 @@ def _accepted_review(
 
 
 def _load_c01_review(run_dir: Path, evidence: EvidenceBundle) -> ReviewResult | None:
-    for directory in (run_dir / "review" / "C01", run_dir):
+    for directory in (run_dir / "cycles" / "001" / "review", run_dir):
         try:
             raw = (directory / "reviewer.raw.md").read_text(encoding="utf-8")
         except (OSError, UnicodeError):
@@ -235,9 +235,9 @@ def _load_c01_review(run_dir: Path, evidence: EvidenceBundle) -> ReviewResult | 
 def _load_accepted_c01_review(
     run_dir: Path, evidence: EvidenceBundle, candidate_sha: str,
 ) -> ReviewResult | None:
-    """Reviewer #1's accepted answer for exactly the pushed C01 candidate."""
+    """Reviewer #1's accepted answer for exactly the pushed 001 candidate."""
 
-    for directory in (run_dir / "review" / "C01", run_dir):
+    for directory in (run_dir / "cycles" / "001" / "review", run_dir):
         review = _accepted_review(directory, evidence, candidate_sha)
         if review is not None:
             return review
@@ -313,18 +313,16 @@ def _load_revision(directory: Path) -> _PersistedRevision | None:
 
 # The scope-repair checkpoint authority, by phase.  A scope-repair cycle has
 # its own durable chain, so a checkpoint taken inside it is never proved by
-# the historical C01/C02 Claude tree -- see
+# the historical 001/002 Claude tree -- see
 # :func:`_scope_repair_checkpoint_tree`.
 _SCOPE_REPAIR_RECOVERY_TREE_PHASES = frozenset({
-    ResumePhase.CHECK_SCOPE_PLANNER_C01, ResumePhase.CHECK_SCOPE_APPROVAL_C01,
-    ResumePhase.CHECK_SCOPE_PLANNER_C02, ResumePhase.CHECK_SCOPE_APPROVAL_C02,
+    ResumePhase.CHECK_REPAIR,
 })
 _SCOPE_REPAIR_STEP_PHASES = frozenset({
-    ResumePhase.CHECK_SCOPE_REPAIR_STEP_C01, ResumePhase.CHECK_SCOPE_REPAIR_STEP_C02,
+    ResumePhase.REVIEW_IMPLEMENTATION,
 })
 _SCOPE_REPAIR_RESIDUAL_PHASES = frozenset({
-    ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C01,
-    ResumePhase.CHECK_SCOPE_REPAIR_FINAL_CHECKS_C02,
+    ResumePhase.DETERMINISTIC_GATE,
 })
 
 def _scope_repair_checkpoint_tree(
@@ -348,7 +346,7 @@ def _scope_repair_checkpoint_tree(
     * final checks: the residual Claude ``tree_after``, and only when its
       ``tree_before`` is exactly the completed Luna chain end.
 
-    The function is cycle-agnostic: C01 and C02 differ only by *directory*.
+    The function is cycle-agnostic: 001 and 002 differ only by *directory*.
     Returns ``(tree, refusal)`` and never a partially trusted tree.
     """
 

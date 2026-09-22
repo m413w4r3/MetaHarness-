@@ -11,7 +11,6 @@ from metaharness.agent.base import AgentRunResult
 from metaharness.models import ExecutionRole, ModelProfile, ProfileDriver, SelectionMode
 from metaharness.orchestrator import Orchestrator
 from metaharness.trace import TraceEvent, TraceStream
-from tests.test_p29 import P29Harness, PASS, SINGLE_PLAN, FakeLuna, writer
 
 
 class _FailingObserver:
@@ -127,50 +126,6 @@ class TraceTests(unittest.TestCase):
         self.assertIsNone(session["input_tokens"])
         self.assertIsNone(session["cached_input_tokens"])
         self.assertIsNone(session["output_tokens"])
-
-
-class TracePipelineTests(P29Harness):
-    def test_success_records_step_commit_and_candidate_push(self) -> None:
-        config = self.make_config()
-        orchestrator, _planner, _reviewer, _luna, _claude = self.orchestrator(
-            config,
-            plans=[SINGLE_PLAN],
-            reviews=[PASS],
-            luna=FakeLuna({(1, "S01"): writer("src/a.py", "A = 2\n")}),
-        )
-        result = self.run_approved(config, orchestrator, "trace-published")
-        rows = [
-            json.loads(line)
-            for line in (result.run_dir / "trace/events.v1.jsonl").read_text().splitlines()
-        ]
-        events = [row["event"] for row in rows]
-        self.assertEqual(result.status.value, "published")
-        self.assertIn("step.committed", events)
-        self.assertIn("candidate.pushed", events)
-        self.assertIn("run.completed", events)
-        commit = next(row for row in rows if row["event"] == "step.committed")
-        self.assertEqual(len(commit["data"]["diff_sha256"]), 64)
-        self.assertEqual(
-            commit["data"]["changed_paths"], ["src/a.py"]
-        )
-
-    def test_failed_step_records_failure_without_a_commit_event(self) -> None:
-        config = self.make_config()
-        orchestrator, _planner, _reviewer, _luna, _claude = self.orchestrator(
-            config,
-            plans=[SINGLE_PLAN],
-            reviews=[PASS],
-            luna=FakeLuna({(1, "S01"): "exit1"}),
-        )
-        result = self.run_approved(config, orchestrator, "trace-failed-step")
-        events = [
-            json.loads(line)["event"]
-            for line in (result.run_dir / "trace/events.v1.jsonl").read_text().splitlines()
-        ]
-        self.assertEqual(result.status.value, "failed")
-        self.assertIn("step.failed", events)
-        self.assertNotIn("step.committed", events)
-        self.assertIn("run.failed", events)
 
 
 if __name__ == "__main__":

@@ -25,9 +25,9 @@ from .resume import ResumeCheckpointError, resume_info, read_checkpoint_record
 from .run_options import (
     RunOptionsError,
     effective_repair_scope_policy,
-    legacy_or_durable_run_options_with_raw,
     read_repair_scope_override,
     read_run_options_with_sha256,
+    read_run_options_with_sha256_and_raw,
 )
 from .step_ids import is_step_id
 from .usage import normalize_usage, phase_usage_summary, read_usage_artifact
@@ -514,7 +514,7 @@ def _prompt_footprint(run_dir: Path) -> str:
             rows.append((relative, artifact, run_dir / usage if usage else None, nested_usage))
 
     add("planner.request.txt", "planner.usage.json")
-    for root, usage_name in (("steps", "step.json"), ("repair/C02/steps", "step.json")):
+    for root, usage_name in (("steps", "step.json"), ("cycles/002/correction/steps", "step.json")):
         base = run_dir / root
         try:
             step_dirs = sorted(
@@ -525,15 +525,15 @@ def _prompt_footprint(run_dir: Path) -> str:
             step_dirs = []
         for step_dir in step_dirs:
             add(f"{root}/{step_dir.name}/agent.prompt.txt", f"{root}/{step_dir.name}/{usage_name}", nested_usage=True)
-    add("revision/C01/agent.prompt.txt", "revision/C01/usage.json")
-    add("revision/check-repair/C01/agent.prompt.txt", "revision/check-repair/C01/usage.json")
-    add("review/C01/reviewer.request.txt", "review/C01/reviewer.usage.json")
-    add("repair/C02/planner.request.txt", "repair/C02/planner.usage.json")
-    add("scope-repair/C01/planner.request.txt", "scope-repair/C01/planner.usage.json")
-    add("scope-repair/C02/planner.request.txt", "scope-repair/C02/planner.usage.json")
-    add("revision/C02/agent.prompt.txt", "revision/C02/usage.json")
-    add("revision/check-repair/C02/agent.prompt.txt", "revision/check-repair/C02/usage.json")
-    add("review/C02/reviewer.request.txt", "review/C02/reviewer.usage.json")
+    add("cycles/001/semantic-revision/agent.prompt.txt", "cycles/001/semantic-revision/usage.json")
+    add("revision/check-repair/001/agent.prompt.txt", "revision/check-repair/001/usage.json")
+    add("cycles/001/review/reviewer.request.txt", "cycles/001/review/reviewer.usage.json")
+    add("cycles/002/correction/planner.request.txt", "cycles/002/correction/planner.usage.json")
+    add("cycles/001/correction/planner.request.txt", "cycles/001/correction/planner.usage.json")
+    add("scope-cycles/002/correction/planner.request.txt", "scope-cycles/002/correction/planner.usage.json")
+    add("cycles/002/semantic-revision/agent.prompt.txt", "cycles/002/semantic-revision/usage.json")
+    add("revision/check-cycles/002/correction/agent.prompt.txt", "revision/check-cycles/002/correction/usage.json")
+    add("cycles/002/review/reviewer.request.txt", "cycles/002/review/reviewer.usage.json")
 
     lines = ["Prompt artifacts:", "| Relative path | Bytes | SHA256 | Input tokens |", "|---|---:|---|---:|"]
     for relative, artifact, usage_path, nested_usage in rows:
@@ -577,29 +577,21 @@ def _claude_status(config: HarnessConfig, run_dir: Path, revision_exists: bool) 
             options, _digest = read_run_options_with_sha256(run_dir)
         except RunOptionsError:
             return "Claude revision status unavailable: durable run options are malformed."
-        if not options.claude_revision_enabled:
-            return "Claude revision disabled by run options."
+        if not options.semantic_revision_enabled:
+            return "Semantic revision disabled by run options."
         if not revision_exists:
             return "Claude revision enabled by run options, but no revision artifact was produced/reached."
         return "Claude revision artifacts present."
-    # Historical runs had no durable per-run switch; make the fallback
-    # explicit instead of treating a missing artifact as proof of disablement.
-    if not config.revision.enabled:
-        return "Claude revision disabled for this legacy run (configuration fallback)."
-    if not revision_exists:
-        return "Claude revision enabled for this legacy run, but no revision artifact was produced/reached."
-    return "Claude revision artifacts present (legacy configuration fallback)."
+    return "Semantic revision status unavailable: durable run options are missing."
 
 
 def _repair_scope_policy_status(config: HarnessConfig, run_dir: Path) -> str:
     """Render the durable and effective scope authorities without ambiguity."""
 
     try:
-        options, _digest, raw = legacy_or_durable_run_options_with_raw(config, run_dir)
+        options, _digest, _raw = read_run_options_with_sha256_and_raw(run_dir)
         override = read_repair_scope_override(run_dir)
-        effective = effective_repair_scope_policy(
-            options, raw_run_options=raw, override=override
-        )
+        effective = effective_repair_scope_policy(options, override=override)
     except RunOptionsError as exc:
         return "\n".join([
             "Repair scope policy:",
@@ -607,14 +599,9 @@ def _repair_scope_policy_status(config: HarnessConfig, run_dir: Path) -> str:
             "  effective policy: unavailable",
             f"  error: {type(exc).__name__}",
         ])
-    pipeline = raw.get("pipeline") if isinstance(raw, Mapping) else None
-    historical = not isinstance(pipeline, Mapping) or not (
-        {"repair_scope_policy", "repair_scope_max_added_paths"} & set(pipeline)
-    )
-    durable = "historical/missing" if historical else "explicit"
     return "\n".join([
         "Repair scope policy:",
-        f"  durable run option: {durable}",
+        "  durable run option: explicit",
         f"  effective policy: {effective.policy}",
         f"  max added paths: {effective.max_added_paths}",
         f"  source: {effective.source}",
@@ -655,7 +642,7 @@ def _second_check_repair_scope_text(scope_path: Path) -> str:
 
 
 def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
-    prefix = "" if cycle == 1 else "repair/C02/"
+    prefix = "" if cycle == 1 else "cycles/002/correction/"
     label = f"CYCLE C0{cycle}"
     parts = [_section(label, "")]
     bundle = prefix + "implementation_bundle.json"
@@ -690,12 +677,12 @@ def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str,
             _event_artifact(run_dir, step_prefix + "agent.events.jsonl", secrets),
         ])
         parts.append(_section(f"{step_id}", body))
-    if cycle == 1 and (run_dir / "checks/C01/checks.json").exists():
-        checks, changed, diff = "checks/C01/checks.json", "checks/C01/changed-files.txt", "checks/C01/diff.patch"
+    if cycle == 1 and (run_dir / "cycles/001/checks/checks.json").exists():
+        checks, changed, diff = "cycles/001/checks/checks.json", "cycles/001/checks/changed-files.txt", "cycles/001/checks/diff.patch"
     else:
-        checks = prefix + "checks.json" if cycle == 1 else "checks/C02/checks.json"
-        changed = prefix + "changed-files.txt" if cycle == 1 else "checks/C02/changed-files.txt"
-        diff = prefix + "diff.patch" if cycle == 1 else "checks/C02/diff.patch"
+        checks = prefix + "checks.json" if cycle == 1 else "cycles/002/checks/checks.json"
+        changed = prefix + "changed-files.txt" if cycle == 1 else "cycles/002/checks/changed-files.txt"
+        diff = prefix + "diff.patch" if cycle == 1 else "cycles/002/checks/diff.patch"
     checks_body = "\n".join([
         _artifact_json(run_dir, checks, secrets),
         _safe_json_artifact(run_dir, checks.rsplit("/", 1)[0] + "/evidence.json" if "/" in checks else "evidence.json", secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
@@ -946,7 +933,7 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
         checkpoint_record = read_checkpoint_record(directory)
         checkpoint_text = _artifact_json(directory, "resume_checkpoint.json", secrets)
         info = resume_info(directory, state)
-        checkpoint_text += "Current resumable status:\n" + _json({"resumable": info.resumable, "phase": info.phase, "cycle": info.cycle, "step_id": info.step_id, "label": info.label, "reason": info.reason})
+        checkpoint_text += "Current resumable status:\n" + _json({"resumable": info.resumable, "phase": info.phase, "review_cycle": info.review_cycle, "step_id": info.step_id, "label": info.label, "reason": info.reason})
         if checkpoint_record:
             checkpoint_text += f"Checkpoint status: {checkpoint_record[1]}\n"
     except (OSError, ValueError, ResumeCheckpointError) as exc:
@@ -988,16 +975,16 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
         _selection_summary(directory, secrets),
     ]))
     body += _cycle(config, directory, 1, secrets)
-    if (directory / "repair" / "C02").is_dir():
-        body += _section("REPAIR C02", "\n".join([
-            _artifact_text(directory, "repair/C02/planner.request.txt", secrets, MAX_PLANNER_REQUEST_BYTES),
-            _artifact_text(directory, "repair/C02/planner.raw.md", secrets),
-            _plan_summary(directory, secrets, "repair/C02/task_plan_v2.json"),
-            _bundle_summary(directory, secrets, "repair/C02/implementation_bundle.json"),
+    if (directory / "repair" / "002").is_dir():
+        body += _section("REPAIR 002", "\n".join([
+            _artifact_text(directory, "cycles/002/correction/planner.request.txt", secrets, MAX_PLANNER_REQUEST_BYTES),
+            _artifact_text(directory, "cycles/002/correction/planner.raw.md", secrets),
+            _plan_summary(directory, secrets, "cycles/002/correction/task_plan_v2.json"),
+            _bundle_summary(directory, secrets, "cycles/002/correction/implementation_bundle.json"),
         ]))
         body += _cycle(config, directory, 2, secrets)
     else:
-        body += _section("REPAIR C02", "No repair cycle executed.")
+        body += _section("REPAIR 002", "No repair cycle executed.")
     body += _section("COMMIT / PUBLISH", "\n".join([
         _safe_json_artifact(directory, "publish.json", secrets, ("mode", "target", "remote", "branch", "run_branch", "base_sha", "commit_sha", "web_url", "status", "local_base_updated", "run_branch_cleanup")),
         "Commit SHA: " + str(state.get("commit_sha", "—")),

@@ -336,15 +336,15 @@ class PublishConfig:
 
 @dataclass(frozen=True)
 class PlanningConfig:
-    protocol: str = "v1"
+    protocol: str = "v2"
     decomposition: str = "balanced"
     single_step_max_mutable_paths: int = 2
     staged_step_max_mutable_paths: int = 6
     execution_mode_policy: str = "auto"
 
     def __post_init__(self) -> None:
-        if self.protocol not in {"v1", "v2"}:
-            raise ValueError("planning protocol must be 'v1' or 'v2'")
+        if self.protocol != "v2":
+            raise ValueError("planning protocol must be 'v2'")
         if self.decomposition not in {"balanced", "aggressive"}:
             raise ValueError("planning decomposition must be 'balanced' or 'aggressive'")
         for name in ("single_step_max_mutable_paths", "staged_step_max_mutable_paths"):
@@ -389,13 +389,6 @@ class RevisionConfig:
         validate_revision_budget(
             self.max_check_repair_attempts, "revision.max_check_repair_attempts"
         )
-
-    @property
-    def max_cycles(self) -> int:
-        """Historical read-only alias; new contracts use explicit budgets."""
-
-        return self.max_review_repair_cycles
-
 
 @dataclass(frozen=True)
 class PromptBudgetConfig:
@@ -611,15 +604,6 @@ class SelectedProfile:
 
 
 @dataclass(frozen=True)
-class ExecutionSelection:
-    schema_version: int
-    planner: SelectedProfile
-    implementer: SelectedProfile
-    reviewer: SelectedProfile
-    reviser: SelectedProfile | None = None
-
-
-@dataclass(frozen=True)
 class StepExecutionSelection:
     """The immutable implementer snapshot selected for one v2 step."""
 
@@ -628,31 +612,8 @@ class StepExecutionSelection:
 
 
 @dataclass(frozen=True)
-class ExecutionSelectionV3:
-    """Durable planner, per-step implementer and reviewer selection."""
-
-    schema_version: int
-    planner: SelectedProfile
-    steps: tuple[StepExecutionSelection, ...]
-    reviewer: SelectedProfile
-    reviser: SelectedProfile | None = None
-
-
-@dataclass(frozen=True)
-class ExecutionSelectionV4:
-    """Historical schema-4 execution authority."""
-
-    schema_version: int
-    planner: SelectedProfile
-    steps: tuple[StepExecutionSelection, ...]
-    reviser: SelectedProfile
-    repair_implementer: SelectedProfile
-    reviewer: SelectedProfile
-
-
-@dataclass(frozen=True)
-class ExecutionSelectionV5:
-    """Immutable, role-shaped execution authority for new META PLAN v2 runs."""
+class ExecutionSelection:
+    """The complete immutable execution authority for one v2 run."""
 
     schema_version: int
     planner: SelectedProfile
@@ -660,21 +621,6 @@ class ExecutionSelectionV5:
     check_repair: SelectedProfile | None
     semantic_reviser: SelectedProfile | None
     final_reviewer: SelectedProfile
-
-    # These aliases let the still-shared orchestration/reporting code consume
-    # the new role-shaped snapshot while historical V4 artifacts remain
-    # untouched.  They are not serialized fields or new authorities.
-    @property
-    def reviewer(self) -> SelectedProfile:
-        return self.final_reviewer
-
-    @property
-    def reviser(self) -> SelectedProfile | None:
-        return self.semantic_reviser
-
-    @property
-    def repair_implementer(self) -> SelectedProfile | None:
-        return self.check_repair
 
 
 @dataclass(frozen=True)

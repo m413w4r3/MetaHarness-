@@ -218,7 +218,7 @@ def _ownership_violations(
 
 @dataclasses.dataclass(frozen=True)
 class StepExecutionOutcome:
-    """The durable result of one successful Codex step (C01 or C02)."""
+    """The durable result of one successful Codex step (001 or 002)."""
 
     step_id: str
     profile_id: str
@@ -272,7 +272,7 @@ _BOUNDED_NO_CHANGE_MISMATCH = (
 
 
 class StepExecutionFailure(OrchestrationError):
-    """One Codex step failed a gate; the C01/C02 caller owns the run status."""
+    """One Codex step failed a gate; the 001/002 caller owns the run status."""
 
     def __init__(
         self,
@@ -351,7 +351,7 @@ _REVIEW_ATTEMPT_ARTIFACTS = (
 _CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "evidence.json")
 
 
-# The historical root aliases of the C01 evidence.  ``checks/C01`` is the
+# The historical root aliases of the 001 evidence.  ``cycles/001/checks`` is the
 # canonical directory; these names are only ever republished *from* it.
 _CHECK_ALIAS_ARTIFACTS = _CHECK_ATTEMPT_ARTIFACTS
 
@@ -534,9 +534,9 @@ _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
 def _repair_checks_payload(bundle: EvidenceBundle) -> dict[str, Any]:
-    """Summarize the accepted C01 deterministic gate for the repair planner.
+    """Summarize the accepted 001 deterministic gate for the repair planner.
 
-    Reviewer #1 only exists because the C01 gate was accepted, so argv, cwd,
+    Reviewer #1 only exists because the 001 gate was accepted, so argv, cwd,
     durations and log tails add no decision value here; they stay in the
     durable check artifacts.
     """
@@ -590,13 +590,7 @@ class CheckRepairScope:
     source: str
 
 
-# Historically named "expanded": these are the phases of the *second* bounded
-# check-repair pass, whether or not it expands the mutable scope.  The names
-# are durable and are never renamed.
-_SECOND_CHECK_REPAIR_PHASES = frozenset({
-    ResumePhase.CHECK_REPAIR_EXPANDED_C01,
-    ResumePhase.CHECK_REPAIR_EXPANDED_C02,
-})
+_SECOND_CHECK_REPAIR_PHASES = frozenset({ResumePhase.CHECK_REPAIR})
 
 
 def _status_has_unstaged_or_untracked(status: tuple[str, ...]) -> list[str]:

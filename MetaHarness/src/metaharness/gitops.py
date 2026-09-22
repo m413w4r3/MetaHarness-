@@ -1197,7 +1197,7 @@ def validate_linear_commit_chain(
 
     ``accepted_commits`` is optional for compatibility with older callers.  If
     supplied, records are authoritative in order and each record must agree
-    with the corresponding Git object; no C01/C02 naming convention is used.
+    with the corresponding Git object; no 001/002 naming convention is used.
     """
 
     base = _require_object_id(base_sha, "base_sha")

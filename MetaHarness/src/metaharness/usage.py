@@ -213,57 +213,49 @@ def _first_usage(*paths: Path) -> dict[str, int]:
 def phase_usage_summary(
     run_dir: str | Path, *, v1_agent_usage: Any = None
 ) -> dict[str, Any]:
-    """Aggregate persisted token usage per phase and cycle; no cost derived."""
+    """Aggregate persisted usage from every generic pipeline cycle."""
 
+    del v1_agent_usage
     directory = Path(run_dir)
     planner = _first_usage(directory / PLANNER_USAGE_ARTIFACT)
-    c01_steps = [{**row, "cycle": 1} for row in persisted_step_usage(directory / "steps")]
-    c02_steps = [
-        {**row, "cycle": 2}
-        for row in persisted_step_usage(directory / "repair" / "C02" / "steps")
-    ]
-    if c01_steps:
-        luna_c01 = add_usage(row["usage"] for row in c01_steps)
-    elif isinstance(v1_agent_usage, Mapping) and v1_agent_usage:
-        luna_c01 = normalize_usage(v1_agent_usage)
-    else:
-        luna_c01 = empty_usage()
-    luna_c02 = add_usage(row["usage"] for row in c02_steps)
-    claude_c01 = _first_usage(
-        directory / "revision" / "C01" / "usage.json", directory / "revision" / "usage.json"
-    )
-    reviewer_c01 = _first_usage(
-        directory / "review" / "C01" / REVIEWER_USAGE_ARTIFACT,
-        directory / REVIEWER_USAGE_ARTIFACT,
-    )
-    repair_planner = _first_usage(directory / "repair" / "C02" / PLANNER_USAGE_ARTIFACT)
-    claude_c02 = _first_usage(directory / "revision" / "C02" / "usage.json")
-    reviewer_c02 = _first_usage(directory / "review" / "C02" / REVIEWER_USAGE_ARTIFACT)
-    has_c02 = (directory / "repair" / "C02").is_dir() or any(
-        value != empty_usage() for value in (repair_planner, luna_c02, claude_c02, reviewer_c02)
-    )
+    cycles: list[dict[str, Any]] = []
+    implementer_rows: list[dict[str, Any]] = []
+    semantic_reviser = empty_usage()
+    check_repair = empty_usage()
+    final_reviewer = empty_usage()
+    for cycle_path in sorted((directory / "cycles").glob("[0-9][0-9][0-9]")):
+        if not cycle_path.is_dir():
+            continue
+        number = int(cycle_path.name)
+        step_rows = [
+            {**row, "cycle": number}
+            for row in persisted_step_usage(cycle_path / "implementation" / "steps")
+        ]
+        cycle_implementer = add_usage(row["usage"] for row in step_rows)
+        cycle_reviser = _first_usage(cycle_path / "semantic-revision" / "usage.json")
+        cycle_repair = _first_usage(cycle_path / "check-repair" / "usage.json")
+        cycle_reviewer = _first_usage(cycle_path / "review" / REVIEWER_USAGE_ARTIFACT)
+        semantic_reviser = add_usage((semantic_reviser, cycle_reviser))
+        check_repair = add_usage((check_repair, cycle_repair))
+        final_reviewer = add_usage((final_reviewer, cycle_reviewer))
+        implementer_rows.extend(step_rows)
+        cycles.append({
+            "number": number,
+            "implementer": cycle_implementer,
+            "semantic_reviser": cycle_reviser,
+            "check_repair": cycle_repair,
+            "final_reviewer": cycle_reviewer,
+        })
     summary: dict[str, Any] = {
         "planner": planner,
-        "implementer": {
-            "total": add_usage((luna_c01, luna_c02)),
-            "steps": c01_steps + c02_steps,
-        },
-        "reviser": add_usage((claude_c01, claude_c02)),
-        "reviewer": add_usage((reviewer_c01, reviewer_c02)),
+        "implementer": {"total": add_usage(row["usage"] for row in implementer_rows), "steps": implementer_rows},
+        "check_repair": check_repair,
+        "semantic_reviser": semantic_reviser,
+        "final_reviewer": final_reviewer,
+        "cycles": cycles,
     }
-    if has_c02:
-        summary.update({
-            "luna_c01": luna_c01,
-            "claude_c01": claude_c01,
-            "reviewer_c01": reviewer_c01,
-            "repair_planner_c02": repair_planner,
-            "luna_c02": luna_c02,
-            "claude_c02": claude_c02,
-            "reviewer_c02": reviewer_c02,
-        })
     summary["grand_total"] = add_usage(
-        (planner, luna_c01, claude_c01, reviewer_c01,
-         repair_planner, luna_c02, claude_c02, reviewer_c02)
+        (planner, summary["implementer"]["total"], check_repair, semantic_reviser, final_reviewer)
     )
     return summary
 

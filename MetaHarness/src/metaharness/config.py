@@ -726,9 +726,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     max_diff_bytes = _positive_int(expanded, "max_diff_bytes", 400_000, "root")
 
     planning_data = _table(expanded, "planning")
-    protocol = planning_data.get("protocol", "v1")
-    if not isinstance(protocol, str) or protocol not in {"v1", "v2"}:
-        raise ConfigError("planning.protocol must be 'v1' or 'v2'")
+    protocol = planning_data.get("protocol", "v2")
+    if protocol != "v2":
+        raise ConfigError("planning.protocol must be 'v2'")
     decomposition = planning_data.get("decomposition", "balanced")
     if not isinstance(decomposition, str) or decomposition not in {"balanced", "aggressive"}:
         raise ConfigError("planning.decomposition must be 'balanced' or 'aggressive'")
@@ -756,38 +756,14 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     )
 
     revision_data = _table(expanded, "revision")
-    allowed_revision = {
-        "enabled", "max_review_repair_cycles", "max_check_repair_attempts",
-        # Input-only compatibility for historical TOML files.
-        "max_cycles",
-    }
+    allowed_revision = {"enabled", "max_review_repair_cycles", "max_check_repair_attempts"}
     unknown_revision = sorted(set(revision_data) - allowed_revision)
     if unknown_revision:
         raise ConfigError(f"revision.{unknown_revision[0]} is not allowed")
-    legacy_review_budget: int | None = None
-    if "max_cycles" in revision_data:
-        # Historical TOML used a total-cycle count.  Keep accepting it as a
-        # read-time alias, but translate it to the generic number of review
-        # repair cycles instead of preserving the old two-cycle contract.
-        legacy_max_cycles = revision_data["max_cycles"]
-        if isinstance(legacy_max_cycles, bool) or not isinstance(legacy_max_cycles, int):
-            raise ConfigError("revision.max_cycles must be an integer")
-        try:
-            legacy_review_budget = validate_revision_budget(
-                max(0, legacy_max_cycles - 1),
-                "revision.max_review_repair_cycles",
-            )
-        except ValueError as exc:
-            raise ConfigError(str(exc)) from None
     revision_enabled = _bool(revision_data, "enabled", False, "revision")
-    explicit_budgets = {
-        "max_review_repair_cycles", "max_check_repair_attempts"
-    }.intersection(revision_data)
     review_budget = _revision_budget(
         revision_data, "max_review_repair_cycles", 1, "revision"
     )
-    if "max_review_repair_cycles" not in revision_data and legacy_review_budget is not None:
-        review_budget = legacy_review_budget
     check_budget = _revision_budget(
         revision_data, "max_check_repair_attempts", 2, "revision"
     )
@@ -795,16 +771,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         # A config with no [revision] section is historical and has no
         # correction pipeline.  RevisionConfig's explicit defaults remain
         # available to new callers that construct it directly.
-        review_budget = check_budget = 0
-    elif (
-        not revision_enabled
-        and legacy_review_budget is not None
-        and not explicit_budgets
-    ):
-        # ``enabled = false`` plus the historical total-cycle alias means an
-        # old run with no correction pipeline.  New explicit budget keys are
-        # independent and are deliberately not covered by this compatibility
-        # branch.
         review_budget = check_budget = 0
     revision = RevisionConfig(
         enabled=revision_enabled,

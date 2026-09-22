@@ -110,20 +110,21 @@ class ConfigTests(unittest.TestCase):
             raw = tomllib.load(stream)
         self.assertEqual(raw["max_diff_bytes"], 2_000_000)
 
-    def test_planning_protocol_defaults_to_v1_and_accepts_v2(self) -> None:
+    def test_planning_protocol_defaults_to_v2_and_rejects_other_versions(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name)))
-        self.assertEqual(config.planning.protocol, "v1")
+        self.assertEqual(config.planning.protocol, "v2")
 
         contents = VALID_CONFIG + '\n[planning]\nprotocol = "v2"\n'
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name), contents))
         self.assertEqual(config.planning.protocol, "v2")
 
-        contents = VALID_CONFIG + '\n[planning]\nprotocol = "v3"\n'
-        with tempfile.TemporaryDirectory() as directory_name:
-            with self.assertRaisesRegex(ConfigError, "planning.protocol"):
-                load_config(self.write_config(Path(directory_name), contents))
+        for protocol in ("v1", "v3"):
+            contents = VALID_CONFIG + f'\n[planning]\nprotocol = "{protocol}"\n'
+            with tempfile.TemporaryDirectory() as directory_name:
+                with self.assertRaisesRegex(ConfigError, "planning.protocol"):
+                    load_config(self.write_config(Path(directory_name), contents))
 
     def test_staged_step_max_mutable_paths_defaults_and_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:

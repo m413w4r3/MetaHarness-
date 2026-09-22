@@ -23,7 +23,7 @@ from ..review import ReviewResult
 
 
 def _repair_mutation_sets(plan: TaskPlanV2) -> tuple[list[str], list[str], list[str]]:
-    """Return canonical C02 mutation sets and reject structural ambiguity."""
+    """Return canonical 002 mutation sets and reject structural ambiguity."""
 
     writes = sorted({path for step in plan.steps for path in step.write_set})
     creates = sorted({path for step in plan.steps for path in step.create_set})
@@ -76,7 +76,7 @@ def _build_scope_delta(
         "source_finding": findings,
         "candidate_commit_sha": candidate_commit_sha,
         "repair_plan_sha256": plan_sha,
-        "repair_bundle_sha256": repair_bundle_sha,
+        "correction_bundle_sha256": repair_bundle_sha,
     }
     return payload, _json_text(payload)
 
@@ -95,7 +95,7 @@ def _ensure_scope_delta(
     expected = content.encode("utf-8")
     digest = hashlib.sha256(expected).hexdigest()
     if expected_sha256 is not None and digest != expected_sha256:
-        raise ResumeIntegrityError("the C02 scope delta changed")
+        raise ResumeIntegrityError("the 002 scope delta changed")
     path = repair_dir / "scope_delta.json"
     if expected_sha256 is None:
         try:
@@ -107,12 +107,12 @@ def _ensure_scope_delta(
             raise OrchestrationError("REPAIR_SCOPE_DELTA_UNWRITABLE") from exc
     try:
         if path.stat().st_size > 256 * 1024:
-            raise ResumeIntegrityError("the C02 scope delta is too large")
+            raise ResumeIntegrityError("the 002 scope delta is too large")
         existing = path.read_bytes()
     except OSError as exc:
-        raise ResumeIntegrityError(f"the C02 scope delta is unreadable: {exc}") from exc
+        raise ResumeIntegrityError(f"the 002 scope delta is unreadable: {exc}") from exc
     if existing != expected:
-        raise ResumeIntegrityError("the C02 scope delta changed")
+        raise ResumeIntegrityError("the 002 scope delta changed")
     return digest
 
 
@@ -142,6 +142,6 @@ def _build_scope_repair_delta(
         "failure_ids": sorted(set(failure_ids)),
         "observed_outside_scope_paths": sorted(set(observed_outside_scope_paths)),
         "repair_plan_sha256": hashlib.sha256(raw_plan).hexdigest(),
-        "repair_bundle_sha256": repair_bundle_sha,
+        "correction_bundle_sha256": repair_bundle_sha,
     }
     return payload, _json_text(payload)

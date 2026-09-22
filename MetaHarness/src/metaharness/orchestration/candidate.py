@@ -39,6 +39,7 @@ from ..review import (
     parse_review,
 )
 from ..agent.base import AgentResult
+from .pipeline_v2 import candidate_dir, cycle_dir
 
 
 def authorize_commit(
@@ -103,7 +104,7 @@ def _commit_web_url(reference: RepositoryReference, commit_sha: str) -> str | No
 
 
 def _candidate_commit_path(run_dir: Path, cycle: int) -> Path:
-    return run_dir / "candidate" / f"C{cycle:02d}" / "commit.json"
+    return candidate_dir(run_dir, cycle) / "commit.json"
 
 
 def _candidate_chain_parent(
@@ -111,25 +112,26 @@ def _candidate_chain_parent(
 ) -> str:
     """The exact direct parent the published candidate of *cycle* must have.
 
-    C01: ``BASE``.  C02: the persisted C01 candidate, itself exactly parented
-    to ``BASE`` with its recorded tree.  Raises :class:`GitError` otherwise.
+    The first candidate is parented to BASE; every later candidate is parented
+    to the previous accepted cycle.  Raises :class:`GitError` otherwise.
     """
 
     record = _read_json_artifact(_candidate_commit_path(run_dir, cycle))
     if not isinstance(record, dict) or record.get("commit_sha") != commit_sha:
         raise GitError("candidate commit artifact does not match publication")
     expected_parent = base_sha
-    if cycle == 2:
-        c01 = _read_json_artifact(_candidate_commit_path(run_dir, 1))
-        if not isinstance(c01, dict) or not _is_object_id(c01.get("commit_sha")):
-            raise GitError("C01 candidate commit artifact is missing")
+    if cycle > 1:
+        previous = _read_json_artifact(_candidate_commit_path(run_dir, cycle - 1))
+        if not isinstance(previous, dict) or not _is_object_id(previous.get("commit_sha")):
+            raise GitError("previous candidate commit artifact is missing")
+        if cycle == 2 and previous.get("parent_sha") != base_sha:
+            raise GitError("previous candidate identity is not exact")
         if (
-            c01.get("parent_sha") != base_sha
-            or commit_parents(worktree, c01["commit_sha"]) != (base_sha,)
-            or resolve_tree(worktree, c01["commit_sha"]) != c01.get("tree_sha")
+            commit_parents(worktree, previous["commit_sha"]) != (previous.get("parent_sha"),)
+            or resolve_tree(worktree, previous["commit_sha"]) != previous.get("tree_sha")
         ):
-            raise GitError("C01 candidate identity is not exact")
-        expected_parent = c01["commit_sha"]
+            raise GitError("previous candidate identity is not exact")
+        expected_parent = previous["commit_sha"]
     if record.get("parent_sha") != expected_parent or commit_parents(worktree, commit_sha) != (expected_parent,):
         raise GitError("candidate commit parent is not the expected parent")
     return expected_parent
@@ -153,7 +155,7 @@ def _candidate_commit_payload(
 
 
 def accepted_chain_records(run_dir: Path) -> tuple[dict[str, Any], ...]:
-    """Read the arbitrary accepted chain, with legacy C01/C02 fallback."""
+    """Read the arbitrary accepted chain."""
 
     chain_path = run_dir / "accepted-chain.json"
     chain = _read_json_artifact(chain_path)
@@ -170,7 +172,7 @@ def accepted_chain_records(run_dir: Path) -> tuple[dict[str, Any], ...]:
     if isinstance(chain, list) and all(isinstance(item, dict) for item in chain):
         return tuple(chain)
     records: list[dict[str, Any]] = []
-    for cycle in range(1, 33):
+    for cycle in range(1, 10_000):
         record = _read_json_artifact(_candidate_commit_path(run_dir, cycle))
         if not isinstance(record, dict):
             break

@@ -137,33 +137,5 @@ class AgentExecutionContractTests(unittest.TestCase):
                 self.assertEqual(result.status, "failed")
 
 
-class PipelineVersionTests(unittest.TestCase):
-    def test_new_state_is_v2_and_absent_field_is_historical_v1(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "state.json"
-            state = RunStateStore(path).initialize("new")
-            self.assertEqual(state["pipeline_version"], 2)
-            historic = dict(state)
-            historic.pop("pipeline_version")
-            self.assertEqual(pipeline_version_from_state(historic), 1)
-
-    def test_resume_dispatch_never_crosses_pipeline_versions(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            state_path = root / "runs" / "v1" / "state.json"
-            store = RunStateStore(state_path)
-            state_path.parent.mkdir(parents=True)
-            state = store.initialize("v1", pipeline_version=1)
-            state.pop("pipeline_version")
-            state_path.write_text(json.dumps(state), encoding="utf-8")
-            harness = object.__new__(Orchestrator)
-            harness.config = type("Config", (), {"runs_root": root / "runs"})()
-            with mock.patch.object(harness, "_resume_impl", return_value="v1") as impl:
-                self.assertEqual(harness.resume("v1"), "v1")
-                impl.assert_called_once()
-            with self.assertRaises(ResumeError):
-                harness.resume_pipeline_v2("v1")
-
-
 if __name__ == "__main__":
     unittest.main()

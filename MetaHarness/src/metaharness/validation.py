@@ -43,7 +43,7 @@ def config_with_check_authority(
     the trusted catalogue.  The command-bearing values (argv, cwd, timeout,
     preflight argv) always come from the durable authority artifact: once a
     run owns a ``check_authority.json`` there is no fallback to today's
-    configuration, even for an ID the initial C01 selection did not include.
+    configuration, even for an ID the initial 001 selection did not include.
 
     *expected_sha256* is the already durable hash the approval bound.  It is
     verified on every live use, not only on resume.

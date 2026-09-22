@@ -248,7 +248,7 @@ def _status(run_dir: Path) -> int:
         print(f"commit: {state['commit_sha']}")
     candidates = state.get("candidate")
     if isinstance(candidates, dict):
-        for cycle in ("C01", "C02"):
+        for cycle in ("001", "002"):
             candidate = candidates.get(cycle)
             if isinstance(candidate, dict):
                 print(f"CANDIDATE {cycle}: {candidate.get('commit_sha', '—')}")

@@ -687,7 +687,7 @@ of an invalid plan or a plan that asks the worker to discover a solution.
 def render_repair_decomposition_policy_text(
     staged_step_max_mutable_paths: int,
 ) -> str:
-    """Render the C02 repair mutable-scope policy from its one real limit.
+    """Render the 002 repair mutable-scope policy from its one real limit.
 
     A bounded repair step is bounded by what a single Luna worker is already
     allowed to touch, so the STAGED per-step maximum is the authority here --
@@ -706,7 +706,7 @@ def render_repair_decomposition_policy_text(
 
     return f"""REPAIR DECOMPOSITION POLICY
 
-This is a bounded C02 repair plan.
+This is a bounded 002 repair plan.
 
 Every repair implementation step, including a SINGLE S01,
 may modify at most {staged_step_max_mutable_paths} distinct mutable
@@ -1169,10 +1169,10 @@ def validate_repair_decomposition_policy(
     plan: TaskPlanV2,
     planning: PlanningConfig,
 ) -> None:
-    """Bound every C02 repair step by the normal staged worker limit.
+    """Bound every 002 repair step by the normal staged worker limit.
 
     The SINGLE limit of :func:`validate_decomposition_policy` decides when an
-    *initial* task must be decomposed.  A C02 repair is already bounded to one
+    *initial* task must be decomposed.  A 002 repair is already bounded to one
     corrective cycle, to the approved repair scope, to a reviewed immutable
     candidate and to the deterministic gates plus reviewer #2 that follow it,
     so the only remaining question is whether one worker may touch that many
@@ -1470,7 +1470,7 @@ class PlannerV2:
         plan = parse_task_plan_v2(raw, implementer_ids=self.implementer_ids, reviewer_ids=self.reviewer_ids,
                                   check_catalog=self.check_catalog, default_check_ids=self.default_check_ids)
         # Only the initial planner is bound by the execution mode policy; the
-        # bounded C02 repair plan keeps its own (possibly single-step) shape.
+        # bounded 002 repair plan keeps its own (possibly single-step) shape.
         validate_execution_mode_policy(plan, self.planning)
         validate_decomposition_policy(plan, self.planning)
         if artifacts_dir is not None:
@@ -1485,10 +1485,10 @@ class PlannerV2:
 
 
 def _repair_plan_recovery_sources(target: Path) -> list[Path]:
-    """The C02 directories that may hold an already paid planner answer.
+    """The 002 directories that may hold an already paid planner answer.
 
     ``target`` first, then its archived retry attempts newest-first: a resume
-    archives ``repair/C02`` into ``attempts/NN`` before the repair planner is
+    archives ``cycles/002/correction`` into ``attempts/NN`` before the repair planner is
     entered again, so the raw response that was already paid for and rejected
     only by local validation is found there rather than at the top level.
     """
@@ -1514,7 +1514,7 @@ def _recover_existing_repair_plan(
     inherited_check_ids: Sequence[str],
     planning: PlanningConfig,
 ) -> TaskPlanV2 | None:
-    """Revalidate an already produced C02 answer locally, or return ``None``.
+    """Revalidate an already produced 002 answer locally, or return ``None``.
 
     A durable ``planner.raw.md`` is reusable only next to a
     ``planner.evidence.md`` byte-identical to *current_evidence_text*: the
@@ -1734,7 +1734,7 @@ class RepairPlannerV2:
             + "\n",
         )
 
-        # Always a fresh completion: C02 never continues the initial planner
+        # Always a fresh completion: 002 never continues the initial planner
         # conversation.
         complete_with_file_fallback = getattr(
             self.client, "complete_with_file_fallback", None

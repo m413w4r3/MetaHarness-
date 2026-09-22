@@ -67,8 +67,8 @@ class RunStateStore:
     ) -> dict[str, Any]:
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
-        if isinstance(pipeline_version, bool) or pipeline_version not in (1, 2):
-            raise ValueError("pipeline_version must be 1 or 2")
+        if isinstance(pipeline_version, bool) or pipeline_version != 2:
+            raise ValueError("pipeline_version must be 2")
         started = started_at or _now()
         state: dict[str, Any] = {
             "schema_version": 1,

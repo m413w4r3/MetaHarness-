@@ -265,28 +265,6 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
             [pending, {"step_id": "S02", "verification_status": "passed"}]
         )
 
-    def test_h_v1_and_v2_resume_dispatch_stays_isolated(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runs = root / "runs"
-            v1 = RunStateStore(runs / "v1" / "state.json")
-            v2 = RunStateStore(runs / "v2" / "state.json")
-            v1.initialize("v1", pipeline_version=1)
-            v2.initialize("v2", pipeline_version=2)
-            old = v1.load()
-            old.pop("pipeline_version")
-            (runs / "v1" / "state.json").write_text(json.dumps(old), encoding="utf-8")
-            self.assertEqual(pipeline_version_from_state(old), 1)
-            self.assertEqual(pipeline_version_from_state(v2.load()), 2)
-            harness = object.__new__(Orchestrator)
-            harness.config = type("Config", (), {"runs_root": runs})()
-            with mock.patch.object(harness, "resume_pipeline_v1", return_value="v1") as v1_resume:
-                with mock.patch.object(harness, "resume_pipeline_v2", return_value="v2") as v2_resume:
-                    self.assertEqual(harness.resume("v1"), "v1")
-                    self.assertEqual(harness.resume("v2"), "v2")
-            v1_resume.assert_called_once()
-            v2_resume.assert_called_once()
-
     def test_i_backend_neutral_executors_have_the_same_business_result(self) -> None:
         class EqualFake:
             capabilities = AgentExecutorCapabilities(edits_workspace=True)

@@ -95,8 +95,8 @@ class TraceEvent:
             raise ValueError("trace run_id must be a non-empty string")
         if isinstance(self.pipeline_version, bool) or not isinstance(self.pipeline_version, int):
             raise ValueError("trace pipeline_version must be an integer")
-        if self.pipeline_version < 1:
-            raise ValueError("trace pipeline_version must be positive")
+        if self.pipeline_version != 2:
+            raise ValueError("trace pipeline_version must be 2")
         if self.schema_version != TRACE_SCHEMA_VERSION:
             raise ValueError("unsupported trace schema version")
         if not isinstance(self.event, str) or not re.fullmatch(r"[a-z][a-z0-9_.-]+", self.event):
