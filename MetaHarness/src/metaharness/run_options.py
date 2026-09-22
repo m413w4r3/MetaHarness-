@@ -246,6 +246,17 @@ def read_run_options_with_sha256_and_raw(
     return options, digest, raw
 
 
+def read_run_options_for_state(
+    run_dir: str | Path, state: Mapping[str, Any],
+) -> tuple[RunOptions, str]:
+    """Read the frozen options of an existing run, bound to its state hash."""
+
+    expected = state.get("run_options_sha256")
+    if not isinstance(expected, str) or not expected:
+        raise RunOptionsError("run options hash is missing from the run state")
+    return read_run_options_with_sha256(run_dir, expected)
+
+
 def read_run_options_with_sha256(run_dir: str | Path, expected_sha256: str | None = None) -> tuple[RunOptions, str]:
     options, digest, _ = read_run_options_with_sha256_and_raw(run_dir, expected_sha256)
     return options, digest
@@ -283,6 +294,7 @@ __all__ = [
     "SCHEMA_VERSION", "RUN_OPTIONS_NAME", "REPAIR_SCOPE_POLICIES",
     "RunOptions", "RunOptionsConflict", "RunOptionsError",
     "EffectiveRepairScopePolicy", "canonical_run_options_bytes", "run_options_sha256",
-    "write_run_options", "read_run_options_with_sha256", "read_run_options_with_sha256_and_raw",
+    "write_run_options", "read_run_options_for_state", "read_run_options_with_sha256",
+    "read_run_options_with_sha256_and_raw",
     "effective_repair_scope_policy", "effective_run_config",
 ]

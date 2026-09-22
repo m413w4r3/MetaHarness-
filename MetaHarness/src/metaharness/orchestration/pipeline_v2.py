@@ -214,8 +214,10 @@ class PipelineV2Operations:
     begin_cycle: Callable[[PipelineV2Context, RunCycle, bool], None]
     load_cycle: Callable[[PipelineV2Context, int], RunCycle]
     initial_plan: Callable[[PipelineV2Context], CyclePlan]
+    # The flag is true when the correction itself is about to run, false
+    # when a later checkpoint of the same cycle is resumed.
     review_implementation_correction: Callable[
-        [PipelineV2Context, RunCycle], tuple[CyclePlan, ReviewResult]
+        [PipelineV2Context, RunCycle, bool], tuple[CyclePlan, ReviewResult]
     ]
     plan_correction: Callable[[PipelineV2Context, RunCycle], CyclePlan]
     load_correction: Callable[[PipelineV2Context, RunCycle, str | None], CyclePlan]
@@ -304,7 +306,9 @@ class PipelineV2Coordinator:
             cycle_plan = ops.initial_plan(ctx)
             previous_review = None
         elif cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
-            cycle_plan, previous_review = ops.review_implementation_correction(ctx, cycle)
+            cycle_plan, previous_review = ops.review_implementation_correction(
+                ctx, cycle, start is None or start.phase is ResumePhase.SEMANTIC_REVISION,
+            )
         elif start is None or start.phase is ResumePhase.REVIEW_REPLAN:
             if start is None:
                 ops.checkpoint(
@@ -503,11 +507,22 @@ class PipelineV2Coordinator:
                     "the red gate evidence of the check-repair attempt is missing",
                 )
             attempt = int(start.check_repair_attempt or 1)
+            # The budget is spent from durable attempt records, never from the
+            # checkpoint alone: it names the next attempt, or one already
+            # recorded whose worker is never called again.
+            durable = len(ops.check_repair_attempts(ctx, number, stage))
+            if attempt not in {durable, durable + 1}:
+                raise PipelineFailure(
+                    "RESUME_INTEGRITY_FAILURE",
+                    "the check-repair attempt does not follow the durable attempts",
+                )
             repair_boundary_written = True
+            attempt_recorded = attempt == durable
         else:
             evidence = ops.run_gate(ctx, cycle_plan, stage)
             attempt = len(ops.check_repair_attempts(ctx, number, stage)) + 1
             repair_boundary_written = False
+            attempt_recorded = False
         while True:
             hard = ops.hard_failures(evidence)
             if hard:
@@ -535,7 +550,9 @@ class PipelineV2Coordinator:
                     ResumePhase.CHECK_REPAIR, cycle_plan, stage=stage,
                     check_repair_attempt=attempt, tree=evidence.staged_tree_sha,
                 )
-            ops.check_repair_attempt(ctx, cycle_plan, stage, attempt, evidence)
+            if not attempt_recorded:
+                ops.check_repair_attempt(ctx, cycle_plan, stage, attempt, evidence)
+            attempt_recorded = False
             self._boundary(
                 ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
                 check_repair_attempt=attempt,

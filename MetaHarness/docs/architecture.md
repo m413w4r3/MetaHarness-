@@ -87,8 +87,8 @@ Selected executors, checks and the locator run through `procutil.run_bounded`:
 no shell, own process group, file-backed stdin/stdout/stderr, hard deadline, and
 termination of the whole group at the deadline and after exit, so a
 background child cannot modify the candidate after its snapshot. A
-descendant that creates its own session escapes this cleanup (no cgroups in
-V0).
+descendant that creates its own session escapes this cleanup (no cgroups
+are used).
 
 Commit objects are built from the exact candidate tree object
 (`git commit-tree`), not from the index, and the branch is advanced with a
@@ -99,11 +99,15 @@ checks, then pushed to the configured repository run branch before final
 review; the remote tip must equal that candidate SHA. Publication remains
 gated by the final reviewer PASS.
 
-Planner and reviewer answers are free Markdown. The parser is tolerant on
-presentation (headings, bold labels, bracket/colon markers, one whole-answer
-fence) but strict on control values: `STATUS`, `VERDICT` and `ROUTE` lines
-must be exactly one known token, content of code fences is never metadata,
-and duplicated or contradictory control values fail closed. A `PASS` also
+Planner answers use the strict META PLAN v2 envelope: nothing outside
+`META PLAN v2` ... `END META PLAN`, `STATUS` exactly `READY` or `BLOCKED`,
+well-formed `BEGIN STEP`/`END STEP` blocks, and only catalogue profiles and
+trusted check IDs; control text inside a section stays data. Reviewer answers
+are Markdown; that parser is tolerant on presentation (headings, bold labels,
+bracket/colon markers, one whole-answer fence) but strict on control values:
+`VERDICT` and `ROUTE` lines must be exactly one known token, content of code
+fences is never metadata, and duplicated or contradictory control values fail
+closed. A `PASS` also
 requires `ROUTE: NONE`, a passed deterministic gate, explicit empty
 `REQUIRED FIXES` and `MISSING TESTS`, and FINDINGS consisting only of
 `NONE` or structured `MINOR`/`NIT` records. No unrecognized finding text or
@@ -193,7 +197,7 @@ PLAN → implementation step → accepted step commit → …
   Session fields include driver, provider, model, effort, profile fingerprint,
   prompt bytes and tree identities whenever available.
 
-## Durable checkpoints and resume (P29)
+## Durable checkpoints and resume
 
 `resume.py` defines `ResumePhase` for context, planning, implementation,
 deterministic gates, check repair, semantic revision, candidate push, final
@@ -218,6 +222,17 @@ reviewer answers are read back from `steps/Sxx/step.json`,
 chain is verified. Durable pre-revision checks and final evidence for the
 exact current tree are reused, and a reviewer answer already accepted for
 that tree is re-parsed rather than requested again.
+
+Before any model call or Git write, the resume gate also requires: every
+correction cycle bound to the exact accepted review (`review.json` SHA-256),
+route and candidate of the previous cycle, for any number of cycles; cycle
+001 recorded as the initial cycle; every earlier candidate a real commit with
+its recorded tree and parent, still an ancestor of the run branch; a green
+pre-semantic gate acceptance naming the HEAD a semantic revision starts from;
+and, when HEAD advanced past a gate checkpoint (a crash after an accepted
+repair or revision commit), exactly the commit, parent, tree and mutable
+scope recorded by that gate's `accepted.json`. Any divergence is
+`RESUME_INTEGRITY_FAILURE`.
 
 ## Conversation policy
 

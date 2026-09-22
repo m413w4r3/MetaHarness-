@@ -30,6 +30,7 @@ from .shared import (
     GateMutableAuthority,
     _PROMPTS_DIR,
     _check_payload,
+    _is_object_id,
     _json_text,
     _read_json_artifact,
 )
@@ -121,11 +122,12 @@ _HARD_FAILURE_PREFIXES = (
 
 
 def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
-    """Return failures that make semantic review unsafe.
+    """Return the failures that close a gate episode without repair.
 
-    A normal configured check failure is evidence for the reviewer in P25;
-    mutations, timeouts, secrets, ownership and malformed/oversized trees are
-    still terminal integrity failures.
+    A normal configured check failure is soft: it may open a bounded
+    check-repair attempt and never reaches the reviewer.  Mutations,
+    timeouts, secrets, ownership and malformed/oversized trees are terminal
+    integrity failures.
     """
 
     return _hard_failure_items(bundle.failures)
@@ -638,6 +640,13 @@ class GateAcceptanceService:
                 raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "gate acceptance does not match evidence")
             if current_head(worktree) != stored["commit_sha"]:
                 raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted gate HEAD moved")
+            if (
+                resolve_tree(worktree, stored["commit_sha"]) != stored["tree_sha"]
+                or commit_parents(worktree, stored["commit_sha"]) != (stored["parent_sha"],)
+            ):
+                raise PipelineFailure(
+                    "RESUME_INTEGRITY_FAILURE", "gate acceptance does not match its commit",
+                )
             if stored.get("commit_created"):
                 chain = list(accepted_chain_records(ctx.run_dir))
                 if not any(

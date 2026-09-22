@@ -129,7 +129,10 @@ budgets. Each reviewable candidate is pushed to the `repository.remote` run
 branch before its reviewer, and MetaHarness persists and verifies the exact
 remote SHA. This staging push happens even when `publish.enabled = false`;
 publication happens only after the final reviewer PASS and the exact-tree
-candidate gate.
+candidate gate, and only for the SHA named by the durable reviewer PASS
+(`REVIEW_AUTHORITY_MISSING` otherwise). With `mode = "run-branch"`, the
+published branch is that staging push, so `publish.remote` must equal
+`repository.remote`; the configuration is refused otherwise.
 It never pushes `base_ref`, never uses force, tags or deletion, and never
 automatically merges the run branch. A published run exposes the branch URL
 (`…/tree/harness/<plan>/<run-id>`).
@@ -378,7 +381,7 @@ catalogue remain the run's own and cannot be edited.
 The action is refused, changing nothing, unless: the protocol is v2; the
 pending checkpoint is `planner`; the failure is a recoverable planner
 failure; no plan approval, execution selection, branch, worktree, or
-Luna/Claude/reviewer execution artifact exists; and the stored BASE SHA and
+worker, reviser or reviewer execution artifact exists; and the stored BASE SHA and
 BASE tree are still exactly those of the run. Local `main` may have moved:
 the run stays bound to its immutable stored BASE.
 
@@ -535,7 +538,7 @@ remote) and run `metaharness resume` or click the run page's single resume
 action: the same run id continues at its checkpoint. Otherwise
 (`RESUME_INTEGRITY_FAILURE`, `RESUME_REQUIRES_OPERATOR`, scope or Git
 violations, `BASE_MOVED_SINCE_RUN`) resolve the issue as an operator, then
-start a new run ID. New P29 reasons: `REVIEWER_TRANSPORT_FAILURE` (no reviewer
+start a new run ID. Resume-related reasons: `REVIEWER_TRANSPORT_FAILURE` (no reviewer
 answer was obtained), `BASE_MOVED_SINCE_RUN`, `RESUME_INTEGRITY_FAILURE`,
 `RESUME_REQUIRES_OPERATOR`; with `execution_mode_policy = "require-staged"` a
 READY SINGLE plan fails as `PLANNER_OUTPUT_INVALID` ("execution policy

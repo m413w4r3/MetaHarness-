@@ -278,7 +278,6 @@ class ClaudeCodeAgent:
             raise ClaudeAgentError("profile driver is not claude-code")
         if not profile.model or not profile.effort or not profile.permission_mode:
             raise ClaudeAgentError("Claude Code profile is incomplete")
-        worktree_path = Path(worktree).expanduser().resolve()
         home = Path(claude_home).expanduser().resolve()
         # ``--print`` with ``--output-format stream-json`` is rejected by the
         # Claude Code CLI unless ``--verbose`` is present.  It is part of the

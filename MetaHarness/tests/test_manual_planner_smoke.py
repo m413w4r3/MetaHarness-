@@ -9,29 +9,27 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.llm.chat import LLMHTTPError, TextLLMResult  # noqa: E402
-from metaharness.planning import PlanParseError  # noqa: E402
+from metaharness.planning_v2 import PlanParseError  # noqa: E402
 from scripts.manual import planner_real_smoke as smoke  # noqa: E402
+from tests.pipeline_support import plan  # noqa: E402
 
 
-READY = """STATUS: READY
-TITLE: Add bounded HTTP retry
-OBJECTIVE: Retry selected transient HTTP errors.
-CONSTRAINTS: Preserve the public request signature.
-FILES: src/client.py; tests/test_client.py
-IMPLEMENTATION: Add bounded exponential retry behavior.
-ACCEPTANCE: Retryable and non-retryable statuses behave as specified.
-TESTS: Cover success, exhaustion, and non-retryable errors.
-RISKS: Backoff must not exceed the attempt limit.
-BLOCKERS: NONE
-"""
+READY = plan(("S01", "src/client.py", "Add bounded HTTP retry")).replace(
+    "{implementer}", "smoke-implementer"
+).replace("REVIEWER_PROFILE: reviewer", "REVIEWER_PROFILE: smoke-reviewer")
 
-BLOCKED = """STATUS: BLOCKED
+BLOCKED = """META PLAN v2
+
+STATUS: BLOCKED
 TITLE: Waiting for transport details
-OBJECTIVE: Define the retry behavior.
-IMPLEMENTATION: Inspect the HTTP client contract.
-ACCEPTANCE: The missing transport detail is supplied.
-TESTS: Re-run the planner after clarification.
-BLOCKERS: The transport implementation is not available in the supplied context.
+
+OBJECTIVE
+Define the retry behavior.
+
+BLOCKERS
+The transport implementation is not available in the supplied context.
+
+END META PLAN
 """
 
 
@@ -113,6 +111,9 @@ class ManualPlannerSmokeTests(unittest.TestCase):
                 },
             )
             attempt_one = directory / "chatgpt" / "attempt-01"
+            # The smoke sends the production v2 planner request.
+            self.assertIn("META PLAN v2", fake.prompts[0])
+            self.assertEqual((attempt_one / "request.txt").read_text(), fake.prompts[0])
             self.assertEqual((attempt_one / "response.raw.md").read_text(), READY)
             self.assertEqual(json.loads((attempt_one / "parsed.json").read_text())["decision"], "READY")
             attempt_two = directory / "chatgpt" / "attempt-02"

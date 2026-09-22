@@ -76,7 +76,8 @@ delete remote run branch           (fast-forward-base only; after publication)
   publication laisse le run `PUBLISHED` avec un warning diagnostiqué.
 - tous les candidats reviewables sont poussés sur la branche distante du run
   avant le reviewer final, même quand `publish.enabled = false`. Ce staging
-  push est distinct de la publication post-PASS contrôlée par `[publish]`.
+  push est distinct de la publication post-PASS contrôlée par `[publish]` ;
+  en `mode = "run-branch"`, `publish.remote` doit être `repository.remote`.
 
 ### Reprise : failure != lost work
 

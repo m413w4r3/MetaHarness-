@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.approval import compute_plan_identity
 from metaharness.models import (
-    AgentConfig,
     ContextConfig,
     ExecutionRole,
     HarnessConfig,
@@ -76,10 +75,7 @@ class P19WebTests(unittest.TestCase):
             runs_root=runs,
             worktrees_root=root / "worktrees",
             require_clean_base=True,
-            planner=endpoint,
-            reviewer=endpoint,
             context=ContextConfig(),
-            agent=AgentConfig(),
             check_catalog=(),
             allow_no_required_checks=True,
             model_profiles=profiles,

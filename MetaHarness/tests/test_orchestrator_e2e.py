@@ -240,7 +240,7 @@ class OrchestratorE2ETests(unittest.TestCase):
         git(self.repo, "push", "-q", "origin", "HEAD:refs/heads/main")
         self.spec = self.root / "SPEC.md"
         self.spec.write_text("Implement the feature without exposing the original request.\n", encoding="utf-8")
-        # CodexAgent invokes the configured V0 executable by the stable name
+        # CodexAgent invokes the configured executable by the stable name
         # ``codex``; putting this test double first on PATH keeps the test local.
         self.codex = self.root / "codex"
         self.codex.write_text(
@@ -570,7 +570,7 @@ class OrchestratorE2ETests(unittest.TestCase):
     def test_codex_auth_exit_is_classified_without_sensitive_detail(self) -> None:
         _, _, state = self.run_case(codex_behavior="auth-fail")
         self.assertEqual(state["failure"]["reason"], "AGENT_START_FAILED")
-        self.assertEqual(state["failure"]["detail"], "step=S01 Codex authentication failed")
+        self.assertEqual(state["failure"]["detail"], "step=S01 worker authentication failed")
         self.assertNotIn("request-id", json.dumps(state))
         self.assertNotIn("https://api.openai.com", json.dumps(state))
 

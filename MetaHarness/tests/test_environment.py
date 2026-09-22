@@ -55,7 +55,7 @@ class EnvironmentFileTests(unittest.TestCase):
                 encoding="utf-8",
             )
             config = load_config(config_file)
-            self.assertEqual(config.planner.endpoint_path, "/from-file")
+            self.assertEqual(config.model_profiles[config.ui.default_planner_profile].endpoint_path, "/from-file")
             self.assertEqual(config.runtime_environment["BRIDGE_API_KEY"], secret)
             self.assertNotIn(secret, repr(config))
 

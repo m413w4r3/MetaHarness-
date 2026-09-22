@@ -75,6 +75,7 @@ from ..gitops import (
     current_head,
     git_root,
     index_tree_sha,
+    is_ancestor,
     registered_worktrees,
     remote_run_branch_tip,
     resolve_commit,
@@ -769,6 +770,9 @@ def validate_resume(
 
     # Cycle identity and every authority of cycles 1..n.
     number = checkpoint.review_cycle
+    if number > 1 or cycle_record_path(run_dir, 1).exists():
+        if read_cycle_record(run_dir, 1).kind is not CycleKind.INITIAL:
+            _refuse("cycle 001 is not the initial cycle")
     for earlier in range(2, number + 1):
         read_cycle_record(run_dir, earlier)
     for earlier in range(1, number):
@@ -808,19 +812,49 @@ def validate_resume(
             _refuse("run branch does not point to the worktree HEAD")
         expected_tree = checkpoint.expected_tree_sha
         if head != checkpoint.expected_head_sha:
-            # A crash may land between the candidate commit and its record;
-            # only that exact commit (expected parent, expected tree) is kept.
-            if not (
-                checkpoint.phase is ResumePhase.CANDIDATE_READY
-                and commit_parents(repo, head) == (checkpoint.expected_head_sha,)
+            # A crash may land between an accepted commit and the next
+            # checkpoint; only that exact commit (expected parent, expected
+            # tree) is kept.  At a gate boundary it must also be the commit
+            # its durable gate acceptance recorded.
+            advanced = (
+                commit_parents(repo, head) == (checkpoint.expected_head_sha,)
                 and resolve_tree(repo, head) == expected_tree
-            ):
+            )
+            if advanced and checkpoint.phase is ResumePhase.DETERMINISTIC_GATE and checkpoint.stage is not None:
+                acceptance = _read_json_artifact(
+                    gate_acceptance_path(run_dir, number, checkpoint.stage)
+                )
+                advanced = (
+                    isinstance(acceptance, dict)
+                    and acceptance.get("commit_created") is True
+                    and acceptance.get("commit_sha") == head
+                    and acceptance.get("parent_sha") == checkpoint.expected_head_sha
+                )
+                if advanced:
+                    _validate_gate_acceptance(
+                        run_dir, number, checkpoint.stage, tree=expected_tree, head=head,
+                        base_scope=_cycle_base_scope(config, selection, run_dir, plan, number),
+                        policy=repair_scope,
+                    )
+            elif checkpoint.phase is not ResumePhase.CANDIDATE_READY:
+                advanced = False
+            if not advanced:
                 _refuse("HEAD moved since the checkpoint")
         if (
             checkpoint.expected_parent_sha is not None
             and commit_parents(repo, head) != (checkpoint.expected_parent_sha,)
         ):
             _refuse("HEAD parent differs from the checkpoint parent")
+        # Every earlier reviewed candidate is a real commit with its recorded
+        # tree and parent, and the run branch still descends from it.
+        for earlier in range(1, number):
+            record = read_candidate_record(run_dir, earlier)
+            if (
+                resolve_tree(repo, record["commit_sha"]) != record["tree_sha"]
+                or commit_parents(repo, record["commit_sha"]) != (record["parent_sha"],)
+                or not is_ancestor(repo, record["commit_sha"], head)
+            ):
+                _refuse(f"cycle {earlier:03d} candidate record is not in the run history")
 
         if checkpoint.phase in _CANDIDATE_PHASES:
             candidate = read_candidate_record(run_dir, number)
@@ -863,6 +897,22 @@ def validate_resume(
             review = _accepted_review(review_dir(run_dir, number), evidence, head)
             if review is None or review.verdict is not ReviewVerdict.PASS or review.route is not ReviewRoute.NONE:
                 _refuse("the reviewer PASS is missing for the candidate")
+        if current_cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION and (
+            checkpoint.phase is ResumePhase.SEMANTIC_REVISION
+            or (
+                checkpoint.phase in {ResumePhase.DETERMINISTIC_GATE, ResumePhase.CHECK_REPAIR}
+                and checkpoint.stage is final_gate_stage(current_cycle.kind)
+            )
+        ):
+            # Semantic revision never precedes a green gate: its pre-semantic
+            # acceptance must durably name the HEAD the revision started from.
+            pre_head = checkpoint.expected_head_sha
+            _validate_gate_acceptance(
+                run_dir, number, pre_semantic_gate_stage(current_cycle.kind),
+                tree=resolve_tree(repo, pre_head), head=pre_head,
+                base_scope=_cycle_base_scope(config, selection, run_dir, plan, number),
+                policy=repair_scope,
+            )
         if checkpoint.phase is ResumePhase.CHECK_REPAIR:
             evidence = _load_evidence(gate_dir(run_dir, number, checkpoint.stage))
             if evidence is None or evidence.staged_tree_sha != expected_tree:

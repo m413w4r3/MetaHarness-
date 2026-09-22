@@ -225,7 +225,6 @@ def _payload_from_template(
         # Spend the available bytes on all authority first, regardless of
         # where a section occurs in the template.  Secondary evidence is then
         # truncated in declared order and finally omitted.
-        authority_names = [section.name for section in sections if section.authority]
         secondary_names = [
             name for name in secondary_order
             if name in current and not current[name].authority

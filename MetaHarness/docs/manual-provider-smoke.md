@@ -1,9 +1,10 @@
 # Smoke-test manuel réel du planner
 
 Ce test contacte réellement le bridge ChatGPT UI et WebAI-to-API Gemini. Il
-vérifie uniquement la chaîne HTTP provider → prompt planner réel → Markdown
-généré → `OpenAIChatTextClient` → `parse_task_plan()` → plan `READY` ou
-`BLOCKED`.
+vérifie uniquement la chaîne HTTP provider → requête planner META PLAN v2 de
+production (catalogue fixe `smoke-implementer` / `smoke-reviewer`, check
+`test`) → Markdown généré → `OpenAIChatTextClient` → `parse_task_plan_v2()` →
+plan `READY` ou `BLOCKED`.
 
 Il ne crée pas de worktree, ne lance pas Codex, n'exécute pas les checks, ne
 contacte pas le reviewer et ne committe rien. Il n'est pas exécuté par la CI

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Manual real-provider smoke test for the planner boundary.
 
-This runner intentionally does not use :class:`metaharness.planning.Planner`:
-that class can perform format repair, while this smoke test measures the
-natural compatibility of each real provider with the existing prompt and
-parser.  It never creates a worktree, starts an agent, runs checks, or calls a
-reviewer.
+It renders the production META PLAN v2 planner request for a fixed smoke
+profile and check catalogue, sends it once, and applies the production v2
+parser without any format repair.  It measures the natural compatibility of
+each real provider with the real prompt and parser.  It never creates a
+worktree, starts an agent, runs checks, or calls a reviewer.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import re
 import sys
 import tempfile
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
@@ -29,13 +29,20 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from metaharness.llm.chat import OpenAIChatTextClient, validate_endpoint  # noqa: E402
-from metaharness.models import LLMEndpointConfig  # noqa: E402
-from metaharness.planning import (  # noqa: E402
+from metaharness.models import (  # noqa: E402
+    CheckConfig,
+    ExecutionRole,
+    LLMEndpointConfig,
+    ModelProfile,
     PlanDecision,
+    ProfileDriver,
+    SelectionMode,
+    TaskPlanV2,
+)
+from metaharness.planning_v2 import (  # noqa: E402
     PlanParseError,
-    TaskPlan,
-    build_planner_prompt,
-    parse_task_plan,
+    build_planner_payload_v2,
+    parse_task_plan_v2,
 )
 
 
@@ -50,6 +57,20 @@ API_KEY_ENV_BY_PROVIDER = {
 GEMINI_MODELS_PATH = "/v1/stateless/models"
 PREFLIGHT_TIMEOUT_SECONDS = 15
 PREFLIGHT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+# The fixed, provider-neutral catalogue offered to the planner.  Profiles are
+# selection metadata only: this smoke never runs an implementer or reviewer.
+SMOKE_IMPLEMENTER = ModelProfile(
+    id="smoke-implementer", display_name="Smoke implementer",
+    roles=(ExecutionRole.IMPLEMENTER,), driver=ProfileDriver.EXTERNAL,
+    model="smoke-worker", selection_mode=SelectionMode.CLI, argv=("smoke-worker",),
+)
+SMOKE_REVIEWER = ModelProfile(
+    id="smoke-reviewer", display_name="Smoke reviewer",
+    roles=(ExecutionRole.REVIEWER,), driver=ProfileDriver.OPENAI_CHAT,
+    model="smoke-reviewer", selection_mode=SelectionMode.REQUEST,
+    base_url="http://127.0.0.1:9", endpoint_path="/v1/chat/completions",
+)
+SMOKE_CHECKS = (CheckConfig("test", ("python", "-m", "unittest")),)
 
 
 class SmokeConfigurationError(ValueError):
@@ -215,10 +236,37 @@ def _empty_counts(repeat: int) -> dict[str, int]:
     }
 
 
-def _plan_json(plan: TaskPlan) -> dict[str, object]:
-    normalized = asdict(plan)
-    normalized["decision"] = plan.decision.value
-    return normalized
+def _plan_json(plan: TaskPlanV2) -> dict[str, object]:
+    return {
+        "decision": plan.decision.value,
+        "title": plan.title,
+        "execution_mode": getattr(plan.execution_mode, "value", plan.execution_mode),
+        "step_ids": [step.id for step in plan.steps],
+        "required_checks": list(plan.required_checks),
+        "blockers": plan.blockers,
+    }
+
+
+def build_smoke_request(spec: str, context: str) -> str:
+    """The production v2 planner request for the fixed smoke catalogue."""
+
+    return build_planner_payload_v2(
+        spec, context,
+        implementer_profiles=(SMOKE_IMPLEMENTER,),
+        reviewer_profiles=(SMOKE_REVIEWER,),
+        check_catalog=SMOKE_CHECKS,
+        default_check_ids=("test",),
+    ).rendered
+
+
+def parse_smoke_plan(raw: str) -> TaskPlanV2:
+    return parse_task_plan_v2(
+        raw,
+        implementer_ids=frozenset({SMOKE_IMPLEMENTER.id}),
+        reviewer_ids=frozenset({SMOKE_REVIEWER.id}),
+        check_catalog=SMOKE_CHECKS,
+        default_check_ids=("test",),
+    )
 
 
 def run_provider(
@@ -251,7 +299,7 @@ def run_provider(
         # exchange, including if an operator changes a fixture between runs.
         spec = spec_path.read_text(encoding="utf-8")
         context = context_path.read_text(encoding="utf-8")
-        prompt = build_planner_prompt(spec, context)
+        prompt = build_smoke_request(spec, context)
         _write_text(attempt_dir / "request.txt", prompt)
 
         try:
@@ -294,7 +342,7 @@ def run_provider(
         # returned by the OpenAI-compatible client.
         _write_text(attempt_dir / "response.raw.md", raw)
         try:
-            plan = parse_task_plan(raw)
+            plan = parse_smoke_plan(raw)
         except PlanParseError as exc:
             counts["parse_failed"] += 1
             _write_text(attempt_dir / "parse-error.txt", _safe_error_text(exc))

@@ -43,7 +43,7 @@ from .gitops import (
     validate_run_branch,
 )
 from .llm.chat import validate_endpoint
-from .models import HarnessConfig, ProfileDriver, PublishMode, RunStatus
+from .models import AgentConfig, HarnessConfig, ProfileDriver, PublishMode, RunStatus, profile_driver_name
 from .orchestrator import OrchestrationError, recover_plan_run, resume_run, run_orchestrator
 from .plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
 from .profiles import profiles_for_config
@@ -77,17 +77,27 @@ def _config_check(config_path: Path) -> int:
     print(f"base_ref: {config.base_ref}")
     print(f"runs_root: {config.runs_root}")
     print(f"worktrees_root: {config.worktrees_root}")
-    print(
-        "planner: "
-        f"{_endpoint(config.planner.base_url, config.planner.endpoint_path)} "
-        f"model={config.planner.model}"
-    )
-    print(
-        "reviewer: "
-        f"{_endpoint(config.reviewer.base_url, config.reviewer.endpoint_path)} "
-        f"model={config.reviewer.model}"
-    )
-    print(f"agent: model={config.agent.model} effort={config.agent.effort}")
+    for role, profile_id in (
+        ("planner", config.ui.default_planner_profile),
+        ("implementer", config.ui.default_implementer_profile),
+        ("reviewer", config.ui.default_reviewer_profile),
+        ("reviser", config.ui.default_reviser_profile),
+        ("repair", config.ui.default_repair_profile),
+    ):
+        profile = config.model_profiles.get(profile_id) if profile_id else None
+        if profile is None:
+            print(f"default {role}: none")
+            continue
+        endpoint = (
+            f" endpoint={_endpoint(profile.base_url, profile.endpoint_path)}"
+            if profile.base_url is not None and profile.endpoint_path is not None
+            else ""
+        )
+        print(
+            f"default {role}: profile={profile.id} "
+            f"driver={profile_driver_name(profile.driver)} provider={profile.provider} "
+            f"model={profile.model} effort={profile.effort or 'default'}{endpoint}"
+        )
     print(
         "plan approval: "
         f"{'required' if config.approval.require_plan_approval else 'disabled'} "
@@ -556,15 +566,10 @@ def _doctor(config_path: Path) -> int:
             label = str(env_file)
         print(f"OK environment file: {label}")
     required_env_names = {
-        endpoint.api_key_env
-        for endpoint in (config.planner, config.reviewer)
-        if endpoint.api_key_env
-    }
-    required_env_names.update(
         profile.api_key_env
         for profile in config.model_profiles.values()
         if profile.api_key_env
-    )
+    }
     for name in sorted(required_env_names):
         if _usable_secret_value(config.runtime_environment.get(name)):
             print(f"OK env {name}: usable")
@@ -629,55 +634,62 @@ def _doctor(config_path: Path) -> int:
         else:
             print(f"{label}: {path}")
     path_value = config.runtime_environment.get("PATH", "")
-    codex = shutil.which("codex", path=path_value)
-    if codex:
-        print("OK codex binary: present")
+    codex_profiles = tuple(
+        profile for profile in profiles_for_config(config).values()
+        if profile.driver is ProfileDriver.CODEX
+    )
+    if not codex_profiles:
+        print("codex: no codex profile configured")
     else:
-        problems.append("codex binary is not resolvable")
-    codex_home: Path | None = None
-    try:
-        codex_home = prepare_codex_home(config)
-        print(f"OK codex home: {codex_home}")
-        print("OK codex MCP isolation: none configured")
-    except CodexRuntimeError as exc:
-        problems.append(str(exc))
-    if codex and codex_home is not None:
-        # The environment Codex really receives: the agent allowlist taken
-        # from the runtime mapping, API keys excluded, CODEX_HOME forced.
-        probe_environment = build_agent_environment(
-            config.agent,
-            source_environment=config.runtime_environment,
-            codex_home=codex_home,
-            forbidden_names=required_env_names,
-        )
-        supported, _detail = _probe_codex_cli(
-            codex, probe_environment, codex_home, secrets
-        )
-        if supported:
-            print("OK codex CLI contract: supported")
+        codex = shutil.which("codex", path=path_value)
+        if codex:
+            print("OK codex binary: present")
         else:
-            problems.append("unsupported Codex CLI for MetaHarness worker")
-        detail = _probe_codex_sandbox(codex, probe_environment, codex_home, secrets)
-        if detail is None:
-            print("OK codex sandbox: usable")
-        else:
-            problems.append(f"codex sandbox probe failed\n  detail: {detail}")
-        auth_status = check_codex_authentication(
-            codex_home,
-            environment=probe_environment,
-        )
-        if auth_status.available:
-            print("OK codex authentication: available")
-        elif auth_status.detail == "codex authentication is unavailable":
-            problems.append(
-                "codex authentication is unavailable for managed CODEX_HOME\n"
-                f'hint: run CODEX_HOME="{codex_home}" codex login'
+            problems.append("codex binary is not resolvable")
+        codex_home: Path | None = None
+        try:
+            codex_home = prepare_codex_home(config)
+            print(f"OK codex home: {codex_home}")
+            print("OK codex MCP isolation: none configured")
+        except CodexRuntimeError as exc:
+            problems.append(str(exc))
+        if codex and codex_home is not None:
+            # The environment Codex really receives: the agent allowlist taken
+            # from the runtime mapping, API keys excluded, CODEX_HOME forced.
+            probe_environment = build_agent_environment(
+                AgentConfig(env_allowlist=config.codex_runtime.env_allowlist),
+                source_environment=config.runtime_environment,
+                codex_home=codex_home,
+                forbidden_names=required_env_names,
             )
-        else:
-            problems.append(
-                "codex authentication could not be verified for managed CODEX_HOME\n"
-                f'hint: run CODEX_HOME="{codex_home}" codex login'
+            supported, _detail = _probe_codex_cli(
+                codex, probe_environment, codex_home, secrets
             )
+            if supported:
+                print("OK codex CLI contract: supported")
+            else:
+                problems.append("unsupported Codex CLI for MetaHarness worker")
+            detail = _probe_codex_sandbox(codex, probe_environment, codex_home, secrets)
+            if detail is None:
+                print("OK codex sandbox: usable")
+            else:
+                problems.append(f"codex sandbox probe failed\n  detail: {detail}")
+            auth_status = check_codex_authentication(
+                codex_home,
+                environment=probe_environment,
+            )
+            if auth_status.available:
+                print("OK codex authentication: available")
+            elif auth_status.detail == "codex authentication is unavailable":
+                problems.append(
+                    "codex authentication is unavailable for managed CODEX_HOME\n"
+                    f'hint: run CODEX_HOME="{codex_home}" codex login'
+                )
+            else:
+                problems.append(
+                    "codex authentication could not be verified for managed CODEX_HOME\n"
+                    f'hint: run CODEX_HOME="{codex_home}" codex login'
+                )
     if (
         config.revision.enabled
         or config.revision.max_check_repair_attempts > 0

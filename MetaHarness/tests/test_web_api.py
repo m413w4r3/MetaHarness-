@@ -12,9 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unittest.mock import patch
 
-from metaharness.approval import compute_plan_identity, compute_plan_identity_from_run, write_check_authority
+from metaharness.approval import compute_plan_identity_from_run, write_check_authority
 from metaharness.models import (
-    AgentConfig,
     CheckConfig,
     ContextConfig,
     HarnessConfig,
@@ -28,7 +27,6 @@ from metaharness.models import (
 from metaharness.run_options import RunOptions, write_run_options
 from metaharness.state import RunStateStore
 from metaharness.web import api
-from metaharness.web.pages import RUN_PAGE_DYNAMIC_IDS, STATE_POLL_MS
 from metaharness.web.server import create_server
 
 
@@ -50,10 +48,7 @@ class WebServerTests(unittest.TestCase):
             runs_root=self.runs,
             worktrees_root=root / "worktrees",
             require_clean_base=True,
-            planner=endpoint,
-            reviewer=endpoint,
             context=ContextConfig(),
-            agent=AgentConfig(),
             check_catalog=(),
             allow_no_required_checks=True,
             ui=UIConfig(

@@ -12,7 +12,6 @@ from typing import Any, Callable, Mapping
 from ..gitops import GitError, candidate_tree_sha, current_head
 from ..models import (
     AgentConfig,
-    ExecutionRole,
     HarnessConfig,
     ModelProfile,
     ProfileDriver,
@@ -207,7 +206,7 @@ class CodexExecutor:
             if config is not None:
                 agent_config = dataclasses.replace(
                     build_agent_config(profile),
-                    env_allowlist=config.agent.env_allowlist,
+                    env_allowlist=config.codex_runtime.env_allowlist,
                 )
             else:
                 agent_config = build_agent_config(profile)

@@ -1090,5 +1090,341 @@ class GitChainAndTraceTests(PipelineHarness):
         )
 
 
+class ResumeAuthorityTests(PipelineHarness):
+    """Legitimate durable states resume; tampered authority fails closed."""
+
+    def _crash_at(self, orchestrator, phase):
+        from metaharness.resume import ResumePhase
+
+        real = type(orchestrator)._write_checkpoint
+        fired: list[bool] = []
+
+        def write(run_dir, next_phase, **fields):
+            if next_phase is ResumePhase(phase) and not fired:
+                fired.append(True)
+                raise RuntimeError(f"crash before {phase}")
+            return real(run_dir, next_phase, **fields)
+
+        return mock.patch.object(type(orchestrator), "_write_checkpoint", staticmethod(write))
+
+    def _crash_on_review(self, orchestrator, number):
+        calls = 0
+        real = type(orchestrator)._review_candidate
+
+        def review_or_crash(owner, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == number:
+                raise RuntimeError("crash at final review")
+            return real(orchestrator, owner, *args, **kwargs)
+
+        return mock.patch.object(type(orchestrator), "_review_candidate", side_effect=review_or_crash)
+
+    def test_changed_direct_correction_resumes_at_its_final_review(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        # A real correction: the accepted tree differs from the reviewed one.
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n\n"))
+        original = self.orchestrator(
+            self.config(review_repair=1), planner=[initial_plan(STEP)],
+            reviewer=[review("REVISE", "IMPLEMENTATION")],
+        )
+        with self._crash_on_review(original, 2):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual((self.checkpoint()["phase"], self.checkpoint()["review_cycle"]), ("final_review", 2))
+
+        resumed = self.orchestrator(
+            self.config(review_repair=1), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
+        self.assertEqual(self.planner.requests, [])
+        candidate = json.loads((self.run_dir() / "cycles/002/candidate/commit.json").read_text())
+        first = json.loads((self.run_dir() / "cycles/001/candidate/commit.json").read_text())
+        self.assertEqual(candidate["parent_sha"], first["commit_sha"])
+        self.assertEqual(self.state()["commit_sha"], candidate["commit_sha"])
+
+    def test_crash_after_an_existing_head_acceptance_resumes(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        original = self.orchestrator(self.config(), planner=[initial_plan(STEP)], reviewer=[review()])
+        with self._crash_at(original, "candidate_ready"):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertTrue(
+            (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").is_file()
+        )
+        resumed = self.orchestrator(self.config(), planner=["unused"], reviewer=[review()]).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def _crash_after_repair_commit(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
+        original = self.orchestrator(
+            self.config(check_repair=1), planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        with self._crash_at(original, "candidate_ready"):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        checkpoint = self.checkpoint()
+        self.assertEqual((checkpoint["phase"], checkpoint["check_repair_attempt"]), ("deterministic_gate", 1))
+        accepted = json.loads(
+            (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").read_text()
+        )
+        self.assertEqual(accepted["acceptance_kind"], "repair")
+        self.assertEqual(git(self.worktree(), "rev-parse", "HEAD"), accepted["commit_sha"])
+
+    def test_crash_after_an_accepted_repair_commit_resumes_without_a_new_repair(self) -> None:
+        self._crash_after_repair_commit()
+        resumed = self.orchestrator(
+            self.config(check_repair=1), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
+
+    def test_a_head_not_recorded_by_the_gate_acceptance_fails_closed(self) -> None:
+        self._crash_after_repair_commit()
+        path = self.run_dir() / "cycles/001/checks/post-implementation/accepted.json"
+        accepted = json.loads(path.read_text())
+        accepted["commit_created"] = False
+        path.write_text(json.dumps(accepted), encoding="utf-8")
+        resumed = self.orchestrator(
+            self.config(check_repair=1), planner=["unused"], reviewer=["unused"],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
+        self.assertEqual(self.reviewer.requests, [])
+
+    def _crash_in_semantic_revision(self) -> None:
+        from metaharness.agent import AgentError
+
+        def crash(_request):
+            raise AgentError("reviser crashed")
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REVISER, crash)
+        failed = self.orchestrator(
+            self.config(semantic_revision=True), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(self.checkpoint()["phase"], "semantic_revision")
+
+    def test_semantic_revision_resumes_after_its_green_gate(self) -> None:
+        self._crash_in_semantic_revision()
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n\n"))
+        resumed = self.orchestrator(
+            self.config(semantic_revision=True), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser"])
+
+    def test_semantic_revision_never_resumes_without_its_green_gate_acceptance(self) -> None:
+        self._crash_in_semantic_revision()
+        (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").unlink()
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n\n"))
+        resumed = self.orchestrator(
+            self.config(semantic_revision=True), planner=["unused"], reviewer=["unused"],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        # The crashed reviser call is the only one: no model call on resume.
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
+
+    def _three_changed_cycles_crashing_at_the_third_review(self):
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(
+            ExecutionRole.REVISER,
+            write("feature.txt", "good\n\n"), write("feature.txt", "good\n\n\n"),
+        )
+        original = self.orchestrator(
+            self.config(review_repair=2), planner=[initial_plan(STEP)],
+            reviewer=[review("REVISE", "IMPLEMENTATION"), review("REVISE", "IMPLEMENTATION")],
+        )
+        with self._crash_on_review(original, 3):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual((self.checkpoint()["phase"], self.checkpoint()["review_cycle"]), ("final_review", 3))
+
+    def test_cycle_three_resume_publishes_the_third_candidate(self) -> None:
+        self._three_changed_cycles_crashing_at_the_third_review()
+        resumed = self.orchestrator(
+            self.config(review_repair=2), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        candidates = [
+            json.loads((self.run_dir() / f"cycles/{number:03d}/candidate/commit.json").read_text())
+            for number in (1, 2, 3)
+        ]
+        self.assertEqual(len({item["commit_sha"] for item in candidates}), 3)
+        self.assertEqual(self.state()["commit_sha"], candidates[2]["commit_sha"])
+
+    def _assert_tampering_fails_before_any_call(self, relative: str, tamper) -> None:
+        self._three_changed_cycles_crashing_at_the_third_review()
+        path = self.run_dir() / relative
+        path.write_text(json.dumps(tamper(json.loads(path.read_text()))), encoding="utf-8")
+        resumed = self.orchestrator(
+            self.config(review_repair=2), planner=["unused"], reviewer=["unused"],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.reviewer.requests, [])
+        self.assertEqual(self.planner.requests, [])
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser"])
+
+    def test_tampered_earlier_candidate_parent_fails_before_any_call(self) -> None:
+        self._assert_tampering_fails_before_any_call(
+            "cycles/001/candidate/commit.json",
+            lambda payload: {**payload, "parent_sha": "0" * 40},
+        )
+
+    def test_tampered_initial_cycle_record_fails_before_any_call(self) -> None:
+        self._assert_tampering_fails_before_any_call(
+            "cycles/001/cycle.json", lambda payload: {**payload, "kind": "review-replan"},
+        )
+
+
+    def test_tampered_run_execution_selection_fails_before_any_call(self) -> None:
+        self._three_changed_cycles_crashing_at_the_third_review()
+        path = self.run_dir() / "execution_selection.json"
+        payload = json.loads(path.read_text())
+        payload["steps"][0]["implementer"]["model"] = "tampered-model"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        resumed = self.orchestrator(
+            self.config(review_repair=2), planner=["unused"], reviewer=["unused"],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.reviewer.requests, [])
+
+    def test_tampered_replan_cycle_execution_selection_fails_before_any_call(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
+        original = self.orchestrator(
+            self.config(review_repair=1),
+            planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
+            reviewer=[review("REVISE", "REPLAN")],
+        )
+        with self._crash_on_review(original, 2):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        path = self.run_dir() / "cycles/002/correction/execution_selection.json"
+        payload = json.loads(path.read_text())
+        payload["steps"][0]["implementer"]["model"] = "tampered-model"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        resumed = self.orchestrator(
+            self.config(review_repair=1), planner=["unused"], reviewer=["unused"],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.reviewer.requests, [])
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+
+    def _crash_in_the_second_check_repair_attempt(self):
+        from metaharness.agent import AgentError
+
+        def crash(_request):  # fails before touching the worktree
+            raise AgentError("repair worker crashed")
+
+        # Attempt 001 leaves the gate red; attempt 002 crashes cleanly.
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "still bad\n"), crash)
+        config = self.config(check_repair=2)
+        failed = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        path = self.run_dir() / "resume_checkpoint.json"
+        checkpoint = json.loads(path.read_text())
+        self.assertEqual((checkpoint["phase"], checkpoint["check_repair_attempt"]), ("check_repair", 2))
+        return config, path, checkpoint
+
+    def test_a_lowered_check_repair_counter_never_replays_a_recorded_attempt(self) -> None:
+        config, path, checkpoint = self._crash_in_the_second_check_repair_attempt()
+        attempt_one = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts/001"
+        record = (attempt_one / "attempt.json").read_text()
+        checkpoint["check_repair_attempt"] = 1
+        path.write_text(json.dumps(checkpoint), encoding="utf-8")
+
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
+        resumed = self.orchestrator(config, planner=["unused"], reviewer=[review()]).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        # Only the unfinished attempt 002 is retried; 001 is never replayed.
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair", "repair"])
+        self.assertEqual((attempt_one / "attempt.json").read_text(), record)
+        self.assertEqual(
+            sorted(item.name for item in attempt_one.parent.iterdir()), ["001", "002"],
+        )
+
+    def test_a_check_repair_counter_beyond_the_durable_attempts_fails_closed(self) -> None:
+        config, path, checkpoint = self._crash_in_the_second_check_repair_attempt()
+        checkpoint["check_repair_attempt"] = 3
+        path.write_text(json.dumps(checkpoint), encoding="utf-8")
+        resumed = self.orchestrator(config, planner=["unused"], reviewer=["unused"]).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
+
+    def test_run_options_without_their_state_hash_are_never_resumed(self) -> None:
+        from metaharness.resume import ResumeNotAllowedError
+        from metaharness.state import RunStateStore
+
+        self._crash_in_semantic_revision()
+        options = self.run_dir() / "run_options.json"
+        payload = json.loads(options.read_text())
+        payload["max_check_repair_attempts"] = 9
+        options.write_text(json.dumps(payload), encoding="utf-8")
+        store = RunStateStore(self.run_dir() / "state.json")
+        store.update(status=store.load()["status"], run_options_sha256=None)
+        with self.assertRaises(ResumeNotAllowedError):
+            self.orchestrator(
+                self.config(semantic_revision=True), planner=["unused"], reviewer=["unused"],
+            ).resume("run")
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
+
+class ObservationAndPublicationAuthorityTests(PipelineHarness):
+    def test_a_failing_external_observer_cannot_change_the_run(self) -> None:
+        from metaharness.orchestrator import Orchestrator
+        from tests.pipeline_support import ScriptedChat
+
+        class BrokenObserver:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def emit(self, event):
+                self.calls += 1
+                raise RuntimeError("cockpit unavailable")
+
+        observer = BrokenObserver()
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
+        self.planner = ScriptedChat([initial_plan(STEP)], name="planner", events=self.events)
+        self.reviewer = ScriptedChat([review()], name="reviewer", events=self.events)
+        result = Orchestrator(
+            self.config(check_repair=1, publish=True),
+            planner_client=self.planner, reviewer_client=self.reviewer,
+            trace_sink=observer,
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertGreater(observer.calls, 0)
+        candidate = json.loads((self.run_dir() / "cycles/001/candidate/commit.json").read_text())
+        self.assertEqual(self.remote_tip(self.state()["branch"]), candidate["commit_sha"])
+        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
+        self.assertIn("publish.completed", self.trace_names())
+
+    def test_publication_requires_a_durable_pass_for_the_exact_candidate(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        orchestrator = self.orchestrator(
+            self.config(publish=True), planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        with mock.patch("metaharness.orchestrator._accepted_review", return_value=None):
+            result = orchestrator.run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "REVIEW_AUTHORITY_MISSING")
+        self.assertFalse((self.run_dir() / "publish.json").exists())
+        self.assertEqual(len(self.reviewer.requests), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

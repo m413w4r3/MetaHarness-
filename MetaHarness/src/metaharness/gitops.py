@@ -12,6 +12,10 @@ import urllib.parse
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from subprocess import CompletedProcess
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .models import RepositoryConfig
 
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
@@ -280,7 +284,7 @@ def build_repository_reference(
     repo: Path,
     *,
     base_sha: str,
-    config: "RepositoryConfig",
+    config: RepositoryConfig,
 ) -> RepositoryReference:
     """Build the secret-free repository identity visible to planners."""
 
@@ -1013,9 +1017,9 @@ def push_run_branch(
     args = [
         "push",
         "--porcelain",
-        "--set-upstream",
         remote,
-        f"HEAD:refs/heads/{branch}",
+        # The exact verified commit, never whatever HEAD became meanwhile.
+        f"{commit_sha}:refs/heads/{branch}",
     ]
     try:
         result = subprocess.run(

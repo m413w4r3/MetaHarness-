@@ -14,10 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from metaharness.agent.base import AgentResult
 from metaharness.agent.codex import (
     AgentCommittedError,
-    CONTRACT_MISMATCH_HEADER,
     CodexAgent,
     build_agent_environment,
     classify_codex_failure,
+)
+from metaharness.agent.protocol import (
+    CONTRACT_MISMATCH_HEADER,
     contract_mismatch_explanation,
 )
 from metaharness.prompt_contracts import build_implementer_payload
@@ -31,7 +33,6 @@ from metaharness.models import (
     CodexRuntimeConfig,
     ContextConfig,
     HarnessConfig,
-    LLMEndpointConfig,
 )
 
 
@@ -268,10 +269,7 @@ class CodexRuntimeTests(unittest.TestCase):
             runs_root=self.root / "runs",
             worktrees_root=self.root / "worktrees",
             require_clean_base=True,
-            planner=LLMEndpointConfig("https://planner.invalid", "/v1", "planner"),
-            reviewer=LLMEndpointConfig("https://reviewer.invalid", "/v1", "reviewer"),
             context=ContextConfig(always_files=()),
-            agent=AgentConfig(),
             check_catalog=(),
             allow_no_required_checks=True,
             codex_runtime=CodexRuntimeConfig(self.home),

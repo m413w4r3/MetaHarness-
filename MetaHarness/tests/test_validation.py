@@ -10,11 +10,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.models import (  # noqa: E402
-    AgentConfig,
     CheckConfig,
     ContextConfig,
     HarnessConfig,
-    LLMEndpointConfig,
 )
 from metaharness.approval import write_check_authority  # noqa: E402
 from metaharness.validation import (  # noqa: E402
@@ -54,17 +52,13 @@ class ValidationTestBase(unittest.TestCase):
         self.tempdir.cleanup()
 
     def config(self, checks: tuple[CheckConfig, ...]) -> HarnessConfig:
-        endpoint = LLMEndpointConfig("https://example.invalid", "/chat", "model")
         return HarnessConfig(
             repo=self.repo,
             base_ref="HEAD",
             runs_root=self.repo.parent / "runs",
             worktrees_root=self.repo.parent / "worktrees",
             require_clean_base=True,
-            planner=endpoint,
-            reviewer=endpoint,
             context=ContextConfig(),
-            agent=AgentConfig(),
             check_catalog=checks,
             max_diff_bytes=400_000,
         )

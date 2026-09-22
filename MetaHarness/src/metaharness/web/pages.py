@@ -866,7 +866,6 @@ _PIPELINE_SYMBOLS = {
 _FAILURE_MESSAGES = {
     "AGENT_TIMEOUT": "Worker timed out",
     "AGENT_RUNTIME_FAILED": "Worker failed",
-    "AGENT_RUNTIME_FAILED": "Worker failed",
     "AGENT_SCOPE_VIOLATION": "Worker changed Git history or scope",
     "AGENT_NO_CHANGE": "Step changed nothing",
     "UNRESOLVED_CONTRACT_MISMATCH": "Deferred contract mismatch needs semantic revision or an operator",
@@ -876,6 +875,7 @@ _FAILURE_MESSAGES = {
     "REVIEWER_TRANSPORT_FAILURE": "Reviewer could not be reached",
     "REVIEWER_OUTPUT_INVALID": "Reviewer answer is invalid",
     "REVIEW_FAILED": "Review failed",
+    "REVIEW_AUTHORITY_MISSING": "No reviewer PASS names the candidate",
     "LLM_FAILURE": "Model call failed",
     "PLANNER_BLOCKED": "Planner could not safely produce a plan",
     "PUSH_FAILED": "Publication push failed",

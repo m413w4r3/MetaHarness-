@@ -34,10 +34,9 @@ from .codex import (
     AgentCommittedError,
     CodexAgent,
     build_agent_environment,
-    build_mismatch_retry_addendum,
     classify_codex_failure,
-    deferred_verify_dependency,
 )
+from .protocol import build_mismatch_retry_addendum, deferred_verify_dependency
 from .events import extract_final, extract_usage, parse_event
 from .runtime import CodexRuntimeError, prepare_codex_home
 

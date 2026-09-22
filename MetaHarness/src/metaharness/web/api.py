@@ -43,7 +43,7 @@ from ..models import (
 )
 from ..planning_v2 import V2PlanParseError, step_contract_path, validate_implementation_bundle
 from ..profiles import ProfileError, profiles_for_config, safe_profile_metadata
-from ..run_options import RunOptions, RunOptionsError, read_run_options_with_sha256
+from ..run_options import RunOptions, RunOptionsError, read_run_options_for_state
 from ..state import RunStateStore
 from ..step_ids import STEP_ID_PATTERN, STEP_ID_RE
 from ..usage import (
@@ -874,11 +874,7 @@ def approve_run(
         if config is None or not isinstance(step_profiles, Mapping) or not isinstance(final_reviewer_profile, str):
             raise WebAPIError(400, "step profiles and final_reviewer_profile are required")
         try:
-            snapshot, _ = read_run_options_with_sha256(
-                directory,
-                expected_sha256=state.get("run_options_sha256")
-                if isinstance(state.get("run_options_sha256"), str) else None,
-            )
+            snapshot, _ = read_run_options_for_state(directory, state)
         except RunOptionsError as exc:
             raise WebAPIError(409, "run options are invalid") from exc
         # A semantic reviser or check-repair field never enables a pipeline

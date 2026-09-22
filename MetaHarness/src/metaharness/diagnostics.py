@@ -29,7 +29,6 @@ from .orchestration.pipeline_v2 import (
     implementation_steps_dir,
     review_dir,
     semantic_revision_dir,
-    step_dir,
 )
 from .run_options import (
     RunOptionsError,

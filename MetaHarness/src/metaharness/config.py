@@ -324,17 +324,6 @@ def _profile_endpoint(profile: ModelProfile) -> LLMEndpointConfig:
     )
 
 
-def _profile_agent(profile: ModelProfile) -> AgentConfig:
-    if profile.driver is not ProfileDriver.CODEX:
-        raise ConfigError(f"profile {profile.id!r} is not a Codex profile")
-    return AgentConfig(
-        model=profile.model,
-        effort=profile.effort or AgentConfig.effort,
-        sandbox=profile.sandbox or AgentConfig.sandbox,
-        timeout_seconds=profile.timeout_seconds,
-    )
-
-
 def _model_profiles(
     data: Mapping[str, Any],
 ) -> dict[str, ModelProfile]:
@@ -834,6 +823,16 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         mode=publish_mode,
     )
     if (
+        publish.enabled
+        and publish.mode == PublishMode.RUN_BRANCH.value
+        and publish.remote != repository.remote
+    ):
+        # Run-branch publication is the reviewed candidate already pushed to
+        # repository.remote; it never pushes anything to another remote.
+        raise ConfigError(
+            "publish.remote must equal repository.remote when publish.mode = 'run-branch'"
+        )
+    if (
         github.enabled
         and github.pull_request_mode == "create"
         and (
@@ -876,16 +875,10 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     repair_default = ui_data.get("default_repair_profile")
     if repair_default is not None:
         repair_default = _check_default(model_profiles, repair_default, ExecutionRole.REPAIR)
-    planner_profile = model_profiles[planner_default]
-    reviewer_profile = model_profiles[reviewer_default]
-    implementer_profile = model_profiles[implementer_default]
-    planner = _profile_endpoint(planner_profile)
-    reviewer = _profile_endpoint(reviewer_profile)
-    agent = (
-        _profile_agent(implementer_profile)
-        if implementer_profile.driver is ProfileDriver.CODEX
-        else AgentConfig()
-    )
+    # The default planner and reviewer are text endpoints; every selected
+    # profile is validated again against its role when a run is prepared.
+    _profile_endpoint(model_profiles[planner_default])
+    _profile_endpoint(model_profiles[reviewer_default])
 
     context_data = _table(expanded, "context")
     context = ContextConfig(
@@ -942,7 +935,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     if "checks" in expanded:
         raise ConfigError("unsupported configuration key 'checks'; use [[check_catalog]]")
     configured_catalog = _checks(expanded.get("check_catalog", []), catalogue=True)
-    checks = configured_catalog
     default_check_ids = _string_array(
         expanded, "default_check_ids",
         tuple(
@@ -962,15 +954,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     codex_runtime = _codex_runtime(
         expanded, config_dir, required=has_explicit_codex
     )
-    if implementer_profile.driver is ProfileDriver.CODEX:
-        agent = AgentConfig(
-            provider=agent.provider,
-            model=agent.model,
-            effort=agent.effort,
-            sandbox=agent.sandbox,
-            timeout_seconds=agent.timeout_seconds,
-            env_allowlist=codex_runtime.env_allowlist,
-        )
     claude_runtime = _claude_runtime(
         expanded, config_dir, required=has_explicit_claude
     )
@@ -1017,10 +1000,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         runs_root=runs_root,
         worktrees_root=worktrees_root,
         require_clean_base=require_clean_base,
-        planner=planner,
-        reviewer=reviewer,
         context=context,
-        agent=agent,
         check_catalog=configured_catalog,
         default_check_ids=tuple(default_check_ids),
         max_diff_bytes=max_diff_bytes,

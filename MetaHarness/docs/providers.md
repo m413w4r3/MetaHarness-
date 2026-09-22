@@ -21,7 +21,7 @@ The required response value is:
 choices[0].message.content
 ```
 
-V0 deliberately does not require JSON output, a `system` role, or a
+The text protocol deliberately does not require JSON output, a `system` role, or a
 `response_format` field. Structured Outputs are intentionally unused so the
 planner and reviewer have the same wire contract on every backend.
 

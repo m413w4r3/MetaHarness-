@@ -112,13 +112,13 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.repo, (directory / "../AutoWork").resolve())
         self.assertEqual(config.runs_root, (directory / "../MetaHarness-runs").resolve())
-        self.assertEqual(config.planner.base_url, "https://planner.example")
-        self.assertEqual(config.planner.model, "planner-model")
-        self.assertEqual(config.planner.extra_body["nested"]["label"], "nested-value")
+        self.assertEqual(config.model_profiles[config.ui.default_planner_profile].base_url, "https://planner.example")
+        self.assertEqual(config.model_profiles[config.ui.default_planner_profile].model, "planner-model")
+        self.assertEqual(config.model_profiles[config.ui.default_planner_profile].extra_body["nested"]["label"], "nested-value")
         self.assertEqual(config.context.locator_argv[0], "ctx")
         self.assertEqual(config.check_catalog[0].argv, ("make", "test"))
-        self.assertEqual(config.planner.api_key_env, "META_PLANNER_API_KEY")
-        self.assertEqual(config.agent.env_allowlist, (
+        self.assertEqual(config.model_profiles[config.ui.default_planner_profile].api_key_env, "META_PLANNER_API_KEY")
+        self.assertEqual(config.codex_runtime.env_allowlist, (
             "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR",
             "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
         ))
@@ -161,6 +161,28 @@ class ConfigTests(unittest.TestCase):
                         config = load_config(path)
                         self.assertTrue(config.publish.enabled)
                         self.assertEqual(config.publish.mode, "run-branch")
+
+    def test_run_branch_publication_uses_the_candidate_staging_remote(self) -> None:
+        # Run-branch publication is the reviewed candidate already pushed to
+        # repository.remote; another publish remote would claim a push that
+        # never happened.
+        cases = (
+            ('[repository]\nremote = "origin"\n\n[publish]\nenabled = true\n'
+             'remote = "upstream"\nmode = "run-branch"\n', True),
+            ('[repository]\nremote = "origin"\n\n[publish]\nenabled = true\n'
+             'remote = "origin"\nmode = "run-branch"\n', False),
+            ('[repository]\nremote = "origin"\n\n[publish]\nenabled = true\n'
+             'remote = "upstream"\nmode = "fast-forward-base"\n', False),
+        )
+        for suffix, invalid in cases:
+            with self.subTest(suffix=suffix):
+                with tempfile.TemporaryDirectory() as directory_name:
+                    path = self.write_config(Path(directory_name), VALID_CONFIG + suffix)
+                    if invalid:
+                        with self.assertRaisesRegex(ConfigError, "publish.remote must equal repository.remote"):
+                            load_config(path)
+                    else:
+                        load_config(path)
 
     def test_planning_protocol_defaults_to_v2_and_rejects_other_versions(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
@@ -281,7 +303,7 @@ class ConfigTests(unittest.TestCase):
         os.environ["META_PLANNER_MODEL"] = "model-${META_NESTED}"
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name)))
-        self.assertEqual(config.planner.model, "model-${META_NESTED}")
+        self.assertEqual(config.model_profiles[config.ui.default_planner_profile].model, "model-${META_NESTED}")
 
     def test_endpoint_urls_are_validated_at_load(self) -> None:
         for base_url, endpoint_path, message in (

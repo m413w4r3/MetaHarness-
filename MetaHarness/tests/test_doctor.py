@@ -217,6 +217,21 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse(record["has_key"])
         self.assertEqual(self.bridge.requests, [("GET", "/health", None)])
 
+    def test_no_codex_profile_skips_every_codex_probe(self) -> None:
+        path = self.config()
+        text = path.read_text(encoding="utf-8").replace(
+            'driver = "codex"\nmodel = "luna"\neffort = "high"\nsandbox = "workspace-write"',
+            f'driver = "external"\nmodel = "worker"\nargv = [{sys.executable!r}, "-c", "pass"]',
+        )
+        self.assertIn('driver = "external"', text)
+        path.write_text(text, encoding="utf-8")
+        (self.bin / "codex").unlink()
+        code, out, err = self.doctor(path)
+        self.assertEqual(code, 0, err)
+        self.assertIn("codex: no codex profile configured", out)
+        self.assertNotIn("codex binary", out + err)
+        self.assertFalse(self.record.exists())
+
     def test_invalid_secret_is_reported_without_its_value(self) -> None:
         code, out, err = self.doctor(self.config(secret="has space inside"))
         self.assertEqual(code, 1)

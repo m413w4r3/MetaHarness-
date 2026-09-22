@@ -25,6 +25,7 @@ from .models import (
     ImplementationStep,
     ModelProfile,
     CheckConfig,
+    PlanDecision,
     PlanningConfig,
     TaskPlanV2,
     profile_driver_name,
@@ -35,7 +36,6 @@ from .prompt_contracts import (
     payload_for_rendered_request,
     write_prompt_diagnostics,
 )
-from .planning import PlanDecision, PlanParseError
 from .result import atomic_write_text
 from .step_ids import LAST_STEP_ID, MAX_STEPS, STEP_ID_RE, step_ids
 from .usage import PLANNER_USAGE_ARTIFACT, completion_usage, write_usage_artifact
@@ -62,6 +62,10 @@ _ENVELOPE_INLINE = frozenset({"STATUS", "TITLE", "EXECUTION_MODE", "STEP_COUNT",
 _ENVELOPE_SECTIONS = frozenset({"OBJECTIVE", "CONSTRAINTS", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS", "REQUIRED_CHECKS"})
 _STEP_INLINE = frozenset({"TITLE", "IMPLEMENTER_PROFILE", "DEPENDS_ON"})
 _STEP_SECTIONS = frozenset({"OBJECTIVE", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN"})
+
+
+class PlanParseError(ValueError):
+    """A planner answer was received but cannot be interpreted unambiguously."""
 
 
 class V2PlanParseError(PlanParseError):
@@ -859,7 +863,7 @@ def build_planner_prompt_v2(*args: Any, **kwargs: Any) -> str:
     return build_planner_payload_v2(*args, **kwargs).rendered
 
 
-# Diagnostic target, not a parser gate: an AW-002-sized repair request must
+# Diagnostic target, not a parser gate: a typical repair request must
 # stay under it because duplicated evidence was removed, never by truncating
 # the SPEC, the reviewer result, the approved scope or the required checks.
 REPAIR_PLANNER_INLINE_TARGET_BYTES = 96 * 1024
@@ -1200,8 +1204,8 @@ def validate_implementation_bundle(
     """Validate the immutable v2 bundle and every contract hash it declares.
 
     With *expected_step_ids*, the bundle must declare exactly those steps in
-    that order.  Contracts are read from the canonical per-step layout only;
-    the P20 ``steps/Sxx.contract.md`` layout is never executed.
+    that order.  Contracts are read from the canonical per-step layout
+    ``steps/Sxx/contract.md`` only.
     """
 
     target = Path(directory).expanduser().resolve()
@@ -1316,7 +1320,7 @@ class TextCompletionClient(Protocol):
 
 
 class PlannerV2:
-    """Standalone v2 planner entry point; it never invokes P17 recommender."""
+    """Standalone v2 planner entry point; it never invokes the profile recommender."""
 
     def __init__(self, client: TextCompletionClient, *, implementer_ids: frozenset[str], reviewer_ids: frozenset[str], implementer_profiles: Sequence[ModelProfile] = (), reviewer_profiles: Sequence[ModelProfile] = (), repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None, check_catalog: Sequence[CheckConfig] = (), default_check_ids: Sequence[str] = (), prompt_budget_bytes: int = 0):
         self.client = client

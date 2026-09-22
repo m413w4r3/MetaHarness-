@@ -14,8 +14,8 @@ locator) goes through :func:`run_bounded`:
   so a lingering background child cannot modify the worktree after the
   harness has taken its evidence snapshot.
 
-A descendant that deliberately creates a new session escapes the group; V0
-does not use cgroups and documents this limitation.
+A descendant that deliberately creates a new session escapes the group;
+MetaHarness does not use cgroups and documents this limitation.
 """
 
 from __future__ import annotations

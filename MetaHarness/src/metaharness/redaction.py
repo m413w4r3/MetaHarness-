@@ -38,11 +38,7 @@ def config_secret_values(
 ) -> tuple[str, ...]:
     """Secrets referenced by all configured execution profiles."""
 
-    names = [
-        config.planner.api_key_env,
-        config.reviewer.api_key_env,
-        config.github.api_key_env,
-    ]
+    names = [config.github.api_key_env]
     names.extend(
         profile.api_key_env for profile in config.model_profiles.values()
     )

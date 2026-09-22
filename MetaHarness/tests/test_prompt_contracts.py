@@ -14,7 +14,6 @@ from metaharness.prompt_contracts import (
     build_semantic_revision_payload,
     write_prompt_diagnostics,
 )
-from metaharness.review import build_reviewer_prompt
 from metaharness.orchestration.revision import EffectivePlanView
 
 
@@ -32,9 +31,6 @@ class PromptContractTests(unittest.TestCase):
                 self.assertLess((prompts / name).stat().st_size, limit)
 
     def test_reviewer_is_independent_of_runtime_cycle_and_agent_names(self) -> None:
-        prompt = build_reviewer_prompt(
-            "SPEC", "PLAN", "CONTEXT", "GATE", "FILES", "DIFF", "CHECKS", "REPORT"
-        ).casefold()
         template = (
             Path(__file__).resolve().parents[1]
             / "src" / "metaharness" / "prompts" / "reviewer.txt"
@@ -48,7 +44,6 @@ class PromptContractTests(unittest.TestCase):
         for forbidden in ("iteration 1", "iteration 2", "c02", "claude", "luna"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, template)
-                self.assertNotIn(forbidden, prompt)
                 self.assertNotIn(forbidden, v2_prompt)
 
     def test_reviser_delegates_the_authoritative_gate_to_metaharness(self) -> None:
@@ -180,7 +175,7 @@ class PromptContractTests(unittest.TestCase):
             diff_sha256="hash",
             diffstat="1 file",
             bounded_diff_excerpt="bounded excerpt",
-            cycle_summary="C01 passed",
+            cycle_summary="cycle 001 passed",
         )
         self.assertEqual(
             [planner.role, implementer.role, repair.role, reviser.role, reviewer.role],

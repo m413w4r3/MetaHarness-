@@ -10,11 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.llm.chat import LLMError
 from metaharness.models import (
-    AgentConfig,
     ContextConfig,
     ExecutionRole,
     HarnessConfig,
-    LLMEndpointConfig,
     ModelProfile,
     ProfileDriver,
     SelectionMode,
@@ -157,10 +155,7 @@ class OrchestratorRecommendationTests(unittest.TestCase):
             runs_root=root / "runs",
             worktrees_root=root / "worktrees",
             require_clean_base=True,
-            planner=LLMEndpointConfig("https://planner.invalid", "/chat", "planner"),
-            reviewer=LLMEndpointConfig("https://reviewer.invalid", "/chat", "reviewer"),
             context=ContextConfig(),
-            agent=AgentConfig(),
             check_catalog=(),
             allow_no_required_checks=True,
             ui=UIConfig(

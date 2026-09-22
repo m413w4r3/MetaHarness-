@@ -27,7 +27,7 @@ from .agent.base import (
     AgentScopeError,
 )
 from .agent.diagnostics import write_token_diagnostics
-from .agent.codex import (
+from .agent.protocol import (
     build_mismatch_retry_addendum,
     contract_mismatch_explanation,
     deferred_verify_dependency,
@@ -77,8 +77,6 @@ from .gitops import (
     candidate_tree_sha,
     changed_paths_between_trees,
     commit_step_tree,
-    commit_repair_tree,
-    commit_revision_tree,
     create_run_worktree,
     current_head,
     delete_run_branch,
@@ -152,8 +150,8 @@ from .models import (
     RunStatus,
     profile_driver_name,
 )
-from .planning import PlanParseError
 from .planning_v2 import (
+    PlanParseError,
     PlannerV2,
     RepairPlannerV2,
     TaskPlanV2,
@@ -216,7 +214,7 @@ from .run_options import (
     RunOptionsError,
     effective_repair_scope_policy,
     effective_run_config,
-    read_run_options_with_sha256,
+    read_run_options_for_state,
     write_run_options,
 )
 from .orchestration.shared import (
@@ -245,7 +243,6 @@ from .orchestration.shared import (
     _bounded_report,
     _bounded_v2_report,
     _check_payload,
-    _commit_subject,
     _git_ownership,
     _git_ownership_payload,
     _is_object_id,
@@ -253,7 +250,6 @@ from .orchestration.shared import (
     _new_status_lines,
     _ownership_violations,
     _paths_detail,
-    _read_bounded_text,
     _read_json_artifact,
     _record_failure_tree,
     _repair_checks_payload,
@@ -304,7 +300,6 @@ from .orchestration.pipeline_v2 import (
     check_repair_attempt_dir,
     check_repair_dir,
     correction_dir,
-    cycle_record_path,
     gate_dir,
     review_dir,
     semantic_revision_dir,
@@ -939,7 +934,7 @@ class Orchestrator:
             try:
                 fingerprint = profile_execution_fingerprint(
                     profile,
-                    agent_env_allowlist=self.config.agent.env_allowlist,
+                    agent_env_allowlist=self.config.codex_runtime.env_allowlist,
                     codex_home=self.config.codex_runtime.home,
                     claude_config_home=self.config.claude_runtime.home,
                 )
@@ -2143,7 +2138,7 @@ class Orchestrator:
         )
 
     def _review_implementation_correction(
-        self, ctx: PipelineV2Context, cycle: RunCycle,
+        self, ctx: PipelineV2Context, cycle: RunCycle, starting: bool,
     ) -> tuple[CyclePlan, ReviewResult]:
         """Load the previous candidate and reviewer report for direct correction."""
 
@@ -2159,7 +2154,12 @@ class Orchestrator:
             raise ResumeIntegrityError(
                 f"cycle {previous:03d} review did not route direct implementation correction"
             )
-        if current_head(ctx.info.worktree) != candidate["commit_sha"]:
+        # The correction starts exactly on the reviewed candidate.  Once its
+        # green tree is accepted, HEAD is the single accepted child of it.
+        head = current_head(ctx.info.worktree)
+        if head != candidate["commit_sha"] and (
+            starting or commit_parents(ctx.info.worktree, head) != (candidate["commit_sha"],)
+        ):
             raise ResumeIntegrityError(
                 f"cycle {cycle.number:03d} does not start from the reviewed candidate"
             )
@@ -2969,6 +2969,22 @@ class Orchestrator:
     ) -> RunResult:
         """Publish the reviewed candidate of cycle *number* after its PASS."""
 
+        # Only the exact SHA a durable reviewer PASS names is ever published.
+        evidence = candidate_evidence(ctx.run_dir, number)
+        review = (
+            _accepted_review(review_dir(ctx.run_dir, number), evidence, candidate["commit_sha"])
+            if evidence is not None and evidence.staged_tree_sha == candidate["tree_sha"]
+            else None
+        )
+        if (
+            review is None
+            or review.verdict is not ReviewVerdict.PASS
+            or review.route is not ReviewRoute.NONE
+        ):
+            raise PipelineFailure(
+                "REVIEW_AUTHORITY_MISSING",
+                "no accepted reviewer PASS names the candidate commit",
+            )
         approved_tree = candidate["tree_sha"]
         self._cycle_update(store, number, status="approved")
         store.update(
@@ -3399,7 +3415,7 @@ class Orchestrator:
             if auth_failure:
                 reason = AGENT_START_FAILED
                 raise StepExecutionFailure(
-                    reason, step_id, "Codex authentication failed", **failed,
+                    reason, step_id, "worker authentication failed", **failed,
                     tree_after=_safe_candidate_tree(worktree),
                 )
             reason = result.exit_reason or AGENT_RUNTIME_FAILED
@@ -3779,9 +3795,9 @@ class Orchestrator:
     ) -> ReviewResult:
         """The single reviewer evidence assembly of every cycle.
 
-        The gate payload, the parse argument and the later commit gate all
-        use the same actual ``evidence.deterministic_passed``; the call is
-        always a fresh conversation.
+        The required-check summary, the parse argument and the later commit
+        gate all use the same actual ``evidence.deterministic_passed``; the
+        call is always a fresh conversation.
         """
 
         candidate_sha = candidate_commit.get("commit_sha")
@@ -3790,12 +3806,6 @@ class Orchestrator:
                 "candidate commit SHA is missing before reviewer"
             )
 
-        gate = _json_text({
-            "deterministic_passed": evidence.deterministic_passed,
-            "required_check_ids": list(evidence.required_check_ids),
-            "failures": list(evidence.failures),
-            "staged_tree_sha": evidence.staged_tree_sha,
-        })
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         code_evidence = _review_code_evidence(
             repository_reference=repository_reference,
@@ -3886,11 +3896,9 @@ class Orchestrator:
             },
         )
         review = reviewer.review(
-            spec, input.plan_text, "", gate, "", "", "", "NONE",
+            prompt_payload,
             deterministic_passed=evidence.deterministic_passed,
             artifacts_dir=artifacts_dir,
-            prompt_payload=prompt_payload,
-            iteration=input.iteration,
         )
         reviewer_usage = getattr(reviewer, "last_usage", None)
         if reviewer_usage is None:
@@ -4544,11 +4552,7 @@ class Orchestrator:
         except (OSError, ValueError) as exc:
             raise ResumeError(f"run state is unreadable: {exc}") from exc
         try:
-            options, _ = read_run_options_with_sha256(
-                run_dir,
-                expected_sha256=state.get("run_options_sha256")
-                if isinstance(state.get("run_options_sha256"), str) else None,
-            )
+            options, _ = read_run_options_for_state(run_dir, state)
             self._run_options = options
             self._effective_repair_scope = effective_repair_scope_policy(options)
             self.config = effective_run_config(self.config, options)
@@ -4698,11 +4702,7 @@ class Orchestrator:
         if not eligibility.eligible:
             refuse(eligibility.reason or "run is not eligible for plan recovery")
         try:
-            options, _ = read_run_options_with_sha256(
-                run_dir,
-                expected_sha256=state.get("run_options_sha256")
-                if isinstance(state.get("run_options_sha256"), str) else None,
-            )
+            options, _ = read_run_options_for_state(run_dir, state)
             # The run's frozen options decide the policies and catalogues,
             # never the current defaults.
             config = effective_run_config(self.config, options)

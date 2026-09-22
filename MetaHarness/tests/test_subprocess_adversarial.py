@@ -1,7 +1,6 @@
 """Codex, deterministic checks and the context locator under hostile processes."""
 
 import json
-import os
 import stat
 import subprocess
 import sys
@@ -24,7 +23,6 @@ from metaharness.models import (  # noqa: E402
     CheckConfig,
     ContextConfig,
     HarnessConfig,
-    LLMEndpointConfig,
 )
 from metaharness.validation import ValidationError, run_checks  # noqa: E402
 from tests.proc_support import process_is_gone, read_pid  # noqa: E402
@@ -143,17 +141,13 @@ class CodexProcessTests(TempRepoCase):
 
 class CheckProcessTests(TempRepoCase):
     def config(self, *checks: CheckConfig) -> HarnessConfig:
-        endpoint = LLMEndpointConfig("http://127.0.0.1:9", "/c", "m")
         return HarnessConfig(
             repo=self.repo,
             base_ref="HEAD",
             runs_root=self.root / "runs",
             worktrees_root=self.root / "worktrees",
             require_clean_base=True,
-            planner=endpoint,
-            reviewer=endpoint,
             context=ContextConfig(),
-            agent=AgentConfig(),
             check_catalog=checks,
         )
 

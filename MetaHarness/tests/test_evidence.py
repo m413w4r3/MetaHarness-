@@ -11,11 +11,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from metaharness.evidence import bounded_semantic_diff, collect_evidence  # noqa: E402
 from metaharness.gitops import current_head, index_tree_sha, stage_all  # noqa: E402
 from metaharness.models import (  # noqa: E402
-    AgentConfig,
     CheckConfig,
     ContextConfig,
     HarnessConfig,
-    LLMEndpointConfig,
 )
 from metaharness.validation import CheckResult  # noqa: E402
 
@@ -54,17 +52,13 @@ class EvidenceTests(unittest.TestCase):
         return (sys.executable, "-c", code)
 
     def config(self, checks: tuple[CheckConfig, ...] = (), max_diff_bytes: int = 400_000) -> HarnessConfig:
-        endpoint = LLMEndpointConfig("https://example.invalid", "/chat", "model")
         return HarnessConfig(
             repo=self.repo,
             base_ref=self.base_sha,
             runs_root=self.repo.parent / "runs",
             worktrees_root=self.repo.parent / "worktrees",
             require_clean_base=True,
-            planner=endpoint,
-            reviewer=endpoint,
             context=ContextConfig(),
-            agent=AgentConfig(),
             check_catalog=checks,
             max_diff_bytes=max_diff_bytes,
         )

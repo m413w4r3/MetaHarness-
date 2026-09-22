@@ -407,7 +407,6 @@ def collect_evidence(
     # tree written below is the exact tree offered to the reviewer.
     stage_all(root)
     changed_files = staged_changed_files(root)
-    changes = staged_changes(root)
     diff = staged_diff(root)
     tree_sha = index_tree_sha(root)
 

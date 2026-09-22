@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import stat
 import subprocess
 import sys
@@ -28,11 +27,9 @@ from metaharness.claude.runtime import (  # noqa: E402
 )
 from metaharness.config import load_config  # noqa: E402
 from metaharness.models import (  # noqa: E402
-    AgentConfig,
     ClaudeRuntimeConfig,
     ContextConfig,
     HarnessConfig,
-    LLMEndpointConfig,
     ModelProfile,
     ProfileDriver,
     ExecutionRole,
@@ -63,10 +60,7 @@ class ClaudeTests(unittest.TestCase):
             runs_root=self.root / "runs",
             worktrees_root=self.root / "worktrees",
             require_clean_base=True,
-            planner=LLMEndpointConfig("https://planner.invalid", "/v1", "planner"),
-            reviewer=LLMEndpointConfig("https://reviewer.invalid", "/v1", "reviewer"),
             context=ContextConfig(always_files=()),
-            agent=AgentConfig(),
             check_catalog=(),
             allow_no_required_checks=True,
             codex_runtime=CodexRuntimeConfig(self.root / "codex-home"),

@@ -89,72 +89,6 @@ def _require_text(name: str, value: object) -> str:
     return value
 
 
-def build_reviewer_prompt(
-    spec: str,
-    plan: str,
-    context: str,
-    gate: str,
-    changed_files: str,
-    diff: str,
-    checks: str,
-    agent_report: str,
-    *,
-    repository: str = "",
-    step_reports: str = "",
-    revision_report: str = "",
-    repository_state: str = "",
-    candidate_commit: str = "",
-    iteration: int = 1,
-    cycle_history: str = "",
-    deferred_mismatches: str = "",
-    code_evidence: str | None = None,
-    template: str | None = None,
-) -> str:
-    """Build a standalone review request through the same modern payload path.
-
-    The orchestration pipeline supplies a pre-built :class:`PromptPayload`.
-    This helper is intentionally only an adapter for callers that still have
-    the older positional evidence shape; it does not define another template.
-    """
-
-    effective_diff = _require_text("diff", diff)
-    effective_code = (
-        _require_text("code_evidence", code_evidence)
-        if code_evidence is not None else effective_diff
-    )
-    cycle_parts = [
-        _require_text("context", context),
-        _require_text("repository_state", repository_state),
-        _require_text("cycle_history", cycle_history),
-        _require_text("step_reports", step_reports),
-        _require_text("revision_report", revision_report),
-        _require_text("deferred_mismatches", deferred_mismatches),
-        _require_text("agent_report", agent_report),
-    ]
-    cycle_summary = "\n\n".join(part for part in cycle_parts if part and part != "NONE") or "NONE"
-    candidate_identity = _require_text("candidate_commit", candidate_commit) or "UNKNOWN"
-    checks_text = _require_text("checks", checks)
-    gate_text = _require_text("gate", gate)
-    required_checks = checks_text or gate_text or "NONE"
-    repository_text = _require_text("repository", repository)
-    if repository_text and gate_text:
-        repository_text += "\n" + gate_text
-    return build_final_review_payload(
-        spec=_require_text("spec", spec),
-        compact_approved_plan=_require_text("plan", plan),
-        required_checks_summary=required_checks,
-        immutable_candidate_identity=candidate_identity,
-        changed_files=_require_text("changed_files", changed_files),
-        diff_sha256=hashlib.sha256(effective_diff.encode("utf-8", errors="replace")).hexdigest(),
-        diffstat="NONE",
-        bounded_diff_excerpt=effective_code,
-        cycle_summary=cycle_summary,
-        repository_reference=repository_text,
-        template=_require_text("template", template) if template is not None else None,
-        budget_bytes=0,
-    ).rendered
-
-
 def _normalise_scalar(value: str) -> str:
     return " ".join(value.strip().split()).casefold()
 
@@ -464,80 +398,35 @@ def persist_review_artifacts(
 
 
 class Reviewer:
-    """Run one reviewer request.
+    """Run one reviewer request built by :func:`build_final_review_payload`.
 
-    The optional format repair is retained for the standalone API.  The V0
-    orchestrator turns it off because it must not create an automatic repair
-    loop.
+    The optional single format repair is off in the orchestrator, which must
+    never create an automatic repair loop.
     """
 
     def __init__(
         self,
         client: TextCompletionClient,
         *,
-        template: str | None = None,
         allow_format_repair: bool = True,
     ):
         self.client = client
-        self.template = template
         self.allow_format_repair = allow_format_repair
         self.last_conversation = None
         self.last_usage: dict[str, Any] | None = None
 
     def review(
         self,
-        spec: str,
-        plan: str,
-        context: str,
-        gate: str,
-        changed_files: str,
-        diff: str,
-        checks: str,
-        agent_report: str,
+        prompt_payload: PromptPayload,
         *,
         deterministic_passed: bool = True,
         artifacts_dir: str | Path | None = None,
-        repository: str = "",
-        step_reports: str = "",
-        revision_report: str = "",
-        repository_state: str = "",
-        candidate_commit: str = "",
-        iteration: int = 1,
-        cycle_history: str = "",
-        deferred_mismatches: str = "",
-        code_evidence: str | None = None,
-        prompt_payload: PromptPayload | None = None,
         diagnostics_filename: str = "prompt.diagnostics.json",
     ) -> ReviewResult:
-        if prompt_payload is not None and not isinstance(prompt_payload, PromptPayload):
+        if not isinstance(prompt_payload, PromptPayload):
             raise TypeError("prompt_payload must be a PromptPayload")
-        request = (
-            prompt_payload.rendered
-            if prompt_payload is not None
-            else build_reviewer_prompt(
-                spec,
-                plan,
-                context,
-                gate,
-                changed_files,
-                diff,
-                checks,
-                agent_report,
-                repository=repository,
-                step_reports=step_reports,
-                revision_report=revision_report,
-                repository_state=repository_state,
-                candidate_commit=candidate_commit,
-                iteration=iteration,
-                cycle_history=cycle_history,
-                deferred_mismatches=deferred_mismatches,
-                code_evidence=code_evidence,
-                template=self.template,
-            )
-        )
-        diagnostics_payload = prompt_payload or payload_for_rendered_request(
-            "final-reviewer", request
-        )
+        request = prompt_payload.rendered
+        diagnostics_payload = prompt_payload
         target = Path(artifacts_dir) if artifacts_dir is not None else None
         encoded_request = request.encode("utf-8")
         # Persist the exchange before parsing: an unparseable or rejected
@@ -605,75 +494,16 @@ class Reviewer:
             persist_review_artifacts(artifacts_dir, request=request, review=review)
         return review
 
-    run = review
-
-
-def run_reviewer(
-    client: TextCompletionClient,
-    spec: str,
-    plan: str,
-    context: str,
-    gate: str,
-    changed_files: str,
-    diff: str,
-    checks: str,
-    agent_report: str,
-    *,
-    deterministic_passed: bool = True,
-    artifacts_dir: str | Path | None = None,
-    template: str | None = None,
-    repository: str = "",
-    step_reports: str = "",
-    revision_report: str = "",
-    repository_state: str = "",
-    candidate_commit: str = "",
-    iteration: int = 1,
-    cycle_history: str = "",
-    deferred_mismatches: str = "",
-    code_evidence: str | None = None,
-) -> ReviewResult:
-    """Functional convenience wrapper around :class:`Reviewer`."""
-
-    return Reviewer(client, template=template).review(
-        spec,
-        plan,
-        context,
-        gate,
-        changed_files,
-        diff,
-        checks,
-        agent_report,
-        deterministic_passed=deterministic_passed,
-        artifacts_dir=artifacts_dir,
-        repository=repository,
-        step_reports=step_reports,
-        revision_report=revision_report,
-        repository_state=repository_state,
-        candidate_commit=candidate_commit,
-        iteration=iteration,
-        cycle_history=cycle_history,
-        deferred_mismatches=deferred_mismatches,
-        code_evidence=code_evidence,
-    )
-
-
-parse_review_result = parse_review
-build_repair_prompt = build_review_repair_prompt
-
 
 __all__ = [
     "ReviewError",
     "ReviewParseError",
     "ReviewResult",
     "Reviewer",
-    "build_repair_prompt",
     "build_review_repair_prompt",
-    "build_reviewer_prompt",
     "build_final_review_payload",
     "ParsedFinding",
     "parse_finding_records",
     "parse_review",
-    "parse_review_result",
     "persist_review_artifacts",
-    "run_reviewer",
 ]

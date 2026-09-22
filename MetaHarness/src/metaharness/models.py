@@ -423,7 +423,8 @@ class PromptBudgetConfig:
 
 @dataclass(frozen=True)
 class AgentConfig:
-    provider: str = "codex"
+    """Codex harness settings derived from one codex ``ModelProfile``."""
+
     model: str = "gpt-5.6-luna"
     effort: str = "high"
     sandbox: str = "workspace-write"
@@ -474,10 +475,6 @@ class CheckConfig:
         return self.name
 
 
-# Public P42 names; retain CheckConfig for the pre-catalogue API.
-CheckCatalogEntry = CheckConfig
-TrustedCheckConfig = CheckConfig
-
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
@@ -519,10 +516,7 @@ class HarnessConfig:
     runs_root: Path
     worktrees_root: Path
     require_clean_base: bool
-    planner: LLMEndpointConfig
-    reviewer: LLMEndpointConfig
     context: ContextConfig
-    agent: AgentConfig
     check_catalog: tuple[CheckConfig, ...]
     max_diff_bytes: int = 400_000
     allow_no_required_checks: bool = False

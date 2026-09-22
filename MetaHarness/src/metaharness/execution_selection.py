@@ -63,7 +63,7 @@ def _selected(config: HarnessConfig, profile_id: str, role: ExecutionRole) -> Se
         config_sha256=profile_execution_fingerprint(
             profile,
             agent_env_allowlist=(
-                tuple(config.agent.env_allowlist)
+                tuple(config.codex_runtime.env_allowlist)
                 if role in {ExecutionRole.IMPLEMENTER, ExecutionRole.REPAIR}
                 else ()
             ),

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import threading
 from typing import Callable
 
@@ -82,7 +81,7 @@ class RunManager:
                 }
                 if planner_profile is not None:
                     kwargs["planner_profile"] = planner_profile
-                if run_options is not None and _supports_run_options(orchestrator.run_text):
+                if run_options is not None:
                     kwargs["run_options"] = run_options
                 orchestrator.run_text(spec, **kwargs)
             except BaseException:
@@ -187,19 +186,6 @@ class RunManager:
                 raise RunResumeNotAllowedError(str(errors[0]))
             raise RunManagerError(failure)
         return selected_run_id
-
-
-def _supports_run_options(method: Callable[..., object]) -> bool:
-    """Keep older embedding/test orchestrators source-compatible."""
-
-    try:
-        parameters = inspect.signature(method).parameters.values()
-    except (TypeError, ValueError):
-        return True
-    return any(
-        parameter.name == "run_options" or parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters
-    )
 
 
 class RunResumeNotAllowedError(RunManagerError):

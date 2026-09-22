@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.config import ConfigError, load_config
 from metaharness.models import (
-    AgentConfig,
     ContextConfig,
     HarnessConfig,
     LLMEndpointConfig,
@@ -26,6 +25,7 @@ from metaharness.models import (
     UIConfig,
 )
 from metaharness.orchestrator import Orchestrator
+from metaharness.run_options import RunOptions
 from metaharness.state import RunStateStore
 from metaharness.web.api import WebAPIError, create_run, validate_spec
 from metaharness.web.run_manager import RunCapacityError, RunManager
@@ -45,10 +45,7 @@ def config_for(root: Path, *, max_active_runs: int = 1) -> HarnessConfig:
         runs_root=root / "runs",
         worktrees_root=root / "worktrees",
         require_clean_base=True,
-        planner=endpoint,
-        reviewer=endpoint,
         context=ContextConfig(),
-        agent=AgentConfig(),
         check_catalog=(),
         allow_no_required_checks=True,
         ui=UIConfig(
@@ -118,7 +115,7 @@ class ManagerP15Tests(unittest.TestCase):
             def __init__(self, _config: HarnessConfig) -> None:
                 pass
 
-            def run_text(self, _spec: str, *, run_id: str, on_created) -> None:
+            def run_text(self, _spec: str, *, run_id: str, on_created, run_options=None) -> None:
                 owner.started.set()
                 on_created(owner.root / "runs" / run_id)
                 if owner.fail:
@@ -181,9 +178,13 @@ class APIP15Tests(unittest.TestCase):
         self.config.runs_root.mkdir()
         root = self.root
 
+        self.received_run_options: list[object] = []
+        received = self.received_run_options
+
         def factory(_config: HarnessConfig):
             class FakeOrchestrator:
-                def run_text(self, spec: str, *, run_id: str, on_created) -> None:
+                def run_text(self, spec: str, *, run_id: str, on_created, run_options=None) -> None:
+                    received.append(run_options)
                     run_dir = root / "runs" / run_id
                     run_dir.mkdir(parents=True, exist_ok=True)
                     (run_dir / "spec.md").write_text(spec, encoding="utf-8")
@@ -200,6 +201,9 @@ class APIP15Tests(unittest.TestCase):
     def test_create_run_valid(self) -> None:
         payload = create_run(self.manager, spec="original\n", run_id="api-one")
         self.assertEqual(payload["ok"], True)
+        # The frozen UI run options always reach the orchestrator.
+        self.assertEqual(len(self.received_run_options), 1)
+        self.assertIsInstance(self.received_run_options[0], RunOptions)
         self.assertEqual(payload["run_id"], "api-one")
         self.assertEqual(payload["location"], "/runs/api-one")
 
@@ -225,7 +229,7 @@ class APIP15Tests(unittest.TestCase):
         root = self.root
 
         class Blocking:
-            def run_text(self, _spec: str, *, run_id: str, on_created) -> None:
+            def run_text(self, _spec: str, *, run_id: str, on_created, run_options=None) -> None:
                 on_created(root / "runs" / run_id)
                 blocker.wait(timeout=2)
 

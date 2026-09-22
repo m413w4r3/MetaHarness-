@@ -69,7 +69,6 @@ def config_with_check_authority(
         raise ValidationError("the run has no check authority")
     authority_ids, catalogue = authority
     selected_ids = authority_ids
-    checks = catalogue
     if requested_check_ids is not None:
         selected_ids = tuple(requested_check_ids)
         if len(set(selected_ids)) != len(selected_ids):
@@ -88,7 +87,6 @@ def config_with_check_authority(
             if check_id not in trusted_ids:
                 raise ValidationError("unknown trusted check ID(s): " + check_id)
             resolved.append(frozen_check)
-        checks = tuple(resolved)
     frozen = dataclasses.replace(
         config,
         check_catalog=catalogue,
