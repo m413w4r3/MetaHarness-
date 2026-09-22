@@ -552,6 +552,21 @@ def _prompt_footprint(run_dir: Path) -> str:
             lines.append(f"| {relative} | {item.size} | {item.sha256 or '—'} | — |")
     if len(lines) == 3:
         lines.append("| (none) | — | — | — |")
+    diagnostics: list[str] = []
+    try:
+        paths = sorted(run_dir.rglob("prompt.diagnostics*.json"))
+    except OSError:
+        paths = []
+    for path in paths:
+        payload = _safe_json_payload(path)
+        if not isinstance(payload, Mapping):
+            continue
+        relative = str(path.relative_to(run_dir))
+        # The payload contains hashes and counts only; retain the exact
+        # section decisions so truncation/omission is visible in diagnostics.
+        diagnostics.append(f"{relative}:\n" + _clean(_json(payload), ()))
+    if diagnostics:
+        lines.extend(("", "Prompt contract diagnostics:", *diagnostics))
     return "\n".join(lines) + "\n"
 
 

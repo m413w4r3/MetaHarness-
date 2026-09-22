@@ -13,6 +13,7 @@ from typing import Iterable, Mapping
 
 from ..gitops import GitError, current_head
 from ..models import AgentConfig
+from ..prompt_contracts import build_implementer_payload
 from ..procutil import run_bounded
 from .base import AgentError, AgentResult
 from .events import extract_final, extract_usage, parse_event
@@ -584,6 +585,7 @@ __all__ = [
     "contract_mismatch_explanation",
     "deferred_verify_dependency",
     "build_implementer_prompt",
+    "build_implementer_payload",
     "build_implementer_step_prompt",
     "build_mismatch_retry_addendum",
     "run_codex",

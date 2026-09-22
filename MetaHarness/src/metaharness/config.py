@@ -26,6 +26,7 @@ from .models import (
     LLMEndpointConfig,
     ModelProfile,
     PlanningConfig,
+    PromptBudgetConfig,
     PublishConfig,
     PublishMode,
     ProfileDriver,
@@ -726,6 +727,25 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         max_check_repair_attempts=check_budget,
     )
 
+    prompt_budget_data = _table(expanded, "prompt_budget")
+    prompt_budget = PromptBudgetConfig(
+        planner_max_bytes=_positive_int(
+            prompt_budget_data, "planner_max_bytes", 160_000, "prompt_budget"
+        ),
+        implementer_max_bytes=_positive_int(
+            prompt_budget_data, "implementer_max_bytes", 120_000, "prompt_budget"
+        ),
+        check_repair_max_bytes=_positive_int(
+            prompt_budget_data, "check_repair_max_bytes", 40_000, "prompt_budget"
+        ),
+        semantic_revision_max_bytes=_positive_int(
+            prompt_budget_data, "semantic_revision_max_bytes", 120_000, "prompt_budget"
+        ),
+        final_review_max_bytes=_positive_int(
+            prompt_budget_data, "final_review_max_bytes", 120_000, "prompt_budget"
+        ),
+    )
+
     repository_data = _table(expanded, "repository")
     repository_remote = _required_string(repository_data, "remote", "repository") if "remote" in repository_data else "origin"
     if "\x00" in repository_remote or any(char.isspace() for char in repository_remote):
@@ -1048,6 +1068,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         workspace_setup=workspace_setup,
         planning=planning,
         revision=revision,
+        prompt_budget=prompt_budget,
         repository=repository,
         publish=publish,
         repository_section_explicit="repository" in expanded,

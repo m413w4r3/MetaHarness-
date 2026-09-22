@@ -24,6 +24,7 @@ from .llm.wire import (
     parse_labeled_document,
 )
 from .models import PlanDecision
+from .prompt_contracts import payload_for_rendered_request, write_prompt_diagnostics
 from .usage import (
     PLANNER_USAGE_ARTIFACT,
     add_usage,
@@ -391,6 +392,11 @@ class Planner:
         # a transport failure still leaves the exact request/response behind.
         if target is not None:
             _atomic_write_text(target / "planner.request.txt", request)
+            write_prompt_diagnostics(
+                target,
+                payload_for_rendered_request("planner", request),
+                filename="prompt.diagnostics.planner.json",
+            )
         first_result = self.client.complete(request)
         first_raw = _completion_text(first_result)
         usages = [normalize_usage(completion_usage(first_result))]
@@ -405,6 +411,11 @@ class Planner:
             repair_request = build_repair_prompt(first_raw, first_error)
             if target is not None:
                 _atomic_write_text(target / "planner.repair.request.txt", repair_request)
+                write_prompt_diagnostics(
+                    target,
+                    payload_for_rendered_request("planner-format-repair", repair_request),
+                    filename="prompt.diagnostics.planner-repair.json",
+                )
             repaired_result = self.client.complete(repair_request)
             repaired_raw = _completion_text(repaired_result)
             usages.append(normalize_usage(completion_usage(repaired_result)))

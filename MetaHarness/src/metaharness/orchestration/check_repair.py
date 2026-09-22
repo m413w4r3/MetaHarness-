@@ -36,6 +36,7 @@ from ..evidence import (
 from ..agent.base import AgentExecutor, AgentRunRequest, AgentRunResult
 from ..gitops import tracked_files_in_tree
 from ..planning_v2 import TaskPlanV2
+from ..prompt_contracts import build_check_repair_payload, write_prompt_diagnostics
 from ..resume import (
     ResumeIntegrityError,
     ResumePhase,
@@ -369,46 +370,34 @@ def _check_repair_prompt(
     added_paths: Sequence[str] = (),
     scope_source: str = "",
     legacy: bool = False,
+    candidate_identity: str = "",
+    budget_bytes: int = 40_000,
+    diagnostics_dir: str | Path | None = None,
 ) -> str:
     """Build the bounded prompt for one automatic check-repair pass."""
 
-    if legacy:
-        note = (
-            "This is the second and final bounded automatic check-repair pass.\n\n"
-            "No mutable-scope expansion was required.\n\n"
-            "Correct the remaining deterministic failures inside the exact existing\n"
-            "mutable scope.\n\n"
-            "Do not repeat unrelated changes from the previous repair.\n"
-            if scope_source == _SAME_SCOPE_RETRY_SOURCE else ""
+    template = (_PROMPTS_DIR / "check_repair.txt").read_text(encoding="utf-8")
+    failed_ids = _soft_check_failures(evidence)
+    failed_evidence = _check_repair_problem_context(evidence)
+    if legacy and scope_source == _SAME_SCOPE_RETRY_SOURCE:
+        failed_evidence += (
+            "\n\nThis is the final bounded same-scope retry. Preserve the exact "
+            "existing mutable scope and do not repeat unrelated changes.\n"
         )
-        return "\n".join([
-            "You are Claude Code correcting a deterministic check failure.", "",
-            "Inspect the current worktree and correct only the reported problem in the",
-            "listed files. Preserve correct behavior. Do not redesign the feature, broaden",
-            "the scope, weaken a test, or edit generated/ignored artifacts to hide a",
-            "failure.", "", "<PROBLEM>", _check_repair_problem_context(evidence),
-            "</PROBLEM>", "", "<FILES CONCERNED>", changed_files,
-            "</FILES CONCERNED>", "", "<EFFECTIVE MUTABLE SCOPE>",
-            _json_text(mutable_scope), "</EFFECTIVE MUTABLE SCOPE>", "", note,
-            "", "If the correction needs a path outside EFFECTIVE MUTABLE SCOPE:",
-            "", "- DO NOT EDIT that path;",
-            "- DO NOT create a workaround in an authorized path;",
-            "- finish without changing outside-scope paths;",
-            "- emit exactly the structured META SCOPE REQUEST v1 block required by the",
-            "  harness, naming the paths and the failed-check evidence.", "",
-        ])
-
-    values = {
-        "{{SPEC}}": spec,
-        "{{CHECK_DETAILS}}": _check_repair_problem_context(evidence),
-        "{{CHANGED_FILES}}": changed_files,
-        "{{MUTABLE_SCOPE}}": _json_text(mutable_scope),
-        "{{CONTRACT_INVARIANTS}}": approved_contract_index,
-    }
-    template = (_PROMPTS_DIR / "check_repair.txt").read_text(
-        encoding="utf-8"
+    payload = build_check_repair_payload(
+        spec=spec,
+        failed_check_ids="\n".join(failed_ids) or "NONE",
+        failed_check_evidence=failed_evidence,
+        compact_contract_invariants=approved_contract_index,
+        changed_files=changed_files,
+        mutable_scope=_json_text(mutable_scope),
+        candidate_identity=candidate_identity,
+        template=template,
+        budget_bytes=budget_bytes,
     )
-    return _render_revision_template(template, values, name="check_repair")
+    if diagnostics_dir is not None:
+        write_prompt_diagnostics(diagnostics_dir, payload)
+    return payload.rendered
 
 _AUTO_BOUNDED_SOURCE = "auto-bounded failing-test evidence"
 

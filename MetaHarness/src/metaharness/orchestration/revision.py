@@ -54,6 +54,10 @@ from ..models import (
     RunStatus,
 )
 from ..planning_v2 import TaskPlanV2
+from ..prompt_contracts import (
+    build_semantic_revision_payload,
+    write_prompt_diagnostics,
+)
 from ..redaction import redact
 from ..result import atomic_write_text
 from ..resume import ResumePhase
@@ -214,24 +218,19 @@ def _revision_execution_anomalies(results: list[dict[str, Any]]) -> str:
 
 
 def _revision_contract_index(plan: TaskPlanV2) -> str:
-    """Render only the approved behavioral and mutation contract index."""
+    """Render a compact deterministic index of approved step contracts."""
 
-    return _json_text([
-        {
-            "id": step.id,
-            "title": step.title,
-            "depends_on": step.depends_on,
-            "objective": step.objective,
-            "mutation_scope": {
-                "write": list(step.write_set),
-                "create": list(step.create_set),
-                "delete": list(step.delete_set),
-            },
-            "verify": step.verify,
-            "forbidden": step.forbidden,
-        }
-        for step in plan.steps
-    ])
+    lines: list[str] = []
+    for step in plan.steps:
+        writes = ",".join((*step.write_set, *step.create_set)) or "NONE"
+        deletes = ",".join(step.delete_set) or "NONE"
+        lines.extend((
+            f"{step.id} | title={step.title} | writes={writes} | deletes={deletes}",
+            f"  objective={step.objective}",
+            f"  invariants={step.forbidden}",
+            f"  verify={step.verify}",
+        ))
+    return "\n".join(lines) + ("\n" if lines else "NONE\n")
 
 
 def _revision_plan_summary(plan: TaskPlanV2) -> str:
@@ -365,13 +364,26 @@ def _revision_prompt(
     pre_checks: str,
     mutable_scope: str,
     deferred_mismatches: str,
+    candidate_identity: str = "",
+    bounded_diff_evidence: str = "",
+    diagnostics_dir: str | Path | None = None,
+    budget_bytes: int = 120_000,
 ) -> str:
     template = (_PROMPTS_DIR / "reviser.txt").read_text(encoding="utf-8")
-    values: dict[str, str] = {
-        "{{SPEC}}": spec,
-        "{{APPROVED_MUTABLE_SCOPE}}": mutable_scope,
-    }
-    return _render_revision_template(template, values, name="reviser")
+    payload = build_semantic_revision_payload(
+        spec=spec,
+        compact_approved_contract_index=_revision_contract_index(plan),
+        candidate_identity=candidate_identity or "UNKNOWN",
+        changed_files=changed_files,
+        required_checks_summary=pre_checks,
+        mutable_scope=mutable_scope,
+        bounded_diff_evidence=bounded_diff_evidence or "NONE\n",
+        template=template,
+        budget_bytes=budget_bytes,
+    )
+    if diagnostics_dir is not None:
+        write_prompt_diagnostics(diagnostics_dir, payload)
+    return payload.rendered
 
 
 def _revision_report_text(result: Any, artifact_dir: Path) -> str:
@@ -654,6 +666,9 @@ class RevisionRunner:
                 added_paths=(check_repair_scope.added_paths if check_repair_scope else ()),
                 scope_source=(check_repair_scope.source if check_repair_scope else ""),
                 legacy=self.legacy_failure_names,
+                candidate_identity=tree_before,
+                budget_bytes=self.config.prompt_budget.check_repair_max_bytes,
+                diagnostics_dir=artifact_dir,
             )
         else:
             revision_prompt = _revision_prompt(
@@ -667,6 +682,13 @@ class RevisionRunner:
                 pre_checks=_revision_check_context(pre_payload),
                 mutable_scope=_json_text(mutable_scope),
                 deferred_mismatches=deferred_mismatches or "NONE\n",
+                candidate_identity=tree_before,
+                # The semantic reviser can inspect the current worktree
+                # directly.  Keep the secondary diff excerpt optional so a
+                # large or adversarial diff never becomes the default prompt.
+                bounded_diff_evidence="NONE\n",
+                diagnostics_dir=artifact_dir,
+                budget_bytes=self.config.prompt_budget.semantic_revision_max_bytes,
             )
         store.update(status=RunStatus.REVISING, current_step=None)
         atomic_write_text(artifact_dir / "tree_before.txt", tree_before.rstrip() + "\n")

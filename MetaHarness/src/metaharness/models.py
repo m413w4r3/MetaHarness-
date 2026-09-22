@@ -284,6 +284,34 @@ class RevisionConfig:
 
 
 @dataclass(frozen=True)
+class PromptBudgetConfig:
+    """Byte budgets for role-specific model payloads.
+
+    Authority sections are never truncated.  A payload may therefore record
+    a soft overrun when the authority alone is larger than its configured
+    budget.
+    """
+
+    planner_max_bytes: int = 160_000
+    implementer_max_bytes: int = 120_000
+    check_repair_max_bytes: int = 40_000
+    semantic_revision_max_bytes: int = 120_000
+    final_review_max_bytes: int = 120_000
+
+    def __post_init__(self) -> None:
+        for name in (
+            "planner_max_bytes",
+            "implementer_max_bytes",
+            "check_repair_max_bytes",
+            "semantic_revision_max_bytes",
+            "final_review_max_bytes",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be an integer greater than zero")
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     provider: str = "codex"
     model: str = "gpt-5.6-luna"
@@ -409,6 +437,7 @@ class HarnessConfig:
     workspace_setup: tuple[WorkspaceSetupCommand, ...] = ()
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     revision: RevisionConfig = field(default_factory=RevisionConfig)
+    prompt_budget: PromptBudgetConfig = field(default_factory=PromptBudgetConfig)
     repository: RepositoryConfig = field(default_factory=RepositoryConfig)
     publish: PublishConfig = field(default_factory=PublishConfig)
     # Compatibility marker for programmatic legacy configurations that do not

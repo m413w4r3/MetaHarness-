@@ -34,6 +34,11 @@ from .agent.codex import (
     contract_mismatch_explanation,
     deferred_verify_dependency,
 )
+from .prompt_contracts import (
+    build_implementer_payload,
+    build_final_review_payload,
+    write_prompt_diagnostics,
+)
 from .agent.execution import (
     ExecutorRuntimeConfig,
     executor_for_profile,
@@ -505,6 +510,103 @@ def _review_plan_text(plan: TaskPlanV2) -> str:
     return _json_text(_review_plan_payload(plan))
 
 
+def _compact_approved_plan_text(plan: TaskPlanV2) -> str:
+    """Render the reviewer-visible plan index, never worker prompt bodies."""
+
+    payload = {
+        "title": plan.title,
+        "objective": plan.objective,
+        "constraints": plan.constraints,
+        "required_checks": list(plan.required_checks),
+        "steps": [
+            {
+                "id": step.id,
+                "title": step.title,
+                "depends_on": step.depends_on,
+                "objective": step.objective,
+                "invariants": step.forbidden,
+                "writes": list(step.write_set),
+                "creates": list(step.create_set),
+                "deletes": list(step.delete_set),
+                "verify": step.verify,
+            }
+            for step in plan.steps
+        ],
+    }
+    return _json_text(payload)
+
+
+def _required_checks_summary(evidence: EvidenceBundle) -> str:
+    """Keep required-check authority while excluding stdout/stderr blobs."""
+
+    rows: list[dict[str, Any]] = []
+    required = set(evidence.required_check_ids)
+    for raw in evidence.checks:
+        item = dict(raw) if isinstance(raw, Mapping) else check_result_json(raw)
+        name = item.get("name")
+        if name not in required and required:
+            continue
+        rows.append({
+            "id": name,
+            "required": bool(item.get("required", name in required)),
+            "exit_code": item.get("exit_code"),
+            "timed_out": bool(item.get("timed_out", False)),
+            "workspace_mutated": bool(item.get("workspace_mutated", False)),
+            "status": (
+                "timed_out" if item.get("timed_out") else
+                "passed" if item.get("exit_code") == 0 else "failed"
+            ),
+        })
+    return _json_text({
+        "required_check_ids": list(evidence.required_check_ids),
+        "failures": list(evidence.failures),
+        "checks": rows,
+        "deterministic_passed": evidence.deterministic_passed,
+    })
+
+
+def _diffstat(diff: str, changed_files: Sequence[str]) -> str:
+    additions = sum(
+        1 for line in diff.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    deletions = sum(
+        1 for line in diff.splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    )
+    return _json_text({
+        "files": len(tuple(changed_files)),
+        "insertions": additions,
+        "deletions": deletions,
+    })
+
+
+def _compact_cycle_summary(text: str) -> str:
+    """Remove check output and worker narration from cycle history."""
+
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                key: clean(item)
+                for key, item in value.items()
+                if key not in {
+                    "stdout", "stderr", "stdout_tail", "stderr_tail",
+                    "final", "final_message", "agent_report", "luna_reports",
+                    "claude_revision_report",
+                }
+            }
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        return value
+
+    return _json_text(clean(value))
+
+
 def _review_code_evidence(
     *,
     repository_reference: RepositoryReference,
@@ -536,6 +638,8 @@ def _review_code_evidence(
         "remote_exploration": "ALLOWED" if remote_available else "UNAVAILABLE",
         "full_diff_bytes": len(diff_bytes),
         "full_diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
+        "diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
+        "diffstat": json.loads(_diffstat(evidence.diff, evidence.changed_files)),
         "inline_full_diff": False,
     }
 
@@ -1010,14 +1114,15 @@ class Orchestrator:
 
         cls._copy_artifacts(
             run_dir / "revision", run_dir / "revision" / "C01",
-            ("agent.prompt.txt", "agent.events.jsonl", "agent.stderr.log",
+            ("agent.prompt.txt", "prompt.diagnostics.json", "agent.events.jsonl", "agent.stderr.log",
              "agent.final.md", "agent.result.json", "pre_checks.json",
              "scope.json", "tree_before.txt", "tree_after.txt",
              "report.json", "usage.json"),
         )
         cls._copy_artifacts(
             run_dir, run_dir / "review" / "C01",
-            ("reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json", "review.json"),
+            ("reviewer.request.txt", "prompt.diagnostics.json", "reviewer.raw.md",
+             "reviewer.usage.json", "review.json"),
         )
         checks_dir = run_dir / "checks" / "C01"
         if (checks_dir / "evidence.json").is_file():
@@ -1468,6 +1573,17 @@ class Orchestrator:
         )
         store.update(status=RunStatus.IMPLEMENTING)
         implementation_contract = render_implementation_contract(plan)
+        implementation_payload = build_implementer_payload(
+            step_title=getattr(plan, "title", ""),
+            step_objective=getattr(plan, "objective", ""),
+            step_invariants=getattr(plan, "constraints", ""),
+            read_set=getattr(plan, "files", "NONE"),
+            mutable_scope=getattr(plan, "files", "NONE"),
+            repository_instructions=getattr(plan, "implementation", ""),
+            verify_instructions=getattr(plan, "tests", ""),
+            budget_bytes=self.config.prompt_budget.implementer_max_bytes,
+        )
+        implementation_contract = implementation_payload.rendered
         implementer_profile = profile_for_role(
             self.config, selection.implementer.profile_id, ExecutionRole.IMPLEMENTER
         )
@@ -1483,6 +1599,11 @@ class Orchestrator:
                 ),
             )
             tree_before_agent = candidate_tree_sha(info.worktree)
+            write_prompt_diagnostics(
+                run_dir,
+                implementation_payload,
+                filename="prompt.diagnostics.implementer.json",
+            )
             agent_result = executor.run(
                 AgentRunRequest(
                     role=ExecutionRole.IMPLEMENTER,
@@ -1643,6 +1764,7 @@ class Orchestrator:
             # a failed check, as required by V0.
             deterministic_passed=True,
             artifacts_dir=run_dir,
+            diagnostics_filename="prompt.diagnostics.final-reviewer.json",
         )
         store.update(
             status=RunStatus.REVIEWING,
@@ -1749,6 +1871,7 @@ class Orchestrator:
                 planning=self.config.planning,
                 check_catalog=self.config.check_catalog,
                 default_check_ids=self.config.default_check_ids,
+                prompt_budget_bytes=self.config.prompt_budget.planner_max_bytes,
             )
             try:
                 plan = planner.plan(spec, context, artifacts_dir=run_dir)
@@ -3070,7 +3193,7 @@ class Orchestrator:
                     repository_reference=repository_reference, evidence=evidence,
                     input=ReviewCycleInput(
                         iteration=1,
-                        plan_text=_review_plan_text(plan),
+                        plan_text=_compact_approved_plan_text(plan),
                         luna_reports=_review_step_reports_text(self._last_v2_step_results),
                         deferred_mismatches=deferred_mismatches,
                         revision_report=revision_report_c01,
@@ -3435,9 +3558,44 @@ class Orchestrator:
         try:
             # The retry addendum is part of the final prompt, while the
             # approved contract itself remains byte-identical in the artifact.
+            # The approved step contract is already the narrow implementer
+            # payload.  Keep the exact byte-shaped wrapper used by the
+            # contract hash/resume protocol; diagnostics are recorded as a
+            # separate role payload and never broaden the request.
             request_prompt = build_implementer_step_prompt(
                 contract, retry_addendum=retry_addendum
             )
+            prompt_payload = build_implementer_payload(
+                step_title=step.title,
+                step_objective=step.objective,
+                step_invariants=step.forbidden,
+                read_set="\n".join(step.read_set),
+                mutable_scope=_json_text({
+                    "write": list(step.write_set),
+                    "create": list(step.create_set),
+                    "delete": list(step.delete_set),
+                }),
+                repository_instructions=step.instructions,
+                verify_instructions=step.verify,
+                retry_addendum=retry_addendum or "",
+                budget_bytes=self.config.prompt_budget.implementer_max_bytes,
+            )
+            prompt_payload = dataclasses.replace(
+                prompt_payload,
+                rendered=request_prompt,
+                total_bytes=len(request_prompt.encode("utf-8", errors="replace")),
+                static_prompt_bytes=max(
+                    0,
+                    len(request_prompt.encode("utf-8", errors="replace"))
+                    - prompt_payload.dynamic_payload_bytes,
+                ),
+                budget_overrun=(
+                    bool(self.config.prompt_budget.implementer_max_bytes)
+                    and len(request_prompt.encode("utf-8", errors="replace"))
+                    > self.config.prompt_budget.implementer_max_bytes
+                ),
+            )
+            write_prompt_diagnostics(artifact_dir, prompt_payload)
             result = executor.run(
                 AgentRunRequest(
                     role=ExecutionRole.IMPLEMENTER,
@@ -3820,23 +3978,56 @@ class Orchestrator:
             candidate_sha=candidate_sha,
             evidence=evidence,
         )
+        try:
+            code_evidence_payload = json.loads(code_evidence)
+        except (TypeError, ValueError):
+            code_evidence_payload = {}
+        candidate_identity = _json_text({
+            key: candidate_commit.get(key)
+            for key in (
+                "commit_sha", "tree_sha", "parent_sha", "candidate_url",
+                "compare_url", "immutable_commit_url", "pushed_at",
+            )
+            if candidate_commit.get(key) is not None
+            or key == "immutable_commit_url"
+        })
+        if isinstance(code_evidence_payload, Mapping):
+            candidate_identity = _json_text({
+                "candidate": json.loads(candidate_identity),
+                "candidate_url": code_evidence_payload.get("candidate_url"),
+                "compare_url": code_evidence_payload.get("compare_url"),
+                "candidate_tree_sha": code_evidence_payload.get("candidate_tree_sha"),
+                "remote_exploration": code_evidence_payload.get("remote_exploration"),
+            })
+        diff_bytes = evidence.diff.encode("utf-8", errors="replace")
+        diff_excerpt = bounded_semantic_diff(evidence.diff, 16 * 1024)[0]
+        prompt_payload = build_final_review_payload(
+            spec=spec,
+            compact_approved_plan=input.plan_text,
+            required_checks_summary=_required_checks_summary(evidence),
+            immutable_candidate_identity=candidate_identity,
+            changed_files="\n".join(evidence.changed_files),
+            diff_sha256=hashlib.sha256(diff_bytes).hexdigest(),
+            diffstat=_diffstat(evidence.diff, evidence.changed_files),
+            bounded_diff_excerpt=diff_excerpt,
+            cycle_summary=(
+                _compact_cycle_summary(input.cycle_history)
+                + "\n"
+                + input.luna_reports
+                + "\n"
+                + input.revision_report
+                + "\nDEFERRED CONTRACT MISMATCHES\n"
+                + input.deferred_mismatches
+            ),
+            repository_reference=_json_text(repository_reference_dict(repository_reference)),
+            budget_bytes=self.config.prompt_budget.final_review_max_bytes,
+        )
         review = reviewer.review(
-            spec, input.plan_text, _bounded_review_context(context), gate,
-            "\n".join(evidence.changed_files),
-            "",
-            _json_text(_check_payload(evidence)),
-            "NONE",
+            spec, input.plan_text, "", gate, "", "", "", "NONE",
             deterministic_passed=evidence.deterministic_passed,
             artifacts_dir=artifacts_dir,
-            repository=_json_text(repository_reference_dict(repository_reference)),
-            luna_reports=input.luna_reports,
-            revision_report=input.revision_report,
-            repository_state=repository_state,
-            candidate_commit=_json_text(dict(candidate_commit)),
+            prompt_payload=prompt_payload,
             iteration=input.iteration,
-            cycle_history=input.cycle_history,
-            deferred_mismatches=input.deferred_mismatches,
-            code_evidence=code_evidence,
         )
         # planner_thread != reviewer_thread: a driver that reports the
         # planner's own conversation for a review breaks independence.
@@ -5129,8 +5320,8 @@ class Orchestrator:
                 input=ReviewCycleInput(
                     iteration=2,
                     plan_text=_json_text({
-                        "original_approved_plan": _review_plan_payload(original_plan),
-                        "repair_plan_c02": _review_plan_payload(normal_repair_plan),
+                        "original_approved_plan": json.loads(_compact_approved_plan_text(original_plan)),
+                        "repair_plan_c02": json.loads(_compact_approved_plan_text(normal_repair_plan)),
                         "scope_delta": scope_delta_text,
                     }),
                     luna_reports=(
@@ -6095,8 +6286,8 @@ class Orchestrator:
                     iteration=2,
                     plan_text=_json_text(
                         {
-                            "original_approved_plan": _review_plan_payload(original_plan),
-                            "repair_plan_c02": _review_plan_payload(repair_plan),
+                            "original_approved_plan": json.loads(_compact_approved_plan_text(original_plan)),
+                            "repair_plan_c02": json.loads(_compact_approved_plan_text(repair_plan)),
                             "scope_delta": scope_delta_text,
                         }
                     ),
@@ -7170,6 +7361,7 @@ class Orchestrator:
                     repository_reference=reference, planning=self.config.planning,
                     check_catalog=self.config.check_catalog,
                     default_check_ids=self.config.default_check_ids,
+                    prompt_budget_bytes=self.config.prompt_budget.planner_max_bytes,
                 )
                 plan = planner.plan(spec, context, artifacts_dir=run_dir)
                 _persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))

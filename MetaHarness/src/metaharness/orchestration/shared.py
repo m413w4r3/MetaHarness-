@@ -63,6 +63,7 @@ _MAX_STEP_REPORT_BYTES = 2_048
 
 
 _AGENT_ARTIFACTS = (
+    "prompt.diagnostics.json",
     "agent.events.jsonl",
     "agent.stderr.log",
     "agent.final.md",
@@ -72,6 +73,7 @@ _AGENT_ARTIFACTS = (
 
 _REVISION_ARTIFACTS = (
     "agent.prompt.txt",
+    "prompt.diagnostics.json",
     "agent.events.jsonl",
     "agent.stderr.log",
     "agent.final.md",
@@ -328,20 +330,20 @@ _GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 # Artifacts of one failed attempt, moved to ``attempts/NN/`` before the same
 # operation is retried so a stale report is never read as the new one.
 _ATTEMPT_ARTIFACTS = (
-    "agent.prompt.txt", "agent.events.jsonl", "agent.stderr.log", "agent.final.md",
+    "agent.prompt.txt", "prompt.diagnostics.json", "agent.events.jsonl", "agent.stderr.log", "agent.final.md",
     "agent.result.json", "step.json", TOKEN_DIAGNOSTICS_NAME, "tree_after_failure.txt",
     "usage.json", "results.json",
 )
 
 
 _PLANNER_ATTEMPT_ARTIFACTS = (
-    "planner.request.txt", "planner.raw.md", "task_plan_v2.json", "task_plan.json",
+    "planner.request.txt", "planner.repair.request.txt", "prompt.diagnostics.json", "prompt.diagnostics.repair.json", "planner.raw.md", "task_plan_v2.json", "task_plan.json",
     "implementation_bundle.json", "planner.usage.json",
 )
 
 
 _REVIEW_ATTEMPT_ARTIFACTS = (
-    "reviewer.request.txt", "reviewer.request.meta.json", "reviewer.raw.md",
+    "reviewer.request.txt", "reviewer.request.meta.json", "prompt.diagnostics.json", "prompt.diagnostics.repair.json", "reviewer.raw.md",
     "reviewer.usage.json", "review.json",
 )
 

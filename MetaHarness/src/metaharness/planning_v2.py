@@ -30,6 +30,12 @@ from .models import (
     PlanningConfig,
     TaskPlanV2,
 )
+from .prompt_contracts import (
+    PromptPayload,
+    build_planner_payload,
+    payload_for_rendered_request,
+    write_prompt_diagnostics,
+)
 from .planning import PlanDecision, PlanParseError
 from .result import atomic_write_text
 from .step_ids import LAST_STEP_ID, MAX_STEPS, STEP_ID_RE, step_ids
@@ -767,7 +773,7 @@ def validate_execution_mode_policy(plan: TaskPlanV2, planning: PlanningConfig) -
         raise V2PlanParseError("execution policy requires STAGED")
 
 
-def build_planner_prompt_v2(
+def build_planner_payload_v2(
     spec: str,
     context: str,
     *,
@@ -781,7 +787,8 @@ def build_planner_prompt_v2(
     staged_step_max_mutable_paths: int = PlanningConfig.staged_step_max_mutable_paths,
     check_catalog: Sequence[CheckConfig] = (),
     default_check_ids: Sequence[str] = (),
-) -> str:
+    budget_bytes: int = 0,
+) -> PromptPayload:
     if not isinstance(spec, str) or not isinstance(context, str):
         raise TypeError("spec and context must be strings")
     if repository_reference is not None and not isinstance(repository_reference, RepositoryReference):
@@ -802,14 +809,55 @@ def build_planner_prompt_v2(
         "{{LAST_STEP_ID}}": LAST_STEP_ID,
         "{{MAX_STEP_CONTRACT_CHARS}}": str(MAX_STEP_CONTRACT_CHARS),
     }
-    # Policies are inserted into the template before substitution so that
-    # SPEC or context text can never impersonate or displace them.
-    template = _apply_execution_mode_policy(template, execution_mode_policy)
-    template = _apply_decomposition_policy(
-        template, decomposition,
-        single_step_max_mutable_paths, staged_step_max_mutable_paths,
+    # Keep policy text in a named section.  It is still inserted before the
+    # wire protocol, but now its exact bytes participate in payload
+    # accounting rather than being an unlabelled concatenation.
+    policy_parts: list[str] = []
+    if execution_mode_policy == ExecutionModePolicy.REQUIRE_STAGED.value:
+        policy_parts.append(REQUIRE_STAGED_POLICY_TEXT)
+    elif execution_mode_policy != ExecutionModePolicy.AUTO.value:
+        raise ValueError("unknown execution mode policy")
+    if decomposition == "aggressive":
+        policy_parts.append(
+            render_decomposition_policy_text(
+                single_step_max_mutable_paths, staged_step_max_mutable_paths
+            )
+        )
+    elif decomposition != "balanced":
+        raise ValueError("unknown planning decomposition")
+    planning_constraints = "\n\n".join(policy_parts) or "NONE\n"
+    if "{{PLANNING_CONSTRAINTS}}" not in template:
+        template = _insert_before_protocol(template, "{{PLANNING_CONSTRAINTS}}")
+    # Non-contract control values are fixed by MetaHarness and are substituted
+    # before the role payload builder sees user-controlled text.
+    template = re.sub(
+        r"\{\{(?:DEFAULT_CHECK_IDS|MAX_STEPS|LAST_STEP_ID|MAX_STEP_CONTRACT_CHARS)\}\}",
+        lambda match: values[match.group(0)],
+        template,
     )
-    return re.sub(r"\{\{(?:SPEC|CONTEXT|REPOSITORY|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|DEFAULT_CHECK_IDS|MAX_STEPS|LAST_STEP_ID|MAX_STEP_CONTRACT_CHARS)\}\}", lambda match: values[match.group(0)], template)
+    profiles = (
+        "IMPLEMENTER PROFILES\n"
+        + values["{{IMPLEMENTER_PROFILES}}"]
+        + "\nREVIEWER PROFILES\n"
+        + values["{{REVIEWER_PROFILES}}"]
+    )
+    payload = build_planner_payload(
+        spec=spec,
+        repository_identity=values["{{REPOSITORY}}"],
+        discovery_context=context,
+        trusted_check_catalogue=values["{{CHECK_CATALOG}}"],
+        available_profile_catalogue=profiles,
+        planning_constraints=planning_constraints,
+        template=template,
+        budget_bytes=budget_bytes,
+    )
+    return payload
+
+
+def build_planner_prompt_v2(*args: Any, **kwargs: Any) -> str:
+    """Compatibility wrapper returning the exact rendered planner prompt."""
+
+    return build_planner_payload_v2(*args, **kwargs).rendered
 
 
 # Diagnostic target, not a parser gate: an AW-002-sized repair request must
@@ -1373,7 +1421,7 @@ class TextCompletionClient(Protocol):
 class PlannerV2:
     """Standalone v2 planner entry point; it never invokes P17 recommender."""
 
-    def __init__(self, client: TextCompletionClient, *, implementer_ids: frozenset[str], reviewer_ids: frozenset[str], implementer_profiles: Sequence[ModelProfile] = (), reviewer_profiles: Sequence[ModelProfile] = (), repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None, check_catalog: Sequence[CheckConfig] = (), default_check_ids: Sequence[str] = ()):
+    def __init__(self, client: TextCompletionClient, *, implementer_ids: frozenset[str], reviewer_ids: frozenset[str], implementer_profiles: Sequence[ModelProfile] = (), reviewer_profiles: Sequence[ModelProfile] = (), repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None, check_catalog: Sequence[CheckConfig] = (), default_check_ids: Sequence[str] = (), prompt_budget_bytes: int = 0):
         self.client = client
         self.implementer_ids = implementer_ids
         self.reviewer_ids = reviewer_ids
@@ -1384,11 +1432,12 @@ class PlannerV2:
         self.template = template
         self.check_catalog = tuple(check_catalog)
         self.default_check_ids = tuple(default_check_ids)
+        self.prompt_budget_bytes = prompt_budget_bytes
         self.last_conversation: LLMConversationHandle | None = None
 
     def plan(self, spec: str, context: str, *, repository_reference: RepositoryReference | None = None, artifacts_dir: str | Path | None = None) -> TaskPlanV2:
         reference = repository_reference if repository_reference is not None else self.repository_reference
-        request = build_planner_prompt_v2(
+        payload = build_planner_payload_v2(
             spec, context, repository_reference=reference,
             implementer_profiles=self.implementer_profiles,
             reviewer_profiles=self.reviewer_profiles, template=self.template,
@@ -1398,10 +1447,13 @@ class PlannerV2:
             staged_step_max_mutable_paths=self.planning.staged_step_max_mutable_paths,
             check_catalog=self.check_catalog,
             default_check_ids=self.default_check_ids,
+            budget_bytes=self.prompt_budget_bytes,
         )
+        request = payload.rendered
         target = Path(artifacts_dir) if artifacts_dir is not None else None
         if target is not None:
             atomic_write_text(target / "planner.request.txt", request)
+            write_prompt_diagnostics(target, payload)
         result = self.client.complete(request)
         self.last_conversation = conversation_handle(result)
         raw = result if isinstance(result, str) else getattr(result, "text", None)
@@ -1647,6 +1699,9 @@ class RepairPlannerV2:
 
         # Written before any transport so an HTTP 502 stays diagnosable.
         atomic_write_text(target / "planner.request.txt", request)
+        write_prompt_diagnostics(
+            target, payload_for_rendered_request("repair-planner", request)
+        )
         atomic_write_text(target / "planner.request.fallback.txt", bundle.fallback_prompt)
         atomic_write_text(target / "planner.evidence.md", bundle.evidence_text)
         atomic_write_text(
@@ -1793,6 +1848,10 @@ class CheckScopeRepairPlannerV2:
                 media_type="text/plain",
             ))
         atomic_write_text(target / "planner.request.txt", bundle.inline_prompt)
+        write_prompt_diagnostics(
+            target,
+            payload_for_rendered_request("check-scope-repair-planner", bundle.inline_prompt),
+        )
         atomic_write_text(target / "planner.request.fallback.txt", bundle.fallback_prompt)
         atomic_write_text(target / "planner.evidence.md", bundle.evidence_text)
         atomic_write_text(
@@ -1879,7 +1938,7 @@ __all__ = [
     "ExecutionMode", "ImplementationStep", "MAX_STEPS", "MAX_STEP_CONTRACT_CHARS",
     "PlannerV2", "STEP_CONTRACT_NAME", "TaskPlanV2", "V2PlanParseError",
     "PlanDecision", "PlanParseError",
-    "build_planner_prompt_v2", "parse_task_plan_v2", "persist_implementation_bundle",
+    "build_planner_payload_v2", "build_planner_prompt_v2", "parse_task_plan_v2", "persist_implementation_bundle",
     "build_repair_planner_prompt", "build_repair_planner_prompt_bundle",
     "RepairPlannerPromptBundle", "REPAIR_PLANNER_INLINE_TARGET_BYTES",
     "REPAIR_EVIDENCE_FILENAME", "RepairPlannerV2",

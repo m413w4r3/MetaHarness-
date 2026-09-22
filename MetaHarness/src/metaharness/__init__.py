@@ -56,6 +56,7 @@ from .models import (
     LLMEndpointConfig,
     PlanDecision,
     PlanningConfig,
+    PromptBudgetConfig,
     PublishConfig,
     RevisionConfig,
     RepositoryConfig,
@@ -67,6 +68,15 @@ from .models import (
     WorkspaceSetupCommand,
     SelectedProfile,
     StepExecutionSelection,
+)
+from .prompt_contracts import (
+    PromptPayload,
+    PromptSection,
+    build_check_repair_payload,
+    build_final_review_payload,
+    build_implementer_payload,
+    build_planner_payload,
+    build_semantic_revision_payload,
 )
 from .orchestrator import Orchestrator, run_orchestrator
 from .orchestration.check_repair import CheckRepairAttempt, CheckRepairResult
@@ -120,6 +130,9 @@ __all__ = [
     "LLMEndpointConfig",
     "PlanDecision",
     "PlanningConfig",
+    "PromptBudgetConfig",
+    "PromptPayload",
+    "PromptSection",
     "PublishConfig",
     "RevisionConfig",
     "RepositoryConfig",
@@ -166,6 +179,11 @@ __all__ = [
     "write_plan_approval",
     "prepare_workspace",
     "prepare_claude_home",
+    "build_planner_payload",
+    "build_implementer_payload",
+    "build_check_repair_payload",
+    "build_semantic_revision_payload",
+    "build_final_review_payload",
     "effective_run_config",
     "read_run_options_with_sha256",
 ]

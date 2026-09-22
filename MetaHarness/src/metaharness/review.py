@@ -25,6 +25,12 @@ from .llm.wire import (
     parse_labeled_document,
 )
 from .models import ReviewRoute, ReviewVerdict
+from .prompt_contracts import (
+    PromptPayload,
+    build_final_review_payload,
+    payload_for_rendered_request,
+    write_prompt_diagnostics,
+)
 from .usage import (
     REVIEWER_USAGE_ARTIFACT,
     add_usage,
@@ -519,26 +525,37 @@ class Reviewer:
         cycle_history: str = "",
         deferred_mismatches: str = "",
         code_evidence: str | None = None,
+        prompt_payload: PromptPayload | None = None,
+        diagnostics_filename: str = "prompt.diagnostics.json",
     ) -> ReviewResult:
-        request = build_reviewer_prompt(
-            spec,
-            plan,
-            context,
-            gate,
-            changed_files,
-            diff,
-            checks,
-            agent_report,
-            repository=repository,
-            luna_reports=luna_reports,
-            revision_report=revision_report,
-            repository_state=repository_state,
-            candidate_commit=candidate_commit,
-            iteration=iteration,
-            cycle_history=cycle_history,
-            deferred_mismatches=deferred_mismatches,
-            code_evidence=code_evidence,
-            template=self.template,
+        if prompt_payload is not None and not isinstance(prompt_payload, PromptPayload):
+            raise TypeError("prompt_payload must be a PromptPayload")
+        request = (
+            prompt_payload.rendered
+            if prompt_payload is not None
+            else build_reviewer_prompt(
+                spec,
+                plan,
+                context,
+                gate,
+                changed_files,
+                diff,
+                checks,
+                agent_report,
+                repository=repository,
+                luna_reports=luna_reports,
+                revision_report=revision_report,
+                repository_state=repository_state,
+                candidate_commit=candidate_commit,
+                iteration=iteration,
+                cycle_history=cycle_history,
+                deferred_mismatches=deferred_mismatches,
+                code_evidence=code_evidence,
+                template=self.template,
+            )
+        )
+        diagnostics_payload = prompt_payload or payload_for_rendered_request(
+            "final-reviewer", request
         )
         target = Path(artifacts_dir) if artifacts_dir is not None else None
         encoded_request = request.encode("utf-8")
@@ -546,6 +563,9 @@ class Reviewer:
         # review must remain inspectable.
         if target is not None:
             _atomic_write_text(target / "reviewer.request.txt", request)
+            write_prompt_diagnostics(
+                target, diagnostics_payload, filename=diagnostics_filename
+            )
             _atomic_write_text(
                 target / "reviewer.request.meta.json",
                 json.dumps(
@@ -577,6 +597,11 @@ class Reviewer:
             repair_request = build_review_repair_prompt(first_raw, first_error)
             if target is not None:
                 _atomic_write_text(target / "reviewer.repair.request.txt", repair_request)
+                write_prompt_diagnostics(
+                    target,
+                    payload_for_rendered_request("reviewer-format-repair", repair_request),
+                    filename="prompt.diagnostics.repair.json",
+                )
             repaired_result = self.client.complete(repair_request)
             repaired_raw = _completion_text(repaired_result)
             usages.append(normalize_usage(completion_usage(repaired_result)))
@@ -661,6 +686,7 @@ __all__ = [
     "build_repair_prompt",
     "build_review_repair_prompt",
     "build_reviewer_prompt",
+    "build_final_review_payload",
     "ParsedFinding",
     "parse_finding_records",
     "parse_review",

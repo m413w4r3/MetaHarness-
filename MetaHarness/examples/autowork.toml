@@ -86,6 +86,13 @@ max_hits = 8
 max_bytes = 160000
 require_locator_head_at_base = true
 
+[prompt_budget]
+planner_max_bytes = 160000
+implementer_max_bytes = 120000
+check_repair_max_bytes = 40000
+semantic_revision_max_bytes = 120000
+final_review_max_bytes = 120000
+
 [model_profiles."planner-chatgpt"]
 display_name = "ChatGPT UI Planner"
 roles = ["planner", "reviewer"]

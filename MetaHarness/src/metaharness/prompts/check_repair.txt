@@ -18,9 +18,13 @@ If the correct fix requires a path outside EFFECTIVE MUTABLE SCOPE:
 - do not create a workaround;
 - emit the required META SCOPE REQUEST protocol.
 
-<SPEC>
+<ORIGINAL SPEC>
 {{SPEC}}
-</SPEC>
+</ORIGINAL SPEC>
+
+<FAILED CHECK IDS>
+{{FAILED_CHECK_IDS}}
+</FAILED CHECK IDS>
 
 <FAILED CHECKS>
 {{CHECK_DETAILS}}
@@ -37,3 +41,7 @@ If the correct fix requires a path outside EFFECTIVE MUTABLE SCOPE:
 <EFFECTIVE MUTABLE SCOPE>
 {{MUTABLE_SCOPE}}
 </EFFECTIVE MUTABLE SCOPE>
+
+<CANDIDATE IDENTITY>
+{{CANDIDATE_IDENTITY}}
+</CANDIDATE IDENTITY>
