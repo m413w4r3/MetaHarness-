@@ -46,7 +46,9 @@ class Server:
                 pass
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
 
     @property
     def base_url(self) -> str:
@@ -158,10 +160,13 @@ class RetryTests(unittest.TestCase):
     def test_retryable_statuses_are_bounded_by_configuration(self) -> None:
         for status in (408, 429, 500, 502, 503, 504):
             with self.subTest(status=status):
-                with Server(lambda h, s=status: send_json(h, s, {"error": "x"})) as server:
+                with Server(lambda h, s=status: send_json(h, s, {"error": "x"})) as server, \
+                        mock.patch.object(chat, "_sleep_before_retry") as backoff:
                     with self.assertRaisesRegex(LLMHTTPError, f"HTTP {status} after 3"):
                         OpenAIChatTextClient(endpoint(server.base_url, retries=2)).complete("p")
                 self.assertEqual(len(server.requests), 3)
+                # A backoff precedes each retry, never the final failure.
+                self.assertEqual([call.args for call in backoff.call_args_list], [(0,), (1,)])
 
     def test_non_retryable_statuses_are_sent_once(self) -> None:
         for status in (400, 401, 403, 404):

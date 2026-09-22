@@ -6,11 +6,13 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from metaharness.llm import chat  # noqa: E402
 from metaharness.llm.chat import (  # noqa: E402
     LLMHTTPError,
     LLMProtocolError,
@@ -53,7 +55,9 @@ class ServerHarness:
                 pass
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
 
     @property
     def base_url(self):
@@ -197,6 +201,15 @@ class ChatClientTests(unittest.TestCase):
         self.assertEqual(result.text, "recovered")
         self.assertEqual(attempts, 2)
 
+    def test_retry_backoff_is_exponential_and_capped(self):
+        with mock.patch.object(chat, "time") as fake_time:
+            for attempt in range(8):
+                chat._sleep_before_retry(attempt)
+        delays = [call.args[0] for call in fake_time.sleep.call_args_list]
+        self.assertEqual(delays[:3], [0.05, 0.1, 0.2])
+        self.assertEqual(delays[-1], 1.0)
+        self.assertEqual(delays, sorted(delays))
+
     def test_401_is_not_retried_and_secret_is_not_in_exception(self):
         def responder(_handler, _request):
             return 401, {"error": "unauthorized"}
@@ -254,6 +267,13 @@ class FileFallbackTests(unittest.TestCase):
         text="EVIDENCE_SENTINEL",
     )
 
+    def setUp(self):
+        # Retry ordering is under test here, not the backoff delay itself
+        # (see test_retry_backoff_is_exponential_and_capped).
+        patcher = mock.patch.object(chat, "_sleep_before_retry")
+        self.backoff = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def call(self, client):
         return client.complete_with_file_fallback(
             "INLINE_SENTINEL",
@@ -277,6 +297,7 @@ class FileFallbackTests(unittest.TestCase):
 
         self.assertEqual(result.text, "repaired")
         self.assertEqual(len(server.requests), 3)
+        self.assertEqual([call.args for call in self.backoff.call_args_list], [(0,), (1,)])
         self.assertEqual(_content(server.requests[0]), "INLINE_SENTINEL")
         self.assertEqual(_content(server.requests[1]), "INLINE_SENTINEL")
 

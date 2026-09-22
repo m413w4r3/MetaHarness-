@@ -255,7 +255,9 @@ class HTTPSecurityP15Tests(unittest.TestCase):
         self.config = config_for(self.root)
         self.config.runs_root.mkdir()
         self.server = create_server(self.config, port=0)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
         self.thread.start()
 
     def tearDown(self) -> None:

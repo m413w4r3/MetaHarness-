@@ -22,6 +22,7 @@ from metaharness.config import load_config  # noqa: E402
 from metaharness.models import RunStatus  # noqa: E402
 from metaharness.orchestrator import Orchestrator  # noqa: E402
 from metaharness.web.api import approve_run  # noqa: E402
+from tests.proc_support import process_is_gone, read_pid  # noqa: E402
 
 
 def git(repo: Path, *args: str) -> str:
@@ -118,7 +119,9 @@ class FakeLLM:
         self.reviewer_calls = 0
         self._mutated = False
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
         self.thread.start()
 
     @property
@@ -203,7 +206,9 @@ class OrchestratorE2ETests(unittest.TestCase):
                     subprocess.run(['git', '-C', str(worktree), *command, 'agent-owned-' + behavior], check=True)
                 elif behavior == 'background':
                     target.write_text('implemented\\n')
-                    subprocess.Popen(['sh', '-c', 'sleep 1; echo late > feature.txt'], cwd=worktree)
+                    child = subprocess.Popen(['sh', '-c', 'sleep 30; echo late > feature.txt'], cwd=worktree)
+                    pid_file = pathlib.Path(os.environ['FAKE_PROMPT']).parent / 'background.pid'
+                    pid_file.write_text(str(child.pid))
                 elif behavior == 'secret':
                     target.write_text(os.environ['META_E2E_KEY'] + '\\n')
                 elif behavior == 'staged-secret':
@@ -332,9 +337,43 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.assertEqual(llm.reviewer_calls, 1)
         self.assertNotIn(self.spec.read_text(), (self.root / "prompt.txt").read_text())
 
-    def test_required_plan_approval_is_before_worktree_and_then_commits(self) -> None:
-        import time
+    def start_run_until_approval_gate(
+        self, config: Path, run_id: str, result_holder: list[int]
+    ) -> threading.Thread:
+        """Start ``metaharness run`` in a thread and return once it blocks on
+        the real approval wait, or once the run ended without reaching it."""
 
+        from unittest import mock
+
+        from metaharness import orchestrator
+
+        progressed = threading.Event()
+        real_wait = orchestrator.wait_for_plan_approval
+
+        def hooked_wait(*args: Any, **kwargs: Any) -> Any:
+            # AWAITING_PLAN_APPROVAL is persisted before this call.
+            progressed.set()
+            return real_wait(*args, **kwargs)
+
+        def target() -> None:
+            try:
+                result_holder.append(
+                    main(["run", "--config", str(config), "--spec", str(self.spec), "--run-id", run_id])
+                )
+            finally:
+                progressed.set()
+
+        patcher = mock.patch("metaharness.orchestrator.wait_for_plan_approval", side_effect=hooked_wait)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Daemon: a failing assertion must not leave the suite blocked on
+        # the real approval wait.
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        self.assertTrue(progressed.wait(timeout=10))
+        return thread
+
+    def test_required_plan_approval_is_before_worktree_and_then_commits(self) -> None:
         run_id = "approval"
         worktree = self.root / "worktrees" / run_id
         llm = FakeLLM(worktree=worktree)
@@ -350,18 +389,8 @@ class OrchestratorE2ETests(unittest.TestCase):
         result_holder: list[int] = []
         try:
             os.environ.update(overrides)
-            thread = threading.Thread(
-                target=lambda: result_holder.append(
-                    main(["run", "--config", str(config), "--spec", str(self.spec), "--run-id", run_id])
-                )
-            )
-            thread.start()
+            thread = self.start_run_until_approval_gate(config, run_id, result_holder)
             state_path = self.root / "runs" / run_id / "state.json"
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if state_path.exists() and json.loads(state_path.read_text())["status"] == RunStatus.AWAITING_PLAN_APPROVAL.value:
-                    break
-                time.sleep(0.01)
             self.assertTrue(state_path.exists())
             waiting = json.loads(state_path.read_text())
             self.assertEqual(waiting["status"], RunStatus.AWAITING_PLAN_APPROVAL.value)
@@ -397,8 +426,6 @@ class OrchestratorE2ETests(unittest.TestCase):
             llm.close()
 
     def test_rejecting_plan_ends_before_agent_and_worktree(self) -> None:
-        import time
-
         run_id = "rejected-plan"
         worktree = self.root / "worktrees" / run_id
         llm = FakeLLM(worktree=worktree)
@@ -414,18 +441,8 @@ class OrchestratorE2ETests(unittest.TestCase):
         result_holder: list[int] = []
         try:
             os.environ.update(overrides)
-            thread = threading.Thread(
-                target=lambda: result_holder.append(
-                    main(["run", "--config", str(config), "--spec", str(self.spec), "--run-id", run_id])
-                )
-            )
-            thread.start()
+            thread = self.start_run_until_approval_gate(config, run_id, result_holder)
             state_path = self.root / "runs" / run_id / "state.json"
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if state_path.exists() and json.loads(state_path.read_text())["status"] == RunStatus.AWAITING_PLAN_APPROVAL.value:
-                    break
-                time.sleep(0.01)
             self.assertEqual(main(["reject-plan", "--run", str(self.root / "runs" / run_id)]), 0)
             thread.join(timeout=10)
             self.assertFalse(thread.is_alive())
@@ -637,12 +654,12 @@ class OrchestratorE2ETests(unittest.TestCase):
             self.assertIn(f"agent-owned-{behavior}", " ".join(state["failure"]["detail"]))
 
     def test_agent_background_process_cannot_alter_reviewed_code(self) -> None:
-        import time
-
         _, _, state = self.run_case(codex_behavior="background", run_id="background")
         worktree = self.root / "worktrees" / "background"
         self.assertEqual(state["status"], RunStatus.COMMITTED.value)
-        time.sleep(1.5)
+        # The late writer was terminated with the agent's group, so the
+        # reviewed tree can no longer change behind the harness.
+        self.assertTrue(process_is_gone(read_pid(self.root / "background.pid")))
         self.assertEqual(git(worktree, "show", "HEAD:feature.txt"), "implemented")
         self.assertEqual((worktree / "feature.txt").read_text(), "implemented\n")
 

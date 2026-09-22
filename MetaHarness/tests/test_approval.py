@@ -3,13 +3,13 @@ import json
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from metaharness import approval as approval_module  # noqa: E402
 from metaharness.approval import (  # noqa: E402
     ApprovalDecision,
     ApprovalError,
@@ -192,8 +192,19 @@ class ApprovalTests(unittest.TestCase):
                     poll_interval_seconds=0.01,
                 )
 
+        # The decision is published only after the wait has observed that no
+        # decision exists yet, so the wait must keep polling to return it.
+        first_miss = threading.Event()
+        real_read = approval_module.read_plan_approval
+
+        def observed_read(*args, **kwargs):
+            result = real_read(*args, **kwargs)
+            if result is None:
+                first_miss.set()
+            return result
+
         def approve() -> None:
-            time.sleep(0.02)
+            self.assertTrue(first_miss.wait(timeout=5))
             write_plan_approval(
                 directory,
                 decision=ApprovalDecision.APPROVE,
@@ -203,12 +214,14 @@ class ApprovalTests(unittest.TestCase):
 
         thread = threading.Thread(target=approve)
         thread.start()
-        approval = wait_for_plan_approval(
-            directory,
-            identity=self.identity,
-            poll_interval_seconds=0.01,
-        )
-        thread.join()
+        with mock.patch.object(approval_module, "read_plan_approval", side_effect=observed_read):
+            approval = wait_for_plan_approval(
+                directory,
+                identity=self.identity,
+                poll_interval_seconds=0.01,
+            )
+        thread.join(timeout=5)
+        self.assertTrue(first_miss.is_set())
         self.assertEqual(approval.decision, ApprovalDecision.APPROVE)
 
     def test_cli_requires_waiting_state_and_does_not_write_state(self) -> None:

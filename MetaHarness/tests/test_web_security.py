@@ -47,7 +47,9 @@ class LocalServerHardeningTests(unittest.TestCase):
         self.runs.mkdir()
         self.server = create_server(_config(root, self.runs), port=0)
         self.port = self.server.server_port
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
         self.thread.start()
 
     def tearDown(self) -> None:
@@ -324,7 +326,9 @@ class WebSecurityTests(unittest.TestCase):
                 allow_no_required_checks=True,
             )
             server = create_server(config, port=0)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+            )
             thread.start()
             try:
                 connection = HTTPConnection("127.0.0.1", server.server_port)

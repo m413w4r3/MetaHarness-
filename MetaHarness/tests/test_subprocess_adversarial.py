@@ -27,6 +27,7 @@ from metaharness.models import (  # noqa: E402
     LLMEndpointConfig,
 )
 from metaharness.validation import ValidationError, run_checks  # noqa: E402
+from tests.proc_support import process_is_gone, read_pid  # noqa: E402
 
 
 def git(repo: Path, *args: str) -> str:
@@ -127,13 +128,16 @@ class CodexProcessTests(TempRepoCase):
 
     def test_background_process_cannot_modify_worktree_after_exit(self) -> None:
         late = self.repo / "late.txt"
+        pid_file = self.root / "background.pid"
         body = f"""
-        import subprocess
-        subprocess.Popen(['sh', '-c', 'sleep 1; echo late > {late}'])
+        import pathlib, subprocess
+        child = subprocess.Popen(['sh', '-c', 'sleep 30; echo late > {late}'])
+        pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))
         """
         result = self.agent(body).run("plan", self.repo, self.root / "art")
         self.assertEqual(result.exit_code, 0)
-        time.sleep(1.5)
+        # The would-be late writer no longer runs once the agent returned.
+        self.assertTrue(process_is_gone(read_pid(pid_file)))
         self.assertFalse(late.exists())
 
 
@@ -159,9 +163,11 @@ class CheckProcessTests(TempRepoCase):
 
     def test_timeout_kills_grandchildren_that_would_mutate_the_worktree(self) -> None:
         late = self.repo / "late.txt"
+        pid_file = self.root / "grandchild.pid"
         code = (
-            "import subprocess, time\n"
-            f"subprocess.Popen(['sh', '-c', 'sleep 2; echo late > {late}'])\n"
+            "import pathlib, subprocess, time\n"
+            f"child = subprocess.Popen(['sh', '-c', 'sleep 30; echo late > {late}'])\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
             "time.sleep(30)\n"
         )
         started = time.monotonic()
@@ -169,18 +175,23 @@ class CheckProcessTests(TempRepoCase):
         self.assertLess(time.monotonic() - started, 9)
         self.assertTrue(result.timed_out)
         self.assertEqual(result.exit_code, 124)
-        time.sleep(2.5)
+        self.assertTrue(process_is_gone(read_pid(pid_file)))
         self.assertFalse(late.exists())
 
     def test_background_child_of_a_passing_check_is_terminated(self) -> None:
         late = self.repo / "late.txt"
-        code = f"import subprocess\nsubprocess.Popen(['sh', '-c', 'sleep 1; echo late > {late}'])\n"
+        pid_file = self.root / "background.pid"
+        code = (
+            "import pathlib, subprocess\n"
+            f"child = subprocess.Popen(['sh', '-c', 'sleep 30; echo late > {late}'])\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+        )
         started = time.monotonic()
         result = run_checks(self.repo, self.config(self.check("t", code)))[0]
         self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(result.exit_code, 0)
         self.assertFalse(result.workspace_mutated)
-        time.sleep(1.5)
+        self.assertTrue(process_is_gone(read_pid(pid_file)))
         self.assertFalse(late.exists())
 
     def test_huge_output_keeps_full_log_and_bounded_tail(self) -> None:

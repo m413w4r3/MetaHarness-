@@ -42,7 +42,9 @@ class P19WebTests(unittest.TestCase):
             allow_no_required_checks=True,
         )
         self.server = create_server(config, port=0)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
         self.thread.start()
 
     def tearDown(self) -> None:

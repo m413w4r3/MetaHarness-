@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.procutil import read_capped, run_bounded  # noqa: E402
+from tests.proc_support import process_is_gone, read_pid  # noqa: E402
 
 
 class BoundedProcessTests(unittest.TestCase):
@@ -34,16 +35,20 @@ class BoundedProcessTests(unittest.TestCase):
 
     def test_timeout_kills_the_whole_group_even_without_output(self) -> None:
         marker = self.root / "grandchild-survived"
+        pid_file = self.root / "grandchild.pid"
         code = (
-            "import subprocess, time\n"
-            f"subprocess.Popen(['sh', '-c', 'sleep 3; touch {marker}'])\n"
+            "import pathlib, subprocess, time\n"
+            f"child = subprocess.Popen(['sh', '-c', 'sleep 30; touch {marker}'])\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
             "time.sleep(30)\n"
         )
         (exit_code, timed_out), elapsed = self.run_code(code, 0.5, grace_seconds=0.2)
         self.assertTrue(timed_out)
         self.assertNotEqual(exit_code, 0)
         self.assertLess(elapsed, 5)
-        time.sleep(3.5)
+        # The grandchild that would write the marker no longer runs, so the
+        # late write can never happen.
+        self.assertTrue(process_is_gone(read_pid(pid_file)))
         self.assertFalse(marker.exists())
 
     def test_process_ignoring_sigterm_and_sigint_is_killed(self) -> None:
@@ -59,14 +64,16 @@ class BoundedProcessTests(unittest.TestCase):
 
     def test_background_child_does_not_outlive_a_successful_command(self) -> None:
         marker = self.root / "late-write"
+        pid_file = self.root / "background.pid"
         code = (
-            "import subprocess\n"
-            f"subprocess.Popen(['sh', '-c', 'sleep 1; touch {marker}'])\n"
+            "import pathlib, subprocess\n"
+            f"child = subprocess.Popen(['sh', '-c', 'sleep 30; touch {marker}'])\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
         )
         (exit_code, timed_out), elapsed = self.run_code(code, 10)
         self.assertEqual((exit_code, timed_out), (0, False))
         self.assertLess(elapsed, 5)
-        time.sleep(1.5)
+        self.assertTrue(process_is_gone(read_pid(pid_file)))
         self.assertFalse(marker.exists())
 
     def test_huge_output_never_blocks_and_stdin_is_closed(self) -> None:
