@@ -113,16 +113,14 @@ class RunStateStore:
             "expected_parent_sha": base_sha,
             "expected_tree_sha": None,
             "next_step_id": None,
-            "agent_usage": {
-                "total_input_tokens": 0,
-                "total_output_tokens": 0,
-                "steps": [],
-            },
             "usage": {
                 "planner": {},
-                "luna": {"total": {}, "steps": []},
-                "reviser": {},
-                "reviewer": {},
+                "correction_planner": {},
+                "implementer": {"total": {}, "steps": []},
+                "check_repair": {},
+                "semantic_reviser": {},
+                "final_reviewer": {},
+                "cycles": [],
                 "grand_total": {},
             },
         }

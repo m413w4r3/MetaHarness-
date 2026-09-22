@@ -96,16 +96,20 @@ class P27Tests(unittest.TestCase):
         )
         self.assertEqual(json.loads((self.fixture.root / "runs/p27/publish.json").read_text())["status"], "pushed")
 
-    def test_revise_does_not_create_remote_branch(self) -> None:
+    def test_revise_pushes_the_reviewed_candidate_but_never_publishes(self) -> None:
         _exit_code, state = self._run(review=REVISE_REVIEW, run_id="revise")
         self.assertEqual(state["failure"]["reason"], "REVIEW_REVISE")
-        self.assertFalse(
+        # The reviewer is given the exact pushed candidate; a REVISE verdict
+        # never turns it into a publication.
+        self.assertEqual(
             subprocess.run(
-                ["git", "-C", str(self.fixture.root / "origin.git"), "show-ref", "--verify", f"refs/heads/{state['branch']}"],
-                capture_output=True,
-            ).returncode
-            == 0
+                ["git", "-C", str(self.fixture.root / "origin.git"), "rev-parse", f"refs/heads/{state['branch']}"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip(),
+            state["candidate_commit_sha"],
         )
+        self.assertFalse(state.get("publish"))
+        self.assertFalse((self.fixture.root / "runs/revise/publish.json").exists())
 
     def test_push_rejection_preserves_local_commit_and_reason(self) -> None:
         root = self.fixture.root
@@ -141,7 +145,9 @@ class P27Tests(unittest.TestCase):
             llm.close()
         state = json.loads((root / "runs/rejected/state.json").read_text())
         self.assertEqual(state["failure"]["reason"], "PUSH_FAILED")
-        self.assertIsInstance(state["commit_sha"], str)
+        # The candidate commit exists locally; the rejected push published nothing.
+        self.assertIsInstance(state["candidate_commit_sha"], str)
+        self.assertIsNone(state.get("commit_sha"))
         self.assertEqual(
             subprocess.run(
                 ["git", "-C", str(bare), "show-ref"],

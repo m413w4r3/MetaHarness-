@@ -45,8 +45,8 @@ class LLMConversationHandle:
     MetaHarness never fabricates one and never scrapes a UI to guess it: a
     handle exists only when the driver/bridge returns it.  A handle may be
     exposed by a driver for explicitly conversation-aware workflows.
-    MetaHarness repair planning does not reuse the initial planner
-    conversation; 002 starts from a fresh bounded request.
+    MetaHarness correction planning does not reuse the initial planner
+    conversation; every correction cycle starts from a fresh bounded request.
     """
 
     provider_id: str

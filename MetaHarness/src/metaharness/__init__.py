@@ -68,9 +68,11 @@ from .models import (
     ClaudeRuntimeConfig,
     CodexRuntimeConfig,
     ContextConfig,
+    CycleKind,
     EnvironmentConfig,
     ExecutionMode,
     ExecutionSelection,
+    GateStage,
     GitHubConfig,
     HarnessConfig,
     ImplementationStep,
@@ -117,7 +119,7 @@ from .integrations.github import (
     GitHubWorkstreamError,
     NullGitHubWorkstreamClient,
 )
-from .orchestration.check_repair import CheckRepairAttempt, CheckRepairResult
+from .orchestration.check_repair import CheckRepairAttempt
 from .review import Reviewer, ReviewParseError, ReviewResult, parse_review
 from .result import RunResult
 from .run_options import (
@@ -150,7 +152,6 @@ __all__ = [
     "CodexRuntimeConfig",
     "CheckResult",
     "CheckRepairAttempt",
-    "CheckRepairResult",
     "CodexAgent",
     "CodexAuthStatus",
     "ConfigError",
@@ -193,6 +194,8 @@ __all__ = [
     "RunOptionsError",
     "RunStatus",
     "RunCycle",
+    "CycleKind",
+    "GateStage",
     "TaskPlanV2",
     "WorkspaceSetupCommand",
     "WorkstreamRef",

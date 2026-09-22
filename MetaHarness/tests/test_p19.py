@@ -74,6 +74,7 @@ class P19WebTests(unittest.TestCase):
         (run / "implementation_contract.md").write_text(contract)
         store.update(
             status="awaiting_plan_approval",
+            planning_protocol="v2",
             plan_identity=compute_plan_identity(raw, contract).__dict__,
         )
         return run
@@ -205,15 +206,21 @@ class P19WebTests(unittest.TestCase):
         run = self.create_waiting("artifacts")
         store = RunStateStore(run / "state.json")
         store.update(status="failed", failure={"reason": "AGENT_FAILED"})
-        (run / "agent.result.json").write_text(json.dumps({"exit_code": 7, "timed_out": False, "usage": {"input_tokens": 3, "output_tokens": 4}}))
-        (run / "agent.final.md").write_text("x" * (32 * 1024 + 100))
-        (run / "agent.stderr.log").write_text("e" * (32 * 1024 + 100))
-        (run / "diff.patch").write_text("d" * (64 * 1024 + 100))
-        (run / "changed-files.txt").write_text("src/app.py\n")
+        step = run / "cycles/001/implementation/steps/S01"
+        step.mkdir(parents=True)
+        (step / "agent.final.md").write_text("x" * (32 * 1024 + 100))
+        (step / "agent.stderr.log").write_text("e" * (32 * 1024 + 100))
+        (run / "implementation_bundle.json").write_text(json.dumps({
+            "schema_version": 1, "steps": [{"id": "S01", "title": "one"}],
+        }))
+        gate = run / "cycles/001/checks/post-implementation"
+        gate.mkdir(parents=True)
+        (gate / "diff.patch").write_text("d" * (64 * 1024 + 100))
+        (gate / "changed-files.txt").write_text("src/app.py\n")
         payload = get_run(self.server.config.runs_root, "artifacts")
-        diagnostics = payload["agent_diagnostics"]
-        self.assertLessEqual(len(diagnostics["final_tail"].encode()), 32 * 1024)
-        self.assertLessEqual(len(diagnostics["stderr_tail"].encode()), 32 * 1024)
+        step_payload = payload["cycle_artifacts"][0]["steps"][0]
+        self.assertLessEqual(len(step_payload["final"].encode()), 8 * 1024)
+        self.assertLessEqual(len(step_payload["stderr"].encode()), 8 * 1024)
         self.assertLessEqual(len(payload["candidate"]["diff_tail"].encode()), 64 * 1024)
         self.assertEqual(payload["candidate"]["changed_files"], ["src/app.py"])
         self.assertEqual(payload["approval"], {"recorded": False, "decision": None})

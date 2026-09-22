@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from .models import HarnessConfig, RevisionConfig, PlanningConfig, UIConfig, validate_revision_budget
+from .models import HarnessConfig, RevisionConfig, PlanningConfig, validate_revision_budget
 from .profiles import ProfileError, profile_for_role
 from .result import atomic_write_text
 from .models import ExecutionRole
@@ -25,37 +25,6 @@ class RunOptionsConflict(RunOptionsError):
 SCHEMA_VERSION = 2
 RUN_OPTIONS_NAME = "run_options.json"
 REPAIR_SCOPE_POLICIES = frozenset({"auto-bounded", "require-approval", "deny-expansion"})
-REPAIR_SCOPE_OVERRIDE_NAME = "repair_scope_override.json"
-REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION = 1
-REPAIR_SCOPE_OVERRIDE_POLICY = "auto-bounded"
-REPAIR_SCOPE_OVERRIDE_REASON = "operator-enabled historical test-scope recovery"
-REPAIR_SCOPE_MAX_ADDED_PATHS = 100
-
-
-@dataclass(frozen=True)
-class RepairScopeOverride:
-    schema_version: int
-    policy: str
-    max_added_paths: int
-    reason: str
-
-    def __post_init__(self) -> None:
-        if self.schema_version != REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION:
-            raise RunOptionsError("repair scope override schema_version is unsupported")
-        if self.policy != REPAIR_SCOPE_OVERRIDE_POLICY:
-            raise RunOptionsError("repair scope override policy is invalid")
-        if not isinstance(self.max_added_paths, int) or isinstance(self.max_added_paths, bool) or not 0 < self.max_added_paths <= REPAIR_SCOPE_MAX_ADDED_PATHS:
-            raise RunOptionsError("repair scope override max_added_paths must be between 1 and 100")
-        if self.reason != REPAIR_SCOPE_OVERRIDE_REASON:
-            raise RunOptionsError("repair scope override reason is invalid")
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema_version": self.schema_version,
-            "policy": self.policy,
-            "max_added_paths": self.max_added_paths,
-            "reason": self.reason,
-        }
 
 
 @dataclass(frozen=True)
@@ -69,7 +38,7 @@ class EffectiveRepairScopePolicy:
             raise RunOptionsError("effective repair scope policy is invalid")
         if not isinstance(self.max_added_paths, int) or isinstance(self.max_added_paths, bool) or self.max_added_paths <= 0:
             raise RunOptionsError("effective repair scope max_added_paths must be greater than zero")
-        if self.source not in {"run-options", "operator-override"}:
+        if self.source != "run-options":
             raise RunOptionsError("effective repair scope policy source is invalid")
 
 
@@ -280,34 +249,7 @@ def read_run_options_with_sha256(run_dir: str | Path, expected_sha256: str | Non
     return options, digest
 
 
-def write_repair_scope_override(run_dir: str | Path, override: RepairScopeOverride) -> str:
-    data = (json.dumps(override.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
-    path = Path(run_dir).expanduser().resolve() / REPAIR_SCOPE_OVERRIDE_NAME
-    if path.exists() and path.read_bytes() != data:
-        raise RunOptionsConflict("repair_scope_override.json is immutable")
-    if not path.exists():
-        atomic_write_text(path, data.decode())
-    return hashlib.sha256(data).hexdigest()
-
-
-def read_repair_scope_override(run_dir: str | Path) -> RepairScopeOverride | None:
-    path = Path(run_dir).expanduser().resolve() / REPAIR_SCOPE_OVERRIDE_NAME
-    if not path.exists():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, Mapping) or set(payload) != {"schema_version", "policy", "max_added_paths", "reason"}:
-            raise RunOptionsError("repair scope override schema is invalid")
-        return RepairScopeOverride(**payload)
-    except RunOptionsError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
-        raise RunOptionsError("repair_scope_override.json is missing or malformed") from exc
-
-
-def effective_repair_scope_policy(options: RunOptions, *, override: RepairScopeOverride | None = None) -> EffectiveRepairScopePolicy:
-    if override is not None:
-        return EffectiveRepairScopePolicy(override.policy, override.max_added_paths, "operator-override")
+def effective_repair_scope_policy(options: RunOptions) -> EffectiveRepairScopePolicy:
     return EffectiveRepairScopePolicy(options.repair_scope_policy, options.repair_scope_max_added_paths, "run-options")
 
 
@@ -336,12 +278,9 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
 
 
 __all__ = [
-    "SCHEMA_VERSION", "RUN_OPTIONS_NAME", "REPAIR_SCOPE_OVERRIDE_NAME",
-    "REPAIR_SCOPE_OVERRIDE_SCHEMA_VERSION", "REPAIR_SCOPE_OVERRIDE_REASON",
-    "REPAIR_SCOPE_OVERRIDE_POLICY", "REPAIR_SCOPE_MAX_ADDED_PATHS", "REPAIR_SCOPE_POLICIES",
-    "RunOptions", "RunOptionsConflict", "RunOptionsError", "RepairScopeOverride",
+    "SCHEMA_VERSION", "RUN_OPTIONS_NAME", "REPAIR_SCOPE_POLICIES",
+    "RunOptions", "RunOptionsConflict", "RunOptionsError",
     "EffectiveRepairScopePolicy", "canonical_run_options_bytes", "run_options_sha256",
     "write_run_options", "read_run_options_with_sha256", "read_run_options_with_sha256_and_raw",
-    "write_repair_scope_override", "read_repair_scope_override",
     "effective_repair_scope_policy", "effective_run_config",
 ]

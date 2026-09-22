@@ -18,9 +18,82 @@ from metaharness.models import PlanningConfig, RepositoryConfig  # noqa: E402
 from metaharness.planning_v2 import (  # noqa: E402
     V2PlanParseError,
     build_planner_prompt_v2,
+    parse_task_plan_v2,
     validate_decomposition_policy,
 )
-from tests.test_planning_v2 import _parse, _plan  # noqa: E402
+
+
+def _step(number: int) -> str:
+    step_id = f"S{number:02d}"
+    dependency = "NONE" if number == 1 else "S01"
+    return f"""BEGIN STEP {step_id}
+TITLE: Step {number}
+IMPLEMENTER_PROFILE: impl-a
+DEPENDS_ON: {dependency}
+
+OBJECTIVE
+Implement step {number}.
+
+READ_SET
+- src/example.py :: function example()
+
+WRITE_SET
+- src/example.py
+
+INSTRUCTIONS
+1. edit the named symbol
+
+VERIFY
+- python -m unittest tests.test_p23
+
+FORBIDDEN
+- Do not change files outside WRITE_SET.
+
+END STEP {step_id}"""
+
+
+def _plan(mode: str = "SINGLE", count: int = 1, *, steps: str | None = None) -> str:
+    if steps is None:
+        steps = _step(1)
+    return f"""META PLAN v2
+
+STATUS: READY
+TITLE: v2 task
+
+OBJECTIVE
+Implement the task.
+
+CONSTRAINTS
+NONE
+
+EXECUTION_MODE: {mode}
+STEP_COUNT: {count}
+REVIEWER_PROFILE: review-a
+
+{steps}
+
+ACCEPTANCE
+The requested behavior is observable.
+
+TESTS
+Run the narrow tests listed in each step.
+
+RISKS
+NONE
+
+BLOCKERS
+NONE
+
+END META PLAN
+"""
+
+
+def _parse(raw: str):
+    return parse_task_plan_v2(
+        raw,
+        implementer_ids=frozenset({"impl-a"}),
+        reviewer_ids=frozenset({"review-a"}),
+    )
 
 
 class P23RepositoryTests(unittest.TestCase):
@@ -142,8 +215,6 @@ class P23DecompositionTests(unittest.TestCase):
 
 
 def _plan_step_with_sets(sets: str, number: int = 1) -> str:
-    from tests.test_planning_v2 import _step
-
     step = _step(number)
     start = step.index("READ_SET")
     end = step.index("INSTRUCTIONS")

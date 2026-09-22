@@ -62,8 +62,7 @@ class CoreP15Tests(unittest.TestCase):
             root = Path(directory)
             config = config_for(root)
             config.runs_root.mkdir()
-            orchestrator = Orchestrator.__new__(Orchestrator)
-            orchestrator.config = config
+            orchestrator = Orchestrator(config)
             orchestrator._execute = Mock(return_value=object())  # type: ignore[method-assign]
             spec = "# SPEC\n\ntext with trailing spaces  \n"
             orchestrator.run_text(spec, run_id="exact")
@@ -75,8 +74,7 @@ class CoreP15Tests(unittest.TestCase):
             root = Path(directory)
             config = config_for(root)
             config.runs_root.mkdir()
-            orchestrator = Orchestrator.__new__(Orchestrator)
-            orchestrator.config = config
+            orchestrator = Orchestrator(config)
             orchestrator._execute = Mock(return_value=object())  # type: ignore[method-assign]
             observed: list[tuple[Path, str, str]] = []
 

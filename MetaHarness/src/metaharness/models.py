@@ -374,11 +374,14 @@ def validate_revision_budget(value: int, name: str) -> int:
 
 @dataclass(frozen=True)
 class RevisionConfig:
-    """Independent, bounded semantic-revision and check-repair budgets."""
+    """Independent, bounded semantic-revision and check-repair budgets.
+
+    The default is no correction pipeline: every budget needs its profile.
+    """
 
     enabled: bool = False
-    max_review_repair_cycles: int = 1
-    max_check_repair_attempts: int = 2
+    max_review_repair_cycles: int = 0
+    max_check_repair_attempts: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -623,15 +626,37 @@ class ExecutionSelection:
     final_reviewer: SelectedProfile
 
 
+class CycleKind(StrEnum):
+    """Why one pipeline cycle exists; every cycle names its kind explicitly."""
+
+    INITIAL = "initial"
+    REVIEW_IMPLEMENTATION = "review-implementation"
+    REVIEW_REPLAN = "review-replan"
+
+
+class GateStage(StrEnum):
+    """Why one deterministic gate episode runs.
+
+    ``(review_cycle, stage)`` identifies exactly one gate episode.
+    """
+
+    POST_IMPLEMENTATION = "POST_IMPLEMENTATION"
+    POST_SEMANTIC_REVISION = "POST_SEMANTIC_REVISION"
+    POST_REVIEW_IMPLEMENTATION = "POST_REVIEW_IMPLEMENTATION"
+    POST_REVIEW_REPLAN = "POST_REVIEW_REPLAN"
+
+
 @dataclass(frozen=True)
 class RunCycle:
     """One generic orchestration cycle; its budget is configured elsewhere."""
 
     number: int
-    kind: str
+    kind: CycleKind
 
     def __post_init__(self) -> None:
         if isinstance(self.number, bool) or not isinstance(self.number, int) or self.number < 1:
             raise ValueError("run cycle number must be a positive integer")
-        if not isinstance(self.kind, str) or not self.kind.strip():
-            raise ValueError("run cycle kind must be a non-empty string")
+        try:
+            object.__setattr__(self, "kind", CycleKind(self.kind))
+        except ValueError as exc:
+            raise ValueError("run cycle kind is unknown") from exc

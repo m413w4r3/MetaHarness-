@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .approval import ApprovalError, PlanIdentity
+from .models import GateStage
 from .result import atomic_write_text
 from .step_ids import STEP_ID_RE
 
@@ -43,18 +43,11 @@ class ResumePhase(StrEnum):
     PUBLISH = "publish"
 
 
-_PHASE_ORDER = {phase: index for index, phase in enumerate(ResumePhase)}
-_GATE_STAGES = frozenset({
-    "POST_IMPLEMENTATION", "POST_SEMANTIC_REVISION",
-    "POST_REVIEW_IMPLEMENTATION", "POST_REVIEW_REPLAN",
-})
+_GATE_STAGES = frozenset(stage.value for stage in GateStage)
+_STAGED_PHASES = frozenset({ResumePhase.DETERMINISTIC_GATE, ResumePhase.CHECK_REPAIR})
 _PRE_PLAN = frozenset({ResumePhase.CONTEXT, ResumePhase.PLANNER})
 _PRE_APPROVAL = _PRE_PLAN | frozenset({ResumePhase.PLAN_APPROVAL})
 _NO_WORKTREE = _PRE_APPROVAL | frozenset({ResumePhase.WORKTREE_SETUP})
-
-
-def phase_index(phase: ResumePhase) -> int:
-    return _PHASE_ORDER[ResumePhase(phase)]
 
 
 class ResumeCheckpointError(ValueError):
@@ -65,7 +58,7 @@ class ResumeCheckpointError(ValueError):
 class ResumeCheckpoint:
     phase: ResumePhase
     review_cycle: int = 1
-    stage: str | None = None
+    stage: GateStage | None = None
     step_id: str | None = None
     next_step_id: str | None = None
     check_repair_attempt: int | None = None
@@ -84,12 +77,14 @@ class ResumeCheckpoint:
         object.__setattr__(self, "phase", phase)
         if isinstance(self.review_cycle, bool) or not isinstance(self.review_cycle, int) or self.review_cycle < 1:
             raise ResumeCheckpointError("checkpoint review_cycle must be a positive integer")
-        if self.stage is not None and (
-            not isinstance(self.stage, str) or self.stage not in _GATE_STAGES
-        ):
-            raise ResumeCheckpointError("checkpoint stage is invalid")
-        if phase is ResumePhase.DETERMINISTIC_GATE and self.stage is None:
-            raise ResumeCheckpointError("deterministic gate checkpoint requires a stage")
+        if self.stage is not None:
+            if not isinstance(self.stage, str) or self.stage not in _GATE_STAGES:
+                raise ResumeCheckpointError("checkpoint stage is invalid")
+            object.__setattr__(self, "stage", GateStage(self.stage))
+        if phase in _STAGED_PHASES and self.stage is None:
+            raise ResumeCheckpointError("gate and check-repair checkpoints require a stage")
+        if phase not in _STAGED_PHASES and self.stage is not None:
+            raise ResumeCheckpointError("checkpoint stage is only valid for gate phases")
         step_phases = {ResumePhase.IMPLEMENT_STEP, ResumePhase.REVIEW_IMPLEMENTATION}
         if phase in step_phases:
             if not isinstance(self.step_id, str) or STEP_ID_RE.fullmatch(self.step_id) is None:
@@ -163,7 +158,7 @@ def checkpoint_payload(checkpoint: ResumeCheckpoint, *, status: str = "pending")
         "status": status,
         "phase": checkpoint.phase.value,
         "review_cycle": checkpoint.review_cycle,
-        "stage": checkpoint.stage,
+        "stage": checkpoint.stage.value if checkpoint.stage else None,
         "step_id": checkpoint.step_id,
         "next_step_id": checkpoint.next_step_id,
         "check_repair_attempt": checkpoint.check_repair_attempt,
@@ -240,18 +235,13 @@ PHASE_STATUS.update({
     ResumePhase.REVIEW_IMPLEMENTATION: "implementing", ResumePhase.REVIEW_REPLAN: "planning",
     ResumePhase.PUBLISH: "publishing",
 })
-_RETRYABLE = frozenset({
-    "AGENT_FAILED", "AGENT_TIMEOUT", "AGENT_RUNTIME_FAILED", "AGENT_START_FAILED",
-    "AGENT_PROTOCOL_FAILED", "AGENT_AUTH_FAILURE", "REVIEWER_TRANSPORT_FAILURE",
-    "LLM_FAILURE", "PUSH_FAILED", "WAITING_SCOPE_APPROVAL",
-})
-RESUMABLE_FAILURES: Mapping[str, frozenset[ResumePhase]] = {
-    reason: frozenset(ResumePhase) for reason in _RETRYABLE
-}
 _RESUMABLE_STATUSES = frozenset({"failed", "interrupted", "waiting_scope_approval"})
+# Failures that a checkpoint can never repair: the run needs an operator.
+_TERMINAL_FAILURES = frozenset({"RESUME_INTEGRITY_FAILURE", "RESUME_REQUIRES_OPERATOR"})
 
 
 def resume_label(checkpoint: ResumeCheckpoint) -> str:
+    cycle = f" (cycle {checkpoint.review_cycle:03d})" if checkpoint.review_cycle > 1 else ""
     labels = {
         ResumePhase.CONTEXT: "Retry context", ResumePhase.PLANNER: "Retry planner",
         ResumePhase.PLAN_APPROVAL: "Resume plan approval", ResumePhase.WORKTREE_SETUP: "Retry workspace setup",
@@ -260,10 +250,10 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         ResumePhase.CHECK_REPAIR: f"Retry check-repair attempt {checkpoint.check_repair_attempt}",
         ResumePhase.SEMANTIC_REVISION: "Retry semantic revision", ResumePhase.CANDIDATE_READY: "Prepare candidate",
         ResumePhase.CANDIDATE_PUSH: "Push candidate", ResumePhase.FINAL_REVIEW: "Retry final review",
-        ResumePhase.REVIEW_IMPLEMENTATION: "Apply review implementation correction",
-        ResumePhase.REVIEW_REPLAN: "Replan after review", ResumePhase.PUBLISH: "Retry publish",
+        ResumePhase.REVIEW_IMPLEMENTATION: f"Retry correction {checkpoint.step_id}",
+        ResumePhase.REVIEW_REPLAN: "Retry correction planner", ResumePhase.PUBLISH: "Retry publish",
     }
-    return labels[checkpoint.phase]
+    return labels[checkpoint.phase] + cycle
 
 
 @dataclass(frozen=True)
@@ -277,49 +267,26 @@ class ResumeInfo:
     step_id: str | None = None
 
 
-def load_resume_checkpoint(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeCheckpoint | None:
-    del state
-    return read_checkpoint(run_dir)
-
-
-def resume_info(run_dir: str | Path, state: Mapping[str, Any], *, revalidate_integrity: bool = False) -> ResumeInfo:
-    del revalidate_integrity
+def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     if state.get("status") not in _RESUMABLE_STATUSES:
         return ResumeInfo(False, reason="run is not failed or interrupted")
     if state.get("planning_protocol") != "v2":
         return ResumeInfo(False, reason="only pipeline v2 runs can be resumed")
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    if failure.get("reason") in _TERMINAL_FAILURES:
+        return ResumeInfo(False, reason="the run requires an operator")
     try:
-        checkpoint = load_resume_checkpoint(run_dir, state)
+        checkpoint = read_checkpoint(run_dir)
     except ResumeCheckpointError:
         return ResumeInfo(False, reason="resume checkpoint is invalid")
     if checkpoint is None:
         return ResumeInfo(False, reason="no resume checkpoint")
-    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-    reason = failure.get("reason")
-    if reason in RESUMABLE_FAILURES and checkpoint.phase not in RESUMABLE_FAILURES[reason]:
-        return ResumeInfo(False, reason="failure does not match resume checkpoint")
     return ResumeInfo(
         True, checkpoint.phase.value, resume_label(checkpoint),
         expected_tree=checkpoint.expected_tree_sha,
         review_cycle=checkpoint.review_cycle,
         step_id=checkpoint.step_id,
     )
-
-
-def integrity_revalidation_allowed(run_dir: str | Path, state: Mapping[str, Any]) -> bool:
-    return False
-
-
-def mismatch_retry_spent(run_dir: str | Path, step_id: str | None) -> bool:
-    return False
-
-
-def is_clean_contract_mismatch_artifact(run_dir: str | Path, state: Mapping[str, Any], checkpoint: ResumeCheckpoint) -> bool:
-    return False
-
-
-def is_recoverable_dirty_contract_mismatch_artifact(run_dir: str | Path, state: Mapping[str, Any], checkpoint: ResumeCheckpoint) -> bool:
-    return False
 
 
 class ResumeError(RuntimeError):
@@ -339,12 +306,10 @@ class ResumeRequiresOperatorError(ResumeError):
 
 
 __all__ = [
-    "CHECKPOINT_NAME", "PHASE_STATUS", "RESUMABLE_FAILURES", "ResumeCheckpoint",
+    "CHECKPOINT_NAME", "PHASE_STATUS", "ResumeCheckpoint",
     "ResumeCheckpointError", "ResumeError", "ResumeInfo", "ResumeIntegrityError",
     "ResumeNotAllowedError", "ResumePhase", "ResumeRequiresOperatorError",
-    "checkpoint_payload", "integrity_revalidation_allowed", "load_resume_checkpoint",
-    "mark_checkpoint_completed", "phase_index", "pipeline_version_from_state",
+    "checkpoint_payload", "mark_checkpoint_completed", "pipeline_version_from_state",
     "plan_identity_from_mapping", "read_checkpoint", "read_checkpoint_record",
-    "resume_info", "resume_label", "is_clean_contract_mismatch_artifact",
-    "is_recoverable_dirty_contract_mismatch_artifact", "mismatch_retry_spent", "write_checkpoint",
+    "resume_info", "resume_label", "write_checkpoint",
 ]

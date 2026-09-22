@@ -21,11 +21,14 @@ execution_mode_policy = "require-staged"
 single_step_max_mutable_paths = 2
 staged_step_max_mutable_paths = 6
 
-# Target workflow: planner (STAGED) -> Luna steps -> Claude -> checks ->
-# candidate commit C01 (parent = BASE), pushed to the run branch -> reviewer
-# -> optional C02 -> candidate commit C02 (parent = C01), pushed -> reviewer.
-# The final PASS publishes the exact approved candidate chain tip (no new
-# commit): CAS fast-forward of local main BASE->tip -> push origin/main.
+# Target workflow: generic cycles 001, 002, ... Each cycle runs its approved
+# steps (accepted step commits), the optional semantic revision, one
+# deterministic gate with bounded check-repair attempts, one immutable
+# candidate commit pushed to the run branch, then the final reviewer. A
+# REVISE (IMPLEMENTATION or REPLAN) opens the next correction cycle while
+# max_review_repair_cycles allows it. The final PASS publishes the exact
+# approved candidate chain tip (no new commit): CAS fast-forward of local
+# main BASE->tip -> push origin/main.
 # [revision] supplies independent defaults; durable UI runs freeze semantic
 # revision, check-repair attempts and review-repair cycles in run_options.json.
 # AutoWork recommendation: repair_scope_policy = "auto-bounded" and

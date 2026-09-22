@@ -1,4 +1,4 @@
-"""The scope-repair sub-domain: mutable-scope deltas and their approval."""
+"""Correction-cycle mutable-scope deltas and their approval."""
 
 from __future__ import annotations
 
@@ -8,10 +8,7 @@ from pathlib import (
     Path,
     PurePosixPath,
 )
-from typing import (
-    Any,
-    Sequence,
-)
+from typing import Any
 from .shared import (
     OrchestrationError,
     _create_file_once,
@@ -23,7 +20,7 @@ from ..review import ReviewResult
 
 
 def _repair_mutation_sets(plan: TaskPlanV2) -> tuple[list[str], list[str], list[str]]:
-    """Return canonical 002 mutation sets and reject structural ambiguity."""
+    """Return canonical correction mutation sets and reject structural ambiguity."""
 
     writes = sorted({path for step in plan.steps for path in step.write_set})
     creates = sorted({path for step in plan.steps for path in step.create_set})
@@ -95,7 +92,7 @@ def _ensure_scope_delta(
     expected = content.encode("utf-8")
     digest = hashlib.sha256(expected).hexdigest()
     if expected_sha256 is not None and digest != expected_sha256:
-        raise ResumeIntegrityError("the 002 scope delta changed")
+        raise ResumeIntegrityError("the correction scope delta changed")
     path = repair_dir / "scope_delta.json"
     if expected_sha256 is None:
         try:
@@ -107,41 +104,10 @@ def _ensure_scope_delta(
             raise OrchestrationError("REPAIR_SCOPE_DELTA_UNWRITABLE") from exc
     try:
         if path.stat().st_size > 256 * 1024:
-            raise ResumeIntegrityError("the 002 scope delta is too large")
+            raise ResumeIntegrityError("the correction scope delta is too large")
         existing = path.read_bytes()
     except OSError as exc:
-        raise ResumeIntegrityError(f"the 002 scope delta is unreadable: {exc}") from exc
+        raise ResumeIntegrityError(f"the correction scope delta is unreadable: {exc}") from exc
     if existing != expected:
-        raise ResumeIntegrityError("the 002 scope delta changed")
+        raise ResumeIntegrityError("the correction scope delta changed")
     return digest
-
-
-def _build_scope_repair_delta(
-    repair_dir: Path, *, original_scope: Sequence[str], plan: TaskPlanV2,
-    failure_ids: Sequence[str], observed_outside_scope_paths: Sequence[str],
-    repair_bundle_sha: str,
-) -> tuple[dict[str, Any], str]:
-    """Build the scope-repair authority from plan mutation sets only."""
-
-    writes, creates, deletes = _repair_mutation_sets(plan)
-    requested = sorted(set(writes) | set(creates) | set(deletes))
-    original = sorted(set(original_scope))
-    added = sorted(set(requested) - set(original))
-    try:
-        raw_plan = (repair_dir / "planner.raw.md").read_bytes()
-    except OSError as exc:
-        raise OrchestrationError("SCOPE_REPAIR_PLAN_UNREADABLE") from exc
-    payload = {
-        "schema_version": 1,
-        "trigger": "revision_scope_violation",
-        "original_mutable_paths": original,
-        "requested_write_paths": writes,
-        "requested_create_paths": creates,
-        "requested_delete_paths": deletes,
-        "added_paths": added,
-        "failure_ids": sorted(set(failure_ids)),
-        "observed_outside_scope_paths": sorted(set(observed_outside_scope_paths)),
-        "repair_plan_sha256": hashlib.sha256(raw_plan).hexdigest(),
-        "correction_bundle_sha256": repair_bundle_sha,
-    }
-    return payload, _json_text(payload)

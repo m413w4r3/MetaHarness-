@@ -111,17 +111,6 @@ def validate_run_branch(branch: str, *, base_ref: str | None = None) -> str:
     return branch
 
 
-def run_branch_web_url(reference: RepositoryReference, branch: str) -> str | None:
-    """Return a credential-free GitHub branch URL when the repository is known."""
-
-    validate_run_branch(branch)
-    if reference.web_url is None or normalize_github_web_url(reference.web_url) is None:
-        return None
-    # Every component was validated by _RUN_BRANCH; "/" separates components
-    # and GitHub expects it literally in /tree/<branch>.
-    return f"{reference.web_url}/tree/{urllib.parse.quote(branch, safe='/')}"
-
-
 def immutable_commit_web_url(
     reference: RepositoryReference,
     commit_sha: str,

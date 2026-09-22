@@ -22,12 +22,17 @@ from .profiles import profiles_for_config, safe_profile_metadata
 from .redaction import config_secret_values, redact
 from .result import atomic_write_text
 from .resume import ResumeCheckpointError, resume_info, read_checkpoint_record
+from .orchestration.pipeline_v2 import (
+    correction_dir,
+    cycle_dir,
+    implementation_dir,
+    review_dir,
+    semantic_revision_dir,
+)
 from .run_options import (
     RunOptionsError,
     effective_repair_scope_policy,
-    read_repair_scope_override,
     read_run_options_with_sha256,
-    read_run_options_with_sha256_and_raw,
 )
 from .step_ids import is_step_id
 from .usage import normalize_usage, phase_usage_summary, read_usage_artifact
@@ -183,48 +188,6 @@ def _safe_json_payload(path: Path) -> Any:
         return None
 
 
-_SCOPE_RECOVERY_SOURCES = ("check-repair", "check-repair-expanded")
-
-
-def _scope_violation_recovery_artifact(
-    run_dir: Path,
-    cycle: int,
-) -> tuple[Mapping[str, Any], str | None]:
-    """Locate the durable scope-violation recovery proof for one cycle.
-
-    A violation may have been produced by the normal check repair or by the
-    expanded one, so both directories are examined.  When both hold a valid
-    recovery artifact the caller is told the situation is ambiguous instead of
-    being handed a silently chosen winner.
-    """
-
-    found: list[tuple[str, Mapping[str, Any]]] = []
-    for source in _SCOPE_RECOVERY_SOURCES:
-        payload = _safe_json_payload(
-            run_dir / "revision" / source / f"C0{cycle}" / "scope_violation_recovery.json"
-        )
-        if isinstance(payload, Mapping):
-            found.append((source, payload))
-    if not found:
-        return {}, None
-    if len(found) == 1:
-        source, payload = found[0]
-        return payload, source
-    return {
-        "ambiguous": True,
-        "candidates": [
-            {
-                "artifact": f"revision/{source}/C0{cycle}/scope_violation_recovery.json",
-                "outside_scope_paths": (
-                    len(payload["outside_scope_paths"])
-                    if isinstance(payload.get("outside_scope_paths"), list) else 0
-                ),
-            }
-            for source, payload in found
-        ],
-    }, "ambiguous"
-
-
 _MAX_TERMINAL_ERRORS = 8
 _MAX_TERMINAL_FIELD_CHARS = 500
 
@@ -235,7 +198,7 @@ def _terminal_text(value: Any) -> str:
     return " ".join(value.split())[:_MAX_TERMINAL_FIELD_CHARS] or "—"
 
 
-def _claude_terminal_summary(
+def _agent_terminal_summary(
     run_dir: Path, relative: str, secrets: tuple[str, ...]
 ) -> str:
     """Render only bounded terminal metadata from the durable result."""
@@ -277,7 +240,7 @@ def _claude_terminal_summary(
     return _clean(summary, secrets)
 
 
-def _claude_result_artifact(
+def _agent_result_artifact(
     run_dir: Path, relative: str, secrets: tuple[str, ...]
 ) -> str:
     """Keep the legacy result visible without replaying untrusted fields."""
@@ -439,7 +402,7 @@ def _selection_summary(run_dir: Path, secrets: tuple[str, ...]) -> str:
     safe: dict[str, Any] = {}
     if isinstance(payload, Mapping):
         safe["schema_version"] = payload.get("schema_version")
-        for role in ("planner", "implementer", "reviser", "repair_implementer", "reviewer"):
+        for role in ("planner", "check_repair", "semantic_reviser", "final_reviewer"):
             value = payload.get(role)
             if isinstance(value, Mapping):
                 safe[role] = {key: value.get(key) for key in ("profile_id", "model", "effort", "selection_mode") if key in value}
@@ -514,26 +477,25 @@ def _prompt_footprint(run_dir: Path) -> str:
             rows.append((relative, artifact, run_dir / usage if usage else None, nested_usage))
 
     add("planner.request.txt", "planner.usage.json")
-    for root, usage_name in (("steps", "step.json"), ("cycles/002/correction/steps", "step.json")):
-        base = run_dir / root
+    for cycle_path in _cycle_dirs(run_dir):
+        relative = cycle_path.relative_to(run_dir).as_posix()
+        add(f"{relative}/correction/planner.request.txt", f"{relative}/correction/planner.usage.json")
+        steps_root = cycle_path / "implementation" / "steps"
         try:
             step_dirs = sorted(
-                path for path in base.iterdir()
+                path for path in steps_root.iterdir()
                 if path.is_dir() and is_step_id(path.name)
             )
         except OSError:
             step_dirs = []
         for step_dir in step_dirs:
-            add(f"{root}/{step_dir.name}/agent.prompt.txt", f"{root}/{step_dir.name}/{usage_name}", nested_usage=True)
-    add("cycles/001/semantic-revision/agent.prompt.txt", "cycles/001/semantic-revision/usage.json")
-    add("revision/check-repair/001/agent.prompt.txt", "revision/check-repair/001/usage.json")
-    add("cycles/001/review/reviewer.request.txt", "cycles/001/review/reviewer.usage.json")
-    add("cycles/002/correction/planner.request.txt", "cycles/002/correction/planner.usage.json")
-    add("cycles/001/correction/planner.request.txt", "cycles/001/correction/planner.usage.json")
-    add("scope-cycles/002/correction/planner.request.txt", "scope-cycles/002/correction/planner.usage.json")
-    add("cycles/002/semantic-revision/agent.prompt.txt", "cycles/002/semantic-revision/usage.json")
-    add("revision/check-cycles/002/correction/agent.prompt.txt", "revision/check-cycles/002/correction/usage.json")
-    add("cycles/002/review/reviewer.request.txt", "cycles/002/review/reviewer.usage.json")
+            step = f"{relative}/implementation/steps/{step_dir.name}"
+            add(f"{step}/agent.prompt.txt", f"{step}/step.json", nested_usage=True)
+        add(f"{relative}/semantic-revision/agent.prompt.txt", f"{relative}/semantic-revision/usage.json")
+        for attempt in sorted((cycle_path / "check-repair").glob("*/attempts/[0-9][0-9][0-9]")):
+            attempt_relative = attempt.relative_to(run_dir).as_posix()
+            add(f"{attempt_relative}/agent.prompt.txt", f"{attempt_relative}/usage.json")
+        add(f"{relative}/review/reviewer.request.txt", f"{relative}/review/reviewer.usage.json")
 
     lines = ["Prompt artifacts:", "| Relative path | Bytes | SHA256 | Input tokens |", "|---|---:|---|---:|"]
     for relative, artifact, usage_path, nested_usage in rows:
@@ -570,38 +532,32 @@ def _prompt_footprint(run_dir: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _claude_status(config: HarnessConfig, run_dir: Path, revision_exists: bool) -> str:
-    options_path = run_dir / "run_options.json"
-    if options_path.is_file():
-        try:
-            options, _digest = read_run_options_with_sha256(run_dir)
-        except RunOptionsError:
-            return "Claude revision status unavailable: durable run options are malformed."
-        if not options.semantic_revision_enabled:
-            return "Semantic revision disabled by run options."
-        if not revision_exists:
-            return "Claude revision enabled by run options, but no revision artifact was produced/reached."
-        return "Claude revision artifacts present."
-    return "Semantic revision status unavailable: durable run options are missing."
+def _semantic_revision_status(run_dir: Path, revision_exists: bool) -> str:
+    try:
+        options, _digest = read_run_options_with_sha256(run_dir)
+    except RunOptionsError:
+        return "Semantic revision status unavailable: durable run options are missing or malformed."
+    if not options.semantic_revision_enabled:
+        return "Semantic revision disabled by run options."
+    if not revision_exists:
+        return "Semantic revision enabled by run options, but no revision artifact was produced/reached."
+    return "Semantic revision artifacts present."
 
 
-def _repair_scope_policy_status(config: HarnessConfig, run_dir: Path) -> str:
-    """Render the durable and effective scope authorities without ambiguity."""
+def _repair_scope_policy_status(run_dir: Path) -> str:
+    """Render the frozen repair-scope authority of the run."""
 
     try:
-        options, _digest, _raw = read_run_options_with_sha256_and_raw(run_dir)
-        override = read_repair_scope_override(run_dir)
-        effective = effective_repair_scope_policy(options, override=override)
+        options, _digest = read_run_options_with_sha256(run_dir)
+        effective = effective_repair_scope_policy(options)
     except RunOptionsError as exc:
         return "\n".join([
             "Repair scope policy:",
-            "  durable run option: unavailable",
             "  effective policy: unavailable",
             f"  error: {type(exc).__name__}",
         ])
     return "\n".join([
         "Repair scope policy:",
-        "  durable run option: explicit",
         f"  effective policy: {effective.policy}",
         f"  max added paths: {effective.max_added_paths}",
         f"  source: {effective.source}",
@@ -615,205 +571,109 @@ def _event_artifact(run_dir: Path, relative: str, secrets: tuple[str, ...]) -> s
     )
 
 
-def _second_check_repair_scope_text(scope_path: Path) -> str:
-    """Say whether the second bounded repair expanded the scope, or not.
-
-    "expanded check repair" used to be printed for every second pass, which
-    is misleading whenever no path was added: the second pass then ran inside
-    exactly the scope the first repair already held.
-    """
-
+def _cycle_dirs(run_dir: Path) -> list[Path]:
     try:
-        scope = json.loads(scope_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError):
-        scope = None
-    if not isinstance(scope, Mapping):
-        return "  scope: unavailable"
-    added = scope.get("added_paths", [])
-    added = added if isinstance(added, list) else []
-    source = scope.get("source", "—")
-    expanded = source != "bounded same-scope retry"
-    return "\n".join([
-        f"  scope expanded: {'yes' if expanded else 'no'}",
-        f"  source: {source}",
-        f"  added paths: {len(added)}",
-        *(f"  - {path}" for path in added),
-    ])
+        return sorted(
+            path for path in (run_dir / "cycles").iterdir()
+            if path.is_dir() and path.name.isdigit() and len(path.name) == 3
+        )
+    except OSError:
+        return []
 
 
-def _cycle(config: HarnessConfig, run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
-    prefix = "" if cycle == 1 else "cycles/002/correction/"
-    label = f"CYCLE C0{cycle}"
-    parts = [_section(label, "")]
-    bundle = prefix + "implementation_bundle.json"
-    plan = prefix + "task_plan_v2.json"
-    parts.append(_section("Contract / plan summary", _plan_summary(run_dir, secrets, plan)))
-    parts.append(_section("Bundle", _bundle_summary(run_dir, secrets, bundle)))
-    steps_root = run_dir / prefix / "steps"
+_EVIDENCE_KEYS = ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")
+
+
+def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
+    """One generic cycle: plan, steps, revision, gates, repairs, candidate, review."""
+
+    root = cycle_dir(run_dir, cycle).relative_to(run_dir).as_posix()
+    record = _safe_json_payload(cycle_dir(run_dir, cycle) / "cycle.json")
+    kind = record.get("kind") if isinstance(record, Mapping) else None
+    parts = [_section(f"CYCLE {cycle:03d}", f"kind: {kind or ('initial' if cycle == 1 else 'unknown')}")]
+    if cycle == 1:
+        contracts = ""
+        plan_body = "Approved plan: see PLANNER RESPONSE and PLAN / BUNDLE."
+    else:
+        correction = correction_dir(run_dir, cycle).relative_to(run_dir).as_posix()
+        contracts = correction + "/"
+        plan_body = "\n".join([
+            _artifact_text(run_dir, f"{correction}/planner.request.txt", secrets, MAX_PLANNER_REQUEST_BYTES),
+            _artifact_text(run_dir, f"{correction}/planner.raw.md", secrets),
+            _plan_summary(run_dir, secrets, f"{correction}/task_plan_v2.json"),
+            _bundle_summary(run_dir, secrets, f"{correction}/implementation_bundle.json"),
+            _artifact_json(run_dir, f"{correction}/scope_delta.json", secrets),
+            _artifact_json(run_dir, f"{correction}/scope_approval.json", secrets),
+        ])
+    parts.append(_section("Plan", plan_body))
+    steps_root = implementation_dir(run_dir, cycle) / "steps"
     try:
-        step_ids = sorted(path.name for path in steps_root.iterdir() if path.is_dir() and path.name.startswith("S"))
+        step_ids = sorted(path.name for path in steps_root.iterdir() if path.is_dir() and is_step_id(path.name))
     except OSError:
         step_ids = []
     if not step_ids:
-        legacy_worker = "\n".join([
-            _artifact_json(run_dir, "agent.result.json", secrets),
-            _artifact_text(run_dir, "agent.final.md", secrets),
-            _artifact_text(run_dir, "agent.stderr.log", secrets, MAX_STDERR_BYTES, tail=True),
-            _event_artifact(run_dir, "agent.events.jsonl", secrets),
-        ])
-        has_legacy_worker = any(
-            (run_dir / name).exists()
-            for name in ("agent.result.json", "agent.final.md", "agent.stderr.log", "agent.events.jsonl")
-        )
-        parts.append(_section("Steps", legacy_worker if has_legacy_worker else "No worker steps recorded."))
+        parts.append(_section("Steps", "No worker steps recorded."))
     for step_id in step_ids:
-        step_prefix = prefix + f"steps/{step_id}/"
+        step = f"{root}/implementation/steps/{step_id}/"
         body = "\n".join([
-            _artifact_text(run_dir, step_prefix + "contract.md", secrets),
-            _artifact_json(run_dir, step_prefix + "step.json", secrets),
-            _artifact_text(run_dir, step_prefix + "agent.final.md", secrets),
-            _artifact_text(run_dir, step_prefix + "agent.stderr.log", secrets, MAX_STDERR_BYTES, tail=True),
-            _artifact_json(run_dir, step_prefix + "usage.json", secrets),
-            _event_artifact(run_dir, step_prefix + "agent.events.jsonl", secrets),
+            _artifact_text(run_dir, f"{contracts}steps/{step_id}/contract.md", secrets),
+            _artifact_json(run_dir, step + "step.json", secrets),
+            _artifact_text(run_dir, step + "agent.final.md", secrets),
+            _artifact_text(run_dir, step + "agent.stderr.log", secrets, MAX_STDERR_BYTES, tail=True),
+            _event_artifact(run_dir, step + "agent.events.jsonl", secrets),
         ])
-        parts.append(_section(f"{step_id}", body))
-    if cycle == 1 and (run_dir / "cycles/001/checks/checks.json").exists():
-        checks, changed, diff = "cycles/001/checks/checks.json", "cycles/001/checks/changed-files.txt", "cycles/001/checks/diff.patch"
-    else:
-        checks = prefix + "checks.json" if cycle == 1 else "cycles/002/checks/checks.json"
-        changed = prefix + "changed-files.txt" if cycle == 1 else "cycles/002/checks/changed-files.txt"
-        diff = prefix + "diff.patch" if cycle == 1 else "cycles/002/checks/diff.patch"
-    checks_body = "\n".join([
-        _artifact_json(run_dir, checks, secrets),
-        _safe_json_artifact(run_dir, checks.rsplit("/", 1)[0] + "/evidence.json" if "/" in checks else "evidence.json", secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
-        _artifact_text(run_dir, changed, secrets),
-        "Diff artifact metadata (diff omitted from consolidated diagnostics):",
-        _artifact_header(_artifact(run_dir, diff)),
-        "Diff content omitted from consolidated diagnostics.",
-    ])
-    parts.append(_section(f"CHECKS C0{cycle}", checks_body))
-    revision = f"revision/C0{cycle}/"
-    if cycle == 1 and not (run_dir / revision).is_dir() and any(
-        (run_dir / "revision" / name).exists()
-        for name in ("agent.prompt.txt", "agent.result.json", "agent.final.md", "agent.stderr.log", "report.json")
-    ):
-        revision = "revision/"
+        parts.append(_section(step_id, body))
+    revision = semantic_revision_dir(run_dir, cycle).relative_to(run_dir).as_posix() + "/"
     revision_exists = any(
         (run_dir / revision / name).exists()
         for name in ("agent.prompt.txt", "agent.result.json", "agent.final.md", "agent.stderr.log", "report.json", "tree_before.txt")
     )
-    claude_body = _claude_status(config, run_dir, revision_exists)
+    revision_body = _semantic_revision_status(run_dir, revision_exists)
     if revision_exists:
-        claude_body += "\n" + _claude_terminal_summary(
-            run_dir, revision + "agent.result.json", secrets
-        )
-        claude_body += "\n" + "\n".join([
+        revision_body += "\n" + _agent_terminal_summary(run_dir, revision + "agent.result.json", secrets)
+        revision_body += "\n" + "\n".join([
             _artifact_text(run_dir, revision + "agent.prompt.txt", secrets),
-            _claude_result_artifact(run_dir, revision + "agent.result.json", secrets),
+            _agent_result_artifact(run_dir, revision + "agent.result.json", secrets),
             _artifact_text(run_dir, revision + "agent.final.md", secrets),
             _artifact_text(run_dir, revision + "agent.stderr.log", secrets, MAX_STDERR_BYTES, tail=True),
             _artifact_json(run_dir, revision + "report.json", secrets),
             _artifact_json(run_dir, revision + "usage.json", secrets),
             _event_artifact(run_dir, revision + "agent.events.jsonl", secrets),
-            _artifact_text(run_dir, revision + "tree_before.txt", secrets),
-            _artifact_text(run_dir, revision + "tree_after.txt", secrets),
         ])
-    parts.append(_section(f"CLAUDE C0{cycle}", claude_body))
-    check_repair = run_dir / "revision" / "check-repair" / f"C0{cycle}"
-    expanded_check_repair = run_dir / "revision" / "check-repair-expanded" / f"C0{cycle}"
-    if check_repair.is_dir() or expanded_check_repair.is_dir():
-        before = f"checks/C0{cycle}/attempts/01/evidence.json"
-        current = f"checks/C0{cycle}/evidence.json"
-        scope_path = check_repair / "scope.json"
-        try:
-            scope = json.loads(scope_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError):
-            scope = {}
-        if isinstance(scope, Mapping):
-            base_values = scope.get("base_mutable_scope", scope.get("approved_mutable_scope", []))
-            base_count = len(base_values) if isinstance(base_values, list) else 0
-            added = scope.get("added_paths", [])
-            added = added if isinstance(added, list) else []
-            scope_text = "\n".join([
-                "Scope:",
-                f"  base paths: {base_count}",
-                f"  auto-added paths: {len(added)}",
-                f"  policy: {scope.get('policy', '—')}",
-                f"  bound: {scope.get('bound', '—')}",
-                *(f"  - {path}" for path in added),
-            ])
-        else:
-            scope_text = "Scope: unavailable"
-        parts.append(_section("AUTOMATIC CHECK REPAIR", "\n".join([
-            "automatic check repair attempted",
-            scope_text,
-            _artifact_text(run_dir, f"revision/check-repair/C0{cycle}/agent.prompt.txt", secrets),
-            _claude_result_artifact(run_dir, f"revision/check-repair/C0{cycle}/agent.result.json", secrets),
-            _artifact_text(run_dir, f"revision/check-repair/C0{cycle}/agent.final.md", secrets),
-            _artifact_json(run_dir, f"revision/check-repair/C0{cycle}/report.json", secrets),
-            "Checks before correction:",
-            _safe_json_artifact(run_dir, before, secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
-            "Checks after correction:",
-            _safe_json_artifact(run_dir, current, secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
+    parts.append(_section(f"SEMANTIC REVISION {cycle:03d}", revision_body))
+    for gate in sorted((cycle_dir(run_dir, cycle) / "checks").glob("*")):
+        if not gate.is_dir():
+            continue
+        gate_relative = gate.relative_to(run_dir).as_posix()
+        parts.append(_section(f"DETERMINISTIC GATE {cycle:03d} {gate.name}", "\n".join([
+            _artifact_json(run_dir, f"{gate_relative}/checks.json", secrets),
+            _safe_json_artifact(run_dir, f"{gate_relative}/evidence.json", secrets, _EVIDENCE_KEYS),
+            _artifact_text(run_dir, f"{gate_relative}/changed-files.txt", secrets),
+            "Diff artifact metadata (diff omitted from consolidated diagnostics):",
+            _artifact_header(_artifact(run_dir, f"{gate_relative}/diff.patch")),
         ])))
-    if expanded_check_repair.is_dir():
-        parts.append(_section("SECOND AUTOMATIC CHECK REPAIR", "\n".join([
-            "second bounded check repair attempted",
-            _second_check_repair_scope_text(expanded_check_repair / "scope.json"),
-            _artifact_json(run_dir, "revision/check-repair-expanded/C0" + str(cycle) + "/scope.json", secrets),
-            _artifact_json(run_dir, "revision/check-repair-expanded/C0" + str(cycle) + "/report.json", secrets),
-            _safe_json_artifact(run_dir, f"checks/C0{cycle}/attempts/02/evidence.json", secrets, ("base_sha", "staged_tree_sha", "deterministic_passed", "failures", "changed_files", "checks")),
-        ])))
-    scope_repair = run_dir / "scope-repair" / f"C0{cycle}"
-    if scope_repair.is_dir():
-        delta = _safe_json_payload(scope_repair / "scope_delta.json")
-        delta = delta if isinstance(delta, Mapping) else {}
-        added = delta.get("added_paths", []) if isinstance(delta.get("added_paths"), list) else []
-        recovery, recovery_source = _scope_violation_recovery_artifact(run_dir, cycle)
-        ambiguous = recovery_source == "ambiguous"
-        candidates = recovery.get("candidates", []) if ambiguous else []
-        candidates = candidates if isinstance(candidates, list) else []
-        scope_meta = _safe_json_payload(scope_repair / "scope.json")
-        scope_meta = scope_meta if isinstance(scope_meta, Mapping) else {}
-        lines = [
-            "Check repair scope escalation:",
-            "  trigger: REVISION_SCOPE_VIOLATION",
-            "  source attempt: " + (recovery_source or "unavailable"),
-            "  failed attempt rolled back: " + ("YES" if recovery else "NO"),
-            "  observed outside-scope paths: " + (
-                "ambiguous" if ambiguous
-                else str(
-                    len(recovery["outside_scope_paths"])
-                    if isinstance(recovery.get("outside_scope_paths"), list) else 0
-                )
-            ),
-            "  planner: planner-chatgpt",
-            f"  scope added: {len(added)}",
-            "  policy: " + str(scope_meta.get("policy", "auto-bounded")),
-            "  implementer: codex-luna-high",
-            "  residual Claude pass: " + ("YES" if (scope_repair / "residual-claude").is_dir() else "NO"),
-            *([
-                "  no authoritative recovery artifact selected",
-                "  ambiguous recovery artifacts:",
-                *[
-                    f"  - {entry.get('artifact', '—')}"
-                    f" (outside-scope paths: {entry.get('outside_scope_paths', 0)})"
-                    for entry in candidates if isinstance(entry, Mapping)
-                ],
-            ] if ambiguous else []),
-            *[f"  - {path}" for path in added],
-        ]
-        parts.append(_section("CHECK REPAIR SCOPE ESCALATION", "\n".join(lines)))
-    review = f"review/C0{cycle}/"
-    if cycle == 1 and not (run_dir / review).is_dir() and (run_dir / "review.json").exists():
-        review = ""
-    review_body = "\n".join([
+        stage_repairs = cycle_dir(run_dir, cycle) / "check-repair" / gate.name
+        for attempt in sorted((stage_repairs / "attempts").glob("[0-9][0-9][0-9]")):
+            attempt_relative = attempt.relative_to(run_dir).as_posix()
+            parts.append(_section(f"CHECK REPAIR {cycle:03d} {gate.name} ATTEMPT {attempt.name}", "\n".join([
+                _artifact_json(run_dir, f"{attempt_relative}/attempt.json", secrets),
+                _artifact_json(run_dir, f"{attempt_relative}/failure.json", secrets),
+                _artifact_json(run_dir, f"{attempt_relative}/scope.json", secrets),
+                _artifact_text(run_dir, f"{attempt_relative}/agent.prompt.txt", secrets),
+                _agent_result_artifact(run_dir, f"{attempt_relative}/agent.result.json", secrets),
+                _artifact_text(run_dir, f"{attempt_relative}/agent.final.md", secrets),
+                _artifact_json(run_dir, f"{attempt_relative}/report.json", secrets),
+            ])))
+    parts.append(_section(f"CANDIDATE {cycle:03d}", _artifact_json(
+        run_dir, f"{root}/candidate/commit.json", secrets,
+    )))
+    review = review_dir(run_dir, cycle).relative_to(run_dir).as_posix() + "/"
+    parts.append(_section(f"REVIEWER {cycle:03d}", "\n".join([
         _artifact_text(run_dir, review + "reviewer.request.txt", secrets),
         _artifact_text(run_dir, review + "reviewer.raw.md", secrets),
         _artifact_json(run_dir, review + "review.json", secrets),
         _artifact_json(run_dir, review + "reviewer.usage.json", secrets),
-    ])
-    parts.append(_section(f"REVIEWER C0{cycle}", review_body))
+    ])))
     return "".join(parts)
 
 
@@ -923,12 +783,7 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
         summary_body += f"\n[TRUNCATED: original {_state_size} bytes]\n"
     body += _section("RUN SUMMARY", summary_body)
     body += _section("RUN OPTIONS", _safe_json_artifact(directory, "run_options.json", secrets, ("schema_version", "planning", "pipeline", "profiles")))
-    body += _section(
-        "REPAIR SCOPE POLICY",
-        _repair_scope_policy_status(config, directory)
-        + "\n"
-        + _artifact_json(directory, "repair_scope_override.json", secrets),
-    )
+    body += _section("REPAIR SCOPE POLICY", _repair_scope_policy_status(directory))
     try:
         checkpoint_record = read_checkpoint_record(directory)
         checkpoint_text = _artifact_json(directory, "resume_checkpoint.json", secrets)
@@ -974,17 +829,11 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
         _safe_json_artifact(directory, "plan_approval.json", secrets, ("decision", "raw_sha256", "contract_sha256", "bundle_sha256", "execution_sha256", "source")),
         _selection_summary(directory, secrets),
     ]))
-    body += _cycle(config, directory, 1, secrets)
-    if (directory / "repair" / "002").is_dir():
-        body += _section("REPAIR 002", "\n".join([
-            _artifact_text(directory, "cycles/002/correction/planner.request.txt", secrets, MAX_PLANNER_REQUEST_BYTES),
-            _artifact_text(directory, "cycles/002/correction/planner.raw.md", secrets),
-            _plan_summary(directory, secrets, "cycles/002/correction/task_plan_v2.json"),
-            _bundle_summary(directory, secrets, "cycles/002/correction/implementation_bundle.json"),
-        ]))
-        body += _cycle(config, directory, 2, secrets)
-    else:
-        body += _section("REPAIR 002", "No repair cycle executed.")
+    cycles = _cycle_dirs(directory)
+    for cycle_path in cycles:
+        body += _cycle(directory, int(cycle_path.name), secrets)
+    if not cycles:
+        body += _section("CYCLES", "No pipeline cycle executed.")
     body += _section("COMMIT / PUBLISH", "\n".join([
         _safe_json_artifact(directory, "publish.json", secrets, ("mode", "target", "remote", "branch", "run_branch", "base_sha", "commit_sha", "web_url", "status", "local_base_updated", "run_branch_cleanup")),
         "Commit SHA: " + str(state.get("commit_sha", "—")),

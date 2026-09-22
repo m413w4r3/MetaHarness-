@@ -28,7 +28,6 @@ from metaharness.recommendation import (
     render_profile_catalogue,
 )
 from metaharness.state import RunStateStore
-from metaharness.web.pages import render_run
 
 
 IMPLEMENTER = frozenset({"impl-a", "impl-b"})
@@ -210,35 +209,6 @@ class OrchestratorRecommendationTests(unittest.TestCase):
             self.assertEqual(state["status"], "planning")
             self.assertEqual(state["recommendation"]["status"], "FAILED")
             self.assertTrue((run / "execution_recommendation.error.txt").exists())
-
-
-class RecommendationUITests(unittest.TestCase):
-    def test_ready_preselects_and_touched_guards_are_present(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = OrchestratorRecommendationTests()._config(root)  # type: ignore[arg-type]
-            html = render_run(
-                {
-                    "run_id": "run",
-                    "status": "awaiting_plan_approval",
-                    "state": {
-                        "status": "awaiting_plan_approval",
-                        "recommendation": {
-                            "status": "READY",
-                            "implementer_profile": "impl-b",
-                            "reviewer_profile": "review-a",
-                            "rationale": "Use this profile.",
-                        },
-                    },
-                    "plan": {},
-                },
-                "token",
-                config=config,
-            )
-            self.assertIn('value="impl-b" selected', html)
-            self.assertIn("Impl-B", html)
-            self.assertIn("Use this profile.", html)
-            self.assertNotIn("<script", html)
 
 
 if __name__ == "__main__":

@@ -154,7 +154,7 @@ def _archived_attempt_usage(step_dir: Path) -> list[dict[str, int]]:
 
     ``_archive_attempt`` *moves* a finished attempt's artifacts into
     ``attempts/NN/``, so an archived record is never also the current one:
-    summing them can not double-count a Luna invocation.
+    summing them can not double-count a worker invocation.
     """
 
     try:
@@ -176,8 +176,8 @@ def persisted_step_usage(steps_dir: str | Path) -> list[dict[str, Any]]:
 
     One logical step may have run several times (a bounded mismatch retry, a
     transient transport failure, a resume).  ``usage`` is the aggregate of
-    every actual Luna invocation of that step: its current ``step.json`` plus
-    each archived ``attempts/NN/step.json``.  Luna totals are always derived
+    every actual worker invocation of that step: its current ``step.json`` plus
+    each archived ``attempts/NN/step.json``.  Worker totals are always derived
     from these durable records, never from ``state.steps``, which only
     describes the current cycle.
     """
@@ -210,16 +210,14 @@ def _first_usage(*paths: Path) -> dict[str, int]:
     return empty_usage()
 
 
-def phase_usage_summary(
-    run_dir: str | Path, *, v1_agent_usage: Any = None
-) -> dict[str, Any]:
+def phase_usage_summary(run_dir: str | Path) -> dict[str, Any]:
     """Aggregate persisted usage from every generic pipeline cycle."""
 
-    del v1_agent_usage
     directory = Path(run_dir)
     planner = _first_usage(directory / PLANNER_USAGE_ARTIFACT)
     cycles: list[dict[str, Any]] = []
     implementer_rows: list[dict[str, Any]] = []
+    correction_planner = empty_usage()
     semantic_reviser = empty_usage()
     check_repair = empty_usage()
     final_reviewer = empty_usage()
@@ -232,15 +230,21 @@ def phase_usage_summary(
             for row in persisted_step_usage(cycle_path / "implementation" / "steps")
         ]
         cycle_implementer = add_usage(row["usage"] for row in step_rows)
+        cycle_planner = _first_usage(cycle_path / "correction" / PLANNER_USAGE_ARTIFACT)
         cycle_reviser = _first_usage(cycle_path / "semantic-revision" / "usage.json")
-        cycle_repair = _first_usage(cycle_path / "check-repair" / "usage.json")
+        cycle_repair = add_usage(
+            _first_usage(path)
+            for path in sorted(cycle_path.glob("check-repair/*/attempts/[0-9][0-9][0-9]/usage.json"))
+        )
         cycle_reviewer = _first_usage(cycle_path / "review" / REVIEWER_USAGE_ARTIFACT)
+        correction_planner = add_usage((correction_planner, cycle_planner))
         semantic_reviser = add_usage((semantic_reviser, cycle_reviser))
         check_repair = add_usage((check_repair, cycle_repair))
         final_reviewer = add_usage((final_reviewer, cycle_reviewer))
         implementer_rows.extend(step_rows)
         cycles.append({
             "number": number,
+            "correction_planner": cycle_planner,
             "implementer": cycle_implementer,
             "semantic_reviser": cycle_reviser,
             "check_repair": cycle_repair,
@@ -248,15 +252,17 @@ def phase_usage_summary(
         })
     summary: dict[str, Any] = {
         "planner": planner,
+        "correction_planner": correction_planner,
         "implementer": {"total": add_usage(row["usage"] for row in implementer_rows), "steps": implementer_rows},
         "check_repair": check_repair,
         "semantic_reviser": semantic_reviser,
         "final_reviewer": final_reviewer,
         "cycles": cycles,
     }
-    summary["grand_total"] = add_usage(
-        (planner, summary["implementer"]["total"], check_repair, semantic_reviser, final_reviewer)
-    )
+    summary["grand_total"] = add_usage((
+        planner, correction_planner, summary["implementer"]["total"],
+        check_repair, semantic_reviser, final_reviewer,
+    ))
     return summary
 
 

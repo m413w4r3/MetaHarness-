@@ -20,6 +20,7 @@ from metaharness.models import (
     HarnessConfig,
     LLMEndpointConfig,
 )
+from metaharness.run_options import RunOptions, write_run_options
 from metaharness.state import RunStateStore
 from metaharness.web import api
 from metaharness.web.pages import RUN_PAGE_DYNAMIC_IDS, STATE_POLL_MS
@@ -78,8 +79,7 @@ class WebServerTests(unittest.TestCase):
         run_dir = self.runs / run_id
         store = RunStateStore(run_dir / "state.json")
         store.initialize(run_id)
-        if status != "created":
-            store.update(status=status)
+        store.update(status=status, planning_protocol="v2")
         return run_dir
 
     def test_list_and_run_and_missing_artifacts(self) -> None:
@@ -106,26 +106,13 @@ class WebServerTests(unittest.TestCase):
                 self.assertIn(status, (400, 404))
 
     def test_approval_requires_token_and_is_exclusive(self) -> None:
-        run_dir = self.create_run("waiting", "awaiting_plan_approval")
-        raw = "STATUS: READY\n"
-        contract = "# contract\n"
-        (run_dir / "planner.raw.md").write_text(raw, encoding="utf-8")
-        (run_dir / "implementation_contract.md").write_text(contract, encoding="utf-8")
-        identity = compute_plan_identity(raw, contract)
-        RunStateStore(run_dir / "state.json").update(
-            status="awaiting_plan_approval", plan_identity=identity.__dict__
-        )
+        run_dir = self._create_v2_approval_run("waiting")
         for token in (None, "wrong"):
             status, _payload, _ = self.request(
                 "POST", "/api/runs/waiting/approval", {"decision": "APPROVE"}, token
             )
             self.assertEqual(status, 403)
-        status, payload, _ = self.request(
-            "POST",
-            "/api/runs/waiting/approval",
-            {"decision": "APPROVE"},
-            self.server.token,
-        )
+        status, payload, _ = self._approve_v2("waiting")
         self.assertEqual(status, 200)
         self.assertEqual(payload["decision"], "APPROVE")
         approval = json.loads((run_dir / "plan_approval.json").read_text())
@@ -169,6 +156,7 @@ class WebServerTests(unittest.TestCase):
             encoding="utf-8",
         )
         write_check_authority(run_dir, [CheckConfig("lint", ("python", "-c", "pass"))])
+        options_sha256 = write_run_options(run_dir, RunOptions.from_config(self.config))
         actual = compute_plan_identity_from_run(run_dir)
         stored = actual.__dict__.copy()
         stored["checks_sha256"] = stored_checks_sha256
@@ -176,6 +164,7 @@ class WebServerTests(unittest.TestCase):
             status="awaiting_plan_approval",
             planning_protocol="v2",
             plan_identity=stored,
+            run_options_sha256=options_sha256,
             execution={"planner": {"profile_id": "legacy-planner"}},
         )
         return run_dir
@@ -186,7 +175,7 @@ class WebServerTests(unittest.TestCase):
             f"/api/runs/{run_id}/approval",
             {
                 "decision": "APPROVE",
-                "reviewer_profile": "legacy-reviewer",
+                "final_reviewer_profile": "legacy-reviewer",
                 "step_profile__S01": "legacy-implementer",
             },
             self.server.token,
@@ -225,11 +214,14 @@ class WebServerTests(unittest.TestCase):
 
     def test_approval_fields_follow_the_actual_12_step_bundle(self) -> None:
         run_dir = self.create_run("form-steps", "committed")
+        RunStateStore(run_dir / "state.json").update(
+            status="committed", execution={"planner": {"profile_id": "legacy-planner"}},
+        )
         (run_dir / "implementation_bundle.json").write_text(
             json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),
             encoding="utf-8",
         )
-        fields = {"_token": self.server.token, "decision": "APPROVE", "reviewer_profile": "r"}
+        fields = {"_token": self.server.token, "decision": "APPROVE", "final_reviewer_profile": "r"}
         twelve = {f"step_profile__S{number:02d}": "luna" for number in range(1, 13)}
         # The fields for the actual bundle are accepted; the gate then refuses
         # this deliberately incomplete synthetic run.
@@ -340,7 +332,9 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(payload["state"]["worktree"], "/tmp/wt live")
 
         checks = [{"name": "unit", "exit_code": 0, "timed_out": False, "stdout_tail": "<b>ok</b>"}]
-        (run_dir / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
+        gate = run_dir / "cycles/001/checks/post-implementation"
+        gate.mkdir(parents=True)
+        (gate / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
         store.update(status="validating")
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assert_poll_shape(payload)
@@ -348,10 +342,12 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(payload["checks"], checks)
         self.assertFalse(payload["reviewer_raw_available"])
 
-        (run_dir / "review.json").write_text(
+        review = run_dir / "cycles/001/review"
+        review.mkdir(parents=True)
+        (review / "review.json").write_text(
             json.dumps({"verdict": "PASS", "route": "NONE", "summary": "ok"}), encoding="utf-8"
         )
-        (run_dir / "reviewer.raw.md").write_text("VERDICT: PASS\n", encoding="utf-8")
+        (review / "reviewer.raw.md").write_text("VERDICT: PASS\n", encoding="utf-8")
         store.update(status="reviewing")
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assert_poll_shape(payload)
@@ -382,11 +378,11 @@ class WebServerTests(unittest.TestCase):
         self.assertIn("/static/run.js", page)
         self.assertNotIn(self.server.token, page)
 
-        self.create_run("gate", "awaiting_plan_approval")
+        self._create_v2_approval_run("gate")
         page = self.get_html("/runs/gate")
         self.assertIn('action="/runs/gate/approval"', page)
-        self.assertIn('>APPROVE</button>', page)
-        self.assertIn('>REJECT</button>', page)
+        self.assertIn('>APPROVE PLAN</button>', page)
+        self.assertIn('>REJECT PLAN</button>', page)
         self.assertNotIn('http-equiv="refresh"', page)
 
 

@@ -141,8 +141,8 @@ def _check_authority_payload(
         entries.append(entry)
     # Schema 1 froze exactly the initially selected checks, so the selection
     # and the catalogue were the same list.  Schema 2 freezes the whole
-    # trusted catalogue and names the 001 selection separately, so a repair
-    # plan can request another approved check without ever reaching today's
+    # trusted catalogue and names the initial selection separately, so a
+    # correction plan can request another approved check without reaching today's
     # configuration for its argv.
     if required_check_ids is None:
         return {
@@ -287,7 +287,7 @@ def write_check_authority(
     Without *required_check_ids* this writes the historical schema 1, where
     the frozen list is both the catalogue and the selection.  With it, the
     schema 2 artifact freezes the whole trusted catalogue and records the
-    initial 001 selection separately.
+    initial selection separately.
     """
 
     normalized = tuple(checks)

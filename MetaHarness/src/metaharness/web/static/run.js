@@ -100,7 +100,7 @@
     setText("live-current", typeof payload.current_label === "string" ? payload.current_label : "—");
     setText("live-next", typeof payload.next_label === "string" ? payload.next_label : "—");
     var totals = payload.token_totals || {};
-    ["planner", "luna", "claude", "reviewer"].forEach(function (name) {
+    ["planner", "implementer", "check_repair", "semantic_reviser", "final_reviewer"].forEach(function (name) {
       setText("live-tokens-" + name, tokens(totals[name]));
     });
     var badge = byId("live-status");

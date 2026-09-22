@@ -2,19 +2,33 @@
 
 This module is a safety boundary: every reader here is fail-closed and
 returns ``None`` (never a partially trusted value) for an artifact that
-does not prove exactly what the caller needs.
+does not prove exactly what the caller needs.  :func:`validate_resume` is the
+single integrity gate in front of every resumed execution checkpoint; it is
+cycle-agnostic and never calls a model, a check or a Git write.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 
 from pathlib import Path
 from typing import (
     Any,
     Mapping,
+    NoReturn,
 )
-from .check_repair import _hard_failure_items
+from .check_repair import _hard_failure_items, _read_check_repair_scope
+from .pipeline_v2 import (
+    candidate_dir,
+    check_repair_attempt_dir,
+    correction_dir,
+    cycle_record_path,
+    gate_dir,
+    implementation_dir,
+    review_dir,
+    semantic_revision_dir,
+)
 from .shared import (
     _MAX_AGENT_REPORT_BYTES,
     _MAX_STEP_REPORT_BYTES,
@@ -24,33 +38,84 @@ from .shared import (
     _json_text,
     _read_bounded_text,
     _read_json_artifact,
+    _read_tree_file,
+    _status_has_unstaged_or_untracked,
+)
+from ..approval import (
+    ApprovalDecision,
+    ApprovalError,
+    compute_plan_identity_from_run,
+    read_check_authority,
+    read_plan_approval,
+    read_scope_approval,
 )
 from ..evidence import EvidenceBundle
+from ..execution_selection import (
+    ExecutionSelectionError,
+    read_execution_selection_with_sha256,
+    validate_execution_selection,
+)
 from ..gitops import (
+    GitError,
     RepositoryReference,
     WorktreeInfo,
+    branch_exists,
+    candidate_tree_sha,
+    changed_paths_between_trees,
+    commit_parents,
+    current_head,
+    git_root,
+    index_tree_sha,
+    registered_worktrees,
+    remote_run_branch_tip,
+    resolve_commit,
+    resolve_tree,
+    status_porcelain,
+    symbolic_head,
 )
-from ..planning_v2 import TaskPlanV2
+from ..models import (
+    CycleKind,
+    ExecutionRole,
+    ExecutionSelection,
+    HarnessConfig,
+    PlanDecision,
+    ReviewRoute,
+    ReviewVerdict,
+    RunCycle,
+)
+from ..planning_v2 import (
+    TaskPlanV2,
+    V2PlanParseError,
+    parse_task_plan_v2,
+    validate_implementation_bundle,
+)
+from ..profiles import ProfileError, profiles_for_config
 from ..result import atomic_write_text
 from ..resume import (
     ResumeCheckpoint,
+    ResumeCheckpointError,
+    ResumeIntegrityError,
     ResumePhase,
+    ResumeRequiresOperatorError,
+    plan_identity_from_mapping,
 )
 from ..review import (
     ReviewParseError,
     ReviewResult,
     parse_review,
 )
+from ..run_options import EffectiveRepairScopePolicy
 from ..usage import (
     normalize_usage,
     read_usage_artifact,
 )
+from ..validation import ValidationError, config_with_check_authority, resolve_check_cwd
 from ..llm.chat import LLMConversationHandle
 
 
 @dataclasses.dataclass(frozen=True)
 class _PersistedRevision:
-    """A completed Claude revision read back from its durable artifacts."""
+    """A completed revision or check-repair pass read back from its artifacts."""
 
     final_message: str
     usage: dict[str, int]
@@ -61,41 +126,20 @@ class _PersistedRevision:
     stderr_tail: str = ""
 
 
-@dataclasses.dataclass
-class _ResumedRun:
+@dataclasses.dataclass(frozen=True)
+class ResumedRun:
     """Everything a resume needs, rebuilt from persisted artifacts only."""
 
     checkpoint: ResumeCheckpoint
     plan: TaskPlanV2
     bundle: dict[str, Any]
-    selection: Any
+    selection: ExecutionSelection
     info: WorktreeInfo
     repository_reference: RepositoryReference
     spec: str
     context: str
+    base_tree_sha: str
     restore_paths: tuple[str, ...] = ()
-    mismatch_recovery: dict[str, Any] | None = None
-    mismatch_recovery_path: Path | None = None
-    scope_violation_recovery: dict[str, Any] | None = None
-    c01_steps: list[dict[str, Any]] = dataclasses.field(default_factory=list)
-    # step id -> the clean mismatch its first attempt returned, for the single
-    # bounded retry this resume owes that step.
-    mismatch_retries: dict[str, str] = dataclasses.field(default_factory=dict)
-    c01_revision: _PersistedRevision | None = None
-    c01_check_repair_revision: _PersistedRevision | None = None
-    c01_expanded_check_repair_revision: _PersistedRevision | None = None
-    c01_evidence: EvidenceBundle | None = None
-    c01_review: ReviewResult | None = None
-    repair_plan: TaskPlanV2 | None = None
-    repair_bundle: dict[str, Any] | None = None
-    repair_bundle_sha: str | None = None
-    c02_steps: list[dict[str, Any]] = dataclasses.field(default_factory=list)
-    c02_revision: _PersistedRevision | None = None
-    c02_check_repair_revision: _PersistedRevision | None = None
-    c02_expanded_check_repair_revision: _PersistedRevision | None = None
-    c02_evidence: EvidenceBundle | None = None
-    c02_review: ReviewResult | None = None
-    existing_commit_sha: str | None = None
 
 
 def _reusable_pre_checks(artifact_dir: Path, tree: str) -> dict[str, Any] | None:
@@ -114,7 +158,7 @@ def _reusable_pre_checks(artifact_dir: Path, tree: str) -> dict[str, Any] | None
         return None
     try:
         # Keep the durable evidence existence check, but never return its
-        # contents to a Claude prompt.
+        # contents to a worker prompt.
         (artifact_dir / "diff.patch").read_bytes()
     except OSError:
         return None
@@ -155,48 +199,6 @@ def _load_evidence(directory: Path) -> EvidenceBundle | None:
     )
 
 
-def _retry_checks_evidence(
-    checks_dir: Path, *, cycle: str, initial_tree: str, repaired_tree: str,
-    legacy_dir: Path | None = None,
-) -> tuple[EvidenceBundle | None, str | None]:
-    """Resolve the evidence authority of a ``FINAL_CHECKS_RETRY`` resume.
-
-    This phase is reached only after the automatic check-repair Claude
-    *succeeded*, so the checkpoint tree is the repaired tree, not the red tree
-    the repair answered to.  Two durable states are legitimate:
-
-    * the first retry crashed before writing its evidence -- the red
-      first-pass bundle has already been moved to ``attempts/01/`` and there
-      is no current bundle;
-    * a complete retry already ran and stayed red -- the current bundle is for
-      the repaired tree.
-
-    The red first-pass evidence stays the authority the repair answers to, so
-    it is preferred when present; the retry checks are re-executed in both
-    cases, which is why a red current bundle is never read as proof that the
-    new checks are green.  Returns ``(evidence, refusal)``.
-    """
-
-    prior = _load_evidence(checks_dir / "attempts" / "01")
-    if prior is not None and prior.staged_tree_sha != initial_tree:
-        return None, (
-            f"the archived {cycle} first-pass evidence is not for the pre-repair checks tree"
-        )
-    # Only a run without the per-cycle directory may fall back to the root
-    # aliases: those aliases still name the *first* pass once the retry
-    # archived it, so they are never the authority for the repaired tree.
-    current = (
-        _load_evidence(checks_dir) if checks_dir.is_dir() or legacy_dir is None
-        else _load_evidence(legacy_dir)
-    )
-    if current is not None and current.staged_tree_sha != repaired_tree:
-        return None, f"the {cycle} retry evidence is not for the repaired checks tree"
-    evidence = prior or current
-    if evidence is None:
-        return None, f"the {cycle} final evidence is missing or not for the expected checks tree"
-    return evidence, None
-
-
 def _accepted_review(
     directory: Path, evidence: EvidenceBundle, candidate_sha: str | None = None,
 ) -> ReviewResult | None:
@@ -209,7 +211,9 @@ def _accepted_review(
         raw = (directory / "reviewer.raw.md").read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return None
-    if f'"CANDIDATE_TREE_SHA": "{evidence.staged_tree_sha}"' not in request:
+    # The request is the exact evidence the answer was given: it must name
+    # both the reviewed tree and the immutable candidate commit.
+    if evidence.staged_tree_sha not in request:
         return None
     if candidate_sha is not None and candidate_sha not in request:
         return None
@@ -217,31 +221,6 @@ def _accepted_review(
         return parse_review(raw, deterministic_passed=evidence.deterministic_passed)
     except ReviewParseError:
         return None
-
-
-def _load_c01_review(run_dir: Path, evidence: EvidenceBundle) -> ReviewResult | None:
-    for directory in (run_dir / "cycles" / "001" / "review", run_dir):
-        try:
-            raw = (directory / "reviewer.raw.md").read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            continue
-        try:
-            return parse_review(raw, deterministic_passed=evidence.deterministic_passed)
-        except ReviewParseError:
-            return None
-    return None
-
-
-def _load_accepted_c01_review(
-    run_dir: Path, evidence: EvidenceBundle, candidate_sha: str,
-) -> ReviewResult | None:
-    """Reviewer #1's accepted answer for exactly the pushed 001 candidate."""
-
-    for directory in (run_dir / "cycles" / "001" / "review", run_dir):
-        review = _accepted_review(directory, evidence, candidate_sha)
-        if review is not None:
-            return review
-    return None
 
 
 def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
@@ -287,15 +266,18 @@ def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
     }
 
 
-def _verify_step_chain(records: list[dict[str, Any] | None], start_tree: str) -> str | None:
-    """The last tree of an unbroken step chain starting at *start_tree*."""
+def completed_step_records(
+    run_dir: Path, cycle: int, step_ids: list[str] | tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """The durable completed prefix of one cycle's approved steps."""
 
-    tree = start_tree
-    for record in records:
-        if record is None or record["tree_before"] != tree:
-            return None
-        tree = record["tree_after"]
-    return tree
+    records: list[dict[str, Any]] = []
+    for step_id in step_ids:
+        record = _load_completed_step(implementation_dir(run_dir, cycle) / "steps" / step_id, step_id)
+        if record is None:
+            break
+        records.append(record)
+    return records
 
 
 def _load_revision(directory: Path) -> _PersistedRevision | None:
@@ -311,69 +293,93 @@ def _load_revision(directory: Path) -> _PersistedRevision | None:
     return _PersistedRevision(final, usage, report["tree_before"], report["tree_after"])
 
 
-# The scope-repair checkpoint authority, by phase.  A scope-repair cycle has
-# its own durable chain, so a checkpoint taken inside it is never proved by
-# the historical 001/002 Claude tree -- see
-# :func:`_scope_repair_checkpoint_tree`.
-_SCOPE_REPAIR_RECOVERY_TREE_PHASES = frozenset({
-    ResumePhase.CHECK_REPAIR,
-})
-_SCOPE_REPAIR_STEP_PHASES = frozenset({
-    ResumePhase.REVIEW_IMPLEMENTATION,
-})
-_SCOPE_REPAIR_RESIDUAL_PHASES = frozenset({
-    ResumePhase.DETERMINISTIC_GATE,
-})
+def read_cycle_record(run_dir: Path, number: int) -> RunCycle:
+    """The durable identity of one cycle, written when the cycle started."""
 
-def _scope_repair_checkpoint_tree(
-    *,
-    directory: Path,
-    checkpoint: ResumeCheckpoint,
-    recovery_tree: str,
-    step_ids: tuple[str, ...],
-) -> tuple[str | None, str | None]:
-    """The tree a scope-repair checkpoint must carry, from durable artifacts.
+    payload = _read_json_artifact(cycle_record_path(run_dir, number), 4096)
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or payload.get("number") != number:
+        raise ResumeIntegrityError(f"cycle {number:03d} record is missing or invalid")
+    try:
+        return RunCycle(number, CycleKind(payload.get("kind")))
+    except ValueError as exc:
+        raise ResumeIntegrityError(f"cycle {number:03d} kind is invalid") from exc
 
-    A scope-repair cycle starts from *recovery_tree* -- the failed-check tree
-    the rollback restored before the strong planner ran -- and advances
-    through its own durable chain: the bounded Luna steps in *directory*,
-    then the residual Claude pass.  Each phase has exactly one authority:
 
-    * planner/approval: nothing has run yet, so *recovery_tree* itself;
-    * step: the completed steps strictly before ``checkpoint.step_id``;
-    * checks and residual Claude: the whole completed Luna chain -- the
-      residual pass has not acquired the checkpoint authority yet;
-    * final checks: the residual Claude ``tree_after``, and only when its
-      ``tree_before`` is exactly the completed Luna chain end.
+def read_candidate_record(run_dir: Path, number: int) -> dict[str, Any]:
+    """One cycle's immutable candidate commit record."""
 
-    The function is cycle-agnostic: 001 and 002 differ only by *directory*.
-    Returns ``(tree, refusal)`` and never a partially trusted tree.
-    """
+    payload = _read_json_artifact(candidate_dir(run_dir, number) / "commit.json")
+    if (
+        not isinstance(payload, dict)
+        or not _is_object_id(payload.get("commit_sha"))
+        or not _is_object_id(payload.get("tree_sha"))
+        or not _is_object_id(payload.get("parent_sha"))
+    ):
+        raise ResumeIntegrityError(f"cycle {number:03d} candidate commit record is missing")
+    return payload
 
-    phase = checkpoint.phase
-    if phase in _SCOPE_REPAIR_RECOVERY_TREE_PHASES:
-        return recovery_tree, None
-    if phase in _SCOPE_REPAIR_STEP_PHASES:
-        step_id = checkpoint.step_id
-        if step_id is None or step_id not in step_ids:
-            return None, "the scope-repair checkpoint step is not in the scope-repair plan"
-        prior = step_ids[: step_ids.index(step_id)]
-    else:
-        prior = step_ids
-    records = [_load_completed_step(directory / "steps" / item, item) for item in prior]
-    if any(record is None for record in records):
-        return None, "a completed scope-repair Luna step record is missing or invalid"
-    chain_end = _verify_step_chain(records, recovery_tree)
-    if chain_end is None:
-        return None, "scope-repair Luna step trees do not form an unbroken chain"
-    if phase not in _SCOPE_REPAIR_RESIDUAL_PHASES:
-        return chain_end, None
-    residual = _load_revision(directory / "residual-claude")
-    if residual is None:
-        return None, "the scope-repair residual Claude record is missing"
-    if residual.tree_before != chain_end:
-        return None, "scope-repair residual Claude is not based on the completed Luna tree"
-    return residual.tree_after, None
+
+def candidate_evidence(run_dir: Path, number: int) -> EvidenceBundle | None:
+    """The gate evidence one cycle's candidate commit answers for."""
+
+    stage = read_candidate_record(run_dir, number).get("gate_stage")
+    try:
+        return _load_evidence(gate_dir(run_dir, number, stage))
+    except ValueError:
+        return None
+
+
+def load_correction_plan(
+    config: HarnessConfig, selection: ExecutionSelection, run_dir: Path, number: int,
+    *, inherited_check_ids: tuple[str, ...],
+) -> tuple[TaskPlanV2, dict[str, Any], str]:
+    """Parse the durable correction plan of cycle *number* (> 1)."""
+
+    if selection.check_repair is None:
+        raise ResumeIntegrityError("correction cycles require a check-repair profile")
+    directory = correction_dir(run_dir, number)
+    try:
+        plan = parse_task_plan_v2(
+            (directory / "planner.raw.md").read_text(encoding="utf-8"),
+            implementer_ids=frozenset({selection.check_repair.profile_id}),
+            reviewer_ids=frozenset({selection.final_reviewer.profile_id}),
+            check_catalog=config.check_catalog,
+            inherited_check_ids=inherited_check_ids,
+        )
+        bundle, bundle_sha = validate_implementation_bundle(
+            directory, expected_step_ids=[step.id for step in plan.steps]
+        )
+    except (OSError, UnicodeError, V2PlanParseError, ValueError, AttributeError) as exc:
+        raise ResumeIntegrityError(f"cycle {number:03d} correction plan is unreadable: {exc}") from exc
+    if plan.decision is not PlanDecision.READY:
+        raise ResumeIntegrityError(f"cycle {number:03d} correction plan is not READY")
+    return plan, bundle, bundle_sha
+
+
+def verify_correction_scope(
+    run_dir: Path, number: int, bundle_sha: str, policy: EffectiveRepairScopePolicy,
+) -> list[str]:
+    """The added paths of one correction scope delta, with their authority."""
+
+    directory = correction_dir(run_dir, number)
+    delta = _read_json_artifact(directory / "scope_delta.json", 256 * 1024)
+    if not isinstance(delta, dict) or delta.get("correction_bundle_sha256") != bundle_sha:
+        raise ResumeIntegrityError(f"cycle {number:03d} scope delta is missing or not bound to its plan")
+    added = delta.get("added_paths")
+    if not isinstance(added, list) or any(not isinstance(path, str) for path in added):
+        raise ResumeIntegrityError(f"cycle {number:03d} scope delta is malformed")
+    if added:
+        if policy.policy == "deny-expansion":
+            raise ResumeIntegrityError(f"cycle {number:03d} scope expansion is denied by the run policy")
+        if policy.policy == "require-approval" or len(added) > policy.max_added_paths:
+            digest = hashlib.sha256((directory / "scope_delta.json").read_bytes()).hexdigest()
+            try:
+                approval = read_scope_approval(directory, expected_sha256=digest)
+            except ApprovalError as exc:
+                raise ResumeIntegrityError(f"cycle {number:03d} scope approval is invalid: {exc}") from exc
+            if approval is None or approval.decision is not ApprovalDecision.APPROVE:
+                raise ResumeIntegrityError(f"cycle {number:03d} scope expansion was not approved")
+    return list(added)
 
 
 def _read_repository_reference(run_dir: Path) -> RepositoryReference | None:
@@ -406,6 +412,300 @@ def _read_planner_conversation(run_dir: Path) -> LLMConversationHandle | None:
         return None
 
 
-def _state_cycle_value(state: Mapping[str, Any]) -> int:
-    value = state.get("cycle")
-    return value if value in (1, 2) and not isinstance(value, bool) else 1
+# -- the resume integrity gate --------------------------------------------------
+
+_STEP_PHASES = frozenset({ResumePhase.IMPLEMENT_STEP, ResumePhase.REVIEW_IMPLEMENTATION})
+_CANDIDATE_PHASES = frozenset({
+    ResumePhase.CANDIDATE_PUSH, ResumePhase.FINAL_REVIEW, ResumePhase.PUBLISH,
+})
+
+
+def _refuse(message: str) -> NoReturn:
+    raise ResumeIntegrityError(message)
+
+
+def _plan_scope(plan: TaskPlanV2) -> set[str]:
+    return {
+        path for step in plan.steps
+        for path in (*step.write_set, *step.create_set, *step.delete_set)
+    }
+
+
+def _approved_scope(
+    config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
+    plan: TaskPlanV2, checkpoint: ResumeCheckpoint, policy: EffectiveRepairScopePolicy,
+) -> set[str]:
+    """Every path any durable authority of cycles ``1..n`` approved."""
+
+    scope = set(_plan_scope(plan))
+    cycle_scopes = {1: sorted(scope)}
+    for number in range(2, checkpoint.review_cycle + 1):
+        if number == checkpoint.review_cycle and checkpoint.phase is ResumePhase.REVIEW_REPLAN:
+            # The correction plan of this cycle is not an authority yet: it
+            # may still await its scope approval.
+            continue
+        correction, _bundle, bundle_sha = load_correction_plan(
+            config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
+        )
+        verify_correction_scope(run_dir, number, bundle_sha, policy)
+        cycle_scopes[number] = sorted(_plan_scope(correction))
+        scope |= _plan_scope(correction)
+    for number, base in cycle_scopes.items():
+        root = Path(run_dir) / "cycles" / f"{number:03d}" / "check-repair"
+        for scope_file in sorted(root.glob("*/attempts/*/scope.json")):
+            attempt = _read_check_repair_scope(
+                scope_file.parent, fallback_base=base, policy_config=policy,
+            )
+            scope |= set(attempt.effective_paths)
+    return scope
+
+
+def _failure_tree_for(
+    run_dir: Path, checkpoint: ResumeCheckpoint,
+) -> str | None:
+    """The tree a failed attempt at *checkpoint* durably recorded, if any."""
+
+    number = checkpoint.review_cycle
+    if checkpoint.phase in _STEP_PHASES:
+        record = _read_json_artifact(
+            implementation_dir(run_dir, number) / "steps" / str(checkpoint.step_id) / "step.json",
+            128 * 1024,
+        )
+        if isinstance(record, dict) and record.get("status") == "FAILED" and _is_object_id(record.get("tree_after")):
+            return record["tree_after"]
+        return None
+    if checkpoint.phase is ResumePhase.SEMANTIC_REVISION:
+        return _read_tree_file(semantic_revision_dir(run_dir, number) / "tree_after_failure.txt")
+    if checkpoint.phase is ResumePhase.CHECK_REPAIR and checkpoint.stage is not None:
+        return _read_tree_file(
+            check_repair_attempt_dir(
+                run_dir, number, checkpoint.stage, int(checkpoint.check_repair_attempt or 1),
+            ) / "tree_after_failure.txt"
+        )
+    return None
+
+
+def validate_resume(
+    *,
+    config: HarnessConfig,
+    repair_scope: EffectiveRepairScopePolicy,
+    run_dir: Path,
+    state: Mapping[str, Any],
+    checkpoint: ResumeCheckpoint,
+    publish_remote: str | None,
+) -> ResumedRun:
+    """Fail-closed integrity gate in front of every resumed execution phase."""
+
+    if state.get("planning_protocol") != "v2":
+        _refuse("only pipeline v2 runs can be resumed")
+    try:
+        repo = git_root(config.repo)
+    except GitError as exc:
+        _refuse(f"repository is unavailable: {exc}")
+    if str(repo) != str(state.get("repo")):
+        _refuse("the configured repository is not the run repository")
+    base_sha = state.get("base_sha")
+    if not _is_object_id(base_sha):
+        _refuse("run base SHA is invalid")
+    reference = _read_repository_reference(run_dir)
+    if reference is None or reference.base_sha != base_sha:
+        _refuse("the base SHA changed for this run")
+    try:
+        spec = (run_dir / "spec.md").read_text(encoding="utf-8")
+        context = (run_dir / "context.txt").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        _refuse("run SPEC or planner context is unreadable")
+
+    # Plan identity, the human approval bound to it and the frozen checks.
+    try:
+        identity = compute_plan_identity_from_run(run_dir)
+        recorded = plan_identity_from_mapping(state.get("plan_identity"))
+        authority = read_check_authority(
+            run_dir, expected_sha256=identity.checks_sha256,
+            trusted_check_ids=tuple(check.id for check in config.trusted_checks()),
+        )
+        approval = read_plan_approval(run_dir, expected_identity=identity)
+    except (ApprovalError, ResumeCheckpointError) as exc:
+        _refuse(f"plan artifacts are invalid: {exc}")
+    if identity != checkpoint.plan_identity or identity != recorded:
+        _refuse("plan identity no longer matches")
+    if identity.checks_sha256 is not None and authority is None:
+        _refuse("check authority is missing for this run")
+    if config.approval.require_plan_approval:
+        if approval is None or approval.decision is not ApprovalDecision.APPROVE:
+            _refuse("plan approval was not APPROVE")
+        if (
+            approval.execution_sha256 != checkpoint.execution_selection_sha256
+            or approval.bundle_sha256 != identity.bundle_sha256
+        ):
+            _refuse("the approval does not bind the checkpoint execution selection")
+    elif approval is not None and approval.decision is not ApprovalDecision.APPROVE:
+        _refuse("plan approval artifact is not APPROVE")
+
+    # The approved execution selection, against today's configuration.
+    try:
+        selection, execution_sha = read_execution_selection_with_sha256(run_dir)
+        validate_execution_selection(config, selection)
+    except (ExecutionSelectionError, ProfileError) as exc:
+        _refuse(f"execution selection is invalid: {exc}")
+    if execution_sha != checkpoint.execution_selection_sha256 or execution_sha != identity.execution_sha256:
+        _refuse("execution selection hash changed")
+    execution = state.get("execution") if isinstance(state.get("execution"), Mapping) else {}
+    planner_state = execution.get("planner") if isinstance(execution.get("planner"), Mapping) else {}
+    if selection.planner.profile_id != planner_state.get("profile_id"):
+        _refuse("execution selection planner is not the run planner")
+
+    # The approved plan and its exact bundle.
+    profiles = profiles_for_config(config).values()
+    try:
+        plan = parse_task_plan_v2(
+            (run_dir / "planner.raw.md").read_text(encoding="utf-8"),
+            implementer_ids=frozenset(p.id for p in profiles if ExecutionRole.IMPLEMENTER in p.roles),
+            reviewer_ids=frozenset(p.id for p in profiles if ExecutionRole.REVIEWER in p.roles),
+            check_catalog=config.check_catalog,
+            default_check_ids=config.default_check_ids,
+        )
+        bundle, bundle_sha = validate_implementation_bundle(
+            run_dir, expected_step_ids=[step.id for step in plan.steps]
+        )
+    except (V2PlanParseError, OSError, UnicodeError) as exc:
+        _refuse(f"approved plan is unreadable: {exc}")
+    if plan.decision is not PlanDecision.READY or bundle_sha != identity.bundle_sha256:
+        _refuse("approved bundle changed")
+    if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
+        _refuse("execution selection steps do not match the plan")
+
+    # Worktree and branch.
+    worktree_value, branch = state.get("worktree"), state.get("branch")
+    if not isinstance(worktree_value, str) or not isinstance(branch, str):
+        _refuse("run has no worktree or branch")
+    worktree = Path(worktree_value).expanduser().resolve()
+    if not worktree.is_dir():
+        _refuse("run worktree is missing")
+    try:
+        frozen_config, frozen_ids = config_with_check_authority(
+            config, run_dir, expected_sha256=identity.checks_sha256,
+        )
+        if frozen_ids is not None:
+            for frozen_check in frozen_config.select_checks(frozen_ids):
+                resolve_check_cwd(worktree, frozen_check)
+    except (ValidationError, ValueError) as exc:
+        _refuse(f"check authority is invalid: {exc}")
+
+    # Cycle identity and every authority of cycles 1..n.
+    number = checkpoint.review_cycle
+    for earlier in range(2, number + 1):
+        read_cycle_record(run_dir, earlier)
+    for earlier in range(1, number):
+        read_candidate_record(run_dir, earlier)
+    scope = _approved_scope(config, selection, run_dir, plan, checkpoint, repair_scope)
+    if checkpoint.phase not in {ResumePhase.REVIEW_REPLAN, *_STEP_PHASES} and number > 1:
+        if checkpoint.correction_bundle_sha256 is None:
+            _refuse("the correction checkpoint is not bound to its plan")
+        _correction, _bundle, correction_sha = load_correction_plan(
+            config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
+        )
+        if correction_sha != checkpoint.correction_bundle_sha256:
+            _refuse("the correction plan changed")
+    if checkpoint.phase is ResumePhase.REVIEW_IMPLEMENTATION:
+        _correction, _bundle, correction_sha = load_correction_plan(
+            config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
+        )
+        if correction_sha != checkpoint.correction_bundle_sha256:
+            _refuse("the correction plan changed")
+
+    restore: tuple[str, ...] = ()
+    try:
+        if str(worktree) not in registered_worktrees(repo):
+            _refuse("run worktree is not registered in the repository")
+        if not branch_exists(repo, branch):
+            _refuse("run branch is missing")
+        if symbolic_head(worktree) != f"refs/heads/{branch}":
+            _refuse("worktree HEAD is not the run branch")
+        head = current_head(worktree)
+        if resolve_commit(repo, f"refs/heads/{branch}") != head:
+            _refuse("run branch does not point to the worktree HEAD")
+        expected_tree = checkpoint.expected_tree_sha
+        if head != checkpoint.expected_head_sha:
+            # A crash may land between the candidate commit and its record;
+            # only that exact commit (expected parent, expected tree) is kept.
+            if not (
+                checkpoint.phase is ResumePhase.CANDIDATE_READY
+                and commit_parents(repo, head) == (checkpoint.expected_head_sha,)
+                and resolve_tree(repo, head) == expected_tree
+            ):
+                _refuse("HEAD moved since the checkpoint")
+        if (
+            checkpoint.expected_parent_sha is not None
+            and commit_parents(repo, head) != (checkpoint.expected_parent_sha,)
+        ):
+            _refuse("HEAD parent differs from the checkpoint parent")
+
+        if checkpoint.phase in _CANDIDATE_PHASES:
+            candidate = read_candidate_record(run_dir, number)
+            if candidate["commit_sha"] != head or candidate["tree_sha"] != expected_tree:
+                _refuse("the run branch is not the recorded candidate commit")
+            if publish_remote is not None:
+                remote_tip = remote_run_branch_tip(repo, remote=publish_remote, branch=branch)
+                if checkpoint.phase is ResumePhase.CANDIDATE_PUSH and remote_tip not in {None, head}:
+                    _refuse("remote run branch points to a different commit")
+                if checkpoint.phase is not ResumePhase.CANDIDATE_PUSH and remote_tip != head:
+                    _refuse("remote run branch does not point to the candidate commit")
+        if checkpoint.phase is ResumePhase.PUBLISH:
+            evidence = candidate_evidence(run_dir, number)
+            if evidence is None or evidence.staged_tree_sha != expected_tree:
+                _refuse("the candidate evidence is missing or not for the approved tree")
+            review = _accepted_review(review_dir(run_dir, number), evidence, head)
+            if review is None or review.verdict is not ReviewVerdict.PASS or review.route is not ReviewRoute.NONE:
+                _refuse("the reviewer PASS is missing for the candidate")
+        if checkpoint.phase is ResumePhase.CHECK_REPAIR:
+            evidence = _load_evidence(gate_dir(run_dir, number, checkpoint.stage))
+            if evidence is None or evidence.staged_tree_sha != expected_tree:
+                _refuse("the red gate evidence is missing or not for the checkpoint tree")
+        if checkpoint.phase is ResumePhase.DETERMINISTIC_GATE and checkpoint.check_repair_attempt is not None:
+            record = _read_json_artifact(
+                check_repair_attempt_dir(
+                    run_dir, number, checkpoint.stage, checkpoint.check_repair_attempt,
+                ) / "attempt.json"
+            )
+            if not isinstance(record, dict) or record.get("tree_after") != expected_tree:
+                _refuse("the check-repair attempt record is not for the checkpoint tree")
+
+        candidate_tree = candidate_tree_sha(worktree)
+        index_tree = index_tree_sha(worktree)
+        dirty = _status_has_unstaged_or_untracked(status_porcelain(worktree))
+        if candidate_tree != expected_tree or index_tree != expected_tree or dirty:
+            failure_tree = _failure_tree_for(run_dir, checkpoint)
+            if failure_tree is None or candidate_tree != failure_tree:
+                _refuse("the worktree differs from the checkpoint tree")
+            changed = changed_paths_between_trees(repo, expected_tree, candidate_tree)
+            if not changed or any(path not in scope for path in changed):
+                raise ResumeRequiresOperatorError(
+                    "the failed attempt changed paths outside the approved scope"
+                )
+            restore = tuple(changed)
+        base_tree = resolve_tree(repo, base_sha)
+        unapproved = [
+            path for path in changed_paths_between_trees(repo, base_tree, expected_tree)
+            if path not in scope
+        ]
+    except GitError as exc:
+        _refuse(f"Git state is unreadable: {exc}")
+    if unapproved:
+        _refuse("the candidate contains a path outside the approved scope")
+    return ResumedRun(
+        checkpoint=checkpoint, plan=plan, bundle=bundle, selection=selection,
+        info=WorktreeInfo(
+            source_repo=repo, worktree=worktree, branch=branch,
+            base_ref=config.base_ref, base_sha=base_sha,
+        ),
+        repository_reference=reference, spec=spec, context=context,
+        base_tree_sha=base_tree, restore_paths=restore,
+    )
+
+
+__all__ = [
+    "ResumedRun", "candidate_evidence", "completed_step_records", "load_correction_plan",
+    "read_candidate_record", "read_cycle_record", "validate_resume",
+    "verify_correction_scope",
+]

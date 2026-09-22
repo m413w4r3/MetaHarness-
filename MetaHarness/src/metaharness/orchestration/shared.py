@@ -34,7 +34,6 @@ from ..result import (
     ResultArtifactError,
     atomic_write_text,
 )
-from ..resume import ResumePhase
 from ..validation import check_result_json
 from ..agent.diagnostics import TOKEN_DIAGNOSTICS_NAME
 
@@ -79,11 +78,6 @@ _REVISION_ARTIFACTS = (
     "agent.final.md",
     "agent.result.json",
 )
-
-
-def _slug(value: str) -> str:
-    candidate = re.sub(r"[^A-Za-z0-9]+", "-", value.casefold()).strip("-")
-    return (candidate[:60] or "task")
 
 
 def _commit_subject(title: str) -> str:
@@ -151,9 +145,6 @@ class GitOwnership:
     worktrees: frozenset[str]
 
 
-# Compatibility alias for the former private name.
-_GitOwnership = GitOwnership
-
 
 def _git_ownership(repo: Path, worktree: Path) -> GitOwnership:
     return GitOwnership(
@@ -171,24 +162,6 @@ def _git_ownership_payload(ownership: GitOwnership) -> dict[str, Any]:
         "branches": sorted(ownership.branches),
         "worktrees": sorted(ownership.worktrees),
     }
-
-
-def _ownership_from_payload(payload: Mapping[str, Any]) -> GitOwnership | None:
-    """Rebuild a persisted ownership proof, or ``None`` when it is malformed."""
-
-    head_ref, head = payload.get("head_ref"), payload.get("head")
-    branches, worktrees = payload.get("branches"), payload.get("worktrees")
-    if (
-        (head_ref is not None and not isinstance(head_ref, str))
-        or not _is_object_id(head)
-        or not isinstance(branches, list) or any(not isinstance(item, str) for item in branches)
-        or not isinstance(worktrees, list) or any(not isinstance(item, str) for item in worktrees)
-    ):
-        return None
-    return GitOwnership(
-        head_ref=head_ref, head=head,
-        branches=frozenset(branches), worktrees=frozenset(worktrees),
-    )
 
 
 def _ownership_violations(
@@ -218,7 +191,7 @@ def _ownership_violations(
 
 @dataclasses.dataclass(frozen=True)
 class StepExecutionOutcome:
-    """The durable result of one successful Codex step (001 or 002)."""
+    """The durable result of one successful implementation step."""
 
     step_id: str
     profile_id: str
@@ -272,7 +245,7 @@ _BOUNDED_NO_CHANGE_MISMATCH = (
 
 
 class StepExecutionFailure(OrchestrationError):
-    """One Codex step failed a gate; the 001/002 caller owns the run status."""
+    """One implementation step failed a gate; the caller owns the run status."""
 
     def __init__(
         self,
@@ -289,6 +262,7 @@ class StepExecutionFailure(OrchestrationError):
         mismatch_retry_count: int = 0,
         initial_mismatch: str | None = None,
         index_tree_after: str | None = None,
+        step_dir: Path | None = None,
     ) -> None:
         super().__init__(f"{reason}: step={step_id}")
         self.reason = reason
@@ -303,25 +277,7 @@ class StepExecutionFailure(OrchestrationError):
         self.mismatch_retry_count = mismatch_retry_count
         self.initial_mismatch = initial_mismatch
         self.index_tree_after = index_tree_after
-
-
-def _step_result_record(outcome: StepExecutionOutcome) -> dict[str, Any]:
-    status = getattr(outcome, "status", "COMPLETED")
-    return {
-        "id": outcome.step_id, "status": status, "profile_id": outcome.profile_id,
-        "tree_before": outcome.tree_before, "tree_after": outcome.tree_after,
-        "changed_paths": list(outcome.changed_paths),
-        "usage": outcome.usage,
-        "final": _bounded_v2_report(outcome.final_report),
-        **({"mismatch": _bounded_v2_report(getattr(outcome, "mismatch", ""))}
-           if getattr(outcome, "mismatch", None) else {}),
-        **({"initial_mismatch": _bounded_v2_report(getattr(outcome, "initial_mismatch", ""))}
-           if getattr(outcome, "initial_mismatch", None) else {}),
-        **({"mismatch_retry_count": getattr(outcome, "mismatch_retry_count", 0)}
-           if getattr(outcome, "mismatch_retry_count", 0) else {}),
-        **({"deferred_verify": _bounded_v2_report(getattr(outcome, "deferred_verify", ""))}
-           if getattr(outcome, "deferred_verify", None) else {}),
-    }
+        self.step_dir = step_dir
 
 
 _GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -351,13 +307,6 @@ _REVIEW_ATTEMPT_ARTIFACTS = (
 _CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "evidence.json")
 
 
-# The historical root aliases of the 001 evidence.  ``cycles/001/checks`` is the
-# canonical directory; these names are only ever republished *from* it.
-_CHECK_ALIAS_ARTIFACTS = _CHECK_ATTEMPT_ARTIFACTS
-
-
-# Archiving ``pre_checks.json`` makes a CHECKS_Cxx resume replay the checks.
-_PRE_CHECK_ATTEMPT_ARTIFACTS = _CHECK_ATTEMPT_ARTIFACTS + ("pre_checks.json",)
 
 
 _REVISION_ATTEMPT_ARTIFACTS = _AGENT_ARTIFACTS + ("tree_after_failure.txt",)
@@ -372,10 +321,6 @@ _PLANNER_CONVERSATION = "planner.conversation.json"
 _RECOVERY_ATTEMPT_ARTIFACTS = _PLANNER_ATTEMPT_ARTIFACTS + (
     "implementation_contract.md", _PLANNER_CONVERSATION, PLAN_RECOVERY_ARTIFACT,
 )
-
-
-class ReviewerTransportError(OrchestrationError):
-    """No reviewer answer was obtained: a transport failure, not a verdict."""
 
 
 class CandidatePushError(OrchestrationError):
@@ -489,7 +434,10 @@ def _archive_attempt_tree(directory: Path) -> None:
 
     if not directory.is_dir():
         return
-    files = [path for path in directory.rglob("*") if path.is_file() and "attempts" not in path.parts]
+    files = [
+        path for path in directory.rglob("*")
+        if path.is_file() and "attempts" not in path.relative_to(directory).parts
+    ]
     if not files:
         return
     root = directory / "attempts"
@@ -534,10 +482,10 @@ _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
 def _repair_checks_payload(bundle: EvidenceBundle) -> dict[str, Any]:
-    """Summarize the accepted 001 deterministic gate for the repair planner.
+    """Summarize a cycle's accepted deterministic gate for the correction planner.
 
-    Reviewer #1 only exists because the 001 gate was accepted, so argv, cwd,
-    durations and log tails add no decision value here; they stay in the
+    The reviewed candidate only exists because its gate was accepted, so argv,
+    cwd, durations and log tails add no decision value here; they stay in the
     durable check artifacts.
     """
 
@@ -590,8 +538,6 @@ class CheckRepairScope:
     source: str
 
 
-_SECOND_CHECK_REPAIR_PHASES = frozenset({ResumePhase.CHECK_REPAIR})
-
 
 def _status_has_unstaged_or_untracked(status: tuple[str, ...]) -> list[str]:
     problems: list[str] = []
@@ -601,16 +547,3 @@ def _status_has_unstaged_or_untracked(status: tuple[str, ...]) -> list[str]:
         elif len(line) >= 2 and line[1] != " ":
             problems.append(f"unstaged change: {line}")
     return problems
-
-
-def _artifact_tail(path: Path, limit: int = 64 * 1024) -> str:
-    """Read only the tail needed for deterministic failure classification."""
-
-    try:
-        with path.open("rb") as stream:
-            stream.seek(0, 2)
-            size = stream.tell()
-            stream.seek(max(0, size - limit))
-            return stream.read(limit).decode("utf-8", errors="replace")
-    except OSError:
-        return ""

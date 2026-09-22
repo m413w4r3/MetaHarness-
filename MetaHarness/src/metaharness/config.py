@@ -768,9 +768,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         revision_data, "max_check_repair_attempts", 2, "revision"
     )
     if not revision_data:
-        # A config with no [revision] section is historical and has no
-        # correction pipeline.  RevisionConfig's explicit defaults remain
-        # available to new callers that construct it directly.
+        # A config with no [revision] section has no correction pipeline.
         review_budget = check_budget = 0
     revision = RevisionConfig(
         enabled=revision_enabled,

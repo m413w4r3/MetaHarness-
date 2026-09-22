@@ -104,7 +104,8 @@ AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
 # Elements updated in place by /static/run.js (textContent/classList/hidden).
 RUN_PAGE_DYNAMIC_IDS: tuple[str, ...] = (
     "live-status", "live-updated", "live-current", "live-next", "live-failure",
-    "live-tokens-planner", "live-tokens-luna", "live-tokens-claude", "live-tokens-reviewer",
+    "live-tokens-planner", "live-tokens-implementer", "live-tokens-check_repair",
+    "live-tokens-semantic_reviser", "live-tokens-final_reviewer",
     "live-events", "refresh-details",
 )
 STATE_POLL_MS = 2000
@@ -247,8 +248,7 @@ def _failure_reason(run: dict[str, Any]) -> str:
 def _publish_section(state: dict[str, Any]) -> str:
     candidates = state.get("candidate") if isinstance(state.get("candidate"), dict) else {}
     candidate_rows = []
-    for cycle in ("001", "002"):
-        item = candidates.get(cycle)
+    for cycle, item in sorted(candidates.items()):
         if not isinstance(item, dict):
             continue
         url = item.get("immutable_commit_url")
@@ -362,39 +362,19 @@ def _check_cards(checks: Any) -> str:
 def _check_repair_notice(run: dict[str, Any]) -> str:
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     repair = state.get("check_repair") if isinstance(state.get("check_repair"), dict) else {}
-    if not repair.get("attempted"):
+    if not repair:
         return ""
     failure_ids = repair.get("failure_ids") if isinstance(repair.get("failure_ids"), list) else []
     detail = ", ".join(str(item) for item in failure_ids) or "ordinary CHECK_FAILED failures"
-    added_paths = repair.get("added_paths") if isinstance(repair.get("added_paths"), list) else []
-    paths = "".join(f"<li>{_e(path)}</li>" for path in added_paths)
-    second = bool(
-        repair.get("second_check_repair_attempted") or repair.get("expanded_attempted")
-    )
-    # ``scope_expanded`` is authoritative when present; older runs only
-    # recorded a second pass at all, and then only added paths can say.
-    scope_expanded = repair.get("scope_expanded")
-    if not isinstance(scope_expanded, bool):
-        scope_expanded = bool(added_paths)
-    if second:
-        # A second pass no longer implies an expansion: say which one it was.
-        expansion = '<p><strong>second bounded check repair attempted</strong></p>'
-        if scope_expanded:
-            expansion += '<p><strong>scope expanded</strong></p>'
-            if added_paths:
-                expansion += f'<p>Added test paths:</p><ul>{paths}</ul>'
-        else:
-            expansion += '<p><strong>scope unchanged</strong></p>'
-    elif added_paths:
-        expansion = (
-            '<p><strong>automatic check repair scope expanded</strong></p>'
-            f'<p>Added test paths:</p><ul>{paths}</ul>'
-        )
-    else:
-        expansion = ""
+    scope = repair.get("mutable_scope") if isinstance(repair.get("mutable_scope"), list) else []
+    paths = "".join(f"<li>{_e(path)}</li>" for path in scope)
     return (
-        '<div class="card fail"><p><strong>automatic check repair attempted</strong></p>'
-        f'<p>Failed checks: {_e(detail)}</p>{expansion}</div>'
+        '<div class="card fail"><p><strong>automatic check repair</strong> · '
+        f'stage {_e(repair.get("stage") or "—")} · attempt {_e(repair.get("attempt_number") or "—")} · '
+        f'{_e(repair.get("status") or "—")}</p>'
+        f'<p>Failed checks: {_e(detail)}</p>'
+        + (f'<p>Mutable scope:</p><ul>{paths}</ul>' if paths else "")
+        + '</div>'
     )
 
 
@@ -405,23 +385,6 @@ def _review(review: Any) -> str:
         return f"<pre>{_e(review)}</pre>"
     fields = (("verdict", review.get("verdict")), ("route", review.get("route")), ("summary", review.get("summary")), ("findings", review.get("findings")), ("required fixes", review.get("required_fixes", review.get("required fixes"))), ("missing tests", review.get("missing_tests", review.get("missing tests"))), ("residual risks", review.get("residual_risks", review.get("residual risks"))))
     return "<dl>" + "".join(f"<dt>{_e(label)}</dt><dd>{_e(value)}</dd>" for label, value in fields) + "</dl>"
-
-
-def _execution_card(state: dict[str, Any], config: HarnessConfig | None) -> str:
-    execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
-    metadata = {}
-    if config is not None:
-        metadata = {profile.id: safe_profile_metadata(profile) for profile in profiles_for_config(config).values()}
-    cards = []
-    for role, title in (("planner", "Planner"), ("implementer", "Implementer"), ("reviser", "Reviser"), ("repair_implementer", "Repair implementer"), ("reviewer", "Reviewer")):
-        selected = execution.get(role) if isinstance(execution.get(role), dict) else {}
-        profile_id = selected.get("profile_id")
-        profile = metadata.get(profile_id, {})
-        model = selected.get("model", profile.get("model_label")); mode = selected.get("selection_mode", profile.get("selection_mode")); effort = selected.get("effort", profile.get("effort"))
-        warning = '<p class="danger">external-ui: le modèle est sélectionné dans le fournisseur externe.</p>' if mode == "external-ui" else ""
-        extra = f'<dt>effort</dt><dd>{_e(effort)}</dd>' if role == "implementer" else ""
-        cards.append(f'<article class="card"><h3>{title}</h3><dl><dt>profile</dt><dd>{_e(profile_id or "—")}</dd><dt>model</dt><dd>{_e(model or "—")}</dd><dt>selection mode</dt><dd>{_e(mode or "—")}</dd>{extra}</dl>{warning}</article>')
-    return '<div class="grid">' + "".join(cards) + "</div>"
 
 
 def _setup_cards(results: Any) -> str:
@@ -512,36 +475,38 @@ def _v2_approval_form(
         )
     reviewer = (
         requested_profiles.get("final_reviewer_profile")
-        or requested_profiles.get("final_reviewer_profile")
         or planner.get("reviewer_recommendation")
     )
     # Each optional role is shown according to the durable V2 budgets.  The
     # profile catalogue, not a driver-name convention, determines options.
     cycle_profiles = ""
     pipeline = options.get("pipeline") if isinstance(options.get("pipeline"), dict) else {}
-    cycle_enabled = bool(
-        pipeline.get("semantic_revision_enabled")
-    ) or pipeline.get("max_check_repair_attempts", 0) > 0 or pipeline.get(
-        "max_review_repair_cycles", pipeline.get("max_review_repair_cycles", 0)
-    ) > 0
-    if config is not None and cycle_enabled:
+    semantic_revision = bool(pipeline.get("semantic_revision_enabled"))
+    check_repair = (
+        pipeline.get("max_check_repair_attempts", 0) > 0
+        or pipeline.get("max_review_repair_cycles", 0) > 0
+    )
+    if config is not None and semantic_revision:
         reviser = requested_profiles.get("semantic_reviser_profile")
-        repair = requested_profiles.get("check_repair_profile")
         reviser_meta = metadata.get(reviser, {})
-        repair_meta = metadata.get(repair, {})
-        cycle_profiles = (
-            '<section class="card revision-profile"><h3>Reviser</h3>'
+        cycle_profiles += (
+            '<section class="card revision-profile"><h3>Semantic reviser</h3>'
             f'<p><span class="mono">{_e(reviser_meta.get("driver"))}</span> / '
             f'<span class="mono">{_e(reviser_meta.get("model_label"))}</span> · '
             f'recommended {_profile_triplet(reviser, reviser_meta.get("model_label"), reviser_meta.get("effort"))}</p>'
             '<label for="reviser-profile">Semantic reviser (selected)</label>'
-            f'<select id="reviser-profile" name="reviser_profile" required>{_profile_options(config, "reviser", reviser)}</select></section>'
-            '<section class="card repair-profile"><h3>Repair implementer</h3>'
+            f'<select id="reviser-profile" name="semantic_reviser_profile" required>{_profile_options(config, "reviser", reviser)}</select></section>'
+        )
+    if config is not None and check_repair:
+        repair = requested_profiles.get("check_repair_profile")
+        repair_meta = metadata.get(repair, {})
+        cycle_profiles += (
+            '<section class="card repair-profile"><h3>Check repair and review corrections</h3>'
             f'<p><span class="mono">{_e(repair_meta.get("driver"))}</span> / '
             f'<span class="mono">{_e(repair_meta.get("model_label"))}</span> · '
             f'recommended {_profile_triplet(repair, repair_meta.get("model_label"), repair_meta.get("effort"))}</p>'
             '<label for="repair-profile">Check-repair profile (selected)</label>'
-            f'<select id="repair-profile" name="repair_profile" required>{_profile_options(config, "repair", repair)}</select></section>'
+            f'<select id="repair-profile" name="check_repair_profile" required>{_profile_options(config, "repair", repair)}</select></section>'
         )
     execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
     planner_selected = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
@@ -553,7 +518,7 @@ def _v2_approval_form(
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE">
 <h3>Planner</h3><p class="mono">{_e(planner_selected.get("profile_id") or "—")} / {_e(planner_selected.get("model") or "—")}</p>
 <h3>Initial implementation</h3><ul class="plan-steps">{"".join(overview)}</ul>
-{"".join(rows)}{cycle_profiles}<section class="card reviewer-profile"><h3>Reviewer</h3><p>recommended {_profile_triplet(reviewer, reviewer_meta.get("model_label"), reviewer_meta.get("selection_mode"))}</p><label for="reviewer-profile">Reviewer (selected)</label><select id="reviewer-profile" name="reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select></section><br><button class="approve" type="submit">APPROVE PLAN</button></form>
+{"".join(rows)}{cycle_profiles}<section class="card reviewer-profile"><h3>Reviewer</h3><p>recommended {_profile_triplet(reviewer, reviewer_meta.get("model_label"), reviewer_meta.get("selection_mode"))}</p><label for="reviewer-profile">Final reviewer (selected)</label><select id="reviewer-profile" name="final_reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select></section><br><button class="approve" type="submit">APPROVE PLAN</button></form>
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT PLAN</button></form></section>'''
 
 
@@ -579,7 +544,7 @@ def _context_line(step_id: Any, cycle: Any, usage: dict[str, Any], level: str) -
     if level not in _CONTEXT_LABELS:
         return ""
     return (
-        f'<p class="context {level}">Luna {_e(step_id)} · {_kilo(usage.get("input_tokens"))} input · '
+        f'<p class="context {level}">{_e(step_id)} · {_kilo(usage.get("input_tokens"))} input · '
         f'{_kilo(usage.get("cached_input_tokens"))} cached · <strong>{_CONTEXT_LABELS[level]}</strong>'
         f' · <a href="#diag-c{_e(cycle)}-{_e(step_id)}">Voir diagnostic</a></p>'
     )
@@ -670,13 +635,13 @@ def _checks_verdict(checks: Any) -> str:
 
 def _cycle_revision_block(revision: Any, open_attr: str) -> str:
     if not isinstance(revision, dict):
-        return f'<details class="card revision"{open_attr}><summary>Claude revision</summary><p class="muted">Not started.</p></details>'
+        return f'<details class="card revision"{open_attr}><summary>Semantic revision</summary><p class="muted">Not started.</p></details>'
     report = revision.get("report") if isinstance(revision.get("report"), dict) else {}
     events = revision.get("events") if isinstance(revision.get("events"), list) else []
     event_items = "".join(f"<li>{_e(event)}</li>" for event in events) or '<li class="muted">No event yet.</li>'
     changed = report.get("changed_paths") if isinstance(report.get("changed_paths"), list) else []
     return (
-        f'<details class="card revision"{open_attr}><summary>Claude revision · '
+        f'<details class="card revision"{open_attr}><summary>Semantic revision · '
         f'{_e(report.get("status") or "running")} · {_usage_pair(revision.get("usage"))}</summary>'
         f'<p>profile: <span class="mono">{_e(report.get("profile_id"))}</span></p>'
         f'<p>changed paths: <span class="mono">{_e(", ".join(str(path) for path in changed) or "—")}</span></p>'
@@ -699,7 +664,7 @@ def _cycle_checks_block(checks: Any, open_attr: str) -> str:
 
 
 def _cycle_review_block(number: Any, review: Any, open_attr: str) -> str:
-    title = f"Reviewer #{_e(number)}"
+    title = f"Reviewer {_e(_cycle_label(number))}"
     if not isinstance(review, dict):
         return f'<details class="card review"{open_attr}><summary>{title}</summary><p class="muted">Not reviewed.</p></details>'
     result = review.get("review") if isinstance(review.get("review"), dict) else {}
@@ -710,13 +675,17 @@ def _cycle_review_block(number: Any, review: Any, open_attr: str) -> str:
     )
 
 
+def _cycle_label(number: Any) -> str:
+    return f"{number:03d}" if isinstance(number, int) and not isinstance(number, bool) else str(number or "—")
+
+
 def _cycle_sections(run: dict[str, Any]) -> str:
-    """CYCLE 1 — INITIAL and (when it exists) CYCLE 2 — REPAIR, never mixed."""
+    """Every cycle of the run, each rendered from its own artifacts only."""
 
     cycles = run.get("cycle_artifacts") if isinstance(run.get("cycle_artifacts"), list) else []
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = str(state.get("status", ""))
-    current = run.get("cycle") if run.get("cycle") in (1, 2) else 1
+    current = run.get("cycle") if isinstance(run.get("cycle"), int) else 1
     terminal = status in TERMINAL_STATUSES
     sections: list[str] = []
     for cycle in cycles:
@@ -737,7 +706,7 @@ def _cycle_sections(run: dict[str, Any]) -> str:
         header_note = f' · <span class="danger">{_e(failure)}</span>' if failure else ""
         sections.append(
             f'<details class="card cycle cycle-{_e(number)}"{" open" if active or terminal and number == len(cycles) else ""}>'
-            f'<summary>CYCLE {_e(number)} — {_e(kind)} · {_e(cycle.get("status") or "—")}{header_note}</summary>'
+            f'<summary>CYCLE {_e(_cycle_label(number))} — {_e(kind)} · {_e(cycle.get("status") or "—")}{header_note}</summary>'
             f'{cards}'
             f'{_cycle_revision_block(cycle.get("revision"), phase_open(_REVISION_PHASES))}'
             f'{_cycle_checks_block(cycle.get("checks"), phase_open(_CHECK_PHASES))}'
@@ -758,8 +727,8 @@ def _final_summary(run: dict[str, Any]) -> str:
     result = review.get("review") if isinstance(review.get("review"), dict) else {}
     verdict = f'{result.get("verdict") or "—"} / {result.get("route") or "—"}' if result else "—"
     return (
-        f'<p class="final-summary">Final cycle C0{_e(final.get("number"))} ({_e(final.get("kind"))}) · '
-        f'checks {_checks_verdict(final.get("checks"))} · reviewer #{_e(final.get("number"))} {_e(verdict)}</p>'
+        f'<p class="final-summary">Final cycle {_e(_cycle_label(final.get("number")))} ({_e(final.get("kind"))}) · '
+        f'checks {_checks_verdict(final.get("checks"))} · reviewer {_e(verdict)}</p>'
     )
 
 
@@ -783,25 +752,15 @@ def _usage_section(run: dict[str, Any]) -> str:
 
     usage = run.get("usage") if isinstance(run.get("usage"), dict) else {}
     implementer = usage.get("implementer") if isinstance(usage.get("implementer"), dict) else {}
-    if "luna_c01" in usage:
-        phase_rows = (
-            ("Planner initial", usage.get("planner")),
-            ("Luna 001", usage.get("luna_c01")),
-            ("Claude 001", usage.get("claude_c01")),
-            ("Reviewer 001", usage.get("reviewer_c01")),
-            ("Repair planner 002", usage.get("repair_planner_c02")),
-            ("Luna 002", usage.get("luna_c02")),
-            ("Claude 002", usage.get("claude_c02")),
-            ("Reviewer 002", usage.get("reviewer_c02")),
-            ("Grand total", usage.get("grand_total")),
-        )
-    else:
-        phase_rows = (
-            ("Planner", usage.get("planner")),
-            ("Luna", implementer.get("total")),
-            ("Claude revision", usage.get("reviser")),
-            ("Reviewer", usage.get("reviewer")),
-        )
+    phase_rows = (
+        ("Planner", usage.get("planner")),
+        ("Correction planner", usage.get("correction_planner")),
+        ("Implementer", implementer.get("total")),
+        ("Check repair", usage.get("check_repair")),
+        ("Semantic reviser", usage.get("semantic_reviser")),
+        ("Final reviewer", usage.get("final_reviewer")),
+        ("Grand total", usage.get("grand_total")),
+    )
     rows = "".join(
         f'<tr><th>{label}</th><td>{_usage_pair(value)}</td><td class="muted">{_usage_detail(value)}</td></tr>'
         for label, value in phase_rows
@@ -818,11 +777,11 @@ def _usage_section(run: dict[str, Any]) -> str:
             if level in _CONTEXT_LABELS else ""
         )
         step_rows.append(
-            f'<tr><td class="mono">{_e(step.get("id"))}</td><td>{_usage_pair(step_usage)}</td>'
+            f'<tr><td class="mono">{_e(_cycle_label(step.get("cycle", 1)))} {_e(step.get("id"))}</td><td>{_usage_pair(step_usage)}</td>'
             f'<td class="muted">{_usage_detail(step_usage)}{flag}</td></tr>'
         )
     steps_table = (
-        '<table class="usage-steps"><thead><tr><th>Luna step</th><th>tokens</th><th>detail</th></tr></thead>'
+        '<table class="usage-steps"><thead><tr><th>Step</th><th>tokens</th><th>detail</th></tr></thead>'
         f'<tbody>{"".join(step_rows)}</tbody></table>'
         if step_rows else ""
     )
@@ -849,7 +808,7 @@ def _execution_card_v2(
     execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
     planner_state = state.get("planner") if isinstance(state.get("planner"), dict) else {}
     selection = run.get("execution_selection")
-    approved = selection if isinstance(selection, dict) and selection.get("schema_version") in (3, 4, 5) else {}
+    approved = selection if isinstance(selection, dict) else {}
     planner = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
     planner_mode = planner.get("selection_mode")
     planner_warning = '<p class="danger">external-ui: le modèle est sélectionné dans le fournisseur externe.</p>' if planner_mode == "external-ui" else ""
@@ -859,11 +818,7 @@ def _execution_card_v2(
     )
     reviewer_recommended = planner_state.get("reviewer_recommendation")
     reviewer_approved = (
-        approved.get("final_reviewer")
-        if isinstance(approved.get("final_reviewer"), dict)
-        else approved.get("reviewer")
-        if isinstance(approved.get("reviewer"), dict)
-        else {}
+        approved.get("final_reviewer") if isinstance(approved.get("final_reviewer"), dict) else {}
     )
     recommended_meta = metadata.get(reviewer_recommended, {})
     reviewer_card = (
@@ -872,8 +827,8 @@ def _execution_card_v2(
         f'<dt>approved</dt><dd>{_profile_triplet(reviewer_approved.get("profile_id"), reviewer_approved.get("model"), reviewer_approved.get("selection_mode")) if reviewer_approved else "<span class=muted>pending approval</span>"}</dd>'
         f'</dl></article>'
     )
-    reviser_approved = approved.get("reviser") if isinstance(approved.get("reviser"), dict) else execution.get("reviser", {})
-    repair_approved = approved.get("repair_implementer") if isinstance(approved.get("repair_implementer"), dict) else execution.get("repair_implementer", {})
+    reviser_approved = approved.get("semantic_reviser") if isinstance(approved.get("semantic_reviser"), dict) else execution.get("semantic_reviser", {})
+    repair_approved = approved.get("check_repair") if isinstance(approved.get("check_repair"), dict) else execution.get("check_repair", {})
     reviser_approved = reviser_approved if isinstance(reviser_approved, dict) else {}
     repair_approved = repair_approved if isinstance(repair_approved, dict) else {}
     show_cycle = bool(
@@ -881,8 +836,8 @@ def _execution_card_v2(
     )
     pending = "<span class=muted>pending approval</span>"
     cycle_cards = (
-        f'<article class="card"><h3>Reviser</h3><dl><dt>approved</dt><dd>{_profile_triplet(reviser_approved.get("profile_id"), reviser_approved.get("model"), reviser_approved.get("effort")) if reviser_approved else pending}</dd></dl></article>'
-        f'<article class="card"><h3>Repair implementer</h3><dl><dt>approved</dt><dd>{_profile_triplet(repair_approved.get("profile_id"), repair_approved.get("model"), repair_approved.get("effort")) if repair_approved else pending}</dd></dl></article>'
+        f'<article class="card"><h3>Semantic reviser</h3><dl><dt>approved</dt><dd>{_profile_triplet(reviser_approved.get("profile_id"), reviser_approved.get("model"), reviser_approved.get("effort")) if reviser_approved else pending}</dd></dl></article>'
+        f'<article class="card"><h3>Check repair</h3><dl><dt>approved</dt><dd>{_profile_triplet(repair_approved.get("profile_id"), repair_approved.get("model"), repair_approved.get("effort")) if repair_approved else pending}</dd></dl></article>'
         if show_cycle else ""
     )
     approved_steps = {
@@ -924,17 +879,16 @@ _PIPELINE_SYMBOLS = {
     "complete": "✓", "running": "▶", "failed": "✗", "deferred": "⚠", "waiting": "·", "resumable": "↻", "skipped": "–",
 }
 _FAILURE_MESSAGES = {
-    "CLAUDE_FAILED": "Claude invocation failed",
-    "CLAUDE_AUTH_FAILURE": "Claude authentication failed",
-    "CLAUDE_TIMEOUT": "Claude revision timed out",
-    "CLAUDE_MAX_TURNS": "Claude stopped after reaching its turn limit",
-    "CLAUDE_COMMITTED": "Claude created a commit",
     "CODEX_AUTH_FAILURE": "Codex authentication failed",
-    "AGENT_TIMEOUT": "Luna step timed out",
-    "AGENT_FAILED": "Luna step failed",
-    "AGENT_NO_CHANGE": "Luna step changed nothing",
-    "UNRESOLVED_CONTRACT_MISMATCH": "Deferred Luna contract mismatch needs Claude or an operator",
-    "STEP_WRITE_SET_VIOLATION": "Luna step changed an unauthorized path",
+    "AGENT_TIMEOUT": "Worker timed out",
+    "AGENT_FAILED": "Worker failed",
+    "AGENT_RUNTIME_FAILED": "Worker failed",
+    "AGENT_SCOPE_VIOLATION": "Worker changed Git history or scope",
+    "AGENT_NO_CHANGE": "Step changed nothing",
+    "UNRESOLVED_CONTRACT_MISMATCH": "Deferred contract mismatch needs semantic revision or an operator",
+    "STEP_WRITE_SET_VIOLATION": "Step changed an unauthorized path",
+    "CHECK_REPAIR_EXHAUSTED": "Check-repair budget exhausted",
+    "REVIEW_REVISE": "Reviewer requested a correction",
     "REVIEWER_TRANSPORT_FAILURE": "Reviewer could not be reached",
     "REVIEWER_OUTPUT_INVALID": "Reviewer answer is invalid",
     "LLM_FAILURE": "Model call failed",
@@ -943,10 +897,9 @@ _FAILURE_MESSAGES = {
     "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
     "RESUME_REQUIRES_OPERATOR": "Resume requires an operator",
-    "REVIEW_LOOP_EXHAUSTED": "Automatic correction budget exhausted",
-    "REPAIR_EXHAUSTED": "Repair budget exhausted",
+    "REPAIR_EXHAUSTED": "Review-correction budget exhausted",
     "WAITING_SCOPE_APPROVAL": "Additional repair scope needs approval",
-    "REVISION_SCOPE_VIOLATION": "Check-repair scope needs bounded recovery",
+    "REVISION_SCOPE_VIOLATION": "A repair pass needed a path outside its scope",
     "INTERRUPTED": "Run interrupted",
 }
 
@@ -992,15 +945,14 @@ def _run_configuration(state: dict[str, Any], config: HarnessConfig | None = Non
     steps = execution.get("steps") if isinstance(execution.get("steps"), list) else []
     if steps and isinstance(steps[0], dict) and isinstance(steps[0].get("implementer"), dict):
         final["default_implementer_profile"] = steps[0]["implementer"].get("profile_id")
-    execution_roles = (
-        ("final_reviewer_profile", "final_reviewer", "reviewer_profile", "reviewer"),
-        ("semantic_reviser_profile", "semantic_reviser", "reviser_profile", "reviser"),
-        ("check_repair_profile", "check_repair", "repair_profile", "repair_implementer"),
-    )
-    for canonical_key, canonical_role, historical_key, historical_role in execution_roles:
-        item = execution.get(canonical_role) or execution.get(historical_role)
+    for key, role in (
+        ("final_reviewer_profile", "final_reviewer"),
+        ("semantic_reviser_profile", "semantic_reviser"),
+        ("check_repair_profile", "check_repair"),
+    ):
+        item = execution.get(role)
         if isinstance(item, dict):
-            final[canonical_key] = item.get("profile_id")
+            final[key] = item.get("profile_id")
     rows = [
         ("decomposition", planning.get("decomposition")),
         ("execution mode", planning.get("execution_mode_policy")),
@@ -1021,12 +973,6 @@ def _run_configuration(state: dict[str, Any], config: HarnessConfig | None = Non
     )
     for key, label in requested_roles:
         value = requested.get(key)
-        if value is None:
-            value = {
-                "final_reviewer_profile": requested.get("reviewer_profile"),
-                "semantic_reviser_profile": requested.get("reviser_profile"),
-                "check_repair_profile": requested.get("repair_profile"),
-            }.get(key, value)
         rows.append((f"requested {label}", value))
         if key in final and final.get(key) != value:
             rows.append((f"effective/final {label}", final.get(key)))
@@ -1046,10 +992,10 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     resume = overview.get("resume") if isinstance(overview.get("resume"), dict) else {}
     recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
     note = (
-        "Reviewer requested one bounded implementation correction loop."
+        "The reviewer requested a correction and the run has no review-correction budget."
         if reason == "REVIEW_REVISE" else
-        "Automatic correction budget exhausted."
-        if reason == "REVIEW_LOOP_EXHAUSTED" else ""
+        "Every review-correction cycle of the budget was used."
+        if reason == "REPAIR_EXHAUSTED" else ""
     )
     action = ""
     if resume.get("resumable"):
@@ -1058,13 +1004,10 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
         checkpoint_detail = (
             f'<p class="small mono">RESUME FROM {_e(checkpoint)}'
             f' · tree={_e(resume.get("expected_tree") or "—")}'
-            f' · cycle={_e(resume.get("cycle") or "—")}'
+            f' · cycle={_e(resume.get("review_cycle") or "—")}'
             f' · step={_e(resume.get("step_id") or "—")}</p>'
         )
-        button_label = (
-            "RECOVER CHECK-REPAIR SCOPE"
-            if reason == "REVISION_SCOPE_VIOLATION" else label
-        )
+        button_label = label
         button = (
             f'<form action="/runs/{_e(run.get("run_id"))}/resume" method="post">'
             f'<input type="hidden" name="_token" value="{_e(token)}">'
@@ -1139,7 +1082,11 @@ def _run_card(run: dict[str, Any], token: str | None, overview: dict[str, Any], 
     totals = overview.get("token_totals") if isinstance(overview.get("token_totals"), dict) else {}
     tokens = "".join(
         f'<dt>{label}</dt><dd id="live-tokens-{key}">{_usage_pair(totals.get(key))}</dd>'
-        for key, label in (("planner", "Planner"), ("luna", "Luna"), ("claude", "Claude"), ("reviewer", "Reviewer"))
+        for key, label in (
+            ("planner", "Planner"), ("implementer", "Implementer"),
+            ("check_repair", "Check repair"), ("semantic_reviser", "Semantic reviser"),
+            ("final_reviewer", "Final reviewer"),
+        )
     )
     style = "failed" if status in {"failed", "blocked", "plan_rejected", "interrupted"} else "success" if status in {"committed", "approved", "published"} else ""
     failure = run.get("failure", state.get("failure"))
@@ -1193,13 +1140,6 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
     approval = run.get("approval") if isinstance(run.get("approval"), dict) else {}
     overview = run.get("overview") if isinstance(run.get("overview"), dict) else {}
     can_decide = status == AWAITING_APPROVAL_STATUS and bool(token) and not approval.get("recorded")
-    recommendation = state.get("recommendation") if isinstance(state.get("recommendation"), dict) else {}
-    impl_selected = recommendation.get("implementer_profile") if recommendation.get("status") == "READY" else config.ui.default_implementer_profile if config else None
-    review_selected = recommendation.get("reviewer_profile") if recommendation.get("status") == "READY" else config.ui.default_reviewer_profile if config else None
-    recommendation_note = ""
-    if recommendation.get("status") == "READY" and config is not None:
-        names = {profile.id: profile.display_name for profile in profiles_for_config(config).values()}
-        recommendation_note = f'<p>Recommended implementer: {_e(names.get(impl_selected, impl_selected))}<br>Recommended reviewer: {_e(names.get(review_selected, review_selected))}</p><p><strong>Rationale:</strong> {_e(recommendation.get("rationale"))}</p>'
     approval_forms = ""
     is_v2 = state.get("planning_protocol") == "v2"
     recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
@@ -1210,14 +1150,8 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
             'the replacement plan, its contract and its bundle</p></div>'
             if recovery.get("recovered") else ""
         ) + _v2_approval_form(run_id, token or "", state, config, run.get("step_artifacts"))
-    elif can_decide:
-        approval_forms = f'''<section class="card"><h2>Plan approval</h2>
-{recommendation_note}
-<form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE"><label for="implementer-profile">Implementer profile</label><select id="implementer-profile" name="implementer_profile" required>{_profile_options(config, "implementer", impl_selected)}</select><label for="reviewer-profile">Reviewer profile</label><select id="reviewer-profile" name="reviewer_profile" required>{_profile_options(config, "reviewer", review_selected)}</select><br><button class="approve" type="submit">APPROVE</button></form>
-<form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT</button></form></section>'''
     elif approval.get("recorded"):
         approval_forms = f'<section class="card"><h2>Plan approval</h2><p>Décision enregistrée : {_e(approval.get("decision"))}</p></section>'
-    diagnostics = run.get("agent_diagnostics") if isinstance(run.get("agent_diagnostics"), dict) else {}; result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}; usage = diagnostics.get("usage") if isinstance(diagnostics.get("usage"), dict) else {}
     candidate = run.get("candidate") if isinstance(run.get("candidate"), dict) else {}; changed_files = candidate.get("changed_files") if isinstance(candidate.get("changed_files"), list) else []
     consolidated = run.get("diagnostics") if isinstance(run.get("diagnostics"), dict) else {}
     consolidated_content = consolidated.get("content") if isinstance(consolidated.get("content"), str) else ""
@@ -1230,9 +1164,8 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
     polls = run_page_polls(run)
     failed = status in {"failed", "interrupted"}
     agent_section = (
-        (_cycle_sections(run) if isinstance(run.get("cycle_artifacts"), list) and run.get("cycle_artifacts") else _v2_steps(state, run.get("step_artifacts")))
-        if is_v2 else
-        f'<details open{_section_open(run, ("AGENT_", "CODEX_AUTH_FAILURE"))}><summary>Agent diagnostics</summary><dl><dt>exit_code</dt><dd>{_e(result.get("exit_code"))}</dd><dt>timed_out</dt><dd>{_e(result.get("timed_out"))}</dd><dt>input_tokens</dt><dd>{_e(usage.get("input_tokens"))}</dd><dt>output_tokens</dt><dd>{_e(usage.get("output_tokens"))}</dd></dl><h3>Final report</h3><pre>{_e(diagnostics.get("final_tail"))}</pre><h3>stderr</h3><pre>{_e(diagnostics.get("stderr_tail"))}</pre></details>'
+        _cycle_sections(run) if isinstance(run.get("cycle_artifacts"), list) and run.get("cycle_artifacts")
+        else _v2_steps(state, run.get("step_artifacts"))
     )
     plan_open = " open" if _section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER")) else ""
     body = f'''<main id="run" data-run-id="{_e(run_id)}" data-status="{_e(status)}"><p><a href="/">← Tous les runs</a></p>
@@ -1242,7 +1175,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
 {_pipeline_section(overview)}
 {_run_configuration(state, config)}
 {approval_forms}
-<section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config) if is_v2 else _execution_card(state, config)}</section>
+<section><h2>EXECUTION</h2>{_execution_card_v2(state, run, config)}</section>
 <section class="current-cycle"><h2>CURRENT CYCLE</h2>{_agent_auth_failure_notice(run, config)}{_live_events_card(polls)}{agent_section}</section>
 <section><h2>CHECKS</h2>{_check_repair_notice(run)}<details open{_section_open(run, ("CHECK_", "DETERMINISTIC_GATE"))}><summary>Check results</summary>{_check_cards(run.get("checks"))}</details></section>
 <section><h2>REVIEW</h2><details open{_section_open(run, ("REVIEW_",))}><summary>Reviewer result</summary>{_review(run.get("review"))}</details></section>

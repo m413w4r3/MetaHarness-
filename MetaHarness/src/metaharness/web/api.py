@@ -33,16 +33,16 @@ from ..execution_selection import (
     is_profile_aware_run,
     read_execution_selection_with_sha256,
     resolve_execution_selection,
+    validate_execution_selection,
 )
 from ..models import (
-    ExecutionRole,
     ExecutionSelection,
     HarnessConfig,
     PublishMode,
     RunStatus,
 )
 from ..planning_v2 import V2PlanParseError, step_contract_path, validate_implementation_bundle
-from ..profiles import ProfileError, profile_for_role, profiles_for_config, safe_profile_metadata
+from ..profiles import ProfileError, profiles_for_config, safe_profile_metadata
 from ..run_options import RunOptions, RunOptionsError, read_run_options_with_sha256
 from ..state import RunStateStore
 from ..step_ids import STEP_ID_PATTERN, STEP_ID_RE
@@ -95,63 +95,6 @@ ARTIFACT_ALLOWLIST = frozenset(
         "agent.result.json",
         "agent.final.md",
         "agent.stderr.log",
-        "revision/agent.prompt.txt",
-        "revision/agent.events.jsonl",
-        "revision/agent.result.json",
-        "revision/agent.final.md",
-        "revision/agent.stderr.log",
-        "revision/pre_checks.json",
-        "revision/scope.json",
-        "revision/tree_before.txt",
-        "revision/tree_after.txt",
-        "revision/report.json",
-        "revision/usage.json",
-        "cycles/001/semantic-revision/agent.prompt.txt",
-        "cycles/001/semantic-revision/agent.events.jsonl",
-        "cycles/001/semantic-revision/agent.result.json",
-        "cycles/001/semantic-revision/agent.final.md",
-        "cycles/001/semantic-revision/agent.stderr.log",
-        "cycles/001/semantic-revision/pre_checks.json",
-        "cycles/001/semantic-revision/scope.json",
-        "cycles/001/semantic-revision/tree_before.txt",
-        "cycles/001/semantic-revision/tree_after.txt",
-        "cycles/001/semantic-revision/report.json",
-        "cycles/001/semantic-revision/usage.json",
-        "cycles/002/semantic-revision/agent.prompt.txt",
-        "cycles/002/semantic-revision/agent.events.jsonl",
-        "cycles/002/semantic-revision/agent.result.json",
-        "cycles/002/semantic-revision/agent.final.md",
-        "cycles/002/semantic-revision/agent.stderr.log",
-        "cycles/002/semantic-revision/pre_checks.json",
-        "cycles/002/semantic-revision/scope.json",
-        "cycles/002/semantic-revision/tree_before.txt",
-        "cycles/002/semantic-revision/tree_after.txt",
-        "cycles/002/semantic-revision/report.json",
-        "cycles/002/semantic-revision/usage.json",
-        "cycles/002/correction/planner.request.txt",
-        "cycles/002/correction/planner.raw.md",
-        "cycles/002/correction/planner.usage.json",
-        "cycles/002/correction/implementation_contract.md",
-        "cycles/002/correction/implementation_bundle.json",
-        "cycles/002/correction/task_plan.json",
-        "cycles/002/correction/task_plan_v2.json",
-        "cycles/002/correction/scope.json",
-        "cycles/002/correction/scope_delta.json",
-        "cycles/002/correction/scope_approval.json",
-        "cycles/002/checks/checks.json",
-        "cycles/002/checks/changed-files.txt",
-        "cycles/002/checks/diff.patch",
-        "cycles/002/review/reviewer.request.txt",
-        "cycles/002/review/reviewer.raw.md",
-        "cycles/002/review/reviewer.usage.json",
-        "cycles/002/review/review.json",
-        "cycles/001/review/reviewer.request.txt",
-        "cycles/001/review/reviewer.raw.md",
-        "cycles/001/review/reviewer.usage.json",
-        "cycles/001/review/review.json",
-        "cycles/001/checks/checks.json",
-        "cycles/001/checks/changed-files.txt",
-        "cycles/001/checks/diff.patch",
         "changed-files.txt",
         "diff.patch",
         "plan_approval.json",
@@ -313,12 +256,21 @@ def _run_dir(runs_root: Path, run_id: str) -> Path:
     return directory
 
 
+# Every durable artifact of any cycle, by its generic layout only.
+_CYCLE_ARTIFACT = re.compile(
+    r"cycles/[0-9]{3}/(?:"
+    rf"implementation/steps/{STEP_ID_PATTERN}"
+    rf"|correction(?:/steps/{STEP_ID_PATTERN})?"
+    r"|semantic-revision"
+    r"|checks/[a-z-]+"
+    r"|check-repair/[a-z-]+/attempts/[0-9]{3}"
+    r"|candidate|review"
+    r")/[A-Za-z0-9_][A-Za-z0-9_.-]*"
+)
+
+
 def _artifact_path(run_dir: Path, name: str) -> Path:
-    cycle_artifact = re.fullmatch(
-        rf"(?:cycles/002/correction/steps/{STEP_ID_PATTERN}|revision/C0[12]|review/C0[12])/[A-Za-z0-9_.-]+",
-        name,
-    )
-    if name not in ARTIFACT_ALLOWLIST and cycle_artifact is None:
+    if name not in ARTIFACT_ALLOWLIST and _CYCLE_ARTIFACT.fullmatch(name) is None:
         raise ValueError("artifact is not allowlisted")
     return run_dir / name
 
@@ -374,7 +326,6 @@ def get_run(
     raw_plan = _load_text(_artifact_path(directory, "planner.raw.md"))
     spec = _load_text(_artifact_path(directory, "spec.md"))
     contract = _load_text(_artifact_path(directory, "implementation_contract.md"))
-    reviewer_raw = _load_text(_artifact_path(directory, "reviewer.raw.md"))
     approval_payload = _load_json(_artifact_path(directory, "plan_approval.json"))
     approval_decision = (
         approval_payload.get("decision")
@@ -382,57 +333,24 @@ def get_run(
         and approval_payload.get("decision") in {ApprovalDecision.APPROVE.value, ApprovalDecision.REJECT.value}
         else None
     )
-    agent_result = _load_json(
-        _artifact_path(directory, "agent.result.json"), max_bytes=MAX_RESULT_BYTES
-    )
-    if not isinstance(agent_result, dict):
-        agent_result = {}
-    raw_usage = agent_result.get("usage")
-    safe_usage = (
-        {
-            key: value
-            for key, value in raw_usage.items()
-            if key in {"input_tokens", "output_tokens", "total_tokens"}
-            and isinstance(value, int)
-            and not isinstance(value, bool)
-        }
-        if isinstance(raw_usage, dict)
-        else {}
-    )
-    safe_result = {
-        key: agent_result[key]
-        for key in ("exit_code", "timed_out", "usage")
-        if key in agent_result
-    }
-    safe_result["usage"] = safe_usage
-    agent_diagnostics = {
-        "result": safe_result,
-        "final_tail": _tail_text(
-            _artifact_path(directory, "agent.final.md"), MAX_DIAGNOSTIC_TAIL_BYTES
-        ),
-        "stderr_tail": _tail_text(
-            _artifact_path(directory, "agent.stderr.log"), MAX_DIAGNOSTIC_TAIL_BYTES
-        ),
-        "usage": safe_usage,
-    }
     workspace_setup = _load_json(_artifact_path(directory, "setup/results.json"))
     if not isinstance(workspace_setup, list):
         workspace_setup = state.get("workspace_setup", [])
     cycle_artifacts = _cycle_artifacts(directory, state)
-    # Historical field: 001 only, rebuilt from the root bundle and
-    # steps/Sxx/step.json, never from a state.steps that describes 002.
-    step_artifacts = cycle_artifacts[0]["steps"]
-    # Top-level aliases describe the FINAL cycle: 002 when it exists.
-    if len(cycle_artifacts) > 1:
-        checks_path = "cycles/002/checks/checks.json"
-        review_path = "cycles/002/review/review.json"
-        reviewer_raw = _load_text(_artifact_path(directory, "cycles/002/review/reviewer.raw.md"))
-        revision_path = "cycles/002/semantic-revision/report.json"
-        changed_path, diff_path = "cycles/002/checks/changed-files.txt", "cycles/002/checks/diff.patch"
-    else:
-        checks_path, review_path = "checks.json", "review.json"
-        revision_path = "revision/report.json"
-        changed_path, diff_path = "changed-files.txt", "diff.patch"
+    # The initial cycle's steps, rebuilt from their durable records.
+    step_artifacts = cycle_artifacts[0]["steps"] if cycle_artifacts else []
+    # Top-level aliases describe the final cycle that exists.
+    last = _cycle_numbers(directory)[-1] if _cycle_numbers(directory) else 1
+    root = f"cycles/{last:03d}"
+    gate = _cycle_gate_dir(directory, last)
+    gate_root = (
+        gate.relative_to(directory).as_posix() if gate is not None
+        else f"{root}/checks/post-implementation"
+    )
+    checks_path, review_path = f"{gate_root}/checks.json", f"{root}/review/review.json"
+    reviewer_raw = _load_text(_artifact_path(directory, f"{root}/review/reviewer.raw.md"))
+    revision_path = f"{root}/semantic-revision/report.json"
+    changed_path, diff_path = f"{gate_root}/changed-files.txt", f"{gate_root}/diff.patch"
     changed_files = _bounded_changed_files(_artifact_path(directory, changed_path))
     diff_tail = _tail_text(_artifact_path(directory, diff_path), MAX_DIFF_BYTES)
     diagnostics_path = _artifact_path(directory, DIAGNOSTICS_NAME)
@@ -483,12 +401,11 @@ def get_run(
             _artifact_path(directory, "execution_recommendation.json")
         ),
         "repair_task": _load_text(_artifact_path(directory, "repair_task.md")),
-        "scope_delta": _load_json(_artifact_path(directory, "cycles/002/correction/scope_delta.json"), max_bytes=256 * 1024),
+        "scope_delta": _load_json(_artifact_path(directory, f"{root}/correction/scope_delta.json"), max_bytes=256 * 1024),
         "failure": state.get("failure"),
         "publish": _load_json(_artifact_path(directory, "publish.json")),
         "approval": {"recorded": approval_decision is not None, "decision": approval_decision},
         "plan_recovery": _plan_recovery_payload(directory, state),
-        "agent_diagnostics": agent_diagnostics,
         "progress_tail": progress_tail(runs_root, safe_id, max_events=50),
         "candidate": {
             **(state.get("candidate") if isinstance(state.get("candidate"), dict) else {}),
@@ -498,7 +415,7 @@ def get_run(
         "step_artifacts": step_artifacts,
         "cycle": _state_cycle(state),
         "cycle_artifacts": cycle_artifacts,
-        "usage": phase_usage_summary(directory, v1_agent_usage=raw_usage),
+        "usage": phase_usage_summary(directory),
         "overview": run_overview(directory, state, config),
         "diagnostics": diagnostics_meta,
     }
@@ -513,6 +430,43 @@ def _cycle_root(directory: Path, cycle: int) -> Path:
     if not isinstance(cycle, int) or isinstance(cycle, bool) or cycle < 1:
         raise WebAPIError(400, "invalid review cycle")
     return directory / "cycles" / f"{cycle:03d}"
+
+
+def _cycle_numbers(directory: Path) -> list[int]:
+    """Every durable cycle of a run, in order."""
+
+    try:
+        return sorted(
+            int(entry.name) for entry in (directory / "cycles").iterdir()
+            if entry.is_dir() and re.fullmatch(r"[0-9]{3}", entry.name) and int(entry.name) >= 1
+        )
+    except OSError:
+        return []
+
+
+def _cycle_contracts_dir(directory: Path, cycle: int) -> Path:
+    """Where the approved plan of one cycle keeps its bundle and contracts."""
+
+    return directory if cycle == 1 else _cycle_root(directory, cycle) / "correction"
+
+
+def _cycle_gate_dir(directory: Path, cycle: int) -> Path | None:
+    """The one deterministic gate directory of a cycle, if it ran."""
+
+    try:
+        gates = sorted(
+            entry for entry in (_cycle_root(directory, cycle) / "checks").iterdir()
+            if entry.is_dir()
+        )
+    except OSError:
+        return None
+    return gates[-1] if gates else None
+
+
+def _cycle_kind(directory: Path, cycle: int) -> str:
+    record = _load_json(_cycle_root(directory, cycle) / "cycle.json", max_bytes=4096)
+    kind = record.get("kind") if isinstance(record, dict) else None
+    return kind if isinstance(kind, str) else ("initial" if cycle == 1 else "unknown")
 
 
 def _bundle_entries(path: Path) -> list[dict[str, Any]]:
@@ -542,7 +496,8 @@ def _cycle_steps(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[
     """
 
     root = _cycle_root(directory, cycle)
-    entries = {entry["id"]: entry for entry in _bundle_entries(root / "implementation_bundle.json")}
+    contracts = _cycle_contracts_dir(directory, cycle)
+    entries = {entry["id"]: entry for entry in _bundle_entries(contracts / "implementation_bundle.json")}
     raw_live = state.get("steps") if _state_cycle(state) == cycle else None
     live = {
         item["id"]: item for item in (raw_live if isinstance(raw_live, list) else [])
@@ -550,14 +505,6 @@ def _cycle_steps(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[
         and _STEP_ID.fullmatch(item["id"]) is not None
     }
     ids = list(entries) or list(live)
-    if not ids:
-        try:
-            ids = sorted(
-                entry.name for entry in (root / "steps").iterdir()
-                if entry.is_dir() and _STEP_ID.fullmatch(entry.name) is not None
-            )
-        except OSError:
-            ids = []
     result: list[dict[str, Any]] = []
     for step_id in ids:
         entry = entries.get(step_id, {})
@@ -567,21 +514,11 @@ def _cycle_steps(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[
         step_usage = (
             normalize_usage(step_json["usage"]) if isinstance(step_json.get("usage"), dict) else None
         )
-        contract = _step_contract(root, step_id, entry.get("contract_sha256"))
+        contract = _step_contract(contracts, step_id, entry.get("contract_sha256"))
         item = live.get(step_id, {})
         status = item.get("status") or _DURABLE_STEP_STATUS.get(
             str(step_json.get("status")), "waiting"
         )
-        failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-        if (
-            status == "failed"
-            and failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
-            and step_json.get("reason") == "AGENT_CONTRACT_MISMATCH"
-            and step_json.get("tree_before") == step_json.get("tree_after")
-            and step_json.get("changed_paths", []) == []
-            and step_json.get("mismatch_clean") is not False
-        ):
-            status = "deferred"
         result.append({
             **item,
             "token_diagnostics": _token_diagnostics(step_dir),
@@ -630,7 +567,9 @@ def _cycle_revision(directory: Path, cycle: int) -> dict[str, Any] | None:
 
 
 def _cycle_checks(directory: Path, cycle: int) -> dict[str, Any] | None:
-    source = _cycle_root(directory, cycle) / "checks"
+    source = _cycle_gate_dir(directory, cycle)
+    if source is None:
+        return None
     checks = _load_json(source / "checks.json", max_bytes=MAX_RESULT_BYTES)
     if checks is None:
         return None
@@ -639,9 +578,19 @@ def _cycle_checks(directory: Path, cycle: int) -> dict[str, Any] | None:
         {"passed": evidence.get("deterministic_passed"), "failures": evidence.get("failures")}
         if isinstance(evidence, dict) else None
     )
+    repairs = sorted((_cycle_root(directory, cycle) / "check-repair").glob("*/attempts/[0-9][0-9][0-9]"))
     return {
+        "stage": source.name,
         "checks": checks,
         "gate": gate,
+        "check_repair_attempts": [
+            {
+                "attempt": item.name,
+                "record": _load_json(item / "attempt.json", max_bytes=MAX_RESULT_BYTES),
+                "failure": _load_json(item / "failure.json", max_bytes=MAX_RESULT_BYTES),
+            }
+            for item in repairs
+        ],
         "changed_files": _bounded_changed_files(source / "changed-files.txt"),
         "diff_tail": _tail_text(source / "diff.patch", MAX_DIFF_BYTES),
     }
@@ -661,29 +610,35 @@ def _cycle_review(directory: Path, cycle: int) -> dict[str, Any] | None:
 
 
 def _cycle_artifacts(directory: Path, state: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """001 and (when it exists) 002, each read only from its own sources."""
+    """Every cycle of the run, each read only from its own sources."""
 
     records = {
         item.get("number"): item for item in (state.get("cycles") or [])
         if isinstance(item, dict)
     } if isinstance(state.get("cycles"), list) else {}
+    numbers = _cycle_numbers(directory) or [1]
     cycles = []
-    for number, kind in ((1, "initial"), (2, "repair")):
-        if number == 2 and not (directory / "repair" / "002").is_dir():
-            break
+    for number in numbers:
         record = records.get(number, {})
         cycles.append({
             "number": number,
-            "kind": kind,
+            "kind": _cycle_kind(directory, number),
             "status": record.get("status"),
             "failure": record.get("failure"),
             "plan_raw": (
-                _load_text_bounded(directory / "repair" / "002" / "planner.raw.md", MAX_RESULT_BYTES)
-                if number == 2 else None
+                _load_text_bounded(
+                    _cycle_root(directory, number) / "correction" / "planner.raw.md",
+                    MAX_RESULT_BYTES,
+                )
+                if number > 1 else None
             ),
             "steps": _cycle_steps(directory, number, state),
             "revision": _cycle_revision(directory, number),
             "checks": _cycle_checks(directory, number),
+            "candidate": _load_json(
+                _cycle_root(directory, number) / "candidate" / "commit.json",
+                max_bytes=MAX_RESULT_BYTES,
+            ),
             "review": _cycle_review(directory, number),
         })
     return cycles
@@ -695,31 +650,23 @@ def _step_contract(
     """Read one step contract exactly as stored, never re-rendered.
 
     ``matches`` tells whether these bytes are the ones hashed in
-    ``implementation_bundle.json``.  Historic P20 runs stored contracts as
-    ``steps/Sxx.contract.md``; that layout is shown read-only.
+    ``implementation_bundle.json``.
     """
 
-    for layout, path in (
-        ("canonical", step_contract_path(directory, step_id)),
-        ("legacy", directory / "steps" / f"{step_id}.contract.md"),
-    ):
-        try:
-            with path.open("rb") as stream:
-                data = stream.read(MAX_STEP_CONTRACT_BYTES + 1)
-        except FileNotFoundError:
-            continue
-        except OSError:
-            break
-        if len(data) > MAX_STEP_CONTRACT_BYTES:
-            return {"text": None, "sha256": None, "matches": False, "layout": layout}
-        digest = hashlib.sha256(data).hexdigest()
-        return {
-            "text": data.decode("utf-8", errors="replace"),
-            "sha256": digest,
-            "matches": isinstance(declared_sha256, str) and digest == declared_sha256,
-            "layout": layout,
-        }
-    return {"text": None, "sha256": None, "matches": False, "layout": None}
+    try:
+        with step_contract_path(directory, step_id).open("rb") as stream:
+            data = stream.read(MAX_STEP_CONTRACT_BYTES + 1)
+    except OSError:
+        return {"text": None, "sha256": None, "matches": False, "layout": None}
+    if len(data) > MAX_STEP_CONTRACT_BYTES:
+        return {"text": None, "sha256": None, "matches": False, "layout": "canonical"}
+    digest = hashlib.sha256(data).hexdigest()
+    return {
+        "text": data.decode("utf-8", errors="replace"),
+        "sha256": digest,
+        "matches": isinstance(declared_sha256, str) and digest == declared_sha256,
+        "layout": "canonical",
+    }
 
 
 def _summaries(
@@ -866,9 +813,9 @@ def cycle_step_progress_tail(
 ) -> list[str]:
     """Latest compact events of one step of one cycle.
 
-    Cycle 1 reads ``steps/Sxx/agent.events.jsonl``; cycle 2 reads
-    ``cycles/002/correction/steps/Sxx/agent.events.jsonl``.  Uses the same bounded JSONL
-    window as :func:`progress_tail`; tool arguments are never rendered.
+    Reads ``cycles/NNN/implementation/steps/Sxx/agent.events.jsonl`` with the
+    same bounded JSONL window as :func:`progress_tail`; tool arguments are
+    never rendered.
     """
 
     if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events < 0:
@@ -889,7 +836,7 @@ def step_progress_tail(
     *,
     max_events: int = STEP_EVENTS_MAX,
 ) -> list[str]:
-    """Latest compact events of one 001 step (historical API)."""
+    """Latest compact events of one step of the initial cycle."""
 
     return cycle_step_progress_tail(run_dir, 1, step_id, max_events=max_events)
 
@@ -900,7 +847,6 @@ def approve_run(
     decision: str,
     *,
     config: HarnessConfig | None = None,
-    implementer_profile: object = None,
     final_reviewer_profile: object = None,
     semantic_reviser_profile: object = None,
     check_repair_profile: object = None,
@@ -908,59 +854,57 @@ def approve_run(
 ) -> dict[str, Any]:
     """Perform the only web mutation through the core approval API."""
 
-    reviewer_profile = final_reviewer_profile
-    reviser_profile = semantic_reviser_profile
-    repair_profile = check_repair_profile
-
     try:
         selected = ApprovalDecision(decision)
     except (TypeError, ValueError) as exc:
         raise WebAPIError(400, "decision must be APPROVE or REJECT") from exc
-    # 1-2. Load state and require the approval gate.
+    # 1-2. Load state and require the approval gate of a pipeline-v2 run.
     directory = _run_dir(runs_root, run_id)
     state = _load_state(directory)
     if state.get("status") != RunStatus.AWAITING_PLAN_APPROVAL.value:
         raise WebAPIError(409, "run is not awaiting plan approval")
-    profile_aware = is_profile_aware_run(state)
-    v2 = state.get("planning_protocol") == "v2"
-    try:
-        snapshot, _ = read_run_options_with_sha256(
-            directory,
-            expected_sha256=state.get("run_options_sha256")
-            if isinstance(state.get("run_options_sha256"), str) else None,
-        ) if config is not None else (None, None)
-    except RunOptionsError as exc:
-        raise WebAPIError(409, "run options are invalid") from exc
-    # A semantic reviser or check-repair field is never accepted to enable a pipeline
-    # implicitly: only the immutable creation snapshot decides this.
-    semantic_revision_enabled = bool(snapshot and snapshot.semantic_revision_enabled)
-    check_repair_enabled = bool(snapshot and snapshot.max_check_repair_attempts > 0)
-    review_repair_enabled = bool(snapshot and snapshot.max_review_repair_cycles > 0)
-    pipeline_enabled = semantic_revision_enabled or check_repair_enabled or review_repair_enabled
-    if selected is ApprovalDecision.APPROVE and not pipeline_enabled and (
-        reviser_profile is not None or repair_profile is not None
-    ):
-        raise WebAPIError(400, "semantic_reviser_profile and check_repair_profile require an enabled pipeline")
-    if v2:
-        if selected is ApprovalDecision.APPROVE:
-            if config is None or not isinstance(step_profiles, Mapping) or not isinstance(reviewer_profile, str):
-                raise WebAPIError(400, "step profiles and final_reviewer_profile are required")
-            if any(not isinstance(value, str) for value in step_profiles.values()):
-                raise WebAPIError(400, "invalid step profile field")
-        if selected is ApprovalDecision.APPROVE and pipeline_enabled:
-            # Each default comes from its own configured key: the repair
-            # implementer is never derived from the reviser.
-            if semantic_revision_enabled and reviser_profile is None:
-                reviser_profile = snapshot.semantic_reviser_profile if snapshot is not None else config.ui.default_reviser_profile
-            elif reviser_profile is not None and (not isinstance(reviser_profile, str) or not reviser_profile):
-                raise WebAPIError(400, "semantic_reviser_profile is invalid")
-            if check_repair_enabled and repair_profile is None:
-                repair_profile = snapshot.check_repair_profile if snapshot is not None else config.ui.default_repair_profile
-            elif repair_profile is not None and (not isinstance(repair_profile, str) or not repair_profile):
-                raise WebAPIError(400, "check_repair_profile is invalid")
-    if selected is ApprovalDecision.APPROVE and profile_aware and not v2:
-        if config is None or not isinstance(implementer_profile, str) or not isinstance(reviewer_profile, str):
-            raise WebAPIError(400, "implementer_profile and reviewer_profile are required")
+    if state.get("planning_protocol") != "v2":
+        raise WebAPIError(409, "run is not a pipeline v2 run")
+    reviser_profile = semantic_reviser_profile
+    repair_profile = check_repair_profile
+    semantic_revision_enabled = check_repair_required = False
+    if selected is ApprovalDecision.APPROVE:
+        if not is_profile_aware_run(state):
+            raise WebAPIError(409, "run has no planner profile")
+        if config is None or not isinstance(step_profiles, Mapping) or not isinstance(final_reviewer_profile, str):
+            raise WebAPIError(400, "step profiles and final_reviewer_profile are required")
+        try:
+            snapshot, _ = read_run_options_with_sha256(
+                directory,
+                expected_sha256=state.get("run_options_sha256")
+                if isinstance(state.get("run_options_sha256"), str) else None,
+            )
+        except RunOptionsError as exc:
+            raise WebAPIError(409, "run options are invalid") from exc
+        # A semantic reviser or check-repair field never enables a pipeline
+        # implicitly: only the immutable creation snapshot decides this.
+        semantic_revision_enabled = snapshot.semantic_revision_enabled
+        check_repair_required = (
+            snapshot.max_check_repair_attempts > 0 or snapshot.max_review_repair_cycles > 0
+        )
+        if any(not isinstance(value, str) for value in step_profiles.values()):
+            raise WebAPIError(400, "invalid step profile field")
+        if reviser_profile is not None and not semantic_revision_enabled:
+            raise WebAPIError(400, "semantic_reviser_profile requires semantic revision")
+        if repair_profile is not None and not check_repair_required:
+            raise WebAPIError(400, "check_repair_profile requires a correction budget")
+        # Each default comes from its own frozen key: the check-repair
+        # profile is never derived from the reviser.
+        if semantic_revision_enabled and reviser_profile is None:
+            reviser_profile = snapshot.semantic_reviser_profile
+        if check_repair_required and repair_profile is None:
+            repair_profile = snapshot.check_repair_profile
+        for name, value in (
+            ("semantic_reviser_profile", reviser_profile),
+            ("check_repair_profile", repair_profile),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise WebAPIError(400, f"{name} is invalid")
     # 3. Verify the plan artifacts shown to the human.
     stored = state.get("plan_identity")
     if not isinstance(stored, dict):
@@ -976,120 +920,60 @@ def approve_run(
         actual = compute_plan_identity_from_run(directory)
     except (KeyError, TypeError, ValueError, ApprovalError, OSError, UnicodeError) as exc:
         raise WebAPIError(409, "plan artifacts do not match run state") from exc
-    if v2:
-        matches = (actual.raw_sha256, actual.contract_sha256, actual.bundle_sha256) == (
-            expected.raw_sha256, expected.contract_sha256, expected.bundle_sha256,
-        )
-    elif profile_aware:
-        # A selection already claimed by a concurrent request is checked by
-        # ensure_execution_selection(), not here: only raw/contract matter.
-        matches = (actual.raw_sha256, actual.contract_sha256) == (
-            expected.raw_sha256,
-            expected.contract_sha256,
-        )
-    else:
-        matches = actual == expected
-    if not matches:
+    if (actual.raw_sha256, actual.contract_sha256, actual.bundle_sha256) != (
+        expected.raw_sha256, expected.contract_sha256, expected.bundle_sha256,
+    ):
         raise WebAPIError(409, "plan artifacts do not match run state")
+    if (directory / "check_authority.json").is_file() and actual.checks_sha256 is None:
+        raise WebAPIError(409, "check authority hash is missing from the plan identity")
+    if expected.checks_sha256 is not None and expected.checks_sha256 != actual.checks_sha256:
+        raise WebAPIError(409, "check authority does not match the durable plan identity")
 
-    if v2:
-        if (directory / "check_authority.json").is_file() and actual.checks_sha256 is None:
-            raise WebAPIError(409, "check authority hash is missing from the plan identity")
-        if expected.checks_sha256 is not None and expected.checks_sha256 != actual.checks_sha256:
-            raise WebAPIError(409, "check authority does not match the durable plan identity")
-
-    if v2 and selected is ApprovalDecision.REJECT:
+    if selected is ApprovalDecision.REJECT:
         _publish_decision(directory, selected, expected)
         return {"ok": True, "decision": selected.value}
 
-    if v2:
-        try:
-            bundle, _ = validate_implementation_bundle(directory)
-        except (V2PlanParseError, OSError, UnicodeError) as exc:
-            raise WebAPIError(409, "plan artifacts do not match run state") from exc
-        expected_ids = [entry["id"] for entry in bundle["steps"]]
-        if set(step_profiles) != set(expected_ids):
-            raise WebAPIError(400, "missing or unknown step profile field")
-        try:
-            requested = resolve_execution_selection(
-                config,
-                planner_profile_id=state["execution"]["planner"]["profile_id"],
-                step_profile_ids={key: value for key, value in step_profiles.items()},
-                semantic_reviser_profile_id=reviser_profile if semantic_revision_enabled else None,
-                check_repair_profile_id=(repair_profile if check_repair_enabled or review_repair_enabled else None),
-                final_reviewer_profile_id=reviewer_profile,
-            )
-        except (ProfileError, ExecutionSelectionError) as exc:
-            raise WebAPIError(400, "selected profile is invalid") from exc
-        try:
-            ensure_execution_selection(directory, requested)
-            durable, execution_sha256 = read_execution_selection_with_sha256(directory)
-            validate_execution_selection(config, durable)
-        except ExecutionSelectionConflict as exc:
-            raise WebAPIError(409, "a different execution selection is already recorded") from exc
-        except ExecutionSelectionError as exc:
-            raise WebAPIError(409, "execution selection is invalid") from exc
-        if durable != requested:
-            raise WebAPIError(409, "a different execution selection is already recorded")
-        identity = PlanIdentity(
-            raw_sha256=expected.raw_sha256,
-            contract_sha256=expected.contract_sha256,
-            execution_sha256=execution_sha256,
-            bundle_sha256=expected.bundle_sha256,
-            checks_sha256=actual.checks_sha256,
-        )
-        _publish_decision(directory, selected, identity)
-        # Compare-and-set: once the orchestrator has left the gate it owns the
-        # state, and this write must not resurrect the approval status.
-        RunStateStore(directory / "state.json").update_if_status(
-            RunStatus.AWAITING_PLAN_APPROVAL,
-            plan_identity=asdict(identity),
-            execution=(
-                _execution_state(durable)
-            ),
-        )
-        return {"ok": True, "decision": selected.value}
-
-    if not (selected is ApprovalDecision.APPROVE and profile_aware):
-        # REJECT never executes anything; historic runs keep schema v1.
-        identity = (
-            PlanIdentity(expected.raw_sha256, expected.contract_sha256)
-            if profile_aware
-            else expected
-        )
-        _publish_decision(directory, selected, identity)
-        return {"ok": True, "decision": selected.value}
-
-    # 4-5. Resolve the requested profiles from trusted configuration only.
+    # 4. Freeze the requested profiles from trusted configuration only.
+    try:
+        bundle, _ = validate_implementation_bundle(directory)
+    except (V2PlanParseError, OSError, UnicodeError) as exc:
+        raise WebAPIError(409, "plan artifacts do not match run state") from exc
+    expected_ids = [entry["id"] for entry in bundle["steps"]]
+    if set(step_profiles) != set(expected_ids):
+        raise WebAPIError(400, "missing or unknown step profile field")
     try:
         requested = resolve_execution_selection(
             config,
             planner_profile_id=state["execution"]["planner"]["profile_id"],
-            implementer_profile_id=implementer_profile,
-            reviewer_profile_id=reviewer_profile,
+            step_profile_ids={key: value for key, value in step_profiles.items()},
+            semantic_reviser_profile_id=reviser_profile if semantic_revision_enabled else None,
+            check_repair_profile_id=repair_profile if check_repair_required else None,
+            final_reviewer_profile_id=final_reviewer_profile,
         )
-    except ProfileError as exc:
+    except (ProfileError, ExecutionSelectionError) as exc:
         raise WebAPIError(400, "selected profile is invalid") from exc
-    # 6. Claim the selection immutably, then read back the exact durable bytes.
+    # 5. Claim the selection immutably, then read back the exact durable bytes.
     try:
         ensure_execution_selection(directory, requested)
         durable, execution_sha256 = read_execution_selection_with_sha256(directory)
+        validate_execution_selection(config, durable)
     except ExecutionSelectionConflict as exc:
         raise WebAPIError(409, "a different execution selection is already recorded") from exc
     except ExecutionSelectionError as exc:
         raise WebAPIError(409, "execution selection is invalid") from exc
     if durable != requested:
         raise WebAPIError(409, "a different execution selection is already recorded")
-    # 7-8. Bind the decision to that selection and publish it exclusively.
+    # 6. Bind the decision to that selection and publish it exclusively.
     identity = PlanIdentity(
         raw_sha256=expected.raw_sha256,
         contract_sha256=expected.contract_sha256,
         execution_sha256=execution_sha256,
+        bundle_sha256=expected.bundle_sha256,
+        checks_sha256=actual.checks_sha256,
     )
     _publish_decision(directory, selected, identity)
-    # 9. Only now reflect the approved choice in state.json.  The orchestrator
-    # may already have left the gate, in which case it owns the state: the
-    # compare-and-set writes nothing then.
+    # Compare-and-set: once the orchestrator has left the gate it owns the
+    # state, and this write must not resurrect the approval status.
     RunStateStore(directory / "state.json").update_if_status(
         RunStatus.AWAITING_PLAN_APPROVAL,
         plan_identity=asdict(identity),
@@ -1279,11 +1163,6 @@ _CHECK_FAILURE_PREFIXES = (
 _PUBLISH_FAILURES = frozenset({
     "PUSH_FAILED", "BASE_MOVED_SINCE_RUN", "COMMIT_TREE_MISMATCH", "TOCTOU_FAILURE",
 })
-_002_PHASES = frozenset({
-    "repair_planner", "scope_approval", "repair_step", "checks_c02", "final_checks_c02",
-    "claude_c02", "candidate_commit_c02", "candidate_push_c02",
-    "reviewer_c02", "com" + "mit",
-})
 _PIPELINE_STEP_STATE = {
     "completed": "complete", "running": "running", "failed": "failed",
     "deferred": "deferred",
@@ -1348,7 +1227,10 @@ def _step_statuses(directory: Path, cycle: int, state: Mapping[str, Any]) -> lis
     """Light (id, status) pairs of one cycle for the pipeline; no event reads."""
 
     root = _cycle_root(directory, cycle)
-    ids = [entry["id"] for entry in _bundle_entries(root / "implementation_bundle.json")]
+    ids = [
+        entry["id"]
+        for entry in _bundle_entries(_cycle_contracts_dir(directory, cycle) / "implementation_bundle.json")
+    ]
     raw_live = state.get("steps") if _state_cycle(state) == cycle else None
     live = {
         item["id"]: item.get("status") for item in (raw_live if isinstance(raw_live, list) else [])
@@ -1359,24 +1241,18 @@ def _step_statuses(directory: Path, cycle: int, state: Mapping[str, Any]) -> lis
     for step_id in ids or list(live):
         status = live.get(step_id)
         if not isinstance(status, str):
-            record = _load_json(root / "steps" / step_id / "step.json", max_bytes=MAX_RESULT_BYTES)
+            record = _load_json(
+                root / "implementation" / "steps" / step_id / "step.json", max_bytes=MAX_RESULT_BYTES,
+            )
             status = _DURABLE_STEP_STATUS.get(
                 str(record.get("status")) if isinstance(record, dict) else "", "waiting"
             )
-        failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-        record = _load_json(root / "steps" / step_id / "step.json", max_bytes=MAX_RESULT_BYTES)
-        if (
-            status == "failed"
-            and failure.get("reason") == "AGENT_CONTRACT_MISMATCH"
-            and isinstance(record, dict)
-            and record.get("reason") == "AGENT_CONTRACT_MISMATCH"
-            and record.get("tree_before") == record.get("tree_after")
-            and record.get("changed_paths", []) == []
-            and record.get("mismatch_clean") is not False
-        ):
-            status = "deferred"
         result.append((step_id, status))
     return result
+
+
+_STEP_PHASES = frozenset({"implement_step", "review_implementation"})
+_GATE_PHASES = frozenset({"deterministic_gate", "check_repair"})
 
 
 def run_pipeline(
@@ -1385,38 +1261,42 @@ def run_pipeline(
     config: HarnessConfig | None = None,
     resume: Mapping[str, Any] | None = None,
 ) -> list[dict[str, str]]:
-    """Server-computed pipeline states: complete/running/failed/waiting/resumable."""
+    """Server-computed pipeline states: complete/running/failed/waiting/resumable.
+
+    Every cycle is rendered from its own durable directory; the number of
+    cycles is never assumed.
+    """
 
     status = str(state.get("status") or "")
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     reason = str(failure.get("reason") or "") if failure else ""
     failed = status in {"failed", "interrupted"}
-    cycle = _state_cycle(state)
+    current = _state_cycle(state)
     planner = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
-    execution = state.get("execution") if isinstance(state.get("execution"), Mapping) else {}
-    resume_phase = resume.get("phase") if isinstance(resume, Mapping) and resume.get("resumable") else None
+    resumable = isinstance(resume, Mapping) and bool(resume.get("resumable"))
+    resume_phase = resume.get("phase") if resumable else None
+    resume_cycle = resume.get("review_cycle") if resumable else None
     snapshot = state.get("run_options") if isinstance(state.get("run_options"), Mapping) else {}
     pipeline_snapshot = snapshot.get("pipeline") if isinstance(snapshot.get("pipeline"), Mapping) else {}
-    revision_enabled = bool(
-        pipeline_snapshot.get("semantic_revision_enabled")
-        if pipeline_snapshot
-        else (config.revision.enabled if config is not None else "semantic_reviser" in execution)
-    )
-    pipeline_enabled = revision_enabled or bool(
-        pipeline_snapshot.get(
-            "max_check_repair_attempts",
-            0,
-        )
-    ) or bool(
-        pipeline_snapshot.get("max_review_repair_cycles", 0)
-    )
+    revision_enabled = bool(pipeline_snapshot.get("semantic_revision_enabled"))
     items: list[dict[str, str]] = []
 
     def add(key: str, label: str, value: str) -> None:
         items.append({"key": key, "label": label, "state": value})
 
-    def failed_at(prefixes: tuple[str, ...], at_cycle: int) -> bool:
-        return failed and cycle == at_cycle and reason.startswith(prefixes)
+    def phase_state(
+        done: bool, phases: frozenset[str], running_statuses: frozenset[str],
+        failure_prefixes: tuple[str, ...], cycle: int,
+    ) -> str:
+        if done:
+            return "complete"
+        if resume_phase in phases and resume_cycle == cycle:
+            return "resumable"
+        if cycle == current and failed and reason.startswith(failure_prefixes):
+            return "failed"
+        if cycle == current and not failed and status in running_statuses:
+            return "running"
+        return "waiting"
 
     decision = planner.get("decision")
     recovered = read_plan_recovery_record(directory) is not None
@@ -1450,84 +1330,48 @@ def run_pipeline(
     else:
         add("approval", "Approval", "waiting")
 
-    c01_steps = _step_statuses(directory, 1, state)
-    for step_id, step_status in c01_steps:
-        value = _PIPELINE_STEP_STATE.get(step_status, "waiting")
-        if value in {"failed", "running"} and resume_phase == "initial_step":
-            value = "resumable"
-        add(f"c1-{step_id}", f"Luna {step_id}", value)
-    if not c01_steps:
-        add("c1-luna", "Luna", "waiting")
-
-    if revision_enabled:
-        report = (
-            _load_json(directory / "revision" / "001" / "report.json", max_bytes=MAX_RESULT_BYTES)
-            or _load_json(directory / "revision" / "report.json", max_bytes=MAX_RESULT_BYTES)
-        )
-        if isinstance(report, dict) and report.get("status") in {"COMPLETED", "NO_CHANGE"}:
-            add("claude-c01", "Claude 001", "complete")
-        elif resume_phase == "claude_c01":
-            add("claude-c01", "Claude 001", "resumable")
-        elif failed_at(("CLAUDE_", "REVISION_SCOPE"), 1):
-            add("claude-c01", "Claude 001", "failed")
-        elif not failed and cycle == 1 and status in {"pre_revision_validating", "revising"}:
-            add("claude-c01", "Claude 001", "running")
-        else:
-            add("claude-c01", "Claude 001", "waiting")
-
-    c01_review = (
-        _load_json(directory / "review" / "001" / "review.json", max_bytes=MAX_RESULT_BYTES)
-        or _load_json(directory / "review.json", max_bytes=MAX_RESULT_BYTES)
-    )
-    evidence_ready = (directory / "checks" / "001" / "evidence.json").exists() or (
-        directory / "evidence.json"
-    ).exists()
-    if evidence_ready:
-        add("checks-c01", "Checks", "complete")
-    elif resume_phase in {"checks_c01", "final_checks_c01"}:
-        add("checks-c01", "Checks", "resumable")
-    elif failed_at(_CHECK_FAILURE_PREFIXES, 1):
-        add("checks-c01", "Checks", "failed")
-    elif not failed and cycle == 1 and status in {"validating", "revalidating"}:
-        add("checks-c01", "Checks", "running")
-    else:
-        add("checks-c01", "Checks", "waiting")
-    if isinstance(c01_review, dict):
-        add("reviewer-c01", "Reviewer #1", "complete")
-    elif resume_phase == "reviewer_c01":
-        add("reviewer-c01", "Reviewer #1", "resumable")
-    elif failed_at(("REVIEW",), 1):
-        add("reviewer-c01", "Reviewer #1", "failed")
-    elif not failed and cycle == 1 and status == "reviewing":
-        add("reviewer-c01", "Reviewer #1", "running")
-    else:
-        add("reviewer-c01", "Reviewer #1", "waiting")
-
-    if pipeline_enabled:
-        cycle_records = state.get("cycles") if isinstance(state.get("cycles"), list) else []
-        repair_record = next((item for item in cycle_records
-                              if isinstance(item, Mapping) and item.get("number") == 2), {})
-        repair_label = "Repair cycle"
-        if repair_record.get("audit_route") == "REPLAN":
-            repair_label = "Repair cycle · plan/scope repair"
-        elif repair_record.get("audit_route") == "IMPLEMENTATION":
-            repair_label = "Repair cycle · implementation repair"
-        if cycle == 2:
-            if resume_phase in _002_PHASES:
+    for cycle in _cycle_numbers(directory) or [1]:
+        root = _cycle_root(directory, cycle)
+        label = f"{cycle:03d}"
+        if cycle > 1:
+            planned = (root / "correction" / "implementation_bundle.json").is_file()
+            value = phase_state(
+                planned, frozenset({"review_replan"}), frozenset({"planning"}),
+                ("REPAIR", "PLANNER", "LLM_FAILURE", "HUMAN_REQUIRED"), cycle,
+            )
+            if status == "waiting_scope_approval" and cycle == current:
                 value = "resumable"
-            elif status == "waiting_scope_approval":
+            add(f"c{cycle}-planner", f"{label} · correction planner ({_cycle_kind(directory, cycle)})", value)
+        steps = _step_statuses(directory, cycle, state)
+        for step_id, step_status in steps:
+            value = _PIPELINE_STEP_STATE.get(step_status, "waiting")
+            if value in {"failed", "running"} and resume_phase in _STEP_PHASES and resume_cycle == cycle:
                 value = "resumable"
-            elif failed and reason not in _PUBLISH_FAILURES:
-                value = "failed"
-            elif status in {"approved", "publishing", "published", "committed"} or reason in _PUBLISH_FAILURES:
-                value = "complete"
-            else:
-                value = "running"
-        elif isinstance(c01_review, dict) and c01_review.get("verdict") == "PASS":
-            value = "skipped"
-        else:
-            value = "waiting"
-        add("repair-cycle", repair_label, value)
+            add(f"c{cycle}-{step_id}", f"{label} · {step_id}", value)
+        if not steps:
+            add(f"c{cycle}-steps", f"{label} · steps", "waiting")
+        if revision_enabled:
+            report = _load_json(root / "semantic-revision" / "report.json", max_bytes=MAX_RESULT_BYTES)
+            add(f"c{cycle}-revision", f"{label} · semantic revision", phase_state(
+                isinstance(report, dict) and report.get("status") in {"COMPLETED", "NO_CHANGE"},
+                frozenset({"semantic_revision"}),
+                frozenset({"pre_revision_validating", "revising"}),
+                ("AGENT_", "REVISION_SCOPE", "SEMANTIC_REVISER"), cycle,
+            ))
+        gate = _cycle_gate_dir(directory, cycle)
+        evidence = _load_json(gate / "evidence.json", max_bytes=MAX_RESULT_BYTES + MAX_DIFF_BYTES * 8) if gate else None
+        add(f"c{cycle}-checks", f"{label} · checks", phase_state(
+            isinstance(evidence, dict) and evidence.get("deterministic_passed") is True,
+            _GATE_PHASES, frozenset({"validating", "revalidating", "revising"}),
+            (*_CHECK_FAILURE_PREFIXES, "REVISION_SCOPE"), cycle,
+        ))
+        review = _load_json(root / "review" / "review.json", max_bytes=MAX_RESULT_BYTES)
+        add(f"c{cycle}-reviewer", f"{label} · reviewer", phase_state(
+            isinstance(review, dict),
+            frozenset({"candidate_ready", "candidate_push", "final_review"}),
+            frozenset({"approved", "reviewing"}),
+            ("REVIEW", "PUSH_FAILED"), cycle,
+        ))
 
     publish_enabled = config.publish.enabled if config is not None else True
     fast_forward = config is not None and config.publish.mode == PublishMode.FAST_FORWARD_BASE.value
@@ -1541,7 +1385,7 @@ def run_pipeline(
         value = "resumable"
     elif failed and reason in _PUBLISH_FAILURES:
         value = "failed"
-    elif status in {"approved", "publishing"}:
+    elif status == "publishing":
         value = "running"
     else:
         value = "waiting"
@@ -1549,36 +1393,15 @@ def run_pipeline(
     return items
 
 
-_REPAIR_SUBPHASES = {
-    "planning": "Repair planner",
-    "implementing": "Luna 002",
-    "pre_revision_validating": "Claude 002",
-    "revising": "Claude 002",
-    "validating": "Checks 002",
-    "revalidating": "Checks 002",
-    "reviewing": "Reviewer #2",
-    "waiting_scope_approval": "Scope approval",
-    "scope_auto_approved": "Scope expansion auto-approved",
-    "candidate_pushed": "Candidate 002 pushed",
-}
-
-
 def _current_and_next(items: list[dict[str, str]], state: Mapping[str, Any]) -> tuple[str, str]:
     status = str(state.get("status") or "")
-    cycle = _state_cycle(state)
     if status == "published":
         return "Published", "—"
     if status == "committed":
         return "Committed", "—"
     index = next((i for i, item in enumerate(items) if item["state"] == "running"), None)
     if index is not None:
-        label = items[index]["label"]
-        if items[index]["key"] == "repair-cycle":
-            label = _REPAIR_SUBPHASES.get(status, label)
-            step = state.get("current_step")
-            if label == "Luna 002" and isinstance(step, str) and _STEP_ID.fullmatch(step):
-                label = f"Luna 002 {step}"
-        current = f"Cycle {cycle} · {label}"
+        current = items[index]["label"]
     else:
         index = next(
             (i for i, item in enumerate(items) if item["state"] in {"failed", "resumable"}), None
@@ -1609,13 +1432,14 @@ def _token_totals(directory: Path) -> dict[str, dict[str, int]]:
     usage = phase_usage_summary(directory)
     implementer = usage.get("implementer") if isinstance(usage.get("implementer"), dict) else {}
     planner = add_usage((
-        normalize_usage(usage.get("planner")), normalize_usage(usage.get("repair_planner_c02")),
+        normalize_usage(usage.get("planner")), normalize_usage(usage.get("correction_planner")),
     ))
     return {
         "planner": _usage_pair(planner),
-        "luna": _usage_pair(implementer.get("total")),
-        "claude": _usage_pair(usage.get("reviser")),
-        "reviewer": _usage_pair(usage.get("reviewer")),
+        "implementer": _usage_pair(implementer.get("total")),
+        "check_repair": _usage_pair(usage.get("check_repair")),
+        "semantic_reviser": _usage_pair(usage.get("semantic_reviser")),
+        "final_reviewer": _usage_pair(usage.get("final_reviewer")),
         "total": _usage_pair(usage.get("grand_total")),
     }
 
@@ -1653,7 +1477,7 @@ def run_overview(
         "pipeline": pipeline,
         "current_label": current,
         "next_label": following,
-        "execution_label": f"{mode} · {len(steps)} Luna step{'s' if len(steps) != 1 else ''}",
+        "execution_label": f"{mode} · {len(steps)} step{'s' if len(steps) != 1 else ''}",
         "publish_target": target,
         "publish_target_detail": target_detail,
         "token_totals": _token_totals(directory),
@@ -1689,7 +1513,7 @@ def _live_events(directory: Path, state: Mapping[str, Any]) -> list[str]:
         path = _cycle_root(directory, cycle) / "implementation" / "steps" / step / "agent.events.jsonl"
         return _recent_events(path, LIVE_EVENTS_MAX)
     if state.get("status") == "revising":
-        source = directory / "revision" / "002" if cycle == 2 else directory / "revision"
+        source = _cycle_root(directory, cycle) / "semantic-revision"
         return _recent_events(source / "agent.events.jsonl", LIVE_EVENTS_MAX)
     return []
 
@@ -1791,7 +1615,7 @@ def recover_plan_request(
 def approve_repair_scope(
     runs_root: Path, run_id: str, decision: str,
 ) -> dict[str, Any]:
-    """Record APPROVE/REJECT for the exact planner-derived 002 delta."""
+    """Record APPROVE/REJECT for the exact planner-derived correction delta."""
 
     try:
         selected = ApprovalDecision(decision)
@@ -1801,15 +1625,16 @@ def approve_repair_scope(
     state = _load_state(directory)
     if state.get("status") != RunStatus.WAITING_SCOPE_APPROVAL.value:
         raise WebAPIError(409, "run is not waiting for scope approval")
-    delta_path = directory / "repair" / "002" / "scope_delta.json"
+    correction = _cycle_root(directory, _state_cycle(state)) / "correction"
+    delta_path = correction / "scope_delta.json"
     try:
         delta_hash = hashlib.sha256(delta_path.read_bytes()).hexdigest()
         if not isinstance(_load_json(delta_path, max_bytes=256 * 1024), dict):
             raise ValueError
-        existing = read_scope_approval(directory / "repair" / "002", expected_sha256=delta_hash)
+        existing = read_scope_approval(correction, expected_sha256=delta_hash)
         if existing is not None:
             raise WebAPIError(409, "scope approval already exists")
-        write_scope_approval(directory / "repair" / "002", decision=selected,
+        write_scope_approval(correction, decision=selected,
                              scope_delta_sha256=delta_hash, source="web-ui")
     except WebAPIError:
         raise

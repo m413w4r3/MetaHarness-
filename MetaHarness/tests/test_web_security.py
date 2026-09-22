@@ -83,6 +83,7 @@ class LocalServerHardeningTests(unittest.TestCase):
         (run_dir / "implementation_contract.md").write_text(contract, encoding="utf-8")
         store.update(
             status="awaiting_plan_approval",
+            planning_protocol="v2",
             plan_identity=compute_plan_identity(raw, contract).__dict__,
         )
         return run_dir
@@ -167,7 +168,7 @@ class LocalServerHardeningTests(unittest.TestCase):
                 "Origin": f"http://localhost:{self.port}",
                 "X-MetaHarness-Token": self.server.token,
             },
-            {"decision": "APPROVE"},
+            {"decision": "REJECT"},
         )
         self.assertEqual(status, 200)
         self.assertTrue((run_dir / "plan_approval.json").exists())
@@ -304,10 +305,12 @@ class WebSecurityTests(unittest.TestCase):
             (run / "planner.raw.md").write_text(
                 "<script>window.PWNED=true</script>", encoding="utf-8"
             )
-            (run / "reviewer.raw.md").write_text(
+            review = run / "cycles" / "001" / "review"
+            review.mkdir(parents=True)
+            (review / "reviewer.raw.md").write_text(
                 "<img src=x onerror=alert(1)>", encoding="utf-8"
             )
-            (run / "review.json").write_text(
+            (review / "review.json").write_text(
                 '{"summary":"<script>window.PWNED=true</script>","findings":"<img src=x onerror=alert(1)>"}',
                 encoding="utf-8",
             )
