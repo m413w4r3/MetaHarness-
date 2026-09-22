@@ -29,6 +29,7 @@ from .models import (
     CheckConfig,
     PlanningConfig,
     TaskPlanV2,
+    profile_driver_name,
 )
 from .prompt_contracts import (
     PromptPayload,
@@ -588,7 +589,7 @@ def render_safe_profile_catalogue(profiles: Sequence[ModelProfile]) -> str:
                     "PROFILE",
                     f"ID: {profile.id}",
                     f"DISPLAY_NAME: {profile.display_name}",
-                    f"DRIVER: {profile.driver.value}",
+                    f"DRIVER: {profile_driver_name(profile.driver)}",
                     f"MODEL_LABEL: {profile.model}",
                     f"EFFORT: {profile.effort or 'NONE'}",
                     f"DESCRIPTION: {profile.description}",

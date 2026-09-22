@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from ..models import ExecutionRole
+from ..models import AgentExecutorCapabilities, ExecutionRole
 
 
 AgentUsage = dict[str, int]
@@ -62,6 +62,7 @@ class AgentRunResult:
     final_message: str = ""
     stderr_tail: str = ""
     driver: str | None = None
+    driver_version: str | None = None
     backend_reason: str | None = None
     terminal_type: str | None = None
     terminal_subtype: str | None = None
@@ -75,6 +76,14 @@ class AgentRunResult:
 @runtime_checkable
 class AgentExecutor(Protocol):
     """Backend-independent execution contract."""
+
+    @property
+    def capabilities(self) -> AgentExecutorCapabilities:
+        ...
+
+    @property
+    def driver_version(self) -> str | None:
+        ...
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         ...

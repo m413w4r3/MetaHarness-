@@ -85,6 +85,7 @@ class TraceTests(unittest.TestCase):
             selection_mode=SelectionMode.CLI,
             effort="high",
             provider="openai",
+            driver_version="local-test-driver",
         )
         owner = object.__new__(Orchestrator)
         owner.config = SimpleNamespace(
@@ -100,6 +101,7 @@ class TraceTests(unittest.TestCase):
                 provider="openai",
                 model="gpt-test",
                 driver="codex",
+                driver_version="local-test-driver",
                 effort="high",
             ),
             role=ExecutionRole.IMPLEMENTER,
@@ -121,6 +123,7 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(session["provider"], "openai")
         self.assertEqual(session["model"], "gpt-test")
         self.assertEqual(session["profile_fingerprint"], "profile-fingerprint")
+        self.assertEqual(session["driver_version"], "local-test-driver")
         self.assertIsNone(session["input_tokens"])
         self.assertIsNone(session["cached_input_tokens"])
         self.assertIsNone(session["output_tokens"])

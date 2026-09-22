@@ -166,6 +166,7 @@ from .models import (
     ReviewVerdict,
     RunCycle,
     RunStatus,
+    profile_driver_name,
 )
 from .planning import (
     PlanDecision,
@@ -1010,8 +1011,8 @@ class Orchestrator:
                 fingerprint = profile_execution_fingerprint(
                     profile,
                     agent_env_allowlist=self.config.agent.env_allowlist,
-                    codex_home=(self.config.codex_runtime.home if profile.driver.value == "codex" else None),
-                    claude_config_home=(self.config.claude_runtime.home if profile.driver.value == "claude-code" else None),
+                    codex_home=self.config.codex_runtime.home,
+                    claude_config_home=self.config.claude_runtime.home,
                 )
             except (TypeError, ValueError, AttributeError):
                 fingerprint = None
@@ -1063,11 +1064,14 @@ class Orchestrator:
 
         return {
             "driver": (
-                profile.driver.value if profile is not None
+                profile_driver_name(profile.driver) if profile is not None
                 else getattr(selected, "driver", None)
                 or getattr(result, "driver", None)
             ),
-            "driver_version": None,
+            "driver_version": (
+                getattr(result, "driver_version", None) if result is not None else None
+            ) or getattr(selected, "driver_version", None)
+            or (profile.driver_version if profile is not None else None),
             "provider": (
                 profile.provider if profile is not None
                 else getattr(selected, "provider", None)
@@ -1274,15 +1278,12 @@ class Orchestrator:
             codex_home=self.config.codex_runtime.home,
             claude_home=self.config.claude_runtime.home,
             forbidden_env_names=forbidden_env_names,
+            legacy_agent_factory=self._agent_for_profile,
         )
-        selected_agent = None
-        if profile.driver.value == "codex":
-            selected_agent = self._agent_for_profile(profile.id)
         return executor_for_profile(
             profile,
             runtime,
-            agent=selected_agent,
-            reviser=self._injected_reviser if profile.driver.value == "claude-code" else None,
+            reviser=self._injected_reviser,
         )
 
     def _agent_for_profile(self, profile_id: str) -> Any:
@@ -1299,10 +1300,16 @@ class Orchestrator:
             profile = profile_for_role(self.config, profile_id, ExecutionRole.IMPLEMENTER)
         except ProfileError:
             profile = profile_for_role(self.config, profile_id, ExecutionRole.REPAIR)
-        agent_config = dataclasses.replace(
-            build_agent_config(profile),
-            env_allowlist=self.config.agent.env_allowlist,
-        )
+        try:
+            agent_config = dataclasses.replace(
+                build_agent_config(profile),
+                env_allowlist=self.config.agent.env_allowlist,
+            )
+        except ProfileError:
+            # The compatibility hook is Codex-shaped, but the resolved
+            # executor is not.  Other registered drivers receive no legacy
+            # worker object and own their process boundary themselves.
+            return None
         return CodexAgent(agent_config)
 
     def _run_revision(
@@ -2079,7 +2086,7 @@ class Orchestrator:
             self._redact_agent_artifacts(run_dir)
             state = store.record_failure(
                 AGENT_SCOPE_VIOLATION, redact(str(exc), self._secrets),
-                agent={"driver": implementer_profile.driver.value},
+                agent={"driver": profile_driver_name(implementer_profile.driver)},
             )
             return RunResult(run_dir, RunStatus.FAILED, state)
         auth_failure = (

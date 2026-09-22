@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ..gitops import GitError, candidate_tree_sha, current_head
 from ..models import (
@@ -15,6 +16,7 @@ from ..models import (
     HarnessConfig,
     ModelProfile,
     ProfileDriver,
+    profile_driver_name,
 )
 from ..profiles import build_agent_config, build_claude_profile
 from ..usage import normalize_usage
@@ -26,6 +28,7 @@ from .base import (
     AGENT_TIMEOUT,
     AgentError,
     AgentExecutor,
+    AgentExecutorCapabilities,
     AgentProtocolError,
     AgentRunRequest,
     AgentRunResult,
@@ -41,6 +44,7 @@ from ..claude.runtime import ClaudeRuntimeError, prepare_claude_home
 from .runtime import CodexRuntimeError, prepare_codex_home
 from ..agent.codex import build_agent_environment
 from ..claude.agent import build_claude_environment
+from .external import ExternalAgentExecutor
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,10 @@ class ExecutorRuntimeConfig:
     codex_home: Path | None = None
     claude_home: Path | None = None
     forbidden_env_names: tuple[str | None, ...] = ()
+    # Compatibility hook for the historical in-process Codex double.  It is
+    # consumed by the Codex adapter only; the orchestration layer does not
+    # select a backend from this callback.
+    legacy_agent_factory: Callable[[str], Any] | None = None
 
 
 def _runtime(value: Any) -> ExecutorRuntimeConfig:
@@ -68,6 +76,7 @@ def _runtime(value: Any) -> ExecutorRuntimeConfig:
             environment=environment,
             codex_home=value.codex_runtime.home,
             claude_home=value.claude_runtime.home,
+            legacy_agent_factory=None,
         )
     if isinstance(value, Mapping):
         config = value.get("config")
@@ -77,6 +86,7 @@ def _runtime(value: Any) -> ExecutorRuntimeConfig:
             codex_home=value.get("codex_home"),
             claude_home=value.get("claude_home"),
             forbidden_env_names=tuple(value.get("forbidden_env_names", ())),
+            legacy_agent_factory=value.get("legacy_agent_factory"),
         )
     config = getattr(value, "config", None)
     return ExecutorRuntimeConfig(
@@ -85,6 +95,7 @@ def _runtime(value: Any) -> ExecutorRuntimeConfig:
         codex_home=getattr(value, "codex_home", None),
         claude_home=getattr(value, "claude_home", None),
         forbidden_env_names=tuple(getattr(value, "forbidden_env_names", ())),
+        legacy_agent_factory=getattr(value, "legacy_agent_factory", None),
     )
 
 
@@ -104,6 +115,7 @@ def _result(
     artifact_dir: Path,
     exit_reason: str | None = None,
     backend_reason: str | None = None,
+    driver_version: str | None = None,
 ) -> AgentRunResult:
     timed_out = bool(getattr(raw, "timed_out", False))
     exit_code = getattr(raw, "exit_code", None)
@@ -135,6 +147,7 @@ def _result(
         final_message=final_message,
         stderr_tail=stderr_tail,
         driver=driver,
+        driver_version=driver_version,
         backend_reason=backend_reason,
         terminal_type=getattr(raw, "terminal_type", None),
         terminal_subtype=getattr(raw, "terminal_subtype", None),
@@ -197,15 +210,37 @@ class CodexExecutor:
         if agent is not None:
             self.agent = agent
         else:
-            config = self.runtime.config
-            if config is not None:
-                agent_config = dataclasses.replace(
-                    build_agent_config(profile),
-                    env_allowlist=config.agent.env_allowlist,
-                )
+            compatibility_factory = self.runtime.legacy_agent_factory
+            compatibility_agent = (
+                compatibility_factory(profile.id)
+                if callable(compatibility_factory)
+                else None
+            )
+            if compatibility_agent is not None:
+                self.agent = compatibility_agent
             else:
-                agent_config = build_agent_config(profile)
-            self.agent = CodexAgent(agent_config)
+                config = self.runtime.config
+                if config is not None:
+                    agent_config = dataclasses.replace(
+                        build_agent_config(profile),
+                        env_allowlist=config.agent.env_allowlist,
+                    )
+                else:
+                    agent_config = build_agent_config(profile)
+                self.agent = CodexAgent(agent_config)
+        self.capabilities = AgentExecutorCapabilities(
+            edits_workspace=True,
+            exposes_session_id=False,
+            exposes_usage=True,
+            exposes_reasoning_usage=True,
+            exposes_tool_count=False,
+            isolation_mode=profile.sandbox,
+        )
+
+    @property
+    def driver_version(self) -> str | None:
+        value = getattr(self.agent, "driver_version", None)
+        return value if isinstance(value, str) and value.strip() else self.profile.driver_version
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         before = _tree(request.worktree)
@@ -271,6 +306,7 @@ class CodexExecutor:
             raw=raw, driver=self.driver, before=before, after=after,
             artifact_dir=request.artifact_dir,
             backend_reason=backend_reason,
+            driver_version=self.driver_version,
         )
 
 
@@ -289,6 +325,19 @@ class ClaudeCodeExecutor:
         self.profile = build_claude_profile(profile)
         self.runtime = _runtime(runtime_config)
         self.agent = agent or ClaudeCodeAgent()
+        self.capabilities = AgentExecutorCapabilities(
+            edits_workspace=True,
+            exposes_session_id=False,
+            exposes_usage=True,
+            exposes_reasoning_usage=False,
+            exposes_tool_count=False,
+            isolation_mode="restricted",
+        )
+
+    @property
+    def driver_version(self) -> str | None:
+        value = getattr(self.agent, "driver_version", None)
+        return value if isinstance(value, str) and value.strip() else self.profile.driver_version
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         before = _tree(request.worktree)
@@ -324,6 +373,7 @@ class ClaudeCodeExecutor:
             raw=raw, driver=self.driver, before=before, after=after,
             artifact_dir=request.artifact_dir,
             backend_reason=backend_reason,
+            driver_version=self.driver_version,
         )
 
 
@@ -336,6 +386,14 @@ class LegacyAgentExecutor:
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         return self.executor.run(request)
+
+    @property
+    def capabilities(self) -> AgentExecutorCapabilities:
+        return self.executor.capabilities
+
+    @property
+    def driver_version(self) -> str | None:
+        return self.executor.driver_version
 
 
 def legacy_codex_agent_factory(config: AgentConfig) -> Any:
@@ -358,6 +416,93 @@ def _read_artifact_tail(path: Path, limit: int = 256 * 1024) -> str:
         return ""
 
 
+ExecutorFactory = Callable[..., AgentExecutor]
+
+
+class ExecutorDriverRegistry:
+    """Allowlisted mapping from trusted driver IDs to infrastructure adapters."""
+
+    def __init__(self) -> None:
+        self._factories: dict[str, ExecutorFactory] = {}
+
+    def register(self, driver: ProfileDriver | str, factory: ExecutorFactory, *, replace: bool = False) -> None:
+        name = profile_driver_name(driver)
+        if not callable(factory):
+            raise TypeError("executor factory must be callable")
+        if name in self._factories and not replace:
+            raise ValueError(f"executor driver {name!r} is already registered")
+        self._factories[name] = factory
+
+    def resolve(
+        self,
+        profile: ModelProfile,
+        runtime_config: Any = None,
+        *,
+        agent: Any | None = None,
+        reviser: Any | None = None,
+    ) -> AgentExecutor:
+        name = profile_driver_name(profile.driver)
+        factory = self._factories.get(name)
+        if factory is None:
+            raise ValueError(
+                f"unsupported concrete driver {name!r} for profile {profile.id!r}; "
+                "register an executor driver adapter"
+            )
+        try:
+            parameters = inspect.signature(factory).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        kwargs: dict[str, Any] = {}
+        if accepts_kwargs or "agent" in parameters:
+            kwargs["agent"] = agent
+        if accepts_kwargs or "reviser" in parameters:
+            kwargs["reviser"] = reviser
+        return factory(profile, runtime_config, **kwargs)
+
+
+EXECUTOR_REGISTRY = ExecutorDriverRegistry()
+
+
+def register_executor_driver(
+    driver: ProfileDriver | str,
+    factory: ExecutorFactory,
+    *,
+    replace: bool = False,
+) -> None:
+    """Register one trusted concrete driver adapter for profile resolution."""
+
+    EXECUTOR_REGISTRY.register(driver, factory, replace=replace)
+
+
+def _codex_factory(
+    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None
+) -> AgentExecutor:
+    del reviser
+    return CodexExecutor(profile, runtime_config, agent=agent)
+
+
+def _claude_factory(
+    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None
+) -> AgentExecutor:
+    return ClaudeCodeExecutor(profile, runtime_config, agent=reviser or agent)
+
+
+def _external_factory(
+    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None
+) -> AgentExecutor:
+    del agent, reviser
+    return ExternalAgentExecutor(profile, runtime_config)
+
+
+register_executor_driver(ProfileDriver.CODEX, _codex_factory)
+register_executor_driver(ProfileDriver.CLAUDE_CODE, _claude_factory)
+register_executor_driver(ProfileDriver.EXTERNAL, _external_factory)
+
+
 def executor_for_profile(
     profile: ModelProfile,
     runtime_config: Any = None,
@@ -369,20 +514,20 @@ def executor_for_profile(
 
     if not isinstance(profile, ModelProfile):
         raise TypeError("profile must be a ModelProfile")
-    if profile.driver is ProfileDriver.CODEX:
-        return CodexExecutor(profile, runtime_config, agent=agent)
-    if profile.driver is ProfileDriver.CLAUDE_CODE:
-        return ClaudeCodeExecutor(profile, runtime_config, agent=reviser or agent)
-    raise ValueError(
-        f"profile {profile.id!r} uses {profile.driver.value!r}, which has no agent executor"
+    return EXECUTOR_REGISTRY.resolve(
+        profile, runtime_config, agent=agent, reviser=reviser
     )
 
 
 __all__ = [
     "ClaudeCodeExecutor",
     "CodexExecutor",
+    "EXECUTOR_REGISTRY",
+    "ExecutorDriverRegistry",
     "ExecutorRuntimeConfig",
+    "ExternalAgentExecutor",
     "LegacyAgentExecutor",
     "executor_for_profile",
     "legacy_codex_agent_factory",
+    "register_executor_driver",
 ]

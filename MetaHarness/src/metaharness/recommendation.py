@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Protocol, Sequence
 
 from .llm.chat import TextLLMResult
-from .models import ModelProfile
+from .models import ModelProfile, profile_driver_name
 
 
 class TextCompletionClient(Protocol):
@@ -55,7 +55,7 @@ def render_profile_catalogue(profiles: Sequence[ModelProfile]) -> str:
             "PROFILE",
             f"ID: {profile.id}",
             f"DISPLAY_NAME: {profile.display_name}",
-            f"DRIVER: {profile.driver.value}",
+            f"DRIVER: {profile_driver_name(profile.driver)}",
             f"MODEL_LABEL: {profile.model}",
             f"SELECTION_MODE: {profile.selection_mode.value}",
             f"EFFORT: {profile.effort if profile.effort is not None else 'NONE'}",

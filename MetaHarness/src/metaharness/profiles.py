@@ -15,6 +15,7 @@ from .models import (
     ModelProfile,
     ProfileDriver,
     SelectionMode,
+    profile_driver_name,
 )
 
 
@@ -111,7 +112,8 @@ def safe_profile_metadata(profile: ModelProfile) -> dict[str, Any]:
         "id": profile.id,
         "display_name": profile.display_name,
         "roles": [role.value for role in profile.roles],
-        "driver": profile.driver.value,
+        "driver": profile_driver_name(profile.driver),
+        "driver_version": profile.driver_version,
         "provider": profile.provider,
         "model_label": profile.model,
         "selection_mode": profile.selection_mode.value,
@@ -145,11 +147,12 @@ def profile_execution_fingerprint(
     ):
         raise ProfileError("agent_env_allowlist must contain variable names")
     payload: dict[str, Any] = {
-        "driver": profile.driver.value,
+        "driver": profile_driver_name(profile.driver),
         "provider": profile.provider,
         "model": profile.model,
         "selection_mode": profile.selection_mode.value,
         "timeout_seconds": profile.timeout_seconds,
+        "driver_version": profile.driver_version,
     }
     if profile.driver is ProfileDriver.OPENAI_CHAT:
         payload.update(
@@ -180,8 +183,26 @@ def profile_execution_fingerprint(
                 else None
             ),
         )
-    else:  # pragma: no cover - ProfileDriver is closed
-        raise ProfileError("profile driver is unknown")
+    elif profile.driver is ProfileDriver.EXTERNAL:
+        payload.update(
+            argv=list(profile.argv),
+            effort=profile.effort,
+        )
+    else:
+        # Registered extension drivers still receive a stable fingerprint even
+        # before this module knows their private runtime contract.  The
+        # registry, rather than this profile module, owns execution support.
+        payload.update(
+            argv=list(profile.argv),
+            effort=profile.effort,
+            sandbox=profile.sandbox,
+            permission_mode=profile.permission_mode,
+            base_url=profile.base_url,
+            endpoint_path=profile.endpoint_path,
+            api_key_env=profile.api_key_env,
+            retries=profile.retries,
+            extra_body=dict(profile.extra_body),
+        )
     try:
         canonical = json.dumps(
             payload,

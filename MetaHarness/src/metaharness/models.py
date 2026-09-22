@@ -10,6 +10,47 @@ class ProfileDriver(StrEnum):
     OPENAI_CHAT = "openai-chat"
     CODEX = "codex"
     CLAUDE_CODE = "claude-code"
+    # A protocol-neutral trusted process driver.  It is deliberately not a
+    # DeepSeek-specific integration: concrete harnesses register their own
+    # driver ID when their local contract is known.
+    EXTERNAL = "external"
+
+
+def profile_driver_name(value: ProfileDriver | str) -> str:
+    """Return a stable driver ID for built-ins and registered extensions."""
+
+    if isinstance(value, ProfileDriver):
+        return value.value
+    if isinstance(value, str) and value.strip():
+        return value
+    raise ValueError("profile driver must be a non-empty string")
+
+
+@dataclass(frozen=True)
+class AgentExecutorCapabilities:
+    """Facts an executor can truthfully expose to orchestration observers."""
+
+    edits_workspace: bool = False
+    exposes_session_id: bool = False
+    exposes_usage: bool = False
+    exposes_reasoning_usage: bool = False
+    exposes_tool_count: bool = False
+    isolation_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "edits_workspace",
+            "exposes_session_id",
+            "exposes_usage",
+            "exposes_reasoning_usage",
+            "exposes_tool_count",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
+        if self.isolation_mode is not None and (
+            not isinstance(self.isolation_mode, str) or not self.isolation_mode.strip()
+        ):
+            raise ValueError("isolation_mode must be a non-empty string or null")
 
 
 class SelectionMode(StrEnum):
@@ -42,7 +83,7 @@ class ModelProfile:
     id: str
     display_name: str
     roles: tuple[ExecutionRole, ...]
-    driver: ProfileDriver
+    driver: ProfileDriver | str
     model: str
     selection_mode: SelectionMode
 
@@ -52,6 +93,9 @@ class ModelProfile:
     timeout_seconds: int = 300
     retries: int = 2
     extra_body: Mapping[str, Any] = field(default_factory=dict)
+    # Trusted argv for the generic external-process driver.  It is never
+    # derived from a prompt, model name, provider name, or role.
+    argv: tuple[str, ...] = ()
 
     effort: str | None = None
     sandbox: str | None = None
@@ -63,10 +107,24 @@ class ModelProfile:
     latency_tier: str = "standard"
     # Provider metadata is independent from the execution driver/harness.
     provider: str = "openai"
+    driver_version: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.driver, (ProfileDriver, str)) or not str(self.driver).strip():
+            raise ValueError("profile driver must be a non-empty string")
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError("profile model must be a non-empty string")
+        if not isinstance(self.argv, tuple) or any(
+            not isinstance(item, str) or not item or "\x00" in item
+            for item in self.argv
+        ):
+            raise ValueError("profile argv must be a tuple of non-empty strings")
         if not isinstance(self.provider, str) or not self.provider.strip():
             raise ValueError("profile provider must be a non-empty string")
+        if self.driver_version is not None and (
+            not isinstance(self.driver_version, str) or not self.driver_version.strip()
+        ):
+            raise ValueError("profile driver_version must be a non-empty string or null")
         if not isinstance(self.description, str) or len(self.description) > 300:
             raise ValueError("profile description must be at most 300 characters")
         if not isinstance(self.strengths, tuple) or len(self.strengths) > 8:

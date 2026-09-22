@@ -21,6 +21,7 @@ from .models import (
     ProfileDriver,
     SelectedProfile,
     StepExecutionSelection,
+    profile_driver_name,
 )
 from .profiles import ProfileError, profile_execution_fingerprint, profile_for_role
 from .step_ids import MAX_STEPS, STEP_ID_RE, step_ids
@@ -82,7 +83,7 @@ def _selected(
 ) -> SelectedProfile:
     return SelectedProfile(
         profile_id=profile.id,
-        driver=profile.driver.value,
+        driver=profile_driver_name(profile.driver),
         model=profile.model,
         selection_mode=profile.selection_mode.value,
         provider=profile.provider,

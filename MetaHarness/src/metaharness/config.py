@@ -35,6 +35,7 @@ from .models import (
     SelectionMode,
     UIConfig,
     WorkspaceSetupCommand,
+    profile_driver_name,
     validate_revision_budget,
 )
 
@@ -59,6 +60,7 @@ _PROFILE_COMMON_KEYS = frozenset({
     "model",
     "selection_mode",
     "timeout_seconds",
+    "driver_version",
     "description",
     "strengths",
     "cost_tier",
@@ -71,6 +73,10 @@ _PROFILE_DRIVER_KEYS = {
     # Codex has no retry policy: ``retries`` would be a silently unused option.
     ProfileDriver.CODEX: frozenset({"effort", "sandbox"}),
     ProfileDriver.CLAUDE_CODE: frozenset({"effort", "permission_mode"}),
+    # Generic trusted process adapter.  No provider command line protocol is
+    # implied: argv is passed exactly as configured and prompt bytes go to
+    # stdin.
+    ProfileDriver.EXTERNAL: frozenset({"argv", "effort"}),
 }
 def _expand_string(value: str, environment: Mapping[str, str]) -> str:
     """Expand ``${NAME}`` references in one non-recursive pass.
@@ -354,16 +360,27 @@ def _model_profiles(
         if not isinstance(profile_data, dict):
             raise ConfigError(f"model_profiles.{profile_id} must be a table")
         where = f"model_profiles.{profile_id}"
+        raw_driver = profile_data.get("driver")
         try:
-            driver = ProfileDriver(profile_data.get("driver"))
+            driver: ProfileDriver | str = ProfileDriver(raw_driver)
         except (TypeError, ValueError) as exc:
-            raise ConfigError(f"{where}.driver is invalid") from exc
+            # Extension IDs are accepted as metadata/configuration only.  A
+            # concrete adapter must still be registered before execution.
+            if (
+                not isinstance(raw_driver, str)
+                or not raw_driver.strip()
+                or "-" not in raw_driver
+                or not re.fullmatch(r"[a-z][a-z0-9-]{2,63}", raw_driver)
+            ):
+                raise ConfigError(f"{where}.driver is invalid") from exc
+            driver = raw_driver
         # Fail closed on typos and on options the driver does not use.
-        unknown = sorted(
-            set(profile_data) - _PROFILE_COMMON_KEYS - _PROFILE_DRIVER_KEYS[driver]
-        )
+        driver_keys = _PROFILE_DRIVER_KEYS.get(driver, frozenset({"effort"}))
+        unknown = sorted(set(profile_data) - _PROFILE_COMMON_KEYS - driver_keys)
         if unknown:
-            raise ConfigError(f"{where}.{unknown[0]} is not allowed for {driver.value}")
+            raise ConfigError(
+                f"{where}.{unknown[0]} is not allowed for {profile_driver_name(driver)}"
+            )
         display_name = _required_string(profile_data, "display_name", where)
         roles_raw = profile_data.get("roles")
         if isinstance(roles_raw, (str, bytes)) or not isinstance(roles_raw, (list, tuple)) or not roles_raw:
@@ -401,6 +418,7 @@ def _model_profiles(
         provider = profile_data.get("provider", "openai")
         if not isinstance(provider, str) or not provider.strip():
             raise ConfigError(f"{where}.provider must be a non-empty string")
+        driver_version = _optional_string(profile_data, "driver_version", None, where)
         if driver is ProfileDriver.OPENAI_CHAT:
             if selection_mode is SelectionMode.CLI:
                 raise ConfigError(f"{where}.selection_mode must not be cli")
@@ -419,23 +437,20 @@ def _model_profiles(
                 timeout_seconds=endpoint.timeout_seconds,
                 retries=endpoint.retries,
                 extra_body=endpoint.extra_body,
+                driver_version=driver_version,
                 description=description,
                 strengths=strengths,
                 cost_tier=cost_tier,
                 latency_tier=latency_tier,
             )
-        else:
+        elif driver is ProfileDriver.CODEX:
             if selection_mode is not SelectionMode.CLI:
                 raise ConfigError(f"{where}.selection_mode must be cli")
             effort = _required_string(profile_data, "effort", where)
-            if driver is ProfileDriver.CODEX:
-                sandbox = _required_string(profile_data, "sandbox", where)
-                if sandbox not in _KNOWN_SANDBOXES:
-                    raise ConfigError(f"unknown {where}.sandbox")
-                permission_mode = None
-            else:
-                sandbox = None
-                permission_mode = _required_string(profile_data, "permission_mode", where)
+            sandbox = _required_string(profile_data, "sandbox", where)
+            if sandbox not in _KNOWN_SANDBOXES:
+                raise ConfigError(f"unknown {where}.sandbox")
+            permission_mode = None
             result[profile_id] = ModelProfile(
                 id=profile_id,
                 display_name=display_name,
@@ -445,10 +460,79 @@ def _model_profiles(
                 selection_mode=selection_mode,
                 provider=provider,
                 timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
-                retries=0 if driver is ProfileDriver.CLAUDE_CODE else 2,
+                retries=2,
                 effort=effort,
                 sandbox=sandbox,
                 permission_mode=permission_mode,
+                driver_version=driver_version,
+                description=description,
+                strengths=strengths,
+                cost_tier=cost_tier,
+                latency_tier=latency_tier,
+            )
+        elif driver is ProfileDriver.CLAUDE_CODE:
+            if selection_mode is not SelectionMode.CLI:
+                raise ConfigError(f"{where}.selection_mode must be cli")
+            effort = _required_string(profile_data, "effort", where)
+            permission_mode = _required_string(profile_data, "permission_mode", where)
+            result[profile_id] = ModelProfile(
+                id=profile_id,
+                display_name=display_name,
+                roles=tuple(roles),
+                driver=driver,
+                model=model,
+                selection_mode=selection_mode,
+                provider=provider,
+                timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
+                retries=0,
+                effort=effort,
+                permission_mode=permission_mode,
+                driver_version=driver_version,
+                description=description,
+                strengths=strengths,
+                cost_tier=cost_tier,
+                latency_tier=latency_tier,
+            )
+        elif driver is ProfileDriver.EXTERNAL:
+            if selection_mode is not SelectionMode.CLI:
+                raise ConfigError(f"{where}.selection_mode must be cli")
+            argv = _string_array(profile_data, "argv", (), where, allow_empty=False)
+            if any(not item or "\x00" in item for item in argv):
+                raise ConfigError(f"{where}.argv must contain non-empty strings without NUL")
+            result[profile_id] = ModelProfile(
+                id=profile_id,
+                display_name=display_name,
+                roles=tuple(roles),
+                driver=driver,
+                model=model,
+                selection_mode=selection_mode,
+                provider=provider,
+                timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
+                retries=0,
+                argv=argv,
+                effort=_optional_string(profile_data, "effort", None, where),
+                driver_version=driver_version,
+                description=description,
+                strengths=strengths,
+                cost_tier=cost_tier,
+                latency_tier=latency_tier,
+            )
+        else:
+            # Unknown extension drivers intentionally have no invented command
+            # syntax.  Their trusted adapter owns any additional runtime
+            # contract once registered.
+            result[profile_id] = ModelProfile(
+                id=profile_id,
+                display_name=display_name,
+                roles=tuple(roles),
+                driver=driver,
+                model=model,
+                selection_mode=selection_mode,
+                provider=provider,
+                timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
+                retries=0,
+                effort=_optional_string(profile_data, "effort", None, where),
+                driver_version=driver_version,
                 description=description,
                 strengths=strengths,
                 cost_tier=cost_tier,
@@ -867,7 +951,14 @@ def load_config(config_path: str | Path) -> HarnessConfig:
                 ),
             )
         else:
-            agent = _profile_agent(implementer_profile)
+            # HarnessConfig keeps the historical AgentConfig projection, but
+            # an external driver owns its own process settings and must not be
+            # forced through the Codex-only legacy section.
+            agent = (
+                _profile_agent(implementer_profile)
+                if implementer_profile.driver is ProfileDriver.CODEX
+                else AgentConfig()
+            )
     else:
         planner = _endpoint(planner_data, "planner")
         reviewer = _endpoint(reviewer_data, "reviewer")
