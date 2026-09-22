@@ -13,9 +13,75 @@ from metaharness.prompt_contracts import (
     build_semantic_revision_payload,
     write_prompt_diagnostics,
 )
+from metaharness.review import build_reviewer_prompt
 
 
 class PromptContractTests(unittest.TestCase):
+    def test_role_prompt_static_size_limits(self) -> None:
+        prompts = Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts"
+        limits = {
+            "check_repair.txt": 3 * 1024,
+            "reviser.txt": 4 * 1024,
+            "reviewer.txt": 6 * 1024,
+            "implementer.txt": 4 * 1024,
+        }
+        for name, limit in limits.items():
+            with self.subTest(prompt=name):
+                self.assertLess((prompts / name).stat().st_size, limit)
+
+    def test_reviewer_is_independent_of_runtime_cycle_and_agent_names(self) -> None:
+        prompt = build_reviewer_prompt(
+            "SPEC", "PLAN", "CONTEXT", "GATE", "FILES", "DIFF", "CHECKS", "REPORT"
+        ).casefold()
+        v2_prompt = build_final_review_payload(
+            spec="SPEC",
+            compact_approved_plan="PLAN",
+            required_checks_summary="CHECKS",
+            cycle_summary="iteration 1 C02 Claude Luna remaining repair budget",
+        ).rendered.casefold()
+        for forbidden in ("iteration 1", "iteration 2", "c02", "claude", "luna"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, prompt)
+                self.assertNotIn(forbidden, v2_prompt)
+
+    def test_reviser_delegates_the_authoritative_gate_to_metaharness(self) -> None:
+        payload = build_semantic_revision_payload(
+            spec="SPEC",
+            compact_approved_contract_index="S01",
+            candidate_identity="TREE",
+            changed_files="src/a.py",
+            required_checks_summary="unit: failed",
+            mutable_scope="src/a.py",
+            bounded_diff_evidence="DIFF",
+        )
+        self.assertIn("MetaHarness owns and reruns the authoritative deterministic gate.", payload.rendered)
+        self.assertNotIn("make test-all", payload.rendered)
+
+    def test_implementer_is_executor_only(self) -> None:
+        payload = build_implementer_payload(
+            step_title="S01",
+            step_objective="implement one step",
+            step_invariants="preserve API",
+            read_set="src/a.py :: symbol",
+            mutable_scope="src/a.py",
+            repository_instructions="follow AGENTS.md",
+            verify_instructions="python -m unittest",
+        )
+        self.assertIn("You are the implementation executor", payload.rendered)
+        self.assertIn("Do not redesign the plan or broaden the task.", payload.rendered)
+        self.assertIn("Implement the supplied contract exactly.", payload.rendered)
+
+    def test_normal_check_repair_prompt_does_not_delegate_to_repair_planner(self) -> None:
+        payload = build_check_repair_payload(
+            spec="SPEC",
+            failed_check_ids="CHECK_FAILED:unit",
+            failed_check_evidence="FAILED",
+            compact_contract_invariants="INVARIANT",
+            changed_files="src/a.py",
+            mutable_scope="src/a.py",
+        )
+        self.assertNotIn("repair planner", payload.rendered.casefold())
+
     def test_sections_are_deterministic_and_hash_injected_bytes(self) -> None:
         kwargs = dict(
             spec="SPEC\né",

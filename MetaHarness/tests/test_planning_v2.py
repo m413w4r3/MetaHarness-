@@ -324,7 +324,7 @@ END META PLAN
                 step_id_authority.step_ids(count)
         self.assertIn(f"between 2 and {MAX_STEPS} coherent", REQUIRE_STAGED_POLICY_TEXT)
         prompts = Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts"
-        for name in ("planner_v2.txt", "repair_planner_v2.txt"):
+        for name in ("planner_v2.txt", "review_repair_planner_v2.txt"):
             text = (prompts / name).read_text(encoding="utf-8")
             with self.subTest(prompt=name):
                 self.assertIn("STAGED has 2 to {{MAX_STEPS}} steps", text)
@@ -350,7 +350,7 @@ END META PLAN
     def test_blocked_protocol_is_documented_in_both_planner_prompts(self):
         prompts = Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts"
         template = "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: <title>\n\nOBJECTIVE\n<text>\n\nBLOCKERS\n<real concrete blockers>\n\nEND META PLAN"
-        for name in ("planner_v2.txt", "repair_planner_v2.txt"):
+        for name in ("planner_v2.txt", "review_repair_planner_v2.txt"):
             text = (prompts / name).read_text(encoding="utf-8")
             with self.subTest(prompt=name):
                 self.assertIn(template, text)
@@ -668,8 +668,8 @@ class ChangeSetTests(unittest.TestCase):
     def test_prompts_carry_the_worker_restrictions(self) -> None:
         planner = build_planner_prompt_v2("spec", "context")
         for sentence in (
-            "The implementation worker is not a discovery agent.",
-            "If the supplied context is insufficient to name the required file, symbol, or architectural operation precisely, return BLOCKED instead of delegating discovery to the worker.",
+            "The worker is not\nresponsible for discovering undeclared implementation targets.",
+            "If the supplied context is insufficient to name the required file, symbol or\narchitectural operation precisely, return BLOCKED.",
             "Normal target: keep each step contract concise, approximately 4000-6000 chars.",
             "Hard per-step parser limit: 16000 characters.",
             "CREATE_SET\nNONE",
@@ -681,9 +681,9 @@ class ChangeSetTests(unittest.TestCase):
             self.assertIn(sentence, planner)
         worker = build_implementer_step_prompt("CONTRACT")
         for sentence in (
-            "Execute exactly the approved META IMPLEMENTATION STEP below.",
-            "The MetaHarness developer instructions supplied by the managed Codex runtime",
-            "The contract is authoritative for this step.",
+            "You are the implementation executor for this step.",
+            "Do not redesign the plan or broaden the task.",
+            "Implement the supplied contract exactly.",
             "<STEP CONTRACT>\nCONTRACT\n</STEP CONTRACT>",
         ):
             self.assertIn(sentence, worker)

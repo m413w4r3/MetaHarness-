@@ -987,7 +987,7 @@ def build_repair_planner_prompt_bundle(
         ),
     }
     if template is None:
-        template = (Path(__file__).with_name("prompts") / "repair_planner_v2.txt").read_text(encoding="utf-8")
+        template = (Path(__file__).with_name("prompts") / "review_repair_planner_v2.txt").read_text(encoding="utf-8")
 
     pattern = r"\{\{(?:EVIDENCE_DELIVERY|REPAIR_EVIDENCE|REPAIR_DECOMPOSITION_POLICY|IMPLEMENTER_PROFILES|REVIEWER_PROFILES|CHECK_CATALOG|ORIGINAL_REQUIRED_CHECKS|MAX_STEPS|LAST_STEP_ID|MAX_STEP_CONTRACT_CHARS)\}\}"
 

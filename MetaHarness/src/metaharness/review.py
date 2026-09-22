@@ -91,7 +91,7 @@ def _replace_placeholders(template: str, values: dict[str, str]) -> str:
     """Replace known placeholders once, preserving placeholders in evidence."""
 
     return re.sub(
-        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|CODE_EVIDENCE|DIFF|CHECKS|AGENT_REPORT|REPOSITORY|LUNA_REPORTS|REVISION_REPORT|REPOSITORY_STATE|CANDIDATE_COMMIT|ITERATION|CYCLE_HISTORY|DEFERRED_CONTRACT_MISMATCHES)\}\}",
+        r"\{\{(?:SPEC|PLAN|CONTEXT|GATE|CHANGED_FILES|CODE_EVIDENCE|DIFF|CHECKS|AGENT_REPORT|REPOSITORY|LUNA_REPORTS|REVISION_REPORT|REPOSITORY_STATE|CANDIDATE_COMMIT|ITERATION|CYCLE_HISTORY|DEFERRED_CONTRACT_MISMATCHES|ADDITIONAL_EVIDENCE)\}\}",
         lambda match: values[match.group(0)],
         template,
     )
@@ -136,6 +136,10 @@ def build_reviewer_prompt(
         if code_evidence is not None
         else _require_text("diff", diff)
     )
+    additional_evidence = "\n\n".join(
+        value for value in (luna_reports, revision_report, deferred_mismatches)
+        if value and value != "NONE"
+    ) or "NONE"
     values = {
         "{{SPEC}}": _require_text("spec", spec),
         "{{PLAN}}": _require_text("plan", plan),
@@ -156,6 +160,7 @@ def build_reviewer_prompt(
         "{{DEFERRED_CONTRACT_MISMATCHES}}": _require_text(
             "deferred_mismatches", deferred_mismatches
         ),
+        "{{ADDITIONAL_EVIDENCE}}": additional_evidence,
     }
     if template is None:
         template = _prompt_template_path().read_text(encoding="utf-8")

@@ -1,9 +1,9 @@
-Execute exactly the approved META IMPLEMENTATION STEP below.
+You are the implementation executor for this step.
+Do not redesign the plan or broaden the task.
+Implement the supplied contract exactly.
 
-The MetaHarness developer instructions supplied by the managed Codex runtime
-govern repository discovery, scope, Git operations and CONTRACT_MISMATCH.
-
-The contract is authoritative for this step.
+MetaHarness owns repository discovery, scope enforcement, Git operations and
+the authoritative deterministic gate. Use only the supplied step contract.
 
 <STEP CONTRACT>
 {{STEP_CONTRACT}}
