@@ -251,6 +251,7 @@ def _revision_prompt(
     deferred_mismatches: str,
     candidate_identity: str = "",
     bounded_diff_evidence: str = "",
+    reviewer_correction_evidence: str = "NONE\n",
     diagnostics_dir: str | Path | None = None,
     budget_bytes: int = 120_000,
 ) -> str:
@@ -263,6 +264,7 @@ def _revision_prompt(
         required_checks_summary=pre_checks,
         mutable_scope=mutable_scope,
         bounded_diff_evidence=bounded_diff_evidence or "NONE\n",
+        reviewer_correction_evidence=reviewer_correction_evidence or "NONE\n",
         template=template,
         budget_bytes=budget_bytes,
     )
@@ -386,6 +388,9 @@ class RevisionRunner:
         step_results: Sequence[dict[str, Any]] = (),
         deferred_mismatches: str | None = None,
         deferred_mismatch_present: bool = False,
+        reviewer_correction_evidence: str | None = None,
+        candidate_identity: str | None = None,
+        bounded_diff_evidence: str | None = None,
         check_repair_evidence: EvidenceBundle | None = None,
         check_repair_scope: CheckRepairScope | None = None,
     ) -> tuple[Any | None, str | None]:
@@ -436,7 +441,7 @@ class RevisionRunner:
                 changed_files="\n".join(check_repair_evidence.changed_files),
                 evidence=check_repair_evidence,
                 mutable_scope=mutable_scope,
-                candidate_identity=tree_before,
+                candidate_identity=candidate_identity or tree_before,
                 budget_bytes=self.config.prompt_budget.check_repair_max_bytes,
                 diagnostics_dir=artifact_dir,
             )
@@ -489,7 +494,8 @@ class RevisionRunner:
                 # The semantic reviser can inspect the current worktree
                 # directly.  Keep the secondary diff excerpt optional so a
                 # large or adversarial diff never becomes the default prompt.
-                bounded_diff_evidence="NONE\n",
+                bounded_diff_evidence=bounded_diff_evidence or "NONE\n",
+                reviewer_correction_evidence=reviewer_correction_evidence or "NONE\n",
                 diagnostics_dir=artifact_dir,
                 budget_bytes=self.config.prompt_budget.semantic_revision_max_bytes,
             )

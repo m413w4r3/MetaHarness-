@@ -55,7 +55,9 @@ from ..approval import (
 from ..evidence import EvidenceBundle
 from ..execution_selection import (
     ExecutionSelectionError,
+    read_cycle_execution_selection,
     read_execution_selection_with_sha256,
+    validate_cycle_execution_selection,
     validate_execution_selection,
 )
 from ..gitops import (
@@ -361,13 +363,15 @@ def load_correction_plan(
 ) -> tuple[TaskPlanV2, dict[str, Any], str]:
     """Parse the durable correction plan of cycle *number* (> 1)."""
 
-    if selection.check_repair is None:
-        raise ResumeIntegrityError("correction cycles require a check-repair profile")
     directory = correction_dir(run_dir, number)
+    implementer_ids = frozenset(
+        profile.id for profile in profiles_for_config(config).values()
+        if ExecutionRole.IMPLEMENTER in profile.roles
+    )
     try:
         plan = parse_task_plan_v2(
             (directory / "planner.raw.md").read_text(encoding="utf-8"),
-            implementer_ids=frozenset({selection.check_repair.profile_id}),
+            implementer_ids=implementer_ids,
             reviewer_ids=frozenset({selection.final_reviewer.profile_id}),
             check_catalog=config.check_catalog,
             inherited_check_ids=inherited_check_ids,
@@ -379,6 +383,23 @@ def load_correction_plan(
         raise ResumeIntegrityError(f"cycle {number:03d} correction plan is unreadable: {exc}") from exc
     if plan.decision is not PlanDecision.READY:
         raise ResumeIntegrityError(f"cycle {number:03d} correction plan is not READY")
+    try:
+        cycle_selection = read_cycle_execution_selection(run_dir, number)
+        validate_cycle_execution_selection(config, cycle_selection)
+    except (ExecutionSelectionError, OSError) as exc:
+        raise ResumeIntegrityError(
+            f"cycle {number:03d} execution selection is unreadable: {exc}"
+        ) from exc
+    if [item.step_id for item in cycle_selection.steps] != [step.id for step in plan.steps]:
+        raise ResumeIntegrityError(
+            f"cycle {number:03d} execution selection does not match the plan"
+        )
+    if {
+        item.step_id: item.implementer.profile_id for item in cycle_selection.steps
+    } != {step.id: step.implementer_profile for step in plan.steps}:
+        raise ResumeIntegrityError(
+            f"cycle {number:03d} execution selection profiles do not match the plan"
+        )
     return plan, bundle, bundle_sha
 
 
@@ -466,6 +487,11 @@ def _approved_scope(
     scope = set(_plan_scope(plan))
     cycle_scopes = {1: sorted(scope)}
     for number in range(2, checkpoint.review_cycle + 1):
+        cycle = read_cycle_record(run_dir, number)
+        if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
+            # Direct semantic corrections reuse the preceding approved plan;
+            # they never create a new plan or scope authority.
+            continue
         if number == checkpoint.review_cycle and checkpoint.phase is ResumePhase.REVIEW_REPLAN:
             # The correction plan of this cycle is not an authority yet: it
             # may still await its scope approval.
@@ -493,6 +519,14 @@ def _failure_tree_for(
 
     number = checkpoint.review_cycle
     if checkpoint.phase in _STEP_PHASES:
+        if checkpoint.phase is ResumePhase.REVIEW_IMPLEMENTATION:
+            try:
+                if read_cycle_record(run_dir, number).kind is CycleKind.REVIEW_IMPLEMENTATION:
+                    return _read_tree_file(
+                        semantic_revision_dir(run_dir, number) / "tree_after_failure.txt"
+                    )
+            except ResumeIntegrityError:
+                return None
         record = _read_json_artifact(
             implementation_dir(run_dir, number) / "steps" / str(checkpoint.step_id) / "step.json",
             128 * 1024,
@@ -624,8 +658,13 @@ def validate_resume(
         read_cycle_record(run_dir, earlier)
     for earlier in range(1, number):
         read_candidate_record(run_dir, earlier)
+    current_cycle = read_cycle_record(run_dir, number) if number > 1 else RunCycle(1, CycleKind.INITIAL)
     scope = _approved_scope(config, selection, run_dir, plan, checkpoint, repair_scope)
-    if checkpoint.phase not in {ResumePhase.REVIEW_REPLAN, *_STEP_PHASES} and number > 1:
+    if (
+        checkpoint.phase not in {ResumePhase.REVIEW_REPLAN, *_STEP_PHASES}
+        and number > 1
+        and current_cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION
+    ):
         if checkpoint.correction_bundle_sha256 is None:
             _refuse("the correction checkpoint is not bound to its plan")
         _correction, _bundle, correction_sha = load_correction_plan(
@@ -633,7 +672,7 @@ def validate_resume(
         )
         if correction_sha != checkpoint.correction_bundle_sha256:
             _refuse("the correction plan changed")
-    if checkpoint.phase is ResumePhase.REVIEW_IMPLEMENTATION:
+    if checkpoint.phase is ResumePhase.REVIEW_IMPLEMENTATION and current_cycle.kind is CycleKind.REVIEW_REPLAN:
         _correction, _bundle, correction_sha = load_correction_plan(
             config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
         )

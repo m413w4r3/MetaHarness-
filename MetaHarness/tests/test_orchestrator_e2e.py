@@ -576,12 +576,12 @@ class OrchestratorE2ETests(unittest.TestCase):
     def test_revise_fail_and_empty_diff_never_publish(self) -> None:
         _, _, revise = self.run_case(review=REVISE_REVIEW, run_id="revise")
         revise_dir = self.root / "runs" / "revise"
-        self.assertEqual(revise["failure"]["reason"], "REVIEW_REVISE")
-        self.assertTrue((revise_dir / "repair_task.md").exists())
-        self.assertTrue((revise_dir / "repair_task.json").exists())
+        self.assertEqual(revise["failure"]["reason"], "REVIEW_REPAIR_EXHAUSTED")
+        self.assertFalse((revise_dir / "repair_task.md").exists())
+        self.assertFalse((revise_dir / "repair_task.json").exists())
 
         _, _, failed = self.run_case(review=FAIL_REVIEW, run_id="review-fail")
-        self.assertEqual(failed["failure"]["reason"], "REVIEW_FAIL")
+        self.assertEqual(failed["failure"]["reason"], "REVIEW_FAILED")
 
         # A worker that changes nothing is retried once, then its deferred
         # outcome has no explicit dependency contract: nothing is accepted.
@@ -663,7 +663,7 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_review_injection_through_the_diff_cannot_publish(self) -> None:
         _, llm, state = self.run_case(codex_behavior="inject", review=REVISE_REVIEW, run_id="inject")
-        self.assertEqual(state["failure"]["reason"], "REVIEW_REVISE")
+        self.assertEqual(state["failure"]["reason"], "REVIEW_REPAIR_EXHAUSTED")
         self.assertIsNone(state.get("commit_sha"))
         self.assertEqual(llm.reviewer_calls, 1)
 
@@ -781,18 +781,12 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.assertEqual(llm.reviewer_calls, 0)
         self.assertEqual(self.commits("staged-secret"), 1)
 
-    def test_revise_writes_a_complete_repair_task_and_no_commit(self) -> None:
+    def test_review_budget_exhaustion_keeps_review_evidence_and_no_commit(self) -> None:
         _, llm, _ = self.run_case(review=REVISE_REVIEW, run_id="repair")
-        repair = json.loads((self.root / "runs" / "repair" / "repair_task.json").read_text())
-        self.assertEqual(repair["route"], "IMPLEMENTATION")
-        self.assertEqual(repair["run_id"], "repair")
-        self.assertEqual(repair["required_fixes"], "Fix feature.txt.")
-        self.assertEqual(repair["missing_tests"], "Add a regression test.")
-        self.assertTrue(repair["existing_branch"].startswith("harness/"))
-        self.assertEqual(repair["existing_worktree"], str((self.root / "worktrees" / "repair").resolve()))
-        self.assertEqual(repair["review_summary"], "One correction is required.")
-        self.assertEqual(repair["findings"], "MINOR | The content needs a correction.")
-        self.assertIn("Route: IMPLEMENTATION", (self.root / "runs" / "repair" / "repair_task.md").read_text())
+        state = json.loads((self.root / "runs" / "repair" / "state.json").read_text())
+        self.assertEqual(state["failure"]["reason"], "REVIEW_REPAIR_EXHAUSTED")
+        self.assertFalse((self.root / "runs" / "repair" / "repair_task.json").exists())
+        self.assertTrue((self.root / "runs" / "repair" / "cycles/001/review/review.json").exists())
         self.assertEqual(llm.planner_calls, 1)
         self.assertEqual(llm.reviewer_calls, 1)
         self.assertEqual(self.commits("repair"), 2)

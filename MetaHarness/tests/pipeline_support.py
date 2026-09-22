@@ -105,7 +105,7 @@ def initial_plan(*steps: tuple[str, str, str], title: str = "Add the feature") -
 
 
 def correction_plan(*steps: tuple[str, str, str], title: str = "Correct the feature") -> str:
-    return plan(*steps, title=title).replace("{implementer}", "repairer")
+    return plan(*steps, title=title).replace("{implementer}", "worker")
 
 
 def review(verdict: str = "PASS", route: str = "NONE") -> str:
@@ -226,7 +226,7 @@ class PipelineHarness(unittest.TestCase):
     ) -> Any:
         path = self.root / "config.toml"
         reviser = '\ndefault_reviser_profile = "reviser"' if semantic_revision or review_repair else ""
-        repair = '\ndefault_repair_profile = "repairer"' if check_repair or review_repair else ""
+        repair = '\ndefault_repair_profile = "repairer"' if check_repair else ""
         path.write_text(f"""
 repo = {str(self.repo)!r}
 base_ref = "main"

@@ -626,6 +626,15 @@ class ExecutionSelection:
     final_reviewer: SelectedProfile
 
 
+@dataclass(frozen=True)
+class CycleExecutionSelection:
+    """Immutable implementer selections for one review-replan cycle."""
+
+    schema_version: int
+    cycle: int
+    steps: tuple[StepExecutionSelection, ...]
+
+
 class CycleKind(StrEnum):
     """Why one pipeline cycle exists; every cycle names its kind explicitly."""
 

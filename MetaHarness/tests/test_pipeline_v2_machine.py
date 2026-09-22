@@ -93,16 +93,15 @@ class SingleCycleTests(PipelineHarness):
         self.assertEqual(self.reviewer.requests, [])
         self.assertFalse((self.run_dir() / "cycles/001/candidate/commit.json").exists())
 
-    def test_review_revise_without_budget_hands_the_task_to_an_operator(self) -> None:
+    def test_review_revise_without_budget_is_exhausted_without_a_repair_task(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(
             self.config(), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "IMPLEMENTATION")],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "REVIEW_REVISE")
-        task = json.loads((self.run_dir() / "repair_task.json").read_text())
-        self.assertEqual(task["route"], "IMPLEMENTATION")
+        self.assertEqual(self.state()["failure"]["reason"], "REVIEW_REPAIR_EXHAUSTED")
+        self.assertFalse((self.run_dir() / "repair_task.json").exists())
 
 
 class CheckRepairTests(PipelineHarness):
@@ -143,52 +142,87 @@ class CheckRepairTests(PipelineHarness):
 
 
 class ReviewCorrectionCycleTests(PipelineHarness):
-    def test_review_corrections_run_generic_cycles_beyond_two(self) -> None:
+    def test_three_direct_implementation_corrections_use_reviser_only(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(
-            ExecutionRole.REPAIR,
-            write("other.txt", "second\n"), write("other.txt", "third\n"),
+            ExecutionRole.REVISER,
+            write("feature.txt", "good\n"), write("feature.txt", "good\n"),
+            write("feature.txt", "good\n"),
         )
         result = self.orchestrator(
             self.config(review_repair=3),
-            planner=[
-                initial_plan(STEP),
-                correction_plan(("S01", "other.txt", "Correct other")),
-                correction_plan(("S01", "other.txt", "Correct other again")),
-            ],
+            planner=[initial_plan(STEP)],
             reviewer=[
-                review("REVISE", "IMPLEMENTATION"), review("REVISE", "REPLAN"), review(),
+                review("REVISE", "IMPLEMENTATION"), review("REVISE", "IMPLEMENTATION"),
+                review("REVISE", "IMPLEMENTATION"), review(),
             ],
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         run_dir = self.run_dir()
         state = self.state()
-        self.assertEqual(state["cycle"], 3)
-        self.assertEqual(sorted(state["candidate"]), ["001", "002", "003"])
-        kinds = [json.loads((run_dir / f"cycles/{n:03d}/cycle.json").read_text())["kind"] for n in (1, 2, 3)]
-        self.assertEqual(kinds, ["initial", "review-implementation", "review-replan"])
-        self.assertTrue((run_dir / "cycles/002/checks/post-review-implementation/evidence.json").is_file())
-        self.assertTrue((run_dir / "cycles/003/checks/post-review-replan/evidence.json").is_file())
-        self.assertTrue((run_dir / "cycles/003/correction/implementation_bundle.json").is_file())
-        # One linear chain: BASE <- S01 <- correction 002 <- correction 003.
-        self.assertEqual(git(self.worktree(), "rev-list", "--count", "HEAD"), "4")
-        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
-        self.assertEqual(len(self.planner.requests), 3)
-        self.assertEqual([cycle["number"] for cycle in state["cycles"]], [1, 2, 3])
+        self.assertEqual(state["cycle"], 4)
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser", "reviser"])
+        self.assertEqual(len(self.planner.requests), 1)
+        self.assertEqual(len(self.reviewer.requests), 4)
+        self.assertEqual((run_dir / "cycles/002/correction/execution_selection.json").exists(), False)
 
-    def test_review_budget_bounds_the_number_of_correction_cycles(self) -> None:
+    def test_replan_uses_one_repair_planner_and_implementer_step(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        self.workers.on(ExecutionRole.REPAIR, write("other.txt", "second\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
         result = self.orchestrator(
             self.config(review_repair=1),
             planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
+            reviewer=[review("REVISE", "REPLAN"), review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+        self.assertEqual(len(self.planner.requests), 2)
+        selection = self.run_dir() / "cycles/002/correction/execution_selection.json"
+        self.assertTrue(selection.is_file())
+        self.assertEqual(json.loads(selection.read_text())["steps"][0]["implementer"]["profile_id"], "worker")
+        self.assertEqual(len(self.reviewer.requests), 2)
+
+    def test_implementation_then_replan_has_distinct_traces(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
+        result = self.orchestrator(
+            self.config(review_repair=2),
+            planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
+            reviewer=[review("REVISE", "IMPLEMENTATION"), review("REVISE", "REPLAN"), review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(len(self.planner.requests), 2)
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "implementer"])
+
+    def test_review_budget_exhaustion_is_exact(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"), write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(review_repair=2), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "IMPLEMENTATION")],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "REPAIR_EXHAUSTED")
-        self.assertEqual(len(self.reviewer.requests), 2)
-        self.assertFalse((self.run_dir() / "cycles/003").exists())
+        failure = self.state()["failure"]
+        self.assertEqual(failure["reason"], "REVIEW_REPAIR_EXHAUSTED")
+        self.assertEqual(failure["detail"]["last_review_cycle"], 3)
+        self.assertEqual(failure["detail"]["corrections_used"], 2)
+        self.assertEqual(len(self.reviewer.requests), 3)
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser"])
+
+    def test_review_budget_without_check_repair_profile_is_valid(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(review_repair=2, check_repair=0), planner=[initial_plan(STEP)],
+            reviewer=[review("REVISE", "IMPLEMENTATION"), review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        selection = json.loads((self.run_dir() / "execution_selection.json").read_text())
+        self.assertIsNone(selection["check_repair"])
+        self.assertEqual(selection["semantic_reviser"]["profile_id"], "reviser")
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
 
 
 class ScopeApprovalTests(PipelineHarness):
@@ -197,13 +231,13 @@ class ScopeApprovalTests(PipelineHarness):
         from metaharness.web.api import approve_repair_scope
 
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        self.workers.on(ExecutionRole.REPAIR, write("other.txt", "second\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
         config = self.config(review_repair=1)
         options = RunOptions.from_config(config, repair_scope_policy="require-approval")
         waiting = self.orchestrator(
             config,
             planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
-            reviewer=[review("REVISE", "IMPLEMENTATION")],
+            reviewer=[review("REVISE", "REPLAN")],
         ).run_text(SPEC, run_id="run", run_options=options)
         self.assertEqual(waiting.status, RunStatus.WAITING_SCOPE_APPROVAL)
         checkpoint = self.checkpoint()
@@ -217,7 +251,7 @@ class ScopeApprovalTests(PipelineHarness):
         self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         # The durable correction answer is reused: no second planner call.
         self.assertEqual(self.planner.requests, [])
-        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
 
 
 class SemanticRevisionTests(PipelineHarness):
@@ -331,7 +365,7 @@ class ResumeTests(PipelineHarness):
         self.assertEqual(self.reviewer.requests, [])
     def test_reviewer_transport_failure_resumes_at_the_final_review_of_its_cycle(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        self.workers.on(ExecutionRole.REPAIR, write("other.txt", "second\n"))
+        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"))
         config = self.config(review_repair=2)
         orchestrator = self.orchestrator(
             config,
@@ -348,7 +382,7 @@ class ResumeTests(PipelineHarness):
         self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.planner.requests, [])
         self.assertEqual(len(self.reviewer.requests), 1)
-        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
 
     def test_a_failed_check_repair_attempt_resumes_at_that_attempt(self) -> None:
         def timeout(request):  # the repair worker edits in scope, then times out

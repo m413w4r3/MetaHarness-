@@ -888,16 +888,17 @@ _FAILURE_MESSAGES = {
     "UNRESOLVED_CONTRACT_MISMATCH": "Deferred contract mismatch needs semantic revision or an operator",
     "STEP_WRITE_SET_VIOLATION": "Step changed an unauthorized path",
     "CHECK_REPAIR_EXHAUSTED": "Check-repair budget exhausted",
-    "REVIEW_REVISE": "Reviewer requested a correction",
+    "HUMAN_REQUIRED": "Human action required",
     "REVIEWER_TRANSPORT_FAILURE": "Reviewer could not be reached",
     "REVIEWER_OUTPUT_INVALID": "Reviewer answer is invalid",
+    "REVIEW_FAILED": "Review failed",
     "LLM_FAILURE": "Model call failed",
     "PLANNER_BLOCKED": "Planner could not safely produce a plan",
     "PUSH_FAILED": "Publication push failed",
     "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
     "RESUME_REQUIRES_OPERATOR": "Resume requires an operator",
-    "REPAIR_EXHAUSTED": "Review-correction budget exhausted",
+    "REVIEW_REPAIR_EXHAUSTED": "Review-correction budget exhausted",
     "WAITING_SCOPE_APPROVAL": "Additional repair scope needs approval",
     "REVISION_SCOPE_VIOLATION": "A repair pass needed a path outside its scope",
     "INTERRUPTED": "Run interrupted",
@@ -993,9 +994,9 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
     note = (
         "The reviewer requested a correction and the run has no review-correction budget."
-        if reason == "REVIEW_REVISE" else
+        if reason == "HUMAN_REQUIRED" else
         "Every review-correction cycle of the budget was used."
-        if reason == "REPAIR_EXHAUSTED" else ""
+        if reason == "REVIEW_REPAIR_EXHAUSTED" else ""
     )
     action = ""
     if resume.get("resumable"):

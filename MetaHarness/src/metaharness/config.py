@@ -564,33 +564,24 @@ def _validate_revision(
     profiles: Mapping[str, ModelProfile],
 ) -> None:
     """Validate role/profile presence without coupling roles to drivers."""
+    if (revision.enabled or revision.max_review_repair_cycles > 0) and planning.protocol != "v2":
+        raise ConfigError("revision corrections require planning.protocol = 'v2'")
 
-    if not revision.enabled:
-        if revision.max_check_repair_attempts <= 0 and revision.max_review_repair_cycles <= 0:
-            return
+    if revision.max_check_repair_attempts > 0:
         value = ui.default_repair_profile
-        if not profiles or not isinstance(value, str) or not value.strip():
-            raise ConfigError("revision repair budget requires ui.default_repair_profile")
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError("revision check-repair budget requires ui.default_repair_profile")
         repair = profiles.get(value)
         if repair is None or ExecutionRole.REPAIR not in repair.roles:
-            raise ConfigError("revision repair profile must resolve for repair")
-        return
-    if planning.protocol != "v2":
-        raise ConfigError("revision.enabled requires planning.protocol = 'v2'")
-    if revision.enabled:
+            raise ConfigError("revision check-repair profile must resolve for repair")
+
+    if revision.enabled or revision.max_review_repair_cycles > 0:
         value = ui.default_reviser_profile
         if not isinstance(value, str) or not value.strip():
-            raise ConfigError("revision.enabled requires ui.default_reviser_profile")
+            raise ConfigError("revision review budget requires ui.default_reviser_profile")
         reviser = profiles.get(value)
         if reviser is None or ExecutionRole.REVISER not in reviser.roles:
-            raise ConfigError("revision reviser profile must resolve for reviser")
-    if revision.max_check_repair_attempts > 0 or revision.max_review_repair_cycles > 0:
-        value = ui.default_repair_profile
-        if not isinstance(value, str) or not value.strip():
-            raise ConfigError("revision repair budget requires ui.default_repair_profile")
-        repair = profiles.get(value)
-        if repair is None or ExecutionRole.REPAIR not in repair.roles:
-            raise ConfigError("revision repair profile must resolve for repair")
+            raise ConfigError("revision semantic reviser profile must resolve for reviser")
 
 
 def _checks(value: Any, *, catalogue: bool = False) -> tuple[CheckConfig, ...]:

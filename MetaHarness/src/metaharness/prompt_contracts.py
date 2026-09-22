@@ -484,6 +484,7 @@ def build_semantic_revision_payload(
     required_checks_summary: str,
     mutable_scope: str,
     bounded_diff_evidence: str,
+    reviewer_correction_evidence: str = "NONE\n",
     template: str | None = None,
     budget_bytes: int = 120_000,
 ) -> PromptPayload:
@@ -499,6 +500,7 @@ def build_semantic_revision_payload(
         _section("required_checks_summary", required_checks_summary, True),
         _section("mutable_scope", mutable_scope, True),
         _section("bounded_diff_evidence", bounded_diff_evidence, False),
+        _section("reviewer_correction_evidence", reviewer_correction_evidence, False),
     )
     placeholders = {
         "{{SPEC}}": "spec",
@@ -508,11 +510,12 @@ def build_semantic_revision_payload(
         "{{REQUIRED_CHECKS}}": "required_checks_summary",
         "{{APPROVED_MUTABLE_SCOPE}}": "mutable_scope",
         "{{BOUNDED_DIFF_EVIDENCE}}": "bounded_diff_evidence",
+        "{{REVIEWER_CORRECTION_EVIDENCE}}": "reviewer_correction_evidence",
     }
     return _payload_from_template(
         role="semantic-reviser", template=template, sections=sections,
         placeholders=placeholders, budget_bytes=budget_bytes,
-        secondary_order=("bounded_diff_evidence", "changed_files"),
+        secondary_order=("reviewer_correction_evidence", "bounded_diff_evidence", "changed_files"),
     )
 
 

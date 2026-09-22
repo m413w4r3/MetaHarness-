@@ -196,6 +196,9 @@ class PipelineV2Operations:
     begin_cycle: Callable[[PipelineV2Context, RunCycle, bool], None]
     load_cycle: Callable[[PipelineV2Context, int], RunCycle]
     initial_plan: Callable[[PipelineV2Context], CyclePlan]
+    review_implementation_correction: Callable[
+        [PipelineV2Context, RunCycle], tuple[CyclePlan, ReviewResult]
+    ]
     plan_correction: Callable[[PipelineV2Context, RunCycle], CyclePlan]
     load_correction: Callable[[PipelineV2Context, RunCycle, str | None], CyclePlan]
     # Implementation.
@@ -203,6 +206,9 @@ class PipelineV2Operations:
     execute_step: Callable[[PipelineV2Context, CyclePlan, int], None]
     unresolved_mismatches: Callable[[PipelineV2Context, CyclePlan], bool]
     semantic_revision: Callable[[PipelineV2Context, CyclePlan], None]
+    semantic_review_correction: Callable[
+        [PipelineV2Context, CyclePlan, ReviewResult], None
+    ]
     # Deterministic gate episode.
     run_gate: Callable[[PipelineV2Context, CyclePlan, GateStage], EvidenceBundle]
     load_gate_evidence: Callable[[PipelineV2Context, int, GateStage], EvidenceBundle | None]
@@ -226,6 +232,9 @@ class PipelineV2Operations:
     ]
     record_review: Callable[[PipelineV2Context, int, ReviewResult, EvidenceBundle], None]
     request_human: Callable[[PipelineV2Context, int, ReviewResult, str], RunResult]
+    review_repair_exhausted: Callable[
+        [PipelineV2Context, int, ReviewResult, Mapping[str, Any]], RunResult
+    ]
     publish: Callable[[PipelineV2Context, int, Mapping[str, Any]], RunResult]
 
 
@@ -275,6 +284,9 @@ class PipelineV2Coordinator:
 
         if cycle.kind is CycleKind.INITIAL:
             cycle_plan = ops.initial_plan(ctx)
+            previous_review = None
+        elif cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
+            cycle_plan, previous_review = ops.review_implementation_correction(ctx, cycle)
         elif start is None or start.phase is ResumePhase.REVIEW_REPLAN:
             if start is None:
                 ops.checkpoint(
@@ -282,12 +294,19 @@ class PipelineV2Coordinator:
                     head=ops.current_head(ctx), tree=ops.candidate_tree(ctx),
                 )
             cycle_plan = ops.plan_correction(ctx, cycle)
+            previous_review = None
         else:
             cycle_plan = ops.load_correction(ctx, cycle, start.correction_bundle_sha256)
+            previous_review = None
 
         phase = (
-            ResumePhase.IMPLEMENT_STEP if cycle.kind is CycleKind.INITIAL
-            else ResumePhase.REVIEW_IMPLEMENTATION
+            ResumePhase.IMPLEMENT_STEP
+            if cycle.kind is CycleKind.INITIAL
+            else (
+                ResumePhase.SEMANTIC_REVISION
+                if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION
+                else ResumePhase.REVIEW_IMPLEMENTATION
+            )
         )
         pre_stage = (
             pre_semantic_gate_stage(cycle.kind)
@@ -299,7 +318,12 @@ class PipelineV2Coordinator:
             and cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION
         )
 
-        if start is None or start.phase is phase or start.phase is ResumePhase.REVIEW_REPLAN:
+        if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
+            if start is None or start.phase is phase:
+                self._boundary(phase, cycle_plan)
+                ops.semantic_review_correction(ctx, cycle_plan, previous_review)
+                self._boundary(ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=final_stage)
+        elif start is None or start.phase is phase or start.phase is ResumePhase.REVIEW_REPLAN:
             self._implement(cycle_plan, next_stage=pre_stage or final_stage)
         if ops.unresolved_mismatches(ctx, cycle_plan) and not semantic_enabled:
             raise PipelineFailure(
@@ -317,7 +341,7 @@ class PipelineV2Coordinator:
                 start if self._is_gate_checkpoint(start, pre_stage) else None,
             )
 
-        if semantic_enabled and (
+        if semantic_enabled and cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION and (
             start is None or start.phase in {
                 phase, ResumePhase.REVIEW_REPLAN, ResumePhase.SEMANTIC_REVISION,
             } or self._is_gate_checkpoint(start, pre_stage)
@@ -399,16 +423,33 @@ class PipelineV2Coordinator:
                 raise PipelineFailure("DETERMINISTIC_GATE_FAILED")
             return ops.publish(ctx, cycle.number, candidate)
         if review.verdict is ReviewVerdict.FAIL:
-            raise PipelineFailure("REVIEW_FAIL")
+            raise PipelineFailure(
+                "REVIEW_FAILED",
+                {
+                    "summary": review.summary,
+                    "findings": review.findings,
+                    "required_fixes": review.required_fixes,
+                    "missing_tests": review.missing_tests,
+                },
+            )
+        if review.route is ReviewRoute.HUMAN:
+            return ops.request_human(ctx, cycle.number, review, "HUMAN_REQUIRED")
         if review.route not in {ReviewRoute.IMPLEMENTATION, ReviewRoute.REPLAN}:
             return ops.request_human(ctx, cycle.number, review, "HUMAN_REQUIRED")
         budget = ctx.options.max_review_repair_cycles
-        if budget <= 0:
-            return ops.request_human(ctx, cycle.number, review, "REVIEW_REVISE")
         # Cycle 001 is the initial implementation; every later cycle spends
         # one review-repair unit of the frozen budget.
-        if cycle.number - 1 >= budget:
-            return ops.request_human(ctx, cycle.number, review, "REPAIR_EXHAUSTED")
+        corrections_used = cycle.number - 1
+        if corrections_used >= budget:
+            return ops.review_repair_exhausted(
+                ctx, cycle.number, review,
+                {
+                    "last_review_cycle": cycle.number,
+                    "corrections_used": corrections_used,
+                    "max_review_repair_cycles": budget,
+                    "last_route": review.route.value,
+                },
+            )
         return review
 
     # -- phases ----------------------------------------------------------------

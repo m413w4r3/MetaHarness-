@@ -132,8 +132,10 @@ class RunOptions:
         result.validate_profiles(config)
         if result.semantic_revision_enabled and result.semantic_reviser_profile is None:
             raise RunOptionsError("semantic revision requires a semantic reviser profile")
-        if (result.max_check_repair_attempts or result.max_review_repair_cycles) and result.check_repair_profile is None:
-            raise RunOptionsError("correction budget requires a check-repair profile")
+        if result.max_check_repair_attempts > 0 and result.check_repair_profile is None:
+            raise RunOptionsError("check-repair budget requires a check-repair profile")
+        if result.max_review_repair_cycles > 0 and result.semantic_reviser_profile is None:
+            raise RunOptionsError("review-repair budget requires a semantic reviser profile")
         return result
 
     def validate_profiles(self, config: HarnessConfig) -> None:

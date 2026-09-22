@@ -130,8 +130,12 @@ from .execution_selection import (
     SCHEMA_VERSION as EXECUTION_SELECTION_SCHEMA,
     ExecutionSelectionError,
     ensure_execution_selection,
+    ensure_cycle_execution_selection,
     read_execution_selection_with_sha256,
+    read_cycle_execution_selection,
     resolve_execution_selection,
+    resolve_cycle_execution_selection,
+    validate_cycle_execution_selection,
     validate_execution_selection,
 )
 from .models import (
@@ -1779,11 +1783,11 @@ class Orchestrator:
                 },
                 semantic_reviser_profile_id=(
                     self._run_options.semantic_reviser_profile
-                    if revision_enabled else None
+                    if revision_enabled or repair_enabled else None
                 ),
                 check_repair_profile_id=(
                     self._run_options.check_repair_profile
-                    if check_repair_enabled or repair_enabled else None
+                    if check_repair_enabled else None
                 ),
                 final_reviewer_profile_id=self._run_options.final_reviewer_profile,
             )
@@ -2081,6 +2085,7 @@ class Orchestrator:
             begin_cycle=bind(self._begin_cycle, store),
             load_cycle=lambda ctx, number: read_cycle_record(ctx.run_dir, number),
             initial_plan=self._initial_cycle_plan,
+            review_implementation_correction=self._review_implementation_correction,
             plan_correction=bind(self._plan_correction, store),
             load_correction=self._load_correction,
             completed_steps=self._completed_steps,
@@ -2089,6 +2094,7 @@ class Orchestrator:
                 self._completed_steps(ctx, plan)
             ),
             semantic_revision=bind(self._semantic_revision, store),
+            semantic_review_correction=bind(self._semantic_review_correction, store),
             run_gate=bind(self._run_gate, store),
             load_gate_evidence=lambda ctx, number, stage: _load_evidence(
                 gate_dir(ctx.run_dir, number, stage)
@@ -2106,6 +2112,7 @@ class Orchestrator:
             review_candidate=bind(self._review_candidate, store),
             record_review=bind(self._record_review, store),
             request_human=bind(self._request_human, store),
+            review_repair_exhausted=bind(self._review_repair_exhausted, store),
             publish=bind(self._publish_candidate, store),
         )
 
@@ -2157,27 +2164,90 @@ class Orchestrator:
 
         if number == 1:
             return self._initial_cycle_plan(ctx)
+        cycle = read_cycle_record(ctx.run_dir, number)
+        if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
+            previous = self._cycle_plan(ctx, number - 1)
+            return CyclePlan(
+                cycle=cycle,
+                plan=previous.plan,
+                bundle=previous.bundle,
+                contracts_dir=previous.contracts_dir,
+                step_profile_ids=previous.step_profile_ids,
+            )
         plan, bundle, bundle_sha = load_correction_plan(
             self.config, ctx.selection, ctx.run_dir, number,
             inherited_check_ids=ctx.plan.required_checks,
         )
         return self._correction_cycle_plan(
-            ctx, read_cycle_record(ctx.run_dir, number), plan, bundle, bundle_sha,
+            ctx, cycle, plan, bundle, bundle_sha, creating=False,
         )
 
-    @staticmethod
     def _correction_cycle_plan(
-        ctx: PipelineV2Context, cycle: RunCycle, plan: TaskPlanV2,
-        bundle: Mapping[str, Any], bundle_sha: str,
+        self, ctx: PipelineV2Context, cycle: RunCycle, plan: TaskPlanV2,
+        bundle: Mapping[str, Any], bundle_sha: str, *, creating: bool,
     ) -> CyclePlan:
-        if ctx.selection.check_repair is None:
-            raise PipelineFailure("CHECK_REPAIR_PROFILE_MISSING")
+        if cycle.kind is not CycleKind.REVIEW_REPLAN:
+            raise PipelineFailure("REPLAN_CYCLE_REQUIRED")
+        planned_profile_ids = {step.id: step.implementer_profile for step in plan.steps}
+        try:
+            if creating:
+                cycle_selection = ensure_cycle_execution_selection(
+                    ctx.run_dir,
+                    resolve_cycle_execution_selection(
+                        self.config, cycle=cycle.number,
+                        step_profile_ids=planned_profile_ids,
+                    ),
+                )
+            else:
+                cycle_selection = read_cycle_execution_selection(ctx.run_dir, cycle.number)
+                validate_cycle_execution_selection(self.config, cycle_selection)
+                if [item.step_id for item in cycle_selection.steps] != [step.id for step in plan.steps]:
+                    raise PipelineFailure("REPLAN_EXECUTION_SELECTION_MISMATCH")
+                if {
+                    item.step_id: item.implementer.profile_id for item in cycle_selection.steps
+                } != planned_profile_ids:
+                    raise PipelineFailure("REPLAN_EXECUTION_SELECTION_MISMATCH")
+        except (ExecutionSelectionError, OSError) as exc:
+            raise PipelineFailure("REPLAN_EXECUTION_SELECTION_INVALID", str(exc)) from exc
+        step_profile_ids = {
+            item.step_id: item.implementer.profile_id for item in cycle_selection.steps
+        }
         return CyclePlan(
             cycle=cycle, plan=plan, bundle=bundle,
             contracts_dir=correction_dir(ctx.run_dir, cycle),
-            step_profile_ids={step.id: ctx.selection.check_repair.profile_id for step in plan.steps},
+            step_profile_ids=step_profile_ids,
             correction_bundle_sha256=bundle_sha,
         )
+
+    def _review_implementation_correction(
+        self, ctx: PipelineV2Context, cycle: RunCycle,
+    ) -> tuple[CyclePlan, ReviewResult]:
+        """Load the previous candidate and reviewer report for direct correction."""
+
+        if cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION:
+            raise PipelineFailure("IMPLEMENTATION_CORRECTION_CYCLE_REQUIRED")
+        previous = cycle.number - 1
+        candidate = read_candidate_record(ctx.run_dir, previous)
+        evidence = candidate_evidence(ctx.run_dir, previous)
+        review = _accepted_review(
+            review_dir(ctx.run_dir, previous), evidence, candidate["commit_sha"]
+        ) if evidence is not None else None
+        if review is None or review.verdict is not ReviewVerdict.REVISE or review.route is not ReviewRoute.IMPLEMENTATION:
+            raise ResumeIntegrityError(
+                f"cycle {previous:03d} review did not route direct implementation correction"
+            )
+        if current_head(ctx.info.worktree) != candidate["commit_sha"]:
+            raise ResumeIntegrityError(
+                f"cycle {cycle.number:03d} does not start from the reviewed candidate"
+            )
+        previous_plan = self._cycle_plan(ctx, previous)
+        return CyclePlan(
+            cycle=cycle,
+            plan=previous_plan.plan,
+            bundle=previous_plan.bundle,
+            contracts_dir=previous_plan.contracts_dir,
+            step_profile_ids=previous_plan.step_profile_ids,
+        ), review
 
     def _approved_scope_before(self, ctx: PipelineV2Context, number: int) -> list[str]:
         """Every mutable path the plans of cycles ``1..number-1`` approved."""
@@ -2195,8 +2265,8 @@ class Orchestrator:
         previous = cycle.number - 1
         repair_dir = correction_dir(ctx.run_dir, cycle)
         repair_dir.mkdir(parents=True, exist_ok=True)
-        if ctx.selection.check_repair is None:
-            raise PipelineFailure("CHECK_REPAIR_PROFILE_MISSING")
+        if cycle.kind is not CycleKind.REVIEW_REPLAN:
+            raise PipelineFailure("REPLAN_CYCLE_REQUIRED")
         candidate = read_candidate_record(ctx.run_dir, previous)
         evidence = candidate_evidence(ctx.run_dir, previous)
         if evidence is None or evidence.staged_tree_sha != candidate["tree_sha"]:
@@ -2214,9 +2284,6 @@ class Orchestrator:
                 f"cycle {cycle.number:03d} does not start from the reviewed candidate"
             )
         tree_before = candidate_tree_sha(ctx.info.worktree)
-        repair_profile = profile_for_role(
-            self.config, ctx.selection.check_repair.profile_id, ExecutionRole.REPAIR
-        )
         reviewer_profile = profile_for_role(
             self.config, ctx.selection.final_reviewer.profile_id, ExecutionRole.REVIEWER
         )
@@ -2232,13 +2299,17 @@ class Orchestrator:
             "CHANGED_FILES": changed_paths_between_trees(ctx.repo, ctx.base_tree_sha, tree_before),
             "GIT_STATUS": status_porcelain(ctx.info.worktree),
         })
+        implementers = tuple(
+            profile for profile in profiles_for_config(self.config).values()
+            if ExecutionRole.IMPLEMENTER in profile.roles
+        )
         planner = RepairPlannerV2(
             self._planner_client or _chat_client(
                 build_llm_endpoint(planner_profile), self._runtime_environment
             ),
-            implementer_ids=frozenset({ctx.selection.check_repair.profile_id}),
+            implementer_ids=frozenset(profile.id for profile in implementers),
             reviewer_ids=frozenset({ctx.selection.final_reviewer.profile_id}),
-            implementer_profiles=(repair_profile,),
+            implementer_profiles=implementers,
             reviewer_profiles=(reviewer_profile,),
             planning=self.config.planning,
             check_catalog=self.config.check_catalog,
@@ -2315,7 +2386,9 @@ class Orchestrator:
         self._authorize_correction_scope(
             store, ctx, cycle, plan, bundle_sha, candidate["commit_sha"], review, approved_scope,
         )
-        return self._correction_cycle_plan(ctx, cycle, plan, bundle, bundle_sha)
+        return self._correction_cycle_plan(
+            ctx, cycle, plan, bundle, bundle_sha, creating=True,
+        )
 
     def _authorize_correction_scope(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle: RunCycle,
@@ -2400,7 +2473,9 @@ class Orchestrator:
         if expected_sha is None or bundle_sha != expected_sha:
             raise ResumeIntegrityError(f"cycle {cycle.number:03d} correction plan changed")
         verify_correction_scope(ctx.run_dir, cycle.number, bundle_sha, self._effective_repair_scope)
-        return self._correction_cycle_plan(ctx, cycle, plan, bundle, bundle_sha)
+        return self._correction_cycle_plan(
+            ctx, cycle, plan, bundle, bundle_sha, creating=False,
+        )
 
     def _completed_steps(self, ctx: PipelineV2Context, cycle_plan: CyclePlan) -> list[dict[str, Any]]:
         return completed_step_records(
@@ -2520,6 +2595,89 @@ class Orchestrator:
                 getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self._secrets),
             ) from exc
         if error is not None:
+            raise PipelineFailure(error)
+        self._cycle_update(
+            store, cycle_plan.cycle, status="revised",
+            semantic_revision_report=_bounded_report(result.final_message) if result else "",
+        )
+
+    def _semantic_review_correction(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
+        review: ReviewResult,
+    ) -> None:
+        """Apply one direct semantic correction requested by the reviewer.
+
+        This route deliberately has no new plan or implementation step.  The
+        reviewer report is evidence for the reviser, while the approved plan,
+        candidate commit and cumulative mutable scope remain the authorities.
+        """
+
+        if review is None or review.route is not ReviewRoute.IMPLEMENTATION:
+            raise ResumeIntegrityError("direct semantic correction has no implementation review")
+        number = cycle_plan.cycle.number
+        previous_plan = self._cycle_plan(ctx, number - 1)
+        candidate = read_candidate_record(ctx.run_dir, number - 1)
+        evidence = candidate_evidence(ctx.run_dir, number - 1)
+        if evidence is None or evidence.staged_tree_sha != candidate["tree_sha"]:
+            raise ResumeIntegrityError(f"cycle {number - 1:03d} candidate evidence is missing")
+        approved_scope = self._approved_scope_before(ctx, number)
+        code_evidence = _review_code_evidence(
+            repository_reference=ctx.repository_reference,
+            base_sha=ctx.base_sha,
+            candidate_sha=candidate["commit_sha"],
+            evidence=evidence,
+        )
+        candidate_identity = _json_text({
+            "authority": "immutable_candidate_commit",
+            "commit_sha": candidate["commit_sha"],
+            "tree_sha": candidate["tree_sha"],
+            "parent_sha": candidate["parent_sha"],
+            "repository_reference": repository_reference_dict(ctx.repository_reference),
+        })
+        reviewer_evidence = _json_text({
+            "authority": "corrective_evidence_only",
+            "scope_authority": "approved_mutable_scope",
+            "git_authority": "immutable_candidate_commit",
+            "summary": review.summary,
+            "findings": review.findings,
+            "required_fixes": review.required_fixes,
+            "missing_tests": review.missing_tests,
+            "reviewer_code_evidence": code_evidence,
+        })
+        artifact_dir = semantic_revision_dir(ctx.run_dir, number)
+        _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+        try:
+            result, error = self._run_v2_revision_cycle(
+                store=store, cycle=number, run_dir=ctx.run_dir, repo=ctx.repo,
+                base_sha=ctx.base_sha, base_tree_sha=ctx.base_tree_sha, spec=ctx.spec,
+                plan=previous_plan.plan, repository_reference=ctx.repository_reference,
+                info=ctx.info, branch_ref=ctx.branch_ref,
+                ownership_before=_git_ownership(ctx.repo, ctx.info.worktree),
+                selection=ctx.selection, artifact_dir=artifact_dir,
+                mutable_scope=approved_scope,
+                step_results=self._completed_steps(ctx, previous_plan),
+                deferred_mismatches=_deferred_contract_mismatches(
+                    previous_plan.plan, self._completed_steps(ctx, previous_plan)
+                ),
+                deferred_mismatch_present=_has_deferred_contract_mismatches(
+                    self._completed_steps(ctx, previous_plan)
+                ),
+                reviewer_correction_evidence=reviewer_evidence,
+                candidate_identity=candidate_identity,
+                bounded_diff_evidence=bounded_semantic_diff(evidence.diff, 16 * 1024)[0],
+            )
+        except AgentScopeError as exc:
+            self._redact_revision_artifacts(artifact_dir)
+            raise PipelineFailure("HUMAN_REQUIRED", redact(str(exc), self._secrets)) from exc
+        except AgentError as exc:
+            self._redact_revision_artifacts(artifact_dir)
+            _record_failure_tree(artifact_dir, ctx.info.worktree)
+            raise PipelineFailure(
+                getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self._secrets),
+            ) from exc
+        if error is not None:
+            if error in {"REVISION_SCOPE_VIOLATION", _SCOPE_REQUEST_ROUTE, AGENT_SCOPE_VIOLATION}:
+                raise PipelineFailure("HUMAN_REQUIRED", "semantic correction requested or changed a path outside approved scope")
             raise PipelineFailure(error)
         self._cycle_update(
             store, cycle_plan.cycle, status="revised",
@@ -3085,6 +3243,17 @@ class Orchestrator:
         })
         return self._v2_failed(store, ctx.run_dir, reason, None)
 
+    def _review_repair_exhausted(
+        self, store: RunStateStore, ctx: PipelineV2Context, number: int,
+        review: ReviewResult, detail: Mapping[str, Any],
+    ) -> RunResult:
+        """Persist exact review-correction exhaustion without a repair task."""
+
+        return self._v2_failed(
+            store, ctx.run_dir, "REVIEW_REPAIR_EXHAUSTED", None,
+            {**detail, "review_summary": review.summary, "findings": review.findings},
+        )
+
     def _publish_candidate(
         self, store: RunStateStore, ctx: PipelineV2Context, number: int,
         candidate: Mapping[str, Any],
@@ -3103,16 +3272,9 @@ class Orchestrator:
         )
 
     def _step_profile(self, profile_id: str) -> tuple[ModelProfile, ExecutionRole]:
-        """The approved profile of one step and the role it executes it in.
+        """The approved implementation profile of one plan step."""
 
-        Initial steps run with an implementer profile; review-driven
-        correction steps run with the frozen check-repair profile.
-        """
-
-        try:
-            return profile_for_role(self.config, profile_id, ExecutionRole.IMPLEMENTER), ExecutionRole.IMPLEMENTER
-        except ProfileError:
-            return profile_for_role(self.config, profile_id, ExecutionRole.REPAIR), ExecutionRole.REPAIR
+        return profile_for_role(self.config, profile_id, ExecutionRole.IMPLEMENTER), ExecutionRole.IMPLEMENTER
 
     def _execute_step_attempts(
         self,
