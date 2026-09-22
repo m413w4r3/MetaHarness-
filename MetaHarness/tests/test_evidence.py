@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -16,6 +17,7 @@ from metaharness.models import (  # noqa: E402
     HarnessConfig,
     LLMEndpointConfig,
 )
+from metaharness.validation import CheckResult  # noqa: E402
 
 
 def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -94,6 +96,9 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(payload["checks"][0]["stdout_tail"], "ok\n")
 
     def test_fail_timeout_and_required_mutation_close_gate(self) -> None:
+        # The gate logic is tested against explicit check results: the real
+        # process timeout and mutation detection belong to run_checks and are
+        # covered by test_validation, test_procutil and test_subprocess_adversarial.
         marker = self.repo / "mutated.txt"
         checks = (
             CheckConfig("fail", self.command("raise SystemExit(2)")),
@@ -103,8 +108,27 @@ class EvidenceTests(unittest.TestCase):
                 self.command(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')"),
             ),
         )
+
+        def result(check: CheckConfig, exit_code: int, *, timed_out: bool = False,
+                   mutated: bool = False) -> CheckResult:
+            return CheckResult(
+                name=check.name, argv=check.argv, cwd=str(self.repo), exit_code=exit_code,
+                timed_out=timed_out, duration_seconds=0.0, stdout_log="", stderr_log="",
+                stdout_tail="", stderr_tail="", workspace_mutated=mutated,
+            )
+
+        def fake_run_checks(*_args, **_kwargs) -> tuple[CheckResult, ...]:
+            # The mutating check really changes the worktree before staging.
+            marker.write_text("x", encoding="utf-8")
+            return (
+                result(checks[0], 2),
+                result(checks[1], 124, timed_out=True),
+                result(checks[2], 0, mutated=True),
+            )
+
         (self.repo / "keep.txt").write_text("change\n", encoding="utf-8")
-        bundle = collect_evidence(self.repo, self.base_sha, self.config(checks))
+        with mock.patch("metaharness.evidence.run_checks", side_effect=fake_run_checks):
+            bundle = collect_evidence(self.repo, self.base_sha, self.config(checks))
         self.assertFalse(bundle.deterministic_passed)
         self.assertIn("CHECK_FAILED:fail", bundle.failures)
         self.assertIn("CHECK_TIMEOUT:timeout", bundle.failures)

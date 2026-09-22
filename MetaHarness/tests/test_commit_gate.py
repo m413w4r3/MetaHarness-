@@ -2,6 +2,7 @@
 
 import ast
 import dataclasses
+import functools
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,16 @@ from metaharness.planning import parse_task_plan  # noqa: E402
 from metaharness.review import parse_review  # noqa: E402
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "metaharness"
+
+
+@functools.cache
+def parsed_sources() -> tuple[tuple[Path, ast.Module], ...]:
+    """Parse the production sources once for every static structure test."""
+
+    return tuple(
+        (path, ast.parse(path.read_text(encoding="utf-8")))
+        for path in sorted(SRC.rglob("*.py"))
+    )
 
 PLAN = """STATUS: READY
 TITLE: t
@@ -52,8 +63,7 @@ class CommitPathStructureTests(unittest.TestCase):
 
     def calls(self, name: str) -> list[tuple[Path, ast.Call]]:
         found = []
-        for path in SRC.rglob("*.py"):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path, tree in parsed_sources():
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call):
                     func = node.func
@@ -64,8 +74,7 @@ class CommitPathStructureTests(unittest.TestCase):
 
     def test_only_gitops_names_history_changing_git_commands(self) -> None:
         forbidden = {"commit", "commit-tree", "update-ref", "merge", "push", "reset", "rebase", "stash"}
-        for path in SRC.rglob("*.py"):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path, tree in parsed_sources():
             literals = {
                 node.value for node in ast.walk(tree)
                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
@@ -82,7 +91,7 @@ class CommitPathStructureTests(unittest.TestCase):
         path, _ = commit_calls[0]
         self.assertEqual(path.name, "orchestrator.py")
 
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = dict(parsed_sources())[path]
         execute = next(
             node for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef) and node.name == "_execute"

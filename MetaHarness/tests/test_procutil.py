@@ -1,5 +1,8 @@
+import os
+import signal
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -89,6 +92,32 @@ class BoundedProcessTests(unittest.TestCase):
         text, truncated = read_capped(self.root / "stdout", 1000)
         self.assertTrue(truncated)
         self.assertTrue(text.endswith("x" * 1000))
+
+    def test_keyboard_interrupt_kills_the_group_before_propagating(self) -> None:
+        pid_file = self.root / "grandchild.pid"
+        code = (
+            "import pathlib, subprocess, time\n"
+            "child = subprocess.Popen(['sleep', '30'])\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+            "time.sleep(30)\n"
+        )
+
+        def interrupt_once_started() -> None:
+            deadline = time.monotonic() + 10
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, previous)
+        trigger = threading.Thread(target=interrupt_once_started)
+        trigger.start()
+        started = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_code(code, 30)
+        trigger.join(timeout=10)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(process_is_gone(read_pid(pid_file)))
 
     def test_missing_executable_raises_oserror(self) -> None:
         with (self.root / "o").open("wb") as out, (self.root / "e").open("wb") as err:

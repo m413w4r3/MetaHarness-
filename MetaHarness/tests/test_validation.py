@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -34,7 +35,9 @@ def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-class ValidationTests(unittest.TestCase):
+class ValidationTestBase(unittest.TestCase):
+    """Shared repository fixture and helpers; deliberately holds no tests."""
+
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         root = Path(self.tempdir.name)
@@ -70,6 +73,8 @@ class ValidationTests(unittest.TestCase):
     def command(code: str) -> tuple[str, ...]:
         return (sys.executable, "-c", code)
 
+
+class ValidationTests(ValidationTestBase):
     def test_success_failure_and_all_checks_continue(self) -> None:
         marker = Path(self.tempdir.name) / "second-ran"
         checks = (
@@ -88,14 +93,22 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(results[0].workspace_mutated)
 
     def test_timeout_is_reported(self) -> None:
+        # Only the mapping of a bounded-process timeout onto the check result
+        # is tested here.  The real OS deadline is covered by test_procutil and
+        # by test_subprocess_adversarial (run_checks with a hanging check).
         check = CheckConfig(
             "test",
             self.command("import time; time.sleep(2)"),
             timeout_seconds=1,
         )
-        result = run_checks(self.repo, self.config((check,)))[0]
+        with mock.patch(
+            "metaharness.validation.run_bounded", return_value=(-15, True),
+        ) as bounded:
+            result = run_checks(self.repo, self.config((check,)))[0]
+        self.assertEqual(bounded.call_args.kwargs["timeout_seconds"], 1)
         self.assertTrue(result.timed_out)
         self.assertEqual(result.exit_code, 124)
+        self.assertIn("check timed out after 1s", result.stderr_log)
 
     def test_mutation_and_new_file_are_detected(self) -> None:
         check = CheckConfig(
@@ -138,7 +151,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual((output / "checks" / "logs.stderr.log").read_text(), result.stderr_log)
 
 
-class CheckAuthorityTests(ValidationTests):
+class CheckAuthorityTests(ValidationTestBase):
     """A run owning a check authority never reads argv from today's TOML."""
 
     CATALOGUE = (

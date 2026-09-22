@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import IO, Sequence
 
 _POLL_SECONDS = 0.05
+_FIRST_POLL_SECONDS = 0.001
 _LEFTOVER_GRACE_SECONDS = 1.0
 
 
@@ -50,10 +51,15 @@ def _group_alive(pgid: int) -> bool:
 
 def _wait_group_gone(pgid: int, seconds: float) -> bool:
     deadline = time.monotonic() + max(0.0, seconds)
+    # Start with a short delay and back off to _POLL_SECONDS: a group that
+    # disappears quickly is noticed quickly, a lingering one costs few probes.
+    delay = _FIRST_POLL_SECONDS
     while _group_alive(pgid):
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return False
-        time.sleep(_POLL_SECONDS)
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, _POLL_SECONDS)
     return True
 
 
@@ -100,18 +106,17 @@ def run_bounded(
     pgid = process.pid
     timed_out = False
     try:
-        deadline = time.monotonic() + timeout_seconds
-        while process.poll() is None:
-            if time.monotonic() >= deadline:
-                timed_out = True
-                _signal_group(pgid, interrupt_signal)
-                grace_deadline = time.monotonic() + max(0.0, grace_seconds)
-                while process.poll() is None and time.monotonic() < grace_deadline:
-                    time.sleep(_POLL_SECONDS)
-                if process.poll() is None:
-                    _signal_group(pgid, signal.SIGKILL)
-                break
-            time.sleep(_POLL_SECONDS)
+        # Popen.wait(timeout=...) returns as soon as the leader exits instead
+        # of paying a fixed polling interval on every short command.
+        try:
+            process.wait(timeout=max(0.0, timeout_seconds))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _signal_group(pgid, interrupt_signal)
+            try:
+                process.wait(timeout=max(0.0, grace_seconds))
+            except subprocess.TimeoutExpired:
+                _signal_group(pgid, signal.SIGKILL)
         exit_code = process.wait()
     finally:
         if process.poll() is None:

@@ -1,10 +1,13 @@
+import fcntl
 import json
+import os
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -51,10 +54,68 @@ class StateTests(unittest.TestCase):
             self.assertIsInstance(json.loads(store.path.read_text()), dict)
 
 
+class LockContentionProbe:
+    """Record, per thread name, that acquiring the state lock had to block.
+
+    Installed in place of ``fcntl.flock``: an exclusive request is first tried
+    without blocking; if the kernel reports the lock as held by another open
+    file description, the thread's event is set before the real blocking call.
+    A set event is therefore proof that the lock really excluded that thread.
+    """
+
+    def __init__(self) -> None:
+        self._real_flock = fcntl.flock
+        self._events: dict[str, threading.Event] = {}
+        self._guard = threading.Lock()
+
+    def blocked(self, thread_name: str) -> threading.Event:
+        with self._guard:
+            return self._events.setdefault(thread_name, threading.Event())
+
+    def flock(self, fd: int, operation: int) -> None:
+        if operation == fcntl.LOCK_EX:
+            try:
+                return self._real_flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.blocked(threading.current_thread().name).set()
+        return self._real_flock(fd, operation)
+
+    def install(self) -> "mock._patch":
+        return mock.patch.object(fcntl, "flock", self.flock)
+
+
+def pause_inside_lock(store: RunStateStore, thread_name: str) -> tuple[threading.Event, threading.Event]:
+    """Park *thread_name* inside its first critical section, right after load.
+
+    Every mutation of the store loads the state under the exclusive lock, so
+    the parked thread holds the lock with a stale read in hand: exactly the
+    interleaving a lost update or a resurrected status would need.
+    """
+
+    reached = threading.Event()
+    resume = threading.Event()
+    real_load = store.load
+
+    def load() -> dict:
+        state = real_load()
+        if threading.current_thread().name == thread_name and not reached.is_set():
+            reached.set()
+            resume.wait(10)
+        return state
+
+    store.load = load  # type: ignore[method-assign]
+    return reached, resume
+
+
 class StateLockingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        # These tests exercise locking and atomic replacement, not durability:
+        # skipping the disk flush keeps every interleaving and write intact.
+        fsync = mock.patch.object(os, "fsync")
+        fsync.start()
+        self.addCleanup(fsync.stop)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -73,16 +134,19 @@ class StateLockingTests(unittest.TestCase):
 
     def test_lock_excludes_other_threads_until_released(self) -> None:
         store = self.store()
+        probe = LockContentionProbe()
         finished = threading.Event()
 
         def writer() -> None:
             store.update(status=RunStatus.PLANNING, marker=True)
             finished.set()
 
-        with _exclusive_state_lock(store.lock_path):
-            thread = threading.Thread(target=writer)
+        with _exclusive_state_lock(store.lock_path), probe.install():
+            thread = threading.Thread(target=writer, name="writer")
             thread.start()
-            self.assertFalse(finished.wait(0.3))
+            # The writer really reached flock and the kernel refused it.
+            self.assertTrue(probe.blocked("writer").wait(5))
+            self.assertFalse(finished.is_set())
             self.assertEqual(store.load()["status"], "created")
         thread.join(timeout=5)
         self.assertTrue(finished.is_set())
@@ -106,48 +170,74 @@ class StateLockingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.update_if_status(RunStatus.PLANNING, status="failed")
 
-    def test_web_metadata_never_resurrects_the_approval_gate(self) -> None:
-        for iteration in range(30):
-            store = self.store(f"race-{iteration}")
-            store.update(status=RunStatus.AWAITING_PLAN_APPROVAL)
-            barrier = threading.Barrier(3)
-            observed: list[str] = []
-            done = threading.Event()
+    def run_interleaved(self, store: RunStateStore, first: tuple, second: tuple) -> dict:
+        """Park *first* inside the lock, prove *second* blocks, then release.
 
-            def orchestrator() -> None:
-                barrier.wait()
-                store.update(status=RunStatus.PLANNING, execution={"owner": "orchestrator"})
-                store.update(status=RunStatus.WORKTREE_READY, branch="harness/x")
+        Each argument is ``(thread_name, target)``; the targets' return values
+        are collected by thread name.
+        """
 
-            def web() -> None:
-                barrier.wait()
-                for _ in range(5):
-                    store.update_if_status(
-                        RunStatus.AWAITING_PLAN_APPROVAL,
-                        plan_identity={"web": True},
-                        execution={"owner": "web"},
-                    )
+        probe = LockContentionProbe()
+        reached, resume = pause_inside_lock(store, first[0])
+        results: dict[str, object] = {}
 
-            def reader() -> None:
-                barrier.wait()
-                while not done.is_set():
-                    observed.append(store.load()["status"])
+        def runner(name: str, target) -> threading.Thread:
+            thread = threading.Thread(
+                target=lambda: results.__setitem__(name, target()), name=name,
+            )
+            thread.start()
+            return thread
 
-            threads = [threading.Thread(target=target) for target in (orchestrator, web, reader)]
+        with probe.install():
+            threads = [runner(*first)]
+            self.assertTrue(reached.wait(5))
+            threads.append(runner(*second))
+            self.assertTrue(probe.blocked(second[0]).wait(5))
+            self.assertNotIn(second[0], results)
+            resume.set()
             for thread in threads:
-                thread.start()
-            threads[0].join(timeout=10)
-            threads[1].join(timeout=10)
-            done.set()
-            threads[2].join(timeout=10)
-            final = store.load()
-            self.assertEqual(final["status"], "worktree_ready")
-            self.assertEqual(final["branch"], "harness/x")
-            self.assertEqual(final["execution"], {"owner": "orchestrator"})
-            # Once the orchestrator left the gate, the gate never reappears.
-            if "planning" in observed:
-                later = observed[observed.index("planning"):]
-                self.assertNotIn("awaiting_plan_approval", later)
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+        return results
+
+    def test_web_metadata_never_resurrects_the_approval_gate(self) -> None:
+        def orchestrator() -> dict:
+            store.update(status=RunStatus.PLANNING, execution={"owner": "orchestrator"})
+            return store.update(status=RunStatus.WORKTREE_READY, branch="harness/x")
+
+        def web() -> dict | None:
+            return store.update_if_status(
+                RunStatus.AWAITING_PLAN_APPROVAL,
+                plan_identity={"web": True},
+                execution={"owner": "web"},
+            )
+
+        # The web holds the lock with the gate still open: its write is legal,
+        # and the orchestrator's later writes are merged on top of it.
+        store = self.store("web-first")
+        store.update(status=RunStatus.AWAITING_PLAN_APPROVAL)
+        results = self.run_interleaved(store, ("web", web), ("orchestrator", orchestrator))
+        self.assertIsNotNone(results["web"])
+        final = store.load()
+        self.assertEqual(final["status"], "worktree_ready")
+        self.assertEqual(final["branch"], "harness/x")
+        self.assertEqual(final["execution"], {"owner": "orchestrator"})
+        self.assertEqual(final["plan_identity"], {"web": True})
+
+        # The orchestrator holds the lock with a read of the open gate: the web
+        # must then observe the closed gate and write nothing.
+        store = self.store("orchestrator-first")
+        store.update(status=RunStatus.AWAITING_PLAN_APPROVAL)
+        results = self.run_interleaved(store, ("orchestrator", orchestrator), ("web", web))
+        self.assertIsNone(results["web"])
+        final = store.load()
+        self.assertEqual(final["status"], "worktree_ready")
+        self.assertEqual(final["branch"], "harness/x")
+        self.assertEqual(final["execution"], {"owner": "orchestrator"})
+        self.assertIsNone(final["plan_identity"])
+        # Once the orchestrator left the gate, the gate never reappears.
+        self.assertIsNone(web())
+        self.assertEqual(store.load()["status"], "worktree_ready")
 
     def test_concurrent_updates_never_lose_fields(self) -> None:
         store = self.store()
@@ -167,26 +257,23 @@ class StateLockingTests(unittest.TestCase):
                 self.assertEqual(final[f"k{index}_{item}"], item)
 
     def test_record_failure_is_not_lost_to_a_concurrent_update(self) -> None:
-        for iteration in range(30):
-            store = self.store(f"failure-{iteration}")
-            barrier = threading.Barrier(2)
-
-            def fail() -> None:
-                barrier.wait()
-                store.record_failure("AGENT_FAILED", "exit status 1")
-
-            def stale() -> None:
-                barrier.wait()
-                store.update(status=RunStatus.IMPLEMENTING, extra=iteration)
-
-            threads = [threading.Thread(target=fail), threading.Thread(target=stale)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=10)
-            final = store.load()
-            self.assertEqual(final["failure"], {"reason": "AGENT_FAILED", "detail": "exit status 1"})
-            self.assertEqual(final["extra"], iteration)
+        # Both orders of the dangerous interleaving: one writer holds a read of
+        # the state while the other must wait instead of overwriting it.
+        for order in (("fail", "stale"), ("stale", "fail")):
+            with self.subTest(first=order[0]):
+                store = self.store(f"failure-{order[0]}-first")
+                targets = {
+                    "fail": lambda: store.record_failure("AGENT_FAILED", "exit status 1"),
+                    "stale": lambda: store.update(status=RunStatus.IMPLEMENTING, extra=order[0]),
+                }
+                self.run_interleaved(
+                    store, (order[0], targets[order[0]]), (order[1], targets[order[1]]),
+                )
+                final = store.load()
+                self.assertEqual(
+                    final["failure"], {"reason": "AGENT_FAILED", "detail": "exit status 1"}
+                )
+                self.assertEqual(final["extra"], order[0])
 
     def test_record_failure_merges_fields_in_one_write(self) -> None:
         store = self.store()

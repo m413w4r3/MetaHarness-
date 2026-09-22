@@ -180,6 +180,10 @@ python -m compileall -q src tests
 python -m metaharness.cli config-check --config examples/autowork.toml
 ```
 
+`python scripts/test_parallel.py [-j N] [module ...]` exécute les mêmes tests,
+un processus par module, pour réduire le temps réel ; la commande `unittest
+discover` ci-dessus reste la référence.
+
 Pour l’architecture, les artefacts et l’exploitation, voir
 [docs/architecture.md](docs/architecture.md), [docs/artifacts.md](docs/artifacts.md)
 et [docs/runbook.md](docs/runbook.md).
