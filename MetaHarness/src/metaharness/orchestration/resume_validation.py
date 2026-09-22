@@ -18,11 +18,13 @@ from typing import (
     Mapping,
     NoReturn,
 )
-from .check_repair import _hard_failure_items, _read_check_repair_scope
+from .check_repair import (
+    _hard_failure_items,
+    gate_mutable_authority,
+)
 from .pipeline_v2 import (
     candidate_dir,
     check_repair_attempt_dir,
-    check_repair_root,
     correction_dir,
     cycle_record_path,
     gate_acceptance_path,
@@ -338,10 +340,17 @@ def candidate_evidence(run_dir: Path, number: int) -> EvidenceBundle | None:
 
 def _validate_gate_acceptance(
     run_dir: Path, number: int, stage: Any, *, tree: str | None, head: str | None,
+    base_scope: tuple[str, ...], policy: EffectiveRepairScopePolicy,
 ) -> None:
     """Require the durable accepted state for a completed gate boundary."""
 
     payload = _read_json_artifact(gate_acceptance_path(run_dir, number, stage))
+    authority = gate_mutable_authority(
+        run_dir, number, stage,
+        base_paths=base_scope,
+        policy_config=policy,
+        require_attempt_records=True,
+    )
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") != 1
@@ -354,6 +363,8 @@ def _validate_gate_acceptance(
         or payload.get("commit_sha") != head
         or payload.get("acceptance_kind") not in {"existing-head", "repair", "semantic-revision"}
         or not isinstance(payload.get("commit_created"), bool)
+        or payload.get("mutable_scope") != list(authority.effective_paths)
+        or payload.get("mutable_scope_sha256") != authority.sha256
     ):
         _refuse("the gate acceptance artifact is missing or invalid")
 
@@ -486,12 +497,16 @@ def _approved_scope(
     """Every path any durable authority of cycles ``1..n`` approved."""
 
     scope = set(_plan_scope(plan))
-    cycle_scopes = {1: sorted(scope)}
+    cycle_scopes: dict[int, tuple[str, ...]] = {1: tuple(sorted(scope))}
+    cycle_kinds: dict[int, CycleKind] = {1: CycleKind.INITIAL}
     for number in range(2, checkpoint.review_cycle + 1):
         cycle = read_cycle_record(run_dir, number)
         if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
-            # Direct semantic corrections reuse the preceding approved plan;
-            # they never create a new plan or scope authority.
+            # Direct semantic corrections reuse the preceding approved plan,
+            # while their final gate may still have its own check-repair
+            # authority.
+            cycle_scopes[number] = cycle_scopes[number - 1]
+            cycle_kinds[number] = cycle.kind
             continue
         if number == checkpoint.review_cycle and checkpoint.phase is ResumePhase.REVIEW_REPLAN:
             # The correction plan of this cycle is not an authority yet: it
@@ -501,16 +516,43 @@ def _approved_scope(
             config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
         )
         verify_correction_scope(run_dir, number, bundle_sha, policy)
-        cycle_scopes[number] = sorted(_plan_scope(correction))
+        cycle_scopes[number] = tuple(sorted(_plan_scope(correction)))
+        cycle_kinds[number] = cycle.kind
         scope |= _plan_scope(correction)
     for number, base in cycle_scopes.items():
-        root = check_repair_root(run_dir, number)
-        for scope_file in sorted(root.glob("*/attempts/*/scope.json")):
-            attempt = _read_check_repair_scope(
-                scope_file.parent, fallback_base=base, policy_config=policy,
+        kind = cycle_kinds[number]
+        stages = (
+            (final_gate_stage(kind),)
+            if kind is CycleKind.REVIEW_IMPLEMENTATION
+            else (pre_semantic_gate_stage(kind), final_gate_stage(kind))
+        )
+        for stage in dict.fromkeys(stages):
+            authority = gate_mutable_authority(
+                run_dir, number, stage,
+                base_paths=base,
+                policy_config=policy,
             )
-            scope |= set(attempt.effective_paths)
+            scope |= set(authority.effective_paths)
     return scope
+
+
+def _cycle_base_scope(
+    config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
+    plan: TaskPlanV2, number: int,
+) -> tuple[str, ...]:
+    """Return the approved plan scope which is the base for one cycle."""
+
+    current = tuple(sorted(_plan_scope(plan)))
+    for cycle_number in range(2, number + 1):
+        cycle = read_cycle_record(run_dir, cycle_number)
+        if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
+            continue
+        correction, _bundle, _bundle_sha = load_correction_plan(
+            config, selection, run_dir, cycle_number,
+            inherited_check_ids=plan.required_checks,
+        )
+        current = tuple(sorted(_plan_scope(correction)))
+    return current
 
 
 def _failure_tree_for(
@@ -715,8 +757,12 @@ def validate_resume(
                 candidate_stage = GateStage(candidate["gate_stage"])
             except (KeyError, TypeError, ValueError):
                 _refuse("the candidate gate stage is invalid")
+            cycle_base_scope = _cycle_base_scope(
+                config, selection, run_dir, plan, number,
+            )
             _validate_gate_acceptance(
                 run_dir, number, candidate_stage, tree=expected_tree, head=head,
+                base_scope=cycle_base_scope, policy=repair_scope,
             )
             if publish_remote is not None:
                 remote_tip = remote_run_branch_tip(repo, remote=publish_remote, branch=branch)

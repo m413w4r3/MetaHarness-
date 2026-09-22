@@ -223,6 +223,7 @@ from .run_options import (
 )
 from .orchestration.shared import (
     CandidatePushError,
+    CheckRepairScope,
     CommitBoundaryError,
     CycleArtifactService,
     DeferredStepExecutionOutcome,
@@ -282,7 +283,7 @@ from .orchestration.check_repair import (
     _check_repair_prompt,
     _check_repair_scope_candidates,
     _hard_integrity_failures,
-    _read_check_repair_scope,
+    gate_mutable_authority,
     _soft_check_failures,
 )
 from .orchestration.scope_repair import (
@@ -2043,11 +2044,18 @@ class Orchestrator:
         candidate_lifecycle = CandidateLifecycle(
             publish_remote=self.config.publish.remote,
             authorize_tree=self._authorize_candidate_tree,
+            gate_mutable_authority=lambda ctx, cycle_plan, stage: gate_mutable_authority(
+                ctx.run_dir, cycle_plan.cycle.number, stage,
+                base_paths=cycle_plan.mutable_scope,
+                policy_config=self._effective_repair_scope,
+                require_attempt_records=True,
+            ),
             push_tree=self._push_candidate,
             cycle_update=self._cycle_update,
         )
         gate_acceptance = GateAcceptanceService(
             secrets=self._secrets,
+            repair_scope_policy=self._effective_repair_scope,
             authorize_candidate_tree=self._authorize_candidate_tree,
             check_repair_attempts=self._check_repair_attempt_records,
             load_revision=_load_revision,
@@ -2737,14 +2745,23 @@ class Orchestrator:
         if selected is None:
             raise PipelineFailure("CHECK_REPAIR_PROFILE_MISSING")
         records = self._check_repair_attempt_records(ctx.run_dir, number, stage)
-        previous_scope = (
-            _read_check_repair_scope(
-                check_repair_attempt_dir(ctx.run_dir, number, stage, records[-1].number),
-                fallback_base=cycle_plan.mutable_scope,
+        previous_scope = None
+        if records:
+            previous_authority = gate_mutable_authority(
+                ctx.run_dir, number, stage,
+                base_paths=cycle_plan.mutable_scope,
                 policy_config=self._effective_repair_scope,
+                through_attempt=len(records),
+                require_attempt_records=True,
             )
-            if records else None
-        )
+            previous_scope = CheckRepairScope(
+                base_paths=previous_authority.base_paths,
+                added_paths=previous_authority.added_paths,
+                effective_paths=previous_authority.effective_paths,
+                policy=self._effective_repair_scope.policy,
+                bound=self._effective_repair_scope.max_added_paths,
+                source=previous_authority.source,
+            )
         soft = _soft_check_failures(evidence)
         failed_ids = tuple(item.split(":", 1)[1] for item in soft if ":" in item)
         scope = CheckRepairCoordinator(

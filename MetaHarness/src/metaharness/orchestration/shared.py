@@ -579,6 +579,17 @@ class CheckRepairScope:
     source: str
 
 
+@dataclasses.dataclass(frozen=True)
+class GateMutableAuthority:
+    """The one durable mutation authority of a gate episode."""
+
+    base_paths: tuple[str, ...]
+    added_paths: tuple[str, ...]
+    effective_paths: tuple[str, ...]
+    source: str
+    sha256: str
+
+
 
 def _status_has_unstaged_or_untracked(status: tuple[str, ...]) -> list[str]:
     problems: list[str] = []

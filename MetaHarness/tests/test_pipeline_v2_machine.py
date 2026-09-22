@@ -11,6 +11,7 @@ from unittest import mock
 from metaharness.llm.chat import LLMError
 from metaharness.config import load_config
 from metaharness.models import ExecutionRole, RunStatus
+from metaharness.run_options import RunOptions
 from tests.pipeline_support import (
     PipelineHarness,
     correction_plan,
@@ -140,6 +141,111 @@ class SingleCycleTests(PipelineHarness):
 
 
 class CheckRepairTests(PipelineHarness):
+    def _add_tracked_paths(self, *paths: str) -> None:
+        for path in paths:
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("base test\n", encoding="utf-8")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "-qm", "add test fixtures")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+
+    def test_repair_scope_is_used_by_commit_gate_and_candidate(self) -> None:
+        self._add_tracked_paths("tests/test_feature.py")
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "if pathlib.Path('feature.txt').read_text().strip() != 'good':\n"
+            "    print('tests/test_feature.py: expected fixture update', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            lambda request: (
+                (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8"),
+                (request.worktree / "tests/test_feature.py").write_text(
+                    "repaired test\n", encoding="utf-8",
+                ),
+                "repaired\n",
+            )[-1],
+        )
+        config = self.config(check_repair=2)
+        result = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        accepted = json.loads(
+            (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").read_text()
+        )
+        self.assertEqual(accepted["mutable_scope"], ["feature.txt", "tests/test_feature.py"])
+        self.assertRegex(accepted["mutable_scope_sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("tests/test_feature.py", git(self.worktree(), "show", "--format=", "--name-only", "HEAD"))
+
+    def test_repair_scope_rejects_paths_over_the_auto_bound(self) -> None:
+        self._add_tracked_paths("tests/test_feature.py", "tests/test_other.py")
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "if not (pathlib.Path('feature.txt').read_text().strip() == 'good'\n"
+            "        and pathlib.Path('tests/test_feature.py').read_text().strip() == 'repaired'\n"
+            "        and pathlib.Path('tests/test_other.py').read_text().strip() == 'repaired'):\n"
+            "    print('tests/test_feature.py tests/test_other.py', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            lambda request: (
+                (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8"),
+                (request.worktree / "tests/test_feature.py").write_text(
+                    "repaired\n", encoding="utf-8",
+                ),
+                (request.worktree / "tests/test_other.py").write_text(
+                    "repaired\n", encoding="utf-8",
+                ),
+                "repaired\n",
+            )[-1],
+        )
+        config = self.config(check_repair=1)
+        options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
+        result = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run", run_options=options)
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
+        self.assertFalse(
+            (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").exists()
+        )
+
+    def test_noop_repair_attempt_is_existing_head_not_an_empty_repair_commit(self) -> None:
+        counter = self.root / "flaky-count"
+        self.check.write_text(
+            "import pathlib, sys\n"
+            f"counter = pathlib.Path({str(counter)!r})\n"
+            "count = int(counter.read_text()) if counter.exists() else 0\n"
+            "counter.write_text(str(count + 1))\n"
+            "if count == 0:\n"
+            "    print('tests/test_feature.py: flaky failure', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REPAIR, lambda _request: "no change\n")
+        result = self.orchestrator(
+            self.config(check_repair=1), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        accepted = json.loads(
+            (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").read_text()
+        )
+        self.assertEqual(accepted["acceptance_kind"], "existing-head")
+        self.assertFalse(accepted["commit_created"])
+        self.assertEqual(git(self.worktree(), "rev-list", "--count", "HEAD"), "2")
+
     def test_red_gate_is_repaired_then_committed_as_a_repair_candidate(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
@@ -703,6 +809,30 @@ class GitChainAndTraceTests(PipelineHarness):
         self.assertTrue(
             (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").exists()
         )
+
+    def test_tampered_accepted_scope_is_rejected_before_resume_agents(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        original = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        with mock.patch(
+            "metaharness.orchestration.candidate.CandidateLifecycle.create",
+            side_effect=RuntimeError("crash after acceptance"),
+        ):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        accepted_path = self.run_dir() / "cycles/001/checks/post-implementation/accepted.json"
+        accepted = json.loads(accepted_path.read_text())
+        accepted["mutable_scope"] = ["feature.txt", "tests/test_feature.py"]
+        accepted_path.write_text(json.dumps(accepted), encoding="utf-8")
+
+        resumed = self.orchestrator(
+            self.config(), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(self.reviewer.requests, [])
 
     def test_integrity_failure_does_not_start_repair_or_review(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))

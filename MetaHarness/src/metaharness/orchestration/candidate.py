@@ -95,11 +95,13 @@ class CandidateLifecycle:
         *,
         publish_remote: str,
         authorize_tree: Callable[..., None],
+        gate_mutable_authority: Callable[..., Any],
         push_tree: Callable[..., dict[str, Any]],
         cycle_update: Callable[..., None],
     ) -> None:
         self._publish_remote = publish_remote
         self._authorize_tree = authorize_tree
+        self._gate_mutable_authority = gate_mutable_authority
         self._push_tree = push_tree
         self._cycle_update = cycle_update
 
@@ -120,11 +122,14 @@ class CandidateLifecycle:
         acceptance = _read_json_artifact(
             gate_acceptance_path(ctx.run_dir, cycle_plan.cycle, stage)
         )
+        authority = self._gate_mutable_authority(ctx, cycle_plan, stage)
         if (
             not isinstance(acceptance, dict)
             or acceptance.get("stage") != stage.value
             or acceptance.get("tree_sha") != evidence.staged_tree_sha
             or acceptance.get("commit_sha") != head
+            or acceptance.get("mutable_scope") != list(authority.effective_paths)
+            or acceptance.get("mutable_scope_sha256") != authority.sha256
         ):
             raise PipelineFailure(
                 "RESUME_INTEGRITY_FAILURE",
