@@ -73,6 +73,30 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("Do not redesign the plan or broaden the task.", payload.rendered)
         self.assertIn("Implement the supplied contract exactly.", payload.rendered)
 
+    def test_worker_output_discipline_is_bounded_and_non_narrative(self) -> None:
+        prompts = Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts"
+        expected = {
+            "implementer.txt": ("at most 8 lines", "1200 characters"),
+            "check_repair.txt": ("<= 6 lines", "800 characters"),
+            "reviser.txt": ("at most 10 lines", "1500 characters"),
+        }
+        forbidden = ("detailed report", "full explanation", "comprehensive summary")
+        for name, markers in expected.items():
+            with self.subTest(prompt=name):
+                text = (prompts / name).read_text(encoding="utf-8").casefold()
+                for marker in markers:
+                    self.assertIn(marker.casefold(), text)
+                for phrase in forbidden:
+                    self.assertNotIn(phrase, text)
+
+    def test_reviewer_pass_and_revise_output_is_compact(self) -> None:
+        text = (Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts" / "reviewer.txt").read_text(encoding="utf-8")
+        self.assertIn("Be terse.", text)
+        self.assertIn("SUMMARY <= 2 short sentences.", text)
+        self.assertIn("maximum 6 findings", text)
+        self.assertIn("maximum 6 required fixes", text)
+        self.assertIn("maximum 4 missing tests", text)
+
     def test_normal_check_repair_prompt_does_not_delegate_to_repair_planner(self) -> None:
         payload = build_check_repair_payload(
             spec="SPEC",

@@ -4,8 +4,29 @@ Do not redesign the plan or broaden the task. Implement the supplied contract ex
 MetaHarness owns discovery, scope enforcement, Git operations and the
 authoritative deterministic gate.
 
-Return a concise implementation report after editing. Do not create commits,
-move HEAD, publish, or make product decisions.
+Work silently. Do not narrate routine file reads, edits or reasoning.
+
+After completing the edits, return at most 8 lines and 1200 characters.
+Report only:
+RESULT: DONE|BLOCKED
+CHANGED: comma-separated repo-relative paths or NONE
+VERIFY: commands actually run and PASS/FAIL, or NOT_RUN
+NOTE: one short material caveat, or NONE
+
+Do not summarize the implementation.
+Do not restate the contract.
+Do not explain unchanged code.
+Do not provide a tutorial.
+
+Use targeted repository reads.
+Do not print entire large files when a symbol/range is sufficient.
+Do not run verbose test modes unless diagnosing a failure.
+Run the narrow VERIFY commands from the contract first.
+When a command fails, inspect the smallest useful failure excerpt.
+Do not repeatedly rerun a noisy full suite for diagnosis.
+MetaHarness owns the final authoritative gate.
+
+Do not create commits, move HEAD, publish, or make product decisions.
 
 META IMPLEMENTATION CONTRACT v1
 

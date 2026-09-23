@@ -258,6 +258,7 @@ from .orchestration.shared import (
     _safe_status,
     _status_has_unstaged_or_untracked,
 )
+
 from .orchestration.revision import (
     ReviewContextBuilder,
     ReviewCycleInput,
@@ -322,6 +323,15 @@ from .orchestration.resume_validation import (
     validate_resume,
     verify_correction_scope,
 )
+
+
+_OUTPUT_DISCIPLINE_TARGETS = {
+    ExecutionRole.PLANNER: "META PLAN v2 only",
+    ExecutionRole.IMPLEMENTER: "<=8 lines; <=1200 characters",
+    ExecutionRole.REPAIR: "<=6 lines; <=800 characters",
+    ExecutionRole.REVISER: "<=10 lines; <=1500 characters",
+    ExecutionRole.REVIEWER: "META REVIEW v1; terse material findings only",
+}
 
 def _chat_client(endpoint: Any, environment: Mapping[str, str]) -> OpenAIChatTextClient:
     """Construct the production client with the runtime mapping.
@@ -926,6 +936,7 @@ class Orchestrator:
         tree_before: str | None = None,
         result: Any | None = None,
         exit_reason: str | None = None,
+        final_message: str | None = None,
     ) -> dict[str, Any]:
         """Build session metadata without deriving unavailable metrics."""
 
@@ -941,6 +952,10 @@ class Orchestrator:
             except (TypeError, ValueError, AttributeError):
                 fingerprint = None
         raw_result = getattr(result, "raw_result", None) if result is not None else None
+        if final_message is None and result is not None:
+            candidate_message = getattr(result, "final_message", None)
+            if isinstance(candidate_message, str):
+                final_message = candidate_message
         raw_usage = getattr(raw_result, "usage", None) if raw_result is not None else None
         usage = raw_usage if isinstance(raw_usage, Mapping) else (
             getattr(result, "usage", None)
@@ -1009,6 +1024,11 @@ class Orchestrator:
             "finished_at": self._trace_time() if result is not None or exit_reason is not None else None,
             "wall_time_ms": round((time.perf_counter() - started_mono) * 1000) if result is not None or exit_reason is not None else None,
             "prompt_bytes": prompt_bytes,
+            "final_message_bytes": (
+                len(final_message.encode("utf-8", errors="replace"))
+                if isinstance(final_message, str) else None
+            ),
+            "output_discipline_target": _OUTPUT_DISCIPLINE_TARGETS.get(role),
             "input_tokens": metric("input_tokens"),
             "cached_input_tokens": metric("cached_input_tokens"),
             "cache_write_input_tokens": metric("cache_write_input_tokens"),
@@ -1034,6 +1054,7 @@ class Orchestrator:
         tree_before: str | None = None,
         tree_after: str | None = None,
         exit_reason: str | None = None,
+        final_message: str | None = None,
     ) -> dict[str, Any]:
         session = self._trace_session(
             profile=profile,
@@ -1045,6 +1066,7 @@ class Orchestrator:
             tree_before=tree_before,
             result=None,
             exit_reason=exit_reason,
+            final_message=final_message,
         )
         session.update(
             finished_at=self._trace_time(),
@@ -1594,6 +1616,7 @@ class Orchestrator:
                         ),
                         tree_before=resolve_tree(repo, base_sha),
                         tree_after=resolve_tree(repo, base_sha),
+                        final_message=getattr(plan, "raw", None),
                     ),
                 },
             )
@@ -2284,6 +2307,7 @@ class Orchestrator:
                     started_at=started_at, started_mono=started_mono,
                     usage=getattr(planner, "last_usage", None),
                     tree_before=tree_before, tree_after=tree_before,
+                    final_message=getattr(plan, "raw", None),
                 ),
             },
         )
@@ -3908,6 +3932,7 @@ class Orchestrator:
                     usage=reviewer_usage,
                     tree_before=evidence.staged_tree_sha,
                     tree_after=evidence.staged_tree_sha,
+                    final_message=review.raw,
                 ),
             },
         )

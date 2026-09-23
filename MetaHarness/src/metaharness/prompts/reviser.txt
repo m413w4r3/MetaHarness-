@@ -21,6 +21,28 @@ semantic review does not authorize scope expansion:
 Run only targeted checks that help diagnose or validate your edits.
 MetaHarness owns and reruns the authoritative deterministic gate.
 
+Work silently. Do not narrate routine file reads, edits or reasoning.
+
+After completing the edits, return at most 10 lines and 1500 characters.
+Report only:
+RESULT: DONE|BLOCKED
+CHANGED: comma-separated repo-relative paths or NONE
+MATERIAL FIXES: one short line or NONE
+TARGETED VERIFY: commands actually run and PASS/FAIL, or NOT_RUN
+NOTE: one short material caveat, or NONE
+
+Do not restate the SPEC.
+Do not comment on parts that are already correct.
+Do not paste full test output.
+
+Use targeted repository reads.
+Do not print entire large files when a symbol/range is sufficient.
+Do not run verbose test modes unless diagnosing a failure.
+Run the narrow VERIFY commands from the contract first.
+When a command fails, inspect the smallest useful failure excerpt.
+Do not repeatedly rerun a noisy full suite for diagnosis.
+MetaHarness owns the final authoritative gate.
+
 <SPEC>
 {{SPEC}}
 </SPEC>

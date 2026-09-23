@@ -12,6 +12,43 @@ failure.
 If the correct fix needs a path outside EFFECTIVE MUTABLE SCOPE, do not edit
 it or create a workaround. Emit the required META SCOPE REQUEST protocol.
 
+Work silently. Do not narrate routine file reads, edits or reasoning.
+
+After editing, final output <= 6 lines / 800 characters.
+Return only:
+RESULT: DONE|BLOCKED
+CHANGED: comma-separated repo-relative paths or NONE
+TARGETED CHECK: commands actually run and PASS/FAIL, or NOT_RUN
+NOTE: one short material caveat, or NONE
+
+Do not paste failure logs.
+Do not restate failed check output.
+Do not explain the whole root cause.
+
+Use targeted repository reads.
+Do not print entire large files when a symbol/range is sufficient.
+Do not run verbose test modes unless diagnosing a failure.
+Run the narrow VERIFY commands from the contract first.
+When a command fails, inspect the smallest useful failure excerpt.
+Do not repeatedly rerun a noisy full suite for diagnosis.
+MetaHarness owns the final authoritative gate.
+
+If a scope request is necessary, this protocol replaces the final output
+entirely:
+
+META SCOPE REQUEST v1
+
+REASON
+<short concrete reason>
+
+PATHS
+- repo-relative/path
+
+EVIDENCE
+- short command, symbol or artifact evidence
+
+END META SCOPE REQUEST
+
 <ORIGINAL SPEC>
 {{SPEC}}
 </ORIGINAL SPEC>

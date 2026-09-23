@@ -212,7 +212,7 @@ def build_revision_prompt(prompt: str) -> str:
         "- Read and analyze the worktree, then edit only files authorized by the implementation contract.\n"
         "- Do not create commits, move HEAD, switch branches, create or remove worktrees, or push.\n"
         "- Runtime capabilities are deliberately restricted; use only the tools exposed by MetaHarness.\n"
-        "- The harness independently reruns deterministic checks after editing; finish with a concise revision report.\n"
+        "- The harness independently reruns deterministic checks after editing; follow the bounded final-output protocol in the supplied prompt.\n"
     )
 
 

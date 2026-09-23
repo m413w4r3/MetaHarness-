@@ -156,6 +156,15 @@ class ReviewTests(unittest.TestCase):
             Reviewer(client).review(review_payload())
         self.assertEqual(len(client.prompts), 2)
 
+    def test_verbose_but_valid_review_does_not_trigger_a_retry(self):
+        verbose_pass = review_text("PASS", "NONE")
+        verbose_pass = verbose_pass.replace("SUMMARY: summary", "SUMMARY: " + ("materially valid. " * 2_000))
+        client = FakeLLMClient([verbose_pass])
+        result = Reviewer(client).review(review_payload())
+
+        self.assertEqual(result.verdict, ReviewVerdict.PASS)
+        self.assertEqual(len(client.prompts), 1)
+
     def test_conflicting_verdict_is_not_accepted(self):
         with self.assertRaisesRegex(ReviewParseError, "wire parsing failed"):
             parse_review("VERDICT: PASS\nVERDICT: REVISE\nROUTE: NONE")

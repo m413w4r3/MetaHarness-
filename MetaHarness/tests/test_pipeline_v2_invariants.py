@@ -42,6 +42,7 @@ from metaharness.gitops import (
 )
 from metaharness.models import ExecutionRole, ModelProfile, SelectionMode
 from metaharness.orchestrator import Orchestrator
+from metaharness.orchestration.resume_validation import _load_completed_step
 from metaharness.resume import pipeline_version_from_state
 from metaharness.review import parse_review
 from metaharness.run_options import RunOptions
@@ -127,6 +128,34 @@ class PipelineFixture(unittest.TestCase):
 
 
 class PipelineV2EndToEndInvariantTests(PipelineFixture):
+    def test_short_worker_report_is_not_resume_authority(self) -> None:
+        """Resume uses the structured tree/check evidence, not narration."""
+
+        step_dir = self.root / "run" / "implementation" / "steps" / "S01"
+        step_dir.mkdir(parents=True)
+        tree_before = "a" * 40
+        tree_after = "b" * 40
+        (step_dir / "step.json").write_text(json.dumps({
+            "id": "S01",
+            "status": "COMPLETED",
+            "profile_id": "test-profile",
+            "tree_before": tree_before,
+            "tree_after": tree_after,
+            "changed_paths": ["feature.txt"],
+            "usage": {"output_tokens": 1},
+        }), encoding="utf-8")
+        (step_dir / "agent.final.md").write_text("RESULT: DONE\n", encoding="utf-8")
+
+        record = _load_completed_step(step_dir, "S01")
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["final"], "RESULT: DONE\n")
+        self.assertEqual(record["tree_before"], tree_before)
+        self.assertEqual(record["tree_after"], tree_after)
+        self.assertEqual(record["changed_paths"], ["feature.txt"])
+        self.assertEqual(record["usage"]["output_tokens"], 1)
+
     def test_a_repair_and_semantic_revision_preserve_the_exact_accepted_chain(self) -> None:
         """A red attempt is evidence only; A, B, C and D are linear."""
 

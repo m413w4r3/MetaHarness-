@@ -112,10 +112,11 @@ class TraceTests(unittest.TestCase):
                 exit_reason=None,
                 tree_before="tree-before",
                 tree_after="tree-after",
-                usage=None,
+                usage={"output_tokens": 7},
                 external_session_id=None,
                 report_path=None,
                 driver="codex",
+                final_message="RESULT: DONE\nCHANGED: src/a.py\nVERIFY: NOT_RUN\nNOTE: NONE\n",
             ),
         )
         self.assertEqual(session["driver"], "codex")
@@ -125,7 +126,9 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(session["driver_version"], "local-test-driver")
         self.assertIsNone(session["input_tokens"])
         self.assertIsNone(session["cached_input_tokens"])
-        self.assertIsNone(session["output_tokens"])
+        self.assertEqual(session["output_tokens"], 7)
+        self.assertEqual(session["final_message_bytes"], 58)
+        self.assertEqual(session["output_discipline_target"], "<=8 lines; <=1200 characters")
 
 
 if __name__ == "__main__":
