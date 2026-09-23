@@ -201,6 +201,17 @@ class DoctorTests(unittest.TestCase):
                 code = main(["doctor", "--config", str(config)])
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def doctor_json(self, config: Path) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        environment = {
+            "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "BRIDGE_API_KEY": SECRET,
+        }
+        with mock.patch.dict(os.environ, environment):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = main(["doctor", "--config", str(config), "--json"])
+        return code, stdout.getvalue(), stderr.getvalue()
+
     def test_pass_probes_sandbox_and_bridge_without_leaking_or_calling_models(self) -> None:
         code, out, err = self.doctor(self.config())
         self.assertEqual(code, 0, err)
@@ -216,6 +227,37 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(record["codex_home"], str((self.root / "codex-home").resolve()))
         self.assertFalse(record["has_key"])
         self.assertEqual(self.bridge.requests, [("GET", "/health", None)])
+
+    def test_json_report_is_one_document_and_redacts_credentials(self) -> None:
+        code, out, err = self.doctor_json(self.config())
+        report = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["summary"]["failed"], 0)
+        self.assertGreater(report["summary"]["passed"], 0)
+        self.assertNotIn(SECRET, out)
+        self.assertNotIn("BRIDGE_API_KEY", out)
+        self.assertNotIn("doctor: PASS\n", out)
+
+    def test_json_failure_has_failed_check_and_nonzero_exit(self) -> None:
+        self.mode.write_text("fail", encoding="utf-8")
+        code, out, err = self.doctor_json(self.config())
+        report = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        self.assertFalse(report["ok"])
+        self.assertGreater(report["summary"]["failed"], 0)
+        self.assertTrue(any(check["status"] == "fail" for check in report["checks"]))
+        self.assertNotIn(SECRET, out)
+
+    def test_text_output_remains_historical_without_json_flag(self) -> None:
+        code, out, err = self.doctor(self.config())
+        self.assertEqual(code, 0, err)
+        self.assertTrue(out.startswith("config: "))
+        self.assertIn("OK env BRIDGE_API_KEY: usable", out)
+        self.assertTrue(out.endswith("doctor: PASS\n"))
+        self.assertFalse(out.lstrip().startswith("{"))
 
     def test_no_codex_profile_skips_every_codex_probe(self) -> None:
         path = self.config()

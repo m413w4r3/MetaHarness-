@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import http.client
 import json
 import re
@@ -12,6 +13,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -775,6 +777,118 @@ def _doctor(config_path: Path) -> int:
     return 0
 
 
+_DOCTOR_CREDENTIAL_NAME = re.compile(
+    r"\b[A-Z][A-Z0-9_]*(?:API_KEY|ACCESS_TOKEN|OAUTH_TOKEN|TOKEN)\b"
+)
+
+
+def _doctor_json(config_path: Path) -> int:
+    """Run the regular doctor once and serialize its bounded output as JSON."""
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        exit_code = _doctor(config_path)
+
+    secrets: tuple[str, ...] = ()
+    credential_names: set[str] = set()
+    try:
+        config = load_config(config_path)
+    except ConfigError:
+        pass
+    else:
+        names = {
+            profile.api_key_env
+            for profile in config.model_profiles.values()
+            if profile.api_key_env
+        }
+        names.update(
+            provider.api_key_env
+            for provider in config.codex_providers.values()
+            if provider.api_key_env
+        )
+        if config.github.api_key_env:
+            names.add(config.github.api_key_env)
+        credential_names = names | {
+            name for name in config.runtime_environment
+            if _DOCTOR_CREDENTIAL_NAME.fullmatch(name)
+            or re.search(r"(?i)(?:secret|credential)", name)
+        }
+        # Doctor output should never contain these values, but redact again at
+        # the serialization boundary so future diagnostics cannot leak them.
+        secrets = tuple(
+            value for name in names
+            if (value := config.runtime_environment.get(name))
+        ) + tuple(
+            value for name in credential_names - names
+            if (value := config.runtime_environment.get(name))
+        )
+
+    def safe_message(message: str) -> str:
+        message = redact(message, secrets)
+        for name in credential_names:
+            message = message.replace(name, "credential")
+        return _DOCTOR_CREDENTIAL_NAME.sub("credential", message)
+
+    checks: list[dict[str, str]] = []
+    for line in stdout.getvalue().splitlines():
+        if line.startswith("OK "):
+            message = safe_message(line[3:])
+            if message.startswith("env credential:"):
+                message = "required credential is usable"
+                check_id = "credentials"
+            else:
+                check_id = _doctor_check_id(message, len(checks) + 1)
+            checks.append({"id": check_id, "status": "pass", "message": message})
+        elif line == "codex: no codex profile configured":
+            checks.append({
+                "id": "codex-profile", "status": "pass",
+                "message": "no Codex profile configured",
+            })
+
+    for line in stderr.getvalue().splitlines():
+        if not line.startswith("error: "):
+            continue
+        message = safe_message(line[7:])
+        if message.startswith("required env credential is missing or invalid"):
+            message = "required credential is missing or invalid"
+            check_id = "credentials"
+        elif exit_code == 2 and not checks:
+            check_id = "config"
+        else:
+            check_id = _doctor_check_id(message, len(checks) + 1)
+        checks.append({"id": check_id, "status": "fail", "message": message})
+
+    id_counts: dict[str, int] = {}
+    for check in checks:
+        base_id = check["id"]
+        id_counts[base_id] = id_counts.get(base_id, 0) + 1
+        if id_counts[base_id] > 1:
+            check["id"] = f"{base_id}-{id_counts[base_id]}"
+
+    report = {
+        "ok": exit_code == 0,
+        "checks": checks,
+        "summary": {
+            "passed": sum(check["status"] == "pass" for check in checks),
+            "failed": sum(check["status"] == "fail" for check in checks),
+            "warnings": sum(check["status"] == "warning" for check in checks),
+        },
+    }
+    # ASCII output is also valid UTF-8 and avoids dependence on the terminal's
+    # locale when paths or diagnostics contain non-ASCII characters.
+    sys.stdout.write(json.dumps(report, ensure_ascii=True, indent=2) + "\n")
+    return exit_code
+
+
+def _doctor_check_id(message: str, ordinal: int) -> str:
+    if message.startswith("env "):
+        return "credentials"
+    label = message.split(":", 1)[0]
+    slug = re.sub(r"[^a-z0-9]+", "-", label.casefold()).strip("-")[:80]
+    return slug or f"check-{ordinal}"
+
+
 def _web(
     config_path: Path,
     port: int,
@@ -821,6 +935,7 @@ def build_parser() -> argparse.ArgumentParser:
     diagnostics.add_argument("--stdout", action="store_true", help="write the report to stdout")
     doctor = subparsers.add_parser("doctor", help="check local prerequisites")
     doctor.add_argument("--config", required=True, type=Path)
+    doctor.add_argument("--json", action="store_true", help="write a structured JSON report")
     approve = subparsers.add_parser(
         "approve-plan", help="approve the exact plan for a waiting run"
     )
@@ -853,7 +968,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "diagnostics":
         return _diagnostics(args.config, args.target, stdout=args.stdout)
     if args.command == "doctor":
-        return _doctor(args.config)
+        return _doctor_json(args.config) if args.json else _doctor(args.config)
     if args.command == "approve-plan":
         return _write_plan_decision(args.run, ApprovalDecision.APPROVE)
     if args.command == "reject-plan":
