@@ -83,6 +83,8 @@ class WebServerTests(unittest.TestCase):
         connection.request(method, path, body=encoded, headers=headers)
         response = connection.getresponse()
         content = response.read()
+        self.last_content_type = response.getheader("Content-Type", "")
+        self.last_location = response.getheader("Location")
         connection.close()
         return response.status, json.loads(content) if content else None, content
 
@@ -92,6 +94,122 @@ class WebServerTests(unittest.TestCase):
         store.initialize(run_id)
         store.update(status=status, planning_protocol="v2")
         return run_dir
+
+    def test_v1_get_routes_are_json_and_delegate_to_existing_api(self) -> None:
+        with (
+            patch("metaharness.web.server.model_profiles", return_value={"profiles": []}) as profiles,
+            patch("metaharness.web.server.list_runs", return_value=[{"run_id": "r1"}]) as runs,
+            patch("metaharness.web.server.get_run", return_value={"run_id": "r1"}) as get_run,
+            patch("metaharness.web.server.live_status", return_value={"status": "created"}) as live,
+            patch("metaharness.web.server.progress", return_value={"next_offset": 4}) as progress,
+        ):
+            cases = (
+                ("/api/v1/health", 200),
+                ("/api/v1/model-profiles", 200),
+                ("/api/v1/runs", 200),
+                ("/api/v1/runs/r1", 200),
+                ("/api/v1/runs/r1/live", 200),
+                ("/api/v1/runs/r1/progress?offset=3", 200),
+            )
+            for path, expected_status in cases:
+                with self.subTest(path=path):
+                    status, payload, raw = self.request("GET", path)
+                    self.assertEqual(status, expected_status)
+                    self.assertTrue(raw)
+                    self.assertIn("application/json", self.last_content_type)
+                    self.assertIsNone(self.last_location)
+                    self.assertIsInstance(payload, dict)
+            profiles.assert_called_once_with(self.config)
+            runs.assert_called_once_with(self.runs)
+            get_run.assert_called_once_with(self.runs, "r1", config=self.config)
+            live.assert_called_once_with(self.runs, "r1", self.config)
+            progress.assert_called_once_with(self.runs, "r1", 3)
+
+    def test_v1_get_rejects_bad_offsets_and_run_ids_as_json(self) -> None:
+        for path, status_expected in (
+            ("/api/v1/runs/r1/progress?offset=-1", 400),
+            ("/api/v1/runs/r1/progress?offset=1&offset=2", 400),
+            ("/api/v1/runs/%2e%2e", 400),
+        ):
+            with self.subTest(path=path):
+                status, payload, raw = self.request("GET", path)
+                self.assertEqual(status, status_expected)
+                self.assertEqual(set(payload), {"error", "message"})
+                self.assertTrue(raw)
+
+    def test_v1_post_routes_authenticate_and_return_json_without_redirects(self) -> None:
+        with (
+            patch("metaharness.web.server.create_run", return_value={"run_id": "new", "location": "/runs/new"}) as create,
+            patch("metaharness.web.server.approve_run", return_value={"decision": "REJECT"}) as approve,
+            patch("metaharness.web.server.approve_repair_scope", return_value={"decision": "APPROVE"}) as scope,
+            patch("metaharness.web.server.resume_run_request", return_value={"run_id": "r1", "location": "/runs/r1"}) as resume,
+            patch("metaharness.web.server.recover_plan_request", return_value={"run_id": "r1", "location": "/runs/r1"}) as recover,
+        ):
+            mutations = (
+                ("/api/v1/runs", {"spec": "spec", "run_id": "new", "planner_profile": "planner"}),
+                ("/api/v1/runs/r1/approval", {"decision": "REJECT"}),
+                ("/api/v1/runs/r1/scope-approval", {"decision": "APPROVE"}),
+                ("/api/v1/runs/r1/resume", {}),
+                ("/api/v1/runs/r1/recover-plan", {"plan": "META PLAN v2\n"}),
+            )
+            for path, body in mutations:
+                with self.subTest(path=path):
+                    status, payload, raw = self.request("POST", path, body, self.server.token)
+                    self.assertIn(status, (200, 202))
+                    self.assertTrue(raw)
+                    self.assertIn("application/json", self.last_content_type)
+                    self.assertIsNone(self.last_location)
+                    self.assertIsInstance(payload, dict)
+                    if status == 202:
+                        self.assertTrue(payload["accepted"])
+            self.assertEqual(create.call_args.kwargs["run_id"], "new")
+            approve.assert_called_once()
+            scope.assert_called_once_with(self.runs, "r1", "APPROVE")
+            resume.assert_called_once_with(self.server.run_manager, self.runs, "r1")
+            recover.assert_called_once_with(self.server.run_manager, self.runs, "r1", "META PLAN v2\n")
+
+    def test_v1_mutations_reject_missing_token_unknown_fields_and_nonempty_resume(self) -> None:
+        requests = (
+            ("/api/v1/runs", {"spec": "spec"}),
+            ("/api/v1/runs/r1/approval", {"decision": "REJECT"}),
+            ("/api/v1/runs/r1/scope-approval", {"decision": "REJECT"}),
+            ("/api/v1/runs/r1/resume", {}),
+            ("/api/v1/runs/r1/recover-plan", {"plan": "x"}),
+        )
+        for path, body in requests:
+            with self.subTest(path=path):
+                status, payload, _ = self.request("POST", path, body)
+                self.assertEqual(status, 403)
+                self.assertEqual(set(payload), {"error", "message"})
+        status, payload, _ = self.request(
+            "POST", "/api/v1/runs", {"spec": "x", "arbitrary": True}, self.server.token
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(set(payload), {"error", "message"})
+
+    def test_v1_invalid_mutation_payloads_and_unsupported_methods_stay_json(self) -> None:
+        cases = (
+            ("/api/v1/runs/r1/approval", {"decision": "REJECT", "unexpected": 1}),
+            ("/api/v1/runs/r1/scope-approval", {"decision": "MAYBE"}),
+            ("/api/v1/runs/r1/recover-plan", {"plan": 1}),
+        )
+        for path, body in cases:
+            with self.subTest(path=path):
+                status, payload, _ = self.request("POST", path, body, self.server.token)
+                self.assertEqual(status, 400)
+                self.assertIn("application/json", self.last_content_type)
+                self.assertIsNone(self.last_location)
+                self.assertEqual(set(payload), {"error", "message"})
+        status, payload, raw = self.request("PUT", "/api/v1/runs")
+        self.assertEqual(status, 501)
+        self.assertTrue(raw)
+        self.assertIn("application/json", self.last_content_type)
+        self.assertEqual(set(payload), {"error", "message"})
+        status, payload, _ = self.request(
+            "POST", "/api/v1/runs/r1/resume", {"unexpected": True}, self.server.token
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(set(payload), {"error", "message"})
 
     def test_list_and_run_and_missing_artifacts(self) -> None:
         run_dir = self.create_run("run-1")

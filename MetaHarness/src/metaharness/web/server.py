@@ -223,6 +223,18 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
         # server logs, and the UI is intended for a local operator.
         return
 
+    def send_error(
+        self, code: int, message: str | None = None, explain: str | None = None
+    ) -> None:
+        # BaseHTTPRequestHandler emits HTML for unsupported methods and parse
+        # errors. Keep even those responses JSON under the versioned API prefix.
+        path = urlsplit(getattr(self, "path", "")).path
+        if path == "/api/v1" or path.startswith("/api/v1/"):
+            detail = message or "request could not be served"
+            self._json(code, {"error": "request_error", "message": detail})
+            return
+        super().send_error(code, message, explain)
+
     def _send(
         self, status: int, body: bytes, content_type: str, *, csp: str = _API_CSP
     ) -> None:
@@ -286,6 +298,34 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "control_api": True,
                 })
+                return
+            if parsed.path == "/api/v1/model-profiles":
+                self._json(200, model_profiles(self.server.config))
+                return
+            if parsed.path == "/api/v1/runs":
+                self._json(200, {"runs": list_runs(root)})
+                return
+            if len(parts) == 5 and parts[1:4] == ["api", "v1", "runs"]:
+                run_id = self._run_id(parts[4])
+                self._json(200, get_run(root, run_id, config=self.server.config))
+                return
+            if (
+                len(parts) == 6
+                and parts[1:4] == ["api", "v1", "runs"]
+                and parts[5] == "live"
+            ):
+                self._json(200, live_status(root, self._run_id(parts[4]), self.server.config))
+                return
+            if (
+                len(parts) == 6
+                and parts[1:4] == ["api", "v1", "runs"]
+                and parts[5] == "progress"
+            ):
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                values = query.get("offset", ["0"])
+                if len(values) != 1 or not values[0].isdigit():
+                    raise WebAPIError(400, "offset must be a non-negative integer")
+                self._json(200, progress(root, self._run_id(parts[4]), int(values[0])))
                 return
             if parsed.path == "/":
                 nonce = secrets.token_urlsafe(18)
@@ -443,6 +483,92 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 )
             )
             self._check_origin(allow_opaque=html_form_route)
+            if parts == ["", "api", "v1", "runs"]:
+                self._authorized_api()
+                payload = self._body()
+                allowed = {
+                    "spec", "run_id", "planner_profile", "mechanical_profile",
+                    "reasoning_profile", "agentic_profile", "final_reviewer_profile",
+                    "semantic_reviser_profile", "check_repair_profile",
+                    "semantic_revision_enabled", "max_check_repair_attempts",
+                    "max_review_repair_cycles", "decomposition", "execution_mode_policy",
+                    "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
+                    "repair_scope_policy", "repair_scope_max_added_paths",
+                }
+                if set(payload) - allowed:
+                    raise WebAPIError(400, "unknown request field")
+                result = create_run(
+                    self.server.run_manager,
+                    spec=payload.get("spec"), run_id=payload.get("run_id"),
+                    planner_profile=payload.get("planner_profile"),
+                    mechanical_profile=payload.get("mechanical_profile"),
+                    reasoning_profile=payload.get("reasoning_profile"),
+                    agentic_profile=payload.get("agentic_profile"),
+                    final_reviewer_profile=payload.get("final_reviewer_profile"),
+                    semantic_reviser_profile=payload.get("semantic_reviser_profile"),
+                    check_repair_profile=payload.get("check_repair_profile"),
+                    semantic_revision_enabled=payload.get("semantic_revision_enabled"),
+                    max_check_repair_attempts=payload.get("max_check_repair_attempts"),
+                    max_review_repair_cycles=payload.get("max_review_repair_cycles"),
+                    decomposition=payload.get("decomposition"),
+                    execution_mode_policy=payload.get("execution_mode_policy"),
+                    single_step_max_mutable_paths=payload.get("single_step_max_mutable_paths"),
+                    staged_step_max_mutable_paths=payload.get("staged_step_max_mutable_paths"),
+                    repair_scope_policy=payload.get("repair_scope_policy"),
+                    repair_scope_max_added_paths=payload.get("repair_scope_max_added_paths"),
+                )
+                self._json(202, {**result, "accepted": True})
+                return
+            if len(parts) == 6 and parts[1:4] == ["api", "v1", "runs"]:
+                run_id = self._run_id(parts[4])
+                action = parts[5]
+                self._authorized_api()
+                if action == "resume":
+                    payload = self._body()
+                    if payload:
+                        raise WebAPIError(400, "resume body must be an empty JSON object")
+                    result = resume_run_request(
+                        self.server.run_manager, self.server.config.runs_root, run_id
+                    )
+                    self._json(202, {**result, "accepted": True})
+                    return
+                if action == "recover-plan":
+                    payload = self._body(max_bytes=_MAX_RECOVERY_BODY_BYTES)
+                    if set(payload) != {"plan"} or not isinstance(payload.get("plan"), str):
+                        raise WebAPIError(400, "body must contain exactly one plan string")
+                    result = recover_plan_request(
+                        self.server.run_manager, self.server.config.runs_root,
+                        run_id, payload["plan"],
+                    )
+                    self._json(202, {**result, "accepted": True})
+                    return
+                if action == "scope-approval":
+                    payload = self._body()
+                    if set(payload) != {"decision"} or not isinstance(
+                        payload.get("decision"), str
+                    ):
+                        raise WebAPIError(400, "decision must be APPROVE or REJECT")
+                    self._json(200, approve_repair_scope(
+                        self.server.config.runs_root, run_id, payload["decision"]
+                    ))
+                    return
+                if action == "approval":
+                    payload = self._body()
+                    decision = payload.get("decision")
+                    if not isinstance(decision, str):
+                        raise WebAPIError(400, "decision must be APPROVE or REJECT")
+                    allowed = {"decision"} if decision == "REJECT" else (
+                        {"decision"} | _APPROVAL_PROFILE_FIELDS | _step_profile_fields(root / run_id)
+                    )
+                    if set(payload) - allowed:
+                        raise WebAPIError(400, "unknown approval field")
+                    result = approve_run(
+                        self.server.config.runs_root, run_id, decision,
+                        config=self.server.config, **_approval_profiles(payload),
+                    )
+                    self._json(200, result)
+                    return
+                raise WebAPIError(404, "not found")
             if parts == ["", "api", "runs"]:
                 self._authorized_api()
                 payload = self._body()

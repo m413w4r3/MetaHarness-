@@ -552,3 +552,24 @@ The locator is advisory and never supplies source truth: context is read from
 the resolved base commit. Nested repository instruction files are loaded when
 the locator identifies code in their scope. A fenced code block in a planner
 or reviewer response is treated as data, not as metadata.
+
+## Versioned JSON API
+
+The stable v1 routes are available alongside the historical `/api/...` routes:
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| GET | `/api/v1/health` | Service and API version status |
+| GET | `/api/v1/model-profiles` | Configured model profiles |
+| GET | `/api/v1/runs` | Run summaries |
+| GET | `/api/v1/runs/<run_id>` | Run details |
+| GET | `/api/v1/runs/<run_id>/live` | Current live status |
+| GET | `/api/v1/runs/<run_id>/progress?offset=N` | Bounded progress events |
+| POST | `/api/v1/runs` | Create a run |
+| POST | `/api/v1/runs/<run_id>/approval` | Approve or reject a plan |
+| POST | `/api/v1/runs/<run_id>/scope-approval` | Approve or reject repair scope |
+| POST | `/api/v1/runs/<run_id>/resume` | Resume a run with body `{}` |
+| POST | `/api/v1/runs/<run_id>/recover-plan` | Replace a failed planner answer |
+
+POST routes require `X-MetaHarness-Token`; requests and errors use JSON. The
+create, resume and recover-plan routes return `202 Accepted` on success.
