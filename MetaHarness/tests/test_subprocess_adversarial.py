@@ -242,7 +242,12 @@ class CheckProcessTests(TempRepoCase):
         config = self.config(
             self.check("formatter", "open('tracked.txt', 'a').write('fmt\\n')", required=False)
         )
-        bundle = collect_evidence(self.repo, self.base, config)
+        bundle = collect_evidence(
+            self.repo,
+            self.base,
+            config,
+            required_check_ids=("formatter",),
+        )
         self.assertIn("CHECK_MUTATED:formatter", bundle.failures)
         self.assertFalse(bundle.deterministic_passed)
 
