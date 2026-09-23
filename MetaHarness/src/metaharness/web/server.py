@@ -27,6 +27,7 @@ from .api import (
     approve_run,
     approve_repair_scope,
     create_run,
+    get_artifact,
     get_run,
     list_runs,
     live_status,
@@ -315,6 +316,21 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/v1/runs":
                 self._json(200, {"runs": list_runs(root)})
+                return
+            if (
+                len(parts) == 6
+                and parts[1:4] == ["api", "v1", "runs"]
+                and parts[5] == "artifact"
+            ):
+                # Artifact names are protocol identifiers, so do not URL-decode
+                # them. Encoded traversal and encoded allowlist names fail closed.
+                fields = parsed.query.split("&") if parsed.query else []
+                if len(fields) != 1 or not fields[0].startswith("name="):
+                    raise WebAPIError(400, "exactly one artifact name is required")
+                name = fields[0][len("name="):]
+                if not name:
+                    raise WebAPIError(400, "exactly one artifact name is required")
+                self._json(200, get_artifact(root, self._run_id(parts[4]), name))
                 return
             if len(parts) == 5 and parts[1:4] == ["api", "v1", "runs"]:
                 run_id = self._run_id(parts[4])

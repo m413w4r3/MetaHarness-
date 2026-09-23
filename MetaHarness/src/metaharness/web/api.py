@@ -130,6 +130,7 @@ MAX_SPEC_BYTES = 48 * 1024
 MAX_DIAGNOSTIC_TAIL_BYTES = 32 * 1024
 MAX_DIFF_BYTES = 64 * 1024
 MAX_RESULT_BYTES = 128 * 1024
+MAX_ARTIFACT_READ_BYTES = 512 * 1024
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
@@ -275,6 +276,50 @@ def _artifact_path(run_dir: Path, name: str) -> Path:
     if name not in ARTIFACT_ALLOWLIST and _CYCLE_ARTIFACT.fullmatch(name) is None:
         raise ValueError("artifact is not allowlisted")
     return run_dir / name
+
+
+def get_artifact(runs_root: Path, run_id: str, name: str) -> dict[str, Any]:
+    """Read one allowlisted artifact with a fixed memory bound.
+
+    Missing artifacts return ``exists=False``, ``size=0`` and ``content=None``.
+    Oversized files return their UTF-8 tail.
+    """
+
+    directory = _run_dir(runs_root, run_id)
+    safe_id = validate_run_id(run_id)
+    try:
+        path = _artifact_path(directory, name)
+    except ValueError as exc:
+        raise WebAPIError(404, "artifact not found") from exc
+    # The allowlist controls names; also prevent symlinks from escaping a run.
+    try:
+        if not path.resolve().is_relative_to(directory.resolve()):
+            raise WebAPIError(404, "artifact not found")
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return {
+            "run_id": safe_id, "name": name, "exists": False,
+            "encoding": "utf-8", "content": None, "truncated": False, "size": 0,
+        }
+    except OSError as exc:
+        raise WebAPIError(503, "artifact is temporarily unavailable") from exc
+
+    truncated = size > MAX_ARTIFACT_READ_BYTES
+    content = (
+        _tail_text(path, MAX_ARTIFACT_READ_BYTES)
+        if truncated else _load_text_bounded(path, MAX_ARTIFACT_READ_BYTES)
+    )
+    if content is None:
+        if not path.exists():
+            return {
+                "run_id": safe_id, "name": name, "exists": False,
+                "encoding": "utf-8", "content": None, "truncated": False, "size": 0,
+            }
+        raise WebAPIError(503, "artifact is temporarily unavailable")
+    return {
+        "run_id": safe_id, "name": name, "exists": True,
+        "encoding": "utf-8", "content": content, "truncated": truncated, "size": size,
+    }
 
 
 def _state_summary(run_id: str, state: dict[str, Any]) -> dict[str, Any]:

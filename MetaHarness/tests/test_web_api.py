@@ -199,6 +199,69 @@ class WebServerTests(unittest.TestCase):
                 self.assertEqual(set(payload), {"error", "message"})
                 self.assertTrue(raw)
 
+    def test_artifact_endpoint_reads_allowlisted_files_with_a_bound(self) -> None:
+        run_dir = self.create_run("r1")
+        (run_dir / "reviewer.raw.md").write_text("review text", encoding="utf-8")
+        (run_dir / "trace").mkdir()
+        (run_dir / "trace" / "events.v1.jsonl").write_text(
+            "event one\nevent two\n", encoding="utf-8"
+        )
+
+        status, payload, _ = self.request(
+            "GET", "/api/v1/runs/r1/artifact?name=reviewer.raw.md"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["name"], "reviewer.raw.md")
+        self.assertTrue(payload["exists"])
+        self.assertEqual(payload["content"], "review text")
+        self.assertFalse(payload["truncated"])
+        self.assertEqual(payload["size"], len("review text"))
+
+        status, missing, _ = self.request(
+            "GET", "/api/v1/runs/r1/artifact?name=review.json"
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(missing["exists"])
+        self.assertIsNone(missing["content"])
+
+        (run_dir / "planner.raw.md").write_text("0123456789", encoding="utf-8")
+        with patch.object(api, "MAX_ARTIFACT_READ_BYTES", 5):
+            status, truncated, _ = self.request(
+                "GET", "/api/v1/runs/r1/artifact?name=planner.raw.md"
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(truncated["truncated"])
+        self.assertEqual(truncated["content"], "56789")
+        self.assertEqual(truncated["size"], 10)
+
+    def test_artifact_endpoint_rejects_traversal_and_encoded_names(self) -> None:
+        self.create_run("r1")
+        for name in (
+            "../etc/passwd",
+            "../../state.json",
+            "%2e%2e/",
+            "cycles/../../state.json",
+        ):
+            with self.subTest(name=name):
+                status, payload, raw = self.request(
+                    "GET", f"/api/v1/runs/r1/artifact?name={name}"
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(set(payload), {"error", "message"})
+                self.assertNotIn("Traceback", raw.decode("utf-8"))
+
+        for query, expected_status in (
+            ("name=%73tate.json", 404),
+            ("name=state.json&name=diff.patch", 400),
+            ("name=state.json&extra=1", 400),
+        ):
+            with self.subTest(query=query):
+                status, payload, _ = self.request(
+                    "GET", f"/api/v1/runs/r1/artifact?{query}"
+                )
+                self.assertEqual(status, expected_status)
+                self.assertEqual(set(payload), {"error", "message"})
+
     def test_v1_post_routes_authenticate_and_return_json_without_redirects(self) -> None:
         with (
             patch("metaharness.web.server.create_run", return_value={"run_id": "new", "location": "/runs/new"}) as create,
