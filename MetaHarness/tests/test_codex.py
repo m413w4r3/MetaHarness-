@@ -286,6 +286,13 @@ class CodexRuntimeTests(unittest.TestCase):
         self.assertEqual(parsed, tomllib.loads(_MANAGED_CONFIG))
         self.assertNotIn("mcp_servers", parsed)
         self.assertFalse(parsed["agents"]["enabled"])
+        self.assertNotIn("mechanical implementation worker", _MANAGED_CONFIG)
+        self.assertIn("bounded implementation worker", _MANAGED_CONFIG)
+        self.assertNotIn("non-mechanical", _MANAGED_CONFIG)
+        self.assertIn("META CONTRACT MISMATCH v1", _MANAGED_CONFIG)
+        self.assertFalse(parsed["sandbox_workspace_write"]["network_access"])
+        self.assertFalse(parsed["features"]["multi_agent"])
+        self.assertFalse(parsed["features"]["worktrees"])
         for key in (
             "multi_agent",
             "apps",
