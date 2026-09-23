@@ -4,6 +4,8 @@ from .chat import (
     LLMError,
     LLMHTTPError,
     LLMProtocolError,
+    ConversationUnavailableError,
+    ConversationContinuationClient,
     OpenAIChatTextClient,
     TextLLMResult,
 )
@@ -21,6 +23,8 @@ __all__ = [
     "LLMEndpointConfig",
     "LLMHTTPError",
     "LLMProtocolError",
+    "ConversationUnavailableError",
+    "ConversationContinuationClient",
     "OpenAIChatTextClient",
     "ParsedTextDocument",
     "TextLLMResult",

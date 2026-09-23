@@ -44,6 +44,19 @@ Transport rules:
 
 ## ChatGPT bridge
 
+Preapproval correction uses `ConversationContinuationClient` only when a driver
+returns an official `LLMConversationHandle` from its first completion. The
+current `openai-chat` adapter sends Chat Completions requests and receives no
+conversation handle from `chatgpt-bridge`'s `/v1/chat/completions` response.
+Consequently `planner-chatgpt` currently uses a fresh, self-contained
+correction request. The bridge's native conversation endpoint uses an explicit
+conversation ID plus an expected turn ID supplied by its caller; those values
+are not exposed by the Chat Completions facade, and MetaHarness never derives
+them from a URL or invents them. For same-conversation support, a bridge driver
+must return a durable handle for the completed turn and implement continuation
+against the native endpoint, distinguishing explicit `conversation_unavailable`
+from ambiguous transport failure. The provider ID must remain stable.
+
 For a ChatGPT-compatible bridge, configure an explicit planner/reviewer profile:
 
 ```toml

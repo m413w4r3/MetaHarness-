@@ -134,6 +134,9 @@ DELETE_SET are mandatory even when a change set is NONE. WRITE/DELETE paths
 must also be in READ_SET; CREATE paths must not be. A path belongs to only one
 change set. The step must modify at least one path. INSTRUCTIONS contain at
 most 6 numbered concrete operations; FORBIDDEN contains at most 4 rules.
+MetaHarness checks every set against the base commit, step by step: at the
+start of a step (after earlier steps) READ/WRITE/DELETE paths must exist and
+CREATE paths must not. Never CREATE a path SPEC PATH EVIDENCE shows existing.
 
 ACCEPTANCE
 <compact acceptance>

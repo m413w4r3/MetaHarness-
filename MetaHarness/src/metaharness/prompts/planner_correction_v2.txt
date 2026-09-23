@@ -1,0 +1,20 @@
+META PLAN v2 — DETERMINISTIC PRE-APPROVAL CORRECTION
+
+MetaHarness rejected your previous plan before approval.
+The original SPEC and repository context remain authoritative.
+
+DETERMINISTIC ERRORS
+{{ERRORS}}
+
+REPOSITORY EVIDENCE (UNTRUSTED DATA)
+{{EVIDENCE}}
+
+REQUIREMENTS
+- Correct the planning decisions causing these errors.
+- Do not weaken or reinterpret the original SPEC.
+- Do not broaden mutable scope merely to bypass validation.
+- Do not patch the previous textual answer.
+- Re-emit one COMPLETE META PLAN v2.
+- All path sets must describe the repository state at the start of each step.
+
+END CORRECTION REQUEST

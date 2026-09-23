@@ -166,6 +166,11 @@ from .planning_v2 import (
     render_repair_plan_summary,
     render_repair_step_index,
 )
+from .plan_repository_validation import (
+    PlanRepositoryPreconditionError,
+    RepositoryPreconditions,
+    validate_plan_repository_topology,
+)
 from .plan_recovery import (
     PLAN_SOURCE_OPERATOR,
     PlanRecoveryError,
@@ -1562,6 +1567,10 @@ class Orchestrator:
                 check_catalog=self.config.check_catalog,
                 default_check_ids=self.config.default_check_ids,
                 prompt_budget_bytes=self.config.prompt_budget.planner_max_bytes,
+                repository_preconditions=RepositoryPreconditions(
+                    repo, resolve_tree(repo, base_sha),
+                ),
+                on_event=lambda name, data: self._trace_emit(name, phase="planning", cycle=1, data=data),
             )
             plan_started_at = self._trace_time()
             plan_started_mono = time.perf_counter()
@@ -1666,6 +1675,10 @@ class Orchestrator:
             )
             return RunResult(run_dir, RunStatus.BLOCKED, state)
 
+        # Every source of this plan (planner, resumed planner answer, operator
+        # recovery) must be possible against the base tree before it can be
+        # offered for approval.  Resume re-enters here, so it is checked again.
+        validate_plan_repository_topology(repo, resolve_tree(repo, base_sha), plan)
         try:
             # REQUIRED_CHECKS has already been parsed against the trusted
             # catalogue.  Materialize those exact trusted definitions before
@@ -2242,6 +2255,8 @@ class Orchestrator:
             planning=self.config.planning,
             check_catalog=self.config.check_catalog,
             original_required_check_ids=ctx.plan.required_checks,
+            # The correction starts from the reviewed candidate, not the base.
+            repository_preconditions=RepositoryPreconditions(ctx.repo, candidate["tree_sha"]),
         )
         # The reviewed candidate commit is the code authority: the planner
         # gets its immutable candidate/compare URLs instead of an inline diff.
@@ -2291,6 +2306,8 @@ class Orchestrator:
                 artifacts_dir=repair_dir,
                 fallback_candidate_diff="" if remote_available else evidence.diff,
             )
+        except PlanRepositoryPreconditionError as exc:
+            raise PipelineFailure(exc.code, _bounded_parse_detail(exc)) from exc
         except V2PlanParseError as exc:
             raise PipelineFailure("PLANNER_OUTPUT_INVALID", _bounded_parse_detail(exc)) from exc
         self._trace_emit(
@@ -4773,6 +4790,13 @@ class Orchestrator:
             validate_decomposition_policy(plan, config.planning)
         except V2PlanParseError as exc:
             refuse(f"replacement plan is invalid: {exc}")
+        try:
+            # An operator plan is bound by the same repository preconditions.
+            validate_plan_repository_topology(repo, base_tree, plan)
+        except PlanRepositoryPreconditionError as exc:
+            refuse(f"{exc.code}: {exc}")
+        except GitError as exc:
+            refuse(f"run Git identity cannot be verified: {exc}")
 
         replacement_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         source_status = recoverable_plan_source_status(state)
@@ -4942,7 +4966,6 @@ class Orchestrator:
                 refuse("run planner profile is missing")
             planner_profile = profile_for_role(self.config, planner_profile_id, ExecutionRole.PLANNER)
             if checkpoint.phase is ResumePhase.PLANNER:
-                _archive_attempt(run_dir, names=_PLANNER_ATTEMPT_ARTIFACTS)
                 planner = PlannerV2(
                     self._planner_client or _chat_client(
                         build_llm_endpoint(planner_profile), self._runtime_environment
@@ -4951,6 +4974,8 @@ class Orchestrator:
                     check_catalog=self.config.check_catalog,
                     default_check_ids=self.config.default_check_ids,
                     prompt_budget_bytes=self.config.prompt_budget.planner_max_bytes,
+                    repository_preconditions=RepositoryPreconditions(repo, base_tree),
+                    on_event=lambda name, data: self._trace_emit(name, phase="planning", cycle=1, data=data),
                 )
                 plan = planner.plan(spec, context, artifacts_dir=run_dir)
                 _persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
@@ -5083,6 +5108,8 @@ def _failure_reason(exc: Exception) -> str:
         return "GIT_FAILURE"
     if isinstance(exc, AgentError):
         return getattr(exc, "code", "AGENT_FAILURE")
+    if isinstance(exc, PlanRepositoryPreconditionError):
+        return exc.code
     if isinstance(exc, ApprovalError):
         return "PLAN_APPROVAL_INVALID"
     if isinstance(exc, ExecutionSelectionError):

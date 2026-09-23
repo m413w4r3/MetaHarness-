@@ -394,6 +394,7 @@ class PlanningConfig:
     max_steps_per_plan: int = 8
     max_read_paths_per_step: int = 8
     max_step_contract_chars: int = 5000
+    max_preapproval_corrections: int = 2
 
     def __post_init__(self) -> None:
         if self.protocol != "v2":
@@ -410,6 +411,7 @@ class PlanningConfig:
                 raise ValueError(f"{name} must be an integer greater than zero")
         if self.max_steps_per_plan > 99:
             raise ValueError("max_steps_per_plan must not exceed the protocol maximum of 99")
+        validate_revision_budget(self.max_preapproval_corrections, "max_preapproval_corrections")
         if self.execution_mode_policy not in {item.value for item in ExecutionModePolicy}:
             raise ValueError("planning execution_mode_policy must be 'auto' or 'require-staged'")
 

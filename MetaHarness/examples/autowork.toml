@@ -13,6 +13,7 @@ default_check_ids = ["lint", "typecheck", "test"]
 protocol = "v2"
 decomposition = "aggressive"
 execution_mode_policy = "auto"
+max_preapproval_corrections = 2
 
 single_step_max_mutable_paths = 6
 staged_step_max_mutable_paths = 12

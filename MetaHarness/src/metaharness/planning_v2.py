@@ -7,14 +7,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 from .gitops import RepositoryReference, render_repository_reference
 from .llm.chat import (
+    ConversationContinuationClient,
+    ConversationUnavailableError,
     LLMConversationHandle,
+    LLMProtocolError,
     TextFileAttachment,
     TextLLMResult,
     conversation_handle,
@@ -31,6 +35,15 @@ from .models import (
     TaskPlanV2,
     profile_driver_name,
 )
+from .plan_repository_validation import (
+    PathPreconditionViolation,
+    PlanRepositoryPreconditionError,
+    RepositoryPreconditions,
+    archive_rejected_planner_attempt,
+    plan_repository_violations,
+    render_conflict_evidence,
+    render_precondition_correction,
+)
 from .prompt_contracts import (
     PromptPayload,
     build_planner_payload,
@@ -39,7 +52,7 @@ from .prompt_contracts import (
 )
 from .result import atomic_write_text
 from .step_ids import LAST_STEP_ID, MAX_STEPS, STEP_ID_RE, step_ids
-from .usage import PLANNER_USAGE_ARTIFACT, completion_usage, write_usage_artifact
+from .usage import PLANNER_USAGE_ARTIFACT, PLANNER_ATTEMPTS_DIR, add_usage, completion_usage, normalize_usage, planner_usage, write_usage_artifact
 
 
 MAX_STEP_CONTRACT_CHARS = 5_000
@@ -1388,8 +1401,9 @@ class TextCompletionClient(Protocol):
 class PlannerV2:
     """Standalone v2 planner entry point; it never invokes the profile recommender."""
 
-    def __init__(self, client: TextCompletionClient, *, repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None, check_catalog: Sequence[CheckConfig] = (), default_check_ids: Sequence[str] = (), prompt_budget_bytes: int = 0):
+    def __init__(self, client: TextCompletionClient, *, repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None, check_catalog: Sequence[CheckConfig] = (), default_check_ids: Sequence[str] = (), prompt_budget_bytes: int = 0, repository_preconditions: RepositoryPreconditions | None = None, on_event: Callable[[str, dict[str, Any]], None] | None = None):
         self.client = client
+        self.repository_preconditions = repository_preconditions
         self.repository_reference = repository_reference
         self.planning = planning or PlanningConfig(protocol="v2")
         self.template = template
@@ -1398,6 +1412,11 @@ class PlannerV2:
         self.prompt_budget_bytes = prompt_budget_bytes
         self.last_conversation: LLMConversationHandle | None = None
         self.last_usage: dict[str, Any] | None = None
+        self.on_event = on_event
+
+    def _event(self, name: str, **data: Any) -> None:
+        if self.on_event is not None:
+            self.on_event(name, data)
 
     def plan(self, spec: str, context: str, *, repository_reference: RepositoryReference | None = None, artifacts_dir: str | Path | None = None) -> TaskPlanV2:
         reference = repository_reference if repository_reference is not None else self.repository_reference
@@ -1415,41 +1434,272 @@ class PlannerV2:
             default_check_ids=self.default_check_ids,
             budget_bytes=self.prompt_budget_bytes,
         )
-        request = payload.rendered
+        initial_request = payload.rendered
         target = Path(artifacts_dir) if artifacts_dir is not None else None
-        if target is not None:
-            atomic_write_text(target / "planner.request.txt", request)
-            write_prompt_diagnostics(target, payload)
-        result = self.client.complete(request)
-        self.last_conversation = conversation_handle(result)
-        self.last_usage = completion_usage(result)
-        raw = result if isinstance(result, str) else getattr(result, "text", None)
-        if target is not None:
-            # Tokens were consumed whether or not the answer parses.
-            write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, completion_usage(result))
-        if not isinstance(raw, str):
-            raise V2PlanParseError("planner client did not return text")
-        if target is not None:
-            atomic_write_text(target / "planner.raw.md", raw)
-        plan = parse_task_plan_v2(
-            raw,
-            planning=self.planning,
-            check_catalog=self.check_catalog,
-            default_check_ids=self.default_check_ids,
+        session = _read_planning_session(target)
+        self.last_conversation = _session_handle(session)
+        attempts = target / PLANNER_ATTEMPTS_DIR if target is not None else None
+        memory_previous: tuple[dict[str, Any], str] | None = None
+        memory_usage: list[dict[str, Any]] = []
+        for attempt in range(1, self.planning.max_preapproval_corrections + 2):
+            if attempts is not None and (attempts / f"{attempt:02d}").is_dir():
+                continue
+            previous = attempts / f"{attempt - 1:02d}" if attempts is not None and attempt > 1 else None
+            if attempt > 1 and (previous is None or not previous.is_dir()) and memory_previous is None:
+                raise LLMProtocolError("planner attempt history is incomplete")
+            raw_path = target / "planner.raw.md" if target is not None else None
+            if raw_path is not None and raw_path.is_file():
+                if session.get("latest_attempt") != attempt:
+                    raise LLMProtocolError("planner raw answer does not match its session")
+                raw = raw_path.read_text(encoding="utf-8")
+                request = (target / "planner.request.txt").read_text(encoding="utf-8")
+            else:
+                if previous is None:
+                    request = initial_request
+                    continuation_used = False
+                    fallback_fresh = False
+                else:
+                    if previous is None:
+                        validation, previous_raw = memory_previous
+                    else:
+                        validation = _read_attempt_validation(previous)
+                        previous_raw = (previous / "planner.raw.md").read_text(encoding="utf-8")
+                    short = _correction_request(validation, self.repository_preconditions)
+                    handle = _session_handle(session)
+                    continuation_used = handle is not None and isinstance(self.client, ConversationContinuationClient)
+                    fallback_fresh = not continuation_used
+                    request = short if continuation_used else _fresh_correction(initial_request, previous_raw, short)
+                self._event("plan.attempt.started", attempt=attempt,
+                    continuation_used=continuation_used, fallback_fresh_request=fallback_fresh)
+                if attempt > 1:
+                    self._event("plan.correction.started", attempt=attempt,
+                        continuation_used=continuation_used, fallback_fresh_request=fallback_fresh)
+                if target is not None:
+                    atomic_write_text(target / "planner.request.txt", request)
+                    write_prompt_diagnostics(target, payload_for_rendered_request(
+                        "planner-correction" if attempt > 1 else "planner", request,
+                        budget_bytes=self.prompt_budget_bytes,
+                    ))
+                if continuation_used:
+                    try:
+                        result = self.client.continue_conversation(handle, request)
+                    except ConversationUnavailableError:
+                        request = _fresh_correction(initial_request, previous_raw, short)
+                        fallback_fresh = True
+                        continuation_used = False
+                        if target is not None:
+                            atomic_write_text(target / "planner.request.txt", request)
+                        result = self.client.complete(request)
+                else:
+                    result = self.client.complete(request)
+                returned_handle = conversation_handle(result)
+                self.last_usage = completion_usage(result)
+                if target is None:
+                    memory_usage.append(self.last_usage)
+                raw = result if isinstance(result, str) else getattr(result, "text", None)
+                if target is not None:
+                    write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, completion_usage(result))
+                if not isinstance(raw, str):
+                    raise LLMProtocolError("planner client did not return text")
+                if (continuation_used and returned_handle is not None
+                        and returned_handle.provider_id != handle.provider_id):
+                    if target is not None:
+                        atomic_write_text(target / "planner.raw.md", raw)
+                    raise LLMProtocolError("continued conversation provider changed")
+                effective_handle = returned_handle or (handle if continuation_used else None)
+                self.last_conversation = effective_handle
+                if target is not None:
+                    session = _write_planning_session(target, attempt, effective_handle,
+                        continuation_used=continuation_used, fallback_fresh_request=fallback_fresh)
+                    atomic_write_text(target / "planner.raw.md", raw)
+                else:
+                    session = {"provider_id": effective_handle.provider_id if effective_handle else None,
+                               "conversation_id": effective_handle.conversation_id if effective_handle else None}
+                self._event("plan.attempt.completed", attempt=attempt,
+                    continuation_used=continuation_used, fallback_fresh_request=fallback_fresh)
+                if attempt > 1:
+                    self._event("plan.correction.completed", attempt=attempt,
+                        continuation_used=continuation_used, fallback_fresh_request=fallback_fresh)
+            try:
+                plan = parse_task_plan_v2(raw, planning=self.planning,
+                    check_catalog=self.check_catalog, default_check_ids=self.default_check_ids)
+                validate_execution_mode_policy(plan, self.planning)
+                validate_decomposition_policy(plan, self.planning)
+                violations = _precondition_violations(self.repository_preconditions, plan)
+                if violations:
+                    raise PlanRepositoryPreconditionError(violations)
+            except (V2PlanParseError, PlanRepositoryPreconditionError) as exc:
+                violations = exc.violations if isinstance(exc, PlanRepositoryPreconditionError) else ()
+                validation = _validation_failure(exc, violations)
+                self._event("plan.validation.failed", attempt=attempt,
+                    validation_error_codes=[item["code"] for item in validation["errors"]])
+                if target is not None:
+                    atomic_write_text(target / "planner.validation.json", json.dumps(validation, ensure_ascii=False, indent=2) + "\n")
+                    archive_rejected_planner_attempt(
+                        target, (*_REJECTED_PLANNER_ARTIFACTS, "planner.validation.json"),
+                        start_tree_sha=self.repository_preconditions.start_tree_sha if self.repository_preconditions else "",
+                        violations=violations,
+                    )
+                    self.last_usage = planner_usage(target)
+                else:
+                    memory_previous = (validation, raw)
+                    self.last_usage = add_usage(memory_usage)
+                security_violation = isinstance(exc, V2PlanParseError) and str(exc).startswith("unsafe ")
+                if security_violation or attempt > self.planning.max_preapproval_corrections:
+                    raise
+                continue
+            if target is not None:
+                atomic_write_text(target / "planner.validation.json", '{"valid": true, "errors": []}\n')
+                persist_planning_v2_artifacts(target, spec=spec, context=context, request=request, plan=plan)
+                self.last_usage = planner_usage(target)
+            else:
+                self.last_usage = add_usage(memory_usage)
+            self._event("plan.validation.passed", attempt=attempt, validation_error_codes=[])
+            return plan
+        raise AssertionError("bounded planning loop exhausted")
+
+# Artifacts moved into the existing planner-attempts hierarchy after rejection.
+_REJECTED_PLANNER_ARTIFACTS = (
+    "planner.request.txt", "planner.request.fallback.txt", "planner.request.meta.json",
+    "prompt.diagnostics.json", "planner.raw.md", "planner.usage.json",
+)
+
+
+def _read_planning_session(target: Path | None) -> dict[str, Any]:
+    if target is None or not (target / "planner.session.json").exists():
+        return {}
+    try:
+        value = json.loads((target / "planner.session.json").read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            raise ValueError("invalid schema")
+        if (isinstance(value.get("latest_attempt"), bool)
+                or not isinstance(value.get("latest_attempt"), int)
+                or value["latest_attempt"] < 1
+                or not isinstance(value.get("continuation_available"), bool)):
+            raise ValueError("invalid session fields")
+        if value["continuation_available"] != (_session_handle(value) is not None):
+            raise ValueError("invalid continuation flag")
+        return value
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise LLMProtocolError("planner session artifact is invalid") from exc
+
+
+def _session_handle(session: dict[str, Any]) -> LLMConversationHandle | None:
+    provider = session.get("provider_id")
+    identifier = session.get("conversation_id")
+    if provider is None and identifier is None:
+        return None
+    try:
+        return LLMConversationHandle(provider, identifier)
+    except (TypeError, ValueError) as exc:
+        raise LLMProtocolError("planner session handle is invalid") from exc
+
+
+def _write_planning_session(
+    target: Path, attempt: int, handle: LLMConversationHandle | None,
+    *, continuation_used: bool, fallback_fresh_request: bool,
+) -> dict[str, Any]:
+    value = {
+        "schema_version": 1,
+        "provider_id": handle.provider_id if handle else None,
+        "conversation_id": handle.conversation_id if handle else None,
+        "latest_attempt": attempt,
+        "continuation_available": handle is not None,
+        "continuation_used": continuation_used,
+        "fallback_fresh_request": fallback_fresh_request,
+    }
+    path = target / "planner.session.json"
+    atomic_write_text(path, json.dumps(value, ensure_ascii=False) + "\n")
+    os.chmod(path, 0o600)
+    return value
+
+
+def _validation_failure(
+    exc: V2PlanParseError | PlanRepositoryPreconditionError,
+    violations: Sequence[PathPreconditionViolation],
+) -> dict[str, Any]:
+    if violations:
+        errors = [{"code": item.kind, "step_id": item.step_id, "path": item.path}
+                  for item in violations]
+    else:
+        errors = [{"code": "plan_format_invalid", "detail": str(exc)[:1000]}]
+    return {"valid": False, "errors": errors}
+
+
+def _read_attempt_validation(attempt: Path) -> dict[str, Any]:
+    try:
+        value = json.loads((attempt / "planner.validation.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise LLMProtocolError("planner validation artifact is invalid") from exc
+    if not isinstance(value, dict) or value.get("valid") is not False or not isinstance(value.get("errors"), list):
+        raise LLMProtocolError("planner validation artifact is invalid")
+    return value
+
+
+def _correction_request(
+    validation: dict[str, Any], preconditions: RepositoryPreconditions | None,
+) -> str:
+    template = (Path(__file__).parent / "prompts" / "planner_correction_v2.txt").read_text(encoding="utf-8")
+    errors = validation["errors"]
+    lines = []
+    violations = []
+    for item in errors[:64]:
+        if not isinstance(item, dict):
+            raise LLMProtocolError("planner validation artifact is invalid")
+        code = str(item.get("code", "invalid"))[:80]
+        step = str(item.get("step_id", ""))[:20]
+        path = str(item.get("path", ""))[:400]
+        detail = str(item.get("detail", ""))[:1000]
+        lines.append(f"{step}: {code}: {path or detail}")
+        if code in {"create_exists", "read_missing", "write_missing", "delete_missing"}:
+            violations.append(PathPreconditionViolation(step, code, path))
+    evidence = render_conflict_evidence(
+        preconditions.repo, preconditions.start_tree_sha, violations,
+    ) if preconditions is not None and violations else ""
+    return template.replace("{{ERRORS}}", "\n".join(lines)).replace("{{EVIDENCE}}", evidence).rstrip() + "\n"
+
+
+def _fresh_correction(initial_request: str, previous_raw: str, correction: str) -> str:
+    from .plan_repository_validation import MAX_PREVIOUS_PLAN_CHARS
+    prior = previous_raw[:MAX_PREVIOUS_PLAN_CHARS]
+    if len(prior) < len(previous_raw):
+        prior += "\n[previous answer truncated]"
+    return (initial_request.rstrip() + "\n\nPREVIOUS PLANNER ANSWER\n" + prior +
+            "\nEND PREVIOUS PLANNER ANSWER\n\n" + correction)
+
+
+def _precondition_violations(
+    preconditions: RepositoryPreconditions | None, plan: TaskPlanV2,
+) -> tuple[PathPreconditionViolation, ...]:
+    if preconditions is None:
+        return ()
+    return plan_repository_violations(preconditions.repo, preconditions.start_tree_sha, plan)
+
+
+def _precondition_correction_text(
+    preconditions: RepositoryPreconditions,
+    violations: Sequence[PathPreconditionViolation],
+    previous_raw: str,
+) -> str:
+    return render_precondition_correction(
+        violations,
+        previous_raw=previous_raw,
+        evidence=render_conflict_evidence(
+            preconditions.repo, preconditions.start_tree_sha, violations,
+        ),
+    )
+
+
+def _archive_rejected_plan(
+    target: Path | None,
+    preconditions: RepositoryPreconditions,
+    violations: Sequence[PathPreconditionViolation],
+) -> None:
+    if target is not None:
+        archive_rejected_planner_attempt(
+            target, _REJECTED_PLANNER_ARTIFACTS,
+            start_tree_sha=preconditions.start_tree_sha, violations=violations,
         )
-        # Only the initial planner is bound by the execution mode policy; the
-        # bounded correction plan keeps its own (possibly single-step) shape.
-        validate_execution_mode_policy(plan, self.planning)
-        validate_decomposition_policy(plan, self.planning)
-        if artifacts_dir is not None:
-            persist_planning_v2_artifacts(
-                artifacts_dir,
-                spec=spec,
-                context=context,
-                request=request,
-                plan=plan,
-            )
-        return plan
 
 
 def _repair_plan_recovery_sources(target: Path) -> list[Path]:
@@ -1478,6 +1728,7 @@ def _recover_existing_repair_plan(
     check_catalog: Sequence[CheckConfig],
     inherited_check_ids: Sequence[str],
     planning: PlanningConfig,
+    repository_preconditions: RepositoryPreconditions | None = None,
 ) -> TaskPlanV2 | None:
     """Revalidate an already produced correction answer locally, or return ``None``.
 
@@ -1510,6 +1761,8 @@ def _recover_existing_repair_plan(
             )
             validate_repair_decomposition_policy(plan, planning)
         except V2PlanParseError:
+            continue
+        if _precondition_violations(repository_preconditions, plan):
             continue
         if source is not target:
             # The retry archived the provenance of the answer being reused, so
@@ -1570,12 +1823,14 @@ class RepairPlannerV2:
         template: str | None = None,
         check_catalog: Sequence[CheckConfig] = (),
         original_required_check_ids: Sequence[str] = (),
+        repository_preconditions: RepositoryPreconditions | None = None,
     ):
         self.client = client
         self.planning = planning or PlanningConfig(protocol="v2")
         self.template = template
         self.check_catalog = tuple(check_catalog)
         self.original_required_check_ids = tuple(original_required_check_ids)
+        self.repository_preconditions = repository_preconditions
         self.last_usage: dict[str, Any] | None = None
 
     def plan(
@@ -1628,6 +1883,7 @@ class RepairPlannerV2:
             check_catalog=self.check_catalog,
             inherited_check_ids=self.original_required_check_ids,
             planning=self.planning,
+            repository_preconditions=self.repository_preconditions,
         )
         if recovered is not None:
             _persist_recovered_repair_plan(
@@ -1656,27 +1912,71 @@ class RepairPlannerV2:
                 )
             )
 
+        plan, usage = self._complete(
+            request, bundle.fallback_prompt, bundle.evidence_text,
+            tuple(attachments), fallback_candidate_diff, target,
+        )
+        preconditions = self.repository_preconditions
+        violations = _precondition_violations(preconditions, plan)
+        if preconditions is not None and violations:
+            # Exactly one bounded correction, archived exactly like the
+            # initial planner's: the rejected answer never becomes authority.
+            correction = "\n\n" + _precondition_correction_text(
+                preconditions, violations, plan.raw,
+            )
+            request = request.rstrip("\n") + correction
+            _archive_rejected_plan(target, preconditions, violations)
+            plan, correction_usage = self._complete(
+                request, bundle.fallback_prompt.rstrip("\n") + correction,
+                bundle.evidence_text, tuple(attachments), fallback_candidate_diff, target,
+            )
+            self.last_usage = add_usage((usage, correction_usage))
+            violations = _precondition_violations(preconditions, plan)
+            if violations:
+                _archive_rejected_plan(target, preconditions, violations)
+                raise PlanRepositoryPreconditionError(violations)
+        if plan.decision is PlanDecision.READY:
+            persist_planning_v2_artifacts(
+                target, spec=original_spec, context=current_repository_state,
+                request=request, plan=plan,
+            )
+        else:
+            atomic_write_text(
+                target / "task_plan.json",
+                json.dumps({**asdict(plan), "decision": plan.decision.value, "execution_mode": None}, ensure_ascii=False, indent=2) + "\n",
+            )
+        return plan
+
+    def _complete(
+        self,
+        request: str,
+        fallback_prompt: str,
+        evidence_text: str,
+        attachments: tuple[TextFileAttachment, ...],
+        fallback_candidate_diff: str,
+        target: Path,
+    ) -> tuple[TaskPlanV2, dict[str, int]]:
         # Written before any transport so an HTTP 502 stays diagnosable.
         atomic_write_text(target / "planner.request.txt", request)
         write_prompt_diagnostics(
             target, payload_for_rendered_request("repair-planner", request)
         )
-        atomic_write_text(target / "planner.request.fallback.txt", bundle.fallback_prompt)
-        atomic_write_text(target / "planner.evidence.md", bundle.evidence_text)
+        atomic_write_text(target / "planner.request.fallback.txt", fallback_prompt)
+        atomic_write_text(target / "planner.evidence.md", evidence_text)
         atomic_write_text(
             target / "planner.request.meta.json",
             json.dumps(
                 {
                     "schema_version": 1,
                     "inline_bytes": len(request.encode("utf-8")),
-                    "fallback_prompt_bytes": len(bundle.fallback_prompt.encode("utf-8")),
-                    "evidence_bytes": len(bundle.evidence_text.encode("utf-8")),
+                    "fallback_prompt_bytes": len(fallback_prompt.encode("utf-8")),
+                    "evidence_bytes": len(evidence_text.encode("utf-8")),
                     "inline_sha256": hashlib.sha256(request.encode("utf-8")).hexdigest(),
                     "fallback_prompt_sha256": hashlib.sha256(
-                        bundle.fallback_prompt.encode("utf-8")
+                        fallback_prompt.encode("utf-8")
                     ).hexdigest(),
                     "evidence_sha256": hashlib.sha256(
-                        bundle.evidence_text.encode("utf-8")
+                        evidence_text.encode("utf-8")
                     ).hexdigest(),
                     "file_fallback_attempt": _REPAIR_FILE_FALLBACK_ATTEMPT,
                     "candidate_diff_attachment_bytes": len(
@@ -1697,8 +1997,8 @@ class RepairPlannerV2:
         if callable(complete_with_file_fallback):
             result = complete_with_file_fallback(
                 request,
-                fallback_prompt=bundle.fallback_prompt,
-                attachments=tuple(attachments),
+                fallback_prompt=fallback_prompt,
+                attachments=attachments,
                 fallback_attempt=_REPAIR_FILE_FALLBACK_ATTEMPT,
             )
         else:
@@ -1714,17 +2014,7 @@ class RepairPlannerV2:
             check_catalog=self.check_catalog, inherited_check_ids=self.original_required_check_ids,
         )
         validate_repair_decomposition_policy(plan, self.planning)
-        if plan.decision is PlanDecision.READY:
-            persist_planning_v2_artifacts(
-                target, spec=original_spec, context=current_repository_state,
-                request=request, plan=plan,
-            )
-        else:
-            atomic_write_text(
-                target / "task_plan.json",
-                json.dumps({**asdict(plan), "decision": plan.decision.value, "execution_mode": None}, ensure_ascii=False, indent=2) + "\n",
-            )
-        return plan
+        return plan, normalize_usage(self.last_usage)
 
 
 def run_planner_v2(

@@ -322,6 +322,7 @@ class OrchestratorE2ETests(unittest.TestCase):
         key_env: str | None = None,
         require_plan_approval: bool = False,
         planning_decomposition: str | None = None,
+        max_preapproval_corrections: int | None = None,
     ) -> Path:
         config = self.root / "config.toml"
         key_line = f"\napi_key_env = {key_env!r}" if key_env else ""
@@ -333,7 +334,10 @@ class OrchestratorE2ETests(unittest.TestCase):
                 f"worktrees_root = {str(self.root / 'worktrees')!r}",
                 "require_clean_base = true",
                 f"max_diff_bytes = {max_diff}",
-                *(["", "[planning]", f'decomposition = "{planning_decomposition}"'] if planning_decomposition else []),
+                *(["", "[planning]",
+                   *([f'decomposition = "{planning_decomposition}"'] if planning_decomposition else []),
+                   *([f"max_preapproval_corrections = {max_preapproval_corrections}"] if max_preapproval_corrections is not None else [])]
+                  if planning_decomposition or max_preapproval_corrections is not None else []),
                 "",
                 "[repository]\nremote = \"origin\"\nplanner_remote_exploration = true",
                 "",
@@ -371,12 +375,14 @@ class OrchestratorE2ETests(unittest.TestCase):
         key_env: str | None = None,
         env: dict[str, str] | None = None,
         planning_decomposition: str | None = None,
+        max_preapproval_corrections: int | None = None,
     ) -> tuple[Any, FakeLLM, Path]:
         worktree = self.root / "worktrees" / run_id
         llm = FakeLLM(planner=planner, review=review, mutate=mutate, worktree=worktree)
         config = self.config_file(
             llm, run_id=run_id, max_diff=max_diff, check_cwd=check_cwd,
             key_env=key_env, planning_decomposition=planning_decomposition,
+            max_preapproval_corrections=max_preapproval_corrections,
         )
         overrides = {
             "PATH": str(self.root) + os.pathsep + os.environ.get("PATH", ""),
@@ -711,9 +717,9 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_planner_invalid_output_is_persisted_and_creates_no_worktree(self) -> None:
         planner = PLAN.replace("TESTS\nRun the configured test.\n", "")
-        _, llm, state = self.run_case(planner=planner, run_id="bad-plan")
+        _, llm, state = self.run_case(planner=planner, run_id="bad-plan", max_preapproval_corrections=0)
         self.assertEqual(state["failure"]["reason"], "PLANNER_OUTPUT_INVALID")
-        self.assertEqual((self.root / "runs" / "bad-plan" / "planner.raw.md").read_text(), planner)
+        self.assertEqual((self.root / "runs" / "bad-plan" / "planner-attempts/01/planner.raw.md").read_text(), planner)
         self.assertFalse((self.root / "worktrees" / "bad-plan").exists())
         self.assertEqual(llm.reviewer_calls, 0)
 

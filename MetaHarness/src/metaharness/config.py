@@ -790,6 +790,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         max_steps_per_plan=max_steps_per_plan,
         max_read_paths_per_step=max_read_paths_per_step,
         max_step_contract_chars=max_step_contract_chars,
+        max_preapproval_corrections=_bounded_int(
+            planning_data, "max_preapproval_corrections", 2, "planning", minimum=0, maximum=10
+        ),
     )
 
     revision_data = _table(expanded, "revision")

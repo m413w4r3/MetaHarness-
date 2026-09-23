@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from ..models import LLMEndpointConfig
 
@@ -38,6 +38,10 @@ class LLMProtocolError(LLMError):
     """Réponse ou configuration incompatible avec le protocole attendu."""
 
 
+class ConversationUnavailableError(LLMError):
+    """The driver explicitly reports that a conversation cannot be continued."""
+
+
 @dataclass(frozen=True)
 class LLMConversationHandle:
     """A stable conversation identifier officially exposed by a driver.
@@ -45,8 +49,8 @@ class LLMConversationHandle:
     MetaHarness never fabricates one and never scrapes a UI to guess it: a
     handle exists only when the driver/bridge returns it.  A handle may be
     exposed by a driver for explicitly conversation-aware workflows.
-    MetaHarness correction planning does not reuse the initial planner
-    conversation; every correction cycle starts from a fresh bounded request.
+    A planning transaction may continue this conversation while validation
+    rejects planner answers. A later review repair starts a new transaction.
     """
 
     provider_id: str
@@ -69,6 +73,13 @@ def conversation_handle(result: object) -> LLMConversationHandle | None:
 
     handle = getattr(result, "conversation", None)
     return handle if isinstance(handle, LLMConversationHandle) else None
+
+
+@runtime_checkable
+class ConversationContinuationClient(Protocol):
+    def continue_conversation(
+        self, handle: LLMConversationHandle, prompt: str,
+    ) -> "TextLLMResult | str": ...
 
 
 @dataclass(frozen=True)

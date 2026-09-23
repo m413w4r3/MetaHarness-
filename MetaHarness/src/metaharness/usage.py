@@ -25,6 +25,9 @@ USAGE_FIELDS = (
     "total_tokens",
 )
 PLANNER_USAGE_ARTIFACT = "planner.usage.json"
+# Planner answers rejected by repository-precondition validation, kept for
+# audit under ``<planning dir>/planner-attempts/NN/``.
+PLANNER_ATTEMPTS_DIR = "planner-attempts"
 REVIEWER_USAGE_ARTIFACT = "reviewer.usage.json"
 _MAX_USAGE_ARTIFACT_BYTES = 16 * 1024
 
@@ -210,11 +213,23 @@ def _first_usage(*paths: Path) -> dict[str, int]:
     return empty_usage()
 
 
+def planner_usage(directory: Path) -> dict[str, int]:
+    """The current planner answer plus every archived rejected attempt."""
+
+    return add_usage((
+        _first_usage(directory / PLANNER_USAGE_ARTIFACT),
+        *(
+            _first_usage(path / PLANNER_USAGE_ARTIFACT)
+            for path in sorted((directory / PLANNER_ATTEMPTS_DIR).glob("[0-9][0-9]"))
+        ),
+    ))
+
+
 def phase_usage_summary(run_dir: str | Path) -> dict[str, Any]:
     """Aggregate persisted usage from every generic pipeline cycle."""
 
     directory = Path(run_dir)
-    planner = _first_usage(directory / PLANNER_USAGE_ARTIFACT)
+    planner = planner_usage(directory)
     cycles: list[dict[str, Any]] = []
     implementer_rows: list[dict[str, Any]] = []
     correction_planner = empty_usage()
@@ -230,7 +245,7 @@ def phase_usage_summary(run_dir: str | Path) -> dict[str, Any]:
             for row in persisted_step_usage(cycle_path / "implementation" / "steps")
         ]
         cycle_implementer = add_usage(row["usage"] for row in step_rows)
-        cycle_planner = _first_usage(cycle_path / "correction" / PLANNER_USAGE_ARTIFACT)
+        cycle_planner = planner_usage(cycle_path / "correction")
         cycle_reviser = _first_usage(cycle_path / "semantic-revision" / "usage.json")
         cycle_repair = add_usage(
             _first_usage(path)
@@ -267,6 +282,7 @@ def phase_usage_summary(run_dir: str | Path) -> dict[str, Any]:
 
 
 __all__ = [
+    "PLANNER_ATTEMPTS_DIR",
     "PLANNER_USAGE_ARTIFACT",
     "REVIEWER_USAGE_ARTIFACT",
     "USAGE_FIELDS",
@@ -276,6 +292,7 @@ __all__ = [
     "normalize_usage",
     "persisted_step_usage",
     "phase_usage_summary",
+    "planner_usage",
     "read_usage_artifact",
     "write_usage_artifact",
 ]

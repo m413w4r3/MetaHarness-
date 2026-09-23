@@ -517,9 +517,11 @@ def _persist_planner_conversation(run_dir: Path, handle: Any) -> None:
     """Persist a driver-provided planner conversation handle, never a guess."""
 
     if isinstance(handle, LLMConversationHandle):
-        atomic_write_text(run_dir / _PLANNER_CONVERSATION, _json_text({
+        path = run_dir / _PLANNER_CONVERSATION
+        atomic_write_text(path, _json_text({
             "provider_id": handle.provider_id, "conversation_id": handle.conversation_id,
         }))
+        path.chmod(0o600)
 
 
 def _read_planner_conversation(run_dir: Path) -> LLMConversationHandle | None:

@@ -66,6 +66,7 @@ class RunOptions:
     max_steps_per_plan: int = 8
     max_read_paths_per_step: int = 8
     max_step_contract_chars: int = 5000
+    max_preapproval_corrections: int = 2
     # Constructor-only migration aid. It is never serialized and is not read
     # by the modern resolver.
     default_implementer_profile: str | None = None
@@ -98,6 +99,10 @@ class RunOptions:
                 raise RunOptionsError(f"run options {name} must be greater than zero")
         if self.max_steps_per_plan > 99:
             raise RunOptionsError("run options max_steps_per_plan must not exceed 99")
+        try:
+            validate_revision_budget(self.max_preapproval_corrections, "run options max_preapproval_corrections")
+        except ValueError as exc:
+            raise RunOptionsError(str(exc)) from None
         if not isinstance(self.semantic_revision_enabled, bool):
             raise RunOptionsError("run options semantic_revision_enabled must be boolean")
         for name in ("max_check_repair_attempts", "max_review_repair_cycles"):
@@ -132,6 +137,7 @@ class RunOptions:
             "check_repair_profile", "semantic_reviser_profile", "final_reviewer_profile",
             "repair_scope_policy", "repair_scope_max_added_paths",
             "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
+            "max_preapproval_corrections",
         }
         unknown = set(overrides) - allowed
         if unknown:
@@ -156,6 +162,7 @@ class RunOptions:
             "max_steps_per_plan": config.planning.max_steps_per_plan,
             "max_read_paths_per_step": config.planning.max_read_paths_per_step,
             "max_step_contract_chars": config.planning.max_step_contract_chars,
+            "max_preapproval_corrections": config.planning.max_preapproval_corrections,
             "semantic_revision_enabled": config.revision.enabled,
             "max_check_repair_attempts": config.revision.max_check_repair_attempts,
             "max_review_repair_cycles": config.revision.max_review_repair_cycles,
@@ -209,6 +216,7 @@ class RunOptions:
                 "max_steps_per_plan": self.max_steps_per_plan,
                 "max_read_paths_per_step": self.max_read_paths_per_step,
                 "max_step_contract_chars": self.max_step_contract_chars,
+                "max_preapproval_corrections": self.max_preapproval_corrections,
             },
             "pipeline": {
                 "semantic_revision_enabled": self.semantic_revision_enabled,
@@ -237,6 +245,7 @@ class RunOptions:
             "protocol", "decomposition", "execution_mode_policy",
             "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
             "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
+            "max_preapproval_corrections",
         }:
             raise RunOptionsError("run options planning schema is invalid")
         if not isinstance(pipeline, Mapping) or set(pipeline) != {
@@ -325,6 +334,7 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
         max_steps_per_plan=options.max_steps_per_plan,
         max_read_paths_per_step=options.max_read_paths_per_step,
         max_step_contract_chars=options.max_step_contract_chars,
+        max_preapproval_corrections=options.max_preapproval_corrections,
     )
     ui = replace(
         config.ui,

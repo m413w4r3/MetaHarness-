@@ -4,13 +4,24 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
-from .gitops import GitError, current_head, git_root, read_file_at_commit, resolve_commit
+from .gitops import (
+    GitError,
+    current_head,
+    git_root,
+    path_exists_in_tree,
+    read_file_at_commit,
+    read_tree_entry_prefix,
+    resolve_commit,
+    resolve_tree,
+)
 from .models import ContextConfig
+from .plan_repository_validation import is_sensitive_repository_path
 from .procutil import run_bounded
 
 
@@ -24,6 +35,17 @@ class ContextExcerpt:
 
 
 @dataclass(frozen=True)
+class SpecPathEvidence:
+    """A repo-relative path named by the SPEC and its state at the base."""
+
+    path: str
+    exists: bool
+    kind: str | None = None
+    excerpt: str | None = None
+    size: int | None = None
+
+
+@dataclass(frozen=True)
 class ContextBundle:
     base_sha: str
     instruction_files: tuple[tuple[str, str], ...]
@@ -32,6 +54,7 @@ class ContextBundle:
     locator_warning: str | None
     omitted: tuple[str, ...]
     total_bytes: int
+    spec_paths: tuple[SpecPathEvidence, ...] = ()
 
 
 _INSTRUCTION_NAMES = frozenset({"AGENTS.md", "CLAUDE.md"})
@@ -39,6 +62,80 @@ _MAX_EXCERPT_LINES = 200
 _MAX_LOCATOR_OUTPUT_BYTES = 16 * 1024 * 1024
 _MAX_SYMBOL_CHARS = 200
 _LOCATOR_GRACE_SECONDS = 2.0
+MAX_SPEC_PATHS = 24
+MAX_SPEC_EXCERPTS = 4
+MAX_SPEC_EXCERPT_BYTES = 4 * 1024
+# A path token: either with a directory separator or with a file extension.
+_SPEC_PATH = re.compile(
+    r"(?<![\w./:@-])((?:[\w.-]+/)+[\w.-]*[\w-]|[\w-][\w.-]*\.[A-Za-z0-9]{1,12})/?(?![\w/-])"
+)
+
+
+def _spec_path_candidates(spec: str) -> list[str]:
+    """Safe repo-relative paths explicitly written in *spec*, in order."""
+
+    found: list[str] = []
+    for match in _SPEC_PATH.finditer(spec):
+        token = match.group(1).rstrip(".")
+        if "/" not in token:
+            stem, _, extension = token.rpartition(".")
+            # ``e.g`` or ``3.12`` are prose, not file names.
+            if len(stem) < 2 or not any(char.isalpha() for char in extension):
+                continue
+        path = _safe_locator_path(token)
+        if (
+            path is None
+            or not path
+            or path.startswith("/")
+            or any(part in {"", ".", ".."} for part in PurePosixPath(path).parts)
+            or is_sensitive_repository_path(path)
+            or path in found
+        ):
+            continue
+        found.append(path)
+        if len(found) >= MAX_SPEC_PATHS:
+            break
+    return found
+
+
+def _spec_path_evidence(repo: Path, base_sha: str, spec: str) -> tuple[SpecPathEvidence, ...]:
+    """Existence at the base commit of each SPEC path, with a few excerpts.
+
+    Every read is pinned to the base tree object; the repository is never
+    walked and the working tree is never consulted.
+    """
+
+    candidates = _spec_path_candidates(spec)
+    if not candidates:
+        return ()
+    try:
+        tree = resolve_tree(repo, base_sha)
+    except GitError:
+        return ()
+    evidence: list[SpecPathEvidence] = []
+    excerpts = 0
+    for path in candidates:
+        try:
+            exists = path_exists_in_tree(repo, tree, path)
+            entry = (
+                read_tree_entry_prefix(repo, tree, path, max_bytes=MAX_SPEC_EXCERPT_BYTES)
+                if exists and excerpts < MAX_SPEC_EXCERPTS else None
+            )
+        except GitError:
+            continue
+        if entry is None:
+            evidence.append(SpecPathEvidence(path, exists))
+            continue
+        if entry.object_type != "blob":
+            kind = "directory" if entry.object_type == "tree" else entry.object_type
+            evidence.append(SpecPathEvidence(path, True, kind))
+            continue
+        excerpt = None
+        if entry.data and b"\x00" not in entry.data:
+            excerpt = entry.data.decode("utf-8", errors="replace")
+            excerpts += 1
+        evidence.append(SpecPathEvidence(path, True, "file", excerpt, entry.size))
+    return tuple(evidence)
 
 
 def _read_optional(repo: Path, base_sha: str, path: str) -> str | None:
@@ -384,6 +481,12 @@ def build_context(
         if include(excerpt.path, excerpt.content):
             selected_excerpts.append(excerpt)
     selected_excerpt_paths = {excerpt.path for excerpt in selected_excerpts}
+    selected_spec_paths: list[SpecPathEvidence] = []
+    for item in _spec_path_evidence(repo, base_sha, spec):
+        # Existence is always kept; an excerpt only while the budget allows.
+        if item.excerpt is not None and not include(item.path, item.excerpt):
+            item = SpecPathEvidence(item.path, item.exists, item.kind, None, item.size)
+        selected_spec_paths.append(item)
     for path, content in always_tail:
         # An ordinary always-file is either a full fallback or the selected
         # locator excerpts for that path, never both.
@@ -400,6 +503,7 @@ def build_context(
         locator_warning="; ".join(warnings) if warnings else None,
         omitted=tuple(omitted),
         total_bytes=total_bytes,
+        spec_paths=tuple(selected_spec_paths),
     )
 
 
@@ -438,6 +542,21 @@ def render_context(bundle: ContextBundle) -> str:
         if excerpt.symbol is not None:
             parts.append(f"symbol: {excerpt.symbol}")
         parts.append(excerpt.content.rstrip("\n"))
+    if bundle.spec_paths:
+        parts.extend(("", "### SPEC PATH EVIDENCE (UNTRUSTED)"))
+        for item in bundle.spec_paths:
+            parts.extend((f"PATH: {item.path}", f"EXISTS_AT_BASE: {'true' if item.exists else 'false'}"))
+            if item.kind is not None:
+                parts.append(f"KIND: {item.kind}")
+            if item.excerpt is not None:
+                shown = len(item.excerpt.encode("utf-8"))
+                truncated = item.size is not None and item.size > MAX_SPEC_EXCERPT_BYTES
+                parts.append(
+                    f"EXCERPT (first {MAX_SPEC_EXCERPT_BYTES} bytes of {item.size}):"
+                    if truncated else f"EXCERPT ({shown} bytes):"
+                )
+                parts.append(item.excerpt.rstrip("\n"))
+                parts.append("END EXCERPT")
     for path, content in trailing_files:
         parts.extend(
             ("", f"### REPOSITORY EVIDENCE (UNTRUSTED): {path}", content.rstrip("\n"))
@@ -448,6 +567,7 @@ def render_context(bundle: ContextBundle) -> str:
 __all__ = [
     "ContextBundle",
     "ContextExcerpt",
+    "SpecPathEvidence",
     "build_context",
     "build_context_bundle",
     "render_context",

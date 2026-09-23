@@ -17,6 +17,8 @@ Target 1000-2200 characters per contract. Use extra text only for an
 implementation fact the worker cannot derive from READ_SET.
 split directly coupled tests from their transformation. Every step must have
 READ_SET, WRITE_SET, CREATE_SET and DELETE_SET; use NONE for an empty set.
+Sets are checked against the reviewed candidate tree, step by step:
+READ/WRITE/DELETE paths must exist and CREATE paths must not.
 Use exact paths, at most 6 numbered instructions and at most 4 forbidden
 rules. EXECUTION_CLASS is MECHANICAL, REASONING or AGENTIC as defined by the
 initial planner; it is not a model selection.

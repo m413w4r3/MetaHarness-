@@ -12,7 +12,9 @@ write goes through `RunStateStore` and uses atomic replacement.
 | `context.txt` | Base-pinned planner context and locator warnings |
 | `repository_reference.json` | Staging remote name, optional GitHub web URL, base SHA and immutable base URL |
 | `run_options.json` | Frozen run options: budgets, semantic revision switch, repair-scope policy, selected profiles |
-| `planner.request.txt` / `planner.raw.md` / `planner.usage.json` | Exact planner request (written before the call), raw answer (written before parsing) and token counters |
+| `planner.request.txt` / `planner.raw.md` / `planner.usage.json` / `planner.validation.json` | Current planner attempt; the raw answer and usage are durable before parsing, while canonical plan artifacts appear only after validation passes |
+| `planner-attempts/NN/` | Rejected attempts, retaining request, raw answer, usage and deterministic validation errors |
+| `planner.session.json` | Private mode 0600 continuation handle and latest attempt; never exposed through state or trace |
 | `task_plan.json` / `task_plan_v2.json` | Parsed plan metadata and preserved raw plan |
 | `implementation_contract.md` | Canonical plan summary rendered from the READY plan |
 | `implementation_bundle.json` | Step IDs, recommended profiles and the SHA-256 of every step contract |

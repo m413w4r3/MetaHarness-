@@ -830,6 +830,49 @@ def path_exists_in_tree(repo: Path, tree_sha: str, path: str) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class TreeEntryPrefix:
+    """A bounded read of one entry of an immutable tree object."""
+
+    object_type: str
+    size: int
+    data: bytes
+    truncated: bool
+
+
+def read_tree_entry_prefix(
+    repo: Path,
+    tree_sha: str,
+    path: str,
+    *,
+    max_bytes: int,
+    max_blob_bytes: int = 1024 * 1024,
+) -> TreeEntryPrefix | None:
+    """Read at most *max_bytes* of *path* from the tree object *tree_sha*.
+
+    ``None`` when the entry does not exist.  Only blobs have content; a blob
+    larger than *max_blob_bytes* is never loaded.  The working tree is never
+    consulted and no filter or textconv is applied.
+    """
+
+    tree = _require_object_id(tree_sha, "tree_sha")
+    relative = _validate_relative_path(path)
+    if not path_exists_in_tree(repo, tree, relative):
+        return None
+    spec = f"{tree}:{relative}"
+    object_type = _git(repo, "cat-file", "-t", spec).stdout.strip()
+    if object_type != "blob":
+        return TreeEntryPrefix(object_type, 0, b"", False)
+    try:
+        size = int(_git(repo, "cat-file", "-s", spec).stdout.strip())
+    except ValueError as exc:
+        raise GitError("git cat-file returned an invalid blob size") from exc
+    if size > max_blob_bytes:
+        return TreeEntryPrefix(object_type, size, b"", True)
+    data = _git_bytes(repo, "cat-file", "blob", spec)
+    return TreeEntryPrefix(object_type, size, data[:max_bytes], len(data) > max_bytes)
+
+
 def changed_paths_between_trees(
     repo: Path, before_tree: str, after_tree: str
 ) -> tuple[str, ...]:

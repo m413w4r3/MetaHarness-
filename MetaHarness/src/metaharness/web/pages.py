@@ -889,6 +889,7 @@ _FAILURE_MESSAGES = {
     "REVIEW_AUTHORITY_MISSING": "No reviewer PASS names the candidate",
     "LLM_FAILURE": "Model call failed",
     "PLANNER_BLOCKED": "Planner could not safely produce a plan",
+    "PLAN_REPOSITORY_PRECONDITION_INVALID": "Planning failed: plan paths do not match the repository",
     "PUSH_FAILED": "Publication push failed",
     "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",

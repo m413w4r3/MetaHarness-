@@ -37,6 +37,8 @@ MAX_REPLACEMENT_PLAN_BYTES = 2 * 1024 * 1024
 # ``PLANNER_BLOCKED`` failure in any other state is not recoverable here.
 RECOVERABLE_PLANNER_STATE_PAIRS = frozenset({
     ("failed", "PLANNER_OUTPUT_INVALID"),
+    # Both planner answers violated the repository preconditions.
+    ("failed", "PLAN_REPOSITORY_PRECONDITION_INVALID"),
     ("failed", "LLM_FAILURE"),
     ("blocked", "PLANNER_BLOCKED"),
 })
