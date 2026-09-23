@@ -889,6 +889,7 @@ def configuration_description(
             "scope_approval": revision.max_review_repair_cycles > 0
                 and callable(approve_repair_scope),
             "recover_plan": callable(recover_plan_request),
+            "cancel": False,
             "publish": bool(config.publish.enabled),
         },
         "config_fingerprint": config_fingerprint,

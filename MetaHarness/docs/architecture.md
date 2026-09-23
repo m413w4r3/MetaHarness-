@@ -90,6 +90,38 @@ background child cannot modify the candidate after its snapshot. A
 descendant that creates its own session escapes this cleanup (no cgroups
 are used).
 
+## Active-run cancellation
+
+The web API advertises `capabilities.cancel: false`; there is no active-run
+cancellation endpoint. The current architecture cannot safely implement one
+by adding a signal in `RunManager` alone:
+
+- `RunManager` owns only an in-memory set of active IDs and starts a daemon
+  thread. It does not retain an orchestrator cancellation handle, and loses
+  worker ownership information if the server process exits.
+- `Orchestrator` runs a synchronous sequence of planning, agents, checks,
+  Git/worktree operations, publication, and durable state updates. No
+  cancellation token is passed across these phases, so a request cannot stop
+  at a safe boundary or prevent a later phase from starting.
+- `procutil.run_bounded` owns each child process group, but only exposes a
+  deadline timeout. Its timeout path signals the group and can escalate to
+  `SIGKILL`; there is no cooperative cancellation result for the orchestrator
+  to distinguish from timeout or ordinary failure. A cancellation request
+  must also wait until the group is gone before the worktree can be treated as
+  quiescent.
+- `RunStateStore` has no durable cancellation-requested state or transition.
+  Adding one without coordinating every orchestrator state update could let a
+  later phase overwrite it, mark a still-running worker terminal, or expose a
+  worktree as settled before its writers stop. Resume/recovery would also need
+  defined handling for a request that survives server restart.
+
+A reliable implementation therefore needs a cancellation token and safe
+boundary checks throughout orchestration, interruptible process-group waits
+with a distinct outcome, durable request/completion transitions guarded from
+ordinary updates, and explicit quiescence/worktree handling. Until those
+pieces are coordinated, cancellation remains unavailable rather than claiming
+a run is cancelled while workers may still be active.
+
 Commit objects are built from the exact candidate tree object
 (`git commit-tree`), not from the index, and the branch is advanced with a
 compare-and-swap `git update-ref HEAD <new> <base>`. Commit hooks therefore
