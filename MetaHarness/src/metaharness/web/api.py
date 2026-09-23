@@ -1223,7 +1223,7 @@ _LIVE_EVENT_WINDOW_BYTES = 256 * 1024
 LIVE_STOP_STATUSES = frozenset({
     "committed", "published", "failed", "blocked", "plan_rejected", "interrupted",
     "awaiting_plan_approval", "waiting_check_infrastructure",
-    "waiting_scope_approval",
+    "waiting_scope_approval", "waiting_remote",
 })
 _DIAGNOSTIC_COUNTERS = (
     "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",

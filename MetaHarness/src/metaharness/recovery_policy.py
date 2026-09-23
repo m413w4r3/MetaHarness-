@@ -184,6 +184,14 @@ def classify_failure(
             RecoveryDisposition.WAIT_EXTERNAL,
             "review is retained at its final-review checkpoint for retry or operator action",
         )
+    if code in {"PUSH_FAILED", "CANDIDATE_PUSH_FAILED"}:
+        if not remote_required:
+            return decision(RecoveryDisposition.CONTINUE_WITH_WARNING, "optional remote publication failed")
+        if remote_unavailable:
+            return decision(RecoveryDisposition.WAIT_EXTERNAL, "required remote is temporarily unavailable")
+        if budget_exhausted:
+            return decision(RecoveryDisposition.HARD_STOP, "required remote publication retries were exhausted")
+        return decision(RecoveryDisposition.RETRY_SAME, "required remote publication did not complete", consumes=True)
     if budget_exhausted:
         return decision(RecoveryDisposition.HARD_STOP, "bounded recovery budget exhausted")
 
@@ -194,12 +202,6 @@ def classify_failure(
             RecoveryDisposition.WAIT_EXTERNAL if remote_required else RecoveryDisposition.CONTINUE_WITH_WARNING,
             "candidate remote availability depends on publication authority",
         )
-    if code in {"PUSH_FAILED", "CANDIDATE_PUSH_FAILED"}:
-        if not remote_required:
-            return decision(RecoveryDisposition.CONTINUE_WITH_WARNING, "optional remote publication failed")
-        if remote_unavailable:
-            return decision(RecoveryDisposition.WAIT_EXTERNAL, "required remote is temporarily unavailable")
-        return decision(RecoveryDisposition.RETRY_SAME, "required remote publication did not complete", consumes=True)
     if code in {"AGENT_CONTRACT_MISMATCH", "CONTRACT_INSUFFICIENT", "CONTRACT_INSUFFICIENCY"}:
         if clean_contract_mismatch:
             return decision(RecoveryDisposition.CONTRACT_REPAIR, "clean contract mismatch is repairable", consumes=True)

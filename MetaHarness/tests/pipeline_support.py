@@ -250,7 +250,7 @@ class PipelineHarness(unittest.TestCase):
     def config(
         self, *, check_repair: int = 0, review_repair: int = 0,
         semantic_revision: bool = False, scope_policy: str | None = None,
-        publish: bool = False,
+        publish: bool = False, github_pr: bool = False,
     ) -> Any:
         path = self.root / "config.toml"
         self.config_path = path
@@ -290,6 +290,7 @@ default_reviewer_profile = "reviewer"{reviser}{repair}
 enabled = {'true' if publish else 'false'}
 remote = "origin"
 mode = "run-branch"
+{('[github]\nenabled = true\npull_request_mode = "create"' if github_pr else '')}
 
 [model_profiles.planner]
 display_name = "Planner"

@@ -36,7 +36,8 @@ def _candidate_commit_path(run_dir: Path, cycle: int) -> Path:
 def _candidate_commit_payload(
     *, commit_sha: str, tree_sha: str, parent_sha: str, branch: str,
     remote: str, immutable_url: str | None, gate_stage: str,
-    pushed_at: str | None = None,
+    remote_sha: str | None = None, pushed_at: str | None = None,
+    remote_status: str = "pending",
 ) -> dict[str, Any]:
     return {
         "commit_sha": commit_sha,
@@ -46,9 +47,10 @@ def _candidate_commit_payload(
         "branch": branch,
         "remote_branch": branch,
         "remote": remote,
-        "remote_sha": commit_sha if pushed_at is not None else None,
+        "remote_sha": remote_sha,
         "immutable_commit_url": immutable_url,
         "pushed_at": pushed_at,
+        "remote_status": remote_status,
     }
 
 
@@ -154,7 +156,12 @@ class CandidateLifecycle:
             remote=self._staging_remote,
             immutable_url=_commit_web_url(ctx.repository_reference, head),
             gate_stage=stage.value,
+            remote_sha=stored.get("remote_sha") if isinstance(stored, dict) else None,
             pushed_at=stored.get("pushed_at") if isinstance(stored, dict) else None,
+            remote_status=(
+                stored.get("remote_status", "pending")
+                if isinstance(stored, dict) else "pending"
+            ),
         )
         atomic_write_text(path, _json_text(payload))
         candidate_state = dict(store.load().get("candidate") or {})
@@ -177,5 +184,13 @@ class CandidateLifecycle:
             )
         except CandidatePushError as exc:
             raise PipelineFailure("PUSH_FAILED", "candidate push did not complete") from exc
-        self._cycle_update(store, number, status="candidate_pushed")
+        self._cycle_update(
+            store,
+            number,
+            status=(
+                "candidate_pushed"
+                if pushed.get("remote_status") == "available"
+                else "candidate_ready"
+            ),
+        )
         return pushed

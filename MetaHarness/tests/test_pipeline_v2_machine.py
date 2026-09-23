@@ -11,7 +11,7 @@ from unittest import mock
 
 from metaharness.llm.chat import LLMError, LLMHTTPError
 from metaharness.config import load_config
-from metaharness.gitops import GitError
+from metaharness.gitops import GitError, remote_run_branch_tip as real_remote_run_branch_tip
 from metaharness.models import ExecutionRole, RunStatus
 from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
 from metaharness.run_options import RunOptions
@@ -48,21 +48,30 @@ class SingleCycleTests(PipelineHarness):
         self.assertIn(candidate["commit_sha"], self.reviewer.requests[0])
         self.assertFalse((self.run_dir() / "publish.json").exists())
 
-    def test_candidate_push_failure_never_calls_reviewer(self) -> None:
+    def test_optional_candidate_push_failure_uses_local_review_and_commits(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         with mock.patch(
-            "metaharness.orchestrator.push_run_branch",
-            side_effect=GitError("simulated push failure"),
+            "metaharness.orchestrator.remote_run_branch_tip",
+            side_effect=GitError("simulated network outage"),
         ):
             result = self.orchestrator(
-                self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+                self.config(publish=False), planner=[initial_plan(STEP)], reviewer=[review()],
             ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "PUSH_FAILED")
-        self.assertEqual(self.reviewer.requests, [])
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(len(self.reviewer.requests), 1)
+        candidate = json.loads(
+            (self.run_dir() / "cycles/001/candidate/commit.json").read_text()
+        )
+        self.assertIsNone(candidate["remote_sha"])
+        self.assertIsNone(candidate["pushed_at"])
+        self.assertEqual(candidate["remote_status"], "unavailable")
+        request = self.reviewer.requests[0]
+        self.assertIn('"remote_exploration": "UNAVAILABLE"', request)
+        self.assertIn("<BOUNDED DIFF EXCERPT>", request)
+        self.assertIn("candidate.push_unavailable", self.trace_names())
 
-    def test_different_remote_tip_fails_closed_before_reviewer(self) -> None:
+    def test_different_remote_tip_does_not_block_local_candidate_review(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         with mock.patch(
             "metaharness.orchestrator.remote_run_branch_tip",
@@ -72,9 +81,13 @@ class SingleCycleTests(PipelineHarness):
                 self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
             ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "REMOTE_AUTHORITY_MISMATCH")
-        self.assertEqual(self.reviewer.requests, [])
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(len(self.reviewer.requests), 1)
+        candidate = json.loads(
+            (self.run_dir() / "cycles/001/candidate/commit.json").read_text()
+        )
+        self.assertIsNone(candidate["remote_sha"])
+        self.assertEqual(candidate["remote_status"], "unavailable")
 
     def test_remote_push_without_web_url_uses_bounded_diff_fallback(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
@@ -86,6 +99,72 @@ class SingleCycleTests(PipelineHarness):
         request = self.reviewer.requests[0]
         self.assertIn('"remote_exploration": "UNAVAILABLE"', request)
         self.assertIn("<BOUNDED DIFF EXCERPT>", request)
+
+    def test_required_candidate_push_waits_and_resumes_at_candidate_push(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        with mock.patch(
+            "metaharness.orchestrator.remote_run_branch_tip",
+            side_effect=GitError("simulated network outage"),
+        ):
+            waiting = self.orchestrator(
+                self.config(publish=True), planner=[initial_plan(STEP)], reviewer=[review()],
+            ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(waiting.status.value, "waiting_remote")
+        self.assertEqual(self.reviewer.requests, [])
+        self.assertEqual(self.checkpoint()["phase"], "candidate_push")
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
+        candidate = json.loads(
+            (self.run_dir() / "cycles/001/candidate/commit.json").read_text()
+        )
+        self.assertIsNone(candidate["remote_sha"])
+        self.assertIsNone(candidate["pushed_at"])
+        self.assertEqual(candidate["remote_status"], "unavailable")
+
+        resumed = self.orchestrator(
+            self.config(publish=True), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(len(self.reviewer.requests), 1)
+
+    def test_pr_creation_requires_remote_candidate_before_review(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        with mock.patch(
+            "metaharness.orchestrator.remote_run_branch_tip",
+            side_effect=GitError("simulated network outage"),
+        ):
+            waiting = self.orchestrator(
+                self.config(publish=True, github_pr=True),
+                planner=[initial_plan(STEP)], reviewer=[review()],
+            ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(waiting.status.value, "waiting_remote")
+        self.assertEqual(self.checkpoint()["phase"], "candidate_push")
+        self.assertEqual(self.reviewer.requests, [])
+
+    def test_publication_rejects_remote_tip_change_after_local_review_pass(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        calls = 0
+
+        def moved_after_review(repo, *, remote, branch):
+            nonlocal calls
+            calls += 1
+            actual = real_remote_run_branch_tip(repo, remote=remote, branch=branch)
+            return "d" * 40 if calls >= 4 else actual
+
+        with mock.patch(
+            "metaharness.orchestrator.remote_run_branch_tip",
+            side_effect=moved_after_review,
+        ):
+            result = self.orchestrator(
+                self.config(publish=True), planner=[initial_plan(STEP)], reviewer=[review()],
+            ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "COMMIT_TREE_MISMATCH")
+        self.assertEqual(len(self.reviewer.requests), 1)
+        self.assertGreaterEqual(calls, 4)
 
     def test_pipeline_v2_stays_backend_neutral(self) -> None:
         source = Path(__file__).parents[1].joinpath(

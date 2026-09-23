@@ -96,7 +96,8 @@ _TIMELINE = (
     ("contract_repairing", "CORRECTING STEP CONTRACT"),
     ("pre_revision_validating", "PRE-REVISION VALIDATING"),
     ("revising", "REVISING"), ("revalidating", "REVALIDATING"), ("reviewing", "REVIEWING"),
-    ("approved", "APPROVED"), ("publishing", "PUBLISHING"), ("published", "PUBLISHED"),
+    ("approved", "APPROVED"), ("waiting_remote", "WAITING FOR REMOTE"),
+    ("publishing", "PUBLISHING"), ("published", "PUBLISHED"),
 )
 _ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
 _TERMINAL_LABELS = {"blocked": "BLOCKED", "plan_rejected": "REJECTED", "failed": "FAILED", "interrupted": "INTERRUPTED"}
@@ -996,7 +997,10 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = str(state.get("status", run.get("status", "")) or "")
     failure = run.get("failure", state.get("failure"))
-    if status not in {"failed", "blocked", "interrupted", "waiting_check_infrastructure"} or not isinstance(failure, dict):
+    if status not in {
+        "failed", "blocked", "interrupted", "waiting_check_infrastructure",
+        "waiting_remote",
+    } or not isinstance(failure, dict):
         return ""
     reason = str(failure.get("reason") or "")
     resume = overview.get("resume") if isinstance(overview.get("resume"), dict) else {}

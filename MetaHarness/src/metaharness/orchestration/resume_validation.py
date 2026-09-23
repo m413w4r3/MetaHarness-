@@ -1102,31 +1102,23 @@ def validate_resume(
                 run_dir, number, candidate_stage, tree=expected_tree, head=head,
                 base_scope=cycle_base_scope, policy=repair_scope,
             )
-            try:
-                remote_tip = remote_run_branch_tip(repo, remote=staging_remote, branch=branch)
-            except (GitError, OSError):
-                if checkpoint.phase is ResumePhase.FINAL_REVIEW:
-                    remote_tip = None
-                else:
-                    raise
-            if checkpoint.phase is ResumePhase.CANDIDATE_PUSH:
-                previous_candidate_sha = None
-                if number > 1:
-                    previous = read_candidate_record(run_dir, number - 1)
-                    previous_candidate_sha = previous.get("commit_sha")
-                if remote_tip not in {None, head, previous_candidate_sha}:
-                    _refuse("remote run branch points to a different commit")
-            elif checkpoint.phase is ResumePhase.FINAL_REVIEW and remote_tip is None:
-                # The candidate record already binds the exact push. Review
-                # can continue from its local immutable commit and saved diff.
-                pass
-            elif remote_tip != head:
-                _refuse("remote run branch does not point to the candidate commit")
-            if checkpoint.phase in {ResumePhase.FINAL_REVIEW, ResumePhase.PUBLISH}:
+            remote_required = config.publish.enabled or (
+                config.github.enabled and config.github.pull_request_mode == "create"
+            )
+            if checkpoint.phase is ResumePhase.PUBLISH and remote_required:
+                try:
+                    remote_tip = remote_run_branch_tip(
+                        repo, remote=staging_remote, branch=branch
+                    )
+                except (GitError, OSError):
+                    _refuse("required remote candidate could not be verified")
+                if remote_tip != head:
+                    _refuse("remote run branch does not point to the candidate commit")
                 if (
                     candidate.get("remote") != staging_remote
                     or candidate.get("remote_branch") != branch
                     or candidate.get("remote_sha") != head
+                    or candidate.get("remote_status") != "available"
                     or not isinstance(candidate.get("pushed_at"), str)
                     or not candidate.get("pushed_at")
                 ):

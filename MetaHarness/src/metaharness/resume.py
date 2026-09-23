@@ -237,6 +237,7 @@ PHASE_STATUS.update({
 })
 _RESUMABLE_STATUSES = frozenset({
     "failed", "interrupted", "waiting_scope_approval", "waiting_check_infrastructure",
+    "waiting_remote",
 })
 # Failures that a checkpoint can never repair: the run needs an operator.
 _TERMINAL_FAILURES = frozenset({
