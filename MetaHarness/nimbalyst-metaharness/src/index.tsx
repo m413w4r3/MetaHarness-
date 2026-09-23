@@ -1,5 +1,6 @@
 import type { ExtensionContext, ExtensionModule } from '@nimbalyst/extension-sdk';
 import './styles.css';
+import './panelLayout.css';
 import { MetaHarnessPanel } from './panel/MetaHarnessPanel';
 import { MetaHarnessSettings } from './settings/MetaHarnessSettings';
 import { bindExtensionRuntime, unbindExtensionRuntime } from './runtime/extensionRuntime';
