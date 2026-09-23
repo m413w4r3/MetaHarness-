@@ -324,6 +324,7 @@ class LocalServerHardeningTests(unittest.TestCase):
             self.assertEqual(data, {
                 "service": "metaharness", "api_version": 1,
                 "status": "ok", "control_api": True,
+                "capabilities_endpoint": "/api/v1/config",
             })
             self.assertNotIn(control, payload)
             self.assertNotIn(control_server.browser_token, payload)

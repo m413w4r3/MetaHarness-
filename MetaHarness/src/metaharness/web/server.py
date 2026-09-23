@@ -8,6 +8,7 @@ mutation token, every request must also name this exact local server in its
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -44,6 +45,7 @@ _MAX_CONTROL_TOKEN_BYTES = 4096
 # Only the REPLACE PLAN routes accept more: room for a 128 KiB plan after
 # form/JSON encoding.  The decoded text is bounded again, exactly.
 _MAX_RECOVERY_BODY_BYTES = 4 * MAX_REPLACEMENT_PLAN_BYTES
+_MAX_CONFIG_CHECKS = 80
 _LOCAL_HOST_NAMES = ("127.0.0.1", "localhost")
 _SECURITY_HEADERS = (
     ("X-Content-Type-Options", "nosniff"),
@@ -145,8 +147,10 @@ class MetaHarnessHTTPServer(ThreadingHTTPServer):
         config: HarnessConfig,
         *,
         control_token_file: str | Path | None = None,
+        config_fingerprint: str | None = None,
     ):
         self.config = config
+        self.config_fingerprint = config_fingerprint
         self.browser_token = secrets.token_urlsafe(32)
         self.control_token = (
             load_or_create_control_token(control_token_file)
@@ -297,7 +301,14 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     "api_version": 1,
                     "status": "ok",
                     "control_api": True,
+                    "capabilities_endpoint": "/api/v1/config",
                 })
+                return
+            if parsed.path == "/api/v1/config":
+                self._json(200, configuration_description(
+                    self.server.config,
+                    config_fingerprint=self.server.config_fingerprint,
+                ))
                 return
             if parsed.path == "/api/v1/model-profiles":
                 self._json(200, model_profiles(self.server.config))
@@ -793,8 +804,79 @@ def create_server(
     *,
     control_token_file: str | Path | None = None,
 ) -> MetaHarnessHTTPServer:
-    loaded = load_config(config) if not isinstance(config, HarnessConfig) else config
-    return MetaHarnessHTTPServer((HOST, port), loaded, control_token_file=control_token_file)
+    fingerprint = None
+    if isinstance(config, HarnessConfig):
+        loaded = config
+    else:
+        source = Path(config).expanduser()
+        loaded = load_config(source)
+        # Hash the original file bytes. In particular, do not serialize the
+        # expanded config, which may contain values loaded from .env files.
+        fingerprint = hashlib.sha256(source.read_bytes()).hexdigest()
+    return MetaHarnessHTTPServer(
+        (HOST, port), loaded, control_token_file=control_token_file,
+        config_fingerprint=fingerprint,
+    )
+
+
+def configuration_description(
+    config: HarnessConfig, *, config_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Return the bounded, credential-free subset intended for UI forms."""
+
+    planning = config.planning
+    revision = config.revision
+    checks = config.check_catalog[:_MAX_CONFIG_CHECKS]
+    return {
+        "repository": {
+            "repo": str(config.repo),
+            "base_ref": config.base_ref,
+            "remote": config.repository.remote,
+        },
+        "planning": {
+            "protocol": planning.protocol,
+            "decomposition": planning.decomposition,
+            "execution_mode_policy": planning.execution_mode_policy,
+            "single_step_max_mutable_paths": planning.single_step_max_mutable_paths,
+            "staged_step_max_mutable_paths": planning.staged_step_max_mutable_paths,
+            "max_steps_per_plan": planning.max_steps_per_plan,
+        },
+        "revision": {
+            "enabled": revision.enabled,
+            "max_check_repair_attempts": revision.max_check_repair_attempts,
+            "max_review_repair_cycles": revision.max_review_repair_cycles,
+        },
+        "approval": {
+            "require_plan_approval": config.approval.require_plan_approval,
+        },
+        "publish": {
+            "enabled": config.publish.enabled,
+            "mode": config.publish.mode,
+            "remote": config.publish.remote,
+        },
+        "ui": {"max_active_runs": config.ui.max_active_runs},
+        "routing": {
+            "mechanical_profile": config.routing.mechanical_profile,
+            "reasoning_profile": config.routing.reasoning_profile,
+            "agentic_profile": config.routing.agentic_profile,
+        },
+        # Do not include argv, preflight_argv, cwd or environment values.
+        "checks": [
+            {"id": check.id[:256], "description": check.description[:300]}
+            for check in checks
+        ],
+        "checks_truncated": len(config.check_catalog) > len(checks),
+        "capabilities": {
+            "plan_approval": bool(config.approval.require_plan_approval),
+            "semantic_revision": bool(revision.enabled),
+            "resume": callable(resume_run_request),
+            "scope_approval": revision.max_review_repair_cycles > 0
+                and callable(approve_repair_scope),
+            "recover_plan": callable(recover_plan_request),
+            "publish": bool(config.publish.enabled),
+        },
+        "config_fingerprint": config_fingerprint,
+    }
 
 
 def serve(
@@ -821,6 +903,7 @@ __all__ = [
     "allowed_hosts",
     "allowed_origins",
     "create_server",
+    "configuration_description",
     "html_csp",
     "serve",
 ]

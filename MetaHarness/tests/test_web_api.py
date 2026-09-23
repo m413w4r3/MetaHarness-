@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from dataclasses import replace
 import sys
 import tempfile
 import threading
@@ -49,8 +51,9 @@ class WebServerTests(unittest.TestCase):
             worktrees_root=root / "worktrees",
             require_clean_base=True,
             context=ContextConfig(),
-            check_catalog=(),
+            check_catalog=(CheckConfig("lint", ("echo", "argv-secret"), description="Repository lint gate."),),
             allow_no_required_checks=True,
+            runtime_environment={"API_KEY": "secret-test-value"},
             ui=UIConfig(
                 default_planner_profile="planner",
                 default_implementer_profile="implementer",
@@ -105,6 +108,7 @@ class WebServerTests(unittest.TestCase):
         ):
             cases = (
                 ("/api/v1/health", 200),
+                ("/api/v1/config", 200),
                 ("/api/v1/model-profiles", 200),
                 ("/api/v1/runs", 200),
                 ("/api/v1/runs/r1", 200),
@@ -124,6 +128,64 @@ class WebServerTests(unittest.TestCase):
             get_run.assert_called_once_with(self.runs, "r1", config=self.config)
             live.assert_called_once_with(self.runs, "r1", self.config)
             progress.assert_called_once_with(self.runs, "r1", 3)
+
+    def test_config_endpoint_exposes_effective_safe_config(self) -> None:
+        status, payload, raw = self.request("GET", "/api/v1/config")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["repository"], {
+            "repo": str(self.config.repo), "base_ref": "HEAD", "remote": "origin",
+        })
+        self.assertEqual(payload["planning"], {
+            "protocol": self.config.planning.protocol,
+            "decomposition": self.config.planning.decomposition,
+            "execution_mode_policy": self.config.planning.execution_mode_policy,
+            "single_step_max_mutable_paths": self.config.planning.single_step_max_mutable_paths,
+            "staged_step_max_mutable_paths": self.config.planning.staged_step_max_mutable_paths,
+            "max_steps_per_plan": self.config.planning.max_steps_per_plan,
+        })
+        self.assertEqual(payload["revision"], {
+            "enabled": self.config.revision.enabled,
+            "max_check_repair_attempts": self.config.revision.max_check_repair_attempts,
+            "max_review_repair_cycles": self.config.revision.max_review_repair_cycles,
+        })
+        self.assertEqual(payload["ui"]["max_active_runs"], self.config.ui.max_active_runs)
+        self.assertEqual(payload["checks"], [{"id": "lint", "description": "Repository lint gate."}])
+        self.assertIsNone(payload["config_fingerprint"])
+        self.assertNotIn("argv-secret", raw.decode())
+        self.assertNotIn("secret-test-value", raw.decode())
+        self.assertNotIn("API_KEY", raw.decode())
+        self.assertLess(len(raw), 64 * 1024)
+
+    def test_config_fingerprint_hashes_stable_original_file_bytes(self) -> None:
+        source = Path(self.temp.name) / "source.toml"
+        source.write_bytes(b"config = 'original'\n")
+        fingerprints = []
+        for _ in range(2):
+            with patch("metaharness.web.server.load_config", return_value=self.config):
+                server = create_server(source, port=0)
+            fingerprints.append(server.config_fingerprint)
+            server.server_close()
+        self.assertEqual(fingerprints[0], fingerprints[1])
+        self.assertEqual(fingerprints[0], hashlib.sha256(source.read_bytes()).hexdigest())
+
+    def test_config_check_catalogue_is_bounded(self) -> None:
+        original = self.server.config
+        self.server.config = replace(
+            original,
+            check_catalog=tuple(
+                CheckConfig(f"check-{index}-" + "x" * 300, ("secret-command",), description="d" * 300)
+                for index in range(300)
+            ),
+        )
+        try:
+            status, payload, raw = self.request("GET", "/api/v1/config")
+        finally:
+            self.server.config = original
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["checks_truncated"])
+        self.assertEqual(len(payload["checks"]), 80)
+        self.assertLess(len(raw), 64 * 1024)
+        self.assertNotIn("secret-command", raw.decode())
 
     def test_v1_get_rejects_bad_offsets_and_run_ids_as_json(self) -> None:
         for path, status_expected in (
