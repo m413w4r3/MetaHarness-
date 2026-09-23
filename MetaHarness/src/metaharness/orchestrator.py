@@ -1618,7 +1618,7 @@ class Orchestrator:
                 "steps": [
                     {"id": step.id, "title": step.title,
                      "execution_class": step.execution_class.value,
-                     "recommended_profile": self._run_options.default_implementer_profile,
+                     "recommended_profile": self.config.routing.profile_for(step.execution_class),
                      "status": "waiting"}
                     for step in plan.steps
                 ],
@@ -1627,7 +1627,7 @@ class Orchestrator:
             steps=[
                 {"id": step.id, "title": step.title, "status": "waiting",
                  "execution_class": step.execution_class.value,
-                 "profile_id": self._run_options.default_implementer_profile}
+                 "profile_id": self.config.routing.profile_for(step.execution_class)}
                 for step in plan.steps
             ],
             current_step=None,
@@ -1690,10 +1690,7 @@ class Orchestrator:
             requested = resolve_execution_selection(
                 self.config,
                 planner_profile_id=planner_profile_id,
-                step_profile_ids={
-                    step.id: self._run_options.default_implementer_profile
-                    for step in plan.steps
-                },
+                plan_steps=plan.steps,
                 semantic_reviser_profile_id=(
                     self._run_options.semantic_reviser_profile
                     if revision_enabled or repair_enabled else None
@@ -1724,6 +1721,8 @@ class Orchestrator:
             raise ExecutionSelectionError("execution selection planner is not the run planner")
         if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
             raise ExecutionSelectionError("execution selection steps do not match the plan")
+        if [item.execution_class for item in selection.steps] != [step.execution_class for step in plan.steps]:
+            raise ExecutionSelectionError("execution selection classes do not match the plan")
         if not isinstance(selection, ExecutionSelection) or selection.schema_version != EXECUTION_SELECTION_SCHEMA:
             raise ExecutionSelectionError("v2 execution requires the generic execution selection")
         validate_execution_selection(self.config, selection)
@@ -2098,7 +2097,7 @@ class Orchestrator:
         if cycle.kind is not CycleKind.REVIEW_REPLAN:
             raise PipelineFailure("REPLAN_CYCLE_REQUIRED")
         planned_profile_ids = {
-            step.id: self._run_options.default_implementer_profile for step in plan.steps
+            step.id: self.config.routing.profile_for(step.execution_class) for step in plan.steps
         }
         try:
             if creating:
@@ -2106,6 +2105,7 @@ class Orchestrator:
                     ctx.run_dir,
                     resolve_cycle_execution_selection(
                         self.config, cycle=cycle.number,
+                        plan_steps=plan.steps,
                         step_profile_ids=planned_profile_ids,
                     ),
                 )
@@ -2113,6 +2113,8 @@ class Orchestrator:
                 cycle_selection = read_cycle_execution_selection(ctx.run_dir, cycle.number)
                 validate_cycle_execution_selection(self.config, cycle_selection)
                 if [item.step_id for item in cycle_selection.steps] != [step.id for step in plan.steps]:
+                    raise PipelineFailure("REPLAN_EXECUTION_SELECTION_MISMATCH")
+                if [item.execution_class for item in cycle_selection.steps] != [step.execution_class for step in plan.steps]:
                     raise PipelineFailure("REPLAN_EXECUTION_SELECTION_MISMATCH")
                 if {
                     item.step_id: item.implementer.profile_id for item in cycle_selection.steps
@@ -4816,7 +4818,7 @@ class Orchestrator:
                 "steps": [
                     {"id": step.id, "title": step.title,
                      "execution_class": step.execution_class.value,
-                     "recommended_profile": self._run_options.default_implementer_profile,
+                     "recommended_profile": self.config.routing.profile_for(step.execution_class),
                      "status": "waiting"}
                     for step in plan.steps
                 ],

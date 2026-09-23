@@ -357,7 +357,8 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 self._authorized()
                 payload = self._body()
                 allowed = {
-                    "spec", "run_id", "planner_profile", "default_implementer_profile",
+                    "spec", "run_id", "planner_profile", "mechanical_profile",
+                    "reasoning_profile", "agentic_profile",
                     "final_reviewer_profile", "semantic_reviser_profile", "check_repair_profile",
                     "semantic_revision_enabled", "max_check_repair_attempts",
                     "max_review_repair_cycles",
@@ -374,7 +375,9 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     spec=payload.get("spec"),
                     run_id=payload.get("run_id"),
                     planner_profile=payload.get("planner_profile"),
-                    default_implementer_profile=payload.get("default_implementer_profile"),
+                    mechanical_profile=payload.get("mechanical_profile"),
+                    reasoning_profile=payload.get("reasoning_profile"),
+                    agentic_profile=payload.get("agentic_profile"),
                     final_reviewer_profile=payload.get("final_reviewer_profile"),
                     semantic_reviser_profile=payload.get("semantic_reviser_profile"),
                     check_repair_profile=payload.get("check_repair_profile"),
@@ -392,7 +395,8 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 return
             if parts == ["", "runs"]:
                 payload = self._form({
-                    "_token", "spec", "run_id", "planner_profile", "default_implementer_profile",
+                    "_token", "spec", "run_id", "planner_profile", "mechanical_profile",
+                    "reasoning_profile", "agentic_profile",
                     "final_reviewer_profile", "semantic_reviser_profile", "check_repair_profile",
                     "semantic_revision_enabled", "max_check_repair_attempts",
                     "max_review_repair_cycles",
@@ -409,7 +413,9 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     spec=payload["spec"],
                     run_id=payload["run_id"] or None,
                     planner_profile=payload["planner_profile"],
-                    default_implementer_profile=payload.get("default_implementer_profile"),
+                    mechanical_profile=payload.get("mechanical_profile"),
+                    reasoning_profile=payload.get("reasoning_profile"),
+                    agentic_profile=payload.get("agentic_profile"),
                     final_reviewer_profile=payload.get("final_reviewer_profile"),
                     semantic_reviser_profile=payload.get("semantic_reviser_profile"),
                     check_repair_profile=payload.get("check_repair_profile"),

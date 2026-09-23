@@ -12,11 +12,13 @@ from typing import Any, Mapping
 
 from .models import (
     CycleExecutionSelection,
+    ExecutionClass,
     ExecutionRole,
     ExecutionSelection,
     HarnessConfig,
     SelectedProfile,
     StepExecutionSelection,
+    ImplementationStep,
     profile_driver_name,
 )
 from .profiles import ProfileError, profile_execution_fingerprint, profile_for_role
@@ -71,6 +73,21 @@ def _selected(config: HarnessConfig, profile_id: str, role: ExecutionRole) -> Se
             claude_config_home=(
                 config.claude_runtime.home if profile.driver == "claude-code" else None
             ),
+            provider_base_url=(
+                config.codex_providers[profile.provider].base_url
+                if profile.driver == "codex" and profile.provider in config.codex_providers
+                else None
+            ),
+            provider_wire_api=(
+                config.codex_providers[profile.provider].wire_api
+                if profile.driver == "codex" and profile.provider in config.codex_providers
+                else None
+            ),
+            provider_api_key_env=(
+                config.codex_providers[profile.provider].api_key_env
+                if profile.driver == "codex" and profile.provider in config.codex_providers
+                else None
+            ),
         ),
     )
 
@@ -100,19 +117,38 @@ def resolve_execution_selection(
     config: HarnessConfig,
     *,
     planner_profile_id: str,
-    step_profile_ids: Mapping[str, str],
+    plan_steps: tuple[ImplementationStep, ...] | list[ImplementationStep] | None = None,
+    step_profile_ids: Mapping[str, str] | None = None,
     check_repair_profile_id: str | None,
     semantic_reviser_profile_id: str | None,
     final_reviewer_profile_id: str,
 ) -> ExecutionSelection:
     """Freeze every role used by the generic v2 state machine."""
 
+    if not plan_steps:
+        raise ExecutionSelectionError("execution plan steps are required")
+    if len(plan_steps) > MAX_STEPS:
+        raise ExecutionSelectionError(f"execution selection may contain at most {MAX_STEPS} steps")
+    override_ids = step_profile_ids or {}
+    step_items = {}
+    for step in plan_steps:
+        if not isinstance(step, ImplementationStep):
+            raise ExecutionSelectionError("execution plan step is invalid")
+        if step.id in step_items:
+            raise ExecutionSelectionError("execution plan step IDs must be unique")
+        profile_id = override_ids.get(step.id) or config.routing.profile_for(step.execution_class)
+        step_items[step.id] = (step.execution_class, profile_id)
+    if set(override_ids) - set(step_items):
+        raise ExecutionSelectionError("execution selection contains an unknown step")
     steps = tuple(
         StepExecutionSelection(
             step_id=step_id,
             implementer=_selected(config, profile_id, ExecutionRole.IMPLEMENTER),
+            execution_class=execution_class,
         )
-        for step_id, profile_id in _canonical_step_items(step_profile_ids)
+        for step_id, (execution_class, profile_id) in sorted(
+            step_items.items(), key=lambda item: int(item[0][1:])
+        )
     )
     return ExecutionSelection(
         schema_version=SCHEMA_VERSION,
@@ -134,18 +170,31 @@ def resolve_cycle_execution_selection(
     config: HarnessConfig,
     *,
     cycle: int,
-    step_profile_ids: Mapping[str, str],
+    plan_steps: tuple[ImplementationStep, ...] | list[ImplementationStep] | None = None,
+    step_profile_ids: Mapping[str, str] | None = None,
 ) -> CycleExecutionSelection:
     """Freeze implementer profiles for a single review-replan cycle."""
 
     if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 2:
         raise ExecutionSelectionError("cycle execution selection cycle is invalid")
+    if not plan_steps:
+        raise ExecutionSelectionError("execution plan steps are required")
+    if len(plan_steps) > MAX_STEPS:
+        raise ExecutionSelectionError(f"cycle execution selection may contain at most {MAX_STEPS} steps")
+    overrides = step_profile_ids or {}
+    if set(overrides) - {step.id for step in plan_steps}:
+        raise ExecutionSelectionError("cycle execution selection contains an unknown step")
     steps = tuple(
         StepExecutionSelection(
-            step_id=step_id,
-            implementer=_selected(config, profile_id, ExecutionRole.IMPLEMENTER),
+            step_id=step.id,
+            implementer=_selected(
+                config,
+                overrides.get(step.id) or config.routing.profile_for(step.execution_class),
+                ExecutionRole.IMPLEMENTER,
+            ),
+            execution_class=step.execution_class,
         )
-        for step_id, profile_id in _canonical_step_items(step_profile_ids)
+        for step in sorted(plan_steps, key=lambda item: int(item.id[1:]))
     )
     return CycleExecutionSelection(_CYCLE_SCHEMA_VERSION, cycle, steps)
 
@@ -175,7 +224,8 @@ def _payload(selection: ExecutionSelection) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "planner": _selected_payload(selection.planner),
         "steps": [
-            {"step_id": item.step_id, "implementer": _selected_payload(item.implementer)}
+            {"step_id": item.step_id, "execution_class": item.execution_class.value,
+             "implementer": _selected_payload(item.implementer)}
             for item in selection.steps
         ],
         "check_repair": (
@@ -238,7 +288,8 @@ def _cycle_payload(selection: CycleExecutionSelection) -> dict[str, Any]:
         "schema_version": _CYCLE_SCHEMA_VERSION,
         "cycle": selection.cycle,
         "steps": [
-            {"step_id": item.step_id, "implementer": _selected_payload(item.implementer)}
+            {"step_id": item.step_id, "execution_class": item.execution_class.value,
+             "implementer": _selected_payload(item.implementer)}
             for item in selection.steps
         ],
     }
@@ -304,12 +355,16 @@ def parse_execution_selection(data: bytes) -> ExecutionSelection:
         raise ExecutionSelectionError("execution selection steps are invalid")
     steps = []
     for item in raw_steps:
-        if not isinstance(item, dict) or set(item) != {"step_id", "implementer"}:
+        if not isinstance(item, dict) or set(item) != {"step_id", "execution_class", "implementer"}:
             raise ExecutionSelectionError("execution selection step is invalid")
         step_id = item.get("step_id")
         if not isinstance(step_id, str) or STEP_ID_RE.fullmatch(step_id) is None:
             raise ExecutionSelectionError("execution selection step ID is invalid")
-        steps.append(StepExecutionSelection(step_id, _parse_selected(item["implementer"], f"step {step_id}")))
+        try:
+            execution_class = ExecutionClass(item["execution_class"])
+        except (TypeError, ValueError) as exc:
+            raise ExecutionSelectionError("execution selection execution class is invalid") from exc
+        steps.append(StepExecutionSelection(step_id, _parse_selected(item["implementer"], f"step {step_id}"), execution_class))
     if [item.step_id for item in steps] != list(step_ids(len(steps))):
         raise ExecutionSelectionError("execution selection step IDs are not contiguous")
     return ExecutionSelection(
@@ -343,12 +398,16 @@ def parse_cycle_execution_selection(data: bytes) -> CycleExecutionSelection:
         raise ExecutionSelectionError("cycle execution selection steps are invalid")
     steps = []
     for item in raw_steps:
-        if not isinstance(item, dict) or set(item) != {"step_id", "implementer"}:
+        if not isinstance(item, dict) or set(item) != {"step_id", "execution_class", "implementer"}:
             raise ExecutionSelectionError("cycle execution selection step is invalid")
         step_id = item.get("step_id")
         if not isinstance(step_id, str) or STEP_ID_RE.fullmatch(step_id) is None:
             raise ExecutionSelectionError("cycle execution selection step ID is invalid")
-        steps.append(StepExecutionSelection(step_id, _parse_selected(item["implementer"], f"cycle step {step_id}")))
+        try:
+            execution_class = ExecutionClass(item["execution_class"])
+        except (TypeError, ValueError) as exc:
+            raise ExecutionSelectionError("cycle execution selection execution class is invalid") from exc
+        steps.append(StepExecutionSelection(step_id, _parse_selected(item["implementer"], f"cycle step {step_id}"), execution_class))
     if [item.step_id for item in steps] != list(step_ids(len(steps))):
         raise ExecutionSelectionError("cycle execution selection step IDs are not contiguous")
     if payload.get("schema_version") != _CYCLE_SCHEMA_VERSION:

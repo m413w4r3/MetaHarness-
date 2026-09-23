@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from .models import HarnessConfig, RevisionConfig, PlanningConfig, validate_revision_budget
+from .models import HarnessConfig, RevisionConfig, PlanningConfig, RoutingConfig, validate_revision_budget
 from .profiles import ProfileError, profile_for_role
 from .result import atomic_write_text
 from .models import ExecutionRole
@@ -55,17 +55,31 @@ class RunOptions:
     max_check_repair_attempts: int
     max_review_repair_cycles: int
     planner_profile: str
-    default_implementer_profile: str
-    check_repair_profile: str | None
-    semantic_reviser_profile: str | None
-    final_reviewer_profile: str
+    mechanical_profile: str = ""
+    reasoning_profile: str = ""
+    agentic_profile: str = ""
+    check_repair_profile: str | None = None
+    semantic_reviser_profile: str | None = None
+    final_reviewer_profile: str = ""
     repair_scope_policy: str = "auto-bounded"
     repair_scope_max_added_paths: int = 4
     max_steps_per_plan: int = 8
     max_read_paths_per_step: int = 8
     max_step_contract_chars: int = 5000
+    # Constructor-only migration aid. It is never serialized and is not read
+    # by the modern resolver.
+    default_implementer_profile: str | None = None
 
     def __post_init__(self) -> None:
+        if (
+            not self.mechanical_profile and not self.reasoning_profile
+            and not self.agentic_profile
+            and isinstance(self.default_implementer_profile, str)
+            and self.default_implementer_profile.strip()
+        ):
+            object.__setattr__(self, "mechanical_profile", self.default_implementer_profile)
+            object.__setattr__(self, "reasoning_profile", self.default_implementer_profile)
+            object.__setattr__(self, "agentic_profile", self.default_implementer_profile)
         if self.schema_version != SCHEMA_VERSION or self.pipeline_version != 2:
             raise RunOptionsError("run options schema or pipeline version is unsupported")
         if self.protocol != "v2":
@@ -91,7 +105,10 @@ class RunOptions:
                 validate_revision_budget(getattr(self, name), f"run options {name}")
             except ValueError as exc:
                 raise RunOptionsError(str(exc)) from None
-        for name in ("planner_profile", "default_implementer_profile", "final_reviewer_profile"):
+        for name in (
+            "planner_profile", "mechanical_profile", "reasoning_profile",
+            "agentic_profile", "final_reviewer_profile",
+        ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise RunOptionsError(f"run options {name} is invalid")
@@ -110,7 +127,8 @@ class RunOptions:
             "protocol", "decomposition", "execution_mode_policy",
             "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
             "semantic_revision_enabled", "max_check_repair_attempts",
-            "max_review_repair_cycles", "planner_profile", "default_implementer_profile",
+            "max_review_repair_cycles", "planner_profile", "mechanical_profile",
+            "reasoning_profile", "agentic_profile",
             "check_repair_profile", "semantic_reviser_profile", "final_reviewer_profile",
             "repair_scope_policy", "repair_scope_max_added_paths",
             "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
@@ -118,6 +136,15 @@ class RunOptions:
         unknown = set(overrides) - allowed
         if unknown:
             raise RunOptionsError(f"unknown run option: {sorted(unknown)[0]}")
+        route_defaults = {
+            "mechanical_profile": config.routing.mechanical_profile,
+            "reasoning_profile": config.routing.reasoning_profile,
+            "agentic_profile": config.routing.agentic_profile,
+        }
+        if not all(profile_id in config.model_profiles for profile_id in route_defaults.values()):
+            legacy = config.ui.default_implementer_profile
+            if isinstance(legacy, str) and legacy.strip():
+                route_defaults = {key: legacy for key in route_defaults}
         values: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "pipeline_version": 2,
@@ -133,7 +160,7 @@ class RunOptions:
             "max_check_repair_attempts": config.revision.max_check_repair_attempts,
             "max_review_repair_cycles": config.revision.max_review_repair_cycles,
             "planner_profile": config.ui.default_planner_profile,
-            "default_implementer_profile": config.ui.default_implementer_profile,
+            **route_defaults,
             "check_repair_profile": config.ui.default_repair_profile,
             "semantic_reviser_profile": config.ui.default_reviser_profile,
             "final_reviewer_profile": config.ui.default_reviewer_profile,
@@ -154,7 +181,9 @@ class RunOptions:
     def validate_profiles(self, config: HarnessConfig) -> None:
         for name, role in (
             ("planner_profile", ExecutionRole.PLANNER),
-            ("default_implementer_profile", ExecutionRole.IMPLEMENTER),
+            ("mechanical_profile", ExecutionRole.IMPLEMENTER),
+            ("reasoning_profile", ExecutionRole.IMPLEMENTER),
+            ("agentic_profile", ExecutionRole.IMPLEMENTER),
             ("final_reviewer_profile", ExecutionRole.REVIEWER),
             ("semantic_reviser_profile", ExecutionRole.REVISER),
             ("check_repair_profile", ExecutionRole.REPAIR),
@@ -190,7 +219,9 @@ class RunOptions:
             },
             "profiles": {
                 "planner_profile": self.planner_profile,
-                "default_implementer_profile": self.default_implementer_profile,
+                "mechanical_profile": self.mechanical_profile,
+                "reasoning_profile": self.reasoning_profile,
+                "agentic_profile": self.agentic_profile,
                 "check_repair_profile": self.check_repair_profile,
                 "semantic_reviser_profile": self.semantic_reviser_profile,
                 "final_reviewer_profile": self.final_reviewer_profile,
@@ -214,7 +245,8 @@ class RunOptions:
         }:
             raise RunOptionsError("run options pipeline schema is invalid")
         if not isinstance(profiles, Mapping) or set(profiles) != {
-            "planner_profile", "default_implementer_profile", "check_repair_profile",
+            "planner_profile", "mechanical_profile", "reasoning_profile", "agentic_profile",
+            "check_repair_profile",
             "semantic_reviser_profile", "final_reviewer_profile",
         }:
             raise RunOptionsError("run options profiles schema is invalid")
@@ -297,17 +329,22 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
     ui = replace(
         config.ui,
         default_planner_profile=options.planner_profile,
-        default_implementer_profile=options.default_implementer_profile,
+        default_implementer_profile=None,
         default_reviewer_profile=options.final_reviewer_profile,
         default_reviser_profile=options.semantic_reviser_profile,
         default_repair_profile=options.check_repair_profile,
+    )
+    routing = RoutingConfig(
+        mechanical_profile=options.mechanical_profile,
+        reasoning_profile=options.reasoning_profile,
+        agentic_profile=options.agentic_profile,
     )
     revision = RevisionConfig(
         enabled=options.semantic_revision_enabled,
         max_check_repair_attempts=options.max_check_repair_attempts,
         max_review_repair_cycles=options.max_review_repair_cycles,
     )
-    return replace(config, planning=planning, ui=ui, revision=revision)
+    return replace(config, planning=planning, ui=ui, routing=routing, revision=revision)
 
 
 __all__ = [

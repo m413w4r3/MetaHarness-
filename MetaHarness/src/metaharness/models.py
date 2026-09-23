@@ -88,6 +88,48 @@ class ExecutionClass(StrEnum):
 
 
 @dataclass(frozen=True)
+class RoutingConfig:
+    """Profiles selected for planner-produced execution classes."""
+
+    mechanical_profile: str = ""
+    reasoning_profile: str = ""
+    agentic_profile: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("mechanical_profile", "reasoning_profile", "agentic_profile"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise ValueError(f"routing {name} must be a profile id")
+
+    def profile_for(self, execution_class: ExecutionClass | str) -> str:
+        try:
+            klass = ExecutionClass(execution_class)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("execution class is invalid") from exc
+        return {
+            ExecutionClass.MECHANICAL: self.mechanical_profile,
+            ExecutionClass.REASONING: self.reasoning_profile,
+            ExecutionClass.AGENTIC: self.agentic_profile,
+        }[klass]
+
+
+@dataclass(frozen=True)
+class CodexProviderConfig:
+    """Secret-free provider wiring for a managed Codex runtime."""
+
+    name: str
+    base_url: str
+    wire_api: str
+    api_key_env: str
+
+    def __post_init__(self) -> None:
+        for name in ("name", "base_url", "wire_api", "api_key_env"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Codex provider {name} must be non-empty")
+
+
+@dataclass(frozen=True)
 class ModelProfile:
     id: str
     display_name: str
@@ -443,6 +485,10 @@ class AgentConfig:
     """Codex harness settings derived from one codex ``ModelProfile``."""
 
     model: str = "gpt-5.6-luna"
+    provider: str = "openai"
+    provider_base_url: str | None = None
+    provider_wire_api: str | None = None
+    provider_api_key_env: str | None = None
     effort: str = "high"
     sandbox: str = "workspace-write"
     timeout_seconds: int = 5400
@@ -540,6 +586,10 @@ class HarnessConfig:
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     model_profiles: Mapping[str, ModelProfile] = field(default_factory=dict)
+    routing: RoutingConfig = field(
+        default_factory=RoutingConfig
+    )
+    codex_providers: Mapping[str, CodexProviderConfig] = field(default_factory=dict)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     runtime_environment: Mapping[str, str] = field(
         default_factory=dict,
@@ -612,6 +662,7 @@ class StepExecutionSelection:
 
     step_id: str
     implementer: SelectedProfile
+    execution_class: ExecutionClass = ExecutionClass.MECHANICAL
 
 
 @dataclass(frozen=True)

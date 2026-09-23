@@ -13,30 +13,14 @@ default_check_ids = ["lint", "typecheck", "test"]
 protocol = "v2"
 decomposition = "aggressive"
 execution_mode_policy = "auto"
-# Aggressive decomposition only (balanced adds no such limit). Mutable paths
-# are counted over the distinct union WRITE_SET ∪ CREATE_SET ∪ DELETE_SET.
-# single_step_max_mutable_paths bounds a READY SINGLE plan;
-# staged_step_max_mutable_paths bounds every STAGED step. Both values are
-# rendered into the planner request and enforced after parsing.
-single_step_max_mutable_paths = 2
-staged_step_max_mutable_paths = 5
-max_steps_per_plan = 8
-max_read_paths_per_step = 8
-max_step_contract_chars = 5000
 
-# Target workflow: generic cycles 001, 002, ... Each cycle runs its approved
-# steps (accepted step commits), the optional semantic revision, one
-# deterministic gate with bounded check-repair attempts, one immutable
-# candidate commit pushed to the repository run branch, verified at the exact
-# remote tip, then the final reviewer. A
-# REVISE (IMPLEMENTATION or REPLAN) opens the next correction cycle while
-# max_review_repair_cycles allows it. The final PASS publishes the exact
-# approved candidate chain tip (no new commit): CAS fast-forward of local
-# main BASE->tip -> push origin/main.
-# [revision] supplies independent defaults; durable UI runs freeze semantic
-# revision, check-repair attempts and review-repair cycles in run_options.json.
-# AutoWork recommendation: repair_scope_policy = "auto-bounded" and
-# repair_scope_max_added_paths = 4 (captured durably per run).
+single_step_max_mutable_paths = 6
+staged_step_max_mutable_paths = 8
+max_steps_per_plan = 16
+max_read_paths_per_step = 12
+max_step_contract_chars = 8000
+
+
 [revision]
 enabled = true
 max_check_repair_attempts = 2
@@ -54,9 +38,9 @@ issue_mode = "off"
 pull_request_mode = "off"
 
 [publish]
-enabled = true
+enabled = false
 remote = "origin"
-mode = "fast-forward-base"
+mode = "run-branch"
 
 [environment]
 files = ["../../Bridges/.env.models"]
@@ -67,6 +51,13 @@ home = "~/.local/share/metaharness/codex"
 [claude_runtime]
 home = "~/.local/share/metaharness/claude"
 
+# EXECUTION_CLASS -> implementation profile.
+# These values are frozen into run_options.json.
+[routing]
+mechanical_profile = "codex-luna-high"
+reasoning_profile = "codex-luna-xhigh"
+agentic_profile = "codex-deepseek-flash-max"
+
 [approval]
 require_plan_approval = true
 poll_interval_seconds = 0.5
@@ -75,9 +66,8 @@ poll_interval_seconds = 0.5
 max_active_runs = 1
 enable_profile_recommendation = true
 default_planner_profile = "planner-chatgpt"
-default_implementer_profile = "codex-luna-high"
 default_reviewer_profile = "planner-chatgpt"
-default_reviser_profile = "claude-opus-medium"
+default_reviser_profile = "claude-opus-5-medium"
 default_repair_profile = "codex-luna-high"
 
 [context]
@@ -95,16 +85,26 @@ locator_argv = [
     "{query}"
 ]
 locator_timeout_seconds = 180
-max_hits = 8
-max_bytes = 160000
+max_hits = 6
+max_bytes = 96000
 require_locator_head_at_base = true
 
 [prompt_budget]
-planner_max_bytes = 160000
-implementer_max_bytes = 120000
-check_repair_max_bytes = 40000
-semantic_revision_max_bytes = 120000
-final_review_max_bytes = 120000
+planner_max_bytes = 96000
+implementer_max_bytes = 48000
+check_repair_max_bytes = 24000
+semantic_revision_max_bytes = 64000
+final_review_max_bytes = 64000
+
+
+# Provider configuration for Codex-backed DeepSeek workers.
+# MetaHarness must persist only the ENV VARIABLE NAME, never its value.
+
+[codex_providers.deepseek]
+base_url = "https://api.deepseek.com/"
+wire_api = "responses"
+api_key_env = "DEEPSEEK_API_KEY"
+
 
 [model_profiles."planner-chatgpt"]
 display_name = "ChatGPT UI Planner"
@@ -123,8 +123,13 @@ strengths = ["planning", "semantic review", "risk analysis"]
 cost_tier = "standard"
 latency_tier = "standard"
 
+
+# ---------------------------------------------------------------------------
+# OPENAI / CODEX
+# ---------------------------------------------------------------------------
+
 [model_profiles."codex-luna-high"]
-display_name = "Codex Luna High"
+display_name = "Luna High"
 roles = ["implementer", "repair"]
 driver = "codex"
 provider = "openai"
@@ -133,36 +138,115 @@ effort = "high"
 sandbox = "workspace-write"
 selection_mode = "cli"
 timeout_seconds = 54000
-description = "Primary implementation profile for normal repository changes."
-strengths = ["implementation", "unit tests", "repository navigation"]
-cost_tier = "standard"
+description = "Small mechanical steps and deterministic check repair."
+strengths = ["mechanical implementation", "unit tests", "check repair"]
+cost_tier = "low"
 latency_tier = "fast"
 
-# Future provider example (inactive until an exact configured model is chosen):
-# [model_profiles."codex-deepseek-high"]
-# display_name = "Codex DeepSeek High"
-# roles = ["implementer", "repair"]
-# driver = "codex"
-# provider = "deepseek"
-# model = "<configure-exact-model>"
-# effort = "high"
-# sandbox = "workspace-write"
-# selection_mode = "cli"
 
-[model_profiles."claude-opus-medium"]
-display_name = "Claude Opus Medium RevisER"
-roles = ["reviser", "repair"]
+[model_profiles."codex-luna-xhigh"]
+display_name = "Luna XHigh"
+roles = ["implementer"]
+driver = "codex"
+provider = "openai"
+model = "gpt-5.6-luna"
+effort = "xhigh"
+sandbox = "workspace-write"
+selection_mode = "cli"
+timeout_seconds = 54000
+description = "Medium bounded steps requiring additional reasoning."
+strengths = ["implementation", "reasoning", "repository navigation"]
+cost_tier = "standard"
+latency_tier = "standard"
+
+
+[model_profiles."codex-sol-high"]
+display_name = "Sol High"
+roles = ["implementer", "reviser"]
+driver = "codex"
+provider = "openai"
+model = "gpt-5.6-sol"
+effort = "high"
+sandbox = "workspace-write"
+selection_mode = "cli"
+timeout_seconds = 54000
+description = "Complex bounded reasoning and alternative semantic revision."
+strengths = ["complex reasoning", "integration", "semantic revision"]
+cost_tier = "high"
+latency_tier = "standard"
+
+
+[model_profiles."codex-astra-medium"]
+display_name = "Astra Medium"
+roles = ["implementer", "reviser"]
+driver = "codex"
+provider = "openai"
+model = "gpt-6-astra"
+effort = "medium"
+sandbox = "workspace-write"
+selection_mode = "cli"
+timeout_seconds = 54000
+description = "Exceptional reserve for difficult implementation or semantic revision."
+strengths = ["agentic implementation", "complex reasoning", "semantic revision"]
+cost_tier = "high"
+latency_tier = "slow"
+
+
+# ---------------------------------------------------------------------------
+# DEEPSEEK THROUGH CODEX
+# ---------------------------------------------------------------------------
+
+[model_profiles."codex-deepseek-flash-high"]
+display_name = "DeepSeek V4.1 Flash High"
+roles = ["implementer"]
+driver = "codex"
+provider = "deepseek"
+model = "deepseek-flash"
+effort = "high"
+sandbox = "workspace-write"
+selection_mode = "cli"
+timeout_seconds = 54000
+description = "Cost-efficient bounded implementation profile."
+strengths = ["implementation", "agentic coding", "cost efficiency"]
+cost_tier = "low"
+latency_tier = "fast"
+
+
+[model_profiles."codex-deepseek-flash-max"]
+display_name = "DeepSeek V4.1 Flash Max"
+roles = ["implementer"]
+driver = "codex"
+provider = "deepseek"
+model = "deepseek-flash"
+effort = "max"
+sandbox = "workspace-write"
+selection_mode = "cli"
+timeout_seconds = 54000
+description = "Large bounded agentic steps and future execution fallback."
+strengths = ["agentic coding", "complex implementation", "long-horizon reasoning"]
+cost_tier = "low"
+latency_tier = "standard"
+
+
+# ---------------------------------------------------------------------------
+# ANTHROPIC / CLAUDE CODE
+# ---------------------------------------------------------------------------
+
+[model_profiles."claude-opus-5-medium"]
+display_name = "Claude Opus 5 Medium"
+roles = ["reviser"]
 driver = "claude-code"
 provider = "anthropic"
-model = "opus"
+model = "claude-opus-5"
 effort = "medium"
 permission_mode = "acceptEdits"
 selection_mode = "cli"
 timeout_seconds = 54000
-description = "Independent semantic revision and direct review correction."
+description = "Primary independent semantic revision profile."
 strengths = ["semantic revision", "integration review", "corrective editing"]
 cost_tier = "high"
 latency_tier = "slow"
+
 
 [[check_catalog]]
 id = "lint"

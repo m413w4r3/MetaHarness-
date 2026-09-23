@@ -36,6 +36,8 @@ from ..execution_selection import (
     validate_execution_selection,
 )
 from ..models import (
+    ExecutionClass,
+    ImplementationStep,
     ExecutionSelection,
     HarnessConfig,
     PublishMode,
@@ -43,7 +45,7 @@ from ..models import (
 )
 from ..planning_v2 import V2PlanParseError, step_contract_path, validate_implementation_bundle
 from ..profiles import ProfileError, profiles_for_config, safe_profile_metadata
-from ..run_options import RunOptions, RunOptionsError, read_run_options_for_state
+from ..run_options import RunOptions, RunOptionsError, effective_run_config, read_run_options_for_state
 from ..state import RunStateStore
 from ..step_ids import STEP_ID_PATTERN, STEP_ID_RE
 from ..usage import (
@@ -876,6 +878,7 @@ def approve_run(
             raise WebAPIError(400, "step profiles and final_reviewer_profile are required")
         try:
             snapshot, _ = read_run_options_for_state(directory, state)
+            config = effective_run_config(config, snapshot)
         except RunOptionsError as exc:
             raise WebAPIError(409, "run options are invalid") from exc
         # A semantic reviser or check-repair field never enables a pipeline
@@ -942,6 +945,13 @@ def approve_run(
         requested = resolve_execution_selection(
             config,
             planner_profile_id=state["execution"]["planner"]["profile_id"],
+            plan_steps=[
+                ImplementationStep(
+                    entry["id"], entry["title"], ExecutionClass(entry["execution_class"]),
+                    None, "", (), (), "", "", "",
+                )
+                for entry in bundle["steps"]
+            ],
             step_profile_ids={key: value for key, value in step_profiles.items()},
             semantic_reviser_profile_id=reviser_profile if semantic_revision_enabled else None,
             check_repair_profile_id=repair_profile if check_repair_required else None,
@@ -1019,9 +1029,10 @@ def model_profiles(config: HarnessConfig) -> dict[str, Any]:
     profiles = profiles_for_config(config)
     defaults = {
         "planner": config.ui.default_planner_profile,
-        "implementer": config.ui.default_implementer_profile,
+        "mechanical": config.routing.mechanical_profile,
+        "reasoning": config.routing.reasoning_profile,
+        "agentic": config.routing.agentic_profile,
         "planner_profile": config.ui.default_planner_profile,
-        "default_implementer_profile": config.ui.default_implementer_profile,
         "final_reviewer_profile": config.ui.default_reviewer_profile,
         "semantic_reviser_profile": config.ui.default_reviser_profile,
         "check_repair_profile": config.ui.default_repair_profile,
@@ -1038,7 +1049,9 @@ def create_run(
     spec: object,
     run_id: object = None,
     planner_profile: object = None,
-    default_implementer_profile: object = None,
+    mechanical_profile: object = None,
+    reasoning_profile: object = None,
+    agentic_profile: object = None,
     final_reviewer_profile: object = None,
     semantic_reviser_profile: object = None,
     check_repair_profile: object = None,
@@ -1088,7 +1101,9 @@ def create_run(
 
         overrides = {
             "planner_profile": profile(planner_profile, "planner_profile"),
-            "default_implementer_profile": profile(default_implementer_profile, "default_implementer_profile"),
+            "mechanical_profile": profile(mechanical_profile, "mechanical_profile"),
+            "reasoning_profile": profile(reasoning_profile, "reasoning_profile"),
+            "agentic_profile": profile(agentic_profile, "agentic_profile"),
             "final_reviewer_profile": profile(final_reviewer_profile, "final_reviewer_profile"),
             "semantic_reviser_profile": optional_profile(semantic_reviser_profile, "semantic_reviser_profile"),
             "check_repair_profile": optional_profile(check_repair_profile, "check_repair_profile"),

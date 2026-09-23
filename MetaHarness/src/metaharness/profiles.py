@@ -65,7 +65,7 @@ def safe_profile_metadata(profile: ModelProfile) -> dict[str, Any]:
         "driver": profile_driver_name(profile.driver),
         "driver_version": profile.driver_version,
         "provider": profile.provider,
-        "model_label": profile.model,
+        "model": profile.model,
         "selection_mode": profile.selection_mode.value,
         "effort": profile.effort,
         "sandbox": profile.sandbox,
@@ -83,6 +83,9 @@ def profile_execution_fingerprint(
     agent_env_allowlist: tuple[str, ...] = (),
     codex_home: Path | None = None,
     claude_config_home: Path | None = None,
+    provider_base_url: str | None = None,
+    provider_wire_api: str | None = None,
+    provider_api_key_env: str | None = None,
 ) -> str:
     """SHA-256 of the profile fields that change execution.
 
@@ -122,6 +125,9 @@ def profile_execution_fingerprint(
                 if codex_home is not None
                 else None
             ),
+            provider_base_url=provider_base_url,
+            provider_wire_api=provider_wire_api,
+            provider_api_key_env=provider_api_key_env,
         )
     elif profile.driver is ProfileDriver.CLAUDE_CODE:
         payload.update(
@@ -183,7 +189,13 @@ def build_llm_endpoint(profile: ModelProfile) -> LLMEndpointConfig:
     )
 
 
-def build_agent_config(profile: ModelProfile) -> AgentConfig:
+def build_agent_config(
+    profile: ModelProfile,
+    *,
+    provider_base_url: str | None = None,
+    provider_wire_api: str | None = None,
+    provider_api_key_env: str | None = None,
+) -> AgentConfig:
     if not isinstance(profile, ModelProfile):
         raise TypeError("profile must be a ModelProfile")
     if profile.driver is not ProfileDriver.CODEX:
@@ -192,6 +204,10 @@ def build_agent_config(profile: ModelProfile) -> AgentConfig:
         raise ProfileError("codex profile has no effort or sandbox")
     return AgentConfig(
         model=profile.model,
+        provider=profile.provider,
+        provider_base_url=provider_base_url,
+        provider_wire_api=provider_wire_api,
+        provider_api_key_env=provider_api_key_env,
         effort=profile.effort,
         sandbox=profile.sandbox,
         timeout_seconds=profile.timeout_seconds,

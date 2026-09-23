@@ -18,6 +18,7 @@ from .models import (
     CheckConfig,
     ClaudeRuntimeConfig,
     CodexRuntimeConfig,
+    CodexProviderConfig,
     ContextConfig,
     EnvironmentConfig,
     ExecutionModePolicy,
@@ -31,6 +32,7 @@ from .models import (
     PublishConfig,
     PublishMode,
     ProfileDriver,
+    RoutingConfig,
     RepositoryConfig,
     RevisionConfig,
     SelectionMode,
@@ -520,6 +522,58 @@ def _model_profiles(
     return result
 
 
+def _routing(data: Mapping[str, Any], profiles: Mapping[str, ModelProfile]) -> RoutingConfig:
+    raw = data.get("routing")
+    if raw is None:
+        # Configs written before class routing was introduced can still be
+        # loaded while their run snapshot is upgraded to the modern shape.
+        legacy = _table(data, "ui").get("default_implementer_profile")
+        if isinstance(legacy, str) and legacy.strip():
+            raw = {
+                "mechanical_profile": legacy,
+                "reasoning_profile": legacy,
+                "agentic_profile": legacy,
+            }
+        else:
+            raise ConfigError("ui.default_implementer_profile is required")
+    if not isinstance(raw, dict):
+        raise ConfigError("routing must be a table")
+    values = {
+        name: _required_string(raw, name, "routing")
+        for name in ("mechanical_profile", "reasoning_profile", "agentic_profile")
+    }
+    routing = RoutingConfig(**values)
+    for name in ("mechanical_profile", "reasoning_profile", "agentic_profile"):
+        profile_id = getattr(routing, name)
+        profile = profiles.get(profile_id)
+        if profile is None:
+            raise ConfigError(f"routing.{name} references unknown profile {profile_id!r}")
+        if ExecutionRole.IMPLEMENTER not in profile.roles:
+            raise ConfigError(f"routing.{name} profile must have the implementer role")
+    return routing
+
+
+def _codex_providers(data: Mapping[str, Any]) -> dict[str, CodexProviderConfig]:
+    raw = data.get("codex_providers", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("codex_providers must be a table")
+    result: dict[str, CodexProviderConfig] = {}
+    for name, provider_data in raw.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(provider_data, dict):
+            raise ConfigError("codex provider configuration is invalid")
+        where = f"codex_providers.{name}"
+        unknown = sorted(set(provider_data) - {"base_url", "wire_api", "api_key_env"})
+        if unknown:
+            raise ConfigError(f"{where}.{unknown[0]} is not allowed")
+        base_url = _required_string(provider_data, "base_url", where)
+        wire_api = _required_string(provider_data, "wire_api", where)
+        api_key_env = _optional_env_name(provider_data, "api_key_env", None, where)
+        if api_key_env is None:
+            raise ConfigError(f"{where}.api_key_env is required")
+        result[name] = CodexProviderConfig(name, base_url, wire_api, api_key_env)
+    return result
+
+
 def _check_default(
     profiles: Mapping[str, ModelProfile], value: str | None, role: ExecutionRole
 ) -> str:
@@ -865,6 +919,15 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         )
 
     model_profiles = _model_profiles(expanded)
+    routing = _routing(expanded, model_profiles)
+    codex_providers = _codex_providers(expanded)
+    for profile in model_profiles.values():
+        if profile.driver is ProfileDriver.CODEX and profile.provider == "deepseek":
+            provider = codex_providers.get(profile.provider)
+            if provider is None:
+                raise ConfigError(
+                    f"Codex profile {profile.id!r} references unknown provider {profile.provider!r}"
+                )
     has_explicit_codex = any(
         profile.driver is ProfileDriver.CODEX for profile in model_profiles.values()
     )
@@ -875,9 +938,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     planner_default = _check_default(
         model_profiles, ui_data.get("default_planner_profile"), ExecutionRole.PLANNER
     )
-    implementer_default = _check_default(
-        model_profiles, ui_data.get("default_implementer_profile"), ExecutionRole.IMPLEMENTER
-    )
+    # Implementer selection is class-based and comes from [routing].  The
+    # former ui.default_implementer_profile is intentionally not consulted.
+    implementer_default = None
     reviewer_default = _check_default(
         model_profiles, ui_data.get("default_reviewer_profile"), ExecutionRole.REVIEWER
     )
@@ -1020,6 +1083,8 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         approval=approval,
         ui=ui,
         model_profiles=model_profiles,
+        routing=routing,
+        codex_providers=codex_providers,
         environment=environment,
         runtime_environment=runtime_environment,
         codex_runtime=codex_runtime,

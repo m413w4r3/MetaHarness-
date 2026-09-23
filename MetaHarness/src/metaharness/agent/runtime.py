@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tomllib
 import os
 import stat
@@ -81,9 +82,28 @@ _MANAGED_CONFIG = (
     "\n"
     "[features.multi_agent_v2]\n"
     "enabled = false\n"
+    "\n"
+    "[model_providers.deepseek]\n"
+    "name = \"deepseek\"\n"
+    "base_url = \"https://api.deepseek.com/\"\n"
+    "wire_api = \"responses\"\n"
+    "env_key = \"DEEPSEEK_API_KEY\"\n"
 )
 
 _MANAGED_CONFIG_SHAPE = tomllib.loads(_MANAGED_CONFIG)
+_MANAGED_MODELS = {
+    "models": [{
+        "slug": "deepseek-flash",
+        "display_name": "DeepSeek V4.1 Flash",
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": [
+            {"effort": "low"}, {"effort": "high"}, {"effort": "max"}
+        ],
+    }]
+}
+_MANAGED_MODELS_TEXT = json.dumps(
+    _MANAGED_MODELS, ensure_ascii=False, indent=2, sort_keys=True
+) + "\n"
 
 
 def _atomic_write_managed_config(path: Path, content: str) -> None:
@@ -148,9 +168,22 @@ def prepare_codex_home(config: HarnessConfig) -> Path:
             parsed = tomllib.load(stream)
         if parsed != _MANAGED_CONFIG_SHAPE:
             raise CodexRuntimeError("managed Codex config.toml has an unexpected shape")
+        models_path = home / "models.json"
+        try:
+            models_stat = models_path.lstat()
+        except FileNotFoundError:
+            models_stat = None
+        if models_stat is not None and (
+            stat.S_ISLNK(models_stat.st_mode) or not stat.S_ISREG(models_stat.st_mode)
+        ):
+            raise CodexRuntimeError("managed Codex models.json must be a regular file")
+        if models_stat is None or models_path.read_text(encoding="utf-8") != _MANAGED_MODELS_TEXT:
+            _atomic_write_managed_config(models_path, _MANAGED_MODELS_TEXT)
+        if json.loads(models_path.read_text(encoding="utf-8")) != _MANAGED_MODELS:
+            raise CodexRuntimeError("managed Codex models.json has an unexpected shape")
     except CodexRuntimeError:
         raise
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, tomllib.TOMLDecodeError):
         raise CodexRuntimeError(
             "could not prepare managed CODEX_HOME"
         ) from None

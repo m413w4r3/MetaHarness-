@@ -203,9 +203,20 @@ class CodexExecutor:
             self.agent = agent
         else:
             config = self.runtime.config
+            provider = (
+                config.codex_providers.get(profile.provider)
+                if config is not None else None
+            )
+            if profile.provider != "openai" and provider is None:
+                raise ValueError(f"Codex provider {profile.provider!r} is not configured")
             if config is not None:
                 agent_config = dataclasses.replace(
-                    build_agent_config(profile),
+                    build_agent_config(
+                        profile,
+                        provider_base_url=provider.base_url if provider else None,
+                        provider_wire_api=provider.wire_api if provider else None,
+                        provider_api_key_env=provider.api_key_env if provider else None,
+                    ),
                     env_allowlist=config.codex_runtime.env_allowlist,
                 )
             else:
@@ -240,6 +251,11 @@ class CodexExecutor:
                 source_environment=self.runtime.environment,
                 codex_home=codex_home,
                 forbidden_names=self.runtime.forbidden_env_names,
+                provider_api_key_env=(
+                    config.codex_providers[self.profile.provider].api_key_env
+                    if config is not None and self.profile.provider != "openai"
+                    else None
+                ),
             )
             base_sha = current_head(request.worktree)
             if request.prompt_mode == "plan" and hasattr(self.agent, "run"):

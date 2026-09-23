@@ -340,7 +340,7 @@ def _profiles(config: HarnessConfig, state: Mapping[str, Any]) -> dict[str, Any]
         metadata = safe_profile_metadata(profile)
         catalog[profile_id] = {
             key: metadata.get(key)
-            for key in ("id", "display_name", "roles", "model_label", "effort", "selection_mode")
+            for key in ("id", "display_name", "roles", "model", "effort", "selection_mode")
         }
     return {"selected": selected, "catalogue": catalog}
 

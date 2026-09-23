@@ -161,7 +161,9 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
     defaults = RunOptions.from_config(config)
     options = {
         "planner": _new_profile_options(config, "planner", defaults.planner_profile),
-        "implementer": _new_profile_options(config, "implementer", defaults.default_implementer_profile),
+        "mechanical": _new_profile_options(config, "implementer", defaults.mechanical_profile),
+        "reasoning": _new_profile_options(config, "implementer", defaults.reasoning_profile),
+        "agentic": _new_profile_options(config, "implementer", defaults.agentic_profile),
         "reviewer": _new_profile_options(config, "reviewer", defaults.final_reviewer_profile),
         "reviser": _new_profile_options(config, "reviser", defaults.semantic_reviser_profile, optional=True),
         "repair": _new_profile_options(config, "repair", defaults.check_repair_profile, optional=True),
@@ -184,7 +186,10 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
 <label for="run-id">Run ID (optional)</label><input id="run-id" name="run_id" type="text" autocomplete="off" value="">
 <section class="card"><h2>RUN OPTIONS</h2>
 <h3>Planner</h3><select id="planner-profile" name="planner_profile" required>{options["planner"]}</select>
-<label for="implementer-profile">Default implementer</label><select id="implementer-profile" name="default_implementer_profile" required>{options["implementer"]}</select>
+<h3>Execution routing</h3>
+<label for="mechanical-profile">MECHANICAL</label><select id="mechanical-profile" name="mechanical_profile" required>{options["mechanical"]}</select>
+<label for="reasoning-profile">REASONING</label><select id="reasoning-profile" name="reasoning_profile" required>{options["reasoning"]}</select>
+<label for="agentic-profile">AGENTIC</label><select id="agentic-profile" name="agentic_profile" required>{options["agentic"]}</select>
 <label for="reviewer-profile">Final reviewer</label><select id="reviewer-profile" name="final_reviewer_profile" required>{options["reviewer"]}</select>
 <label for="semantic-revision">Semantic revision</label><select id="semantic-revision" name="semantic_revision_enabled" required><option value="enabled"{" selected" if semantic_revision == "enabled" else ""}>enabled</option><option value="disabled"{" selected" if semantic_revision == "disabled" else ""}>disabled</option></select>
 <label for="reviser-profile">Semantic reviser profile</label><select id="reviser-profile" name="semantic_reviser_profile" aria-describedby="reviser-help">{options["reviser"]}</select><p id="reviser-help" class="muted">The profile's declared role and executor determine whether the selection is valid.</p>
@@ -212,7 +217,8 @@ def _new_profile_options(
         if role in item["roles"]:
             rows.append(
                 f'<option value="{_e(item["id"])}"{" selected" if item["id"] == selected else ""}>'
-                f'{_e(item["display_name"])}</option>'
+                f'{_e(item["display_name"])} · {_e(item["provider"])} · '
+                f'{_e(item["model"])} · {_e(item["effort"] or "default")}</option>'
             )
     return "".join(rows)
 
@@ -444,11 +450,16 @@ def _v2_approval_form(
         if not isinstance(item, dict) or not isinstance(item.get("id"), str):
             continue
         step_id = item["id"]
-        selected = requested_profiles.get("default_implementer_profile") or item.get("recommended_profile") or item.get("profile_id")
+        route_key = {
+            "MECHANICAL": "mechanical_profile",
+            "REASONING": "reasoning_profile",
+            "AGENTIC": "agentic_profile",
+        }.get(item.get("execution_class"), "mechanical_profile")
+        selected = requested_profiles.get(route_key) or item.get("recommended_profile") or item.get("profile_id")
         meta = metadata.get(selected, {})
         overview.append(
             f'<li><span class="mono">{_e(step_id)}</span> → recommended '
-            f'{_profile_triplet(selected, meta.get("model_label"), meta.get("effort"))}</li>'
+            f'{_profile_triplet(selected, meta.get("model"), meta.get("effort"))}</li>'
         )
         rows.append(
             f'<section class="card"><h3>{_e(step_id)} — {_e(item.get("title"))}</h3>'
@@ -477,8 +488,8 @@ def _v2_approval_form(
         cycle_profiles += (
             '<section class="card revision-profile"><h3>Semantic reviser</h3>'
             f'<p><span class="mono">{_e(reviser_meta.get("driver"))}</span> / '
-            f'<span class="mono">{_e(reviser_meta.get("model_label"))}</span> · '
-            f'recommended {_profile_triplet(reviser, reviser_meta.get("model_label"), reviser_meta.get("effort"))}</p>'
+            f'<span class="mono">{_e(reviser_meta.get("model"))}</span> · '
+            f'recommended {_profile_triplet(reviser, reviser_meta.get("model"), reviser_meta.get("effort"))}</p>'
             '<label for="reviser-profile">Semantic reviser (selected)</label>'
             f'<select id="reviser-profile" name="semantic_reviser_profile" required>{_profile_options(config, "reviser", reviser)}</select></section>'
         )
@@ -488,8 +499,8 @@ def _v2_approval_form(
         cycle_profiles += (
             '<section class="card repair-profile"><h3>Check repair and review corrections</h3>'
             f'<p><span class="mono">{_e(repair_meta.get("driver"))}</span> / '
-            f'<span class="mono">{_e(repair_meta.get("model_label"))}</span> · '
-            f'recommended {_profile_triplet(repair, repair_meta.get("model_label"), repair_meta.get("effort"))}</p>'
+            f'<span class="mono">{_e(repair_meta.get("model"))}</span> · '
+            f'recommended {_profile_triplet(repair, repair_meta.get("model"), repair_meta.get("effort"))}</p>'
             '<label for="repair-profile">Check-repair profile (selected)</label>'
             f'<select id="repair-profile" name="check_repair_profile" required>{_profile_options(config, "repair", repair)}</select></section>'
         )
@@ -503,7 +514,7 @@ def _v2_approval_form(
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE">
 <h3>Planner</h3><p class="mono">{_e(planner_selected.get("profile_id") or "—")} / {_e(planner_selected.get("model") or "—")}</p>
 <h3>Initial implementation</h3><ul class="plan-steps">{"".join(overview)}</ul>
-{"".join(rows)}{cycle_profiles}<section class="card reviewer-profile"><h3>Reviewer</h3><p>recommended {_profile_triplet(reviewer, reviewer_meta.get("model_label"), reviewer_meta.get("selection_mode"))}</p><label for="reviewer-profile">Final reviewer (selected)</label><select id="reviewer-profile" name="final_reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select></section><br><button class="approve" type="submit">APPROVE PLAN</button></form>
+{"".join(rows)}{cycle_profiles}<section class="card reviewer-profile"><h3>Reviewer</h3><p>recommended {_profile_triplet(reviewer, reviewer_meta.get("model"), reviewer_meta.get("selection_mode"))}</p><label for="reviewer-profile">Final reviewer (selected)</label><select id="reviewer-profile" name="final_reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select></section><br><button class="approve" type="submit">APPROVE PLAN</button></form>
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT PLAN</button></form></section>'''
 
 
@@ -808,7 +819,7 @@ def _execution_card_v2(
     recommended_meta = metadata.get(reviewer_recommended, {})
     reviewer_card = (
         f'<article class="card"><h3>Reviewer</h3><dl>'
-        f'<dt>recommended</dt><dd>{_profile_triplet(reviewer_recommended, recommended_meta.get("model_label"), recommended_meta.get("selection_mode"))}</dd>'
+        f'<dt>recommended</dt><dd>{_profile_triplet(reviewer_recommended, recommended_meta.get("model"), recommended_meta.get("selection_mode"))}</dd>'
         f'<dt>approved</dt><dd>{_profile_triplet(reviewer_approved.get("profile_id"), reviewer_approved.get("model"), reviewer_approved.get("selection_mode")) if reviewer_approved else "<span class=muted>pending approval</span>"}</dd>'
         f'</dl></article>'
     )
@@ -841,7 +852,7 @@ def _execution_card_v2(
         chosen = approved_steps.get(step_id)
         rows.append(
             f'<tr><td class="mono">{_e(step_id)}</td>'
-            f'<td>recommended {_profile_triplet(recommended, meta.get("model_label"), meta.get("effort"))}</td>'
+            f'<td>recommended {_profile_triplet(recommended, meta.get("model"), meta.get("effort"))}</td>'
             f'<td>approved {_profile_triplet(chosen.get("profile_id"), chosen.get("model"), chosen.get("effort")) if chosen else "<span class=muted>pending approval</span>"}</td></tr>'
         )
     steps_table = (
@@ -929,7 +940,7 @@ def _run_configuration(state: dict[str, Any], config: HarnessConfig | None = Non
         final["planner_profile"] = planner["profile_id"]
     steps = execution.get("steps") if isinstance(execution.get("steps"), list) else []
     if steps and isinstance(steps[0], dict) and isinstance(steps[0].get("implementer"), dict):
-        final["default_implementer_profile"] = steps[0]["implementer"].get("profile_id")
+        final["mechanical_profile"] = steps[0]["implementer"].get("profile_id")
     for key, role in (
         ("final_reviewer_profile", "final_reviewer"),
         ("semantic_reviser_profile", "semantic_reviser"),
@@ -951,7 +962,9 @@ def _run_configuration(state: dict[str, Any], config: HarnessConfig | None = Non
     ]
     requested_roles = (
         ("planner_profile", "planner"),
-        ("default_implementer_profile", "implementer"),
+        ("mechanical_profile", "mechanical"),
+        ("reasoning_profile", "reasoning"),
+        ("agentic_profile", "agentic"),
         ("final_reviewer_profile", "reviewer"),
         ("semantic_reviser_profile", "reviser"),
         ("check_repair_profile", "repair"),

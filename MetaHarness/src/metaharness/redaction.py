@@ -42,6 +42,7 @@ def config_secret_values(
     names.extend(
         profile.api_key_env for profile in config.model_profiles.values()
     )
+    names.extend(provider.api_key_env for provider in config.codex_providers.values())
     if environment is None and config.runtime_environment:
         environment = config.runtime_environment
     return secret_values(names, environment)

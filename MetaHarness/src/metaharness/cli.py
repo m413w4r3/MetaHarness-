@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -62,6 +63,19 @@ _CODEX_HELP_TIMEOUT_SECONDS = 20
 _CLAUDE_HELP_TIMEOUT_SECONDS = 20
 
 
+def _codex_version(codex: str, environment: Mapping[str, str]) -> tuple[int, int, int] | None:
+    try:
+        result = subprocess.run(
+            [codex, "--version"], capture_output=True, text=True, errors="replace",
+            stdin=subprocess.DEVNULL, timeout=_CODEX_HELP_TIMEOUT_SECONDS,
+            env=dict(environment), check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(?:codex-cli\s+)?(\d+)\.(\d+)\.(\d+)", result.stdout + result.stderr)
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
 def _endpoint(base_url: str, endpoint_path: str) -> str:
     return validate_endpoint(base_url, endpoint_path)
 
@@ -79,7 +93,9 @@ def _config_check(config_path: Path) -> int:
     print(f"worktrees_root: {config.worktrees_root}")
     for role, profile_id in (
         ("planner", config.ui.default_planner_profile),
-        ("implementer", config.ui.default_implementer_profile),
+        ("mechanical", config.routing.mechanical_profile),
+        ("reasoning", config.routing.reasoning_profile),
+        ("agentic", config.routing.agentic_profile),
         ("reviewer", config.ui.default_reviewer_profile),
         ("reviser", config.ui.default_reviser_profile),
         ("repair", config.ui.default_repair_profile),
@@ -570,6 +586,11 @@ def _doctor(config_path: Path) -> int:
         for profile in config.model_profiles.values()
         if profile.api_key_env
     }
+    required_env_names.update(
+        provider.api_key_env
+        for provider in config.codex_providers.values()
+        if provider.api_key_env
+    )
     for name in sorted(required_env_names):
         if _usable_secret_value(config.runtime_environment.get(name)):
             print(f"OK env {name}: usable")
@@ -644,6 +665,26 @@ def _doctor(config_path: Path) -> int:
         codex = shutil.which("codex", path=path_value)
         if codex:
             print("OK codex binary: present")
+            version = _codex_version(codex, config.runtime_environment)
+            if version is None:
+                # Older test doubles and wrappers do not expose --version. A
+                # concrete version, when available, is still enforced below.
+                print("OK codex CLI version: unavailable")
+            else:
+                minimum = (0, 153, 0) if any(
+                    profile.model == "gpt-6-astra" for profile in codex_profiles
+                ) else (0, 144, 0) if any(
+                    profile.model in {"gpt-5.6-luna", "gpt-5.6-sol"}
+                    for profile in codex_profiles
+                ) else (0, 0, 0)
+                if version < minimum:
+                    problems.append(
+                        "Codex CLI is too old for configured models: "
+                        f"need >= {minimum[0]}.{minimum[1]}.{minimum[2]}, "
+                        f"found {version[0]}.{version[1]}.{version[2]}"
+                    )
+                else:
+                    print(f"OK codex CLI version: {version[0]}.{version[1]}.{version[2]}")
         else:
             problems.append("codex binary is not resolvable")
         codex_home: Path | None = None

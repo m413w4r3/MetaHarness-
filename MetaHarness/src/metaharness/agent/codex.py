@@ -57,6 +57,7 @@ def build_agent_environment(
     source_environment: Mapping[str, str] | None = None,
     codex_home: Path | None = None,
     forbidden_names: Iterable[str] = (),
+    provider_api_key_env: str | None = None,
 ) -> dict[str, str]:
     """Build the explicit, minimal environment passed to Codex."""
 
@@ -74,6 +75,14 @@ def build_agent_environment(
     }
     if codex_home is not None:
         environment["CODEX_HOME"] = str(Path(codex_home).expanduser().resolve())
+    if provider_api_key_env is None:
+        provider_api_key_env = config.provider_api_key_env
+    if provider_api_key_env is not None:
+        if _ENV_NAME.fullmatch(provider_api_key_env) is None:
+            raise ValueError("provider API key environment name is invalid")
+        if provider_api_key_env in forbidden or provider_api_key_env not in source:
+            raise ValueError(f"required provider environment {provider_api_key_env} is missing")
+        environment[provider_api_key_env] = source[provider_api_key_env]
     return environment
 
 
@@ -158,6 +167,10 @@ class CodexAgent:
             str(worktree_path),
             "-",
         ]
+        if self.config.provider != "openai":
+            argv[argv.index("-m"):argv.index("-m")] = [
+                "-c", f'model_provider="{self.config.provider}"',
+            ]
         # These flags are version-dependent in the Codex CLI.  A failed help
         # probe is treated as support, matching the safe behavior for wrappers
         # and older CLIs that do not expose useful help text.
@@ -291,7 +304,9 @@ class CodexAgent:
 
         argv = self.build_argv(worktree_path, final_path)
         agent_environment = (
-            build_agent_environment(self.config) if env is None else dict(env)
+            build_agent_environment(
+                self.config, provider_api_key_env=self.config.provider_api_key_env
+            ) if env is None else dict(env)
         )
         exit_code, timed_out = self._execute(
             argv, prompt_path, worktree_path, events_path, stderr_path, agent_environment
