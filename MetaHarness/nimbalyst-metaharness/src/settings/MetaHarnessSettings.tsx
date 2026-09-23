@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { SettingsPanelProps } from '@nimbalyst/extension-sdk';
+import { isBackendFailure } from '../contract';
 
 export interface MetaHarnessSettingsData {
   executable: string;
@@ -39,9 +40,8 @@ function object(value: unknown): Record<string, unknown> {
 }
 
 function backendValue(value: unknown): unknown {
-  const result = object(value);
-  if (result.ok === false) {
-    const error = object(result.error);
+  if (isBackendFailure(value)) {
+    const { error } = value;
     throw new Error(typeof error.message === 'string' ? error.message : 'MetaHarness backend call failed.');
   }
   return value;
@@ -72,7 +72,7 @@ function doctorChecks(value: unknown): Check[] {
           ? 'fail'
           : check.ok === true ? 'pass' : check.ok === false ? 'fail' : 'warn';
     return {
-      name: String(check.name ?? check.check ?? key),
+      name: String(check.id ?? check.name ?? check.check ?? key),
       status,
       message: String(check.message ?? check.detail ?? check.description ?? rawStatus ?? 'No details provided.'),
     };

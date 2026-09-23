@@ -101,14 +101,20 @@ test('rendered event memory is capped and older event count is retained', async 
   assert.ok(screen.getByText('event-2104'));
 });
 
-test('terminal runs do not start progress polling', async () => {
-  let calls = 0;
-  render(React.createElement(ProgressView, {
-    runId: 'done', status: 'published', callBackendTool: async () => { calls += 1; return { next_offset: 0, events: [] }; },
-  }));
+test('terminal runs read the log up to its end once, then stop polling', async () => {
+  const offsets = [];
+  const callBackendTool = async (_name, { offset }) => {
+    offsets.push(offset);
+    if (offset === 0) return { next_offset: 10, events: ['planner started'] };
+    if (offset === 10) return { next_offset: 20, events: ['run committed'] };
+    return { next_offset: 20, events: [] };
+  };
+  render(React.createElement(ProgressView, { runId: 'done', status: 'published', intervalMs: 100, callBackendTool }));
   assert.ok(screen.getByText('Run is terminal; live polling stopped.'));
-  await new Promise((resolve) => setTimeout(resolve, 150));
-  assert.equal(calls, 0);
+  await screen.findByText('run committed');
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.deepEqual(offsets, [0, 10, 20]);
+  assert.equal(screen.getAllByText('planner started').length, 1);
 });
 
 test('unmount stops future polling and ignores the pending response', async () => {

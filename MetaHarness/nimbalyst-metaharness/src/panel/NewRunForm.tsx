@@ -1,15 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import type { MetaHarnessSettingsData } from '../settings/MetaHarnessSettings';
 import { buildCreateRunInput, defaultsFromServer, parseProfiles, profilesForRole, validateRunForm, type ModelProfile, type RunFormState } from '../model/runForm';
+import { isBackendFailure } from '../contract';
 
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
 type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): ObjectValue => typeof value === 'object' && value !== null ? value as ObjectValue : {};
 
 function unwrap(value: unknown): unknown {
-  const result = object(value);
-  if (result.ok === false) {
-    const error = object(result.error);
+  if (isBackendFailure(value)) {
+    const { error } = value;
     const caught = new Error(typeof error.message === 'string' ? error.message : 'MetaHarness request failed.') as Error & { httpStatus?: number; code?: string };
     caught.httpStatus = typeof error.httpStatus === 'number' ? error.httpStatus : undefined;
     caught.code = typeof error.code === 'string' ? error.code : undefined;

@@ -590,3 +590,28 @@ test('submitting twice while create_run is pending makes one backend request', a
   resolveCreate({ run_id: 'created-001' });
   await waitFor(() => assert.equal(screen.getByRole('button', { name: 'Create Run' }).disabled, false));
 });
+
+test('the dashboard does not keep its own poll while a run detail is shown', async () => {
+  const originalSetInterval = window.setInterval;
+  const originalClearInterval = window.clearInterval;
+  const active = new Map();
+  let nextId = 1000;
+  window.setInterval = (_callback, interval) => { nextId += 1; active.set(nextId, interval); return nextId; };
+  window.clearInterval = (id) => { active.delete(id); };
+  try {
+    const callBackendTool = async (name) => {
+      if (name === 'metaharness.status') return { configured: true, connected: true };
+      if (name === 'metaharness.list_runs') return [];
+      if (name === 'metaharness.get_run') return { run_id: 'r1', status: 'committed' };
+      return {};
+    };
+    renderDashboard(callBackendTool, { view: { kind: 'run', runId: 'r1' } });
+    await screen.findByText('r1', { exact: false });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Terminal run: neither the dashboard nor RunDetail keeps a state poll.
+    assert.deepEqual([...active.values()], []);
+  } finally {
+    window.setInterval = originalSetInterval;
+    window.clearInterval = originalClearInterval;
+  }
+});

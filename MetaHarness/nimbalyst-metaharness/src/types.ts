@@ -21,18 +21,22 @@ export interface RuntimeConfigCall {
   settings?: RuntimeConfig;
 }
 
+/** GET /api/v1/health (web/server.py). */
 export interface HealthResponse extends JsonObject {
-  service?: string;
-  api_version?: number;
-  status?: string;
+  service: 'metaharness';
+  api_version: number;
+  status: string;
   control_api?: boolean;
+  capabilities_endpoint?: string;
 }
 
 export type MetaHarnessConfigResponse = JsonObject;
 export type ModelProfilesResponse = JsonObject;
+
+/** One entry of GET /api/v1/runs (web/api.py `_state_summary`). */
 export interface RunSummary extends JsonObject {
-  run_id?: string;
-  status?: string;
+  run_id: string;
+  status?: string | null;
   updated_at?: string | null;
   plan_title?: string | null;
   commit_sha?: string | null;
@@ -40,8 +44,32 @@ export interface RunSummary extends JsonObject {
   failure?: unknown;
 }
 export type RunDetail = JsonObject;
-export type ProgressResponse = JsonObject;
-export type CreateRunResponse = JsonObject;
+
+/** GET /api/v1/runs/<id>/progress: byte offset of the next unread event. */
+export interface ProgressResponse extends JsonObject {
+  next_offset: number;
+  events: string[];
+}
+
+/** 202 body of POST /api/v1/runs, /resume and /recover-plan. */
+export interface MutationAccepted extends JsonObject {
+  ok: true;
+  run_id: string;
+  location: string;
+  accepted?: boolean;
+}
+export type CreateRunResponse = MutationAccepted;
+
+/** GET /api/v1/runs/<id>/artifact (web/api.py `get_artifact`). */
+export interface ArtifactResponse extends JsonObject {
+  run_id?: string;
+  name: string;
+  exists: boolean;
+  encoding?: string;
+  content: string | null;
+  truncated: boolean;
+  size: number;
+}
 
 export interface CreateRunInput extends JsonObject {
   spec: string;
@@ -137,7 +165,7 @@ export interface MetaHarnessBackend {
     get_run: (
       input: { runId: string } | string
     ) => Promise<BackendToolResult<RunDetail>>;
-    get_artifact: (input: { runId: string; name: string }) => Promise<BackendToolResult<JsonObject>>;
+    get_artifact: (input: { runId: string; name: string }) => Promise<BackendToolResult<ArtifactResponse>>;
     progress: (
       input: { runId: string; offset: number }
     ) => Promise<BackendToolResult<ProgressResponse>>;
@@ -152,10 +180,10 @@ export interface MetaHarnessBackend {
     ) => Promise<BackendToolResult<JsonObject>>;
     resume_run: (
       input: { runId: string } | string
-    ) => Promise<BackendToolResult<JsonObject>>;
+    ) => Promise<BackendToolResult<MutationAccepted>>;
     recover_plan: (
       input: { runId: string; input?: RecoverPlanInput; plan?: string } & JsonObject
-    ) => Promise<BackendToolResult<JsonObject>>;
+    ) => Promise<BackendToolResult<MutationAccepted>>;
     doctor: (input?: RuntimeConfigCall) => Promise<BackendToolResult<JsonObject>>;
   };
   deactivate: () => void | Promise<void>;

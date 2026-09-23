@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { parseProfiles, type ModelProfile } from '../../model/runForm';
+import { isBackendFailure } from '../../contract';
 
 type Data = Record<string, unknown>;
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -15,24 +16,14 @@ function text(value: unknown): string | undefined {
 
 function awaitingPlan(data: Data): boolean {
   const approval = object(data.approval);
-  const overview = object(data.overview);
-  const resume = object(overview.resume);
-  const status = text(data.status)?.toLowerCase();
-  const explicit = status === 'awaiting_plan_approval'
-    || (resume.resumable === true && resume.phase === 'plan_approval');
-  return explicit && approval.recorded !== true && approval.awaiting !== false;
+  return text(data.status)?.toLowerCase() === 'awaiting_plan_approval'
+    && approval.recorded !== true && approval.awaiting !== false;
 }
 
 function awaitingScope(data: Data): boolean {
   const scopeApproval = object(data.scope_approval);
-  const approval = object(data.approval);
-  const overview = object(data.overview);
-  const resume = object(overview.resume);
-  const status = text(data.status)?.toLowerCase();
-  const explicit = status === 'waiting_scope_approval'
-    || (resume.resumable === true && resume.phase === 'scope_approval')
-    || scopeApproval.awaiting === true || approval.scope_awaiting === true;
-  return explicit && Object.keys(object(data.scope_delta)).length > 0
+  return text(data.status)?.toLowerCase() === 'waiting_scope_approval'
+    && Object.keys(object(data.scope_delta)).length > 0
     && scopeApproval.recorded !== true && scopeApproval.awaiting !== false;
 }
 
@@ -80,7 +71,7 @@ function errorFrom(value: unknown): string {
 }
 
 function requireOk(value: unknown): unknown {
-  if (object(value).ok === false) throw new Error(errorFrom(value));
+  if (isBackendFailure(value)) throw new Error(errorFrom(value));
   return value;
 }
 

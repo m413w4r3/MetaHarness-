@@ -50,7 +50,7 @@ test('health OK, reads do not send the mutation token, and mutation headers are 
   let seen;
   const server = await listen((req, res) => {
     seen = { method: req.method, path: req.url, token: req.headers['x-metaharness-token'] };
-    if (req.url === '/api/v1/health') return json(res, 200, { service: 'metaharness', status: 'ok' });
+    if (req.url === '/api/v1/health') return json(res, 200, { service: 'metaharness', api_version: 1, status: 'ok' });
     if (req.method === 'GET' && req.url === '/api/v1/runs') return json(res, 200, { runs: [] });
     return json(res, 404, { message: 'not found' });
   });
@@ -87,7 +87,7 @@ test('get_artifact reads a named text artifact without mutation credentials', as
   let seen;
   const server = await listen((req, res) => {
     seen = { method: req.method, path: req.url, token: req.headers['x-metaharness-token'] };
-    return json(res, 200, { run_id: 'run-1', name: 'diagnostics.json', content: '{"ok":true}', truncated: false });
+    return json(res, 200, { run_id: 'run-1', name: 'diagnostics.json', exists: true, encoding: 'utf-8', content: '{"ok":true}', truncated: false, size: 11 });
   });
   try {
     const client = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${port(server)}`, tokenFile: tokenFile('artifact.token') });
@@ -105,7 +105,7 @@ test('403 mutation, invalid JSON, and missing token are standardized', async () 
       baseUrl: `http://127.0.0.1:${port(forbidden)}`,
       tokenFile: tokenFile('forbidden.token'),
     });
-    await assert.rejects(client.resumeRun('run-1'), errorCode('HTTP_ERROR', { httpStatus: 403 }));
+    await assert.rejects(client.resumeRun('run-1'), errorCode('TOKEN_REJECTED', { httpStatus: 403 }));
   } finally {
     await close(forbidden);
   }
@@ -165,7 +165,7 @@ test('approval bridge flattens conceptual step profile map and keeps reject body
   }
 });
 
-function fakeExecutable(name, doctorOutput = null) {
+function fakeExecutable(name, doctorOutput = null, doctorExit = 0) {
   const script = join(root, `${name}.mjs`);
   writeFileSync(script, `#!/usr/bin/env node
 import { createServer } from 'node:http';
@@ -173,14 +173,14 @@ import { writeFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 if (args[0] === 'doctor') {
   process.stdout.write(${JSON.stringify(doctorOutput ?? '{"ok":true}')} + '\\n');
-  process.exit(0);
+  process.exit(${doctorExit});
 }
 const port = Number(args[args.indexOf('--port') + 1]);
 const tokenFile = args[args.indexOf('--control-token-file') + 1];
 writeFileSync(tokenFile, 'fake-token\\n');
 const server = createServer((req, res) => {
   if (req.url === '/api/v1/health') {
-    const body = JSON.stringify({ service: 'metaharness', status: 'ok' });
+    const body = JSON.stringify({ service: 'metaharness', api_version: 1, status: 'ok' });
     res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
     res.end(body);
     return;
@@ -216,7 +216,7 @@ test('start spawns when absent, attaches when present, and stop does not kill an
   assert.equal(runtime.ownedProcess, undefined);
 
   const external = await listen((req, res) => {
-    if (req.url === '/api/v1/health') return json(res, 200, { service: 'metaharness', status: 'ok' });
+    if (req.url === '/api/v1/health') return json(res, 200, { service: 'metaharness', api_version: 1, status: 'ok' });
     return json(res, 200, { ok: true });
   });
   try {
@@ -350,12 +350,109 @@ test('mutations send the control token from the token file and never expose it i
   let seen;
   const server = await listen((req, res) => {
     seen = { method: req.method, token: req.headers['x-metaharness-token'] };
-    return json(res, 200, { run_id: 'created-1' });
+    return json(res, 202, { ok: true, run_id: 'created-1', location: '/runs/created-1', accepted: true });
   });
   try {
     const secret = 'only-in-token-file';
     const client = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${port(server)}`, tokenFile: tokenFile('auth.token', `${secret}\n`) });
-    assert.deepEqual(await client.createRun({ spec: 'small test' }), { run_id: 'created-1' });
+    assert.deepEqual(await client.createRun({ spec: 'small test' }), { ok: true, run_id: 'created-1', location: '/runs/created-1', accepted: true });
     assert.deepEqual(seen, { method: 'POST', token: secret });
   } finally { await close(server); }
+});
+
+test('health rejects an unsupported MetaHarness API version', async () => {
+  const server = await listen((_req, res) => json(res, 200, { service: 'metaharness', api_version: 2, status: 'ok' }));
+  try {
+    const client = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${port(server)}`, tokenFile: tokenFile('version.token') });
+    await assert.rejects(client.health(), errorCode('API_VERSION_MISMATCH'));
+  } finally {
+    await close(server);
+  }
+});
+
+test('run summaries, progress and mutation acknowledgements are decoded against the server contract', async () => {
+  const responses = {
+    '/api/v1/runs': { runs: [{ run_id: 'ok-1', status: 'planning', updated_at: null, plan_title: null, commit_sha: null, candidate: null, failure: null }, { status: 'failed' }] },
+    '/api/v1/runs/ok-1/progress?offset=0': { next_offset: -1, events: [] },
+    '/api/v1/runs/ok-1/resume': { run_id: 'ok-1' },
+  };
+  const server = await listen((req, res) => json(res, req.method === 'POST' ? 202 : 200, responses[req.url] ?? {}));
+  try {
+    const client = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${port(server)}`, tokenFile: tokenFile('contract.token') });
+    await assert.rejects(client.listRuns(), errorCode('INVALID_RESPONSE'));
+    await assert.rejects(client.progress('ok-1', 0), errorCode('INVALID_RESPONSE'));
+    await assert.rejects(client.resumeRun('ok-1'), errorCode('INVALID_RESPONSE'));
+  } finally {
+    await close(server);
+  }
+});
+
+test('doctor keeps the structured report when a check fails with a non-zero exit', async () => {
+  const report = { ok: false, checks: [{ id: 'credentials', status: 'fail', message: 'required credential is missing or invalid' }], summary: { passed: 0, failed: 1, warnings: 0 } };
+  const runtime = new MetaHarnessRuntime({
+    config: { executable: fakeExecutable('failing-doctor', JSON.stringify(report), 1), configPath: join(root, 'doctor.toml'), port: await freePort(), autoStart: false },
+    dataDir: join(root, 'doctor-failing-data'),
+  });
+  assert.deepEqual(await runtime.doctor(), report);
+  const broken = new MetaHarnessRuntime({
+    config: { executable: fakeExecutable('broken-doctor', 'Traceback', 2), configPath: join(root, 'doctor.toml'), port: await freePort(), autoStart: false },
+    dataDir: join(root, 'doctor-broken-data'),
+  });
+  await assert.rejects(broken.doctor(), errorCode('DOCTOR_FAILED'));
+});
+
+function registerOnly() {
+  return { workspacePath: root, extensionPath: root, log: () => undefined, registerMcpTools: async () => undefined };
+}
+
+test('read and mutation tools follow the service selected by the panel settings', async () => {
+  const hits = [];
+  const serve = (name) => listen((req, res) => {
+    hits.push(`${name} ${req.url}`);
+    if (req.url === '/api/v1/health') return json(res, 200, { service: 'metaharness', api_version: 1, status: 'ok' });
+    return json(res, 200, { runs: [] });
+  });
+  const first = await serve('default');
+  const second = await serve('selected');
+  try {
+    const backend = await activate({ dataDir: join(root, 'routing-data'), services: registerOnly() }, { port: port(first), autoStart: false });
+    const settings = { executable: 'metaharness', configPath: '/work/metaharness.toml', port: port(second), autoStart: true, pollIntervalMs: 1000 };
+    assert.equal((await backend.methods.status({ settings })).connected, true);
+    assert.deepEqual(await backend.methods.list_runs(), []);
+    assert.ok(hits.includes('selected /api/v1/runs'));
+    assert.ok(!hits.includes('default /api/v1/runs'));
+    // A poll-interval change is a client preference, not another service.
+    assert.equal((await backend.methods.status({ settings: { ...settings, pollIntervalMs: 5000 } })).connected, true);
+    assert.deepEqual(await backend.methods.list_runs(), []);
+    assert.ok(!hits.includes('default /api/v1/runs'));
+    await backend.deactivate();
+  } finally {
+    await close(first);
+    await close(second);
+  }
+});
+
+test('reconfiguring the same port replaces only the owned process and deactivate leaves none running', async () => {
+  const executable = fakeExecutable('reconfigured-server');
+  const servicePort = await freePort();
+  const backend = await activate({ dataDir: join(root, 'reconfigure-data'), services: registerOnly() }, { port: servicePort, autoStart: false });
+  const settings = { executable, configPath: join(root, 'one.toml'), port: servicePort, autoStart: true, pollIntervalMs: 1000 };
+  const started = await backend.methods.start({ settings });
+  assert.equal(started.serverOwned, true);
+  // A second start with the same identity attaches to the owned process.
+  assert.equal((await backend.methods.start({ settings: { ...settings, pollIntervalMs: 2000 } })).serverOwned, true);
+  const replaced = await backend.methods.start({ settings: { ...settings, configPath: join(root, 'two.toml') } });
+  assert.equal(replaced.connected, true);
+  assert.equal(replaced.serverOwned, true);
+  await backend.deactivate();
+  const probe = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${servicePort}`, tokenFile: tokenFile('after.token') });
+  await assert.rejects(probe.health(), errorCode('NETWORK_ERROR'));
+});
+
+test('synchronous argument errors are returned as failure envelopes', async () => {
+  const backend = await activate({ dataDir: join(root, 'sync-error-data'), services: registerOnly() }, { port: await freePort(), autoStart: false });
+  assert.deepEqual(await backend.methods.create_run({ spec: '   ' }), { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'spec is required' } });
+  assert.equal((await backend.methods.get_run({ runId: '../x' })).error.code, 'INVALID_ARGUMENT');
+  assert.equal((await backend.methods.progress({ runId: 'r', offset: -1 })).error.code, 'INVALID_ARGUMENT');
+  await backend.deactivate();
 });

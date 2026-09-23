@@ -8,6 +8,15 @@ import { StepsView } from './StepsView';
 import { ProgressView } from './ProgressView';
 import { ChecksView, DiagnosticsView, DiffView, ResultsView, ReviewView, UsageView } from './RunArtifactViews';
 import { deriveRunActions } from './runActions';
+import { classifyRunStatus } from '../runStatus';
+
+/** State poll period: live runs at the configured rate, slower while a human decides, none once terminal. */
+export function runDetailPollInterval(status: unknown, pollIntervalMs: number): number | undefined {
+  const category = classifyRunStatus(typeof status === 'string' ? status : '');
+  if (category === 'completed' || category === 'failed') return undefined;
+  return category === 'awaiting-action' ? Math.max(5000, pollIntervalMs) : pollIntervalMs;
+}
+import { isBackendFailure } from '../../contract';
 
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
 type Data = Record<string, unknown>;
@@ -19,9 +28,8 @@ function object(value: unknown): Data {
 function entries(value: unknown): Data[] { return Array.isArray(value) ? value.map(object) : []; }
 
 function unwrap(value: unknown): unknown {
-  const result = object(value);
-  if (result.ok === false) {
-    const error = object(result.error);
+  if (isBackendFailure(value)) {
+    const { error } = value;
     const failure = new Error(typeof error.message === 'string' ? error.message : 'MetaHarness backend call failed.') as Error & { httpStatus?: number };
     if (typeof error.httpStatus === 'number') failure.httpStatus = error.httpStatus;
     throw failure;
@@ -87,11 +95,12 @@ export function RunDetail({ runId, run, callBackendTool, onBack, pollIntervalMs 
     }).catch(() => { if (active) setCapabilities(undefined); });
     return () => { active = false; };
   }, [callBackendTool]);
+  const interval = runDetailPollInterval(detail ? detail.status : undefined, pollIntervalMs);
   useEffect(() => {
-    if (!callBackendTool) return undefined;
-    const timer = window.setInterval(() => { void refresh(true); }, pollIntervalMs);
+    if (!callBackendTool || interval === undefined) return undefined;
+    const timer = window.setInterval(() => { void refresh(true); }, interval);
     return () => window.clearInterval(timer);
-  }, [callBackendTool, pollIntervalMs, refresh]);
+  }, [callBackendTool, interval, refresh]);
   const mutationError = (caught: unknown): string => {
     const status = typeof caught === 'object' && caught !== null && 'httpStatus' in caught
       ? (caught as { httpStatus?: unknown }).httpStatus : undefined;

@@ -106,3 +106,17 @@ test('missing backend shows an actionable message instead of throwing', async ()
   fireEvent.click(screen.getByRole('button', { name: 'RUN DOCTOR' }));
   await screen.findByText('MetaHarness backend is unavailable. Enable the extension backend and try again.');
 });
+
+test('a failing doctor report (ok: false) is rendered as structured checks, not as a backend error', async () => {
+  const storage = fakeStorage({ settings: { ...DEFAULT_SETTINGS, configPath: '/work/custom.toml' } });
+  const callBackendTool = async () => ({
+    ok: false,
+    checks: [{ id: 'credentials', status: 'fail', message: 'required credential is missing or invalid' }],
+    summary: { passed: 0, failed: 1, warnings: 0 },
+  });
+  render(React.createElement(MetaHarnessSettings, { storage, callBackendTool }));
+  fireEvent.click(screen.getByRole('button', { name: 'RUN DOCTOR' }));
+  await screen.findByText('required credential is missing or invalid');
+  assert.ok(screen.getByText('credentials'));
+  assert.equal(screen.queryByText(/MetaHarness doctor failed/), null);
+});

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { isBackendFailure } from '../contract';
 
 export const MAX_RUN_PROGRESS_EVENTS = 2000;
 
@@ -19,9 +20,8 @@ function object(value: unknown): Record<string, unknown> {
 }
 
 function progressError(value: unknown): string {
-  const result = object(value);
-  if (result.ok === false) {
-    const error = object(result.error);
+  if (isBackendFailure(value)) {
+    const { error } = value;
     throw new Error(typeof error.message === 'string' ? error.message : 'MetaHarness progress request failed.');
   }
   return '';
@@ -36,11 +36,14 @@ export function useRunProgress({
   enabled,
   intervalMs,
   callBackendTool,
+  terminal = false,
 }: {
   runId: string;
   enabled: boolean;
   intervalMs: number;
   callBackendTool?: BackendCall;
+  /** A terminal run's log is read up to its current end once, then polling stops. */
+  terminal?: boolean;
 }) {
   const [state, setState] = useState<RunProgressState>({
     events: [], droppedCount: 0, nextOffset: 0, loading: false, error: '',
@@ -77,6 +80,7 @@ export function useRunProgress({
     const generation = generationRef.current;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
+    let caughtUp = false;
 
     const poll = async () => {
       if (!active) return;
@@ -100,6 +104,7 @@ export function useRunProgress({
           throw new Error('MetaHarness returned invalid progress events.');
         }
         failures = 0;
+        caughtUp = nextOffset === requestedOffset;
         if (active && generation === generationRef.current) {
           // A response at the same/older byte offset must never append again.
           const appended = (nextOffset as number) > requestedOffset ? response.events as string[] : [];
@@ -124,7 +129,7 @@ export function useRunProgress({
         }
       } finally {
         inFlightRef.current = false;
-        if (active) {
+        if (active && !(terminal && caughtUp)) {
           const delay = Math.max(100, intervalMs) * (failures ? Math.min(4, 2 ** (failures - 1)) : 1);
           timer = setTimeout(() => { void poll(); }, delay);
         }
@@ -136,7 +141,7 @@ export function useRunProgress({
       active = false;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [callBackendTool, enabled, intervalMs, reloadSequence, runId]);
+  }, [callBackendTool, enabled, intervalMs, reloadSequence, runId, terminal]);
 
   return { ...state, reloadFromBeginning };
 }

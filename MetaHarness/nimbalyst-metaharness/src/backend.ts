@@ -1,7 +1,17 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import {
+  isArtifactResponse,
+  isHealthResponse,
+  isMutationAccepted,
+  isProgressResponse,
+  isRecord,
+  isRunSummary,
+  SUPPORTED_API_VERSION,
+} from './contract';
 import type {
+  ArtifactResponse,
   ApproveRunInput,
   ApproveScopeInput,
   BackendActivateContext,
@@ -16,6 +26,7 @@ import type {
   MetaHarnessConfigResponse,
   MetaHarnessStatus,
   ModelProfilesResponse,
+  MutationAccepted,
   ProgressResponse,
   RecoverPlanInput,
   RunDetail,
@@ -48,10 +59,6 @@ export const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
   autoStart: true,
   pollIntervalMs: 1_000,
 };
-
-function isRecord(value: unknown): value is JsonObject {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function asErrorDetails(value: unknown): unknown {
   if (value === undefined || value === null) return undefined;
@@ -191,6 +198,16 @@ function jsonResponseObject(value: unknown, operation = 'response'): JsonObject 
     throw new MetaHarnessBackendError(
       'INVALID_RESPONSE',
       `${operation} returned a JSON value that is not an object`,
+    );
+  }
+  return value;
+}
+
+function decoded<T>(value: unknown, guard: (candidate: unknown) => candidate is T, operation: string): T {
+  if (!guard(value)) {
+    throw new MetaHarnessBackendError(
+      'INVALID_RESPONSE',
+      `${operation} response does not match the MetaHarness API contract`,
     );
   }
   return value;
@@ -385,6 +402,16 @@ export class MetaHarnessClient {
       const message = isRecord(payload) && typeof payload.message === 'string'
         ? payload.message
         : `MetaHarness returned HTTP ${response.status}`;
+      if (method === 'POST' && response.status === 403 && message === 'mutation token required') {
+        // Typically a MetaHarness attached on this port that was not started
+        // with this extension's --control-token-file. Never echo the token.
+        throw new MetaHarnessBackendError(
+          'TOKEN_REJECTED',
+          'MetaHarness rejected the control token; the service on this port was not started with this extension\'s token file',
+          response.status,
+          payload,
+        );
+      }
       throw new MetaHarnessBackendError('HTTP_ERROR', message, response.status, payload);
     }
     return payload as T;
@@ -394,13 +421,21 @@ export class MetaHarnessClient {
     const payload = jsonResponseObject(
       await this.request<unknown>('GET', '/api/v1/health'),
       'health',
-    ) as HealthResponse;
-    if (payload.service !== 'metaharness') {
+    );
+    if (!isHealthResponse(payload)) {
       throw new MetaHarnessBackendError(
         'SERVICE_MISMATCH',
         'loopback service is not MetaHarness',
         undefined,
-        { service: payload.service ?? null, port: this.port },
+        { service: typeof payload.service === 'string' ? payload.service : null, port: this.port },
+      );
+    }
+    if (payload.api_version !== SUPPORTED_API_VERSION) {
+      throw new MetaHarnessBackendError(
+        'API_VERSION_MISMATCH',
+        `MetaHarness API version ${payload.api_version} is not supported (expected ${SUPPORTED_API_VERSION})`,
+        undefined,
+        { apiVersion: payload.api_version, port: this.port },
       );
     }
     return payload;
@@ -428,7 +463,14 @@ export class MetaHarnessClient {
     if (!Array.isArray(payload.runs)) {
       throw new MetaHarnessBackendError('INVALID_RESPONSE', 'list_runs response has no runs array');
     }
-    return payload.runs as RunSummary[];
+    const runs: RunSummary[] = [];
+    for (const entry of payload.runs) {
+      if (!isRunSummary(entry)) {
+        throw new MetaHarnessBackendError('INVALID_RESPONSE', 'list_runs returned a malformed run summary');
+      }
+      runs.push(entry);
+    }
+    return runs;
   }
 
   async getRun(runId: string): Promise<RunDetail> {
@@ -438,14 +480,15 @@ export class MetaHarnessClient {
     );
   }
 
-  async getArtifact(runId: string, name: string): Promise<JsonObject> {
+  async getArtifact(runId: string, name: string): Promise<ArtifactResponse> {
     if (!name || name.includes('..') || name.startsWith('/') || name.includes('\\')) {
       throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'artifact name is invalid');
     }
-    return jsonResponseObject(
+    return decoded(
       await this.request<unknown>(
         'GET', `/api/v1/runs/${encodeURIComponent(validateRunId(runId))}/artifact?name=${encodeURIComponent(name)}`,
       ),
+      isArtifactResponse,
       'get_artifact',
     );
   }
@@ -454,20 +497,22 @@ export class MetaHarnessClient {
     if (!Number.isInteger(offset) || offset < 0) {
       throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'offset must be a non-negative integer');
     }
-    return jsonResponseObject(
+    return decoded(
       await this.request<unknown>(
         'GET',
         `/api/v1/runs/${encodeURIComponent(validateRunId(runId))}/progress?offset=${offset}`,
       ),
+      isProgressResponse,
       'progress',
     );
   }
 
   async createRun(input: CreateRunInput): Promise<CreateRunResponse> {
-    return jsonResponseObject(
+    return decoded(
       await this.request<unknown>('POST', '/api/v1/runs', mutationInput(input)),
+      isMutationAccepted,
       'create_run',
-    ) as CreateRunResponse;
+    );
   }
 
   async approveRun(
@@ -505,20 +550,28 @@ export class MetaHarnessClient {
     );
   }
 
-  async resumeRun(runId: string): Promise<unknown> {
-    return this.request<unknown>(
-      'POST',
-      `/api/v1/runs/${encodeURIComponent(validateRunId(runId))}/resume`,
-      {},
+  async resumeRun(runId: string): Promise<MutationAccepted> {
+    return decoded(
+      await this.request<unknown>(
+        'POST',
+        `/api/v1/runs/${encodeURIComponent(validateRunId(runId))}/resume`,
+        {},
+      ),
+      isMutationAccepted,
+      'resume_run',
     );
   }
 
-  async recoverPlan(runId: string, input: RecoverPlanInput | string): Promise<unknown> {
+  async recoverPlan(runId: string, input: RecoverPlanInput | string): Promise<MutationAccepted> {
     const body: RecoverPlanInput = typeof input === 'string' ? { plan: input } : input;
-    return this.request<unknown>(
-      'POST',
-      `/api/v1/runs/${encodeURIComponent(validateRunId(runId))}/recover-plan`,
-      body,
+    return decoded(
+      await this.request<unknown>(
+        'POST',
+        `/api/v1/runs/${encodeURIComponent(validateRunId(runId))}/recover-plan`,
+        body,
+      ),
+      isMutationAccepted,
+      'recover_plan',
     );
   }
 }
@@ -770,6 +823,15 @@ export class MetaHarnessRuntime {
     if (outputTooLarge) {
       throw new MetaHarnessBackendError('DOCTOR_OUTPUT_TOO_LARGE', 'doctor output is too large');
     }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(stdout);
+    } catch {
+      payload = undefined;
+    }
+    // `doctor --json` exits non-zero when a check fails but still writes its
+    // structured report; only a missing or malformed report is an error.
+    if (isRecord(payload) && Array.isArray(payload.checks)) return payload;
     if (exit.code !== 0) {
       throw new MetaHarnessBackendError(
         'DOCTOR_FAILED',
@@ -778,13 +840,7 @@ export class MetaHarnessRuntime {
         { exitCode: exit.code, signal: exit.signal },
       );
     }
-    let payload: unknown;
-    try {
-      payload = JSON.parse(stdout);
-    } catch {
-      throw new MetaHarnessBackendError('DOCTOR_INVALID_JSON', 'metaharness doctor returned invalid JSON');
-    }
-    return jsonResponseObject(payload, 'doctor');
+    throw new MetaHarnessBackendError('DOCTOR_INVALID_JSON', 'metaharness doctor returned invalid JSON');
   }
 }
 
@@ -792,7 +848,9 @@ function toolError<T>(
   operation: () => Promise<T>,
   development: boolean,
 ): Promise<BackendToolResult<T>> {
-  return operation().catch((error) => ({
+  // Argument validation inside `operation` may throw synchronously; it must
+  // still become a JSON failure envelope, never an uncaught backend error.
+  return Promise.resolve().then(operation).catch((error) => ({
     ok: false as const,
     error: toBackendError(error, development),
   }));
@@ -890,18 +948,40 @@ export async function activate(
     dataDir: runtimeDataDir(context),
   });
   const workspacePath = context.services.workspacePath || context.services.extensionPath;
-  const startedRuntimes = new Map<string, MetaHarnessRuntime>();
+  // One runtime per MetaHarness service identity. Poll interval and autoStart
+  // are client preferences and must not create a second service.
+  const identity = (value: RuntimeConfig) => JSON.stringify([value.executable, value.configPath, value.port]);
+  const runtimes = new Map<string, MetaHarnessRuntime>([[identity(config), runtime]]);
+  // Every call without explicit settings (runs, progress, mutations) goes to
+  // the service the panel last selected, never to a stale default port.
+  let current = runtime;
   const runtimeForSettings = (input: RuntimeConfigCall) => {
     const selectedConfig = mergeRuntimeConfig(input.settings);
-    const key = JSON.stringify(selectedConfig);
-    const selected = startedRuntimes.get(key)
-      ?? new MetaHarnessRuntime({ config: selectedConfig, dataDir: runtimeDataDir(context) });
-    return { key, runtime: selected };
+    const key = identity(selectedConfig);
+    let selected = runtimes.get(key);
+    if (!selected) {
+      selected = new MetaHarnessRuntime({ config: selectedConfig, dataDir: runtimeDataDir(context) });
+      runtimes.set(key, selected);
+    }
+    return selected;
   };
-  const forCall = (input?: RuntimeConfigCall) => {
-    if (!input?.settings) return runtime;
-    return runtimeForSettings(input).runtime;
+  const select = (input?: RuntimeConfigCall) => {
+    if (input?.settings) current = runtimeForSettings(input);
+    return current;
   };
+  const startSelected = async (input?: RuntimeConfigCall) => {
+    const selected = select(input);
+    // A reconfiguration on the same port must not attach to our own process
+    // started with the previous config: stop that owned process first. A
+    // process on another port, or one we do not own, is never stopped here.
+    for (const other of runtimes.values()) {
+      if (other !== selected && other.config.port === selected.config.port && other.ownedProcess) {
+        await other.stop();
+      }
+    }
+    return selected.start();
+  };
+  const forCall = (input?: RuntimeConfigCall) => (input?.settings ? runtimeForSettings(input) : current);
   const recommendedConfigPath = () => {
     for (const name of ['metaharness.toml', '.metaharness.toml']) {
       const candidate = join(workspacePath, name);
@@ -915,69 +995,62 @@ export async function activate(
 
   const methods: MetaHarnessBackend['methods'] = {
     status: async (input) => ({
-      ...await forCall(input).status(),
+      ...await select(input).status(),
       ...(recommendedConfigPath() ? { recommendedConfigPath: recommendedConfigPath() } : {}),
     }),
-    start: (input) => {
-      if (!input?.settings) {
-        return toolError(() => runtime.start(), runtime.isDevelopment);
-      }
-      const { key, runtime: selected } = runtimeForSettings(input);
-      startedRuntimes.set(key, selected);
-      return toolError(() => selected.start(), selected.isDevelopment);
-    },
-    stop: () => toolError(() => runtime.stop(), runtime.isDevelopment),
+    start: (input) => toolError(() => startSelected(input), current.isDevelopment),
+    stop: () => toolError(() => current.stop(), current.isDevelopment),
     get_config: (input) => {
       const selected = forCall(input);
       return toolError(() => selected.client.getConfig(), selected.isDevelopment);
     },
-    model_profiles: () => toolError(() => runtime.client.modelProfiles(), runtime.isDevelopment),
-    list_runs: () => toolError(() => runtime.client.listRuns(), runtime.isDevelopment),
+    model_profiles: () => toolError(() => current.client.modelProfiles(), current.isDevelopment),
+    list_runs: () => toolError(() => current.client.listRuns(), current.isDevelopment),
     get_run: (input) => toolError(
-      () => runtime.client.getRun(argumentRunId(input)),
-      runtime.isDevelopment,
+      () => current.client.getRun(argumentRunId(input)),
+      current.isDevelopment,
     ),
     get_artifact: (input) => toolError(
-      () => runtime.client.getArtifact(validateRunId(input.runId), String(input.name ?? '')),
-      runtime.isDevelopment,
+      () => current.client.getArtifact(validateRunId(input.runId), String(input.name ?? '')),
+      current.isDevelopment,
     ),
     progress: (input) => toolError(
-      () => runtime.client.progress(validateRunId(input.runId), input.offset),
-      runtime.isDevelopment,
+      () => current.client.progress(validateRunId(input.runId), input.offset),
+      current.isDevelopment,
     ),
     create_run: (input) => toolError(() => {
       const request = mutationInput<CreateRunInput>(input);
       if (typeof request.spec !== 'string' || !request.spec.trim()) {
         throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'spec is required');
       }
-      return runtime.client.createRun(request);
-    }, runtime.isDevelopment),
+      return current.client.createRun(request);
+    }, current.isDevelopment),
     approve_run: (input) => toolError(
       () => {
         if (typeof input.decision !== 'string' || !input.decision) {
           throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'decision is required');
         }
         const options = Object.fromEntries(Object.entries(input).filter(([key]) => !['runId', 'decision'].includes(key)));
-        return runtime.client.approveRun(
+        return current.client.approveRun(
           validateRunId(input.runId), { ...options, decision: input.decision },
         ).then((value) => jsonResponseObject(value, 'approve_run'));
       },
-      runtime.isDevelopment,
+      current.isDevelopment,
     ),
     approve_scope: (input) => toolError(
       () => {
         if (typeof input.decision !== 'string' || !input.decision) {
           throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'decision is required');
         }
-        return runtime.client.approveScope(
+        return current.client.approveScope(
           validateRunId(input.runId), { decision: input.decision },
         ).then((value) => jsonResponseObject(value, 'approve_scope'));
       },
-      runtime.isDevelopment,
+      current.isDevelopment,
     ),
     resume_run: (input) => toolError(
-      () => runtime.client.resumeRun(argumentRunId(input)).then((value) => jsonResponseObject(value, 'resume_run')),
-      runtime.isDevelopment,
+      () => current.client.resumeRun(argumentRunId(input)),
+      current.isDevelopment,
     ),
     recover_plan: (input) => toolError(
       () => {
@@ -985,11 +1058,11 @@ export async function activate(
         if (typeof planInput.plan !== 'string' || !planInput.plan.trim()) {
           throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'non-empty plan content is required');
         }
-        return runtime.client.recoverPlan(
+        return current.client.recoverPlan(
           validateRunId(input.runId), planInput as RecoverPlanInput,
-        ).then((value) => jsonResponseObject(value, 'recover_plan'));
+        );
       },
-      runtime.isDevelopment,
+      current.isDevelopment,
     ),
     doctor: (input) => {
       const selected = forCall(input);
@@ -1010,7 +1083,7 @@ export async function activate(
   return {
     methods,
     deactivate: async () => {
-      await Promise.all([runtime.deactivate(), ...Array.from(startedRuntimes.values(), (item) => item.deactivate())]);
+      await Promise.all(Array.from(runtimes.values(), (item) => item.deactivate()));
     },
   };
 }

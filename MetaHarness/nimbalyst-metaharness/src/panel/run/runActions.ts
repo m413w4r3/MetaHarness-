@@ -33,11 +33,11 @@ export function deriveRunActions(run: RunDetail): RunActions {
   const scopeApproval = firstObject(data.scope_approval, approval.scope_approval);
   const planRecovery = object(data.plan_recovery);
   const status = typeof data.status === 'string' ? data.status.toLowerCase() : '';
-  const phase = typeof resume.phase === 'string' ? resume.phase : '';
-  const planPending = approval.awaiting === true
-    || status === 'awaiting_plan_approval' || (resume.resumable === true && phase === 'plan_approval');
-  const scopePending = scopeApproval.awaiting === true || approval.scope_awaiting === true
-    || status === 'waiting_scope_approval';
+  // MetaHarness accepts a plan decision only in `awaiting_plan_approval` and a
+  // scope decision only in `waiting_scope_approval` (web/api.py). A resumable
+  // `plan_approval` phase is a Resume action, not an approval form.
+  const planPending = status === 'awaiting_plan_approval';
+  const scopePending = status === 'waiting_scope_approval';
   const hasScopeDelta = Object.keys(object(data.scope_delta)).length > 0;
   const resumeLabel = typeof resume.label === 'string' && resume.label.trim()
     ? resume.label

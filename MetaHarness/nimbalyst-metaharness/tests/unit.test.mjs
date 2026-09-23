@@ -3,6 +3,8 @@ import { test } from 'node:test';
 import { parseProfiles, profilesForRole, validateRunForm } from '../src/model/runForm.ts';
 import { classifyRunStatus } from '../src/panel/runStatus.ts';
 import { deriveRunActions } from '../src/panel/run/runActions.ts';
+import { runDetailPollInterval } from '../src/panel/run/RunDetail.tsx';
+import { isBackendFailure, isRunSummary, isProgressResponse, isMutationAccepted, isHealthResponse } from '../src/contract.ts';
 import { shortSha } from '../src/panel/run/RunHeader.tsx';
 import { workspaceFile } from '../src/panel/run/RunArtifactViews.tsx';
 
@@ -72,4 +74,35 @@ test('short SHA and workspace file resolution preserve display and reject escape
   for (const input of ['../outside', '/etc/passwd', '\\server\\share', 'C:\\Windows\\system.ini', '../../outside']) {
     assert.equal(workspaceFile('/workspace/project', input), undefined, input);
   }
+});
+
+test('contract decoders match the MetaHarness JSON and keep doctor reports distinct from failures', () => {
+  assert.equal(isHealthResponse({ service: 'metaharness', api_version: 1, status: 'ok', control_api: true }), true);
+  assert.equal(isHealthResponse({ service: 'other', api_version: 1, status: 'ok' }), false);
+  assert.equal(isRunSummary({ run_id: 'r', status: 'planning', updated_at: null, plan_title: null, commit_sha: null, candidate: null, failure: null }), true);
+  assert.equal(isRunSummary({ status: 'planning' }), false);
+  assert.equal(isRunSummary({ run_id: 'r', status: 7 }), false);
+  assert.equal(isProgressResponse({ next_offset: 4, events: ['a'] }), true);
+  assert.equal(isProgressResponse({ next_offset: 1.5, events: [] }), false);
+  assert.equal(isMutationAccepted({ ok: true, run_id: 'r', location: '/runs/r', accepted: true }), true);
+  assert.equal(isMutationAccepted({ run_id: 'r' }), false);
+  assert.equal(isBackendFailure({ ok: false, error: { code: 'HTTP_ERROR', message: 'x' } }), true);
+  assert.equal(isBackendFailure({ ok: false, checks: [], summary: { failed: 1 } }), false);
+});
+
+test('run detail polling slows while awaiting a human and stops once terminal', () => {
+  assert.equal(runDetailPollInterval('implementing', 1000), 1000);
+  assert.equal(runDetailPollInterval('approved', 1000), 1000);
+  assert.equal(runDetailPollInterval('awaiting_plan_approval', 1000), 5000);
+  assert.equal(runDetailPollInterval('committed', 1000), undefined);
+  assert.equal(runDetailPollInterval('failed', 1000), undefined);
+  assert.equal(runDetailPollInterval(undefined, 1000), 1000);
+});
+
+test('approval actions require the exact server status that accepts the decision', () => {
+  const resumablePlanPhase = { status: 'interrupted', overview: { resume: { resumable: true, phase: 'plan_approval' } } };
+  assert.equal(deriveRunActions(resumablePlanPhase).canApprovePlan, false);
+  assert.equal(deriveRunActions(resumablePlanPhase).canResume, true);
+  assert.equal(deriveRunActions({ status: 'awaiting_plan_approval', approval: { recorded: false } }).canApprovePlan, true);
+  assert.equal(deriveRunActions({ status: 'failed', scope_delta: { added_paths: ['a'] }, scope_approval: { awaiting: true } }).canApproveScope, false);
 });

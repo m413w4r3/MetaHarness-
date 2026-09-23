@@ -16,7 +16,7 @@ export function ProgressView({ runId, status, callBackendTool, intervalMs = 1000
   const category = classifyRunStatus(status ?? '');
   const terminal = category === 'completed' || category === 'failed';
   const slow = category === 'awaiting-action';
-  const progress = useRunProgress({ runId, enabled: Boolean(callBackendTool) && !terminal, intervalMs: slow ? Math.max(5000, intervalMs) : intervalMs, callBackendTool });
+  const progress = useRunProgress({ runId, enabled: Boolean(callBackendTool), terminal, intervalMs: slow ? Math.max(5000, intervalMs) : intervalMs, callBackendTool });
   const [filter, setFilter] = useState<ProgressFilter>('All');
   const [autoScroll, setAutoScroll] = useState(true);
   const [copyMessage, setCopyMessage] = useState('');

@@ -6,6 +6,7 @@ import { NewRunForm } from './NewRunForm';
 import { StatusBadge } from './StatusBadge';
 import { classifyRunStatus, type RunCategory } from './runStatus';
 import { RunDetail } from './run/RunDetail';
+import { isBackendFailure } from '../contract';
 
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
 type PanelView = { kind: 'dashboard' } | { kind: 'run'; runId: string } | { kind: 'new-run' };
@@ -16,9 +17,8 @@ function object(value: unknown): Record<string, unknown> {
 }
 
 function unwrap(value: unknown): unknown {
-  const result = object(value);
-  if (result.ok === false) {
-    const error = object(result.error);
+  if (isBackendFailure(value)) {
+    const { error } = value;
     throw new Error(typeof error.message === 'string' ? error.message : 'MetaHarness backend call failed.');
   }
   return value;
@@ -101,11 +101,13 @@ export function RunsDashboard({
 
   useEffect(() => { void refresh(); }, [refresh]);
 
+  // Only the visible view polls: RunDetail owns its own state poll.
+  const dashboardVisible = view.kind === 'dashboard';
   useEffect(() => {
-    if (!callBackendTool) return undefined;
+    if (!callBackendTool || !dashboardVisible) return undefined;
     const timer = window.setInterval(() => { void refresh(); }, settings.pollIntervalMs);
     return () => window.clearInterval(timer);
-  }, [callBackendTool, refresh, settings.pollIntervalMs]);
+  }, [callBackendTool, dashboardVisible, refresh, settings.pollIntervalMs]);
 
   const selectedRun = view.kind === 'run' ? runs.find((run) => run.run_id === view.runId) : undefined;
   if (view.kind === 'new-run') {
