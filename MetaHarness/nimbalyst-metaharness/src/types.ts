@@ -47,7 +47,6 @@ export interface MetaHarnessStatus {
   configured: boolean;
   connected: boolean;
   serverOwned: boolean;
-  error?: BackendError;
 }
 
 export interface BackendToolSchema {
