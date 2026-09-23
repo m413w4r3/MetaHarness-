@@ -119,6 +119,36 @@ test('403 mutation, invalid JSON, and missing token are standardized', async () 
   );
 });
 
+test('approval bridge flattens conceptual step profile map and keeps reject body minimal', async () => {
+  const seen = [];
+  const server = await listen(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    seen.push({ path: req.url, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+    return json(res, 200, { ok: true });
+  });
+  try {
+    const client = new MetaHarnessClient({
+      baseUrl: `http://127.0.0.1:${port(server)}`,
+      tokenFile: tokenFile('approval.token'),
+    });
+    await client.approveRun('run-1', {
+      decision: 'APPROVE', final_reviewer_profile: 'reviewer',
+      step_profiles: { S01: 'mechanical', S02: 'reasoning' },
+    });
+    await client.approveRun('run-1', { decision: 'REJECT' });
+    assert.deepEqual(seen, [
+      { path: '/api/v1/runs/run-1/approval', body: {
+        decision: 'APPROVE', final_reviewer_profile: 'reviewer',
+        step_profile__S01: 'mechanical', step_profile__S02: 'reasoning',
+      } },
+      { path: '/api/v1/runs/run-1/approval', body: { decision: 'REJECT' } },
+    ]);
+  } finally {
+    await close(server);
+  }
+});
+
 function fakeExecutable(name, doctorOutput = null) {
   const script = join(root, `${name}.mjs`);
   writeFileSync(script, `#!/usr/bin/env node

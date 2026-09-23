@@ -66,6 +66,10 @@ export interface CreateRunInput extends JsonObject {
 
 export interface ApproveRunInput extends JsonObject {
   decision: string;
+  final_reviewer_profile?: string;
+  semantic_reviser_profile?: string;
+  check_repair_profile?: string;
+  step_profiles?: Record<string, string>;
 }
 
 export interface ApproveScopeInput extends JsonObject {

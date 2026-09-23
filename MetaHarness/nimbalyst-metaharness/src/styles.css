@@ -528,6 +528,113 @@
   color: var(--metaharness-text);
 }
 
+.metaharness-approval {
+  display: grid;
+  gap: 16px;
+  margin: 22px 0;
+  padding: 18px;
+  border: 1px solid var(--metaharness-accent);
+  border-radius: 10px;
+  background: var(--metaharness-surface);
+}
+
+.metaharness-approval h2,
+.metaharness-approval h3,
+.metaharness-approval p {
+  margin: 0;
+}
+
+.metaharness-approval h2 {
+  font-size: 15px;
+  letter-spacing: 0.06em;
+}
+
+.metaharness-approval__roles,
+.metaharness-approval__steps {
+  display: grid;
+  gap: 12px;
+}
+
+.metaharness-approval__roles {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.metaharness-approval__roles label,
+.metaharness-approval__steps > label,
+.metaharness-approval__profile {
+  display: grid;
+  gap: 7px;
+}
+
+.metaharness-approval__roles label > span,
+.metaharness-approval__profile > span {
+  color: var(--metaharness-muted);
+  font-size: 13px;
+}
+
+.metaharness-approval select {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--metaharness-border);
+  border-radius: 7px;
+  background: var(--metaharness-bg);
+  color: var(--metaharness-text);
+  font: inherit;
+}
+
+.metaharness-approval__steps > label {
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 0.55fr);
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--metaharness-border);
+  border-radius: 8px;
+}
+
+.metaharness-approval__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.metaharness-button--danger {
+  border: 1px solid #c94d56;
+  background: #762a32;
+  color: #fff;
+}
+
+.metaharness-approval__scrim {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(0 0 0 / 68%);
+}
+
+.metaharness-approval__dialog {
+  display: grid;
+  gap: 16px;
+  width: min(100%, 460px);
+  padding: 22px;
+  border: 1px solid var(--metaharness-border);
+  border-radius: 12px;
+  background: var(--metaharness-surface);
+}
+
+.metaharness-approval__dialog p {
+  color: var(--metaharness-muted);
+}
+
+@media (max-width: 560px) {
+  .metaharness-approval__steps > label {
+    grid-template-columns: 1fr;
+  }
+}
+
 .metaharness-settings__error {
   color: #f87171;
 }

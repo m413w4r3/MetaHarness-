@@ -171,6 +171,10 @@ for (const [name, payload] of runFixtures) {
     await screen.findByText(name === 'awaiting approval' ? 'awaiting_approval' : name, { exact: false });
     assert.deepEqual(calls[0], ['metaharness.get_run', { runId: `fixture-${name}` }]);
     assert.ok(screen.getByRole('button', { name: 'Refresh' }));
+    if (name === 'awaiting approval') {
+      assert.equal(screen.queryByRole('button', { name: 'APPROVE & CONTINUE' }), null);
+      assert.equal(screen.queryByRole('button', { name: 'REJECT PLAN' }), null);
+    }
     if (name === 'implementing') {
       assert.ok(screen.getByText('API search endpoint'));
       assert.equal(screen.getByText('8c12d77').title, '8c12d77abcdef');
@@ -287,6 +291,137 @@ test('advanced form submits all supported run options', async () => {
   assert.equal(payload.semantic_revision_enabled, false);
   assert.equal(payload.max_check_repair_attempts, 0);
   assert.equal(payload.repair_scope_policy, 'auto-bounded');
+});
+
+const approvalRun = (extra = {}) => ({
+  run_id: 'approval-001', status: 'awaiting_plan_approval', approval: { recorded: false },
+  run_options: { profiles: {}, pipeline: { semantic_revision_enabled: true, max_check_repair_attempts: 1 } },
+  implementation_bundle: { steps: [
+    { id: 'S01', title: 'Database model', execution_class: 'MECHANICAL' },
+    { id: 'S02', title: 'API layer', execution_class: 'REASONING' },
+  ] },
+  ...extra,
+});
+
+test('plan approval loads metadata-compatible profiles, maps steps, submits once, and reloads the run', async () => {
+  const calls = [];
+  let detail = approvalRun();
+  let finishMutation;
+  const callBackendTool = async (name, args) => {
+    calls.push([name, args]);
+    if (name === 'metaharness.get_run') return detail;
+    if (name === 'metaharness.model_profiles') return {
+      profiles: [
+        ...modelProfiles.profiles,
+        { id: 'impl-b', display_name: 'Implementer B', roles: ['implementer'], execution_classes: ['REASONING'] },
+        { id: 'not-impl', display_name: 'Reviewer only', roles: ['reviewer'] },
+      ],
+      defaults: modelProfiles.defaults,
+    };
+    if (name === 'metaharness.approve_run') {
+      await new Promise((resolve) => { finishMutation = resolve; });
+      detail = { ...detail, status: 'implementing', approval: { recorded: true, decision: 'APPROVE' } };
+      return { ok: true };
+    }
+    throw new Error(`Unexpected backend call: ${name}`);
+  };
+  render(React.createElement(RunDetail, { runId: 'approval-001', callBackendTool, onBack: () => {} }));
+  await screen.findByRole('heading', { name: 'PLAN APPROVAL REQUIRED' });
+  await screen.findByLabelText('S02 Profile');
+  const s01 = screen.getByLabelText('S01 Profile');
+  const s02 = screen.getByLabelText('S02 Profile');
+  assert.deepEqual([...s01.options].map((option) => option.value), ['impl-a']);
+  assert.deepEqual([...s02.options].map((option) => option.value), ['impl-a', 'impl-b']);
+  assert.equal([...s01.options].some((option) => option.value === 'not-impl'), false);
+  fireEvent.change(s01, { target: { value: 'impl-a' } });
+  fireEvent.change(s02, { target: { value: 'impl-b' } });
+  const approve = screen.getByRole('button', { name: 'APPROVE & CONTINUE' });
+  fireEvent.click(approve);
+  fireEvent.click(approve);
+  await waitFor(() => assert.equal(calls.filter(([name]) => name === 'metaharness.approve_run').length, 1));
+  assert.equal(approve.disabled, true);
+  assert.deepEqual(calls.find(([name]) => name === 'metaharness.approve_run')[1], {
+    runId: 'approval-001',
+    input: {
+      decision: 'APPROVE', final_reviewer_profile: 'review-a', semantic_reviser_profile: 'revise-a',
+      check_repair_profile: 'repair-a', step_profiles: { S01: 'impl-a', S02: 'impl-b' },
+    },
+  });
+  finishMutation();
+  await waitFor(() => assert.equal(calls.filter(([name]) => name === 'metaharness.get_run').length, 2));
+  await waitFor(() => assert.equal(screen.queryByRole('heading', { name: 'PLAN APPROVAL REQUIRED' }), null));
+});
+
+test('plan reject confirms irreversible choice and omits profile fields', async () => {
+  const calls = [];
+  const callBackendTool = async (name, args) => {
+    calls.push([name, args]);
+    if (name === 'metaharness.get_run') return approvalRun();
+    if (name === 'metaharness.model_profiles') return modelProfiles;
+    if (name === 'metaharness.approve_run') return { ok: true };
+    throw new Error(`Unexpected backend call: ${name}`);
+  };
+  render(React.createElement(RunDetail, { runId: 'approval-001', callBackendTool, onBack: () => {} }));
+  await screen.findByRole('heading', { name: 'PLAN APPROVAL REQUIRED' });
+  fireEvent.click(screen.getByRole('button', { name: 'REJECT PLAN' }));
+  assert.ok(screen.getByRole('dialog').textContent.includes('irreversible'));
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm irreversible rejection' }));
+  await waitFor(() => assert.ok(calls.some(([name]) => name === 'metaharness.approve_run')));
+  assert.deepEqual(calls.find(([name]) => name === 'metaharness.approve_run')[1], {
+    runId: 'approval-001', input: { decision: 'REJECT' },
+  });
+});
+
+test('scope expansion approval displays added paths and sends only the decision', async () => {
+  const calls = [];
+  const callBackendTool = async (name, args) => {
+    calls.push([name, args]);
+    if (name === 'metaharness.get_run') return {
+      run_id: 'scope-001', status: 'waiting_scope_approval',
+      scope_delta: { added_paths: ['src/foo.py', 'tests/test_foo.py'] },
+    };
+    if (name === 'metaharness.approve_scope') return { ok: true };
+    throw new Error(`Unexpected backend call: ${name}`);
+  };
+  render(React.createElement(RunDetail, { runId: 'scope-001', callBackendTool, onBack: () => {} }));
+  await screen.findByRole('heading', { name: 'REPAIR SCOPE EXPANSION' });
+  assert.ok(screen.getByText('+ src/foo.py'));
+  assert.ok(screen.getByText('+ tests/test_foo.py'));
+  fireEvent.click(screen.getByRole('button', { name: 'APPROVE' }));
+  await waitFor(() => assert.ok(calls.some(([name]) => name === 'metaharness.approve_scope')));
+  assert.deepEqual(calls.find(([name]) => name === 'metaharness.approve_scope')[1], {
+    runId: 'scope-001', input: { decision: 'APPROVE' },
+  });
+});
+
+test('approval is hidden when API reports a recorded decision even if status is stale', async () => {
+  const callBackendTool = async (name) => {
+    if (name === 'metaharness.get_run') return approvalRun({ approval: { recorded: true, decision: 'REJECT' } });
+    throw new Error(`Unexpected backend call: ${name}`);
+  };
+  render(React.createElement(RunDetail, { runId: 'approval-001', callBackendTool, onBack: () => {} }));
+  await screen.findByText('awaiting_plan_approval');
+  assert.equal(screen.queryByRole('button', { name: 'APPROVE & CONTINUE' }), null);
+  assert.equal(screen.queryByRole('button', { name: 'REJECT PLAN' }), null);
+});
+
+test('HTTP conflict reports the error and refreshes the run state', async () => {
+  const calls = [];
+  let reads = 0;
+  const callBackendTool = async (name) => {
+    calls.push(name);
+    if (name === 'metaharness.get_run') return ++reads === 1 ? approvalRun() : { ...approvalRun(), status: 'implementing' };
+    if (name === 'metaharness.model_profiles') return modelProfiles;
+    if (name === 'metaharness.approve_run') return { ok: false, error: { code: 'HTTP_ERROR', httpStatus: 409, message: 'run is not awaiting plan approval' } };
+    throw new Error(`Unexpected backend call: ${name}`);
+  };
+  render(React.createElement(RunDetail, { runId: 'approval-001', callBackendTool, onBack: () => {} }));
+  await screen.findByRole('heading', { name: 'PLAN APPROVAL REQUIRED' });
+  await waitFor(() => assert.equal(screen.getByRole('button', { name: 'APPROVE & CONTINUE' }).disabled, false));
+  fireEvent.click(screen.getByRole('button', { name: 'APPROVE & CONTINUE' }));
+  await screen.findByRole('alert');
+  assert.ok(screen.getByRole('alert').textContent.includes('not awaiting plan approval'));
+  await waitFor(() => assert.equal(calls.filter((name) => name === 'metaharness.get_run').length, 2));
 });
 
 test('backend failure leaves spec in place and reports capacity conflicts', async () => {

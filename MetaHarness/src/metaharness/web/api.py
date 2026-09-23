@@ -395,6 +395,19 @@ def get_run(
         else f"{root}/checks/post-implementation"
     )
     checks_path, review_path = f"{gate_root}/checks.json", f"{root}/review/review.json"
+    scope_delta_path = _artifact_path(directory, f"{root}/correction/scope_delta.json")
+    scope_approval_path = _artifact_path(directory, f"{root}/correction/scope_approval.json")
+    scope_delta = _load_json(scope_delta_path, max_bytes=256 * 1024)
+    scope_approval_payload = _load_json(scope_approval_path, max_bytes=16 * 1024)
+    try:
+        with scope_delta_path.open("rb") as stream:
+            scope_delta_bytes = stream.read(256 * 1024 + 1)
+        scope_delta_sha256 = hashlib.sha256(scope_delta_bytes).hexdigest() if len(scope_delta_bytes) <= 256 * 1024 else None
+    except OSError:
+        scope_delta_sha256 = None
+    scope_approval_recorded = isinstance(scope_approval_payload, dict) and scope_approval_payload.get("decision") in {
+        ApprovalDecision.APPROVE.value, ApprovalDecision.REJECT.value,
+    } and scope_approval_payload.get("scope_delta_sha256") == scope_delta_sha256 and scope_delta_sha256 is not None
     reviewer_raw = _load_text(_artifact_path(directory, f"{root}/review/reviewer.raw.md"))
     revision_path = f"{root}/semantic-revision/report.json"
     changed_path, diff_path = f"{gate_root}/changed-files.txt", f"{gate_root}/diff.patch"
@@ -448,7 +461,11 @@ def get_run(
             _artifact_path(directory, "execution_recommendation.json")
         ),
         "repair_task": _load_text(_artifact_path(directory, "repair_task.md")),
-        "scope_delta": _load_json(_artifact_path(directory, f"{root}/correction/scope_delta.json"), max_bytes=256 * 1024),
+        "scope_delta": scope_delta,
+        "scope_approval": {
+            "recorded": scope_approval_recorded,
+            "decision": scope_approval_payload.get("decision") if scope_approval_recorded else None,
+        },
         "failure": state.get("failure"),
         "publish": _load_json(_artifact_path(directory, "publish.json")),
         "approval": {"recorded": approval_decision is not None, "decision": approval_decision},

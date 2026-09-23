@@ -463,9 +463,17 @@ export class MetaHarnessClient {
     input: ApproveRunInput | string,
     extra: JsonObject = {},
   ): Promise<unknown> {
-    const body: ApproveRunInput = typeof input === 'string'
+    const selected: ApproveRunInput = typeof input === 'string'
       ? { ...extra, decision: input }
       : input;
+    const body: JsonObject = { ...selected };
+    const stepProfiles = body.step_profiles;
+    delete body.step_profiles;
+    if (stepProfiles && typeof stepProfiles === 'object' && !Array.isArray(stepProfiles)) {
+      for (const [stepId, profileId] of Object.entries(stepProfiles as Record<string, unknown>)) {
+        body[`step_profile__${stepId}`] = profileId;
+      }
+    }
     return this.request<unknown>(
       'POST',
       `/api/v1/runs/${encodeURIComponent(validateRunId(runId))}/approval`,
