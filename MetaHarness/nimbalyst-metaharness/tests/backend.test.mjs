@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import {
   activate,
+  MCP_TOOL_DESCRIPTORS,
   MetaHarnessBackendError,
   MetaHarnessClient,
   MetaHarnessRuntime,
@@ -276,9 +277,9 @@ test('activate registers the complete tool surface with default config safely', 
     },
   }, { port: await freePort() });
   assert.deepEqual(registered, [
-    'status', 'start', 'stop', 'get_config', 'model_profiles', 'list_runs',
+    'status', 'get_config', 'model_profiles', 'list_runs',
     'get_run', 'get_artifact', 'progress', 'create_run', 'approve_run', 'approve_scope',
-    'resume_run', 'recover_plan', 'doctor',
+    'resume_run', 'recover_plan',
   ]);
   assert.deepEqual(await backend.methods.status(), {
     configured: false,
@@ -286,4 +287,28 @@ test('activate registers the complete tool surface with default config safely', 
     serverOwned: false,
   });
   await backend.deactivate();
+});
+
+test('MCP descriptors classify reads and require explicit mutation arguments', () => {
+  const descriptors = new Map(MCP_TOOL_DESCRIPTORS.map((tool) => [tool.name, tool]));
+  const readOnly = ['status', 'get_config', 'model_profiles', 'list_runs', 'get_run', 'progress', 'get_artifact'];
+  const mutations = ['create_run', 'approve_run', 'approve_scope', 'resume_run', 'recover_plan'];
+  for (const name of readOnly) assert.match(descriptors.get(name).description, /^READ-ONLY\./);
+  for (const name of mutations) {
+    const description = descriptors.get(name).description;
+    assert.match(description, /MUTATING ACTION/);
+    assert.match(description, /user’s explicit request/i);
+    assert.match(description, /Never approve or reject a plan automatically/i);
+    assert.match(description, /Never recover a plan without .*plan content.*intent/i);
+    assert.match(description, /Never launch multiple runs to compensate for an error/i);
+  }
+  assert.deepEqual(descriptors.get('create_run').inputSchema.required, ['spec']);
+  assert.deepEqual(descriptors.get('approve_run').inputSchema.required, ['runId', 'decision']);
+  assert.deepEqual(descriptors.get('approve_scope').inputSchema.required, ['runId', 'decision']);
+  assert.deepEqual(descriptors.get('resume_run').inputSchema.required, ['runId']);
+  assert.deepEqual(descriptors.get('recover_plan').inputSchema.required, ['runId', 'input']);
+  assert.deepEqual(descriptors.get('recover_plan').inputSchema.properties.input.required, ['plan']);
+  assert.equal(descriptors.has('start'), false);
+  assert.equal(descriptors.has('stop'), false);
+  assert.equal(descriptors.has('doctor'), false);
 });

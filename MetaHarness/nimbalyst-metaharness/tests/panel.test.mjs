@@ -469,10 +469,8 @@ test('plan approval loads metadata-compatible profiles, maps steps, submits once
   assert.equal(approve.disabled, true);
   assert.deepEqual(calls.find(([name]) => name === 'metaharness.approve_run')[1], {
     runId: 'approval-001',
-    input: {
-      decision: 'APPROVE', final_reviewer_profile: 'review-a', semantic_reviser_profile: 'revise-a',
-      check_repair_profile: 'repair-a', step_profiles: { S01: 'impl-a', S02: 'impl-b' },
-    },
+    decision: 'APPROVE', final_reviewer_profile: 'review-a', semantic_reviser_profile: 'revise-a',
+    check_repair_profile: 'repair-a', step_profiles: { S01: 'impl-a', S02: 'impl-b' },
   });
   finishMutation();
   await waitFor(() => assert.equal(calls.filter(([name]) => name === 'metaharness.get_run').length, 2));
@@ -495,7 +493,7 @@ test('plan reject confirms irreversible choice and omits profile fields', async 
   fireEvent.click(screen.getByRole('button', { name: 'Confirm irreversible rejection' }));
   await waitFor(() => assert.ok(calls.some(([name]) => name === 'metaharness.approve_run')));
   assert.deepEqual(calls.find(([name]) => name === 'metaharness.approve_run')[1], {
-    runId: 'approval-001', input: { decision: 'REJECT' },
+    runId: 'approval-001', decision: 'REJECT',
   });
 });
 
@@ -517,7 +515,7 @@ test('scope expansion approval displays added paths and sends only the decision'
   fireEvent.click(screen.getByRole('button', { name: 'APPROVE' }));
   await waitFor(() => assert.ok(calls.some(([name]) => name === 'metaharness.approve_scope')));
   assert.deepEqual(calls.find(([name]) => name === 'metaharness.approve_scope')[1], {
-    runId: 'scope-001', input: { decision: 'APPROVE' },
+    runId: 'scope-001', decision: 'APPROVE',
   });
 });
 

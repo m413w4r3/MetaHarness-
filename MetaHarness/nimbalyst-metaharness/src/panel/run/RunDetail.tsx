@@ -126,7 +126,7 @@ export function RunDetail({ runId, run, callBackendTool, onBack, pollIntervalMs 
   const planBytes = new TextEncoder().encode(replacementPlan).length;
   const decide = useCallback(async (kind: 'plan' | 'scope', decision: 'APPROVE' | 'REJECT', input?: Data) => {
     const tool = kind === 'plan' ? 'metaharness.approve_run' : 'metaharness.approve_scope';
-    await mutate(tool, { runId, input: input ?? { decision } });
+    await mutate(tool, { runId, ...(input ?? { decision }) });
   }, [mutate, runId]);
   useEffect(() => {
     if (!detail || !callBackendTool) return;

@@ -807,61 +807,65 @@ function descriptor(
 }
 
 export const MCP_TOOL_DESCRIPTORS: BackendToolDescriptor[] = [
-  descriptor('status', 'Return MetaHarness connection and ownership status for the supplied settings.', {
+  descriptor('status', 'READ-ONLY. Return MetaHarness connection and ownership status for the supplied settings.', {
     type: 'object', properties: { settings: { type: 'object', properties: {
       executable: { type: 'string' }, configPath: { type: 'string' }, port: { type: 'integer' },
       autoStart: { type: 'boolean' }, pollIntervalMs: { type: 'integer' },
     }, additionalProperties: false } }, additionalProperties: false,
   }),
-  descriptor('start', 'Attach to or start MetaHarness with the supplied settings.', {
+  descriptor('get_config', 'READ-ONLY. Return the credential-free MetaHarness configuration description.', {
     type: 'object', properties: { settings: { type: 'object', properties: {
       executable: { type: 'string' }, configPath: { type: 'string' }, port: { type: 'integer' },
       autoStart: { type: 'boolean' }, pollIntervalMs: { type: 'integer' },
     }, additionalProperties: false } }, additionalProperties: false,
   }),
-  descriptor('stop', 'Stop only the MetaHarness server started by this extension.'),
-  descriptor('get_config', 'Return the credential-free MetaHarness configuration description.', {
-    type: 'object', properties: { settings: { type: 'object', properties: {
-      executable: { type: 'string' }, configPath: { type: 'string' }, port: { type: 'integer' },
-      autoStart: { type: 'boolean' }, pollIntervalMs: { type: 'integer' },
-    }, additionalProperties: false } }, additionalProperties: false,
-  }),
-  descriptor('model_profiles', 'Return available MetaHarness model profiles.'),
-  descriptor('list_runs', 'List MetaHarness runs.'),
-  descriptor('get_run', 'Return one MetaHarness run.', {
+  descriptor('model_profiles', 'READ-ONLY. Return available MetaHarness model profiles.'),
+  descriptor('list_runs', 'READ-ONLY. List MetaHarness runs.'),
+  descriptor('get_run', 'READ-ONLY. Return one MetaHarness run.', {
     type: 'object', properties: { runId: { type: 'string' } }, required: ['runId'], additionalProperties: false,
   }),
-  descriptor('get_artifact', 'Return one allowlisted text artifact from a MetaHarness run.', {
+  descriptor('get_artifact', 'READ-ONLY. Return one allowlisted text artifact from a MetaHarness run.', {
     type: 'object', properties: { runId: { type: 'string' }, name: { type: 'string' } },
     required: ['runId', 'name'], additionalProperties: false,
   }),
-  descriptor('progress', 'Return bounded progress events for one run.', {
+  descriptor('progress', 'READ-ONLY. Return bounded progress events for one run.', {
     type: 'object', properties: { runId: { type: 'string' }, offset: { type: 'integer', minimum: 0 } },
     required: ['runId', 'offset'], additionalProperties: false,
   }),
-  descriptor('create_run', 'Create a MetaHarness run.', {
-    type: 'object', properties: { input: { type: 'object' } }, required: ['input'], additionalProperties: true,
+  descriptor('create_run', 'MUTATING ACTION. Only use at the user’s explicit request. Never approve or reject a plan automatically. Never recover a plan without supplied plan content and clear intent. Never launch multiple runs to compensate for an error.', {
+    type: 'object', properties: {
+      spec: { type: 'string', minLength: 1 },
+      run_id: { type: 'string' }, planner_profile: { type: 'string' }, mechanical_profile: { type: 'string' },
+      reasoning_profile: { type: 'string' }, agentic_profile: { type: 'string' }, final_reviewer_profile: { type: 'string' },
+      semantic_reviser_profile: { type: 'string' }, check_repair_profile: { type: 'string' },
+      semantic_revision_enabled: { type: 'boolean' }, max_check_repair_attempts: { type: 'integer' },
+      max_review_repair_cycles: { type: 'integer' }, decomposition: { type: 'string' },
+      execution_mode_policy: { type: 'string' }, single_step_max_mutable_paths: { type: 'integer' },
+      staged_step_max_mutable_paths: { type: 'integer' }, repair_scope_policy: { type: 'string' },
+      repair_scope_max_added_paths: { type: 'integer' },
+    }, required: ['spec'], additionalProperties: false,
   }),
-  descriptor('approve_run', 'Approve or reject a MetaHarness plan.', {
-    type: 'object', properties: { runId: { type: 'string' }, input: { type: 'object' }, decision: { type: 'string' } },
-    required: ['runId'], additionalProperties: true,
+  descriptor('approve_run', 'MUTATING ACTION. Approve or reject a MetaHarness plan. Only use at the user’s explicit request for this exact run. Never approve or reject a plan automatically. Never recover a plan without supplied plan content and clear intent. Never launch multiple runs to compensate for an error. Requires the exact runId and decision; never infer the latest run.', {
+    type: 'object', properties: {
+      runId: { type: 'string', minLength: 1 }, decision: { type: 'string', enum: ['APPROVE', 'REJECT'] },
+      final_reviewer_profile: { type: 'string' }, semantic_reviser_profile: { type: 'string' },
+      check_repair_profile: { type: 'string' }, step_profiles: { type: 'object', additionalProperties: { type: 'string' } },
+    }, required: ['runId', 'decision'], additionalProperties: false,
   }),
-  descriptor('approve_scope', 'Approve or reject a MetaHarness repair scope.', {
-    type: 'object', properties: { runId: { type: 'string' }, input: { type: 'object' }, decision: { type: 'string' } },
-    required: ['runId'], additionalProperties: true,
+  descriptor('approve_scope', 'MUTATING ACTION. Approve or reject a MetaHarness repair scope. Only use at the user’s explicit request for this exact run. Never approve or reject a plan automatically. Never recover a plan without supplied plan content and clear intent. Never launch multiple runs to compensate for an error. Requires the exact runId and decision; never infer the latest run.', {
+    type: 'object', properties: {
+      runId: { type: 'string', minLength: 1 }, decision: { type: 'string', enum: ['APPROVE', 'REJECT'] },
+    }, required: ['runId', 'decision'], additionalProperties: false,
   }),
-  descriptor('resume_run', 'Resume one resumable MetaHarness run.', {
+  descriptor('resume_run', 'MUTATING ACTION. Resume one MetaHarness run. Only use at the user’s explicit request. Never approve or reject a plan automatically. Never recover a plan without supplied plan content and clear intent. Never launch multiple runs to compensate for an error.', {
     type: 'object', properties: { runId: { type: 'string' } }, required: ['runId'], additionalProperties: false,
   }),
-  descriptor('recover_plan', 'Replace the plan of one recoverable MetaHarness run.', {
-    type: 'object', properties: { runId: { type: 'string' }, input: { type: 'object' }, plan: { type: 'string' } },
-    required: ['runId'], additionalProperties: true,
-  }),
-  descriptor('doctor', 'Run metaharness doctor with JSON output using the supplied settings.', {
-    type: 'object', properties: { settings: { type: 'object', properties: {
-      executable: { type: 'string' }, configPath: { type: 'string' }, port: { type: 'integer' },
-      autoStart: { type: 'boolean' }, pollIntervalMs: { type: 'integer' },
-    }, additionalProperties: false } }, additionalProperties: false,
+  descriptor('recover_plan', 'MUTATING ACTION. Replace a plan for one recoverable MetaHarness run. Only use at the user’s explicit request. Never approve or reject a plan automatically. Never recover a plan without non-empty plan content supplied by the user and clear intent. Never launch multiple runs to compensate for an error. Requires the exact runId; never infer the latest run.', {
+    type: 'object', properties: {
+      runId: { type: 'string', minLength: 1 }, input: { type: 'object', properties: {
+        plan: { type: 'string', minLength: 1 },
+      }, required: ['plan'], additionalProperties: false },
+    }, required: ['runId', 'input'], additionalProperties: false,
   }),
 ];
 
@@ -941,25 +945,34 @@ export async function activate(
       () => runtime.client.progress(validateRunId(input.runId), input.offset),
       runtime.isDevelopment,
     ),
-    create_run: (input) => toolError(
-      () => runtime.client.createRun(mutationInput<CreateRunInput>(input)),
-      runtime.isDevelopment,
-    ),
+    create_run: (input) => toolError(() => {
+      const request = mutationInput<CreateRunInput>(input);
+      if (typeof request.spec !== 'string' || !request.spec.trim()) {
+        throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'spec is required');
+      }
+      return runtime.client.createRun(request);
+    }, runtime.isDevelopment),
     approve_run: (input) => toolError(
-      () => runtime.client.approveRun(
-        validateRunId(input.runId),
-        input.input ?? input.decision ?? '',
-        Object.fromEntries(
-          Object.entries(input).filter(([key]) => !['runId', 'input', 'decision'].includes(key)),
-        ),
-      ).then((value) => jsonResponseObject(value, 'approve_run')),
+      () => {
+        if (typeof input.decision !== 'string' || !input.decision) {
+          throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'decision is required');
+        }
+        const options = Object.fromEntries(Object.entries(input).filter(([key]) => !['runId', 'decision'].includes(key)));
+        return runtime.client.approveRun(
+          validateRunId(input.runId), { ...options, decision: input.decision },
+        ).then((value) => jsonResponseObject(value, 'approve_run'));
+      },
       runtime.isDevelopment,
     ),
     approve_scope: (input) => toolError(
-      () => runtime.client.approveScope(
-        validateRunId(input.runId),
-        input.input ?? input.decision ?? '',
-      ).then((value) => jsonResponseObject(value, 'approve_scope')),
+      () => {
+        if (typeof input.decision !== 'string' || !input.decision) {
+          throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'decision is required');
+        }
+        return runtime.client.approveScope(
+          validateRunId(input.runId), { decision: input.decision },
+        ).then((value) => jsonResponseObject(value, 'approve_scope'));
+      },
       runtime.isDevelopment,
     ),
     resume_run: (input) => toolError(
@@ -967,10 +980,15 @@ export async function activate(
       runtime.isDevelopment,
     ),
     recover_plan: (input) => toolError(
-      () => runtime.client.recoverPlan(
-        validateRunId(input.runId),
-        input.input ?? input.plan ?? '',
-      ).then((value) => jsonResponseObject(value, 'recover_plan')),
+      () => {
+        const planInput: JsonObject = isRecord(input.input) ? input.input : {};
+        if (typeof planInput.plan !== 'string' || !planInput.plan.trim()) {
+          throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'non-empty plan content is required');
+        }
+        return runtime.client.recoverPlan(
+          validateRunId(input.runId), planInput as RecoverPlanInput,
+        ).then((value) => jsonResponseObject(value, 'recover_plan'));
+      },
       runtime.isDevelopment,
     ),
     doctor: (input) => {
