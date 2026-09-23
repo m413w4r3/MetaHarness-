@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { MetaHarnessSettingsData } from '../settings/MetaHarnessSettings';
+import type { MetaHarnessSettingsData } from '../config/settings';
 import type { RunSummary } from '../types';
 import { RunCard } from './RunCard';
 import { NewRunForm } from './NewRunForm';
@@ -41,7 +41,6 @@ export function RunsDashboard({
   settings,
   view,
   onViewChange,
-  onOpenSettings,
   workspacePath,
   openFile,
 }: {
@@ -49,7 +48,6 @@ export function RunsDashboard({
   settings: MetaHarnessSettingsData;
   view: PanelView;
   onViewChange: (view: PanelView) => void;
-  onOpenSettings: () => void;
   workspacePath: string;
   openFile: (path: string) => void;
 }) {
@@ -118,10 +116,10 @@ export function RunsDashboard({
   }
 
   if (!callBackendTool) {
-    return <ConfigurationScreen onOpenSettings={onOpenSettings} />;
+    return <ConfigurationScreen />;
   }
   if (!loading && connection?.configured === false) {
-    return <ConfigurationScreen onOpenSettings={onOpenSettings} />;
+    return <ConfigurationScreen />;
   }
 
   return (
@@ -159,10 +157,9 @@ export function RunsDashboard({
   );
 }
 
-function ConfigurationScreen({ onOpenSettings }: { onOpenSettings: () => void }) {
+function ConfigurationScreen() {
   return <section className="metaharness-dashboard metaharness-configuration" aria-labelledby="metaharness-config-title">
     <h1 id="metaharness-config-title">Configure MetaHarness</h1>
     <p>Set a MetaHarness configuration file to see runs for this workspace.</p>
-    <button className="metaharness-button" type="button" onClick={onOpenSettings}>Open Settings</button>
   </section>;
 }

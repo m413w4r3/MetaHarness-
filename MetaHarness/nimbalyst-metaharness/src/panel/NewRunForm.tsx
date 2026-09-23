@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { MetaHarnessSettingsData } from '../settings/MetaHarnessSettings';
+import type { MetaHarnessSettingsData } from '../config/settings';
 import { buildCreateRunInput, defaultsFromServer, parseProfiles, profilesForRole, validateRunForm, type ModelProfile, type RunFormState } from '../model/runForm';
 import { isBackendFailure } from '../contract';
 

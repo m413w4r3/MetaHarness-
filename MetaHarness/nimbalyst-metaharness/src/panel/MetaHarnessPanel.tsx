@@ -1,32 +1,39 @@
 import { useState } from 'react';
 import type { PanelHostProps } from '@nimbalyst/extension-sdk';
-import { DEFAULT_SETTINGS, type MetaHarnessSettingsData } from '../settings/MetaHarnessSettings';
+import { MetaHarnessConfigForm } from '../config/MetaHarnessConfigForm';
+import { DEFAULT_SETTINGS, SETTINGS_KEY, type MetaHarnessSettingsData } from '../config/settings';
+import { callMetaHarnessBackend } from '../runtime/extensionRuntime';
 import { RunsDashboard } from './RunsDashboard';
 
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
-type ExtendedPanelHost = PanelHostProps['host'] & { callBackendTool?: BackendCall };
 
-function settingsFromHost(host: ExtendedPanelHost): MetaHarnessSettingsData {
-  const saved = host.storage.get<Partial<MetaHarnessSettingsData>>('settings') ?? {};
+function settingsFromHost(host: PanelHostProps['host']): MetaHarnessSettingsData {
+  const saved = host.storage.get<Partial<MetaHarnessSettingsData>>(SETTINGS_KEY) ?? {};
   return { ...DEFAULT_SETTINGS, ...saved };
 }
 
 export function MetaHarnessPanel({ host }: PanelHostProps) {
-  const backendCall = (host as ExtendedPanelHost).callBackendTool;
-  const [settings] = useState(() => settingsFromHost(host as ExtendedPanelHost));
+  const [settings, setSettings] = useState(() => settingsFromHost(host));
   const [view, setView] = useState<{ kind: 'dashboard' } | { kind: 'run'; runId: string } | { kind: 'new-run' }>({ kind: 'dashboard' });
+  const callBackendTool: BackendCall = (toolName, args) => callMetaHarnessBackend(toolName, args ?? {}, host.workspacePath);
+
+  function handleConfigured() {
+    setSettings(settingsFromHost(host));
+    setView({ kind: 'dashboard' });
+  }
 
   return (
     <main className="metaharness-panel" aria-label="MetaHarness runs">
-      <RunsDashboard
-        callBackendTool={backendCall}
-        settings={settings}
-        view={view}
-        onViewChange={setView}
-        onOpenSettings={() => host.openSettings()}
-        workspacePath={host.workspacePath}
-        openFile={(path) => host.openFile(path)}
-      />
+      {!settings.configPath.trim()
+        ? <MetaHarnessConfigForm storage={host.storage} theme={host.theme} workspacePath={host.workspacePath} callBackendTool={callBackendTool} onConfigured={handleConfigured} />
+        : <RunsDashboard
+          callBackendTool={callBackendTool}
+          settings={settings}
+          view={view}
+          onViewChange={setView}
+          workspacePath={host.workspacePath}
+          openFile={(path) => host.openFile(path)}
+        />}
     </main>
   );
 }

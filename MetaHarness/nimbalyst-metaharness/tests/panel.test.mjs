@@ -7,6 +7,8 @@ import { RunsDashboard } from '../src/panel/RunsDashboard.tsx';
 import { RunDetail } from '../src/panel/run/RunDetail.tsx';
 import { deriveRunActions } from '../src/panel/run/runActions.ts';
 import { NewRunForm } from '../src/panel/NewRunForm.tsx';
+import { MetaHarnessPanel } from '../src/panel/MetaHarnessPanel.tsx';
+import { bindExtensionRuntime, unbindExtensionRuntime } from '../src/runtime/extensionRuntime.ts';
 import { defaultsFromServer, validateRunForm, buildCreateRunInput } from '../src/model/runForm.ts';
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost' });
@@ -117,10 +119,38 @@ function renderDashboard(callBackendTool, overrides = {}) {
     settings,
     view: { kind: 'dashboard' },
     onViewChange: () => {},
-    onOpenSettings: () => {},
     ...overrides,
   }));
 }
+
+test('unconfigured fullscreen panel shows the inline form and switches to dashboard after connection', async () => {
+  const saved = {};
+  const storage = {
+    get: (key) => saved[key],
+    set: async (key, value) => { saved[key] = value; },
+  };
+  const calls = [];
+  const context = { services: { ai: { callBackendTool: async (name, args, workspacePath) => {
+    calls.push([name, args, workspacePath]);
+    if (name === 'metaharness.status') return { configured: true, connected: true };
+    if (name === 'metaharness.list_runs') return [];
+    throw new Error(`Unexpected backend call: ${name}`);
+  } } } };
+  bindExtensionRuntime(context);
+  render(React.createElement(MetaHarnessPanel, { host: {
+    storage, theme: 'dark', workspacePath: '/work', openFile: () => {},
+  } }));
+  assert.ok(screen.getByRole('heading', { name: 'Configure MetaHarness' }));
+  assert.ok(screen.getByRole('button', { name: 'SAVE & TEST CONNECTION' }));
+  assert.equal(screen.queryByRole('button', { name: 'Open Settings' }), null);
+  fireEvent.change(screen.getByLabelText('Configuration file'), { target: { value: '/work/config.toml' } });
+  fireEvent.click(screen.getByRole('button', { name: 'SAVE & TEST CONNECTION' }));
+  await screen.findByText('No runs in this workspace yet.');
+  assert.deepEqual(calls.map(([name]) => name), ['metaharness.status', 'metaharness.status', 'metaharness.list_runs']);
+  assert.ok(calls.every(([, , workspacePath]) => workspacePath === '/work'));
+  assert.equal(saved.settings.configPath, '/work/config.toml');
+  unbindExtensionRuntime();
+});
 
 function backend({ connected = true, configured = true, runs = [] } = {}) {
   const calls = [];

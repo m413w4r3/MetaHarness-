@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 import { JSDOM } from 'jsdom';
 import React from 'react';
-import { DEFAULT_SETTINGS, MetaHarnessSettings, validateSettings } from '../src/settings/MetaHarnessSettings.tsx';
+import { MetaHarnessConfigForm } from '../src/config/MetaHarnessConfigForm.tsx';
+import { DEFAULT_SETTINGS, validateSettings } from '../src/config/settings.ts';
+import { MetaHarnessSettings } from '../src/settings/MetaHarnessSettings.tsx';
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost' });
 globalThis.window = dom.window;
@@ -21,102 +23,102 @@ function fakeStorage(saved = {}) {
   };
 }
 
-test('settings defaults validate and persist in project ExtensionStorage', async () => {
+function fillConfig() {
+  fireEvent.change(screen.getByLabelText('Configuration file'), { target: { value: '/work/config.toml' } });
+}
+
+test('shared config form shows defaults, validates and persists on Save', async () => {
   const storage = fakeStorage();
-  render(React.createElement(MetaHarnessSettings, { storage, workspacePath: '/work', callBackendTool: undefined }));
-  await waitFor(() => assert.deepEqual(storage.saved.settings, DEFAULT_SETTINGS));
-  assert.equal(screen.getByLabelText('Executable').value, 'metaharness');
-  assert.equal(screen.getByLabelText('Configuration').value, '');
-  fireEvent.change(screen.getByLabelText('Configuration'), {
-    target: { value: '/home/user/dev/MetaHarness-/MetaHarness/examples/autowork.toml' },
-  });
-  await waitFor(() => assert.equal(storage.saved.settings.configPath,
-    '/home/user/dev/MetaHarness-/MetaHarness/examples/autowork.toml'));
+  render(React.createElement(MetaHarnessConfigForm, { storage, theme: 'dark', workspacePath: '/work' }));
+  assert.equal(screen.getByLabelText('MetaHarness executable').value, 'metaharness');
+  assert.equal(screen.getByLabelText('Configuration file').value, '');
   assert.equal(validateSettings(DEFAULT_SETTINGS), 'Configuration path must not be empty.');
-  const valid = { ...DEFAULT_SETTINGS, configPath: '/home/user/dev/MetaHarness-/MetaHarness/examples/autowork.toml' };
-  assert.equal(validateSettings(valid), undefined);
-  assert.equal(validateSettings({ ...valid, port: 65536 }), 'Port must be an integer between 1 and 65535.');
-  assert.equal(validateSettings({ ...valid, pollIntervalMs: 499 }), 'Polling interval must be between 500 and 30000 ms.');
+  fillConfig();
+  fireEvent.click(screen.getByRole('button', { name: 'SAVE' }));
+  await waitFor(() => assert.deepEqual(storage.saved.settings, { ...DEFAULT_SETTINGS, configPath: '/work/config.toml' }));
+  assert.equal(validateSettings({ ...DEFAULT_SETTINGS, configPath: '/work/config.toml', port: 65536 }), 'Port must be an integer between 1 and 65535.');
+  assert.equal(validateSettings({ ...DEFAULT_SETTINGS, configPath: '/work/config.toml', pollIntervalMs: 499 }), 'Polling interval must be between 500 and 30000 ms.');
 });
 
-test('test connection uses explicit settings and does not start when autoStart is false', async () => {
-  const storage = fakeStorage({ settings: { ...DEFAULT_SETTINGS, configPath: '/work/custom.toml', autoStart: false } });
-  const calls = [];
-  const callBackendTool = async (name, args) => {
-    calls.push([name, args]);
-    if (name === 'metaharness.status') return { connected: true, configured: true };
-    return { repo: '/work' };
-  };
-  render(React.createElement(MetaHarnessSettings, { storage, workspacePath: '/work', callBackendTool }));
-  await waitFor(() => assert.ok(calls.some(([name]) => name === 'metaharness.status')));
-  calls.length = 0;
-  fireEvent.click(screen.getByRole('button', { name: 'TEST CONNECTION' }));
-  await waitFor(() => assert.match(screen.getByText('Connected').textContent, /Connected/));
-  assert.deepEqual(calls.map(([name]) => name), ['metaharness.status']);
-  assert.deepEqual(calls[0][1].settings, storage.saved.settings);
-});
-
-test('autoStart starts MetaHarness with the project settings when the status probe is down', async () => {
+test('Save & Test calls status, starts when configured, then checks status and configures', async () => {
   const settings = { ...DEFAULT_SETTINGS, configPath: '/work/config.toml' };
+  const storage = fakeStorage({ settings });
   const calls = [];
-  const callBackendTool = async (name, args) => {
-    calls.push([name, args]);
-    if (name === 'metaharness.status') return { connected: false };
-    if (name === 'metaharness.start') return { connected: true, serverOwned: true };
-    return { repository: { repo: '/work', base_ref: 'main' } };
-  };
-  render(React.createElement(MetaHarnessSettings, { storage: fakeStorage({ settings }), callBackendTool }));
-  await waitFor(() => assert.ok(calls.some(([name]) => name === 'metaharness.start')));
-  const startCall = calls.find(([name]) => name === 'metaharness.start');
-  assert.deepEqual(startCall[1].settings, settings);
-});
-
-test('doctor displays each check on success and readable failure on backend rejection', async () => {
-  const storage = fakeStorage({ settings: { ...DEFAULT_SETTINGS, configPath: '/work/custom.toml' } });
-  let fail = false;
-  const callBackendTool = async (name) => {
-    if (name === 'metaharness.status') return { connected: false };
+  let statuses = 0;
+  let configured = 0;
+  const callBackendTool = async (name, args, workspacePath) => {
+    calls.push([name, args, workspacePath]);
+    if (name === 'metaharness.status') return { connected: ++statuses > 1 };
     if (name === 'metaharness.start') return { connected: true };
-    if (name === 'metaharness.get_config') return { repository: { repo: '/work' } };
-    if (fail) throw new Error('doctor could not read config');
-    return { checks: [
-      { name: 'config', status: 'pass', message: 'Configuration loaded' },
-      { name: 'git', status: 'warn', message: 'Branch is dirty' },
-      { name: 'publish', status: 'fail', message: 'Remote missing' },
-    ] };
+    throw new Error(`Unexpected backend call: ${name}`);
   };
-  render(React.createElement(MetaHarnessSettings, { storage, callBackendTool }));
-  fireEvent.click(screen.getByRole('button', { name: 'RUN DOCTOR' }));
-  await screen.findByText('Configuration loaded');
-  assert.equal(screen.getByText('PASS').textContent, 'PASS');
-  assert.equal(screen.getByText('WARN').textContent, 'WARN');
-  assert.equal(screen.getByText('FAIL').textContent, 'FAIL');
+  render(React.createElement(MetaHarnessConfigForm, { storage, theme: 'dark', workspacePath: '/work', callBackendTool, onConfigured: () => { configured += 1; } }));
+  fireEvent.click(screen.getByRole('button', { name: 'SAVE & TEST CONNECTION' }));
+  await screen.findByText('Connected');
+  assert.deepEqual(calls.map(([name]) => name), ['metaharness.status', 'metaharness.start', 'metaharness.status']);
+  assert.equal(calls[0][2], '/work');
+  assert.equal(configured, 1);
+  assert.deepEqual(storage.saved.settings, settings);
+});
+
+test('successful connected status saves and configures without starting', async () => {
+  const settings = { ...DEFAULT_SETTINGS, configPath: '/work/config.toml', autoStart: false };
+  const calls = [];
+  let configured = false;
+  render(React.createElement(MetaHarnessConfigForm, {
+    storage: fakeStorage({ settings }), theme: 'light',
+    callBackendTool: async (name) => { calls.push(name); return { connected: true }; },
+    onConfigured: () => { configured = true; },
+  }));
+  fireEvent.click(screen.getByRole('button', { name: 'SAVE & TEST CONNECTION' }));
+  await screen.findByText('Connected');
+  assert.deepEqual(calls, ['metaharness.status']);
+  assert.equal(configured, true);
+});
+
+test('permission rejection shows friendly copy and keeps the form visible', async () => {
+  const settings = { ...DEFAULT_SETTINGS, configPath: '/work/config.toml' };
+  render(React.createElement(MetaHarnessConfigForm, {
+    storage: fakeStorage({ settings }), theme: 'dark',
+    callBackendTool: async () => { throw new Error('Backend permission denied'); },
+  }));
+  fireEvent.click(screen.getByRole('button', { name: 'SAVE & TEST CONNECTION' }));
+  await screen.findByText('MetaHarness backend permission is required to control local runs.');
+  assert.ok(screen.getByLabelText('Configuration file'));
+});
+
+test('port and missing executable backend failures use friendly messages', async () => {
+  const settings = { ...DEFAULT_SETTINGS, configPath: '/work/config.toml' };
+  const storage = fakeStorage({ settings });
+  render(React.createElement(MetaHarnessConfigForm, {
+    storage, theme: 'dark',
+    callBackendTool: async () => ({ ok: false, error: { code: 'PORT_IN_USE', message: 'port 8765 is occupied by a non-MetaHarness service' } }),
+  }));
+  fireEvent.click(screen.getByRole('button', { name: 'SAVE & TEST CONNECTION' }));
+  await screen.findByText('Port 8765 is already in use by a service that is not MetaHarness.');
   cleanup();
-  fail = true;
-  render(React.createElement(MetaHarnessSettings, { storage, callBackendTool }));
-  fireEvent.click(screen.getByRole('button', { name: 'RUN DOCTOR' }));
-  await screen.findByText('MetaHarness doctor failed: doctor could not read config');
+
+  render(React.createElement(MetaHarnessConfigForm, {
+    storage, theme: 'dark',
+    callBackendTool: async () => ({ ok: false, error: { code: 'SPAWN_FAILED', message: 'MetaHarness could not be started', details: { causeCode: 'ENOENT' } } }),
+  }));
+  fireEvent.click(screen.getByRole('button', { name: 'SAVE & TEST CONNECTION' }));
+  await screen.findByText('MetaHarness executable was not found. Check the configured absolute path.');
 });
 
-test('missing backend shows an actionable message instead of throwing', async () => {
-  const storage = fakeStorage({ settings: { ...DEFAULT_SETTINGS, configPath: '/work/config.toml' } });
-  render(React.createElement(MetaHarnessSettings, { storage }));
-  fireEvent.click(screen.getByRole('button', { name: 'TEST CONNECTION' }));
-  await screen.findByText('MetaHarness backend is unavailable. Enable the extension backend and try again.');
-  fireEvent.click(screen.getByRole('button', { name: 'RUN DOCTOR' }));
-  await screen.findByText('MetaHarness backend is unavailable. Enable the extension backend and try again.');
+test('unavailable backend module has friendly copy', async () => {
+  const settings = { ...DEFAULT_SETTINGS, configPath: '/work/config.toml' };
+  render(React.createElement(MetaHarnessConfigForm, {
+    storage: fakeStorage({ settings }), theme: 'dark',
+    callBackendTool: async () => { throw new Error('backend module metaharness-runtime is not running'); },
+  }));
+  fireEvent.click(screen.getByRole('button', { name: 'SAVE & TEST CONNECTION' }));
+  await screen.findByText('The MetaHarness Nimbalyst backend module is unavailable. Reload the extension and retry.');
 });
 
-test('a failing doctor report (ok: false) is rendered as structured checks, not as a backend error', async () => {
-  const storage = fakeStorage({ settings: { ...DEFAULT_SETTINGS, configPath: '/work/custom.toml' } });
-  const callBackendTool = async () => ({
-    ok: false,
-    checks: [{ id: 'credentials', status: 'fail', message: 'required credential is missing or invalid' }],
-    summary: { passed: 0, failed: 1, warnings: 0 },
-  });
-  render(React.createElement(MetaHarnessSettings, { storage, callBackendTool }));
-  fireEvent.click(screen.getByRole('button', { name: 'RUN DOCTOR' }));
-  await screen.findByText('required credential is missing or invalid');
-  assert.ok(screen.getByText('credentials'));
-  assert.equal(screen.queryByText(/MetaHarness doctor failed/), null);
+test('settings route is a wrapper around the shared configuration form', () => {
+  const settings = { ...DEFAULT_SETTINGS, configPath: '/work/config.toml' };
+  render(React.createElement(MetaHarnessSettings, { storage: fakeStorage({ settings }), theme: 'dark', workspacePath: '/work' }));
+  assert.ok(screen.getByLabelText('MetaHarness executable'));
+  assert.ok(screen.getByRole('button', { name: 'SAVE & TEST CONNECTION' }));
 });
