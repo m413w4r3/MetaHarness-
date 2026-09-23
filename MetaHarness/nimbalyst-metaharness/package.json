@@ -7,7 +7,7 @@
   "scripts": {
     "build": "vite build && vite build --config vite.backend.config.ts",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && npm run build && node --test tests/backend.test.mjs && node --import tsx --test tests/settings.test.mjs tests/panel.test.mjs tests/progress.test.mjs && node --input-type=module -e \"import { readFileSync } from 'node:fs'; import { validateExtensionBundle } from './node_modules/@nimbalyst/extension-sdk/dist/validate.js'; const manifest = JSON.parse(readFileSync('manifest.json', 'utf8')); if (manifest.id !== 'com.m413w4r3.metaharness') throw new Error('Unexpected extension id'); const result = await validateExtensionBundle('./dist'); if (!result.valid) { console.error(result.errors.join('\\n')); process.exit(1); } if (result.warnings.length) console.warn(result.warnings.join('\\n'));\""
+    "test": "npm run typecheck && npm run build && node --test tests/backend.test.mjs && node --import tsx --test tests/unit.test.mjs tests/settings.test.mjs tests/panel.test.mjs tests/progress.test.mjs && node --input-type=module -e \"import { readFileSync } from 'node:fs'; import { validateExtensionBundle } from './node_modules/@nimbalyst/extension-sdk/dist/validate.js'; const manifest = JSON.parse(readFileSync('manifest.json', 'utf8')); if (manifest.id !== 'com.m413w4r3.metaharness') throw new Error('Unexpected extension id'); const result = await validateExtensionBundle('./dist'); if (!result.valid) { console.error(result.errors.join('\\n')); process.exit(1); } if (result.warnings.length) console.warn(result.warnings.join('\\n'));\""
   },
   "devDependencies": {
     "@nimbalyst/extension-sdk": "0.6.0",

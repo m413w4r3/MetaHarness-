@@ -444,7 +444,7 @@ export class MetaHarnessClient {
     }
     return jsonResponseObject(
       await this.request<unknown>(
-        'GET', `/api/v1/runs/${encodeURIComponent(validateRunId(runId))}/artifact?name=${name}`,
+        'GET', `/api/v1/runs/${encodeURIComponent(validateRunId(runId))}/artifact?name=${encodeURIComponent(name)}`,
       ),
       'get_artifact',
     );

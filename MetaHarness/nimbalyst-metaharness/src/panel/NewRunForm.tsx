@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { MetaHarnessSettingsData } from '../settings/MetaHarnessSettings';
-import { buildCreateRunInput, defaultsFromServer, parseProfiles, validateRunForm, type ModelProfile, type RunFormState } from '../model/runForm';
+import { buildCreateRunInput, defaultsFromServer, parseProfiles, profilesForRole, validateRunForm, type ModelProfile, type RunFormState } from '../model/runForm';
 
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
 type ObjectValue = Record<string, unknown>;
@@ -111,7 +111,7 @@ export function NewRunForm({ callBackendTool, settings, onBack, onCreated }: {
 
   if (!form) return <section className="metaharness-dashboard"><button className="metaharness-link-button" type="button" onClick={onBack}>← All runs</button><h1>New Run</h1><p className="metaharness-error" role="alert">{error || 'Could not load MetaHarness defaults.'}</p></section>;
 
-  const profileOptions = (role: string) => profiles.filter((profile) => profile.roles.includes(role));
+  const profileOptions = (role: string) => profilesForRole(profiles, role);
   const field = (key: keyof RunFormState, label: string, type: 'number' | 'text' = 'number') => <label className="metaharness-form__field" key={key}>
     <span>{label}</span><input type={type} min={type === 'number' ? (key === 'max_check_repair_attempts' || key === 'max_review_repair_cycles' ? 0 : 1) : undefined} step={type === 'number' ? 1 : undefined} value={form[key] as string | number} onChange={(event) => update(key, type === 'number' ? (event.target.value === '' ? Number.NaN : Number(event.target.value)) : event.target.value)} />
   </label>;

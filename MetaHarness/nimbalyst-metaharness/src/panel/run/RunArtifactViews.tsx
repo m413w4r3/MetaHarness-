@@ -27,7 +27,7 @@ function CheckRow({ check }: { check: Data }) {
   const duration = first(check.duration_seconds, check.duration_s, check.duration);
   const seconds = typeof duration === 'number' ? `${duration.toFixed(1)}s` : typeof duration === 'string' ? duration : undefined;
   return <article className={`metaharness-check-row ${passed === false || ['failed', 'failure'].includes(String(check.status).toLowerCase()) ? 'is-failed' : ''}`}>
-    <strong aria-label={status ? 'passed' : 'failed'}>{status ? '✓' : '✗'}</strong><b>{String(check.id ?? check.name ?? 'check')}</b>
+    <strong aria-label={status ? 'PASS' : 'FAIL'}><span aria-hidden="true">{status ? '✓' : '✗'}</span><span className="sr-only">{status ? 'PASS' : 'FAIL'}</span></strong><b>{String(check.id ?? check.name ?? 'check')}</b>
     {seconds && <span>{seconds}</span>}{check.attempt !== undefined && <span>Attempt {String(check.attempt)}</span>}
     {text(check.message ?? check.output ?? [check.stdout_tail, check.stderr_tail].filter(Boolean).join('\n')) && <pre>{(text(check.message ?? check.output ?? [check.stdout_tail, check.stderr_tail].filter(Boolean).join('\n')) ?? '').slice(0, 4000)}</pre>}
   </article>;
@@ -62,7 +62,7 @@ export function DiffView({ data, workspacePath, openFile }: { data: Data; worksp
   </section>;
 }
 
-function workspaceFile(root: string, input: string): string | undefined {
+export function workspaceFile(root: string, input: string): string | undefined {
   const normalizedRoot = root.replace(/[\\/]+$/, '');
   if (!normalizedRoot || !input || input.startsWith('/') || input.startsWith('\\') || /^[A-Za-z]:/.test(input)) return undefined;
   const parts = input.replace(/\\/g, '/').split('/');

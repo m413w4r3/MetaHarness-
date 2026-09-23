@@ -264,6 +264,18 @@ test('run detail tabs show empty states when each optional artifact is absent', 
   }
 });
 
+test('run tabs support roving focus with arrow keys', async () => {
+  const callBackendTool = async (tool) => tool === 'metaharness.get_run' ? { run_id: 'keyboard-tabs', status: 'published' } : {};
+  render(React.createElement(RunDetail, { runId: 'keyboard-tabs', callBackendTool, onBack: () => {} }));
+  const overview = await screen.findByRole('tab', { name: 'Overview' });
+  fireEvent.keyDown(overview, { key: 'ArrowRight' });
+  const plan = screen.getByRole('tab', { name: 'Plan' });
+  assert.equal(plan.getAttribute('aria-selected'), 'true');
+  assert.equal(document.activeElement, plan);
+  fireEvent.keyDown(plan, { key: 'End' });
+  assert.equal(screen.getByRole('tab', { name: 'Results' }).getAttribute('aria-selected'), 'true');
+});
+
 test('run tabs display partial check, review, diff, usage and diagnostic artifacts', async () => {
   const callBackendTool = async (tool) => tool === 'metaharness.get_run' ? {
     run_id: 'partial-views', status: 'implementing', cycle: 2, planner_raw: 'draft plan',

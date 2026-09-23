@@ -49,6 +49,10 @@ export function parseProfiles(value: unknown): { profiles: ModelProfile[]; defau
   return { profiles, defaults: record(data.defaults) };
 }
 
+export function profilesForRole(profiles: ModelProfile[], role: string): ModelProfile[] {
+  return profiles.filter((profile) => profile.roles.includes(role));
+}
+
 function value<T>(candidate: unknown, fallback: T): T {
   return (candidate === undefined || candidate === null ? fallback : candidate) as T;
 }

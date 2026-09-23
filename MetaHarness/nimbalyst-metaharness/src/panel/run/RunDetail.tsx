@@ -51,6 +51,7 @@ export function RunDetail({ runId, run, callBackendTool, onBack, pollIntervalMs 
   const [confirmRecovery, setConfirmRecovery] = useState(false);
   const [progressGeneration, setProgressGeneration] = useState(0);
   const [activeTab, setActiveTab] = useState('Overview');
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [artifact, setArtifact] = useState<Data>({});
   const actionInFlight = useRef(false);
   const pollInFlight = useRef(false);
@@ -163,6 +164,11 @@ export function RunDetail({ runId, run, callBackendTool, onBack, pollIntervalMs 
     return () => { cancelled = true; };
   }, [activeTab, artifact, callBackendTool, detail, runId]);
   const tabs = ['Overview', 'Plan', 'Steps', 'Checks', 'Review', 'Diff', 'Usage', 'Logs', 'Diagnostics', 'Results'];
+  const focusTab = (index: number) => {
+    const next = (index + tabs.length) % tabs.length;
+    setActiveTab(tabs[next]);
+    tabRefs.current[next]?.focus();
+  };
   return <section className="metaharness-dashboard metaharness-run-detail-page" aria-labelledby="metaharness-run-detail-title">
     <RunHeader runId={runId} data={displayed} loading={loading} onBack={onBack} onRefresh={() => void refresh()} />
     {error && <p className="metaharness-error" role="alert">{error}</p>}
@@ -189,8 +195,13 @@ export function RunDetail({ runId, run, callBackendTool, onBack, pollIntervalMs 
         </div>}
       </section>}
       <RunApproval runId={runId} data={displayed} callBackendTool={callBackendTool} disabled={actionBusy} onDecision={decide} canApprovePlan={actions.canApprovePlan} canApproveScope={actions.canApproveScope} />
-      <nav className="metaharness-run-tabs" aria-label="Run detail views">{tabs.map((tab) => <button type="button" role="tab" aria-selected={activeTab === tab} key={tab} onClick={() => setActiveTab(tab)}>{tab}</button>)}</nav>
-      <div role="tabpanel" aria-label={activeTab}>
+      <nav className="metaharness-run-tabs" role="tablist" aria-label="Run detail views">{tabs.map((tab, index) => <button ref={(element) => { tabRefs.current[index] = element; }} type="button" role="tab" tabIndex={activeTab === tab ? 0 : -1} aria-selected={activeTab === tab} aria-controls="metaharness-run-tabpanel" key={tab} onClick={() => setActiveTab(tab)} onKeyDown={(event) => {
+        if (event.key === 'ArrowRight') { event.preventDefault(); focusTab(index + 1); }
+        else if (event.key === 'ArrowLeft') { event.preventDefault(); focusTab(index - 1); }
+        else if (event.key === 'Home') { event.preventDefault(); focusTab(0); }
+        else if (event.key === 'End') { event.preventDefault(); focusTab(tabs.length - 1); }
+      }}>{tab}</button>)}</nav>
+      <div id="metaharness-run-tabpanel" role="tabpanel" aria-label={activeTab} tabIndex={0}>
         {activeTab === 'Overview' && <RunSummary data={displayed} />}
         {activeTab === 'Plan' && <PlanView data={displayed} />}
         {activeTab === 'Steps' && <StepsView data={displayed} />}

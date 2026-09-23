@@ -263,6 +263,25 @@ test('doctor rejects invalid JSON', async () => {
   await assert.rejects(runtime.doctor(), errorCode('DOCTOR_INVALID_JSON'));
 });
 
+test('doctor returns the decoded JSON report from the local executable', async () => {
+  const report = { ok: true, checks: [{ name: 'config', status: 'pass' }] };
+  const runtime = new MetaHarnessRuntime({
+    config: { executable: fakeExecutable('good-doctor', JSON.stringify(report)), configPath: join(root, 'doctor.toml'), port: await freePort(), autoStart: false },
+    dataDir: join(root, 'doctor-success-data'),
+  });
+  assert.deepEqual(await runtime.doctor(), report);
+});
+
+test('token file decoder rejects multiline and oversized credentials without echoing them', async () => {
+  const server = await listen((_req, res) => json(res, 200, { ok: true }));
+  try {
+    const multiline = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${port(server)}`, tokenFile: tokenFile('multiline.token', 'line-one\nline-two\n') });
+    await assert.rejects(multiline.resumeRun('run-1'), errorCode('TOKEN_INVALID'));
+    const oversized = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${port(server)}`, tokenFile: tokenFile('oversized.token', `${'x'.repeat(5000)}\n`) });
+    await assert.rejects(oversized.resumeRun('run-1'), errorCode('TOKEN_INVALID'));
+  } finally { await close(server); }
+});
+
 test('activate registers the complete tool surface with default config safely', async () => {
   const registered = [];
   const backend = await activate({
@@ -311,4 +330,32 @@ test('MCP descriptors classify reads and require explicit mutation arguments', (
   assert.equal(descriptors.has('start'), false);
   assert.equal(descriptors.has('stop'), false);
   assert.equal(descriptors.has('doctor'), false);
+});
+
+test('API decoders reject non-object payloads and malformed run collections', async () => {
+  const server = await listen((_req, res) => json(res, 200, { runs: 'not-an-array' }));
+  try {
+    const client = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${port(server)}`, tokenFile: tokenFile('decode.token') });
+    await assert.rejects(client.listRuns(), errorCode('INVALID_RESPONSE'));
+  } finally { await close(server); }
+
+  const scalar = await listen((_req, res) => json(res, 200, ['not', 'an object']));
+  try {
+    const client = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${port(scalar)}`, tokenFile: tokenFile('scalar.token') });
+    await assert.rejects(client.getConfig(), errorCode('INVALID_RESPONSE'));
+  } finally { await close(scalar); }
+});
+
+test('mutations send the control token from the token file and never expose it in errors', async () => {
+  let seen;
+  const server = await listen((req, res) => {
+    seen = { method: req.method, token: req.headers['x-metaharness-token'] };
+    return json(res, 200, { run_id: 'created-1' });
+  });
+  try {
+    const secret = 'only-in-token-file';
+    const client = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${port(server)}`, tokenFile: tokenFile('auth.token', `${secret}\n`) });
+    assert.deepEqual(await client.createRun({ spec: 'small test' }), { run_id: 'created-1' });
+    assert.deepEqual(seen, { method: 'POST', token: secret });
+  } finally { await close(server); }
 });
