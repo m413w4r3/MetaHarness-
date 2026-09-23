@@ -9,7 +9,9 @@ mutation token, every request must also name this exact local server in its
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
@@ -38,6 +40,7 @@ from .run_manager import RunManager
 
 HOST = "127.0.0.1"
 _MAX_BODY_BYTES = 64 * 1024
+_MAX_CONTROL_TOKEN_BYTES = 4096
 # Only the REPLACE PLAN routes accept more: room for a 128 KiB plan after
 # form/JSON encoding.  The decoded text is bounded again, exactly.
 _MAX_RECOVERY_BODY_BYTES = 4 * MAX_REPLACEMENT_PLAN_BYTES
@@ -136,14 +139,80 @@ class MetaHarnessHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], config: HarnessConfig):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        config: HarnessConfig,
+        *,
+        control_token_file: str | Path | None = None,
+    ):
         self.config = config
-        self.token = secrets.token_urlsafe(32)
+        self.browser_token = secrets.token_urlsafe(32)
+        self.control_token = (
+            load_or_create_control_token(control_token_file)
+            if control_token_file is not None else None
+        )
         self.run_manager = RunManager(
             config,
             max_active_runs=config.ui.max_active_runs,
         )
         super().__init__(address, MetaHarnessRequestHandler)
+
+    @property
+    def token(self) -> str:
+        """Compatibility alias for the token embedded in browser forms."""
+
+        return self.browser_token
+
+
+def load_or_create_control_token(token_file: str | Path) -> str:
+    """Read one bounded token or atomically create a private token file."""
+
+    path = Path(token_file).expanduser()
+
+    def read_token() -> str:
+        with path.open("rb") as stream:
+            raw = stream.read(_MAX_CONTROL_TOKEN_BYTES + 1)
+        if len(raw) > _MAX_CONTROL_TOKEN_BYTES:
+            raise ValueError("control token file is too large")
+        try:
+            value = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("control token file must be UTF-8") from exc
+        value = value.removesuffix("\n").removesuffix("\r")
+        if not value.strip() or "\n" in value or "\r" in value:
+            raise ValueError("control token file must contain one non-empty token")
+        return value
+
+    try:
+        return read_token()
+    except FileNotFoundError:
+        pass
+
+    token = secrets.token_urlsafe(32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as stream:
+            temporary_path = Path(stream.name)
+            try:
+                os.chmod(temporary_path, 0o600)
+            except (OSError, NotImplementedError):
+                pass
+            stream.write(token.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+    return read_token()
 
 
 class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
@@ -210,6 +279,14 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             parsed = urlsplit(self.path)
             parts = parsed.path.split("/")
             root = self.server.config.runs_root
+            if parsed.path == "/api/v1/health":
+                self._json(200, {
+                    "service": "metaharness",
+                    "api_version": 1,
+                    "status": "ok",
+                    "control_api": True,
+                })
+                return
             if parsed.path == "/":
                 nonce = secrets.token_urlsafe(18)
                 self._html(render_index(list_runs(root), nonce=nonce), nonce)
@@ -217,7 +294,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/new":
                 nonce = secrets.token_urlsafe(18)
                 self._html(
-                    render_new_run(self.server.config, self.server.token, nonce=nonce),
+                    render_new_run(self.server.config, self.server.browser_token, nonce=nonce),
                     nonce,
                 )
                 return
@@ -231,7 +308,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 # a plan approval or to resume a resumable run.
                 self._html(
                     render_run(
-                        run, self.server.token, config=self.server.config, nonce=nonce
+                        run, self.server.browser_token, config=self.server.config, nonce=nonce
                     ),
                     nonce,
                     script_self=run_page_polls(run),
@@ -262,13 +339,26 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError, UnicodeError):
             self._error(WebAPIError(503, "request could not be served"))
 
-    def _authorized(self) -> None:
+    def _authorized_api(self) -> None:
         supplied = self.headers.get("X-MetaHarness-Token")
-        if supplied is None or not secrets.compare_digest(supplied, self.server.token):
+        supplied_bytes = supplied.encode("utf-8") if supplied is not None else None
+        browser_match = supplied_bytes is not None and secrets.compare_digest(
+            supplied_bytes, self.server.browser_token.encode("utf-8")
+        )
+        control_match = (
+            supplied_bytes is not None
+            and self.server.control_token is not None
+            and secrets.compare_digest(
+                supplied_bytes, self.server.control_token.encode("utf-8")
+            )
+        )
+        if not (browser_match or control_match):
             raise WebAPIError(403, "mutation token required")
 
     def _authorized_form(self, token: str | None) -> None:
-        if token is None or not secrets.compare_digest(token, self.server.token):
+        if token is None or not secrets.compare_digest(
+            token.encode("utf-8"), self.server.browser_token.encode("utf-8")
+        ):
             raise WebAPIError(403, "mutation token required")
 
     def _form(
@@ -354,7 +444,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
             )
             self._check_origin(allow_opaque=html_form_route)
             if parts == ["", "api", "runs"]:
-                self._authorized()
+                self._authorized_api()
                 payload = self._body()
                 allowed = {
                     "spec", "run_id", "planner_profile", "mechanical_profile",
@@ -458,7 +548,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 self._redirect(result["location"])
                 return
             if len(parts) == 5 and parts[1:3] == ["api", "runs"] and parts[4] == "recover-plan":
-                self._authorized()
+                self._authorized_api()
                 payload = self._body(max_bytes=_MAX_RECOVERY_BODY_BYTES)
                 if set(payload) != {"plan"} or not isinstance(payload.get("plan"), str):
                     raise WebAPIError(400, "body must contain exactly one plan string")
@@ -506,7 +596,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 self._redirect(f"/runs/{run_id}")
                 return
             if len(parts) == 5 and parts[1:3] == ["api", "runs"] and parts[4] == "scope-approval":
-                self._authorized()
+                self._authorized_api()
                 payload = self._body()
                 if set(payload) != {"decision"} or not isinstance(payload.get("decision"), str):
                     raise WebAPIError(400, "decision must be APPROVE or REJECT")
@@ -516,7 +606,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 return
             if len(parts) != 5 or parts[1:3] != ["api", "runs"] or parts[4] != "approval":
                 raise WebAPIError(404, "not found")
-            self._authorized()
+            self._authorized_api()
             payload = self._body()
             decision = payload.get("decision")
             if not isinstance(decision, str):
@@ -571,13 +661,23 @@ def _approval_profiles(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def create_server(config: HarnessConfig | str | Path, port: int = 8765) -> MetaHarnessHTTPServer:
+def create_server(
+    config: HarnessConfig | str | Path,
+    port: int = 8765,
+    *,
+    control_token_file: str | Path | None = None,
+) -> MetaHarnessHTTPServer:
     loaded = load_config(config) if not isinstance(config, HarnessConfig) else config
-    return MetaHarnessHTTPServer((HOST, port), loaded)
+    return MetaHarnessHTTPServer((HOST, port), loaded, control_token_file=control_token_file)
 
 
-def serve(config: HarnessConfig | str | Path, port: int = 8765) -> None:
-    server = create_server(config, port=port)
+def serve(
+    config: HarnessConfig | str | Path,
+    port: int = 8765,
+    *,
+    control_token_file: str | Path | None = None,
+) -> None:
+    server = create_server(config, port=port, control_token_file=control_token_file)
     print(f"MetaHarness UI: http://{HOST}:{server.server_port}/", flush=True)
     try:
         server.serve_forever()

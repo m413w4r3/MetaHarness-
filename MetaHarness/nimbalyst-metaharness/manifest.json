@@ -1,0 +1,50 @@
+{
+  "id": "com.m413w4r3.metaharness",
+  "name": "MetaHarness",
+  "version": "0.1.0",
+  "description": "Control and inspect MetaHarness runs from Nimbalyst.",
+  "author": "m413w4r3",
+  "main": "dist/index.js",
+  "styles": "dist/index.css",
+  "apiVersion": "1.0.0",
+  "permissions": {
+    "ai": true
+  },
+  "contributions": {
+    "panels": [
+      {
+        "id": "metaharness",
+        "title": "MetaHarness",
+        "icon": "account_tree",
+        "placement": "fullscreen",
+        "aiSupported": false,
+        "order": 50,
+        "tooltip": "Open the MetaHarness run inspector."
+      }
+    ],
+    "settingsRoutes": [
+      {
+        "id": "metaharness",
+        "scope": "project",
+        "label": "MetaHarness",
+        "group": "Extensions",
+        "icon": "account_tree",
+        "order": 50,
+        "component": "MetaHarnessSettings"
+      }
+    ],
+    "backendModules": [
+      {
+        "id": "metaharness-runtime",
+        "entry": "dist/backend.js",
+        "runtime": "utility-process",
+        "permissions": ["mcp-server-register"],
+        "enablement": {
+          "default": "disabled",
+          "promptOn": "firstUse",
+          "purpose": "Connect to and manage the local MetaHarness service for this project."
+        }
+      }
+    ]
+  }
+}

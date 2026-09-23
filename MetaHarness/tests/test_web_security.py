@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import tempfile
@@ -111,7 +112,7 @@ class LocalServerHardeningTests(unittest.TestCase):
             f"x127.0.0.1:{self.port}",
             "",
         ):
-            for path in ("/", "/runs/waiting", "/api/runs", "/api/runs/waiting"):
+            for path in ("/", "/runs/waiting", "/api/runs", "/api/runs/waiting", "/api/v1/health"):
                 with self.subTest(host=host, path=path):
                     status, _headers, content = self.request("GET", path, {"Host": host})
                     self.assertEqual(status, 403)
@@ -299,6 +300,111 @@ class LocalServerHardeningTests(unittest.TestCase):
 
     def test_server_binds_loopback_only(self) -> None:
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
+
+    def test_health_identifies_service_without_exposing_tokens(self) -> None:
+        control_file = Path(self.temp.name) / "private" / "control.token"
+        control_server = create_server(
+            _config(Path(self.temp.name), self.runs), port=0,
+            control_token_file=control_file,
+        )
+        thread = threading.Thread(
+            target=control_server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+        thread.start()
+        try:
+            control = control_server.control_token
+            self.assertIsNotNone(control)
+            connection = HTTPConnection("127.0.0.1", control_server.server_port)
+            connection.request("GET", "/api/v1/health")
+            response = connection.getresponse()
+            payload = response.read().decode("utf-8")
+            connection.close()
+            self.assertEqual(response.status, 200)
+            data = json.loads(payload)
+            self.assertEqual(data, {
+                "service": "metaharness", "api_version": 1,
+                "status": "ok", "control_api": True,
+            })
+            self.assertNotIn(control, payload)
+            self.assertNotIn(control_server.browser_token, payload)
+        finally:
+            control_server.shutdown()
+            control_server.server_close()
+            thread.join(timeout=2)
+
+    def test_control_token_file_is_private_and_reused(self) -> None:
+        token_file = Path(self.temp.name) / "nested" / "control.token"
+        config = _config(Path(self.temp.name), self.runs)
+        first = create_server(config, port=0, control_token_file=token_file)
+        try:
+            token = first.control_token
+            self.assertTrue(token)
+            self.assertEqual(token_file.read_text(encoding="utf-8"), token)
+            if os.name == "posix":
+                self.assertEqual(token_file.stat().st_mode & 0o777, 0o600)
+        finally:
+            first.server_close()
+        second = create_server(config, port=0, control_token_file=token_file)
+        try:
+            self.assertEqual(second.control_token, token)
+            self.assertNotEqual(second.browser_token, token)
+        finally:
+            second.server_close()
+
+        token_file.write_text("", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            create_server(config, port=0, control_token_file=token_file)
+        token_file.write_bytes(b"x" * 4097)
+        with self.assertRaises(ValueError):
+            create_server(config, port=0, control_token_file=token_file)
+
+    def test_control_token_authenticates_json_mutation_only(self) -> None:
+        run_dir = self.awaiting_run()
+        token_file = Path(self.temp.name) / "control.token"
+        control_server = create_server(
+            _config(Path(self.temp.name), self.runs), port=0,
+            control_token_file=token_file,
+        )
+        thread = threading.Thread(
+            target=control_server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+        thread.start()
+        try:
+            control = control_server.control_token
+            assert control is not None
+            def control_request(token: str | None):
+                connection = HTTPConnection("127.0.0.1", control_server.server_port)
+                headers = {"Content-Type": "application/json"}
+                if token is not None:
+                    headers["X-MetaHarness-Token"] = token
+                connection.request(
+                    "POST", "/api/runs/waiting/approval",
+                    json.dumps({"decision": "REJECT"}), headers,
+                )
+                response = connection.getresponse()
+                content = response.read()
+                connection.close()
+                return response.status, content
+
+            self.assertEqual(control_request(control)[0], 200)
+            self.assertEqual(control_request("invalid-token")[0], 403)
+            self.assertEqual(control_request(None)[0], 403)
+            self.assertTrue((run_dir / "plan_approval.json").exists())
+
+            connection = HTTPConnection("127.0.0.1", control_server.server_port)
+            body = "_token=" + control + "&decision=REJECT"
+            connection.request(
+                "POST", "/runs/waiting/approval", body,
+                {"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response = connection.getresponse()
+            response.read()
+            connection.close()
+            self.assertEqual(response.status, 403)
+        finally:
+            control_server.shutdown()
+            control_server.server_close()
+            thread.join(timeout=2)
 
 
 class WebSecurityTests(unittest.TestCase):

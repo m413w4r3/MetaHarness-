@@ -775,11 +775,15 @@ def _doctor(config_path: Path) -> int:
     return 0
 
 
-def _web(config_path: Path, port: int) -> int:
+def _web(
+    config_path: Path,
+    port: int,
+    control_token_file: Path | None = None,
+) -> int:
     try:
         from .web.server import serve
 
-        serve(config_path, port=port)
+        serve(config_path, port=port, control_token_file=control_token_file)
     except (ConfigError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -828,6 +832,7 @@ def build_parser() -> argparse.ArgumentParser:
     web = subparsers.add_parser("web", help="serve the local observation UI")
     web.add_argument("--config", required=True, type=Path)
     web.add_argument("--port", default=8765, type=int)
+    web.add_argument("--control-token-file", type=Path)
     return parser
 
 
@@ -854,7 +859,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "reject-plan":
         return _write_plan_decision(args.run, ApprovalDecision.REJECT)
     if args.command == "web":
-        return _web(args.config, args.port)
+        return _web(args.config, args.port, args.control_token_file)
     return 2  # pragma: no cover - argparse restricts commands
 
 

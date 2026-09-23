@@ -1,0 +1,146 @@
+:root {
+  --metaharness-bg: var(--nim-bg, #111318);
+  --metaharness-surface: var(--nim-bg-secondary, #1a1d24);
+  --metaharness-text: var(--nim-text, #f3f4f6);
+  --metaharness-muted: var(--nim-text-muted, #9ca3af);
+  --metaharness-border: var(--nim-border, #30343d);
+  --metaharness-accent: var(--nim-accent, #8b9cf7);
+}
+
+.metaharness-panel,
+.metaharness-settings {
+  box-sizing: border-box;
+  min-height: 100%;
+  color: var(--metaharness-text);
+  font-family: var(--nim-font-family, Inter, system-ui, sans-serif);
+}
+
+.metaharness-panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  background: var(--metaharness-bg);
+}
+
+.metaharness-panel__content {
+  width: min(100%, 720px);
+  padding: 40px;
+  border: 1px solid var(--metaharness-border);
+  border-radius: 16px;
+  background: var(--metaharness-surface);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 18%);
+}
+
+.metaharness-panel__eyebrow,
+.metaharness-settings__eyebrow {
+  color: var(--metaharness-accent);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.metaharness-panel h1,
+.metaharness-settings h1 {
+  margin: 12px 0 8px;
+  font-size: 30px;
+  line-height: 1.2;
+}
+
+.metaharness-panel__description,
+.metaharness-settings__description {
+  max-width: 60ch;
+  margin: 0;
+  color: var(--metaharness-muted);
+  line-height: 1.6;
+}
+
+.metaharness-panel__details {
+  display: grid;
+  gap: 1px;
+  margin: 32px 0;
+  overflow: hidden;
+  border: 1px solid var(--metaharness-border);
+  border-radius: 10px;
+}
+
+.metaharness-panel__details > div {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 16px;
+  padding: 16px;
+  background: var(--metaharness-bg);
+}
+
+.metaharness-panel dt,
+.metaharness-settings__workspace span {
+  color: var(--metaharness-muted);
+  font-size: 13px;
+}
+
+.metaharness-panel dd {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metaharness-status-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--metaharness-muted);
+  flex: 0 0 auto;
+}
+
+.metaharness-button {
+  padding: 10px 16px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--metaharness-accent);
+  color: #10131d;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+}
+
+.metaharness-button:hover {
+  filter: brightness(1.08);
+}
+
+.metaharness-settings {
+  max-width: 760px;
+  padding: 32px;
+}
+
+.metaharness-settings__workspace,
+.metaharness-settings__notice {
+  display: grid;
+  gap: 8px;
+  margin-top: 28px;
+  padding: 16px;
+  border: 1px solid var(--metaharness-border);
+  border-radius: 10px;
+  background: var(--metaharness-surface);
+}
+
+.metaharness-settings__workspace code {
+  overflow: hidden;
+  color: var(--metaharness-text);
+  font-family: var(--nim-font-mono, ui-monospace, monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metaharness-settings__notice {
+  color: var(--metaharness-muted);
+}
+
+.metaharness-settings__notice strong {
+  color: var(--metaharness-text);
+}
