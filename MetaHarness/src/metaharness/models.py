@@ -6,6 +6,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping
 
+from .recovery_policy import RecoveryBudgets
+
 
 class ProfileDriver(StrEnum):
     OPENAI_CHAT = "openai-chat"
@@ -616,6 +618,7 @@ class HarnessConfig:
     workspace_setup: tuple[WorkspaceSetupCommand, ...] = ()
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     revision: RevisionConfig = field(default_factory=RevisionConfig)
+    recovery: RecoveryBudgets = field(default_factory=RecoveryBudgets)
     prompt_budget: PromptBudgetConfig = field(default_factory=PromptBudgetConfig)
     repository: RepositoryConfig = field(default_factory=RepositoryConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)

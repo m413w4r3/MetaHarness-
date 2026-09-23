@@ -105,6 +105,7 @@ class RunStateStore:
             "commit_sha": None,
             "publish": {},
             "failure": None,
+            "recovery_counters": {},
             "steps": [],
             "accepted_steps": [],
             "accepted_commits": [],

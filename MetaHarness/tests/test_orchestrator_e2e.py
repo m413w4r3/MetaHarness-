@@ -281,6 +281,8 @@ class OrchestratorE2ETests(unittest.TestCase):
                     pid_file.write_text(str(child.pid))
                 elif behavior == 'secret':
                     target.write_text(os.environ['META_E2E_KEY'] + '\\n')
+                elif behavior == 'change-fail':
+                    target.write_text('partial failed attempt\\n')
                 elif behavior == 'staged-secret':
                     (worktree / '.gitattributes').write_text('*.py -diff\\n')
                     (worktree / 'secret.py').write_text(os.environ['FAKE_STAGED_SECRET'] + '\\n')
@@ -292,7 +294,7 @@ class OrchestratorE2ETests(unittest.TestCase):
                     raise SystemExit(1)
                 final = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])
                 final.write_text(os.environ.get('FAKE_FINAL', 'fake codex completed\\n'))
-                if behavior == 'fail':
+                if behavior in ('fail', 'change-fail'):
                     raise SystemExit(1)
                 """
             ),
@@ -418,7 +420,9 @@ class OrchestratorE2ETests(unittest.TestCase):
         )
         self.assertEqual(llm.planner_calls, 1)
         self.assertEqual(llm.reviewer_calls, 1)
-        self.assertNotIn(self.spec.read_text(), (self.root / "prompt.txt").read_text())
+        implementer_prompt = (self.root / "prompt.txt").read_text()
+        self.assertIn("<ORIGINAL SPEC AUTHORITY>", implementer_prompt)
+        self.assertIn(self.spec.read_text(), implementer_prompt)
 
     def start_run_until_approval_gate(
         self, config: Path, run_id: str, result_holder: list[int]
@@ -575,11 +579,46 @@ class OrchestratorE2ETests(unittest.TestCase):
         _, _, state = self.run_case(codex_behavior="fail")
         self.assertEqual(state["failure"]["reason"], "AGENT_RUNTIME_FAILED")
         self.assertEqual(git(self.root / "worktrees" / "run-1", "rev-list", "--count", "HEAD"), "1")
+        self.assertEqual(state["recovery_counters"]["agent-step:001:S01"], 2)
+        trace = [
+            json.loads(line)
+            for line in (self.root / "runs" / "run-1" / "trace" / "events.v1.jsonl")
+            .read_text().splitlines()
+        ]
+        recovery = [item for item in trace if item["event"].startswith("recovery.")]
+        self.assertEqual(sum(item["event"] == "recovery.started" for item in recovery), 2)
+        self.assertEqual(sum(item["event"] == "recovery.completed" for item in recovery), 2)
+        self.assertEqual(sum(item["event"] == "recovery.exhausted" for item in recovery), 1)
+        self.assertTrue(all(
+            {"reason", "disposition", "attempt", "tree_before", "tree_after", "budget_remaining"}
+            <= set(item["data"])
+            for item in recovery
+        ))
+
+    def test_transient_failure_rolls_back_scoped_changes_before_retry(self) -> None:
+        _, _, state = self.run_case(codex_behavior="change-fail", run_id="rollback")
+        worktree = self.root / "worktrees" / "rollback"
+        self.assertEqual(state["failure"]["reason"], "AGENT_RUNTIME_FAILED")
+        self.assertFalse((worktree / "feature.txt").exists())
+        self.assertEqual(git(worktree, "rev-list", "--count", "HEAD"), "1")
+        self.assertEqual(state["recovery_counters"]["agent-step:001:S01"], 2)
+        trace = [
+            json.loads(line)
+            for line in (self.root / "runs" / "rollback" / "trace" / "events.v1.jsonl")
+            .read_text().splitlines()
+        ]
+        retries = [item for item in trace if item["event"] == "recovery.started"]
+        self.assertEqual(len(retries), 2)
+        self.assertTrue(all(
+            item["data"]["tree_before"] == item["data"]["tree_after"]
+            for item in retries
+        ))
 
     def test_codex_auth_exit_is_classified_without_sensitive_detail(self) -> None:
         _, _, state = self.run_case(codex_behavior="auth-fail")
-        self.assertEqual(state["failure"]["reason"], "AGENT_START_FAILED")
+        self.assertEqual(state["failure"]["reason"], "AGENT_AUTH_FAILURE")
         self.assertEqual(state["failure"]["detail"], "step=S01 worker authentication failed")
+        self.assertEqual(state["recovery_counters"], {})
         self.assertNotIn("request-id", json.dumps(state))
         self.assertNotIn("https://api.openai.com", json.dumps(state))
 
@@ -607,10 +646,10 @@ class OrchestratorE2ETests(unittest.TestCase):
         _, _, failed = self.run_case(review=FAIL_REVIEW, run_id="review-fail")
         self.assertEqual(failed["failure"]["reason"], "REVIEW_FAILED")
 
-        # A worker that changes nothing is retried once, then its deferred
-        # outcome has no explicit dependency contract: nothing is accepted.
+        # A worker that changes nothing enters the bounded contract-repair
+        # path introduced by 261ff2a. No reviewer or candidate is authorized.
         _, empty_llm, empty = self.run_case(codex_behavior="none", run_id="empty")
-        self.assertEqual(empty["failure"]["reason"], "COMMIT_GATE_FAILED")
+        self.assertEqual(empty["failure"]["reason"], "AGENT_CONTRACT_MISMATCH")
         self.assertEqual(empty_llm.reviewer_calls, 0)
 
     def test_changes_after_review_never_reach_the_reviewed_commit(self) -> None:
@@ -686,7 +725,8 @@ class OrchestratorE2ETests(unittest.TestCase):
         reviewer_prompt = json.loads(reviewer_body)["messages"][0]["content"]
         agent_prompt = (self.root / "prompt.txt").read_text()
         self.assertIn(spec, planner_prompt)
-        self.assertNotIn(spec, agent_prompt)
+        self.assertIn("<ORIGINAL SPEC AUTHORITY>", agent_prompt)
+        self.assertIn(spec, agent_prompt)
         self.assertIn("Create feature.txt with the requested content.", agent_prompt)
         self.assertNotIn("END META PLAN", agent_prompt)
         self.assertNotIn("REVIEWER_PROFILE", agent_prompt)

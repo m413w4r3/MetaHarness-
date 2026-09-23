@@ -59,6 +59,18 @@ class FrozenRoutingTests(unittest.TestCase):
     def test_snapshot_is_secret_free_and_managed_catalog_is_minimal(self) -> None:
         options = RunOptions.from_config(self.config)
         self.assertNotIn("default_implementer_profile", json.dumps(options.to_dict()))
+        snapshot = options.to_dict()
+        self.assertEqual(snapshot["recovery"]["max_transient_attempts"], 2)
+        self.assertEqual(
+            RunOptions.from_mapping(snapshot).recovery,
+            options.recovery,
+        )
+        legacy_snapshot = dict(snapshot)
+        legacy_snapshot.pop("recovery")
+        self.assertEqual(
+            RunOptions.from_mapping(legacy_snapshot).recovery,
+            options.recovery,
+        )
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "codex"
             runtime_config = HarnessConfig(

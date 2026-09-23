@@ -71,7 +71,7 @@ class SingleCycleTests(PipelineHarness):
             ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "PUSH_FAILED")
+        self.assertEqual(self.state()["failure"]["reason"], "REMOTE_AUTHORITY_MISMATCH")
         self.assertEqual(self.reviewer.requests, [])
 
     def test_remote_push_without_web_url_uses_bounded_diff_fallback(self) -> None:
@@ -1062,7 +1062,7 @@ class GitChainAndTraceTests(PipelineHarness):
         self.assertFalse((attempt / "failure.json").exists())
         self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
 
-    def test_a_failed_step_is_rerun_alone_after_its_partial_tree_is_restored(self) -> None:
+    def test_transient_step_failure_is_rolled_back_and_retried_automatically(self) -> None:
         def crash(request):  # the worker edits in scope, then fails
             (request.worktree / "feature.txt").write_text("partial\n", encoding="utf-8")
             from metaharness.agent import AgentRunResult
@@ -1075,18 +1075,22 @@ class GitChainAndTraceTests(PipelineHarness):
 
         self.workers.on(ExecutionRole.IMPLEMENTER, crash, write("feature.txt", "good\n"))
         config = self.config()
-        failed = self.orchestrator(
+        completed = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "AGENT_TIMEOUT")
-        self.assertEqual(self.checkpoint()["phase"], "implement_step")
-
-        resumed = self.orchestrator(config, planner=["unused"], reviewer=[review()]).resume("run")
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(self.state()["resume"]["restored_paths"], ["feature.txt"])
+        self.assertEqual(completed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.state()["recovery_counters"]["agent-step:001:S01"], 1)
         self.assertTrue(
-            (self.run_dir() / "cycles/001/implementation/steps/S01/attempts/01/step.json").is_file()
+            (self.run_dir() / "cycles/001/implementation/steps/S01/attempts/01").is_dir()
+        )
+        recovery = [
+            json.loads(line)
+            for line in (self.run_dir() / "trace" / "events.v1.jsonl").read_text().splitlines()
+            if '"event":"recovery.started"' in line
+        ]
+        self.assertEqual(len(recovery), 1)
+        self.assertEqual(
+            recovery[0]["data"]["tree_before"], recovery[0]["data"]["tree_after"],
         )
 
 

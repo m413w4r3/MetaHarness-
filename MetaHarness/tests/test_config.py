@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from metaharness.config import ConfigError, load_config
 from metaharness.models import CheckConfig
 from metaharness.planning_v2 import render_safe_check_catalogue
+from metaharness.recovery_policy import RecoveryBudgets
 
 
 VALID_CONFIG = """
@@ -167,6 +168,33 @@ class ConfigTests(unittest.TestCase):
         for check_id in checks:
             with self.subTest(check_id=check_id):
                 self.assertIn(f"ID: {check_id}", rendered_catalogue)
+
+    def test_recovery_budgets_are_configurable_and_bounded(self) -> None:
+        contents = VALID_CONFIG + """
+
+[recovery]
+max_transient_attempts = 3
+max_executor_fallbacks = 1
+max_check_infra_retries = 2
+max_review_transport_retries = 0
+max_workspace_setup_retries = 2
+"""
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), contents))
+        self.assertEqual(config.recovery, RecoveryBudgets(
+            max_transient_attempts=3,
+            max_executor_fallbacks=1,
+            max_check_infra_retries=2,
+            max_review_transport_retries=0,
+            max_workspace_setup_retries=2,
+        ))
+
+    def test_recovery_budget_rejects_unknown_keys(self) -> None:
+        contents = VALID_CONFIG + "\n[recovery]\nretries = 9\n"
+        with tempfile.TemporaryDirectory() as directory_name:
+            config_path = self.write_config(Path(directory_name), contents)
+            with self.assertRaisesRegex(ConfigError, "recovery.retries"):
+                load_config(config_path)
 
     def test_alembic_heads_check_accepts_only_the_baseline_head(self) -> None:
         example = Path(__file__).resolve().parents[1] / "examples" / "autowork.toml"

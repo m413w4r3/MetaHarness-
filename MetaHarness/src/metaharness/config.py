@@ -35,6 +35,7 @@ from .models import (
     RoutingConfig,
     RepositoryConfig,
     RevisionConfig,
+    RecoveryBudgets,
     SelectionMode,
     UIConfig,
     WorkspaceSetupCommand,
@@ -823,6 +824,26 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         max_step_contract_repairs=contract_budget,
     )
 
+    recovery_data = _table(expanded, "recovery")
+    recovery_fields = {
+        "max_transient_attempts", "max_executor_fallbacks",
+        "max_check_infra_retries", "max_review_transport_retries",
+        "max_workspace_setup_retries",
+    }
+    unknown_recovery = sorted(set(recovery_data) - recovery_fields)
+    if unknown_recovery:
+        raise ConfigError(f"recovery.{unknown_recovery[0]} is not allowed")
+    try:
+        recovery = RecoveryBudgets(**{
+            name: _bounded_int(
+                recovery_data, name, getattr(RecoveryBudgets(), name), "recovery",
+                minimum=0, maximum=10,
+            )
+            for name in sorted(recovery_fields)
+        })
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from None
+
     prompt_budget_data = _table(expanded, "prompt_budget")
     prompt_budget = PromptBudgetConfig(
         planner_max_bytes=_positive_int(
@@ -1102,6 +1123,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         workspace_setup=workspace_setup,
         planning=planning,
         revision=revision,
+        recovery=recovery,
         prompt_budget=prompt_budget,
         repository=repository,
         github=github,

@@ -28,6 +28,13 @@ max_check_repair_attempts = 2
 max_review_repair_cycles = 2
 max_step_contract_repairs = 2
 
+[recovery]
+max_transient_attempts = 2
+max_executor_fallbacks = 1
+max_check_infra_retries = 2
+max_review_transport_retries = 2
+max_workspace_setup_retries = 2
+
 [repository]
 remote = "origin"
 planner_remote_exploration = true

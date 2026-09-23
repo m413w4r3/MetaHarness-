@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
 from .models import HarnessConfig, RevisionConfig, PlanningConfig, RoutingConfig, validate_revision_budget
+from .recovery_policy import RecoveryBudgets
 from .profiles import ProfileError, profile_for_role
 from .result import atomic_write_text
 from .models import ExecutionRole
@@ -68,6 +69,7 @@ class RunOptions:
     max_read_paths_per_step: int = 8
     max_step_contract_chars: int = 5000
     max_preapproval_corrections: int = 2
+    recovery: RecoveryBudgets = RecoveryBudgets()
     # Constructor-only migration aid. It is never serialized and is not read
     # by the modern resolver.
     default_implementer_profile: str | None = None
@@ -106,6 +108,8 @@ class RunOptions:
             raise RunOptionsError(str(exc)) from None
         if not isinstance(self.semantic_revision_enabled, bool):
             raise RunOptionsError("run options semantic_revision_enabled must be boolean")
+        if not isinstance(self.recovery, RecoveryBudgets):
+            raise RunOptionsError("run options recovery budgets are invalid")
         for name in ("max_check_repair_attempts", "max_review_repair_cycles"):
             try:
                 validate_revision_budget(getattr(self, name), f"run options {name}")
@@ -145,6 +149,7 @@ class RunOptions:
             "repair_scope_policy", "repair_scope_max_added_paths",
             "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
             "max_preapproval_corrections", "max_step_contract_repairs",
+            "recovery",
         }
         unknown = set(overrides) - allowed
         if unknown:
@@ -181,6 +186,7 @@ class RunOptions:
             "final_reviewer_profile": config.ui.default_reviewer_profile,
             "repair_scope_policy": "auto-bounded",
             "repair_scope_max_added_paths": 4,
+            "recovery": config.recovery,
         }
         values.update(overrides)
         result = cls(**values)
@@ -234,6 +240,7 @@ class RunOptions:
                 "repair_scope_policy": self.repair_scope_policy,
                 "repair_scope_max_added_paths": self.repair_scope_max_added_paths,
             },
+            "recovery": asdict(self.recovery),
             "profiles": {
                 "planner_profile": self.planner_profile,
                 "mechanical_profile": self.mechanical_profile,
@@ -247,9 +254,24 @@ class RunOptions:
 
     @classmethod
     def from_mapping(cls, value: Any) -> "RunOptions":
-        if not isinstance(value, Mapping) or set(value) != {"schema_version", "pipeline_version", "planning", "pipeline", "profiles"}:
+        if not isinstance(value, Mapping) or set(value) not in (
+            {"schema_version", "pipeline_version", "planning", "pipeline", "profiles"},
+            {"schema_version", "pipeline_version", "planning", "pipeline", "profiles", "recovery"},
+        ):
             raise RunOptionsError("run options schema is invalid")
         planning, pipeline, profiles = value["planning"], value["pipeline"], value["profiles"]
+        recovery = value.get("recovery", {})
+        recovery_fields = {
+            "max_transient_attempts", "max_executor_fallbacks",
+            "max_check_infra_retries", "max_review_transport_retries",
+            "max_workspace_setup_retries",
+        }
+        if (
+            not isinstance(recovery, Mapping)
+            or ("recovery" in value and set(recovery) != recovery_fields)
+            or ("recovery" not in value and recovery)
+        ):
+            raise RunOptionsError("run options recovery schema is invalid")
         if not isinstance(planning, Mapping) or set(planning) != {
             "protocol", "decomposition", "execution_mode_policy",
             "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
@@ -279,8 +301,9 @@ class RunOptions:
             return cls(
                 schema_version=value["schema_version"], pipeline_version=value["pipeline_version"],
                 **planning, **pipeline, **profiles,
+                recovery=RecoveryBudgets(**recovery),
             )
-        except (KeyError, TypeError) as exc:
+        except (KeyError, TypeError, ValueError) as exc:
             raise RunOptionsError("run options schema is invalid") from exc
 
 
@@ -371,7 +394,10 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
         max_step_contract_repairs=options.max_step_contract_repairs,
         max_review_repair_cycles=options.max_review_repair_cycles,
     )
-    return replace(config, planning=planning, ui=ui, routing=routing, revision=revision)
+    return replace(
+        config, planning=planning, ui=ui, routing=routing, revision=revision,
+        recovery=options.recovery,
+    )
 
 
 __all__ = [
