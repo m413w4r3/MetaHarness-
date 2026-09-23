@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type {
   ApproveRunInput,
@@ -21,10 +21,11 @@ import type {
   RunDetail,
   RunSummary,
   RuntimeConfig,
+  RuntimeConfigCall,
 } from './types';
 
 const DEFAULT_EXECUTABLE = 'metaharness';
-const DEFAULT_PORT = 8766;
+const DEFAULT_PORT = 8765;
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_500;
 const START_TIMEOUT_MS = 15_000;
 const START_POLL_MS = 150;
@@ -44,7 +45,8 @@ export const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
   executable: DEFAULT_EXECUTABLE,
   configPath: '',
   port: DEFAULT_PORT,
-  autoStart: false,
+  autoStart: true,
+  pollIntervalMs: 1_000,
 };
 
 function isRecord(value: unknown): value is JsonObject {
@@ -130,6 +132,10 @@ function validateRuntimeConfig(input: RuntimeConfig): RuntimeConfig {
   }
   if (typeof input.autoStart !== 'boolean') {
     throw new MetaHarnessBackendError('INVALID_CONFIG', 'autoStart must be a boolean');
+  }
+  if (input.pollIntervalMs !== undefined && (!Number.isInteger(input.pollIntervalMs)
+    || input.pollIntervalMs < 500 || input.pollIntervalMs > 30_000)) {
+    throw new MetaHarnessBackendError('INVALID_CONFIG', 'pollIntervalMs must be between 500 and 30000');
   }
   return { ...input, port: validatePort(input.port) };
 }
@@ -544,8 +550,9 @@ export class MetaHarnessRuntime {
       serverOwned: processIsAlive(this.ownedChild),
     };
     try {
-      await this.client.health();
+      const health = await this.client.health();
       result.connected = true;
+      result.api_version = health.api_version;
     } catch {
       // Status is a probe, not an error channel: callers only need the three
       // stable state fields. Mutating and control operations return BackendError.
@@ -780,10 +787,25 @@ function descriptor(
 }
 
 export const MCP_TOOL_DESCRIPTORS: BackendToolDescriptor[] = [
-  descriptor('status', 'Return MetaHarness connection and ownership status.'),
-  descriptor('start', 'Attach to or start the local MetaHarness server.'),
+  descriptor('status', 'Return MetaHarness connection and ownership status for the supplied settings.', {
+    type: 'object', properties: { settings: { type: 'object', properties: {
+      executable: { type: 'string' }, configPath: { type: 'string' }, port: { type: 'integer' },
+      autoStart: { type: 'boolean' }, pollIntervalMs: { type: 'integer' },
+    }, additionalProperties: false } }, additionalProperties: false,
+  }),
+  descriptor('start', 'Attach to or start MetaHarness with the supplied settings.', {
+    type: 'object', properties: { settings: { type: 'object', properties: {
+      executable: { type: 'string' }, configPath: { type: 'string' }, port: { type: 'integer' },
+      autoStart: { type: 'boolean' }, pollIntervalMs: { type: 'integer' },
+    }, additionalProperties: false } }, additionalProperties: false,
+  }),
   descriptor('stop', 'Stop only the MetaHarness server started by this extension.'),
-  descriptor('get_config', 'Return the credential-free MetaHarness configuration description.'),
+  descriptor('get_config', 'Return the credential-free MetaHarness configuration description.', {
+    type: 'object', properties: { settings: { type: 'object', properties: {
+      executable: { type: 'string' }, configPath: { type: 'string' }, port: { type: 'integer' },
+      autoStart: { type: 'boolean' }, pollIntervalMs: { type: 'integer' },
+    }, additionalProperties: false } }, additionalProperties: false,
+  }),
   descriptor('model_profiles', 'Return available MetaHarness model profiles.'),
   descriptor('list_runs', 'List MetaHarness runs.'),
   descriptor('get_run', 'Return one MetaHarness run.', {
@@ -811,7 +833,12 @@ export const MCP_TOOL_DESCRIPTORS: BackendToolDescriptor[] = [
     type: 'object', properties: { runId: { type: 'string' }, input: { type: 'object' }, plan: { type: 'string' } },
     required: ['runId'], additionalProperties: true,
   }),
-  descriptor('doctor', 'Run metaharness doctor with JSON output.'),
+  descriptor('doctor', 'Run metaharness doctor with JSON output using the supplied settings.', {
+    type: 'object', properties: { settings: { type: 'object', properties: {
+      executable: { type: 'string' }, configPath: { type: 'string' }, port: { type: 'integer' },
+      autoStart: { type: 'boolean' }, pollIntervalMs: { type: 'integer' },
+    }, additionalProperties: false } }, additionalProperties: false,
+  }),
 ];
 
 function runtimeDataDir(context: BackendActivateContext): string {
@@ -834,15 +861,48 @@ export async function activate(
     config,
     dataDir: runtimeDataDir(context),
   });
+  const workspacePath = context.services.workspacePath || context.services.extensionPath;
+  const startedRuntimes = new Map<string, MetaHarnessRuntime>();
+  const runtimeForSettings = (input: RuntimeConfigCall) => {
+    const selectedConfig = mergeRuntimeConfig(input.settings);
+    const key = JSON.stringify(selectedConfig);
+    const selected = startedRuntimes.get(key)
+      ?? new MetaHarnessRuntime({ config: selectedConfig, dataDir: runtimeDataDir(context) });
+    return { key, runtime: selected };
+  };
+  const forCall = (input?: RuntimeConfigCall) => {
+    if (!input?.settings) return runtime;
+    return runtimeForSettings(input).runtime;
+  };
+  const recommendedConfigPath = () => {
+    for (const name of ['metaharness.toml', '.metaharness.toml']) {
+      const candidate = join(workspacePath, name);
+      if (existsSync(candidate)) return candidate;
+    }
+    return undefined;
+  };
 
   await context.services.registerMcpTools(MCP_TOOL_DESCRIPTORS);
   context.services.log('info', '[metaharness] control tools registered');
 
   const methods: MetaHarnessBackend['methods'] = {
-    status: () => runtime.status(),
-    start: () => toolError(() => runtime.start(), runtime.isDevelopment),
+    status: async (input) => ({
+      ...await forCall(input).status(),
+      ...(recommendedConfigPath() ? { recommendedConfigPath: recommendedConfigPath() } : {}),
+    }),
+    start: (input) => {
+      if (!input?.settings) {
+        return toolError(() => runtime.start(), runtime.isDevelopment);
+      }
+      const { key, runtime: selected } = runtimeForSettings(input);
+      startedRuntimes.set(key, selected);
+      return toolError(() => selected.start(), selected.isDevelopment);
+    },
     stop: () => toolError(() => runtime.stop(), runtime.isDevelopment),
-    get_config: () => toolError(() => runtime.client.getConfig(), runtime.isDevelopment),
+    get_config: (input) => {
+      const selected = forCall(input);
+      return toolError(() => selected.client.getConfig(), selected.isDevelopment);
+    },
     model_profiles: () => toolError(() => runtime.client.modelProfiles(), runtime.isDevelopment),
     list_runs: () => toolError(() => runtime.client.listRuns(), runtime.isDevelopment),
     get_run: (input) => toolError(
@@ -885,7 +945,10 @@ export async function activate(
       ).then((value) => jsonResponseObject(value, 'recover_plan')),
       runtime.isDevelopment,
     ),
-    doctor: () => toolError(() => runtime.doctor(), runtime.isDevelopment),
+    doctor: (input) => {
+      const selected = forCall(input);
+      return toolError(() => selected.doctor(), selected.isDevelopment);
+    },
   };
 
   if (config.autoStart && config.configPath.trim()) {
@@ -900,6 +963,8 @@ export async function activate(
 
   return {
     methods,
-    deactivate: () => runtime.deactivate(),
+    deactivate: async () => {
+      await Promise.all([runtime.deactivate(), ...Array.from(startedRuntimes.values(), (item) => item.deactivate())]);
+    },
   };
 }

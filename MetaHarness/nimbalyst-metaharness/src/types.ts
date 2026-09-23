@@ -14,6 +14,11 @@ export interface RuntimeConfig {
   configPath: string;
   port: number;
   autoStart: boolean;
+  pollIntervalMs?: number;
+}
+
+export interface RuntimeConfigCall {
+  settings?: RuntimeConfig;
 }
 
 export interface HealthResponse extends JsonObject {
@@ -47,6 +52,7 @@ export interface MetaHarnessStatus {
   configured: boolean;
   connected: boolean;
   serverOwned: boolean;
+  api_version?: number;
 }
 
 export interface BackendToolSchema {
@@ -90,10 +96,10 @@ export type BackendToolResult<T> = T | BackendToolFailure;
 
 export interface MetaHarnessBackend {
   methods: {
-    status: () => Promise<MetaHarnessStatus>;
-    start: () => Promise<BackendToolResult<MetaHarnessStatus>>;
+    status: (input?: RuntimeConfigCall) => Promise<MetaHarnessStatus & { recommendedConfigPath?: string }>;
+    start: (input?: RuntimeConfigCall) => Promise<BackendToolResult<MetaHarnessStatus>>;
     stop: () => Promise<BackendToolResult<MetaHarnessStatus>>;
-    get_config: () => Promise<BackendToolResult<MetaHarnessConfigResponse>>;
+    get_config: (input?: RuntimeConfigCall) => Promise<BackendToolResult<MetaHarnessConfigResponse>>;
     model_profiles: () => Promise<BackendToolResult<ModelProfilesResponse>>;
     list_runs: () => Promise<BackendToolResult<RunSummary[]>>;
     get_run: (
@@ -117,7 +123,7 @@ export interface MetaHarnessBackend {
     recover_plan: (
       input: { runId: string; input?: RecoverPlanInput; plan?: string } & JsonObject
     ) => Promise<BackendToolResult<JsonObject>>;
-    doctor: () => Promise<BackendToolResult<JsonObject>>;
+    doctor: (input?: RuntimeConfigCall) => Promise<BackendToolResult<JsonObject>>;
   };
   deactivate: () => void | Promise<void>;
 }
