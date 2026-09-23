@@ -36,7 +36,7 @@
     "backendModules": [
       {
         "id": "metaharness-runtime",
-        "entry": "dist/backend.js",
+        "entry": "dist/backend-runtime.js",
         "runtime": "utility-process",
         "permissions": ["mcp-server-register"],
         "enablement": {
