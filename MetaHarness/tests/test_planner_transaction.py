@@ -180,6 +180,16 @@ class PlannerTransactionTests(PipelineHarness):
         self.run_plan(chat)
         self.assertEqual(len(chat.complete_calls), 1)
 
+    def test_resume_reuses_raw_if_usage_persistence_crashes(self) -> None:
+        chat = _Chat([self.valid])
+        with mock.patch("metaharness.planning_v2.write_usage_artifact", side_effect=OSError("crash")):
+            with self.assertRaises(OSError):
+                self.run_plan(chat)
+        self.assertEqual((self.target / "planner.raw.md").read_text(), self.valid)
+        self.assertFalse((self.target / "planner.session.json").exists())
+        self.run_plan(chat)
+        self.assertEqual(len(chat.complete_calls), 1)
+
     def test_resume_after_failed_validation_continues_once(self) -> None:
         chat = _Chat([self.invalid, self.valid], continue_mode="timeout")
         with self.assertRaises(TimeoutError):

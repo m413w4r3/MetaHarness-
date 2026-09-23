@@ -1449,8 +1449,15 @@ class PlannerV2:
                 raise LLMProtocolError("planner attempt history is incomplete")
             raw_path = target / "planner.raw.md" if target is not None else None
             if raw_path is not None and raw_path.is_file():
-                if session.get("latest_attempt") != attempt:
+                # A crash may land after the answer is durable but before its
+                # usage/session metadata. The raw response is the paid-call
+                # boundary, so consume it instead of issuing that request
+                # again. A one-attempt lag is the only recoverable window.
+                latest_attempt = session.get("latest_attempt", 0)
+                if latest_attempt not in {attempt - 1, attempt}:
                     raise LLMProtocolError("planner raw answer does not match its session")
+                if session.get("response_error"):
+                    raise LLMProtocolError(str(session["response_error"]))
                 raw = raw_path.read_text(encoding="utf-8")
                 request = (target / "planner.request.txt").read_text(encoding="utf-8")
             else:
@@ -1497,21 +1504,30 @@ class PlannerV2:
                 if target is None:
                     memory_usage.append(self.last_usage)
                 raw = result if isinstance(result, str) else getattr(result, "text", None)
-                if target is not None:
-                    write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, completion_usage(result))
                 if not isinstance(raw, str):
                     raise LLMProtocolError("planner client did not return text")
+                # Persist the paid response first. Resume can then validate it
+                # without repeating a remote call, even if metadata persistence
+                # is interrupted immediately afterwards.
+                if target is not None:
+                    atomic_write_text(target / "planner.raw.md", raw)
+                if target is not None:
+                    write_usage_artifact(target / PLANNER_USAGE_ARTIFACT, completion_usage(result))
                 if (continuation_used and returned_handle is not None
                         and returned_handle.provider_id != handle.provider_id):
                     if target is not None:
-                        atomic_write_text(target / "planner.raw.md", raw)
+                        session = _write_planning_session(
+                            target, attempt, handle,
+                            continuation_used=continuation_used,
+                            fallback_fresh_request=fallback_fresh,
+                            response_error="continued conversation provider changed",
+                        )
                     raise LLMProtocolError("continued conversation provider changed")
                 effective_handle = returned_handle or (handle if continuation_used else None)
                 self.last_conversation = effective_handle
                 if target is not None:
                     session = _write_planning_session(target, attempt, effective_handle,
                         continuation_used=continuation_used, fallback_fresh_request=fallback_fresh)
-                    atomic_write_text(target / "planner.raw.md", raw)
                 else:
                     session = {"provider_id": effective_handle.provider_id if effective_handle else None,
                                "conversation_id": effective_handle.conversation_id if effective_handle else None}
@@ -1598,6 +1614,7 @@ def _session_handle(session: dict[str, Any]) -> LLMConversationHandle | None:
 def _write_planning_session(
     target: Path, attempt: int, handle: LLMConversationHandle | None,
     *, continuation_used: bool, fallback_fresh_request: bool,
+    response_error: str | None = None,
 ) -> dict[str, Any]:
     value = {
         "schema_version": 1,
@@ -1608,6 +1625,8 @@ def _write_planning_session(
         "continuation_used": continuation_used,
         "fallback_fresh_request": fallback_fresh_request,
     }
+    if response_error is not None:
+        value["response_error"] = response_error[:1000]
     path = target / "planner.session.json"
     atomic_write_text(path, json.dumps(value, ensure_ascii=False) + "\n")
     os.chmod(path, 0o600)
