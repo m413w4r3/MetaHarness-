@@ -5,6 +5,7 @@ import React from 'react';
 import { classifyRunStatus } from '../src/panel/runStatus.ts';
 import { RunsDashboard } from '../src/panel/RunsDashboard.tsx';
 import { RunDetail } from '../src/panel/run/RunDetail.tsx';
+import { deriveRunActions } from '../src/panel/run/runActions.ts';
 import { NewRunForm } from '../src/panel/NewRunForm.tsx';
 import { defaultsFromServer, validateRunForm, buildCreateRunInput } from '../src/model/runForm.ts';
 
@@ -16,6 +17,68 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const { cleanup, fireEvent, render, screen, waitFor } = await import('@testing-library/react');
 
 afterEach(() => cleanup());
+
+test('run actions use MetaHarness resume, approval and capability authority', () => {
+  const base = { status: 'failed', capabilities: { resume: true, recover_plan: true, plan_approval: true, scope_approval: true, cancel: false } };
+  assert.deepEqual(deriveRunActions({ ...base, overview: { resume: { resumable: true, phase: 'implement_step', label: 'Retry S02' } } }), {
+    canResume: true, resumeLabel: 'Retry S02', canRecoverPlan: false,
+    canApprovePlan: false, canApproveScope: false, canCancel: false,
+  });
+  assert.equal(deriveRunActions({ ...base, overview: { resume: { resumable: false, phase: 'implementation', reason: 'integrity failure' } } }).canResume, false);
+  const recovered = deriveRunActions({
+    status: 'failed', capabilities: { recover_plan: true }, plan_recovery: { eligible: true },
+  });
+  assert.equal(recovered.canRecoverPlan, true);
+  assert.equal(deriveRunActions({ status: 'implementing', capabilities: { cancel: false } }).canCancel, false);
+});
+
+test('plan recovery displays rejected plan, counts UTF-8 bytes and submits confirmed replacement', async () => {
+  const calls = [];
+  const run = { run_id: 'recover-001', status: 'failed', planner_raw: 'invalid plan', plan_recovery: { eligible: true, reason: 'planner output invalid', max_bytes: 5 } };
+  const callBackendTool = async (name, args) => {
+    calls.push([name, args]);
+    if (name === 'metaharness.get_run') return run;
+    if (name === 'metaharness.get_config') return { capabilities: { recover_plan: true } };
+    if (name === 'metaharness.recover_plan') return { ok: true };
+    throw new Error(`Unexpected backend call: ${name}`);
+  };
+  render(React.createElement(RunDetail, { runId: 'recover-001', callBackendTool, onBack: () => {} }));
+  await screen.findByRole('heading', { name: 'REPLACE PLAN' });
+  fireEvent.click(screen.getByText('Rejected / invalid plan'));
+  assert.ok(screen.getByText('invalid plan'));
+  const textarea = screen.getByLabelText('Replacement META PLAN v2');
+  fireEvent.change(textarea, { target: { value: 'ééé' } });
+  assert.ok(screen.getByText('6 / 5 bytes UTF-8'));
+  assert.equal(screen.getByRole('button', { name: 'Review replacement' }).disabled, true);
+  fireEvent.change(textarea, { target: { value: 'Plan' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Review replacement' }));
+  fireEvent.click(screen.getByRole('button', { name: 'REPLACE PLAN & CONTINUE' }));
+  await waitFor(() => assert.ok(calls.some(([name]) => name === 'metaharness.recover_plan')));
+  assert.deepEqual(calls.find(([name]) => name === 'metaharness.recover_plan')[1], {
+    runId: 'recover-001', input: { plan: 'Plan' },
+  });
+});
+
+test('resume stale state 409 refreshes run and reports the fixed stale-state message', async () => {
+  let reads = 0;
+  const calls = [];
+  const callBackendTool = async (name, args) => {
+    calls.push([name, args]);
+    if (name === 'metaharness.get_run') return ++reads === 1
+      ? { run_id: 'resume-001', status: 'failed', overview: { resume: { resumable: true, label: 'Retry S02' } } }
+      : { run_id: 'resume-001', status: 'implementing', overview: { resume: { resumable: false } } };
+    if (name === 'metaharness.get_config') return { capabilities: { resume: true } };
+    if (name === 'metaharness.resume_run') return { ok: false, error: { httpStatus: 409, message: 'run is not resumable' } };
+    throw new Error(`Unexpected backend call: ${name}`);
+  };
+  render(React.createElement(RunDetail, { runId: 'resume-001', callBackendTool, onBack: () => {} }));
+  const button = await screen.findByRole('button', { name: 'Retry S02' });
+  fireEvent.click(button);
+  await screen.findByText('The run changed before this action could be applied. Data has been refreshed.');
+  assert.ok(screen.getByText('implementing'));
+  assert.equal(screen.queryByRole('button', { name: 'Retry S02' }), null);
+  assert.equal(calls.filter(([name]) => name === 'metaharness.get_run').length, 2);
+});
 
 const settings = { executable: 'metaharness', configPath: '/work/metaharness.toml', port: 8765, autoStart: false, pollIntervalMs: 1000 };
 const modelProfiles = {
@@ -483,8 +546,8 @@ test('HTTP conflict reports the error and refreshes the run state', async () => 
   await screen.findByRole('heading', { name: 'PLAN APPROVAL REQUIRED' });
   await waitFor(() => assert.equal(screen.getByRole('button', { name: 'APPROVE & CONTINUE' }).disabled, false));
   fireEvent.click(screen.getByRole('button', { name: 'APPROVE & CONTINUE' }));
-  await screen.findByText('run is not awaiting plan approval');
-  assert.equal(screen.getByText('run is not awaiting plan approval').getAttribute('role'), 'alert');
+  await screen.findByText('The run changed before this action could be applied. Data has been refreshed.');
+  assert.equal(screen.getByText('The run changed before this action could be applied. Data has been refreshed.').getAttribute('role'), 'alert');
   await waitFor(() => assert.equal(calls.filter((name) => name === 'metaharness.get_run').length, 2));
 });
 

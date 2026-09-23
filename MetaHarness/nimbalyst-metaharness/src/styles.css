@@ -658,6 +658,24 @@
   color: var(--metaharness-muted);
 }
 
+.metaharness-run-actions__recover {
+  display: grid;
+  gap: 12px;
+}
+
+.metaharness-run-actions__recover textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 240px;
+  padding: 10px;
+  border: 1px solid var(--metaharness-border);
+  border-radius: 7px;
+  background: var(--metaharness-bg);
+  color: var(--metaharness-text);
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  resize: vertical;
+}
+
 @media (max-width: 560px) {
   .metaharness-approval__steps > label {
     grid-template-columns: 1fr;

@@ -7,6 +7,7 @@ import { PlanView } from './PlanView';
 import { StepsView } from './StepsView';
 import { ProgressView } from './ProgressView';
 import { ChecksView, DiagnosticsView, DiffView, ResultsView, ReviewView, UsageView } from './RunArtifactViews';
+import { deriveRunActions } from './runActions';
 
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
 type Data = Record<string, unknown>;
@@ -21,7 +22,9 @@ function unwrap(value: unknown): unknown {
   const result = object(value);
   if (result.ok === false) {
     const error = object(result.error);
-    throw new Error(typeof error.message === 'string' ? error.message : 'MetaHarness backend call failed.');
+    const failure = new Error(typeof error.message === 'string' ? error.message : 'MetaHarness backend call failed.') as Error & { httpStatus?: number };
+    if (typeof error.httpStatus === 'number') failure.httpStatus = error.httpStatus;
+    throw failure;
   }
   return value;
 }
@@ -40,9 +43,13 @@ export function RunDetail({ runId, run, callBackendTool, onBack, pollIntervalMs 
   openFile?: (path: string) => void;
 }) {
   const [detail, setDetail] = useState<Data>();
+  const [capabilities, setCapabilities] = useState<Data>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [actionBusy, setActionBusy] = useState(false);
+  const [replacementPlan, setReplacementPlan] = useState('');
+  const [confirmRecovery, setConfirmRecovery] = useState(false);
+  const [progressGeneration, setProgressGeneration] = useState(0);
   const [activeTab, setActiveTab] = useState('Overview');
   const [artifact, setArtifact] = useState<Data>({});
   const actionInFlight = useRef(false);
@@ -71,29 +78,56 @@ export function RunDetail({ runId, run, callBackendTool, onBack, pollIntervalMs 
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
+    if (!callBackendTool) return;
+    let active = true;
+    void callBackendTool('metaharness.get_config').then((raw) => {
+      const config = object(unwrap(raw));
+      if (active) setCapabilities(object(config.capabilities));
+    }).catch(() => { if (active) setCapabilities(undefined); });
+    return () => { active = false; };
+  }, [callBackendTool]);
+  useEffect(() => {
     if (!callBackendTool) return undefined;
     const timer = window.setInterval(() => { void refresh(true); }, pollIntervalMs);
     return () => window.clearInterval(timer);
   }, [callBackendTool, pollIntervalMs, refresh]);
-  const decide = useCallback(async (kind: 'plan' | 'scope', decision: 'APPROVE' | 'REJECT', input?: Data) => {
+  const mutationError = (caught: unknown): string => {
+    const status = typeof caught === 'object' && caught !== null && 'httpStatus' in caught
+      ? (caught as { httpStatus?: unknown }).httpStatus : undefined;
+    return status === 409
+      ? 'The run changed before this action could be applied. Data has been refreshed.'
+      : errorMessage(caught);
+  };
+  const mutate = useCallback(async (tool: string, args: Data) => {
     if (!callBackendTool || actionInFlight.current) return;
     actionInFlight.current = true;
     setActionBusy(true);
     setError('');
     try {
-      const tool = kind === 'plan' ? 'metaharness.approve_run' : 'metaharness.approve_scope';
-      const result = await callBackendTool(tool, { runId, input: input ?? { decision } });
-      unwrap(result);
+      unwrap(await callBackendTool(tool, args));
+      setConfirmRecovery(false);
+      setProgressGeneration((value) => value + 1);
       await refresh(true, true);
     } catch (caught) {
-      setError(errorMessage(caught));
+      setError(mutationError(caught));
+      setProgressGeneration((value) => value + 1);
       await refresh(true, true);
     } finally {
       actionInFlight.current = false;
       setActionBusy(false);
     }
-  }, [callBackendTool, refresh, runId]);
-  const displayed = { ...object(run), ...detail };
+    setProgressGeneration((value) => value + 1);
+  }, [callBackendTool, refresh]);
+  const displayed: Data = { ...object(run), ...detail, capabilities: detail?.capabilities ?? capabilities };
+  const actions = deriveRunActions(displayed);
+  const recovery = object(displayed.plan_recovery);
+  const maxPlanBytes = typeof recovery.max_bytes === 'number' && Number.isFinite(recovery.max_bytes)
+    ? Math.max(0, recovery.max_bytes) : 0;
+  const planBytes = new TextEncoder().encode(replacementPlan).length;
+  const decide = useCallback(async (kind: 'plan' | 'scope', decision: 'APPROVE' | 'REJECT', input?: Data) => {
+    const tool = kind === 'plan' ? 'metaharness.approve_run' : 'metaharness.approve_scope';
+    await mutate(tool, { runId, input: input ?? { decision } });
+  }, [mutate, runId]);
   useEffect(() => {
     if (!detail || !callBackendTool) return;
     const cycle = typeof detail.cycle === 'number' && detail.cycle > 0 ? detail.cycle : 1;
@@ -134,7 +168,27 @@ export function RunDetail({ runId, run, callBackendTool, onBack, pollIntervalMs 
     {error && <p className="metaharness-error" role="alert">{error}</p>}
     {!detail && loading && <p className="metaharness-muted" role="status">Loading run…</p>}
     {detail && <>
-      <RunApproval runId={runId} data={displayed} callBackendTool={callBackendTool} disabled={actionBusy} onDecision={decide} />
+      {(actions.canResume || actions.canRecoverPlan) && <section className="metaharness-approval metaharness-run-actions" aria-label="Run actions">
+        {actions.canResume && <button type="button" className="metaharness-button" disabled={actionBusy} onClick={() => void mutate('metaharness.resume_run', { runId })}>{actions.resumeLabel ?? 'Resume run'}</button>}
+        {actions.canRecoverPlan && <div className="metaharness-run-actions__recover">
+          <h2>REPLACE PLAN</h2>
+          <p>Replace the rejected or invalid planner output with a META PLAN v2 document.</p>
+          {(typeof displayed.planner_raw === 'string' || typeof object(displayed.plan).raw === 'string') && <details><summary>Rejected / invalid plan</summary><pre>{String(displayed.planner_raw ?? object(displayed.plan).raw)}</pre></details>}
+          {typeof recovery.reason === 'string' && <p>{recovery.reason}</p>}
+          <label htmlFor="metaharness-replacement-plan">Replacement META PLAN v2</label>
+          <textarea id="metaharness-replacement-plan" value={replacementPlan} disabled={actionBusy} onChange={(event) => { setReplacementPlan(event.target.value); setConfirmRecovery(false); }} rows={14} />
+          <p aria-live="polite">{planBytes} / {maxPlanBytes} bytes UTF-8</p>
+          <button type="button" className="metaharness-button" disabled={actionBusy || !replacementPlan.trim() || maxPlanBytes === 0 || planBytes > maxPlanBytes} onClick={() => setConfirmRecovery(true)}>Review replacement</button>
+          {confirmRecovery && <div role="dialog" aria-modal="true" aria-label="Confirm plan replacement" className="metaharness-approval__dialog">
+            <p>Replace the rejected plan with this META PLAN v2? MetaHarness will validate it before continuing.</p>
+            <div className="metaharness-approval__actions">
+              <button type="button" className="metaharness-secondary-button" disabled={actionBusy} onClick={() => setConfirmRecovery(false)}>Keep editing</button>
+              <button type="button" className="metaharness-button" disabled={actionBusy || planBytes > maxPlanBytes} onClick={() => void mutate('metaharness.recover_plan', { runId, input: { plan: replacementPlan } })}>REPLACE PLAN &amp; CONTINUE</button>
+            </div>
+          </div>}
+        </div>}
+      </section>}
+      <RunApproval runId={runId} data={displayed} callBackendTool={callBackendTool} disabled={actionBusy} onDecision={decide} canApprovePlan={actions.canApprovePlan} canApproveScope={actions.canApproveScope} />
       <nav className="metaharness-run-tabs" aria-label="Run detail views">{tabs.map((tab) => <button type="button" role="tab" aria-selected={activeTab === tab} key={tab} onClick={() => setActiveTab(tab)}>{tab}</button>)}</nav>
       <div role="tabpanel" aria-label={activeTab}>
         {activeTab === 'Overview' && <RunSummary data={displayed} />}
@@ -144,7 +198,7 @@ export function RunDetail({ runId, run, callBackendTool, onBack, pollIntervalMs 
         {activeTab === 'Review' && <ReviewView data={{ ...displayed, review: displayed.review ?? parseArtifact(artifact['review.json']), reviewer_raw: displayed.reviewer_raw ?? object(artifact['reviewer.raw.md']).content, revision: displayed.revision ?? parseArtifact(artifact['revision.json']) }} />}
         {activeTab === 'Diff' && <DiffView data={{ ...displayed, candidate: { ...object(displayed.candidate), changed_files: object(displayed.candidate).changed_files ?? artifactFileList(artifact['changed-files.txt']), diff_tail: object(artifact['diff.patch']).content ?? object(displayed.candidate).diff_tail, diff_truncated: object(artifact['diff.patch']).truncated ?? diffIsTruncated(object(displayed.candidate).diff_tail) } }} workspacePath={propsWorkspace(workspacePath)} openFile={openFile} />}
         {activeTab === 'Usage' && <UsageView data={displayed} />}
-        {activeTab === 'Logs' && <ProgressView runId={runId} status={typeof displayed.status === 'string' ? displayed.status : undefined} callBackendTool={callBackendTool} intervalMs={pollIntervalMs} />}
+        {activeTab === 'Logs' && <ProgressView key={`${runId}:${progressGeneration}`} runId={runId} status={typeof displayed.status === 'string' ? displayed.status : undefined} callBackendTool={callBackendTool} intervalMs={pollIntervalMs} />}
         {activeTab === 'Diagnostics' && <DiagnosticsView data={displayed} artifact={object(artifact['diagnostics.json'])} />}
         {activeTab === 'Results' && <ResultsView data={displayed} />}
       </div>

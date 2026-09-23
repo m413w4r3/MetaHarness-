@@ -84,15 +84,17 @@ function requireOk(value: unknown): unknown {
   return value;
 }
 
-export function RunApproval({ runId, data, callBackendTool, disabled, onDecision }: {
+export function RunApproval({ runId, data, callBackendTool, disabled, onDecision, canApprovePlan, canApproveScope }: {
   runId: string;
   data: Data;
   callBackendTool?: BackendCall;
   disabled: boolean;
   onDecision: (kind: 'plan' | 'scope', decision: 'APPROVE' | 'REJECT', input?: Data) => Promise<void>;
+  canApprovePlan?: boolean;
+  canApproveScope?: boolean;
 }) {
-  const planPending = awaitingPlan(data);
-  const scopePending = awaitingScope(data);
+  const planPending = canApprovePlan ?? awaitingPlan(data);
+  const scopePending = canApproveScope ?? awaitingScope(data);
   const [profiles, setProfiles] = useState<ModelProfile[]>([]);
   const [profileError, setProfileError] = useState('');
   const [values, setValues] = useState<Record<string, string>>({});
