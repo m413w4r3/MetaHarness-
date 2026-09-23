@@ -24,6 +24,8 @@ export function MetaHarnessPanel({ host }: PanelHostProps) {
         view={view}
         onViewChange={setView}
         onOpenSettings={() => host.openSettings()}
+        workspacePath={host.workspacePath}
+        openFile={(path) => host.openFile(path)}
       />
     </main>
   );

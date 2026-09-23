@@ -42,12 +42,16 @@ export function RunsDashboard({
   view,
   onViewChange,
   onOpenSettings,
+  workspacePath,
+  openFile,
 }: {
   callBackendTool?: BackendCall;
   settings: MetaHarnessSettingsData;
   view: PanelView;
   onViewChange: (view: PanelView) => void;
   onOpenSettings: () => void;
+  workspacePath: string;
+  openFile: (path: string) => void;
 }) {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [connection, setConnection] = useState<ConnectionStatus>();
@@ -108,7 +112,7 @@ export function RunsDashboard({
     return <NewRunForm callBackendTool={callBackendTool} settings={effectiveSettings} onBack={() => onViewChange({ kind: 'dashboard' })} onCreated={(runId) => onViewChange({ kind: 'run', runId })} />;
   }
   if (view.kind === 'run') {
-    return <RunDetail runId={view.runId} run={selectedRun} callBackendTool={callBackendTool} pollIntervalMs={settings.pollIntervalMs} onBack={() => onViewChange({ kind: 'dashboard' })} />;
+    return <RunDetail runId={view.runId} run={selectedRun} callBackendTool={callBackendTool} pollIntervalMs={settings.pollIntervalMs} workspacePath={workspacePath} openFile={openFile} onBack={() => onViewChange({ kind: 'dashboard' })} />;
   }
 
   if (!callBackendTool) {

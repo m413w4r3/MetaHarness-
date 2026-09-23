@@ -82,6 +82,21 @@ test('health timeout is bounded', async () => {
   }
 });
 
+test('get_artifact reads a named text artifact without mutation credentials', async () => {
+  let seen;
+  const server = await listen((req, res) => {
+    seen = { method: req.method, path: req.url, token: req.headers['x-metaharness-token'] };
+    return json(res, 200, { run_id: 'run-1', name: 'diagnostics.json', content: '{"ok":true}', truncated: false });
+  });
+  try {
+    const client = new MetaHarnessClient({ baseUrl: `http://127.0.0.1:${port(server)}`, tokenFile: tokenFile('artifact.token') });
+    const artifact = await client.getArtifact('run-1', 'diagnostics.json');
+    assert.equal(artifact.content, '{"ok":true}');
+    assert.deepEqual(seen, { method: 'GET', path: '/api/v1/runs/run-1/artifact?name=diagnostics.json', token: undefined });
+    await assert.rejects(client.getArtifact('run-1', '../state.json'), errorCode('INVALID_ARGUMENT'));
+  } finally { await close(server); }
+});
+
 test('403 mutation, invalid JSON, and missing token are standardized', async () => {
   const forbidden = await listen((_req, res) => json(res, 403, { message: 'mutation token required' }));
   try {
@@ -262,7 +277,7 @@ test('activate registers the complete tool surface with default config safely', 
   }, { port: await freePort() });
   assert.deepEqual(registered, [
     'status', 'start', 'stop', 'get_config', 'model_profiles', 'list_runs',
-    'get_run', 'progress', 'create_run', 'approve_run', 'approve_scope',
+    'get_run', 'get_artifact', 'progress', 'create_run', 'approve_run', 'approve_scope',
     'resume_run', 'recover_plan', 'doctor',
   ]);
   assert.deepEqual(await backend.methods.status(), {

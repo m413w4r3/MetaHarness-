@@ -137,6 +137,7 @@ export interface MetaHarnessBackend {
     get_run: (
       input: { runId: string } | string
     ) => Promise<BackendToolResult<RunDetail>>;
+    get_artifact: (input: { runId: string; name: string }) => Promise<BackendToolResult<JsonObject>>;
     progress: (
       input: { runId: string; offset: number }
     ) => Promise<BackendToolResult<ProgressResponse>>;

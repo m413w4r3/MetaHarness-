@@ -347,6 +347,20 @@
 .metaharness-step-card__facts { border: 0; border-radius: 0; }
 .metaharness-step-card__facts > div { padding: 8px 10px; }
 
+.metaharness-run-tabs { display: flex; flex-wrap: wrap; gap: 5px; margin: 18px 0; border-bottom: 1px solid var(--metaharness-border); }
+.metaharness-run-tabs button { padding: 8px 11px; border: 0; border-bottom: 2px solid transparent; color: var(--metaharness-muted); background: transparent; cursor: pointer; font: inherit; }
+.metaharness-run-tabs button[aria-selected="true"] { border-bottom-color: var(--metaharness-accent); color: var(--metaharness-accent); }
+.metaharness-check-row,.metaharness-file-row { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 9px 11px; border-bottom: 1px solid var(--metaharness-border); }
+.metaharness-check-row pre { flex-basis: 100%; max-height: 180px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.metaharness-check-row.is-failed { color: var(--metaharness-danger, #dc5b5b); }
+.metaharness-artifact-group { margin-top: 14px; }
+.metaharness-artifact-group h3 { font-size: 14px; }
+.metaharness-file-row code { flex: 1; overflow-wrap: anywhere; }
+.metaharness-diff { max-height: 520px; padding: 12px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--metaharness-surface); }
+.metaharness-warning { color: var(--metaharness-warning, #d7a82e); }
+.metaharness-usage-list { display: grid; gap: 10px; }
+.metaharness-usage-list .metaharness-detail-grid { padding: 10px; }
+
 .metaharness-progress { min-width: 0; }
 .metaharness-progress__header,
 .metaharness-progress__actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }

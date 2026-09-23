@@ -175,7 +175,12 @@ for (const [name, payload] of runFixtures) {
       assert.equal(screen.queryByRole('button', { name: 'APPROVE & CONTINUE' }), null);
       assert.equal(screen.queryByRole('button', { name: 'REJECT PLAN' }), null);
     }
+    if (name === 'planning') {
+      fireEvent.click(screen.getByRole('tab', { name: 'Plan' }));
+      assert.ok(screen.getByText('# Draft plan'));
+    }
     if (name === 'implementing') {
+      fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
       assert.ok(screen.getByText('API search endpoint'));
       assert.equal(screen.getByText('8c12d77').title, '8c12d77abcdef');
       assert.ok(screen.getByText('4'));
@@ -185,6 +190,65 @@ for (const [name, payload] of runFixtures) {
     if (name === 'published') assert.ok(screen.getByText('pull_request'));
   });
 }
+
+test('run detail tabs show empty states when each optional artifact is absent', async () => {
+  const callBackendTool = async (tool) => tool === 'metaharness.get_run' ? { run_id: 'empty-views', status: 'published' } : tool === 'metaharness.progress' ? { events: [], next_offset: 0 } : {};
+  render(React.createElement(RunDetail, { runId: 'empty-views', callBackendTool, onBack: () => {} }));
+  await screen.findByRole('tab', { name: 'Overview' });
+  for (const [tab, expected] of [['Plan', 'Plan has not been produced.'], ['Steps', 'No implementation steps are available yet.'], ['Checks', 'No data available yet.'], ['Review', 'No data available yet.'], ['Diff', 'Diff is not available.'], ['Usage', 'No data available yet.'], ['Logs', 'Run is terminal; live polling stopped.'], ['Diagnostics', 'No data available yet.'], ['Results', 'No data available yet.']]) {
+    fireEvent.click(screen.getByRole('tab', { name: tab }));
+    assert.ok(await screen.findByText(expected), `${tab} should have an empty state`);
+  }
+});
+
+test('run tabs display partial check, review, diff, usage and diagnostic artifacts', async () => {
+  const callBackendTool = async (tool) => tool === 'metaharness.get_run' ? {
+    run_id: 'partial-views', status: 'implementing', cycle: 2, planner_raw: 'draft plan',
+    implementation_bundle: { steps: [{ id: 'S01', title: 'Implement API' }] },
+    checks: { results: [{ id: 'lint', passed: true, duration_seconds: 4.2 }] },
+    review: { verdict: 'APPROVE', category: 'IMPLEMENTATION', reviewer_profile: 'review-a', cycle: 2, candidate_sha: 'abc123' },
+    reviewer_raw: 'raw reviewer note',
+    candidate: { changed_files: ['src/new.ts'], diff_tail: 'diff contents', diff_truncated: true },
+    usage: { phases: [{ phase: 'planner', input_tokens: 10, output_tokens: 5, total_tokens: 15 }] },
+    diagnostics: { content: 'diagnostic report' },
+    results: { status: 'passed' },
+  } : tool === 'metaharness.progress' ? { events: ['step started'], next_offset: 20 } : {};
+  const opened = [];
+  render(React.createElement(RunDetail, { runId: 'partial-views', callBackendTool, workspacePath: '/workspace/project', openFile: (path) => opened.push(path), onBack: () => {} }));
+  await screen.findByRole('tab', { name: 'Overview' });
+  fireEvent.click(screen.getByRole('tab', { name: 'Plan' }));
+  assert.ok(await screen.findByText('draft plan'));
+  fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
+  assert.ok(await screen.findByText('Implement API'));
+  fireEvent.click(screen.getByRole('tab', { name: 'Checks' }));
+  assert.ok(await screen.findByText('lint'));
+  fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+  assert.ok(await screen.findByText('IMPLEMENTATION'));
+  assert.ok(screen.getByText('raw reviewer note'));
+  fireEvent.click(screen.getByRole('tab', { name: 'Diff' }));
+  assert.ok(await screen.findByText('diff contents'));
+  fireEvent.click(screen.getByRole('button', { name: 'Open file' }));
+  assert.deepEqual(opened, ['/workspace/project/src/new.ts']);
+  fireEvent.click(screen.getByRole('tab', { name: 'Usage' }));
+  assert.ok(await screen.findByText(/Input: 10/));
+  fireEvent.click(screen.getByRole('tab', { name: 'Diagnostics' }));
+  assert.ok(await screen.findByText('diagnostic report'));
+  fireEvent.click(screen.getByRole('tab', { name: 'Results' }));
+  assert.ok(await screen.findByText(/passed/));
+  fireEvent.click(screen.getByRole('tab', { name: 'Logs' }));
+  assert.ok(await screen.findByText('step started'));
+});
+
+test('Open file rejects traversal and absolute paths', async () => {
+  const callBackendTool = async (tool) => tool === 'metaharness.get_run' ? { candidate: { changed_files: ['../outside', '/etc/passwd', 'safe/file.ts'], diff_tail: '' } } : {};
+  const opened = [];
+  render(React.createElement(RunDetail, { runId: 'paths', callBackendTool, workspacePath: '/workspace', openFile: (path) => opened.push(path), onBack: () => {} }));
+  await screen.findByRole('tab', { name: 'Diff' });
+  fireEvent.click(screen.getByRole('tab', { name: 'Diff' }));
+  const buttons = screen.getAllByRole('button', { name: 'Open file' });
+  buttons.forEach((button) => fireEvent.click(button));
+  assert.deepEqual(opened, ['/workspace/safe/file.ts']);
+});
 
 test('polling timer is cleared on unmount and overlapping polls are skipped', async () => {
   const originalSetInterval = window.setInterval;

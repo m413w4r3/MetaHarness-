@@ -438,6 +438,18 @@ export class MetaHarnessClient {
     );
   }
 
+  async getArtifact(runId: string, name: string): Promise<JsonObject> {
+    if (!name || name.includes('..') || name.startsWith('/') || name.includes('\\')) {
+      throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'artifact name is invalid');
+    }
+    return jsonResponseObject(
+      await this.request<unknown>(
+        'GET', `/api/v1/runs/${encodeURIComponent(validateRunId(runId))}/artifact?name=${name}`,
+      ),
+      'get_artifact',
+    );
+  }
+
   async progress(runId: string, offset: number): Promise<ProgressResponse> {
     if (!Number.isInteger(offset) || offset < 0) {
       throw new MetaHarnessBackendError('INVALID_ARGUMENT', 'offset must be a non-negative integer');
@@ -819,6 +831,10 @@ export const MCP_TOOL_DESCRIPTORS: BackendToolDescriptor[] = [
   descriptor('get_run', 'Return one MetaHarness run.', {
     type: 'object', properties: { runId: { type: 'string' } }, required: ['runId'], additionalProperties: false,
   }),
+  descriptor('get_artifact', 'Return one allowlisted text artifact from a MetaHarness run.', {
+    type: 'object', properties: { runId: { type: 'string' }, name: { type: 'string' } },
+    required: ['runId', 'name'], additionalProperties: false,
+  }),
   descriptor('progress', 'Return bounded progress events for one run.', {
     type: 'object', properties: { runId: { type: 'string' }, offset: { type: 'integer', minimum: 0 } },
     required: ['runId', 'offset'], additionalProperties: false,
@@ -915,6 +931,10 @@ export async function activate(
     list_runs: () => toolError(() => runtime.client.listRuns(), runtime.isDevelopment),
     get_run: (input) => toolError(
       () => runtime.client.getRun(argumentRunId(input)),
+      runtime.isDevelopment,
+    ),
+    get_artifact: (input) => toolError(
+      () => runtime.client.getArtifact(validateRunId(input.runId), String(input.name ?? '')),
       runtime.isDevelopment,
     ),
     progress: (input) => toolError(
