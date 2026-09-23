@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -8,6 +9,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.config import ConfigError, load_config
+from metaharness.models import CheckConfig
+from metaharness.planning_v2 import render_safe_check_catalogue
 
 
 VALID_CONFIG = """
@@ -131,6 +134,78 @@ class ConfigTests(unittest.TestCase):
         with example.open("rb") as stream:
             raw = tomllib.load(stream)
         self.assertEqual(raw["max_diff_bytes"], 2_000_000)
+
+    def test_autowork_aw010_trusted_check_catalogue(self) -> None:
+        example = Path(__file__).resolve().parents[1] / "examples" / "autowork.toml"
+        with example.open("rb") as stream:
+            raw = tomllib.load(stream)
+
+        checks = {check["id"]: check for check in raw["check_catalog"]}
+        self.assertEqual(raw["default_check_ids"], ["lint", "typecheck", "test"])
+        self.assertIn("frontend-e2e", checks)
+        self.assertEqual(checks["frontend-e2e"]["cwd"], "frontend")
+        self.assertEqual(tuple(checks["frontend-e2e"]["argv"]), ("pnpm", "test:e2e"))
+        self.assertNotIn("frontend-e2e", raw["default_check_ids"])
+        self.assertIn("alembic-heads", checks)
+        self.assertEqual(
+            tuple(checks["alembic-heads"]["argv"][:2]), ("sh", "-c")
+        )
+
+        trusted = tuple(
+            CheckConfig(
+                name=check["id"],
+                argv=tuple(check["argv"]),
+                cwd=check.get("cwd", "."),
+                timeout_seconds=check.get("timeout_seconds", 3600),
+                required=check.get("required", True),
+                preflight_argv=tuple(check.get("preflight_argv", ())),
+                description=check.get("description", ""),
+            )
+            for check in raw["check_catalog"]
+        )
+        rendered_catalogue = render_safe_check_catalogue(trusted)
+        for check_id in checks:
+            with self.subTest(check_id=check_id):
+                self.assertIn(f"ID: {check_id}", rendered_catalogue)
+
+    def test_alembic_heads_check_accepts_only_the_baseline_head(self) -> None:
+        example = Path(__file__).resolve().parents[1] / "examples" / "autowork.toml"
+        with example.open("rb") as stream:
+            raw = tomllib.load(stream)
+        check = next(item for item in raw["check_catalog"] if item["id"] == "alembic-heads")
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            fake_uv = directory / "uv"
+            fake_uv.write_text(
+                "#!/bin/sh\nprintf '%s' \"$FAKE_HEADS\"\n",
+                encoding="utf-8",
+            )
+            fake_uv.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{directory}{os.pathsep}{environment.get('PATH', '')}"
+
+            def run_heads(output: str) -> subprocess.CompletedProcess[str]:
+                test_environment = environment | {"FAKE_HEADS": output}
+                return subprocess.run(
+                    check["argv"],
+                    cwd=directory,
+                    env=test_environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            exact = run_heads("0001_baseline (head)")
+            self.assertEqual(exact.returncode, 0)
+            self.assertEqual(exact.stdout, "0001_baseline (head)\n")
+
+            multiple = run_heads("0001_baseline (head)\n0002_other (head)")
+            self.assertNotEqual(multiple.returncode, 0)
+            self.assertEqual(
+                multiple.stdout,
+                "0001_baseline (head)\n0002_other (head)\n",
+            )
 
     def test_pull_request_creation_requires_run_branch_publication(self) -> None:
         cases = (

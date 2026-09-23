@@ -275,10 +275,17 @@ timeout_seconds = 54000
 preflight_argv = ["docker", "info"]
 
 [[check_catalog]]
+id = "frontend-e2e"
+description = "Frontend end-to-end acceptance gate."
+cwd = "frontend"
+argv = ["pnpm", "test:e2e"]
+timeout_seconds = 54000
+
+[[check_catalog]]
 id = "alembic-heads"
 description = "Alembic migration head evidence."
 cwd = "backend"
-argv = ["uv", "run", "alembic", "heads"]
+argv = ["sh", "-c", "set -eu; out=\"$(uv run alembic heads)\"; printf '%s\\n' \"$out\"; test \"$out\" = '0001_baseline (head)'"]
 timeout_seconds = 300
 
 [[workspace_setup]]
