@@ -7,6 +7,7 @@ export function MetaHarnessSettings({ storage, theme, workspacePath, callBackend
       storage={storage}
       theme={theme}
       workspacePath={workspacePath}
+      mode="settings"
       callBackendTool={callBackendTool
         ? (name, args) => callBackendTool(name, args)
         : undefined}

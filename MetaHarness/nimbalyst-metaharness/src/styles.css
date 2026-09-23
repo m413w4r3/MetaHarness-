@@ -789,3 +789,196 @@
   color: var(--metaharness-muted);
   overflow-wrap: anywhere;
 }
+
+/* Shared panel header and configuration view */
+.metaharness-panel-header__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.metaharness-configuration > .metaharness-panel-header {
+  justify-self: stretch;
+}
+
+.metaharness-icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--metaharness-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.metaharness-icon-button:hover {
+  border-color: var(--metaharness-border);
+  background: var(--metaharness-surface);
+  color: var(--metaharness-text);
+}
+
+.metaharness-config-view {
+  max-width: 900px;
+}
+
+.metaharness-config-view > h1 {
+  margin: 0 0 8px;
+  font-size: 25px;
+}
+
+.metaharness-config-section {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--metaharness-border);
+}
+
+.metaharness-config-section h2 {
+  margin: 0;
+  color: var(--metaharness-muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.metaharness-config-section__label {
+  margin: 4px 0 0;
+  color: var(--metaharness-accent);
+  font-size: 13px;
+}
+
+.metaharness-settings--embedded {
+  min-height: 0;
+}
+
+.metaharness-settings--embedded .metaharness-settings__form {
+  margin-top: 16px;
+}
+
+.metaharness-settings__dirty {
+  color: var(--metaharness-warning);
+}
+
+.metaharness-settings__saved {
+  color: var(--metaharness-muted);
+}
+
+.metaharness-config-file {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.metaharness-config-file code {
+  font-family: var(--nim-font-mono, ui-monospace, monospace);
+  overflow-wrap: anywhere;
+}
+
+.metaharness-config-file__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.metaharness-server-status,
+.metaharness-effective-config {
+  display: grid;
+  gap: 18px;
+  margin-top: 16px;
+}
+
+.metaharness-server-status {
+  gap: 0;
+}
+
+.metaharness-effective-config__group h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+
+.metaharness-effective-config__row {
+  display: grid;
+  grid-template-columns: minmax(140px, 240px) minmax(0, 1fr);
+  gap: 16px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--metaharness-border);
+  font-size: 13px;
+}
+
+.metaharness-effective-config__row > span:first-child {
+  color: var(--metaharness-muted);
+}
+
+.metaharness-effective-config__row > span:last-child {
+  overflow-wrap: anywhere;
+}
+
+.metaharness-effective-config__checks,
+.metaharness-doctor__checks {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+}
+
+.metaharness-config-note {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--metaharness-border);
+  border-left: 3px solid var(--metaharness-warning);
+  border-radius: 8px;
+}
+
+.metaharness-config-note p {
+  margin: 6px 0 0;
+  color: var(--metaharness-muted);
+}
+
+.metaharness-doctor {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--metaharness-border);
+  border-radius: 8px;
+}
+
+.metaharness-doctor summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.metaharness-doctor__checks {
+  margin-top: 10px;
+}
+
+.metaharness-doctor__check {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.metaharness-doctor__status {
+  min-width: 36px;
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 11px;
+}
+
+.metaharness-doctor__check--pass { color: var(--metaharness-success); }
+.metaharness-doctor__check--warn,
+.metaharness-doctor__check--warning { color: var(--metaharness-warning); }
+.metaharness-doctor__check--fail { color: var(--metaharness-danger); }
+
+.metaharness-doctor__raw {
+  max-height: 240px;
+  overflow: auto;
+  font-size: 12px;
+}

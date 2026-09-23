@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ExtensionStorage } from '@nimbalyst/extension-sdk';
 import { isBackendFailure } from '../contract';
 import { DEFAULT_SETTINGS, SETTINGS_KEY, validateSettings, type MetaHarnessSettingsData } from './settings';
@@ -11,6 +11,16 @@ export interface MetaHarnessConfigFormProps {
   workspacePath?: string;
   callBackendTool?: BackendCall;
   onConfigured?: () => void;
+  /** Called after every successful persist, tested or not, with the saved settings. */
+  onSaved?: (settings: MetaHarnessSettingsData) => void;
+  /** Reports whether the inputs differ from the persisted settings. */
+  onDirtyChange?: (dirty: boolean) => void;
+  mode?: 'initial' | 'settings' | 'embedded';
+  showTitle?: boolean;
+}
+
+function sameSettings(left: MetaHarnessSettingsData, right: MetaHarnessSettingsData): boolean {
+  return (Object.keys(DEFAULT_SETTINGS) as Array<keyof MetaHarnessSettingsData>).every((key) => left[key] === right[key]);
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -63,20 +73,29 @@ export function MetaHarnessConfigForm({
   workspacePath,
   callBackendTool,
   onConfigured,
+  onSaved,
+  onDirtyChange,
+  mode = 'initial',
+  showTitle = mode !== 'embedded',
 }: MetaHarnessConfigFormProps) {
-  const [settings, setSettings] = useState<MetaHarnessSettingsData>(() => ({
+  const [savedSettings, setSavedSettings] = useState<MetaHarnessSettingsData>(() => ({
     ...DEFAULT_SETTINGS,
     ...(storage.get<Partial<MetaHarnessSettingsData>>(SETTINGS_KEY) ?? {}),
   }));
+  const [settings, setSettings] = useState<MetaHarnessSettingsData>(savedSettings);
   const [validationError, setValidationError] = useState('');
   const [actionError, setActionError] = useState('');
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
+  const dirty = !sameSettings(settings, savedSettings);
+
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
 
   function update<K extends keyof MetaHarnessSettingsData>(key: K, value: MetaHarnessSettingsData[K]) {
     setSettings((current) => ({ ...current, [key]: value }));
     setValidationError('');
     setActionError('');
+    setStatus('');
   }
 
   async function save(test: boolean) {
@@ -86,9 +105,13 @@ export function MetaHarnessConfigForm({
     const invalid = validateSettings(settings);
     if (invalid) { setValidationError(invalid); return; }
     setBusy(true);
+    let persisted = false;
     try {
       await storage.set(SETTINGS_KEY, settings);
+      persisted = true;
+      setSavedSettings(settings);
       if (!test) {
+        setStatus('Saved');
         onConfigured?.();
         return;
       }
@@ -109,13 +132,20 @@ export function MetaHarnessConfigForm({
       setActionError(friendlyError(error, settings.port));
     } finally {
       setBusy(false);
+      if (persisted) onSaved?.(settings);
     }
   }
 
   return (
-    <section className="metaharness-settings" aria-labelledby="metaharness-config-title" data-theme={theme}>
-      <div className="metaharness-settings__eyebrow">Project settings</div>
-      <h1 id="metaharness-config-title">Configure MetaHarness</h1>
+    <section
+      className={`metaharness-settings metaharness-settings--${mode}`}
+      {...(showTitle ? { 'aria-labelledby': 'metaharness-config-title' } : { 'aria-label': 'MetaHarness connection settings' })}
+      data-theme={theme}
+    >
+      {showTitle && <>
+        <div className="metaharness-settings__eyebrow">Project settings</div>
+        <h1 id="metaharness-config-title">Configure MetaHarness</h1>
+      </>}
       <div className="metaharness-settings__form">
         <label>MetaHarness executable
           <input value={settings.executable} onChange={(event) => update('executable', event.target.value)} />
@@ -138,7 +168,8 @@ export function MetaHarnessConfigForm({
       </div>
       {validationError && <p className="metaharness-settings__error" role="alert">{validationError}</p>}
       {actionError && <p className="metaharness-settings__error" role="alert">{actionError}</p>}
-      {status && <p className={status === 'Connected' ? 'metaharness-settings__connected' : 'metaharness-settings__disconnected'} role="status">{status}</p>}
+      {dirty && !busy && <p className="metaharness-settings__dirty" role="status">Unsaved changes — connection not retested</p>}
+      {status && !dirty && <p className={status === 'Connected' ? 'metaharness-settings__connected' : status === 'Saved' ? 'metaharness-settings__saved' : 'metaharness-settings__disconnected'} role="status">{status}</p>}
       <div className="metaharness-settings__actions">
         <button className="metaharness-button" type="button" onClick={() => void save(false)} disabled={busy}>SAVE</button>
         <button className="metaharness-button metaharness-button--secondary" type="button" onClick={() => void save(true)} disabled={busy}>

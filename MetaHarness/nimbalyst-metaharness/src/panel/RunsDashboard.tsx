@@ -7,9 +7,15 @@ import { StatusBadge } from './StatusBadge';
 import { classifyRunStatus, type RunCategory } from './runStatus';
 import { RunDetail } from './run/RunDetail';
 import { isBackendFailure } from '../contract';
+import { PanelHeader } from './PanelHeader';
 
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
-type PanelView = { kind: 'dashboard' } | { kind: 'run'; runId: string } | { kind: 'new-run' };
+export type MetaHarnessPanelView =
+  | { kind: 'dashboard' }
+  | { kind: 'new-run' }
+  | { kind: 'run'; runId: string }
+  | { kind: 'configuration' };
+type PanelView = MetaHarnessPanelView;
 type ConnectionStatus = { configured?: boolean; connected?: boolean; recommendedConfigPath?: string };
 
 function object(value: unknown): Record<string, unknown> {
@@ -43,7 +49,9 @@ export function RunsDashboard({
   onViewChange,
   workspacePath,
   openFile,
+  onOpenConfiguration,
 }: {
+  onOpenConfiguration?: () => void;
   callBackendTool?: BackendCall;
   settings: MetaHarnessSettingsData;
   view: PanelView;
@@ -115,22 +123,19 @@ export function RunsDashboard({
     return <RunDetail runId={view.runId} run={selectedRun} callBackendTool={callBackendTool} pollIntervalMs={settings.pollIntervalMs} workspacePath={workspacePath} openFile={openFile} onBack={() => onViewChange({ kind: 'dashboard' })} />;
   }
 
-  if (!callBackendTool) {
-    return <ConfigurationScreen />;
-  }
-  if (!loading && connection?.configured === false) {
-    return <ConfigurationScreen />;
+  if (!callBackendTool || (!loading && connection?.configured === false)) {
+    return <ConfigurationScreen configPath={settings.configPath} onOpenConfiguration={onOpenConfiguration} />;
   }
 
   return (
     <section className="metaharness-dashboard" aria-labelledby="metaharness-dashboard-title">
-      <header className="metaharness-dashboard__header">
-        <h1 id="metaharness-dashboard-title">MetaHarness</h1>
-        <span className={`metaharness-connection ${connection?.connected ? 'is-connected' : ''}`}>
-          <span className="metaharness-status-dot" aria-hidden="true" />
-          {loading && !connection ? 'Connecting…' : connection?.connected ? 'Connected' : 'Disconnected'}
-        </span>
-      </header>
+      <PanelHeader
+        titleId="metaharness-dashboard-title"
+        connection={loading && !connection ? 'Connecting…' : connection?.connected ? 'Connected' : 'Disconnected'}
+        connected={connection?.connected === true}
+        configPath={effectiveSettings.configPath}
+        onOpenConfiguration={onOpenConfiguration}
+      />
       <div className="metaharness-dashboard__actions">
         <button className="metaharness-button" type="button" onClick={() => onViewChange({ kind: 'new-run' })}>＋ New Run</button>
         <button className="metaharness-secondary-button" type="button" onClick={() => void refresh()} disabled={loading}>Refresh</button>
@@ -157,9 +162,9 @@ export function RunsDashboard({
   );
 }
 
-function ConfigurationScreen() {
+function ConfigurationScreen({ configPath, onOpenConfiguration }: { configPath?: string; onOpenConfiguration?: () => void }) {
   return <section className="metaharness-dashboard metaharness-configuration" aria-labelledby="metaharness-config-title">
-    <h1 id="metaharness-config-title">Configure MetaHarness</h1>
+    <PanelHeader title="Configure MetaHarness" titleId="metaharness-config-title" configPath={configPath} onOpenConfiguration={onOpenConfiguration} />
     <p>Set a MetaHarness configuration file to see runs for this workspace.</p>
   </section>;
 }
