@@ -41,8 +41,28 @@ export interface RunSummary extends JsonObject {
 }
 export type RunDetail = JsonObject;
 export type ProgressResponse = JsonObject;
-export type CreateRunInput = JsonObject;
 export type CreateRunResponse = JsonObject;
+
+export interface CreateRunInput extends JsonObject {
+  spec: string;
+  run_id?: string;
+  planner_profile?: string;
+  mechanical_profile?: string;
+  reasoning_profile?: string;
+  agentic_profile?: string;
+  final_reviewer_profile?: string;
+  semantic_reviser_profile?: string;
+  check_repair_profile?: string;
+  semantic_revision_enabled?: boolean;
+  max_check_repair_attempts?: number;
+  max_review_repair_cycles?: number;
+  decomposition?: string;
+  execution_mode_policy?: string;
+  single_step_max_mutable_paths?: number;
+  staged_step_max_mutable_paths?: number;
+  repair_scope_policy?: string;
+  repair_scope_max_added_paths?: number;
+}
 
 export interface ApproveRunInput extends JsonObject {
   decision: string;

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MetaHarnessSettingsData } from '../settings/MetaHarnessSettings';
 import type { RunSummary } from '../types';
 import { RunCard } from './RunCard';
+import { NewRunForm } from './NewRunForm';
 import { StatusBadge } from './StatusBadge';
 import { classifyRunStatus, type RunCategory } from './runStatus';
 
@@ -109,10 +110,10 @@ export function RunsDashboard({
 
   const selectedRun = view.kind === 'run' ? runs.find((run) => run.run_id === view.runId) : undefined;
   if (view.kind === 'new-run') {
-    return <section className="metaharness-dashboard"><button className="metaharness-link-button" onClick={() => onViewChange({ kind: 'dashboard' })}>← All runs</button><h1>New Run</h1><p className="metaharness-muted">Run creation is not available yet.</p></section>;
+    return <NewRunForm callBackendTool={callBackendTool} settings={effectiveSettings} onBack={() => onViewChange({ kind: 'dashboard' })} onCreated={(runId) => onViewChange({ kind: 'run', runId })} />;
   }
   if (view.kind === 'run') {
-    return <RunDetail runId={view.runId} run={selectedRun} onBack={() => onViewChange({ kind: 'dashboard' })} />;
+    return <RunDetail runId={view.runId} run={selectedRun} callBackendTool={callBackendTool} onBack={() => onViewChange({ kind: 'dashboard' })} />;
   }
 
   if (!callBackendTool) {
@@ -165,18 +166,31 @@ function ConfigurationScreen({ onOpenSettings }: { onOpenSettings: () => void })
   </section>;
 }
 
-function RunDetail({ runId, run, onBack }: { runId: string; run?: RunSummary; onBack: () => void }) {
-  const status = typeof run?.status === 'string' ? run.status : 'unknown';
-  const hasFailure = run?.failure !== undefined && run.failure !== null && run.failure !== '';
+function RunDetail({ runId, run, callBackendTool, onBack }: { runId: string; run?: RunSummary; callBackendTool?: BackendCall; onBack: () => void }) {
+  const [detail, setDetail] = useState<Record<string, unknown>>();
+  const [detailError, setDetailError] = useState('');
+  useEffect(() => {
+    let active = true;
+    if (!callBackendTool) return () => { active = false; };
+    void callBackendTool('metaharness.get_run', { runId }).then((value) => {
+      const result = object(unwrap(value));
+      const loaded = object(result.run ?? result);
+      if (active) setDetail(loaded);
+    }).catch((error) => { if (active) setDetailError(message(error)); });
+    return () => { active = false; };
+  }, [callBackendTool, runId]);
+  const displayed = detail ? { ...run, ...detail } : run;
+  const status = typeof displayed?.status === 'string' ? displayed.status : 'unknown';
+  const hasFailure = displayed?.failure !== undefined && displayed.failure !== null && displayed.failure !== '';
   return <section className="metaharness-dashboard" aria-labelledby="metaharness-run-detail-title">
     <button className="metaharness-link-button" type="button" onClick={onBack}>← All runs</button>
     <h1 id="metaharness-run-detail-title">{runId}</h1>
-    {run ? <dl className="metaharness-run-detail">
+    {displayed ? <dl className="metaharness-run-detail">
       <div><dt>Status</dt><dd><StatusBadge status={status} /></dd></div>
-      {run.plan_title && <div><dt>Plan</dt><dd>{run.plan_title}</dd></div>}
-      {run.updated_at && <div><dt>Updated</dt><dd>{run.updated_at}</dd></div>}
-      {run.commit_sha && <div><dt>Commit</dt><dd><code>{run.commit_sha}</code></dd></div>}
-      {hasFailure && <div><dt>Failure</dt><dd>{failureText(run.failure)}</dd></div>}
-    </dl> : <p className="metaharness-muted">This run is no longer in the current list.</p>}
+      {displayed.plan_title && <div><dt>Plan</dt><dd>{String(displayed.plan_title)}</dd></div>}
+      {displayed.updated_at && <div><dt>Updated</dt><dd>{String(displayed.updated_at)}</dd></div>}
+      {displayed.commit_sha && <div><dt>Commit</dt><dd><code>{String(displayed.commit_sha)}</code></dd></div>}
+      {hasFailure && <div><dt>Failure</dt><dd>{failureText(displayed.failure)}</dd></div>}
+    </dl> : detailError ? <p className="metaharness-error" role="alert">{detailError}</p> : <p className="metaharness-muted" role="status">Loading run…</p>}
   </section>;
 }

@@ -4,6 +4,8 @@ import { JSDOM } from 'jsdom';
 import React from 'react';
 import { classifyRunStatus } from '../src/panel/runStatus.ts';
 import { RunsDashboard } from '../src/panel/RunsDashboard.tsx';
+import { NewRunForm } from '../src/panel/NewRunForm.tsx';
+import { defaultsFromServer, validateRunForm, buildCreateRunInput } from '../src/model/runForm.ts';
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost' });
 globalThis.window = dom.window;
@@ -15,6 +17,35 @@ const { cleanup, fireEvent, render, screen, waitFor } = await import('@testing-l
 afterEach(() => cleanup());
 
 const settings = { executable: 'metaharness', configPath: '/work/metaharness.toml', port: 8765, autoStart: false, pollIntervalMs: 1000 };
+const modelProfiles = {
+  profiles: [
+    { id: 'plan-a', display_name: 'Planner A', roles: ['planner'], model: 'p1' },
+    { id: 'impl-a', display_name: 'Implementer A', roles: ['implementer'] },
+    { id: 'review-a', display_name: 'Reviewer A', roles: ['reviewer'] },
+    { id: 'revise-a', display_name: 'Reviser A', roles: ['reviser'] },
+    { id: 'repair-a', display_name: 'Repair A', roles: ['repair'] },
+  ],
+  defaults: { planner_profile: 'plan-a', mechanical: 'impl-a', reasoning: 'impl-a', agentic: 'impl-a', final_reviewer_profile: 'review-a', semantic_reviser_profile: 'revise-a', check_repair_profile: 'repair-a' },
+};
+const configResponse = { planning: { decomposition: 'balanced', execution_mode_policy: 'require-staged', single_step_max_mutable_paths: 3, staged_step_max_mutable_paths: 6 }, revision: { enabled: true, max_check_repair_attempts: 2, max_review_repair_cycles: 3 } };
+
+function renderNewRun(callBackendTool, onCreated = () => {}) {
+  return render(React.createElement(NewRunForm, { callBackendTool, settings, onBack: () => {}, onCreated }));
+}
+
+function newRunBackend(overrides = {}) {
+  const calls = [];
+  const callBackendTool = async (name, args) => {
+    if (name === 'metaharness.model_profiles') return modelProfiles;
+    if (name === 'metaharness.get_config') return configResponse;
+    if (name === 'metaharness.create_run') return { run_id: 'created-001' };
+    throw new Error(`Unexpected backend call: ${name}`);
+  };
+  return { calls, callBackendTool: async (name, args) => {
+    calls.push([name, args]);
+    return overrides[name] ? overrides[name](args, calls) : callBackendTool(name, args);
+  } };
+}
 
 function renderDashboard(callBackendTool, overrides = {}) {
   return render(React.createElement(RunsDashboard, {
@@ -146,4 +177,110 @@ test('polling timer is cleared on unmount and overlapping polls are skipped', as
     window.setInterval = originalSetInterval;
     window.clearInterval = originalClearInterval;
   }
+});
+
+test('server profile and config defaults populate the form reset state', async () => {
+  const defaults = defaultsFromServer(modelProfiles, configResponse);
+  assert.equal(defaults.decomposition, 'balanced');
+  assert.equal(defaults.execution_mode_policy, 'require-staged');
+  assert.equal(defaults.semantic_revision_enabled, true);
+  assert.equal(defaults.max_review_repair_cycles, 3);
+  const { callBackendTool, calls } = newRunBackend();
+  renderNewRun(callBackendTool);
+  await screen.findByRole('heading', { name: 'New Run' });
+  assert.deepEqual(calls.slice(0, 2).map(([name]) => name), ['metaharness.model_profiles', 'metaharness.get_config']);
+  assert.equal(screen.getByLabelText('Planner').value, 'plan-a');
+  assert.equal(screen.getByLabelText('Mechanical').value, 'impl-a');
+});
+
+test('each profile selector contains only profiles with its required role', async () => {
+  const { callBackendTool } = newRunBackend();
+  renderNewRun(callBackendTool);
+  await screen.findByRole('heading', { name: 'New Run' });
+  assert.deepEqual([...screen.getByLabelText('Planner').options].map((option) => option.value), ['plan-a']);
+  assert.deepEqual([...screen.getByLabelText('Mechanical').options].map((option) => option.value), ['impl-a']);
+  assert.deepEqual([...screen.getByLabelText('Final reviewer').options].map((option) => option.value), ['review-a']);
+  assert.deepEqual([...screen.getByLabelText('Semantic reviser').options].map((option) => option.value), ['', 'revise-a']);
+  assert.deepEqual([...screen.getByLabelText('Check repair').options].map((option) => option.value), ['', 'repair-a']);
+});
+
+test('invalid blank spec is rejected before create_run', async () => {
+  const { callBackendTool, calls } = newRunBackend();
+  renderNewRun(callBackendTool);
+  await screen.findByRole('heading', { name: 'New Run' });
+  fireEvent.click(screen.getByRole('button', { name: 'Create Run' }));
+  assert.equal(calls.some(([name]) => name === 'metaharness.create_run'), false);
+  assert.ok(screen.getByRole('alert').textContent.includes('SPEC'));
+  const defaults = defaultsFromServer(modelProfiles, configResponse);
+  assert.ok(validateRunForm({ spec: '  ', run_id: '', ...defaults }, modelProfiles));
+  assert.ok(validateRunForm({ spec: 'é'.repeat(24 * 1024 + 1), run_id: '', ...defaults }, modelProfiles));
+});
+
+test('minimal form submits spec and compatible selected profile fields', async () => {
+  const { callBackendTool, calls } = newRunBackend();
+  let created;
+  renderNewRun(callBackendTool, (runId) => { created = runId; });
+  await screen.findByRole('heading', { name: 'New Run' });
+  fireEvent.change(screen.getByLabelText(/SPEC/), { target: { value: 'Implement the requested feature.' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Create Run' }));
+  await waitFor(() => assert.equal(created, 'created-001'));
+  const payload = calls.find(([name]) => name === 'metaharness.create_run')[1];
+  assert.deepEqual(payload, {
+    spec: 'Implement the requested feature.', planner_profile: 'plan-a', mechanical_profile: 'impl-a',
+    reasoning_profile: 'impl-a', agentic_profile: 'impl-a', final_reviewer_profile: 'review-a',
+    semantic_reviser_profile: 'revise-a', check_repair_profile: 'repair-a',
+  });
+  assert.equal(Object.keys(payload).some((key) => /key|secret|token/i.test(key)), false);
+});
+
+test('advanced form submits all supported run options', async () => {
+  const { callBackendTool, calls } = newRunBackend();
+  renderNewRun(callBackendTool);
+  await screen.findByRole('heading', { name: 'New Run' });
+  fireEvent.change(screen.getByLabelText(/SPEC/), { target: { value: 'Do work.' } });
+  fireEvent.click(screen.getByText('Advanced'));
+  fireEvent.change(screen.getByLabelText('Run ID (optional)'), { target: { value: 'custom-run-2' } });
+  fireEvent.change(screen.getByLabelText('Decomposition'), { target: { value: 'aggressive' } });
+  fireEvent.change(screen.getByLabelText('Execution mode policy'), { target: { value: 'auto' } });
+  fireEvent.click(screen.getByLabelText('Semantic revision'));
+  fireEvent.change(screen.getByLabelText('Max check repair attempts'), { target: { value: '0' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Create Run' }));
+  await waitFor(() => assert.ok(calls.some(([name]) => name === 'metaharness.create_run')));
+  const payload = calls.find(([name]) => name === 'metaharness.create_run')[1];
+  assert.equal(payload.run_id, 'custom-run-2');
+  assert.equal(payload.decomposition, 'aggressive');
+  assert.equal(payload.execution_mode_policy, 'auto');
+  assert.equal(payload.semantic_revision_enabled, false);
+  assert.equal(payload.max_check_repair_attempts, 0);
+  assert.equal(payload.repair_scope_policy, 'auto-bounded');
+});
+
+test('backend failure leaves spec in place and reports capacity conflicts', async () => {
+  const { callBackendTool } = newRunBackend({
+    'metaharness.create_run': async () => ({ ok: false, error: { code: 'RUN_CAPACITY', message: 'maximum active runs reached', httpStatus: 409 } }),
+  });
+  renderNewRun(callBackendTool);
+  await screen.findByRole('heading', { name: 'New Run' });
+  const spec = 'Please keep this exact SPEC.';
+  fireEvent.change(screen.getByLabelText(/SPEC/), { target: { value: spec } });
+  fireEvent.click(screen.getByRole('button', { name: 'Create Run' }));
+  const alert = await screen.findByRole('alert');
+  assert.ok(alert.textContent.includes('capacity is full'));
+  assert.equal(screen.getByLabelText(/SPEC/).value, spec);
+});
+
+test('submitting twice while create_run is pending makes one backend request', async () => {
+  let resolveCreate;
+  const { callBackendTool, calls } = newRunBackend({
+    'metaharness.create_run': async () => new Promise((resolve) => { resolveCreate = resolve; }),
+  });
+  renderNewRun(callBackendTool);
+  await screen.findByRole('heading', { name: 'New Run' });
+  fireEvent.change(screen.getByLabelText(/SPEC/), { target: { value: 'Do work.' } });
+  const button = screen.getByRole('button', { name: 'Create Run' });
+  fireEvent.click(button);
+  fireEvent.click(button);
+  assert.equal(calls.filter(([name]) => name === 'metaharness.create_run').length, 1);
+  resolveCreate({ run_id: 'created-001' });
+  await waitFor(() => assert.equal(screen.getByRole('button', { name: 'Create Run' }).disabled, false));
 });
