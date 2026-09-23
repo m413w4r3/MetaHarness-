@@ -4,6 +4,7 @@ import { JSDOM } from 'jsdom';
 import React from 'react';
 import { classifyRunStatus } from '../src/panel/runStatus.ts';
 import { RunsDashboard } from '../src/panel/RunsDashboard.tsx';
+import { RunDetail } from '../src/panel/run/RunDetail.tsx';
 import { NewRunForm } from '../src/panel/NewRunForm.tsx';
 import { defaultsFromServer, validateRunForm, buildCreateRunInput } from '../src/model/runForm.ts';
 
@@ -147,6 +148,39 @@ test('new status values classify as other and remain visible', async () => {
   assert.ok(screen.getByRole('region', { name: 'Other' }));
   assert.ok(screen.getByText('future_status'));
 });
+
+const runFixtures = [
+  ['planning', { status: 'planning', planner_raw: '# Draft plan', spec: 'Add search', implementation_bundle: null }],
+  ['awaiting approval', { status: 'awaiting_approval', planner_raw: '# Proposed plan', implementation_contract: 'Contract text' }],
+  ['implementing', { status: 'implementing', implementation_bundle: { steps: [{ id: 'S03', title: 'API search endpoint', execution_class: 'reasoning' }] }, cycle_artifacts: [{ number: 1, steps: [{ id: 'S03', title: 'API search endpoint', status: 'accepted', execution_class: 'reasoning', profile_id: 'codex-luna-xhigh', commit_sha: '8c12d77abcdef', changed_files: ['a', 'b', 'c', 'd'] }] }] }],
+  ['checking', { status: 'checking', cycle_artifacts: [{ number: 1, steps: [{ id: 'S01', title: 'Check step', status: 'completed', checks: { passed: true } }] }] }],
+  ['review', { status: 'review', implementation_bundle: { steps: [{ id: 'S02', title: 'Review step' }] }, cycle_artifacts: [{ number: 1, steps: [{ id: 'S02', title: 'Review step', status: 'completed' }] }] }],
+  ['failed', { status: 'failed', failure: { reason: 'workspace setup failed' }, workspace_setup: null }],
+  ['published', { status: 'published', publish: { mode: 'pull_request', status: 'published' }, commit_sha: '123456789abcdef' }],
+];
+
+for (const [name, payload] of runFixtures) {
+  test(`run detail fixture renders ${name} from durable state`, async () => {
+    const calls = [];
+    const callBackendTool = async (tool, args) => {
+      calls.push([tool, args]);
+      if (tool === 'metaharness.get_run') return { run_id: `fixture-${name}`, updated_at: '2026-09-23T10:42:00Z', ...payload };
+      throw new Error(`Unexpected backend call: ${tool}`);
+    };
+    render(React.createElement(RunDetail, { runId: `fixture-${name}`, callBackendTool, onBack: () => {} }));
+    await screen.findByText(name === 'awaiting approval' ? 'awaiting_approval' : name, { exact: false });
+    assert.deepEqual(calls[0], ['metaharness.get_run', { runId: `fixture-${name}` }]);
+    assert.ok(screen.getByRole('button', { name: 'Refresh' }));
+    if (name === 'implementing') {
+      assert.ok(screen.getByText('API search endpoint'));
+      assert.equal(screen.getByText('8c12d77').title, '8c12d77abcdef');
+      assert.ok(screen.getByText('4'));
+    }
+    if (name === 'failed') assert.ok(screen.getByText('workspace setup failed'));
+    if (name === 'planning') assert.ok(screen.getByText('# Draft plan'));
+    if (name === 'published') assert.ok(screen.getByText('pull_request'));
+  });
+}
 
 test('polling timer is cleared on unmount and overlapping polls are skipped', async () => {
   const originalSetInterval = window.setInterval;

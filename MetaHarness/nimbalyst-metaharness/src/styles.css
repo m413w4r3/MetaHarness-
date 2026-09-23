@@ -284,6 +284,69 @@
   overflow-wrap: anywhere;
 }
 
+.metaharness-run-header__actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.metaharness-run-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px 18px;
+  align-items: start;
+  padding: 18px 0 22px;
+  border-bottom: 1px solid var(--metaharness-border);
+}
+
+.metaharness-run-header h1 { margin: 0; font-size: 23px; }
+.metaharness-run-header__id { margin: 0 0 6px; color: var(--metaharness-muted); font-size: 13px; }
+.metaharness-run-header__facts {
+  display: flex;
+  flex-wrap: wrap;
+  grid-column: 1 / -1;
+  gap: 8px 20px;
+  margin: 0;
+}
+.metaharness-run-header__facts > div,
+.metaharness-run-header__sha { display: flex; gap: 7px; min-width: 0; }
+.metaharness-run-header__facts dt { color: var(--metaharness-muted); }
+.metaharness-run-header__facts dd { margin: 0; overflow-wrap: anywhere; }
+.metaharness-run-header__failure { flex-basis: 100%; color: var(--metaharness-danger, #dc5b5b); }
+.metaharness-run-header__sha code { cursor: copy; }
+
+.metaharness-detail-section { margin-top: 24px; }
+.metaharness-detail-section h2 { margin: 0 0 12px; font-size: 18px; }
+.metaharness-detail-grid,
+.metaharness-step-card__facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: 1px;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--metaharness-border);
+  border-radius: 9px;
+}
+.metaharness-detail-grid > div,
+.metaharness-step-card__facts > div { min-width: 0; padding: 11px 13px; background: var(--metaharness-surface); }
+.metaharness-detail-grid dt,
+.metaharness-step-card__facts dt { margin-bottom: 5px; color: var(--metaharness-muted); font-size: 12px; }
+.metaharness-detail-grid dd,
+.metaharness-step-card__facts dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.metaharness-detail-grid pre,
+.metaharness-step-card__facts pre,
+.metaharness-plan-artifact pre { max-height: 360px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.metaharness-plan-artifact { margin: 8px 0; border: 1px solid var(--metaharness-border); border-radius: 8px; background: var(--metaharness-surface); }
+.metaharness-plan-artifact summary { padding: 10px 13px; cursor: pointer; font-weight: 600; }
+.metaharness-plan-artifact pre { padding: 0 13px 13px; }
+.metaharness-step-list { display: grid; gap: 12px; }
+.metaharness-step-card { padding: 14px; border: 1px solid var(--metaharness-border); border-radius: 9px; background: var(--metaharness-surface); }
+.metaharness-step-card h3 { margin: 0 0 12px; font-size: 15px; }
+.metaharness-step-card h3 code { margin-right: 7px; color: var(--metaharness-muted); }
+.metaharness-step-card__facts { border: 0; border-radius: 0; }
+.metaharness-step-card__facts > div { padding: 8px 10px; }
+
 .sr-only {
   position: absolute;
   width: 1px;

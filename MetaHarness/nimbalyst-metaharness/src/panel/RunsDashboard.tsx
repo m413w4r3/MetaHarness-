@@ -5,6 +5,7 @@ import { RunCard } from './RunCard';
 import { NewRunForm } from './NewRunForm';
 import { StatusBadge } from './StatusBadge';
 import { classifyRunStatus, type RunCategory } from './runStatus';
+import { RunDetail } from './run/RunDetail';
 
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
 type PanelView = { kind: 'dashboard' } | { kind: 'run'; runId: string } | { kind: 'new-run' };
@@ -25,12 +26,6 @@ function unwrap(value: unknown): unknown {
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : 'Unexpected MetaHarness error.';
-}
-
-function failureText(value: unknown): string {
-  if (typeof value === 'string') return value;
-  const reason = object(value).reason;
-  return typeof reason === 'string' ? reason : 'Failure reported';
 }
 
 const GROUPS: Array<{ category: RunCategory; title: string }> = [
@@ -163,34 +158,5 @@ function ConfigurationScreen({ onOpenSettings }: { onOpenSettings: () => void })
     <h1 id="metaharness-config-title">Configure MetaHarness</h1>
     <p>Set a MetaHarness configuration file to see runs for this workspace.</p>
     <button className="metaharness-button" type="button" onClick={onOpenSettings}>Open Settings</button>
-  </section>;
-}
-
-function RunDetail({ runId, run, callBackendTool, onBack }: { runId: string; run?: RunSummary; callBackendTool?: BackendCall; onBack: () => void }) {
-  const [detail, setDetail] = useState<Record<string, unknown>>();
-  const [detailError, setDetailError] = useState('');
-  useEffect(() => {
-    let active = true;
-    if (!callBackendTool) return () => { active = false; };
-    void callBackendTool('metaharness.get_run', { runId }).then((value) => {
-      const result = object(unwrap(value));
-      const loaded = object(result.run ?? result);
-      if (active) setDetail(loaded);
-    }).catch((error) => { if (active) setDetailError(message(error)); });
-    return () => { active = false; };
-  }, [callBackendTool, runId]);
-  const displayed = detail ? { ...run, ...detail } : run;
-  const status = typeof displayed?.status === 'string' ? displayed.status : 'unknown';
-  const hasFailure = displayed?.failure !== undefined && displayed.failure !== null && displayed.failure !== '';
-  return <section className="metaharness-dashboard" aria-labelledby="metaharness-run-detail-title">
-    <button className="metaharness-link-button" type="button" onClick={onBack}>← All runs</button>
-    <h1 id="metaharness-run-detail-title">{runId}</h1>
-    {displayed ? <dl className="metaharness-run-detail">
-      <div><dt>Status</dt><dd><StatusBadge status={status} /></dd></div>
-      {displayed.plan_title && <div><dt>Plan</dt><dd>{String(displayed.plan_title)}</dd></div>}
-      {displayed.updated_at && <div><dt>Updated</dt><dd>{String(displayed.updated_at)}</dd></div>}
-      {displayed.commit_sha && <div><dt>Commit</dt><dd><code>{String(displayed.commit_sha)}</code></dd></div>}
-      {hasFailure && <div><dt>Failure</dt><dd>{failureText(displayed.failure)}</dd></div>}
-    </dl> : detailError ? <p className="metaharness-error" role="alert">{detailError}</p> : <p className="metaharness-muted" role="status">Loading run…</p>}
   </section>;
 }
