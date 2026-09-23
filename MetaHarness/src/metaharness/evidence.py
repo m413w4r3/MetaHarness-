@@ -7,7 +7,7 @@ import os
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .gitops import (
     StagedChange,
@@ -176,6 +176,30 @@ class EvidenceBundle:
     deterministic_passed: bool
     failures: tuple[str, ...]
     required_check_ids: tuple[str, ...] = ()
+
+
+def required_checks_passed(bundle: EvidenceBundle) -> bool:
+    """Verify every required ID has a durable normal PASS result."""
+
+    by_name: dict[str, Any] = {}
+    for raw in bundle.checks:
+        if isinstance(raw, CheckResult):
+            by_name[raw.name] = raw
+        elif isinstance(raw, dict) and isinstance(raw.get("name"), str):
+            by_name[raw["name"]] = raw
+    for check_id in bundle.required_check_ids:
+        result = by_name.get(check_id)
+        if result is None:
+            return False
+        get = result.get if isinstance(result, dict) else lambda key, default=None: getattr(result, key, default)
+        if (
+            get("exit_code") != 0
+            or bool(get("timed_out", False))
+            or get("failure_kind", "passed") != "passed"
+            or (bool(get("workspace_mutated", False)) and not bool(get("mutation_recovered", False)))
+        ):
+            return False
+    return True
 
 
 class EvidenceError(RuntimeError):
@@ -378,6 +402,7 @@ def collect_evidence(
     required_check_ids: tuple[str, ...] | list[str] | None = None,
     enforce_diff_size: bool = True,
     allow_empty_diff: bool = False,
+    retry_check_infrastructure: Callable[[str, str], bool] | None = None,
 ) -> EvidenceBundle:
     """Run all configured checks, then stage and freeze the submitted tree."""
 
@@ -399,7 +424,8 @@ def collect_evidence(
         logs_dir = evidence_path / "checks"
     checks = run_checks(
         root, config, required_check_ids=required_check_ids,
-        logs_dir=logs_dir, tail_bytes=tail_bytes, secrets=secrets
+        logs_dir=logs_dir, tail_bytes=tail_bytes, secrets=secrets,
+        retry_infrastructure=retry_check_infrastructure,
     )
 
     head_matches = current_head(root) == (expected_head_sha or base_sha)
@@ -430,9 +456,12 @@ def collect_evidence(
     except ValueError as exc:
         raise EvidenceError(str(exc)) from exc
     for check, check_config in zip(checks, selected_configs):
-        # A mutation changes the code that is reviewed, whatever the check's
-        # importance: it always closes the gate.
-        if check.workspace_mutated:
+        # A safely rolled back mutation is archived in check evidence, then
+        # the exact check is rerun. Only an unrecovered mutation can close the
+        # gate; rollback/ownership failures already raise a hard error.
+        if check.failure_kind in {"side_effect_repeated", "side_effect_unstable"}:
+            failures.append(f"CHECK_SIDE_EFFECT_REPEATED:{check.name}")
+        elif check.workspace_mutated and not check.mutation_recovered:
             failures.append(f"CHECK_MUTATED:{check.name}")
         # P42 selection itself is the mandatory contract.  ``required`` is
         # metadata for the trusted catalogue and does not alter selection.
@@ -440,6 +469,10 @@ def collect_evidence(
             continue
         if check.timed_out:
             failures.append(f"CHECK_TIMEOUT:{check.name}")
+        elif check.failure_kind in {
+            "missing_executable", "process_start_failed", "signal_terminated",
+        }:
+            failures.append(f"CHECK_INFRA_FAILURE:{check.name}")
         elif check.exit_code != 0:
             failures.append(f"CHECK_FAILED:{check.name}")
 

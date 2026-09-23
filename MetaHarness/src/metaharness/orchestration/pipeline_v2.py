@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ..evidence import EvidenceBundle
+from ..evidence import EvidenceBundle, required_checks_passed
 from ..gitops import RepositoryReference, WorktreeInfo
 from ..models import (
     CycleKind,
@@ -529,6 +529,11 @@ class PipelineV2Coordinator:
             if hard:
                 raise PipelineFailure(hard[0].split(":", 1)[0], ", ".join(hard))
             if evidence.deterministic_passed:
+                if evidence.failures or not required_checks_passed(evidence):
+                    raise PipelineFailure(
+                        "DURABLE_ARTIFACT_CORRUPTED",
+                        "deterministic gate claims PASS without PASS evidence for every required check",
+                    )
                 ops.accept_gate_state(ctx, cycle_plan, stage, evidence)
                 return evidence
             soft = ops.soft_failures(evidence)

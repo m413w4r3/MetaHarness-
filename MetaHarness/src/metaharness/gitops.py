@@ -793,6 +793,133 @@ def candidate_tree_sha(worktree: Path) -> str:
     return tree_sha
 
 
+@dataclass(frozen=True)
+class CandidateState:
+    """Exact candidate/index state and Git ownership around an untrusted process."""
+
+    head: str
+    head_ref: str | None
+    index_tree: str
+    candidate_tree: str
+    status: tuple[str, ...]
+    branches: frozenset[str]
+    worktrees: frozenset[str]
+
+
+def _status_records(worktree: Path) -> tuple[str, ...]:
+    output = _git(
+        worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+        errors="replace",
+    ).stdout
+    return tuple(record for record in output.split("\0") if record)
+
+
+def _status_entries(records: tuple[str, ...]) -> dict[str, str]:
+    paths: dict[str, str] = {}
+    index = 0
+    while index < len(records):
+        record = records[index]
+        if len(record) >= 4:
+            paths[record[3:]] = record[:2]
+            if "R" in record[:2] or "C" in record[:2]:
+                index += 1
+                if index < len(records):
+                    paths[records[index]] = record[:2]
+        index += 1
+    return paths
+
+
+def _status_changed_paths(before: tuple[str, ...], after: tuple[str, ...]) -> set[str]:
+    before_entries, after_entries = _status_entries(before), _status_entries(after)
+    return {
+        path for path in before_entries.keys() | after_entries.keys()
+        if before_entries.get(path) != after_entries.get(path)
+    }
+
+
+def snapshot_candidate_state(worktree: Path) -> CandidateState:
+    """Capture both Git ownership and the exact index/worktree candidate."""
+
+    root = Path(worktree).expanduser().resolve()
+    return CandidateState(
+        head=current_head(root),
+        head_ref=symbolic_head(root),
+        index_tree=index_tree_sha(root),
+        candidate_tree=candidate_tree_sha(root),
+        status=_status_records(root),
+        branches=local_branches(root),
+        worktrees=registered_worktrees(root),
+    )
+
+
+def candidate_ownership_matches(before: CandidateState, after: CandidateState) -> bool:
+    """Whether HEAD/ref/branch/worktree ownership stayed unchanged."""
+
+    return (
+        before.head == after.head
+        and before.head_ref == after.head_ref
+        and before.branches == after.branches
+        and before.worktrees == after.worktrees
+    )
+
+
+def candidate_state_changed_paths(
+    worktree: Path, before: CandidateState, after: CandidateState,
+) -> tuple[str, ...]:
+    """Return every candidate path whose index, worktree, or status changed."""
+
+    return tuple(sorted(
+        _tree_diff_paths(worktree, before.index_tree, after.index_tree)
+        | _tree_diff_paths(worktree, before.candidate_tree, after.candidate_tree)
+        | _status_changed_paths(before.status, after.status)
+    ))
+
+
+def _tree_diff_paths(worktree: Path, before: str, after: str) -> set[str]:
+    if before == after:
+        return set()
+    output = _git(
+        worktree, "diff", "--name-only", "--no-renames", "-z", before, after,
+        errors="replace", timeout=600,
+    ).stdout
+    return {path for path in output.split("\0") if path}
+
+
+def restore_candidate_state(worktree: Path, state: CandidateState) -> CandidateState:
+    """Restore candidate files and index, then prove the complete snapshot matches."""
+
+    root = Path(worktree).expanduser().resolve()
+    current = snapshot_candidate_state(root)
+    if not candidate_ownership_matches(state, current):
+        raise GitError("Git ownership changed while a process was running")
+    paths = (
+        _tree_diff_paths(root, state.index_tree, current.index_tree)
+        | _tree_diff_paths(root, state.candidate_tree, current.candidate_tree)
+        | _status_changed_paths(state.status, current.status)
+    )
+    _git(root, "read-tree", state.index_tree, timeout=600)
+    if paths:
+        present = set(tracked_files_in_tree(root, state.candidate_tree))
+        to_restore = sorted(path for path in paths if path in present)
+        to_remove = sorted(path for path in paths if path not in present)
+        if to_restore:
+            _git(
+                root, "--literal-pathspecs", "restore", "--worktree",
+                f"--source={state.candidate_tree}", "--", *to_restore,
+                timeout=600,
+            )
+        for relative in to_remove:
+            path = root / _validate_relative_path(relative)
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif os.path.lexists(path):
+                raise GitError("candidate rollback encountered a non-file path")
+    restored = snapshot_candidate_state(root)
+    if restored != state:
+        raise GitError("candidate rollback did not restore the exact Git state")
+    return restored
+
+
 def _require_object_id(value: str, label: str) -> str:
     if not isinstance(value, str) or _OBJECT_ID.fullmatch(value) is None:
         raise GitError(f"{label} must be a complete object ID")

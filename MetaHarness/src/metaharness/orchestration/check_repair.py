@@ -125,9 +125,9 @@ def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
     """Return the failures that close a gate episode without repair.
 
     A normal configured check failure is soft: it may open a bounded
-    check-repair attempt and never reaches the reviewer.  Mutations,
-    timeouts, secrets, ownership and malformed/oversized trees are terminal
-    integrity failures.
+    check-repair attempt and never reaches the reviewer. Reversible check
+    side effects and transient process failures are recovered before they can
+    reach this boundary; secrets, ownership and malformed trees remain hard.
     """
 
     return _hard_failure_items(bundle.failures)
@@ -313,8 +313,6 @@ def _hard_failure_items(failures: Any) -> list[str]:
         if item in _DIRECT_FAILURES
         or item in _HARD_FAILURE_CODES
         or any(item.startswith(f"{prefix}:") for prefix in _DIRECT_FAILURES)
-        or item.startswith("CHECK_MUTATED:")
-        or item.startswith("CHECK_TIMEOUT:")
         or any(item.startswith(prefix) for prefix in _HARD_FAILURE_PREFIXES)
     ]
 

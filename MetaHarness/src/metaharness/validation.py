@@ -8,18 +8,29 @@ interpreted as a command.
 from __future__ import annotations
 
 import re
+import shutil
+import json
 import tempfile
 import time
 import dataclasses
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .approval import ApprovalError, read_check_authority
-from .gitops import GitError, candidate_tree_sha, current_head, symbolic_head
+from .gitops import (
+    CandidateState,
+    GitError,
+    candidate_state_changed_paths,
+    candidate_ownership_matches,
+    restore_candidate_state,
+    snapshot_candidate_state,
+)
 from .models import CheckConfig, HarnessConfig
 from .procutil import read_capped, run_bounded
 from .redaction import redact_file
+from .redaction import redact
+from .result import ResultArtifactError, atomic_write_text
 
 
 DEFAULT_TAIL_BYTES = 4_096
@@ -108,15 +119,11 @@ class CheckResult:
     stdout_tail: str
     stderr_tail: str
     workspace_mutated: bool
-
-
-@dataclass(frozen=True)
-class _GitSnapshot:
-    """The candidate that a subsequent ``git add -A`` would submit."""
-
-    head: str
-    head_ref: str | None
-    candidate_tree: str
+    failure_kind: str = "unknown"
+    mutation_recovered: bool = False
+    mutated_tree_sha: str | None = None
+    mutated_paths: tuple[str, ...] = ()
+    infrastructure_retries: int = 0
 
 
 def bounded_tail(value: str, max_bytes: int = DEFAULT_TAIL_BYTES) -> str:
@@ -130,15 +137,44 @@ def bounded_tail(value: str, max_bytes: int = DEFAULT_TAIL_BYTES) -> str:
     return encoded[-max_bytes:].decode("utf-8", errors="ignore") if max_bytes else ""
 
 
-def _git_snapshot(worktree: Path) -> _GitSnapshot:
+def _snapshot(worktree: Path) -> CandidateState:
     try:
-        return _GitSnapshot(
-            head=current_head(worktree),
-            head_ref=symbolic_head(worktree),
-            candidate_tree=candidate_tree_sha(worktree),
-        )
+        return snapshot_candidate_state(worktree)
     except GitError as exc:
-        raise ValidationError(f"could not snapshot the candidate worktree: {exc}") from exc
+        raise ValidationError(f"TREE_MISMATCH: could not snapshot candidate state: {exc}") from exc
+
+
+def _archive_mutation(
+    directory: Path | None,
+    *,
+    check_id: str,
+    attempt: int,
+    before: CandidateState,
+    after: CandidateState,
+    changed_paths: tuple[str, ...],
+    secrets: tuple[str, ...],
+    rollback: str,
+) -> None:
+    """Durably retain mutation identity and paths without storing file contents."""
+
+    if directory is None:
+        return
+    path = directory / "mutations.jsonl"
+    try:
+        previous = path.read_text(encoding="utf-8") if path.exists() else ""
+        entry = {
+            "check_id": redact(check_id, secrets),
+            "attempt": attempt,
+            "candidate_tree_before": before.candidate_tree,
+            "candidate_tree_after": after.candidate_tree,
+            "index_tree_before": before.index_tree,
+            "index_tree_after": after.index_tree,
+            "mutated_paths": [redact(item, secrets) for item in changed_paths[:100]],
+            "rollback": rollback,
+        }
+        atomic_write_text(path, previous + json.dumps(entry, sort_keys=True) + "\n")
+    except (OSError, ResultArtifactError) as exc:
+        raise ValidationError(f"DURABLE_ARTIFACT_CORRUPTED: could not archive check mutation: {type(exc).__name__}") from None
 
 
 def resolve_check_cwd(worktree: str | Path, check: CheckConfig) -> Path:
@@ -191,6 +227,7 @@ def run_checks(
     logs_dir: str | Path | None = None,
     tail_bytes: int = DEFAULT_TAIL_BYTES,
     secrets: tuple[str, ...] = (),
+    retry_infrastructure: Callable[[str, str], bool] | None = None,
 ) -> tuple[CheckResult, ...]:
     """Run every configured check, continuing after failures and timeouts.
 
@@ -225,50 +262,172 @@ def run_checks(
         log_root.mkdir(parents=True, exist_ok=True)
         for check, cwd in zip(selected, cwds):
             stem = _safe_log_stem(check.name, used_log_stems)
-            stdout_path = log_root / f"{stem}.stdout.log"
-            stderr_path = log_root / f"{stem}.stderr.log"
-            before = _git_snapshot(root)
+            canonical_stdout = log_root / f"{stem}.stdout.log"
+            canonical_stderr = log_root / f"{stem}.stderr.log"
             started = time.monotonic()
-            exit_code = -1
-            timed_out = False
-            with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-                try:
-                    exit_code, timed_out = run_bounded(
-                        check.argv,
-                        cwd=cwd,
-                        timeout_seconds=check.timeout_seconds,
-                        stdout=stdout,
-                        stderr=stderr,
-                        grace_seconds=_CHECK_GRACE_SECONDS,
+            attempt_number = 0
+            infra_retries = 0
+            mutation_retry_used = False
+            prior_mutation: tuple[str, str, tuple[str, ...], tuple[str, ...]] | None = None
+            any_mutation = False
+            mutation_paths: set[str] = set()
+            mutated_tree_sha: str | None = None
+            while True:
+                attempt_number += 1
+                stdout_path = (
+                    canonical_stdout if attempt_number == 1
+                    else log_root / f"{stem}.attempt-{attempt_number}.stdout.log"
+                )
+                stderr_path = (
+                    canonical_stderr if attempt_number == 1
+                    else log_root / f"{stem}.attempt-{attempt_number}.stderr.log"
+                )
+                before = _snapshot(root)
+                exit_code = -1
+                timed_out = False
+                process_error: OSError | ValueError | None = None
+                attempt_started = time.monotonic()
+                with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+                    try:
+                        exit_code, timed_out = run_bounded(
+                            check.argv,
+                            cwd=cwd,
+                            timeout_seconds=check.timeout_seconds,
+                            stdout=stdout,
+                            stderr=stderr,
+                            grace_seconds=_CHECK_GRACE_SECONDS,
+                        )
+                    except (OSError, ValueError) as exc:
+                        process_error = exc
+                        stderr.write(
+                            f"could not start check: {type(exc).__name__}\n".encode("utf-8")
+                        )
+                    if timed_out:
+                        exit_code = 124
+                        stderr.write(
+                            f"\ncheck timed out after {check.timeout_seconds}s\n".encode("utf-8")
+                        )
+                duration = time.monotonic() - attempt_started
+                after = _snapshot(root)
+                redact_file(stdout_path, secrets)
+                redact_file(stderr_path, secrets)
+
+                if before != after:
+                    changed_paths = candidate_state_changed_paths(root, before, after)
+                    if not candidate_ownership_matches(before, after):
+                        _archive_mutation(
+                            output_dir,
+                            check_id=check.id, attempt=attempt_number,
+                            before=before, after=after, changed_paths=changed_paths,
+                            secrets=secrets, rollback="ownership_changed",
+                        )
+                        raise ValidationError(
+                            "AGENT_GIT_VIOLATION: check changed Git ownership; "
+                            f"mutated_tree={after.candidate_tree}; "
+                            f"mutated_paths={','.join(changed_paths[:20])}"
+                        )
+                    mutation_signature = (
+                        after.index_tree, after.candidate_tree, changed_paths, after.status,
                     )
-                except (OSError, ValueError) as exc:
-                    stderr.write(f"could not start check: {exc}\n".encode("utf-8", "replace"))
+                    any_mutation = True
+                    mutation_paths.update(changed_paths)
+                    mutated_tree_sha = after.candidate_tree
+                    try:
+                        restored = restore_candidate_state(root, before)
+                    except GitError as exc:
+                        _archive_mutation(
+                            output_dir,
+                            check_id=check.id, attempt=attempt_number,
+                            before=before, after=after, changed_paths=changed_paths,
+                            secrets=secrets, rollback="failed",
+                        )
+                        raise ValidationError(
+                            "ROLLBACK_FAILED: check mutation could not be restored; "
+                            f"mutated_tree={after.candidate_tree}; "
+                            f"mutated_paths={','.join(changed_paths[:20])}; "
+                            f"error={type(exc).__name__}"
+                        ) from None
+                    if restored != before:
+                        _archive_mutation(
+                            output_dir,
+                            check_id=check.id, attempt=attempt_number,
+                            before=before, after=after, changed_paths=changed_paths,
+                            secrets=secrets, rollback="mismatch",
+                        )
+                        raise ValidationError(
+                            "ROLLBACK_TREE_MISMATCH: check rollback did not restore exact state; "
+                            f"mutated_tree={after.candidate_tree}"
+                        )
+                    _archive_mutation(
+                        output_dir,
+                        check_id=check.id, attempt=attempt_number,
+                        before=before, after=after, changed_paths=changed_paths,
+                        secrets=secrets, rollback="verified",
+                    )
+                    if not mutation_retry_used:
+                        mutation_retry_used = True
+                        prior_mutation = mutation_signature
+                        continue
+                    failure_kind = (
+                        "side_effect_repeated"
+                        if mutation_signature == prior_mutation else "side_effect_unstable"
+                    )
+                    final_timed_out = timed_out
+                    final_exit_code = 124 if timed_out else exit_code
+                    break
+
                 if timed_out:
-                    exit_code = 124
-                    stderr.write(
-                        f"\ncheck timed out after {check.timeout_seconds}s\n".encode("utf-8")
+                    failure_kind = "timeout"
+                elif process_error is not None:
+                    failure_kind = (
+                        "missing_executable"
+                        if isinstance(process_error, FileNotFoundError)
+                        else "process_start_failed"
                     )
-            duration = time.monotonic() - started
-            after = _git_snapshot(root)
-            redact_file(stdout_path, secrets)
-            redact_file(stderr_path, secrets)
+                elif exit_code < 0:
+                    failure_kind = "signal_terminated"
+                elif exit_code == 0:
+                    failure_kind = "passed"
+                else:
+                    failure_kind = "nonzero_exit"
+                final_exit_code = 124 if timed_out else exit_code
+                final_timed_out = timed_out
+                if failure_kind in {
+                    "timeout", "missing_executable", "process_start_failed", "signal_terminated",
+                } and retry_infrastructure is not None and retry_infrastructure(check.id, failure_kind):
+                    infra_retries += 1
+                    continue
+                break
+
+            # The canonical logs always refer to the final trusted invocation;
+            # earlier invocations stay archived beside them for diagnosis.
+            if attempt_number > 1 and output_dir is not None:
+                if canonical_stdout.exists():
+                    shutil.move(str(canonical_stdout), str(log_root / f"{stem}.attempt-1.stdout.log"))
+                if canonical_stderr.exists():
+                    shutil.move(str(canonical_stderr), str(log_root / f"{stem}.attempt-1.stderr.log"))
+                shutil.copyfile(stdout_path, canonical_stdout)
+                shutil.copyfile(stderr_path, canonical_stderr)
             stdout_text, _ = read_capped(stdout_path, _IN_MEMORY_LOG_BYTES)
             stderr_text, _ = read_capped(stderr_path, _IN_MEMORY_LOG_BYTES)
-            results.append(
-                CheckResult(
-                    name=check.name,
-                    argv=tuple(check.argv),
-                    cwd=str(cwd),
-                    exit_code=exit_code,
-                    timed_out=timed_out,
-                    duration_seconds=duration,
-                    stdout_log=stdout_text,
-                    stderr_log=stderr_text,
-                    stdout_tail=bounded_tail(stdout_text, tail_bytes),
-                    stderr_tail=bounded_tail(stderr_text, tail_bytes),
-                    workspace_mutated=before != after,
-                )
-            )
+            results.append(CheckResult(
+                name=check.name,
+                argv=tuple(check.argv),
+                cwd=str(cwd),
+                exit_code=final_exit_code,
+                timed_out=final_timed_out,
+                duration_seconds=time.monotonic() - started,
+                stdout_log=stdout_text,
+                stderr_log=stderr_text,
+                stdout_tail=bounded_tail(stdout_text, tail_bytes),
+                stderr_tail=bounded_tail(stderr_text, tail_bytes),
+                workspace_mutated=any_mutation,
+                failure_kind=failure_kind,
+                mutation_recovered=any_mutation,
+                mutated_tree_sha=mutated_tree_sha,
+                mutated_paths=tuple(sorted(redact(path, secrets) for path in mutation_paths)),
+                infrastructure_retries=infra_retries,
+            ))
 
     return tuple(results)
 
@@ -294,20 +453,48 @@ def run_check_preflights(
         if not check.preflight_argv:
             continue
         cwd = resolve_check_cwd(root, check)
-        try:
-            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-                exit_code, timed_out = run_bounded(
-                    check.preflight_argv,
-                    cwd=cwd,
-                    timeout_seconds=check.timeout_seconds,
-                    stdout=stdout,
-                    stderr=stderr,
-                    grace_seconds=_CHECK_GRACE_SECONDS,
+        mutation_retry_used = False
+        first_mutation: tuple[str, str, tuple[str, ...], tuple[str, ...]] | None = None
+        while True:
+            before = _snapshot(root)
+            try:
+                with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                    exit_code, timed_out = run_bounded(
+                        check.preflight_argv,
+                        cwd=cwd,
+                        timeout_seconds=check.timeout_seconds,
+                        stdout=stdout,
+                        stderr=stderr,
+                        grace_seconds=_CHECK_GRACE_SECONDS,
+                    )
+            except (OSError, ValueError):
+                exit_code, timed_out = -1, False
+            after = _snapshot(root)
+            if before != after:
+                if not candidate_ownership_matches(before, after):
+                    raise ValidationError(
+                        "AGENT_GIT_VIOLATION: preflight changed Git ownership"
+                    )
+                changed_paths = candidate_state_changed_paths(root, before, after)
+                signature = (after.index_tree, after.candidate_tree, changed_paths, after.status)
+                try:
+                    if restore_candidate_state(root, before) != before:
+                        raise GitError("preflight rollback did not restore exact state")
+                except GitError as exc:
+                    raise ValidationError(f"ROLLBACK_FAILED: preflight mutation: {exc}") from None
+                if not mutation_retry_used:
+                    mutation_retry_used = True
+                    first_mutation = signature
+                    continue
+                code = (
+                    "CHECK_SIDE_EFFECT_REPEATED"
+                    if signature == first_mutation else "CHECK_SIDE_EFFECT_UNSTABLE"
                 )
-        except (OSError, ValueError):
-            exit_code, timed_out = -1, False
-        if timed_out or exit_code != 0:
-            failures.append(f"CHECK_PREFLIGHT_FAILED:{check.id}")
+                failures.append(f"{code}:{check.id}")
+                break
+            if timed_out or exit_code != 0:
+                failures.append(f"CHECK_PREFLIGHT_FAILED:{check.id}")
+            break
     return tuple(failures)
 
 

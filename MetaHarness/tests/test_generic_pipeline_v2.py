@@ -5,7 +5,11 @@ import unittest
 from pathlib import Path
 
 from metaharness.approval import PlanIdentity
-from metaharness.execution_selection import ensure_execution_selection, read_execution_selection
+from metaharness.execution_selection import (
+    SCHEMA_VERSION,
+    ensure_execution_selection,
+    read_execution_selection,
+)
 from metaharness.models import ExecutionSelection, RunCycle, SelectedProfile, StepExecutionSelection
 from metaharness.orchestration.pipeline_v2 import (
     check_repair_attempt_dir,
@@ -79,7 +83,7 @@ class GenericSnapshotTests(unittest.TestCase):
             )
 
         selection = ExecutionSelection(
-            schema_version=5, planner=selected("planner"),
+            schema_version=SCHEMA_VERSION, planner=selected("planner"),
             steps=(StepExecutionSelection("S01", selected("implementer")),),
             check_repair=None, semantic_reviser=None,
             final_reviewer=selected("final-reviewer"),

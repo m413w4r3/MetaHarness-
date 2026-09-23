@@ -303,10 +303,23 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.codex.chmod(self.codex.stat().st_mode | stat.S_IXUSR)
         self.check = self.root / "check.py"
         self.check.write_text(
-            "import os, sys\n"
+            "import os, pathlib, sys, time\n"
             "mode = os.environ.get('FAKE_CHECK')\n"
+            "state = pathlib.Path(os.environ.get('FAKE_CHECK_STATE', 'check-state'))\n"
+            "if os.environ.get('FAKE_PREFLIGHT'):\n"
+            " preflight_state = pathlib.Path(os.environ.get('FAKE_PREFLIGHT_STATE', 'preflight-state'))\n"
+            " count = int(preflight_state.read_text()) if preflight_state.exists() else 0\n"
+            " preflight_state.write_text(str(count + 1))\n"
+            " if count == 0: raise SystemExit(1)\n"
+            "if mode in ('timeout_once', 'timeout_repeat', 'timeout_then_pass'):\n"
+            " count = int(state.read_text()) if state.exists() else 0\n"
+            " state.write_text(str(count + 1))\n"
+            " if mode == 'timeout_repeat' or (mode == 'timeout_once' and count == 0) or (mode == 'timeout_then_pass' and count < 3): time.sleep(5)\n"
             "if mode == 'fail': sys.exit(1)\n"
             "if mode == 'mutate': open('feature.txt', 'a').write('formatted\\n')\n"
+            "if mode == 'mutate_once' and not state.exists():\n"
+            " state.write_text('mutated')\n"
+            " open('feature.txt', 'a').write('formatted\\n')\n"
             "if mode == 'leak': print('key=' + os.environ.get('META_E2E_KEY', ''))\n",
             encoding="utf-8",
         )
@@ -321,6 +334,8 @@ class OrchestratorE2ETests(unittest.TestCase):
         run_id: str = "run-1",
         max_diff: int = 400000,
         check_cwd: str = ".",
+        check_preflight: bool = False,
+        workspace_setup_mode: str | None = None,
         key_env: str | None = None,
         require_plan_approval: bool = False,
         planning_decomposition: str | None = None,
@@ -328,6 +343,31 @@ class OrchestratorE2ETests(unittest.TestCase):
     ) -> Path:
         config = self.root / "config.toml"
         key_line = f"\napi_key_env = {key_env!r}" if key_env else ""
+        setup_block = ""
+        if workspace_setup_mode is not None:
+            setup_script = self.root / f"{run_id}-setup.py"
+            marker = self.root / f"{run_id}-setup-state"
+            setup_script.write_text(
+                "import pathlib, sys\n"
+                f"marker = pathlib.Path({str(marker)!r})\n"
+                "if not marker.exists():\n"
+                " marker.write_text('once')\n"
+                + (
+                    " pathlib.Path('setup-artifact.txt').write_text('must roll back')\n"
+                    if workspace_setup_mode == "mutate_once" else ""
+                )
+                + (
+                    " raise SystemExit(1)\n"
+                    if workspace_setup_mode == "fail_once" else
+                    "raise SystemExit(1)\n"
+                    if workspace_setup_mode == "fail_always" else ""
+                ),
+                encoding="utf-8",
+            )
+            setup_block = (
+                f"[[workspace_setup]]\nname = \"deps\"\n"
+                f"argv = [{str(sys.executable)!r}, {str(setup_script)!r}]\ntimeout_seconds = 3"
+            )
         config.write_text(
             "\n".join([
                 f"repo = {str(self.repo)!r}",
@@ -348,6 +388,7 @@ class OrchestratorE2ETests(unittest.TestCase):
                 "poll_interval_seconds = 0.01",
                 "",
                 "[context]\nalways_files = []",
+                setup_block,
                 "[codex_runtime]\nhome = \"codex-home\"\nenv_allowlist = [\"PATH\", \"HOME\", \"LANG\", \"LC_ALL\", \"TERM\", "
                 "\"TMPDIR\", \"XDG_CONFIG_HOME\", \"XDG_CACHE_HOME\", \"CODEX_HOME\", "
                 "\"FAKE_CODEX_BEHAVIOR\", \"FAKE_WORKTREE\", \"FAKE_PROMPT\", \"FAKE_FINAL\", "
@@ -356,7 +397,8 @@ class OrchestratorE2ETests(unittest.TestCase):
                 f"[model_profiles.planner]\ndisplay_name = \"Planner\"\nroles = [\"planner\"]\ndriver = \"openai-chat\"\nprovider = \"test\"\nmodel = \"fake-planner\"\nselection_mode = \"request\"\nbase_url = {llm.base_url!r}\nendpoint_path = \"/planner\"\nretries = 0{key_line}",
                 f"[model_profiles.reviewer]\ndisplay_name = \"Reviewer\"\nroles = [\"reviewer\"]\ndriver = \"openai-chat\"\nprovider = \"test\"\nmodel = \"fake-reviewer\"\nselection_mode = \"request\"\nbase_url = {llm.base_url!r}\nendpoint_path = \"/reviewer\"\nretries = 0",
                 "[model_profiles.implementer]\ndisplay_name = \"Implementer\"\nroles = [\"implementer\"]\ndriver = \"codex\"\nprovider = \"openai\"\nmodel = \"gpt-5.6-luna\"\neffort = \"high\"\nsandbox = \"workspace-write\"\nselection_mode = \"cli\"\ntimeout_seconds = 3",
-                f"[[check_catalog]]\nid = \"test\"\nargv = [{str(sys.executable)!r}, {str(self.check)!r}]\ntimeout_seconds = 3\ncwd = {check_cwd!r}",
+                f"[[check_catalog]]\nid = \"test\"\nargv = [{str(sys.executable)!r}, {str(self.check)!r}]\ntimeout_seconds = 1\ncwd = {check_cwd!r}"
+                + (f"\npreflight_argv = [{str(sys.executable)!r}, {str(self.check)!r}]" if check_preflight else ""),
             ]) + "\n",
             encoding="utf-8",
         )
@@ -374,15 +416,20 @@ class OrchestratorE2ETests(unittest.TestCase):
         run_id: str = "run-1",
         check_mode: str | None = None,
         check_cwd: str = ".",
+        check_preflight: bool = False,
+        workspace_setup_mode: str | None = None,
         key_env: str | None = None,
         env: dict[str, str] | None = None,
         planning_decomposition: str | None = None,
         max_preapproval_corrections: int | None = None,
+        close_llm: bool = True,
     ) -> tuple[Any, FakeLLM, Path]:
         worktree = self.root / "worktrees" / run_id
         llm = FakeLLM(planner=planner, review=review, mutate=mutate, worktree=worktree)
         config = self.config_file(
             llm, run_id=run_id, max_diff=max_diff, check_cwd=check_cwd,
+            check_preflight=check_preflight,
+            workspace_setup_mode=workspace_setup_mode,
             key_env=key_env, planning_decomposition=planning_decomposition,
             max_preapproval_corrections=max_preapproval_corrections,
         )
@@ -391,6 +438,8 @@ class OrchestratorE2ETests(unittest.TestCase):
             "FAKE_CODEX_BEHAVIOR": codex_behavior,
             "FAKE_WORKTREE": str(worktree),
             "FAKE_CHECK": check_mode or ("fail" if check_fail else "pass"),
+            "FAKE_CHECK_STATE": str(self.root / f"{run_id}-check-state"),
+            "FAKE_PREFLIGHT_STATE": str(self.root / f"{run_id}-preflight-state"),
             "FAKE_PROMPT": str(self.root / "prompt.txt"),
             **(env or {}),
         }
@@ -405,7 +454,8 @@ class OrchestratorE2ETests(unittest.TestCase):
                 else:
                     os.environ[name] = old
         state = json.loads((self.root / "runs" / run_id / "state.json").read_text())
-        llm.close()
+        if close_llm:
+            llm.close()
         return exit_code, llm, state
 
     def test_ready_changes_green_pass_commits_exactly_once(self) -> None:
@@ -616,8 +666,11 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_codex_auth_exit_is_classified_without_sensitive_detail(self) -> None:
         _, _, state = self.run_case(codex_behavior="auth-fail")
-        self.assertEqual(state["failure"]["reason"], "AGENT_AUTH_FAILURE")
-        self.assertEqual(state["failure"]["detail"], "step=S01 worker authentication failed")
+        self.assertEqual(state["failure"]["reason"], "EXTERNAL_AUTH_REQUIRED")
+        self.assertEqual(
+            state["failure"]["detail"],
+            "step=S01 executor credentials or external authorization are required",
+        )
         self.assertEqual(state["recovery_counters"], {})
         self.assertNotIn("request-id", json.dumps(state))
         self.assertNotIn("https://api.openai.com", json.dumps(state))
@@ -765,9 +818,113 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_check_mutation_fails_before_review(self) -> None:
         _, llm, state = self.run_case(check_mode="mutate", run_id="mutate")
-        self.assertEqual(state["failure"]["reason"], "CHECK_MUTATED")
+        self.assertEqual(state["status"], RunStatus.WAITING_CHECK_INFRASTRUCTURE.value)
+        self.assertEqual(state["failure"]["reason"], "CHECK_SIDE_EFFECT_REPEATED")
         self.assertEqual(llm.reviewer_calls, 0)
         self.assertIsNone(state.get("commit_sha"))
+        self.assertEqual(
+            (self.root / "worktrees" / "mutate" / "feature.txt").read_text(encoding="utf-8"),
+            "implemented\n",
+        )
+
+    def test_check_mutation_is_rolled_back_before_clean_pass(self) -> None:
+        _, llm, state = self.run_case(check_mode="mutate_once", run_id="mutate-once")
+        self.assertEqual(state["status"], RunStatus.COMMITTED.value)
+        self.assertEqual(llm.planner_calls, 1)
+        self.assertEqual(llm.reviewer_calls, 1)
+        check = state["checks"][0]
+        self.assertTrue(check["workspace_mutated"])
+        self.assertTrue(check["mutation_recovered"])
+        self.assertEqual(
+            (self.root / "worktrees" / "mutate-once" / "feature.txt").read_text(encoding="utf-8"),
+            "implemented\n",
+        )
+
+    def test_check_timeout_then_pass_continues_the_run(self) -> None:
+        _, llm, state = self.run_case(check_mode="timeout_once", run_id="timeout-once")
+        self.assertEqual(state["status"], RunStatus.COMMITTED.value)
+        self.assertEqual(llm.planner_calls, 1)
+        self.assertEqual(llm.reviewer_calls, 1)
+        check = state["checks"][0]
+        self.assertFalse(check["timed_out"])
+        self.assertEqual(check["infrastructure_retries"], 1)
+
+    def test_repeated_check_timeout_waits_resumably_with_candidate_intact(self) -> None:
+        from metaharness.gitops import candidate_tree_sha
+        from metaharness.resume import resume_info
+
+        run_id = "timeout-resume"
+        _, llm, state = self.run_case(
+            check_mode="timeout_then_pass", run_id=run_id, close_llm=False,
+        )
+        run_dir = self.root / "runs" / run_id
+        worktree = self.root / "worktrees" / run_id
+        self.assertEqual(state["status"], RunStatus.WAITING_CHECK_INFRASTRUCTURE.value)
+        self.assertEqual(state["failure"]["reason"], "CHECK_INFRASTRUCTURE_UNAVAILABLE")
+        self.assertTrue(resume_info(run_dir, state).resumable)
+        self.assertEqual(candidate_tree_sha(worktree), state["staged_tree_sha"])
+        self.assertEqual(llm.planner_calls, 1)
+        self.assertEqual(llm.reviewer_calls, 0)
+
+        saved = {key: os.environ.get(key) for key in ("FAKE_CHECK", "FAKE_CHECK_STATE")}
+        os.environ["FAKE_CHECK"] = "timeout_then_pass"
+        os.environ["FAKE_CHECK_STATE"] = str(self.root / f"{run_id}-check-state")
+        try:
+            resumed = Orchestrator(load_config(self.root / "config.toml")).resume(run_id)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            llm.close()
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, resumed.state.get("failure"))
+        self.assertEqual(llm.planner_calls, 1)
+        self.assertEqual(llm.reviewer_calls, 1)
+
+    def test_preflight_recovers_without_replanning_or_restarting_run(self) -> None:
+        _, llm, state = self.run_case(
+            check_preflight=True,
+            env={"FAKE_PREFLIGHT": "fail-once"},
+            run_id="preflight-retry",
+        )
+        self.assertEqual(state["status"], RunStatus.COMMITTED.value)
+        self.assertEqual(llm.planner_calls, 1)
+        self.assertEqual(llm.reviewer_calls, 1)
+        self.assertGreaterEqual(
+            int((self.root / "preflight-retry-preflight-state").read_text()), 2,
+        )
+
+    def test_workspace_setup_transient_failure_retries_in_place(self) -> None:
+        _, llm, state = self.run_case(
+            workspace_setup_mode="fail_once", run_id="setup-retry",
+        )
+        self.assertEqual(state["status"], RunStatus.COMMITTED.value)
+        self.assertEqual(llm.planner_calls, 1)
+        self.assertEqual(llm.reviewer_calls, 1)
+        self.assertTrue((self.root / "setup-retry-setup-state").is_file())
+
+    def test_workspace_setup_candidate_mutation_is_rolled_back_before_retry(self) -> None:
+        _, llm, state = self.run_case(
+            workspace_setup_mode="mutate_once", run_id="setup-mutation",
+        )
+        self.assertEqual(state["status"], RunStatus.COMMITTED.value)
+        self.assertEqual(llm.planner_calls, 1)
+        self.assertFalse((self.root / "worktrees/setup-mutation/setup-artifact.txt").exists())
+
+    def test_workspace_setup_exhaustion_waits_at_setup_checkpoint(self) -> None:
+        from metaharness.resume import resume_info
+
+        _, llm, state = self.run_case(
+            workspace_setup_mode="fail_always", run_id="setup-wait",
+        )
+        run_dir = self.root / "runs" / "setup-wait"
+        self.assertEqual(state["status"], RunStatus.WAITING_CHECK_INFRASTRUCTURE.value)
+        self.assertEqual(state["failure"]["reason"], "CHECK_INFRASTRUCTURE_UNAVAILABLE")
+        self.assertEqual(resume_info(run_dir, state).phase, "worktree_setup")
+        self.assertFalse((self.root / "worktrees/setup-wait/feature.txt").exists())
+        self.assertEqual(llm.planner_calls, 1)
+        self.assertEqual(llm.reviewer_calls, 0)
 
     def test_check_path_escape_fails_without_running_or_committing(self) -> None:
         _, llm, state = self.run_case(check_cwd="..", run_id="escape")

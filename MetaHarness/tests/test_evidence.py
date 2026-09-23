@@ -8,7 +8,12 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from metaharness.evidence import bounded_semantic_diff, collect_evidence  # noqa: E402
+from metaharness.evidence import (  # noqa: E402
+    EvidenceBundle,
+    bounded_semantic_diff,
+    collect_evidence,
+    required_checks_passed,
+)
 from metaharness.gitops import current_head, index_tree_sha, stage_all  # noqa: E402
 from metaharness.models import (  # noqa: E402
     CheckConfig,
@@ -50,6 +55,22 @@ class EvidenceTests(unittest.TestCase):
     @staticmethod
     def command(code: str) -> tuple[str, ...]:
         return (sys.executable, "-c", code)
+
+    def test_gate_claim_cannot_replace_required_check_pass_evidence(self) -> None:
+        evidence = EvidenceBundle(
+            base_sha=self.base_sha,
+            staged_tree_sha="a" * 40,
+            changed_files=("keep.txt",),
+            diff="diff",
+            checks=({
+                "name": "unit", "exit_code": 1, "timed_out": False,
+                "failure_kind": "nonzero_exit",
+            },),
+            deterministic_passed=True,
+            failures=(),
+            required_check_ids=("unit",),
+        )
+        self.assertFalse(required_checks_passed(evidence))
 
     def config(self, checks: tuple[CheckConfig, ...] = (), max_diff_bytes: int = 400_000) -> HarnessConfig:
         return HarnessConfig(

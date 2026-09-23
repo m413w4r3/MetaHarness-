@@ -27,6 +27,8 @@ class RecoveryPolicyTests(unittest.TestCase):
             "AGENT_SCOPE_VIOLATION", "SECRET_IN_DIFF", "RESUME_INTEGRITY_FAILURE",
             "CHECK_AUTHORITY_TAMPERING", "STAGED_BLOB_SCAN_FAILED",
             "UNSCANNABLE_STAGED_BLOB", "UNREVIEWABLE_TEXT_DIFF",
+            "SECRET_IN_STAGED_BLOB", "AGENT_GIT_VIOLATION",
+            "ROLLBACK_FAILED", "DURABLE_ARTIFACT_CORRUPTED",
         ):
             with self.subTest(reason=reason):
                 self.assertEqual(
@@ -45,6 +47,19 @@ class RecoveryPolicyTests(unittest.TestCase):
                     classify_failure(reason).disposition,
                     RecoveryDisposition.RETRY_SAME,
                 )
+        for reason in (
+            "CHECK_INFRASTRUCTURE_UNAVAILABLE:unit",
+            "CHECK_SIDE_EFFECT_REPEATED:formatter",
+        ):
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    classify_failure(reason).disposition,
+                    RecoveryDisposition.WAIT_EXTERNAL,
+                )
+        self.assertEqual(
+            classify_failure("CHECK_TIMEOUT", budget_exhausted=True).disposition,
+            RecoveryDisposition.WAIT_EXTERNAL,
+        )
 
     def test_clean_contract_and_review_format_failures_are_recoverable(self) -> None:
         self.assertEqual(

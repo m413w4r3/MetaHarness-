@@ -1222,7 +1222,7 @@ _LIVE_EVENT_WINDOW_BYTES = 256 * 1024
 # human decision that needs the complete server-rendered page.
 LIVE_STOP_STATUSES = frozenset({
     "committed", "published", "failed", "blocked", "plan_rejected", "interrupted",
-    "awaiting_plan_approval",
+    "awaiting_plan_approval", "waiting_check_infrastructure",
     "waiting_scope_approval",
 })
 _DIAGNOSTIC_COUNTERS = (

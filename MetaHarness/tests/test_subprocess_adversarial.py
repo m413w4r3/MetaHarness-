@@ -18,6 +18,7 @@ from metaharness.agent.base import AgentError  # noqa: E402
 from metaharness.agent.codex import CodexAgent  # noqa: E402
 from metaharness.context import build_context, render_context  # noqa: E402
 from metaharness.evidence import collect_evidence  # noqa: E402
+from metaharness.gitops import candidate_tree_sha  # noqa: E402
 from metaharness.models import (  # noqa: E402
     AgentConfig,
     CheckConfig,
@@ -205,7 +206,7 @@ class CheckProcessTests(TempRepoCase):
         bundle = collect_evidence(self.repo, self.base, config)
         self.assertEqual(bundle.checks[0].exit_code, -1)
         self.assertIn("could not start", bundle.checks[0].stderr_log)
-        self.assertIn("CHECK_FAILED:absent", bundle.failures)
+        self.assertIn("CHECK_INFRA_FAILURE:absent", bundle.failures)
         self.assertIn("CHECK_FAILED:fails", bundle.failures)
         self.assertFalse(bundle.deterministic_passed)
 
@@ -222,22 +223,96 @@ class CheckProcessTests(TempRepoCase):
             "new file": "open('created.txt', 'w').write('x')",
             "deletion": "import os; os.remove('tracked.txt')",
             "mode": "import os; os.chmod('tracked.txt', 0o755)",
-            "commit": "import subprocess; subprocess.run(['git', 'commit', '-q', '--allow-empty', '-m', 'x'], check=True)",
-            "branch switch": "import subprocess; subprocess.run(['git', 'switch', '-q', '-c', 'other'], check=True)",
         }
         for name, code in mutations.items():
             with self.subTest(mutation=name):
+                before = candidate_tree_sha(self.repo)
                 result = run_checks(self.repo, self.config(self.check(name, code)))[0]
                 self.assertTrue(result.workspace_mutated)
-                git(self.repo, "switch", "-q", "-f", "-")  if name == "branch switch" else None
-                git(self.repo, "reset", "-q", "--hard", self.base)
+                self.assertEqual(result.failure_kind, "side_effect_repeated")
+                self.assertTrue(result.mutation_recovered)
+                after = candidate_tree_sha(self.repo)
+                self.assertEqual(after, before)
                 (self.repo / "untracked.txt").write_text("agent output\n", encoding="utf-8")
                 for leftover in ("created.txt",):
                     (self.repo / leftover).unlink(missing_ok=True)
         ignored = "import os; os.makedirs('ignored', exist_ok=True); open('ignored/cache', 'w').write('x')"
         self.assertFalse(run_checks(self.repo, self.config(self.check("cache", ignored)))[0].workspace_mutated)
 
-    def test_non_required_check_mutation_still_closes_the_gate(self) -> None:
+    def test_check_timeout_then_pass_retries_the_same_trusted_process(self) -> None:
+        marker = self.root / "timeout-count"
+        code = (
+            "import pathlib, time\n"
+            f"marker = pathlib.Path({str(marker)!r})\n"
+            "count = int(marker.read_text()) if marker.exists() else 0\n"
+            "marker.write_text(str(count + 1))\n"
+            "if count == 0: time.sleep(5)\n"
+        )
+        calls: list[tuple[str, str]] = []
+        result = run_checks(
+            self.repo,
+            self.config(self.check("retry", code, timeout_seconds=1)),
+            retry_infrastructure=lambda check_id, kind: calls.append((check_id, kind)) or True,
+        )[0]
+        self.assertEqual(calls, [("retry", "timeout")])
+        self.assertEqual((result.exit_code, result.timed_out, result.failure_kind), (0, False, "passed"))
+        self.assertEqual(result.infrastructure_retries, 1)
+
+    def test_repeated_timeout_is_infrastructure_evidence_and_preserves_candidate(self) -> None:
+        code = "import time\ntime.sleep(5)\n"
+        before = candidate_tree_sha(self.repo)
+        retries = 0
+
+        def retry(_check_id: str, kind: str) -> bool:
+            nonlocal retries
+            self.assertEqual(kind, "timeout")
+            retries += 1
+            return retries <= 2
+
+        result = run_checks(
+            self.repo,
+            self.config(self.check("always-timeout", code, timeout_seconds=1)),
+            retry_infrastructure=retry,
+        )[0]
+        after = candidate_tree_sha(self.repo)
+        self.assertEqual(retries, 3)  # the third decision exhausts the two retry slots
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.infrastructure_retries, 2)
+        self.assertEqual(before, after)
+
+    def test_mutation_is_rolled_back_then_same_check_can_pass(self) -> None:
+        (self.repo / "tracked.txt").write_text("candidate\n", encoding="utf-8")
+        marker = self.root / "mutation-count"
+        code = (
+            "import pathlib\n"
+            f"marker = pathlib.Path({str(marker)!r})\n"
+            "if not marker.exists():\n"
+            " marker.write_text('once')\n"
+            " pathlib.Path('tracked.txt').write_text('check mutation\\n')\n"
+        )
+        before = candidate_tree_sha(self.repo)
+        bundle = collect_evidence(
+            self.repo, self.base, self.config(self.check("mutate-once", code)),
+            required_check_ids=("mutate-once",),
+        )
+        result = bundle.checks[0]
+        after = candidate_tree_sha(self.repo)
+        self.assertTrue(bundle.deterministic_passed)
+        self.assertEqual(bundle.failures, ())
+        self.assertEqual(result.failure_kind, "passed")
+        self.assertTrue(result.workspace_mutated)
+        self.assertTrue(result.mutation_recovered)
+        self.assertIsNotNone(result.mutated_tree_sha)
+        self.assertNotEqual(before, result.mutated_tree_sha)
+        self.assertEqual(result.mutated_paths, ("tracked.txt",))
+        self.assertEqual(before, after)
+
+    def test_git_ownership_mutation_is_a_hard_stop(self) -> None:
+        code = "import subprocess\nsubprocess.run(['git', 'switch', '-c', 'other'], check=True)\n"
+        with self.assertRaisesRegex(ValidationError, "AGENT_GIT_VIOLATION"):
+            run_checks(self.repo, self.config(self.check("branch", code)))
+
+    def test_non_required_check_side_effect_is_rolled_back_and_closes_the_gate(self) -> None:
         (self.repo / "tracked.txt").write_text("change\n", encoding="utf-8")
         config = self.config(
             self.check("formatter", "open('tracked.txt', 'a').write('fmt\\n')", required=False)
@@ -248,8 +323,9 @@ class CheckProcessTests(TempRepoCase):
             config,
             required_check_ids=("formatter",),
         )
-        self.assertIn("CHECK_MUTATED:formatter", bundle.failures)
+        self.assertIn("CHECK_SIDE_EFFECT_REPEATED:formatter", bundle.failures)
         self.assertFalse(bundle.deterministic_passed)
+        self.assertEqual((self.repo / "tracked.txt").read_text(encoding="utf-8"), "change\n")
 
     def test_cwd_escapes_are_rejected_before_any_check_runs(self) -> None:
         outside = self.root / "outside"

@@ -28,6 +28,7 @@ from .shared import (
 from ..evidence import (
     EvidenceBundle,
     collect_evidence,
+    required_checks_passed,
 )
 from ..gitops import (
     GitError,
@@ -746,6 +747,7 @@ class RevisionRunner:
         reviewer_correction_evidence: str | None = None,
         candidate_identity: str | None = None,
         bounded_diff_evidence: str | None = None,
+        pre_check_evidence: EvidenceBundle | None = None,
         check_repair_evidence: EvidenceBundle | None = None,
         check_repair_scope: CheckRepairScope | None = None,
     ) -> tuple[Any | None, str | None]:
@@ -810,7 +812,21 @@ class RevisionRunner:
                 "source": "human-approved mutable scope",
             }))
             pre_payload = self.reusable_pre_checks(artifact_dir, tree_before)
-            if pre_payload is None:
+            if pre_check_evidence is not None:
+                if (
+                    pre_check_evidence.staged_tree_sha != tree_before
+                    or not pre_check_evidence.deterministic_passed
+                    or not required_checks_passed(pre_check_evidence)
+                ):
+                    return None, "TOCTOU_FAILURE"
+                pre_payload = {
+                    "checks": _check_payload(pre_check_evidence),
+                    "failures": list(pre_check_evidence.failures),
+                    "deterministic_passed": pre_check_evidence.deterministic_passed,
+                    "staged_tree_sha": pre_check_evidence.staged_tree_sha,
+                }
+                atomic_write_text(artifact_dir / "pre_checks.json", _json_text(pre_payload))
+            elif pre_payload is None:
                 store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
                 check_config, check_ids = config_with_check_authority(
                     self.config, run_dir, requested_check_ids=plan.required_checks or None,

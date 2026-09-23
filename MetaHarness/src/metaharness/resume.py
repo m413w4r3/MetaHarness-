@@ -235,11 +235,20 @@ PHASE_STATUS.update({
     ResumePhase.REVIEW_IMPLEMENTATION: "implementing", ResumePhase.REVIEW_REPLAN: "planning",
     ResumePhase.PUBLISH: "publishing",
 })
-_RESUMABLE_STATUSES = frozenset({"failed", "interrupted", "waiting_scope_approval"})
+_RESUMABLE_STATUSES = frozenset({
+    "failed", "interrupted", "waiting_scope_approval", "waiting_check_infrastructure",
+})
 # Failures that a checkpoint can never repair: the run needs an operator.
 _TERMINAL_FAILURES = frozenset({
     "RESUME_INTEGRITY_FAILURE", "RESUME_REQUIRES_OPERATOR",
     "AGENT_SCOPE_VIOLATION", "AGENT_GIT_VIOLATION",
+    "SECRET_IN_DIFF", "SECRET_IN_STAGED_BLOB", "UNSCANNABLE_STAGED_BLOB",
+    "STAGED_BLOB_SCAN_FAILED", "UNREVIEWABLE_TEXT_DIFF",
+    "HEAD_MISMATCH", "TREE_MISMATCH", "UNEXPECTED_HEAD", "UNEXPECTED_TREE",
+    "COMMIT_TREE_MISMATCH", "INTEGRITY_MISMATCH",
+    "DURABLE_ARTIFACT_CORRUPTED", "CORRUPTED_DURABLE_ARTIFACT",
+    "ROLLBACK_FAILED", "ROLLBACK_TREE_MISMATCH",
+    "CHECK_MUTATED_FORBIDDEN_FILES",
 })
 
 

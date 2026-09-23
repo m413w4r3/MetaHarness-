@@ -365,7 +365,7 @@ _REVIEW_ATTEMPT_ARTIFACTS = (
 )
 
 
-_CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "evidence.json")
+_CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "evidence.json", "checks")
 
 
 

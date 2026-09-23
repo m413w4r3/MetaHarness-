@@ -87,7 +87,7 @@ class RecoveryBudgets:
 
 
 _HARD_STOP_CODES = frozenset({
-    "SECRET_IN_DIFF", "SECRET_IN_BLOB", "SECRET_DETECTED",
+    "SECRET_IN_DIFF", "SECRET_IN_BLOB", "SECRET_IN_STAGED_BLOB", "SECRET_DETECTED",
     "STAGED_BLOB_SCAN_FAILED", "UNSCANNABLE_STAGED_BLOB",
     "SOURCE_STAGED_BLOB_NOT_REVIEWABLE", "UNREVIEWABLE_TEXT_DIFF",
     "BLOB_SCAN_FAILED", "SOURCE_LIKE_STAGED_BLOB_NOT_REVIEWABLE",
@@ -108,7 +108,7 @@ _HARD_STOP_CODES = frozenset({
     "COMMIT_TREE_MISMATCH", "BASE_MOVED_SINCE_RUN",
     "CHECK_REPAIR_EXHAUSTED", "CHECK_INFRA_RETRIES_EXHAUSTED",
     "TRANSIENT_ATTEMPTS_EXHAUSTED", "REVIEW_REPAIR_EXHAUSTED",
-    "CHECK_MUTATED", "CHECK_MUTATED_FORBIDDEN_FILES",
+    "CHECK_MUTATED_FORBIDDEN_FILES",
     "REMOTE_AUTHORITY_MISMATCH",
 })
 
@@ -167,6 +167,16 @@ def classify_failure(
         return decision(RecoveryDisposition.HARD_STOP, "tree changed outside approved scope")
     if not rollback_succeeded:
         return decision(RecoveryDisposition.HARD_STOP, "rollback did not restore the expected tree")
+    if code in {
+        "CHECK_INFRASTRUCTURE_UNAVAILABLE", "CHECK_SIDE_EFFECT_REPEATED",
+        "CHECK_SIDE_EFFECT_UNSTABLE",
+    }:
+        return decision(RecoveryDisposition.WAIT_EXTERNAL, "check infrastructure needs operator or environment recovery")
+    if budget_exhausted and code in {
+        "CHECK_TIMEOUT", "CHECK_PREFLIGHT_FAILED", "CHECK_INFRA_FAILURE",
+        "WORKSPACE_SETUP_FAILED", "WORKSPACE_SETUP_TIMEOUT",
+    }:
+        return decision(RecoveryDisposition.WAIT_EXTERNAL, "bounded infrastructure retries were exhausted")
     if budget_exhausted:
         return decision(RecoveryDisposition.HARD_STOP, "bounded recovery budget exhausted")
 

@@ -344,7 +344,11 @@ def _check_cards(checks: Any) -> str:
         if not isinstance(check, dict):
             cards.append(f"<pre>{_e(check)}</pre>")
             continue
-        passed = check.get("exit_code") == 0 and not check.get("timed_out") and not check.get("workspace_mutated")
+        passed = (
+            check.get("exit_code") == 0 and not check.get("timed_out")
+            and check.get("failure_kind", "passed") == "passed"
+            and (not check.get("workspace_mutated") or check.get("mutation_recovered"))
+        )
         status = "PASS" if passed else "FAIL"
         duration = check.get("duration_seconds", check.get("duration"))
         cards.append(f'<article class="card {"pass" if passed else "fail"}"><h3>{_e(check.get("name"))} — {status}</h3><p><strong>{status}</strong> · exit code {_e(check.get("exit_code"))} · duration {_e(duration)} · mutation {_e(check.get("workspace_mutated"))}</p><details><summary>stdout / stderr</summary><p>stdout</p><pre>{_e(check.get("stdout_tail"))}</pre><p>stderr</p><pre>{_e(check.get("stderr_tail"))}</pre></details></article>')
@@ -624,7 +628,9 @@ def _checks_verdict(checks: Any) -> str:
         return "—"
     required = [item for item in items if isinstance(item, dict) and item.get("required", True)]
     passed = all(
-        item.get("exit_code") == 0 and not item.get("timed_out") and not item.get("workspace_mutated")
+        item.get("exit_code") == 0 and not item.get("timed_out")
+        and item.get("failure_kind", "passed") == "passed"
+        and (not item.get("workspace_mutated") or item.get("mutation_recovered"))
         for item in required
     )
     return "PASS" if passed else "FAIL"
@@ -883,6 +889,8 @@ _FAILURE_MESSAGES = {
     "UNRESOLVED_CONTRACT_MISMATCH": "Deferred contract mismatch needs semantic revision or an operator",
     "STEP_WRITE_SET_VIOLATION": "Step changed an unauthorized path",
     "CHECK_REPAIR_EXHAUSTED": "Check-repair budget exhausted",
+    "CHECK_INFRASTRUCTURE_UNAVAILABLE": "Deterministic check infrastructure is unavailable",
+    "CHECK_SIDE_EFFECT_REPEATED": "A deterministic check repeatedly changed the candidate",
     "HUMAN_REQUIRED": "Human action required",
     "REVIEWER_TRANSPORT_FAILURE": "Reviewer could not be reached",
     "REVIEWER_OUTPUT_INVALID": "Reviewer answer is invalid",
@@ -986,7 +994,7 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = str(state.get("status", run.get("status", "")) or "")
     failure = run.get("failure", state.get("failure"))
-    if status not in {"failed", "blocked", "interrupted"} or not isinstance(failure, dict):
+    if status not in {"failed", "blocked", "interrupted", "waiting_check_infrastructure"} or not isinstance(failure, dict):
         return ""
     reason = str(failure.get("reason") or "")
     resume = overview.get("resume") if isinstance(overview.get("resume"), dict) else {}
