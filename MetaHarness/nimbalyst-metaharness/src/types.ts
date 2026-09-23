@@ -30,7 +30,15 @@ export interface HealthResponse extends JsonObject {
 
 export type MetaHarnessConfigResponse = JsonObject;
 export type ModelProfilesResponse = JsonObject;
-export type RunSummary = JsonObject;
+export interface RunSummary extends JsonObject {
+  run_id?: string;
+  status?: string;
+  updated_at?: string | null;
+  plan_title?: string | null;
+  commit_sha?: string | null;
+  candidate?: unknown;
+  failure?: unknown;
+}
 export type RunDetail = JsonObject;
 export type ProgressResponse = JsonObject;
 export type CreateRunInput = JsonObject;

@@ -1,39 +1,30 @@
+import { useState } from 'react';
 import type { PanelHostProps } from '@nimbalyst/extension-sdk';
+import { DEFAULT_SETTINGS, type MetaHarnessSettingsData } from '../settings/MetaHarnessSettings';
+import { RunsDashboard } from './RunsDashboard';
+
+type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
+type ExtendedPanelHost = PanelHostProps['host'] & { callBackendTool?: BackendCall };
+
+function settingsFromHost(host: ExtendedPanelHost): MetaHarnessSettingsData {
+  const saved = host.storage.get<Partial<MetaHarnessSettingsData>>('settings') ?? {};
+  return { ...DEFAULT_SETTINGS, ...saved };
+}
 
 export function MetaHarnessPanel({ host }: PanelHostProps) {
-  const workspace = host.workspacePath || 'No workspace open';
+  const backendCall = (host as ExtendedPanelHost).callBackendTool;
+  const [settings] = useState(() => settingsFromHost(host as ExtendedPanelHost));
+  const [view, setView] = useState<{ kind: 'dashboard' } | { kind: 'run'; runId: string } | { kind: 'new-run' }>({ kind: 'dashboard' });
 
   return (
-    <main className="metaharness-panel" aria-labelledby="metaharness-title">
-      <div className="metaharness-panel__content">
-        <div className="metaharness-panel__eyebrow">Nimbalyst extension</div>
-        <h1 id="metaharness-title">MetaHarness</h1>
-        <p className="metaharness-panel__description">
-          Control and inspect MetaHarness runs from this workspace.
-        </p>
-
-        <dl className="metaharness-panel__details">
-          <div>
-            <dt>Workspace</dt>
-            <dd title={workspace}>{workspace}</dd>
-          </div>
-          <div>
-            <dt>Status</dt>
-            <dd>
-              <span className="metaharness-status-dot" aria-hidden="true" />
-              Not configured
-            </dd>
-          </div>
-        </dl>
-
-        <button
-          className="metaharness-button"
-          type="button"
-          onClick={() => host.openSettings()}
-        >
-          Open Settings
-        </button>
-      </div>
+    <main className="metaharness-panel" aria-label="MetaHarness runs">
+      <RunsDashboard
+        callBackendTool={backendCall}
+        settings={settings}
+        view={view}
+        onViewChange={setView}
+        onOpenSettings={() => host.openSettings()}
+      />
     </main>
   );
 }
