@@ -30,6 +30,7 @@ from .pipeline_v2 import (
     cycle_record_path,
     gate_acceptance_path,
     gate_dir,
+    implementation_steps_dir,
     review_dir,
     semantic_revision_dir,
     step_dir,
@@ -553,6 +554,59 @@ def _plan_scope(plan: TaskPlanV2) -> set[str]:
     }
 
 
+def _contract_repair_scope(
+    run_dir: Path, number: int, policy: EffectiveRepairScopePolicy,
+) -> set[str]:
+    """Read durable mutable paths approved by step-contract repairs."""
+
+    scope: set[str] = set()
+    root = implementation_steps_dir(run_dir, number)
+    if not root.is_dir():
+        return scope
+    for step_root in root.iterdir():
+        repairs = step_root / "contract_repairs"
+        if not repairs.is_dir():
+            continue
+        for repair in repairs.iterdir():
+            validation = _read_json_artifact(repair / "validation.json", 64 * 1024)
+            contract = repair / "contract.md"
+            if not isinstance(validation, dict) or validation.get("status") != "validated":
+                continue
+            added = validation.get("added_mutable_paths")
+            digest = validation.get("repaired_contract_sha256")
+            if (
+                not isinstance(added, list) or any(
+                    not isinstance(path, str) or not path or path.startswith("/")
+                    or ".." in Path(path).parts for path in added
+                )
+                or not isinstance(digest, str) or not contract.is_file()
+            ):
+                raise ResumeIntegrityError("step contract repair scope artifact is malformed")
+            try:
+                actual = hashlib.sha256(contract.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise ResumeIntegrityError("step contract repair contract is unreadable") from exc
+            if actual != digest:
+                raise ResumeIntegrityError("step contract repair contract hash changed")
+            if added:
+                if policy.policy == "deny-expansion":
+                    raise ResumeIntegrityError("step contract repair scope expansion is denied")
+                if policy.policy == "require-approval" or len(added) > policy.max_added_paths:
+                    delta_path = repair / "scope_delta.json"
+                    delta = _read_json_artifact(delta_path, 64 * 1024)
+                    if not isinstance(delta, dict) or delta.get("added_paths") != added:
+                        raise ResumeIntegrityError("step contract repair scope delta is malformed")
+                    try:
+                        delta_sha = hashlib.sha256(delta_path.read_bytes()).hexdigest()
+                        approval = read_scope_approval(repair, expected_sha256=delta_sha)
+                    except (OSError, ApprovalError) as exc:
+                        raise ResumeIntegrityError("step contract repair scope approval is invalid") from exc
+                    if approval is None or approval.decision is not ApprovalDecision.APPROVE:
+                        raise ResumeIntegrityError("step contract repair scope was not approved")
+            scope.update(added)
+    return scope
+
+
 def _approved_scope(
     config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
     plan: TaskPlanV2, checkpoint: ResumeCheckpoint, policy: EffectiveRepairScopePolicy,
@@ -560,6 +614,7 @@ def _approved_scope(
     """Every path any durable authority of cycles ``1..n`` approved."""
 
     scope = set(_plan_scope(plan))
+    scope |= _contract_repair_scope(run_dir, 1, policy)
     cycle_scopes: dict[int, tuple[str, ...]] = {1: tuple(sorted(scope))}
     cycle_kinds: dict[int, CycleKind] = {1: CycleKind.INITIAL}
     for number in range(2, checkpoint.review_cycle + 1):
@@ -580,8 +635,10 @@ def _approved_scope(
         )
         verify_correction_scope(run_dir, number, bundle_sha, policy)
         cycle_scopes[number] = tuple(sorted(_plan_scope(correction)))
+        cycle_scopes[number] = tuple(sorted(set(cycle_scopes[number]) | _contract_repair_scope(run_dir, number, policy)))
         cycle_kinds[number] = cycle.kind
         scope |= _plan_scope(correction)
+        scope |= _contract_repair_scope(run_dir, number, policy)
     for number, base in cycle_scopes.items():
         kind = cycle_kinds[number]
         stages = (
@@ -601,11 +658,11 @@ def _approved_scope(
 
 def _cycle_base_scope(
     config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
-    plan: TaskPlanV2, number: int,
+    plan: TaskPlanV2, number: int, policy: EffectiveRepairScopePolicy,
 ) -> tuple[str, ...]:
     """Return the approved plan scope which is the base for one cycle."""
 
-    current = tuple(sorted(_plan_scope(plan)))
+    current = tuple(sorted(set(_plan_scope(plan)) | _contract_repair_scope(run_dir, 1, policy)))
     for cycle_number in range(2, number + 1):
         cycle = read_cycle_record(run_dir, cycle_number)
         if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
@@ -615,6 +672,7 @@ def _cycle_base_scope(
             inherited_check_ids=plan.required_checks,
         )
         current = tuple(sorted(_plan_scope(correction)))
+        current = tuple(sorted(set(current) | _contract_repair_scope(run_dir, cycle_number, policy)))
     return current
 
 
@@ -821,7 +879,9 @@ def validate_resume(
                 if advanced:
                     _validate_gate_acceptance(
                         run_dir, number, checkpoint.stage, tree=expected_tree, head=head,
-                        base_scope=_cycle_base_scope(config, selection, run_dir, plan, number),
+                        base_scope=_cycle_base_scope(
+                            config, selection, run_dir, plan, number, repair_scope,
+                        ),
                         policy=repair_scope,
                     )
             elif checkpoint.phase is not ResumePhase.CANDIDATE_READY:
@@ -853,7 +913,7 @@ def validate_resume(
             except (KeyError, TypeError, ValueError):
                 _refuse("the candidate gate stage is invalid")
             cycle_base_scope = _cycle_base_scope(
-                config, selection, run_dir, plan, number,
+                config, selection, run_dir, plan, number, repair_scope,
             )
             _validate_gate_acceptance(
                 run_dir, number, candidate_stage, tree=expected_tree, head=head,
@@ -898,7 +958,9 @@ def validate_resume(
             _validate_gate_acceptance(
                 run_dir, number, pre_semantic_gate_stage(current_cycle.kind),
                 tree=resolve_tree(repo, pre_head), head=pre_head,
-                base_scope=_cycle_base_scope(config, selection, run_dir, plan, number),
+                base_scope=_cycle_base_scope(
+                    config, selection, run_dir, plan, number, repair_scope,
+                ),
                 policy=repair_scope,
             )
         if checkpoint.phase is ResumePhase.CHECK_REPAIR:

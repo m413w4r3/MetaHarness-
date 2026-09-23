@@ -233,6 +233,7 @@ class RunStatus(StrEnum):
     WORKTREE_READY = "worktree_ready"
     PREPARING = "preparing"
     IMPLEMENTING = "implementing"
+    CONTRACT_REPAIRING = "contract_repairing"
     VALIDATING = "validating"
     PRE_REVISION_VALIDATING = "pre_revision_validating"
     REVISING = "revising"
@@ -443,6 +444,7 @@ class RevisionConfig:
     enabled: bool = False
     max_review_repair_cycles: int = 0
     max_check_repair_attempts: int = 0
+    max_step_contract_repairs: int = 2
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -452,6 +454,9 @@ class RevisionConfig:
         )
         validate_revision_budget(
             self.max_check_repair_attempts, "revision.max_check_repair_attempts"
+        )
+        validate_revision_budget(
+            self.max_step_contract_repairs, "revision.max_step_contract_repairs"
         )
 
 @dataclass(frozen=True)

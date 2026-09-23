@@ -55,6 +55,7 @@ class RunOptions:
     max_check_repair_attempts: int
     max_review_repair_cycles: int
     planner_profile: str
+    max_step_contract_repairs: int = 2
     mechanical_profile: str = ""
     reasoning_profile: str = ""
     agentic_profile: str = ""
@@ -110,6 +111,12 @@ class RunOptions:
                 validate_revision_budget(getattr(self, name), f"run options {name}")
             except ValueError as exc:
                 raise RunOptionsError(str(exc)) from None
+        try:
+            validate_revision_budget(
+                self.max_step_contract_repairs, "run options max_step_contract_repairs"
+            )
+        except ValueError as exc:
+            raise RunOptionsError(str(exc)) from None
         for name in (
             "planner_profile", "mechanical_profile", "reasoning_profile",
             "agentic_profile", "final_reviewer_profile",
@@ -137,7 +144,7 @@ class RunOptions:
             "check_repair_profile", "semantic_reviser_profile", "final_reviewer_profile",
             "repair_scope_policy", "repair_scope_max_added_paths",
             "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
-            "max_preapproval_corrections",
+            "max_preapproval_corrections", "max_step_contract_repairs",
         }
         unknown = set(overrides) - allowed
         if unknown:
@@ -166,6 +173,7 @@ class RunOptions:
             "semantic_revision_enabled": config.revision.enabled,
             "max_check_repair_attempts": config.revision.max_check_repair_attempts,
             "max_review_repair_cycles": config.revision.max_review_repair_cycles,
+            "max_step_contract_repairs": config.revision.max_step_contract_repairs,
             "planner_profile": config.ui.default_planner_profile,
             **route_defaults,
             "check_repair_profile": config.ui.default_repair_profile,
@@ -222,6 +230,7 @@ class RunOptions:
                 "semantic_revision_enabled": self.semantic_revision_enabled,
                 "max_check_repair_attempts": self.max_check_repair_attempts,
                 "max_review_repair_cycles": self.max_review_repair_cycles,
+                "max_step_contract_repairs": self.max_step_contract_repairs,
                 "repair_scope_policy": self.repair_scope_policy,
                 "repair_scope_max_added_paths": self.repair_scope_max_added_paths,
             },
@@ -248,10 +257,15 @@ class RunOptions:
             "max_preapproval_corrections",
         }:
             raise RunOptionsError("run options planning schema is invalid")
-        if not isinstance(pipeline, Mapping) or set(pipeline) != {
+        if not isinstance(pipeline, Mapping) or set(pipeline) not in ({
+            "semantic_revision_enabled", "max_check_repair_attempts", "max_review_repair_cycles",
+            "repair_scope_policy", "repair_scope_max_added_paths", "max_step_contract_repairs",
+        }, {
+            # Runs written before contract-repair budgeting used the same
+            # schema version; default the newly introduced bounded budget.
             "semantic_revision_enabled", "max_check_repair_attempts", "max_review_repair_cycles",
             "repair_scope_policy", "repair_scope_max_added_paths",
-        }:
+        }):
             raise RunOptionsError("run options pipeline schema is invalid")
         if not isinstance(profiles, Mapping) or set(profiles) != {
             "planner_profile", "mechanical_profile", "reasoning_profile", "agentic_profile",
@@ -260,6 +274,8 @@ class RunOptions:
         }:
             raise RunOptionsError("run options profiles schema is invalid")
         try:
+            if "max_step_contract_repairs" not in pipeline:
+                pipeline = {**pipeline, "max_step_contract_repairs": 2}
             return cls(
                 schema_version=value["schema_version"], pipeline_version=value["pipeline_version"],
                 **planning, **pipeline, **profiles,
@@ -352,6 +368,7 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
     revision = RevisionConfig(
         enabled=options.semantic_revision_enabled,
         max_check_repair_attempts=options.max_check_repair_attempts,
+        max_step_contract_repairs=options.max_step_contract_repairs,
         max_review_repair_cycles=options.max_review_repair_cycles,
     )
     return replace(config, planning=planning, ui=ui, routing=routing, revision=revision)

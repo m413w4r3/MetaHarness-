@@ -796,7 +796,10 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     )
 
     revision_data = _table(expanded, "revision")
-    allowed_revision = {"enabled", "max_review_repair_cycles", "max_check_repair_attempts"}
+    allowed_revision = {
+        "enabled", "max_review_repair_cycles", "max_check_repair_attempts",
+        "max_step_contract_repairs",
+    }
     unknown_revision = sorted(set(revision_data) - allowed_revision)
     if unknown_revision:
         raise ConfigError(f"revision.{unknown_revision[0]} is not allowed")
@@ -807,13 +810,17 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     check_budget = _revision_budget(
         revision_data, "max_check_repair_attempts", 2, "revision"
     )
+    contract_budget = _revision_budget(
+        revision_data, "max_step_contract_repairs", 2, "revision"
+    )
     if not revision_data:
         # A config with no [revision] section has no correction pipeline.
-        review_budget = check_budget = 0
+        review_budget = check_budget = contract_budget = 0
     revision = RevisionConfig(
         enabled=revision_enabled,
         max_review_repair_cycles=review_budget,
         max_check_repair_attempts=check_budget,
+        max_step_contract_repairs=contract_budget,
     )
 
     prompt_budget_data = _table(expanded, "prompt_budget")

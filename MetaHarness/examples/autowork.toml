@@ -26,6 +26,7 @@ max_step_contract_chars = 8500
 enabled = true
 max_check_repair_attempts = 2
 max_review_repair_cycles = 2
+max_step_contract_repairs = 2
 
 [repository]
 remote = "origin"
@@ -92,7 +93,7 @@ require_locator_head_at_base = true
 
 [prompt_budget]
 planner_max_bytes = 192000
-implementer_max_bytes = 48000
+implementer_max_bytes = 96000
 check_repair_max_bytes = 64000
 semantic_revision_max_bytes = 128000
 final_review_max_bytes = 128000

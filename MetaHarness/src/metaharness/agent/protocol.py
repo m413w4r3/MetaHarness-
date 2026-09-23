@@ -104,63 +104,17 @@ def parse_scope_request(final_message: str) -> ScopeRequest | None:
 
 CONTRACT_MISMATCH_HEADER = "META CONTRACT MISMATCH v1"
 DEFERRED_VERIFY_HEADER = "DEFERRED VERIFY DEPENDENCY"
-# The single bounded retry of one clean structural mismatch.  The addendum
-# never widens the approved mutable scope: it only forbids returning a second
-# mismatch for an out-of-scope verification dependency owned by a later step.
-MISMATCH_RETRY_ADDENDUM = """<MISMATCH RETRY ADDENDUM>
+# Kept as a compatibility symbol for backend callers. Contract mismatches are
+# now handled by StepContractRepairPlanner; this text is never used to replay
+# the same approved contract blindly.
+MISMATCH_RETRY_ADDENDUM = """<CONTRACT REPAIR REQUIRED>
 
-This is one bounded retry of the exact same approved step.
+MetaHarness will archive the failed attempt, restore its in-scope edits, and
+run a bounded StepContractRepairPlanner transaction before retrying.
 
-The approved STEP CONTRACT remains authoritative.
-This addendum does NOT expand your mutable scope.
+Do not treat this text as permission to repeat the same contract.
 
-STRICT PROHIBITIONS:
-
-- Do not modify any path outside WRITE_SET / CREATE_SET / DELETE_SET.
-- Do not move work into a path assigned to a later step.
-- Do not add temporary shims merely to make an intermediate verification pass.
-- Do not weaken, skip, delete or rewrite a test merely to hide an out-of-scope dependency.
-- Do not return META CONTRACT MISMATCH solely because a VERIFY command reaches
-  code that belongs to a later approved step.
-
-REQUIRED BEHAVIOR:
-
-Complete every coherent modification that IS possible inside this step's
-approved mutable scope.
-
-Run the step's VERIFY commands.
-
-If a VERIFY failure is caused exclusively by an out-of-scope dependency that
-is explicitly scheduled in a later approved step:
-
-1. keep the valid in-scope implementation;
-2. do NOT edit that out-of-scope path;
-3. do NOT roll back valid in-scope work;
-4. report the remaining failure in your normal final report under:
-
-DEFERRED VERIFY DEPENDENCY
-
-Include:
-- failing command/test;
-- out-of-scope path or symbol;
-- later step that owns it, when known.
-
-Return:
-
-META CONTRACT MISMATCH v1
-
-ONLY if the requested transformation itself cannot be implemented coherently
-inside the approved mutable scope, or safe completion genuinely requires an
-unauthorized modification.
-
-NO-CHANGE HANDLING:
-
-If no repository change is necessary or safely possible inside this step's
-scope, do not exit as a normal successful no-change result. Return
-META CONTRACT MISMATCH v1 with the bounded explanation so MetaHarness can
-defer the step safely.
-
-</MISMATCH RETRY ADDENDUM>
+</CONTRACT REPAIR REQUIRED>
 """
 
 

@@ -386,6 +386,303 @@ def render_step_contract(plan: TaskPlanV2, step: ImplementationStep) -> str:
     return rendered
 
 
+_STEP_REPAIR_HEADER = "META STEP CONTRACT REPAIR v1"
+_STEP_REPAIR_END = "END META STEP CONTRACT REPAIR"
+_STEP_REPAIR_INLINE = frozenset({"STEP_ID", "TITLE", "EXECUTION_CLASS", "DEPENDS_ON"})
+_STEP_REPAIR_SECTIONS = frozenset({
+    "OBJECTIVE", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET",
+    "INSTRUCTIONS", "VERIFY", "FORBIDDEN",
+})
+
+
+def parse_step_contract_repair(
+    raw: str, *, max_read_paths_per_step: int,
+) -> ImplementationStep:
+    """Parse one complete, standalone repaired step contract."""
+
+    if not isinstance(raw, str) or not raw.strip():
+        raise V2PlanParseError("step contract repair is empty")
+    lines = _lines(raw)
+    first = next((index for index, line in enumerate(lines) if line.strip()), None)
+    if first is None or lines[first].strip() != _STEP_REPAIR_HEADER:
+        raise V2PlanParseError("missing META STEP CONTRACT REPAIR v1 header")
+    ends = [index for index, line in enumerate(lines) if line.strip() == _STEP_REPAIR_END]
+    if len(ends) != 1 or ends[0] <= first:
+        raise V2PlanParseError("missing or duplicate END META STEP CONTRACT REPAIR")
+    end = ends[0]
+    if any(line.strip() for line in lines[:first]) or any(line.strip() for line in lines[end + 1:]):
+        raise V2PlanParseError("content outside step contract repair envelope")
+    inline, sections = _parse_labeled_body(
+        lines[first + 1:end],
+        inline_names=_STEP_REPAIR_INLINE,
+        section_names=_STEP_REPAIR_SECTIONS,
+        where="step contract repair",
+    )
+    step_id = inline.get("STEP_ID", "")
+    if _STEP_ID.fullmatch(step_id) is None:
+        raise V2PlanParseError("step contract repair STEP_ID is invalid")
+    title = _nonempty(inline.get("TITLE", ""), "step contract repair TITLE")
+    execution_class = inline.get("EXECUTION_CLASS")
+    if execution_class not in {item.value for item in ExecutionClass}:
+        raise V2PlanParseError("step contract repair EXECUTION_CLASS is invalid")
+    dependency = inline.get("DEPENDS_ON", "")
+    if dependency != "NONE" and _STEP_ID.fullmatch(dependency) is None:
+        raise V2PlanParseError("step contract repair DEPENDS_ON is invalid")
+    for name in _STEP_REPAIR_SECTIONS:
+        if not sections.get(name, "").strip():
+            raise V2PlanParseError(f"step contract repair is missing {name}")
+    _validate_step_text_limits(step_id, sections | {"TITLE": title})
+    read_set = _read_set(sections["READ_SET"], max_paths=max_read_paths_per_step)
+    write_set, create_set, delete_set = _change_sets(sections, read_set)
+    return ImplementationStep(
+        step_id, title, ExecutionClass(execution_class),
+        None if dependency == "NONE" else dependency,
+        _nonempty(sections["OBJECTIVE"], "step contract repair OBJECTIVE"),
+        read_set,
+        write_set,
+        _nonempty(sections["INSTRUCTIONS"], "step contract repair INSTRUCTIONS"),
+        _nonempty(sections["VERIFY"], "step contract repair VERIFY"),
+        _nonempty(sections["FORBIDDEN"], "step contract repair FORBIDDEN"),
+        create_set=create_set,
+        delete_set=delete_set,
+    )
+
+
+def render_repaired_step_contract(step: ImplementationStep) -> str:
+    """Render the durable canonical form of an effective repaired contract."""
+
+    def lines(items: tuple[str, ...]) -> str:
+        return "\n".join(f"- {item}" for item in items) if items else "NONE"
+
+    return "\n\n".join((
+        _STEP_REPAIR_HEADER,
+        f"STEP_ID: {step.id}",
+        f"TITLE: {step.title}",
+        f"EXECUTION_CLASS: {step.execution_class.value}",
+        f"DEPENDS_ON: {step.depends_on or 'NONE'}",
+        "OBJECTIVE\n" + step.objective,
+        "READ_SET\n" + lines(step.read_set),
+        "WRITE_SET\n" + lines(step.write_set),
+        "CREATE_SET\n" + lines(step.create_set),
+        "DELETE_SET\n" + lines(step.delete_set),
+        "INSTRUCTIONS\n" + step.instructions,
+        "VERIFY\n" + step.verify,
+        "FORBIDDEN\n" + step.forbidden,
+        _STEP_REPAIR_END,
+    )) + "\n"
+
+
+def build_step_contract_repair_prompt(
+    *, original_spec: str, current_tree_sha: str, original_plan_identity: str,
+    current_contract: str, mismatch_explanation: str,
+    read_set: str, write_set: str, create_set: str, delete_set: str,
+    future_ownership: str = "NONE",
+    repository_evidence: str = "NONE",
+) -> str:
+    """Build the bounded planner transaction for one worker mismatch."""
+
+    return f"""You are the MetaHarness StepContractRepairPlanner.
+
+Repair only the current approved step contract so one implementation worker
+can execute it deterministically. ORIGINAL SPEC remains semantic authority.
+Do not reinterpret the SPEC, hide the mismatch, move work to another step, or
+broaden mutable scope unless a genuinely required path is explicitly requested.
+WRITE_SET, CREATE_SET and DELETE_SET are absolute until MetaHarness applies its
+scope policy. Preserve step identity, dependency and required checks.
+
+<ORIGINAL SPEC AUTHORITY>
+{original_spec}
+</ORIGINAL SPEC AUTHORITY>
+
+<CURRENT TREE SHA>
+{current_tree_sha}
+</CURRENT TREE SHA>
+
+<ORIGINAL PLAN IDENTITY>
+{original_plan_identity}
+</ORIGINAL PLAN IDENTITY>
+
+<CURRENT STEP CONTRACT>
+{current_contract}
+</CURRENT STEP CONTRACT>
+
+<WORKER MISMATCH>
+{mismatch_explanation}
+</WORKER MISMATCH>
+
+<CURRENT READ_SET>
+{read_set}
+</CURRENT READ_SET>
+<CURRENT WRITE_SET>
+{write_set}
+</CURRENT WRITE_SET>
+<CURRENT CREATE_SET>
+{create_set}
+</CURRENT CREATE_SET>
+<CURRENT DELETE_SET>
+{delete_set}
+</CURRENT DELETE_SET>
+<FUTURE STEP OWNERSHIP>
+{future_ownership}
+</FUTURE STEP OWNERSHIP>
+<BOUNDED REPOSITORY EVIDENCE>
+{repository_evidence}
+</BOUNDED REPOSITORY EVIDENCE>
+
+Return exactly a complete repaired current-step contract. READ_SET may be
+clarified and instructions, objective, VERIFY, FORBIDDEN and anchors may be
+repaired. Do not change mutation sets unless the requested work truly requires
+it; any such change is subject to MetaHarness scope policy.
+
+{_STEP_REPAIR_HEADER}
+STEP_ID: <current step ID>
+TITLE: <current title>
+EXECUTION_CLASS: MECHANICAL|REASONING|AGENTIC
+DEPENDS_ON: NONE|earlier step ID
+
+OBJECTIVE
+<complete objective>
+
+READ_SET
+- relative/path :: exact symbol or anchor
+
+WRITE_SET
+- relative/path
+
+CREATE_SET
+NONE
+
+DELETE_SET
+NONE
+
+INSTRUCTIONS
+1. <concrete instruction>
+
+VERIFY
+<at most 3 lines>
+
+FORBIDDEN
+- <rule>
+
+{_STEP_REPAIR_END}
+"""
+
+
+def _read_repair_json(path: Path, limit: int) -> Any:
+    try:
+        if path.stat().st_size > limit:
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
+class StepContractRepairPlanner:
+    """One bounded, durable planner transaction for a contract mismatch."""
+
+    def __init__(self, client: TextCompletionClient, *, max_read_paths_per_step: int):
+        self.client = client
+        self.max_read_paths_per_step = max_read_paths_per_step
+        self.last_usage: dict[str, Any] | None = None
+
+    def repair(
+        self, *, original_spec: str, current_tree_sha: str,
+        original_plan_identity: str, current_contract: str,
+        mismatch_explanation: str, read_set: str, write_set: str,
+        create_set: str, delete_set: str, future_ownership: str,
+        repository_evidence: str, artifacts_dir: str | Path,
+    ) -> ImplementationStep:
+        target = Path(artifacts_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        request = build_step_contract_repair_prompt(
+            original_spec=original_spec, current_tree_sha=current_tree_sha,
+            original_plan_identity=original_plan_identity,
+            current_contract=current_contract,
+            mismatch_explanation=mismatch_explanation,
+            read_set=read_set, write_set=write_set, create_set=create_set,
+            delete_set=delete_set, future_ownership=future_ownership,
+            repository_evidence=repository_evidence,
+        )
+        request_sha = hashlib.sha256(request.encode("utf-8")).hexdigest()
+        meta_path = target / "request.meta.json"
+        existing = None
+        try:
+            existing = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+        contract_path = target / "contract.md"
+        if (
+            isinstance(existing, dict)
+            and existing.get("request_sha256") == request_sha
+            and existing.get("status") == "validated"
+            and contract_path.is_file()
+        ):
+            validation = _read_repair_json(target / "validation.json", 64 * 1024)
+            digest = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+            if isinstance(validation, dict) and validation.get("repaired_contract_sha256") == digest:
+                return parse_step_contract_repair(
+                    contract_path.read_text(encoding="utf-8"),
+                    max_read_paths_per_step=self.max_read_paths_per_step,
+                )
+        raw_path = target / "planner.raw.md"
+        reusable_raw = False
+        if (
+            isinstance(existing, dict)
+            and existing.get("request_sha256") == request_sha
+            and existing.get("status") in {"raw", "validated"}
+            and raw_path.is_file()
+        ):
+            raw_digest = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+            reusable_raw = raw_digest == existing.get("raw_sha256")
+        if reusable_raw:
+            raw = raw_path.read_text(encoding="utf-8")
+            usage = _read_repair_json(target / "usage.json", 64 * 1024)
+            self.last_usage = usage if isinstance(usage, dict) else None
+        else:
+            atomic_write_text(target / "planner.request.txt", request)
+            write_prompt_diagnostics(target, payload_for_rendered_request("step-contract-repair", request))
+            atomic_write_text(meta_path, json.dumps({
+                "status": "pending", "request_sha256": request_sha,
+                "current_tree_sha": current_tree_sha,
+            }, ensure_ascii=False, indent=2) + "\n")
+            result = self.client.complete(request)
+            self.last_usage = completion_usage(result)
+            raw = result if isinstance(result, str) else getattr(result, "text", None)
+            if not isinstance(raw, str):
+                raise V2PlanParseError("step contract repair planner did not return text")
+            atomic_write_text(raw_path, raw)
+            write_usage_artifact(target / "usage.json", self.last_usage)
+            atomic_write_text(meta_path, json.dumps({
+                "status": "raw", "request_sha256": request_sha,
+                "raw_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                "current_tree_sha": current_tree_sha,
+            }, ensure_ascii=False, indent=2) + "\n")
+        step = parse_step_contract_repair(
+            raw, max_read_paths_per_step=self.max_read_paths_per_step
+        )
+        canonical = render_repaired_step_contract(step)
+        atomic_write_text(target / "contract.md", canonical)
+        atomic_write_text(target / "validation.json", json.dumps({
+            "status": "planner_validated",
+            "request_sha256": request_sha,
+            "original_plan_identity": original_plan_identity,
+            "original_contract_sha256": hashlib.sha256(current_contract.encode("utf-8")).hexdigest(),
+            "current_tree_sha": current_tree_sha,
+            "mismatch_sha256": hashlib.sha256(mismatch_explanation.encode("utf-8")).hexdigest(),
+            "repaired_contract_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "step_id": step.id,
+            "write_set": list(step.write_set),
+            "create_set": list(step.create_set),
+            "delete_set": list(step.delete_set),
+        }, ensure_ascii=False, indent=2) + "\n")
+        atomic_write_text(meta_path, json.dumps({
+            "status": "validated", "request_sha256": request_sha,
+            "raw_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "current_tree_sha": current_tree_sha,
+        }, ensure_ascii=False, indent=2) + "\n")
+        return step
+
+
 def _validate_bounds(plan: TaskPlanV2) -> None:
     contracts = [_render_step_contract_unchecked(plan, step) for step in plan.steps]
     if any(len(contract) > plan.max_step_contract_chars for contract in contracts):
@@ -2068,7 +2365,7 @@ __all__ = [
     "REPAIR_EVIDENCE_FILENAME", "RepairPlannerV2",
     "persist_planning_artifacts_v2", "persist_planning_v2_artifacts", "persist_recovered_plan_artifacts",
     "read_approved_step_contract", "read_set_paths",
-    "render_plan_summary_v2", "render_repair_plan_summary", "render_repair_step_index", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract",
+    "render_plan_summary_v2", "render_repair_plan_summary", "render_repair_step_index", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract", "render_repaired_step_contract", "parse_step_contract_repair", "build_step_contract_repair_prompt", "StepContractRepairPlanner",
     "run_planner_v2", "step_contract_path", "validate_decomposition_policy", "validate_implementation_bundle", "write_implementation_bundle",
     "REQUIRE_STAGED_POLICY_TEXT", "validate_execution_mode_policy",
     "render_decomposition_policy_text",

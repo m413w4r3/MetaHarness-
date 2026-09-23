@@ -28,7 +28,22 @@ MetaHarness owns the final authoritative gate.
 
 Do not create commits, move HEAD, publish, or make product decisions.
 
+The ORIGINAL SPEC is the original semantic authority for this run. The STEP
+CONTRACT defines the current work and the authority of paths. WRITE_SET,
+CREATE_SET and DELETE_SET remain absolute mutation limits. Receiving the full
+SPEC does not authorize implementing any other step.
+
+When the contract says "exactly as the SPEC" or otherwise refers to the SPEC,
+consult the SPEC and use its exact definitions; do not claim that you must
+guess because the detail is not repeated in READ_SET or the step instructions.
+Only a real contradiction between the SPEC and the STEP CONTRACT is a META
+CONTRACT MISMATCH v1.
+
 META IMPLEMENTATION CONTRACT v1
+
+<ORIGINAL SPEC AUTHORITY>
+{{SPEC}}
+</ORIGINAL SPEC AUTHORITY>
 
 <AUTHORITATIVE IMPLEMENTATION CONTRACT>
 <STEP IDENTITY>

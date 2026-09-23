@@ -355,6 +355,7 @@ def build_planner_payload(
 
 def build_implementer_payload(
     *,
+    original_spec: str = "",
     step_objective: str,
     step_invariants: str,
     read_set: str,
@@ -386,6 +387,7 @@ def build_implementer_payload(
         forbidden_contract if forbidden_contract is not None else step_invariants
     )
     sections = (
+        _section("original_spec", original_spec, True),
         _section("step_identity", effective_identity, True),
         _section("step_objective", step_objective, True),
         _section("step_invariants", step_invariants, True),
@@ -400,6 +402,7 @@ def build_implementer_payload(
         _section("retry_addendum", retry_addendum, False),
     )
     placeholders = {
+        "{{SPEC}}": "original_spec",
         "{{STEP_IDENTITY}}": "step_identity",
         "{{STEP_OBJECTIVE}}": "step_objective",
         "{{STEP_INVARIANTS}}": "step_invariants",

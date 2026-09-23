@@ -27,11 +27,7 @@ from .agent.base import (
     AgentScopeError,
 )
 from .agent.diagnostics import write_token_diagnostics
-from .agent.protocol import (
-    build_mismatch_retry_addendum,
-    contract_mismatch_explanation,
-    deferred_verify_dependency,
-)
+from .agent.protocol import contract_mismatch_explanation, deferred_verify_dependency
 from .prompt_contracts import (
     build_implementer_payload,
     build_final_review_payload,
@@ -154,6 +150,7 @@ from .planning_v2 import (
     PlanParseError,
     PlannerV2,
     RepairPlannerV2,
+    StepContractRepairPlanner,
     TaskPlanV2,
     V2PlanParseError,
     parse_task_plan_v2,
@@ -165,6 +162,8 @@ from .planning_v2 import (
     validate_implementation_bundle,
     render_repair_plan_summary,
     render_repair_step_index,
+    render_step_contract,
+    parse_step_contract_repair,
 )
 from .plan_repository_validation import (
     PlanRepositoryPreconditionError,
@@ -307,6 +306,7 @@ from .orchestration.pipeline_v2 import (
     check_repair_dir,
     correction_dir,
     gate_dir,
+    implementation_steps_dir,
     review_dir,
     semantic_revision_dir,
     step_dir as cycle_step_dir,
@@ -2029,7 +2029,7 @@ class Orchestrator:
             authorize_tree=self._authorize_candidate_tree,
             gate_mutable_authority=lambda ctx, cycle_plan, stage: gate_mutable_authority(
                 ctx.run_dir, cycle_plan.cycle.number, stage,
-                base_paths=cycle_plan.mutable_scope,
+                base_paths=self._effective_cycle_scope(ctx, cycle_plan),
                 policy_config=self._effective_repair_scope,
                 require_attempt_records=True,
             ),
@@ -2434,6 +2434,49 @@ class Orchestrator:
             ctx.run_dir, cycle_plan.cycle.number, [step.id for step in cycle_plan.plan.steps],
         )
 
+    def _effective_cycle_scope(
+        self, ctx: PipelineV2Context, cycle_plan: CyclePlan,
+    ) -> tuple[str, ...]:
+        """Include only durable, policy-approved contract-repair additions."""
+
+        scope = set(cycle_plan.mutable_scope)
+        root = implementation_steps_dir(ctx.run_dir, cycle_plan.cycle)
+        if not root.is_dir():
+            return tuple(sorted(scope))
+        for step_dir in root.iterdir():
+            repairs = step_dir / "contract_repairs"
+            if not repairs.is_dir():
+                continue
+            for repair_dir in repairs.iterdir():
+                validation = _read_json_artifact(repair_dir / "validation.json", 64 * 1024)
+                if isinstance(validation, dict) and validation.get("status") == "validated":
+                    added = validation.get("added_mutable_paths")
+                    if isinstance(added, list) and all(isinstance(path, str) for path in added):
+                        contract_path = repair_dir / "contract.md"
+                        digest = validation.get("repaired_contract_sha256")
+                        if (
+                            not isinstance(digest, str) or not contract_path.is_file()
+                            or hashlib.sha256(contract_path.read_bytes()).hexdigest() != digest
+                        ):
+                            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "step contract repair contract hash changed")
+                        if added:
+                            policy = self._effective_repair_scope
+                            if policy.policy == "deny-expansion":
+                                raise PipelineFailure("REPAIR_SCOPE_EXPANSION")
+                            if policy.policy == "require-approval" or len(added) > policy.max_added_paths:
+                                delta_path = repair_dir / "scope_delta.json"
+                                delta = _read_json_artifact(delta_path, 64 * 1024)
+                                if not isinstance(delta, dict) or delta.get("added_paths") != sorted(added):
+                                    raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "step contract repair scope delta is malformed")
+                                approval = read_scope_approval(
+                                    repair_dir,
+                                    expected_sha256=hashlib.sha256(delta_path.read_bytes()).hexdigest(),
+                                )
+                                if approval is None or approval.decision is not ApprovalDecision.APPROVE:
+                                    raise ScopeApprovalRequired()
+                        scope.update(added)
+        return tuple(sorted(scope))
+
     def _state_steps(
         self, ctx: PipelineV2Context, cycle_plan: CyclePlan, *, running: str | None = None,
     ) -> list[dict[str, Any]]:
@@ -2486,6 +2529,10 @@ class Orchestrator:
             self.config, ctx.selection.final_reviewer.profile_id, ExecutionRole.REVIEWER
         )
         outcome = self._execute_step_attempts(
+            store=store, run_dir=ctx.run_dir, original_spec=ctx.spec,
+            original_plan_identity=_json_text(
+                asdict(checkpoint.plan_identity) if checkpoint and checkpoint.plan_identity else {}
+            ),
             repo=ctx.repo, worktree=ctx.info.worktree, base_sha=parent_sha,
             branch_ref=ctx.branch_ref,
             ownership_before=_git_ownership(ctx.repo, ctx.info.worktree),
@@ -2533,7 +2580,7 @@ class Orchestrator:
                 info=ctx.info, branch_ref=ctx.branch_ref,
                 ownership_before=_git_ownership(ctx.repo, ctx.info.worktree),
                 selection=ctx.selection, artifact_dir=artifact_dir,
-                mutable_scope=list(cycle_plan.mutable_scope), step_results=steps,
+                mutable_scope=list(self._effective_cycle_scope(ctx, cycle_plan)), step_results=steps,
                 deferred_mismatches=_deferred_contract_mismatches(cycle_plan.plan, steps),
                 deferred_mismatch_present=_has_deferred_contract_mismatches(steps),
             )
@@ -2743,7 +2790,7 @@ class Orchestrator:
         if records:
             previous_authority = gate_mutable_authority(
                 ctx.run_dir, number, stage,
-                base_paths=cycle_plan.mutable_scope,
+                base_paths=self._effective_cycle_scope(ctx, cycle_plan),
                 policy_config=self._effective_repair_scope,
                 through_attempt=len(records),
                 require_attempt_records=True,
@@ -2763,7 +2810,7 @@ class Orchestrator:
         ).resolve_scope(
             repo=ctx.repo, worktree=ctx.info.worktree, tree_sha=evidence.staged_tree_sha,
             run_dir=ctx.run_dir, evidence=evidence,
-            base_mutable_scope=cycle_plan.mutable_scope, previous=previous_scope,
+            base_mutable_scope=self._effective_cycle_scope(ctx, cycle_plan), previous=previous_scope,
         )
         atomic_write_text(
             attempt_dir / "failed_check_evidence_before.json",
@@ -3029,6 +3076,10 @@ class Orchestrator:
     def _execute_step_attempts(
         self,
         *,
+        store: RunStateStore,
+        run_dir: Path,
+        original_spec: str,
+        original_plan_identity: str,
         repo: Path,
         worktree: Path,
         base_sha: str,
@@ -3042,57 +3093,335 @@ class Orchestrator:
         forbidden_env_names: tuple[str | None, ...],
         future_ownership: Mapping[str, tuple[str, ...]] | None = None,
     ) -> StepExecutionOutcome:
-        """One approved step, with at most one bounded mismatch retry.
+        """Execute a step, repairing semantic contract mismatches in-place.
 
-        A *clean* structural mismatch — the worker changed nothing at all — is
-        retried exactly once with the same contract, the same profile, the same
-        mutable scope and the same candidate tree, in a new fresh worker
-        process.  The retry only adds a prompt addendum; it never widens
-        WRITE/CREATE/DELETE.  There is never a third attempt.  Every failure
-        names the durable step directory it belongs to.
+        A mismatch is a recoverable transaction: its attempt artifacts are
+        archived, all in-scope edits are restored to the pre-attempt tree, a
+        bounded planner repair is validated, and the worker receives the
+        effective contract.  The approved plan and original contract remain
+        immutable evidence throughout.
         """
 
-        common = {
-            "repo": repo, "worktree": worktree, "base_sha": base_sha,
-            "branch_ref": branch_ref, "ownership_before": ownership_before,
-            "expected_tree": expected_tree, "step": step, "contract": contract,
-            "profile_id": profile_id, "artifact_dir": artifact_dir,
-            "forbidden_env_names": forbidden_env_names,
-            "future_ownership": future_ownership,
-        }
-        try:
-            outcome = self._run_step_attempt(
-                **common, initial_mismatch=None, mismatch_retry_count=0,
-            )
-            if not isinstance(outcome, DeferredStepExecutionOutcome):
-                return outcome
-            # The boundary must still be exactly the pre-step boundary before a
-            # second worker is allowed to run against it.  Drift here is lost
-            # authority, never a deferrable outcome: fail closed so that no
-            # second worker and no later step runs.
-            drift = self._pre_step_boundary_drift(
-                repo, worktree, ownership_before,
-                branch_ref=branch_ref, base_sha=base_sha, tree_before=outcome.tree_before,
-            )
-            # Attempt 1 keeps its own artifacts, including its diagnostics; its
-            # deferred record is never the step's current record on a drift.
-            _archive_attempt(artifact_dir)
-            if drift:
-                raise StepExecutionFailure(
-                    "STEP_CONTRACT_DRIFT", outcome.step_id,
-                    _bounded_v2_report(
-                        f"the step boundary drifted before the bounded mismatch retry: {drift}"
-                    ),
-                    profile_id=outcome.profile_id, tree_before=outcome.tree_before,
-                    tree_after=_safe_candidate_tree(worktree), usage=outcome.usage,
-                    mismatch=outcome.mismatch,
+        effective_step = self._load_repaired_step(artifact_dir, step)
+        effective_contract = contract
+        repair_count = self._count_contract_repairs(artifact_dir)
+        if effective_step is not step:
+            effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
+        max_repairs = getattr(self._run_options, "max_step_contract_repairs", 0)
+        pending_repair = self._pending_contract_repair(artifact_dir)
+        if pending_repair is not None:
+            try:
+                self._set_contract_repair_state(store, step.id, repair_count)
+                effective_step = self._repair_step_contract(
+                    repo=repo, worktree=worktree, run_dir=run_dir,
+                    artifact_dir=pending_repair, original_spec=original_spec,
+                    original_plan_identity=original_plan_identity,
+                    original_step=effective_step, current_contract=effective_contract,
+                    mismatch="resuming durable step contract repair",
+                    tree_before=candidate_tree_sha(worktree),
+                    future_ownership=future_ownership,
                 )
-            return self._run_step_attempt(
-                **common, initial_mismatch=outcome.mismatch, mismatch_retry_count=1,
+                effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
+            except ScopeApprovalRequired:
+                delta = _read_json_artifact(pending_repair / "scope_delta.json", 64 * 1024)
+                store.update(
+                    status=RunStatus.WAITING_SCOPE_APPROVAL,
+                    current_step=step.id,
+                    scope_delta=delta if isinstance(delta, dict) else {},
+                )
+                raise
+        while True:
+            common = {
+                "repo": repo, "worktree": worktree, "base_sha": base_sha,
+                "branch_ref": branch_ref, "ownership_before": ownership_before,
+                "expected_tree": expected_tree, "step": effective_step,
+                "contract": effective_contract, "profile_id": profile_id,
+                "artifact_dir": artifact_dir,
+                "forbidden_env_names": forbidden_env_names,
+                "future_ownership": future_ownership,
+                "original_spec": original_spec,
+            }
+            try:
+                return self._run_step_attempt(
+                    **common, initial_mismatch=None,
+                    mismatch_retry_count=repair_count,
+                )
+            except StepExecutionFailure as failure:
+                if failure.reason != "AGENT_CONTRACT_MISMATCH":
+                    failure.step_dir = artifact_dir
+                    raise
+                if failure.tree_before is None or failure.mismatch is None:
+                    failure.step_dir = artifact_dir
+                    raise
+                allowed = set(
+                    (*effective_step.write_set, *effective_step.create_set, *effective_step.delete_set)
+                )
+                if failure.tree_after is not None:
+                    try:
+                        changed = changed_paths_between_trees(repo, failure.tree_before, failure.tree_after)
+                    except GitError:
+                        changed = []
+                    unexpected = [path for path in changed if path not in allowed]
+                    if unexpected:
+                        failure.reason = AGENT_SCOPE_VIOLATION
+                        failure.detail = "worker changed paths outside scope: " + _paths_detail(unexpected)
+                        failure.step_dir = artifact_dir
+                        raise
+                drift = self._pre_step_boundary_drift(
+                    repo, worktree, ownership_before,
+                    branch_ref=branch_ref, base_sha=base_sha,
+                    tree_before=failure.tree_before,
+                )
+                if drift and not self._restore_failed_contract_attempt(
+                    worktree, failure.tree_before, allowed,
+                ):
+                    failure.detail = (failure.detail or "worker reported a contract mismatch") + "; " + drift
+                    failure.step_dir = artifact_dir
+                    raise
+                if not self._restore_failed_contract_attempt(worktree, failure.tree_before, allowed):
+                    failure.detail = (failure.detail or "worker reported a contract mismatch") + "; failed to restore attempt tree"
+                    failure.step_dir = artifact_dir
+                    raise
+                _archive_attempt(artifact_dir)
+                if repair_count >= max_repairs:
+                    failure.detail = (failure.detail or "worker reported a contract mismatch") + "; contract repair budget exhausted"
+                    failure.tree_after = failure.tree_before
+                    failure.index_tree_after = failure.tree_before
+                    failure.step_dir = artifact_dir
+                    raise
+                repair_count += 1
+                repair_dir = artifact_dir / "contract_repairs" / f"{repair_count:02d}"
+                try:
+                    self._set_contract_repair_state(store, step.id, repair_count)
+                    effective_step = self._repair_step_contract(
+                        repo=repo, worktree=worktree, run_dir=run_dir,
+                        artifact_dir=repair_dir, original_spec=original_spec,
+                        original_plan_identity=original_plan_identity,
+                        original_step=effective_step, current_contract=effective_contract,
+                        mismatch=failure.mismatch, tree_before=failure.tree_before,
+                        future_ownership=future_ownership,
+                    )
+                    effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
+                except ScopeApprovalRequired:
+                    delta = _read_json_artifact(repair_dir / "scope_delta.json", 64 * 1024)
+                    store.update(
+                        status=RunStatus.WAITING_SCOPE_APPROVAL,
+                        current_step=step.id,
+                        scope_delta=delta if isinstance(delta, dict) else {},
+                    )
+                    raise
+                except (AgentError, GitError, OSError, V2PlanParseError) as exc:
+                    raise StepExecutionFailure(
+                        "AGENT_CONTRACT_MISMATCH", step.id,
+                        _bounded_v2_report(f"contract repair failed: {exc}"),
+                        profile_id=profile_id, tree_before=failure.tree_before,
+                        tree_after=failure.tree_before, usage=failure.usage,
+                        mismatch=failure.mismatch,
+                        mismatch_retry_count=repair_count,
+                        step_dir=artifact_dir,
+                    ) from exc
+                self._trace_emit(
+                    "step.contract_repair.completed", phase="implementation",
+                    cycle=getattr(self, "_trace_cycle", 1), step_id=step.id,
+                    data={"repair": repair_count, "tree_sha": failure.tree_before},
+                )
+                # The next attempt starts at the exact restored tree and uses
+                # no blind retry addendum.
+
+    @staticmethod
+    def _count_contract_repairs(artifact_dir: Path) -> int:
+        root = artifact_dir / "contract_repairs"
+        if not root.is_dir():
+            return 0
+        numbers = []
+        for path in root.iterdir():
+            if not path.is_dir() or not path.name.isdigit():
+                continue
+            validation = _read_json_artifact(path / "validation.json", 64 * 1024)
+            if isinstance(validation, dict) and validation.get("status") in {
+                "planner_validated", "validated",
+            }:
+                numbers.append(int(path.name))
+        return max(numbers, default=0)
+
+    @staticmethod
+    def _pending_contract_repair(artifact_dir: Path) -> Path | None:
+        root = artifact_dir / "contract_repairs"
+        if not root.is_dir():
+            return None
+        candidates = []
+        for path in root.iterdir():
+            if not path.is_dir() or not path.name.isdigit():
+                continue
+            validation = _read_json_artifact(path / "validation.json", 64 * 1024)
+            if isinstance(validation, dict) and validation.get("status") == "planner_validated":
+                candidates.append(path)
+        return max(candidates, key=lambda path: int(path.name), default=None)
+
+    def _load_repaired_step(self, artifact_dir: Path, original: ImplementationStep) -> ImplementationStep:
+        root = artifact_dir / "contract_repairs"
+        if not root.is_dir():
+            return original
+        candidates = sorted(
+            (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
+            key=lambda path: int(path.name),
+        )
+        for directory in reversed(candidates):
+            validation = _read_json_artifact(directory / "validation.json", 64 * 1024)
+            contract_path = directory / "contract.md"
+            if not isinstance(validation, dict) or validation.get("status") != "validated" or not contract_path.is_file():
+                continue
+            try:
+                repaired = parse_step_contract_repair(
+                    contract_path.read_text(encoding="utf-8"),
+                    max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
+                )
+            except (OSError, UnicodeError, V2PlanParseError):
+                continue
+            if repaired.id == original.id:
+                return repaired
+        return original
+
+    def _read_repaired_contract(self, artifact_dir: Path, step: ImplementationStep) -> str:
+        root = artifact_dir / "contract_repairs"
+        candidates = sorted(
+            (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
+            key=lambda path: int(path.name),
+        ) if root.is_dir() else []
+        for directory in reversed(candidates):
+            path = directory / "contract.md"
+            validation = _read_json_artifact(directory / "validation.json", 64 * 1024)
+            if path.is_file() and isinstance(validation, dict) and validation.get("status") == "validated":
+                try:
+                    parsed = parse_step_contract_repair(
+                        path.read_text(encoding="utf-8"),
+                        max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
+                    )
+                except (OSError, UnicodeError, V2PlanParseError):
+                    continue
+                if parsed.id == step.id:
+                    return path.read_text(encoding="utf-8")
+        return ""
+
+    @staticmethod
+    def _restore_failed_contract_attempt(
+        worktree: Path, tree_before: str, allowed: set[str],
+    ) -> bool:
+        try:
+            restore_paths_from_tree(worktree, tree_before, sorted(allowed))
+            stage_all(worktree)
+            return (
+                candidate_tree_sha(worktree) == tree_before
+                and index_tree_sha(worktree) == tree_before
+                and not _status_has_unstaged_or_untracked(status_porcelain(worktree))
             )
-        except StepExecutionFailure as failure:
-            failure.step_dir = artifact_dir
-            raise
+        except (GitError, OSError):
+            return False
+
+    def _set_contract_repair_state(
+        self, store: RunStateStore, step_id: str, repair_count: int,
+    ) -> None:
+        store.update(
+            status=RunStatus.CONTRACT_REPAIRING,
+            current_step=step_id,
+            contract_repair={"status": "running", "step_id": step_id, "attempt": repair_count},
+        )
+
+    def _repair_step_contract(
+        self, *, repo: Path, worktree: Path, run_dir: Path,
+        artifact_dir: Path, original_spec: str, original_plan_identity: str,
+        original_step: ImplementationStep, current_contract: str,
+        mismatch: str, tree_before: str,
+        future_ownership: Mapping[str, tuple[str, ...]] | None,
+    ) -> ImplementationStep:
+        """Run and validate one durable StepContractRepairPlanner transaction."""
+
+        planner_profile = profile_for_role(
+            self.config, self._run_options.planner_profile, ExecutionRole.PLANNER
+        )
+        evidence_parts = [
+            "TREE SHA: " + tree_before,
+            "STATUS: " + "; ".join(status_porcelain(worktree)[:20]),
+        ]
+        for path in read_set_paths(original_step.read_set):
+            target = worktree / path
+            try:
+                data = target.read_bytes()[:8192]
+                evidence_parts.append(
+                    f"PATH {path}\n" + data.decode("utf-8", errors="replace")
+                )
+            except (OSError, UnicodeError):
+                evidence_parts.append(f"PATH {path}\n<unavailable>")
+        planner = StepContractRepairPlanner(
+            self._planner_client or _chat_client(
+                build_llm_endpoint(planner_profile), self._runtime_environment
+            ),
+            max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
+        )
+        read_set = "\n".join(f"- {item}" for item in original_step.read_set)
+        future = _json_text(future_ownership or {})
+        repaired = planner.repair(
+            original_spec=original_spec, current_tree_sha=tree_before,
+            original_plan_identity=original_plan_identity,
+            current_contract=current_contract,
+            mismatch_explanation=_bounded_v2_report(mismatch),
+            read_set=read_set,
+            write_set="\n".join(f"- {item}" for item in original_step.write_set) or "NONE",
+            create_set="\n".join(f"- {item}" for item in original_step.create_set) or "NONE",
+            delete_set="\n".join(f"- {item}" for item in original_step.delete_set) or "NONE",
+            future_ownership=future,
+            repository_evidence="\n\n".join(evidence_parts),
+            artifacts_dir=artifact_dir,
+        )
+        if (
+            repaired.id != original_step.id
+            or repaired.title != original_step.title
+            or repaired.execution_class != original_step.execution_class
+            or repaired.depends_on != original_step.depends_on
+        ):
+            raise V2PlanParseError("contract repair changed step identity or dependency")
+        original_mutable = set((*original_step.write_set, *original_step.create_set, *original_step.delete_set))
+        repaired_mutable = set((*repaired.write_set, *repaired.create_set, *repaired.delete_set))
+        removed = original_mutable - repaired_mutable
+        added = repaired_mutable - original_mutable
+        if removed:
+            raise V2PlanParseError("contract repair removed approved mutable paths")
+        if added:
+            policy = self._effective_repair_scope
+            if len(added) > policy.max_added_paths or policy.policy == "deny-expansion":
+                raise V2PlanParseError("contract repair requested a disallowed mutable-scope expansion")
+            if policy.policy == "require-approval":
+                delta = {
+                    "schema_version": 1, "step_id": original_step.id,
+                    "added_paths": sorted(added), "tree_sha": tree_before,
+                    "repair_number": int(artifact_dir.name),
+                }
+                delta_path = artifact_dir / "scope_delta.json"
+                atomic_write_text(delta_path, _json_text(delta))
+                approval = read_scope_approval(
+                    artifact_dir,
+                    expected_sha256=hashlib.sha256(delta_path.read_bytes()).hexdigest(),
+                )
+                if approval is None:
+                    raise ScopeApprovalRequired()
+                if approval.decision is not ApprovalDecision.APPROVE:
+                    raise PipelineFailure("HUMAN_REQUIRED", "contract repair scope rejected")
+        drift = self._step_contract_drift(repo, tree_before, tree_before, repaired)
+        if drift:
+            raise V2PlanParseError("repaired contract is not executable on current tree: " + drift)
+        validation_path = artifact_dir / "validation.json"
+        validation = _read_json_artifact(validation_path, 64 * 1024)
+        if isinstance(validation, dict):
+            validation.update({
+                "status": "validated", "added_mutable_paths": sorted(added),
+                "removed_mutable_paths": sorted(removed),
+                "original_step_contract_sha256": hashlib.sha256(current_contract.encode("utf-8")).hexdigest(),
+                "repaired_contract_sha256": hashlib.sha256(
+                    (artifact_dir / "contract.md").read_bytes()
+                ).hexdigest(),
+            })
+            atomic_write_text(validation_path, _json_text(validation))
+        return repaired
 
     def _pre_step_boundary_drift(
         self, repo: Path, worktree: Path, ownership_before: GitOwnership, *,
@@ -3130,6 +3459,7 @@ class Orchestrator:
         artifact_dir: Path,
         forbidden_env_names: tuple[str | None, ...],
         future_ownership: Mapping[str, tuple[str, ...]] | None = None,
+        original_spec: str = "",
         initial_mismatch: str | None = None,
         mismatch_retry_count: int = 0,
     ) -> StepExecutionOutcome:
@@ -3174,16 +3504,10 @@ class Orchestrator:
         # 5. One fresh worker process for this step.  On a bounded retry the
         # contract is byte-identical; only the addendum is added.
         # The selected adapter owns the single execution call.
-        retry_addendum = (
-            build_mismatch_retry_addendum(
-                initial_mismatch=initial_mismatch or "",
-                future_ownership=future_ownership,
-            )
-            if mismatch_retry_count else None
-        )
         artifact_dir.mkdir(parents=True, exist_ok=True)
         try:
             prompt_payload = build_implementer_payload(
+                original_spec=original_spec,
                 step_identity=f"{step.id}\nTITLE\n{step.title}",
                 step_title=step.title,
                 step_objective=step.objective,
@@ -3202,7 +3526,6 @@ class Orchestrator:
                 instructions=step.instructions,
                 verify_contract=step.verify,
                 forbidden_contract=step.forbidden,
-                retry_addendum=retry_addendum or "",
                 budget_bytes=self.config.prompt_budget.implementer_max_bytes,
             )
             request_prompt = prompt_payload.rendered
@@ -3243,7 +3566,7 @@ class Orchestrator:
                     ),
                     prompt_mode="raw",
                     contract=contract,
-                    retry_addendum=retry_addendum,
+                    retry_addendum=None,
                 )
             )
         except AgentScopeError as exc:
@@ -3346,9 +3669,29 @@ class Orchestrator:
                         if mismatch_retry_count else _SYNTHETIC_NO_CHANGE_MISMATCH
                     )
         if mismatch is not None:
+            # Freeze even unstaged worker edits into a durable candidate tree
+            # before the repair transaction.  This makes a crash at the
+            # mismatch boundary recoverable by the normal resume validator.
+            try:
+                stage_all(worktree)
+            except GitError as exc:
+                raise StepExecutionFailure(
+                    AGENT_RUNTIME_FAILED, step_id, "could not freeze mismatch tree",
+                    **failed, tree_after=_safe_candidate_tree(worktree),
+                ) from exc
             tree_after = _safe_candidate_tree(worktree)
             index_after = _safe_index_tree(worktree)
             status_after = _safe_status(worktree)
+            if ownership_violations:
+                _record_failure_tree(artifact_dir, worktree)
+                raise StepExecutionFailure(
+                    "AGENT_GIT_VIOLATION", step_id,
+                    "; ".join(ownership_violations),
+                    profile_id=profile.id, tree_before=tree_before,
+                    tree_after=tree_after, usage=usage,
+                    mismatch=_bounded_v2_report(mismatch),
+                    mismatch_retry_count=mismatch_retry_count,
+                )
             # Clean means "the worker changed nothing": the candidate tree,
             # the index, the porcelain status and Git ownership are all exactly
             # what this step received.  It is deliberately not "git status is
@@ -3362,56 +3705,46 @@ class Orchestrator:
                 and status_after == status_before
                 and not ownership_violations
             )
-            if clean:
-                deferred_verify = _bounded_v2_report(
-                    deferred_verify_dependency(result.final_message) or ""
-                )
-                atomic_write_text(artifact_dir / "step.json", _json_text({
-                    "id": step_id, "status": "DEFERRED_CONTRACT_MISMATCH",
-                    "profile_id": profile.id,
-                    "tree_before": tree_before, "tree_after": tree_before,
-                    "changed_paths": [], "mismatch": _bounded_v2_report(mismatch),
-                    **({"initial_mismatch": _bounded_v2_report(initial_mismatch)}
-                       if mismatch_retry_count and initial_mismatch else {}),
-                    **({"mismatch_retry_count": mismatch_retry_count}
-                       if mismatch_retry_count else {}),
-                    **({"deferred_verify": deferred_verify} if deferred_verify else {}),
-                    "usage": usage,
-                }))
-                return DeferredStepExecutionOutcome(
-                    step_id=step_id, profile_id=profile.id,
-                    tree_before=tree_before, tree_after=tree_before,
-                    changed_paths=(), usage=usage, final_report=result.final_message,
+            changed = []
+            if tree_after is not None:
+                try:
+                    changed = changed_paths_between_trees(repo, tree_before, tree_after)
+                except GitError:
+                    changed = []
+            allowed = {*step.write_set, *step.create_set, *step.delete_set}
+            unexpected = [path for path in changed if path not in allowed]
+            if unexpected:
+                _record_failure_tree(artifact_dir, worktree)
+                raise StepExecutionFailure(
+                    AGENT_SCOPE_VIOLATION, step_id,
+                    "worker changed paths outside scope: " + _paths_detail(unexpected),
+                    profile_id=profile.id, tree_before=tree_before,
+                    tree_after=tree_after, usage=usage,
                     mismatch=_bounded_v2_report(mismatch),
-                    initial_mismatch=(
-                        _bounded_v2_report(initial_mismatch)
-                        if mismatch_retry_count and initial_mismatch else ""
-                    ),
+                    index_tree_after=index_after,
                     mismatch_retry_count=mismatch_retry_count,
-                    deferred_verify=deferred_verify,
                 )
+            atomic_write_text(artifact_dir / "step.json", _json_text({
+                "id": step_id, "status": "FAILED", "reason": "AGENT_CONTRACT_MISMATCH",
+                "profile_id": profile.id, "tree_before": tree_before,
+                "tree_after": tree_after, "index_tree_after": index_after,
+                "changed_paths": list(changed),
+                "mismatch": _bounded_v2_report(mismatch), "usage": usage,
+            }))
             _record_failure_tree(artifact_dir, worktree)
             details = []
             if mismatch:
                 details.append(_bounded_v2_report(mismatch))
-            if tree_after is not None and tree_after != tree_before:
-                details.append("worker left candidate modifications")
-            elif tree_after is None:
+            if tree_after is None:
                 details.append("failure tree could not be read")
-            if index_after is None or index_after != index_before:
-                details.append("worker left index modifications")
-            if ownership_violations:
-                details.extend(ownership_violations)
             residual = _new_status_lines(status_before, status_after)
-            if residual:
-                details.append("worker left residual Git modifications: " + _paths_detail(residual))
             raise StepExecutionFailure(
                 "AGENT_CONTRACT_MISMATCH", step_id,
                 "; ".join(details) or "worker reported a contract mismatch",
                 profile_id=profile.id, tree_before=tree_before,
                 tree_after=tree_after, usage=usage,
                 mismatch=_bounded_v2_report(mismatch),
-                clean_contract_mismatch=False,
+                clean_contract_mismatch=clean,
                 mismatch_retry_count=mismatch_retry_count,
                 initial_mismatch=(
                     _bounded_v2_report(initial_mismatch)
@@ -3562,11 +3895,17 @@ class Orchestrator:
                 },
             )
             raise CommitSafetyError("step VERIFY did not pass")
-        if re.search(
+        verify_failed = re.search(
             r"^\s*(?:VERIFY|VERIFICATION)\s*(?::|=)\s*(?:FAIL|FAILED|RED)\b",
             outcome.final_report,
             flags=re.IGNORECASE | re.MULTILINE,
-        ):
+        )
+        environment_verify_failure = bool(re.search(
+            r"^\s*(?:VERIFY|VERIFICATION)\s*[:=].*\b(?:FAIL|FAILED|RED)\b\s*\(\s*environment\s*:",
+            outcome.final_report,
+            flags=re.IGNORECASE | re.MULTILINE,
+        ))
+        if verify_failed and not environment_verify_failure:
             self._trace_emit(
                 "step.verification.completed",
                 phase="implementation",

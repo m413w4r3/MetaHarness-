@@ -1701,14 +1701,27 @@ def approve_repair_scope(
         raise WebAPIError(409, "run is not waiting for scope approval")
     correction = _cycle_root(directory, _state_cycle(state)) / "correction"
     delta_path = correction / "scope_delta.json"
+    approval_dir = correction
+    if not delta_path.is_file():
+        candidates = sorted(
+            (
+                path for path in (_cycle_root(directory, _state_cycle(state)) / "implementation" / "steps").glob(
+                    "*/contract_repairs/*/scope_delta.json"
+                ) if path.is_file()
+            ),
+            key=lambda path: path.stat().st_mtime_ns,
+        )
+        if candidates:
+            delta_path = candidates[-1]
+            approval_dir = delta_path.parent
     try:
         delta_hash = hashlib.sha256(delta_path.read_bytes()).hexdigest()
         if not isinstance(_load_json(delta_path, max_bytes=256 * 1024), dict):
             raise ValueError
-        existing = read_scope_approval(correction, expected_sha256=delta_hash)
+        existing = read_scope_approval(approval_dir, expected_sha256=delta_hash)
         if existing is not None:
             raise WebAPIError(409, "scope approval already exists")
-        write_scope_approval(correction, decision=selected,
+        write_scope_approval(approval_dir, decision=selected,
                              scope_delta_sha256=delta_hash, source="web-ui")
     except WebAPIError:
         raise

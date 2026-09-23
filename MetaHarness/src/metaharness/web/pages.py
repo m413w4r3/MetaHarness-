@@ -93,6 +93,7 @@ _TIMELINE = (
     ("created", "CREATED"), ("planning", "PLANNING"),
     ("awaiting_plan_approval", "AWAITING PLAN APPROVAL"), ("worktree_ready", "WORKTREE"),
     ("preparing", "PREPARING"), ("implementing", "IMPLEMENTING"),
+    ("contract_repairing", "CORRECTING STEP CONTRACT"),
     ("pre_revision_validating", "PRE-REVISION VALIDATING"),
     ("revising", "REVISING"), ("revalidating", "REVALIDATING"), ("reviewing", "REVIEWING"),
     ("approved", "APPROVED"), ("publishing", "PUBLISHING"), ("published", "PUBLISHED"),

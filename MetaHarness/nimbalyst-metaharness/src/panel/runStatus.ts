@@ -2,6 +2,7 @@ export type RunCategory = 'active' | 'awaiting-action' | 'completed' | 'failed' 
 
 const ACTIVE_STATUSES = new Set([
   'created', 'planning', 'worktree_ready', 'preparing', 'implementing',
+  'contract_repairing',
   'validating', 'pre_revision_validating', 'revising', 'revalidating',
   // `approved` is transient: the orchestrator commits or publishes next.
   'reviewing', 'approved', 'publishing',
