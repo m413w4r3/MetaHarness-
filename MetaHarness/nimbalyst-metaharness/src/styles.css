@@ -347,6 +347,21 @@
 .metaharness-step-card__facts { border: 0; border-radius: 0; }
 .metaharness-step-card__facts > div { padding: 8px 10px; }
 
+.metaharness-progress { min-width: 0; }
+.metaharness-progress__header,
+.metaharness-progress__actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.metaharness-progress__header h2 { margin: 0; }
+.metaharness-progress__header label { display: flex; align-items: center; gap: 7px; color: var(--metaharness-muted); }
+.metaharness-progress__actions { justify-content: flex-start; margin: 12px 0; }
+.metaharness-progress__filters { display: flex; flex-wrap: wrap; gap: 5px; }
+.metaharness-progress__filters button { border: 1px solid var(--metaharness-border); border-radius: 6px; padding: 5px 9px; color: inherit; background: var(--metaharness-surface); cursor: pointer; font: inherit; }
+.metaharness-progress__filters button[aria-pressed="true"] { border-color: var(--metaharness-accent); color: var(--metaharness-accent); }
+.metaharness-progress__list { display: grid; gap: 1px; max-height: 420px; margin: 0; padding: 0; overflow: auto; list-style: none; border: 1px solid var(--metaharness-border); border-radius: 8px; background: var(--metaharness-border); }
+.metaharness-progress__row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px; min-width: 0; padding: 9px 11px; background: var(--metaharness-surface); font-family: var(--nim-font-mono, ui-monospace, monospace); font-size: 12px; }
+.metaharness-progress__row:not(:has(.metaharness-progress__time)) { grid-template-columns: minmax(0, 1fr); }
+.metaharness-progress__time { color: var(--metaharness-muted); white-space: nowrap; }
+.metaharness-progress__message { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+
 .sr-only {
   position: absolute;
   width: 1px;

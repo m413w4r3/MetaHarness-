@@ -5,6 +5,7 @@ import { RunHeader } from './RunHeader';
 import { RunSummary } from './RunSummary';
 import { PlanView } from './PlanView';
 import { StepsView } from './StepsView';
+import { ProgressView } from './ProgressView';
 
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
 type Data = Record<string, unknown>;
@@ -94,6 +95,7 @@ export function RunDetail({ runId, run, callBackendTool, onBack, pollIntervalMs 
       <RunSummary data={displayed} />
       <PlanView data={displayed} />
       <StepsView data={displayed} />
+      <ProgressView runId={runId} status={typeof displayed.status === 'string' ? displayed.status : undefined} callBackendTool={callBackendTool} intervalMs={pollIntervalMs} />
     </>}
   </section>;
 }

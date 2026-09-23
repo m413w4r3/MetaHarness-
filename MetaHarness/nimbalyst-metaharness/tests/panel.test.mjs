@@ -419,8 +419,8 @@ test('HTTP conflict reports the error and refreshes the run state', async () => 
   await screen.findByRole('heading', { name: 'PLAN APPROVAL REQUIRED' });
   await waitFor(() => assert.equal(screen.getByRole('button', { name: 'APPROVE & CONTINUE' }).disabled, false));
   fireEvent.click(screen.getByRole('button', { name: 'APPROVE & CONTINUE' }));
-  await screen.findByRole('alert');
-  assert.ok(screen.getByRole('alert').textContent.includes('not awaiting plan approval'));
+  await screen.findByText('run is not awaiting plan approval');
+  assert.equal(screen.getByText('run is not awaiting plan approval').getAttribute('role'), 'alert');
   await waitFor(() => assert.equal(calls.filter((name) => name === 'metaharness.get_run').length, 2));
 });
 
