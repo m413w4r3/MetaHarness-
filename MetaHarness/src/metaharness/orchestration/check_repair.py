@@ -625,9 +625,10 @@ class GateAcceptanceService:
         if path.is_file() and stored is None:
             raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "gate acceptance is corrupted")
         if stored is not None:
+            evidence_sha256 = self._durable_evidence_sha256(directory)
             if (
                 not isinstance(stored, dict)
-                or stored.get("schema_version") != 1
+                or stored.get("schema_version") not in {1, 2}
                 or stored.get("review_cycle") != cycle_plan.cycle.number
                 or not all(_is_object_id(stored.get(key)) for key in ("tree_sha", "commit_sha", "parent_sha"))
                 or stored.get("stage") != stage.value
@@ -636,6 +637,10 @@ class GateAcceptanceService:
                 or stored.get("tree_sha") != evidence.staged_tree_sha
                 or stored.get("mutable_scope") != list(authority.effective_paths)
                 or stored.get("mutable_scope_sha256") != authority.sha256
+                or (
+                    stored.get("schema_version") == 2
+                    and stored.get("evidence_sha256") != evidence_sha256
+                )
             ):
                 raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "gate acceptance does not match evidence")
             if current_head(worktree) != stored["commit_sha"]:
@@ -733,7 +738,7 @@ class GateAcceptanceService:
             commit_created = True
 
         acceptance = {
-            "schema_version": 1,
+            "schema_version": 2,
             "review_cycle": cycle_plan.cycle.number,
             "stage": stage.value,
             "tree_sha": evidence.staged_tree_sha,
@@ -743,6 +748,7 @@ class GateAcceptanceService:
             "acceptance_kind": acceptance_kind,
             "mutable_scope": list(authority.effective_paths),
             "mutable_scope_sha256": authority.sha256,
+            "evidence_sha256": self._durable_evidence_sha256(directory),
         }
         atomic_write_text(path, _json_text(acceptance))
         if commit_created:
@@ -759,6 +765,15 @@ class GateAcceptanceService:
         )
         self._emit_acceptance(ctx, cycle_plan, stage, acceptance)
         return acceptance
+
+    @staticmethod
+    def _durable_evidence_sha256(directory: Path) -> str:
+        try:
+            return hashlib.sha256((directory / "evidence.json").read_bytes()).hexdigest()
+        except OSError as exc:
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", "accepted gate evidence is unreadable",
+            ) from exc
 
     def _emit_acceptance(self, ctx: Any, cycle_plan: Any, stage: GateStage, payload: Mapping[str, Any]) -> None:
         self._trace_emit(

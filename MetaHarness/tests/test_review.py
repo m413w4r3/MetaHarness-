@@ -122,9 +122,32 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(result.route, ReviewRoute.REPLAN)
 
     def test_fail(self):
-        result = parse_review(review_text("FAIL", "HUMAN", "Evidence is contradictory."))
+        result = parse_review(review_text(
+            "FAIL", "NONE", "Evidence is contradictory.",
+            "EVIDENCE_INVALID | durable evidence is contradictory",
+        ))
 
         self.assertEqual(result.verdict, ReviewVerdict.FAIL)
+        self.assertEqual(result.route, ReviewRoute.NONE)
+
+    def test_fail_requires_a_structured_evidence_class_and_no_recovery_route(self):
+        with self.assertRaisesRegex(ReviewParseError, "EVIDENCE_INVALID"):
+            parse_review(review_text("FAIL", "NONE", "Evidence is contradictory."))
+        with self.assertRaisesRegex(ReviewParseError, "ROUTE: NONE"):
+            parse_review(review_text(
+                "FAIL", "HUMAN", "Evidence is contradictory.",
+                "EVIDENCE_UNAVAILABLE | remote evidence cannot be fetched",
+            ))
+
+    def test_human_route_requires_an_authorized_reason_class(self):
+        with self.assertRaisesRegex(ReviewParseError, "structured product"):
+            parse_review(review_text(
+                "REVISE", "HUMAN", "Ask the operator.", "MINOR | needs a choice",
+            ))
+        result = parse_review(review_text(
+            "REVISE", "HUMAN", "Ask the operator.",
+            "PRODUCT_SPEC_AMBIGUITY | the spec allows two incompatible outcomes",
+        ))
         self.assertEqual(result.route, ReviewRoute.HUMAN)
 
     def test_pass_is_rejected_when_deterministic_gate_failed(self):
@@ -142,7 +165,14 @@ class ReviewTests(unittest.TestCase):
             parse_review(review_text("PASS", "NONE", "Fix the persistence race."))
 
     def test_malformed_then_repaired_uses_one_format_retry(self):
-        client = FakeLLMClient(["VERDICT: PASS\nROUTE: NONE\nREQUIRED FIXES: fix", PASS])
+        repaired_pass = PASS.replace(
+            "The implementation matches the requested behavior.", "Original summary text.",
+        )
+        client = FakeLLMClient([
+            "VERDICT: PASS\nROUTE: NONE\nSUMMARY: Original summary text.\nFINDINGS: NONE\n"
+            "REQUIRED FIXES: NONE",
+            repaired_pass,
+        ])
         result = Reviewer(client).review(review_payload())
 
         self.assertEqual(result.verdict, ReviewVerdict.PASS)
@@ -155,6 +185,19 @@ class ReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewParseError, "after one repair"):
             Reviewer(client).review(review_payload())
         self.assertEqual(len(client.prompts), 2)
+
+    def test_format_repair_cannot_change_a_clear_conclusion(self):
+        changed = PASS.replace(
+            "The implementation matches the requested behavior.",
+            "A different outcome was selected.",
+        )
+        client = FakeLLMClient([
+            "VERDICT: PASS\nROUTE: NONE\nSUMMARY: original summary\n"
+            "FINDINGS: NONE\nREQUIRED FIXES: NONE",
+            changed,
+        ])
+        with self.assertRaisesRegex(ReviewParseError, "changed"):
+            Reviewer(client).review(review_payload())
 
     def test_verbose_but_valid_review_does_not_trigger_a_retry(self):
         verbose_pass = review_text("PASS", "NONE")

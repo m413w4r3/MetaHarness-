@@ -103,7 +103,7 @@ class P27Tests(unittest.TestCase):
 
     def test_revise_pushes_the_reviewed_candidate_but_never_publishes(self) -> None:
         _exit_code, state = self._run(review=REVISE_REVIEW, run_id="revise")
-        self.assertEqual(state["failure"]["reason"], "REVIEW_REPAIR_EXHAUSTED")
+        self.assertEqual(state["failure"]["reason"], "WAITING_REPAIR_EXHAUSTED")
         # The reviewer is given the exact pushed candidate; a REVISE verdict
         # never turns it into a publication.
         self.assertEqual(

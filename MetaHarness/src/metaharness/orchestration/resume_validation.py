@@ -420,6 +420,11 @@ def _validate_gate_acceptance(
     """Require the durable accepted state for a completed gate boundary."""
 
     payload = _read_json_artifact(gate_acceptance_path(run_dir, number, stage))
+    evidence_path = gate_dir(run_dir, number, stage) / "evidence.json"
+    try:
+        evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    except OSError:
+        evidence_sha256 = None
     authority = gate_mutable_authority(
         run_dir, number, stage,
         base_paths=base_scope,
@@ -428,7 +433,7 @@ def _validate_gate_acceptance(
     )
     if (
         not isinstance(payload, dict)
-        or payload.get("schema_version") != 1
+        or payload.get("schema_version") not in {1, 2}
         or payload.get("review_cycle") != number
         or payload.get("stage") != getattr(stage, "value", stage)
         or not _is_object_id(payload.get("tree_sha"))
@@ -440,6 +445,10 @@ def _validate_gate_acceptance(
         or not isinstance(payload.get("commit_created"), bool)
         or payload.get("mutable_scope") != list(authority.effective_paths)
         or payload.get("mutable_scope_sha256") != authority.sha256
+        or (
+            payload.get("schema_version") == 2
+            and payload.get("evidence_sha256") != evidence_sha256
+        )
     ):
         _refuse("the gate acceptance artifact is missing or invalid")
 
@@ -1093,7 +1102,13 @@ def validate_resume(
                 run_dir, number, candidate_stage, tree=expected_tree, head=head,
                 base_scope=cycle_base_scope, policy=repair_scope,
             )
-            remote_tip = remote_run_branch_tip(repo, remote=staging_remote, branch=branch)
+            try:
+                remote_tip = remote_run_branch_tip(repo, remote=staging_remote, branch=branch)
+            except (GitError, OSError):
+                if checkpoint.phase is ResumePhase.FINAL_REVIEW:
+                    remote_tip = None
+                else:
+                    raise
             if checkpoint.phase is ResumePhase.CANDIDATE_PUSH:
                 previous_candidate_sha = None
                 if number > 1:
@@ -1101,6 +1116,10 @@ def validate_resume(
                     previous_candidate_sha = previous.get("commit_sha")
                 if remote_tip not in {None, head, previous_candidate_sha}:
                     _refuse("remote run branch points to a different commit")
+            elif checkpoint.phase is ResumePhase.FINAL_REVIEW and remote_tip is None:
+                # The candidate record already binds the exact push. Review
+                # can continue from its local immutable commit and saved diff.
+                pass
             elif remote_tip != head:
                 _refuse("remote run branch does not point to the candidate commit")
             if checkpoint.phase in {ResumePhase.FINAL_REVIEW, ResumePhase.PUBLISH}:

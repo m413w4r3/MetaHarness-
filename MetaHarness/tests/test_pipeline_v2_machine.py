@@ -9,12 +9,13 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from metaharness.llm.chat import LLMError
+from metaharness.llm.chat import LLMError, LLMHTTPError
 from metaharness.config import load_config
 from metaharness.gitops import GitError
 from metaharness.models import ExecutionRole, RunStatus
 from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
 from metaharness.run_options import RunOptions
+from metaharness.resume import resume_info
 from tests.pipeline_support import (
     PipelineHarness,
     correction_plan,
@@ -174,7 +175,9 @@ class SingleCycleTests(PipelineHarness):
             reviewer=[review("REVISE", "IMPLEMENTATION")],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "REVIEW_REPAIR_EXHAUSTED")
+        self.assertEqual(self.state()["failure"]["reason"], "WAITING_REPAIR_EXHAUSTED")
+        self.assertEqual(self.checkpoint()["phase"], "final_review")
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
         self.assertFalse((self.run_dir() / "repair_task.json").exists())
 
     def test_human_route_stops_without_automatic_correction_or_publication(self) -> None:
@@ -182,7 +185,10 @@ class SingleCycleTests(PipelineHarness):
         result = self.orchestrator(
             self.config(review_repair=3), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "HUMAN")],
-        ).run_text(SPEC, run_id="run")
+        ).run_text(
+            "Return either a file containing 'green' or one containing 'blue'; both outcomes are allowed.",
+            run_id="run",
+        )
 
         self.assertEqual(result.status, RunStatus.FAILED)
         self.assertEqual(self.state()["failure"]["reason"], "HUMAN_REQUIRED")
@@ -198,10 +204,125 @@ class SingleCycleTests(PipelineHarness):
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "REVIEW_FAILED")
+        self.assertEqual(self.state()["failure"]["reason"], "REVIEW_EVIDENCE_UNRESOLVED")
         self.assertEqual(self.workers.roles(), ["implementer"])
-        self.assertEqual(len(self.reviewer.requests), 1)
+        self.assertEqual(len(self.reviewer.requests), 2)
+        self.assertEqual(self.checkpoint()["phase"], "final_review")
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
         self.assertFalse((self.run_dir() / "publish.json").exists())
+
+    def test_malformed_review_is_repaired_to_pass_without_repeating_review(self) -> None:
+        malformed = "VERDICT: PASS\nROUTE: NONE\nREQUIRED FIXES: NONE\n"
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], reviewer=[malformed, review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(len(self.reviewer.requests), 2)
+        self.assertIn("Do not redo the review", self.reviewer.requests[1])
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_malformed_review_twice_keeps_final_review_checkpoint_and_candidate(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        failed = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)],
+            reviewer=["VERDICT: PASS\nROUTE: NONE", "still malformed"],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "REVIEW_FORMAT_INVALID")
+        self.assertEqual(self.checkpoint()["phase"], "final_review")
+        self.assertTrue((self.run_dir() / "cycles/001/candidate/commit.json").is_file())
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
+
+        resumed = self.orchestrator(
+            self.config(), planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_review_http_503_recovers_on_the_same_candidate(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)],
+            reviewer=[LLMHTTPError("LLM endpoint returned HTTP 503 after 1 attempt(s)"), review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(len(self.reviewer.requests), 2)
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_transport_retry_does_not_spend_replan_correction_budget(self) -> None:
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "good\n"), write("other.txt", "second\n"),
+        )
+        result = self.orchestrator(
+            self.config(review_repair=1),
+            planner=[
+                initial_plan(STEP),
+                correction_plan(("S01", "other.txt", "Correct other")),
+            ],
+            reviewer=[
+                LLMHTTPError("LLM endpoint returned HTTP 503 after 1 attempt(s)"),
+                review("REVISE", "REPLAN"), review(),
+            ],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.state()["cycle"], 2)
+        self.assertEqual(len(self.planner.requests), 2)
+        self.assertEqual(len(self.reviewer.requests), 3)
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+
+    def test_fail_for_remote_unavailable_retries_from_local_inline_evidence(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)],
+            reviewer=[
+                "VERDICT: FAIL\nROUTE: NONE\nSUMMARY: remote unavailable\n"
+                "FINDINGS: EVIDENCE_UNAVAILABLE | remote candidate view is unavailable\n"
+                "REQUIRED FIXES: NONE\nMISSING TESTS: NONE\nRESIDUAL RISKS: NONE\n",
+                review(),
+            ],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(len(self.reviewer.requests), 2)
+        self.assertIn('"review_evidence_mode": "LOCAL_INLINE_ONLY"', self.reviewer.requests[1])
+        self.assertIn("<BOUNDED DIFF EXCERPT>", self.reviewer.requests[1])
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_fail_with_corrupted_local_evidence_is_a_hard_integrity_failure(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        harness = self
+
+        class CorruptingReviewer:
+            def __init__(self):
+                self.requests = []
+
+            def complete(self, prompt):
+                self.requests.append(prompt)
+                evidence = harness.run_dir() / "cycles/001/checks/post-implementation/evidence.json"
+                evidence.write_text("{}", encoding="utf-8")
+                return (
+                    "VERDICT: FAIL\nROUTE: NONE\nSUMMARY: evidence invalid\n"
+                    "FINDINGS: EVIDENCE_INVALID | durable evidence is corrupt\n"
+                    "REQUIRED FIXES: NONE\nMISSING TESTS: NONE\nRESIDUAL RISKS: NONE\n"
+                )
+
+        orchestrator = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        reviewer = CorruptingReviewer()
+        orchestrator._reviewer_client = reviewer
+        result = orchestrator.run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(len(reviewer.requests), 1)
+        self.assertEqual(self.workers.roles(), ["implementer"])
 
 
 class CheckRepairTests(PipelineHarness):
@@ -456,9 +577,11 @@ class ReviewCorrectionCycleTests(PipelineHarness):
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.FAILED)
         failure = self.state()["failure"]
-        self.assertEqual(failure["reason"], "REVIEW_REPAIR_EXHAUSTED")
+        self.assertEqual(failure["reason"], "WAITING_REPAIR_EXHAUSTED")
         self.assertEqual(failure["detail"]["last_review_cycle"], 3)
         self.assertEqual(failure["detail"]["corrections_used"], 2)
+        self.assertTrue(failure["detail"]["same_findings_as_previous_cycle"])
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
         self.assertEqual(len(self.reviewer.requests), 3)
         self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser"])
 

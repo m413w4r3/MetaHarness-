@@ -111,7 +111,15 @@ def correction_plan(*steps: tuple[str, str, str], title: str = "Correct the feat
 
 
 def review(verdict: str = "PASS", route: str = "NONE") -> str:
-    findings = "NONE" if verdict == "PASS" else "MINOR | the content needs a correction"
+    if verdict == "PASS":
+        findings = "NONE"
+    elif verdict == "FAIL":
+        route = "NONE"
+        findings = "EVIDENCE_INVALID | required evidence is contradictory"
+    elif route == "HUMAN":
+        findings = "PRODUCT_SPEC_AMBIGUITY | the spec permits incompatible outcomes"
+    else:
+        findings = "MINOR | the content needs a correction"
     fixes = "NONE" if verdict == "PASS" else "Fix feature.txt."
     return (
         f"VERDICT: {verdict}\nROUTE: {route}\nSUMMARY: scripted review\n"

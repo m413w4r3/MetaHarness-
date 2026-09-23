@@ -107,7 +107,7 @@ _HARD_STOP_CODES = frozenset({
     "INTEGRITY_MISMATCH", "HEAD_MISMATCH", "BRANCH_MISMATCH",
     "COMMIT_TREE_MISMATCH", "BASE_MOVED_SINCE_RUN",
     "CHECK_REPAIR_EXHAUSTED", "CHECK_INFRA_RETRIES_EXHAUSTED",
-    "TRANSIENT_ATTEMPTS_EXHAUSTED", "REVIEW_REPAIR_EXHAUSTED",
+    "TRANSIENT_ATTEMPTS_EXHAUSTED",
     "CHECK_MUTATED_FORBIDDEN_FILES",
     "REMOTE_AUTHORITY_MISMATCH",
 })
@@ -177,6 +177,13 @@ def classify_failure(
         "WORKSPACE_SETUP_FAILED", "WORKSPACE_SETUP_TIMEOUT",
     }:
         return decision(RecoveryDisposition.WAIT_EXTERNAL, "bounded infrastructure retries were exhausted")
+    if code in {"WAITING_REPAIR_EXHAUSTED", "REVIEW_EVIDENCE_UNRESOLVED"} or (
+        code == "REVIEWER_TRANSPORT_FAILURE" and budget_exhausted
+    ):
+        return decision(
+            RecoveryDisposition.WAIT_EXTERNAL,
+            "review is retained at its final-review checkpoint for retry or operator action",
+        )
     if budget_exhausted:
         return decision(RecoveryDisposition.HARD_STOP, "bounded recovery budget exhausted")
 

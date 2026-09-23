@@ -895,6 +895,8 @@ _FAILURE_MESSAGES = {
     "REVIEWER_TRANSPORT_FAILURE": "Reviewer could not be reached",
     "REVIEWER_OUTPUT_INVALID": "Reviewer answer is invalid",
     "REVIEW_FAILED": "Review failed",
+    "REVIEW_FORMAT_INVALID": "Reviewer answer remains malformed",
+    "REVIEW_EVIDENCE_UNRESOLVED": "Reviewer evidence remains unresolved",
     "REVIEW_AUTHORITY_MISSING": "No reviewer PASS names the candidate",
     "LLM_FAILURE": "Model call failed",
     "PLANNER_BLOCKED": "Planner could not safely produce a plan",
@@ -903,7 +905,7 @@ _FAILURE_MESSAGES = {
     "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
     "RESUME_REQUIRES_OPERATOR": "Resume requires an operator",
-    "REVIEW_REPAIR_EXHAUSTED": "Review-correction budget exhausted",
+    "WAITING_REPAIR_EXHAUSTED": "Review-correction budget exhausted",
     "WAITING_SCOPE_APPROVAL": "Additional repair scope needs approval",
     "REVISION_SCOPE_VIOLATION": "A repair pass needed a path outside its scope",
     "INTERRUPTED": "Run interrupted",
@@ -1002,8 +1004,8 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     note = (
         "The reviewer requested a correction and the run has no review-correction budget."
         if reason == "HUMAN_REQUIRED" else
-        "Every review-correction cycle of the budget was used."
-        if reason == "REVIEW_REPAIR_EXHAUSTED" else ""
+        "Every review-correction cycle of the budget was used; the candidate remains at final review."
+        if reason == "WAITING_REPAIR_EXHAUSTED" else ""
     )
     action = ""
     if resume.get("resumable"):

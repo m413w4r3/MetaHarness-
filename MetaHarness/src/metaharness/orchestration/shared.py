@@ -360,8 +360,9 @@ _PLANNER_ATTEMPT_ARTIFACTS = (
 
 
 _REVIEW_ATTEMPT_ARTIFACTS = (
-    "reviewer.request.txt", "reviewer.request.meta.json", "prompt.diagnostics.json", "prompt.diagnostics.repair.json", "reviewer.raw.md",
-    "reviewer.usage.json", "review.json",
+    "reviewer.request.txt", "reviewer.request.meta.json", "reviewer.repair.request.txt",
+    "prompt.diagnostics.json", "prompt.diagnostics.repair.json", "reviewer.raw.md",
+    "reviewer.repair.raw.md", "reviewer.usage.json", "review.json",
 )
 
 

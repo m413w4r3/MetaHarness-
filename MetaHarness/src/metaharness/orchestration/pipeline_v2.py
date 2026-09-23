@@ -233,6 +233,9 @@ class PipelineV2Operations:
     # Deterministic gate episode.
     run_gate: Callable[[PipelineV2Context, CyclePlan, GateStage], EvidenceBundle]
     load_gate_evidence: Callable[[PipelineV2Context, int, GateStage], EvidenceBundle | None]
+    load_accepted_gate_evidence: Callable[
+        [PipelineV2Context, int, GateStage], EvidenceBundle | None
+    ]
     accept_gate_state: Callable[
         [PipelineV2Context, CyclePlan, GateStage, EvidenceBundle], Mapping[str, Any]
     ]
@@ -447,13 +450,8 @@ class PipelineV2Coordinator:
             return ops.publish(ctx, cycle.number, candidate)
         if review.verdict is ReviewVerdict.FAIL:
             raise PipelineFailure(
-                "REVIEW_FAILED",
-                {
-                    "summary": review.summary,
-                    "findings": review.findings,
-                    "required_fixes": review.required_fixes,
-                    "missing_tests": review.missing_tests,
-                },
+                "REVIEW_EVIDENCE_UNRESOLVED",
+                {"summary": review.summary, "findings": review.findings},
             )
         if review.route is ReviewRoute.HUMAN:
             return ops.request_human(ctx, cycle.number, review, "HUMAN_REQUIRED")
@@ -519,6 +517,13 @@ class PipelineV2Coordinator:
                 )
             repair_boundary_written = True
             attempt_recorded = attempt == durable
+        elif start is not None and start.phase is ResumePhase.DETERMINISTIC_GATE:
+            evidence = ops.load_accepted_gate_evidence(ctx, number, stage)
+            if evidence is None:
+                evidence = ops.run_gate(ctx, cycle_plan, stage)
+            attempt = len(ops.check_repair_attempts(ctx, number, stage)) + 1
+            repair_boundary_written = False
+            attempt_recorded = False
         else:
             evidence = ops.run_gate(ctx, cycle_plan, stage)
             attempt = len(ops.check_repair_attempts(ctx, number, stage)) + 1

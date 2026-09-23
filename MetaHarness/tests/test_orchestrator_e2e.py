@@ -129,11 +129,11 @@ RESIDUAL RISKS: NONE
 """
 
 FAIL_REVIEW = """VERDICT: FAIL
-ROUTE: HUMAN
+ROUTE: NONE
 SUMMARY: The implementation cannot be accepted.
-FINDINGS: BLOCKER | The implementation is unsafe.
-REQUIRED FIXES: Rework the change.
-MISSING TESTS: Add safety coverage.
+FINDINGS: EVIDENCE_INVALID | the implementation evidence is contradictory.
+REQUIRED FIXES: NONE
+MISSING TESTS: NONE
 RESIDUAL RISKS: High.
 """
 
@@ -692,12 +692,12 @@ class OrchestratorE2ETests(unittest.TestCase):
     def test_revise_fail_and_empty_diff_never_publish(self) -> None:
         _, _, revise = self.run_case(review=REVISE_REVIEW, run_id="revise")
         revise_dir = self.root / "runs" / "revise"
-        self.assertEqual(revise["failure"]["reason"], "REVIEW_REPAIR_EXHAUSTED")
+        self.assertEqual(revise["failure"]["reason"], "WAITING_REPAIR_EXHAUSTED")
         self.assertFalse((revise_dir / "repair_task.md").exists())
         self.assertFalse((revise_dir / "repair_task.json").exists())
 
         _, _, failed = self.run_case(review=FAIL_REVIEW, run_id="review-fail")
-        self.assertEqual(failed["failure"]["reason"], "REVIEW_FAILED")
+        self.assertEqual(failed["failure"]["reason"], "REVIEW_EVIDENCE_UNRESOLVED")
 
         # A worker that changes nothing enters the bounded contract-repair
         # path introduced by 261ff2a. No reviewer or candidate is authorized.
@@ -794,7 +794,7 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_review_injection_through_the_diff_cannot_publish(self) -> None:
         _, llm, state = self.run_case(codex_behavior="inject", review=REVISE_REVIEW, run_id="inject")
-        self.assertEqual(state["failure"]["reason"], "REVIEW_REPAIR_EXHAUSTED")
+        self.assertEqual(state["failure"]["reason"], "WAITING_REPAIR_EXHAUSTED")
         self.assertIsNone(state.get("commit_sha"))
         self.assertEqual(llm.reviewer_calls, 1)
 
@@ -802,7 +802,7 @@ class OrchestratorE2ETests(unittest.TestCase):
         major = PASS_REVIEW.replace("FINDINGS: NONE", "FINDINGS: MAJOR | data loss on retry")
         for run_id, review in (("major", major), ("garbage", "Looks great, ship it!")):
             _, _, state = self.run_case(review=review, run_id=run_id)
-            self.assertEqual(state["failure"]["reason"], "REVIEWER_OUTPUT_INVALID")
+            self.assertEqual(state["failure"]["reason"], "REVIEW_FORMAT_INVALID")
             self.assertIsNone(state.get("commit_sha"))
             self.assertEqual(
                 (self.root / "runs" / run_id / "cycles/001/review/reviewer.raw.md").read_text(), review
@@ -1019,7 +1019,7 @@ class OrchestratorE2ETests(unittest.TestCase):
     def test_review_budget_exhaustion_keeps_review_evidence_and_no_commit(self) -> None:
         _, llm, _ = self.run_case(review=REVISE_REVIEW, run_id="repair")
         state = json.loads((self.root / "runs" / "repair" / "state.json").read_text())
-        self.assertEqual(state["failure"]["reason"], "REVIEW_REPAIR_EXHAUSTED")
+        self.assertEqual(state["failure"]["reason"], "WAITING_REPAIR_EXHAUSTED")
         self.assertFalse((self.root / "runs" / "repair" / "repair_task.json").exists())
         self.assertTrue((self.root / "runs" / "repair" / "cycles/001/review/review.json").exists())
         self.assertEqual(llm.planner_calls, 1)

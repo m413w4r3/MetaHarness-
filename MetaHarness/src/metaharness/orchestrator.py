@@ -54,6 +54,7 @@ from .evidence import (
     EvidenceBundle,
     bounded_semantic_diff,
     collect_evidence,
+    required_checks_passed,
     scan_staged_security,
 )
 from .validation import (
@@ -111,7 +112,7 @@ from .commit_gate import (
     commit_safety_gate,
     parse_deferred_verification,
 )
-from .llm.chat import LLMError, OpenAIChatTextClient
+from .llm.chat import LLMError, LLMHTTPError, LLMProtocolError, OpenAIChatTextClient
 from .integrations.github import (
     GitHubIntegrationError,
     GitHubWorkstreamError,
@@ -214,7 +215,12 @@ from .profiles import (
 )
 from .trace import TraceSink, TraceStream
 from .result import RunResult, ResultArtifactError, atomic_write_text, write_repair_task
-from .review import Reviewer, ReviewParseError, ReviewResult
+from .review import (
+    Reviewer,
+    ReviewParseError,
+    ReviewResult,
+    structured_review_reason,
+)
 from .recovery_policy import RecoveryDecision, RecoveryDisposition, classify_failure
 from .state import RunStateStore
 from .workspace import WorkspaceSetupError, prepare_workspace
@@ -312,6 +318,7 @@ from .orchestration.pipeline_v2 import (
     check_repair_dir,
     correction_dir,
     gate_dir,
+    gate_acceptance_path,
     implementation_steps_dir,
     review_dir,
     semantic_revision_dir,
@@ -469,6 +476,7 @@ def _review_code_evidence(
     remote_sha: str | None = None,
     remote_branch: str | None = None,
     remote_name: str | None = None,
+    force_inline_diff: bool = False,
 ) -> str:
     diff_bytes = evidence.diff.encode("utf-8", errors="replace")
 
@@ -494,6 +502,7 @@ def _review_code_evidence(
     )
     remote_available = (
         remote_pushed and candidate_url is not None and compare_url is not None
+        and not force_inline_diff
     )
 
     payload: dict[str, Any] = {
@@ -1189,7 +1198,7 @@ class Orchestrator:
             client = _chat_client(
                 build_llm_endpoint(profile), self._runtime_environment
             )
-        return Reviewer(client, allow_format_repair=False)
+        return Reviewer(client, allow_format_repair=True)
 
     def _recommender_for_profile(self, profile_id: str) -> ExecutionRecommender:
         profile = profile_for_role(self.config, profile_id, ExecutionRole.PLANNER)
@@ -2138,7 +2147,7 @@ class Orchestrator:
                 failure.detail = "external executor authorization is required"
             exhausted = failure.reason in {
                 "CHECK_REPAIR_EXHAUSTED", "CHECK_INFRA_RETRIES_EXHAUSTED",
-                "TRANSIENT_ATTEMPTS_EXHAUSTED", "REVIEW_REPAIR_EXHAUSTED",
+                "TRANSIENT_ATTEMPTS_EXHAUSTED", "WAITING_REPAIR_EXHAUSTED",
             }
             if (
                 failure.reason == "DETERMINISTIC_GATE_FAILED"
@@ -2265,6 +2274,7 @@ class Orchestrator:
             load_gate_evidence=lambda ctx, number, stage: _load_evidence(
                 gate_dir(ctx.run_dir, number, stage)
             ),
+            load_accepted_gate_evidence=self._load_accepted_gate_evidence,
             accept_gate_state=lambda ctx, cycle_plan, stage, evidence: gate_acceptance.accept(
                 store, ctx, cycle_plan, stage, evidence,
                 base_paths=self._effective_cycle_scope(ctx, cycle_plan),
@@ -3286,6 +3296,53 @@ class Orchestrator:
             )
         return evidence
 
+    @staticmethod
+    def _load_accepted_gate_evidence(
+        ctx: PipelineV2Context, number: int, stage: GateStage,
+    ) -> EvidenceBundle | None:
+        """Return a green evidence bundle only when its gate acceptance binds it."""
+
+        directory = gate_dir(ctx.run_dir, number, stage)
+        acceptance_path = gate_acceptance_path(ctx.run_dir, number, stage)
+        if not acceptance_path.is_file():
+            return None
+        try:
+            payload = _read_json_artifact(acceptance_path)
+            evidence_path = directory / "evidence.json"
+            evidence_bytes = evidence_path.read_bytes()
+            evidence = _load_evidence(directory)
+            current = current_head(ctx.info.worktree)
+            current_tree = resolve_tree(ctx.info.worktree, current)
+            parents = commit_parents(ctx.info.worktree, current)
+        except (OSError, GitError, ValueError) as exc:
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", "accepted gate evidence is unreadable",
+            ) from exc
+        digest = hashlib.sha256(evidence_bytes).hexdigest()
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") not in {1, 2}
+            or payload.get("review_cycle") != number
+            or payload.get("stage") != stage.value
+            or evidence is None
+            or evidence.base_sha != ctx.base_sha
+            or not evidence.deterministic_passed
+            or not required_checks_passed(evidence)
+            or bool(evidence.failures)
+            or payload.get("tree_sha") != evidence.staged_tree_sha
+            or payload.get("commit_sha") != current
+            or current_tree != evidence.staged_tree_sha
+            or parents != (payload.get("parent_sha"),)
+            or (
+                payload.get("schema_version") == 2
+                and payload.get("evidence_sha256") != digest
+            )
+        ):
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", "gate acceptance does not bind its evidence",
+            )
+        return evidence
+
     def _run_check_preflights_recoverably(
         self,
         *,
@@ -3647,39 +3704,274 @@ class Orchestrator:
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
         candidate: Mapping[str, Any], evidence: EvidenceBundle,
     ) -> ReviewResult:
-        """Review exactly the pushed candidate; an accepted answer is reused."""
+        """Review the immutable candidate, recovering only reviewer-side failures."""
 
         self._assert_candidate_review_authority(ctx, candidate, evidence)
         directory = review_dir(ctx.run_dir, cycle_plan.cycle)
         accepted = _accepted_review(directory, evidence, candidate["commit_sha"])
-        if accepted is not None:
+        if accepted is not None and accepted.verdict is not ReviewVerdict.FAIL:
             store.update(
                 status=store.load().get("status", RunStatus.REVIEWING),
                 reviewed_candidate_sha=candidate["commit_sha"],
             )
             return accepted
-        _archive_attempt(directory, names=_REVIEW_ATTEMPT_ARTIFACTS)
-        reviewer = self._reviewer_for_profile(ctx.selection.final_reviewer.profile_id)
         store.update(status=RunStatus.REVIEWING, current_step=None)
-        try:
-            review = self._run_v2_reviewer(
-                reviewer=reviewer, spec=ctx.spec, run_dir=ctx.run_dir,
-                repository_reference=ctx.repository_reference, evidence=evidence,
-                input=self._review_context_builder().build(ctx, cycle_plan), artifacts_dir=directory,
-                worktree=ctx.info.worktree, base_sha=ctx.base_sha,
-                candidate_commit=candidate,
+        if accepted is None:
+            _archive_attempt(directory, names=_REVIEW_ATTEMPT_ARTIFACTS)
+            review = self._review_with_transport_retries(
+                store=store, ctx=ctx, cycle_plan=cycle_plan, candidate=candidate,
+                evidence=evidence, artifacts_dir=directory,
             )
-            store.update(
-                status=store.load().get("status", RunStatus.REVIEWING),
-                reviewed_candidate_sha=candidate["commit_sha"],
+        else:
+            # A FAIL response is durable but never an accepted review outcome.
+            # Re-enter its deterministic recovery after a crash at FINAL_REVIEW.
+            review = accepted
+
+        if review.verdict is ReviewVerdict.FAIL:
+            review = self._recover_reviewer_fail(
+                store=store, ctx=ctx, cycle_plan=cycle_plan, candidate=candidate,
+                supplied_evidence=evidence, first_review=review, artifacts_dir=directory,
             )
-            return review
-        except LLMError as exc:
-            # Transport only: no reviewer answer was accepted, so the same
-            # exact candidate can be reviewed again on resume.
+        store.update(
+            status=store.load().get("status", RunStatus.REVIEWING),
+            reviewed_candidate_sha=candidate["commit_sha"],
+        )
+        return review
+
+    def _review_with_transport_retries(
+        self,
+        *,
+        store: RunStateStore,
+        ctx: PipelineV2Context,
+        cycle_plan: CyclePlan,
+        candidate: Mapping[str, Any],
+        evidence: EvidenceBundle,
+        artifacts_dir: Path,
+        force_inline_diff: bool = False,
+        review_input: ReviewCycleInput | None = None,
+    ) -> ReviewResult:
+        """Retry transient reviewer transport on this candidate only."""
+
+        cycle = cycle_plan.cycle.number
+        generation = self._recovery_generation(store)
+        retry_key = f"review-transport:{cycle:03d}:resume:{generation}"
+        retries_used = self._recovery_counter(store, retry_key)
+        retry_budget = ctx.options.recovery.max_review_transport_retries
+        reviewer = self._reviewer_for_profile(ctx.selection.final_reviewer.profile_id)
+        while True:
+            try:
+                return self._run_v2_reviewer(
+                    reviewer=reviewer, spec=ctx.spec, run_dir=ctx.run_dir,
+                    repository_reference=ctx.repository_reference, evidence=evidence,
+                    input=review_input or self._review_context_builder().build(ctx, cycle_plan),
+                    artifacts_dir=artifacts_dir, worktree=ctx.info.worktree,
+                    base_sha=ctx.base_sha, candidate_commit=candidate,
+                    force_inline_diff=force_inline_diff,
+                )
+            except ReviewParseError as exc:
+                raise PipelineFailure(
+                    "REVIEW_FORMAT_INVALID", _bounded_parse_detail(exc),
+                ) from exc
+            except LLMError as exc:
+                status_match = re.search(r"\bHTTP\s+(\d{3})\b", str(exc))
+                status_code = int(status_match.group(1)) if status_match else None
+                if status_code in {401, 403}:
+                    raise PipelineFailure(
+                        f"LLM_{status_code}", "reviewer authorization is required",
+                    ) from exc
+                retryable = (
+                    not isinstance(exc, LLMProtocolError)
+                    and (
+                        not isinstance(exc, LLMHTTPError)
+                        or status_code in {408, 429, 500, 502, 503, 504}
+                        or any(marker in str(exc).casefold() for marker in (
+                            "timed out", "before receiving an http response",
+                        ))
+                    )
+                )
+                if not retryable:
+                    raise PipelineFailure(
+                        "REVIEW_FORMAT_INVALID", _bounded_parse_detail(exc),
+                    ) from exc
+                decision = classify_failure("REVIEWER_TRANSPORT_FAILURE")
+                tree = candidate.get("tree_sha")
+                attempt = retries_used + 1
+                self._trace_recovery(
+                    "recovery.classified", reason="REVIEWER_TRANSPORT_FAILURE",
+                    decision=decision, attempt=attempt, tree_before=tree,
+                    tree_after=tree, budget_remaining=max(0, retry_budget - retries_used),
+                    phase="final_review", cycle=cycle,
+                )
+                if retries_used >= retry_budget:
+                    self._trace_recovery(
+                        "recovery.exhausted", reason="REVIEWER_TRANSPORT_FAILURE",
+                        decision=classify_failure(
+                            "REVIEWER_TRANSPORT_FAILURE", budget_exhausted=True,
+                        ), attempt=attempt, tree_before=tree, tree_after=tree,
+                        budget_remaining=0, phase="final_review", cycle=cycle,
+                    )
+                    raise PipelineFailure(
+                        "REVIEWER_TRANSPORT_FAILURE", _bounded_parse_detail(exc),
+                    ) from exc
+                retries_used = self._consume_recovery_counter(store, retry_key)
+                self._trace_recovery(
+                    "recovery.started", reason="REVIEWER_TRANSPORT_FAILURE",
+                    decision=decision, attempt=attempt, tree_before=tree,
+                    tree_after=tree, budget_remaining=retry_budget - retries_used,
+                    phase="final_review", cycle=cycle,
+                )
+                _archive_attempt(artifacts_dir, names=_REVIEW_ATTEMPT_ARTIFACTS)
+
+    def _recover_reviewer_fail(
+        self,
+        *,
+        store: RunStateStore,
+        ctx: PipelineV2Context,
+        cycle_plan: CyclePlan,
+        candidate: Mapping[str, Any],
+        supplied_evidence: EvidenceBundle,
+        first_review: ReviewResult,
+        artifacts_dir: Path,
+    ) -> ReviewResult:
+        """Rebuild local authority, then allow one reviewer evidence retry."""
+
+        reason_class = structured_review_reason(first_review.findings)
+        durable_evidence = self._assert_local_review_evidence(
+            ctx, cycle_plan, candidate, supplied_evidence,
+        )
+        cycle = cycle_plan.cycle.number
+        retry_key = f"review-fail-recovery:{cycle:03d}"
+        if self._recovery_counter(store, retry_key) >= 1:
             raise PipelineFailure(
-                "REVIEWER_TRANSPORT_FAILURE", _bounded_parse_detail(exc),
-            ) from exc
+                "REVIEW_EVIDENCE_UNRESOLVED",
+                {
+                    "reason_class": reason_class,
+                    "findings": _bounded_v2_report(first_review.findings),
+                },
+            )
+        self._consume_recovery_counter(store, retry_key)
+        _archive_attempt(artifacts_dir, names=_REVIEW_ATTEMPT_ARTIFACTS)
+        recovery_input = self._review_context_builder().build(ctx, cycle_plan)
+        review = self._review_with_transport_retries(
+            store=store, ctx=ctx, cycle_plan=cycle_plan, candidate=candidate,
+            evidence=durable_evidence, artifacts_dir=artifacts_dir,
+            force_inline_diff=reason_class == "EVIDENCE_UNAVAILABLE",
+            review_input=recovery_input,
+        )
+        if review.verdict is ReviewVerdict.FAIL:
+            raise PipelineFailure(
+                "REVIEW_EVIDENCE_UNRESOLVED",
+                {
+                    "first_reason_class": reason_class,
+                    "retry_reason_class": structured_review_reason(review.findings),
+                    "findings": _bounded_v2_report(review.findings),
+                },
+            )
+        return review
+
+    def _assert_local_review_evidence(
+        self,
+        ctx: PipelineV2Context,
+        cycle_plan: CyclePlan,
+        candidate: Mapping[str, Any],
+        supplied_evidence: EvidenceBundle,
+    ) -> EvidenceBundle:
+        """Prove candidate and gate artifacts locally before retrying a FAIL."""
+
+        def integrity(detail: str) -> NoReturn:
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", detail)
+
+        number = cycle_plan.cycle.number
+        try:
+            stored_candidate = read_candidate_record(ctx.run_dir, number)
+            stage = stored_candidate.get("gate_stage")
+            evidence_dir = gate_dir(ctx.run_dir, number, stage)
+            evidence_path = evidence_dir / "evidence.json"
+            evidence_bytes = evidence_path.read_bytes()
+            evidence_payload = json.loads(evidence_bytes.decode("utf-8"))
+            durable_evidence = candidate_evidence(ctx.run_dir, number)
+            acceptance = _read_json_artifact(gate_acceptance_path(ctx.run_dir, number, stage))
+            diff_artifact = (evidence_dir / "diff.patch").read_text(encoding="utf-8")
+            changed_artifact = (evidence_dir / "changed-files.txt").read_text(encoding="utf-8")
+            checks_artifact = json.loads((evidence_dir / "checks.json").read_text(encoding="utf-8"))
+            current = current_head(ctx.info.worktree)
+            current_tree = resolve_tree(ctx.info.worktree, stored_candidate["commit_sha"])
+            parents = commit_parents(ctx.info.worktree, stored_candidate["commit_sha"])
+            authority = gate_mutable_authority(
+                ctx.run_dir, number, stage,
+                base_paths=self._effective_cycle_scope(ctx, cycle_plan),
+                policy_config=self._effective_repair_scope,
+                require_attempt_records=True,
+            )
+        except (OSError, UnicodeError, ValueError, GitError, TypeError) as exc:
+            integrity(f"candidate or gate evidence is unreadable: {type(exc).__name__}")
+        if any(
+            candidate.get(key) != stored_candidate.get(key)
+            for key in (
+                "commit_sha", "tree_sha", "parent_sha", "gate_stage", "remote",
+                "remote_branch", "remote_sha", "pushed_at",
+            )
+        ):
+            integrity("candidate identity differs from its durable record")
+        if (
+            stored_candidate.get("remote") != self.config.repository.remote
+            or stored_candidate.get("remote_branch") != ctx.info.branch
+            or stored_candidate.get("remote_sha") != stored_candidate.get("commit_sha")
+            or not isinstance(stored_candidate.get("pushed_at"), str)
+            or not stored_candidate.get("pushed_at")
+            or symbolic_head(ctx.info.worktree) != ctx.branch_ref
+            or current != stored_candidate.get("commit_sha")
+            or current_tree != stored_candidate.get("tree_sha")
+            or parents != (stored_candidate.get("parent_sha"),)
+        ):
+            integrity("local immutable candidate identity no longer matches")
+        if (
+            durable_evidence is None
+            or not isinstance(evidence_payload, dict)
+            or evidence_payload.get("staged_tree_sha") != stored_candidate.get("tree_sha")
+            or evidence_payload.get("base_sha") != ctx.base_sha
+            or not evidence_payload.get("deterministic_passed")
+            or not durable_evidence.deterministic_passed
+            or not required_checks_passed(durable_evidence)
+            or durable_evidence.staged_tree_sha != stored_candidate.get("tree_sha")
+            or durable_evidence.base_sha != supplied_evidence.base_sha
+            or durable_evidence.staged_tree_sha != supplied_evidence.staged_tree_sha
+            or durable_evidence.changed_files != supplied_evidence.changed_files
+            or durable_evidence.diff != supplied_evidence.diff
+            or _required_checks_summary(durable_evidence) != _required_checks_summary(supplied_evidence)
+        ):
+            integrity("durable gate evidence is missing, failed, or differs from the reviewed evidence")
+        changed_expected = "".join(f"{path}\n" for path in durable_evidence.changed_files)
+        if (
+            diff_artifact != durable_evidence.diff
+            or changed_artifact != changed_expected
+            or checks_artifact != evidence_payload.get("checks")
+            or evidence_payload.get("changed_files") != list(durable_evidence.changed_files)
+            or evidence_payload.get("required_check_ids") != list(durable_evidence.required_check_ids)
+        ):
+            integrity("duplicate durable gate evidence artifacts disagree")
+        expected_stage = getattr(stage, "value", stage)
+        if (
+            not isinstance(acceptance, dict)
+            or acceptance.get("review_cycle") != number
+            or acceptance.get("stage") != expected_stage
+            or acceptance.get("tree_sha") != stored_candidate.get("tree_sha")
+            or acceptance.get("commit_sha") != stored_candidate.get("commit_sha")
+            or acceptance.get("parent_sha") != stored_candidate.get("parent_sha")
+            or acceptance.get("schema_version") not in {1, 2}
+            or acceptance.get("acceptance_kind") not in {
+                "existing-head", "repair", "semantic-revision",
+            }
+            or not isinstance(acceptance.get("commit_created"), bool)
+            or acceptance.get("mutable_scope") != list(authority.effective_paths)
+            or acceptance.get("mutable_scope_sha256") != authority.sha256
+            or (
+                acceptance.get("schema_version") == 2
+                and acceptance.get("evidence_sha256") != hashlib.sha256(evidence_bytes).hexdigest()
+            )
+        ):
+            integrity("gate acceptance does not bind the durable evidence and candidate")
+        return durable_evidence
 
     def _assert_candidate_review_authority(
         self,
@@ -3712,12 +4004,17 @@ class Orchestrator:
                 raise GitError("candidate record has no exact remote SHA proof")
             if not isinstance(candidate.get("pushed_at"), str) or not candidate["pushed_at"]:
                 raise GitError("candidate record has no push timestamp")
-            remote_tip = remote_run_branch_tip(
-                ctx.info.source_repo,
-                remote=self.config.repository.remote,
-                branch=ctx.info.branch,
-            )
-            if remote_tip != candidate_sha:
+            try:
+                remote_tip = remote_run_branch_tip(
+                    ctx.info.source_repo,
+                    remote=self.config.repository.remote,
+                    branch=ctx.info.branch,
+                )
+            except (GitError, OSError):
+                # The durable exact push proof and local candidate are enough
+                # to review while the staging remote is temporarily offline.
+                remote_tip = None
+            if remote_tip is not None and remote_tip != candidate_sha:
                 raise GitError("remote run branch does not point to the candidate commit")
         except (GitError, OSError, ValueError) as exc:
             raise PipelineFailure(
@@ -3745,6 +4042,21 @@ class Orchestrator:
     ) -> RunResult:
         """End the run with the reviewer's request as an operator task."""
 
+        reason_class = structured_review_reason(review.findings)
+        authorized_classes = {
+            "PRODUCT_SPEC_AMBIGUITY", "SECURITY_POLICY_DECISION", "AUTHORITY_CONFLICT",
+        }
+        if reason_class == "SCOPE_EXPANSION_REQUIRE_APPROVAL":
+            if self._effective_repair_scope.policy != "require-approval":
+                raise PipelineFailure(
+                    "REVIEW_FORMAT_INVALID",
+                    "HUMAN scope approval was requested outside the configured require-approval policy",
+                )
+        elif reason_class not in authorized_classes:
+            raise PipelineFailure(
+                "REVIEW_FORMAT_INVALID", "HUMAN route lacks an authorized structured reason",
+            )
+
         write_repair_task(ctx.run_dir, fields={
             "route": review.route.value,
             "review_summary": review.summary,
@@ -3761,11 +4073,36 @@ class Orchestrator:
         self, store: RunStateStore, ctx: PipelineV2Context, number: int,
         review: ReviewResult, detail: Mapping[str, Any],
     ) -> RunResult:
-        """Persist exact review-correction exhaustion without a repair task."""
+        """Keep correction exhaustion visible and resumable at FINAL_REVIEW."""
+
+        unchanged: bool | None = None
+        if number > 1:
+            cycles = store.load().get("cycles")
+            previous = next((
+                item for item in cycles
+                if isinstance(item, dict) and item.get("number") == number - 1
+            ), None) if isinstance(cycles, list) else None
+            previous_review = (
+                previous.get("reviewer_conclusion")
+                if isinstance(previous, dict) else None
+            )
+            previous_findings = (
+                previous_review.get("findings")
+                if isinstance(previous_review, dict) else None
+            )
+            if isinstance(previous_findings, str):
+                unchanged = " ".join(previous_findings.split()).casefold() == (
+                    " ".join(review.findings.split()).casefold()
+                )
 
         return self._v2_failed(
-            store, ctx.run_dir, "REVIEW_REPAIR_EXHAUSTED", None,
-            {**detail, "review_summary": review.summary, "findings": review.findings},
+            store, ctx.run_dir, "WAITING_REPAIR_EXHAUSTED", None,
+            {
+                **detail,
+                "review_summary": review.summary,
+                "findings": _bounded_v2_report(review.findings),
+                "same_findings_as_previous_cycle": unchanged,
+            },
         )
 
     def _publish_candidate(
@@ -5356,6 +5693,7 @@ class Orchestrator:
         worktree: Path,
         base_sha: str,
         candidate_commit: Mapping[str, Any],
+        force_inline_diff: bool = False,
     ) -> ReviewResult:
         """The single reviewer evidence assembly of every cycle.
 
@@ -5379,6 +5717,7 @@ class Orchestrator:
             remote_sha=candidate_commit.get("remote_sha"),
             remote_branch=candidate_commit.get("remote_branch"),
             remote_name=candidate_commit.get("remote"),
+            force_inline_diff=force_inline_diff,
         )
         try:
             code_evidence_payload = json.loads(code_evidence)
@@ -5401,6 +5740,7 @@ class Orchestrator:
                 "compare_url": code_evidence_payload.get("compare_url"),
                 "candidate_tree_sha": code_evidence_payload.get("candidate_tree_sha"),
                 "remote_exploration": code_evidence_payload.get("remote_exploration"),
+                **({"review_evidence_mode": "LOCAL_INLINE_ONLY"} if force_inline_diff else {}),
             })
         diff_bytes = evidence.diff.encode("utf-8", errors="replace")
         diff_excerpt = bounded_semantic_diff(evidence.diff, 16 * 1024)[0]
