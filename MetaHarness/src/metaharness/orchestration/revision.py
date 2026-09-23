@@ -554,8 +554,33 @@ def review_cycle_revision_report(
 ) -> str:
     reports: dict[str, Any] = {}
     revision_dir = semantic_revision_dir(run_dir, number)
+    try:
+        status_payload = json.loads((revision_dir / "status.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        status_payload = None
+    if isinstance(status_payload, dict) and status_payload.get("status") == "UNAVAILABLE":
+        reason = status_payload.get("reason")
+        reports["semantic_revision"] = (
+            "SEMANTIC REVISION: UNAVAILABLE\nreason="
+            + (str(reason)[:120] if isinstance(reason, str) else "infrastructure failure")
+        )
+    elif isinstance(status_payload, dict) and status_payload.get("status") == "REPLAN_REQUIRED":
+        reports["semantic_revision"] = (
+            "SEMANTIC REVISION: SCOPE EXPANSION DENIED\nroute=REPLAN\nreason="
+            + str(status_payload.get("reason", "scope expansion denied"))[:200]
+        )
+    elif isinstance(status_payload, dict) and status_payload.get("status") == "SCOPE_REQUEST_RECORDED":
+        requested = status_payload.get("requested_paths")
+        reports["semantic_revision"] = (
+            "SEMANTIC REVISION: SCOPE REQUEST RECORDED\nreason="
+            + str(status_payload.get("reason", "scope already authorized"))[:200]
+            + "\npaths="
+            + ", ".join(path for path in requested if isinstance(path, str))[:500]
+            if isinstance(requested, list) else
+            "SEMANTIC REVISION: SCOPE REQUEST RECORDED"
+        )
     revision = load_revision(revision_dir)
-    if revision is not None:
+    if revision is not None and "semantic_revision" not in reports:
         reports["semantic_revision"] = _revision_report_text(revision, revision_dir)
     for stage_dir in sorted(check_repair_root(run_dir, number).glob("*")):
         for attempt_dir in sorted((stage_dir / "attempts").glob("[0-9][0-9][0-9]")):
@@ -564,7 +589,9 @@ def review_cycle_revision_report(
                 reports[f"check_repair/{stage_dir.name}/{attempt_dir.name}"] = (
                     _revision_report_text(attempt, attempt_dir)
                 )
-    return _json_text(reports) if reports else ""
+    return "\n\n".join(
+        f"{key}\n{value}" for key, value in reports.items()
+    ) if reports else ""
 
 
 def _revision_prompt(
@@ -734,6 +761,10 @@ class RevisionRunner:
         expected_head = current_head(info.worktree)
         stage_all(info.worktree)
         tree_before = candidate_tree_sha(info.worktree)
+        index_before = index_tree_sha(info.worktree)
+        status_before = status_porcelain(info.worktree)
+        if index_before != tree_before:
+            return None, "RESUME_REQUIRES_OPERATOR"
         if is_check_repair and check_repair_evidence.staged_tree_sha != tree_before:
             return None, "TOCTOU_FAILURE"
         if is_check_repair:
@@ -881,9 +912,9 @@ class RevisionRunner:
         atomic_write_text(artifact_dir / "tree_after.txt", tree_after.rstrip() + "\n")
         changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
         outside_scope = [path for path in changed_paths if path not in set(mutable_scope)]
-        # Both revision roles use the same deterministic parser, but only
-        # check-repair scope is governed by its configurable policy. Semantic
-        # revision requests are advisory evidence and can never auto-expand.
+        # A valid request is evidence for the orchestration layer, never an
+        # authorization by itself. The pass is rolled back before policy can
+        # authorize a new scope.
         scope_request = parse_scope_request(result.final_message)
         malformed_scope_request = (
             _SCOPE_REQUEST_HEADER in result.final_message
@@ -920,6 +951,22 @@ class RevisionRunner:
         }))
         store.update(status=RunStatus.REVISING, revision=revision_state)
         if outside_scope:
+            requested_paths = set(scope_request.paths) if scope_request is not None else set()
+            unrequested = [path for path in outside_scope if path not in requested_paths]
+            if scope_request is not None and not unrequested:
+                _record_failure_tree(artifact_dir, info.worktree)
+                try:
+                    restore_paths_from_tree(info.worktree, tree_before, list(changed_paths))
+                    stage_all(info.worktree)
+                    if (
+                        candidate_tree_sha(info.worktree) != tree_before
+                        or index_tree_sha(info.worktree) != index_before
+                        or status_porcelain(info.worktree) != status_before
+                    ):
+                        raise GitError("scope-request rollback did not restore the exact tree")
+                except (GitError, OSError):
+                    return result, "RESUME_REQUIRES_OPERATOR"
+                return result, _SCOPE_REQUEST_ROUTE
             # A successful transport with an unsafe candidate: the exact failed
             # tree stays durable as evidence and the run stops for an operator.
             _record_failure_tree(artifact_dir, info.worktree)
@@ -944,11 +991,11 @@ class RevisionRunner:
                 stage_all(info.worktree)
                 if (
                     candidate_tree_sha(info.worktree) != tree_before
-                    or index_tree_sha(info.worktree) != tree_before
-                    or _status_has_unstaged_or_untracked(status_porcelain(info.worktree))
+                    or index_tree_sha(info.worktree) != index_before
+                    or status_porcelain(info.worktree) != status_before
                 ):
                     raise GitError("scope-request rollback did not restore the exact tree")
             except (GitError, OSError):
                 pass
-            return result, _SCOPE_REQUEST_ROUTE if is_check_repair else "HUMAN_REQUIRED"
+            return result, _SCOPE_REQUEST_ROUTE
         return result, None

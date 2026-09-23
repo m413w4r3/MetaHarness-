@@ -6,7 +6,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping
 
-from .recovery_policy import RecoveryBudgets
+from .recovery_policy import ExecutionFallbacks, RecoveryBudgets
 
 
 class ProfileDriver(StrEnum):
@@ -673,6 +673,7 @@ class StepExecutionSelection:
     step_id: str
     implementer: SelectedProfile
     execution_class: ExecutionClass = ExecutionClass.MECHANICAL
+    fallbacks: tuple[SelectedProfile, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -685,6 +686,8 @@ class ExecutionSelection:
     check_repair: SelectedProfile | None
     semantic_reviser: SelectedProfile | None
     final_reviewer: SelectedProfile
+    check_repair_fallbacks: tuple[SelectedProfile, ...] = ()
+    semantic_reviser_fallbacks: tuple[SelectedProfile, ...] = ()
 
 
 @dataclass(frozen=True)

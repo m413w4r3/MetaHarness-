@@ -16,6 +16,7 @@ from metaharness.models import (
     ImplementationStep,
 )
 from metaharness.run_options import RunOptions
+from metaharness.recovery_policy import RecoveryBudgets
 
 
 class FrozenRoutingTests(unittest.TestCase):
@@ -69,7 +70,7 @@ class FrozenRoutingTests(unittest.TestCase):
         legacy_snapshot.pop("recovery")
         self.assertEqual(
             RunOptions.from_mapping(legacy_snapshot).recovery,
-            options.recovery,
+            RecoveryBudgets(),
         )
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "codex"

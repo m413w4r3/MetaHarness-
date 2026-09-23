@@ -125,6 +125,7 @@ _AGENT_ARTIFACTS = (
     "agent.stderr.log",
     "agent.final.md",
     "agent.result.json",
+    "executor.json",
 )
 
 
@@ -320,6 +321,7 @@ class StepExecutionFailure(OrchestrationError):
         mismatch_retry_count: int = 0,
         initial_mismatch: str | None = None,
         index_tree_after: str | None = None,
+        status_before: tuple[str, ...] | None = None,
         step_dir: Path | None = None,
     ) -> None:
         super().__init__(f"{reason}: step={step_id}")
@@ -335,6 +337,7 @@ class StepExecutionFailure(OrchestrationError):
         self.mismatch_retry_count = mismatch_retry_count
         self.initial_mismatch = initial_mismatch
         self.index_tree_after = index_tree_after
+        self.status_before = status_before
         self.step_dir = step_dir
 
 
@@ -346,7 +349,7 @@ _GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _ATTEMPT_ARTIFACTS = (
     "agent.prompt.txt", "prompt.diagnostics.json", "agent.events.jsonl", "agent.stderr.log", "agent.final.md",
     "agent.result.json", "step.json", TOKEN_DIAGNOSTICS_NAME, "tree_after_failure.txt",
-    "usage.json", "results.json",
+    "usage.json", "results.json", "executor.json", "failure.json",
 )
 
 
@@ -367,7 +370,10 @@ _CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "e
 
 
 
-_REVISION_ATTEMPT_ARTIFACTS = _AGENT_ARTIFACTS + ("tree_after_failure.txt",)
+_REVISION_ATTEMPT_ARTIFACTS = _AGENT_ARTIFACTS + (
+    "tree_after_failure.txt", "failure.json", "report.json", "usage.json",
+    "tree_before.txt", "tree_after.txt",
+)
 
 
 _PLANNER_CONVERSATION = "planner.conversation.json"

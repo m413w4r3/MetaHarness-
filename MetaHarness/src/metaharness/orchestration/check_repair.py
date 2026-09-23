@@ -607,7 +607,7 @@ class GateAcceptanceService:
 
     def accept(
         self, store: Any, ctx: Any, cycle_plan: Any, stage: GateStage,
-        evidence: EvidenceBundle,
+        evidence: EvidenceBundle, *, base_paths: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         if not evidence.deterministic_passed or evidence.staged_tree_sha is None:
             raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
@@ -617,7 +617,9 @@ class GateAcceptanceService:
         path = gate_acceptance_path(ctx.run_dir, cycle_plan.cycle, stage)
         authority = gate_mutable_authority(
             ctx.run_dir, cycle_plan.cycle.number, stage,
-            base_paths=cycle_plan.mutable_scope,
+            base_paths=(
+                cycle_plan.mutable_scope if base_paths is None else base_paths
+            ),
             policy_config=self._repair_scope_policy,
             require_attempt_records=True,
         )

@@ -193,6 +193,7 @@ class CyclePlan:
     contracts_dir: Path
     step_profile_ids: Mapping[str, str]
     correction_bundle_sha256: str | None = None
+    step_fallback_profile_ids: Mapping[str, tuple[str, ...]] | None = None
 
     @property
     def mutable_scope(self) -> tuple[str, ...]:

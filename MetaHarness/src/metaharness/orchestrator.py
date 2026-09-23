@@ -323,6 +323,7 @@ from .orchestration.resume_validation import (
     _read_planner_conversation,
     _read_repository_reference,
     _reusable_pre_checks,
+    _semantic_revision_scope,
     candidate_evidence,
     completed_step_records,
     load_correction_plan,
@@ -721,6 +722,9 @@ class Orchestrator:
                     selected = getattr(item, "implementer", None)
                     if getattr(selected, "profile_id", None) == profile_id:
                         return selected
+                    for fallback in getattr(item, "fallbacks", ()):
+                        if getattr(fallback, "profile_id", None) == profile_id:
+                            return fallback
         name = {
             ExecutionRole.PLANNER: "planner",
             ExecutionRole.REPAIR: "check_repair",
@@ -728,7 +732,16 @@ class Orchestrator:
             ExecutionRole.REVISER: "semantic_reviser",
         }.get(role)
         selected = getattr(selection, name, None) if name is not None else None
-        return selected if getattr(selected, "profile_id", None) == profile_id else None
+        if getattr(selected, "profile_id", None) == profile_id:
+            return selected
+        fallback_name = {
+            ExecutionRole.REPAIR: "check_repair_fallbacks",
+            ExecutionRole.REVISER: "semantic_reviser_fallbacks",
+        }.get(role)
+        for fallback in getattr(selection, fallback_name, ()) if fallback_name else ():
+            if getattr(fallback, "profile_id", None) == profile_id:
+                return fallback
+        return None
 
     @staticmethod
     def _github_result_number(value: Any, kind: str) -> int:
@@ -1770,6 +1783,7 @@ class Orchestrator:
                     if check_repair_enabled else None
                 ),
                 final_reviewer_profile_id=self._run_options.final_reviewer_profile,
+                fallback_authority=self._run_options.recovery.execution_fallbacks,
             )
             selection = ensure_execution_selection(run_dir, requested)
             durable_identity = compute_plan_identity_from_run(run_dir)
@@ -2041,6 +2055,12 @@ class Orchestrator:
         try:
             return coordinator.run(start, resumed=resumed)
         except PipelineFailure as failure:
+            if failure.reason in {
+                AGENT_AUTH_FAILURE, "LLM_401", "LLM_403", "LLM_AUTH_FAILURE",
+                "MISSING_PROVIDER_CREDENTIALS", "PROVIDER_CREDENTIALS_MISSING",
+            }:
+                failure.reason = "EXTERNAL_AUTH_REQUIRED"
+                failure.detail = "external executor authorization is required"
             exhausted = failure.reason in {
                 "CHECK_REPAIR_EXHAUSTED", "CHECK_INFRA_RETRIES_EXHAUSTED",
                 "TRANSIENT_ATTEMPTS_EXHAUSTED", "REVIEW_REPAIR_EXHAUSTED",
@@ -2170,7 +2190,10 @@ class Orchestrator:
             load_gate_evidence=lambda ctx, number, stage: _load_evidence(
                 gate_dir(ctx.run_dir, number, stage)
             ),
-            accept_gate_state=bind(gate_acceptance.accept, store),
+            accept_gate_state=lambda ctx, cycle_plan, stage, evidence: gate_acceptance.accept(
+                store, ctx, cycle_plan, stage, evidence,
+                base_paths=self._effective_cycle_scope(ctx, cycle_plan),
+            ),
             check_repair_attempts=lambda ctx, number, stage: self._check_repair_attempt_records(
                 ctx.run_dir, number, stage
             ),
@@ -2198,6 +2221,10 @@ class Orchestrator:
             step_profile_ids={
                 item.step_id: item.implementer.profile_id for item in ctx.selection.steps
             },
+            step_fallback_profile_ids={
+                item.step_id: tuple(profile.profile_id for profile in item.fallbacks)
+                for item in ctx.selection.steps
+            },
         )
 
     def _cycle_plan(self, ctx: PipelineV2Context, number: int) -> CyclePlan:
@@ -2214,6 +2241,7 @@ class Orchestrator:
                 bundle=previous.bundle,
                 contracts_dir=previous.contracts_dir,
                 step_profile_ids=previous.step_profile_ids,
+                step_fallback_profile_ids=previous.step_fallback_profile_ids,
             )
         plan, bundle, bundle_sha = load_correction_plan(
             self.config, ctx.selection, ctx.run_dir, number,
@@ -2240,6 +2268,7 @@ class Orchestrator:
                         self.config, cycle=cycle.number,
                         plan_steps=plan.steps,
                         step_profile_ids=planned_profile_ids,
+                        fallback_authority=self._run_options.recovery.execution_fallbacks,
                     ),
                 )
             else:
@@ -2258,11 +2287,16 @@ class Orchestrator:
         step_profile_ids = {
             item.step_id: item.implementer.profile_id for item in cycle_selection.steps
         }
+        step_fallback_profile_ids = {
+            item.step_id: tuple(profile.profile_id for profile in item.fallbacks)
+            for item in cycle_selection.steps
+        }
         return CyclePlan(
             cycle=cycle, plan=plan, bundle=bundle,
             contracts_dir=correction_dir(ctx.run_dir, cycle),
             step_profile_ids=step_profile_ids,
             correction_bundle_sha256=bundle_sha,
+            step_fallback_profile_ids=step_fallback_profile_ids,
         )
 
     def _review_implementation_correction(
@@ -2298,6 +2332,7 @@ class Orchestrator:
             bundle=previous_plan.bundle,
             contracts_dir=previous_plan.contracts_dir,
             step_profile_ids=previous_plan.step_profile_ids,
+            step_fallback_profile_ids=previous_plan.step_fallback_profile_ids,
         ), review
 
     def _approved_scope_before(self, ctx: PipelineV2Context, number: int) -> list[str]:
@@ -2305,7 +2340,8 @@ class Orchestrator:
 
         scope: set[str] = set()
         for earlier in range(1, number):
-            scope |= set(self._cycle_plan(ctx, earlier).mutable_scope)
+            earlier_plan = self._cycle_plan(ctx, earlier)
+            scope |= set(self._effective_cycle_scope(ctx, earlier_plan))
         return sorted(scope)
 
     def _plan_correction(
@@ -2575,6 +2611,10 @@ class Orchestrator:
                                 if approval is None or approval.decision is not ApprovalDecision.APPROVE:
                                     raise ScopeApprovalRequired()
                         scope.update(added)
+        scope.update(_semantic_revision_scope(
+            ctx.repo, ctx.run_dir, cycle_plan.cycle.number,
+            self._effective_repair_scope,
+        ))
         return tuple(sorted(scope))
 
     def _state_steps(
@@ -2642,6 +2682,7 @@ class Orchestrator:
             ),
             step=step, contract=contract,
             profile_id=cycle_plan.step_profile_ids[step.id],
+            fallback_profile_ids=(cycle_plan.step_fallback_profile_ids or {}).get(step.id, ()),
             artifact_dir=step_artifact_dir,
             forbidden_env_names=(planner_profile.api_key_env, reviewer_profile.api_key_env),
             future_ownership=_future_step_ownership(cycle_plan.plan.steps, index),
@@ -2670,40 +2711,246 @@ class Orchestrator:
 
         number = cycle_plan.cycle.number
         artifact_dir = semantic_revision_dir(ctx.run_dir, number)
-        _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
         steps = self._completed_steps(ctx, cycle_plan)
-        try:
-            result, error = self._run_v2_revision_cycle(
-                store=store, cycle=number, run_dir=ctx.run_dir, repo=ctx.repo,
-                base_sha=ctx.base_sha, base_tree_sha=ctx.base_tree_sha, spec=ctx.spec,
-                plan=cycle_plan.plan, repository_reference=ctx.repository_reference,
-                info=ctx.info, branch_ref=ctx.branch_ref,
-                ownership_before=_git_ownership(ctx.repo, ctx.info.worktree),
-                selection=ctx.selection, artifact_dir=artifact_dir,
-                mutable_scope=list(self._effective_cycle_scope(ctx, cycle_plan)), step_results=steps,
-                deferred_mismatches=_deferred_contract_mismatches(cycle_plan.plan, steps),
-                deferred_mismatch_present=_has_deferred_contract_mismatches(steps),
-            )
-        except AgentScopeError as exc:
-            self._redact_revision_artifacts(artifact_dir)
-            raise PipelineFailure(AGENT_SCOPE_VIOLATION, redact(str(exc), self._secrets)) from exc
-        except AgentError as exc:
-            self._redact_revision_artifacts(artifact_dir)
-            _record_failure_tree(artifact_dir, ctx.info.worktree)
-            raise PipelineFailure(
-                getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self._secrets),
-            ) from exc
-        if error is not None:
-            if error in {_SCOPE_REQUEST_ROUTE, "REVISION_SCOPE_VIOLATION", AGENT_SCOPE_VIOLATION}:
-                raise PipelineFailure(
-                    "HUMAN_REQUIRED",
-                    "semantic revision requested scope outside its approved authority",
+        mutable_scope = list(self._effective_cycle_scope(ctx, cycle_plan))
+        while True:
+            _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+            try:
+                result, error = self._run_revision_with_recovery(
+                    store=store, cycle=number, is_check_repair=False,
+                    request={
+                "store": store, "cycle": number, "run_dir": ctx.run_dir, "repo": ctx.repo,
+                "base_sha": ctx.base_sha, "base_tree_sha": ctx.base_tree_sha, "spec": ctx.spec,
+                "plan": cycle_plan.plan, "repository_reference": ctx.repository_reference,
+                "info": ctx.info, "branch_ref": ctx.branch_ref,
+                "ownership_before": _git_ownership(ctx.repo, ctx.info.worktree),
+                "selection": ctx.selection, "artifact_dir": artifact_dir,
+                "mutable_scope": mutable_scope, "step_results": steps,
+                "deferred_mismatches": _deferred_contract_mismatches(cycle_plan.plan, steps),
+                "deferred_mismatch_present": _has_deferred_contract_mismatches(steps),
+                    },
                 )
-            raise PipelineFailure(error)
-        self._cycle_update(
-            store, cycle_plan.cycle, status="revised",
-            semantic_revision_report=_bounded_report(result.final_message) if result else "",
-        )
+            except PipelineFailure:
+                raise
+            except (AgentScopeError, AgentError) as exc:
+                self._redact_revision_artifacts(artifact_dir)
+                _record_failure_tree(artifact_dir, ctx.info.worktree)
+                raise PipelineFailure(
+                    getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self._secrets),
+                ) from exc
+            if error == _SCOPE_REQUEST_ROUTE:
+                outcome, mutable_scope = self._authorize_semantic_scope_request(
+                    store, ctx, cycle_plan, artifact_dir, mutable_scope,
+                )
+                if outcome == "expanded":
+                    _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+                    continue
+                if outcome == "replan":
+                    _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+                    return
+                report = _read_json_artifact(artifact_dir / "report.json", 256 * 1024)
+                final = report.get("final", "") if isinstance(report, dict) else ""
+                _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+                self._cycle_update(
+                    store, cycle_plan.cycle, status="revised",
+                    semantic_revision_status="SCOPE_REQUEST_RECORDED",
+                    semantic_revision_report=_bounded_report(str(final)),
+                )
+                return
+            if error is not None:
+                if error in {
+                    AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
+                    AGENT_PROTOCOL_FAILED,
+                }:
+                    unavailable = {"status": "UNAVAILABLE", "reason": error[:120]}
+                    atomic_write_text(artifact_dir / "status.json", _json_text(unavailable))
+                    self._cycle_update(
+                        store, cycle_plan.cycle, status="revision_unavailable",
+                        semantic_revision_status="UNAVAILABLE",
+                        semantic_revision_reason=unavailable["reason"],
+                        semantic_revision_report=(
+                            "SEMANTIC REVISION: UNAVAILABLE\nreason=" + unavailable["reason"]
+                        ),
+                    )
+                    store.update(status=RunStatus.REVISING, semantic_revision=unavailable)
+                    return
+                if error in {"REVISION_SCOPE_VIOLATION", AGENT_SCOPE_VIOLATION}:
+                    raise PipelineFailure(
+                        AGENT_SCOPE_VIOLATION,
+                        "semantic revision changed a path outside approved authority",
+                    )
+                raise PipelineFailure(error)
+            self._cycle_update(
+                store, cycle_plan.cycle, status="revised",
+                semantic_revision_status="COMPLETED",
+                semantic_revision_report=_bounded_report(result.final_message) if result else "",
+            )
+            return
+
+    def _authorize_semantic_scope_request(
+        self,
+        store: RunStateStore,
+        ctx: PipelineV2Context,
+        cycle_plan: CyclePlan,
+        artifact_dir: Path,
+        current_scope: list[str],
+    ) -> tuple[str, list[str]]:
+        """Persist and apply a strict, policy-bounded reviser scope request."""
+
+        report = _read_json_artifact(artifact_dir / "report.json", 256 * 1024)
+        request = report.get("scope_request") if isinstance(report, dict) else None
+        paths = request.get("paths") if isinstance(request, dict) else None
+        reason = request.get("reason") if isinstance(request, dict) else None
+        evidence = request.get("evidence") if isinstance(request, dict) else None
+        tree_sha = report.get("tree_before") if isinstance(report, dict) else None
+        if (
+            not isinstance(paths, list) or not paths or any(
+                not isinstance(path, str) or not self._safe_scope_request_path(path)
+                for path in paths
+            ) or len(paths) != len(set(paths))
+            or not isinstance(reason, str) or not reason.strip()
+            or not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence)
+            or not isinstance(tree_sha, str) or not _is_object_id(tree_sha)
+        ):
+            raise PipelineFailure(AGENT_SCOPE_VIOLATION, "semantic scope request is malformed")
+        source_report = artifact_dir / "report.json"
+        try:
+            source_report_sha = hashlib.sha256(source_report.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise PipelineFailure(
+                "RESUME_REQUIRES_OPERATOR", "semantic scope request report is unreadable",
+            ) from exc
+        try:
+            exists = {
+                path: path_exists_in_tree(ctx.repo, tree_sha, path) for path in paths
+            }
+        except GitError as exc:
+            raise PipelineFailure("RESUME_REQUIRES_OPERATOR", "scope request tree semantics are unreadable") from exc
+        base = tuple(sorted(set(current_scope)))
+        requested = tuple(sorted(set(paths)))
+        added = tuple(path for path in requested if path not in base)
+        root = artifact_dir / "scope_requests"
+        root.mkdir(parents=True, exist_ok=True)
+        existing_added: set[str] = set()
+        next_number = 1
+        prior_request_dir: Path | None = None
+        for path in sorted(root.iterdir(), key=lambda item: item.name):
+            if not path.is_dir() or not path.name.isdigit():
+                continue
+            next_number = max(next_number, int(path.name) + 1)
+            saved = _read_json_artifact(path / "authority.json", 64 * 1024)
+            if isinstance(saved, dict):
+                saved_added = saved.get("added_paths")
+                if isinstance(saved_added, list):
+                    existing_added.update(item for item in saved_added if isinstance(item, str))
+                if (
+                    saved.get("tree_sha") == tree_sha
+                    and saved.get("base_mutable_scope") == list(base)
+                    and saved.get("requested_paths") == list(requested)
+                    and saved.get("reason") == reason
+                    and saved.get("evidence") == [item[:1000] for item in evidence[:16]]
+                ):
+                    prior_request_dir = path
+        target = prior_request_dir or root / f"{next_number:03d}"
+        target.mkdir(parents=True, exist_ok=True)
+        added_all = tuple(sorted(existing_added | set(added)))
+        policy = self._effective_repair_scope
+        authority = {
+            "schema_version": 1,
+            "cycle": cycle_plan.cycle.number,
+            "tree_sha": tree_sha,
+            "source_report_sha256": source_report_sha,
+            "base_mutable_scope": list(base),
+            "requested_paths": list(requested),
+            "added_paths": list(added),
+            "existing_paths": [path for path in requested if exists[path]],
+            "create_paths": [path for path in requested if not exists[path]],
+            "reason": reason[:2000],
+            "evidence": [item[:1000] for item in evidence[:16]],
+            "policy": policy.policy,
+            "bound": policy.max_added_paths,
+        }
+        authority_path = target / "authority.json"
+        authority_content = _json_text(authority)
+        if authority_path.exists():
+            saved_authority = _read_json_artifact(authority_path, 64 * 1024)
+            saved_semantics = (
+                {key: value for key, value in saved_authority.items()
+                 if key != "source_report_sha256"}
+                if isinstance(saved_authority, dict) else None
+            )
+            current_semantics = {
+                key: value for key, value in authority.items()
+                if key != "source_report_sha256"
+            }
+            if saved_semantics != current_semantics:
+                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "semantic scope request authority changed")
+            authority = saved_authority
+        else:
+            atomic_write_text(authority_path, authority_content)
+
+        if not added:
+            atomic_write_text(target / "decision.json", _json_text({
+                **authority, "decision": "recorded-in-scope",
+            }))
+            atomic_write_text(artifact_dir / "status.json", _json_text({
+                "status": "SCOPE_REQUEST_RECORDED",
+                "reason": reason[:2000],
+                "requested_paths": list(requested),
+            }))
+            return "recorded", current_scope
+        if policy.policy == "deny-expansion":
+            denied = {**authority, "decision": "denied-expansion"}
+            atomic_write_text(target / "decision.json", _json_text(denied))
+            status = {
+                "status": "REPLAN_REQUIRED",
+                "reason": "semantic scope expansion denied by recovery policy",
+            }
+            atomic_write_text(artifact_dir / "status.json", _json_text(status))
+            report_text = (
+                "SEMANTIC REVISION: SCOPE EXPANSION DENIED\nroute=REPLAN\n"
+                f"reason={_bounded_v2_report(reason)}"
+            )
+            self._cycle_update(
+                store, cycle_plan.cycle, status="scope_expansion_denied",
+                semantic_revision_status="REPLAN_REQUIRED",
+                semantic_revision_report=report_text,
+            )
+            return "replan", current_scope
+
+        delta_path = target / "scope_delta.json"
+        delta = {
+            "schema_version": 1, "cycle": cycle_plan.cycle.number,
+            "tree_sha": tree_sha, "added_paths": list(added),
+            "requested_paths": list(requested), "reason": reason[:2000],
+            "evidence": [item[:1000] for item in evidence[:16]],
+            "policy": policy.policy, "bound": policy.max_added_paths,
+        }
+        delta_content = _json_text(delta)
+        if delta_path.exists() and delta_path.read_text(encoding="utf-8") != delta_content:
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "semantic scope delta changed")
+        if not delta_path.exists():
+            atomic_write_text(delta_path, delta_content)
+        delta_sha = hashlib.sha256(delta_path.read_bytes()).hexdigest()
+        approval = read_scope_approval(target, expected_sha256=delta_sha)
+        requires_approval = policy.policy == "require-approval" or len(added_all) > policy.max_added_paths
+        if requires_approval and approval is None:
+            _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+            delta["approval_artifact"] = delta_path.relative_to(ctx.run_dir).as_posix()
+            store.update(
+                status=RunStatus.WAITING_SCOPE_APPROVAL,
+                scope_delta=delta,
+                current_step=None,
+            )
+            self._cycle_update(
+                store, cycle_plan.cycle, status="waiting_scope_approval", scope_delta=delta,
+            )
+            raise ScopeApprovalRequired()
+        if approval is not None and approval.decision is not ApprovalDecision.APPROVE:
+            raise PipelineFailure("HUMAN_REQUIRED", "semantic scope request was rejected")
+        if requires_approval and approval is None:
+            raise ScopeApprovalRequired()
+        return "expanded", sorted(set(current_scope) | set(added))
 
     def _semantic_review_correction(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
@@ -2749,47 +2996,81 @@ class Orchestrator:
             "CORRECTION EVIDENCE\n" + code_evidence,
         ))
         artifact_dir = semantic_revision_dir(ctx.run_dir, number)
-        _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
-        try:
-            result, error = self._run_v2_revision_cycle(
-                store=store, cycle=number, run_dir=ctx.run_dir, repo=ctx.repo,
-                base_sha=ctx.base_sha, base_tree_sha=ctx.base_tree_sha, spec=ctx.spec,
-                plan=previous_plan.plan, repository_reference=ctx.repository_reference,
-                info=ctx.info, branch_ref=ctx.branch_ref,
-                ownership_before=_git_ownership(ctx.repo, ctx.info.worktree),
-                selection=ctx.selection, artifact_dir=artifact_dir,
-                mutable_scope=approved_scope,
-                step_results=self._completed_steps(ctx, previous_plan),
-                deferred_mismatches=_deferred_contract_mismatches(
-                    previous_plan.plan, self._completed_steps(ctx, previous_plan)
+        mutable_scope = list(self._effective_cycle_scope(ctx, cycle_plan))
+        step_results = self._completed_steps(ctx, previous_plan)
+        while True:
+            _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+            try:
+                result, error = self._run_revision_with_recovery(
+                    store=store, cycle=number, is_check_repair=False,
+                    request={
+                "store": store, "cycle": number, "run_dir": ctx.run_dir, "repo": ctx.repo,
+                "base_sha": ctx.base_sha, "base_tree_sha": ctx.base_tree_sha, "spec": ctx.spec,
+                "plan": previous_plan.plan, "repository_reference": ctx.repository_reference,
+                "info": ctx.info, "branch_ref": ctx.branch_ref,
+                "ownership_before": _git_ownership(ctx.repo, ctx.info.worktree),
+                "selection": ctx.selection, "artifact_dir": artifact_dir,
+                "mutable_scope": mutable_scope,
+                "step_results": step_results,
+                "deferred_mismatches": _deferred_contract_mismatches(
+                    previous_plan.plan, step_results
                 ),
-                deferred_mismatch_present=_has_deferred_contract_mismatches(
-                    self._completed_steps(ctx, previous_plan)
+                "deferred_mismatch_present": _has_deferred_contract_mismatches(
+                    step_results
                 ),
-                reviewer_correction_evidence=reviewer_evidence,
-                candidate_identity=candidate_identity,
-                bounded_diff_evidence=bounded_semantic_diff(evidence.diff, 16 * 1024)[0],
-            )
-        except AgentScopeError as exc:
-            self._redact_revision_artifacts(artifact_dir)
-            raise PipelineFailure("HUMAN_REQUIRED", redact(str(exc), self._secrets)) from exc
-        except AgentError as exc:
-            self._redact_revision_artifacts(artifact_dir)
-            _record_failure_tree(artifact_dir, ctx.info.worktree)
-            raise PipelineFailure(
-                getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self._secrets),
-            ) from exc
-        if error is not None:
+                "reviewer_correction_evidence": reviewer_evidence,
+                "candidate_identity": candidate_identity,
+                "bounded_diff_evidence": bounded_semantic_diff(evidence.diff, 16 * 1024)[0],
+                    },
+                )
+            except PipelineFailure:
+                raise
+            except AgentError as exc:
+                self._redact_revision_artifacts(artifact_dir)
+                raise PipelineFailure(
+                    getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self._secrets),
+                ) from exc
+            if error == _SCOPE_REQUEST_ROUTE:
+                outcome, mutable_scope = self._authorize_semantic_scope_request(
+                    store, ctx, cycle_plan, artifact_dir, mutable_scope,
+                )
+                if outcome == "expanded":
+                    _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+                    continue
+                if outcome == "replan":
+                    _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+                    return
+                _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+                self._cycle_update(
+                    store, cycle_plan.cycle, status="revised",
+                    semantic_revision_status="SCOPE_REQUEST_RECORDED",
+                    semantic_revision_report="SEMANTIC REVISION: SCOPE REQUEST RECORDED",
+                )
+                return
             if error in {
-                "REVISION_SCOPE_VIOLATION", _SCOPE_REQUEST_ROUTE,
-                "HUMAN_REQUIRED", AGENT_SCOPE_VIOLATION,
+                AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT, AGENT_PROTOCOL_FAILED,
             }:
-                raise PipelineFailure("HUMAN_REQUIRED", "semantic correction requested or changed a path outside approved scope")
-            raise PipelineFailure(error)
-        self._cycle_update(
-            store, cycle_plan.cycle, status="revised",
-            semantic_revision_report=_bounded_report(result.final_message) if result else "",
-        )
+                unavailable = {"status": "UNAVAILABLE", "reason": error[:120]}
+                atomic_write_text(artifact_dir / "status.json", _json_text(unavailable))
+                self._cycle_update(
+                    store, cycle_plan.cycle, status="revision_unavailable",
+                    semantic_revision_status="UNAVAILABLE",
+                    semantic_revision_reason=error[:120],
+                    semantic_revision_report=(
+                        "SEMANTIC REVISION: UNAVAILABLE\nreason=" + error[:120]
+                    ),
+                )
+                return
+            if error is not None:
+                if error in {"REVISION_SCOPE_VIOLATION", AGENT_SCOPE_VIOLATION}:
+                    raise PipelineFailure(AGENT_SCOPE_VIOLATION, "semantic correction changed a path outside approved scope")
+                raise PipelineFailure(error)
+            self._cycle_update(
+                store, cycle_plan.cycle, status="revised",
+                semantic_revision_status="COMPLETED",
+                semantic_revision_report=_bounded_report(result.final_message) if result else "",
+            )
+            return
 
     def _run_gate(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
@@ -3139,21 +3420,58 @@ class Orchestrator:
             phase="validation", cycle=number,
         )
         try:
-            _result, error = self._run_v2_revision_cycle(
-                store=store, cycle=number, run_dir=ctx.run_dir, repo=ctx.repo,
-                base_sha=ctx.base_sha, base_tree_sha=ctx.base_tree_sha, spec=ctx.spec,
-                plan=cycle_plan.plan, repository_reference=ctx.repository_reference,
-                info=ctx.info, branch_ref=ctx.branch_ref,
-                ownership_before=_git_ownership(ctx.repo, ctx.info.worktree),
-                selection=ctx.selection, artifact_dir=attempt_dir,
-                mutable_scope=list(scope.effective_paths),
-                check_repair_evidence=evidence, check_repair_scope=scope,
-                check_repair_attempt=attempt,
+            _result, error = self._run_revision_with_recovery(
+                store=store, cycle=number, is_check_repair=True, attempt=attempt,
+                request={
+                "store": store, "cycle": number, "run_dir": ctx.run_dir, "repo": ctx.repo,
+                "base_sha": ctx.base_sha, "base_tree_sha": ctx.base_tree_sha, "spec": ctx.spec,
+                "plan": cycle_plan.plan, "repository_reference": ctx.repository_reference,
+                "info": ctx.info, "branch_ref": ctx.branch_ref,
+                "ownership_before": _git_ownership(ctx.repo, ctx.info.worktree),
+                "selection": ctx.selection, "artifact_dir": attempt_dir,
+                "mutable_scope": list(scope.effective_paths),
+                "check_repair_evidence": evidence, "check_repair_scope": scope,
+                "check_repair_attempt": attempt,
+                "gate_stage": stage.value,
+                },
             )
         except (AgentError, GitError, OSError) as exc:
             error = getattr(exc, "code", None) or AGENT_RUNTIME_FAILED
             _record_failure_tree(attempt_dir, ctx.info.worktree)
+        effective_executor = _read_json_artifact(attempt_dir / "executor.json", 16 * 1024)
+        effective_profile_id = (
+            effective_executor.get("profile_id")
+            if isinstance(effective_executor, dict)
+            and isinstance(effective_executor.get("profile_id"), str)
+            else selected.profile_id
+        )
+        effective_selected = self._trace_selected_profile(effective_profile_id, ExecutionRole.REPAIR)
+        effective_fingerprint = getattr(effective_selected, "config_sha256", None)
         if error is not None:
+            if error in {
+                AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
+                AGENT_PROTOCOL_FAILED,
+            }:
+                error_detail = f"CHECK_REPAIR_UNAVAILABLE after {error}"
+                atomic_write_text(attempt_dir / "failure.json", _json_text({
+                    "schema_version": 1,
+                    "number": attempt,
+                    "failed_check_ids_before": list(failed_ids),
+                    "tree_before": evidence.staged_tree_sha,
+                    "tree_after": candidate_tree_sha(ctx.info.worktree),
+                    "mutable_scope": list(scope.effective_paths),
+                    "profile_id": effective_profile_id,
+                    "profile_fingerprint": effective_fingerprint,
+                    "reason": "CHECK_REPAIR_UNAVAILABLE",
+                    "infrastructure_reason": error[:120],
+                }))
+                store.update(
+                    status=RunStatus.REVISING,
+                    check_repair={
+                        "status": "unavailable", "error": error[:120], **progress,
+                    },
+                )
+                raise PipelineFailure("CHECK_REPAIR_UNAVAILABLE", error_detail)
             reason = "REVISION_SCOPE_VIOLATION" if error == _SCOPE_REQUEST_ROUTE else error
             self._trace_recovery(
                 "recovery.completed", reason="CHECK_FAILED", decision=decision,
@@ -3169,7 +3487,8 @@ class Orchestrator:
                 "tree_before": evidence.staged_tree_sha,
                 "tree_after": _safe_candidate_tree(ctx.info.worktree),
                 "mutable_scope": list(scope.effective_paths),
-                "profile_id": selected.profile_id,
+                "profile_id": effective_profile_id,
+                "profile_fingerprint": effective_fingerprint,
                 "reason": reason,
             }))
             store.update(
@@ -3187,8 +3506,8 @@ class Orchestrator:
         atomic_write_text(attempt_dir / "attempt.json", _json_text({
             "schema_version": 1,
             **asdict(record),
-            "profile_id": selected.profile_id,
-            "profile_fingerprint": selected.config_sha256,
+            "profile_id": effective_profile_id,
+            "profile_fingerprint": effective_fingerprint,
             "status": "completed",
         }))
         attempts = [*records, record]
@@ -3405,6 +3724,7 @@ class Orchestrator:
         contract: str,
         profile_id: str,
         artifact_dir: Path,
+        fallback_profile_ids: Sequence[str] = (),
         forbidden_env_names: tuple[str | None, ...],
         future_ownership: Mapping[str, tuple[str, ...]] | None = None,
     ) -> StepExecutionOutcome:
@@ -3423,8 +3743,16 @@ class Orchestrator:
         if effective_step is not step:
             effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
         max_repairs = getattr(self._run_options, "max_step_contract_repairs", 0)
+        recovery_generation = self._recovery_generation(store)
+        active_profile_id = profile_id
+        fallback_ids = tuple(fallback_profile_ids)[
+            :self._run_options.recovery.max_executor_fallbacks
+        ]
+        fallback_index = 0
+        cycle_key = f"{getattr(self, '_trace_cycle', 1):03d}:{step.id}"
         retry_key = (
-            f"agent-step:{getattr(self, '_trace_cycle', 1):03d}:{step.id}"
+            f"agent-step:{cycle_key}" if recovery_generation == 0
+            else f"agent-step:r{recovery_generation}:{cycle_key}"
         )
         transient_retry_count = self._recovery_counter(store, retry_key)
         pending_transient: tuple[int, str, str, RecoveryDecision] | None = None
@@ -3455,7 +3783,7 @@ class Orchestrator:
                 "repo": repo, "worktree": worktree, "base_sha": base_sha,
                 "branch_ref": branch_ref, "ownership_before": ownership_before,
                 "expected_tree": expected_tree, "step": effective_step,
-                "contract": effective_contract, "profile_id": profile_id,
+                "contract": effective_contract, "profile_id": active_profile_id,
                 "artifact_dir": artifact_dir,
                 "forbidden_env_names": forbidden_env_names,
                 "future_ownership": future_ownership,
@@ -3481,6 +3809,15 @@ class Orchestrator:
                     )
                 return outcome
             except StepExecutionFailure as failure:
+                atomic_write_text(artifact_dir / "failure.json", _json_text({
+                    "schema_version": 1,
+                    "reason": failure.reason[:120],
+                    "step_id": failure.step_id,
+                    "profile_id": failure.profile_id,
+                    "tree_before": failure.tree_before,
+                    "tree_after": failure.tree_after,
+                    "status_before": list(failure.status_before or ()),
+                }))
                 if pending_transient is not None:
                     attempt, reason, tree_before, decision = pending_transient
                     self._trace_recovery(
@@ -3507,6 +3844,50 @@ class Orchestrator:
                     pending_transient = (
                         transient_retry_count, reason, tree_before, decision,
                     )
+                    continue
+                if failure.reason == AGENT_AUTH_FAILURE:
+                    failure.reason = "EXTERNAL_AUTH_REQUIRED"
+                    failure.detail = "executor credentials or external authorization are required"
+                    failure.step_dir = artifact_dir
+                    raise
+                if (
+                    failure.reason in {
+                        AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
+                        AGENT_PROTOCOL_FAILED,
+                    }
+                    and transient_retry_count >= self._run_options.recovery.max_transient_attempts
+                    and fallback_index < len(fallback_ids)
+                ):
+                    fallback_index += 1
+                    active_profile_id = fallback_ids[fallback_index - 1]
+                    retry_key = (
+                        f"agent-step:{cycle_key}:fallback:{active_profile_id}"
+                        if recovery_generation == 0
+                        else f"agent-step:r{recovery_generation}:{cycle_key}:fallback:{active_profile_id}"
+                    )
+                    transient_retry_count = self._recovery_counter(store, retry_key)
+                    fallback_decision = RecoveryDecision(
+                        RecoveryDisposition.FALLBACK_EXECUTOR,
+                        "primary executor transient retry budget exhausted",
+                        True, False,
+                    )
+                    self._trace_recovery(
+                        "recovery.executor_selected", reason=failure.reason,
+                        decision=fallback_decision, attempt=fallback_index,
+                        tree_before=failure.tree_before,
+                        tree_after=_safe_candidate_tree(worktree),
+                        budget_remaining=max(
+                            0, self._run_options.recovery.max_executor_fallbacks - fallback_index,
+                        ), phase="implementation",
+                        cycle=getattr(self, "_trace_cycle", 1), step_id=step.id,
+                    )
+                    _archive_attempt(artifact_dir)
+                    atomic_write_text(artifact_dir / "executor.json", _json_text({
+                        "profile_id": active_profile_id,
+                        "role": "implementer",
+                        "selection_source": "frozen execution fallback authority",
+                    }))
+                    store.update(status=RunStatus.IMPLEMENTING, current_step=step.id)
                     continue
                 if failure.reason != "AGENT_CONTRACT_MISMATCH":
                     failure.step_dir = artifact_dir
@@ -3653,8 +4034,8 @@ class Orchestrator:
         """Retry only transient worker failures after proving exact restoration."""
 
         retryable_codes = {
-            AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
-            AGENT_PROTOCOL_FAILED, AGENT_AUTH_FAILURE,
+            AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT, AGENT_PROTOCOL_FAILED,
+            AGENT_AUTH_FAILURE,
         }
         reason = failure.reason
         before = failure.tree_before
@@ -3676,27 +4057,27 @@ class Orchestrator:
 
         attempt = retries_used + 1
         if before is None:
-            decision = classify_failure(reason, rollback_succeeded=False)
+            failure.reason = "RESUME_REQUIRES_OPERATOR"
+            decision = classify_failure(failure.reason, rollback_succeeded=False)
             self._trace_recovery(
-                "recovery.classified", reason=reason, decision=decision,
+                "recovery.classified", reason=failure.reason, decision=decision,
                 attempt=attempt, tree_before=None,
                 tree_after=failure.tree_after or _safe_candidate_tree(worktree),
                 budget_remaining=0, phase="implementation",
                 cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
             )
-            failure.reason = "REPOSITORY_TREE_DRIFT_UNEXPLAINED"
             failure.detail = (failure.detail or "worker failed") + "; pre-attempt tree identity is unavailable"
             failure.step_dir = artifact_dir
             return None
         if failure.tree_after is None:
-            decision = classify_failure(reason, rollback_succeeded=False)
+            failure.reason = "RESUME_REQUIRES_OPERATOR"
+            decision = classify_failure(failure.reason, rollback_succeeded=False)
             self._trace_recovery(
-                "recovery.classified", reason=reason, decision=decision,
+                "recovery.classified", reason=failure.reason, decision=decision,
                 attempt=attempt, tree_before=before, tree_after=None,
                 budget_remaining=0, phase="implementation",
                 cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
             )
-            failure.reason = "REPOSITORY_TREE_DRIFT_UNEXPLAINED"
             failure.detail = (failure.detail or "worker failed") + "; post-attempt tree identity is unavailable"
             failure.step_dir = artifact_dir
             return None
@@ -3727,7 +4108,7 @@ class Orchestrator:
         tree_changed = tree_after is not None and tree_after != before
         status = _safe_status(worktree)
         if status is None:
-            failure.reason = "ROLLBACK_FAILED"
+            failure.reason = "RESUME_REQUIRES_OPERATOR"
             failure.detail = (failure.detail or "worker failed") + "; post-attempt status is unreadable"
             failure.step_dir = artifact_dir
             decision = classify_failure(failure.reason, rollback_succeeded=False)
@@ -3746,6 +4127,34 @@ class Orchestrator:
                 stage_all(worktree)
                 tree_after = index_tree_sha(worktree)
                 failure.tree_after = tree_after
+                changed = changed_paths_between_trees(repo, before, tree_after)
+            except (GitError, OSError, ValueError) as exc:
+                failure.reason = "RESUME_REQUIRES_OPERATOR"
+                failure.detail = f"failed attempt tree could not be frozen: {type(exc).__name__}"
+                failure.tree_after = _safe_candidate_tree(worktree)
+                failure.step_dir = artifact_dir
+                decision = classify_failure(failure.reason, rollback_succeeded=False)
+                self._trace_recovery(
+                    "recovery.classified", reason=failure.reason, decision=decision,
+                    attempt=attempt, tree_before=before, tree_after=failure.tree_after,
+                    budget_remaining=0, phase="implementation",
+                    cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
+                )
+                return None
+            unexpected = [path for path in changed if path not in allowed]
+            if unexpected:
+                failure.reason = AGENT_SCOPE_VIOLATION
+                failure.detail = "worker changed paths outside scope: " + _paths_detail(unexpected)
+                failure.step_dir = artifact_dir
+                decision = classify_failure(failure.reason, tree_changed_out_of_scope=True)
+                self._trace_recovery(
+                    "recovery.classified", reason=failure.reason, decision=decision,
+                    attempt=attempt, tree_before=before, tree_after=tree_after,
+                    budget_remaining=0, phase="implementation",
+                    cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
+                )
+                return None
+            try:
                 security_failures = scan_staged_security(
                     worktree, secrets=self._secrets,
                 )
@@ -3774,27 +4183,33 @@ class Orchestrator:
                     cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
                 )
                 return None
-            try:
-                changed = changed_paths_between_trees(repo, before, tree_after)
-            except GitError:
-                changed = None
-            if changed is not None:
-                unexpected = [path for path in changed if path not in allowed]
-                if unexpected:
-                    failure.reason = AGENT_SCOPE_VIOLATION
-                    failure.detail = "worker changed paths outside scope: " + _paths_detail(unexpected)
-                    failure.step_dir = artifact_dir
-                    decision = classify_failure(failure.reason, tree_changed_out_of_scope=True)
-                    self._trace_recovery(
-                        "recovery.classified", reason=failure.reason, decision=decision,
-                        attempt=attempt, tree_before=before, tree_after=tree_after,
-                        budget_remaining=0, phase="implementation",
-                        cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-                    )
-                    return None
         if tree_changed and not self._restore_failed_step_attempt(worktree, before, allowed):
-            failure.reason = "ROLLBACK_FAILED"
+            failure.reason = "RESUME_REQUIRES_OPERATOR"
             failure.detail = (failure.detail or "worker failed") + "; rollback did not restore the pre-attempt tree"
+            failure.tree_after = _safe_candidate_tree(worktree)
+            failure.step_dir = artifact_dir
+            decision = classify_failure(failure.reason, rollback_succeeded=False)
+            self._trace_recovery(
+                "recovery.classified", reason=failure.reason, decision=decision,
+                attempt=attempt, tree_before=before, tree_after=failure.tree_after,
+                budget_remaining=0, phase="implementation",
+                cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
+            )
+            return None
+
+        try:
+            restored_status = status_porcelain(worktree)
+            exact_restoration = (
+                candidate_tree_sha(worktree) == before
+                and index_tree_sha(worktree) == before
+                and restored_status == failure.status_before
+                and not _status_has_unstaged_or_untracked(restored_status)
+            )
+        except (GitError, OSError):
+            exact_restoration = False
+        if not exact_restoration:
+            failure.reason = "RESUME_REQUIRES_OPERATOR"
+            failure.detail = (failure.detail or "worker failed") + "; retry boundary is not exact"
             failure.tree_after = _safe_candidate_tree(worktree)
             failure.step_dir = artifact_dir
             decision = classify_failure(failure.reason, rollback_succeeded=False)
@@ -3873,6 +4288,12 @@ class Orchestrator:
         )
         _archive_attempt(artifact_dir)
         return retries_used, reason, before, decision
+
+    @staticmethod
+    def _recovery_generation(store: RunStateStore) -> int:
+        resume = store.load().get("resume")
+        attempts = resume.get("attempts", 0) if isinstance(resume, dict) else 0
+        return attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else 0
 
     @staticmethod
     def _count_contract_repairs(artifact_dir: Path) -> int:
@@ -4147,6 +4568,22 @@ class Orchestrator:
             step_role,
             forbidden_env_names=forbidden_env_names,
         )
+        selected_executor = self._trace_selected_profile(profile.id, step_role, step_id=step_id)
+        selection_source = "primary execution authority"
+        frozen_selection = getattr(self, "_last_selection", None)
+        if frozen_selection is not None and step_id is not None:
+            for selected_step in frozen_selection.steps:
+                if selected_step.step_id == step_id and any(
+                    fallback.profile_id == profile.id for fallback in selected_step.fallbacks
+                ):
+                    selection_source = "frozen execution fallback authority"
+                    break
+        atomic_write_text(artifact_dir / "executor.json", _json_text({
+            "profile_id": profile.id,
+            "role": step_role.value,
+            "config_sha256": getattr(selected_executor, "config_sha256", None),
+            "selection_source": selection_source,
+        }))
         # 5. One fresh worker process for this step.  On a bounded retry the
         # contract is byte-identical; only the addendum is added.
         # The selected adapter owns the single execution call.
@@ -4178,9 +4615,7 @@ class Orchestrator:
             write_prompt_diagnostics(artifact_dir, prompt_payload)
             trace_started_at = self._trace_time()
             trace_started_mono = time.perf_counter()
-            trace_selected = self._trace_selected_profile(
-                profile.id, step_role, step_id=step_id
-            )
+            trace_selected = selected_executor
             self._trace_emit(
                 "step.started",
                 phase="implementation",
@@ -4241,6 +4676,27 @@ class Orchestrator:
                 AGENT_SCOPE_VIOLATION, step_id, redact(str(exc), self._secrets),
                 profile_id=profile.id, tree_before=tree_before, **retry_mode,
             ) from None
+        except AgentError as exc:
+            reason = getattr(exc, "code", None) or AGENT_RUNTIME_FAILED
+            tree_after = _safe_candidate_tree(worktree)
+            _record_failure_tree(artifact_dir, worktree)
+            atomic_write_text(artifact_dir / "failure.json", _json_text({
+                "schema_version": 1,
+                "reason": str(reason)[:120],
+                "profile_id": profile.id,
+                "tree_before": tree_before,
+                "tree_after": tree_after,
+                "mutable_scope": sorted({
+                    *step.write_set, *step.create_set, *step.delete_set,
+                }),
+            }))
+            self._redact_step_artifacts(artifact_dir)
+            raise StepExecutionFailure(
+                reason, step_id, redact(str(exc), self._secrets),
+                profile_id=profile.id, tree_before=tree_before,
+                tree_after=tree_after, status_before=status_before,
+                **retry_mode,
+            ) from None
         # 6. Complete and redact the durable artifacts.
         self._ensure_step_artifacts(artifact_dir, result)
         self._redact_step_artifacts(artifact_dir)
@@ -4277,6 +4733,7 @@ class Orchestrator:
             pass
         failed = {
             "profile_id": profile.id, "tree_before": tree_before, "usage": usage,
+            "status_before": status_before,
             **retry_mode,
         }
         # 7. Authentication classification from fixed markers only.
@@ -4405,6 +4862,11 @@ class Orchestrator:
             raise StepExecutionFailure(
                 "AGENT_GIT_VIOLATION", step_id, "; ".join(ownership_violations), **failed
             )
+        if auth_failure:
+            raise StepExecutionFailure(
+                AGENT_AUTH_FAILURE, step_id, "worker authentication failed", **failed,
+                tree_after=_safe_candidate_tree(worktree),
+            )
         # 10-11. Process outcome.  The tree left behind is recorded so that a
         # resume can tell a clean retry from partial worker changes.
         if result.timed_out or result.exit_reason == AGENT_TIMEOUT:
@@ -4416,12 +4878,6 @@ class Orchestrator:
             AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_PROTOCOL_FAILED,
             AGENT_SCOPE_VIOLATION,
         }:
-            if auth_failure:
-                reason = AGENT_AUTH_FAILURE
-                raise StepExecutionFailure(
-                    reason, step_id, "worker authentication failed", **failed,
-                    tree_after=_safe_candidate_tree(worktree),
-                )
             reason = result.exit_reason or AGENT_RUNTIME_FAILED
             raise StepExecutionFailure(
                 reason, step_id, f"exit status {result.exit_code}", **failed,
@@ -4439,7 +4895,7 @@ class Orchestrator:
         unexpected = [path for path in changed_paths if path not in allowed]
         if unexpected:
             raise StepExecutionFailure(
-                "STEP_WRITE_SET_VIOLATION", step_id,
+                AGENT_SCOPE_VIOLATION, step_id,
                 f"unexpected={_paths_detail(unexpected)}", **failed, tree_after=tree_after,
             )
         # 17-18. Durable step record, then the outcome.  A deferred verify
@@ -4861,6 +5317,9 @@ class Orchestrator:
             cycle_summary=(
                 _compact_cycle_summary(input.cycle_history)
                 + "\n"
+                + "REVISION REPORTS\n"
+                + (input.revision_report or "NONE")
+                + "\n"
                 + input.step_reports
                 + "\nDEFERRED CONTRACT MISMATCHES\n"
                 + input.deferred_mismatches
@@ -5141,6 +5600,263 @@ class Orchestrator:
                 },
             )
         return result, error
+
+    def _run_revision_with_recovery(
+        self,
+        *,
+        store: RunStateStore,
+        request: Mapping[str, Any],
+        is_check_repair: bool,
+        cycle: int,
+        attempt: int | None = None,
+    ) -> tuple[Any | None, str | None]:
+        """Retry one reviser/repair contract after proving an exact rollback."""
+
+        selection = request["selection"]
+        primary = selection.check_repair if is_check_repair else selection.semantic_reviser
+        if primary is None:
+            return None, "CHECK_REPAIR_PROFILE_MISSING" if is_check_repair else "SEMANTIC_REVISER_PROFILE_MISSING"
+        fallback_authority = (
+            selection.check_repair_fallbacks if is_check_repair
+            else selection.semantic_reviser_fallbacks
+        )
+        fallbacks = tuple(fallback_authority)[:self._run_options.recovery.max_executor_fallbacks]
+        role = ExecutionRole.REPAIR if is_check_repair else ExecutionRole.REVISER
+        phase = "check-repair" if is_check_repair else "semantic-revision"
+        prefix = "check-repair" if is_check_repair else "semantic-revision"
+        stage_name = request.get("gate_stage", "")
+        generation = self._recovery_generation(store)
+        retry_key = f"{prefix}:{generation}:{cycle:03d}:{stage_name}:{attempt or 0}"
+        retries_used = self._recovery_counter(store, retry_key)
+        active = primary
+        fallback_index = 0
+        artifact_dir = Path(request["artifact_dir"])
+        repo = Path(request["repo"])
+        worktree = Path(request["info"].worktree)
+        allowed = set(request["mutable_scope"])
+
+        while True:
+            active_selection = dataclasses.replace(
+                selection,
+                check_repair=active if is_check_repair else selection.check_repair,
+                semantic_reviser=active if not is_check_repair else selection.semantic_reviser,
+            )
+            current_request = {
+                key: value for key, value in request.items() if key != "gate_stage"
+            }
+            current_request["selection"] = active_selection
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(artifact_dir / "executor.json", _json_text({
+                "profile_id": active.profile_id,
+                "role": role.value,
+                "config_sha256": active.config_sha256,
+                "selection_source": "primary execution authority" if active == primary else "frozen execution fallback authority",
+            }))
+            try:
+                tree_before = candidate_tree_sha(worktree)
+                index_before = index_tree_sha(worktree)
+                status_before = status_porcelain(worktree)
+                ownership_before = _git_ownership(repo, worktree)
+                if index_before != tree_before:
+                    raise PipelineFailure(
+                        "RESUME_REQUIRES_OPERATOR",
+                        "revision worker checkpoint does not have an exact index tree "
+                        f"(tree={tree_before}, index={index_before}, status={list(status_before)[:8]})",
+                    )
+            except GitError as exc:
+                raise PipelineFailure("RESUME_REQUIRES_OPERATOR", "revision pre-attempt tree is unreadable") from exc
+            try:
+                result, error = self._run_v2_revision_cycle(**current_request)
+            except AgentError as exc:
+                result, error = None, getattr(exc, "code", AGENT_RUNTIME_FAILED)
+            except (GitError, OSError) as exc:
+                result, error = None, getattr(exc, "code", AGENT_RUNTIME_FAILED)
+
+            if error is None:
+                return result, None
+
+            failed_tree_after = _safe_candidate_tree(worktree)
+            changed = self._restore_failed_revision_attempt(
+                repo=repo, worktree=worktree, tree_before=tree_before,
+                ownership_before=ownership_before, branch_ref=request["branch_ref"],
+                allowed=allowed, artifact_dir=artifact_dir,
+                status_before=status_before,
+                allow_requested_paths=(error == _SCOPE_REQUEST_ROUTE),
+            )
+            if error in {
+                AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
+                AGENT_PROTOCOL_FAILED, AGENT_AUTH_FAILURE,
+            }:
+                atomic_write_text(artifact_dir / "failure.json", _json_text({
+                    "schema_version": 1,
+                    "reason": str(error)[:120],
+                    "profile_id": active.profile_id,
+                    "tree_before": tree_before,
+                    "tree_after": failed_tree_after,
+                    "mutable_scope": sorted(allowed),
+                    "rollback_tree_sha": candidate_tree_sha(worktree),
+                    "rollback_index_tree_sha": index_tree_sha(worktree),
+                    "rollback_status": list(status_porcelain(worktree)),
+                }))
+            if error == AGENT_AUTH_FAILURE:
+                raise PipelineFailure(
+                    "EXTERNAL_AUTH_REQUIRED",
+                    "executor credentials or external authorization are required",
+                )
+            if error == _SCOPE_REQUEST_ROUTE:
+                return result, error
+            if error not in {
+                AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
+                AGENT_PROTOCOL_FAILED,
+            }:
+                return result, error
+
+            decision = classify_failure(error, tree_changed_in_scope=changed)
+            budget = self._run_options.recovery.max_transient_attempts
+            if retries_used < budget:
+                retries_used = self._consume_recovery_counter(store, retry_key)
+                self._trace_recovery(
+                    "recovery.started", reason=error, decision=decision,
+                    attempt=retries_used, tree_before=tree_before,
+                    tree_after=candidate_tree_sha(worktree),
+                    budget_remaining=max(0, budget - retries_used), phase=phase,
+                    cycle=cycle,
+                )
+                _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+                continue
+
+            if fallback_index < len(fallbacks):
+                fallback_index += 1
+                fallback_decision = RecoveryDecision(
+                    RecoveryDisposition.FALLBACK_EXECUTOR,
+                    "primary executor transient retry budget exhausted",
+                    True, False,
+                )
+                self._trace_recovery(
+                    "recovery.executor_selected", reason=error,
+                    decision=fallback_decision, attempt=fallback_index,
+                    tree_before=tree_before, tree_after=candidate_tree_sha(worktree),
+                    budget_remaining=max(0, len(fallbacks) - fallback_index),
+                    phase=phase, cycle=cycle,
+                )
+                _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+                active = fallbacks[fallback_index - 1]
+                retry_key = f"{prefix}:{generation}:{cycle:03d}:{stage_name}:{attempt or 0}:{active.profile_id}"
+                retries_used = self._recovery_counter(store, retry_key)
+                continue
+
+            self._trace_recovery(
+                "recovery.exhausted", reason=error, decision=decision,
+                attempt=retries_used + 1, tree_before=tree_before,
+                tree_after=candidate_tree_sha(worktree), budget_remaining=0,
+                phase=phase, cycle=cycle,
+            )
+            return result, error
+
+    def _restore_failed_revision_attempt(
+        self,
+        *,
+        repo: Path,
+        worktree: Path,
+        tree_before: str,
+        ownership_before: GitOwnership,
+        branch_ref: str,
+        allowed: set[str],
+        artifact_dir: Path,
+        status_before: tuple[str, ...],
+        allow_requested_paths: bool,
+    ) -> bool:
+        """Audit worker ownership and restore only a fully in-scope failed tree."""
+
+        try:
+            ownership_violations = _ownership_violations(
+                ownership_before, _git_ownership(repo, worktree),
+                branch_ref=branch_ref, base_sha=ownership_before.head,
+            )
+        except GitError as exc:
+            ownership_violations = [f"Git ownership could not be read: {type(exc).__name__}"]
+        if ownership_violations:
+            raise PipelineFailure("AGENT_GIT_VIOLATION", "; ".join(ownership_violations))
+
+        try:
+            current_tree = candidate_tree_sha(worktree)
+            current_index = index_tree_sha(worktree)
+            status = status_porcelain(worktree)
+            changed = changed_paths_between_trees(repo, tree_before, current_tree)
+            if (
+                current_tree != tree_before or current_index != tree_before
+                or _status_has_unstaged_or_untracked(status)
+            ):
+                stage_all(worktree)
+                current_tree = candidate_tree_sha(worktree)
+                current_index = index_tree_sha(worktree)
+                status = status_porcelain(worktree)
+                changed = changed_paths_between_trees(repo, tree_before, current_tree)
+        except PipelineFailure:
+            raise
+        except (GitError, OSError, ValueError) as exc:
+            raise PipelineFailure("RESUME_REQUIRES_OPERATOR", "failed revision tree could not be frozen") from exc
+
+        requested: set[str] = set()
+        if allow_requested_paths:
+            report = _read_json_artifact(artifact_dir / "report.json", 256 * 1024)
+            scope_request = report.get("scope_request") if isinstance(report, dict) else None
+            paths = scope_request.get("paths") if isinstance(scope_request, dict) else None
+            if isinstance(paths, list) and all(isinstance(path, str) for path in paths):
+                requested = set(paths)
+        unsafe_request = [path for path in requested if not self._safe_scope_request_path(path)]
+        if unsafe_request:
+            raise PipelineFailure("AGENT_SCOPE_VIOLATION", "scope request contains an unsafe path")
+        outside = [path for path in changed if path not in allowed and path not in requested]
+        if outside:
+            raise PipelineFailure(
+                AGENT_SCOPE_VIOLATION,
+                "worker changed paths outside scope: " + _paths_detail(outside),
+            )
+        if current_tree != tree_before:
+            try:
+                security_failures = scan_staged_security(worktree, secrets=self._secrets)
+            except (GitError, OSError, ValueError) as exc:
+                raise PipelineFailure(
+                    "RESUME_REQUIRES_OPERATOR", "failed revision changes could not be security-scanned",
+                ) from exc
+            if security_failures:
+                raise PipelineFailure(
+                    security_failures[0].split(":", 1)[0], "; ".join(security_failures),
+                )
+
+        try:
+            if changed:
+                restore_paths_from_tree(worktree, tree_before, sorted(changed))
+                stage_all(worktree)
+            if (
+                candidate_tree_sha(worktree) != tree_before
+                or index_tree_sha(worktree) != tree_before
+                or status_porcelain(worktree) != status_before
+            ):
+                raise GitError("failed revision rollback did not restore the exact tree")
+            violations = _ownership_violations(
+                ownership_before, _git_ownership(repo, worktree),
+                branch_ref=branch_ref, base_sha=ownership_before.head,
+            )
+            if violations:
+                raise GitError("Git ownership changed during rollback")
+            atomic_write_text(artifact_dir / "tree_after_failure.txt", tree_before + "\n")
+        except (GitError, OSError) as exc:
+            _record_failure_tree(artifact_dir, worktree)
+            raise PipelineFailure("RESUME_REQUIRES_OPERATOR", "failed revision rollback was not exact") from exc
+        return bool(changed)
+
+    @staticmethod
+    def _safe_scope_request_path(path: str) -> bool:
+        return bool(
+            isinstance(path, str) and path and path == path.strip()
+            and path not in {".", ".."}
+            and "\x00" not in path and "\\" not in path
+            and not path.startswith("/") and "//" not in path
+            and all(part not in {"", ".", "..", ".git"} for part in Path(path).parts)
+            and not any(char in path for char in "*?[]{}")
+        )
 
     def _redact_revision_artifacts(self, artifact_dir: Path) -> None:
         for name in _REVISION_ARTIFACTS:

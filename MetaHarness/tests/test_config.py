@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from metaharness.config import ConfigError, load_config
 from metaharness.models import CheckConfig
 from metaharness.planning_v2 import render_safe_check_catalogue
-from metaharness.recovery_policy import RecoveryBudgets
+from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
 
 
 VALID_CONFIG = """
@@ -188,6 +188,38 @@ max_workspace_setup_retries = 2
             max_review_transport_retries=0,
             max_workspace_setup_retries=2,
         ))
+
+    def test_execution_fallback_profiles_are_provider_neutral_config(self) -> None:
+        contents = VALID_CONFIG + """
+
+[recovery]
+[recovery.execution_fallbacks]
+mechanical = ["mechanical-rescue"]
+reasoning = ["reasoning-rescue"]
+agentic = ["agentic-rescue"]
+semantic_reviser = ["reviser-rescue"]
+check_repair = ["repair-rescue"]
+"""
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), contents))
+        self.assertEqual(config.recovery.execution_fallbacks, ExecutionFallbacks(
+            mechanical=("mechanical-rescue",),
+            reasoning=("reasoning-rescue",),
+            agentic=("agentic-rescue",),
+            semantic_reviser=("reviser-rescue",),
+            check_repair=("repair-rescue",),
+        ))
+
+    def test_execution_fallback_profiles_must_be_arrays(self) -> None:
+        contents = VALID_CONFIG + """
+
+[recovery.execution_fallbacks]
+mechanical = "rescue"
+"""
+        with tempfile.TemporaryDirectory() as directory_name:
+            config_path = self.write_config(Path(directory_name), contents)
+            with self.assertRaisesRegex(ConfigError, "execution_fallbacks.mechanical"):
+                load_config(config_path)
 
     def test_recovery_budget_rejects_unknown_keys(self) -> None:
         contents = VALID_CONFIG + "\n[recovery]\nretries = 9\n"

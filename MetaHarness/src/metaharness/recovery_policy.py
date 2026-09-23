@@ -31,6 +31,38 @@ class RecoveryDecision:
 
 
 @dataclass(frozen=True)
+class ExecutionFallbacks:
+    """Configured executor fallback profile IDs, grouped by worker authority."""
+
+    mechanical: tuple[str, ...] = ()
+    reasoning: tuple[str, ...] = ()
+    agentic: tuple[str, ...] = ()
+    semantic_reviser: tuple[str, ...] = ()
+    check_repair: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("mechanical", "reasoning", "agentic", "semantic_reviser", "check_repair"):
+            values = getattr(self, name)
+            if isinstance(values, str) or not isinstance(values, tuple):
+                raise ValueError(f"execution_fallbacks.{name} must be a tuple of profile IDs")
+            if len(values) > 10 or any(
+                not isinstance(value, str)
+                or not value
+                or len(value) > 64
+                or not value[0].isalnum()
+                or any(not (char.isalnum() or char in "_.-") for char in value)
+                for value in values
+            ) or len(set(values)) != len(values):
+                raise ValueError(f"execution_fallbacks.{name} contains an invalid profile ID")
+
+    def for_execution_class(self, execution_class: str) -> tuple[str, ...]:
+        key = str(execution_class).casefold()
+        if key not in {"mechanical", "reasoning", "agentic"}:
+            raise ValueError("execution class is invalid")
+        return getattr(self, key)
+
+
+@dataclass(frozen=True)
 class RecoveryBudgets:
     """Retry limits frozen into each run's immutable options snapshot."""
 
@@ -39,6 +71,7 @@ class RecoveryBudgets:
     max_check_infra_retries: int = 2
     max_review_transport_retries: int = 2
     max_workspace_setup_retries: int = 2
+    execution_fallbacks: ExecutionFallbacks = ExecutionFallbacks()
 
     def __post_init__(self) -> None:
         for name in (
@@ -49,6 +82,8 @@ class RecoveryBudgets:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10:
                 raise ValueError(f"{name} must be an integer between 0 and 10")
+        if not isinstance(self.execution_fallbacks, ExecutionFallbacks):
+            raise ValueError("execution_fallbacks is invalid")
 
 
 _HARD_STOP_CODES = frozenset({
@@ -80,6 +115,7 @@ _HARD_STOP_CODES = frozenset({
 _AUTH_CODES = frozenset({
     "AGENT_AUTH_FAILURE", "LLM_401", "LLM_403", "LLM_AUTH_FAILURE",
     "MISSING_PROVIDER_CREDENTIALS", "PROVIDER_CREDENTIALS_MISSING",
+    "EXTERNAL_AUTH_REQUIRED",
 })
 
 _TRANSIENT_AGENT_CODES = frozenset({
@@ -187,5 +223,6 @@ def classify_failure(
 
 
 __all__ = [
-    "RecoveryBudgets", "RecoveryDecision", "RecoveryDisposition", "classify_failure",
+    "ExecutionFallbacks", "RecoveryBudgets", "RecoveryDecision", "RecoveryDisposition",
+    "classify_failure",
 ]

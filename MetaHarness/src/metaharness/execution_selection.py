@@ -34,8 +34,8 @@ class ExecutionSelectionConflict(ExecutionSelectionError):
 
 
 _FILENAME = "execution_selection.json"
-SCHEMA_VERSION = 5
-_CYCLE_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 6
+_CYCLE_SCHEMA_VERSION = 2
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _PROFILE_FIELDS = frozenset({
     "profile_id", "driver", "provider", "model", "effort", "selection_mode",
@@ -122,6 +122,7 @@ def resolve_execution_selection(
     check_repair_profile_id: str | None,
     semantic_reviser_profile_id: str | None,
     final_reviewer_profile_id: str,
+    fallback_authority: Any | None = None,
 ) -> ExecutionSelection:
     """Freeze every role used by the generic v2 state machine."""
 
@@ -140,11 +141,16 @@ def resolve_execution_selection(
         step_items[step.id] = (step.execution_class, profile_id)
     if set(override_ids) - set(step_items):
         raise ExecutionSelectionError("execution selection contains an unknown step")
+    fallbacks = fallback_authority or config.recovery.execution_fallbacks
     steps = tuple(
         StepExecutionSelection(
             step_id=step_id,
             implementer=_selected(config, profile_id, ExecutionRole.IMPLEMENTER),
             execution_class=execution_class,
+            fallbacks=tuple(
+                _selected(config, fallback_id, ExecutionRole.IMPLEMENTER)
+                for fallback_id in fallbacks.for_execution_class(execution_class.value)
+            ),
         )
         for step_id, (execution_class, profile_id) in sorted(
             step_items.items(), key=lambda item: int(item[0][1:])
@@ -163,6 +169,16 @@ def resolve_execution_selection(
             if semantic_reviser_profile_id is not None else None
         ),
         final_reviewer=_selected(config, final_reviewer_profile_id, ExecutionRole.REVIEWER),
+        check_repair_fallbacks=(
+            tuple(_selected(config, profile_id, ExecutionRole.REPAIR)
+                  for profile_id in fallbacks.check_repair)
+            if check_repair_profile_id is not None else ()
+        ),
+        semantic_reviser_fallbacks=(
+            tuple(_selected(config, profile_id, ExecutionRole.REVISER)
+                  for profile_id in fallbacks.semantic_reviser)
+            if semantic_reviser_profile_id is not None else ()
+        ),
     )
 
 
@@ -172,6 +188,7 @@ def resolve_cycle_execution_selection(
     cycle: int,
     plan_steps: tuple[ImplementationStep, ...] | list[ImplementationStep] | None = None,
     step_profile_ids: Mapping[str, str] | None = None,
+    fallback_authority: Any | None = None,
 ) -> CycleExecutionSelection:
     """Freeze implementer profiles for a single review-replan cycle."""
 
@@ -184,6 +201,7 @@ def resolve_cycle_execution_selection(
     overrides = step_profile_ids or {}
     if set(overrides) - {step.id for step in plan_steps}:
         raise ExecutionSelectionError("cycle execution selection contains an unknown step")
+    fallbacks = fallback_authority or config.recovery.execution_fallbacks
     steps = tuple(
         StepExecutionSelection(
             step_id=step.id,
@@ -193,6 +211,10 @@ def resolve_cycle_execution_selection(
                 ExecutionRole.IMPLEMENTER,
             ),
             execution_class=step.execution_class,
+            fallbacks=tuple(
+                _selected(config, fallback_id, ExecutionRole.IMPLEMENTER)
+                for fallback_id in fallbacks.for_execution_class(step.execution_class.value)
+            ),
         )
         for step in sorted(plan_steps, key=lambda item: int(item.id[1:]))
     )
@@ -225,7 +247,8 @@ def _payload(selection: ExecutionSelection) -> dict[str, Any]:
         "planner": _selected_payload(selection.planner),
         "steps": [
             {"step_id": item.step_id, "execution_class": item.execution_class.value,
-             "implementer": _selected_payload(item.implementer)}
+             "implementer": _selected_payload(item.implementer),
+             "fallbacks": [_selected_payload(profile) for profile in item.fallbacks]}
             for item in selection.steps
         ],
         "check_repair": (
@@ -237,6 +260,12 @@ def _payload(selection: ExecutionSelection) -> dict[str, Any]:
             if selection.semantic_reviser is not None else None
         ),
         "final_reviewer": _selected_payload(selection.final_reviewer),
+        "check_repair_fallbacks": [
+            _selected_payload(profile) for profile in selection.check_repair_fallbacks
+        ],
+        "semantic_reviser_fallbacks": [
+            _selected_payload(profile) for profile in selection.semantic_reviser_fallbacks
+        ],
     }
 
 
@@ -289,7 +318,8 @@ def _cycle_payload(selection: CycleExecutionSelection) -> dict[str, Any]:
         "cycle": selection.cycle,
         "steps": [
             {"step_id": item.step_id, "execution_class": item.execution_class.value,
-             "implementer": _selected_payload(item.implementer)}
+             "implementer": _selected_payload(item.implementer),
+             "fallbacks": [_selected_payload(profile) for profile in item.fallbacks]}
             for item in selection.steps
         ],
     }
@@ -339,23 +369,42 @@ def _parse_selected(value: Any, name: str) -> SelectedProfile:
     )
 
 
+def _parse_selected_list(value: Any, name: str) -> tuple[SelectedProfile, ...]:
+    if not isinstance(value, list) or len(value) > 10:
+        raise ExecutionSelectionError(f"execution selection {name} is invalid")
+    profiles = tuple(_parse_selected(item, name) for item in value)
+    ids = [item.profile_id for item in profiles]
+    if len(ids) != len(set(ids)):
+        raise ExecutionSelectionError(f"execution selection {name} contains duplicates")
+    return profiles
+
+
 def parse_execution_selection(data: bytes) -> ExecutionSelection:
     try:
         payload = json.loads(data.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ExecutionSelectionError("execution selection is missing or invalid") from exc
-    expected = {
+    schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
+    expected_v5 = {
         "schema_version", "planner", "steps", "check_repair",
         "semantic_reviser", "final_reviewer",
     }
-    if not isinstance(payload, dict) or set(payload) != expected or payload.get("schema_version") != SCHEMA_VERSION:
+    expected_v6 = expected_v5 | {"check_repair_fallbacks", "semantic_reviser_fallbacks"}
+    if not isinstance(payload, dict) or (
+        (schema_version == 5 and set(payload) != expected_v5)
+        or (schema_version == 6 and set(payload) != expected_v6)
+        or schema_version not in {5, 6}
+    ):
         raise ExecutionSelectionError("execution selection schema_version is unsupported")
     raw_steps = payload["steps"]
     if not isinstance(raw_steps, list) or not raw_steps:
         raise ExecutionSelectionError("execution selection steps are invalid")
     steps = []
     for item in raw_steps:
-        if not isinstance(item, dict) or set(item) != {"step_id", "execution_class", "implementer"}:
+        allowed_keys = {"step_id", "execution_class", "implementer"}
+        if schema_version == 6:
+            allowed_keys.add("fallbacks")
+        if not isinstance(item, dict) or set(item) != allowed_keys:
             raise ExecutionSelectionError("execution selection step is invalid")
         step_id = item.get("step_id")
         if not isinstance(step_id, str) or STEP_ID_RE.fullmatch(step_id) is None:
@@ -364,11 +413,14 @@ def parse_execution_selection(data: bytes) -> ExecutionSelection:
             execution_class = ExecutionClass(item["execution_class"])
         except (TypeError, ValueError) as exc:
             raise ExecutionSelectionError("execution selection execution class is invalid") from exc
-        steps.append(StepExecutionSelection(step_id, _parse_selected(item["implementer"], f"step {step_id}"), execution_class))
+        steps.append(StepExecutionSelection(
+            step_id, _parse_selected(item["implementer"], f"step {step_id}"), execution_class,
+            _parse_selected_list(item.get("fallbacks", []), f"step {step_id} fallbacks"),
+        ))
     if [item.step_id for item in steps] != list(step_ids(len(steps))):
         raise ExecutionSelectionError("execution selection step IDs are not contiguous")
     return ExecutionSelection(
-        schema_version=SCHEMA_VERSION,
+        schema_version=schema_version,
         planner=_parse_selected(payload["planner"], "planner"),
         steps=tuple(steps),
         check_repair=(
@@ -380,6 +432,12 @@ def parse_execution_selection(data: bytes) -> ExecutionSelection:
             if payload["semantic_reviser"] is not None else None
         ),
         final_reviewer=_parse_selected(payload["final_reviewer"], "final_reviewer"),
+        check_repair_fallbacks=(
+            _parse_selected_list(payload.get("check_repair_fallbacks", []), "check_repair_fallbacks")
+        ),
+        semantic_reviser_fallbacks=(
+            _parse_selected_list(payload.get("semantic_reviser_fallbacks", []), "semantic_reviser_fallbacks")
+        ),
     )
 
 
@@ -388,7 +446,12 @@ def parse_cycle_execution_selection(data: bytes) -> CycleExecutionSelection:
         payload = json.loads(data.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ExecutionSelectionError("cycle execution selection is missing or invalid") from exc
-    if not isinstance(payload, dict) or set(payload) != {"schema_version", "cycle", "steps"}:
+    schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or (
+        schema_version == 1 and set(payload) != {"schema_version", "cycle", "steps"}
+    ) or (
+        schema_version == 2 and set(payload) != {"schema_version", "cycle", "steps"}
+    ) or schema_version not in {1, 2}:
         raise ExecutionSelectionError("cycle execution selection schema is invalid")
     cycle = payload.get("cycle")
     if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 2:
@@ -398,7 +461,10 @@ def parse_cycle_execution_selection(data: bytes) -> CycleExecutionSelection:
         raise ExecutionSelectionError("cycle execution selection steps are invalid")
     steps = []
     for item in raw_steps:
-        if not isinstance(item, dict) or set(item) != {"step_id", "execution_class", "implementer"}:
+        allowed_keys = {"step_id", "execution_class", "implementer"}
+        if schema_version == 2:
+            allowed_keys.add("fallbacks")
+        if not isinstance(item, dict) or set(item) != allowed_keys:
             raise ExecutionSelectionError("cycle execution selection step is invalid")
         step_id = item.get("step_id")
         if not isinstance(step_id, str) or STEP_ID_RE.fullmatch(step_id) is None:
@@ -407,12 +473,13 @@ def parse_cycle_execution_selection(data: bytes) -> CycleExecutionSelection:
             execution_class = ExecutionClass(item["execution_class"])
         except (TypeError, ValueError) as exc:
             raise ExecutionSelectionError("cycle execution selection execution class is invalid") from exc
-        steps.append(StepExecutionSelection(step_id, _parse_selected(item["implementer"], f"cycle step {step_id}"), execution_class))
+        steps.append(StepExecutionSelection(
+            step_id, _parse_selected(item["implementer"], f"cycle step {step_id}"), execution_class,
+            _parse_selected_list(item.get("fallbacks", []), f"cycle step {step_id} fallbacks"),
+        ))
     if [item.step_id for item in steps] != list(step_ids(len(steps))):
         raise ExecutionSelectionError("cycle execution selection step IDs are not contiguous")
-    if payload.get("schema_version") != _CYCLE_SCHEMA_VERSION:
-        raise ExecutionSelectionError("cycle execution selection schema_version is unsupported")
-    return CycleExecutionSelection(_CYCLE_SCHEMA_VERSION, cycle, tuple(steps))
+    return CycleExecutionSelection(schema_version, cycle, tuple(steps))
 
 
 def read_cycle_execution_selection_with_sha256(
@@ -433,7 +500,7 @@ def read_cycle_execution_selection(run_dir: Path, cycle: int) -> CycleExecutionS
 def validate_cycle_execution_selection(
     config: HarnessConfig, selection: CycleExecutionSelection,
 ) -> None:
-    if not isinstance(selection, CycleExecutionSelection):
+    if not isinstance(selection, CycleExecutionSelection) or selection.schema_version not in {1, _CYCLE_SCHEMA_VERSION}:
         raise ExecutionSelectionError("cycle execution selection is invalid")
     for item in selection.steps:
         try:
@@ -446,6 +513,25 @@ def validate_cycle_execution_selection(
             raise ExecutionSelectionError(
                 f"cycle step {item.step_id} implementer profile no longer matches config"
             )
+        if selection.schema_version == _CYCLE_SCHEMA_VERSION:
+            expected_ids = config.recovery.execution_fallbacks.for_execution_class(
+                item.execution_class.value
+            )
+            if tuple(profile.profile_id for profile in item.fallbacks) != expected_ids:
+                raise ExecutionSelectionError(
+                    f"cycle step {item.step_id} fallback authority changed"
+                )
+            for profile in item.fallbacks:
+                try:
+                    selected = _selected(config, profile.profile_id, ExecutionRole.IMPLEMENTER)
+                except ProfileError as exc:
+                    raise ExecutionSelectionError(
+                        f"cycle step {item.step_id} fallback profile is unavailable"
+                    ) from exc
+                if profile != selected:
+                    raise ExecutionSelectionError(
+                        f"cycle step {item.step_id} fallback profile no longer matches config"
+                    )
 
 
 def read_execution_selection_with_sha256(run_dir: Path) -> tuple[ExecutionSelection, str]:
@@ -464,7 +550,7 @@ def read_execution_selection(run_dir: Path) -> ExecutionSelection:
 def validate_execution_selection(config: HarnessConfig, selection: ExecutionSelection) -> None:
     if not isinstance(config, HarnessConfig) or not isinstance(selection, ExecutionSelection):
         raise ExecutionSelectionError("execution selection is invalid")
-    if selection.schema_version != SCHEMA_VERSION:
+    if selection.schema_version not in {5, SCHEMA_VERSION}:
         raise ExecutionSelectionError("execution selection schema_version is unsupported")
 
     def check(name: str, selected: SelectedProfile, role: ExecutionRole) -> None:
@@ -483,6 +569,25 @@ def validate_execution_selection(config: HarnessConfig, selection: ExecutionSele
         check("semantic_reviser", selection.semantic_reviser, ExecutionRole.REVISER)
     for item in selection.steps:
         check(f"step {item.step_id}", item.implementer, ExecutionRole.IMPLEMENTER)
+        if selection.schema_version == SCHEMA_VERSION:
+            expected_ids = config.recovery.execution_fallbacks.for_execution_class(
+                item.execution_class.value
+            )
+            if tuple(profile.profile_id for profile in item.fallbacks) != expected_ids:
+                raise ExecutionSelectionError(f"step {item.step_id} fallback authority changed")
+            for profile in item.fallbacks:
+                check(f"step {item.step_id} fallback", profile, ExecutionRole.IMPLEMENTER)
+    if selection.schema_version == SCHEMA_VERSION:
+        for name, selected_profiles, configured_ids, role in (
+            ("check_repair", selection.check_repair_fallbacks,
+             config.recovery.execution_fallbacks.check_repair, ExecutionRole.REPAIR),
+            ("semantic_reviser", selection.semantic_reviser_fallbacks,
+             config.recovery.execution_fallbacks.semantic_reviser, ExecutionRole.REVISER),
+        ):
+            if tuple(profile.profile_id for profile in selected_profiles) != configured_ids:
+                raise ExecutionSelectionError(f"{name} fallback authority changed")
+            for profile in selected_profiles:
+                check(f"{name} fallback", profile, role)
 
 
 __all__ = [

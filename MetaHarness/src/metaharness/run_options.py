@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .models import HarnessConfig, RevisionConfig, PlanningConfig, RoutingConfig, validate_revision_budget
-from .recovery_policy import RecoveryBudgets
+from .recovery_policy import ExecutionFallbacks, RecoveryBudgets
 from .profiles import ProfileError, profile_for_role
 from .result import atomic_write_text
 from .models import ExecutionRole
@@ -216,6 +216,33 @@ class RunOptions:
                 profile_for_role(config, value, role)
             except ProfileError as exc:
                 raise RunOptionsError(f"{name} is invalid or incompatible") from exc
+        for execution_class in ("mechanical", "reasoning", "agentic"):
+            fallback_ids = self.recovery.execution_fallbacks.for_execution_class(execution_class)
+            if getattr(self, f"{execution_class}_profile") in fallback_ids:
+                raise RunOptionsError(
+                    f"recovery.execution_fallbacks.{execution_class} repeats the primary profile"
+                )
+            for profile_id in fallback_ids:
+                try:
+                    profile_for_role(config, profile_id, ExecutionRole.IMPLEMENTER)
+                except ProfileError as exc:
+                    raise RunOptionsError(
+                        f"recovery.execution_fallbacks.{execution_class} contains an incompatible profile"
+                    ) from exc
+        for key, role in (
+            ("semantic_reviser", ExecutionRole.REVISER),
+            ("check_repair", ExecutionRole.REPAIR),
+        ):
+            for profile_id in getattr(self.recovery.execution_fallbacks, key):
+                primary = getattr(self, "semantic_reviser_profile" if key == "semantic_reviser" else "check_repair_profile")
+                if profile_id == primary:
+                    raise RunOptionsError(f"recovery.execution_fallbacks.{key} repeats the primary profile")
+                try:
+                    profile_for_role(config, profile_id, role)
+                except ProfileError as exc:
+                    raise RunOptionsError(
+                        f"recovery.execution_fallbacks.{key} contains an incompatible profile"
+                    ) from exc
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -266,12 +293,39 @@ class RunOptions:
             "max_check_infra_retries", "max_review_transport_retries",
             "max_workspace_setup_retries",
         }
+        fallback_fields = {
+            "mechanical", "reasoning", "agentic", "semantic_reviser", "check_repair",
+        }
+        recovery_keys = set(recovery) if isinstance(recovery, Mapping) else set()
+        fallback_payload = recovery.get("execution_fallbacks", {}) if isinstance(recovery, Mapping) else {}
         if (
             not isinstance(recovery, Mapping)
-            or ("recovery" in value and set(recovery) != recovery_fields)
+            or ("recovery" in value and recovery_keys not in (
+                recovery_fields, recovery_fields | {"execution_fallbacks"},
+            ))
             or ("recovery" not in value and recovery)
+            or not isinstance(fallback_payload, Mapping)
+            or set(fallback_payload) - fallback_fields
         ):
             raise RunOptionsError("run options recovery schema is invalid")
+        normalized_recovery: dict[str, Any] = {
+            key: recovery[key] for key in recovery_fields if key in recovery
+        }
+        try:
+            for key, raw in fallback_payload.items():
+                if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)) or any(
+                    not isinstance(profile_id, str) for profile_id in raw
+                ):
+                    raise ValueError
+                normalized_recovery.setdefault("execution_fallbacks", {})[key] = tuple(raw)
+            if "execution_fallbacks" not in normalized_recovery:
+                normalized_recovery["execution_fallbacks"] = ExecutionFallbacks()
+            else:
+                normalized_recovery["execution_fallbacks"] = ExecutionFallbacks(
+                    **normalized_recovery["execution_fallbacks"]
+                )
+        except (TypeError, ValueError) as exc:
+            raise RunOptionsError("run options execution fallback authority is invalid") from exc
         if not isinstance(planning, Mapping) or set(planning) != {
             "protocol", "decomposition", "execution_mode_policy",
             "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
@@ -301,7 +355,7 @@ class RunOptions:
             return cls(
                 schema_version=value["schema_version"], pipeline_version=value["pipeline_version"],
                 **planning, **pipeline, **profiles,
-                recovery=RecoveryBudgets(**recovery),
+                recovery=RecoveryBudgets(**normalized_recovery),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RunOptionsError("run options schema is invalid") from exc

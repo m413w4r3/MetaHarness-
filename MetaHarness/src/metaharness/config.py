@@ -35,6 +35,7 @@ from .models import (
     RoutingConfig,
     RepositoryConfig,
     RevisionConfig,
+    ExecutionFallbacks,
     RecoveryBudgets,
     SelectionMode,
     UIConfig,
@@ -830,9 +831,24 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         "max_check_infra_retries", "max_review_transport_retries",
         "max_workspace_setup_retries",
     }
-    unknown_recovery = sorted(set(recovery_data) - recovery_fields)
+    unknown_recovery = sorted(set(recovery_data) - recovery_fields - {"execution_fallbacks"})
     if unknown_recovery:
         raise ConfigError(f"recovery.{unknown_recovery[0]} is not allowed")
+    fallback_data = recovery_data.get("execution_fallbacks", {})
+    if not isinstance(fallback_data, dict):
+        raise ConfigError("recovery.execution_fallbacks must be a table")
+    fallback_fields = {"mechanical", "reasoning", "agentic", "semantic_reviser", "check_repair"}
+    unknown_fallbacks = sorted(set(fallback_data) - fallback_fields)
+    if unknown_fallbacks:
+        raise ConfigError(f"recovery.execution_fallbacks.{unknown_fallbacks[0]} is not allowed")
+    parsed_fallbacks: dict[str, tuple[str, ...]] = {}
+    for name in sorted(fallback_fields):
+        values = fallback_data.get(name, [])
+        if isinstance(values, str) or not isinstance(values, list) or any(
+            not isinstance(value, str) for value in values
+        ):
+            raise ConfigError(f"recovery.execution_fallbacks.{name} must be an array of profile IDs")
+        parsed_fallbacks[name] = tuple(values)
     try:
         recovery = RecoveryBudgets(**{
             name: _bounded_int(
@@ -840,7 +856,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
                 minimum=0, maximum=10,
             )
             for name in sorted(recovery_fields)
-        })
+        }, execution_fallbacks=ExecutionFallbacks(**parsed_fallbacks))
     except ValueError as exc:
         raise ConfigError(str(exc)) from None
 

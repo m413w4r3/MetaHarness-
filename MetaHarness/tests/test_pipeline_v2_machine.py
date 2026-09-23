@@ -13,6 +13,7 @@ from metaharness.llm.chat import LLMError
 from metaharness.config import load_config
 from metaharness.gitops import GitError
 from metaharness.models import ExecutionRole, RunStatus
+from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
 from metaharness.run_options import RunOptions
 from tests.pipeline_support import (
     PipelineHarness,
@@ -145,7 +146,11 @@ class SingleCycleTests(PipelineHarness):
         self.assertEqual(self.state()["run_options"], options)
         self.assertEqual(
             set(selection),
-            {"schema_version", "planner", "steps", "check_repair", "semantic_reviser", "final_reviewer"},
+            {
+                "schema_version", "planner", "steps", "check_repair",
+                "check_repair_fallbacks", "semantic_reviser",
+                "semantic_reviser_fallbacks", "final_reviewer",
+            },
         )
         for forbidden in ("reviser", "repair_implementer", "reviewer", "implementer"):
             self.assertNotIn(forbidden, selection)
@@ -274,7 +279,7 @@ class CheckRepairTests(PipelineHarness):
         ).run_text(SPEC, run_id="run", run_options=options)
 
         self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "REVISION_SCOPE_VIOLATION")
+        self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
         self.assertFalse(
             (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").exists()
         )
@@ -501,6 +506,145 @@ class ScopeApprovalTests(PipelineHarness):
 
 
 class SemanticRevisionTests(PipelineHarness):
+    def test_exhausted_semantic_infrastructure_still_reaches_gate_and_reviewer(self) -> None:
+        from metaharness.agent import AgentRunResult
+        from metaharness.gitops import candidate_tree_sha
+
+        def timeout(request):
+            tree = candidate_tree_sha(request.worktree)
+            return AgentRunResult(
+                status="timed_out", exit_reason="AGENT_TIMEOUT", tree_before=tree,
+                tree_after=tree, usage=None, external_session_id=None,
+                report_path=None, timed_out=True,
+            )
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REVISER, timeout, timeout, timeout)
+        result = self.orchestrator(
+            self.config(semantic_revision=True), planner=[initial_plan(STEP)],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser", "reviser"])
+        self.assertTrue((self.run_dir() / "cycles/001/checks/post-semantic-revision/evidence.json").is_file())
+        self.assertIn("SEMANTIC REVISION: UNAVAILABLE", self.reviewer.requests[0])
+        self.assertIn("reason=AGENT_TIMEOUT", self.reviewer.requests[0])
+        self.assertEqual(
+            json.loads((self.run_dir() / "cycles/001/semantic-revision/status.json").read_text())[
+                "status"],
+            "UNAVAILABLE",
+        )
+
+    def test_semantic_worker_scope_violation_is_a_hard_stop(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REVISER, write("other.txt", "unsafe\n"))
+        result = self.orchestrator(
+            self.config(semantic_revision=True), planner=[initial_plan(STEP)],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
+        self.assertEqual(self.reviewer.requests, [])
+
+    def test_semantic_scope_request_within_auto_bound_is_authorized_and_retried(self) -> None:
+        request = (
+            "META SCOPE REQUEST v1\n\n"
+            "REASON\nThe correction depends on the related file.\n\n"
+            "PATHS\n- other.txt\n\n"
+            "EVIDENCE\n- The related file supplies required context.\n\n"
+            "END META SCOPE REQUEST"
+        )
+
+        def use_added_scope(agent_request):
+            self.assertIn("other.txt", agent_request.mutable_paths)
+            (agent_request.worktree / "other.txt").write_text("authorized\n", encoding="utf-8")
+            return "updated within requested scope\n"
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REVISER, lambda _request: request, use_added_scope)
+        config = self.config(semantic_revision=True)
+        options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
+        result = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run", run_options=options)
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser"])
+        authority = json.loads((
+            self.run_dir() / "cycles/001/semantic-revision/scope_requests/001/authority.json"
+        ).read_text())
+        self.assertEqual(authority["added_paths"], ["other.txt"])
+        self.assertEqual(git(self.worktree(), "show", "HEAD:other.txt").strip(), "authorized")
+
+    def test_semantic_scope_request_waits_for_approval_then_resumes(self) -> None:
+        from metaharness.web.api import approve_repair_scope
+
+        request = (
+            "META SCOPE REQUEST v1\n\n"
+            "REASON\nThe correction depends on the related file.\n\n"
+            "PATHS\n- other.txt\n\n"
+            "EVIDENCE\n- The related file supplies required context.\n\n"
+            "END META SCOPE REQUEST"
+        )
+
+        def use_added_scope(agent_request):
+            self.assertIn("other.txt", agent_request.mutable_paths)
+            (agent_request.worktree / "other.txt").write_text("approved\n", encoding="utf-8")
+            return "updated within approved scope\n"
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REVISER, lambda _request: request, use_added_scope)
+        config = self.config(semantic_revision=True)
+        options = RunOptions.from_config(
+            config, repair_scope_policy="require-approval", repair_scope_max_added_paths=1,
+        )
+        waiting = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run", run_options=options)
+
+        self.assertEqual(waiting.status, RunStatus.WAITING_SCOPE_APPROVAL)
+        approval_artifact = self.state()["scope_delta"]["approval_artifact"]
+        self.assertTrue((self.run_dir() / approval_artifact).is_file())
+        approve_repair_scope(self.root / "runs", "run", "APPROVE")
+
+        resumed = self.orchestrator(
+            config, planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser"])
+        self.assertEqual(git(self.worktree(), "show", "HEAD:other.txt").strip(), "approved")
+
+    def test_denied_semantic_scope_expansion_routes_to_replan(self) -> None:
+        request = (
+            "META SCOPE REQUEST v1\n\n"
+            "REASON\nThe correction depends on the related file.\n\n"
+            "PATHS\n- other.txt\n\n"
+            "EVIDENCE\n- The related file supplies required context.\n\n"
+            "END META SCOPE REQUEST"
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(
+            ExecutionRole.REVISER,
+            lambda _request: request,
+            lambda _request: "no additional correction needed\n",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n\n"))
+        config = self.config(semantic_revision=True, review_repair=1)
+        options = RunOptions.from_config(config, repair_scope_policy="deny-expansion")
+        result = self.orchestrator(
+            config,
+            planner=[initial_plan(STEP), correction_plan(STEP)],
+            reviewer=[review("REVISE", "REPLAN"), review()],
+        ).run_text(SPEC, run_id="run", run_options=options)
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.state()["cycle"], 2)
+        self.assertIn("SEMANTIC REVISION: SCOPE EXPANSION DENIED\nroute=REPLAN", self.reviewer.requests[0])
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "implementer", "reviser"])
+
     def test_gate_before_revision_has_the_exact_target_order(self) -> None:
         self.check.write_text(
             "import pathlib, sys\n"
@@ -1027,7 +1171,7 @@ class GitChainAndTraceTests(PipelineHarness):
         self.assertEqual(len(self.reviewer.requests), 1)
         self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
 
-    def test_a_failed_check_repair_attempt_resumes_at_that_attempt(self) -> None:
+    def test_a_dirty_check_repair_timeout_rolls_back_and_retries_exact_contract(self) -> None:
         def timeout(request):  # the repair worker edits in scope, then times out
             (request.worktree / "feature.txt").write_text("half\n", encoding="utf-8")
             from metaharness.agent import AgentRunResult
@@ -1041,25 +1185,50 @@ class GitChainAndTraceTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(ExecutionRole.REPAIR, timeout, write("feature.txt", "good\n"))
         config = self.config(check_repair=2)
-        failed = self.orchestrator(
+        completed = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "AGENT_TIMEOUT")
-        checkpoint = self.checkpoint()
-        self.assertEqual(
-            (checkpoint["phase"], checkpoint["stage"], checkpoint["check_repair_attempt"]),
-            ("check_repair", "POST_IMPLEMENTATION", 1),
-        )
-
-        resumed = self.orchestrator(config, planner=["unused"], reviewer=[review()]).resume("run")
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(completed.status, RunStatus.COMMITTED, self.state().get("failure"))
         attempt = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts/001"
         self.assertTrue((attempt / "attempt.json").is_file())
-        # The failed try keeps its own artifacts; the durable attempt record
-        # belongs to the successful one only.
         self.assertTrue((attempt / "attempts/01/failure.json").is_file())
         self.assertFalse((attempt / "failure.json").exists())
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
+
+    def test_check_repair_infrastructure_exhaustion_resumes_at_the_red_gate(self) -> None:
+        from metaharness.agent import AgentRunResult
+        from metaharness.gitops import candidate_tree_sha
+
+        def timeout(request):
+            tree = candidate_tree_sha(request.worktree)
+            return AgentRunResult(
+                status="timed_out", exit_reason="AGENT_TIMEOUT", tree_before=tree,
+                tree_after=tree, usage=None, external_session_id=None,
+                report_path=None, timed_out=True,
+            )
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, timeout, write("feature.txt", "good\n"))
+        config = self.config(check_repair=1)
+        options = RunOptions.from_config(
+            config,
+            recovery=RecoveryBudgets(max_transient_attempts=0, max_executor_fallbacks=0),
+        )
+        failed = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run", run_options=options)
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_UNAVAILABLE")
+        self.assertEqual(
+            (self.checkpoint()["phase"], self.checkpoint()["check_repair_attempt"]),
+            ("check_repair", 1),
+        )
+        self.assertFalse((self.run_dir() / "cycles/001/candidate/commit.json").exists())
+
+        resumed = self.orchestrator(
+            config, planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
 
     def test_transient_step_failure_is_rolled_back_and_retried_automatically(self) -> None:
@@ -1092,6 +1261,133 @@ class GitChainAndTraceTests(PipelineHarness):
         self.assertEqual(
             recovery[0]["data"]["tree_before"], recovery[0]["data"]["tree_after"],
         )
+
+    def test_clean_implementer_timeout_retries_the_exact_effective_contract(self) -> None:
+        from metaharness.agent import AgentRunResult
+        from metaharness.gitops import candidate_tree_sha
+
+        def timeout(request):
+            tree = candidate_tree_sha(request.worktree)
+            return AgentRunResult(
+                status="timed_out", exit_reason="AGENT_TIMEOUT", tree_before=tree,
+                tree_after=tree, usage=None, external_session_id=None,
+                report_path=None, timed_out=True,
+            )
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, timeout, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        first, second = self.workers.calls
+        self.assertEqual(first.contract, second.contract)
+        self.assertEqual(first.prompt, second.prompt)
+        self.assertEqual(first.mutable_paths, second.mutable_paths)
+        self.assertEqual(first.profile_id, second.profile_id)
+
+    def test_out_of_scope_timeout_is_a_hard_stop_without_retry(self) -> None:
+        from metaharness.agent import AgentRunResult
+        from metaharness.gitops import candidate_tree_sha
+
+        def timeout(request):
+            (request.worktree / "other.txt").write_text("unsafe\n", encoding="utf-8")
+            tree = candidate_tree_sha(request.worktree)
+            return AgentRunResult(
+                status="timed_out", exit_reason="AGENT_TIMEOUT", tree_before="",
+                tree_after=tree, usage=None, external_session_id=None,
+                report_path=None, timed_out=True,
+            )
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, timeout, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_in_scope_timeout_without_exact_rollback_requires_operator(self) -> None:
+        from metaharness.agent import AgentRunResult
+        from metaharness.gitops import candidate_tree_sha
+
+        def dirty_timeout(request):
+            (request.worktree / "feature.txt").write_text("partial\n", encoding="utf-8")
+            tree = candidate_tree_sha(request.worktree)
+            return AgentRunResult(
+                status="timed_out", exit_reason="AGENT_TIMEOUT", tree_before="",
+                tree_after=tree, usage=None, external_session_id=None,
+                report_path=None, timed_out=True,
+            )
+
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER, dirty_timeout, write("feature.txt", "good\n"),
+        )
+        original = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        with mock.patch.object(
+            type(original), "_restore_failed_step_attempt", staticmethod(lambda *_args: False),
+        ):
+            result = original.run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_REQUIRES_OPERATOR")
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_frozen_executor_fallback_keeps_the_same_contract_and_scope(self) -> None:
+        from metaharness.agent import AgentRunResult
+        from metaharness.gitops import candidate_tree_sha
+
+        def timeout(request):
+            tree = candidate_tree_sha(request.worktree)
+            return AgentRunResult(
+                status="timed_out", exit_reason="AGENT_TIMEOUT", tree_before=tree,
+                tree_after=tree, usage=None, external_session_id=None,
+                report_path=None, timed_out=True,
+            )
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, timeout, write("feature.txt", "good\n"))
+        config = self.config()
+        config = replace(config, recovery=RecoveryBudgets(
+            max_transient_attempts=0,
+            max_executor_fallbacks=1,
+            execution_fallbacks=ExecutionFallbacks(mechanical=("live_worker",)),
+        ))
+        result = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        primary, fallback = self.workers.calls
+        self.assertEqual((primary.profile_id, fallback.profile_id), ("worker", "live_worker"))
+        self.assertEqual(primary.contract, fallback.contract)
+        self.assertEqual(primary.prompt, fallback.prompt)
+        self.assertEqual(primary.mutable_paths, fallback.mutable_paths)
+        self.assertEqual(
+            json.loads((self.run_dir() / "execution_selection.json").read_text())[
+                "steps"][0]["fallbacks"][0]["profile_id"],
+            "live_worker",
+        )
+
+    def test_auth_failure_is_resumable_and_never_tries_the_fallback(self) -> None:
+        from metaharness.agent import AGENT_AUTH_FAILURE, AgentError
+
+        class AuthFailure(AgentError):
+            code = AGENT_AUTH_FAILURE
+
+        def auth_failure(_request):
+            raise AuthFailure("missing credentials")
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, auth_failure, write("feature.txt", "good\n"))
+        config = self.config()
+        config = replace(config, recovery=RecoveryBudgets(
+            execution_fallbacks=ExecutionFallbacks(mechanical=("live_worker",)),
+        ))
+        result = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "EXTERNAL_AUTH_REQUIRED")
+        self.assertEqual(self.workers.roles(), ["implementer"])
 
 
 class ResumeAuthorityTests(PipelineHarness):
@@ -1201,18 +1497,20 @@ class ResumeAuthorityTests(PipelineHarness):
         self.assertEqual(self.reviewer.requests, [])
 
     def _crash_in_semantic_revision(self) -> None:
-        from metaharness.agent import AgentError
-
-        def crash(_request):
-            raise AgentError("reviser crashed")
-
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        self.workers.on(ExecutionRole.REVISER, crash)
-        failed = self.orchestrator(
+        original = self.orchestrator(
             self.config(semantic_revision=True), planner=[initial_plan(STEP)], reviewer=[review()],
-        ).run_text(SPEC, run_id="run")
+        )
+        with mock.patch.object(
+            original, "_run_revision_with_recovery",
+            side_effect=RuntimeError("crash before semantic worker"),
+        ):
+            failed = original.run_text(SPEC, run_id="run")
         self.assertEqual(failed.status, RunStatus.FAILED)
-        self.assertEqual(self.checkpoint()["phase"], "semantic_revision")
+        self.assertEqual(
+            self.checkpoint()["phase"], "semantic_revision", self.state().get("failure"),
+        )
+        self.assertEqual(self.workers.roles(), ["implementer"])
 
     def test_semantic_revision_resumes_after_its_green_gate(self) -> None:
         self._crash_in_semantic_revision()
@@ -1221,7 +1519,7 @@ class ResumeAuthorityTests(PipelineHarness):
             self.config(semantic_revision=True), planner=["unused"], reviewer=[review()],
         ).resume("run")
         self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser"])
+        self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
 
     def test_semantic_revision_never_resumes_without_its_green_gate_acceptance(self) -> None:
         self._crash_in_semantic_revision()
@@ -1232,8 +1530,8 @@ class ResumeAuthorityTests(PipelineHarness):
         ).resume("run")
         self.assertEqual(resumed.status, RunStatus.FAILED)
         self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-        # The crashed reviser call is the only one: no model call on resume.
-        self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
+        # The checkpoint lacked its green gate acceptance, so no reviser runs.
+        self.assertEqual(self.workers.roles(), ["implementer"])
 
     def _three_changed_cycles_crashing_at_the_third_review(self):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
@@ -1325,18 +1623,24 @@ class ResumeAuthorityTests(PipelineHarness):
         self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
 
     def _crash_in_the_second_check_repair_attempt(self):
-        from metaharness.agent import AgentError
-
-        def crash(_request):  # fails before touching the worktree
-            raise AgentError("repair worker crashed")
-
-        # Attempt 001 leaves the gate red; attempt 002 crashes cleanly.
+        # Attempt 001 leaves the gate red; interrupt before attempt 002 starts.
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
-        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "still bad\n"), crash)
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "still bad\n"))
         config = self.config(check_repair=2)
-        failed = self.orchestrator(
+        original = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
-        ).run_text(SPEC, run_id="run")
+        )
+        real = type(original)._run_check_repair_attempt
+
+        def crash_before_second(owner, *args, **kwargs):
+            if len(args) >= 5 and args[4] == 2:
+                raise RuntimeError("crash before repair attempt 2")
+            return real(owner, *args, **kwargs)
+
+        with mock.patch.object(
+            type(original), "_run_check_repair_attempt", crash_before_second,
+        ):
+            failed = original.run_text(SPEC, run_id="run")
         self.assertEqual(failed.status, RunStatus.FAILED)
         path = self.run_dir() / "resume_checkpoint.json"
         checkpoint = json.loads(path.read_text())
@@ -1350,11 +1654,12 @@ class ResumeAuthorityTests(PipelineHarness):
         checkpoint["check_repair_attempt"] = 1
         path.write_text(json.dumps(checkpoint), encoding="utf-8")
 
+        self.workers.scripts[ExecutionRole.REPAIR].clear()
         self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
         resumed = self.orchestrator(config, planner=["unused"], reviewer=[review()]).resume("run")
         self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         # Only the unfinished attempt 002 is retried; 001 is never replayed.
-        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair", "repair"])
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
         self.assertEqual((attempt_one / "attempt.json").read_text(), record)
         self.assertEqual(
             sorted(item.name for item in attempt_one.parent.iterdir()), ["001", "002"],
@@ -1367,7 +1672,7 @@ class ResumeAuthorityTests(PipelineHarness):
         resumed = self.orchestrator(config, planner=["unused"], reviewer=["unused"]).resume("run")
         self.assertEqual(resumed.status, RunStatus.FAILED)
         self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
+        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
 
     def test_run_options_without_their_state_hash_are_never_resumed(self) -> None:
         from metaharness.resume import ResumeNotAllowedError
@@ -1384,7 +1689,7 @@ class ResumeAuthorityTests(PipelineHarness):
             self.orchestrator(
                 self.config(semantic_revision=True), planner=["unused"], reviewer=["unused"],
             ).resume("run")
-        self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
+        self.assertEqual(self.workers.roles(), ["implementer"])
 
 class ObservationAndPublicationAuthorityTests(PipelineHarness):
     def test_a_failing_external_observer_cannot_change_the_run(self) -> None:

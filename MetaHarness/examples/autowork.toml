@@ -35,6 +35,12 @@ max_check_infra_retries = 2
 max_review_transport_retries = 2
 max_workspace_setup_retries = 2
 
+[recovery.execution_fallbacks]
+mechanical = ["codex-luna-xhigh"]
+reasoning = ["codex-sol-high"]
+agentic = ["codex-sol-high"]
+semantic_reviser = ["codex-astra-medium"]
+
 [repository]
 remote = "origin"
 planner_remote_exploration = true

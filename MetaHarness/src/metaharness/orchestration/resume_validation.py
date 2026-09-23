@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 
 from pathlib import Path
 from typing import (
@@ -77,6 +78,7 @@ from ..gitops import (
     git_root,
     index_tree_sha,
     is_ancestor,
+    path_exists_in_tree,
     registered_worktrees,
     remote_run_branch_tip,
     resolve_commit,
@@ -607,6 +609,135 @@ def _contract_repair_scope(
     return scope
 
 
+def _semantic_revision_scope(
+    repo: Path,
+    run_dir: Path,
+    number: int,
+    policy: EffectiveRepairScopePolicy,
+) -> set[str]:
+    """Read reviser-requested paths only when durable policy authorized them."""
+
+    root = semantic_revision_dir(run_dir, number) / "scope_requests"
+    if not root.is_dir():
+        return set()
+    revision_dir = semantic_revision_dir(run_dir, number)
+    scope: set[str] = set()
+    added_total: set[str] = set()
+    for request_dir in sorted(root.iterdir(), key=lambda item: item.name):
+        if not request_dir.is_dir() or not request_dir.name.isdigit():
+            continue
+        authority = _read_json_artifact(request_dir / "authority.json", 64 * 1024)
+        if not isinstance(authority, dict):
+            _refuse("semantic scope authority is missing")
+        added = authority.get("added_paths")
+        requested = authority.get("requested_paths")
+        tree_sha = authority.get("tree_sha")
+        source_report_sha = authority.get("source_report_sha256")
+        existing = authority.get("existing_paths")
+        creates = authority.get("create_paths")
+        if (
+            authority.get("schema_version") != 1
+            or authority.get("cycle") != number
+            or authority.get("policy") != policy.policy
+            or authority.get("bound") != policy.max_added_paths
+            or not isinstance(added, list) or not isinstance(requested, list)
+            or not isinstance(existing, list) or not isinstance(creates, list)
+            or any(not _safe_semantic_scope_path(path) for path in (*added, *requested, *existing, *creates))
+            or not isinstance(tree_sha, str) or not _is_object_id(tree_sha)
+            or not isinstance(source_report_sha, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source_report_sha)
+        ):
+            _refuse("semantic scope authority is malformed")
+        if (
+            added != sorted(set(added))
+            or requested != sorted(set(requested))
+            or set(existing) | set(creates) != set(requested)
+            or set(existing) & set(creates)
+            or set(added) - set(requested)
+        ):
+            _refuse("semantic scope authority is not canonical")
+        source_reports = [revision_dir / "report.json"]
+        attempts_root = revision_dir / "attempts"
+        if attempts_root.is_dir():
+            source_reports.extend(sorted(attempts_root.glob("[0-9][0-9]/report.json")))
+        source_matches = False
+        for report_path in source_reports:
+            try:
+                raw_report = report_path.read_bytes()
+            except OSError:
+                continue
+            if hashlib.sha256(raw_report).hexdigest() != source_report_sha:
+                continue
+            report = _read_json_artifact(report_path, 256 * 1024)
+            scope_request = report.get("scope_request") if isinstance(report, dict) else None
+            if not isinstance(scope_request, dict):
+                continue
+            source_paths = scope_request.get("paths")
+            evidence = scope_request.get("evidence")
+            source_reason = scope_request.get("reason")
+            if (
+                not isinstance(source_paths, list)
+                or any(not isinstance(path, str) for path in source_paths)
+                or not isinstance(source_reason, str)
+            ):
+                continue
+            source_matches = bool(
+                sorted(source_paths) == requested
+                and source_reason[:2000] == authority.get("reason")
+                and isinstance(evidence, list)
+                and [str(item)[:1000] for item in evidence[:16]] == authority.get("evidence")
+                and report.get("tree_before") == tree_sha
+            )
+            if source_matches:
+                break
+        if not source_matches:
+            _refuse("semantic scope authority is not bound to its reviser report")
+        for path in requested:
+            if path_exists_in_tree(repo, tree_sha, path) != (path in existing):
+                _refuse("semantic scope tree existence semantics changed")
+        decision = _read_json_artifact(request_dir / "decision.json", 64 * 1024)
+        if isinstance(decision, dict) and decision.get("decision") == "denied-expansion":
+            if policy.policy != "deny-expansion" or decision.get("added_paths") != added:
+                _refuse("semantic denied-scope record is invalid")
+            continue
+        if added and policy.policy == "deny-expansion":
+            _refuse("semantic scope expansion is denied")
+        added_total.update(added)
+        needs_approval = (
+            bool(added) and (
+                policy.policy == "require-approval"
+                or (policy.policy == "auto-bounded" and len(added_total) > policy.max_added_paths)
+            )
+        )
+        if needs_approval:
+            delta_path = request_dir / "scope_delta.json"
+            delta = _read_json_artifact(delta_path, 64 * 1024)
+            if not isinstance(delta, dict) or delta.get("added_paths") != added:
+                _refuse("semantic scope delta is malformed")
+            try:
+                approval = read_scope_approval(
+                    request_dir, expected_sha256=hashlib.sha256(delta_path.read_bytes()).hexdigest(),
+                )
+            except (OSError, ApprovalError) as exc:
+                _refuse(f"semantic scope approval is invalid: {exc}")
+            if approval is None:
+                continue
+            if approval.decision is not ApprovalDecision.APPROVE:
+                _refuse("semantic scope request was rejected")
+        scope.update(added)
+    return scope
+
+
+def _safe_semantic_scope_path(path: Any) -> bool:
+    return bool(
+        isinstance(path, str) and path and path == path.strip()
+        and path not in {".", ".."} and not path.startswith("/")
+        and "\x00" not in path and "\\" not in path and "//" not in path
+        and all(part not in {"", ".", "..", ".git"} for part in Path(path).parts)
+        and not any(char in path for char in "*?[]{}")
+    )
+
+
 def _approved_scope(
     config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
     plan: TaskPlanV2, checkpoint: ResumeCheckpoint, policy: EffectiveRepairScopePolicy,
@@ -616,14 +747,26 @@ def _approved_scope(
     scope = set(_plan_scope(plan))
     scope |= _contract_repair_scope(run_dir, 1, policy)
     cycle_scopes: dict[int, tuple[str, ...]] = {1: tuple(sorted(scope))}
+    cycle_base_scopes: dict[int, tuple[str, ...]] = {1: tuple(sorted(scope))}
     cycle_kinds: dict[int, CycleKind] = {1: CycleKind.INITIAL}
+    cycle_semantic_scopes: dict[int, set[str]] = {
+        1: _semantic_revision_scope(config.repo, run_dir, 1, policy),
+    }
+    scope |= cycle_semantic_scopes[1]
     for number in range(2, checkpoint.review_cycle + 1):
         cycle = read_cycle_record(run_dir, number)
         if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
             # Direct semantic corrections reuse the preceding approved plan,
             # while their final gate may still have its own check-repair
             # authority.
-            cycle_scopes[number] = cycle_scopes[number - 1]
+            cycle_semantic_scopes[number] = _semantic_revision_scope(
+                config.repo, run_dir, number, policy,
+            )
+            scope |= cycle_semantic_scopes[number]
+            cycle_base_scopes[number] = tuple(sorted(set(cycle_scopes[number - 1])))
+            cycle_scopes[number] = tuple(sorted(
+                set(cycle_base_scopes[number]) | cycle_semantic_scopes[number]
+            ))
             cycle_kinds[number] = cycle.kind
             continue
         if number == checkpoint.review_cycle and checkpoint.phase is ResumePhase.REVIEW_REPLAN:
@@ -634,12 +777,18 @@ def _approved_scope(
             config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
         )
         verify_correction_scope(run_dir, number, bundle_sha, policy)
-        cycle_scopes[number] = tuple(sorted(_plan_scope(correction)))
-        cycle_scopes[number] = tuple(sorted(set(cycle_scopes[number]) | _contract_repair_scope(run_dir, number, policy)))
+        cycle_base_scopes[number] = tuple(sorted(_plan_scope(correction)))
+        cycle_base_scopes[number] = tuple(sorted(
+            set(cycle_base_scopes[number]) | _contract_repair_scope(run_dir, number, policy)
+        ))
+        semantic_added = _semantic_revision_scope(config.repo, run_dir, number, policy)
+        cycle_semantic_scopes[number] = semantic_added
+        cycle_scopes[number] = tuple(sorted(set(cycle_base_scopes[number]) | semantic_added))
         cycle_kinds[number] = cycle.kind
         scope |= _plan_scope(correction)
         scope |= _contract_repair_scope(run_dir, number, policy)
-    for number, base in cycle_scopes.items():
+        scope |= semantic_added
+    for number, base in cycle_base_scopes.items():
         kind = cycle_kinds[number]
         stages = (
             (final_gate_stage(kind),)
@@ -647,9 +796,12 @@ def _approved_scope(
             else (pre_semantic_gate_stage(kind), final_gate_stage(kind))
         )
         for stage in dict.fromkeys(stages):
+            stage_scope = set(base)
+            if stage == final_gate_stage(kind):
+                stage_scope |= cycle_semantic_scopes.get(number, set())
             authority = gate_mutable_authority(
                 run_dir, number, stage,
-                base_paths=base,
+                base_paths=stage_scope,
                 policy_config=policy,
             )
             scope |= set(authority.effective_paths)
@@ -659,13 +811,24 @@ def _approved_scope(
 def _cycle_base_scope(
     config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
     plan: TaskPlanV2, number: int, policy: EffectiveRepairScopePolicy,
+    *, include_current_semantic: bool = True,
 ) -> tuple[str, ...]:
     """Return the approved plan scope which is the base for one cycle."""
 
-    current = tuple(sorted(set(_plan_scope(plan)) | _contract_repair_scope(run_dir, 1, policy)))
+    current = tuple(sorted(
+        set(_plan_scope(plan)) | _contract_repair_scope(run_dir, 1, policy)
+    ))
+    if number > 1 or include_current_semantic:
+        current = tuple(sorted(
+            set(current) | _semantic_revision_scope(config.repo, run_dir, 1, policy)
+        ))
     for cycle_number in range(2, number + 1):
         cycle = read_cycle_record(run_dir, cycle_number)
         if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
+            if cycle_number != number or include_current_semantic:
+                current = tuple(sorted(
+                    set(current) | _semantic_revision_scope(config.repo, run_dir, cycle_number, policy)
+                ))
             continue
         correction, _bundle, _bundle_sha = load_correction_plan(
             config, selection, run_dir, cycle_number,
@@ -673,6 +836,10 @@ def _cycle_base_scope(
         )
         current = tuple(sorted(_plan_scope(correction)))
         current = tuple(sorted(set(current) | _contract_repair_scope(run_dir, cycle_number, policy)))
+        if cycle_number != number or include_current_semantic:
+            current = tuple(sorted(
+                set(current) | _semantic_revision_scope(config.repo, run_dir, cycle_number, policy)
+            ))
     return current
 
 
@@ -881,6 +1048,10 @@ def validate_resume(
                         run_dir, number, checkpoint.stage, tree=expected_tree, head=head,
                         base_scope=_cycle_base_scope(
                             config, selection, run_dir, plan, number, repair_scope,
+                            include_current_semantic=(
+                                current_cycle.kind is CycleKind.REVIEW_IMPLEMENTATION
+                                or checkpoint.stage != pre_semantic_gate_stage(current_cycle.kind)
+                            ),
                         ),
                         policy=repair_scope,
                     )
@@ -914,6 +1085,9 @@ def validate_resume(
                 _refuse("the candidate gate stage is invalid")
             cycle_base_scope = _cycle_base_scope(
                 config, selection, run_dir, plan, number, repair_scope,
+                include_current_semantic=(
+                    candidate_stage is final_gate_stage(current_cycle.kind)
+                ),
             )
             _validate_gate_acceptance(
                 run_dir, number, candidate_stage, tree=expected_tree, head=head,
@@ -960,6 +1134,7 @@ def validate_resume(
                 tree=resolve_tree(repo, pre_head), head=pre_head,
                 base_scope=_cycle_base_scope(
                     config, selection, run_dir, plan, number, repair_scope,
+                    include_current_semantic=False,
                 ),
                 policy=repair_scope,
             )

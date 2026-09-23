@@ -1702,6 +1702,16 @@ def approve_repair_scope(
     correction = _cycle_root(directory, _state_cycle(state)) / "correction"
     delta_path = correction / "scope_delta.json"
     approval_dir = correction
+    state_delta = state.get("scope_delta") if isinstance(state.get("scope_delta"), dict) else {}
+    requested_artifact = state_delta.get("approval_artifact")
+    if isinstance(requested_artifact, str) and requested_artifact:
+        candidate = (directory / requested_artifact).resolve()
+        try:
+            candidate.relative_to(directory.resolve())
+        except ValueError as exc:
+            raise WebAPIError(409, "scope approval artifact is invalid") from exc
+        if candidate.is_file():
+            delta_path, approval_dir = candidate, candidate.parent
     if not delta_path.is_file():
         candidates = sorted(
             (
@@ -1711,6 +1721,12 @@ def approve_repair_scope(
             ),
             key=lambda path: path.stat().st_mtime_ns,
         )
+        candidates.extend(
+            path for path in (
+                _cycle_root(directory, _state_cycle(state)) / "semantic-revision" / "scope_requests"
+            ).glob("*/scope_delta.json") if path.is_file()
+        )
+        candidates.sort(key=lambda path: path.stat().st_mtime_ns)
         if candidates:
             delta_path = candidates[-1]
             approval_dir = delta_path.parent

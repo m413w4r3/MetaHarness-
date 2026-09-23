@@ -237,7 +237,10 @@ PHASE_STATUS.update({
 })
 _RESUMABLE_STATUSES = frozenset({"failed", "interrupted", "waiting_scope_approval"})
 # Failures that a checkpoint can never repair: the run needs an operator.
-_TERMINAL_FAILURES = frozenset({"RESUME_INTEGRITY_FAILURE", "RESUME_REQUIRES_OPERATOR"})
+_TERMINAL_FAILURES = frozenset({
+    "RESUME_INTEGRITY_FAILURE", "RESUME_REQUIRES_OPERATOR",
+    "AGENT_SCOPE_VIOLATION", "AGENT_GIT_VIOLATION",
+})
 
 
 def resume_label(checkpoint: ResumeCheckpoint) -> str:
