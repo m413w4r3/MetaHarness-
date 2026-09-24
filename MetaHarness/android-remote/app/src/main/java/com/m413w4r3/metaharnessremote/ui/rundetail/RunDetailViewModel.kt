@@ -17,6 +17,8 @@ import com.m413w4r3.metaharnessremote.network.GatewayClient
 import com.m413w4r3.metaharnessremote.network.GatewayUrls
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 
 /** Everything the Run Detail screen renders. */
@@ -29,6 +31,8 @@ data class RunDetailUiState(
     val progress: RunProgress = RunProgress(),
     /** One `GET /v1/runs/{runId}` pass has completed, whatever its outcome. */
     val hasLoaded: Boolean = false,
+    /** A detail/progress refresh is currently running. */
+    val refreshing: Boolean = false,
     /** Failure of the last pass, shown next to the last good detail. */
     val error: String? = null,
     /**
@@ -135,6 +139,8 @@ class RunDetailViewModel(
     private val httpClient: OkHttpClient = GatewayClient.defaultHttpClient(),
 ) : ViewModel() {
 
+    private val refreshMutex = Mutex()
+
     var state by mutableStateOf(RunDetailUiState(runId = runId))
         private set
 
@@ -148,7 +154,16 @@ class RunDetailViewModel(
      * that was active when the gateway went away returns to the active cadence
      * as soon as an answer comes back.
      */
-    suspend fun refreshOnce(): Long? {
+    suspend fun refreshOnce(): Long? = refreshMutex.withLock {
+        state = state.copy(refreshing = true)
+        try {
+            refreshOnceLocked()
+        } finally {
+            state = state.copy(refreshing = false)
+        }
+    }
+
+    private suspend fun refreshOnceLocked(): Long? {
         val baseUrl = when (val normalized = GatewayUrls.normalize(settingsStore.loadServerUrl())) {
             is GatewayUrls.BaseUrl.Invalid -> {
                 state = state.copy(hasLoaded = true, error = normalized.reason)

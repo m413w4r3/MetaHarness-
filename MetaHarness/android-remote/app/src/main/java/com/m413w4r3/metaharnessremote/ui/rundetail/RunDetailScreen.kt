@@ -138,8 +138,11 @@ fun RunDetailScreen(
                     }
                 },
                 actions = {
-                    TextButton(onClick = { coroutineScope.launch { viewModel.refreshOnce() } }) {
-                        Text("Refresh")
+                    TextButton(
+                        onClick = { coroutineScope.launch { viewModel.refreshOnce() } },
+                        enabled = !state.refreshing,
+                    ) {
+                        Text(if (state.refreshing) "Refreshing…" else "Refresh")
                     }
                 },
             )
