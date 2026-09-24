@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.m413w4r3.metaharnessremote.data.ConnectionSession
+import com.m413w4r3.metaharnessremote.data.SecureTokenStore
 import com.m413w4r3.metaharnessremote.data.ServerSettingsStore
 import com.m413w4r3.metaharnessremote.network.GatewayClient
 import com.m413w4r3.metaharnessremote.network.GatewayUrls
@@ -26,11 +27,13 @@ sealed interface ConnectionStatus {
 /**
  * Connection settings of the app.
  *
- * The typed token is mirrored into [ConnectionSession], where the Runs screen
- * reads it, and stays in memory: it is never persisted.
+ * The typed token is mirrored into [ConnectionSession], where the other screens
+ * read it, and handed to [SecureTokenStore], which encrypts it under an
+ * Android Keystore key before it reaches the disk.
  */
 class SettingsViewModel(
     private val settingsStore: ServerSettingsStore,
+    private val tokenStore: SecureTokenStore,
     private val gatewayClient: GatewayClient = GatewayClient(),
     private val session: ConnectionSession = ConnectionSession.shared,
 ) : ViewModel() {
@@ -39,12 +42,16 @@ class SettingsViewModel(
     var serverUrl by mutableStateOf(settingsStore.loadServerUrl())
         private set
 
-    /** In memory only: the remote token is never persisted. */
-    var remoteToken by mutableStateOf("")
+    /** Reloaded from the encrypted store at launch, then kept in memory only. */
+    var remoteToken by mutableStateOf(tokenStore.loadRemoteToken().orEmpty())
         private set
 
     var status by mutableStateOf<ConnectionStatus>(ConnectionStatus.Idle)
         private set
+
+    init {
+        session.remoteToken = remoteToken
+    }
 
     fun onServerUrlChange(value: String) {
         serverUrl = value
@@ -55,6 +62,17 @@ class SettingsViewModel(
     fun onRemoteTokenChange(value: String) {
         remoteToken = value
         session.remoteToken = value
+        tokenStore.saveRemoteToken(value)
+        status = ConnectionStatus.Idle
+    }
+
+    /** Drops the server URL and the stored token from the device. */
+    fun forgetCredentials() {
+        serverUrl = ""
+        remoteToken = ""
+        session.remoteToken = ""
+        settingsStore.saveServerUrl("")
+        tokenStore.clearRemoteToken()
         status = ConnectionStatus.Idle
     }
 
@@ -76,7 +94,11 @@ class SettingsViewModel(
     companion object {
         fun factory(context: Context): ViewModelProvider.Factory = viewModelFactory {
             initializer {
-                SettingsViewModel(ServerSettingsStore(context.applicationContext))
+                val applicationContext = context.applicationContext
+                SettingsViewModel(
+                    settingsStore = ServerSettingsStore(applicationContext),
+                    tokenStore = SecureTokenStore(applicationContext),
+                )
             }
         }
     }

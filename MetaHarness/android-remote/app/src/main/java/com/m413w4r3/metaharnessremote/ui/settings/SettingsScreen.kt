@@ -13,6 +13,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -64,15 +65,21 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
             ),
         )
         Text(
-            text = "The remote token is kept in memory only and is never written to the device.",
+            text = "The remote token is encrypted with an Android Keystore key before it is " +
+                "stored: the device only ever holds the ciphertext.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Button(
-            onClick = viewModel::testConnection,
-            enabled = viewModel.status != ConnectionStatus.Testing,
-        ) {
-            Text("Test Connection")
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(
+                onClick = viewModel::testConnection,
+                enabled = viewModel.status != ConnectionStatus.Testing,
+            ) {
+                Text("Test Connection")
+            }
+            OutlinedButton(onClick = viewModel::forgetCredentials) {
+                Text("Forget credentials")
+            }
         }
         ConnectionStatusLine(viewModel.status)
     }

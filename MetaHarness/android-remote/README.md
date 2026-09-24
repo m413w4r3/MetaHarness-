@@ -24,9 +24,11 @@ platform 35 and build-tools 35.
 `GET <baseUrl>/v1/health` with `Authorization: Bearer <token>`.
 
 * `Server URL` is the only persisted setting (private `SharedPreferences`).
-* `Remote token` is kept in memory only — it is mirrored into
-  `ConnectionSession`, where the Runs screen reads it, and is never written to
-  disk.
+* `Remote token` is encrypted by `SecureTokenStore` with an AES/GCM key held
+  by the `AndroidKeyStore` and stored as IV + ciphertext in private
+  `SharedPreferences`, so the clear token is never written to disk; the only
+  clear copy is the one `ConnectionSession` holds in memory, reloaded at launch.
+* `Forget credentials` clears the stored token and the server URL.
 * Cleartext HTTP is refused twice: `android:usesCleartextTraffic="false"` in the
   manifest, and the URL validator rejects any base URL that is not `https`.
 * OkHttp is built without a logging interceptor, so the `Authorization` header
