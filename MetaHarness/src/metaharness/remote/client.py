@@ -204,7 +204,7 @@ class LocalMetaHarnessClient:
             ) from None
         try:
             decoded = json.loads(text)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             raise LocalMetaHarnessError(
                 f"local MetaHarness response is not valid JSON (HTTP {status})",
                 status=status,

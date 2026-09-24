@@ -207,6 +207,12 @@ jamais affichés : le token distant authentifie le client du tunnel, le token de
 contrôle reste le seul credential accepté par le MetaHarness local. Les ports
 vont de 1 à 65535 et le port du gateway doit différer du port MetaHarness.
 
+Chaque requête, `GET` compris, exige `Authorization: Bearer <token distant>`.
+Les cinq routes de mutation n’acceptent qu’un corps JSON
+(`Content-Type: application/json`, un seul `Content-Length`, aucun
+`Transfer-Encoding`) dont les champs sont connus d’avance ; toute autre forme
+est refusée avant le moindre appel local.
+
 Le gateway écoute obligatoirement en localhost (`127.0.0.1`) : il n’existe
 aucune option `--host` et il ne doit jamais être exposé directement. L’accès
 distant passe par un tunnel privé tel que Tailscale Serve, qui ne publie

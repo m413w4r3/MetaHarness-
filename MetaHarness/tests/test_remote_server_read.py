@@ -24,8 +24,12 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from metaharness.remote import (
+    MAX_RESPONSE_BYTES,
+    create_remote_gateway,
+    serve_remote_gateway,
+)
 from metaharness.remote import server as gateway_module
-from metaharness.remote import create_remote_gateway, serve_remote_gateway
 from metaharness.remote.auth import load_token_file
 
 REMOTE_TOKEN = "remote-gateway-unit-test-token"
@@ -46,7 +50,11 @@ UPSTREAM_MEMORY_PORT = 8765
 # ---------------------------------------------------------------------------
 
 
-def upstream_response(path: str) -> tuple[int, dict[str, object]]:
+def upstream_response(
+    path: str, override: tuple[int, object] | None = None
+) -> tuple[int, object]:
+    if override is not None:
+        return override
     target, _, query = path.partition("?")
     if target == "/api/v1/health":
         return 200, {"service": "metaharness", "api_version": 1, "status": "ok"}
@@ -69,6 +77,10 @@ def upstream_response(path: str) -> tuple[int, dict[str, object]]:
 class UpstreamState:
     def __init__(self) -> None:
         self.down = False
+        # One canned answer for every path, and an optional stall; both are
+        # only used by the bounded-response and timeout tests.
+        self.override: tuple[int, object] | None = None
+        self.delay = 0.0
         self._requests: list[tuple[str, dict[str, str]]] = []
         self.lock = threading.Lock()
 
@@ -97,16 +109,23 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
-        self.server.state.record(  # type: ignore[attr-defined]
+        state = self.server.state  # type: ignore[attr-defined]
+        state.record(
             self.path, {name.lower(): value for name, value in self.headers.items()}
         )
-        status, payload = upstream_response(self.path)
+        if state.delay:
+            time.sleep(state.delay)
+        status, payload = upstream_response(self.path, state.override)
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except OSError:
+            # A gateway that gave up (oversized body, timeout) closes first.
+            pass
 
 
 class UpstreamServer(ThreadingHTTPServer):
@@ -181,7 +200,9 @@ def _upstream_bytes(state: UpstreamState, raw_request: bytes) -> bytes:
         raise ConnectionRefusedError("upstream is down")
     _method, path, headers = _parse_request(raw_request)
     state.record(path, headers)
-    status, payload = upstream_response(path)
+    if state.delay:
+        time.sleep(state.delay)
+    status, payload = upstream_response(path, state.override)
     body = json.dumps(payload).encode("utf-8")
     head = (
         f"HTTP/1.1 {status} {http.client.responses.get(status, '')}\r\n"
@@ -234,11 +255,14 @@ class MemoryConnection(http.client.HTTPConnection):
         self._request.extend(data)
 
     def getresponse(self) -> http.client.HTTPResponse:
+        started = time.monotonic()
         raw = bytes(self._request)
         if self.port == self._server.server_port:
             served = _gateway_bytes(self._server, raw)
         else:
             served = _upstream_bytes(self._upstream, raw)
+        if self.timeout is not None and time.monotonic() - started > self.timeout:
+            raise TimeoutError("local server exceeded the client timeout")
         self.sock = _MemorySocket(served)
         response = self.response_class(self.sock, method=self._method)
         response.begin()
@@ -579,12 +603,60 @@ class RefusalTests(GatewayCase):
             {"error": "upstream_error", "message": "local MetaHarness request failed"},
         )
 
+    def test_malformed_request_targets_are_refused_without_echo(self) -> None:
+        # ``urlsplit`` refuses a malformed bracketed host; the gateway must
+        # answer bounded JSON instead of letting the error escape.
+        for target in ("http://[", "http://[::1"):
+            with self.subTest(target=target):
+                raw = self.raw_exchange(
+                    f"GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    f"Authorization: Bearer {REMOTE_TOKEN}\r\n\r\n".encode()
+                )
+                self.assertTrue(raw.startswith(b"HTTP/1.0 400"), raw[:40])
+                self.assertIn(b"invalid_request", raw)
+                self.assertNotIn(target.encode(), raw)
+        self.assert_upstream_untouched()
+
     def test_malformed_request_line_is_answered_with_json_and_not_echoed(self) -> None:
         raw = self.raw_exchange(b"BOGUS-LINE\r\n\r\n")
         self.assertTrue(raw.startswith(b"HTTP/1.0 400"), raw[:40])
         self.assertIn(b"request_error", raw)
         self.assertNotIn(b"BOGUS-LINE", raw)
         self.assert_upstream_untouched()
+
+
+class LocalBoundTests(GatewayCase):
+    """The loopback leg is bounded in time and in size."""
+
+    def test_an_oversized_local_response_is_never_relayed(self) -> None:
+        self.upstream.override = (200, {"blob": "a" * MAX_RESPONSE_BYTES})
+        response = self.request("GET", "/v1/health")
+        self.assertEqual(response.status, 502)
+        self.assertEqual(
+            response.payload,
+            {"error": "upstream_error", "message": "local MetaHarness request failed"},
+        )
+        self.assertEqual(self.upstream.paths(), ["/api/v1/health"])
+
+    def test_a_stalled_local_server_is_bounded_by_the_timeout(self) -> None:
+        self.upstream.delay = 0.4
+        started = time.monotonic()
+        with mock.patch.object(gateway_module, "_UPSTREAM_TIMEOUT_SECONDS", 0.05):
+            response = self.request("GET", "/v1/health")
+        self.assertEqual(response.status, 502)
+        self.assertEqual(
+            response.payload,
+            {"error": "upstream_error", "message": "local MetaHarness request failed"},
+        )
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_surrogate_escape_from_localhost_is_relayed_safely(self) -> None:
+        # JSON may carry a lone surrogate; the gateway must relay the value
+        # instead of failing to encode its own response.
+        self.upstream.override = (200, {"run_id": "\ud800"})
+        response = self.request("GET", "/v1/health")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload, {"run_id": "\ud800"})
 
 
 # ---------------------------------------------------------------------------

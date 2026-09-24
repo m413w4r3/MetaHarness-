@@ -10,8 +10,8 @@ target, and an unknown route or method never reaches the local server.
 The observation routes are read-only.  The five mutation routes are validated
 and translated here, then sent to MetaHarness by exactly one loopback request
 carrying ``X-MetaHarness-Token``: the remote bearer token is never forwarded,
-no mutation is ever retried, and the local status and JSON body are relayed
-unchanged.
+no mutation is ever retried, and the local status and JSON value are relayed
+unchanged (non-ASCII text may be escaped, never dropped).
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import http.client
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import SplitResult, parse_qs, urlsplit
 
 from ..plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
 from ..step_ids import is_step_id
@@ -91,6 +91,25 @@ class _RouteError(Exception):
 
 class _UpstreamError(RuntimeError):
     """The local MetaHarness server did not answer with bounded JSON."""
+
+
+def _split_target(value: str) -> SplitResult:
+    """Split one request target; a malformed target is refused, never echoed."""
+
+    try:
+        return urlsplit(value)
+    except ValueError:
+        # ``urlsplit`` refuses some bracketed hosts and its message may quote
+        # the target it was given; only a fixed description is propagated.
+        raise _RouteError(400, "invalid_request", "invalid request target") from None
+
+
+def _json_media_type(value: str | None) -> bool:
+    """True when a ``Content-Type`` header names the JSON media type."""
+
+    if not isinstance(value, str):
+        return False
+    return value.split(";", 1)[0].strip().lower() == "application/json"
 
 
 def _upstream_target(path: str, query: str) -> str:
@@ -268,7 +287,7 @@ def _upstream_json(port: int, target: str) -> tuple[int, object]:
         raise _UpstreamError("local MetaHarness response exceeds the size limit")
     try:
         return status, json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise _UpstreamError("local MetaHarness response is not valid JSON") from None
 
 
@@ -327,8 +346,8 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json(401, _UNAUTHORIZED_PAYLOAD)
             return
-        parsed = urlsplit(self.path)
         try:
+            parsed = _split_target(self.path)
             target = _upstream_target(parsed.path, parsed.query)
         except _RouteError as error:
             self._json(error.status, {"error": error.error, "message": error.message})
@@ -347,7 +366,7 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
             self._json(401, _UNAUTHORIZED_PAYLOAD)
             return
         try:
-            action, run_id, max_bytes = _mutation_target(urlsplit(self.path).path)
+            action, run_id, max_bytes = _mutation_target(_split_target(self.path).path)
             payload = self._body(max_bytes)
             status, response = self._mutate(action, run_id, payload)
         except _RouteError as error:
@@ -384,11 +403,23 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
         return client.recover_plan(run_id, _plan_text(payload))
 
     def _body(self, max_bytes: int) -> dict[str, object]:
-        """Read the single bounded JSON object of a mutation request."""
+        """Read the single bounded JSON object of a mutation request.
 
-        raw_length = self.headers.get("Content-Length")
+        The body must declare exactly one ``Content-Length``, carry no
+        ``Transfer-Encoding`` and be sent as ``application/json``: a request
+        whose framing or media type is ambiguous is refused before the first
+        byte is read.
+        """
+
+        if not _json_media_type(self.headers.get("Content-Type")):
+            raise _RouteError(415, "unsupported_media_type", "body must be application/json")
+        if self.headers.get_all("Transfer-Encoding"):
+            raise _RouteError(400, "invalid_request", "body must use Content-Length framing")
+        lengths = self.headers.get_all("Content-Length") or []
+        if len(lengths) > 1:
+            raise _RouteError(400, "invalid_request", "body must declare one Content-Length")
         try:
-            length = int(raw_length) if raw_length is not None else 0
+            length = int(lengths[0]) if lengths else 0
         except ValueError:
             raise _RouteError(400, "invalid_request", "invalid request body") from None
         if length < 0 or length > max_bytes:
@@ -398,7 +429,9 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
             if len(raw) != length:
                 raise ValueError("short body")
             payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_fields)
-        except (OSError, UnicodeError, ValueError):
+        except (OSError, UnicodeError, ValueError, RecursionError):
+            # A hostile nesting depth ends in RecursionError; the parser
+            # message may quote the body, so only a fixed description leaves.
             raise _RouteError(400, "invalid_request", "body must be valid JSON") from None
         if not isinstance(payload, dict):
             raise _RouteError(400, "invalid_request", "body must be a JSON object")
@@ -421,7 +454,10 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _json(self, status: int, payload: object) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # ``ensure_ascii`` escapes every non-ASCII code unit, so a lone
+        # surrogate relayed by the local server can never raise here; the
+        # decoded JSON value is unchanged.
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -432,7 +468,8 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
+            # A stalled or closed client is never retried and never logged.
             pass
 
 

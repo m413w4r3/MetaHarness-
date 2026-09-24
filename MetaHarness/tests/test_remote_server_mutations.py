@@ -13,9 +13,11 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,7 +26,11 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
-from metaharness.remote import LocalMetaHarnessClient, create_remote_gateway
+from metaharness.remote import (
+    MAX_RESPONSE_BYTES,
+    LocalMetaHarnessClient,
+    create_remote_gateway,
+)
 from metaharness.remote import server as gateway_module
 from metaharness.remote.auth import load_token_file
 
@@ -43,6 +49,17 @@ UPSTREAM_ERROR = {
 }
 BAD_RUN_ID = {"error": "invalid_run_id", "message": "invalid run id"}
 TOO_LARGE = {"error": "body_too_large", "message": "request body is too large"}
+NOT_JSON = {"error": "unsupported_media_type", "message": "body must be application/json"}
+BAD_FRAMING = {
+    "error": "invalid_request",
+    "message": "body must use Content-Length framing",
+}
+DUPLICATED_LENGTH = {
+    "error": "invalid_request",
+    "message": "body must declare one Content-Length",
+}
+BAD_TARGET = {"error": "invalid_request", "message": "invalid request target"}
+BAD_JSON = {"error": "invalid_request", "message": "body must be valid JSON"}
 TEST_TIMEOUT = 10
 LOCAL_HOST = "127.0.0.1"
 GATEWAY_MEMORY_PORT = 8771
@@ -114,6 +131,8 @@ class UpstreamState:
 
     def __init__(self) -> None:
         self.down = False
+        # Only the timeout test stalls the local server.
+        self.delay = 0.0
         self.responses = dict(DEFAULT_RESPONSES)
         self._requests: list[RecordedRequest] = []
         self.lock = threading.Lock()
@@ -161,18 +180,23 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         raw_length = self.headers.get("Content-Length")
         length = int(raw_length) if raw_length else 0
         body = self.rfile.read(length) if length else b""
-        self.server.state.record(  # type: ignore[attr-defined]
+        state = self.server.state  # type: ignore[attr-defined]
+        state.record(
             method, self.path, {name.lower(): value for name, value in self.headers.items()}, body
         )
-        status, payload = upstream_response(  # type: ignore[attr-defined]
-            self.server.state, method, self.path
-        )
+        if state.delay:
+            time.sleep(state.delay)
+        status, payload = upstream_response(state, method, self.path)
         encoded = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.wfile.write(encoded)
+        except OSError:
+            # A gateway that gave up (oversized body, timeout) closes first.
+            pass
 
 
 class UpstreamServer(ThreadingHTTPServer):
@@ -246,6 +270,8 @@ def _upstream_bytes(state: UpstreamState, raw_request: bytes) -> bytes:
         raise ConnectionRefusedError("upstream is down")
     method, path, headers, body = _parse_request(raw_request)
     state.record(method, path, headers, body)
+    if state.delay:
+        time.sleep(state.delay)
     status, payload = upstream_response(state, method, path)
     encoded = json.dumps(payload).encode("utf-8")
     head = (
@@ -307,11 +333,14 @@ class MemoryConnection(http.client.HTTPConnection):
         self._request.extend(data)
 
     def getresponse(self) -> http.client.HTTPResponse:
+        started = time.monotonic()
         raw = bytes(self._request)
         if self.port == self._server.server_port:
             served = _gateway_bytes(self._server, raw)
         else:
             served = _upstream_bytes(self._upstream, raw)
+        if self.timeout is not None and time.monotonic() - started > self.timeout:
+            raise TimeoutError("local server exceeded the client timeout")
         self.sock = _MemorySocket(served)
         response = self.response_class(self.sock, method=self._method)
         response.begin()
@@ -405,6 +434,8 @@ class MutationCase(unittest.TestCase):
         token: str | None = REMOTE_TOKEN,
         body: bytes | None = None,
         declared_length: int | None = None,
+        content_type: str | None = "application/json",
+        extra_headers: tuple[tuple[str, str], ...] = (),
     ) -> Response:
         connection = http.client.HTTPConnection(
             LOCAL_HOST, self.gateway_port, timeout=TEST_TIMEOUT
@@ -413,15 +444,35 @@ class MutationCase(unittest.TestCase):
             connection.putrequest(method, path, skip_accept_encoding=True)
             if token is not None:
                 connection.putheader("Authorization", f"Bearer {token}")
-            if body is not None:
-                connection.putheader("Content-Length", str(len(body)))
-            elif declared_length is not None:
+            if content_type is not None:
+                connection.putheader("Content-Type", content_type)
+            for name, value in extra_headers:
+                connection.putheader(name, value)
+            if declared_length is not None:
                 connection.putheader("Content-Length", str(declared_length))
+            elif body is not None:
+                connection.putheader("Content-Length", str(len(body)))
             connection.endheaders(body)
             response = connection.getresponse()
             return Response(response.status, response.read(), response.getheaders())
         finally:
             connection.close()
+
+    def raw_exchange(self, request: bytes) -> bytes:
+        """Send raw bytes and return the raw reply, EOF terminated."""
+
+        if not self.live:
+            return _gateway_bytes(self.gateway, request)
+        with socket.create_connection(
+            (LOCAL_HOST, self.gateway_port), timeout=TEST_TIMEOUT
+        ) as connection:
+            connection.sendall(request)
+            chunks: list[bytes] = []
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
 
     def post(
         self,
@@ -790,6 +841,113 @@ class RecoverPlanTests(MutationCase):
                     },
                 )
         self.assert_upstream_untouched()
+
+
+class RequestContractTests(MutationCase):
+    """Media type and framing rules of a mutation body."""
+
+    def test_post_requires_a_json_content_type(self) -> None:
+        for content_type in (
+            "application/json",
+            "Application/JSON",
+            "application/json; charset=utf-8",
+        ):
+            with self.subTest(content_type=content_type):
+                self.upstream.reset()
+                response = self.post(
+                    CREATE_PATH, {"spec": "Do it."}, content_type=content_type
+                )
+                self.assertEqual(response.status, 202)
+                self.assert_single_call(CREATE_PATH)
+        for content_type in (
+            None,
+            "",
+            "text/plain",
+            "application/x-www-form-urlencoded",
+            "application/jsonx",
+            "application/ld+json",
+        ):
+            with self.subTest(content_type=content_type):
+                self.upstream.reset()
+                response = self.request("POST", CREATE_PATH, content_type=content_type)
+                self.assertEqual(response.status, 415)
+                self.assertEqual(response.payload, NOT_JSON)
+                self.assert_upstream_untouched()
+        # A read route is unchanged: no media type is required for GET, which
+        # is routed (and answered by the stand-in) instead of refused.
+        self.assertNotEqual(
+            self.request("GET", "/v1/health", content_type=None).status, 415
+        )
+
+    def test_ambiguous_body_framing_is_refused_before_any_local_call(self) -> None:
+        cases = (
+            ((("Transfer-Encoding", "chunked"),), None, BAD_FRAMING),
+            ((("Transfer-Encoding", "chunked"),), 0, BAD_FRAMING),
+            ((("Content-Length", "0"),), 0, DUPLICATED_LENGTH),
+        )
+        for extra, declared, expected in cases:
+            with self.subTest(extra=extra, declared=declared):
+                self.upstream.reset()
+                response = self.request(
+                    "POST", CREATE_PATH, declared_length=declared, extra_headers=extra
+                )
+                self.assertEqual(response.status, 400)
+                self.assertEqual(response.payload, expected)
+                self.assert_upstream_untouched()
+
+    def test_malformed_request_targets_are_refused_without_echo(self) -> None:
+        # http.client refuses to serialise such a target; the gateway must
+        # answer bounded JSON instead of letting urlsplit's error escape.
+        for target in ("http://[", "http://[::1"):
+            with self.subTest(target=target):
+                raw = self.raw_exchange(
+                    f"POST {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    f"Authorization: Bearer {REMOTE_TOKEN}\r\n"
+                    "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}".encode()
+                )
+                self.assertTrue(raw.startswith(b"HTTP/1.0 400"), raw[:40])
+                self.assertIn(b"invalid_request", raw)
+                self.assertNotIn(target.encode(), raw)
+        self.assert_upstream_untouched()
+
+    def test_a_pathologically_nested_body_is_refused(self) -> None:
+        nested = b'{"plan": ' + b"[" * 100_000 + b"]" * 100_000 + b"}"
+        self.assertLess(len(nested), gateway_module._MAX_RECOVERY_BODY_BYTES)
+        response = self.post(RECOVERY_PATH, raw=nested)
+        self.assertEqual(response.status, 400)
+        self.assertEqual(response.payload, BAD_JSON)
+        self.assert_upstream_untouched()
+
+
+class LocalBoundTests(MutationCase):
+    """The loopback mutation leg is bounded in time and in size."""
+
+    def test_an_oversized_local_response_is_never_relayed(self) -> None:
+        self.upstream.respond(
+            "POST", LOCAL_CREATE, 202, {"blob": "a" * MAX_RESPONSE_BYTES}
+        )
+        response = self.post(CREATE_PATH, {"spec": "Do it."})
+        self.assertEqual(response.status, 502)
+        self.assertEqual(response.payload, UPSTREAM_ERROR)
+        self.assert_single_call(CREATE_PATH)
+
+    def test_a_stalled_local_server_is_bounded_and_never_retried(self) -> None:
+        self.upstream.delay = 0.4
+        self.gateway.local_client = LocalMetaHarnessClient(  # type: ignore[attr-defined]
+            port=self.upstream_port, control_token=CONTROL_TOKEN, timeout_seconds=0.05
+        )
+        started = time.monotonic()
+        response = self.post(CREATE_PATH, {"spec": "Do it."})
+        self.assertEqual(response.status, 502)
+        self.assertEqual(response.payload, UPSTREAM_ERROR)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assert_single_call(CREATE_PATH)
+
+    def test_a_surrogate_escape_from_localhost_is_relayed_safely(self) -> None:
+        self.upstream.respond("POST", LOCAL_CREATE, 202, {"run_id": "\ud800"})
+        response = self.post(CREATE_PATH, {"spec": "Do it."})
+        self.assertEqual(response.status, 202)
+        self.assertEqual(response.payload, {"run_id": "\ud800"})
 
 
 # ---------------------------------------------------------------------------

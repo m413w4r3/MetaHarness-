@@ -398,6 +398,14 @@ class ErrorHandlingTests(RemoteClientTest):
             self.client.health()
         self.assertIn("UTF-8", str(raised.exception))
 
+    def test_pathologically_nested_json_is_refused(self) -> None:
+        deep = b"[" * 100_000 + b"]" * 100_000
+        self.respond_with(lambda handler, record: send_bytes(handler, deep))
+        with self.assertRaises(LocalMetaHarnessError) as raised:
+            self.client.health()
+        self.assertIn("JSON", str(raised.exception))
+        self.assertIsNone(raised.exception.payload)
+
     def test_non_object_json_is_refused(self) -> None:
         self.respond_with(lambda handler, record: send_json(handler, [1, 2, 3]))
         with self.assertRaises(LocalMetaHarnessError) as raised:
