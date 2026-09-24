@@ -30,7 +30,7 @@ fun AppNavigation(navController: NavHostController = rememberNavController()) {
     NavHost(navController = navController, startDestination = Routes.RUNS) {
         composable(Routes.RUNS) {
             RunsScreen(
-                onOpenRun = { _ -> /* the Run Detail screen arrives with a later prompt */ },
+                onOpenRun = { runId -> navController.navigate(Routes.runDetail(runId)) },
                 onNewRun = { navController.navigate(Routes.NEW_RUN) },
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) },
             )

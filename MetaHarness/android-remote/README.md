@@ -54,12 +54,52 @@ Runs are grouped by `state.status`:
 Each card shows the run id, the plan title, the status, `updated_at`, the first
 7 characters of the commit SHA and the failure summary (`reason — detail`, the
 way the desktop list renders it). A card in `ACTION REQUIRED` carries the badge,
-and tapping any card hands its run id to a callback. `+ NEW RUN` opens the New
-Run screen; the Run Detail view arrives with a later prompt, so the route it
-will use only shows the run id it was opened with.
+and tapping any card opens the Run Detail screen of that run. `+ NEW RUN` opens
+the New Run screen.
 
 The board only ever reads the gateway: nothing is cached on the device, the
 desktop stays the source of authority, and no local database is involved.
+
+## Run Detail screen
+
+Tapping a card (or creating a run) opens it read-only. Each pass reads
+`GET /v1/runs/<run_id>` and then `GET /v1/runs/<run_id>/progress?offset=N`:
+
+| Field | Read from |
+| --- | --- |
+| run id | `run_id`, else the id the screen was opened with |
+| status | `status` |
+| failure | `failure`, rendered `reason — detail` as on the board |
+| candidate SHA | the current cycle's entry in `candidate`, else `state.candidate_commit_sha`, else `commit_sha` |
+| cycle | `cycle` |
+| overview | `overview`: `current_label`, `next_label`, `execution_label`, `publish_target`, `resume` |
+| plan | `plan.raw`, bounded to 8000 characters, falling back to `plan.contract` |
+| implementation steps | `implementation_bundle.steps`, each showing `id`, `title`, `execution_class` and the profile: `profile_id` from `state.steps`, else `recommended_profile` from `state.planner.steps` |
+
+Every field is optional and type-checked, so a run whose document is still
+incomplete renders what it has instead of failing. Nothing is written and no
+route of this screen can change a run.
+
+Progress is incremental: the offset starts at `0` and every answer replaces it
+with its own `next_offset`, so each pass appends only the events that became
+visible since the previous one. A reply that does not move the offset forward is
+ignored whole, so an event is never listed twice, and the screen keeps the last
+1000 events in memory while the gateway keeps the history.
+
+Polling cadence follows the run status, through the same classification as the
+board:
+
+| Status | Poll |
+| --- | --- |
+| `ACTIVE` | every 2 seconds |
+| `ACTION REQUIRED` | every 5 seconds |
+| `COMPLETED`, `FAILED` | stops |
+| any other status | every 5 seconds |
+
+A failed pass keeps the last good detail, reports the error, and retries every
+5 seconds. All polling stops when the screen leaves the foreground — the loop
+lives in `repeatOnLifecycle(RESUMED)` — so a screen that is not visible costs
+nothing.
 
 ## New Run screen
 
