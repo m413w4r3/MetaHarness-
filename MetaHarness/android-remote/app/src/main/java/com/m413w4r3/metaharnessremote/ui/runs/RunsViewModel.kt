@@ -27,8 +27,16 @@ sealed interface GatewayConnection {
     data class Unreachable(val message: String) : GatewayConnection
 }
 
+/** Whether the Runs screen has the local credentials it needs to contact a gateway. */
+enum class SetupState {
+    READY,
+    MISSING_SERVER_URL,
+    MISSING_REMOTE_TOKEN,
+}
+
 /** Everything the Runs screen renders. */
 data class RunsUiState(
+    val setupState: SetupState = SetupState.READY,
     val connection: GatewayConnection = GatewayConnection.Unknown,
     val sections: List<RunSection> = emptyList(),
     /** The gateway has been queried at least once, whatever the outcome. */
@@ -65,28 +73,43 @@ class RunsViewModel(
      */
     fun refresh() {
         if (inFlight?.isActive == true) return
-        when (val baseUrl = GatewayUrls.normalize(settingsStore.loadServerUrl())) {
-            is GatewayUrls.BaseUrl.Invalid -> {
+        val serverUrl = settingsStore.loadServerUrl()
+        val token = session.remoteToken
+        when (resolveSetupState(serverUrl, token)) {
+            SetupState.MISSING_SERVER_URL -> {
                 state = state.copy(
+                    setupState = SetupState.MISSING_SERVER_URL,
                     connection = GatewayConnection.Unknown,
                     hasLoaded = true,
                     loading = false,
-                    error = baseUrl.reason,
+                    error = null,
                 )
             }
 
-            is GatewayUrls.BaseUrl.Valid -> {
-                val token = session.remoteToken
-                if (token.isBlank()) {
+            SetupState.MISSING_REMOTE_TOKEN -> {
+                state = state.copy(
+                    setupState = SetupState.MISSING_REMOTE_TOKEN,
+                    connection = GatewayConnection.Unknown,
+                    hasLoaded = true,
+                    loading = false,
+                    error = null,
+                )
+            }
+
+            SetupState.READY -> when (val baseUrl = GatewayUrls.normalize(serverUrl)) {
+                is GatewayUrls.BaseUrl.Invalid -> {
                     state = state.copy(
+                        setupState = SetupState.READY,
                         connection = GatewayConnection.Unknown,
                         hasLoaded = true,
                         loading = false,
-                        error = MISSING_TOKEN,
+                        error = baseUrl.reason,
                     )
-                } else {
+                }
+
+                is GatewayUrls.BaseUrl.Valid -> {
                     val api = MetaHarnessApi(baseUrl.value, token, httpClient)
-                    state = state.copy(loading = true)
+                    state = state.copy(setupState = SetupState.READY, loading = true)
                     inFlight = viewModelScope.launch { load(api) }
                 }
             }
@@ -126,7 +149,11 @@ class RunsViewModel(
         /** Poll cadence of the Runs screen while it is visible. */
         const val POLL_INTERVAL_MILLIS = 3_000L
 
-        private const val MISSING_TOKEN = "Remote token required: set it in Settings"
+        internal fun resolveSetupState(serverUrl: String, remoteToken: String): SetupState = when {
+            serverUrl.isBlank() -> SetupState.MISSING_SERVER_URL
+            remoteToken.isBlank() -> SetupState.MISSING_REMOTE_TOKEN
+            else -> SetupState.READY
+        }
 
         fun factory(context: Context): ViewModelProvider.Factory = viewModelFactory {
             initializer {

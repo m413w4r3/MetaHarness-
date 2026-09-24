@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -19,11 +21,16 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -71,8 +78,13 @@ import kotlinx.coroutines.delay
  * irreversible or replayable action is confirmed first or reported as possibly
  * applied, and nothing is ever retried.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
+fun RunDetailScreen(
+    runId: String,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val context = LocalContext.current
     val viewModel: RunDetailViewModel =
         viewModel(key = runId, factory = RunDetailViewModel.factory(context, runId))
@@ -107,16 +119,35 @@ fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
         }
     }
 
-    LazyColumn(
+    Scaffold(
         modifier = modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        item(key = "header") { Header(state.runId) }
-        state.error?.let { message -> item(key = "error") { Note(message, isError = true) } }
-        if (!state.hasLoaded) item(key = "loading") { Note("Loading run…", isError = false) }
-        state.detail?.let { detail ->
-            detailItems(detail, state, approvalActions, scopeActions, recoveryActions, resumeActions)
+        topBar = {
+            TopAppBar(
+                title = { Text("Run Detail") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                        )
+                    }
+                },
+            )
+        },
+    ) { innerPadding ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item(key = "header") { Header(state.runId) }
+            state.error?.let { message -> item(key = "error") { Note(message, isError = true) } }
+            if (!state.hasLoaded) item(key = "loading") { Note("Loading run…", isError = false) }
+            state.detail?.let { detail ->
+                detailItems(detail, state, approvalActions, scopeActions, recoveryActions, resumeActions)
+            }
         }
     }
 
@@ -195,16 +226,13 @@ private fun LazyListScope.detailItems(
 
 @Composable
 private fun Header(runId: String) {
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(text = "Run Detail", style = MaterialTheme.typography.headlineSmall)
-        Text(
-            text = runId.ifBlank { DASH },
-            style = MaterialTheme.typography.titleMedium,
-            fontFamily = FontFamily.Monospace,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-    }
+    Text(
+        text = runId.ifBlank { DASH },
+        style = MaterialTheme.typography.titleMedium,
+        fontFamily = FontFamily.Monospace,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
 }
 
 /**

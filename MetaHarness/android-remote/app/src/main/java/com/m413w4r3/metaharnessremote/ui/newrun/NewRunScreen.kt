@@ -10,11 +10,18 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
@@ -33,9 +40,11 @@ import androidx.lifecycle.viewmodel.compose.viewModel
  * opens the run. The button is disabled while the call is in flight, so a
  * double tap cannot create two runs.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NewRunScreen(
     onCreated: (String) -> Unit,
+    onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -47,61 +56,75 @@ fun NewRunScreen(
         LaunchedEffect(runId) { onCreated(runId) }
     }
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        Text(
-            text = "New Run",
-            style = MaterialTheme.typography.headlineSmall,
-        )
-        OutlinedTextField(
-            value = state.spec,
-            onValueChange = viewModel::onSpecChange,
-            modifier = Modifier.fillMaxWidth(),
-            label = { Text("SPEC") },
-            minLines = SPEC_MIN_LINES,
-            maxLines = SPEC_MAX_LINES,
-            isError = state.specError != null,
-        )
-        FieldError(state.specError)
-        OutlinedTextField(
-            value = state.runId,
-            onValueChange = viewModel::onRunIdChange,
-            modifier = Modifier.fillMaxWidth(),
-            label = { Text("Run ID optional") },
-            singleLine = true,
-            isError = state.runIdError != null,
-            keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Ascii,
-                imeAction = ImeAction.Done,
-            ),
-        )
-        FieldError(state.runIdError)
-        Button(
-            onClick = viewModel::createRun,
-            enabled = !state.submitting && state.createdRunId == null,
-        ) {
-            Text("CREATE RUN")
-        }
-        if (state.submitting) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                Text(text = "Creating the run…", style = MaterialTheme.typography.bodyMedium)
-            }
-        }
-        state.error?.let { message ->
-            Text(
-                text = message,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.error,
+    Scaffold(
+        modifier = modifier.fillMaxSize(),
+        topBar = {
+            TopAppBar(
+                title = { Text("New Run") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                        )
+                    }
+                },
             )
+        },
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .verticalScroll(rememberScrollState())
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            OutlinedTextField(
+                value = state.spec,
+                onValueChange = viewModel::onSpecChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("SPEC") },
+                minLines = SPEC_MIN_LINES,
+                maxLines = SPEC_MAX_LINES,
+                isError = state.specError != null,
+            )
+            FieldError(state.specError)
+            OutlinedTextField(
+                value = state.runId,
+                onValueChange = viewModel::onRunIdChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Run ID optional") },
+                singleLine = true,
+                isError = state.runIdError != null,
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Ascii,
+                    imeAction = ImeAction.Done,
+                ),
+            )
+            FieldError(state.runIdError)
+            Button(
+                onClick = viewModel::createRun,
+                enabled = !state.submitting && state.createdRunId == null,
+            ) {
+                Text("CREATE RUN")
+            }
+            if (state.submitting) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text(text = "Creating the run…", style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+            state.error?.let { message ->
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
         }
     }
 }

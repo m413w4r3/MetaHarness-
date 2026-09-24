@@ -1,6 +1,7 @@
 package com.m413w4r3.metaharnessremote.ui.runs
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -15,8 +16,10 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -57,40 +60,90 @@ fun RunsScreen(
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             while (true) {
                 viewModel.refresh()
+                if (viewModel.state.setupState != SetupState.READY) break
                 delay(RunsViewModel.POLL_INTERVAL_MILLIS)
             }
         }
     }
 
-    PullToRefreshBox(
-        isRefreshing = state.loading && state.hasLoaded,
-        onRefresh = viewModel::refresh,
+    Scaffold(
         modifier = modifier.fillMaxSize(),
-    ) {
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            item(key = "header") {
-                Header(
-                    state = state,
-                    onNewRun = onNewRun,
-                    onRefresh = viewModel::refresh,
+        topBar = {
+            TopAppBar(
+                title = { Text("MetaHarness Remote") },
+                actions = {
+                    TextButton(onClick = onOpenSettings) { Text("Settings") }
+                },
+            )
+        },
+    ) { innerPadding ->
+        if (state.setupState != SetupState.READY) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(innerPadding),
+                contentAlignment = Alignment.Center,
+            ) {
+                SetupCard(
+                    setupState = state.setupState,
                     onOpenSettings = onOpenSettings,
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
                 )
             }
-            state.error?.let { message -> item(key = "error") { Note(message, isError = true) } }
-            if (!state.hasLoaded) item(key = "loading") { Note("Loading runs…", isError = false) }
-            if (state.hasLoaded && state.sections.isEmpty() && state.error == null) {
-                item(key = "empty") { Note("No runs yet.", isError = false) }
-            }
-            state.sections.forEach { section ->
-                item(key = "section:${section.category.name}") { SectionHeader(section) }
-                items(section.runs, key = { "run:${it.runId}" }) { card ->
-                    RunCardView(card = card, onOpen = { onOpenRun(card.runId) })
+        } else {
+            PullToRefreshBox(
+                isRefreshing = state.loading && state.hasLoaded,
+                onRefresh = viewModel::refresh,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+            ) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    item(key = "header") {
+                        Header(
+                            state = state,
+                            onNewRun = onNewRun,
+                            onRefresh = viewModel::refresh,
+                        )
+                    }
+                    state.error?.let { message -> item(key = "error") { Note(message, isError = true) } }
+                    if (!state.hasLoaded) item(key = "loading") { Note("Loading runs…", isError = false) }
+                    if (state.hasLoaded && state.sections.isEmpty() && state.error == null) {
+                        item(key = "empty") { Note("No runs yet.", isError = false) }
+                    }
+                    state.sections.forEach { section ->
+                        item(key = "section:${section.category.name}") { SectionHeader(section) }
+                        items(section.runs, key = { "run:${it.runId}" }) { card ->
+                            RunCardView(card = card, onOpen = { onOpenRun(card.runId) })
+                        }
+                    }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun SetupCard(
+    setupState: SetupState,
+    onOpenSettings: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val message = when (setupState) {
+        SetupState.READY -> return
+        SetupState.MISSING_SERVER_URL -> "Set the HTTPS address of your MetaHarness remote gateway."
+        SetupState.MISSING_REMOTE_TOKEN -> "Enter the remote access token for your gateway."
+    }
+    Card(modifier = modifier) {
+        Column(
+            modifier = Modifier.padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("Connect MetaHarness", style = MaterialTheme.typography.titleLarge)
+            Text(message, style = MaterialTheme.typography.bodyMedium)
+            Button(onClick = onOpenSettings) { Text("OPEN SETTINGS") }
         }
     }
 }
@@ -100,17 +153,8 @@ private fun Header(
     state: RunsUiState,
     onNewRun: () -> Unit,
     onRefresh: () -> Unit,
-    onOpenSettings: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = "MetaHarness Remote",
-                style = MaterialTheme.typography.headlineSmall,
-                modifier = Modifier.weight(1f),
-            )
-            TextButton(onClick = onOpenSettings) { Text("Settings") }
-        }
         ConnectionLine(state)
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Button(onClick = onNewRun) { Text("+ NEW RUN") }

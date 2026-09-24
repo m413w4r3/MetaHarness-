@@ -37,6 +37,7 @@ fun AppNavigation(navController: NavHostController = rememberNavController()) {
         }
         composable(Routes.NEW_RUN) {
             NewRunScreen(
+                onBack = { navController.popBackStack() },
                 onCreated = { runId ->
                     navController.navigate(Routes.runDetail(runId)) {
                         // The form is consumed by the run it created: going back
@@ -51,8 +52,13 @@ fun AppNavigation(navController: NavHostController = rememberNavController()) {
             route = Routes.RUN_DETAIL,
             arguments = listOf(navArgument(Routes.RUN_ID) { type = NavType.StringType }),
         ) { entry ->
-            RunDetailScreen(runId = entry.arguments?.getString(Routes.RUN_ID).orEmpty())
+            RunDetailScreen(
+                runId = entry.arguments?.getString(Routes.RUN_ID).orEmpty(),
+                onBack = { navController.popBackStack() },
+            )
         }
-        composable(Routes.SETTINGS) { SettingsScreen() }
+        composable(Routes.SETTINGS) {
+            SettingsScreen(onBack = { navController.popBackStack() })
+        }
     }
 }
