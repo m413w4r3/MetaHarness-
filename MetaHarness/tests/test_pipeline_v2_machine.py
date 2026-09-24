@@ -1789,6 +1789,71 @@ class ResumeAuthorityTests(PipelineHarness):
 
         return mock.patch.object(type(orchestrator), "_review_candidate", side_effect=review_or_crash)
 
+    def _crash_before_no_change_review(self) -> str:
+        (self.repo / "feature.txt").write_text("good\n", encoding="utf-8")
+        git(self.repo, "add", "feature.txt")
+        git(self.repo, "commit", "-qm", "already satisfied")
+        base = git(self.repo, "rev-parse", "HEAD")
+        self.workers.on(ExecutionRole.IMPLEMENTER, lambda _request: "done\n", lambda _request: "done\n")
+        original = self.orchestrator(
+            self.config(max_step_contract_repairs=1),
+            planner=[initial_plan(STEP), repaired_step_contract()], reviewer=["unused"],
+        )
+        with self._crash_on_review(original, 1):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(self.checkpoint()["phase"], "final_review", self.state().get("failure"))
+        self.assertEqual(git(self.worktree(), "rev-parse", "HEAD"), base)
+        return base
+
+    def test_no_change_resume_reuses_existing_candidate(self) -> None:
+        base = self._crash_before_no_change_review()
+        confirmed = review().replace("SUMMARY: scripted review", "SUMMARY: SPEC_ALREADY_SATISFIED: feature.txt is good")
+        resumed = self.orchestrator(
+            self.config(), planner=["unused"], reviewer=[confirmed],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(git(self.worktree(), "rev-parse", "HEAD"), base)
+        self.assertEqual(self.state()["no_change_candidate_sha"], base)
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+
+    def _reject_tampered_no_change_candidate(self, field: str) -> None:
+        self._crash_before_no_change_review()
+        path = self.run_dir() / "cycles/001/candidate/commit.json"
+        candidate = json.loads(path.read_text())
+        candidate[field] = "a" * 40
+        path.write_text(json.dumps(candidate), encoding="utf-8")
+        resumed = self.orchestrator(
+            self.config(), planner=["unused"], reviewer=["unused"],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.reviewer.requests, [])
+
+    def test_no_change_resume_rejects_tampered_tree(self) -> None:
+        self._reject_tampered_no_change_candidate("tree_sha")
+
+    def test_no_change_resume_rejects_tampered_commit(self) -> None:
+        self._reject_tampered_no_change_candidate("commit_sha")
+
+    def test_changed_candidate_resume_still_rejects_wrong_parent(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        original = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], reviewer=["unused"],
+        )
+        with self._crash_on_review(original, 1):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        path = self.run_dir() / "cycles/001/candidate/commit.json"
+        candidate = json.loads(path.read_text())
+        candidate["parent_sha"] = "a" * 40
+        path.write_text(json.dumps(candidate), encoding="utf-8")
+        resumed = self.orchestrator(
+            self.config(), planner=["unused"], reviewer=["unused"],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+
     def test_changed_direct_correction_resumes_at_its_final_review(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         # A real correction: the accepted tree differs from the reviewed one.

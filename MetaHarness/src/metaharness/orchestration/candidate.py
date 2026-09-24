@@ -15,6 +15,7 @@ from ..gitops import (
     resolve_tree,
     validate_linear_commit_chain,
 )
+from ..evidence import required_checks_passed
 from ..result import atomic_write_text
 from ..models import GateStage, RunStatus
 
@@ -112,7 +113,7 @@ class CandidateLifecycle:
         self, store: Any, ctx: Any, cycle_plan: Any, stage: GateStage,
         evidence: Any,
     ) -> dict[str, Any]:
-        if not evidence.deterministic_passed:
+        if not evidence.deterministic_passed or not required_checks_passed(evidence):
             raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
         worktree = ctx.info.worktree
         head = current_head(worktree)
@@ -138,9 +139,11 @@ class CandidateLifecycle:
                 "RESUME_INTEGRITY_FAILURE",
                 "final gate acceptance is missing or stale",
             )
-        parents = commit_parents(worktree, head)
         no_change = not evidence.changed_files
-        if len(parents) not in ({0} if no_change else {1}):
+        if no_change and evidence.diff != "":
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "no-change evidence has a diff")
+        parents = () if no_change else commit_parents(worktree, head)
+        if not no_change and len(parents) != 1:
             raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "candidate HEAD has no single parent")
         path = _candidate_commit_path(ctx.run_dir, cycle_plan.cycle.number)
         stored = _read_json_artifact(path)
@@ -148,12 +151,14 @@ class CandidateLifecycle:
             not isinstance(stored, dict)
             or stored.get("commit_sha") != head
             or stored.get("tree_sha") != evidence.staged_tree_sha
+            or stored.get("parent_sha") != (None if no_change else parents[0])
+            or stored.get("no_change", False) is not no_change
         ):
             raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "candidate artifact does not match accepted HEAD")
         payload = _candidate_commit_payload(
             commit_sha=head,
             tree_sha=evidence.staged_tree_sha,
-            parent_sha=parents[0] if parents else None,
+            parent_sha=None if no_change else parents[0],
             branch=ctx.info.branch,
             remote=self._staging_remote,
             immutable_url=_commit_web_url(ctx.repository_reference, head),
@@ -173,7 +178,7 @@ class CandidateLifecycle:
             status=RunStatus.APPROVED, candidate=candidate_state,
             candidate_commit_sha=head, approved_tree_sha=evidence.staged_tree_sha,
             expected_head_sha=head,
-            expected_parent_sha=parents[0] if parents else None,
+            expected_parent_sha=None if no_change else parents[0],
             expected_tree_sha=evidence.staged_tree_sha, next_step_id=None,
         )
         return payload

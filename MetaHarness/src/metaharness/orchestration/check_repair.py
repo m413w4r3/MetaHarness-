@@ -36,6 +36,7 @@ from .shared import (
 )
 from ..evidence import (
     EvidenceBundle,
+    required_checks_passed,
     SECRET_IN_DIFF,
     SECRET_IN_STAGED_BLOB,
     UNREVIEWABLE_TEXT_DIFF,
@@ -607,8 +608,17 @@ class GateAcceptanceService:
         self, store: Any, ctx: Any, cycle_plan: Any, stage: GateStage,
         evidence: EvidenceBundle, *, base_paths: Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        if not evidence.deterministic_passed or evidence.staged_tree_sha is None:
+        if (
+            not evidence.deterministic_passed
+            or not required_checks_passed(evidence)
+            or evidence.staged_tree_sha is None
+        ):
             raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
+        no_change = not evidence.changed_files
+        if no_change and (evidence.diff != "" or evidence.base_sha != ctx.base_sha):
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", "no-change evidence is not bound to the run base",
+            )
         worktree = ctx.info.worktree
         directory = gate_dir(ctx.run_dir, cycle_plan.cycle, stage)
         directory.mkdir(parents=True, exist_ok=True)
@@ -641,6 +651,14 @@ class GateAcceptanceService:
                 or not isinstance(stored_no_change, bool)
                 or not parent_valid
                 or stored_no_change is not (not evidence.changed_files)
+                or (
+                    stored_no_change
+                    and (
+                        stored_parent is not None
+                        or stored.get("commit_created") is not False
+                        or stored.get("acceptance_kind") != "existing-head"
+                    )
+                )
                 or stored.get("stage") != stage.value
                 or stored.get("acceptance_kind") not in {"existing-head", "repair", "semantic-revision"}
                 or not isinstance(stored.get("commit_created"), bool)
@@ -657,8 +675,9 @@ class GateAcceptanceService:
                 raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted gate HEAD moved")
             if (
                 resolve_tree(worktree, stored["commit_sha"]) != stored["tree_sha"]
-                or commit_parents(worktree, stored["commit_sha"]) != (
-                    (stored["parent_sha"],) if stored["parent_sha"] is not None else ()
+                or (
+                    not stored_no_change
+                    and commit_parents(worktree, stored["commit_sha"]) != (stored["parent_sha"],)
                 )
             ):
                 raise PipelineFailure(
@@ -684,12 +703,15 @@ class GateAcceptanceService:
         )
         head = current_head(worktree)
         current_tree = resolve_tree(worktree, head)
+        if no_change and current_tree != evidence.staged_tree_sha:
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", "no-change HEAD tree differs from gate evidence",
+            )
         if current_tree == evidence.staged_tree_sha:
-            parents = commit_parents(worktree, head)
-            no_change = not evidence.changed_files
-            if len(parents) not in ({0} if no_change else {1}):
+            parents = () if no_change else commit_parents(worktree, head)
+            if not no_change and len(parents) != 1:
                 raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted HEAD has no single parent")
-            commit_sha, parent_sha = head, parents[0] if parents else None
+            commit_sha, parent_sha = head, None if no_change else parents[0]
             parent_tree = resolve_tree(worktree, parent_sha) if parent_sha else None
             attempts = self._check_repair_attempts(
                 ctx.run_dir, cycle_plan.cycle.number, stage,

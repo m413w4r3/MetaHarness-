@@ -3385,11 +3385,20 @@ class Orchestrator:
             or payload.get("tree_sha") != evidence.staged_tree_sha
             or payload.get("commit_sha") != current
             or current_tree != evidence.staged_tree_sha
-            or parents != (
-                (payload.get("parent_sha"),)
-                if payload.get("parent_sha") is not None else ()
+            or (
+                payload.get("no_change") is not True
+                and parents != (payload.get("parent_sha"),)
             )
             or not isinstance(payload.get("no_change", False), bool)
+            or (
+                payload.get("no_change") is True
+                and (
+                    payload.get("parent_sha") is not None
+                    or evidence.diff != ""
+                    or bool(evidence.changed_files)
+                    or payload.get("commit_created") is not False
+                )
+            )
             or (
                 payload.get("parent_sha") is None
                 and (
@@ -3981,9 +3990,9 @@ class Orchestrator:
             symbolic_head(ctx.info.worktree) != ctx.branch_ref
             or current != stored_candidate.get("commit_sha")
             or current_tree != stored_candidate.get("tree_sha")
-            or parents != (
-                (stored_candidate.get("parent_sha"),)
-                if stored_candidate.get("parent_sha") is not None else ()
+            or (
+                stored_candidate.get("no_change") is not True
+                and parents != (stored_candidate.get("parent_sha"),)
             )
         ):
             integrity("local immutable candidate identity no longer matches")
@@ -4001,6 +4010,13 @@ class Orchestrator:
             or durable_evidence.changed_files != supplied_evidence.changed_files
             or durable_evidence.diff != supplied_evidence.diff
             or stored_candidate.get("no_change", False) is not (not durable_evidence.changed_files)
+            or (
+                stored_candidate.get("no_change") is True
+                and (
+                    stored_candidate.get("parent_sha") is not None
+                    or durable_evidence.diff != ""
+                )
+            )
             or _required_checks_summary(durable_evidence) != _required_checks_summary(supplied_evidence)
         ):
             integrity("durable gate evidence is missing, failed, or differs from the reviewed evidence")

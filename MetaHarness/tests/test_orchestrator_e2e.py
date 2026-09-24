@@ -759,6 +759,59 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.assertIn(empty["no_change_candidate_sha"], reviewer_prompt)
         self.assertIn('"required_check_ids": [\n    "test"', reviewer_prompt)
 
+    def test_no_change_preserves_existing_head_with_any_base_ancestry(self) -> None:
+        no_change_review = PASS_REVIEW.replace(
+            "SUMMARY: The implementation is acceptable.",
+            "SUMMARY: SPEC_ALREADY_SATISFIED: the requested feature already exists.",
+        )
+        branch = git(self.repo, "branch", "--show-current")
+        bases = [("root", self.base_sha)]
+        for name in ("B", "C"):
+            (self.repo / "README.md").write_text(name + "\n", encoding="utf-8")
+            git(self.repo, "add", "README.md")
+            git(self.repo, "commit", "-qm", name)
+            bases.append((name, git(self.repo, "rev-parse", "HEAD")))
+        git(self.repo, "checkout", "-qb", "side", bases[1][1])
+        (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
+        git(self.repo, "add", "side.txt")
+        git(self.repo, "commit", "-qm", "side")
+        git(self.repo, "checkout", "-q", branch)
+        git(self.repo, "merge", "-q", "--no-ff", "side", "-m", "merge")
+        bases.append(("merge", git(self.repo, "rev-parse", "HEAD")))
+
+        for name, base in bases:
+            with self.subTest(base=name):
+                git(self.repo, "checkout", "-q", branch)
+                git(self.repo, "reset", "--hard", "-q", base)
+                _, llm, state = self.run_case(
+                    codex_behavior="none", review=no_change_review, run_id=f"empty-{name}",
+                )
+                worktree = self.root / "worktrees" / f"empty-{name}"
+                run_dir = self.root / "runs" / f"empty-{name}"
+                candidate = json.loads((run_dir / "cycles/001/candidate/commit.json").read_text())
+                accepted = json.loads((run_dir / "cycles/001/checks/post-implementation/accepted.json").read_text())
+                self.assertEqual(state["status"], RunStatus.COMMITTED.value, state.get("failure"))
+                self.assertEqual(git(worktree, "rev-parse", "HEAD"), base)
+                self.assertEqual(candidate["commit_sha"], base)
+                self.assertIsNone(candidate["parent_sha"])
+                self.assertEqual(candidate["remote_status"], "not_required")
+                self.assertIsNone(accepted["parent_sha"])
+                self.assertFalse(accepted["commit_created"])
+                self.assertFalse((run_dir / "accepted-chain.json").exists())
+                self.assertEqual(state["no_change_candidate_sha"], base)
+                self.assertEqual(state["reviewed_candidate_sha"], base)
+                self.assertEqual(state["approved_tree_sha"], git(worktree, "rev-parse", "HEAD^{tree}"))
+                self.assertIsNone(state["commit_sha"])
+                self.assertFalse(state["published"])
+                self.assertEqual(llm.reviewer_calls, 1)
+
+    def test_no_change_requires_green_check_and_explicit_review(self) -> None:
+        _, llm, red = self.run_case(codex_behavior="none", check_fail=True, run_id="empty-red")
+        self.assertNotEqual(red["status"], RunStatus.COMMITTED.value)
+        self.assertEqual(llm.reviewer_calls, 0)
+        _, _, vague = self.run_case(codex_behavior="none", run_id="empty-vague")
+        self.assertNotEqual(vague["status"], RunStatus.COMMITTED.value)
+
     def test_changes_after_review_never_reach_the_reviewed_commit(self) -> None:
         # The reviewed artifact is the immutable candidate commit: later
         # index, worktree or untracked edits are not part of what is kept.

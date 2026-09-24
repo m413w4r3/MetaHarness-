@@ -58,7 +58,7 @@ from ..approval import (
     read_plan_approval,
     read_scope_approval,
 )
-from ..evidence import EvidenceBundle
+from ..evidence import EvidenceBundle, required_checks_passed
 from ..execution_selection import (
     ExecutionSelectionError,
     read_cycle_execution_selection,
@@ -468,8 +468,24 @@ def _validate_gate_acceptance(
         or payload.get("commit_sha") != head
         or payload.get("acceptance_kind") not in {"existing-head", "repair", "semantic-revision"}
         or not isinstance(payload.get("commit_created"), bool)
+        or (
+            no_change
+            and (
+                parent_sha is not None
+                or payload.get("commit_created") is not False
+                or payload.get("acceptance_kind") != "existing-head"
+            )
+        )
         or payload.get("mutable_scope") != list(authority.effective_paths)
         or payload.get("mutable_scope_sha256") != authority.sha256
+        or (
+            no_change
+            and (
+                evidence is None or evidence.diff != ""
+                or not evidence.deterministic_passed
+                or not required_checks_passed(evidence)
+            )
+        )
         or (
             payload.get("schema_version") == 2
             and payload.get("evidence_sha256") != evidence_sha256
@@ -1107,7 +1123,10 @@ def validate_resume(
             )
             if (
                 resolve_tree(repo, record["commit_sha"]) != record["tree_sha"]
-                or commit_parents(repo, record["commit_sha"]) != earlier_parents
+                or (
+                    record.get("no_change") is not True
+                    and commit_parents(repo, record["commit_sha"]) != earlier_parents
+                )
                 or not is_ancestor(repo, record["commit_sha"], head)
             ):
                 _refuse(f"cycle {earlier:03d} candidate record is not in the run history")
@@ -1123,13 +1142,26 @@ def validate_resume(
             )
             evidence = candidate_evidence(run_dir, number)
             if (
-                candidate_parents != expected_candidate_parents
+                (
+                    candidate.get("no_change") is not True
+                    and candidate_parents != expected_candidate_parents
+                )
                 or (
                     candidate.get("parent_sha") is None
                     and (
                         candidate.get("no_change") is not True
                         or evidence is None
                         or bool(evidence.changed_files)
+                    )
+                )
+                or (
+                    candidate.get("no_change") is True
+                    and (
+                        candidate.get("parent_sha") is not None
+                        or evidence is None or evidence.diff != ""
+                        or evidence.base_sha != base_sha
+                        or not evidence.deterministic_passed
+                        or not required_checks_passed(evidence)
                     )
                 )
             ):
