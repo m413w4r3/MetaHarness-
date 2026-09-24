@@ -4,6 +4,10 @@ The gateway is always reached at ``127.0.0.1``: the host is a module
 constant and callers cannot substitute another one.  The client follows no
 redirect, caps every response, and never logs bodies or headers.  Failure
 messages repeat neither the control token nor response content.
+
+A mutation method performs exactly one local request and returns the local
+``(status, payload)`` unchanged: it never retries and never turns a non-2xx
+answer into an exception, so a relaying caller can never replay a mutation.
 """
 
 from __future__ import annotations
@@ -93,6 +97,49 @@ class LocalMetaHarnessClient:
         position = _validated_offset(offset)
         return self._object(
             self._request_json("GET", f"{_API_PREFIX}/runs/{target}/progress?offset={position}")
+        )
+
+    def create_run(self, payload: dict[str, object]) -> tuple[int, object]:
+        """Create a run with exactly one local POST; nothing is retried.
+
+        The local status and JSON body are returned unchanged so a caller
+        that relays them never repeats the mutation.
+        """
+
+        return self._request_json("POST", f"{_API_PREFIX}/runs", payload)
+
+    def approve_run(self, run_id: str, payload: dict[str, object]) -> tuple[int, object]:
+        """Approve or reject the plan of *run_id* with one local POST."""
+
+        target = _validated_run_id(run_id)
+        return self._request_json(
+            "POST", f"{_API_PREFIX}/runs/{target}/approval", payload
+        )
+
+    def approve_scope(self, run_id: str, decision: str) -> tuple[int, object]:
+        """Answer the scope gate of *run_id* with one local POST."""
+
+        target = _validated_run_id(run_id)
+        if decision not in ("APPROVE", "REJECT"):
+            raise ValueError("decision must be APPROVE or REJECT")
+        return self._request_json(
+            "POST", f"{_API_PREFIX}/runs/{target}/scope-approval", {"decision": decision}
+        )
+
+    def resume_run(self, run_id: str) -> tuple[int, object]:
+        """Resume *run_id* with one local POST carrying exactly ``{}``."""
+
+        target = _validated_run_id(run_id)
+        return self._request_json("POST", f"{_API_PREFIX}/runs/{target}/resume", {})
+
+    def recover_plan(self, run_id: str, plan: str) -> tuple[int, object]:
+        """Replace the plan of *run_id* with one local POST."""
+
+        target = _validated_run_id(run_id)
+        if not isinstance(plan, str):
+            raise ValueError("plan must be a string")
+        return self._request_json(
+            "POST", f"{_API_PREFIX}/runs/{target}/recover-plan", {"plan": plan}
         )
 
     def _request_json(

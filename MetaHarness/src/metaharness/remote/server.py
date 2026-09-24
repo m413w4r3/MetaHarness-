@@ -1,4 +1,4 @@
-"""Read-only HTTP gateway in front of a local MetaHarness server.
+"""HTTP gateway in front of a local MetaHarness server.
 
 The gateway always binds ``127.0.0.1``: network exposure belongs to Tailscale
 Serve, so no host is configurable and no CORS header is ever emitted.  Every
@@ -7,10 +7,11 @@ read from ``remote_token_file``.  The request line is never logged, echoed or
 forwarded: each allowlisted ``/v1`` route maps to exactly one MetaHarness
 target, and an unknown route or method never reaches the local server.
 
-This phase is read-only.  The control token is loaded at startup so a broken
-deployment fails before the first request, and is held for the mutation routes
-that are not implemented yet; it is never sent to MetaHarness and never leaves
-the process.
+The observation routes are read-only.  The five mutation routes are validated
+and translated here, then sent to MetaHarness by exactly one loopback request
+carrying ``X-MetaHarness-Token``: the remote bearer token is never forwarded,
+no mutation is ever retried, and the local status and JSON body are relayed
+unchanged.
 """
 
 from __future__ import annotations
@@ -21,24 +22,61 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from ..plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
+from ..step_ids import is_step_id
 from .auth import bearer_token_from_header, load_token_file, token_matches
-from .client import LOCAL_HOST, MAX_RESPONSE_BYTES
+from .client import (
+    LOCAL_HOST,
+    MAX_RESPONSE_BYTES,
+    LocalMetaHarnessClient,
+    LocalMetaHarnessError,
+)
 
 DEFAULT_METAHARNESS_PORT = 8765
 
 # A longer offset cannot be an index into any run and would make int() raise.
 _MAX_OFFSET_DIGITS = 18
 _UPSTREAM_TIMEOUT_SECONDS = 10.0
+# Request bodies of the mutation routes: 64 KiB, and the room the local
+# server itself reserves for a replacement plan after JSON encoding.
+_MAX_BODY_BYTES = 64 * 1024
+_MAX_RECOVERY_BODY_BYTES = 4 * MAX_REPLACEMENT_PLAN_BYTES
 _FIXED_TARGETS = {
     "/v1/health": "/api/v1/health",
     "/v1/config": "/api/v1/config",
     "/v1/model-profiles": "/api/v1/model-profiles",
     "/v1/runs": "/api/v1/runs",
 }
+_MUTATION_SUFFIXES = ("approval", "scope-approval", "resume", "recover-plan")
+# The statuses a mutation relays from MetaHarness; any other status, and any
+# non-object body, is reported as an upstream failure instead.
+_RELAYED_STATUSES = frozenset({200, 202, 400, 403, 404, 409, 413, 500, 503})
+_CREATE_FIELDS = frozenset({
+    "spec", "run_id", "planner_profile", "mechanical_profile",
+    "reasoning_profile", "agentic_profile", "final_reviewer_profile",
+    "semantic_reviser_profile", "check_repair_profile",
+    "semantic_revision_enabled", "max_check_repair_attempts",
+    "max_review_repair_cycles", "decomposition", "execution_mode_policy",
+    "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
+    "repair_scope_policy", "repair_scope_max_added_paths",
+})
+_APPROVAL_FIELDS = frozenset({
+    "decision", "final_reviewer_profile", "semantic_reviser_profile",
+    "check_repair_profile", "step_profiles",
+})
+_APPROVAL_PROFILE_FIELDS = (
+    "final_reviewer_profile", "semantic_reviser_profile", "check_repair_profile",
+)
+_DECISIONS = ("APPROVE", "REJECT")
 # Sending any of these could escape the single path component the local
 # server expects; run-id policy beyond that stays owned by MetaHarness.
 _RUN_ID_REFUSED = ("/", "\\", "..", "%", "\x00")
 _UNAUTHORIZED_PAYLOAD = {"error": "unauthorized", "message": "authentication required"}
+_UPSTREAM_ERROR_PAYLOAD = {
+    "error": "upstream_error",
+    "message": "local MetaHarness request failed",
+}
+_METHOD_MESSAGE = "method not allowed for this route"
 
 
 class _RouteError(Exception):
@@ -99,6 +137,113 @@ def _ascii_digits(value: str) -> bool:
     )
 
 
+def _mutation_target(path: str) -> tuple[str, str, int]:
+    """Return ``(action, run_id, max_body_bytes)`` of a ``POST`` route."""
+
+    if path == "/v1/runs":
+        return "create", "", _MAX_BODY_BYTES
+    parts = path.split("/")
+    if len(parts) == 5 and parts[:3] == ["", "v1", "runs"] and parts[4] in _MUTATION_SUFFIXES:
+        action = parts[4]
+        limit = _MAX_RECOVERY_BODY_BYTES if action == "recover-plan" else _MAX_BODY_BYTES
+        return action, _run_id(parts[3]), limit
+    if _read_route(path):
+        raise _RouteError(405, "method_not_allowed", _METHOD_MESSAGE)
+    raise _RouteError(404, "not_found", "unknown route")
+
+
+def _read_route(path: str) -> bool:
+    """True for the path shapes the read-only ``GET`` routes answer."""
+
+    if path in _FIXED_TARGETS:
+        return True
+    parts = path.split("/")
+    if len(parts) == 4 and parts[:3] == ["", "v1", "runs"]:
+        return bool(parts[3])
+    return (
+        len(parts) == 5
+        and parts[:3] == ["", "v1", "runs"]
+        and bool(parts[3])
+        and parts[4] == "progress"
+    )
+
+
+def _create_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Refuse an unknown creation field or a missing spec before any call."""
+
+    if set(payload) - _CREATE_FIELDS:
+        raise _RouteError(400, "invalid_request", "unknown request field")
+    spec = payload.get("spec")
+    if not isinstance(spec, str) or not spec.strip():
+        raise _RouteError(400, "invalid_request", "spec must be a non-empty string")
+    return payload
+
+
+def _approval_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Translate the external approval contract into the local field names."""
+
+    decision = payload.get("decision")
+    if decision not in _DECISIONS:
+        raise _RouteError(400, "invalid_request", "decision must be APPROVE or REJECT")
+    if set(payload) - _APPROVAL_FIELDS:
+        raise _RouteError(400, "invalid_request", "unknown approval field")
+    local: dict[str, object] = {"decision": decision}
+    if decision == "REJECT":
+        # A rejection needs no profile: the known profile fields are dropped
+        # rather than forwarded to a local route that would refuse them.
+        return local
+    for name in _APPROVAL_PROFILE_FIELDS:
+        value = payload.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value:
+            raise _RouteError(400, "invalid_request", f"{name} is invalid")
+        local[name] = value
+    step_profiles = payload.get("step_profiles")
+    if step_profiles is None:
+        return local
+    if not isinstance(step_profiles, dict):
+        raise _RouteError(400, "invalid_request", "step_profiles must be a JSON object")
+    for step_id, profile_id in step_profiles.items():
+        # The step IDs of an approval are plan step IDs, never free text:
+        # they build local field names, so only the exact form is accepted.
+        if not is_step_id(step_id) or not isinstance(profile_id, str) or not profile_id:
+            raise _RouteError(400, "invalid_request", "invalid step profile field")
+        local[f"step_profile__{step_id}"] = profile_id
+    return local
+
+
+def _scope_decision(payload: dict[str, object]) -> str:
+    """Return the single decision of an exact scope-approval body."""
+
+    decision = payload.get("decision")
+    if set(payload) != {"decision"} or decision not in _DECISIONS:
+        raise _RouteError(400, "invalid_request", "decision must be APPROVE or REJECT")
+    return decision
+
+
+def _require_empty_body(payload: dict[str, object]) -> None:
+    if payload:
+        raise _RouteError(400, "invalid_request", "resume body must be an empty JSON object")
+
+
+def _plan_text(payload: dict[str, object]) -> str:
+    if set(payload) != {"plan"} or not isinstance(payload.get("plan"), str):
+        raise _RouteError(400, "invalid_request", "body must contain exactly one plan string")
+    return payload["plan"]  # type: ignore[return-value]
+
+
+def _reject_duplicate_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    # The local body reader refuses duplicated JSON fields; the gateway
+    # refuses them too so a field can never be shadowed after validation.
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicated JSON field")
+        result[key] = value
+    return result
+
+
 def _upstream_json(port: int, target: str) -> tuple[int, object]:
     """Return ``(status, decoded JSON)`` of one loopback MetaHarness ``GET``."""
 
@@ -133,19 +278,24 @@ class _RemoteGatewayServer(ThreadingHTTPServer):
     remote_token: str
     control_token: str
     metaharness_port: int
+    local_client: LocalMetaHarnessClient
 
 
 class _GatewayRequestHandler(BaseHTTPRequestHandler):
     """One remote request; every response is JSON.
 
-    ``protocol_version`` stays at the HTTP/1.0 default: request bodies are
-    never read, so a kept-alive connection could not be resynchronised.
+    ``protocol_version`` stays at the HTTP/1.0 default: a mutation reads
+    exactly the body length it was given, so a kept-alive connection could
+    not be resynchronised.
     ``default_request_version`` is HTTP/1.0 as well, so a legacy or malformed
     request line never receives an HTTP/0.9 body without status line.
     """
 
     server: _RemoteGatewayServer
     default_request_version = "HTTP/1.0"
+    # A mutation reads its declared request body, so a stalled client must
+    # not hold a handler thread forever.
+    timeout = _UPSTREAM_TIMEOUT_SECONDS
 
     def log_message(self, *_args: object) -> None:
         # BaseHTTPRequestHandler logs the request line, URL included; the
@@ -167,7 +317,8 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
 
     def __getattr__(self, name: str) -> object:
         # Verbs BaseHTTPRequestHandler does not implement would otherwise be
-        # answered with 501; this gateway answers 405 to every non-GET verb.
+        # answered with 501; this gateway answers 405 to every unsupported
+        # verb.
         if name.startswith("do_"):
             return self._method_not_allowed
         raise AttributeError(name)
@@ -185,12 +336,73 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
         try:
             status, payload = _upstream_json(self.server.metaharness_port, target)
         except _UpstreamError:
-            self._json(
-                502,
-                {"error": "upstream_error", "message": "local MetaHarness request failed"},
-            )
+            self._json(502, _UPSTREAM_ERROR_PAYLOAD)
             return
         self._json(status, payload)
+
+    def do_POST(self) -> None:
+        # Authentication is checked before routing so an unauthenticated
+        # caller learns nothing about the routes this gateway serves.
+        if not self._authorized():
+            self._json(401, _UNAUTHORIZED_PAYLOAD)
+            return
+        try:
+            action, run_id, max_bytes = _mutation_target(urlsplit(self.path).path)
+            payload = self._body(max_bytes)
+            status, response = self._mutate(action, run_id, payload)
+        except _RouteError as error:
+            self._json(error.status, {"error": error.error, "message": error.message})
+            return
+        except LocalMetaHarnessError:
+            self._json(502, _UPSTREAM_ERROR_PAYLOAD)
+            return
+        if status not in _RELAYED_STATUSES or not isinstance(response, dict):
+            self._json(502, _UPSTREAM_ERROR_PAYLOAD)
+            return
+        self._json(status, response)
+
+    def _mutate(
+        self, action: str, run_id: str, payload: dict[str, object]
+    ) -> tuple[int, object]:
+        """Validate, translate and send exactly one local mutation.
+
+        The control client is the only path to MetaHarness and knows neither
+        the remote bearer token nor any other caller header.  Exactly one
+        request is sent here: nothing is retried, ever.
+        """
+
+        client = self.server.local_client
+        if action == "create":
+            return client.create_run(_create_payload(payload))
+        if action == "approval":
+            return client.approve_run(run_id, _approval_payload(payload))
+        if action == "scope-approval":
+            return client.approve_scope(run_id, _scope_decision(payload))
+        if action == "resume":
+            _require_empty_body(payload)
+            return client.resume_run(run_id)
+        return client.recover_plan(run_id, _plan_text(payload))
+
+    def _body(self, max_bytes: int) -> dict[str, object]:
+        """Read the single bounded JSON object of a mutation request."""
+
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length) if raw_length is not None else 0
+        except ValueError:
+            raise _RouteError(400, "invalid_request", "invalid request body") from None
+        if length < 0 or length > max_bytes:
+            raise _RouteError(413, "body_too_large", "request body is too large")
+        try:
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ValueError("short body")
+            payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_fields)
+        except (OSError, UnicodeError, ValueError):
+            raise _RouteError(400, "invalid_request", "body must be valid JSON") from None
+        if not isinstance(payload, dict):
+            raise _RouteError(400, "invalid_request", "body must be a JSON object")
+        return payload
 
     def _method_not_allowed(self) -> None:
         # Authentication is checked before the method so an unauthenticated
@@ -198,7 +410,7 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json(401, _UNAUTHORIZED_PAYLOAD)
             return
-        self._json(405, {"error": "method_not_allowed", "message": "only GET is supported"})
+        self._json(405, {"error": "method_not_allowed", "message": _METHOD_MESSAGE})
 
     def _authorized(self) -> bool:
         values = self.headers.get_all("Authorization") or []
@@ -235,7 +447,8 @@ def create_remote_gateway(
 
     The host is the module constant ``127.0.0.1`` and is not a parameter.
     ``port`` 0 selects an ephemeral loopback port.  Both token files are read
-    eagerly so a broken deployment fails before the first request.
+    eagerly so a broken deployment fails before the first request, and the
+    control client is built once from the validated control token.
     """
 
     remote_token = load_token_file(remote_token_file)
@@ -246,6 +459,11 @@ def create_remote_gateway(
     server.remote_token = remote_token
     server.control_token = control_token
     server.metaharness_port = _validated_port(metaharness_port)
+    server.local_client = LocalMetaHarnessClient(
+        port=server.metaharness_port,
+        control_token=control_token,
+        timeout_seconds=_UPSTREAM_TIMEOUT_SECONDS,
+    )
     return server
 
 
@@ -256,7 +474,7 @@ def serve_remote_gateway(
     control_token_file: str | Path,
     metaharness_port: int = DEFAULT_METAHARNESS_PORT,
 ) -> None:
-    """Serve the read-only gateway on ``127.0.0.1:port`` until interrupted."""
+    """Serve the gateway on ``127.0.0.1:port`` until interrupted."""
 
     server = create_remote_gateway(
         port=port,

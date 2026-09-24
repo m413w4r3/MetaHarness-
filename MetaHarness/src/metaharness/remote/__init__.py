@@ -1,7 +1,8 @@
 """Remote gateway primitives.
 
 The package holds the token helpers, the local control client, and the
-read-only gateway that exposes the local MetaHarness API to a remote client.
+gateway that exposes the observation routes and the five control mutations
+of the local MetaHarness API to a remote client.
 """
 
 from .auth import (
