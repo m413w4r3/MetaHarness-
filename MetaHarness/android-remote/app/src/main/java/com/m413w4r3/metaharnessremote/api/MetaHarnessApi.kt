@@ -8,6 +8,7 @@ import com.google.gson.JsonParser
 import com.google.gson.JsonPrimitive
 import com.m413w4r3.metaharnessremote.network.GatewayUrls
 import java.io.IOException
+import java.io.InterruptedIOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -17,14 +18,15 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
 /**
- * Read-only client of the MetaHarness Remote gateway (`/v1` routes).
+ * Client of the MetaHarness Remote gateway (`/v1` routes).
  *
  * Every request carries `Authorization: Bearer <remoteToken>` and
  * `Accept: application/json`, and a request with a body also carries
  * `Content-Type: application/json`. Each call performs exactly one exchange:
  * nothing is retried, and the injected [OkHttpClient] owns timeouts, redirects
- * and connection reuse. Failures raise [MetaHarnessException]; the remote
- * token is never copied into one.
+ * and connection reuse. Failures raise [MetaHarnessException], a call that got
+ * no answer in time raises [MetaHarnessTimeoutException]; the remote token is
+ * never copied into either.
  */
 class MetaHarnessApi(
     baseUrl: String,
@@ -62,6 +64,39 @@ class MetaHarnessApi(
         return get("${runPath(runId)}/progress?offset=$offset", ProgressResponse::class.java)
     }
 
+    /**
+     * `POST /v1/runs` with [spec] and, when it is not blank, [runId].
+     *
+     * The run id is optional: an empty one is left out of the payload so the
+     * gateway generates it. Exactly one exchange is sent — nothing is retried,
+     * because a create that timed out may still have created the run, which is
+     * what [MetaHarnessTimeoutException] reports.
+     */
+    suspend fun createRun(spec: String, runId: String?): CreateRunResponse {
+        require(spec.trim().isNotEmpty()) { "spec must not be empty" }
+        require(spec.toByteArray(Charsets.UTF_8).size <= MAX_SPEC_BYTES) { "spec is too large" }
+        val selectedRunId = runId?.trim()?.takeIf { it.isNotEmpty() }
+        require(selectedRunId == null || RUN_ID_PATTERN.matches(selectedRunId)) { "invalid run id" }
+
+        val document = post(RUNS_PATH, createRunBody(spec, selectedRunId), CreateRunDocument::class.java)
+        val createdRunId = document.runId?.trim().orEmpty()
+        if (!RUN_ID_PATTERN.matches(createdRunId)) {
+            throw MetaHarnessException(
+                statusCode = null,
+                message = "The gateway replied without a run id",
+            )
+        }
+        return CreateRunResponse(createdRunId)
+    }
+
+    /** The body of `POST /v1/runs`: the spec, and the run id unless it is null. */
+    internal fun createRunBody(spec: String, runId: String?): String {
+        val payload = JsonObject()
+        payload.addProperty("spec", spec)
+        if (runId != null) payload.addProperty("run_id", runId)
+        return gson.toJson(payload)
+    }
+
     /** `GET <baseUrl><path>` with the bearer token and the JSON accept header. */
     internal fun getRequest(path: String): Request = requestBuilder(path).get().build()
 
@@ -78,14 +113,19 @@ class MetaHarnessApi(
             .header(AUTHORIZATION, "Bearer $remoteToken")
             .header(ACCEPT, "application/json")
 
-    private suspend fun <T> get(path: String, type: Class<T>): T = withContext(Dispatchers.IO) {
+    private suspend fun <T> call(request: Request, type: Class<T>): T = withContext(Dispatchers.IO) {
         val response = try {
-            httpClient.newCall(getRequest(path)).execute()
+            httpClient.newCall(request).execute()
         } catch (io: IOException) {
             throw requestFailure(io)
         }
         response.use { read(it, type) }
     }
+
+    private suspend fun <T> get(path: String, type: Class<T>): T = call(getRequest(path), type)
+
+    private suspend fun <T> post(path: String, body: String, type: Class<T>): T =
+        call(postRequest(path, body), type)
 
     private fun <T> read(response: Response, type: Class<T>): T {
         val body = readBody(response)
@@ -141,6 +181,11 @@ class MetaHarnessApi(
     }
 
     private fun requestFailure(io: IOException): MetaHarnessException {
+        // A timeout is not a failure: the request was sent, so the gateway may
+        // have applied it. The caller is told the outcome is unknown.
+        if (io is InterruptedIOException) {
+            return MetaHarnessTimeoutException("Response timed out", cause = io)
+        }
         val detail = io.message?.takeIf { it.isNotBlank() } ?: io.javaClass.simpleName
         return MetaHarnessException(
             statusCode = null,
@@ -159,7 +204,7 @@ class MetaHarnessApi(
      */
     private fun runPath(runId: String): String {
         require(
-            RUN_ID.matches(runId) &&
+            RUN_ID_PATTERN.matches(runId) &&
                 !runId.contains("..") &&
                 !runId.endsWith(".") &&
                 !runId.endsWith(".lock")
@@ -173,22 +218,25 @@ class MetaHarnessApi(
         else -> "Gateway replied HTTP $status"
     }
 
-    private companion object {
-        const val HEALTH_PATH = "/v1/health"
-        const val CONFIG_PATH = "/v1/config"
-        const val MODEL_PROFILES_PATH = "/v1/model-profiles"
-        const val RUNS_PATH = "/v1/runs"
+    companion object {
+        /** Largest SPEC `POST /v1/runs` accepts, as the local server measures it. */
+        const val MAX_SPEC_BYTES = 48 * 1024
 
-        const val AUTHORIZATION = "Authorization"
-        const val ACCEPT = "Accept"
-        const val CONTENT_TYPE = "Content-Type"
+        /** The run-id charset the gateway and the local server enforce. */
+        val RUN_ID_PATTERN = Regex("[A-Za-z0-9][A-Za-z0-9_.-]*")
 
-        val JSON_MEDIA_TYPE = "application/json".toMediaType()
+        private const val HEALTH_PATH = "/v1/health"
+        private const val CONFIG_PATH = "/v1/config"
+        private const val MODEL_PROFILES_PATH = "/v1/model-profiles"
+        private const val RUNS_PATH = "/v1/runs"
 
-        /** Matches the gateway's own run-id charset. */
-        val RUN_ID = Regex("[A-Za-z0-9][A-Za-z0-9_.-]*")
+        private const val AUTHORIZATION = "Authorization"
+        private const val ACCEPT = "Accept"
+        private const val CONTENT_TYPE = "Content-Type"
+
+        private val JSON_MEDIA_TYPE = "application/json".toMediaType()
 
         /** The cap the gateway applies to its own responses. */
-        const val MAX_RESPONSE_BYTES = 2L * 1024 * 1024
+        private const val MAX_RESPONSE_BYTES = 2L * 1024 * 1024
     }
 }

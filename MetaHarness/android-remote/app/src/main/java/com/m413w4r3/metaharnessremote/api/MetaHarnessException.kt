@@ -12,9 +12,22 @@ import com.google.gson.JsonElement
  * The remote token is never part of the message, of [payload] or of any other
  * field: this exception can be logged or shown as-is.
  */
-class MetaHarnessException(
+open class MetaHarnessException(
     val statusCode: Int?,
     message: String,
     val payload: JsonElement? = null,
     cause: Throwable? = null,
 ) : Exception(message, cause)
+
+/**
+ * The gateway did not answer before the deadline of the call.
+ *
+ * The request was sent, so a mutation may still have been applied: the
+ * outcome is unknown. That is why this is not a plain failure — a caller must
+ * never retry it on its own — and why even a connect timeout is reported this
+ * way: the client never assumes the gateway did nothing.
+ */
+class MetaHarnessTimeoutException(
+    message: String,
+    cause: Throwable? = null,
+) : MetaHarnessException(statusCode = null, message = message, cause = cause)

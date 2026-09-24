@@ -54,15 +54,43 @@ Runs are grouped by `state.status`:
 Each card shows the run id, the plan title, the status, `updated_at`, the first
 7 characters of the commit SHA and the failure summary (`reason — detail`, the
 way the desktop list renders it). A card in `ACTION REQUIRED` carries the badge,
-and tapping any card hands its run id to a callback: the Run Detail screen
-arrives with a later prompt, as does `+ NEW RUN`.
+and tapping any card hands its run id to a callback. `+ NEW RUN` opens the New
+Run screen; the Run Detail view arrives with a later prompt, so the route it
+will use only shows the run id it was opened with.
 
 The board only ever reads the gateway: nothing is cached on the device, the
 desktop stays the source of authority, and no local database is involved.
 
+## New Run screen
+
+`+ NEW RUN` opens a form with one `SPEC`, one optional `Run ID` and one
+`CREATE RUN` button. A tap validates both fields, then sends exactly one
+`POST /v1/runs`:
+
+* the SPEC must hold text, and at most 48 KiB of UTF-8 bytes;
+* the run id, when the field is not empty, must match
+  `^[A-Za-z0-9][A-Za-z0-9_.-]*$`. An empty field is left out of the payload,
+  so the gateway generates the id.
+
+`submitting = true` is held for the duration of the call and disables the
+button, so a double tap cannot create two runs. A create that succeeds opens
+the Run Detail route with the run id the gateway returned, and the form is
+popped: going back from the run returns to the board, never to a filled-in
+form that could create the run twice.
+
+A create that times out is *not* a failure: the request reached the gateway,
+so the run may exist. Nothing is retried automatically, and the screen says
+exactly that:
+
+```text
+Response timed out.
+The run may have been created.
+Refresh the runs list before trying again.
+```
+
 ## API client
 
-`com.m413w4r3.metaharnessremote.api.MetaHarnessApi` is the read layer over the
+`com.m413w4r3.metaharnessremote.api.MetaHarnessApi` is the client of the
 gateway, built from a `baseUrl`, the in-memory `remoteToken` and an injected
 `OkHttpClient`:
 
@@ -74,9 +102,13 @@ gateway, built from a `baseUrl`, the in-memory `remoteToken` and an injected
 | `listRuns()` | `GET /v1/runs` |
 | `getRun(runId)` | `GET /v1/runs/<run_id>` |
 | `progress(runId, offset)` | `GET /v1/runs/<run_id>/progress?offset=N` |
+| `createRun(spec, runId)` | `POST /v1/runs` |
 
 Every call is one exchange with no retry, carries the bearer token and
 `Accept: application/json`, reads at most 2 MiB, and raises
 `MetaHarnessException(statusCode, message, payload)` on failure without ever
-copying the token. `config()` and `modelProfiles()` stay raw `JsonObject`s and
-`getRun()` returns the raw document, so only the displayed fields are typed.
+copying the token. A call that got no answer in time raises
+`MetaHarnessTimeoutException` instead: the request was sent, so a mutation may
+still have been applied. `config()` and `modelProfiles()` stay raw
+`JsonObject`s and `getRun()` returns the raw document, so only the displayed
+fields are typed.

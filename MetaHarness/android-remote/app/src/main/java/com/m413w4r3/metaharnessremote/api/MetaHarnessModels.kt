@@ -46,5 +46,19 @@ data class ProgressResponse(
  */
 data class RunDetail(val raw: JsonObject)
 
+/**
+ * Answer of `POST /v1/runs`.
+ *
+ * [runId] is the id of the run the gateway created, never blank: the Run
+ * Detail screen opens from it, so an answer without a usable id is a failure
+ * of the call rather than a response without an id.
+ */
+data class CreateRunResponse(val runId: String)
+
 /** Envelope of `GET /v1/runs`. */
 internal data class RunListDocument(val runs: List<RunSummary> = emptyList())
+
+/** Envelope of `POST /v1/runs`, parsed before the created run id is checked. */
+internal data class CreateRunDocument(
+    @SerializedName("run_id") val runId: String? = null,
+)
