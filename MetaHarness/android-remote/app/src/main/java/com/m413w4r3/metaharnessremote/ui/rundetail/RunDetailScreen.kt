@@ -12,12 +12,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -36,6 +38,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -50,6 +53,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.m413w4r3.metaharnessremote.ui.runs.RunCategory
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * Run Detail: one run, and the plan decision it may wait for.
@@ -89,6 +93,7 @@ fun RunDetailScreen(
     val viewModel: RunDetailViewModel =
         viewModel(key = runId, factory = RunDetailViewModel.factory(context, runId))
     val lifecycleOwner = LocalLifecycleOwner.current
+    val coroutineScope = rememberCoroutineScope()
     val state = viewModel.state
     val approvalActions = remember(viewModel) {
         RunApprovalActions(
@@ -130,6 +135,11 @@ fun RunDetailScreen(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
                         )
+                    }
+                },
+                actions = {
+                    TextButton(onClick = { coroutineScope.launch { viewModel.refreshOnce() } }) {
+                        Text("Refresh")
                     }
                 },
             )
@@ -196,16 +206,10 @@ private fun LazyListScope.detailItems(
     state.resume.gate?.let { gate ->
         item(key = "resume") { ResumeCard(gate, state.resume, resumeActions) }
     }
-    detail.failure?.let { failure -> item(key = "failure") { Failure(failure) } }
-    if (detail.overview.isNotEmpty()) {
-        item(key = "overview-title") { SectionTitle("OVERVIEW") }
-        detail.overview.forEach { line ->
-            item(key = "overview:${line.label}") { Field(line.label, line.value) }
-        }
-    }
+    detail.failure?.let { failure -> item(key = "failure") { FailureCard(failure) } }
+    if (detail.overview.isNotEmpty()) item(key = "overview") { OverviewCard(detail.overview) }
     detail.plan?.let { plan ->
-        item(key = "plan-title") { SectionTitle("PLAN") }
-        item(key = "plan") { Body(plan) }
+        item(key = "plan") { PlanCard(plan) }
     }
     item(key = "steps-title") { SectionTitle("IMPLEMENTATION STEPS") }
     if (detail.steps.isEmpty()) {
@@ -214,25 +218,27 @@ private fun LazyListScope.detailItems(
         items(detail.steps, key = { "step:${it.id}" }) { step -> StepCard(step) }
     }
     item(key = "progress-title") {
-        SectionTitle("PROGRESS · offset ${state.progress.offset}")
+        ProgressHeader(state.progress.events.size, state.progress.offset)
     }
     if (state.progress.events.isEmpty()) {
         item(key = "progress-empty") { Note("No progress events yet.", isError = false) }
     } else {
         // Newest first: a polled log is read from its end, without scrolling.
-        items(state.progress.events.asReversed()) { event -> Body(event, mono = true) }
+        items(state.progress.events.asReversed()) { event -> ProgressEventCard(event) }
     }
 }
 
 @Composable
 private fun Header(runId: String) {
-    Text(
-        text = runId.ifBlank { DASH },
-        style = MaterialTheme.typography.titleMedium,
-        fontFamily = FontFamily.Monospace,
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis,
-    )
+    SelectionContainer {
+        Text(
+            text = runId.ifBlank { DASH },
+            style = MaterialTheme.typography.titleMedium,
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
 }
 
 /**
@@ -287,7 +293,10 @@ private fun ApprovalCard(approval: RunApprovalUiState, actions: RunApprovalActio
     val gate = approval.gate ?: return
     val profiles = approval.profiles
     val selection = approval.selection
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
         Column(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -493,7 +502,10 @@ private fun RejectPlanDialog(
  */
 @Composable
 private fun ScopeApprovalCard(gate: ScopeGate, scope: RunScopeUiState, actions: RunScopeActions) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
         Column(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -554,7 +566,10 @@ private fun ScopeApprovalCard(gate: ScopeGate, scope: RunScopeUiState, actions: 
  */
 @Composable
 private fun ResumeCard(gate: ResumeGate, resume: RunResumeUiState, actions: RunResumeActions) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
         Column(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -633,7 +648,10 @@ private fun RecoverPlanCard(
     recovery: RunRecoveryUiState,
     actions: RunRecoveryActions,
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
         Column(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -727,7 +745,25 @@ private fun StateCard(detail: RunDetailView, pollingStopped: Boolean) {
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Field("STATUS", detail.status ?: DASH, color = statusColor(detail.status))
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = "STATUS",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = detail.status ?: DASH,
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = statusColor(detail.status),
+                )
+                statusDescription(detail.status)?.let { description ->
+                    Text(
+                        text = description,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = statusColor(detail.status),
+                    )
+                }
+            }
             detail.planTitle?.let { title -> Field("PLAN TITLE", title) }
             Field("CYCLE", detail.cycle?.toString() ?: DASH)
             Field("CANDIDATE SHA", detail.candidateSha ?: DASH, mono = true)
@@ -786,6 +822,77 @@ private fun SectionTitle(text: String) {
 }
 
 @Composable
+private fun FailureCard(failure: String) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("FAILURE", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onErrorContainer)
+            Text(
+                text = failure,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+        }
+    }
+}
+
+@Composable
+private fun OverviewCard(lines: List<OverviewLine>) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SectionTitle("OVERVIEW")
+            lines.forEach { line -> Field(line.label, line.value) }
+        }
+    }
+}
+
+@Composable
+private fun PlanCard(plan: String) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SectionTitle("PLAN")
+            Body(plan)
+        }
+    }
+}
+
+@Composable
+private fun ProgressHeader(eventCount: Int, offset: Long) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        SectionTitle("PROGRESS")
+        Text(
+            text = "$eventCount events · offset $offset",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun ProgressEventCard(event: String) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Body(event, mono = true)
+        }
+    }
+}
+
+@Composable
 private fun Field(
     label: String,
     value: String,
@@ -798,22 +905,34 @@ private fun Field(
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Text(
-            text = value,
-            style = MaterialTheme.typography.bodyMedium,
-            fontFamily = if (mono) FontFamily.Monospace else null,
-            color = color,
-        )
+        if (mono) {
+            SelectionContainer {
+                Text(
+                    text = value,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontFamily = FontFamily.Monospace,
+                    color = color,
+                )
+            }
+        } else {
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodyMedium,
+                color = color,
+            )
+        }
     }
 }
 
 @Composable
 private fun Body(text: String, mono: Boolean = false) {
-    Text(
-        text = text,
-        style = MaterialTheme.typography.bodySmall,
-        fontFamily = if (mono) FontFamily.Monospace else null,
-    )
+    SelectionContainer {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = if (mono) FontFamily.Monospace else null,
+        )
+    }
 }
 
 @Composable
@@ -839,6 +958,14 @@ private fun statusColor(status: String?): Color = when (RunCategory.of(status)) 
     RunCategory.ACTION_REQUIRED, RunCategory.FAILED -> MaterialTheme.colorScheme.error
     RunCategory.ACTIVE -> MaterialTheme.colorScheme.primary
     RunCategory.COMPLETED, RunCategory.OTHER -> MaterialTheme.colorScheme.onSurface
+}
+
+private fun statusDescription(status: String?): String? = when (RunCategory.of(status)) {
+    RunCategory.ACTION_REQUIRED -> "Action required"
+    RunCategory.COMPLETED -> "Completed"
+    RunCategory.FAILED -> "Failed"
+    RunCategory.ACTIVE -> "Running"
+    RunCategory.OTHER -> null
 }
 
 private const val DASH = "—"
