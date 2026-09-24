@@ -30,3 +30,24 @@ platform 35 and build-tools 35.
 * OkHttp is built without a logging interceptor, so the `Authorization` header
   is never written to logcat, and `retryOnConnectionFailure` plus redirect
   following are disabled so a request is never replayed.
+
+## API client
+
+`com.m413w4r3.metaharnessremote.api.MetaHarnessApi` is the read layer over the
+gateway, built from a `baseUrl`, the in-memory `remoteToken` and an injected
+`OkHttpClient`:
+
+| Method | Route |
+| --- | --- |
+| `health()` | `GET /v1/health` |
+| `config()` | `GET /v1/config` |
+| `modelProfiles()` | `GET /v1/model-profiles` |
+| `listRuns()` | `GET /v1/runs` |
+| `getRun(runId)` | `GET /v1/runs/<run_id>` |
+| `progress(runId, offset)` | `GET /v1/runs/<run_id>/progress?offset=N` |
+
+Every call is one exchange with no retry, carries the bearer token and
+`Accept: application/json`, reads at most 2 MiB, and raises
+`MetaHarnessException(statusCode, message, payload)` on failure without ever
+copying the token. `config()` and `modelProfiles()` stay raw `JsonObject`s and
+`getRun()` returns the raw document, so only the displayed fields are typed.
