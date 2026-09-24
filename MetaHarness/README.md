@@ -188,6 +188,38 @@ Les valeurs `${VARIABLE}` sont développées depuis l’environnement. Une
 variable absente provoque une erreur. Le contrat provider est un POST
 OpenAI-compatible texte, documenté dans [docs/providers.md](docs/providers.md).
 
+## Remote Android gateway
+
+Le gateway distant expose les routes d’observation et de contrôle de
+MetaHarness à un client Android ; le port `--metaharness-port` est celui du
+`metaharness web` local :
+
+```bash
+metaharness remote-gateway \
+  --port 8770 \
+  --metaharness-port 8765 \
+  --remote-token-file ~/.config/metaharness/remote.token \
+  --control-token-file ~/.config/metaharness/control.token
+```
+
+Les deux tokens sont lus avant tout bind, doivent être différents et ne sont
+jamais affichés : le token distant authentifie le client du tunnel, le token de
+contrôle reste le seul credential accepté par le MetaHarness local. Les ports
+vont de 1 à 65535 et le port du gateway doit différer du port MetaHarness.
+
+Le gateway écoute obligatoirement en localhost (`127.0.0.1`) : il n’existe
+aucune option `--host` et il ne doit jamais être exposé directement. L’accès
+distant passe par un tunnel privé tel que Tailscale Serve, qui ne publie
+l’URL que dans le tailnet :
+
+```bash
+tailscale serve --bg 8770
+```
+
+Ne jamais utiliser Tailscale Funnel, et ne jamais ouvrir le port 8770
+directement sur Internet : le gateway n’est joignable que depuis la machine
+locale ou via le tunnel privé.
+
 ## Vérification locale
 
 ```sh

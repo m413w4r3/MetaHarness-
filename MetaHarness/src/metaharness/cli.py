@@ -51,6 +51,13 @@ from .orchestrator import OrchestrationError, recover_plan_run, resume_run, run_
 from .plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
 from .profiles import profiles_for_config
 from .redaction import config_secret_values, redact
+from .remote import (
+    DEFAULT_METAHARNESS_PORT,
+    LOCAL_HOST,
+    create_remote_gateway,
+    load_token_file,
+    token_matches,
+)
 from .result import RunResult
 from .resume import ResumeCheckpointError, ResumeError, plan_identity_from_mapping, resume_info
 from .state import STATE_LOCK_NAME, RunStateStore
@@ -63,6 +70,8 @@ _LOCAL_BRIDGE_HOSTS = frozenset({"127.0.0.1", "localhost"})
 _DOCTOR_DETAIL_CHARS = 300
 _CODEX_HELP_TIMEOUT_SECONDS = 20
 _CLAUDE_HELP_TIMEOUT_SECONDS = 20
+_DEFAULT_GATEWAY_PORT = 8770
+_MAX_PORT = 65535
 
 
 def _codex_version(codex: str, environment: Mapping[str, str]) -> tuple[int, int, int] | None:
@@ -904,6 +913,63 @@ def _web(
     return 0
 
 
+def _remote_gateway(
+    port: int,
+    metaharness_port: int,
+    remote_token_file: Path,
+    control_token_file: Path,
+) -> int:
+    """Serve the loopback remote gateway; no token value is ever shown.
+
+    Both token files are read before anything is bound and the two tokens
+    must differ: the remote bearer token authenticates the tunnel client,
+    the control token stays the only credential accepted by the local
+    MetaHarness.  The bind host is the gateway module constant 127.0.0.1 and
+    is never a command-line option.
+    """
+
+    try:
+        remote_token = load_token_file(remote_token_file)
+        control_token = load_token_file(control_token_file)
+        if token_matches(remote_token, control_token):
+            raise ValueError("remote token and control token must be different")
+        for label, value in (
+            ("gateway port", port),
+            ("MetaHarness port", metaharness_port),
+        ):
+            if not 1 <= value <= _MAX_PORT:
+                raise ValueError(f"{label} must be between 1 and 65535")
+        if port == metaharness_port:
+            raise ValueError("gateway port and MetaHarness port must be different")
+        server = create_remote_gateway(
+            port=port,
+            remote_token_file=remote_token_file,
+            control_token_file=control_token_file,
+            metaharness_port=metaharness_port,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        # Token file failures never quote a file's content, so neither does this.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        # The banner follows the bind: a refused port never announces a
+        # gateway that is not listening.
+        print(
+            f"MetaHarness remote gateway listening on http://{LOCAL_HOST}:{server.server_port}",
+            flush=True,
+        )
+        print(
+            f"Upstream MetaHarness: http://{LOCAL_HOST}:{server.metaharness_port}",
+            flush=True,
+        )
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="metaharness")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -948,6 +1014,13 @@ def build_parser() -> argparse.ArgumentParser:
     web.add_argument("--config", required=True, type=Path)
     web.add_argument("--port", default=8765, type=int)
     web.add_argument("--control-token-file", type=Path)
+    gateway = subparsers.add_parser(
+        "remote-gateway", help="serve the loopback gateway for a private tunnel"
+    )
+    gateway.add_argument("--port", default=_DEFAULT_GATEWAY_PORT, type=int)
+    gateway.add_argument("--metaharness-port", default=DEFAULT_METAHARNESS_PORT, type=int)
+    gateway.add_argument("--remote-token-file", required=True, type=Path)
+    gateway.add_argument("--control-token-file", required=True, type=Path)
     return parser
 
 
@@ -975,6 +1048,10 @@ def main(argv: list[str] | None = None) -> int:
         return _write_plan_decision(args.run, ApprovalDecision.REJECT)
     if args.command == "web":
         return _web(args.config, args.port, args.control_token_file)
+    if args.command == "remote-gateway":
+        return _remote_gateway(
+            args.port, args.metaharness_port, args.remote_token_file, args.control_token_file
+        )
     return 2  # pragma: no cover - argparse restricts commands
 
 
