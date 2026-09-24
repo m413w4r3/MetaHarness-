@@ -23,6 +23,9 @@ jobs:
     defaults:
       run:
         working-directory: MetaHarness
+    env:
+      # The checkout alone is the test environment: no installed package.
+      PYTHONPATH: src
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,4 +40,9 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Compile
+        # Visible even when a unit test failed.
+        if: always()
         run: python -m compileall -q src tests
+      - name: Check patch whitespace
+        if: always()
+        run: git diff --check

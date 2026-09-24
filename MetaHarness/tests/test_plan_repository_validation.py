@@ -360,7 +360,7 @@ class PlannerCorrectionTests(PipelineHarness):
             reviewer=[review()],
         ).run_text("Make feature.txt good.\n", run_id="run")
 
-        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
         state = self.state()
         self.assertEqual(state["failure"]["reason"], "PLAN_REPOSITORY_PRECONDITION_INVALID")
         self.assertIn(f"create_exists={AW010_PATH}", state["failure"]["detail"])
@@ -438,7 +438,7 @@ class ReplanPreconditionTests(PipelineHarness):
             reviewer=[review("REVISE", "REPLAN")],
         ).run_text("Make feature.txt good.\n", run_id="run")
 
-        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
         self.assertEqual(self.state()["failure"]["reason"], "PLAN_REPOSITORY_PRECONDITION_INVALID")
         self.assertEqual(self.workers.roles(), ["implementer"])
         self.assertFalse((self.run_dir() / "cycles/002/correction/implementation_bundle.json").exists())

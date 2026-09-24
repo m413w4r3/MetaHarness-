@@ -796,7 +796,14 @@ class OrchestratorE2ETests(unittest.TestCase):
                 candidate = json.loads((run_dir / "cycles/001/candidate/commit.json").read_text())
                 accepted = json.loads((run_dir / "cycles/001/checks/post-implementation/accepted.json").read_text())
                 self.assertEqual(state["status"], RunStatus.COMMITTED.value, state.get("failure"))
+                self.assertIs(state["no_change"], True)
+                # No commit D: the worktree HEAD and its whole history are the base's.
                 self.assertEqual(git(worktree, "rev-parse", "HEAD"), base)
+                self.assertEqual(
+                    git(worktree, "rev-list", "--count", "HEAD"),
+                    git(self.repo, "rev-list", "--count", base),
+                )
+                self.assertEqual(state["approved_tree_sha"], git(self.repo, "rev-parse", f"{base}^{{tree}}"))
                 self.assertEqual(candidate["commit_sha"], base)
                 self.assertIsNone(candidate["parent_sha"])
                 self.assertEqual(candidate["remote_status"], "not_required")
@@ -1076,7 +1083,8 @@ class OrchestratorE2ETests(unittest.TestCase):
     def test_long_step_title_still_commits_with_a_bounded_subject(self) -> None:
         planner = v2_plan(step_title="Very long title " * 10)
         _, _, state = self.run_case(planner=planner, run_id="long-title")
-        self.assertEqual(state["status"], RunStatus.FAILED.value)
+        # Exhausted planner correction waits for an operator plan recovery.
+        self.assertEqual(state["status"], RunStatus.WAITING_HUMAN.value)
         self.assertEqual(state["failure"]["reason"], "PLANNER_OUTPUT_INVALID")
         self.assertFalse((self.root / "worktrees" / "long-title").exists())
 

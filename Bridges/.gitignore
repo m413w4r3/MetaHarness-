@@ -5,3 +5,5 @@
 /WebAI-to-API/.env
 /WebAI-to-API/config.conf
 /WebAI-to-API/runtime/
+__pycache__/
+*.py[cod]

@@ -55,22 +55,17 @@ from .evidence import (
     bounded_semantic_diff,
     collect_evidence,
     required_checks_passed,
-    scan_staged_security,
 )
 from .validation import (
     ValidationError,
     check_result_json,
     config_with_check_authority,
-    run_check_preflights,
 )
 from .gitops import (
     BaseMovedError,
     BasePushError,
     GitError,
     WorktreeInfo,
-    candidate_ownership_matches,
-    restore_candidate_state,
-    snapshot_candidate_state,
     assert_clean,
     branch_exists,
     commit_parents,
@@ -112,7 +107,7 @@ from .commit_gate import (
     commit_safety_gate,
     parse_deferred_verification,
 )
-from .llm.chat import LLMError, LLMHTTPError, LLMProtocolError, OpenAIChatTextClient
+from .llm.chat import LLMError, OpenAIChatTextClient
 from .integrations.github import (
     GitHubIntegrationError,
     GitHubWorkstreamError,
@@ -169,7 +164,6 @@ from .planning_v2 import (
     validate_implementation_bundle,
     render_repair_plan_summary,
     render_repair_step_index,
-    render_step_contract,
     parse_step_contract_repair,
 )
 from .plan_repository_validation import (
@@ -222,7 +216,7 @@ from .review import (
     ReviewResult,
     structured_review_reason,
 )
-from .recovery_policy import RecoveryDecision, RecoveryDisposition, classify_failure
+from .recovery_policy import RecoveryDisposition, classify_failure
 from .state import RunStateStore
 from .workspace import WorkspaceSetupError, prepare_workspace
 from .run_options import (
@@ -239,7 +233,6 @@ from .orchestration.shared import (
     CheckRepairScope,
     CommitBoundaryError,
     CycleArtifactService,
-    DeferredStepExecutionOutcome,
     GitOwnership,
     OrchestrationError,
     ScopeApprovalRequired,
@@ -248,7 +241,6 @@ from .orchestration.shared import (
     _AGENT_ARTIFACTS,
     _BOUNDED_NO_CHANGE_MISMATCH,
     _CHECK_ATTEMPT_ARTIFACTS,
-    _PLANNER_ATTEMPT_ARTIFACTS,
     _RECOVERY_ATTEMPT_ARTIFACTS,
     _REVIEW_ATTEMPT_ARTIFACTS,
     _REVISION_ARTIFACTS,
@@ -304,6 +296,7 @@ from .orchestration.scope_repair import (
 )
 from .orchestration.candidate import (
     CandidateLifecycle,
+    CandidateRemoteStaging,
     accepted_chain_records,
     validate_accepted_chain,
     _candidate_commit_path,
@@ -326,7 +319,20 @@ from .orchestration.pipeline_v2 import (
     pre_semantic_gate_stage,
     step_dir as cycle_step_dir,
 )
-from .orchestration.recovery import terminal_state_for
+from .orchestration.recovery import (
+    RecoveryAdmission,
+    RecoveryAttempt,
+    RecoveryCoordinator,
+    normalize_exit_reason,
+    project_exit,
+)
+from .orchestration.check_recovery import CheckInfrastructureRecovery
+from .orchestration.review_recovery import ReviewRecovery
+from .orchestration.worker_recovery import (
+    TRANSIENT_WORKER_FAILURES,
+    WorkerRecovery,
+    safe_scope_request_path,
+)
 from .orchestration.resume_validation import (
     ResumedRun,
     _accepted_review,
@@ -690,55 +696,23 @@ class Orchestrator:
         else:
             stream.emit(event, **kwargs)
 
-    def _trace_recovery(
-        self,
-        event: str,
-        *,
-        reason: str,
-        decision: RecoveryDecision,
-        attempt: int,
-        tree_before: str | None,
-        tree_after: str | None,
-        budget_remaining: int,
-        phase: str,
-        cycle: int | None = None,
-        step_id: str | None = None,
-        recovered: bool | None = None,
-        terminal_status: RunStatus | None = None,
-        checkpoint_phase: ResumePhase | None = None,
-    ) -> None:
-        """Record one secret-free recovery transition with its tree boundary."""
+    def _recovery(self, store: RunStateStore) -> RecoveryCoordinator:
+        """The recovery coordinator bound to this run's durable state."""
 
-        data: dict[str, Any] = {
-            "reason": reason,
-            "disposition": decision.disposition.value,
-            "attempt": attempt,
-            "tree_before": tree_before,
-            "tree_after": tree_after,
-            "budget_remaining": budget_remaining,
-        }
-        if recovered is not None:
-            data["recovered"] = recovered
-        if event == "recovery.exhausted":
-            checkpoint_phase = checkpoint_phase or {
-                "implementation": ResumePhase.IMPLEMENT_STEP,
-                "workspace setup": ResumePhase.WORKTREE_SETUP,
-                "review": ResumePhase.FINAL_REVIEW,
-                "checks": ResumePhase.DETERMINISTIC_GATE,
-                "planning": ResumePhase.PLANNER,
-            }.get(phase)
-            if terminal_status is None and checkpoint_phase is not None:
-                try:
-                    terminal_status = terminal_state_for(
-                        decision, failure_code=reason, phase=checkpoint_phase,
-                    ).status
-                except ValueError:
-                    terminal_status = RunStatus.FAILED
-            data["terminal_disposition"] = decision.disposition.value
-            data["terminal_status"] = terminal_status.value if terminal_status else RunStatus.FAILED.value
-            data["checkpoint_phase"] = checkpoint_phase.value if checkpoint_phase else phase
-        self._trace_emit(
-            event, phase=phase, cycle=cycle, step_id=step_id, data=data,
+        return RecoveryCoordinator(store, emit=self._trace_emit)
+
+    def _check_recovery(self, store: RunStateStore) -> CheckInfrastructureRecovery:
+        return CheckInfrastructureRecovery(
+            self._recovery(store), store=store, budgets=self._run_options.recovery,
+        )
+
+    def _review_recovery(self, store: RunStateStore) -> ReviewRecovery:
+        return ReviewRecovery(self._recovery(store), budgets=self._run_options.recovery)
+
+    def _worker_recovery(self, store: RunStateStore) -> WorkerRecovery:
+        return WorkerRecovery(
+            self._recovery(store), store=store,
+            budgets=self._run_options.recovery, secrets=self._secrets,
         )
 
     @staticmethod
@@ -1504,16 +1478,7 @@ class Orchestrator:
         except Exception as exc:
             if store is None:
                 raise
-            reason = _failure_reason(exc)
-            state = store.record_failure(
-                reason,
-                redact(str(exc), self._secrets),
-                **self._closing_step_fields(store, "failed"),
-            )
-            if reason == "CHECK_INFRASTRUCTURE_UNAVAILABLE":
-                state = store.update(status=RunStatus.WAITING_CHECK_INFRASTRUCTURE)
-                return RunResult(run_dir, RunStatus.WAITING_CHECK_INFRASTRUCTURE, state)
-            return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, state))
+            return self._diagnose_result(self._project_exception(store, run_dir, exc))
 
     def _diagnose_result(self, result: RunResult) -> RunResult:
         """Best-effort terminal projection; diagnostics never changes a run result."""
@@ -1968,86 +1933,14 @@ class Orchestrator:
             status=RunStatus.PREPARING,
             git_ownership=_git_ownership_payload(ownership_before),
         )
-        setup_retry_budget = self._run_options.recovery.max_workspace_setup_retries
-        setup_generation = self._recovery_generation(store)
-        setup_retry_key = f"workspace-setup:resume:{setup_generation}"
-        setup_retry_used = self._recovery_counter(store, setup_retry_key)
-        setup_pending: tuple[int, str, str, RecoveryDecision] | None = None
-        while True:
-            setup_before = snapshot_candidate_state(info.worktree)
-            try:
-                setup_results = prepare_workspace(
-                    info.worktree, self.config.workspace_setup,
-                    environment=self._runtime_environment, artifacts_dir=run_dir,
-                    secrets=self._secrets,
-                )
-                setup_error: WorkspaceSetupError | None = None
-            except WorkspaceSetupError as exc:
-                setup_results = exc.results
-                setup_error = exc
-            setup_after = snapshot_candidate_state(info.worktree)
-            if not candidate_ownership_matches(setup_before, setup_after):
-                raise OrchestrationError(
-                    "AGENT_GIT_VIOLATION: workspace setup changed Git ownership"
-                )
-            if setup_before != setup_after:
-                try:
-                    restored = restore_candidate_state(info.worktree, setup_before)
-                except GitError as exc:
-                    raise OrchestrationError(
-                        f"ROLLBACK_FAILED: workspace setup rollback failed: {exc}"
-                    ) from None
-                if restored != setup_before:
-                    raise OrchestrationError(
-                        "ROLLBACK_TREE_MISMATCH: workspace setup rollback was not exact"
-                    )
-            if setup_error is None:
-                if setup_pending is not None:
-                    attempt, reason, old_tree, decision = setup_pending
-                    self._trace_recovery(
-                        "recovery.completed", reason=reason, decision=decision,
-                        attempt=attempt, tree_before=old_tree,
-                        tree_after=setup_after.candidate_tree,
-                        budget_remaining=max(0, setup_retry_budget - setup_retry_used),
-                        phase="workspace setup", recovered=True,
-                    )
-                break
-            if setup_error.results:
-                store.update(
-                    status=RunStatus.PREPARING,
-                    workspace_setup=[asdict(result) for result in setup_error.results],
-                )
-            reason = setup_error.code
-            decision = classify_failure(reason)
-            attempt = setup_retry_used + 1
-            self._trace_recovery(
-                "recovery.classified", reason=reason, decision=decision,
-                attempt=attempt, tree_before=setup_before.candidate_tree,
-                tree_after=setup_after.candidate_tree,
-                budget_remaining=max(0, setup_retry_budget - setup_retry_used),
-                phase="workspace setup",
-            )
-            if setup_retry_used >= setup_retry_budget:
-                exhausted = classify_failure(reason, budget_exhausted=True)
-                self._trace_recovery(
-                    "recovery.exhausted", reason=reason, decision=exhausted,
-                    attempt=attempt, tree_before=setup_before.candidate_tree,
-                    tree_after=setup_after.candidate_tree,
-                    budget_remaining=0, phase="workspace setup",
-                )
-                raise OrchestrationError(
-                    f"CHECK_INFRASTRUCTURE_UNAVAILABLE: {reason}; workspace setup retry budget exhausted"
-                ) from setup_error
-            _archive_attempt_tree(run_dir / "setup")
-            setup_retry_used = self._consume_recovery_counter(store, setup_retry_key)
-            self._trace_recovery(
-                "recovery.started", reason=reason, decision=decision,
-                attempt=attempt, tree_before=setup_before.candidate_tree,
-                tree_after=setup_after.candidate_tree,
-                budget_remaining=setup_retry_budget - setup_retry_used,
-                phase="workspace setup",
-            )
-            setup_pending = (attempt, reason, setup_before.candidate_tree, decision)
+        setup_results = self._check_recovery(store).prepare_workspace(
+            worktree=info.worktree, run_dir=run_dir,
+            run_setup=lambda: prepare_workspace(
+                info.worktree, self.config.workspace_setup,
+                environment=self._runtime_environment, artifacts_dir=run_dir,
+                secrets=self._secrets,
+            ),
+        )
         store.update(status=RunStatus.PREPARING,
                      workspace_setup=[asdict(result) for result in setup_results])
         # The candidate starts as the base tree and all later gates use the
@@ -2205,95 +2098,43 @@ class Orchestrator:
         self, store: RunStateStore, pipeline: PipelineV2Context,
         start: ResumeCheckpoint, *, resumed: bool,
     ) -> RunResult:
-        """Run the generic coordinator and classify its terminal failure."""
+        """Run the generic coordinator and project a failure that left it."""
 
         self._last_selection = pipeline.selection
         coordinator = PipelineV2Coordinator(pipeline, self._pipeline_operations(store))
         try:
             return coordinator.run(start, resumed=resumed)
         except PipelineFailure as failure:
-            if failure.reason in {
-                AGENT_AUTH_FAILURE, "LLM_401", "LLM_403", "LLM_AUTH_FAILURE",
-                "MISSING_PROVIDER_CREDENTIALS", "PROVIDER_CREDENTIALS_MISSING",
-            }:
-                failure.reason = "EXTERNAL_AUTH_REQUIRED"
+            reason = normalize_exit_reason(failure.reason)
+            if reason != failure.reason:
+                failure.reason = reason
                 failure.detail = "external executor authorization is required"
-            exhausted = failure.reason in {
-                "CHECK_REPAIR_EXHAUSTED", "CHECK_INFRA_RETRIES_EXHAUSTED",
-                "TRANSIENT_ATTEMPTS_EXHAUSTED", "WAITING_REPAIR_EXHAUSTED",
-                "REVIEWER_TRANSPORT_FAILURE", "REVIEW_TRANSPORT_FAILURE",
-                "REVIEW_FORMAT_INVALID", "REVIEWER_OUTPUT_INVALID",
-            }
-            if (
-                failure.reason == "DETERMINISTIC_GATE_FAILED"
-                and pipeline.options.max_check_repair_attempts == 0
-                and isinstance(failure.detail, str)
-                and "CHECK_FAILED:" in failure.detail
-            ):
-                exhausted = True
-            if failure.reason == "CHECK_TIMEOUT":
-                stage_value = getattr(start, "stage", None)
-                try:
-                    stage = GateStage(stage_value)
-                    cycle_number = store.load().get("cycle", 1)
-                    if isinstance(cycle_number, bool) or not isinstance(cycle_number, int):
-                        raise ValueError("cycle is invalid")
-                    retry_key = f"check-infra:{cycle_number:03d}:{stage.value}"
-                    exhausted = self._recovery_counter(store, retry_key) >= (
-                        pipeline.options.recovery.max_check_infra_retries
-                    )
-                except (TypeError, ValueError):
-                    exhausted = False
-            remote_required = failure.reason == "PUSH_FAILED"
-            decision = classify_failure(
-                failure.reason, budget_exhausted=exhausted,
-                remote_required=remote_required, remote_unavailable=remote_required,
+            checkpoint_phase = self._checkpoint_phase(pipeline.run_dir, default=start.phase)
+            decision, terminal = project_exit(
+                failure.reason, phase=checkpoint_phase,
+                remote_required=failure.reason == "PUSH_FAILED",
             )
-            checkpoint = read_checkpoint(pipeline.run_dir)
-            checkpoint_phase = checkpoint.phase if checkpoint is not None else start.phase
-            try:
-                terminal = terminal_state_for(
-                    decision, failure_code=failure.reason, phase=checkpoint_phase,
-                )
-            except ValueError:
-                # A coordinator must consume recoverable dispositions before exit.
-                # An escaped operation cannot authorize an automatic replan.
-                decision = RecoveryDecision(
-                    RecoveryDisposition.HARD_STOP,
-                    "recovery operation escaped its coordinator", False, False,
-                )
-                terminal = terminal_state_for(
-                    decision, failure_code=failure.reason, phase=checkpoint_phase,
-                )
             state = store.load()
             tree = state.get("staged_tree_sha")
             if not isinstance(tree, str):
                 tree = _safe_candidate_tree(pipeline.info.worktree)
-            repair_state = state.get("check_repair")
-            used = repair_state.get("attempt_count", 0) if isinstance(repair_state, dict) else 0
-            attempt = used + 1 if isinstance(used, int) and not isinstance(used, bool) else 1
-            phase = state.get("status")
-            self._trace_recovery(
-                "recovery.classified", reason=failure.reason,
-                decision=decision, attempt=attempt,
+            cycle = state.get("cycle") if isinstance(state.get("cycle"), int) else None
+            phase = state.get("status") if isinstance(state.get("status"), str) else "run"
+            recovery = self._recovery(store)
+            initial = recovery.stop(
+                failure.reason, phase=phase, cycle=cycle, step_id=failure.step_id,
                 tree_before=tree, tree_after=_safe_candidate_tree(pipeline.info.worktree),
-                budget_remaining=(
-                    0 if exhausted else pipeline.options.recovery.max_transient_attempts
-                ),
-                phase=phase if isinstance(phase, str) else "run",
-                cycle=state.get("cycle") if isinstance(state.get("cycle"), int) else None,
-                step_id=failure.step_id,
             )
-            if exhausted or terminal.status is not RunStatus.FAILED:
-                self._trace_recovery(
-                    "recovery.exhausted", reason=failure.reason,
-                    decision=decision, attempt=attempt,
-                    tree_before=tree, tree_after=_safe_candidate_tree(pipeline.info.worktree),
-                    budget_remaining=0,
-                    phase=phase if isinstance(phase, str) else "run",
-                    cycle=state.get("cycle") if isinstance(state.get("cycle"), int) else None,
-                    step_id=failure.step_id,
-                    terminal_status=terminal.status,
+            if (
+                initial.disposition is not RecoveryDisposition.HARD_STOP
+                or terminal.status is not RunStatus.FAILED
+            ):
+                recovery.trace(
+                    "recovery.exhausted", reason=failure.reason, decision=decision,
+                    attempt=1, tree_before=tree,
+                    tree_after=_safe_candidate_tree(pipeline.info.worktree),
+                    budget_remaining=0, phase=phase, cycle=cycle,
+                    step_id=failure.step_id, terminal_status=terminal.status,
                     checkpoint_phase=checkpoint_phase,
                 )
             return self._v2_failed(
@@ -2993,7 +2834,7 @@ class Orchestrator:
         tree_sha = report.get("tree_before") if isinstance(report, dict) else None
         if (
             not isinstance(paths, list) or not paths or any(
-                not isinstance(path, str) or not self._safe_scope_request_path(path)
+                not isinstance(path, str) or not safe_scope_request_path(path)
                 for path in paths
             ) or len(paths) != len(set(paths))
             or not isinstance(reason, str) or not reason.strip()
@@ -3269,44 +3110,9 @@ class Orchestrator:
 
         directory = gate_dir(ctx.run_dir, cycle_plan.cycle, stage)
         directory.mkdir(parents=True, exist_ok=True)
-        retry_budget = ctx.options.recovery.max_check_infra_retries
-        generation = self._recovery_generation(store)
-        retry_states: dict[str, tuple[int, str, RecoveryDecision]] = {}
-
-        def retry_check(check_id: str, failure_kind: str) -> bool:
-            stable_reason = "CHECK_TIMEOUT" if failure_kind == "timeout" else "CHECK_INFRA_FAILURE"
-            retry_key = (
-                f"check-infra:{cycle_plan.cycle.number:03d}:{stage.value}:"
-                f"{check_id}:resume:{generation}"
-            )
-            used = self._recovery_counter(store, retry_key)
-            tree = _safe_candidate_tree(ctx.info.worktree)
-            decision = classify_failure(stable_reason)
-            attempt = used + 1
-            self._trace_recovery(
-                "recovery.classified", reason=f"{stable_reason}:{check_id}",
-                decision=decision, attempt=attempt, tree_before=tree, tree_after=tree,
-                budget_remaining=max(0, retry_budget - used),
-                phase="validation", cycle=cycle_plan.cycle.number,
-            )
-            if used >= retry_budget:
-                exhausted = classify_failure(stable_reason, budget_exhausted=True)
-                self._trace_recovery(
-                    "recovery.exhausted", reason=f"{stable_reason}:{check_id}",
-                    decision=exhausted, attempt=attempt, tree_before=tree, tree_after=tree,
-                    budget_remaining=0, phase="validation", cycle=cycle_plan.cycle.number,
-                )
-                retry_states[check_id] = (used, stable_reason, decision)
-                return False
-            consumed = self._consume_recovery_counter(store, retry_key)
-            retry_states[check_id] = (consumed, stable_reason, decision)
-            self._trace_recovery(
-                "recovery.started", reason=f"{stable_reason}:{check_id}",
-                decision=decision, attempt=attempt, tree_before=tree, tree_after=tree,
-                budget_remaining=retry_budget - consumed,
-                phase="validation", cycle=cycle_plan.cycle.number,
-            )
-            return True
+        retry_check = self._check_recovery(store).gate_retries(
+            cycle=cycle_plan.cycle.number, stage=stage.value, worktree=ctx.info.worktree,
+        )
 
         _archive_attempt(directory, names=_CHECK_ATTEMPT_ARTIFACTS)
         store.update(status=RunStatus.VALIDATING, current_step=None)
@@ -3331,62 +3137,7 @@ class Orchestrator:
             deterministic_gate=gate,
         )
         self._cycle_update(store, cycle_plan.cycle, deterministic_gate=gate)
-        infra_failures = [
-            item for item in evidence.failures
-            if item.startswith((
-                "CHECK_TIMEOUT:", "CHECK_INFRA_FAILURE:",
-                "CHECK_SIDE_EFFECT_REPEATED:", "CHECK_SIDE_EFFECT_UNSTABLE:",
-            ))
-        ]
-        for check_result in evidence.checks:
-            if isinstance(check_result, Mapping):
-                check_id = check_result.get("name")
-                retries = check_result.get("infrastructure_retries", 0)
-                failure_kind = check_result.get("failure_kind")
-            else:
-                check_id = getattr(check_result, "name", None)
-                retries = getattr(check_result, "infrastructure_retries", 0)
-                failure_kind = getattr(check_result, "failure_kind", None)
-            if (
-                isinstance(check_id, str) and isinstance(retries, int) and retries > 0
-                and failure_kind in {"passed", "nonzero_exit"}
-            ):
-                state = retry_states.get(check_id)
-                if state is not None:
-                    used, retry_reason, decision = state
-                    self._trace_recovery(
-                        "recovery.completed", reason=f"{retry_reason}:{check_id}",
-                        decision=decision, attempt=used,
-                        tree_before=evidence.staged_tree_sha,
-                        tree_after=evidence.staged_tree_sha,
-                        budget_remaining=max(0, retry_budget - used),
-                        phase="validation", cycle=cycle_plan.cycle.number,
-                        recovered=True,
-                    )
-        for item in infra_failures:
-            check_id = item.split(":", 1)[1]
-            state = retry_states.get(check_id)
-            if state is not None:
-                used, retry_reason, decision = state
-                self._trace_recovery(
-                    "recovery.completed", reason=f"{retry_reason}:{check_id}",
-                    decision=decision, attempt=used,
-                    tree_before=evidence.staged_tree_sha,
-                    tree_after=evidence.staged_tree_sha,
-                    budget_remaining=max(0, retry_budget - used),
-                    phase="validation", cycle=cycle_plan.cycle.number,
-                    recovered=False,
-                )
-        if infra_failures:
-            waiting_reason = (
-                "CHECK_SIDE_EFFECT_REPEATED"
-                if all(item.startswith("CHECK_SIDE_EFFECT_REPEATED:") for item in infra_failures)
-                else "CHECK_INFRASTRUCTURE_UNAVAILABLE"
-            )
-            raise PipelineFailure(
-                waiting_reason,
-                ", ".join(infra_failures),
-            )
+        retry_check.settle(evidence)
         return evidence
 
     @staticmethod
@@ -3469,95 +3220,10 @@ class Orchestrator:
     ) -> tuple[str, ...]:
         """Retry each trusted preflight itself under a durable infra budget."""
 
-        retry_budget = self._run_options.recovery.max_check_infra_retries
-        generation = self._recovery_generation(store)
-        try:
-            selected = check_config.select_checks(check_ids)
-        except ValueError as exc:
-            raise OrchestrationError("CHECK_PREFLIGHT_FAILED: trusted check selection invalid") from exc
-        for check in selected:
-            if not check.preflight_argv:
-                continue
-            retry_key = f"{counter_key}:{check.id}:resume:{generation}"
-            while True:
-                before_state = snapshot_candidate_state(worktree)
-                failures = run_check_preflights(worktree, check_config, [check.id])
-                after_state = snapshot_candidate_state(worktree)
-                if before_state != after_state:
-                    raise OrchestrationError(
-                        "ROLLBACK_TREE_MISMATCH: preflight did not preserve candidate state"
-                    )
-                if not failures:
-                    return_to_next = True
-                    break
-                failure = failures[0]
-                reason = (
-                    "CHECK_PREFLIGHT_FAILED"
-                    if failure.startswith("CHECK_PREFLIGHT_FAILED:")
-                    else "CHECK_INFRA_FAILURE"
-                )
-                used = self._recovery_counter(store, retry_key)
-                attempt = used + 1
-                decision = classify_failure(reason)
-                before_tree = before_state.candidate_tree
-                after_tree = after_state.candidate_tree
-                self._trace_recovery(
-                    "recovery.classified", reason=f"{reason}:{check.id}",
-                    decision=decision, attempt=attempt,
-                    tree_before=before_tree, tree_after=after_tree,
-                    budget_remaining=max(0, retry_budget - used),
-                    phase=phase, cycle=cycle,
-                )
-                if used >= retry_budget:
-                    exhausted = classify_failure(reason, budget_exhausted=True)
-                    self._trace_recovery(
-                        "recovery.exhausted", reason=f"{reason}:{check.id}",
-                        decision=exhausted, attempt=attempt,
-                        tree_before=before_tree, tree_after=after_tree,
-                        budget_remaining=0, phase=phase, cycle=cycle,
-                    )
-                    raise OrchestrationError(
-                        f"CHECK_INFRASTRUCTURE_UNAVAILABLE: {failure}; retry budget exhausted"
-                    )
-                consumed = self._consume_recovery_counter(store, retry_key)
-                self._trace_recovery(
-                    "recovery.started", reason=f"{reason}:{check.id}",
-                    decision=decision, attempt=attempt,
-                    tree_before=before_tree, tree_after=after_tree,
-                    budget_remaining=retry_budget - consumed,
-                    phase=phase, cycle=cycle,
-                )
-                # The next loop invokes this same approved preflight only.
-            if return_to_next:
-                continue
-        return ()
-
-    @staticmethod
-    def _recovery_counter(store: RunStateStore, key: str) -> int:
-        state = store.load()
-        counters = state.get("recovery_counters", {})
-        if not isinstance(counters, dict):
-            raise PipelineFailure("DURABLE_ARTIFACT_CORRUPTED", "recovery counters are malformed")
-        value = counters.get(key, 0)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise PipelineFailure("DURABLE_ARTIFACT_CORRUPTED", "recovery counter is malformed")
-        return value
-
-    @classmethod
-    def _consume_recovery_counter(cls, store: RunStateStore, key: str) -> int:
-        state = store.load()
-        counters = state.get("recovery_counters", {})
-        if not isinstance(counters, dict):
-            raise PipelineFailure("DURABLE_ARTIFACT_CORRUPTED", "recovery counters are malformed")
-        value = counters.get(key, 0)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise PipelineFailure("DURABLE_ARTIFACT_CORRUPTED", "recovery counter is malformed")
-        updated = {**counters, key: value + 1}
-        store.update(
-            status=state.get("status", RunStatus.VALIDATING),
-            recovery_counters=updated,
+        return self._check_recovery(store).run_preflights(
+            worktree=worktree, check_config=check_config, check_ids=check_ids,
+            counter_key=counter_key, phase=phase, cycle=cycle,
         )
-        return value + 1
 
     @staticmethod
     def _check_repair_attempt_records(
@@ -3674,14 +3340,22 @@ class Orchestrator:
             status=RunStatus.REVISING,
             check_repair={"status": "running", "attempt_count": len(records), **progress},
         )
-        self._trace_recovery(
+        self._recovery(store).trace(
             "recovery.classified", reason="CHECK_FAILED", decision=decision,
             attempt=attempt, tree_before=evidence.staged_tree_sha,
             tree_after=evidence.staged_tree_sha,
             budget_remaining=max(0, ctx.options.max_check_repair_attempts - attempt + 1),
             phase="validation", cycle=number,
         )
-        self._trace_recovery(
+        # The attempt directories stay the check-repair budget authority.
+        self._recovery(store).record(RecoveryAttempt(
+            phase="validation", reason="CHECK_FAILED", attempt=attempt,
+            budget_key="check_repair_attempts", budget=ctx.options.max_check_repair_attempts,
+            budget_consumed=attempt, disposition=decision.disposition.value,
+            cycle=number, profile_id=selected.profile_id,
+            tree_before=evidence.staged_tree_sha, tree_after=evidence.staged_tree_sha,
+        ))
+        self._recovery(store).trace(
             "recovery.started", reason="CHECK_FAILED", decision=decision,
             attempt=attempt, tree_before=evidence.staged_tree_sha,
             tree_after=_safe_candidate_tree(ctx.info.worktree),
@@ -3742,7 +3416,7 @@ class Orchestrator:
                 )
                 raise PipelineFailure("CHECK_REPAIR_UNAVAILABLE", error_detail)
             reason = "REVISION_SCOPE_VIOLATION" if error == _SCOPE_REQUEST_ROUTE else error
-            self._trace_recovery(
+            self._recovery(store).trace(
                 "recovery.completed", reason="CHECK_FAILED", decision=decision,
                 attempt=attempt, tree_before=evidence.staged_tree_sha,
                 tree_after=_safe_candidate_tree(ctx.info.worktree),
@@ -3794,7 +3468,7 @@ class Orchestrator:
                 "attempts": [asdict(item) for item in attempts], **progress,
             },
         )
-        self._trace_recovery(
+        self._recovery(store).trace(
             "recovery.completed", reason="CHECK_FAILED", decision=decision,
             attempt=attempt, tree_before=evidence.staged_tree_sha,
             tree_after=record.tree_after,
@@ -3866,75 +3540,22 @@ class Orchestrator:
     ) -> ReviewResult:
         """Retry transient reviewer transport on this candidate only."""
 
-        cycle = cycle_plan.cycle.number
-        generation = self._recovery_generation(store)
-        retry_key = f"review-transport:{cycle:03d}:resume:{generation}"
-        retries_used = self._recovery_counter(store, retry_key)
-        retry_budget = ctx.options.recovery.max_review_transport_retries
         reviewer = self._reviewer_for_profile(ctx.selection.final_reviewer.profile_id)
-        while True:
-            try:
-                return self._run_v2_reviewer(
-                    reviewer=reviewer, spec=ctx.spec, run_dir=ctx.run_dir,
-                    repository_reference=ctx.repository_reference, evidence=evidence,
-                    input=review_input or self._review_context_builder().build(ctx, cycle_plan),
-                    artifacts_dir=artifacts_dir, worktree=ctx.info.worktree,
-                    base_sha=ctx.base_sha, candidate_commit=candidate,
-                    force_inline_diff=force_inline_diff,
-                )
-            except ReviewParseError as exc:
-                raise PipelineFailure(
-                    "REVIEW_FORMAT_INVALID", _bounded_parse_detail(exc),
-                ) from exc
-            except LLMError as exc:
-                status_match = re.search(r"\bHTTP\s+(\d{3})\b", str(exc))
-                status_code = int(status_match.group(1)) if status_match else None
-                if status_code in {401, 403}:
-                    raise PipelineFailure(
-                        f"LLM_{status_code}", "reviewer authorization is required",
-                    ) from exc
-                retryable = (
-                    not isinstance(exc, LLMProtocolError)
-                    and (
-                        not isinstance(exc, LLMHTTPError)
-                        or status_code in {408, 429, 500, 502, 503, 504}
-                        or any(marker in str(exc).casefold() for marker in (
-                            "timed out", "before receiving an http response",
-                        ))
-                    )
-                )
-                if not retryable:
-                    raise PipelineFailure(
-                        "REVIEW_FORMAT_INVALID", _bounded_parse_detail(exc),
-                    ) from exc
-                decision = classify_failure("REVIEWER_TRANSPORT_FAILURE")
-                tree = candidate.get("tree_sha")
-                attempt = retries_used + 1
-                self._trace_recovery(
-                    "recovery.classified", reason="REVIEWER_TRANSPORT_FAILURE",
-                    decision=decision, attempt=attempt, tree_before=tree,
-                    tree_after=tree, budget_remaining=max(0, retry_budget - retries_used),
-                    phase="final_review", cycle=cycle,
-                )
-                if retries_used >= retry_budget:
-                    self._trace_recovery(
-                        "recovery.exhausted", reason="REVIEWER_TRANSPORT_FAILURE",
-                        decision=classify_failure(
-                            "REVIEWER_TRANSPORT_FAILURE", budget_exhausted=True,
-                        ), attempt=attempt, tree_before=tree, tree_after=tree,
-                        budget_remaining=0, phase="final_review", cycle=cycle,
-                    )
-                    raise PipelineFailure(
-                        "REVIEWER_TRANSPORT_FAILURE", _bounded_parse_detail(exc),
-                    ) from exc
-                retries_used = self._consume_recovery_counter(store, retry_key)
-                self._trace_recovery(
-                    "recovery.started", reason="REVIEWER_TRANSPORT_FAILURE",
-                    decision=decision, attempt=attempt, tree_before=tree,
-                    tree_after=tree, budget_remaining=retry_budget - retries_used,
-                    phase="final_review", cycle=cycle,
-                )
-                _archive_attempt(artifacts_dir, names=_REVIEW_ATTEMPT_ARTIFACTS)
+        return self._review_recovery(store).with_transport_retries(
+            cycle=cycle_plan.cycle.number,
+            candidate_tree=candidate.get("tree_sha"),
+            run_review=lambda: self._run_v2_reviewer(
+                reviewer=reviewer, spec=ctx.spec, run_dir=ctx.run_dir,
+                repository_reference=ctx.repository_reference, evidence=evidence,
+                input=review_input or self._review_context_builder().build(ctx, cycle_plan),
+                artifacts_dir=artifacts_dir, worktree=ctx.info.worktree,
+                base_sha=ctx.base_sha, candidate_commit=candidate,
+                force_inline_diff=force_inline_diff,
+            ),
+            archive_attempt=lambda: _archive_attempt(
+                artifacts_dir, names=_REVIEW_ATTEMPT_ARTIFACTS,
+            ),
+        )
 
     def _recover_reviewer_fail(
         self,
@@ -3949,39 +3570,22 @@ class Orchestrator:
     ) -> ReviewResult:
         """Rebuild local authority, then allow one reviewer evidence retry."""
 
-        reason_class = structured_review_reason(first_review.findings)
-        durable_evidence = self._assert_local_review_evidence(
-            ctx, cycle_plan, candidate, supplied_evidence,
+        return self._review_recovery(store).after_reviewer_fail(
+            cycle=cycle_plan.cycle.number,
+            first_review=first_review,
+            rebuild_evidence=lambda: self._assert_local_review_evidence(
+                ctx, cycle_plan, candidate, supplied_evidence,
+            ),
+            rerun=lambda evidence, inline: self._review_with_transport_retries(
+                store=store, ctx=ctx, cycle_plan=cycle_plan, candidate=candidate,
+                evidence=evidence, artifacts_dir=artifacts_dir,
+                force_inline_diff=inline,
+                review_input=self._review_context_builder().build(ctx, cycle_plan),
+            ),
+            archive_attempt=lambda: _archive_attempt(
+                artifacts_dir, names=_REVIEW_ATTEMPT_ARTIFACTS,
+            ),
         )
-        cycle = cycle_plan.cycle.number
-        retry_key = f"review-fail-recovery:{cycle:03d}"
-        if self._recovery_counter(store, retry_key) >= 1:
-            raise PipelineFailure(
-                "REVIEW_EVIDENCE_UNRESOLVED",
-                {
-                    "reason_class": reason_class,
-                    "findings": _bounded_v2_report(first_review.findings),
-                },
-            )
-        self._consume_recovery_counter(store, retry_key)
-        _archive_attempt(artifacts_dir, names=_REVIEW_ATTEMPT_ARTIFACTS)
-        recovery_input = self._review_context_builder().build(ctx, cycle_plan)
-        review = self._review_with_transport_retries(
-            store=store, ctx=ctx, cycle_plan=cycle_plan, candidate=candidate,
-            evidence=durable_evidence, artifacts_dir=artifacts_dir,
-            force_inline_diff=reason_class == "EVIDENCE_UNAVAILABLE",
-            review_input=recovery_input,
-        )
-        if review.verdict is ReviewVerdict.FAIL:
-            raise PipelineFailure(
-                "REVIEW_EVIDENCE_UNRESOLVED",
-                {
-                    "first_reason_class": reason_class,
-                    "retry_reason_class": structured_review_reason(review.findings),
-                    "findings": _bounded_v2_report(review.findings),
-                },
-            )
-        return review
 
     def _assert_local_review_evidence(
         self,
@@ -4330,19 +3934,15 @@ class Orchestrator:
         if effective_step is not step:
             effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
         max_repairs = getattr(self._run_options, "max_step_contract_repairs", 0)
-        recovery_generation = self._recovery_generation(store)
+        recovery = self._recovery(store)
+        cycle_number = getattr(self, "_trace_cycle", 1)
         active_profile_id = profile_id
         fallback_ids = tuple(fallback_profile_ids)[
             :self._run_options.recovery.max_executor_fallbacks
         ]
         fallback_index = 0
-        cycle_key = f"{getattr(self, '_trace_cycle', 1):03d}:{step.id}"
-        retry_key = (
-            f"agent-step:{cycle_key}" if recovery_generation == 0
-            else f"agent-step:r{recovery_generation}:{cycle_key}"
-        )
-        transient_retry_count = self._recovery_counter(store, retry_key)
-        pending_transient: tuple[int, str, str, RecoveryDecision] | None = None
+        retry_key = recovery.budget_key("agent-step", f"{cycle_number:03d}", step.id)
+        pending_transient: RecoveryAdmission | None = None
         pending_repair = self._pending_contract_repair(artifact_dir)
         if pending_repair is not None:
             try:
@@ -4382,17 +3982,8 @@ class Orchestrator:
                     mismatch_retry_count=repair_count,
                 )
                 if pending_transient is not None:
-                    attempt, reason, tree_before, decision = pending_transient
-                    self._trace_recovery(
-                        "recovery.completed", reason=reason, decision=decision,
-                        attempt=attempt, tree_before=tree_before,
-                        tree_after=outcome.tree_after,
-                        budget_remaining=max(
-                            0, self._run_options.recovery.max_transient_attempts
-                            - transient_retry_count,
-                        ),
-                        phase="implementation", cycle=getattr(self, "_trace_cycle", 1),
-                        step_id=step.id, recovered=True,
+                    recovery.complete(
+                        pending_transient, recovered=True, tree_after=outcome.tree_after,
                     )
                 return outcome
             except StepExecutionFailure as failure:
@@ -4406,31 +3997,19 @@ class Orchestrator:
                     "status_before": list(failure.status_before or ()),
                 }))
                 if pending_transient is not None:
-                    attempt, reason, tree_before, decision = pending_transient
-                    self._trace_recovery(
-                        "recovery.completed", reason=reason, decision=decision,
-                        attempt=attempt, tree_before=tree_before,
+                    recovery.complete(
+                        pending_transient, recovered=False,
                         tree_after=failure.tree_after or _safe_candidate_tree(worktree),
-                        budget_remaining=max(
-                            0, self._run_options.recovery.max_transient_attempts
-                            - transient_retry_count,
-                        ),
-                        phase="implementation", cycle=getattr(self, "_trace_cycle", 1),
-                        step_id=step.id, recovered=False,
                     )
                     pending_transient = None
-                retry = self._try_retry_transient_step_failure(
-                    failure=failure, store=store, retry_key=retry_key,
-                    retries_used=transient_retry_count, repo=repo, worktree=worktree,
+                retry = self._worker_recovery(store).admit_step_retry(
+                    failure=failure, retry_key=retry_key, repo=repo, worktree=worktree,
                     branch_ref=branch_ref, base_sha=base_sha,
                     ownership_before=ownership_before, step=effective_step,
-                    artifact_dir=artifact_dir,
+                    artifact_dir=artifact_dir, cycle=cycle_number,
                 )
                 if retry is not None:
-                    transient_retry_count, reason, tree_before, decision = retry
-                    pending_transient = (
-                        transient_retry_count, reason, tree_before, decision,
-                    )
+                    pending_transient = retry
                     continue
                 if failure.reason == AGENT_AUTH_FAILURE:
                     failure.reason = "EXTERNAL_AUTH_REQUIRED"
@@ -4442,35 +4021,22 @@ class Orchestrator:
                         failure, artifact_dir, worktree=worktree, expected_head=base_sha,
                     )
                 if (
-                    failure.reason in {
-                        AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
-                        AGENT_PROTOCOL_FAILED,
-                    }
-                    and transient_retry_count >= self._run_options.recovery.max_transient_attempts
+                    failure.reason in TRANSIENT_WORKER_FAILURES
+                    and recovery.used(retry_key) >= self._run_options.recovery.max_transient_attempts
                     and fallback_index < len(fallback_ids)
                 ):
                     fallback_index += 1
                     active_profile_id = fallback_ids[fallback_index - 1]
-                    retry_key = (
-                        f"agent-step:{cycle_key}:fallback:{active_profile_id}"
-                        if recovery_generation == 0
-                        else f"agent-step:r{recovery_generation}:{cycle_key}:fallback:{active_profile_id}"
+                    retry_key = recovery.budget_key(
+                        "agent-step", f"{cycle_number:03d}", step.id,
+                        "fallback", active_profile_id,
                     )
-                    transient_retry_count = self._recovery_counter(store, retry_key)
-                    fallback_decision = RecoveryDecision(
-                        RecoveryDisposition.FALLBACK_EXECUTOR,
-                        "primary executor transient retry budget exhausted",
-                        True, False,
-                    )
-                    self._trace_recovery(
-                        "recovery.executor_selected", reason=failure.reason,
-                        decision=fallback_decision, attempt=fallback_index,
+                    recovery.fallback_selected(
+                        reason=failure.reason, index=fallback_index,
+                        available=len(fallback_ids), phase="implementation",
+                        cycle=cycle_number, step_id=step.id,
                         tree_before=failure.tree_before,
                         tree_after=_safe_candidate_tree(worktree),
-                        budget_remaining=max(
-                            0, self._run_options.recovery.max_executor_fallbacks - fallback_index,
-                        ), phase="implementation",
-                        cycle=getattr(self, "_trace_cycle", 1), step_id=step.id,
                     )
                     _archive_attempt(artifact_dir)
                     atomic_write_text(artifact_dir / "executor.json", _json_text({
@@ -4484,6 +4050,8 @@ class Orchestrator:
                     failure.step_dir = artifact_dir
                     raise
                 if failure.tree_before is None or failure.mismatch is None:
+                    if failure.tree_before is None:
+                        failure.reason = "RESUME_REQUIRES_OPERATOR"
                     failure.step_dir = artifact_dir
                     raise
                 allowed = set(
@@ -4509,10 +4077,12 @@ class Orchestrator:
                 if drift and not self._restore_failed_step_attempt(
                     worktree, failure.tree_before, allowed,
                 ):
+                    failure.reason = "RESUME_REQUIRES_OPERATOR"
                     failure.detail = (failure.detail or "worker reported a contract mismatch") + "; " + drift
                     failure.step_dir = artifact_dir
                     raise
                 if not self._restore_failed_step_attempt(worktree, failure.tree_before, allowed):
+                    failure.reason = "RESUME_REQUIRES_OPERATOR"
                     failure.detail = (failure.detail or "worker reported a contract mismatch") + "; failed to restore attempt tree"
                     failure.step_dir = artifact_dir
                     raise
@@ -4523,12 +4093,12 @@ class Orchestrator:
                     rollback_succeeded=True,
                 )
                 recovery_attempt = repair_count + 1
-                self._trace_recovery(
+                recovery.trace(
                     "recovery.classified", reason="AGENT_CONTRACT_MISMATCH",
                     decision=recovery_decision, attempt=recovery_attempt,
                     tree_before=failure.tree_before, tree_after=failure.tree_before,
                     budget_remaining=max(0, max_repairs - repair_count),
-                    phase="implementation", cycle=getattr(self, "_trace_cycle", 1),
+                    phase="implementation", cycle=cycle_number,
                     step_id=step.id,
                 )
                 if recovery_decision.disposition is not RecoveryDisposition.CONTRACT_REPAIR:
@@ -4547,12 +4117,12 @@ class Orchestrator:
                         "AGENT_CONTRACT_MISMATCH", clean_contract_mismatch=True,
                         budget_exhausted=True,
                     )
-                    self._trace_recovery(
+                    recovery.trace(
                         "recovery.exhausted", reason="AGENT_CONTRACT_MISMATCH",
                         decision=exhausted, attempt=recovery_attempt,
                         tree_before=failure.tree_before, tree_after=failure.tree_before,
                         budget_remaining=0, phase="implementation",
-                        cycle=getattr(self, "_trace_cycle", 1), step_id=step.id,
+                        cycle=cycle_number, step_id=step.id,
                     )
                     failure.detail = (failure.detail or "worker reported a contract mismatch") + "; contract repair budget exhausted"
                     failure.tree_after = failure.tree_before
@@ -4563,12 +4133,20 @@ class Orchestrator:
                 repair_dir = artifact_dir / "contract_repairs" / f"{repair_count:02d}"
                 try:
                     self._set_contract_repair_state(store, step.id, repair_count)
-                    self._trace_recovery(
+                    recovery.record(RecoveryAttempt(
+                        phase="implementation", reason="AGENT_CONTRACT_MISMATCH",
+                        attempt=recovery_attempt, budget_key="contract_repairs",
+                        budget=max_repairs, budget_consumed=repair_count,
+                        disposition=recovery_decision.disposition.value,
+                        cycle=cycle_number, step_id=step.id, profile_id=active_profile_id,
+                        tree_before=failure.tree_before, tree_after=failure.tree_before,
+                    ))
+                    recovery.trace(
                         "recovery.started", reason="AGENT_CONTRACT_MISMATCH",
                         decision=recovery_decision, attempt=recovery_attempt,
                         tree_before=failure.tree_before, tree_after=failure.tree_before,
                         budget_remaining=max(0, max_repairs - repair_count),
-                        phase="implementation", cycle=getattr(self, "_trace_cycle", 1),
+                        phase="implementation", cycle=cycle_number,
                         step_id=step.id,
                     )
                     effective_step = self._repair_step_contract(
@@ -4600,15 +4178,15 @@ class Orchestrator:
                     ) from exc
                 self._trace_emit(
                     "step.contract_repair.completed", phase="implementation",
-                    cycle=getattr(self, "_trace_cycle", 1), step_id=step.id,
+                    cycle=cycle_number, step_id=step.id,
                     data={"repair": repair_count, "tree_sha": failure.tree_before},
                 )
-                self._trace_recovery(
+                recovery.trace(
                     "recovery.completed", reason="AGENT_CONTRACT_MISMATCH",
                     decision=recovery_decision, attempt=recovery_attempt,
                     tree_before=failure.tree_before, tree_after=candidate_tree_sha(worktree),
                     budget_remaining=max(0, max_repairs - repair_count),
-                    phase="implementation", cycle=getattr(self, "_trace_cycle", 1),
+                    phase="implementation", cycle=cycle_number,
                     step_id=step.id, recovered=True,
                 )
                 # The next attempt starts at the exact restored tree and uses
@@ -4664,285 +4242,6 @@ class Orchestrator:
             mismatch_retry_count=failure.mismatch_retry_count,
             no_change=True,
         )
-
-    def _try_retry_transient_step_failure(
-        self,
-        *,
-        failure: StepExecutionFailure,
-        store: RunStateStore,
-        retry_key: str,
-        retries_used: int,
-        repo: Path,
-        worktree: Path,
-        branch_ref: str,
-        base_sha: str,
-        ownership_before: GitOwnership,
-        step: ImplementationStep,
-        artifact_dir: Path,
-    ) -> tuple[int, str, str, RecoveryDecision] | None:
-        """Retry only transient worker failures after proving exact restoration."""
-
-        retryable_codes = {
-            AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT, AGENT_PROTOCOL_FAILED,
-            AGENT_AUTH_FAILURE,
-        }
-        reason = failure.reason
-        before = failure.tree_before
-        if reason not in retryable_codes:
-            decision = classify_failure(
-                reason,
-                tree_changed_out_of_scope=reason == AGENT_SCOPE_VIOLATION,
-            )
-            if decision.disposition is RecoveryDisposition.HARD_STOP:
-                tree = before or _safe_candidate_tree(worktree)
-                self._trace_recovery(
-                    "recovery.classified", reason=reason, decision=decision,
-                    attempt=max(1, retries_used + 1), tree_before=before,
-                    tree_after=failure.tree_after or _safe_candidate_tree(worktree),
-                    budget_remaining=0, phase="implementation",
-                    cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-                )
-            return None
-
-        attempt = retries_used + 1
-        if before is None:
-            failure.reason = "RESUME_REQUIRES_OPERATOR"
-            decision = classify_failure(failure.reason, rollback_succeeded=False)
-            self._trace_recovery(
-                "recovery.classified", reason=failure.reason, decision=decision,
-                attempt=attempt, tree_before=None,
-                tree_after=failure.tree_after or _safe_candidate_tree(worktree),
-                budget_remaining=0, phase="implementation",
-                cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-            )
-            failure.detail = (failure.detail or "worker failed") + "; pre-attempt tree identity is unavailable"
-            failure.step_dir = artifact_dir
-            return None
-        if failure.tree_after is None:
-            failure.reason = "RESUME_REQUIRES_OPERATOR"
-            decision = classify_failure(failure.reason, rollback_succeeded=False)
-            self._trace_recovery(
-                "recovery.classified", reason=failure.reason, decision=decision,
-                attempt=attempt, tree_before=before, tree_after=None,
-                budget_remaining=0, phase="implementation",
-                cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-            )
-            failure.detail = (failure.detail or "worker failed") + "; post-attempt tree identity is unavailable"
-            failure.step_dir = artifact_dir
-            return None
-
-        try:
-            ownership_violations = _ownership_violations(
-                ownership_before, _git_ownership(repo, worktree),
-                branch_ref=branch_ref, base_sha=base_sha,
-            )
-        except GitError as exc:
-            ownership_violations = [f"Git ownership could not be read: {exc}"]
-        if ownership_violations:
-            failure.reason = AGENT_GIT_VIOLATION
-            failure.detail = "; ".join(ownership_violations)
-            failure.step_dir = artifact_dir
-            decision = classify_failure(failure.reason)
-            self._trace_recovery(
-                "recovery.classified", reason=failure.reason, decision=decision,
-                attempt=attempt, tree_before=before,
-                tree_after=failure.tree_after or _safe_candidate_tree(worktree),
-                budget_remaining=0, phase="implementation",
-                cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-            )
-            return None
-
-        allowed = set((*step.write_set, *step.create_set, *step.delete_set))
-        tree_after = failure.tree_after
-        tree_changed = tree_after is not None and tree_after != before
-        status = _safe_status(worktree)
-        if status is None:
-            failure.reason = "RESUME_REQUIRES_OPERATOR"
-            failure.detail = (failure.detail or "worker failed") + "; post-attempt status is unreadable"
-            failure.step_dir = artifact_dir
-            decision = classify_failure(failure.reason, rollback_succeeded=False)
-            self._trace_recovery(
-                "recovery.classified", reason=failure.reason, decision=decision,
-                attempt=attempt, tree_before=before,
-                tree_after=tree_after, budget_remaining=0,
-                phase="implementation", cycle=getattr(self, "_trace_cycle", 1),
-                step_id=failure.step_id,
-            )
-            return None
-        status_changed = bool(status)
-        tree_changed = tree_changed or status_changed
-        if tree_changed:
-            try:
-                stage_all(worktree)
-                tree_after = index_tree_sha(worktree)
-                failure.tree_after = tree_after
-                changed = changed_paths_between_trees(repo, before, tree_after)
-            except (GitError, OSError, ValueError) as exc:
-                failure.reason = "RESUME_REQUIRES_OPERATOR"
-                failure.detail = f"failed attempt tree could not be frozen: {type(exc).__name__}"
-                failure.tree_after = _safe_candidate_tree(worktree)
-                failure.step_dir = artifact_dir
-                decision = classify_failure(failure.reason, rollback_succeeded=False)
-                self._trace_recovery(
-                    "recovery.classified", reason=failure.reason, decision=decision,
-                    attempt=attempt, tree_before=before, tree_after=failure.tree_after,
-                    budget_remaining=0, phase="implementation",
-                    cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-                )
-                return None
-            unexpected = [path for path in changed if path not in allowed]
-            if unexpected:
-                failure.reason = AGENT_SCOPE_VIOLATION
-                failure.detail = "worker changed paths outside scope: " + _paths_detail(unexpected)
-                failure.step_dir = artifact_dir
-                decision = classify_failure(failure.reason, tree_changed_out_of_scope=True)
-                self._trace_recovery(
-                    "recovery.classified", reason=failure.reason, decision=decision,
-                    attempt=attempt, tree_before=before, tree_after=tree_after,
-                    budget_remaining=0, phase="implementation",
-                    cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-                )
-                return None
-            try:
-                security_failures = scan_staged_security(
-                    worktree, secrets=self._secrets,
-                )
-            except (GitError, OSError, ValueError) as exc:
-                failure.reason = "STAGED_BLOB_SCAN_FAILED"
-                failure.detail = f"staged changes could not be scanned: {type(exc).__name__}"
-                failure.tree_after = _safe_candidate_tree(worktree)
-                failure.step_dir = artifact_dir
-                decision = classify_failure(failure.reason)
-                self._trace_recovery(
-                    "recovery.classified", reason=failure.reason, decision=decision,
-                    attempt=attempt, tree_before=before, tree_after=failure.tree_after,
-                    budget_remaining=0, phase="implementation",
-                    cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-                )
-                return None
-            if security_failures:
-                failure.reason = security_failures[0].split(":", 1)[0]
-                failure.detail = "; ".join(security_failures)
-                failure.step_dir = artifact_dir
-                decision = classify_failure(failure.reason)
-                self._trace_recovery(
-                    "recovery.classified", reason=failure.reason, decision=decision,
-                    attempt=attempt, tree_before=before, tree_after=tree_after,
-                    budget_remaining=0, phase="implementation",
-                    cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-                )
-                return None
-        if tree_changed and not self._restore_failed_step_attempt(worktree, before, allowed):
-            failure.reason = "RESUME_REQUIRES_OPERATOR"
-            failure.detail = (failure.detail or "worker failed") + "; rollback did not restore the pre-attempt tree"
-            failure.tree_after = _safe_candidate_tree(worktree)
-            failure.step_dir = artifact_dir
-            decision = classify_failure(failure.reason, rollback_succeeded=False)
-            self._trace_recovery(
-                "recovery.classified", reason=failure.reason, decision=decision,
-                attempt=attempt, tree_before=before, tree_after=failure.tree_after,
-                budget_remaining=0, phase="implementation",
-                cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-            )
-            return None
-
-        try:
-            restored_status = status_porcelain(worktree)
-            exact_restoration = (
-                candidate_tree_sha(worktree) == before
-                and index_tree_sha(worktree) == before
-                and restored_status == failure.status_before
-                and not _status_has_unstaged_or_untracked(restored_status)
-            )
-        except (GitError, OSError):
-            exact_restoration = False
-        if not exact_restoration:
-            failure.reason = "RESUME_REQUIRES_OPERATOR"
-            failure.detail = (failure.detail or "worker failed") + "; retry boundary is not exact"
-            failure.tree_after = _safe_candidate_tree(worktree)
-            failure.step_dir = artifact_dir
-            decision = classify_failure(failure.reason, rollback_succeeded=False)
-            self._trace_recovery(
-                "recovery.classified", reason=failure.reason, decision=decision,
-                attempt=attempt, tree_before=before, tree_after=failure.tree_after,
-                budget_remaining=0, phase="implementation",
-                cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-            )
-            return None
-
-        try:
-            ownership_after = _ownership_violations(
-                ownership_before, _git_ownership(repo, worktree),
-                branch_ref=branch_ref, base_sha=base_sha,
-            )
-        except GitError as exc:
-            ownership_after = [f"Git ownership could not be read: {exc}"]
-        if ownership_after:
-            failure.reason = AGENT_GIT_VIOLATION
-            failure.detail = "; ".join(ownership_after)
-            failure.step_dir = artifact_dir
-            decision = classify_failure(failure.reason)
-            self._trace_recovery(
-                "recovery.classified", reason=failure.reason, decision=decision,
-                attempt=attempt, tree_before=before,
-                tree_after=_safe_candidate_tree(worktree), budget_remaining=0,
-                phase="implementation", cycle=getattr(self, "_trace_cycle", 1),
-                step_id=failure.step_id,
-            )
-            return None
-
-        failure.tree_after = before
-        failure.index_tree_after = before
-        decision = classify_failure(
-            reason, tree_changed_in_scope=tree_changed,
-            rollback_succeeded=True,
-        )
-        budget = self._run_options.recovery.max_transient_attempts
-        self._trace_recovery(
-            "recovery.classified", reason=reason, decision=decision,
-            attempt=attempt, tree_before=before, tree_after=before,
-            budget_remaining=max(0, budget - retries_used),
-            phase="implementation", cycle=getattr(self, "_trace_cycle", 1),
-            step_id=failure.step_id,
-        )
-        if decision.disposition is RecoveryDisposition.WAIT_EXTERNAL:
-            failure.step_dir = artifact_dir
-            return None
-        if decision.disposition not in {
-            RecoveryDisposition.RETRY_SAME,
-            RecoveryDisposition.RETRY_AFTER_ROLLBACK,
-        }:
-            failure.step_dir = artifact_dir
-            return None
-        if retries_used >= budget:
-            exhausted = classify_failure(reason, budget_exhausted=True)
-            self._trace_recovery(
-                "recovery.exhausted", reason=reason, decision=exhausted,
-                attempt=attempt, tree_before=before, tree_after=before,
-                budget_remaining=0, phase="implementation",
-                cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
-            )
-            failure.detail = (failure.detail or "transient agent failure") + "; transient attempt budget exhausted"
-            failure.step_dir = artifact_dir
-            return None
-
-        retries_used = self._consume_recovery_counter(store, retry_key)
-        store.update(status=RunStatus.IMPLEMENTING, current_step=step.id)
-        self._trace_recovery(
-            "recovery.started", reason=reason, decision=decision,
-            attempt=attempt, tree_before=before, tree_after=before,
-            budget_remaining=max(0, budget - retries_used),
-            phase="implementation", cycle=getattr(self, "_trace_cycle", 1),
-            step_id=step.id,
-        )
-        _archive_attempt(artifact_dir)
-        return retries_used, reason, before, decision
-
-    @staticmethod
-    def _recovery_generation(store: RunStateStore) -> int:
-        resume = store.load().get("resume")
-        attempts = resume.get("attempts", 0) if isinstance(resume, dict) else 0
-        return attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else 0
 
     @staticmethod
     def _count_contract_repairs(artifact_dir: Path) -> int:
@@ -5583,11 +4882,8 @@ class Orchestrator:
     def _step_failed(
         self, store: RunStateStore, run_dir: Path, failure: StepExecutionFailure,
     ) -> RunResult:
-        checkpoint = read_checkpoint(run_dir)
-        decision = classify_failure(failure.reason, budget_exhausted=True)
-        terminal = terminal_state_for(
-            decision, failure_code=failure.reason,
-            phase=checkpoint.phase if checkpoint else ResumePhase.IMPLEMENT_STEP,
+        _decision, terminal = project_exit(
+            failure.reason, phase=self._checkpoint_phase(run_dir),
         )
         self._trace_emit(
             "step.failed",
@@ -5862,152 +5158,17 @@ class Orchestrator:
     ) -> dict[str, Any]:
         """Best-effort stage the candidate; remote proof never replaces local identity."""
 
-        staging_remote = self.config.repository.remote
-        remote_required = self.config.publish.enabled or (
-            self.config.github.enabled
-            and self.config.github.pull_request_mode == "create"
-        )
-        previous_candidate_sha = None
-        if cycle > 1:
-            previous = _read_json_artifact(_candidate_commit_path(run_dir, cycle - 1))
-            if isinstance(previous, dict):
-                previous_candidate_sha = previous.get("commit_sha")
-
-        def persist_unavailable(reason: str) -> dict[str, Any]:
-            unavailable = {
-                **candidate,
-                "remote": staging_remote,
-                "remote_branch": info.branch,
-                "remote_sha": None,
-                "pushed_at": None,
-                "remote_status": "unavailable",
-            }
-            atomic_write_text(
-                _candidate_commit_path(run_dir, cycle), _json_text(unavailable)
-            )
-            state = store.load()
-            candidate_state = dict(state.get("candidate") or {})
-            candidate_state[f"{cycle:03d}"] = unavailable
-            store.update(
-                status=state.get("status", RunStatus.APPROVED),
-                candidate=candidate_state,
-                remote_branch=info.branch,
-                remote_sha=None,
-            )
-            self._trace_emit(
-                "candidate.push_unavailable",
-                phase="publication",
-                cycle=cycle,
-                data={
-                    "warning": "candidate staging remote is unavailable",
-                    "reason": reason,
-                    "required": remote_required,
-                    "commit_sha": unavailable.get("commit_sha"),
-                    "tree_sha": unavailable.get("tree_sha"),
-                    "remote": staging_remote,
-                    "branch": info.branch,
-                    "remote_status": "unavailable",
-                },
-            )
-            return unavailable
-
-        generation = self._recovery_generation(store)
-        retry_key = f"candidate-push:{cycle:03d}:resume:{generation}"
-        retries_used = self._recovery_counter(store, retry_key)
-        retry_budget = self._run_options.recovery.max_transient_attempts
-        last_failure: Exception | None = None
-        pushed = False
-        while True:
-            try:
-                remote_tip = remote_run_branch_tip(
-                    info.source_repo, remote=staging_remote, branch=info.branch
-                )
-                if remote_tip not in {
-                    None, candidate["commit_sha"], previous_candidate_sha,
-                }:
-                    return persist_unavailable("remote branch identity mismatch")
-                if remote_tip != candidate["commit_sha"]:
-                    push_run_branch(
-                        info.worktree, remote=staging_remote,
-                        branch=info.branch, commit_sha=candidate["commit_sha"],
-                    )
-                verified_tip = remote_run_branch_tip(
-                    info.source_repo, remote=staging_remote, branch=info.branch
-                )
-                if verified_tip != candidate["commit_sha"]:
-                    return persist_unavailable("remote candidate SHA mismatch")
-                pushed = True
-                break
-            except (GitError, OSError, ValueError) as exc:
-                last_failure = exc
-                decision = classify_failure(
-                    "PUSH_FAILED", remote_required=remote_required,
-                )
-                attempt = retries_used + 1
-                self._trace_recovery(
-                    "recovery.classified", reason="PUSH_FAILED", decision=decision,
-                    attempt=attempt, tree_before=candidate.get("tree_sha"),
-                    tree_after=candidate.get("tree_sha"),
-                    budget_remaining=max(0, retry_budget - retries_used),
-                    phase="candidate_push", cycle=cycle,
-                )
-                if retries_used >= retry_budget:
-                    self._trace_recovery(
-                        "recovery.exhausted", reason="PUSH_FAILED",
-                        decision=classify_failure(
-                            "PUSH_FAILED", budget_exhausted=True,
-                            remote_required=remote_required, remote_unavailable=True,
-                        ),
-                        attempt=attempt, tree_before=candidate.get("tree_sha"),
-                        tree_after=candidate.get("tree_sha"), budget_remaining=0,
-                        phase="candidate_push", cycle=cycle,
-                    )
-                    break
-                retries_used = self._consume_recovery_counter(store, retry_key)
-                self._trace_recovery(
-                    "recovery.started", reason="PUSH_FAILED", decision=decision,
-                    attempt=attempt, tree_before=candidate.get("tree_sha"),
-                    tree_after=candidate.get("tree_sha"),
-                    budget_remaining=retry_budget - retries_used,
-                    phase="candidate_push", cycle=cycle,
-                )
-
-        if not pushed:
-            unavailable = persist_unavailable("transport unavailable")
-            if remote_required:
-                raise CandidatePushError("PUSH_FAILED: candidate push did not complete") from last_failure
-            return unavailable
-
-        candidate = dict(candidate)
-        candidate["remote"] = staging_remote
-        candidate["remote_branch"] = info.branch
-        candidate["remote_sha"] = candidate["commit_sha"]
-        candidate["pushed_at"] = candidate.get("pushed_at") or datetime.now(timezone.utc).isoformat()
-        candidate["remote_status"] = "available"
-        atomic_write_text(_candidate_commit_path(run_dir, cycle), _json_text(candidate))
-        candidate_state = dict(store.load().get("candidate") or {})
-        candidate_state[f"{cycle:03d}"] = candidate
-        store.update(
-            status=store.load().get("status", RunStatus.APPROVED),
-            candidate=candidate_state,
-            remote_branch=info.branch,
-            remote_sha=candidate["commit_sha"],
-        )
-        self._trace_emit(
-            "candidate.pushed", phase="publication", cycle=cycle,
-            data={
-                "parent_sha": candidate.get("parent_sha"),
-                "commit_sha": candidate.get("commit_sha"),
-                "tree_sha": candidate.get("tree_sha"),
-                "remote": candidate.get("remote"),
-                "branch": candidate.get("remote_branch") or info.branch,
-                "remote_sha": candidate.get("remote_sha"),
-                "pushed_at": candidate.get("pushed_at"),
-                "remote_status": candidate.get("remote_status"),
-            },
-            once=True,
-        )
-        return candidate
+        return CandidateRemoteStaging(
+            self._recovery(store), store=store, budgets=self._run_options.recovery,
+            emit=self._trace_emit, remote=self.config.repository.remote,
+            remote_required=self.config.publish.enabled or (
+                self.config.github.enabled
+                and self.config.github.pull_request_mode == "create"
+            ),
+            # Resolved per call: the Git transport is this façade's dependency.
+            remote_tip=lambda *args, **kwargs: remote_run_branch_tip(*args, **kwargs),
+            push=lambda *args, **kwargs: push_run_branch(*args, **kwargs),
+        ).stage(run_dir=run_dir, info=info, cycle=cycle, candidate=candidate)
 
     def _run_v2_reviewer(
         self,
@@ -6395,250 +5556,11 @@ class Orchestrator:
     ) -> tuple[Any | None, str | None]:
         """Retry one reviser/repair contract after proving an exact rollback."""
 
-        selection = request["selection"]
-        primary = selection.check_repair if is_check_repair else selection.semantic_reviser
-        if primary is None:
-            return None, "CHECK_REPAIR_PROFILE_MISSING" if is_check_repair else "SEMANTIC_REVISER_PROFILE_MISSING"
-        fallback_authority = (
-            selection.check_repair_fallbacks if is_check_repair
-            else selection.semantic_reviser_fallbacks
-        )
-        fallbacks = tuple(fallback_authority)[:self._run_options.recovery.max_executor_fallbacks]
-        role = ExecutionRole.REPAIR if is_check_repair else ExecutionRole.REVISER
-        phase = "check-repair" if is_check_repair else "semantic-revision"
-        prefix = "check-repair" if is_check_repair else "semantic-revision"
-        stage_name = request.get("gate_stage", "")
-        generation = self._recovery_generation(store)
-        retry_key = f"{prefix}:{generation}:{cycle:03d}:{stage_name}:{attempt or 0}"
-        retries_used = self._recovery_counter(store, retry_key)
-        active = primary
-        fallback_index = 0
-        artifact_dir = Path(request["artifact_dir"])
-        repo = Path(request["repo"])
-        worktree = Path(request["info"].worktree)
-        allowed = set(request["mutable_scope"])
-
-        while True:
-            active_selection = dataclasses.replace(
-                selection,
-                check_repair=active if is_check_repair else selection.check_repair,
-                semantic_reviser=active if not is_check_repair else selection.semantic_reviser,
-            )
-            current_request = {
-                key: value for key, value in request.items() if key != "gate_stage"
-            }
-            current_request["selection"] = active_selection
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(artifact_dir / "executor.json", _json_text({
-                "profile_id": active.profile_id,
-                "role": role.value,
-                "config_sha256": active.config_sha256,
-                "selection_source": "primary execution authority" if active == primary else "frozen execution fallback authority",
-            }))
-            try:
-                tree_before = candidate_tree_sha(worktree)
-                index_before = index_tree_sha(worktree)
-                status_before = status_porcelain(worktree)
-                ownership_before = _git_ownership(repo, worktree)
-                if index_before != tree_before:
-                    raise PipelineFailure(
-                        "RESUME_REQUIRES_OPERATOR",
-                        "revision worker checkpoint does not have an exact index tree "
-                        f"(tree={tree_before}, index={index_before}, status={list(status_before)[:8]})",
-                    )
-            except GitError as exc:
-                raise PipelineFailure("RESUME_REQUIRES_OPERATOR", "revision pre-attempt tree is unreadable") from exc
-            try:
-                result, error = self._run_v2_revision_cycle(**current_request)
-            except AgentError as exc:
-                result, error = None, getattr(exc, "code", AGENT_RUNTIME_FAILED)
-            except (GitError, OSError) as exc:
-                result, error = None, getattr(exc, "code", AGENT_RUNTIME_FAILED)
-
-            if error is None:
-                return result, None
-
-            failed_tree_after = _safe_candidate_tree(worktree)
-            changed = self._restore_failed_revision_attempt(
-                repo=repo, worktree=worktree, tree_before=tree_before,
-                ownership_before=ownership_before, branch_ref=request["branch_ref"],
-                allowed=allowed, artifact_dir=artifact_dir,
-                status_before=status_before,
-                allow_requested_paths=(error == _SCOPE_REQUEST_ROUTE),
-            )
-            if error in {
-                AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
-                AGENT_PROTOCOL_FAILED, AGENT_AUTH_FAILURE,
-            }:
-                atomic_write_text(artifact_dir / "failure.json", _json_text({
-                    "schema_version": 1,
-                    "reason": str(error)[:120],
-                    "profile_id": active.profile_id,
-                    "tree_before": tree_before,
-                    "tree_after": failed_tree_after,
-                    "mutable_scope": sorted(allowed),
-                    "rollback_tree_sha": candidate_tree_sha(worktree),
-                    "rollback_index_tree_sha": index_tree_sha(worktree),
-                    "rollback_status": list(status_porcelain(worktree)),
-                }))
-            if error == AGENT_AUTH_FAILURE:
-                raise PipelineFailure(
-                    "EXTERNAL_AUTH_REQUIRED",
-                    "executor credentials or external authorization are required",
-                )
-            if error == _SCOPE_REQUEST_ROUTE:
-                return result, error
-            if error not in {
-                AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
-                AGENT_PROTOCOL_FAILED,
-            }:
-                return result, error
-
-            decision = classify_failure(error, tree_changed_in_scope=changed)
-            budget = self._run_options.recovery.max_transient_attempts
-            if retries_used < budget:
-                retries_used = self._consume_recovery_counter(store, retry_key)
-                self._trace_recovery(
-                    "recovery.started", reason=error, decision=decision,
-                    attempt=retries_used, tree_before=tree_before,
-                    tree_after=candidate_tree_sha(worktree),
-                    budget_remaining=max(0, budget - retries_used), phase=phase,
-                    cycle=cycle,
-                )
-                _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
-                continue
-
-            if fallback_index < len(fallbacks):
-                fallback_index += 1
-                fallback_decision = RecoveryDecision(
-                    RecoveryDisposition.FALLBACK_EXECUTOR,
-                    "primary executor transient retry budget exhausted",
-                    True, False,
-                )
-                self._trace_recovery(
-                    "recovery.executor_selected", reason=error,
-                    decision=fallback_decision, attempt=fallback_index,
-                    tree_before=tree_before, tree_after=candidate_tree_sha(worktree),
-                    budget_remaining=max(0, len(fallbacks) - fallback_index),
-                    phase=phase, cycle=cycle,
-                )
-                _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
-                active = fallbacks[fallback_index - 1]
-                retry_key = f"{prefix}:{generation}:{cycle:03d}:{stage_name}:{attempt or 0}:{active.profile_id}"
-                retries_used = self._recovery_counter(store, retry_key)
-                continue
-
-            self._trace_recovery(
-                "recovery.exhausted", reason=error, decision=decision,
-                attempt=retries_used + 1, tree_before=tree_before,
-                tree_after=candidate_tree_sha(worktree), budget_remaining=0,
-                phase=phase, cycle=cycle,
-            )
-            return result, error
-
-    def _restore_failed_revision_attempt(
-        self,
-        *,
-        repo: Path,
-        worktree: Path,
-        tree_before: str,
-        ownership_before: GitOwnership,
-        branch_ref: str,
-        allowed: set[str],
-        artifact_dir: Path,
-        status_before: tuple[str, ...],
-        allow_requested_paths: bool,
-    ) -> bool:
-        """Audit worker ownership and restore only a fully in-scope failed tree."""
-
-        try:
-            ownership_violations = _ownership_violations(
-                ownership_before, _git_ownership(repo, worktree),
-                branch_ref=branch_ref, base_sha=ownership_before.head,
-            )
-        except GitError as exc:
-            ownership_violations = [f"Git ownership could not be read: {type(exc).__name__}"]
-        if ownership_violations:
-            raise PipelineFailure("AGENT_GIT_VIOLATION", "; ".join(ownership_violations))
-
-        try:
-            current_tree = candidate_tree_sha(worktree)
-            current_index = index_tree_sha(worktree)
-            status = status_porcelain(worktree)
-            changed = changed_paths_between_trees(repo, tree_before, current_tree)
-            if (
-                current_tree != tree_before or current_index != tree_before
-                or _status_has_unstaged_or_untracked(status)
-            ):
-                stage_all(worktree)
-                current_tree = candidate_tree_sha(worktree)
-                current_index = index_tree_sha(worktree)
-                status = status_porcelain(worktree)
-                changed = changed_paths_between_trees(repo, tree_before, current_tree)
-        except PipelineFailure:
-            raise
-        except (GitError, OSError, ValueError) as exc:
-            raise PipelineFailure("RESUME_REQUIRES_OPERATOR", "failed revision tree could not be frozen") from exc
-
-        requested: set[str] = set()
-        if allow_requested_paths:
-            report = _read_json_artifact(artifact_dir / "report.json", 256 * 1024)
-            scope_request = report.get("scope_request") if isinstance(report, dict) else None
-            paths = scope_request.get("paths") if isinstance(scope_request, dict) else None
-            if isinstance(paths, list) and all(isinstance(path, str) for path in paths):
-                requested = set(paths)
-        unsafe_request = [path for path in requested if not self._safe_scope_request_path(path)]
-        if unsafe_request:
-            raise PipelineFailure("AGENT_SCOPE_VIOLATION", "scope request contains an unsafe path")
-        outside = [path for path in changed if path not in allowed and path not in requested]
-        if outside:
-            raise PipelineFailure(
-                AGENT_SCOPE_VIOLATION,
-                "worker changed paths outside scope: " + _paths_detail(outside),
-            )
-        if current_tree != tree_before:
-            try:
-                security_failures = scan_staged_security(worktree, secrets=self._secrets)
-            except (GitError, OSError, ValueError) as exc:
-                raise PipelineFailure(
-                    "RESUME_REQUIRES_OPERATOR", "failed revision changes could not be security-scanned",
-                ) from exc
-            if security_failures:
-                raise PipelineFailure(
-                    security_failures[0].split(":", 1)[0], "; ".join(security_failures),
-                )
-
-        try:
-            if changed:
-                restore_paths_from_tree(worktree, tree_before, sorted(changed))
-                stage_all(worktree)
-            if (
-                candidate_tree_sha(worktree) != tree_before
-                or index_tree_sha(worktree) != tree_before
-                or status_porcelain(worktree) != status_before
-            ):
-                raise GitError("failed revision rollback did not restore the exact tree")
-            violations = _ownership_violations(
-                ownership_before, _git_ownership(repo, worktree),
-                branch_ref=branch_ref, base_sha=ownership_before.head,
-            )
-            if violations:
-                raise GitError("Git ownership changed during rollback")
-            atomic_write_text(artifact_dir / "tree_after_failure.txt", tree_before + "\n")
-        except (GitError, OSError) as exc:
-            _record_failure_tree(artifact_dir, worktree)
-            raise PipelineFailure("RESUME_REQUIRES_OPERATOR", "failed revision rollback was not exact") from exc
-        return bool(changed)
-
-    @staticmethod
-    def _safe_scope_request_path(path: str) -> bool:
-        return bool(
-            isinstance(path, str) and path and path == path.strip()
-            and path not in {".", ".."}
-            and "\x00" not in path and "\\" not in path
-            and not path.startswith("/") and "//" not in path
-            and all(part not in {"", ".", "..", ".git"} for part in Path(path).parts)
-            and not any(char in path for char in "*?[]{}")
+        return self._worker_recovery(store).run_revision(
+            request=request, is_check_repair=is_check_repair, cycle=cycle,
+            attempt=attempt,
+            fallbacks_limit=self._run_options.recovery.max_executor_fallbacks,
+            run_attempt=self._run_v2_revision_cycle,
         )
 
     def _redact_revision_artifacts(self, artifact_dir: Path) -> None:
@@ -6687,25 +5609,21 @@ class Orchestrator:
         initial_mismatch: str | None = None,
         index_tree_after: str | None = None,
         step_dir: Path | None = None,
-        terminal_status: RunStatus = RunStatus.FAILED,
+        terminal_status: RunStatus | None = None,
         auto_resumable: bool | None = None,
     ) -> RunResult:
-        if terminal_status is RunStatus.FAILED and reason in {
-            "CHECK_INFRASTRUCTURE_UNAVAILABLE", "CHECK_SIDE_EFFECT_REPEATED",
-            "CHECK_INFRA_RETRIES_EXHAUSTED", "PUSH_FAILED",
-            "CHECK_REPAIR_EXHAUSTED", "WAITING_REPAIR_EXHAUSTED",
-            "REVIEW_EVIDENCE_UNRESOLVED", "HUMAN_REQUIRED",
-            "EXTERNAL_AUTH_REQUIRED",
-        }:
-            checkpoint = read_checkpoint(run_dir)
-            decision = classify_failure(
-                reason, remote_required=reason == "PUSH_FAILED",
-                remote_unavailable=reason == "PUSH_FAILED", budget_exhausted=True,
-            )
-            terminal_status = terminal_state_for(
-                decision, failure_code=reason,
-                phase=checkpoint.phase if checkpoint else ResumePhase.IMPLEMENT_STEP,
-            ).status
+        """Persist a failure that left its recovery loop, with its step record.
+
+        Without an explicit ``terminal_status`` the failure is projected by
+        the recovery policy: only a hard stop becomes ``FAILED``.
+        """
+
+        if terminal_status is None:
+            reason = normalize_exit_reason(reason)
+            terminal_status = project_exit(
+                reason, phase=self._checkpoint_phase(run_dir),
+                remote_required=reason == "PUSH_FAILED",
+            )[1].status
         if reason == "CHECK_REPAIR_EXHAUSTED":
             self._trace_emit(
                 "check_repair.exhausted",
@@ -6770,17 +5688,68 @@ class Orchestrator:
                        if index_tree_after else {}),
                     "usage": step_usage,
                 }))
-        if terminal_status is RunStatus.FAILED:
-            state = store.record_failure(
-                reason, redact(detail, self._secrets) if detail is not None else None,
-                **fields,
-            )
-        else:
-            failure = {"reason": reason}
-            if detail is not None:
-                failure["detail"] = redact(detail, self._secrets)
-            state = store.update(status=terminal_status, failure=failure, **fields)
+        state = self._persist_exit(store, reason, detail, terminal_status, **fields)
         return RunResult(run_dir, terminal_status, state)
+
+    @staticmethod
+    def _checkpoint_phase(
+        run_dir: Path, *, default: ResumePhase = ResumePhase.IMPLEMENT_STEP,
+    ) -> ResumePhase:
+        try:
+            checkpoint = read_checkpoint(run_dir)
+        except ResumeCheckpointError:
+            return default
+        return checkpoint.phase if checkpoint is not None else default
+
+    def _persist_exit(
+        self, store: RunStateStore, reason: str, detail: Any,
+        status: RunStatus, **fields: Any,
+    ) -> dict[str, Any]:
+        """Write one terminal or waiting outcome; FAILED only for hard stops."""
+
+        detail = redact(detail, self._secrets) if detail is not None else None
+        if status is RunStatus.FAILED:
+            return store.record_failure(reason, detail, **fields)
+        failure = {"reason": reason}
+        if detail is not None:
+            failure["detail"] = detail
+        return store.update(status=status, failure=failure, **fields)
+
+    def _project_exception(
+        self, store: RunStateStore, run_dir: Path, exc: Exception,
+    ) -> RunResult:
+        """Project an exception that escaped every recovery loop."""
+
+        reason = normalize_exit_reason(_failure_reason(exc))
+        _decision, terminal = project_exit(reason, phase=self._checkpoint_phase(run_dir))
+        fields = self._closing_step_fields(
+            store, "failed" if terminal.status is RunStatus.FAILED else "waiting",
+        )
+        # A crash-shaped hard stop stays operator-resumable: resume validation,
+        # not this projection, is the authority over its checkpoint.
+        state = self._persist_exit(store, reason, str(exc), terminal.status, **fields)
+        return RunResult(run_dir, terminal.status, state)
+
+    def _publication_push_failed(
+        self, store: RunStateStore, run_dir: Path, detail: str, *,
+        cycle: int, approved_tree: str | None, **fields: Any,
+    ) -> RunResult:
+        """A required publication remote is unavailable: wait, keep the candidate."""
+
+        decision, terminal = project_exit(
+            "PUSH_FAILED", phase=ResumePhase.PUBLISH, remote_required=True,
+        )
+        self._recovery(store).trace(
+            "recovery.exhausted", reason="PUSH_FAILED", decision=decision,
+            attempt=1, tree_before=approved_tree, tree_after=approved_tree,
+            budget_remaining=0, phase="publication", cycle=cycle,
+            terminal_status=terminal.status, checkpoint_phase=ResumePhase.PUBLISH,
+        )
+        state = self._persist_exit(
+            store, "PUSH_FAILED", detail, terminal.status,
+            recovery_resumable=terminal.resumable, **fields,
+        )
+        return RunResult(run_dir, terminal.status, state)
 
     def _cleanup_published_run_branch(
         self,
@@ -7027,7 +5996,7 @@ class Orchestrator:
                 }
         except BaseMovedError as exc:
             decision = classify_failure("BASE_MOVED_SINCE_RUN")
-            self._trace_recovery(
+            self._recovery(store).trace(
                 "recovery.classified", reason="BASE_MOVED_SINCE_RUN",
                 decision=decision, attempt=1, tree_before=approved_tree,
                 tree_after=approved_tree, budget_remaining=0,
@@ -7044,35 +6013,18 @@ class Orchestrator:
             detail = "push did not complete"
             if exc.local_base_updated:
                 detail += f"; local {base_branch} already points to {commit_sha}"
-            decision = classify_failure(
-                "PUSH_FAILED", remote_required=True, remote_unavailable=True,
-            )
-            self._trace_recovery(
-                "recovery.classified", reason="PUSH_FAILED", decision=decision,
-                attempt=1, tree_before=approved_tree, tree_after=approved_tree,
-                budget_remaining=self._run_options.recovery.max_transient_attempts,
-                phase="publication", cycle=cycle,
-            )
-            state = store.record_failure(
-                "PUSH_FAILED", detail,
+            return self._publication_push_failed(
+                store, run_dir, detail, cycle=cycle, approved_tree=approved_tree,
                 publish={"mode": self.config.publish.mode, "target": base_branch,
                          "remote": self.config.publish.remote, "commit_sha": commit_sha,
                          "status": "push-failed", "local_base_updated": exc.local_base_updated},
                 **fields,
             )
-            return RunResult(run_dir, RunStatus.FAILED, state)
         except (GitError, OSError, ValueError):
-            decision = classify_failure(
-                "PUSH_FAILED", remote_required=True, remote_unavailable=True,
+            return self._publication_push_failed(
+                store, run_dir, "publication did not complete", cycle=cycle,
+                approved_tree=approved_tree, **fields,
             )
-            self._trace_recovery(
-                "recovery.classified", reason="PUSH_FAILED", decision=decision,
-                attempt=1, tree_before=approved_tree, tree_after=approved_tree,
-                budget_remaining=self._run_options.recovery.max_transient_attempts,
-                phase="publication", cycle=cycle,
-            )
-            state = store.record_failure("PUSH_FAILED", "publication did not complete", **fields)
-            return RunResult(run_dir, RunStatus.FAILED, state)
         self._ensure_github_pull_request_metadata(
             store=store,
             run_id=str(store.load().get("run_id", "")),
@@ -7224,12 +6176,7 @@ class Orchestrator:
             )
             return self._diagnose_result(RunResult(run_dir, RunStatus.INTERRUPTED, interrupted))
         except Exception as exc:
-            failed = store.record_failure(
-                _failure_reason(exc),
-                redact(str(exc), self._secrets),
-                **self._closing_step_fields(store, "failed"),
-            )
-            return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
+            return self._diagnose_result(self._project_exception(store, run_dir, exc))
 
     def _restore_checkpoint_tree(self, resumed: ResumedRun) -> None:
         """Undo a failed attempt's in-scope edits, exactly and boundedly."""
@@ -7614,9 +6561,7 @@ class Orchestrator:
                                        **self._closing_step_fields(store, "interrupted"))
             return RunResult(run_dir, RunStatus.INTERRUPTED, interrupted)
         except Exception as exc:
-            failed = store.record_failure(_failure_reason(exc), redact(str(exc), self._secrets),
-                                          **self._closing_step_fields(store, "failed"))
-            return RunResult(run_dir, RunStatus.FAILED, failed)
+            return self._project_exception(store, run_dir, exc)
 
     @staticmethod
     def _existing_setup_worktree(

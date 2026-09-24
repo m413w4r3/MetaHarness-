@@ -19,16 +19,21 @@ from typing import (
     Callable,
     Mapping,
 )
+from ..attempt_transaction import (
+    MAX_REPORTED_PATHS,
+    GitOwnership,
+    git_ownership,
+    ownership_violations,
+    paths_detail,
+    safe_path_label,
+    status_has_unstaged_or_untracked,
+)
 from ..evidence import EvidenceBundle
 from ..gitops import (
     GitError,
     candidate_tree_sha,
-    current_head,
     index_tree_sha,
-    local_branches,
-    registered_worktrees,
     status_porcelain,
-    symbolic_head,
 )
 from ..plan_recovery import PLAN_RECOVERY_ARTIFACT
 from ..result import (
@@ -176,42 +181,13 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
-_MAX_REPORTED_PATHS = 20
+_MAX_REPORTED_PATHS = MAX_REPORTED_PATHS
+_safe_path_label = safe_path_label
+_paths_detail = paths_detail
 
 
-def _safe_path_label(path: str) -> str:
-    """A printable rendering of one repository path for failure details."""
-
-    return "".join(
-        character if character.isprintable() else f"\\x{ord(character) & 0xFF:02x}"
-        for character in path
-    )[:300]
-
-
-def _paths_detail(paths: list[str]) -> str:
-    shown = [_safe_path_label(path) for path in paths[:_MAX_REPORTED_PATHS]]
-    extra = len(paths) - len(shown)
-    return ",".join(shown) + (f" (+{extra} more)" if extra > 0 else "")
-
-
-@dataclasses.dataclass(frozen=True)
-class GitOwnership:
-    """Git state the implementation agent is not allowed to change."""
-
-    head_ref: str | None
-    head: str
-    branches: frozenset[str]
-    worktrees: frozenset[str]
-
-
-
-def _git_ownership(repo: Path, worktree: Path) -> GitOwnership:
-    return GitOwnership(
-        head_ref=symbolic_head(worktree),
-        head=current_head(worktree),
-        branches=local_branches(repo),
-        worktrees=registered_worktrees(repo),
-    )
+_git_ownership = git_ownership
+_ownership_violations = ownership_violations
 
 
 def _git_ownership_payload(ownership: GitOwnership) -> dict[str, Any]:
@@ -221,31 +197,6 @@ def _git_ownership_payload(ownership: GitOwnership) -> dict[str, Any]:
         "branches": sorted(ownership.branches),
         "worktrees": sorted(ownership.worktrees),
     }
-
-
-def _ownership_violations(
-    before: GitOwnership, after: GitOwnership, *, branch_ref: str, base_sha: str
-) -> list[str]:
-    problems: list[str] = []
-    if after.head_ref != branch_ref:
-        problems.append(
-            f"worktree HEAD switched from {branch_ref} to {after.head_ref or 'a detached HEAD'}"
-        )
-    if after.head != base_sha:
-        problems.append("worktree HEAD commit changed (commit, merge, reset or rewrite)")
-    created = sorted(after.branches - before.branches)
-    if created:
-        problems.append("branch(es) created: " + ", ".join(created))
-    deleted = sorted(before.branches - after.branches)
-    if deleted:
-        problems.append("branch(es) deleted: " + ", ".join(deleted))
-    added_worktrees = sorted(after.worktrees - before.worktrees)
-    if added_worktrees:
-        problems.append("worktree(s) created: " + ", ".join(added_worktrees))
-    removed_worktrees = sorted(before.worktrees - after.worktrees)
-    if removed_worktrees:
-        problems.append("worktree(s) removed: " + ", ".join(removed_worktrees))
-    return problems
 
 
 @dataclasses.dataclass(frozen=True)
@@ -616,11 +567,4 @@ class GateMutableAuthority:
 
 
 
-def _status_has_unstaged_or_untracked(status: tuple[str, ...]) -> list[str]:
-    problems: list[str] = []
-    for line in status:
-        if line.startswith("?? "):
-            problems.append(f"new untracked file: {line[3:]}")
-        elif len(line) >= 2 and line[1] != " ":
-            problems.append(f"unstaged change: {line}")
-    return problems
+_status_has_unstaged_or_untracked = status_has_unstaged_or_untracked

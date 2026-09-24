@@ -130,6 +130,15 @@ _TRANSIENT_EXTERNAL_CODES = frozenset({
 })
 
 
+# Model corrections whose exhaustion needs an operator, never a hard stop:
+# the candidate is still the exact, rolled-back pre-attempt tree.
+_CORRECTNESS_REPAIR_CODES = frozenset({
+    "AGENT_CONTRACT_MISMATCH", "CONTRACT_INSUFFICIENT", "CONTRACT_INSUFFICIENCY",
+    "REVIEW_IMPLEMENTATION", "REVIEW_REPLAN", "BOUNDED_SCOPE_REQUEST",
+    "PLANNER_REPOSITORY_EVIDENCE",
+})
+
+
 def classify_failure(
     failure: str,
     *,
@@ -167,7 +176,10 @@ def classify_failure(
         return decision(RecoveryDisposition.HARD_STOP, "tree changed outside approved scope")
     if not rollback_succeeded:
         return decision(RecoveryDisposition.HARD_STOP, "rollback did not restore the expected tree")
-    if code in {"CHECK_REPAIR_EXHAUSTED", "DETERMINISTIC_GATE_FAILED", "WAITING_REPAIR_EXHAUSTED", "REVIEW_EVIDENCE_UNRESOLVED", "HUMAN_REQUIRED"}:
+    if code in {
+        "CHECK_REPAIR_EXHAUSTED", "DETERMINISTIC_GATE_FAILED", "WAITING_REPAIR_EXHAUSTED",
+        "REVIEW_EVIDENCE_UNRESOLVED", "HUMAN_REQUIRED", "REPOSITORY_EVIDENCE_RECOVERY_EXHAUSTED",
+    }:
         return decision(RecoveryDisposition.WAIT_HUMAN, "correctness repair or operator decision is required")
     if code == "CHECK_INFRA_RETRIES_EXHAUSTED":
         return decision(RecoveryDisposition.WAIT_EXTERNAL, "check infrastructure retries were exhausted")
@@ -211,6 +223,12 @@ def classify_failure(
             return decision(RecoveryDisposition.WAIT_EXTERNAL, "external recovery budget exhausted")
         if code.startswith(("REVIEW_FORMAT_INVALID", "REVIEWER_OUTPUT_INVALID", "REVIEW_PARSE")):
             return decision(RecoveryDisposition.WAIT_HUMAN, "review repair budget exhausted")
+        if code == "REVIEW_EVIDENCE_RETRY":
+            return decision(RecoveryDisposition.WAIT_HUMAN, "reviewer evidence recovery was exhausted")
+        if code in _CORRECTNESS_REPAIR_CODES or code.startswith("CHECK_FAILED"):
+            return decision(RecoveryDisposition.WAIT_HUMAN, "bounded correctness repair was exhausted")
+        if code.startswith(("PLANNER_FORMAT_INVALID", "PLANNER_OUTPUT_INVALID")):
+            return decision(RecoveryDisposition.WAIT_HUMAN, "planner correction budget exhausted")
         if code in {"PLAN_REPOSITORY_PRECONDITION_INVALID", "PLAN_REPOSITORY_PRECONDITION_ERROR", "PLANNER_REPOSITORY_PRECONDITION_ERROR"}:
             return decision(RecoveryDisposition.WAIT_HUMAN, "planning correction budget exhausted")
         return decision(RecoveryDisposition.HARD_STOP, "bounded recovery budget exhausted")
@@ -232,6 +250,11 @@ def classify_failure(
         return decision(RecoveryDisposition.CHECK_REPAIR, "deterministic check failed", consumes=True)
     if code in {"CHECK_TIMEOUT", "CHECK_PREFLIGHT_FAILED", "CHECK_INFRA_FAILURE"}:
         return decision(RecoveryDisposition.RETRY_SAME, "check infrastructure can be retried", consumes=True)
+    if code == "REVIEW_EVIDENCE_RETRY":
+        return decision(
+            RecoveryDisposition.RETRY_SAME,
+            "reviewer FAIL is retried once on rebuilt local evidence", consumes=True,
+        )
     if code.startswith(("REVIEW_PARSE", "REVIEWER_OUTPUT_INVALID", "REVIEW_FORMAT_INVALID")):
         return decision(RecoveryDisposition.CONTRACT_REPAIR, "review output format can be repaired", consumes=True)
     if code.startswith(("PLANNER_FORMAT_INVALID", "PLANNER_PROTOCOL_FAILED", "PLANNER_OUTPUT_INVALID")):

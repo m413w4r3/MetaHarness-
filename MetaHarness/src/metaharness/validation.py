@@ -13,17 +13,22 @@ import json
 import tempfile
 import time
 import dataclasses
+import functools
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from .approval import ApprovalError, read_check_authority
+from .attempt_transaction import (
+    AttemptViolation,
+    SideEffect,
+    contain_trusted_process,
+    observe_side_effects,
+    restore_exact,
+)
 from .gitops import (
     CandidateState,
     GitError,
-    candidate_state_changed_paths,
-    candidate_ownership_matches,
-    restore_candidate_state,
     snapshot_candidate_state,
 )
 from .models import CheckConfig, HarnessConfig
@@ -140,6 +145,13 @@ def bounded_tail(value: str, max_bytes: int = DEFAULT_TAIL_BYTES) -> str:
 def _snapshot(worktree: Path) -> CandidateState:
     try:
         return snapshot_candidate_state(worktree)
+    except GitError as exc:
+        raise ValidationError(f"TREE_MISMATCH: could not snapshot candidate state: {exc}") from exc
+
+
+def _observe(worktree: Path, before: CandidateState) -> SideEffect | None:
+    try:
+        return observe_side_effects(worktree, before)
     except GitError as exc:
         raise ValidationError(f"TREE_MISMATCH: could not snapshot candidate state: {exc}") from exc
 
@@ -308,62 +320,48 @@ def run_checks(
                             f"\ncheck timed out after {check.timeout_seconds}s\n".encode("utf-8")
                         )
                 duration = time.monotonic() - attempt_started
-                after = _snapshot(root)
+                effect = _observe(root, before)
                 redact_file(stdout_path, secrets)
                 redact_file(stderr_path, secrets)
 
-                if before != after:
-                    changed_paths = candidate_state_changed_paths(root, before, after)
-                    if not candidate_ownership_matches(before, after):
-                        _archive_mutation(
-                            output_dir,
-                            check_id=check.id, attempt=attempt_number,
-                            before=before, after=after, changed_paths=changed_paths,
-                            secrets=secrets, rollback="ownership_changed",
-                        )
+                if effect is not None:
+                    after, changed_paths = effect.after, list(effect.changed_paths)
+
+                    archive = functools.partial(
+                        _archive_mutation, output_dir,
+                        check_id=check.id, attempt=attempt_number,
+                        before=before, after=after, changed_paths=changed_paths,
+                        secrets=secrets,
+                    )
+
+                    if not effect.ownership_preserved:
+                        archive(rollback="ownership_changed")
                         raise ValidationError(
                             "AGENT_GIT_VIOLATION: check changed Git ownership; "
                             f"mutated_tree={after.candidate_tree}; "
                             f"mutated_paths={','.join(changed_paths[:20])}"
                         )
-                    mutation_signature = (
-                        after.index_tree, after.candidate_tree, changed_paths, after.status,
-                    )
+                    mutation_signature = effect.signature
                     any_mutation = True
                     mutation_paths.update(changed_paths)
                     mutated_tree_sha = after.candidate_tree
                     try:
-                        restored = restore_candidate_state(root, before)
-                    except GitError as exc:
-                        _archive_mutation(
-                            output_dir,
-                            check_id=check.id, attempt=attempt_number,
-                            before=before, after=after, changed_paths=changed_paths,
-                            secrets=secrets, rollback="failed",
-                        )
-                        raise ValidationError(
-                            "ROLLBACK_FAILED: check mutation could not be restored; "
-                            f"mutated_tree={after.candidate_tree}; "
-                            f"mutated_paths={','.join(changed_paths[:20])}; "
-                            f"error={type(exc).__name__}"
-                        ) from None
-                    if restored != before:
-                        _archive_mutation(
-                            output_dir,
-                            check_id=check.id, attempt=attempt_number,
-                            before=before, after=after, changed_paths=changed_paths,
-                            secrets=secrets, rollback="mismatch",
-                        )
+                        restore_exact(root, before, label="check mutation")
+                    except AttemptViolation as violation:
+                        if violation.code == "ROLLBACK_FAILED":
+                            archive(rollback="failed")
+                            raise ValidationError(
+                                "ROLLBACK_FAILED: check mutation could not be restored; "
+                                f"mutated_tree={after.candidate_tree}; "
+                                f"mutated_paths={','.join(changed_paths[:20])}; "
+                                f"error={violation.detail.rsplit(' ', 1)[-1]}"
+                            ) from None
+                        archive(rollback="mismatch")
                         raise ValidationError(
                             "ROLLBACK_TREE_MISMATCH: check rollback did not restore exact state; "
                             f"mutated_tree={after.candidate_tree}"
-                        )
-                    _archive_mutation(
-                        output_dir,
-                        check_id=check.id, attempt=attempt_number,
-                        before=before, after=after, changed_paths=changed_paths,
-                        secrets=secrets, rollback="verified",
-                    )
+                        ) from None
+                    archive(rollback="verified")
                     if not mutation_retry_used:
                         mutation_retry_used = True
                         prior_mutation = mutation_signature
@@ -469,19 +467,14 @@ def run_check_preflights(
                     )
             except (OSError, ValueError):
                 exit_code, timed_out = -1, False
-            after = _snapshot(root)
-            if before != after:
-                if not candidate_ownership_matches(before, after):
-                    raise ValidationError(
-                        "AGENT_GIT_VIOLATION: preflight changed Git ownership"
-                    )
-                changed_paths = candidate_state_changed_paths(root, before, after)
-                signature = (after.index_tree, after.candidate_tree, changed_paths, after.status)
-                try:
-                    if restore_candidate_state(root, before) != before:
-                        raise GitError("preflight rollback did not restore exact state")
-                except GitError as exc:
-                    raise ValidationError(f"ROLLBACK_FAILED: preflight mutation: {exc}") from None
+            try:
+                effect = contain_trusted_process(root, before, label="preflight mutation")
+            except AttemptViolation as violation:
+                raise ValidationError(f"{violation.code}: {violation.detail}") from None
+            except GitError as exc:
+                raise ValidationError(f"TREE_MISMATCH: could not snapshot candidate state: {exc}") from exc
+            if effect is not None:
+                signature = effect.signature
                 if not mutation_retry_used:
                     mutation_retry_used = True
                     first_mutation = signature

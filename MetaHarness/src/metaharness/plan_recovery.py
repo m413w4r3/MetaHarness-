@@ -40,6 +40,10 @@ RECOVERABLE_PLANNER_STATE_PAIRS = frozenset({
     # Both planner answers violated the repository preconditions.
     ("failed", "PLAN_REPOSITORY_PRECONDITION_INVALID"),
     ("failed", "LLM_FAILURE"),
+    # The same planner failures once projected onto their waiting conditions.
+    ("waiting_human", "PLANNER_OUTPUT_INVALID"),
+    ("waiting_human", "PLAN_REPOSITORY_PRECONDITION_INVALID"),
+    ("waiting_external", "LLM_FAILURE"),
     ("blocked", "PLANNER_BLOCKED"),
 })
 RECOVERABLE_PLANNER_FAILURES = frozenset(

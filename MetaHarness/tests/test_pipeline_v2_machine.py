@@ -247,7 +247,8 @@ class SingleCycleTests(PipelineHarness):
         ).run_text(SPEC, run_id="residual-mismatch")
 
         worktree = self.worktree("residual-mismatch")
-        self.assertEqual(result.status, RunStatus.FAILED)
+        # Exhausted contract repair is a correctness decision for an operator.
+        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
         self.assertEqual(
             self.state("residual-mismatch")["failure"]["reason"],
             "AGENT_CONTRACT_MISMATCH",
@@ -1708,8 +1709,9 @@ class GitChainAndTraceTests(PipelineHarness):
         original = self.orchestrator(
             self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
         )
-        with mock.patch.object(
-            type(original), "_restore_failed_step_attempt", staticmethod(lambda *_args: False),
+        # The shared attempt transaction cannot restore the partial edit.
+        with mock.patch(
+            "metaharness.attempt_transaction.restore_paths_from_tree", lambda *_args: None,
         ):
             result = original.run_text(SPEC, run_id="run")
 

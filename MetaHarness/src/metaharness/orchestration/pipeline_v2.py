@@ -150,7 +150,12 @@ def correction_kind(route: ReviewRoute) -> CycleKind:
 
 
 class PipelineFailure(Exception):
-    """A terminal, classified failure of the current operation."""
+    """An attempt failure that left the current operation's recovery loop.
+
+    ``reason`` is a stable failure code.  It is not necessarily terminal:
+    the recovery coordinator projects it onto a hard failure (``FAILED``) or
+    onto a waiting condition (``WAITING_*``) from the recovery policy.
+    """
 
     def __init__(self, reason: str, detail: Any = None, *, step_id: str | None = None) -> None:
         super().__init__(f"{reason}: {detail}" if detail is not None else reason)

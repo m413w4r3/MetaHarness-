@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from .pipeline_v2 import PipelineFailure, candidate_dir, gate_acceptance_path
@@ -18,6 +19,7 @@ from ..gitops import (
 from ..evidence import required_checks_passed
 from ..result import atomic_write_text
 from ..models import GateStage, RunStatus
+from ..recovery_policy import RecoveryBudgets
 
 
 def _commit_web_url(reference: RepositoryReference, commit_sha: str) -> str | None:
@@ -211,3 +213,155 @@ class CandidateLifecycle:
             ),
         )
         return pushed
+
+
+class CandidateRemoteStaging:
+    """Stage one exact candidate on the remote under a bounded retry budget.
+
+    Remote proof never replaces local identity: the remote tip must equal the
+    candidate SHA exactly.  An optional remote degrades to a warning; a
+    required remote that stays unavailable is a waiting condition.
+    """
+
+    def __init__(
+        self,
+        recovery: Any,
+        *,
+        store: Any,
+        budgets: RecoveryBudgets,
+        emit: Callable[..., None],
+        remote: str,
+        remote_required: bool,
+        remote_tip: Callable[..., str | None],
+        push: Callable[..., None],
+    ) -> None:
+        self._recovery = recovery
+        self._store = store
+        self._budgets = budgets
+        self._emit = emit
+        self._remote = remote
+        self._remote_required = remote_required
+        self._remote_tip = remote_tip
+        self._push = push
+
+    def stage(
+        self, *, run_dir: Path, info: Any, cycle: int, candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        store = self._store
+        previous_candidate_sha = None
+        if cycle > 1:
+            previous = _read_json_artifact(_candidate_commit_path(run_dir, cycle - 1))
+            if isinstance(previous, dict):
+                previous_candidate_sha = previous.get("commit_sha")
+        key = self._recovery.budget_key("candidate-push", f"{cycle:03d}")
+        tree = candidate.get("tree_sha")
+        last_failure: Exception | None = None
+        while True:
+            try:
+                remote_tip = self._remote_tip(
+                    info.source_repo, remote=self._remote, branch=info.branch,
+                )
+                if remote_tip not in {None, candidate["commit_sha"], previous_candidate_sha}:
+                    return self._unavailable(
+                        run_dir, info, cycle, candidate, "remote branch identity mismatch",
+                    )
+                if remote_tip != candidate["commit_sha"]:
+                    self._push(
+                        info.worktree, remote=self._remote,
+                        branch=info.branch, commit_sha=candidate["commit_sha"],
+                    )
+                verified_tip = self._remote_tip(
+                    info.source_repo, remote=self._remote, branch=info.branch,
+                )
+                if verified_tip != candidate["commit_sha"]:
+                    return self._unavailable(
+                        run_dir, info, cycle, candidate, "remote candidate SHA mismatch",
+                    )
+                break
+            except (GitError, OSError, ValueError) as exc:
+                last_failure = exc
+                admission = self._recovery.admit(
+                    key, reason="PUSH_FAILED", budget=self._budgets.max_transient_attempts,
+                    phase="candidate_push", cycle=cycle, tree_before=tree, tree_after=tree,
+                    facts={"remote_required": self._remote_required},
+                )
+                if not admission.admitted:
+                    unavailable = self._unavailable(
+                        run_dir, info, cycle, candidate, "transport unavailable",
+                    )
+                    if self._remote_required:
+                        raise CandidatePushError(
+                            "PUSH_FAILED: candidate push did not complete"
+                        ) from last_failure
+                    return unavailable
+
+        candidate = {
+            **candidate,
+            "remote": self._remote,
+            "remote_branch": info.branch,
+            "remote_sha": candidate["commit_sha"],
+            "pushed_at": candidate.get("pushed_at") or datetime.now(timezone.utc).isoformat(),
+            "remote_status": "available",
+        }
+        atomic_write_text(_candidate_commit_path(run_dir, cycle), _json_text(candidate))
+        candidate_state = dict(store.load().get("candidate") or {})
+        candidate_state[f"{cycle:03d}"] = candidate
+        store.update(
+            status=store.load().get("status", RunStatus.APPROVED),
+            candidate=candidate_state,
+            remote_branch=info.branch,
+            remote_sha=candidate["commit_sha"],
+        )
+        self._emit(
+            "candidate.pushed", phase="publication", cycle=cycle,
+            data={
+                "parent_sha": candidate.get("parent_sha"),
+                "commit_sha": candidate.get("commit_sha"),
+                "tree_sha": candidate.get("tree_sha"),
+                "remote": candidate.get("remote"),
+                "branch": candidate.get("remote_branch") or info.branch,
+                "remote_sha": candidate.get("remote_sha"),
+                "pushed_at": candidate.get("pushed_at"),
+                "remote_status": candidate.get("remote_status"),
+            },
+            once=True,
+        )
+        return candidate
+
+    def _unavailable(
+        self, run_dir: Path, info: Any, cycle: int, candidate: dict[str, Any], reason: str,
+    ) -> dict[str, Any]:
+        unavailable = {
+            **candidate,
+            "remote": self._remote,
+            "remote_branch": info.branch,
+            "remote_sha": None,
+            "pushed_at": None,
+            "remote_status": "unavailable",
+        }
+        atomic_write_text(_candidate_commit_path(run_dir, cycle), _json_text(unavailable))
+        state = self._store.load()
+        candidate_state = dict(state.get("candidate") or {})
+        candidate_state[f"{cycle:03d}"] = unavailable
+        self._store.update(
+            status=state.get("status", RunStatus.APPROVED),
+            candidate=candidate_state,
+            remote_branch=info.branch,
+            remote_sha=None,
+        )
+        self._emit(
+            "candidate.push_unavailable",
+            phase="publication",
+            cycle=cycle,
+            data={
+                "warning": "candidate staging remote is unavailable",
+                "reason": reason,
+                "required": self._remote_required,
+                "commit_sha": unavailable.get("commit_sha"),
+                "tree_sha": unavailable.get("tree_sha"),
+                "remote": self._remote,
+                "branch": info.branch,
+                "remote_status": "unavailable",
+            },
+        )
+        return unavailable
