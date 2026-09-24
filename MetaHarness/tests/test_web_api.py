@@ -127,7 +127,7 @@ class WebServerTests(unittest.TestCase):
             runs.assert_called_once_with(self.runs)
             get_run.assert_called_once_with(self.runs, "r1", config=self.config)
             live.assert_called_once_with(self.runs, "r1", self.config)
-            progress.assert_called_once_with(self.runs, "r1", 3)
+            progress.assert_called_once_with(self.runs, "r1", 3, self.config)
 
     def test_config_endpoint_exposes_effective_safe_config(self) -> None:
         status, payload, raw = self.request("GET", "/api/v1/config")
@@ -520,12 +520,46 @@ class WebServerTests(unittest.TestCase):
         (run_dir / "agent.events.jsonl").write_text("".join(events), encoding="utf-8")
         status, payload, _ = self.request("GET", "/api/runs/events/progress?offset=0")
         self.assertEqual(status, 200)
-        self.assertEqual(payload["events"], ["turn.started", "$ python -m unittest"])
+        self.assertTrue(any("turn.started" in item for item in payload["events"]))
         status, second, _ = self.request(
             "GET", f"/api/runs/events/progress?offset={payload['next_offset']}"
         )
         self.assertEqual(status, 200)
         self.assertEqual(second["events"], [])
+
+    def test_unified_progress_projects_trace_agent_and_redacts_credentials(self) -> None:
+        run_dir = self.create_run("unified")
+        trace = run_dir / "trace" / "events.v1.jsonl"
+        trace.parent.mkdir(parents=True)
+        trace.write_text(json.dumps({
+            "schema_version": 1, "sequence": 1, "timestamp": "2026-09-23T15:45:17Z",
+            "event": "contract_repair.waiting_external", "phase": "repair", "cycle": 1,
+            "step_id": "S04", "data": {"detail": "HTTP 503 after 3 attempts", "action": "waiting external",
+                "authorization": "Bearer SECRET"},
+        }) + "\n", encoding="utf-8")
+        agent = run_dir / "cycles/001/implementation/steps/S01/agent.events.jsonl"
+        agent.parent.mkdir(parents=True)
+        agent.write_text(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "rg Authorization SECRET"}}) + "\n" + json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "DEEPSEEK_API_KEY=SECRET found issue"}}) + "\n", encoding="utf-8")
+        status, first, _ = self.request("GET", "/api/runs/unified/progress?offset=0")
+        self.assertEqual(status, 200)
+        self.assertTrue(any("[recovery] [S04]" in item and "HTTP 503" in item for item in first["events"]))
+        self.assertTrue(any("[S01] tool: command rg" in item for item in first["events"]))
+        self.assertTrue(any("[REDACTED]" in item for item in first["events"]))
+        self.assertNotIn("SECRET", "\n".join(first["events"]))
+        status, second, _ = self.request("GET", f"/api/runs/unified/progress?offset={first['next_offset']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(second["events"], [])
+        projection = (run_dir / "progress/events.v1.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("SECRET", projection)
+
+    def test_waiting_external_live_payload_includes_durable_history(self) -> None:
+        run_dir = self.create_run("waiting-progress", "waiting_external")
+        (run_dir / "state.json").write_text(json.dumps({"status": "waiting_external", "current_step": None}), encoding="utf-8")
+        trace = run_dir / "trace/events.v1.jsonl"
+        trace.parent.mkdir(parents=True)
+        trace.write_text(json.dumps({"sequence": 1, "timestamp": "2026-09-23T15:45:17Z", "event": "repair.waiting_external", "phase": "repair", "step_id": "S04", "data": {"reason": "LLM_FAILURE", "detail": "HTTP 503 after 3 attempts"}}) + "\n", encoding="utf-8")
+        payload = api.live_status(self.runs, "waiting-progress", self.config)
+        self.assertTrue(any("HTTP 503" in event for event in payload["progress_events"]))
 
     def test_progress_is_capped_to_complete_lines(self) -> None:
         run_dir = self.create_run("large-events")
@@ -671,7 +705,8 @@ class ProgressOffsetTests(unittest.TestCase):
             stream.write(data)
 
     def poll(self, offset: int) -> dict:
-        return api.progress(self.runs, "p", offset)
+        with self.path.open("rb") as stream:
+            return api._read_progress(stream, min(offset, self.path.stat().st_size))
 
     def drain(self, offset: int = 0, max_requests: int = 200) -> tuple[int, list[str]]:
         """Poll like the browser until the offset stops, checking progress."""

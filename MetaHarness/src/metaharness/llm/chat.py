@@ -192,6 +192,7 @@ class OpenAIChatTextClient:
         config: LLMEndpointConfig,
         *,
         environment: Mapping[str, str] | None = None,
+        on_transport: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.config = config
         # ``None`` deliberately retains the old library-level behavior for
@@ -205,6 +206,16 @@ class OpenAIChatTextClient:
                 f"extra_body cannot override protected request keys: {keys}"
             )
         self._opener = _opener()
+        self._on_transport = on_transport
+
+    def _transport_event(self, name: str, **data: Any) -> None:
+        callback = self._on_transport
+        if callback is not None:
+            try:
+                callback({"event": name, "operation": "chat_completion", **data})
+            except Exception:
+                # Observation must never affect a model request.
+                pass
 
     def complete(self, prompt: str) -> TextLLMResult:
         if not isinstance(prompt, str):
@@ -306,9 +317,13 @@ class OpenAIChatTextClient:
         request_factory: Callable[[int], urllib.request.Request],
     ) -> dict[str, Any]:
         attempts = self.config.retries + 1
+        started = time.monotonic()
+        self._transport_event("request_started", attempts=attempts)
         for attempt in range(attempts):
             # 1-based: the factory decides what attempt #N carries.
             request = request_factory(attempt + 1)
+            attempt_started = time.monotonic()
+            self._transport_event("attempt_started", attempt=attempt + 1, attempts=attempts)
             try:
                 deadline = time.monotonic() + self.config.timeout_seconds
                 with self._opener.open(
@@ -317,19 +332,25 @@ class OpenAIChatTextClient:
                     body = _read_bounded(response, deadline)
             except urllib.error.HTTPError as exc:
                 status = exc.code
+                elapsed_ms = round((time.monotonic() - attempt_started) * 1000)
                 try:
                     exc.close()
                 except OSError:
                     pass
                 if status in _RETRYABLE_STATUS_CODES and attempt + 1 < attempts:
+                    self._transport_event("http_response", attempt=attempt + 1, attempts=attempts, http_status=status, elapsed_ms=elapsed_ms)
+                    self._transport_event("retrying", attempt=attempt + 1, attempts=attempts, http_status=status)
                     _sleep_before_retry(attempt)
                     continue
+                self._transport_event("http_response", attempt=attempt + 1, attempts=attempts, http_status=status, elapsed_ms=elapsed_ms)
+                self._transport_event("waiting_external", attempt=attempt + 1, attempts=attempts, http_status=status, elapsed_ms=round((time.monotonic() - started) * 1000))
                 raise LLMHTTPError(
                     f"LLM endpoint returned HTTP {status} after {attempt + 1} attempt(s)"
                 ) from None
             except LLMError:
                 raise
             except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
+                self._transport_event("waiting_external", attempt=attempt + 1, attempts=attempts, elapsed_ms=round((time.monotonic() - started) * 1000))
                 if _is_timeout_error(exc):
                     message = "LLM request timed out"
                 else:
@@ -354,6 +375,7 @@ class OpenAIChatTextClient:
                 ) from None
             if not isinstance(decoded, dict):
                 raise LLMProtocolError("LLM endpoint JSON response must be an object")
+            self._transport_event("request_completed", attempt=attempt + 1, attempts=attempts, elapsed_ms=round((time.monotonic() - started) * 1000))
             return decoded
 
         raise LLMHTTPError("LLM endpoint request failed")  # pragma: no cover

@@ -43,6 +43,8 @@ from ..models import (
     PublishMode,
     RunStatus,
 )
+from ..progress import display_event, sync_progress
+from ..redaction import config_secret_values
 from ..planning_v2 import V2PlanParseError, step_contract_path, validate_implementation_bundle
 from ..profiles import ProfileError, profiles_for_config, safe_profile_metadata
 from ..run_options import RunOptions, RunOptionsError, effective_run_config, read_run_options_for_state
@@ -483,7 +485,10 @@ def get_run(
         "publish": _load_json(_artifact_path(directory, "publish.json")),
         "approval": {"recorded": approval_decision is not None, "decision": approval_decision},
         "plan_recovery": _plan_recovery_payload(directory, state),
-        "progress_tail": progress_tail(runs_root, safe_id, max_events=50),
+        "progress_tail": progress_tail(
+            runs_root, safe_id, max_events=50,
+            secrets=config_secret_values(config) if config is not None else (),
+        ),
         "candidate": {
             **(state.get("candidate") if isinstance(state.get("candidate"), dict) else {}),
             "changed_files": changed_files, "diff_tail": diff_tail,
@@ -826,22 +831,28 @@ def _read_progress(
     return {"next_offset": position, "events": [OVERSIZED_EVENT]}
 
 
-def progress(runs_root: Path, run_id: str, offset: int) -> dict[str, Any]:
+def progress(
+    runs_root: Path, run_id: str, offset: int, config: HarnessConfig | None = None,
+) -> dict[str, Any]:
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
         raise WebAPIError(400, "offset must be a non-negative integer")
     directory = _run_dir(runs_root, run_id)
-    path = _artifact_path(directory, "agent.events.jsonl")
     try:
+        secrets = config_secret_values(config) if config is not None else ()
+        path = sync_progress(directory, secrets=secrets)
         with path.open("rb") as stream:
             size = os.fstat(stream.fileno()).st_size
-            return _read_progress(stream, min(offset, size))
+            return _read_progress(stream, min(offset, size), lambda item: _summarize_progress(item, secrets))
     except FileNotFoundError:
         return {"next_offset": 0, "events": []}
     except OSError as exc:
         raise WebAPIError(503, "progress is temporarily unavailable") from exc
 
 
-def progress_tail(runs_root: Path, run_id: str, max_events: int = 50) -> list[str]:
+def progress_tail(
+    runs_root: Path, run_id: str, max_events: int = 50,
+    *, secrets: tuple[str, ...] = (),
+) -> list[str]:
     """Return at most the latest human-readable progress events.
 
     The existing bounded JSONL reader is deliberately reused so a malformed
@@ -853,7 +864,14 @@ def progress_tail(runs_root: Path, run_id: str, max_events: int = 50) -> list[st
     if max_events == 0:
         return []
     directory = _run_dir(runs_root, run_id)
-    return _tail_events(_artifact_path(directory, "agent.events.jsonl"), max_events)
+    path = sync_progress(directory, secrets=secrets)
+    return _tail_events(path, max_events, lambda item: _summarize_progress(item, secrets))
+
+
+def _summarize_progress(payload: dict[str, Any], secrets: tuple[str, ...] = ()) -> str | None:
+    if payload.get("schema_version") != 1 or not isinstance(payload.get("sequence"), int):
+        return None
+    return display_event(payload, secrets)
 
 
 def _tail_events(
@@ -1596,7 +1614,15 @@ def _recent_events(
     return _summaries(complete, summarize)[-max_events:]
 
 
-def _live_events(directory: Path, state: Mapping[str, Any]) -> list[str]:
+def _live_events(
+    directory: Path, state: Mapping[str, Any], secrets: tuple[str, ...] = (),
+) -> list[str]:
+    # The durable projection covers waiting_external (where current_step is
+    # deliberately cleared), terminal runs, and resumed worker activity.
+    try:
+        return progress_tail(directory.parent, directory.name, LIVE_EVENTS_MAX, secrets=secrets)
+    except WebAPIError:
+        pass
     cycle = _state_cycle(state)
     step = state.get("current_step")
     if isinstance(step, str) and _STEP_ID.fullmatch(step):
@@ -1642,7 +1668,9 @@ def live_status(
         "resume_label": overview["resume"]["label"],
         "running": status not in LIVE_STOP_STATUSES,
         "token_totals": overview["token_totals"],
-        "progress_events": _live_events(directory, state),
+        "progress_events": _live_events(
+            directory, state, config_secret_values(config) if config is not None else (),
+        ),
         "pipeline": overview["pipeline"],
         "current_label": overview["current_label"],
         "next_label": overview["next_label"],

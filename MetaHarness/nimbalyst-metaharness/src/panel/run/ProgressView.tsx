@@ -5,7 +5,7 @@ import { EventRow, eventMatchesFilter, type ProgressFilter } from './EventRow';
 
 type BackendCall = (toolName: string, args?: Record<string, unknown>) => Promise<unknown>;
 
-const FILTERS: ProgressFilter[] = ['All', 'Planner', 'Steps', 'Checks', 'Review', 'Errors'];
+const FILTERS: ProgressFilter[] = ['All', 'Planner', 'Steps', 'Checks', 'Review', 'Recovery', 'Errors'];
 
 export function ProgressView({ runId, status, callBackendTool, intervalMs = 1000 }: {
   runId: string;
@@ -56,6 +56,7 @@ export function ProgressView({ runId, status, callBackendTool, intervalMs = 1000
     {progress.error && <p className="metaharness-error" role="alert">{progress.error}</p>}
     {terminal && <p className="metaharness-muted">Run is terminal; live polling stopped.</p>}
     <ul className="metaharness-progress__list" ref={listRef} aria-live="polite">
+      {visibleEvents.length === 0 && <li className="metaharness-progress__row"><span className="metaharness-progress__message">No progress events have been recorded yet.</span></li>}
       {visibleEvents.map((event, index) => <EventRow event={event} key={index} />)}
     </ul>
   </section>;

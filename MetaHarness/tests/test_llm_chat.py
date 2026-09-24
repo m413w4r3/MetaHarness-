@@ -188,6 +188,7 @@ class ChatClientTests(unittest.TestCase):
 
     def test_retryable_500_is_retried_then_succeeds(self):
         attempts = 0
+        observations = []
 
         def responder(_handler, _request):
             nonlocal attempts
@@ -197,9 +198,17 @@ class ChatClientTests(unittest.TestCase):
             return 200, {"choices": [{"message": {"content": "recovered"}}]}
 
         with ServerHarness(responder) as server:
-            result = OpenAIChatTextClient(config(server, retries=1)).complete("prompt")
+            result = OpenAIChatTextClient(
+                config(server, retries=1), on_transport=observations.append
+            ).complete("prompt")
         self.assertEqual(result.text, "recovered")
         self.assertEqual(attempts, 2)
+        self.assertEqual([item["event"] for item in observations], [
+            "request_started", "attempt_started", "http_response", "retrying",
+            "attempt_started", "request_completed",
+        ])
+        self.assertEqual(observations[2]["http_status"], 500)
+        self.assertNotIn("prompt", json.dumps(observations))
 
     def test_retry_backoff_is_exponential_and_capped(self):
         with mock.patch.object(chat, "time") as fake_time:

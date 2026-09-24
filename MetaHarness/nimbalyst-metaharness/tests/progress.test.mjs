@@ -4,6 +4,7 @@ import { JSDOM } from 'jsdom';
 import React from 'react';
 import { useRunProgress } from '../src/hooks/useRunProgress.ts';
 import { ProgressView } from '../src/panel/run/ProgressView.tsx';
+import { eventMatchesFilter } from '../src/panel/run/EventRow.tsx';
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost' });
 globalThis.window = dom.window;
@@ -13,6 +14,27 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const { act, cleanup, fireEvent, render, screen, waitFor } = await import('@testing-library/react');
 
 afterEach(() => cleanup());
+
+test('structured categories drive filters and Errors includes an LLM 503', () => {
+  const event = '15:12:09 [recovery] [S04] LLM_FAILURE · HTTP 503 after 3 attempts';
+  assert.equal(eventMatchesFilter(event, 'Recovery'), true);
+  assert.equal(eventMatchesFilter(event, 'Errors'), true);
+  assert.equal(eventMatchesFilter('15:12:09 [step] [S04] step started', 'Steps'), true);
+  assert.equal(eventMatchesFilter('15:12:09 [planner] planning started', 'Planner'), true);
+});
+
+test('progress view renders returned rows, empty state and backend errors visibly', async () => {
+  const callBackendTool = async () => ({ events: ['15:12:09 [step] [S04] step started'], next_offset: 40 });
+  render(React.createElement(ProgressView, { runId: 'p', status: 'waiting_external', callBackendTool }));
+  assert.ok(await screen.findByText(/\[S04\] step started/));
+  cleanup();
+  render(React.createElement(ProgressView, { runId: 'empty', status: 'published', callBackendTool: async () => ({ events: [], next_offset: 0 }) }));
+  assert.ok(screen.getByText('No progress events have been recorded yet.'));
+  cleanup();
+  render(React.createElement(ProgressView, { runId: 'broken', status: 'implementing', callBackendTool: async () => ({ ok: false, error: { message: 'progress backend unavailable' } }) }));
+  assert.ok(await screen.findByRole('alert'));
+  assert.match(screen.getByRole('alert').textContent, /progress backend unavailable/);
+});
 
 function Harness({ callBackendTool, enabled = true }) {
   const progress = useRunProgress({ runId: 'progress-1', enabled, intervalMs: 100, callBackendTool });

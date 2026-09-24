@@ -352,7 +352,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 values = query.get("offset", ["0"])
                 if len(values) != 1 or not values[0].isdigit():
                     raise WebAPIError(400, "offset must be a non-negative integer")
-                self._json(200, progress(root, self._run_id(parts[4]), int(values[0])))
+                self._json(200, progress(root, self._run_id(parts[4]), int(values[0]), self.server.config))
                 return
             if parsed.path == "/":
                 nonce = secrets.token_urlsafe(18)
@@ -398,7 +398,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 values = query.get("offset", ["0"])
                 if len(values) != 1 or not values[0].isdigit():
                     raise WebAPIError(400, "offset must be a non-negative integer")
-                self._json(200, progress(root, self._run_id(parts[3]), int(values[0])))
+                self._json(200, progress(root, self._run_id(parts[3]), int(values[0]), self.server.config))
                 return
             raise WebAPIError(404, "not found")
         except WebAPIError as exc:

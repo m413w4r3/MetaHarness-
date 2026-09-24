@@ -14,7 +14,9 @@ function failureText(value: unknown): string | undefined {
   if (typeof value === 'string') return value;
   if (value && typeof value === 'object') {
     const failure = value as Data;
-    return text(failure.reason) ?? text(failure.detail);
+    const reason = text(failure.reason);
+    const detail = text(failure.detail);
+    return reason && detail ? `${reason} · ${detail}` : reason ?? detail;
   }
   return undefined;
 }

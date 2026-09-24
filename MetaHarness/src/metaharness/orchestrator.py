@@ -363,7 +363,10 @@ _OUTPUT_DISCIPLINE_TARGETS = {
     ExecutionRole.REVIEWER: "META REVIEW v1; terse material findings only",
 }
 
-def _chat_client(endpoint: Any, environment: Mapping[str, str]) -> OpenAIChatTextClient:
+def _chat_client(
+    endpoint: Any, environment: Mapping[str, str],
+    on_transport: Callable[[dict[str, Any]], None] | None = None,
+) -> OpenAIChatTextClient:
     """Construct the production client with the runtime mapping.
 
     The constructor is inspected once so embedded clients can receive the
@@ -378,11 +381,20 @@ def _chat_client(endpoint: Any, environment: Mapping[str, str]) -> OpenAIChatTex
             or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
+        accepts_transport = any(
+            parameter.name == "on_transport"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
     except (TypeError, ValueError):
         accepts_environment = True
+        accepts_transport = True
+    kwargs: dict[str, Any] = {}
     if accepts_environment:
-        return constructor(endpoint, environment=environment)
-    return constructor(endpoint)
+        kwargs["environment"] = environment
+    if accepts_transport:
+        kwargs["on_transport"] = on_transport
+    return constructor(endpoint, **kwargs)
 
 
 _MAX_REVIEW_FALLBACK_DIFF_BYTES = 32 * 1024
@@ -697,6 +709,18 @@ class Orchestrator:
                 stream.emit_once(event, **kwargs)
         else:
             stream.emit(event, **kwargs)
+
+    def _trace_transport(self, observation: dict[str, Any]) -> None:
+        """Persist only bounded transport metadata, never request material."""
+        event = observation.get("event")
+        if not isinstance(event, str):
+            return
+        data = {
+            key: observation[key]
+            for key in ("operation", "attempt", "attempts", "http_status", "elapsed_ms")
+            if isinstance(observation.get(key), (str, int))
+        }
+        self._trace_emit(f"transport.{event}", phase="transport", data=data)
 
     def _recovery(self, store: RunStateStore) -> RecoveryCoordinator:
         """The recovery coordinator bound to this run's durable state."""
@@ -1194,7 +1218,7 @@ class Orchestrator:
         client = self._reviewer_client
         if client is None:
             client = _chat_client(
-                build_llm_endpoint(profile), self._runtime_environment
+                build_llm_endpoint(profile), self._runtime_environment, self._trace_transport
             )
         return Reviewer(client, allow_format_repair=True)
 
@@ -1206,7 +1230,7 @@ class Orchestrator:
             # planner conversation/history, while using the same profile
             # endpoint and transport policy.
             client = _chat_client(
-                build_llm_endpoint(profile), self._runtime_environment
+                build_llm_endpoint(profile), self._runtime_environment, self._trace_transport
             )
         return ExecutionRecommender(client)
 
@@ -1628,7 +1652,7 @@ class Orchestrator:
         planner_profile_id = planner_profile.id
         if existing_plan is None:
             planner = PlannerV2(
-                self._planner_client or _chat_client(build_llm_endpoint(planner_profile), self._runtime_environment),
+                self._planner_client or _chat_client(build_llm_endpoint(planner_profile), self._runtime_environment, self._trace_transport),
                 repository_reference=repository_reference,
                 planning=self.config.planning,
                 check_catalog=self.config.check_catalog,
@@ -2405,7 +2429,7 @@ class Orchestrator:
         })
         planner = RepairPlannerV2(
             self._planner_client or _chat_client(
-                build_llm_endpoint(planner_profile), self._runtime_environment
+                build_llm_endpoint(planner_profile), self._runtime_environment, self._trace_transport
             ),
             planning=self.config.planning,
             check_catalog=self.config.check_catalog,
@@ -4481,7 +4505,7 @@ class Orchestrator:
                 evidence_parts.append(f"PATH {path}\n<unavailable>")
         planner = StepContractRepairPlanner(
             self._planner_client or _chat_client(
-                build_llm_endpoint(planner_profile), self._runtime_environment
+                build_llm_endpoint(planner_profile), self._runtime_environment, self._trace_transport
             ),
             max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
         )
@@ -6604,7 +6628,7 @@ class Orchestrator:
             if checkpoint.phase is ResumePhase.PLANNER:
                 planner = PlannerV2(
                     self._planner_client or _chat_client(
-                        build_llm_endpoint(planner_profile), self._runtime_environment
+                        build_llm_endpoint(planner_profile), self._runtime_environment, self._trace_transport
                     ),
                     repository_reference=reference, planning=self.config.planning,
                     check_catalog=self.config.check_catalog,
