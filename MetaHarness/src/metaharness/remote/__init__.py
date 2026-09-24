@@ -1,7 +1,7 @@
 """Remote gateway primitives.
 
-The package holds authentication helpers and the local control client; no
-server is defined here.
+The package holds the token helpers, the local control client, and the
+read-only gateway that exposes the local MetaHarness API to a remote client.
 """
 
 from .auth import (
@@ -17,15 +17,23 @@ from .client import (
     LocalMetaHarnessClient,
     LocalMetaHarnessError,
 )
+from .server import (
+    DEFAULT_METAHARNESS_PORT,
+    create_remote_gateway,
+    serve_remote_gateway,
+)
 
 __all__ = [
     "DEFAULT_MAX_TOKEN_BYTES",
+    "DEFAULT_METAHARNESS_PORT",
     "LOCAL_HOST",
     "MAX_RESPONSE_BYTES",
     "LocalMetaHarnessClient",
     "LocalMetaHarnessError",
     "TokenFileError",
     "bearer_token_from_header",
+    "create_remote_gateway",
     "load_token_file",
+    "serve_remote_gateway",
     "token_matches",
 ]
