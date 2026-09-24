@@ -594,9 +594,8 @@ class StepContractRepairPlanner:
         mismatch_explanation: str, read_set: str, write_set: str,
         create_set: str, delete_set: str, future_ownership: str,
         repository_evidence: str, artifacts_dir: str | Path,
+        on_response_durable: Callable[[], None] | None = None,
     ) -> ImplementationStep:
-        target = Path(artifacts_dir)
-        target.mkdir(parents=True, exist_ok=True)
         request = build_step_contract_repair_prompt(
             original_spec=original_spec, current_tree_sha=current_tree_sha,
             original_plan_identity=original_plan_identity,
@@ -606,13 +605,57 @@ class StepContractRepairPlanner:
             delete_set=delete_set, future_ownership=future_ownership,
             repository_evidence=repository_evidence,
         )
+        return self._complete(
+            Path(artifacts_dir), request,
+            original_plan_identity=original_plan_identity,
+            current_contract=current_contract,
+            mismatch_explanation=mismatch_explanation,
+            current_tree_sha=current_tree_sha,
+            on_response_durable=on_response_durable,
+        )
+
+    def resume(
+        self, *, artifacts_dir: str | Path, original_plan_identity: str,
+        current_contract: str, mismatch_explanation: str, current_tree_sha: str,
+        on_response_durable: Callable[[], None] | None = None,
+    ) -> ImplementationStep:
+        """Complete the exact durable request of an interrupted repair.
+
+        The request is never rebuilt: its bytes are the transaction identity,
+        so a resume can only re-send, or re-parse the answer to, that request.
+        """
+
+        target = Path(artifacts_dir)
+        meta = _read_repair_json(target / "request.meta.json", 64 * 1024)
+        try:
+            request = (target / "planner.request.txt").read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise V2PlanParseError("durable contract repair request is unavailable") from exc
+        request_sha = hashlib.sha256(request.encode("utf-8")).hexdigest()
+        if (
+            not isinstance(meta, dict)
+            or meta.get("request_sha256") != request_sha
+            or meta.get("current_tree_sha") != current_tree_sha
+        ):
+            raise V2PlanParseError("durable contract repair request identity changed")
+        return self._complete(
+            target, request,
+            original_plan_identity=original_plan_identity,
+            current_contract=current_contract,
+            mismatch_explanation=mismatch_explanation,
+            current_tree_sha=current_tree_sha,
+            on_response_durable=on_response_durable,
+        )
+
+    def _complete(
+        self, target: Path, request: str, *, original_plan_identity: str,
+        current_contract: str, mismatch_explanation: str, current_tree_sha: str,
+        on_response_durable: Callable[[], None] | None,
+    ) -> ImplementationStep:
+        target.mkdir(parents=True, exist_ok=True)
         request_sha = hashlib.sha256(request.encode("utf-8")).hexdigest()
         meta_path = target / "request.meta.json"
-        existing = None
-        try:
-            existing = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            pass
+        existing = _read_repair_json(meta_path, 64 * 1024)
         contract_path = target / "contract.md"
         if (
             isinstance(existing, dict)
@@ -638,6 +681,7 @@ class StepContractRepairPlanner:
             raw_digest = hashlib.sha256(raw_path.read_bytes()).hexdigest()
             reusable_raw = raw_digest == existing.get("raw_sha256")
         if reusable_raw:
+            # A paid answer is durable: a resume re-parses it, never re-buys it.
             raw = raw_path.read_text(encoding="utf-8")
             usage = _read_repair_json(target / "usage.json", 64 * 1024)
             self.last_usage = usage if isinstance(usage, dict) else None
@@ -660,6 +704,8 @@ class StepContractRepairPlanner:
                 "raw_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
                 "current_tree_sha": current_tree_sha,
             }, ensure_ascii=False, indent=2) + "\n")
+        if on_response_durable is not None:
+            on_response_durable()
         step = parse_step_contract_repair(
             raw, max_read_paths_per_step=self.max_read_paths_per_step
         )

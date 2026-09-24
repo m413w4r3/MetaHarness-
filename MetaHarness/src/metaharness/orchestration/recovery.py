@@ -134,6 +134,18 @@ class RecoveryAttempt:
     profile_id: str | None = None
     tree_before: str | None = None
     tree_after: str | None = None
+    # A stable semantic identity; a resumed operation records it only once.
+    operation_id: str | None = None
+
+
+def _attempt_record(attempt: RecoveryAttempt, **overrides: Any) -> dict[str, Any]:
+    record = {**asdict(attempt), **overrides}
+    if record.get("operation_id") is None:
+        record.pop("operation_id", None)
+    return record
+
+
+_LEGACY_IDENTITY = ("phase", "reason", "attempt", "budget_key", "cycle", "step_id", "tree_before")
 
 
 @dataclass(frozen=True)
@@ -186,7 +198,7 @@ class RecoveryCoordinator:
         attempts = state.get("recovery_attempts", [])
         if not isinstance(attempts, list):
             raise PipelineFailure("DURABLE_ARTIFACT_CORRUPTED", "recovery attempts are malformed")
-        record = {**asdict(attempt), "budget_consumed": value}
+        record = _attempt_record(attempt, budget_consumed=value)
         self._store.update(
             status=state.get("status", RunStatus.VALIDATING),
             recovery_counters={**counters, key: value},
@@ -201,9 +213,26 @@ class RecoveryCoordinator:
         attempts = state.get("recovery_attempts", [])
         if not isinstance(attempts, list):
             raise PipelineFailure("DURABLE_ARTIFACT_CORRUPTED", "recovery attempts are malformed")
+        record = _attempt_record(attempt)
+        if attempt.operation_id is not None:
+            if any(
+                isinstance(item, dict) and item.get("operation_id") == attempt.operation_id
+                for item in attempts
+            ):
+                return
+            # Records written before stable identities existed describe the
+            # same semantic operation once per resume; keep only this one.
+            identity = tuple(record.get(key) for key in _LEGACY_IDENTITY)
+            attempts = [
+                item for item in attempts
+                if not (
+                    isinstance(item, dict) and "operation_id" not in item
+                    and tuple(item.get(key) for key in _LEGACY_IDENTITY) == identity
+                )
+            ]
         self._store.update(
             status=state.get("status", RunStatus.VALIDATING),
-            recovery_attempts=[*attempts, asdict(attempt)][-MAX_RECOVERY_ATTEMPT_RECORDS:],
+            recovery_attempts=[*attempts, record][-MAX_RECOVERY_ATTEMPT_RECORDS:],
         )
 
     @staticmethod

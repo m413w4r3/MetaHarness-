@@ -303,6 +303,16 @@ def _safe_state(state: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(failure, Mapping) and key in failure
     }
     publish = state.get("publish")
+    contract_repair = state.get("contract_repair")
+    if isinstance(contract_repair, Mapping):
+        result["contract_repair"] = {
+            key: contract_repair.get(key)
+            for key in (
+                "status", "step_id", "attempt", "pending_operation",
+                "contract_repair_number", "repair_id", "planner_transport_attempt",
+            )
+            if key in contract_repair
+        }
     result["publish"] = {
         key: publish.get(key)
         for key in ("mode", "target", "remote", "branch", "run_branch", "base_sha", "commit_sha", "web_url", "status", "local_base_updated", "run_branch_cleanup")

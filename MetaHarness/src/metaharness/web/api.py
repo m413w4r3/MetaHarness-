@@ -15,7 +15,7 @@ from urllib.parse import unquote
 
 from ..agent.diagnostics import TOKEN_DIAGNOSTICS_NAME
 from ..agent.events import parse_event, summarize_event, summarize_step_event
-from ..diagnostics import DIAGNOSTICS_ERROR_NAME, DIAGNOSTICS_NAME, MAX_REPORT_BYTES
+from ..diagnostics import DIAGNOSTICS_ERROR_NAME, DIAGNOSTICS_NAME, MAX_REPORT_BYTES, build_run_diagnostics
 from ..resume import resume_info
 from ..approval import (
     ApprovalDecision,
@@ -415,21 +415,34 @@ def get_run(
     diff_tail = _tail_text(_artifact_path(directory, diff_path), MAX_DIFF_BYTES)
     diagnostics_path = _artifact_path(directory, DIAGNOSTICS_NAME)
     diagnostics_content = _load_text_bounded(diagnostics_path, MAX_REPORT_BYTES)
+    diagnostics_live = False
+    if config is not None:
+        # Rebuilt read-only from the current artifacts, so a waiting run never
+        # shows a stale report; nothing is written and no authority changes.
+        try:
+            diagnostics_content = build_run_diagnostics(config, directory)
+            diagnostics_live = True
+        except Exception:
+            pass
     diagnostics_meta: dict[str, Any] = {
         "path": DIAGNOSTICS_NAME,
         "available": diagnostics_content is not None,
         "size": None,
         "generated_at": None,
         "content": diagnostics_content,
+        "live": diagnostics_live,
     }
     if diagnostics_content is not None:
         generated_match = re.search(r'"generated_at"\s*:\s*"([^"]+)"', diagnostics_content[:16 * 1024])
         if generated_match:
             diagnostics_meta["generated_at"] = generated_match.group(1)
-    try:
-        diagnostics_meta["size"] = diagnostics_path.stat().st_size
-    except OSError:
-        pass
+    if diagnostics_live and diagnostics_content is not None:
+        diagnostics_meta["size"] = len(diagnostics_content.encode("utf-8"))
+    else:
+        try:
+            diagnostics_meta["size"] = diagnostics_path.stat().st_size
+        except OSError:
+            pass
     # Keep this shape stable for both the JSON API and the server-rendered run
     # page; all newly exposed artifact data below is bounded or allowlisted.
     return {

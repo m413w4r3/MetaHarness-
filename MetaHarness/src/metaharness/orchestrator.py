@@ -327,6 +327,8 @@ from .orchestration.recovery import (
     project_exit,
 )
 from .orchestration.check_recovery import CheckInfrastructureRecovery
+from .orchestration import contract_repair
+from .orchestration.contract_repair import ContractRepairIntegrityError
 from .orchestration.review_recovery import ReviewRecovery
 from .orchestration.worker_recovery import (
     TRANSIENT_WORKER_FAILURES,
@@ -1526,6 +1528,8 @@ class Orchestrator:
         if result.status in {
             RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.BLOCKED,
             RunStatus.PLAN_REJECTED, RunStatus.WAITING_HUMAN,
+            RunStatus.WAITING_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE,
+            RunStatus.WAITING_REMOTE, RunStatus.WAITING_SCOPE_APPROVAL,
             RunStatus.COMMITTED, RunStatus.PUBLISHED,
         }:
             try:
@@ -3930,9 +3934,10 @@ class Orchestrator:
 
         effective_step = self._load_repaired_step(artifact_dir, step)
         effective_contract = contract
-        repair_count = self._count_contract_repairs(artifact_dir)
         if effective_step is not step:
             effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
+        # The semantic repair number: opened slots, never transport retries.
+        repair_count = contract_repair.semantic_repair_count(artifact_dir)
         max_repairs = getattr(self._run_options, "max_step_contract_repairs", 0)
         recovery = self._recovery(store)
         cycle_number = getattr(self, "_trace_cycle", 1)
@@ -3943,28 +3948,42 @@ class Orchestrator:
         fallback_index = 0
         retry_key = recovery.budget_key("agent-step", f"{cycle_number:03d}", step.id)
         pending_transient: RecoveryAdmission | None = None
-        pending_repair = self._pending_contract_repair(artifact_dir)
+        repair_context = {
+            "store": store, "recovery": recovery, "repo": repo, "worktree": worktree,
+            "run_dir": run_dir, "artifact_dir": artifact_dir, "cycle": cycle_number,
+            "original_spec": original_spec,
+            "original_plan_identity": original_plan_identity,
+            "future_ownership": future_ownership, "max_repairs": max_repairs,
+        }
+        try:
+            pending_repair = contract_repair.find_pending(
+                artifact_dir, cycle=cycle_number, step_id=step.id,
+                current_contract=effective_contract,
+                legacy_mismatch_sources=_archived_step_mismatches(artifact_dir, step.id),
+            )
+        except ContractRepairIntegrityError as exc:
+            raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
         if pending_repair is not None:
-            try:
-                self._set_contract_repair_state(store, step.id, repair_count)
-                effective_step = self._repair_step_contract(
-                    repo=repo, worktree=worktree, run_dir=run_dir,
-                    artifact_dir=pending_repair, original_spec=original_spec,
-                    original_plan_identity=original_plan_identity,
-                    original_step=effective_step, current_contract=effective_contract,
-                    mismatch="resuming durable step contract repair",
-                    tree_before=candidate_tree_sha(worktree),
-                    future_ownership=future_ownership,
+            # Resume the incomplete repair; the worker that produced its
+            # mismatch is never replayed.
+            drift = self._pre_step_boundary_drift(
+                repo, worktree, ownership_before,
+                branch_ref=branch_ref, base_sha=base_sha,
+                tree_before=pending_repair.tree_sha,
+            )
+            if drift:
+                raise PipelineFailure(
+                    "RESUME_INTEGRITY_FAILURE",
+                    f"pending contract repair {pending_repair.number:02d}: {drift}",
+                    step_id=step.id,
                 )
-                effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
-            except ScopeApprovalRequired:
-                delta = _read_json_artifact(pending_repair / "scope_delta.json", 64 * 1024)
-                store.update(
-                    status=RunStatus.WAITING_SCOPE_APPROVAL,
-                    current_step=step.id,
-                    scope_delta=delta if isinstance(delta, dict) else {},
-                )
-                raise
+            effective_step, effective_contract = self._contract_repair_transaction(
+                **repair_context, directory=pending_repair.directory,
+                number=pending_repair.number, step=effective_step,
+                current_contract=effective_contract, mismatch=pending_repair.mismatch,
+                tree_before=pending_repair.tree_sha, profile_id=active_profile_id,
+                resumed=True,
+            )
         while True:
             common = {
                 "repo": repo, "worktree": worktree, "base_sha": base_sha,
@@ -4129,65 +4148,33 @@ class Orchestrator:
                     failure.index_tree_after = failure.tree_before
                     failure.step_dir = artifact_dir
                     raise
-                repair_count += 1
-                repair_dir = artifact_dir / "contract_repairs" / f"{repair_count:02d}"
+                number = repair_count + 1
+                repair_dir = artifact_dir / "contract_repairs" / f"{number:02d}"
+                bounded_mismatch = _bounded_v2_report(failure.mismatch)
                 try:
-                    self._set_contract_repair_state(store, step.id, repair_count)
-                    recovery.record(RecoveryAttempt(
-                        phase="implementation", reason="AGENT_CONTRACT_MISMATCH",
-                        attempt=recovery_attempt, budget_key="contract_repairs",
-                        budget=max_repairs, budget_consumed=repair_count,
-                        disposition=recovery_decision.disposition.value,
-                        cycle=cycle_number, step_id=step.id, profile_id=active_profile_id,
-                        tree_before=failure.tree_before, tree_after=failure.tree_before,
-                    ))
-                    recovery.trace(
-                        "recovery.started", reason="AGENT_CONTRACT_MISMATCH",
-                        decision=recovery_decision, attempt=recovery_attempt,
-                        tree_before=failure.tree_before, tree_after=failure.tree_before,
-                        budget_remaining=max(0, max_repairs - repair_count),
-                        phase="implementation", cycle=cycle_number,
-                        step_id=step.id,
+                    contract_repair.begin(
+                        repair_dir, number=number, cycle=cycle_number, step_id=step.id,
+                        current_contract=effective_contract, mismatch=bounded_mismatch,
+                        tree_sha=failure.tree_before,
                     )
-                    effective_step = self._repair_step_contract(
-                        repo=repo, worktree=worktree, run_dir=run_dir,
-                        artifact_dir=repair_dir, original_spec=original_spec,
-                        original_plan_identity=original_plan_identity,
-                        original_step=effective_step, current_contract=effective_contract,
-                        mismatch=failure.mismatch, tree_before=failure.tree_before,
-                        future_ownership=future_ownership,
-                    )
-                    effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
-                except ScopeApprovalRequired:
-                    delta = _read_json_artifact(repair_dir / "scope_delta.json", 64 * 1024)
-                    store.update(
-                        status=RunStatus.WAITING_SCOPE_APPROVAL,
-                        current_step=step.id,
-                        scope_delta=delta if isinstance(delta, dict) else {},
-                    )
-                    raise
-                except (AgentError, GitError, OSError, V2PlanParseError) as exc:
-                    raise StepExecutionFailure(
-                        "AGENT_CONTRACT_MISMATCH", step.id,
-                        _bounded_v2_report(f"contract repair failed: {exc}"),
-                        profile_id=profile_id, tree_before=failure.tree_before,
-                        tree_after=failure.tree_before, usage=failure.usage,
-                        mismatch=failure.mismatch,
-                        mismatch_retry_count=repair_count,
-                        step_dir=artifact_dir,
+                except (ContractRepairIntegrityError, OSError) as exc:
+                    raise PipelineFailure(
+                        "RESUME_INTEGRITY_FAILURE", str(exc), step_id=step.id,
                     ) from exc
-                self._trace_emit(
-                    "step.contract_repair.completed", phase="implementation",
-                    cycle=cycle_number, step_id=step.id,
-                    data={"repair": repair_count, "tree_sha": failure.tree_before},
-                )
+                repair_count = number
                 recovery.trace(
-                    "recovery.completed", reason="AGENT_CONTRACT_MISMATCH",
+                    "recovery.started", reason="AGENT_CONTRACT_MISMATCH",
                     decision=recovery_decision, attempt=recovery_attempt,
-                    tree_before=failure.tree_before, tree_after=candidate_tree_sha(worktree),
+                    tree_before=failure.tree_before, tree_after=failure.tree_before,
                     budget_remaining=max(0, max_repairs - repair_count),
                     phase="implementation", cycle=cycle_number,
-                    step_id=step.id, recovered=True,
+                    step_id=step.id,
+                )
+                effective_step, effective_contract = self._contract_repair_transaction(
+                    **repair_context, directory=repair_dir, number=number,
+                    step=effective_step, current_contract=effective_contract,
+                    mismatch=bounded_mismatch, tree_before=failure.tree_before,
+                    profile_id=active_profile_id, resumed=False, usage=failure.usage,
                 )
                 # The next attempt starts at the exact restored tree and uses
                 # no blind retry addendum.
@@ -4242,36 +4229,6 @@ class Orchestrator:
             mismatch_retry_count=failure.mismatch_retry_count,
             no_change=True,
         )
-
-    @staticmethod
-    def _count_contract_repairs(artifact_dir: Path) -> int:
-        root = artifact_dir / "contract_repairs"
-        if not root.is_dir():
-            return 0
-        numbers = []
-        for path in root.iterdir():
-            if not path.is_dir() or not path.name.isdigit():
-                continue
-            validation = _read_json_artifact(path / "validation.json", 64 * 1024)
-            if isinstance(validation, dict) and validation.get("status") in {
-                "planner_validated", "validated",
-            }:
-                numbers.append(int(path.name))
-        return max(numbers, default=0)
-
-    @staticmethod
-    def _pending_contract_repair(artifact_dir: Path) -> Path | None:
-        root = artifact_dir / "contract_repairs"
-        if not root.is_dir():
-            return None
-        candidates = []
-        for path in root.iterdir():
-            if not path.is_dir() or not path.name.isdigit():
-                continue
-            validation = _read_json_artifact(path / "validation.json", 64 * 1024)
-            if isinstance(validation, dict) and validation.get("status") == "planner_validated":
-                candidates.append(path)
-        return max(candidates, key=lambda path: int(path.name), default=None)
 
     def _load_repaired_step(self, artifact_dir: Path, original: ImplementationStep) -> ImplementationStep:
         root = artifact_dir / "contract_repairs"
@@ -4333,14 +4290,131 @@ class Orchestrator:
         except (GitError, OSError):
             return False
 
-    def _set_contract_repair_state(
-        self, store: RunStateStore, step_id: str, repair_count: int,
-    ) -> None:
+    def _contract_repair_transaction(
+        self, *, store: RunStateStore, recovery: RecoveryCoordinator,
+        repo: Path, worktree: Path, run_dir: Path, artifact_dir: Path,
+        directory: Path, cycle: int, number: int, step: ImplementationStep,
+        current_contract: str, mismatch: str, tree_before: str,
+        original_spec: str, original_plan_identity: str,
+        future_ownership: Mapping[str, tuple[str, ...]] | None,
+        max_repairs: int, profile_id: str, resumed: bool,
+        usage: dict[str, int] | None = None,
+    ) -> tuple[ImplementationStep, str]:
+        """Drive one durable semantic repair slot to ``completed``.
+
+        A planner transport failure parks the slot in ``waiting_external``
+        and propagates; the resume re-enters this same slot.  Only a
+        validated repair consumes the semantic ``contract_repairs`` budget.
+        """
+
+        try:
+            if contract_repair.planner_response_durable(directory):
+                contract_repair.ensure(directory, contract_repair.PLANNER_RESPONSE_DURABLE)
+            transaction = contract_repair.read_transaction(directory) or {}
+            if contract_repair.is_awaiting_planner(transaction):
+                transaction = contract_repair.advance(
+                    directory, contract_repair.AWAITING_PLANNER,
+                    planner_transport_attempt=int(transaction.get("planner_transport_attempt") or 0) + 1,
+                )
+        except ContractRepairIntegrityError as exc:
+            raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
+        progress = {
+            "step_id": step.id, "attempt": number,
+            "pending_operation": "contract_repair",
+            "contract_repair_number": number,
+            "repair_id": transaction.get("repair_id"),
+            "planner_transport_attempt": transaction.get("planner_transport_attempt"),
+        }
         store.update(
-            status=RunStatus.CONTRACT_REPAIRING,
-            current_step=step_id,
-            contract_repair={"status": "running", "step_id": step_id, "attempt": repair_count},
+            status=RunStatus.CONTRACT_REPAIRING, current_step=step.id,
+            contract_repair={"status": "running", **progress},
         )
+        if resumed:
+            self._trace_emit(
+                "recovery.resumed", phase="implementation", cycle=cycle, step_id=step.id,
+                data={"operation": "contract_repair", "transaction_status": transaction.get("status"), **progress},
+            )
+        try:
+            repaired = self._repair_step_contract(
+                repo=repo, worktree=worktree, run_dir=run_dir,
+                artifact_dir=directory, original_spec=original_spec,
+                original_plan_identity=original_plan_identity,
+                original_step=step, current_contract=current_contract,
+                mismatch=mismatch, tree_before=tree_before,
+                future_ownership=future_ownership,
+                resume_request=contract_repair.durable_request_matches(directory, tree_before) is True,
+            )
+            effective_contract = self._read_repaired_contract(artifact_dir, repaired)
+        except LLMError as exc:
+            detail = redact(str(exc), self._secrets)[:500]
+            try:
+                if contract_repair.is_awaiting_planner(contract_repair.read_transaction(directory) or {}):
+                    contract_repair.advance(
+                        directory, contract_repair.WAITING_EXTERNAL,
+                        last_transport_failure=detail,
+                    )
+            except ContractRepairIntegrityError as marker:
+                raise PipelineFailure(marker.code, str(marker), step_id=step.id) from exc
+            store.update(
+                status=RunStatus.CONTRACT_REPAIRING, current_step=step.id,
+                contract_repair={"status": "waiting_external", **progress},
+            )
+            self._trace_emit(
+                "recovery.waiting_external", phase="implementation", cycle=cycle,
+                step_id=step.id,
+                data={"operation": "contract_repair", "reason": "LLM_FAILURE", **progress},
+            )
+            raise
+        except ScopeApprovalRequired:
+            delta = _read_json_artifact(directory / "scope_delta.json", 64 * 1024)
+            store.update(
+                status=RunStatus.WAITING_SCOPE_APPROVAL,
+                current_step=step.id,
+                scope_delta=delta if isinstance(delta, dict) else {},
+            )
+            raise
+        except ContractRepairIntegrityError as exc:
+            raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
+        except (AgentError, GitError, OSError, V2PlanParseError) as exc:
+            raise StepExecutionFailure(
+                "AGENT_CONTRACT_MISMATCH", step.id,
+                _bounded_v2_report(f"contract repair failed: {exc}"),
+                profile_id=profile_id, tree_before=tree_before,
+                tree_after=tree_before, usage=usage, mismatch=mismatch,
+                mismatch_retry_count=number, step_dir=artifact_dir,
+            ) from exc
+        decision = classify_failure(
+            "AGENT_CONTRACT_MISMATCH", clean_contract_mismatch=True, rollback_succeeded=True,
+        )
+        # One semantic record per repair, whatever the number of resumes.
+        recovery.record(RecoveryAttempt(
+            phase="implementation", reason="AGENT_CONTRACT_MISMATCH",
+            attempt=number, budget_key="contract_repairs",
+            budget=max_repairs, budget_consumed=number,
+            disposition=decision.disposition.value,
+            cycle=cycle, step_id=step.id, profile_id=profile_id,
+            tree_before=tree_before, tree_after=tree_before,
+            operation_id=progress["repair_id"],
+        ))
+        contract_repair.ensure(directory, contract_repair.COMPLETED)
+        store.update(
+            status=RunStatus.CONTRACT_REPAIRING, current_step=step.id,
+            contract_repair={"status": "completed", **progress},
+        )
+        self._trace_emit(
+            "step.contract_repair.completed", phase="implementation",
+            cycle=cycle, step_id=step.id,
+            data={"repair": number, "repair_id": progress["repair_id"], "tree_sha": tree_before},
+        )
+        recovery.trace(
+            "recovery.completed", reason="AGENT_CONTRACT_MISMATCH",
+            decision=decision, attempt=number,
+            tree_before=tree_before, tree_after=candidate_tree_sha(worktree),
+            budget_remaining=max(0, max_repairs - number),
+            phase="implementation", cycle=cycle,
+            step_id=step.id, recovered=True,
+        )
+        return repaired, effective_contract
 
     def _repair_step_contract(
         self, *, repo: Path, worktree: Path, run_dir: Path,
@@ -4348,8 +4422,13 @@ class Orchestrator:
         original_step: ImplementationStep, current_contract: str,
         mismatch: str, tree_before: str,
         future_ownership: Mapping[str, tuple[str, ...]] | None,
+        resume_request: bool = False,
     ) -> ImplementationStep:
-        """Run and validate one durable StepContractRepairPlanner transaction."""
+        """Run and validate one durable StepContractRepairPlanner transaction.
+
+        ``resume_request`` re-sends (or re-parses the answer to) the exact
+        durable request of an interrupted transaction instead of rebuilding it.
+        """
 
         planner_profile = profile_for_role(
             self.config, self._run_options.planner_profile, ExecutionRole.PLANNER
@@ -4373,21 +4452,35 @@ class Orchestrator:
             ),
             max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
         )
-        read_set = "\n".join(f"- {item}" for item in original_step.read_set)
-        future = _json_text(future_ownership or {})
-        repaired = planner.repair(
-            original_spec=original_spec, current_tree_sha=tree_before,
-            original_plan_identity=original_plan_identity,
-            current_contract=current_contract,
-            mismatch_explanation=_bounded_v2_report(mismatch),
-            read_set=read_set,
-            write_set="\n".join(f"- {item}" for item in original_step.write_set) or "NONE",
-            create_set="\n".join(f"- {item}" for item in original_step.create_set) or "NONE",
-            delete_set="\n".join(f"- {item}" for item in original_step.delete_set) or "NONE",
-            future_ownership=future,
-            repository_evidence="\n\n".join(evidence_parts),
-            artifacts_dir=artifact_dir,
-        )
+        def response_durable() -> None:
+            contract_repair.ensure(artifact_dir, contract_repair.PLANNER_RESPONSE_DURABLE)
+
+        if resume_request:
+            repaired = planner.resume(
+                artifacts_dir=artifact_dir,
+                original_plan_identity=original_plan_identity,
+                current_contract=current_contract,
+                mismatch_explanation=_bounded_v2_report(mismatch),
+                current_tree_sha=tree_before,
+                on_response_durable=response_durable,
+            )
+        else:
+            read_set = "\n".join(f"- {item}" for item in original_step.read_set)
+            repaired = planner.repair(
+                original_spec=original_spec, current_tree_sha=tree_before,
+                original_plan_identity=original_plan_identity,
+                current_contract=current_contract,
+                mismatch_explanation=_bounded_v2_report(mismatch),
+                read_set=read_set,
+                write_set="\n".join(f"- {item}" for item in original_step.write_set) or "NONE",
+                create_set="\n".join(f"- {item}" for item in original_step.create_set) or "NONE",
+                delete_set="\n".join(f"- {item}" for item in original_step.delete_set) or "NONE",
+                future_ownership=_json_text(future_ownership or {}),
+                repository_evidence="\n\n".join(evidence_parts),
+                artifacts_dir=artifact_dir,
+                on_response_durable=response_durable,
+            )
+        contract_repair.ensure(artifact_dir, contract_repair.PLANNER_VALIDATED)
         if (
             repaired.id != original_step.id
             or repaired.title != original_step.title
@@ -4418,6 +4511,7 @@ class Orchestrator:
                     expected_sha256=hashlib.sha256(delta_path.read_bytes()).hexdigest(),
                 )
                 if approval is None:
+                    contract_repair.ensure(artifact_dir, contract_repair.SCOPE_WAITING)
                     raise ScopeApprovalRequired()
                 if approval.decision is not ApprovalDecision.APPROVE:
                     raise PipelineFailure("HUMAN_REQUIRED", "contract repair scope rejected")
@@ -4436,6 +4530,7 @@ class Orchestrator:
                 ).hexdigest(),
             })
             atomic_write_text(validation_path, _json_text(validation))
+            contract_repair.ensure(artifact_dir, contract_repair.VALIDATED)
         return repaired
 
     def _pre_step_boundary_drift(
@@ -6599,6 +6694,27 @@ class Orchestrator:
         except GitError as exc:
             raise ResumeIntegrityError(f"partial worktree is unreadable: {exc}") from exc
         return WorktreeInfo(repo, path, expected_branch, base_ref, base_sha)
+
+
+def _archived_step_mismatches(artifact_dir: Path, step_id: str) -> list[str]:
+    """Archived worker mismatch reports of a step, newest attempt first."""
+
+    root = artifact_dir / "attempts"
+    if not root.is_dir():
+        return []
+    reports: list[str] = []
+    for attempt in sorted(
+        (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=lambda path: int(path.name), reverse=True,
+    ):
+        record = _read_json_artifact(attempt / "step.json", 256 * 1024)
+        if (
+            isinstance(record, dict) and record.get("id") == step_id
+            and record.get("reason") == "AGENT_CONTRACT_MISMATCH"
+            and isinstance(record.get("mismatch"), str)
+        ):
+            reports.append(_bounded_v2_report(record["mismatch"]))
+    return reports
 
 def _failure_reason(exc: Exception) -> str:
     if isinstance(exc, (ResumeIntegrityError, ResumeRequiresOperatorError)):
