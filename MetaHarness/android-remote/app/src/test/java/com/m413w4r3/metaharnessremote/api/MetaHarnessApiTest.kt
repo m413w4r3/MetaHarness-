@@ -245,6 +245,12 @@ class MetaHarnessApiTest {
             assertThrows(IllegalArgumentException::class.java) {
                 runBlocking { api.getRun(id) }
             }
+            assertThrows(IllegalArgumentException::class.java) {
+                runBlocking { api.approveScope(id, "APPROVE") }
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                runBlocking { api.resumeRun(id) }
+            }
         }
         assertThrows(IllegalArgumentException::class.java) {
             runBlocking { api.progress("run-1", -1) }
@@ -460,5 +466,74 @@ class MetaHarnessApiTest {
         assertNull(failure.statusCode)
         assertTrue(!failure.message!!.contains(token))
         assertEquals(1, interceptor.requests.size)
+    }
+
+    @Test
+    fun `approve scope posts the decision once`() = runBlocking {
+        val (api, interceptor) = apiReturning(
+            """{"ok":true,"decision":"APPROVE","scope_delta_sha256":"a"}"""
+        )
+
+        api.approveScope("run-1", "APPROVE")
+
+        val request = interceptor.requests.single()
+        assertEquals("POST", request.method)
+        assertEquals("$baseUrl/v1/runs/run-1/scope-approval", request.url.toString())
+        assertEquals("Bearer $token", request.header("Authorization"))
+        assertEquals("application/json", request.header("Accept"))
+        assertEquals("application/json", request.header("Content-Type"))
+        assertEquals("""{"decision":"APPROVE"}""", bodyOf(request))
+    }
+
+    @Test
+    fun `approve scope sends a rejection as the decision alone`() = runBlocking {
+        val (api, interceptor) = apiReturning("""{"ok":true,"decision":"REJECT"}""")
+
+        api.approveScope("run-1", "REJECT")
+
+        assertEquals("""{"decision":"REJECT"}""", bodyOf(interceptor.requests.single()))
+    }
+
+    @Test
+    fun `approve scope refuses an unknown decision before any request`() {
+        val (api, interceptor) = apiReturning("{}")
+
+        listOf("", "approve", "REJECTED", "true").forEach { decision ->
+            assertThrows(IllegalArgumentException::class.java) {
+                runBlocking { api.approveScope("run-1", decision) }
+            }
+        }
+        assertTrue(interceptor.requests.isEmpty())
+    }
+
+    @Test
+    fun `resume posts an empty json object once`() = runBlocking {
+        val (api, interceptor) = apiReturning(
+            """{"ok":true,"run_id":"run-1","location":"/runs/run-1","accepted":true}""",
+            code = 202,
+        )
+
+        api.resumeRun("run-1")
+
+        val request = interceptor.requests.single()
+        assertEquals("POST", request.method)
+        assertEquals("$baseUrl/v1/runs/run-1/resume", request.url.toString())
+        assertEquals("Bearer $token", request.header("Authorization"))
+        assertEquals("application/json", request.header("Accept"))
+        assertEquals("application/json", request.header("Content-Type"))
+        assertEquals("{}", bodyOf(request))
+    }
+
+    @Test
+    fun `a timed out resume is reported once and never retried`() {
+        val (api, interceptor) = apiWith { throw SocketTimeoutException("timeout") }
+
+        val failure = assertThrows(MetaHarnessTimeoutException::class.java) {
+            runBlocking { api.resumeRun("run-1") }
+        }
+
+        assertNull(failure.statusCode)
+        assertEquals(1, interceptor.requests.size)
+        assertEquals("POST", interceptor.requests.single().method)
     }
 }

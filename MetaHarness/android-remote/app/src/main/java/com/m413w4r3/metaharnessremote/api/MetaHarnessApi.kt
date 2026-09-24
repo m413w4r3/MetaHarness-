@@ -122,6 +122,33 @@ class MetaHarnessApi(
         )
     }
 
+    /**
+     * `POST /v1/runs/{runId}/scope-approval` with the [decision] (`APPROVE` or
+     * `REJECT`) for the repair scope the run requested.
+     *
+     * The body carries the decision alone: the delta is the one the run
+     * recorded, so no path is ever sent from the phone and no scope can be
+     * edited here. Exactly one exchange is sent — nothing is retried, because a
+     * decision that timed out may still have been recorded.
+     */
+    suspend fun approveScope(runId: String, decision: String) {
+        require(decision == APPROVE || decision == REJECT) { "decision must be $APPROVE or $REJECT" }
+        val payload = JsonObject()
+        payload.addProperty(DECISION, decision)
+        post("${runPath(runId)}$SCOPE_APPROVAL_PATH", gson.toJson(payload), JsonObject::class.java)
+    }
+
+    /**
+     * `POST /v1/runs/{runId}/resume` with an empty JSON object.
+     *
+     * The body is exactly `{}`: the gateway resumes the run from its own
+     * checkpoint. Exactly one exchange is sent — nothing is retried, because a
+     * resume that timed out may still have been accepted.
+     */
+    suspend fun resumeRun(runId: String) {
+        post("${runPath(runId)}$RESUME_PATH", EMPTY_BODY, JsonObject::class.java)
+    }
+
     /** `GET <baseUrl><path>` with the bearer token and the JSON accept header. */
     internal fun getRequest(path: String): Request = requestBuilder(path).get().build()
 
@@ -263,6 +290,11 @@ class MetaHarnessApi(
         private const val MODEL_PROFILES_PATH = "/v1/model-profiles"
         private const val RUNS_PATH = "/v1/runs"
         private const val APPROVAL_PATH = "/approval"
+        private const val SCOPE_APPROVAL_PATH = "/scope-approval"
+        private const val RESUME_PATH = "/resume"
+
+        /** The body of a resume: the empty document, as the gateway requires. */
+        private const val EMPTY_BODY = "{}"
 
         private const val APPROVE = "APPROVE"
         private const val REJECT = "REJECT"

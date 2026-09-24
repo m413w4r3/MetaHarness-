@@ -173,6 +173,59 @@ The decision may have been recorded.
 The run is read again to show what it recorded.
 ```
 
+## Scope approval
+
+While a run waits for a decision on a requested repair scope, a
+`SCOPE APPROVAL` block appears between the state card and the plan. It is shown
+only when the run document holds all five conditions:
+
+```text
+status == waiting_scope_approval
+scope_delta non vide
+scope_approval.recorded != true
+scope_approval.awaiting != false
+capabilities.scope_approval != false
+```
+
+The delta is read from `scope_delta`, falling back to the `scope_delta` the
+state recorded — a contract-repair delta lives beside its step, and the state
+names it. Only an explicit `scope_approval: false` hides the block; a
+capability that cannot be read does not. The block displays
+`scope_delta.added_paths`, one path per line and nothing else: approval is
+bound to the exact delta the run recorded, so no path can be edited from the
+phone.
+
+`APPROVE SCOPE` sends `POST /v1/runs/<run_id>/scope-approval` with
+`{"decision": "APPROVE"}`, and `REJECT SCOPE` opens an `AlertDialog` that states
+the rejection is irreversible; confirming it sends `{"decision": "REJECT"}` and
+nothing else. Both buttons are disabled while a decision is in flight, and the
+screen then reads `GET /v1/runs/<run_id>` again — an accepted decision moves the
+run, and an HTTP 409 means another decision is already recorded. Nothing is
+ever retried.
+
+## Resume
+
+While the run publishes a resumable checkpoint, a `RESUME` block appears below
+the state card. It is shown only when both conditions hold:
+
+```text
+overview.resume.resumable == true
+capabilities.resume != false
+```
+
+The button uses `overview.resume.label` when the run publishes one, and
+`RESUME RUN` otherwise. It sends exactly one
+`POST /v1/runs/<run_id>/resume` with `{}`; a second tap starts nothing while the
+call is in flight. The resume is never retried and the screen then reads
+`GET /v1/runs/<run_id>` again — a resumed run is live again, so that answer also
+starts the polling loop a terminal run had stopped. A timeout says so and leaves
+the refreshed run to tell the operator whether it was accepted:
+
+```text
+The resume request may have been accepted.
+Refresh before retrying.
+```
+
 ## New Run screen
 
 `+ NEW RUN` opens a form with one `SPEC`, one optional `Run ID` and one
@@ -216,6 +269,8 @@ gateway, built from a `baseUrl`, the in-memory `remoteToken` and an injected
 | `progress(runId, offset)` | `GET /v1/runs/<run_id>/progress?offset=N` |
 | `createRun(spec, runId)` | `POST /v1/runs` |
 | `approveRun(runId, payload)` | `POST /v1/runs/<run_id>/approval` |
+| `approveScope(runId, decision)` | `POST /v1/runs/<run_id>/scope-approval` |
+| `resumeRun(runId)` | `POST /v1/runs/<run_id>/resume` |
 
 Every call is one exchange with no retry, carries the bearer token and
 `Accept: application/json`, reads at most 2 MiB, and raises
@@ -226,3 +281,6 @@ still have been applied. `config()` and `modelProfiles()` stay raw
 `JsonObject`s and `getRun()` returns the raw document, so only the displayed
 fields are typed. `approveRun(runId, payload)` takes the external approval body
 described above and answers the decision the gateway recorded.
+`approveScope(runId, decision)` sends the decision alone — the delta stays the
+one the gateway recorded — and `resumeRun(runId)` sends the empty document the
+resume route requires.

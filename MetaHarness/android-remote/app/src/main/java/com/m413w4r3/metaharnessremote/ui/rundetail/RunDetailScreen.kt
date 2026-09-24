@@ -50,7 +50,8 @@ import kotlinx.coroutines.delay
  * on entry and then on the cadence the run itself asks for
  * ([runPollIntervalMillis]) while this screen is resumed: every two seconds
  * while the run is active, every five seconds while it waits for the operator,
- * and not at all once it is completed or failed. A screen that is not visible
+ * and not at all once it is completed or failed — a resume answer starts the
+ * loop again, because the run may be live again. A screen that is not visible
  * polls nothing, because leaving [Lifecycle.State.RESUMED] cancels the loop.
  *
  * Progress is incremental: the offset starts at 0 and then follows the
@@ -59,8 +60,12 @@ import kotlinx.coroutines.delay
  *
  * While the run waits for a plan decision, a `PLAN APPROVAL` block appears above
  * the plan: it offers the profiles the decision must name, and sends one
- * `POST /v1/runs/{runId}/approval` per decision — never two at a time. The
- * rejection is confirmed first, because it is irreversible.
+ * `POST /v1/runs/{runId}/approval` per decision — never two at a time. While it
+ * waits for a repair scope, a `SCOPE APPROVAL` block shows the paths the delta
+ * adds and sends one `POST /v1/runs/{runId}/scope-approval` per decision; while
+ * the run publishes a resumable checkpoint, a `RESUME` block sends one
+ * `POST /v1/runs/{runId}/resume`. Every irreversible or replayable action is
+ * confirmed first or reported as possibly applied, and nothing is ever retried.
  */
 @Composable
 fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
@@ -79,9 +84,14 @@ fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
             askReject = viewModel::askReject,
         )
     }
+    val scopeActions = remember(viewModel) {
+        RunScopeActions(approve = viewModel::approveScope, askReject = viewModel::askScopeReject)
+    }
+    val resumeActions = remember(viewModel) { RunResumeActions(resume = viewModel::resume) }
 
-    // A pass returns the delay it wants next, or null for a terminal run.
-    LaunchedEffect(lifecycleOwner, viewModel) {
+    // A pass returns the delay it wants next, or null for a terminal run. A
+    // resume answer starts the loop again: the run may be live again.
+    LaunchedEffect(lifecycleOwner, viewModel, state.resumeAnswers) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             while (true) {
                 val interval = viewModel.refreshOnce() ?: break
@@ -98,7 +108,9 @@ fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
         item(key = "header") { Header(state.runId) }
         state.error?.let { message -> item(key = "error") { Note(message, isError = true) } }
         if (!state.hasLoaded) item(key = "loading") { Note("Loading run…", isError = false) }
-        state.detail?.let { detail -> detailItems(detail, state, approvalActions) }
+        state.detail?.let { detail ->
+            detailItems(detail, state, approvalActions, scopeActions, resumeActions)
+        }
     }
 
     // The dialog sits outside the list: a lazy item may be disposed while the
@@ -110,6 +122,13 @@ fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
             onDismiss = viewModel::dismissReject,
         )
     }
+    if (state.scope.confirmingReject) {
+        RejectScopeDialog(
+            submitting = state.scope.submitting,
+            onConfirm = viewModel::confirmScopeReject,
+            onDismiss = viewModel::dismissScopeReject,
+        )
+    }
 }
 
 /** The sections of one loaded run, in the order the screen reads them. */
@@ -117,9 +136,17 @@ private fun LazyListScope.detailItems(
     detail: RunDetailView,
     state: RunDetailUiState,
     actions: RunApprovalActions,
+    scopeActions: RunScopeActions,
+    resumeActions: RunResumeActions,
 ) {
     item(key = "state") { StateCard(detail, state.pollingStopped) }
     if (state.approval.gate != null) item(key = "approval") { ApprovalCard(state.approval, actions) }
+    state.scope.gate?.let { gate ->
+        item(key = "scope") { ScopeApprovalCard(gate, state.scope, scopeActions) }
+    }
+    state.resume.gate?.let { gate ->
+        item(key = "resume") { ResumeCard(gate, state.resume, resumeActions) }
+    }
     detail.failure?.let { failure -> item(key = "failure") { Failure(failure) } }
     if (detail.overview.isNotEmpty()) {
         item(key = "overview-title") { SectionTitle("OVERVIEW") }
@@ -174,6 +201,21 @@ data class RunApprovalActions(
     val approve: () -> Unit,
     val askReject: () -> Unit,
 )
+
+/**
+ * What the scope approval block does; the screen owns the ViewModel that
+ * implements it, so the card stays a function of the state it renders.
+ */
+data class RunScopeActions(
+    val approve: () -> Unit,
+    val askReject: () -> Unit,
+)
+
+/**
+ * What the resume block does; the screen owns the ViewModel that implements it,
+ * so the card stays a function of the state it renders.
+ */
+data class RunResumeActions(val resume: () -> Unit)
 
 /**
  * The plan approval of one run: the profiles the decision must name, and the
@@ -378,6 +420,140 @@ private fun RejectPlanDialog(
                 colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
             ) {
                 Text("REJECT PLAN")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !submitting) { Text("Cancel") }
+        },
+    )
+}
+
+/**
+ * The repair scope of one run: the paths the requested delta adds, and the two
+ * decisions.
+ *
+ * The block only reaches this composable when the run document holds the gate,
+ * so it never offers to edit the delta: approval is bound to the exact scope
+ * the run recorded, and the rejection is confirmed because it is irreversible.
+ */
+@Composable
+private fun ScopeApprovalCard(gate: ScopeGate, scope: RunScopeUiState, actions: RunScopeActions) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SectionTitle("SCOPE APPROVAL")
+            Text(
+                text = "The repair asks for additional mutable scope beyond the automatic limit.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            scope.error?.let { message -> Note(message, isError = true) }
+            if (gate.addedPaths.isEmpty()) {
+                Note("The scope delta adds no path.", isError = false)
+            } else {
+                Text(
+                    text = "ADDED PATHS · ${gate.addedPaths.size}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                gate.addedPaths.forEach { path -> Body(path, mono = true) }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = actions.askReject,
+                    enabled = !scope.submitting,
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) {
+                    Text("REJECT SCOPE")
+                }
+                Button(onClick = actions.approve, enabled = !scope.submitting) {
+                    Text("APPROVE SCOPE")
+                }
+            }
+            if (scope.submitting) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text(
+                        text = "Sending the decision…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The resume of one run: the checkpoint the run publishes, and the one action
+ * that continues it.
+ *
+ * A resume that failed says so and is never sent again by the screen: a timeout
+ * may have been accepted, so the refreshed run is what tells the operator where
+ * it stands.
+ */
+@Composable
+private fun ResumeCard(gate: ResumeGate, resume: RunResumeUiState, actions: RunResumeActions) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SectionTitle("RESUME")
+            Text(
+                text = "The run holds a checkpoint it can continue from.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            resume.error?.let { message -> Note(message, isError = true) }
+            Button(onClick = actions.resume, enabled = !resume.submitting) {
+                Text(gate.label ?: "RESUME RUN")
+            }
+            if (resume.submitting) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text(
+                        text = "Sending the resume request…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** The irreversibility of a scope rejection is stated before it is sent, once. */
+@Composable
+private fun RejectScopeDialog(
+    submitting: Boolean,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = { if (!submitting) onDismiss() },
+        title = { Text("Reject this scope?") },
+        text = {
+            Text(
+                "This action is irreversible: the run records the rejection and " +
+                    "fails without repairing the scope.",
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onConfirm,
+                enabled = !submitting,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+            ) {
+                Text("REJECT SCOPE")
             }
         },
         dismissButton = {
