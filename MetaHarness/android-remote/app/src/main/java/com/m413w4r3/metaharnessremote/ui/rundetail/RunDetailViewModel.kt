@@ -6,14 +6,17 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.google.gson.JsonObject
 import com.m413w4r3.metaharnessremote.api.MetaHarnessApi
 import com.m413w4r3.metaharnessremote.data.ConnectionSession
 import com.m413w4r3.metaharnessremote.data.ServerSettingsStore
 import com.m413w4r3.metaharnessremote.network.GatewayClient
 import com.m413w4r3.metaharnessremote.network.GatewayUrls
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 
 /** Everything the Run Detail screen renders. */
@@ -30,16 +33,45 @@ data class RunDetailUiState(
     val error: String? = null,
     /** The run is terminal: polling stopped until the screen is entered again. */
     val pollingStopped: Boolean = false,
+    /** The plan approval block: what it shows and what it is doing. */
+    val approval: RunApprovalUiState = RunApprovalUiState(),
+)
+
+/** Everything the plan approval block of the Run Detail screen renders. */
+data class RunApprovalUiState(
+    /** The gate the last run document exposed, or null when there is no block. */
+    val gate: ApprovalGate? = null,
+    /** The model profiles the form offers; null until they are read. */
+    val profiles: ApprovalProfiles? = null,
+    /** Failure of the last profile read, shown in place of the form. */
+    val profilesError: String? = null,
+    /** The operator's choices; null until the form is initialised. */
+    val selection: ApprovalSelection? = null,
+    /** The capabilities document of `GET /v1/config`, read once per screen. */
+    val capabilities: JsonObject? = null,
+    /** One `POST /v1/runs/{runId}/approval` is in flight: no second one starts. */
+    val submitting: Boolean = false,
+    /** Failure of the last decision, shown above the form. */
+    val error: String? = null,
+    /** The irreversible rejection waits for its confirmation. */
+    val confirmingReject: Boolean = false,
 )
 
 /**
- * Read-only detail of one run.
+ * One run: its detail, its progress, and the plan decision it may wait for.
  *
  * A pass reads `GET /v1/runs/{runId}` and then
  * `GET /v1/runs/{runId}/progress?offset=N` with the offset kept here, and the
  * caller owns the delay before the next pass: [refreshOnce] returns it, so a
  * screen that is no longer visible stops polling by cancelling its loop.
- * Nothing is stored on the device, and nothing here can change the run.
+ * Nothing is stored on the device.
+ *
+ * While the run waits for a plan decision, the pass also reads the capabilities
+ * of `GET /v1/config` and the profiles of `GET /v1/model-profiles`, once per
+ * screen entry, and keeps the operator's choices across passes. [approve] and
+ * [confirmReject] then send at most one `POST /v1/runs/{runId}/approval` each —
+ * never two at a time — and every answer, a refusal and a timeout included, is
+ * followed by one more [refreshOnce]. Nothing is ever retried.
  */
 class RunDetailViewModel(
     private val settingsStore: ServerSettingsStore,
@@ -80,8 +112,10 @@ class RunDetailViewModel(
         val detail = attempt { api.getRun(runId) }
         val progress = attempt { api.progress(runId, state.progress.offset) }
 
-        val read = detail.getOrNull()?.let { runDetailView(it.raw, runId) }
+        val document = detail.getOrNull()?.raw
+        val read = document?.let { runDetailView(it, runId) }
         val shown = read ?: state.detail
+        val approval = approvalPass(api, document)
         val complete = detail.isSuccess && progress.isSuccess
         val interval = if (complete) runPollIntervalMillis(shown?.status) else RETRY_POLL_INTERVAL_MILLIS
 
@@ -93,8 +127,143 @@ class RunDetailViewModel(
                 .firstOrNull()
                 ?.let(::describe),
             pollingStopped = interval == null,
+            approval = approval,
         )
         return interval
+    }
+
+    /**
+     * The approval block of one pass.
+     *
+     * The run document decides whether there is a block at all; while it asks
+     * for a plan decision, the pass also reads the two documents the form needs
+     * — the capabilities of `GET /v1/config` and the profiles of
+     * `GET /v1/model-profiles` — once per screen entry, and keeps the operator's
+     * choices. A pass that read no run document leaves the block as it was.
+     */
+    private suspend fun approvalPass(api: MetaHarnessApi, document: JsonObject?): RunApprovalUiState {
+        if (document == null) return state.approval
+        val awaiting = awaitingPlanDecision(document)
+        var approval = state.approval
+        if (awaiting && approval.capabilities == null) {
+            // A capabilities document that cannot be read never hides the block:
+            // an explicit `plan_approval: false` does.
+            approval = approval.copy(capabilities = attempt { api.config() }.getOrNull())
+        }
+        val capabilities = approvalCapabilities(document, approval.capabilities)
+        if (awaiting && planApprovalAvailable(capabilities) && approval.profiles == null) {
+            val read = attempt { api.modelProfiles() }
+            val failure = read.exceptionOrNull()
+            approval = if (failure == null) {
+                approval.copy(profiles = approvalProfiles(read.getOrThrow()), profilesError = null)
+            } else {
+                approval.copy(profilesError = describe(failure))
+            }
+        }
+        val gate = planApprovalGate(document, capabilities)
+        val selection = when {
+            gate == null -> null
+            approval.selection != null -> approval.selection
+            approval.profiles != null -> defaultApprovalSelection(document, gate, approval.profiles)
+            else -> null
+        }
+        return approval.copy(gate = gate, selection = selection)
+    }
+
+    /** The operator chose the reviewer of the plan. */
+    fun selectFinalReviewer(profileId: String) {
+        changeSelection { it.copy(finalReviewerProfile = profileId) }
+    }
+
+    /** The operator chose the profile that revises the plan after validation. */
+    fun selectSemanticReviser(profileId: String) {
+        changeSelection { it.copy(semanticReviserProfile = profileId) }
+    }
+
+    /** The operator chose the profile that repairs a failed check. */
+    fun selectCheckRepair(profileId: String) {
+        changeSelection { it.copy(checkRepairProfile = profileId) }
+    }
+
+    /** The operator chose the implementer of one plan step. */
+    fun selectStepProfile(stepId: String, profileId: String) {
+        changeSelection { it.copy(stepProfiles = it.stepProfiles + (stepId to profileId)) }
+    }
+
+    /**
+     * The operator tapped APPROVE: at most one decision leaves this screen, and
+     * only when every step and role of the form holds a compatible profile.
+     */
+    fun approve() {
+        val approval = state.approval
+        val gate = approval.gate ?: return
+        val profiles = approval.profiles ?: return
+        val selection = approval.selection ?: return
+        val payload = approvalPayload(selection, gate, profiles) ?: return
+        decide(payload)
+    }
+
+    /** The operator tapped REJECT: the irreversible decision is asked first. */
+    fun askReject() {
+        if (state.approval.submitting) return
+        state = state.copy(approval = state.approval.copy(confirmingReject = true, error = null))
+    }
+
+    /** The operator closed the rejection dialog without deciding. */
+    fun dismissReject() {
+        state = state.copy(approval = state.approval.copy(confirmingReject = false))
+    }
+
+    /** The operator confirmed the irreversible rejection: one `REJECT` is sent. */
+    fun confirmReject() {
+        decide(rejectionPayload())
+    }
+
+    /** One `POST /v1/runs/{runId}/approval`; nothing is sent while one is in flight. */
+    private fun decide(payload: JsonObject) {
+        val approval = state.approval
+        if (approval.submitting) return
+        when (val baseUrl = GatewayUrls.normalize(settingsStore.loadServerUrl())) {
+            is GatewayUrls.BaseUrl.Invalid ->
+                state = state.copy(approval = approval.copy(error = baseUrl.reason, confirmingReject = false))
+
+            is GatewayUrls.BaseUrl.Valid -> {
+                val token = session.remoteToken
+                if (token.isBlank()) {
+                    state = state.copy(approval = approval.copy(error = MISSING_TOKEN, confirmingReject = false))
+                } else {
+                    state = state.copy(
+                        approval = approval.copy(submitting = true, error = null, confirmingReject = false),
+                    )
+                    viewModelScope.launch { send(MetaHarnessApi(baseUrl.value, token, httpClient), payload) }
+                }
+            }
+        }
+    }
+
+    /**
+     * One decision, reported as it ends.
+     *
+     * The run is read again whatever the answer was: an accepted decision moved
+     * it, and a refusal means another decision is already recorded. The decision
+     * itself is never sent twice. [CancellationException] belongs to the scope:
+     * the screen was left, so its answer is shown nowhere.
+     */
+    private suspend fun send(api: MetaHarnessApi, payload: JsonObject) {
+        val outcome = attempt { api.approveRun(runId, payload) }
+        state = state.copy(
+            approval = state.approval.copy(
+                submitting = false,
+                error = outcome.exceptionOrNull()?.let(::approvalFailure),
+            ),
+        )
+        refreshOnce()
+    }
+
+    private fun changeSelection(change: (ApprovalSelection) -> ApprovalSelection) {
+        val approval = state.approval
+        val selection = approval.selection ?: return
+        state = state.copy(approval = approval.copy(selection = change(selection), error = null))
     }
 
     /** [CancellationException] belongs to the scope, not to the gateway. */

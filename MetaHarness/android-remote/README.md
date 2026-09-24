@@ -77,8 +77,9 @@ Tapping a card (or creating a run) opens it read-only. Each pass reads
 | implementation steps | `implementation_bundle.steps`, each showing `id`, `title`, `execution_class` and the profile: `profile_id` from `state.steps`, else `recommended_profile` from `state.planner.steps` |
 
 Every field is optional and type-checked, so a run whose document is still
-incomplete renders what it has instead of failing. Nothing is written and no
-route of this screen can change a run.
+incomplete renders what it has instead of failing. The only route of this
+screen that can change a run is the plan decision below, and it is sent only
+when the operator asks for it.
 
 Progress is incremental: the offset starts at `0` and every answer replaces it
 with its own `next_offset`, so each pass appends only the events that became
@@ -100,6 +101,77 @@ A failed pass keeps the last good detail, reports the error, and retries every
 5 seconds. All polling stops when the screen leaves the foreground — the loop
 lives in `repeatOnLifecycle(RESUMED)` — so a screen that is not visible costs
 nothing.
+
+## Plan approval
+
+While a run waits for a decision on its plan, the Run Detail screen renders a
+`PLAN APPROVAL` block between the status card and the plan. It is shown only
+when the run document holds all four conditions, each one read exactly as the
+desktop form reads it:
+
+```text
+status == awaiting_plan_approval
+approval.recorded != true
+approval.awaiting != false
+capabilities.plan_approval != false
+```
+
+`capabilities` is the object of the run document, else the one of its
+`overview`, else the `capabilities` of `GET /v1/config` — a run document
+carries none, so the configuration is read once per screen entry. A capability
+that cannot be read does not hide the block: only an explicit `false` does.
+
+| Field | Read from |
+| --- | --- |
+| steps | `implementation_bundle.steps` (`id`, `title`, `execution_class`; a step without a class is mechanical) |
+| recorded implementer | `execution_selection.steps[].step_id` + `.implementer.profile_id` |
+| requested profiles | `run_options.profiles` (`mechanical_profile`, `reasoning_profile`, `agentic_profile`, `final_reviewer_profile`, `semantic_reviser_profile`, `check_repair_profile`) |
+| selectable profiles | `GET /v1/model-profiles`, role `implementer` for a step, `reviewer` / `reviser` / `repair` for the role fields, filtered by `execution_classes` (or the historic `classes`) when the profile declares any |
+
+Each step starts from what the run recorded for it, then from the profile its
+run options routed to that execution class, then from the first compatible
+profile. The three role fields start from the same order, ending with the
+gateway's own `defaults`. The semantic reviser and the check repair fields are
+offered only when the run's own options use them (`semantic_revision_enabled`,
+or a correction budget): MetaHarness refuses a profile of a role the run does
+not enable.
+
+`APPROVE & CONTINUE` sends exactly one `POST /v1/runs/<run_id>/approval`, and is
+enabled only once every step, the final reviewer, and every role the run uses
+hold a compatible profile:
+
+```json
+{
+  "decision": "APPROVE",
+  "final_reviewer_profile": "reviewer-heavy",
+  "semantic_reviser_profile": "reviser-1",
+  "check_repair_profile": "repair-1",
+  "step_profiles": {
+    "S01": "impl-fast",
+    "S02": "impl-heavy"
+  }
+}
+```
+
+That body is the external contract: the step keys are plan step ids, and
+translating them into the local field names is the gateway's job. The app never
+builds a `step_profile__S01` field, and a role the run does not use is left out
+of the body. `REJECT PLAN` opens an `AlertDialog` that states the rejection is
+irreversible; confirming it sends `{"decision": "REJECT"}` and nothing else.
+
+One mutation runs at a time: while a decision is in flight both buttons are
+disabled and a second tap starts nothing. Whatever the answer was, the screen
+then reads `GET /v1/runs/<run_id>` again — an accepted decision moves the run,
+and an HTTP 409 means another decision is already recorded, so the block
+disappears on the refreshed state. Nothing is ever retried; a decision that
+timed out says so and lets the refreshed run, not a second decision, tell the
+operator what happened:
+
+```text
+Response timed out.
+The decision may have been recorded.
+The run is read again to show what it recorded.
+```
 
 ## New Run screen
 
@@ -143,6 +215,7 @@ gateway, built from a `baseUrl`, the in-memory `remoteToken` and an injected
 | `getRun(runId)` | `GET /v1/runs/<run_id>` |
 | `progress(runId, offset)` | `GET /v1/runs/<run_id>/progress?offset=N` |
 | `createRun(spec, runId)` | `POST /v1/runs` |
+| `approveRun(runId, payload)` | `POST /v1/runs/<run_id>/approval` |
 
 Every call is one exchange with no retry, carries the bearer token and
 `Accept: application/json`, reads at most 2 MiB, and raises
@@ -151,4 +224,5 @@ copying the token. A call that got no answer in time raises
 `MetaHarnessTimeoutException` instead: the request was sent, so a mutation may
 still have been applied. `config()` and `modelProfiles()` stay raw
 `JsonObject`s and `getRun()` returns the raw document, so only the displayed
-fields are typed.
+fields are typed. `approveRun(runId, payload)` takes the external approval body
+described above and answers the decision the gateway recorded.

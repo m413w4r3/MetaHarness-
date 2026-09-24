@@ -1,20 +1,34 @@
 package com.m413w4r3.metaharnessremote.ui.rundetail
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -30,7 +44,7 @@ import com.m413w4r3.metaharnessremote.ui.runs.RunCategory
 import kotlinx.coroutines.delay
 
 /**
- * Run Detail: one run, read-only.
+ * Run Detail: one run, and the plan decision it may wait for.
  *
  * `GET /v1/runs/{runId}` and `GET /v1/runs/{runId}/progress?offset=N` are read
  * on entry and then on the cadence the run itself asks for
@@ -42,6 +56,11 @@ import kotlinx.coroutines.delay
  * Progress is incremental: the offset starts at 0 and then follows the
  * `next_offset` of every answer, so each pass adds only the events that became
  * visible since the previous one.
+ *
+ * While the run waits for a plan decision, a `PLAN APPROVAL` block appears above
+ * the plan: it offers the profiles the decision must name, and sends one
+ * `POST /v1/runs/{runId}/approval` per decision — never two at a time. The
+ * rejection is confirmed first, because it is irreversible.
  */
 @Composable
 fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
@@ -50,6 +69,16 @@ fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
         viewModel(key = runId, factory = RunDetailViewModel.factory(context, runId))
     val lifecycleOwner = LocalLifecycleOwner.current
     val state = viewModel.state
+    val approvalActions = remember(viewModel) {
+        RunApprovalActions(
+            selectFinalReviewer = viewModel::selectFinalReviewer,
+            selectSemanticReviser = viewModel::selectSemanticReviser,
+            selectCheckRepair = viewModel::selectCheckRepair,
+            selectStepProfile = viewModel::selectStepProfile,
+            approve = viewModel::approve,
+            askReject = viewModel::askReject,
+        )
+    }
 
     // A pass returns the delay it wants next, or null for a terminal run.
     LaunchedEffect(lifecycleOwner, viewModel) {
@@ -69,7 +98,17 @@ fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
         item(key = "header") { Header(state.runId) }
         state.error?.let { message -> item(key = "error") { Note(message, isError = true) } }
         if (!state.hasLoaded) item(key = "loading") { Note("Loading run…", isError = false) }
-        state.detail?.let { detail -> detailItems(detail, state) }
+        state.detail?.let { detail -> detailItems(detail, state, approvalActions) }
+    }
+
+    // The dialog sits outside the list: a lazy item may be disposed while the
+    // operator reads the plan, and the confirmation must survive that.
+    if (state.approval.confirmingReject) {
+        RejectPlanDialog(
+            submitting = state.approval.submitting,
+            onConfirm = viewModel::confirmReject,
+            onDismiss = viewModel::dismissReject,
+        )
     }
 }
 
@@ -77,8 +116,10 @@ fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
 private fun LazyListScope.detailItems(
     detail: RunDetailView,
     state: RunDetailUiState,
+    actions: RunApprovalActions,
 ) {
     item(key = "state") { StateCard(detail, state.pollingStopped) }
+    if (state.approval.gate != null) item(key = "approval") { ApprovalCard(state.approval, actions) }
     detail.failure?.let { failure -> item(key = "failure") { Failure(failure) } }
     if (detail.overview.isNotEmpty()) {
         item(key = "overview-title") { SectionTitle("OVERVIEW") }
@@ -119,6 +160,230 @@ private fun Header(runId: String) {
             overflow = TextOverflow.Ellipsis,
         )
     }
+}
+
+/**
+ * What the approval block does; the screen owns the ViewModel that implements
+ * it, so the card stays a function of the state it renders.
+ */
+data class RunApprovalActions(
+    val selectFinalReviewer: (String) -> Unit,
+    val selectSemanticReviser: (String) -> Unit,
+    val selectCheckRepair: (String) -> Unit,
+    val selectStepProfile: (stepId: String, profileId: String) -> Unit,
+    val approve: () -> Unit,
+    val askReject: () -> Unit,
+)
+
+/**
+ * The plan approval of one run: the profiles the decision must name, and the
+ * two decisions.
+ *
+ * The block only reaches this composable when the run document holds the four
+ * conditions of the gate, so everything here is about the decision itself: it
+ * starts from the profiles the run routed, keeps what the operator changes, and
+ * only enables APPROVE once every step and every role the run uses holds a
+ * compatible profile.
+ */
+@Composable
+private fun ApprovalCard(approval: RunApprovalUiState, actions: RunApprovalActions) {
+    val gate = approval.gate ?: return
+    val profiles = approval.profiles
+    val selection = approval.selection
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SectionTitle("PLAN APPROVAL")
+            Text(
+                text = "The run waits for a decision on this plan.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            approval.error?.let { message -> Note(message, isError = true) }
+            approval.profilesError?.let { message -> Note(message, isError = true) }
+            when {
+                profiles == null || selection == null ->
+                    Note("Loading model profiles…", isError = false)
+
+                profiles.options.isEmpty() ->
+                    Note("No model profile is available.", isError = true)
+
+                else -> ApprovalForm(gate, profiles, selection, approval.submitting, actions)
+            }
+            if (approval.submitting) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text(
+                        text = "Sending the decision…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** The three role profiles, the step implementers and the two decisions. */
+@Composable
+private fun ApprovalForm(
+    gate: ApprovalGate,
+    profiles: ApprovalProfiles,
+    selection: ApprovalSelection,
+    submitting: Boolean,
+    actions: RunApprovalActions,
+) {
+    ProfilePicker(
+        label = "Final reviewer",
+        options = profiles.withRole(REVIEWER_ROLE),
+        selected = selection.finalReviewerProfile,
+        enabled = !submitting,
+        onSelect = actions.selectFinalReviewer,
+    )
+    ProfilePicker(
+        label = "Semantic reviser",
+        options = profiles.withRole(REVISER_ROLE),
+        selected = selection.semanticReviserProfile,
+        enabled = !submitting && gate.semanticRevisionEnabled,
+        disabledNote = "This run does not enable semantic revision",
+        onSelect = actions.selectSemanticReviser,
+    )
+    ProfilePicker(
+        label = "Check repair",
+        options = profiles.withRole(REPAIR_ROLE),
+        selected = selection.checkRepairProfile,
+        enabled = !submitting && gate.checkRepairEnabled,
+        disabledNote = "This run has no correction budget",
+        onSelect = actions.selectCheckRepair,
+    )
+    SectionTitle("STEP PROFILES")
+    if (gate.steps.isEmpty()) {
+        Note("The plan holds no step to select an implementer for.", isError = true)
+    }
+    gate.steps.forEach { step ->
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = listOfNotNull(step.id, step.title).joinToString(" · "),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            ProfilePicker(
+                label = step.executionClass,
+                options = profiles.implementers(step),
+                selected = selection.stepProfiles[step.id].orEmpty(),
+                enabled = !submitting,
+                onSelect = { profileId -> actions.selectStepProfile(step.id, profileId) },
+            )
+        }
+    }
+    // The payload is built here only to know whether APPROVE may be tapped; the
+    // ViewModel builds the one it sends from the same function.
+    val approveEnabled = !submitting && approvalPayload(selection, gate, profiles) != null
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(
+            onClick = actions.askReject,
+            enabled = !submitting,
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+        ) {
+            Text("REJECT PLAN")
+        }
+        Button(onClick = actions.approve, enabled = approveEnabled) {
+            Text("APPROVE & CONTINUE")
+        }
+    }
+}
+
+/**
+ * One profile of the form, read as a button that opens the list of the profiles
+ * the run may use for that role or step.
+ */
+@Composable
+private fun ProfilePicker(
+    label: String,
+    options: List<ProfileOption>,
+    selected: String,
+    enabled: Boolean,
+    disabledNote: String? = null,
+    onSelect: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        when {
+            !enabled -> Text(
+                text = disabledNote ?: selected.ifEmpty { DASH },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            options.isEmpty() -> Text(
+                text = "No compatible profile",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+
+            else -> Box {
+                TextButton(onClick = { expanded = true }) {
+                    Text(
+                        text = selected.ifEmpty { "Select a profile" },
+                        fontFamily = FontFamily.Monospace,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                    options.forEach { option ->
+                        DropdownMenuItem(
+                            text = { Text(text = option.id, fontFamily = FontFamily.Monospace) },
+                            onClick = {
+                                expanded = false
+                                onSelect(option.id)
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** The irreversibility of a rejection is stated before it is sent, once. */
+@Composable
+private fun RejectPlanDialog(
+    submitting: Boolean,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = { if (!submitting) onDismiss() },
+        title = { Text("Reject this plan?") },
+        text = {
+            Text(
+                "This action is irreversible: the run records the rejection and " +
+                    "does not implement the plan.",
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onConfirm,
+                enabled = !submitting,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+            ) {
+                Text("REJECT PLAN")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !submitting) { Text("Cancel") }
+        },
+    )
 }
 
 @Composable

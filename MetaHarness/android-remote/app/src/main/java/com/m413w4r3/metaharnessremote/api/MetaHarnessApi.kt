@@ -97,6 +97,31 @@ class MetaHarnessApi(
         return gson.toJson(payload)
     }
 
+    /**
+     * `POST /v1/runs/{runId}/approval` with the external approval [payload].
+     *
+     * The body speaks the external contract: a `decision`, the role profiles,
+     * and `step_profiles` keyed by plan step id (`{"S01": "impl-fast"}`).
+     * Translating those keys into the local field names belongs to the gateway,
+     * so this client never builds a `step_profile__S01` field.
+     *
+     * Exactly one exchange is sent — nothing is retried, because a decision
+     * that timed out may still have been recorded.
+     */
+    suspend fun approveRun(runId: String, payload: JsonObject): ApprovalResponse {
+        val decision = payload.decision() ?: throw IllegalArgumentException(
+            "decision must be $APPROVE or $REJECT",
+        )
+        val document = post(
+            "${runPath(runId)}$APPROVAL_PATH",
+            gson.toJson(payload),
+            ApprovalDocument::class.java,
+        )
+        return ApprovalResponse(
+            decision = document.decision?.trim()?.takeIf { it.isNotEmpty() } ?: decision,
+        )
+    }
+
     /** `GET <baseUrl><path>` with the bearer token and the JSON accept header. */
     internal fun getRequest(path: String): Request = requestBuilder(path).get().build()
 
@@ -212,6 +237,14 @@ class MetaHarnessApi(
         return "$RUNS_PATH/$runId"
     }
 
+    /** The decision of an approval body, or null when it is absent or unknown. */
+    private fun JsonObject.decision(): String? =
+        get(DECISION)
+            ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+            ?.asString
+            ?.trim()
+            ?.takeIf { it == APPROVE || it == REJECT }
+
     private fun failureMessage(status: Int): String = when (status) {
         401 -> "Unauthorized: the remote token was rejected"
         403 -> "Forbidden: the remote token is not allowed"
@@ -229,6 +262,11 @@ class MetaHarnessApi(
         private const val CONFIG_PATH = "/v1/config"
         private const val MODEL_PROFILES_PATH = "/v1/model-profiles"
         private const val RUNS_PATH = "/v1/runs"
+        private const val APPROVAL_PATH = "/approval"
+
+        private const val APPROVE = "APPROVE"
+        private const val REJECT = "REJECT"
+        private const val DECISION = "decision"
 
         private const val AUTHORIZATION = "Authorization"
         private const val ACCEPT = "Accept"

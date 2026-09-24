@@ -55,10 +55,24 @@ data class RunDetail(val raw: JsonObject)
  */
 data class CreateRunResponse(val runId: String)
 
+/**
+ * Answer of `POST /v1/runs/{runId}/approval`.
+ *
+ * [decision] is the decision the gateway recorded: the one its answer names,
+ * or, when it names none, the one that was sent — the call succeeded, so the
+ * decision is durable. The screen reads the run again to show what it decided.
+ */
+data class ApprovalResponse(val decision: String)
+
 /** Envelope of `GET /v1/runs`. */
 internal data class RunListDocument(val runs: List<RunSummary> = emptyList())
 
 /** Envelope of `POST /v1/runs`, parsed before the created run id is checked. */
 internal data class CreateRunDocument(
     @SerializedName("run_id") val runId: String? = null,
+)
+
+/** Document of `POST /v1/runs/{runId}/approval`, parsed before its decision is checked. */
+internal data class ApprovalDocument(
+    @SerializedName("decision") val decision: String? = null,
 )

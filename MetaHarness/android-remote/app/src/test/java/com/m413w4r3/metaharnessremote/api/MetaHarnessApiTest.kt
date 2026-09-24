@@ -353,4 +353,112 @@ class MetaHarnessApiTest {
         assertTrue(failure !is MetaHarnessTimeoutException)
         assertTrue(failure.message!!.contains("run id"))
     }
+
+    @Test
+    fun `approve run posts the external payload once and reads the decision back`() = runBlocking {
+        val (api, interceptor) = apiReturning("""{"ok":true,"decision":"APPROVE"}""")
+        val payload = JsonParser.parseString(
+            """{"decision":"APPROVE","final_reviewer_profile":"reviewer-heavy","step_profiles":{"S01":"impl-fast"}}""",
+        ).asJsonObject
+
+        val response = api.approveRun("run-1", payload)
+
+        assertEquals(ApprovalResponse(decision = "APPROVE"), response)
+        val request = interceptor.requests.single()
+        assertEquals("POST", request.method)
+        assertEquals("$baseUrl/v1/runs/run-1/approval", request.url.toString())
+        assertEquals("Bearer $token", request.header("Authorization"))
+        assertEquals("application/json", request.header("Accept"))
+        assertEquals("application/json", request.header("Content-Type"))
+        val body = JsonParser.parseString(bodyOf(request)).asJsonObject
+        assertEquals("APPROVE", body.get("decision").asString)
+        assertEquals("reviewer-heavy", body.get("final_reviewer_profile").asString)
+        assertEquals("impl-fast", body.getAsJsonObject("step_profiles").get("S01").asString)
+        assertTrue(
+            "the client never builds a local field name",
+            !body.toString().contains("step_profile__"),
+        )
+    }
+
+    @Test
+    fun `approve run sends a rejection as the decision alone`() = runBlocking {
+        val (api, interceptor) = apiReturning("""{"ok":true,"decision":"REJECT"}""")
+        val payload = JsonParser.parseString("""{"decision":"REJECT"}""").asJsonObject
+
+        val response = api.approveRun("run-1", payload)
+
+        assertEquals(ApprovalResponse(decision = "REJECT"), response)
+        assertEquals("""{"decision":"REJECT"}""", bodyOf(interceptor.requests.single()))
+    }
+
+    @Test
+    fun `approve run keeps the sent decision when the answer names none`() = runBlocking {
+        val (api, _) = apiReturning("""{"ok":true}""")
+        val payload = JsonParser.parseString("""{"decision":"APPROVE"}""").asJsonObject
+
+        assertEquals(ApprovalResponse(decision = "APPROVE"), api.approveRun("run-1", payload))
+    }
+
+    @Test
+    fun `approve run refuses a body without a decision and a hostile run id`() {
+        val (api, interceptor) = apiReturning("""{"ok":true,"decision":"APPROVE"}""")
+
+        listOf("""{"decision":"MAYBE"}""", """{"decision":1}""", """{"final_reviewer_profile":"p"}""")
+            .forEach { body ->
+                assertThrows(IllegalArgumentException::class.java) {
+                    runBlocking { api.approveRun("run-1", JsonParser.parseString(body).asJsonObject) }
+                }
+            }
+        listOf("../run", "run/1", ".", "", "run.lock").forEach { runId ->
+            assertThrows(IllegalArgumentException::class.java) {
+                runBlocking {
+                    api.approveRun(
+                        runId,
+                        JsonParser.parseString("""{"decision":"APPROVE"}""").asJsonObject,
+                    )
+                }
+            }
+        }
+        assertTrue(interceptor.requests.isEmpty())
+    }
+
+    @Test
+    fun `a refused decision is reported once and never retried`() {
+        val (api, interceptor) = apiReturning(
+            """{"error":"conflict","message":"run is not awaiting plan approval"}""",
+            code = 409,
+        )
+
+        val failure = assertThrows(MetaHarnessException::class.java) {
+            runBlocking {
+                api.approveRun(
+                    "run-1",
+                    JsonParser.parseString("""{"decision":"APPROVE"}""").asJsonObject,
+                )
+            }
+        }
+
+        assertEquals(409, failure.statusCode)
+        assertEquals("run is not awaiting plan approval", failure.payload?.asJsonObject?.get("message")?.asString)
+        assertEquals(1, interceptor.requests.size)
+        assertEquals("POST", interceptor.requests.single().method)
+    }
+
+    @Test
+    fun `a timed out decision is reported as an unknown outcome`() {
+        val (api, interceptor) = apiWith { throw SocketTimeoutException("timeout") }
+
+        val failure = assertThrows(MetaHarnessTimeoutException::class.java) {
+            runBlocking {
+                api.approveRun(
+                    "run-1",
+                    JsonParser.parseString("""{"decision":"REJECT"}""").asJsonObject,
+                )
+            }
+        }
+
+        assertNull(failure.statusCode)
+        assertTrue(!failure.message!!.contains(token))
+        assertEquals(1, interceptor.requests.size)
+    }
 }
