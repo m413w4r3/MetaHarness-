@@ -142,14 +142,48 @@ class ConfigTests(unittest.TestCase):
             raw = tomllib.load(stream)
 
         checks = {check["id"]: check for check in raw["check_catalog"]}
+        self.assertEqual(
+            raw["routing"],
+            {
+                "mechanical_profile": "codex-luna-high",
+                "reasoning_profile": "codex-luna-xhigh",
+                "agentic_profile": "codex-deepseek-flash-max",
+            },
+        )
+        self.assertEqual(
+            raw["recovery"]["execution_fallbacks"],
+            {
+                "mechanical": ["codex-luna-xhigh"],
+                "reasoning": ["codex-sol-high"],
+                "agentic": ["codex-sol-high"],
+                "semantic_reviser": ["codex-astra-medium"],
+            },
+        )
         self.assertEqual(raw["default_check_ids"], ["lint", "typecheck", "test"])
+        self.assertEqual(
+            tuple(check["id"] for check in raw["check_catalog"]),
+            (
+                "lint",
+                "typecheck",
+                "test",
+                "test-integration",
+                "frontend-e2e",
+                "alembic-heads",
+            ),
+        )
         self.assertIn("frontend-e2e", checks)
         self.assertEqual(checks["frontend-e2e"]["cwd"], "frontend")
         self.assertEqual(tuple(checks["frontend-e2e"]["argv"]), ("pnpm", "test:e2e"))
         self.assertNotIn("frontend-e2e", raw["default_check_ids"])
         self.assertIn("alembic-heads", checks)
+        self.assertEqual(checks["alembic-heads"]["cwd"], "backend")
         self.assertEqual(
-            tuple(checks["alembic-heads"]["argv"][:2]), ("sh", "-c")
+            tuple(checks["alembic-heads"]["argv"]),
+            (
+                "sh",
+                "-c",
+                "set -eu; out=\"$(uv run alembic heads)\"; printf '%s\\n' \"$out\"; test \"$out\" = '0001_baseline (head)'",
+            ),
         )
 
         trusted = tuple(
@@ -418,6 +452,12 @@ mechanical = "rescue"
         with tempfile.TemporaryDirectory() as directory_name:
             with self.assertRaisesRegex(ConfigError, "META_PLANNER_MODEL"):
                 load_config(self.write_config(Path(directory_name)))
+
+    def test_declared_missing_environment_file_fails_closed(self) -> None:
+        contents = VALID_CONFIG + '\n[environment]\nfiles = ["missing.env"]\n'
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, r"cannot read environment file .*missing\.env"):
+                load_config(self.write_config(Path(directory_name), contents))
 
     def test_check_argv_string_is_rejected(self) -> None:
         contents = VALID_CONFIG.replace('argv = ["make", "test"]', 'argv = "make test"')

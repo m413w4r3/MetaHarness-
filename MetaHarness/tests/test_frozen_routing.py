@@ -5,23 +5,125 @@ from pathlib import Path
 
 from metaharness.agent.codex import build_agent_environment
 from metaharness.agent.runtime import prepare_codex_home
-from metaharness.config import load_config
 from metaharness.execution_selection import resolve_execution_selection
 from metaharness.models import (
     AgentConfig,
+    CodexProviderConfig,
     ContextConfig,
     CodexRuntimeConfig,
     ExecutionClass,
+    ExecutionRole,
     HarnessConfig,
     ImplementationStep,
+    ModelProfile,
+    ProfileDriver,
+    RoutingConfig,
+    SelectionMode,
+    UIConfig,
 )
 from metaharness.run_options import RunOptions
-from metaharness.recovery_policy import RecoveryBudgets
+from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
+
+
+def frozen_routing_config() -> HarnessConfig:
+    """Build the smallest secret-free config needed by the routing tests."""
+
+    profiles = {
+        "planner-chat": ModelProfile(
+            "planner-chat",
+            "Planner",
+            (ExecutionRole.PLANNER,),
+            ProfileDriver.OPENAI_CHAT,
+            "planner-model",
+            SelectionMode.REQUEST,
+            base_url="https://planner.example",
+            endpoint_path="/v1/chat",
+            api_key_env="PLANNER_API_KEY",
+        ),
+        "reviewer-chat": ModelProfile(
+            "reviewer-chat",
+            "Reviewer",
+            (ExecutionRole.REVIEWER,),
+            ProfileDriver.OPENAI_CHAT,
+            "reviewer-model",
+            SelectionMode.REQUEST,
+            base_url="https://reviewer.example",
+            endpoint_path="/v1/chat",
+            api_key_env="REVIEWER_API_KEY",
+        ),
+        "codex-luna-high": ModelProfile(
+            "codex-luna-high",
+            "Luna High",
+            (ExecutionRole.IMPLEMENTER,),
+            ProfileDriver.CODEX,
+            "gpt-6-luna",
+            SelectionMode.CLI,
+            effort="high",
+            sandbox="workspace-write",
+        ),
+        "codex-luna-xhigh": ModelProfile(
+            "codex-luna-xhigh",
+            "Luna XHigh",
+            (ExecutionRole.IMPLEMENTER,),
+            ProfileDriver.CODEX,
+            "gpt-6-luna",
+            SelectionMode.CLI,
+            effort="xhigh",
+            sandbox="workspace-write",
+        ),
+        "codex-deepseek-flash-max": ModelProfile(
+            "codex-deepseek-flash-max",
+            "DeepSeek Flash Max",
+            (ExecutionRole.IMPLEMENTER,),
+            ProfileDriver.CODEX,
+            "deepseek-flash",
+            SelectionMode.CLI,
+            provider="deepseek",
+            effort="max",
+            sandbox="workspace-write",
+        ),
+    }
+    repository = Path(__file__).resolve().parents[1]
+    return HarnessConfig(
+        repo=repository,
+        base_ref="main",
+        runs_root=repository / ".test-runs",
+        worktrees_root=repository / ".test-worktrees",
+        require_clean_base=True,
+        context=ContextConfig(always_files=()),
+        check_catalog=(),
+        allow_no_required_checks=True,
+        ui=UIConfig(
+            default_planner_profile="planner-chat",
+            default_reviewer_profile="reviewer-chat",
+        ),
+        model_profiles=profiles,
+        routing=RoutingConfig(
+            mechanical_profile="codex-luna-high",
+            reasoning_profile="codex-luna-xhigh",
+            agentic_profile="codex-deepseek-flash-max",
+        ),
+        codex_providers={
+            "deepseek": CodexProviderConfig(
+                "deepseek",
+                "https://api.deepseek.com/",
+                "responses",
+                "DEEPSEEK_API_KEY",
+            )
+        },
+        recovery=RecoveryBudgets(
+            execution_fallbacks=ExecutionFallbacks(
+                mechanical=("codex-luna-xhigh",),
+                reasoning=("codex-luna-high",),
+                agentic=("codex-luna-high",),
+            )
+        ),
+    )
 
 
 class FrozenRoutingTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.config = load_config(Path(__file__).parents[1] / "examples" / "autowork.toml")
+        self.config = frozen_routing_config()
 
     def test_execution_classes_resolve_to_frozen_profiles(self) -> None:
         options = RunOptions.from_config(self.config)
