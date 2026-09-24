@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Platform theme only: the colours themselves come from Compose/Material 3. -->
+    <style name="Theme.MetaHarnessRemote" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
