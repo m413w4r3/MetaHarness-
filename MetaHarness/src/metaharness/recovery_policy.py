@@ -18,6 +18,7 @@ class RecoveryDisposition(StrEnum):
     CHECK_REPAIR = "check_repair"
     REPLAN = "replan"
     WAIT_EXTERNAL = "wait_external"
+    WAIT_HUMAN = "wait_human"
     CONTINUE_WITH_WARNING = "continue_with_warning"
     HARD_STOP = "hard_stop"
 
@@ -110,6 +111,7 @@ _HARD_STOP_CODES = frozenset({
     "TRANSIENT_ATTEMPTS_EXHAUSTED",
     "CHECK_MUTATED_FORBIDDEN_FILES",
     "REMOTE_AUTHORITY_MISMATCH",
+    "APPROVAL_IDENTITY_MISMATCH", "RESUME_IDENTITY_INVALID",
 })
 
 _AUTH_CODES = frozenset({
@@ -184,6 +186,12 @@ def classify_failure(
             RecoveryDisposition.WAIT_EXTERNAL,
             "review is retained at its final-review checkpoint for retry or operator action",
         )
+    if code in {
+        "SPEC_DECISION_REQUIRED", "SECURITY_POLICY_DECISION_REQUIRED",
+        "ATOMIC_SCOPE_POLICY_LIMIT", "REPAIR_SCOPE_APPROVAL_REQUIRED",
+        "REVIEW_HUMAN_REQUIRED",
+    }:
+        return decision(RecoveryDisposition.WAIT_HUMAN, "an operator decision is required")
     if code in {"PUSH_FAILED", "CANDIDATE_PUSH_FAILED"}:
         if not remote_required:
             return decision(RecoveryDisposition.CONTINUE_WITH_WARNING, "optional remote publication failed")
@@ -206,6 +214,10 @@ def classify_failure(
         if clean_contract_mismatch:
             return decision(RecoveryDisposition.CONTRACT_REPAIR, "clean contract mismatch is repairable", consumes=True)
         return decision(RecoveryDisposition.REPLAN, "contract facts require a bounded replan", consumes=True)
+    if code in {"REVIEW_IMPLEMENTATION", "BOUNDED_SCOPE_REQUEST"}:
+        return decision(RecoveryDisposition.CONTRACT_REPAIR, "bounded implementation correction is available", consumes=True)
+    if code == "REVIEW_REPLAN":
+        return decision(RecoveryDisposition.REPLAN, "review requested a bounded planning correction", consumes=True)
     if code.startswith("CHECK_FAILED"):
         return decision(RecoveryDisposition.CHECK_REPAIR, "deterministic check failed", consumes=True)
     if code in {"CHECK_TIMEOUT", "CHECK_PREFLIGHT_FAILED", "CHECK_INFRA_FAILURE"}:
@@ -214,6 +226,8 @@ def classify_failure(
         return decision(RecoveryDisposition.CONTRACT_REPAIR, "review output format can be repaired", consumes=True)
     if code.startswith(("PLANNER_FORMAT_INVALID", "PLANNER_PROTOCOL_FAILED", "PLANNER_OUTPUT_INVALID")):
         return decision(RecoveryDisposition.REPLAN, "planner protocol can be retried", consumes=True)
+    if code == "PLANNER_REPOSITORY_EVIDENCE":
+        return decision(RecoveryDisposition.REPLAN, "named immutable repository evidence can repair the plan", consumes=True)
     if code in {
         "PLAN_REPOSITORY_PRECONDITION_ERROR", "PLAN_REPOSITORY_PRECONDITION_INVALID",
         "PLANNER_REPOSITORY_PRECONDITION_ERROR",
@@ -230,6 +244,8 @@ def classify_failure(
                 "agent failed after an in-scope tree change", consumes=True, rollback=True,
             )
         return decision(RecoveryDisposition.RETRY_SAME, "transient agent failure", consumes=True)
+    if code == "SEMANTIC_REVISER_UNAVAILABLE":
+        return decision(RecoveryDisposition.CONTINUE_WITH_WARNING, "semantic reviser is unavailable; deterministic checks remain authoritative")
     if (
         code in _TRANSIENT_EXTERNAL_CODES
         or code.startswith(("LLM_5", "LLM_429", "LLM_HTTP_5", "LLM_HTTP_429"))

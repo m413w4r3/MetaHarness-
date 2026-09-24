@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from metaharness.models import CheckConfig, PlanDecision, PlanningConfig  # noqa: E402
+from metaharness.models import BlockerKind, CheckConfig, PlanDecision, PlanningConfig  # noqa: E402
 from metaharness.planning_v2 import V2PlanParseError, parse_task_plan_v2  # noqa: E402
 from tests.pipeline_support import initial_plan  # noqa: E402
 
@@ -25,6 +25,28 @@ def parse(raw: str, planning: PlanningConfig | None = None):
 
 
 class PlanV2ControlTests(unittest.TestCase):
+    def test_blocked_requires_a_structured_kind(self) -> None:
+        raw = (
+            "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: Need a decision\n"
+            "BLOCKER_KIND: SPEC_DECISION\n\nOBJECTIVE\nImplement it.\n\n"
+            "BLOCKERS\nThe SPEC does not choose a default.\n\nEND META PLAN\n"
+        )
+        plan = parse(raw)
+        self.assertIs(plan.decision, PlanDecision.BLOCKED)
+        self.assertIs(plan.blocker_kind, BlockerKind.SPEC_DECISION)
+        for invalid in (
+            raw.replace("BLOCKER_KIND: SPEC_DECISION\n", ""),
+            raw.replace("BLOCKER_KIND: SPEC_DECISION", "BLOCKER_KIND: GUESS"),
+        ):
+            with self.subTest(invalid=invalid.splitlines()[3]):
+                with self.assertRaisesRegex(V2PlanParseError, "BLOCKER_KIND"):
+                    parse(invalid)
+
+    def test_ready_plan_cannot_claim_a_blocker_kind(self) -> None:
+        raw = initial_plan(STEP).replace("STATUS: READY\n", "STATUS: READY\nBLOCKER_KIND: SPEC_DECISION\n")
+        with self.assertRaisesRegex(V2PlanParseError, "only valid for BLOCKED"):
+            parse(raw)
+
     def test_valid_plan_is_ready_and_raw_is_preserved(self) -> None:
         raw = initial_plan(STEP)
         plan = parse(raw)

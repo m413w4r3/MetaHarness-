@@ -264,6 +264,7 @@ class StepExecutionOutcome:
     # deterministic gate and the reviewer remain the authority.
     deferred_verify: str = ""
     mismatch_retry_count: int = 0
+    no_change: bool = False
 
 
 class DeferredStepExecutionOutcome:

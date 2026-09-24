@@ -64,12 +64,21 @@ ACCEPTANCE, TESTS and RISKS must be compact and must not repeat step
 instructions.
 
 The answer must use exactly this protocol, with no prose or code fences.
-BLOCKED contains only STATUS, TITLE, OBJECTIVE and BLOCKERS.
+BLOCKED contains only STATUS, TITLE, BLOCKER_KIND, OBJECTIVE and BLOCKERS.
+Choose BLOCKER_KIND from REPOSITORY_EVIDENCE, SPEC_DECISION, SECURITY_POLICY,
+or ATOMIC_SCOPE. Use REPOSITORY_EVIDENCE only when a deterministic fact in a
+named repository path could resolve the question. Name each target as
+`path/to/file :: ExactSymbol` or `path: file`; MetaHarness reads only these
+targets from the immutable start tree. Use SPEC_DECISION only for a real
+product choice the SPEC does not authorize. Use SECURITY_POLICY when an
+operator must decide a security or policy question. Use ATOMIC_SCOPE when the
+required atomic transformation exceeds the configured planning limits.
 
 META PLAN v2
 
 STATUS: BLOCKED
 TITLE: <title, at most 100 characters>
+BLOCKER_KIND: REPOSITORY_EVIDENCE|SPEC_DECISION|SECURITY_POLICY|ATOMIC_SCOPE
 
 OBJECTIVE
 <text>

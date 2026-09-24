@@ -641,6 +641,20 @@ class WebServerTests(unittest.TestCase):
         self.assertIn('>REJECT PLAN</button>', page)
         self.assertNotIn('http-equiv="refresh"', page)
 
+    def test_waiting_human_planner_is_rendered_as_waiting_not_failed(self) -> None:
+        run_dir = self.runs / "human-decision"
+        run_dir.mkdir()
+        state = {
+            "status": "waiting_human",
+            "cycle": 1,
+            "planner": {"decision": "BLOCKED"},
+            "failure": {"reason": "SPEC_DECISION_REQUIRED", "detail": {}},
+        }
+        rows = api.run_pipeline(run_dir, state, self.config)
+        planner = next(item for item in rows if item["key"] == "planner")
+        self.assertEqual(planner["state"], "waiting")
+        self.assertIn("waiting_human", api.LIVE_STOP_STATUSES)
+
 
 class ProgressOffsetTests(unittest.TestCase):
     def setUp(self) -> None:

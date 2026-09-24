@@ -76,6 +76,13 @@ class PlanDecision(StrEnum):
     BLOCKED = "BLOCKED"
 
 
+class BlockerKind(StrEnum):
+    REPOSITORY_EVIDENCE = "REPOSITORY_EVIDENCE"
+    SPEC_DECISION = "SPEC_DECISION"
+    SECURITY_POLICY = "SECURITY_POLICY"
+    ATOMIC_SCOPE = "ATOMIC_SCOPE"
+
+
 class ExecutionMode(StrEnum):
     SINGLE = "SINGLE"
     STAGED = "STAGED"
@@ -223,12 +230,14 @@ class TaskPlanV2:
     raw: str
     required_checks: tuple[str, ...] = ()
     max_step_contract_chars: int = 5000
+    blocker_kind: BlockerKind | None = None
 
 
 class RunStatus(StrEnum):
     CREATED = "created"
     PLANNING = "planning"
     BLOCKED = "blocked"
+    WAITING_HUMAN = "waiting_human"
     AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
     WAITING_SCOPE_APPROVAL = "waiting_scope_approval"
     WAITING_CHECK_INFRASTRUCTURE = "waiting_check_infrastructure"

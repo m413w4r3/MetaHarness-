@@ -625,12 +625,22 @@ class GateAcceptanceService:
         if path.is_file() and stored is None:
             raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "gate acceptance is corrupted")
         if stored is not None:
+            stored_no_change = stored.get("no_change", False) if isinstance(stored, dict) else False
+            stored_parent = stored.get("parent_sha") if isinstance(stored, dict) else None
+            parent_valid = _is_object_id(stored_parent) or (
+                stored_no_change is True
+                and stored_parent is None
+                and not evidence.changed_files
+            )
             evidence_sha256 = self._durable_evidence_sha256(directory)
             if (
                 not isinstance(stored, dict)
                 or stored.get("schema_version") not in {1, 2}
                 or stored.get("review_cycle") != cycle_plan.cycle.number
-                or not all(_is_object_id(stored.get(key)) for key in ("tree_sha", "commit_sha", "parent_sha"))
+                or not all(_is_object_id(stored.get(key)) for key in ("tree_sha", "commit_sha"))
+                or not isinstance(stored_no_change, bool)
+                or not parent_valid
+                or stored_no_change is not (not evidence.changed_files)
                 or stored.get("stage") != stage.value
                 or stored.get("acceptance_kind") not in {"existing-head", "repair", "semantic-revision"}
                 or not isinstance(stored.get("commit_created"), bool)
@@ -647,7 +657,9 @@ class GateAcceptanceService:
                 raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted gate HEAD moved")
             if (
                 resolve_tree(worktree, stored["commit_sha"]) != stored["tree_sha"]
-                or commit_parents(worktree, stored["commit_sha"]) != (stored["parent_sha"],)
+                or commit_parents(worktree, stored["commit_sha"]) != (
+                    (stored["parent_sha"],) if stored["parent_sha"] is not None else ()
+                )
             ):
                 raise PipelineFailure(
                     "RESUME_INTEGRITY_FAILURE", "gate acceptance does not match its commit",
@@ -674,10 +686,11 @@ class GateAcceptanceService:
         current_tree = resolve_tree(worktree, head)
         if current_tree == evidence.staged_tree_sha:
             parents = commit_parents(worktree, head)
-            if len(parents) != 1:
+            no_change = not evidence.changed_files
+            if len(parents) not in ({0} if no_change else {1}):
                 raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted HEAD has no single parent")
-            commit_sha, parent_sha = head, parents[0]
-            parent_tree = resolve_tree(worktree, parent_sha)
+            commit_sha, parent_sha = head, parents[0] if parents else None
+            parent_tree = resolve_tree(worktree, parent_sha) if parent_sha else None
             attempts = self._check_repair_attempts(
                 ctx.run_dir, cycle_plan.cycle.number, stage,
             )
@@ -687,6 +700,7 @@ class GateAcceptanceService:
             last_attempt = attempts[-1] if attempts else None
             recovered_repair = bool(
                 last_attempt is not None
+                and parent_tree is not None
                 and last_attempt.tree_before == parent_tree
                 and last_attempt.tree_after == evidence.staged_tree_sha
                 and last_attempt.tree_before != last_attempt.tree_after
@@ -696,6 +710,7 @@ class GateAcceptanceService:
                 and revision is not None
                 and revision.tree_before != revision.tree_after
                 and revision.tree_after == evidence.staged_tree_sha
+                and parent_tree is not None
                 and parent_tree == revision.tree_before
             )
             acceptance_kind = (
@@ -744,6 +759,7 @@ class GateAcceptanceService:
             "tree_sha": evidence.staged_tree_sha,
             "commit_sha": commit_sha,
             "parent_sha": parent_sha,
+            "no_change": not evidence.changed_files,
             "commit_created": commit_created,
             "acceptance_kind": acceptance_kind,
             "mutable_scope": list(authority.effective_paths),

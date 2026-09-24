@@ -100,7 +100,10 @@ _TIMELINE = (
     ("publishing", "PUBLISHING"), ("published", "PUBLISHED"),
 )
 _ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
-_TERMINAL_LABELS = {"blocked": "BLOCKED", "plan_rejected": "REJECTED", "failed": "FAILED", "interrupted": "INTERRUPTED"}
+_TERMINAL_LABELS = {
+    "blocked": "BLOCKED", "plan_rejected": "REJECTED", "failed": "FAILED",
+    "interrupted": "INTERRUPTED", "waiting_human": "WAITING FOR OPERATOR",
+}
 TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
 AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
 # Elements updated in place by /static/run.js (textContent/classList/hidden).

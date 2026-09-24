@@ -249,6 +249,7 @@ class PipelineHarness(unittest.TestCase):
 
     def config(
         self, *, check_repair: int = 0, review_repair: int = 0,
+        max_step_contract_repairs: int = 2,
         semantic_revision: bool = False, scope_policy: str | None = None,
         publish: bool = False, github_pr: bool = False,
     ) -> Any:
@@ -270,6 +271,7 @@ protocol = "v2"
 enabled = {'true' if semantic_revision else 'false'}
 max_check_repair_attempts = {check_repair}
 max_review_repair_cycles = {review_repair}
+max_step_contract_repairs = {max_step_contract_repairs}
 
 [repository]
 remote = "origin"

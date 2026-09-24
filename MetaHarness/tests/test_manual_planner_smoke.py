@@ -22,6 +22,7 @@ BLOCKED = """META PLAN v2
 
 STATUS: BLOCKED
 TITLE: Waiting for transport details
+BLOCKER_KIND: SPEC_DECISION
 
 OBJECTIVE
 Define the retry behavior.

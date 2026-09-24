@@ -243,7 +243,10 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
         for route in ("IMPLEMENTATION", "REPLAN", "HUMAN"):
             raw = PASS.replace("VERDICT: PASS", "VERDICT: REVISE").replace(
                 "ROUTE: NONE", f"ROUTE: {route}"
-            ).replace("FINDINGS: NONE", "FINDINGS: MAJOR | issue | fix | required").replace(
+            ).replace("FINDINGS: NONE", (
+                "FINDINGS: PRODUCT_SPEC_AMBIGUITY | SPEC leaves incompatible outcomes"
+                if route == "HUMAN" else "FINDINGS: MAJOR | issue | fix | required"
+            )).replace(
                 "REQUIRED FIXES: NONE", "REQUIRED FIXES: apply the selected route"
             )
             result = parse_review(raw, deterministic_passed=True)

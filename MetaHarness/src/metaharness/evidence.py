@@ -18,8 +18,10 @@ from .gitops import (
     staged_binary_files,
     staged_changed_blobs,
     staged_changed_files,
+    staged_changed_files_from,
     staged_changes,
     staged_diff,
+    staged_diff_from,
 )
 from .models import HarnessConfig
 from .redaction import contains_secret, redact
@@ -432,8 +434,11 @@ def collect_evidence(
     # This is intentionally after every check, including failed checks, so the
     # tree written below is the exact tree offered to the reviewer.
     stage_all(root)
-    changed_files = staged_changed_files(root)
-    diff = staged_diff(root)
+    # Pipeline v2 freezes accepted implementation steps as commits. The
+    # reviewer therefore needs the cumulative delta from the immutable run
+    # base, while security checks still inspect staged post-commit changes.
+    changed_files = staged_changed_files_from(root, base_sha)
+    diff = staged_diff_from(root, base_sha)
     tree_sha = index_tree_sha(root)
 
     failures = _gate_failures(

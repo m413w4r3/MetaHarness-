@@ -749,6 +749,26 @@ def staged_diff(worktree: Path) -> str:
     ).stdout
 
 
+def staged_diff_from(worktree: Path, base_sha: str) -> str:
+    """Return the frozen index delta from an immutable run base commit."""
+
+    if not isinstance(base_sha, str) or not base_sha.strip():
+        raise ValueError("base_sha must be a non-empty commit identifier")
+    return _git(
+        worktree,
+        "diff",
+        "--cached",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        base_sha,
+        "--",
+        timeout=600,
+        errors="replace",
+    ).stdout
+
+
 def staged_changed_files(worktree: Path) -> tuple[str, ...]:
     """Return staged paths, safely preserving spaces and other characters.
 
@@ -757,6 +777,25 @@ def staged_changed_files(worktree: Path) -> tuple[str, ...]:
 
     output = _git(
         worktree, "diff", "--cached", "--name-only", "--no-renames", "-z", errors="replace"
+    ).stdout
+    return tuple(path for path in output.split("\0") if path)
+
+
+def staged_changed_files_from(worktree: Path, base_sha: str) -> tuple[str, ...]:
+    """Return frozen index paths changed from an immutable run base commit."""
+
+    if not isinstance(base_sha, str) or not base_sha.strip():
+        raise ValueError("base_sha must be a non-empty commit identifier")
+    output = _git(
+        worktree,
+        "diff",
+        "--cached",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        base_sha,
+        "--",
+        errors="replace",
     ).stdout
     return tuple(path for path in output.split("\0") if path)
 
@@ -1577,6 +1616,12 @@ def _validate_relative_path(relative_path: str) -> str:
     if ".." in posix_path.parts or ".." in windows_path.parts:
         raise GitError("relative path must not contain ..")
     return relative_path
+
+
+def validate_repository_relative_path(relative_path: str) -> str:
+    """Validate an explicit repository-relative path without resolving it."""
+
+    return _validate_relative_path(relative_path)
 
 
 def read_file_at_commit(

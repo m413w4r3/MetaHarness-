@@ -31,6 +31,10 @@ For PASS:
 - REQUIRED FIXES = NONE
 - MISSING TESTS = NONE
 - RESIDUAL RISKS = NONE unless a material non-blocking risk exists.
+- When IMMUTABLE CANDIDATE IDENTITY says `candidate delta is empty`, PASS is
+  allowed only when the original SPEC is already fully satisfied. Begin
+  SUMMARY exactly with `SPEC_ALREADY_SATISFIED:` and give concise evidence.
+  Otherwise return REVISE with the required correction route.
 
 For REVISE:
 - include only material findings needed to perform the correction;

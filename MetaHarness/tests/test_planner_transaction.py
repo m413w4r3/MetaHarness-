@@ -60,10 +60,23 @@ class PlannerTransactionTests(PipelineHarness):
         self.target.mkdir()
         self.config_value = self.config()
         (self.repo / "other.txt").write_text("existing\n", encoding="utf-8")
+        (self.repo / "src").mkdir()
+        (self.repo / "src/module.py").write_text(
+            "def evidence_symbol():\n    return 'immutable source evidence'\n",
+            encoding="utf-8",
+        )
         git(self.repo, "add", "--all")
         git(self.repo, "commit", "-qm", "other file")
         self.invalid = meta_plan({"read": ("feature.txt",), "write": ("feature.txt",), "create": ("other.txt",)})
         self.valid = meta_plan({"read": ("feature.txt",), "write": ("feature.txt",)})
+
+    @staticmethod
+    def blocked_repository_evidence(path: str = "src/module.py", symbol: str = "evidence_symbol") -> str:
+        return (
+            "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: Need source evidence\n"
+            "BLOCKER_KIND: REPOSITORY_EVIDENCE\n\nOBJECTIVE\nMake feature.txt good.\n\n"
+            f"BLOCKERS\n- {path} :: {symbol}\n\nEND META PLAN\n"
+        )
 
     def planner(self, client, *, budget: int = 2, events=None) -> PlannerV2:
         return PlannerV2(
@@ -85,6 +98,31 @@ class PlannerTransactionTests(PipelineHarness):
         self.assertEqual(len(chat.complete_calls), 1)
         self.assertEqual(chat.continue_calls, [])
         self.assertTrue((self.target / "implementation_bundle.json").is_file())
+
+    def test_repository_evidence_blocker_recovers_from_immutable_named_path(self) -> None:
+        chat = _Chat([self.blocked_repository_evidence(), self.valid])
+        (self.repo / "src/module.py").write_text("def changed_in_worktree(): pass\n", encoding="utf-8")
+        plan = self.run_plan(chat)
+        self.assertEqual(plan.raw, self.valid)
+        self.assertEqual(len(chat.complete_calls), 1)
+        self.assertEqual(len(chat.continue_calls), 1)
+        prompt = chat.continue_calls[0][1]
+        self.assertIn("REPOSITORY EVIDENCE", prompt)
+        self.assertIn("immutable source evidence", prompt)
+        self.assertNotIn("changed_in_worktree", prompt)
+        self.assertIn("IMMUTABLE TREE", prompt)
+        self.assertIn("COMPLETE META PLAN v2", prompt)
+        validation = json.loads(
+            (self.target / "planner-attempts/01/planner.validation.json").read_text()
+        )
+        self.assertEqual(validation["blocker_kind"], "REPOSITORY_EVIDENCE")
+
+    def test_repository_evidence_paths_are_validated_before_reading(self) -> None:
+        chat = _Chat([self.blocked_repository_evidence("../README.md", "heading"), self.valid])
+        self.run_plan(chat)
+        prompt = chat.continue_calls[0][1]
+        self.assertIn("rejected (not a valid repo-relative path)", prompt)
+        self.assertNotIn("pipeline fixture", prompt)
 
     def test_same_conversation_receives_small_correction_and_keeps_handle_private(self) -> None:
         chat = _Chat([self.invalid, self.valid])

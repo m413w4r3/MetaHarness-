@@ -269,10 +269,16 @@ def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
         or len(record["mismatch"].encode("utf-8", errors="replace")) > _MAX_STEP_REPORT_BYTES
     ):
         return None
+    no_change = record.get("no_change", False)
+    if not isinstance(no_change, bool) or (no_change and (
+        record["tree_before"] != record["tree_after"] or changed
+    )):
+        return None
     return {
         "id": step_id, "status": status, "profile_id": record.get("profile_id"),
         "tree_before": record["tree_before"], "tree_after": record["tree_after"],
         "changed_paths": list(changed),
+        **({"no_change": True} if no_change else {}),
         "usage": normalize_usage(record.get("usage")),
         "final": _bounded_v2_report(_read_bounded_text(step_dir / "agent.final.md")),
         **({"mismatch": _bounded_v2_report(record["mismatch"])}
@@ -393,11 +399,16 @@ def read_candidate_record(run_dir: Path, number: int) -> dict[str, Any]:
     """One cycle's immutable candidate commit record."""
 
     payload = _read_json_artifact(candidate_dir(run_dir, number) / "commit.json")
+    no_change = payload.get("no_change", False) if isinstance(payload, dict) else False
     if (
         not isinstance(payload, dict)
         or not _is_object_id(payload.get("commit_sha"))
         or not _is_object_id(payload.get("tree_sha"))
-        or not _is_object_id(payload.get("parent_sha"))
+        or not isinstance(no_change, bool)
+        or (
+            not _is_object_id(payload.get("parent_sha"))
+            and not (no_change and payload.get("parent_sha") is None)
+        )
     ):
         raise ResumeIntegrityError(f"cycle {number:03d} candidate commit record is missing")
     return payload
@@ -431,6 +442,15 @@ def _validate_gate_acceptance(
         policy_config=policy,
         require_attempt_records=True,
     )
+    no_change = payload.get("no_change", False) if isinstance(payload, dict) else False
+    parent_sha = payload.get("parent_sha") if isinstance(payload, dict) else None
+    evidence = _load_evidence(gate_dir(run_dir, number, stage))
+    parent_valid = _is_object_id(parent_sha) or (
+        no_change is True
+        and parent_sha is None
+        and evidence is not None
+        and not evidence.changed_files
+    )
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") not in {1, 2}
@@ -438,7 +458,12 @@ def _validate_gate_acceptance(
         or payload.get("stage") != getattr(stage, "value", stage)
         or not _is_object_id(payload.get("tree_sha"))
         or not _is_object_id(payload.get("commit_sha"))
-        or not _is_object_id(payload.get("parent_sha"))
+        or not isinstance(no_change, bool)
+        or not parent_valid
+        or (
+            evidence is not None
+            and no_change is not (not evidence.changed_files)
+        )
         or payload.get("tree_sha") != tree
         or payload.get("commit_sha") != head
         or payload.get("acceptance_kind") not in {"existing-head", "repair", "semantic-revision"}
@@ -1077,9 +1102,12 @@ def validate_resume(
         # tree and parent, and the run branch still descends from it.
         for earlier in range(1, number):
             record = read_candidate_record(run_dir, earlier)
+            earlier_parents = (
+                (record["parent_sha"],) if record.get("parent_sha") is not None else ()
+            )
             if (
                 resolve_tree(repo, record["commit_sha"]) != record["tree_sha"]
-                or commit_parents(repo, record["commit_sha"]) != (record["parent_sha"],)
+                or commit_parents(repo, record["commit_sha"]) != earlier_parents
                 or not is_ancestor(repo, record["commit_sha"], head)
             ):
                 _refuse(f"cycle {earlier:03d} candidate record is not in the run history")
@@ -1088,6 +1116,24 @@ def validate_resume(
             candidate = read_candidate_record(run_dir, number)
             if candidate["commit_sha"] != head or candidate["tree_sha"] != expected_tree:
                 _refuse("the run branch is not the recorded candidate commit")
+            candidate_parents = commit_parents(repo, candidate["commit_sha"])
+            expected_candidate_parents = (
+                (candidate["parent_sha"],)
+                if candidate.get("parent_sha") is not None else ()
+            )
+            evidence = candidate_evidence(run_dir, number)
+            if (
+                candidate_parents != expected_candidate_parents
+                or (
+                    candidate.get("parent_sha") is None
+                    and (
+                        candidate.get("no_change") is not True
+                        or evidence is None
+                        or bool(evidence.changed_files)
+                    )
+                )
+            ):
+                _refuse("the candidate parent identity is invalid")
             try:
                 candidate_stage = GateStage(candidate["gate_stage"])
             except (KeyError, TypeError, ValueError):

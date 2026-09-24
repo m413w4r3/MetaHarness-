@@ -137,6 +137,7 @@ from .execution_selection import (
     validate_execution_selection,
 )
 from .models import (
+    BlockerKind,
     CycleKind,
     ExecutionRole,
     ExecutionSelection,
@@ -1524,10 +1525,22 @@ class Orchestrator:
                 },
                 once=True,
             )
+        elif result.status is RunStatus.WAITING_HUMAN:
+            failure = result.state.get("failure") if isinstance(result.state, Mapping) else None
+            self._trace_emit(
+                "run.waiting_human",
+                phase="run",
+                cycle=result.state.get("cycle") if isinstance(result.state, Mapping) else None,
+                data={
+                    "reason": failure.get("reason") if isinstance(failure, Mapping) else None,
+                },
+                once=True,
+            )
 
         if result.status in {
             RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.BLOCKED,
-            RunStatus.PLAN_REJECTED, RunStatus.COMMITTED, RunStatus.PUBLISHED,
+            RunStatus.PLAN_REJECTED, RunStatus.WAITING_HUMAN,
+            RunStatus.COMMITTED, RunStatus.PUBLISHED,
         }:
             try:
                 write_run_diagnostics(self.config, result.run_dir)
@@ -1702,6 +1715,8 @@ class Orchestrator:
             planning_protocol="v2",
             planner={
                 "decision": plan.decision.value,
+                "blocker_kind": plan.blocker_kind.value if plan.blocker_kind else None,
+                "blockers": plan.blockers if plan.decision is PlanDecision.BLOCKED else None,
                 "title": plan.title,
                 "model": planner_profile.model,
                 "profile_id": planner_profile.id,
@@ -1733,11 +1748,48 @@ class Orchestrator:
             steps_summary=[{"id": step.id, "title": step.title} for step in plan.steps],
         )
         if plan.decision is PlanDecision.BLOCKED:
+            kind = plan.blocker_kind
+            if kind is BlockerKind.REPOSITORY_EVIDENCE:
+                reason = "REPOSITORY_EVIDENCE_RECOVERY_EXHAUSTED"
+                detail: dict[str, Any] = {
+                    "blocker_kind": kind.value,
+                    "blockers": plan.blockers,
+                    "action": "operator must clarify the named repository path or symbol",
+                }
+            elif kind is BlockerKind.SPEC_DECISION:
+                reason = "SPEC_DECISION_REQUIRED"
+                detail = {
+                    "blocker_kind": kind.value,
+                    "blockers": plan.blockers,
+                    "action": "operator must resolve the product choice left open by the SPEC",
+                }
+            elif kind is BlockerKind.SECURITY_POLICY:
+                reason = "SECURITY_POLICY_DECISION_REQUIRED"
+                detail = {
+                    "blocker_kind": kind.value,
+                    "blockers": plan.blockers,
+                    "action": "operator must decide the security or policy question",
+                }
+            elif kind is BlockerKind.ATOMIC_SCOPE:
+                reason = "ATOMIC_SCOPE_POLICY_LIMIT"
+                detail = {
+                    "blocker_kind": kind.value,
+                    "blockers": plan.blockers,
+                    "planning_limits": {
+                        "max_steps_per_plan": self.config.planning.max_steps_per_plan,
+                        "single_step_max_mutable_paths": self.config.planning.single_step_max_mutable_paths,
+                        "staged_step_max_mutable_paths": self.config.planning.staged_step_max_mutable_paths,
+                    },
+                    "action": "operator must authorize a higher planning limit or split the requested work",
+                }
+            else:
+                reason = "PLANNER_BLOCKED_REQUIRES_OPERATOR"
+                detail = {"blocker_kind": None, "blockers": plan.blockers}
             state = store.update(
-                status=RunStatus.BLOCKED,
-                failure={"reason": "PLANNER_BLOCKED", "detail": plan.blockers},
+                status=RunStatus.WAITING_HUMAN,
+                failure={"reason": reason, "detail": detail},
             )
-            return RunResult(run_dir, RunStatus.BLOCKED, state)
+            return RunResult(run_dir, RunStatus.WAITING_HUMAN, state)
 
         # Every source of this plan (planner, resumed planner answer, operator
         # recovery) must be possible against the base tree before it can be
@@ -2719,6 +2771,7 @@ class Orchestrator:
             if record is not None:
                 row.update(
                     status="deferred" if record["status"] == "DEFERRED_CONTRACT_MISMATCH" else "completed",
+                    no_change=record.get("no_change", False),
                     usage=record["usage"],
                     input_tokens=record["usage"]["input_tokens"],
                     output_tokens=record["usage"]["output_tokens"],
@@ -3332,7 +3385,18 @@ class Orchestrator:
             or payload.get("tree_sha") != evidence.staged_tree_sha
             or payload.get("commit_sha") != current
             or current_tree != evidence.staged_tree_sha
-            or parents != (payload.get("parent_sha"),)
+            or parents != (
+                (payload.get("parent_sha"),)
+                if payload.get("parent_sha") is not None else ()
+            )
+            or not isinstance(payload.get("no_change", False), bool)
+            or (
+                payload.get("parent_sha") is None
+                and (
+                    payload.get("no_change") is not True
+                    or bool(evidence.changed_files)
+                )
+            )
             or (
                 payload.get("schema_version") == 2
                 and payload.get("evidence_sha256") != digest
@@ -3917,7 +3981,10 @@ class Orchestrator:
             symbolic_head(ctx.info.worktree) != ctx.branch_ref
             or current != stored_candidate.get("commit_sha")
             or current_tree != stored_candidate.get("tree_sha")
-            or parents != (stored_candidate.get("parent_sha"),)
+            or parents != (
+                (stored_candidate.get("parent_sha"),)
+                if stored_candidate.get("parent_sha") is not None else ()
+            )
         ):
             integrity("local immutable candidate identity no longer matches")
         if (
@@ -3933,6 +4000,7 @@ class Orchestrator:
             or durable_evidence.staged_tree_sha != supplied_evidence.staged_tree_sha
             or durable_evidence.changed_files != supplied_evidence.changed_files
             or durable_evidence.diff != supplied_evidence.diff
+            or stored_candidate.get("no_change", False) is not (not durable_evidence.changed_files)
             or _required_checks_summary(durable_evidence) != _required_checks_summary(supplied_evidence)
         ):
             integrity("durable gate evidence is missing, failed, or differs from the reviewed evidence")
@@ -3960,6 +4028,7 @@ class Orchestrator:
             or not isinstance(acceptance.get("commit_created"), bool)
             or acceptance.get("mutable_scope") != list(authority.effective_paths)
             or acceptance.get("mutable_scope_sha256") != authority.sha256
+            or acceptance.get("no_change", False) is not (not durable_evidence.changed_files)
             or (
                 acceptance.get("schema_version") == 2
                 and acceptance.get("evidence_sha256") != hashlib.sha256(evidence_bytes).hexdigest()
@@ -3982,6 +4051,14 @@ class Orchestrator:
             raise PipelineFailure(
                 "CANDIDATE_PUSH_FAILED", "candidate identity is incomplete before review"
             )
+        if (
+            not isinstance(candidate.get("no_change", False), bool)
+            or candidate.get("no_change", False) is not (len(evidence.changed_files) == 0)
+        ):
+            raise PipelineFailure(
+                "DURABLE_ARTIFACT_CORRUPTED",
+                "candidate no-change marker does not match immutable gate evidence",
+            )
         try:
             if symbolic_head(ctx.info.worktree) != ctx.branch_ref:
                 raise GitError("candidate worktree is not on the run branch")
@@ -3996,6 +4073,8 @@ class Orchestrator:
                 "CANDIDATE_PUSH_FAILED",
                 f"local candidate identity is invalid: {exc}",
             ) from exc
+        if candidate.get("no_change") is True:
+            return False
         if (
             candidate.get("remote") != self.config.repository.remote
             or candidate.get("remote_branch") != ctx.info.branch
@@ -4119,6 +4198,30 @@ class Orchestrator:
                 "REVIEW_AUTHORITY_MISSING",
                 "no accepted reviewer PASS names the candidate commit",
             )
+        if candidate.get("no_change") is True:
+            if not review.summary.startswith("SPEC_ALREADY_SATISFIED:"):
+                raise PipelineFailure(
+                    "REVIEW_AUTHORITY_MISSING",
+                    "no-change PASS must explicitly confirm SPEC_ALREADY_SATISFIED",
+                )
+            self._cycle_update(store, number, status="completed_no_change")
+            state = store.update(
+                status=RunStatus.COMMITTED,
+                no_change=True,
+                no_change_candidate_sha=candidate["commit_sha"],
+                reviewed_candidate_sha=candidate["commit_sha"],
+                commit_sha=None,
+                published=False,
+                approved_tree_sha=candidate["tree_sha"],
+                current_step=None,
+            )
+            mark_checkpoint_completed(ctx.run_dir)
+            self._trace_emit(
+                "run.completed_no_change", phase="run", cycle=number,
+                data={"candidate_sha": candidate["commit_sha"], "tree_sha": candidate["tree_sha"]},
+                once=True,
+            )
+            return RunResult(ctx.run_dir, RunStatus.COMMITTED, state)
         approved_tree = candidate["tree_sha"]
         self._cycle_update(store, number, status="approved")
         store.update(
@@ -4278,6 +4381,10 @@ class Orchestrator:
                     failure.detail = "executor credentials or external authorization are required"
                     failure.step_dir = artifact_dir
                     raise
+                if failure.reason == "AGENT_NO_CHANGE":
+                    return self._finish_no_change_step(
+                        failure, artifact_dir, worktree=worktree, expected_head=base_sha,
+                    )
                 if (
                     failure.reason in {
                         AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
@@ -4373,6 +4480,13 @@ class Orchestrator:
                     raise
                 _archive_attempt(artifact_dir)
                 if repair_count >= max_repairs:
+                    if failure.mismatch in {
+                        _SYNTHETIC_NO_CHANGE_MISMATCH,
+                        _BOUNDED_NO_CHANGE_MISMATCH,
+                    }:
+                        return self._finish_no_change_step(
+                            failure, artifact_dir, worktree=worktree, expected_head=base_sha,
+                        )
                     exhausted = classify_failure(
                         "AGENT_CONTRACT_MISMATCH", clean_contract_mismatch=True,
                         budget_exhausted=True,
@@ -4443,6 +4557,57 @@ class Orchestrator:
                 )
                 # The next attempt starts at the exact restored tree and uses
                 # no blind retry addendum.
+
+    def _finish_no_change_step(
+        self, failure: StepExecutionFailure, artifact_dir: Path, *,
+        worktree: Path, expected_head: str,
+    ) -> StepExecutionOutcome:
+        """Record a clean empty delta after the bounded worker/repair path."""
+
+        before = failure.tree_before
+        after = _safe_candidate_tree(worktree)
+        index_after = _safe_index_tree(worktree)
+        status_after = _safe_status(worktree)
+        if (
+            before is None or after != before or index_after != before
+            or current_head(worktree) != expected_head
+            or _status_has_unstaged_or_untracked(status_after or ())
+            or (failure.status_before is not None and status_after != failure.status_before)
+        ):
+            failure.step_dir = artifact_dir
+            raise failure
+        usage = normalize_usage(failure.usage)
+        report = _bounded_v2_report(failure.detail or "candidate delta is empty")
+        atomic_write_text(artifact_dir / "step.json", _json_text({
+            "id": failure.step_id,
+            "status": "COMPLETED",
+            "no_change": True,
+            "reason": "bounded execution left the exact candidate tree unchanged",
+            "profile_id": failure.profile_id,
+            "tree_before": before,
+            "tree_after": after,
+            "changed_paths": [],
+            "mismatch_retry_count": failure.mismatch_retry_count,
+            **({"initial_mismatch": failure.initial_mismatch}
+               if failure.initial_mismatch else {}),
+            "usage": usage,
+        }))
+        self._trace_emit(
+            "step.completed_no_change", phase="implementation",
+            cycle=getattr(self, "_trace_cycle", 1), step_id=failure.step_id,
+            data={"tree_sha": after, "mismatch_retry_count": failure.mismatch_retry_count},
+        )
+        return StepExecutionOutcome(
+            step_id=failure.step_id,
+            profile_id=failure.profile_id or "",
+            tree_before=before,
+            tree_after=after,
+            changed_paths=(),
+            usage=usage,
+            final_report=report,
+            mismatch_retry_count=failure.mismatch_retry_count,
+            no_change=True,
+        )
 
     def _try_retry_transient_step_failure(
         self,
@@ -5315,7 +5480,11 @@ class Orchestrator:
         stage_all(worktree)
         tree_after = index_tree_sha(worktree)
         if tree_after == tree_before:
-            raise StepExecutionFailure("AGENT_NO_CHANGE", step_id, **failed)
+            raise StepExecutionFailure(
+                "AGENT_NO_CHANGE", step_id,
+                _bounded_v2_report(result.final_message) or "candidate delta is empty",
+                tree_after=tree_after, index_tree_after=_safe_index_tree(worktree), **failed,
+            )
         # 15-16. Git, not the prompt, is the scope barrier: every changed path
         # must be authorized by this step's WRITE, CREATE or DELETE set.
         changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
@@ -5408,6 +5577,30 @@ class Orchestrator:
 
         if current_head(info.worktree) != parent_sha:
             raise CommitSafetyError("step parent HEAD changed before acceptance")
+        if outcome.no_change:
+            if (
+                outcome.tree_after != outcome.tree_before
+                or candidate_tree_sha(info.worktree) != outcome.tree_after
+                or index_tree_sha(info.worktree) != outcome.tree_after
+                or _status_has_unstaged_or_untracked(status_porcelain(info.worktree))
+            ):
+                raise CommitSafetyError("no-change outcome does not match the exact current tree")
+            parent_list = commit_parents(info.worktree, parent_sha)
+            expected_parent = parent_list[0] if parent_list else None
+            store.update(
+                status=RunStatus.IMPLEMENTING,
+                expected_head_sha=parent_sha,
+                expected_parent_sha=expected_parent,
+                expected_tree_sha=outcome.tree_after,
+                next_step_id=(future_step_ids[0] if future_step_ids else None),
+                no_change_step=step.id,
+            )
+            self._trace_emit(
+                "step.no_change.accepted", phase="implementation",
+                cycle=getattr(self, "_trace_cycle", 1), step_id=step.id,
+                data={"head_sha": parent_sha, "tree_sha": outcome.tree_after},
+            )
+            return None
         reported_verification = getattr(outcome, "verification_status", None)
         if isinstance(reported_verification, str) and reported_verification.casefold() in {
             "failed", "fail", "red",
@@ -5494,7 +5687,7 @@ class Orchestrator:
                 "commit_sha": None,
             })
             parents = commit_parents(info.worktree, parent_sha)
-            expected_parent = parents[0] if parents else parent_sha
+            expected_parent = parents[0] if parents else None
             store.update(
                 status=RunStatus.IMPLEMENTING,
                 deferred_verifications=deferred_records,
@@ -5805,6 +5998,12 @@ class Orchestrator:
             if candidate_commit.get(key) is not None
             or key == "immutable_commit_url"
         })
+        if candidate_commit.get("no_change") is True:
+            candidate_identity = _json_text({
+                "candidate": json.loads(candidate_identity),
+                "candidate_delta": "candidate delta is empty",
+                "no_change_review": "independent reviewer must explicitly confirm SPEC_ALREADY_SATISFIED in SUMMARY",
+            })
         if isinstance(code_evidence_payload, Mapping):
             candidate_identity = _json_text({
                 "candidate": json.loads(candidate_identity),
@@ -5827,6 +6026,10 @@ class Orchestrator:
             bounded_diff_excerpt=diff_excerpt,
             cycle_summary=(
                 _compact_cycle_summary(input.cycle_history)
+                + (
+                    "\nNO-CHANGE REVIEW\ncandidate delta is empty; assess whether the original SPEC is already satisfied.\n"
+                    if candidate_commit.get("no_change") is True else ""
+                )
                 + "\n"
                 + "REVISION REPORTS\n"
                 + (input.revision_report or "NONE")
@@ -5878,6 +6081,7 @@ class Orchestrator:
             prompt_payload,
             deterministic_passed=evidence.deterministic_passed,
             artifacts_dir=artifacts_dir,
+            require_no_change_confirmation=candidate_commit.get("no_change") is True,
         )
         reviewer_usage = getattr(reviewer, "last_usage", None)
         if reviewer_usage is None:
@@ -5986,7 +6190,9 @@ class Orchestrator:
                 # Accepted step commits make the current HEAD itself the
                 # candidate.  There is no staged diff against that HEAD, but the
                 # authoritative checks still must run and their tree is exact.
-                allow_empty_diff=current_head(worktree) != base_sha,
+                allow_empty_diff=(
+                    stage is not None or current_head(worktree) != base_sha
+                ),
                 retry_check_infrastructure=retry_check_infrastructure,
             )
         except Exception as exc:

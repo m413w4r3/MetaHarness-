@@ -62,6 +62,7 @@ from .gitops import (
 from .models import (
     AgentConfig,
     ApprovalConfig,
+    BlockerKind,
     CheckConfig,
     ClaudeRuntimeConfig,
     CodexProviderConfig,
@@ -152,6 +153,7 @@ __all__ = [
     "CodexRuntimeConfig",
     "CheckResult",
     "CheckRepairAttempt",
+    "BlockerKind",
     "CodexAgent",
     "CodexAuthStatus",
     "ConfigError",

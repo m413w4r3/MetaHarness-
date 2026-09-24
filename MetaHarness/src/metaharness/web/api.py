@@ -1222,6 +1222,7 @@ _LIVE_EVENT_WINDOW_BYTES = 256 * 1024
 # human decision that needs the complete server-rendered page.
 LIVE_STOP_STATUSES = frozenset({
     "committed", "published", "failed", "blocked", "plan_rejected", "interrupted",
+    "waiting_human",
     "awaiting_plan_approval", "waiting_check_infrastructure",
     "waiting_scope_approval", "waiting_remote",
 })
@@ -1378,6 +1379,8 @@ def run_pipeline(
         add("planner", "Planner", "resumable")
     elif decision == "READY":
         add("planner", "Planner · operator recovery" if recovered else "Planner", "complete")
+    elif status == "waiting_human":
+        add("planner", "Planner · operator decision required", "waiting")
     elif decision == "BLOCKED" or status == "blocked" or failed:
         add("planner", "Planner", "failed")
     elif status in {"created", "planning"}:

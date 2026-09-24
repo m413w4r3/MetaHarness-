@@ -9,7 +9,44 @@ from metaharness.recovery_policy import (
 )
 
 
+# One central architecture table covers all pipeline outcomes. Changes to the
+# classifier must update this policy invariant and its path-level tests.
+FAILURE_POLICY_MATRIX = (
+    ("planner format", "PLANNER_FORMAT_INVALID", RecoveryDisposition.REPLAN, {}),
+    ("planner topology", "PLAN_REPOSITORY_PRECONDITION_INVALID", RecoveryDisposition.REPLAN, {}),
+    ("planner repository evidence blocker", "PLANNER_REPOSITORY_EVIDENCE", RecoveryDisposition.REPLAN, {}),
+    ("contract mismatch", "AGENT_CONTRACT_MISMATCH", RecoveryDisposition.CONTRACT_REPAIR, {"clean_contract_mismatch": True}),
+    ("agent timeout", "AGENT_TIMEOUT", RecoveryDisposition.RETRY_SAME, {}),
+    ("agent runtime", "AGENT_RUNTIME_FAILED", RecoveryDisposition.RETRY_SAME, {}),
+    ("workspace setup timeout", "WORKSPACE_SETUP_TIMEOUT", RecoveryDisposition.RETRY_SAME, {}),
+    ("check preflight", "CHECK_PREFLIGHT_FAILED", RecoveryDisposition.RETRY_SAME, {}),
+    ("check timeout", "CHECK_TIMEOUT", RecoveryDisposition.RETRY_SAME, {}),
+    ("review format", "REVIEW_FORMAT_INVALID", RecoveryDisposition.CONTRACT_REPAIR, {}),
+    ("review transport", "REVIEWER_TRANSPORT_FAILURE", RecoveryDisposition.RETRY_SAME, {}),
+    ("semantic reviser unavailable", "SEMANTIC_REVISER_UNAVAILABLE", RecoveryDisposition.CONTINUE_WITH_WARNING, {}),
+    ("candidate staging remote unavailable", "CANDIDATE_REMOTE_UNAVAILABLE", RecoveryDisposition.CONTINUE_WITH_WARNING, {}),
+    ("ordinary check failed", "CHECK_FAILED:unit", RecoveryDisposition.CHECK_REPAIR, {}),
+    ("review IMPLEMENTATION", "REVIEW_IMPLEMENTATION", RecoveryDisposition.CONTRACT_REPAIR, {}),
+    ("review REPLAN", "REVIEW_REPLAN", RecoveryDisposition.REPLAN, {}),
+    ("bounded scope request", "BOUNDED_SCOPE_REQUEST", RecoveryDisposition.CONTRACT_REPAIR, {}),
+    ("secret", "SECRET_IN_DIFF", RecoveryDisposition.HARD_STOP, {}),
+    ("out-of-scope mutation", "AGENT_SCOPE_VIOLATION", RecoveryDisposition.HARD_STOP, {}),
+    ("Git ownership mutation", "AGENT_GIT_VIOLATION", RecoveryDisposition.HARD_STOP, {}),
+    ("corrupt durable artifact", "DURABLE_ARTIFACT_CORRUPTED", RecoveryDisposition.HARD_STOP, {}),
+    ("approval identity mismatch", "PLAN_APPROVAL_IDENTITY_MISMATCH", RecoveryDisposition.HARD_STOP, {}),
+    ("resume identity mismatch", "RESUME_IDENTITY_MISMATCH", RecoveryDisposition.HARD_STOP, {}),
+    ("true SPEC decision", "SPEC_DECISION_REQUIRED", RecoveryDisposition.WAIT_HUMAN, {}),
+    ("security policy decision", "SECURITY_POLICY_DECISION_REQUIRED", RecoveryDisposition.WAIT_HUMAN, {}),
+    ("scope configured require-approval", "REPAIR_SCOPE_APPROVAL_REQUIRED", RecoveryDisposition.WAIT_HUMAN, {}),
+)
+
+
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_failure_policy_matrix_is_an_architectural_invariant(self) -> None:
+        for name, reason, expected, kwargs in FAILURE_POLICY_MATRIX:
+            with self.subTest(policy=name):
+                self.assertEqual(classify_failure(reason, **kwargs).disposition, expected)
+
     def test_agent_timeout_retries_same_executor(self) -> None:
         decision = classify_failure("AGENT_TIMEOUT")
         self.assertEqual(decision.disposition, RecoveryDisposition.RETRY_SAME)

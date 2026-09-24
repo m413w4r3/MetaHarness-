@@ -615,15 +615,52 @@ class OrchestratorE2ETests(unittest.TestCase):
         finally:
             llm.close()
 
-    def test_planner_blocked_creates_no_worktree(self) -> None:
+    def test_planner_spec_decision_waits_for_operator_without_worktree(self) -> None:
         blocked = (
-            "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: Blocked\n\nOBJECTIVE\nImplement it.\n\n"
+            "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: Blocked\nBLOCKER_KIND: SPEC_DECISION\n\nOBJECTIVE\nImplement it.\n\n"
             "BLOCKERS\nmissing information\n\nEND META PLAN\n"
         )
         exit_code, _, state = self.run_case(planner=blocked, run_id="blocked")
         self.assertEqual(exit_code, 1)
-        self.assertEqual(state["status"], RunStatus.BLOCKED.value)
+        self.assertEqual(state["status"], RunStatus.WAITING_HUMAN.value)
+        self.assertEqual(state["failure"]["reason"], "SPEC_DECISION_REQUIRED")
+        self.assertEqual(state["failure"]["detail"]["blocker_kind"], "SPEC_DECISION")
         self.assertFalse((self.root / "worktrees" / "blocked").exists())
+
+    def test_planner_policy_and_atomic_scope_blockers_wait_for_operator(self) -> None:
+        for blocker_kind, reason in (
+            ("SECURITY_POLICY", "SECURITY_POLICY_DECISION_REQUIRED"),
+            ("ATOMIC_SCOPE", "ATOMIC_SCOPE_POLICY_LIMIT"),
+        ):
+            with self.subTest(blocker_kind=blocker_kind):
+                blocked = (
+                    "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: Blocked\n"
+                    f"BLOCKER_KIND: {blocker_kind}\n\nOBJECTIVE\nImplement it.\n\n"
+                    "BLOCKERS\nThe operator must decide this boundary.\n\nEND META PLAN\n"
+                )
+                _, _, state = self.run_case(
+                    planner=blocked, run_id=f"blocked-{blocker_kind.lower()}"
+                )
+                self.assertEqual(state["status"], RunStatus.WAITING_HUMAN.value)
+                self.assertEqual(state["failure"]["reason"], reason)
+                self.assertFalse(
+                    (self.root / "worktrees" / f"blocked-{blocker_kind.lower()}").exists()
+                )
+
+    def test_repository_evidence_blocker_waits_after_bounded_correction(self) -> None:
+        blocked = (
+            "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: Need source evidence\n"
+            "BLOCKER_KIND: REPOSITORY_EVIDENCE\n\nOBJECTIVE\nImplement it.\n\n"
+            "BLOCKERS\n- missing fact in `src/absent.py` :: required_symbol\n\n"
+            "END META PLAN\n"
+        )
+        _, llm, state = self.run_case(
+            planner=blocked, run_id="evidence-exhausted", max_preapproval_corrections=1,
+        )
+        self.assertEqual(state["status"], RunStatus.WAITING_HUMAN.value)
+        self.assertEqual(state["failure"]["reason"], "REPOSITORY_EVIDENCE_RECOVERY_EXHAUSTED")
+        self.assertEqual(llm.planner_calls, 2)
+        self.assertFalse((self.root / "worktrees" / "evidence-exhausted").exists())
 
     def test_codex_exit_one_creates_no_harness_commit(self) -> None:
         _, _, state = self.run_case(codex_behavior="fail")
@@ -699,11 +736,28 @@ class OrchestratorE2ETests(unittest.TestCase):
         _, _, failed = self.run_case(review=FAIL_REVIEW, run_id="review-fail")
         self.assertEqual(failed["failure"]["reason"], "REVIEW_EVIDENCE_UNRESOLVED")
 
-        # A worker that changes nothing enters the bounded contract-repair
-        # path introduced by 261ff2a. No reviewer or candidate is authorized.
-        _, empty_llm, empty = self.run_case(codex_behavior="none", run_id="empty")
-        self.assertEqual(empty["failure"]["reason"], "AGENT_CONTRACT_MISMATCH")
-        self.assertEqual(empty_llm.reviewer_calls, 0)
+        # An empty candidate still requires the exact-tree gate and an
+        # independent reviewer confirmation before it can complete.
+        no_change_review = PASS_REVIEW.replace(
+            "SUMMARY: The implementation is acceptable.",
+            "SUMMARY: SPEC_ALREADY_SATISFIED: the requested feature already exists.",
+        )
+        _, empty_llm, empty = self.run_case(
+            codex_behavior="none", review=no_change_review, run_id="empty",
+        )
+        self.assertEqual(empty["status"], RunStatus.COMMITTED.value)
+        self.assertTrue(empty["no_change"])
+        self.assertIsNone(empty.get("commit_sha"))
+        self.assertEqual(empty_llm.reviewer_calls, 1)
+        self.assertEqual(self.commits("empty"), 1)
+        reviewer_prompt = (
+            self.root / "runs" / "empty" / "cycles/001/review/reviewer.request.txt"
+        ).read_text()
+        self.assertIn("candidate delta is empty", reviewer_prompt)
+        self.assertIn("SPEC_ALREADY_SATISFIED", reviewer_prompt)
+        self.assertIn(self.spec.read_text(), reviewer_prompt)
+        self.assertIn(empty["no_change_candidate_sha"], reviewer_prompt)
+        self.assertIn('"required_check_ids": [\n    "test"', reviewer_prompt)
 
     def test_changes_after_review_never_reach_the_reviewed_commit(self) -> None:
         # The reviewed artifact is the immutable candidate commit: later

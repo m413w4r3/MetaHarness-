@@ -34,10 +34,10 @@ def _candidate_commit_path(run_dir: Path, cycle: int) -> Path:
 
 
 def _candidate_commit_payload(
-    *, commit_sha: str, tree_sha: str, parent_sha: str, branch: str,
+    *, commit_sha: str, tree_sha: str, parent_sha: str | None, branch: str,
     remote: str, immutable_url: str | None, gate_stage: str,
     remote_sha: str | None = None, pushed_at: str | None = None,
-    remote_status: str = "pending",
+    remote_status: str = "pending", no_change: bool = False,
 ) -> dict[str, Any]:
     return {
         "commit_sha": commit_sha,
@@ -51,6 +51,7 @@ def _candidate_commit_payload(
         "immutable_commit_url": immutable_url,
         "pushed_at": pushed_at,
         "remote_status": remote_status,
+        "no_change": no_change,
     }
 
 
@@ -138,7 +139,8 @@ class CandidateLifecycle:
                 "final gate acceptance is missing or stale",
             )
         parents = commit_parents(worktree, head)
-        if len(parents) != 1:
+        no_change = not evidence.changed_files
+        if len(parents) not in ({0} if no_change else {1}):
             raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "candidate HEAD has no single parent")
         path = _candidate_commit_path(ctx.run_dir, cycle_plan.cycle.number)
         stored = _read_json_artifact(path)
@@ -151,7 +153,7 @@ class CandidateLifecycle:
         payload = _candidate_commit_payload(
             commit_sha=head,
             tree_sha=evidence.staged_tree_sha,
-            parent_sha=parents[0],
+            parent_sha=parents[0] if parents else None,
             branch=ctx.info.branch,
             remote=self._staging_remote,
             immutable_url=_commit_web_url(ctx.repository_reference, head),
@@ -162,6 +164,7 @@ class CandidateLifecycle:
                 stored.get("remote_status", "pending")
                 if isinstance(stored, dict) else "pending"
             ),
+            no_change=no_change,
         )
         atomic_write_text(path, _json_text(payload))
         candidate_state = dict(store.load().get("candidate") or {})
@@ -169,7 +172,8 @@ class CandidateLifecycle:
         store.update(
             status=RunStatus.APPROVED, candidate=candidate_state,
             candidate_commit_sha=head, approved_tree_sha=evidence.staged_tree_sha,
-            expected_head_sha=head, expected_parent_sha=parents[0],
+            expected_head_sha=head,
+            expected_parent_sha=parents[0] if parents else None,
             expected_tree_sha=evidence.staged_tree_sha, next_step_id=None,
         )
         return payload
@@ -177,6 +181,14 @@ class CandidateLifecycle:
     def push(
         self, store: Any, ctx: Any, number: int, candidate: dict[str, Any],
     ) -> dict[str, Any]:
+        if candidate.get("no_change") is True:
+            skipped = {**candidate, "remote_sha": None, "pushed_at": None, "remote_status": "not_required"}
+            atomic_write_text(_candidate_commit_path(ctx.run_dir, number), _json_text(skipped))
+            candidates = dict(store.load().get("candidate") or {})
+            candidates[f"{number:03d}"] = skipped
+            store.update(status=store.load().get("status", RunStatus.APPROVED), candidate=candidates)
+            self._cycle_update(store, number, status="candidate_no_change")
+            return skipped
         try:
             pushed = self._push_tree(
                 run_dir=ctx.run_dir, info=ctx.info, cycle=number,
