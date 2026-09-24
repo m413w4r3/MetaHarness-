@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,13 +35,15 @@ PLANNER_VALIDATED = "planner_validated"
 SCOPE_WAITING = "scope_waiting"
 VALIDATED = "validated"
 COMPLETED = "completed"
+SUPERSEDED = "superseded"
+LEGACY_PROMPT_BUG = "legacy_forbidden_as_invariants_prompt_bug"
 
 _RANK = {
     AWAITING_PLANNER: 0, WAITING_EXTERNAL: 0,
     PLANNER_RESPONSE_DURABLE: 1, PLANNER_VALIDATED: 2, SCOPE_WAITING: 3,
-    VALIDATED: 4, COMPLETED: 5,
+    VALIDATED: 4, COMPLETED: 5, SUPERSEDED: 5,
 }
-FINISHED = frozenset({VALIDATED, COMPLETED})
+FINISHED = frozenset({VALIDATED, COMPLETED, SUPERSEDED})
 _AWAITING = frozenset({AWAITING_PLANNER, WAITING_EXTERNAL})
 _MAX_JSON_BYTES = 256 * 1024
 
@@ -213,10 +216,117 @@ def durable_request_matches(directory: Path, tree_sha: str) -> bool | None:
 
 
 def semantic_repair_count(artifact_dir: Path) -> int:
-    """The highest opened semantic slot; transport retries never add one."""
+    """Count semantic slots; superseded generator bugs use no budget."""
 
+    return sum(
+        (transaction := read_transaction(directory)) is None
+        or transaction["status"] != SUPERSEDED
+        for directory in repair_dirs(artifact_dir)
+    )
+
+
+def next_repair_number(artifact_dir: Path) -> int:
     dirs = repair_dirs(artifact_dir)
-    return int(dirs[-1].name) if dirs else 0
+    return int(dirs[-1].name) + 1 if dirs else 1
+
+
+def _prompt_section(prompt: bytes, label: bytes) -> bytes | None:
+    opening = b"<" + label + b">\n"
+    closing = b"\n</" + label + b">"
+    if prompt.count(opening) != 1 or prompt.count(closing) != 1:
+        return None
+    after = prompt.split(opening, 1)[1]
+    return after.split(closing, 1)[0] if closing in after else None
+
+
+def _latest_attempt(artifact_dir: Path) -> Path | None:
+    root = artifact_dir / "attempts"
+    if not root.is_dir():
+        return None
+    attempts = [path for path in root.iterdir() if path.is_dir() and path.name.isdigit()]
+    return max(attempts, key=lambda path: int(path.name)) if attempts else None
+
+
+def legacy_prompt_bug_candidate(artifact_dir: Path) -> bool:
+    attempt = _latest_attempt(artifact_dir)
+    if attempt is None:
+        return False
+    diagnostics = _read_json(attempt / "prompt.diagnostics.json")
+    if not isinstance(diagnostics, dict) or diagnostics.get("role") != "implementer":
+        return False
+    sections = diagnostics.get("sections")
+    return isinstance(sections, list) and any(
+        isinstance(item, dict) and item.get("name") == "step_invariants"
+        for item in sections
+    )
+
+
+def legacy_prompt_bug_proven(
+    pending: PendingContractRepair, *, step_forbidden: str,
+) -> bool:
+    """Prove the archived worker received forbidden bytes under two labels."""
+
+    attempt = _latest_attempt(pending.directory.parent.parent)
+    if attempt is None:
+        return False
+    for attempt in (attempt,):
+        record = _read_json(attempt / "step.json")
+        diagnostics = _read_json(attempt / "prompt.diagnostics.json")
+        if not isinstance(record, dict) or not isinstance(diagnostics, dict):
+            continue
+        if (
+            record.get("id") != pending.step_id
+            or record.get("reason") != "AGENT_CONTRACT_MISMATCH"
+            or record.get("tree_before") != pending.tree_sha
+            or record.get("tree_after") != pending.tree_sha
+            or record.get("mismatch") != pending.mismatch
+            or diagnostics.get("role") != "implementer"
+        ):
+            continue
+        sections = diagnostics.get("sections")
+        if not isinstance(sections, list):
+            continue
+        by_name = {
+            item.get("name"): item for item in sections
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        invariants = by_name.get("step_invariants")
+        forbidden = by_name.get("forbidden_contract")
+        if not isinstance(invariants, dict) or not isinstance(forbidden, dict):
+            continue
+        try:
+            prompt = (attempt / "agent.prompt.txt").read_bytes()
+        except OSError:
+            continue
+        invariant_bytes = _prompt_section(prompt, b"STEP INVARIANTS")
+        forbidden_bytes = _prompt_section(prompt, b"FORBIDDEN CONTRACT")
+        if invariant_bytes is None or forbidden_bytes is None:
+            continue
+        digest = hashlib.sha256(invariant_bytes).hexdigest()
+        if (
+            invariant_bytes == forbidden_bytes == step_forbidden.encode("utf-8")
+            and digest == invariants.get("sha256") == forbidden.get("sha256")
+            and len(invariant_bytes) == invariants.get("bytes") == forbidden.get("bytes")
+            and invariants.get("authority") is True
+            and forbidden.get("authority") is True
+            and invariants.get("truncated") is False
+            and forbidden.get("truncated") is False
+            and len(prompt) == diagnostics.get("prompt_bytes")
+        ):
+            return True
+    return False
+
+
+def supersede_legacy_prompt_bug(pending: PendingContractRepair) -> dict[str, Any]:
+    if pending.transaction.get("status") not in _AWAITING or planner_response_durable(pending.directory):
+        raise ContractRepairIntegrityError("only a pending planner repair can be superseded")
+    return advance(
+        pending.directory, SUPERSEDED,
+        superseded_reason=LEGACY_PROMPT_BUG,
+        superseded_at=datetime.now(timezone.utc).isoformat(),
+        tree_sha=pending.tree_sha,
+        repair_id=pending.transaction["repair_id"],
+    )
 
 
 def find_pending(
@@ -347,7 +457,8 @@ def _adopt_legacy(
 __all__ = [
     "AWAITING_PLANNER", "COMPLETED", "ContractRepairIntegrityError", "FINISHED",
     "PLANNER_RESPONSE_DURABLE", "PLANNER_VALIDATED", "PendingContractRepair",
-    "SCOPE_WAITING", "VALIDATED", "WAITING_EXTERNAL", "advance", "begin",
+    "SCOPE_WAITING", "SUPERSEDED", "VALIDATED", "WAITING_EXTERNAL", "advance", "begin",
     "durable_request_matches", "ensure", "find_pending", "is_awaiting_planner", "planner_response_durable", "repair_dirs",
-    "repair_identity", "semantic_repair_count", "sha256_text",
+    "legacy_prompt_bug_candidate", "legacy_prompt_bug_proven", "next_repair_number", "repair_identity",
+    "semantic_repair_count", "sha256_text", "supersede_legacy_prompt_bug",
 ]

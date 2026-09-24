@@ -3936,8 +3936,11 @@ class Orchestrator:
         effective_contract = contract
         if effective_step is not step:
             effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
-        # The semantic repair number: opened slots, never transport retries.
-        repair_count = contract_repair.semantic_repair_count(artifact_dir)
+        # Semantic budget excludes superseded generator bugs and transport retries.
+        try:
+            repair_count = contract_repair.semantic_repair_count(artifact_dir)
+        except ContractRepairIntegrityError as exc:
+            raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
         max_repairs = getattr(self._run_options, "max_step_contract_repairs", 0)
         recovery = self._recovery(store)
         cycle_number = getattr(self, "_trace_cycle", 1)
@@ -3977,13 +3980,42 @@ class Orchestrator:
                     f"pending contract repair {pending_repair.number:02d}: {drift}",
                     step_id=step.id,
                 )
-            effective_step, effective_contract = self._contract_repair_transaction(
-                **repair_context, directory=pending_repair.directory,
-                number=pending_repair.number, step=effective_step,
-                current_contract=effective_contract, mismatch=pending_repair.mismatch,
-                tree_before=pending_repair.tree_sha, profile_id=active_profile_id,
-                resumed=True,
-            )
+            if contract_repair.legacy_prompt_bug_candidate(artifact_dir):
+                if (
+                    any(field.name == "invariants" for field in dataclasses.fields(ImplementationStep))
+                    or contract_repair.planner_response_durable(pending_repair.directory)
+                    or not contract_repair.legacy_prompt_bug_proven(
+                        pending_repair, step_forbidden=effective_step.forbidden,
+                    )
+                ):
+                    raise PipelineFailure(
+                        "RESUME_INTEGRITY_FAILURE",
+                        "legacy implementer prompt bug evidence is incomplete; operator decision required",
+                        step_id=step.id,
+                    )
+                try:
+                    contract_repair.supersede_legacy_prompt_bug(pending_repair)
+                except (ContractRepairIntegrityError, OSError) as exc:
+                    raise PipelineFailure(
+                        "RESUME_INTEGRITY_FAILURE", str(exc), step_id=step.id,
+                    ) from exc
+                repair_count = contract_repair.semantic_repair_count(artifact_dir)
+                store.update(
+                    status=RunStatus.IMPLEMENTING, current_step=step.id,
+                    contract_repair={
+                        "status": "superseded",
+                        "repair_id": pending_repair.transaction["repair_id"],
+                        "contract_repair_number": pending_repair.number,
+                    },
+                )
+            else:
+                effective_step, effective_contract = self._contract_repair_transaction(
+                    **repair_context, directory=pending_repair.directory,
+                    number=pending_repair.number, step=effective_step,
+                    current_contract=effective_contract, mismatch=pending_repair.mismatch,
+                    tree_before=pending_repair.tree_sha, profile_id=active_profile_id,
+                    resumed=True,
+                )
         while True:
             common = {
                 "repo": repo, "worktree": worktree, "base_sha": base_sha,
@@ -4148,7 +4180,7 @@ class Orchestrator:
                     failure.index_tree_after = failure.tree_before
                     failure.step_dir = artifact_dir
                     raise
-                number = repair_count + 1
+                number = contract_repair.next_repair_number(artifact_dir)
                 repair_dir = artifact_dir / "contract_repairs" / f"{number:02d}"
                 bounded_mismatch = _bounded_v2_report(failure.mismatch)
                 try:
@@ -4161,7 +4193,7 @@ class Orchestrator:
                     raise PipelineFailure(
                         "RESUME_INTEGRITY_FAILURE", str(exc), step_id=step.id,
                     ) from exc
-                repair_count = number
+                repair_count += 1
                 recovery.trace(
                     "recovery.started", reason="AGENT_CONTRACT_MISMATCH",
                     decision=recovery_decision, attempt=recovery_attempt,
@@ -4308,6 +4340,7 @@ class Orchestrator:
         """
 
         try:
+            semantic_attempt = contract_repair.semantic_repair_count(artifact_dir)
             if contract_repair.planner_response_durable(directory):
                 contract_repair.ensure(directory, contract_repair.PLANNER_RESPONSE_DURABLE)
             transaction = contract_repair.read_transaction(directory) or {}
@@ -4319,7 +4352,7 @@ class Orchestrator:
         except ContractRepairIntegrityError as exc:
             raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
         progress = {
-            "step_id": step.id, "attempt": number,
+            "step_id": step.id, "attempt": semantic_attempt,
             "pending_operation": "contract_repair",
             "contract_repair_number": number,
             "repair_id": transaction.get("repair_id"),
@@ -4381,7 +4414,7 @@ class Orchestrator:
                 _bounded_v2_report(f"contract repair failed: {exc}"),
                 profile_id=profile_id, tree_before=tree_before,
                 tree_after=tree_before, usage=usage, mismatch=mismatch,
-                mismatch_retry_count=number, step_dir=artifact_dir,
+                mismatch_retry_count=semantic_attempt, step_dir=artifact_dir,
             ) from exc
         decision = classify_failure(
             "AGENT_CONTRACT_MISMATCH", clean_contract_mismatch=True, rollback_succeeded=True,
@@ -4389,8 +4422,8 @@ class Orchestrator:
         # One semantic record per repair, whatever the number of resumes.
         recovery.record(RecoveryAttempt(
             phase="implementation", reason="AGENT_CONTRACT_MISMATCH",
-            attempt=number, budget_key="contract_repairs",
-            budget=max_repairs, budget_consumed=number,
+            attempt=semantic_attempt, budget_key="contract_repairs",
+            budget=max_repairs, budget_consumed=semantic_attempt,
             disposition=decision.disposition.value,
             cycle=cycle, step_id=step.id, profile_id=profile_id,
             tree_before=tree_before, tree_after=tree_before,
@@ -4408,9 +4441,9 @@ class Orchestrator:
         )
         recovery.trace(
             "recovery.completed", reason="AGENT_CONTRACT_MISMATCH",
-            decision=decision, attempt=number,
+            decision=decision, attempt=semantic_attempt,
             tree_before=tree_before, tree_after=candidate_tree_sha(worktree),
-            budget_remaining=max(0, max_repairs - number),
+            budget_remaining=max(0, max_repairs - semantic_attempt),
             phase="implementation", cycle=cycle,
             step_id=step.id, recovered=True,
         )
@@ -4637,7 +4670,6 @@ class Orchestrator:
                 step_identity=f"{step.id}\nTITLE\n{step.title}",
                 step_title=step.title,
                 step_objective=step.objective,
-                step_invariants=step.forbidden,
                 read_set="\n".join(step.read_set),
                 write_set="\n".join(step.write_set) or "NONE",
                 create_set="\n".join(step.create_set) or "NONE",

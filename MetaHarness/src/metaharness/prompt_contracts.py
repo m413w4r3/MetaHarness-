@@ -357,7 +357,6 @@ def build_implementer_payload(
     *,
     original_spec: str = "",
     step_objective: str,
-    step_invariants: str,
     read_set: str,
     mutable_scope: str,
     repository_instructions: str = "",
@@ -383,14 +382,11 @@ def build_implementer_payload(
         instructions if instructions is not None else repository_instructions
     )
     effective_verify = verify_contract if verify_contract is not None else verify_instructions
-    effective_forbidden = (
-        forbidden_contract if forbidden_contract is not None else step_invariants
-    )
+    effective_forbidden = forbidden_contract if forbidden_contract is not None else ""
     sections = (
         _section("original_spec", original_spec, True),
         _section("step_identity", effective_identity, True),
         _section("step_objective", step_objective, True),
-        _section("step_invariants", step_invariants, True),
         _section("read_set", read_set, True),
         _section("write_set", write_set, True),
         _section("create_set", create_set, True),
@@ -405,7 +401,6 @@ def build_implementer_payload(
         "{{SPEC}}": "original_spec",
         "{{STEP_IDENTITY}}": "step_identity",
         "{{STEP_OBJECTIVE}}": "step_objective",
-        "{{STEP_INVARIANTS}}": "step_invariants",
         "{{READ_SET}}": "read_set",
         "{{WRITE_SET}}": "write_set",
         "{{CREATE_SET}}": "create_set",

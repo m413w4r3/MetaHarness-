@@ -11,9 +11,10 @@ from metaharness.gitops import GitError
 from metaharness.llm.chat import LLMError
 from metaharness.models import ExecutionRole, RunStatus
 from metaharness.orchestration.pipeline_v2 import PipelineFailure
+from metaharness.orchestration import contract_repair
 from metaharness.resume import resume_info
 from metaharness.run_options import RunOptions
-from tests.pipeline_support import PipelineHarness, initial_plan, review, write
+from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
 from tests.test_pipeline_v2_machine import SPEC, STEP, repaired_step_contract
 
 OUTAGE = "LLM endpoint returned HTTP 503 after 3 attempt(s)"
@@ -86,6 +87,103 @@ class ContractRepairTransactionTests(PipelineHarness):
         self.assertEqual((record["attempt"], record["budget_consumed"]), (1, 1))
         self.assertEqual(record["operation_id"], REPAIR_ID)
         self.assertIn("recovery.resumed", self.trace_names())
+
+    def test_legacy_s04_prompt_bug_supersedes_repair_and_retries_worker(self) -> None:
+        for name in ("s01.txt", "s02.txt", "s03.txt"):
+            (self.repo / name).write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "-qm", "add staged files")
+        git(self.repo, "push", "-q", "origin", "main")
+        steps = (
+            ("S01", "s01.txt", "First stage"),
+            ("S02", "s02.txt", "Second stage"),
+            ("S03", "s03.txt", "Third stage"),
+            ("S04", "feature.txt", "Remove references conversation state"),
+        )
+        forbidden = "- add migration 0002\n- change synthesis semantics\n- disable REFERENCES ModelRun reconciliation"
+        plan = initial_plan(*steps).replace(
+            "FORBIDDEN\n- Do not change paths outside the declared sets.\n\nEND STEP S04",
+            f"FORBIDDEN\n{forbidden}\n\nEND STEP S04",
+        )
+        plan = plan.replace(
+            "OBJECTIVE\nRemove references conversation state\n",
+            "OBJECTIVE\nRemove references_conversation_id while preserving ModelRun reconciliation and synthesis conversation\n",
+        )
+        for previous, current in (("S01", "S02"), ("S02", "S03"), ("S03", "S04")):
+            block = f"BEGIN STEP {current}"
+            start = plan.index(block)
+            before, after = plan[:start], plan[start:]
+            plan = before + after.replace("DEPENDS_ON: NONE", f"DEPENDS_ON: {previous}", 1)
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("s01.txt", "one\n"), write("s02.txt", "two\n"),
+            write("s03.txt", "three\n"), mismatch,
+            write("feature.txt", "good\n"),
+        )
+        result = self.orchestrator(
+            self.config(max_step_contract_repairs=1),
+            planner=[plan, LLMError(OUTAGE)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL, self.state().get("failure"))
+        self.assertEqual((self.checkpoint()["phase"], self.checkpoint()["step_id"]), ("implement_step", "S04"))
+        self.assertEqual(len(self.workers.calls), 4)
+        step_dir = self.run_dir() / "cycles/001/implementation/steps/S04"
+        attempt = step_dir / "attempts/01"
+        prompt_path = attempt / "agent.prompt.txt"
+        diagnostics_path = attempt / "prompt.diagnostics.json"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        prompt = prompt.replace(
+            "<FORBIDDEN CONTRACT>",
+            f"<STEP INVARIANTS>\n{forbidden}\n</STEP INVARIANTS>\n\n<FORBIDDEN CONTRACT>",
+            1,
+        )
+        prompt_path.write_text(prompt, encoding="utf-8")
+        diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        old_forbidden = next(item for item in diagnostics["sections"] if item["name"] == "forbidden_contract")
+        diagnostics["sections"].append({**old_forbidden, "name": "step_invariants"})
+        diagnostics["prompt_bytes"] = len(prompt.encode("utf-8"))
+        diagnostics_path.write_text(json.dumps(diagnostics), encoding="utf-8")
+
+        resumed = self.orchestrator(
+            self.config(max_step_contract_repairs=1), planner=["planner must not be called"],
+            reviewer=[review()],
+        ).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(len(self.workers.calls), 5)
+        self.assertEqual(self.planner.requests, [])
+        transaction = json.loads((step_dir / "contract_repairs/01/transaction.json").read_text(encoding="utf-8"))
+        self.assertEqual(transaction["status"], "superseded")
+        self.assertEqual(transaction["superseded_reason"], "legacy_forbidden_as_invariants_prompt_bug")
+        self.assertEqual(transaction["repair_id"], "contract-repair:cycle-001:S04:01")
+        self.assertTrue(transaction["superseded_at"])
+        self.assertTrue((step_dir / "contract_repairs/01/mismatch.json").is_file())
+        self.assertEqual(self.semantic_records(), [])
+        self.assertEqual(contract_repair.semantic_repair_count(step_dir), 0)
+        self.assertEqual(contract_repair.next_repair_number(step_dir), 2)
+        self.assertNotIn("STEP INVARIANTS", self.workers.calls[-1].prompt)
+        self.assertIn(f"<FORBIDDEN CONTRACT>\n{forbidden}\n</FORBIDDEN CONTRACT>", self.workers.calls[-1].prompt)
+        retried_diagnostics = json.loads((step_dir / "prompt.diagnostics.json").read_text(encoding="utf-8"))
+        self.assertNotIn("step_invariants", [item["name"] for item in retried_diagnostics["sections"]])
+
+    def test_incomplete_legacy_prompt_evidence_requires_operator(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, mismatch)
+        self.wait_on_outage()
+        step_dir = self.step_dir()
+        attempt = step_dir / "attempts/01"
+        diagnostics_path = attempt / "prompt.diagnostics.json"
+        diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        forbidden = next(item for item in diagnostics["sections"] if item["name"] == "forbidden_contract")
+        diagnostics["sections"].append({**forbidden, "name": "step_invariants"})
+        diagnostics_path.write_text(json.dumps(diagnostics), encoding="utf-8")
+
+        result = self.resume(["planner must not be called"])
+
+        self.assertNotEqual(result.status, RunStatus.COMMITTED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.transaction()["status"], "waiting_external")
+        self.assertEqual(len(self.workers.calls), 1)
+        self.assertEqual(self.planner.requests, [])
 
     def test_a_durable_raw_answer_is_reparsed_without_a_provider_call(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))

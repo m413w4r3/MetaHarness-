@@ -226,7 +226,6 @@ class CodexAgent:
         payload = build_implementer_payload(
         step_identity="implementation request",
             step_objective=plan,
-            step_invariants="NONE",
             read_set="NONE",
             mutable_scope="NONE",
             repository_instructions="NONE",

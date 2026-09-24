@@ -127,7 +127,6 @@ class CodexTests(unittest.TestCase):
         payload = build_implementer_payload(
             step_identity="S01\\nTITLE\\nWrite the feature",
             step_objective="write feature.txt",
-            step_invariants="preserve API",
             read_set="README.md",
             write_set="feature.txt",
             mutable_scope='{"write": ["feature.txt"]}',

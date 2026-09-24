@@ -63,7 +63,7 @@ class PromptContractTests(unittest.TestCase):
         payload = build_implementer_payload(
             step_title="S01",
             step_objective="implement one step",
-            step_invariants="preserve API",
+            forbidden_contract="preserve API",
             read_set="src/a.py :: symbol",
             mutable_scope="src/a.py",
             repository_instructions="follow AGENTS.md",
@@ -72,6 +72,41 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("You are the implementation executor", payload.rendered)
         self.assertIn("Do not redesign the plan or broaden the task.", payload.rendered)
         self.assertIn("Implement the supplied contract exactly.", payload.rendered)
+
+    def test_forbidden_is_single_nontruncatable_authority(self) -> None:
+        forbidden = "DO NOT CREATE migration 0002"
+        payload = build_implementer_payload(
+            step_identity="S04", step_objective="remove references conversation state",
+            read_set="NONE", mutable_scope="NONE", forbidden_contract=forbidden,
+            budget_bytes=1,
+        )
+        self.assertIn(f"<FORBIDDEN CONTRACT>\n{forbidden}\n</FORBIDDEN CONTRACT>", payload.rendered)
+        self.assertEqual(payload.rendered.count(forbidden), 1)
+        self.assertNotIn("STEP INVARIANTS", payload.rendered)
+        self.assertNotIn("step_invariants", [section.name for section in payload.sections])
+        authority = next(section for section in payload.sections if section.name == "forbidden_contract")
+        self.assertTrue(authority.authority)
+        self.assertFalse(authority.truncated)
+        self.assertEqual(authority.sha256, hashlib.sha256(forbidden.encode()).hexdigest())
+
+    def test_aw010_s04_prompt_preserves_synthesis_and_reconciliation(self) -> None:
+        objective = (
+            "Remove references_conversation_id while preserving ModelRun "
+            "reconciliation and synthesis conversation."
+        )
+        forbidden = (
+            "- add migration 0002\n- change synthesis semantics\n"
+            "- disable REFERENCES ModelRun reconciliation"
+        )
+        payload = build_implementer_payload(
+            step_identity="S04", step_objective=objective,
+            read_set="ModelRun", mutable_scope="ModelRun",
+            instructions="Remove references conversation state; preserve synthesis conversation and ModelRun reconciliation.",
+            forbidden_contract=forbidden,
+        )
+        self.assertIn(f"<STEP OBJECTIVE>\n{objective}\n</STEP OBJECTIVE>", payload.rendered)
+        self.assertIn(f"<FORBIDDEN CONTRACT>\n{forbidden}\n</FORBIDDEN CONTRACT>", payload.rendered)
+        self.assertNotIn("STEP INVARIANTS", payload.rendered)
 
     def test_worker_output_discipline_is_bounded_and_non_narrative(self) -> None:
         prompts = Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts"
@@ -164,7 +199,7 @@ class PromptContractTests(unittest.TestCase):
         implementer = build_implementer_payload(
             step_title="S01",
             step_objective="implement one step",
-            step_invariants="preserve API",
+            forbidden_contract="preserve API",
             read_set="src/a.py :: symbol",
             mutable_scope="src/a.py",
             repository_instructions="follow AGENTS.md",
