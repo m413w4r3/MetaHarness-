@@ -9,6 +9,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.m413w4r3.metaharnessremote.data.ConnectionSession
 import com.m413w4r3.metaharnessremote.data.ServerSettingsStore
 import com.m413w4r3.metaharnessremote.network.GatewayClient
 import com.m413w4r3.metaharnessremote.network.GatewayUrls
@@ -22,9 +23,16 @@ sealed interface ConnectionStatus {
     data class Error(val message: String) : ConnectionStatus
 }
 
+/**
+ * Connection settings of the app.
+ *
+ * The typed token is mirrored into [ConnectionSession], where the Runs screen
+ * reads it, and stays in memory: it is never persisted.
+ */
 class SettingsViewModel(
     private val settingsStore: ServerSettingsStore,
     private val gatewayClient: GatewayClient = GatewayClient(),
+    private val session: ConnectionSession = ConnectionSession.shared,
 ) : ViewModel() {
 
     /** Persisted across launches. */
@@ -46,6 +54,7 @@ class SettingsViewModel(
 
     fun onRemoteTokenChange(value: String) {
         remoteToken = value
+        session.remoteToken = value
         status = ConnectionStatus.Idle
     }
 
