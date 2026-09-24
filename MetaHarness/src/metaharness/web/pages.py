@@ -103,6 +103,15 @@ _ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
 _TERMINAL_LABELS = {
     "blocked": "BLOCKED", "plan_rejected": "REJECTED", "failed": "FAILED",
     "interrupted": "INTERRUPTED", "waiting_human": "WAITING FOR OPERATOR",
+    "waiting_external": "WAITING FOR EXTERNAL AUTHORIZATION",
+    "waiting_check_infrastructure": "WAITING FOR CHECK INFRASTRUCTURE",
+    "waiting_remote": "WAITING FOR REMOTE",
+}
+_WAITING_LABELS = {
+    "waiting_external": "Waiting for external authorization",
+    "waiting_check_infrastructure": "Waiting for check infrastructure",
+    "waiting_remote": "Waiting for remote",
+    "waiting_human": "Waiting for operator decision",
 }
 TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
 AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
@@ -141,7 +150,7 @@ def _failure(value: Any) -> str:
 def _status_badge(status: Any) -> str:
     value = str(status or "—")
     style = "failed" if value in {"failed", "blocked", "plan_rejected", "interrupted"} else "success" if value in {"committed", "approved", "published"} else ""
-    return f'<span class="badge {style}">{_e(value)}</span>'
+    return f'<span class="badge {style}">{_e(_WAITING_LABELS.get(value, value))}</span>'
 
 
 def render_index(runs: list[dict[str, Any]], *, nonce: str | None = None) -> str:
@@ -892,7 +901,7 @@ _FAILURE_MESSAGES = {
     "AGENT_NO_CHANGE": "Step changed nothing",
     "UNRESOLVED_CONTRACT_MISMATCH": "Deferred contract mismatch needs semantic revision or an operator",
     "STEP_WRITE_SET_VIOLATION": "Step changed an unauthorized path",
-    "CHECK_REPAIR_EXHAUSTED": "Check-repair budget exhausted",
+    "CHECK_REPAIR_EXHAUSTED": "Recovery exhausted: checks still fail",
     "CHECK_INFRASTRUCTURE_UNAVAILABLE": "Deterministic check infrastructure is unavailable",
     "CHECK_SIDE_EFFECT_REPEATED": "A deterministic check repeatedly changed the candidate",
     "HUMAN_REQUIRED": "Human action required",
@@ -909,7 +918,7 @@ _FAILURE_MESSAGES = {
     "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
     "RESUME_REQUIRES_OPERATOR": "Resume requires an operator",
-    "WAITING_REPAIR_EXHAUSTED": "Review-correction budget exhausted",
+    "WAITING_REPAIR_EXHAUSTED": "Recovery exhausted: operator decision required",
     "WAITING_SCOPE_APPROVAL": "Additional repair scope needs approval",
     "REVISION_SCOPE_VIOLATION": "A repair pass needed a path outside its scope",
     "INTERRUPTED": "Run interrupted",
@@ -1002,7 +1011,7 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     failure = run.get("failure", state.get("failure"))
     if status not in {
         "failed", "blocked", "interrupted", "waiting_check_infrastructure",
-        "waiting_remote",
+        "waiting_remote", "waiting_external", "waiting_human",
     } or not isinstance(failure, dict):
         return ""
     reason = str(failure.get("reason") or "")
@@ -1049,10 +1058,10 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
         )
     detail = failure.get("detail")
     return (
-        f'<div class="card fail failure-card"><p class="label">{_e(status.upper())}</p>'
+        f'<div class="card failure-card"><p class="label">{_e(_WAITING_LABELS.get(status, status.upper()))}</p>'
         f'<p class="failure-title"><strong>{_e(_FAILURE_MESSAGES.get(reason, reason or "Run failed"))}</strong></p>'
         f'{action}'
-        f'<p class="danger small"><strong>{_e(status.upper())}: {_e(reason)}</strong>'
+        f'<p class="small"><strong>{_e(reason)}</strong>'
         f'{"<br>" + _e(note) if note else ""}{"<br>" + _e(detail) if detail is not None else ""}</p></div>'
     )
 
@@ -1114,7 +1123,7 @@ def _run_card(run: dict[str, Any], token: str | None, overview: dict[str, Any], 
         f'<h1>Run <span class="mono">{_e(run_id)}</span></h1>'
         '<div class="card-grid">'
         f'<div><p class="label">RUN</p><p class="value mono">{_e(_short_id(run_id))}</p></div>'
-        f'<div><p class="label">STATUS</p><p class="value"><span id="live-status" class="badge {style}">{_e(status.upper() or "—")}</span></p>'
+        f'<div><p class="label">STATUS</p><p class="value"><span id="live-status" class="badge {style}">{_e(_WAITING_LABELS.get(status, status.upper() or "—"))}</span></p>'
         f'<p class="muted small">updated <span id="live-updated" class="mono">{_e(run.get("updated_at"))}</span></p></div>'
         f'<div><p class="label">CURRENT</p><p class="value" id="live-current">{_e(overview.get("current_label") or "—")}</p></div>'
         f'<div><p class="label">NEXT</p><p class="value" id="live-next">{_e(overview.get("next_label") or "—")}</p></div>'

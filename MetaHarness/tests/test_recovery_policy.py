@@ -7,6 +7,9 @@ from metaharness.recovery_policy import (
     RecoveryDisposition,
     classify_failure,
 )
+from metaharness.orchestration.recovery import terminal_state_for
+from metaharness.models import RunStatus
+from metaharness.resume import ResumePhase
 
 
 # One central architecture table covers all pipeline outcomes. Changes to the
@@ -42,6 +45,29 @@ FAILURE_POLICY_MATRIX = (
 
 
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_unknown_failure_fails_closed(self) -> None:
+        decision = classify_failure("TOTALLY_NEW_FAILURE")
+        self.assertEqual(decision.disposition, RecoveryDisposition.HARD_STOP)
+        self.assertFalse(decision.consumes_budget)
+        self.assertEqual(
+            terminal_state_for(decision, failure_code="TOTALLY_NEW_FAILURE", phase=ResumePhase.IMPLEMENT_STEP).status,
+            RunStatus.FAILED,
+        )
+
+    def test_exhausted_outcomes_have_distinct_waiting_states(self) -> None:
+        cases = (
+            ("AGENT_AUTH_FAILURE", {}, ResumePhase.IMPLEMENT_STEP, RunStatus.WAITING_EXTERNAL),
+            ("LLM_503", {"budget_exhausted": True}, ResumePhase.FINAL_REVIEW, RunStatus.WAITING_EXTERNAL),
+            ("CHECK_TIMEOUT", {"budget_exhausted": True}, ResumePhase.DETERMINISTIC_GATE, RunStatus.WAITING_CHECK_INFRASTRUCTURE),
+            ("PUSH_FAILED", {"remote_required": True, "budget_exhausted": True}, ResumePhase.CANDIDATE_PUSH, RunStatus.WAITING_REMOTE),
+            ("CHECK_REPAIR_EXHAUSTED", {}, ResumePhase.DETERMINISTIC_GATE, RunStatus.WAITING_HUMAN),
+            ("PLAN_REPOSITORY_PRECONDITION_INVALID", {"budget_exhausted": True}, ResumePhase.PLANNER, RunStatus.WAITING_HUMAN),
+        )
+        for code, options, phase, status in cases:
+            with self.subTest(code=code):
+                decision = classify_failure(code, **options)
+                self.assertEqual(terminal_state_for(decision, failure_code=code, phase=phase).status, status)
+
     def test_failure_policy_matrix_is_an_architectural_invariant(self) -> None:
         for name, reason, expected, kwargs in FAILURE_POLICY_MATRIX:
             with self.subTest(policy=name):

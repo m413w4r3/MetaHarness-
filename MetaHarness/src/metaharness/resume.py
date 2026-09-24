@@ -237,7 +237,7 @@ PHASE_STATUS.update({
 })
 _RESUMABLE_STATUSES = frozenset({
     "failed", "interrupted", "waiting_scope_approval", "waiting_check_infrastructure",
-    "waiting_remote",
+    "waiting_remote", "waiting_external",
 })
 # Failures that a checkpoint can never repair: the run needs an operator.
 _TERMINAL_FAILURES = frozenset({
@@ -282,12 +282,14 @@ class ResumeInfo:
 
 def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     if state.get("status") not in _RESUMABLE_STATUSES:
-        return ResumeInfo(False, reason="run is not failed or interrupted")
+        return ResumeInfo(False, reason="run has no resumable waiting state")
     if state.get("planning_protocol") != "v2":
         return ResumeInfo(False, reason="only pipeline v2 runs can be resumed")
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     if failure.get("reason") in _TERMINAL_FAILURES:
         return ResumeInfo(False, reason="the run requires an operator")
+    if state.get("recovery_resumable") is False:
+        return ResumeInfo(False, reason="the run stopped at a non-resumable failure")
     try:
         checkpoint = read_checkpoint(run_dir)
     except ResumeCheckpointError:

@@ -1224,7 +1224,7 @@ LIVE_STOP_STATUSES = frozenset({
     "committed", "published", "failed", "blocked", "plan_rejected", "interrupted",
     "waiting_human",
     "awaiting_plan_approval", "waiting_check_infrastructure",
-    "waiting_scope_approval", "waiting_remote",
+    "waiting_scope_approval", "waiting_remote", "waiting_external",
 })
 _DIAGNOSTIC_COUNTERS = (
     "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",

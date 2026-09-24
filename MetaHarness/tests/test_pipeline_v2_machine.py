@@ -15,6 +15,7 @@ from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
 from metaharness.gitops import GitError, remote_run_branch_tip as real_remote_run_branch_tip
 from metaharness.models import ExecutionRole, RunStatus
 from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
+from metaharness.orchestration.pipeline_v2 import PipelineFailure
 from metaharness.run_options import RunOptions
 from metaharness.resume import resume_info
 from tests.pipeline_support import (
@@ -66,6 +67,24 @@ END META STEP CONTRACT REPAIR
 
 
 class SingleCycleTests(PipelineHarness):
+    def test_unknown_pipeline_failure_stops_without_recovery_model_calls(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        with mock.patch(
+            "metaharness.orchestrator.PipelineV2Coordinator.run",
+            side_effect=PipelineFailure("TOTALLY_NEW_FAILURE", "retained diagnostic"),
+        ):
+            result = self.orchestrator(
+                self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+            ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"], {
+            "reason": "TOTALLY_NEW_FAILURE", "detail": "retained diagnostic",
+        })
+        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
+        self.assertEqual(len(self.planner.requests), 1)  # initial planning only
+        self.assertEqual(self.reviewer.requests, [])
+        self.assertEqual(self.workers.calls, [])
+
     def test_publish_disabled_still_pushes_exact_candidate_before_review(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(
@@ -409,7 +428,7 @@ class SingleCycleTests(PipelineHarness):
         result = self.orchestrator(
             self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
         self.assertEqual(self.state()["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
         self.assertEqual(self.reviewer.requests, [])
         self.assertFalse((self.run_dir() / "cycles/001/candidate/commit.json").exists())
@@ -420,10 +439,10 @@ class SingleCycleTests(PipelineHarness):
             self.config(), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "IMPLEMENTATION")],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
         self.assertEqual(self.state()["failure"]["reason"], "WAITING_REPAIR_EXHAUSTED")
         self.assertEqual(self.checkpoint()["phase"], "final_review")
-        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
+        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
         self.assertFalse((self.run_dir() / "repair_task.json").exists())
 
     def test_human_route_stops_without_automatic_correction_or_publication(self) -> None:
@@ -436,7 +455,7 @@ class SingleCycleTests(PipelineHarness):
             run_id="run",
         )
 
-        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
         self.assertEqual(self.state()["failure"]["reason"], "HUMAN_REQUIRED")
         self.assertEqual(self.workers.roles(), ["implementer"])
         self.assertEqual(len(self.reviewer.requests), 1)
@@ -449,12 +468,12 @@ class SingleCycleTests(PipelineHarness):
             reviewer=[review("FAIL", "HUMAN")],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
         self.assertEqual(self.state()["failure"]["reason"], "REVIEW_EVIDENCE_UNRESOLVED")
         self.assertEqual(self.workers.roles(), ["implementer"])
         self.assertEqual(len(self.reviewer.requests), 2)
         self.assertEqual(self.checkpoint()["phase"], "final_review")
-        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
+        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
         self.assertFalse((self.run_dir() / "publish.json").exists())
 
     def test_malformed_review_is_repaired_to_pass_without_repeating_review(self) -> None:
@@ -476,16 +495,11 @@ class SingleCycleTests(PipelineHarness):
             reviewer=["VERDICT: PASS\nROUTE: NONE", "still malformed"],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_HUMAN)
         self.assertEqual(self.state()["failure"]["reason"], "REVIEW_FORMAT_INVALID")
         self.assertEqual(self.checkpoint()["phase"], "final_review")
         self.assertTrue((self.run_dir() / "cycles/001/candidate/commit.json").is_file())
-        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
-
-        resumed = self.orchestrator(
-            self.config(), planner=["unused"], reviewer=[review()],
-        ).resume("run")
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
         self.assertEqual(self.workers.roles(), ["implementer"])
 
     def test_review_http_503_recovers_on_the_same_candidate(self) -> None:
@@ -705,7 +719,7 @@ class CheckRepairTests(PipelineHarness):
         result = self.orchestrator(
             self.config(check_repair=3), planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
         self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair", "repair"])
         attempts = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts"
@@ -821,13 +835,13 @@ class ReviewCorrectionCycleTests(PipelineHarness):
             self.config(review_repair=2), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "IMPLEMENTATION")],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
         failure = self.state()["failure"]
         self.assertEqual(failure["reason"], "WAITING_REPAIR_EXHAUSTED")
         self.assertEqual(failure["detail"]["last_review_cycle"], 3)
         self.assertEqual(failure["detail"]["corrections_used"], 2)
         self.assertTrue(failure["detail"]["same_findings_as_previous_cycle"])
-        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
+        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
         self.assertEqual(len(self.reviewer.requests), 3)
         self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser"])
 
@@ -1460,10 +1474,10 @@ class GitChainAndTraceTests(PipelineHarness):
         )
         with mock.patch(
             "metaharness.orchestration.check_repair.GateAcceptanceService.accept",
-            side_effect=RuntimeError("crash after green evidence"),
+            side_effect=PipelineFailure("CHECK_INFRASTRUCTURE_UNAVAILABLE", "acceptance service unavailable"),
         ):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_CHECK_INFRASTRUCTURE)
         self.assertFalse(
             (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").exists()
         )
@@ -1529,7 +1543,7 @@ class GitChainAndTraceTests(PipelineHarness):
             reviewer=[review("REVISE", "IMPLEMENTATION"), LLMError("transport down")],
         )
         failed = orchestrator.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "REVIEWER_TRANSPORT_FAILURE")
         checkpoint = self.checkpoint()
         self.assertEqual((checkpoint["phase"], checkpoint["review_cycle"]), ("final_review", 2))
@@ -1586,7 +1600,7 @@ class GitChainAndTraceTests(PipelineHarness):
         failed = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run", run_options=options)
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_UNAVAILABLE")
         self.assertEqual(
             (self.checkpoint()["phase"], self.checkpoint()["check_repair_attempt"]),
@@ -1754,7 +1768,7 @@ class GitChainAndTraceTests(PipelineHarness):
         result = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "EXTERNAL_AUTH_REQUIRED")
         self.assertEqual(self.workers.roles(), ["implementer"])
 

@@ -240,6 +240,7 @@ class RunStatus(StrEnum):
     WAITING_HUMAN = "waiting_human"
     AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
     WAITING_SCOPE_APPROVAL = "waiting_scope_approval"
+    WAITING_EXTERNAL = "waiting_external"
     WAITING_CHECK_INFRASTRUCTURE = "waiting_check_infrastructure"
     WAITING_REMOTE = "waiting_remote"
     PLAN_REJECTED = "plan_rejected"

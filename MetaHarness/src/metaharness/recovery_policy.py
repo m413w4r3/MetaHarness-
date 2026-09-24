@@ -107,8 +107,6 @@ _HARD_STOP_CODES = frozenset({
     "UNEXPECTED_HEAD", "UNEXPECTED_TREE", "TREE_MISMATCH",
     "INTEGRITY_MISMATCH", "HEAD_MISMATCH", "BRANCH_MISMATCH",
     "COMMIT_TREE_MISMATCH", "BASE_MOVED_SINCE_RUN",
-    "CHECK_REPAIR_EXHAUSTED", "CHECK_INFRA_RETRIES_EXHAUSTED",
-    "TRANSIENT_ATTEMPTS_EXHAUSTED",
     "CHECK_MUTATED_FORBIDDEN_FILES",
     "REMOTE_AUTHORITY_MISMATCH",
     "APPROVAL_IDENTITY_MISMATCH", "RESUME_IDENTITY_INVALID",
@@ -144,7 +142,7 @@ def classify_failure(
     fallback_executor_available: bool = False,
     budget_exhausted: bool = False,
 ) -> RecoveryDecision:
-    """Classify stable failure facts; unknown failures default to bounded replan.
+    """Classify stable failure facts; unknown failures fail closed.
 
     ``failure`` may include a check ID suffix (for example
     ``CHECK_FAILED:unit``); only its stable code is consulted.
@@ -169,6 +167,14 @@ def classify_failure(
         return decision(RecoveryDisposition.HARD_STOP, "tree changed outside approved scope")
     if not rollback_succeeded:
         return decision(RecoveryDisposition.HARD_STOP, "rollback did not restore the expected tree")
+    if code in {"CHECK_REPAIR_EXHAUSTED", "DETERMINISTIC_GATE_FAILED", "WAITING_REPAIR_EXHAUSTED", "REVIEW_EVIDENCE_UNRESOLVED", "HUMAN_REQUIRED"}:
+        return decision(RecoveryDisposition.WAIT_HUMAN, "correctness repair or operator decision is required")
+    if code == "CHECK_INFRA_RETRIES_EXHAUSTED":
+        return decision(RecoveryDisposition.WAIT_EXTERNAL, "check infrastructure retries were exhausted")
+    if code == "TRANSIENT_ATTEMPTS_EXHAUSTED":
+        return decision(RecoveryDisposition.WAIT_EXTERNAL, "external executor retries were exhausted")
+    if code == "CHECK_REPAIR_UNAVAILABLE":
+        return decision(RecoveryDisposition.WAIT_EXTERNAL, "check repair executor is unavailable")
     if code in {
         "CHECK_INFRASTRUCTURE_UNAVAILABLE", "CHECK_SIDE_EFFECT_REPEATED",
         "CHECK_SIDE_EFFECT_UNSTABLE",
@@ -179,9 +185,7 @@ def classify_failure(
         "WORKSPACE_SETUP_FAILED", "WORKSPACE_SETUP_TIMEOUT",
     }:
         return decision(RecoveryDisposition.WAIT_EXTERNAL, "bounded infrastructure retries were exhausted")
-    if code in {"WAITING_REPAIR_EXHAUSTED", "REVIEW_EVIDENCE_UNRESOLVED"} or (
-        code == "REVIEWER_TRANSPORT_FAILURE" and budget_exhausted
-    ):
+    if code == "REVIEWER_TRANSPORT_FAILURE" and budget_exhausted:
         return decision(
             RecoveryDisposition.WAIT_EXTERNAL,
             "review is retained at its final-review checkpoint for retry or operator action",
@@ -198,13 +202,19 @@ def classify_failure(
         if remote_unavailable:
             return decision(RecoveryDisposition.WAIT_EXTERNAL, "required remote is temporarily unavailable")
         if budget_exhausted:
-            return decision(RecoveryDisposition.HARD_STOP, "required remote publication retries were exhausted")
+            return decision(RecoveryDisposition.WAIT_EXTERNAL, "required remote publication retries were exhausted")
         return decision(RecoveryDisposition.RETRY_SAME, "required remote publication did not complete", consumes=True)
-    if budget_exhausted:
-        return decision(RecoveryDisposition.HARD_STOP, "bounded recovery budget exhausted")
-
     if code in _AUTH_CODES or code.startswith(("LLM_401", "LLM_403")):
         return decision(RecoveryDisposition.WAIT_EXTERNAL, "credentials or external authorization required")
+    if budget_exhausted:
+        if code in _TRANSIENT_AGENT_CODES or code in _TRANSIENT_EXTERNAL_CODES or code.startswith(("LLM_5", "LLM_429", "LLM_HTTP_5", "LLM_HTTP_429")) or code in {"REVIEW_TRANSPORT_FAILURE", "REVIEWER_TRANSPORT_FAILURE"}:
+            return decision(RecoveryDisposition.WAIT_EXTERNAL, "external recovery budget exhausted")
+        if code.startswith(("REVIEW_FORMAT_INVALID", "REVIEWER_OUTPUT_INVALID", "REVIEW_PARSE")):
+            return decision(RecoveryDisposition.WAIT_HUMAN, "review repair budget exhausted")
+        if code in {"PLAN_REPOSITORY_PRECONDITION_INVALID", "PLAN_REPOSITORY_PRECONDITION_ERROR", "PLANNER_REPOSITORY_PRECONDITION_ERROR"}:
+            return decision(RecoveryDisposition.WAIT_HUMAN, "planning correction budget exhausted")
+        return decision(RecoveryDisposition.HARD_STOP, "bounded recovery budget exhausted")
+
     if code in {"CANDIDATE_REMOTE_UNAVAILABLE", "REMOTE_UNAVAILABLE"}:
         return decision(
             RecoveryDisposition.WAIT_EXTERNAL if remote_required else RecoveryDisposition.CONTINUE_WITH_WARNING,
@@ -254,7 +264,7 @@ def classify_failure(
     if code in {"REVIEWER_TRANSPORT_FAILURE", "REVIEW_TRANSPORT_FAILURE"}:
         return decision(RecoveryDisposition.RETRY_SAME, "review transport can be retried", consumes=True)
 
-    return decision(RecoveryDisposition.REPLAN, "unclassified failure is recoverable by bounded replan", consumes=True)
+    return decision(RecoveryDisposition.HARD_STOP, "unclassified failure has no authorized automatic recovery")
 
 
 __all__ = [

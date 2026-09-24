@@ -664,6 +664,7 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_codex_exit_one_creates_no_harness_commit(self) -> None:
         _, _, state = self.run_case(codex_behavior="fail")
+        self.assertEqual(state["status"], RunStatus.WAITING_EXTERNAL.value)
         self.assertEqual(state["failure"]["reason"], "AGENT_RUNTIME_FAILED")
         self.assertEqual(git(self.root / "worktrees" / "run-1", "rev-list", "--count", "HEAD"), "1")
         self.assertEqual(state["recovery_counters"]["agent-step:001:S01"], 2)
@@ -676,6 +677,10 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.assertEqual(sum(item["event"] == "recovery.started" for item in recovery), 2)
         self.assertEqual(sum(item["event"] == "recovery.completed" for item in recovery), 2)
         self.assertEqual(sum(item["event"] == "recovery.exhausted" for item in recovery), 1)
+        exhausted = next(item["data"] for item in recovery if item["event"] == "recovery.exhausted")
+        self.assertEqual(exhausted["terminal_disposition"], "wait_external")
+        self.assertEqual(exhausted["terminal_status"], RunStatus.WAITING_EXTERNAL.value)
+        self.assertEqual(exhausted["checkpoint_phase"], "implement_step")
         self.assertTrue(all(
             {"reason", "disposition", "attempt", "tree_before", "tree_after", "budget_remaining"}
             <= set(item["data"])
@@ -720,7 +725,7 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_commit_is_impossible_without_both_gates(self) -> None:
         _, llm, state = self.run_case(check_fail=True, review=PASS_REVIEW)
-        self.assertEqual(state["status"], RunStatus.FAILED.value)
+        self.assertEqual(state["status"], RunStatus.WAITING_HUMAN.value)
         self.assertEqual(state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
         # The deterministic gate precedes the immutable candidate and review.
         self.assertEqual(llm.reviewer_calls, 0)

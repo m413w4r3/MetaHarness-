@@ -326,6 +326,7 @@ from .orchestration.pipeline_v2 import (
     pre_semantic_gate_stage,
     step_dir as cycle_step_dir,
 )
+from .orchestration.recovery import terminal_state_for
 from .orchestration.resume_validation import (
     ResumedRun,
     _accepted_review,
@@ -703,6 +704,8 @@ class Orchestrator:
         cycle: int | None = None,
         step_id: str | None = None,
         recovered: bool | None = None,
+        terminal_status: RunStatus | None = None,
+        checkpoint_phase: ResumePhase | None = None,
     ) -> None:
         """Record one secret-free recovery transition with its tree boundary."""
 
@@ -716,6 +719,24 @@ class Orchestrator:
         }
         if recovered is not None:
             data["recovered"] = recovered
+        if event == "recovery.exhausted":
+            checkpoint_phase = checkpoint_phase or {
+                "implementation": ResumePhase.IMPLEMENT_STEP,
+                "workspace setup": ResumePhase.WORKTREE_SETUP,
+                "review": ResumePhase.FINAL_REVIEW,
+                "checks": ResumePhase.DETERMINISTIC_GATE,
+                "planning": ResumePhase.PLANNER,
+            }.get(phase)
+            if terminal_status is None and checkpoint_phase is not None:
+                try:
+                    terminal_status = terminal_state_for(
+                        decision, failure_code=reason, phase=checkpoint_phase,
+                    ).status
+                except ValueError:
+                    terminal_status = RunStatus.FAILED
+            data["terminal_disposition"] = decision.disposition.value
+            data["terminal_status"] = terminal_status.value if terminal_status else RunStatus.FAILED.value
+            data["checkpoint_phase"] = checkpoint_phase.value if checkpoint_phase else phase
         self._trace_emit(
             event, phase=phase, cycle=cycle, step_id=step_id, data=data,
         )
@@ -2200,6 +2221,8 @@ class Orchestrator:
             exhausted = failure.reason in {
                 "CHECK_REPAIR_EXHAUSTED", "CHECK_INFRA_RETRIES_EXHAUSTED",
                 "TRANSIENT_ATTEMPTS_EXHAUSTED", "WAITING_REPAIR_EXHAUSTED",
+                "REVIEWER_TRANSPORT_FAILURE", "REVIEW_TRANSPORT_FAILURE",
+                "REVIEW_FORMAT_INVALID", "REVIEWER_OUTPUT_INVALID",
             }
             if (
                 failure.reason == "DETERMINISTIC_GATE_FAILED"
@@ -2226,40 +2249,57 @@ class Orchestrator:
                 failure.reason, budget_exhausted=exhausted,
                 remote_required=remote_required, remote_unavailable=remote_required,
             )
-            if failure.reason != "CHECK_TIMEOUT" and decision.disposition in {
-                RecoveryDisposition.HARD_STOP, RecoveryDisposition.WAIT_EXTERNAL,
-            }:
-                state = store.load()
-                tree = state.get("staged_tree_sha")
-                if not isinstance(tree, str):
-                    tree = _safe_candidate_tree(pipeline.info.worktree)
-                repair_state = state.get("check_repair")
-                used = repair_state.get("attempt_count", 0) if isinstance(repair_state, dict) else 0
-                attempt = used + 1 if isinstance(used, int) and not isinstance(used, bool) else 1
-                phase = state.get("status")
+            checkpoint = read_checkpoint(pipeline.run_dir)
+            checkpoint_phase = checkpoint.phase if checkpoint is not None else start.phase
+            try:
+                terminal = terminal_state_for(
+                    decision, failure_code=failure.reason, phase=checkpoint_phase,
+                )
+            except ValueError:
+                # A coordinator must consume recoverable dispositions before exit.
+                # An escaped operation cannot authorize an automatic replan.
+                decision = RecoveryDecision(
+                    RecoveryDisposition.HARD_STOP,
+                    "recovery operation escaped its coordinator", False, False,
+                )
+                terminal = terminal_state_for(
+                    decision, failure_code=failure.reason, phase=checkpoint_phase,
+                )
+            state = store.load()
+            tree = state.get("staged_tree_sha")
+            if not isinstance(tree, str):
+                tree = _safe_candidate_tree(pipeline.info.worktree)
+            repair_state = state.get("check_repair")
+            used = repair_state.get("attempt_count", 0) if isinstance(repair_state, dict) else 0
+            attempt = used + 1 if isinstance(used, int) and not isinstance(used, bool) else 1
+            phase = state.get("status")
+            self._trace_recovery(
+                "recovery.classified", reason=failure.reason,
+                decision=decision, attempt=attempt,
+                tree_before=tree, tree_after=_safe_candidate_tree(pipeline.info.worktree),
+                budget_remaining=(
+                    0 if exhausted else pipeline.options.recovery.max_transient_attempts
+                ),
+                phase=phase if isinstance(phase, str) else "run",
+                cycle=state.get("cycle") if isinstance(state.get("cycle"), int) else None,
+                step_id=failure.step_id,
+            )
+            if exhausted or terminal.status is not RunStatus.FAILED:
                 self._trace_recovery(
-                    "recovery.classified", reason=failure.reason,
+                    "recovery.exhausted", reason=failure.reason,
                     decision=decision, attempt=attempt,
                     tree_before=tree, tree_after=_safe_candidate_tree(pipeline.info.worktree),
-                    budget_remaining=(
-                        0 if exhausted else pipeline.options.recovery.max_transient_attempts
-                    ),
+                    budget_remaining=0,
                     phase=phase if isinstance(phase, str) else "run",
                     cycle=state.get("cycle") if isinstance(state.get("cycle"), int) else None,
                     step_id=failure.step_id,
+                    terminal_status=terminal.status,
+                    checkpoint_phase=checkpoint_phase,
                 )
-                if exhausted:
-                    self._trace_recovery(
-                        "recovery.exhausted", reason=failure.reason,
-                        decision=decision, attempt=attempt,
-                        tree_before=tree, tree_after=_safe_candidate_tree(pipeline.info.worktree),
-                        budget_remaining=0,
-                        phase=phase if isinstance(phase, str) else "run",
-                        cycle=state.get("cycle") if isinstance(state.get("cycle"), int) else None,
-                        step_id=failure.step_id,
-                    )
             return self._v2_failed(
                 store, pipeline.run_dir, failure.reason, failure.step_id, failure.detail,
+                terminal_status=terminal.status,
+                auto_resumable=terminal.resumable,
             )
         except StepExecutionFailure as failure:
             return self._step_failed(store, pipeline.run_dir, failure)
@@ -5543,6 +5583,12 @@ class Orchestrator:
     def _step_failed(
         self, store: RunStateStore, run_dir: Path, failure: StepExecutionFailure,
     ) -> RunResult:
+        checkpoint = read_checkpoint(run_dir)
+        decision = classify_failure(failure.reason, budget_exhausted=True)
+        terminal = terminal_state_for(
+            decision, failure_code=failure.reason,
+            phase=checkpoint.phase if checkpoint else ResumePhase.IMPLEMENT_STEP,
+        )
         self._trace_emit(
             "step.failed",
             phase="implementation",
@@ -5568,6 +5614,8 @@ class Orchestrator:
             initial_mismatch=failure.initial_mismatch,
             index_tree_after=failure.index_tree_after,
             step_dir=failure.step_dir,
+            terminal_status=terminal.status,
+            auto_resumable=terminal.resumable,
         )
 
     def _accept_v2_step_tree(
@@ -6639,7 +6687,25 @@ class Orchestrator:
         initial_mismatch: str | None = None,
         index_tree_after: str | None = None,
         step_dir: Path | None = None,
+        terminal_status: RunStatus = RunStatus.FAILED,
+        auto_resumable: bool | None = None,
     ) -> RunResult:
+        if terminal_status is RunStatus.FAILED and reason in {
+            "CHECK_INFRASTRUCTURE_UNAVAILABLE", "CHECK_SIDE_EFFECT_REPEATED",
+            "CHECK_INFRA_RETRIES_EXHAUSTED", "PUSH_FAILED",
+            "CHECK_REPAIR_EXHAUSTED", "WAITING_REPAIR_EXHAUSTED",
+            "REVIEW_EVIDENCE_UNRESOLVED", "HUMAN_REQUIRED",
+            "EXTERNAL_AUTH_REQUIRED",
+        }:
+            checkpoint = read_checkpoint(run_dir)
+            decision = classify_failure(
+                reason, remote_required=reason == "PUSH_FAILED",
+                remote_unavailable=reason == "PUSH_FAILED", budget_exhausted=True,
+            )
+            terminal_status = terminal_state_for(
+                decision, failure_code=reason,
+                phase=checkpoint.phase if checkpoint else ResumePhase.IMPLEMENT_STEP,
+            ).status
         if reason == "CHECK_REPAIR_EXHAUSTED":
             self._trace_emit(
                 "check_repair.exhausted",
@@ -6653,12 +6719,16 @@ class Orchestrator:
         except (OSError, ValueError):
             pass
         state = store.load()
-        fields = _terminal_step_fields(state, step_id)
+        fields = _terminal_step_fields(
+            state, step_id, "waiting" if terminal_status is not RunStatus.FAILED else "failed",
+        )
+        if auto_resumable is not None:
+            fields["recovery_resumable"] = auto_resumable
         cycles = list(state.get("cycles") or [])
         current_cycle = state.get("cycle", 1)
         for index, cycle in enumerate(cycles):
             if isinstance(cycle, dict) and cycle.get("number") == current_cycle:
-                cycles[index] = {**cycle, "status": "failed", "failure": reason}
+                cycles[index] = {**cycle, "status": "waiting" if terminal_status is not RunStatus.FAILED else "failed", "failure": reason}
                 break
         if cycles:
             fields["cycles"] = cycles
@@ -6700,18 +6770,17 @@ class Orchestrator:
                        if index_tree_after else {}),
                     "usage": step_usage,
                 }))
-        state = store.record_failure(
-            reason,
-            redact(detail, self._secrets) if detail is not None else None,
-            **fields,
-        )
-        if reason in {"CHECK_INFRASTRUCTURE_UNAVAILABLE", "CHECK_SIDE_EFFECT_REPEATED"}:
-            state = store.update(status=RunStatus.WAITING_CHECK_INFRASTRUCTURE)
-            return RunResult(run_dir, RunStatus.WAITING_CHECK_INFRASTRUCTURE, state)
-        if reason == "PUSH_FAILED":
-            state = store.update(status=RunStatus.WAITING_REMOTE)
-            return RunResult(run_dir, RunStatus.WAITING_REMOTE, state)
-        return RunResult(run_dir, RunStatus.FAILED, state)
+        if terminal_status is RunStatus.FAILED:
+            state = store.record_failure(
+                reason, redact(detail, self._secrets) if detail is not None else None,
+                **fields,
+            )
+        else:
+            failure = {"reason": reason}
+            if detail is not None:
+                failure["detail"] = redact(detail, self._secrets)
+            state = store.update(status=terminal_status, failure=failure, **fields)
+        return RunResult(run_dir, terminal_status, state)
 
     def _cleanup_published_run_branch(
         self,

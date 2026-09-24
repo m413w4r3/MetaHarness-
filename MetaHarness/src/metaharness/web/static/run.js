@@ -14,7 +14,16 @@
   var POLL_MS = 2000;
   var STOP_STATUSES = {
     committed: true, published: true, failed: true, blocked: true,
-    plan_rejected: true, interrupted: true, awaiting_plan_approval: true
+    plan_rejected: true, interrupted: true, awaiting_plan_approval: true,
+    waiting_human: true, waiting_external: true,
+    waiting_check_infrastructure: true, waiting_remote: true,
+    waiting_scope_approval: true
+  };
+  var WAITING_LABELS = {
+    waiting_external: "Waiting for external authorization",
+    waiting_check_infrastructure: "Waiting for check infrastructure",
+    waiting_remote: "Waiting for remote",
+    waiting_human: "Waiting for operator decision"
   };
   var SYMBOLS = {complete: "✓", running: "▶", failed: "✗", waiting: "·", resumable: "↻", skipped: "–"};
   var STATES = ["complete", "running", "failed", "waiting", "resumable", "skipped"];
@@ -95,7 +104,7 @@
       return;
     }
     var status = typeof payload.status === "string" ? payload.status : "";
-    setText("live-status", status.toUpperCase());
+    setText("live-status", WAITING_LABELS[status] || status.toUpperCase());
     setText("live-updated", typeof payload.updated_at === "string" ? payload.updated_at : "");
     setText("live-current", typeof payload.current_label === "string" ? payload.current_label : "—");
     setText("live-next", typeof payload.next_label === "string" ? payload.next_label : "—");
