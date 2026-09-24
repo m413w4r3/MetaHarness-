@@ -77,8 +77,9 @@ Tapping a card (or creating a run) opens it read-only. Each pass reads
 | implementation steps | `implementation_bundle.steps`, each showing `id`, `title`, `execution_class` and the profile: `profile_id` from `state.steps`, else `recommended_profile` from `state.planner.steps` |
 
 Every field is optional and type-checked, so a run whose document is still
-incomplete renders what it has instead of failing. The only route of this
-screen that can change a run is the plan decision below, and it is sent only
+incomplete renders what it has instead of failing. The routes of this screen
+that can change a run are the operator blocks below — the plan decision, the
+scope decision, the replacement plan and the resume — and each one is sent only
 when the operator asks for it.
 
 Progress is incremental: the offset starts at `0` and every answer replaces it
@@ -226,6 +227,36 @@ The resume request may have been accepted.
 Refresh before retrying.
 ```
 
+## Recover plan
+
+While the run offers a plan recovery, a `RECOVER PLAN` block appears below the
+scope approval. It is shown only when both conditions hold:
+
+```text
+plan_recovery.eligible == true
+capabilities.recover_plan != false
+```
+
+The block shows `plan_recovery.reason`, the plan the run rejected
+(`planner_raw`, else `plan.raw`, bounded like the plan of the screen), a
+`Replacement META PLAN v2` field, and the size of what it holds against
+`plan_recovery.max_bytes`, counted in UTF-8 bytes the way the gateway counts
+them. `REPLACE PLAN` stays disabled until the replacement holds text and fits
+the bound, and it opens a confirmation that states what the replacement does
+before the single `POST /v1/runs/<run_id>/recover-plan` leaves the phone:
+
+```json
+{"plan": "STATUS: READY\n..."}
+```
+
+Nothing but the bound is judged here: the replacement goes back through the
+exact parser and policies a planner answer goes through, so MetaHarness decides
+whether it is a plan. A recovery that timed out may have been recorded, so it is
+never sent again; the screen reads `GET /v1/runs/<run_id>` again whatever the
+answer was — that read, not a second replacement, tells the operator where the
+run stands — and the block disappears with the refreshed state once the plan is
+the run's plan authority.
+
 ## New Run screen
 
 `+ NEW RUN` opens a form with one `SPEC`, one optional `Run ID` and one
@@ -271,6 +302,7 @@ gateway, built from a `baseUrl`, the in-memory `remoteToken` and an injected
 | `approveRun(runId, payload)` | `POST /v1/runs/<run_id>/approval` |
 | `approveScope(runId, decision)` | `POST /v1/runs/<run_id>/scope-approval` |
 | `resumeRun(runId)` | `POST /v1/runs/<run_id>/resume` |
+| `recoverPlan(runId, plan)` | `POST /v1/runs/<run_id>/recover-plan` |
 
 Every call is one exchange with no retry, carries the bearer token and
 `Accept: application/json`, reads at most 2 MiB, and raises
@@ -283,4 +315,6 @@ fields are typed. `approveRun(runId, payload)` takes the external approval body
 described above and answers the decision the gateway recorded.
 `approveScope(runId, decision)` sends the decision alone — the delta stays the
 one the gateway recorded — and `resumeRun(runId)` sends the empty document the
-resume route requires.
+resume route requires. `recoverPlan(runId, plan)` sends the replacement text
+alone, bounded to the 2 MiB `MAX_REPLACEMENT_PLAN_BYTES` of the gateway, and
+refuses an empty or oversized plan before any request.

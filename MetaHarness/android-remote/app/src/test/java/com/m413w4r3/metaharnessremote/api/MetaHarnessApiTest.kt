@@ -536,4 +536,48 @@ class MetaHarnessApiTest {
         assertEquals(1, interceptor.requests.size)
         assertEquals("POST", interceptor.requests.single().method)
     }
+
+    @Test
+    fun `recover plan posts the replacement once`() = runBlocking {
+        val (api, interceptor) = apiReturning(
+            """{"ok":true,"run_id":"run-1","location":"/runs/run-1"}""",
+            code = 202,
+        )
+
+        api.recoverPlan("run-1", "STATUS: READY\nPLAN")
+
+        val request = interceptor.requests.single()
+        assertEquals("POST", request.method)
+        assertEquals("$baseUrl/v1/runs/run-1/recover-plan", request.url.toString())
+        assertEquals("Bearer $token", request.header("Authorization"))
+        assertEquals("application/json", request.header("Accept"))
+        assertEquals("application/json", request.header("Content-Type"))
+        assertEquals("""{"plan":"STATUS: READY\nPLAN"}""", bodyOf(request))
+    }
+
+    @Test
+    fun `recover plan refuses an empty or oversized plan before any request`() {
+        val (api, interceptor) = apiReturning("{}")
+        val oversized = "x".repeat(MetaHarnessApi.MAX_REPLACEMENT_PLAN_BYTES + 1)
+
+        listOf("", "   ", oversized).forEach { plan ->
+            assertThrows(IllegalArgumentException::class.java) {
+                runBlocking { api.recoverPlan("run-1", plan) }
+            }
+        }
+        assertTrue(interceptor.requests.isEmpty())
+    }
+
+    @Test
+    fun `a timed out replacement is reported once and never retried`() {
+        val (api, interceptor) = apiWith { throw SocketTimeoutException("timeout") }
+
+        val failure = assertThrows(MetaHarnessTimeoutException::class.java) {
+            runBlocking { api.recoverPlan("run-1", "PLAN") }
+        }
+
+        assertNull(failure.statusCode)
+        assertEquals(1, interceptor.requests.size)
+        assertEquals("POST", interceptor.requests.single().method)
+    }
 }

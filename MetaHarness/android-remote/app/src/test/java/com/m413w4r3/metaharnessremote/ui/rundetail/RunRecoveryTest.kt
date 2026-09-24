@@ -44,6 +44,21 @@ private fun resumeDocument(
 private fun documentWithoutResume(): JsonObject =
     document("""{"status": "implementing", "overview": {"current_label": "Implement"}}""")
 
+private fun recoveryDocument(
+    recovery: String = """{"eligible": true, "reason": "PLANNER_OUTPUT_INVALID", "max_bytes": 1048576}""",
+    plan: String = """{"raw": "rejected plan"}""",
+    plannerRaw: String? = null,
+): JsonObject = document(
+    """
+    {
+      "status": "failed",
+      "plan_recovery": $recovery,
+      "plan": $plan,
+      "planner_raw": ${plannerRaw?.let { "\"$it\"" } ?: "null"}
+    }
+    """,
+)
+
 class RunRecoveryTest {
 
     @Test
@@ -155,5 +170,93 @@ class RunRecoveryTest {
         )
         assertEquals("Refused: run is not resumable", resumeFailure(refused))
         assertEquals("Request failed", resumeFailure(MetaHarnessException(null, "Request failed")))
+    }
+
+    @Test
+    fun `the recovery block needs an eligible run and no refused capability`() {
+        assertTrue(planRecoverable(recoveryDocument()))
+        assertTrue(planRecoveryGate(recoveryDocument(), null) != null)
+        assertTrue(planRecoveryGate(recoveryDocument(), document("""{"recover_plan": true}""")) != null)
+        assertTrue(planRecoveryGate(recoveryDocument(), document("""{"recover_plan": "no"}""")) != null)
+
+        assertFalse(planRecoverable(recoveryDocument(recovery = """{"eligible": false, "reason": "not v2"}""")))
+        assertNull(planRecoveryGate(recoveryDocument(recovery = """{"eligible": "yes"}"""), null))
+        assertNull(planRecoveryGate(recoveryDocument(recovery = """{"reason": "no eligible field"}"""), null))
+        assertNull(planRecoveryGate(document("{}"), null))
+        assertNull(planRecoveryGate(recoveryDocument(), document("""{"recover_plan": false}""")))
+    }
+
+    @Test
+    fun `the block shows the reason, the bound and the rejected plan`() {
+        val gate = planRecoveryGate(recoveryDocument(), null)!!
+
+        assertEquals("PLANNER_OUTPUT_INVALID", gate.reason)
+        assertEquals(1048576L, gate.maxBytes)
+        assertEquals("rejected plan", gate.rejectedPlan)
+
+        val plannerRaw = recoveryDocument(plan = """{"raw": "published plan"}""", plannerRaw = "PLANNER RAW")
+        assertEquals("PLANNER RAW", planRecoveryGate(plannerRaw, null)!!.rejectedPlan)
+
+        val bare = planRecoveryGate(
+            recoveryDocument(recovery = """{"eligible": true, "max_bytes": "2048"}"""),
+            null,
+        )!!
+        assertNull(bare.reason)
+        assertEquals(2048L, bare.maxBytes)
+        assertNull(planRecoveryGate(recoveryDocument(recovery = """{"eligible": true}"""), null)!!.maxBytes)
+        assertNull(planRecoveryGate(recoveryDocument(recovery = """{"eligible": true, "max_bytes": -1}"""), null)!!.maxBytes)
+        assertNull(planRecoveryGate(recoveryDocument(plan = "null"), null)!!.rejectedPlan)
+    }
+
+    @Test
+    fun `the rejected plan is bounded like the plan of the screen`() {
+        val long = recoveryDocument(plan = """{"raw": "${"x".repeat(MAX_FREE_TEXT_CHARS * 3)}"}""")
+
+        assertEquals(MAX_FREE_TEXT_CHARS + 1, planRecoveryGate(long, null)!!.rejectedPlan?.length)
+    }
+
+    @Test
+    fun `a replacement must hold text and fit the published bound`() {
+        assertEquals(0L, replacementPlanBytes(""))
+        assertEquals(1L, replacementPlanBytes("a"))
+        assertEquals(2L, replacementPlanBytes("é"))
+
+        assertTrue(replacementPlanAccepted("PLAN", 4, 4))
+        assertFalse(replacementPlanAccepted("PLAN", 5, 4))
+        assertFalse(replacementPlanAccepted("   ", 3, 4))
+        assertFalse(replacementPlanAccepted("PLAN", 4, null))
+        assertFalse(replacementPlanAccepted("PLAN", 4, 0))
+    }
+
+    @Test
+    fun `the confirmation states what a replacement does`() {
+        assertEquals(
+            "Replace the rejected plan with this META PLAN v2?\n" +
+                "MetaHarness will validate it before continuing.",
+            RECOVER_CONFIRMATION_MESSAGE,
+        )
+    }
+
+    @Test
+    fun `a timed out replacement says it may have been recorded and is not retried`() {
+        assertEquals(
+            "Response timed out.\n" +
+                "The replacement plan may have been recorded.\n" +
+                "The run is read again to show what it recorded.",
+            recoverFailure(MetaHarnessTimeoutException("Response timed out")),
+        )
+
+        val refused = MetaHarnessException(
+            statusCode = 409,
+            message = "Gateway replied HTTP 409",
+            payload = JsonParser.parseString(
+                """{"message": "plan recovery refused: run is not at its PLANNER checkpoint"}""",
+            ),
+        )
+        assertEquals(
+            "Refused: plan recovery refused: run is not at its PLANNER checkpoint",
+            recoverFailure(refused),
+        )
+        assertEquals("Request failed", recoverFailure(MetaHarnessException(null, "Request failed")))
     }
 }

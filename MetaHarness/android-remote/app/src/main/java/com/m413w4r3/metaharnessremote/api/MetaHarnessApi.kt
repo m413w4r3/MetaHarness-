@@ -149,6 +149,27 @@ class MetaHarnessApi(
         post("${runPath(runId)}$RESUME_PATH", EMPTY_BODY, JsonObject::class.java)
     }
 
+    /**
+     * `POST /v1/runs/{runId}/recover-plan` with the operator's META PLAN v2
+     * [plan].
+     *
+     * The body carries the replacement text alone: SPEC, context, BASE, run
+     * options and catalogues stay those of the run, and no model is called.
+     * The text goes back through the exact parser and policies a planner answer
+     * goes through, so a replacement the gateway refuses is reported by the
+     * gateway, never judged here.
+     *
+     * Exactly one exchange is sent — nothing is retried, because a replacement
+     * that timed out may still have been recorded.
+     */
+    suspend fun recoverPlan(runId: String, plan: String) {
+        require(plan.isNotBlank()) { "plan must not be empty" }
+        require(plan.toByteArray(Charsets.UTF_8).size <= MAX_REPLACEMENT_PLAN_BYTES) { "plan is too large" }
+        val payload = JsonObject()
+        payload.addProperty(PLAN, plan)
+        post("${runPath(runId)}$RECOVER_PLAN_PATH", gson.toJson(payload), JsonObject::class.java)
+    }
+
     /** `GET <baseUrl><path>` with the bearer token and the JSON accept header. */
     internal fun getRequest(path: String): Request = requestBuilder(path).get().build()
 
@@ -282,6 +303,9 @@ class MetaHarnessApi(
         /** Largest SPEC `POST /v1/runs` accepts, as the local server measures it. */
         const val MAX_SPEC_BYTES = 48 * 1024
 
+        /** Largest replacement plan `POST /v1/runs/{runId}/recover-plan` accepts. */
+        const val MAX_REPLACEMENT_PLAN_BYTES = 2 * 1024 * 1024
+
         /** The run-id charset the gateway and the local server enforce. */
         val RUN_ID_PATTERN = Regex("[A-Za-z0-9][A-Za-z0-9_.-]*")
 
@@ -292,6 +316,7 @@ class MetaHarnessApi(
         private const val APPROVAL_PATH = "/approval"
         private const val SCOPE_APPROVAL_PATH = "/scope-approval"
         private const val RESUME_PATH = "/resume"
+        private const val RECOVER_PLAN_PATH = "/recover-plan"
 
         /** The body of a resume: the empty document, as the gateway requires. */
         private const val EMPTY_BODY = "{}"
@@ -299,6 +324,7 @@ class MetaHarnessApi(
         private const val APPROVE = "APPROVE"
         private const val REJECT = "REJECT"
         private const val DECISION = "decision"
+        private const val PLAN = "plan"
 
         private const val AUTHORIZATION = "Authorization"
         private const val ACCEPT = "Accept"

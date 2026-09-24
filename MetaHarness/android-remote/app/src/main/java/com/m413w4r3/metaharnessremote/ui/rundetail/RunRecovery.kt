@@ -5,14 +5,15 @@ import com.google.gson.JsonObject
 import com.m413w4r3.metaharnessremote.api.MetaHarnessTimeoutException
 
 /**
- * The scope approval and the resume of the Run Detail screen.
+ * The scope approval, the plan recovery and the resume of the Run Detail screen.
  *
- * Both blocks are pure reads of the documents the gateway publishes:
+ * Every block is a pure read of the documents the gateway publishes:
  * `GET /v1/runs/{runId}` carries the repair scope the run requested, the
- * decision already recorded, and the resume checkpoint under `overview.resume`;
+ * decision already recorded, the plan recovery it offers under
+ * `plan_recovery`, and the resume checkpoint under `overview.resume`;
  * `GET /v1/config` carries the capabilities that say whether each action is
- * available at all. Nothing here retries anything: a decision and a resume are
- * single mutations the operator asks for.
+ * available at all. Nothing here retries anything: a decision, a replacement
+ * plan and a resume are single mutations the operator asks for.
  */
 
 /** The status of a run that waits for a decision on its repair scope. */
@@ -23,6 +24,16 @@ data class ScopeGate(val addedPaths: List<String>)
 
 /** The resume of one run: the checkpoint label, when the run publishes one. */
 data class ResumeGate(val label: String?)
+
+/** The plan recovery of one run: why it is offered, and what it accepts. */
+data class PlanRecoveryGate(
+    /** Why the run may recover a plan, when the gateway publishes a reason. */
+    val reason: String?,
+    /** The largest replacement the gateway accepts, in UTF-8 bytes. */
+    val maxBytes: Long?,
+    /** The plan the run rejected, when the document still holds it. */
+    val rejectedPlan: String?,
+)
 
 /**
  * True while the run waits for a scope decision and publishes the delta it
@@ -71,6 +82,80 @@ fun resumeGate(document: JsonObject, capabilities: JsonObject?): ResumeGate? {
     return ResumeGate(document.obj("overview")?.obj("resume")?.text("label"))
 }
 
+/**
+ * True when the run publishes a plan recovery the operator may attempt:
+ * `plan_recovery.eligible == true`, the eligibility the gateway computes from
+ * the durable run shape. The orchestrator re-checks everything, so this is a
+ * gate to show the form, never a promise that a replacement is accepted.
+ */
+fun planRecoverable(document: JsonObject): Boolean =
+    document.obj("plan_recovery")?.bool("eligible") == true
+
+/**
+ * The plan recovery block of one run, or null when it must not be shown:
+ * `plan_recovery.eligible == true`, and no explicit `recover_plan: false`.
+ *
+ * The block only collects the replacement: the text goes back through the
+ * exact parser and policies a planner answer goes through, so validating the
+ * META PLAN v2 document itself stays the gateway's authority.
+ */
+fun planRecoveryGate(document: JsonObject, capabilities: JsonObject?): PlanRecoveryGate? {
+    if (!planRecoverable(document)) return null
+    if (capabilities?.bool("recover_plan") == false) return null
+    val recovery = document.obj("plan_recovery")
+    return PlanRecoveryGate(
+        reason = recovery?.text("reason"),
+        maxBytes = recovery?.bytes("max_bytes"),
+        rejectedPlan = rejectedPlan(document),
+    )
+}
+
+/**
+ * The UTF-8 size of one replacement plan, counted the way the gateway counts
+ * it: the bytes of the text as sent, whitespace included.
+ */
+fun replacementPlanBytes(plan: String): Long = plan.toByteArray(Charsets.UTF_8).size.toLong()
+
+/**
+ * True when [plan] may be sent: it holds text, and its UTF-8 size fits
+ * [maxBytes]. A bound the gateway does not publish — or publishes as zero —
+ * accepts nothing, exactly as the desktop form reads it.
+ */
+fun replacementPlanAccepted(plan: String, bytes: Long, maxBytes: Long?): Boolean =
+    plan.isNotBlank() && maxBytes != null && maxBytes > 0 && bytes <= maxBytes
+
+/**
+ * The confirmation a replacement is sent under.
+ *
+ * A replacement is published as the plan authority of the run, so the operator
+ * states the intent before the single request leaves the phone.
+ */
+const val RECOVER_CONFIRMATION_MESSAGE =
+    "Replace the rejected plan with this META PLAN v2?\n" +
+        "MetaHarness will validate it before continuing."
+
+/**
+ * What a timed-out replacement shows.
+ *
+ * A timeout is not a failure: the request reached the gateway, so the plan may
+ * have been recorded. The run is read again — that read, not a second
+ * replacement, is what tells the operator where the run stands.
+ */
+const val RECOVER_TIMEOUT_MESSAGE =
+    "Response timed out.\n" +
+        "The replacement plan may have been recorded.\n" +
+        "The run is read again to show what it recorded."
+
+/**
+ * The line the plan recovery block shows when the request failed.
+ *
+ * A timeout carries its own words; every other answer is described like one of
+ * a decision — a conflict is prefixed, a refusal keeps the gateway's message —
+ * and nothing is ever sent twice.
+ */
+fun recoverFailure(failure: Throwable): String =
+    if (failure is MetaHarnessTimeoutException) RECOVER_TIMEOUT_MESSAGE else approvalFailure(failure)
+
 /** The body of one scope decision: the decision alone. */
 fun scopeDecisionPayload(decision: String): JsonObject =
     JsonObject().apply { addProperty(DECISION_FIELD, decision) }
@@ -105,6 +190,15 @@ private fun scopeDelta(document: JsonObject): JsonObject? =
     document.obj("scope_delta")?.takeIf { it.size() > 0 }
         ?: document.obj("state")?.obj("scope_delta")?.takeIf { it.size() > 0 }
 
+/**
+ * The plan the run rejected: the planner's raw answer, else the plan the
+ * document publishes. Both are bounded before they are rendered, because the
+ * gateway may hold a whole planner reply in either.
+ */
+private fun rejectedPlan(document: JsonObject): String? =
+    boundedText(document.contents("planner_raw"))
+        ?: boundedText(document.obj("plan")?.contents("raw"))
+
 /** The string entries of one array field, or an empty list when it is absent. */
 private fun JsonObject.strings(key: String): List<String> {
     val array: JsonArray = get(key)?.takeIf { it.isJsonArray }?.asJsonArray ?: return emptyList()
@@ -129,6 +223,20 @@ private fun JsonObject.bool(key: String): Boolean? =
     get(key)
         ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }
         ?.asBoolean
+
+/** The integer at [key], or null when it is absent, negative or not a number. */
+private fun JsonObject.bytes(key: String): Long? {
+    val primitive = get(key)?.takeIf { it.isJsonPrimitive }?.asJsonPrimitive ?: return null
+    val value = if (primitive.isNumber) primitive.asLong else primitive.asString.trim().toLongOrNull()
+    return value?.takeIf { it >= 0 }
+}
+
+/** The string at [key] as sent, or null when it is absent, empty or not a string. */
+private fun JsonObject.contents(key: String): String? =
+    get(key)
+        ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+        ?.asString
+        ?.takeIf { it.isNotEmpty() }
 
 /** The object at [key], or null when it is absent or not an object. */
 private fun JsonObject.obj(key: String): JsonObject? =

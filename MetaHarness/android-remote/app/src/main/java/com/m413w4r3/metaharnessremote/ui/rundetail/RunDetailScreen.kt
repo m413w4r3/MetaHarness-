@@ -21,6 +21,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -64,8 +65,11 @@ import kotlinx.coroutines.delay
  * waits for a repair scope, a `SCOPE APPROVAL` block shows the paths the delta
  * adds and sends one `POST /v1/runs/{runId}/scope-approval` per decision; while
  * the run publishes a resumable checkpoint, a `RESUME` block sends one
- * `POST /v1/runs/{runId}/resume`. Every irreversible or replayable action is
- * confirmed first or reported as possibly applied, and nothing is ever retried.
+ * `POST /v1/runs/{runId}/resume`. While the run offers a plan recovery, a
+ * `RECOVER PLAN` block collects a replacement and sends one
+ * `POST /v1/runs/{runId}/recover-plan` once the operator confirms it. Every
+ * irreversible or replayable action is confirmed first or reported as possibly
+ * applied, and nothing is ever retried.
  */
 @Composable
 fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
@@ -86,6 +90,9 @@ fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
     }
     val scopeActions = remember(viewModel) {
         RunScopeActions(approve = viewModel::approveScope, askReject = viewModel::askScopeReject)
+    }
+    val recoveryActions = remember(viewModel) {
+        RunRecoveryActions(updatePlan = viewModel::updateReplacementPlan, askReplace = viewModel::askRecoverPlan)
     }
     val resumeActions = remember(viewModel) { RunResumeActions(resume = viewModel::resume) }
 
@@ -109,7 +116,7 @@ fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
         state.error?.let { message -> item(key = "error") { Note(message, isError = true) } }
         if (!state.hasLoaded) item(key = "loading") { Note("Loading run…", isError = false) }
         state.detail?.let { detail ->
-            detailItems(detail, state, approvalActions, scopeActions, resumeActions)
+            detailItems(detail, state, approvalActions, scopeActions, recoveryActions, resumeActions)
         }
     }
 
@@ -129,6 +136,13 @@ fun RunDetailScreen(runId: String, modifier: Modifier = Modifier) {
             onDismiss = viewModel::dismissScopeReject,
         )
     }
+    if (state.recovery.confirming) {
+        RecoverPlanDialog(
+            submitting = state.recovery.submitting,
+            onConfirm = viewModel::confirmRecoverPlan,
+            onDismiss = viewModel::dismissRecoverPlan,
+        )
+    }
 }
 
 /** The sections of one loaded run, in the order the screen reads them. */
@@ -137,12 +151,16 @@ private fun LazyListScope.detailItems(
     state: RunDetailUiState,
     actions: RunApprovalActions,
     scopeActions: RunScopeActions,
+    recoveryActions: RunRecoveryActions,
     resumeActions: RunResumeActions,
 ) {
     item(key = "state") { StateCard(detail, state.pollingStopped) }
     if (state.approval.gate != null) item(key = "approval") { ApprovalCard(state.approval, actions) }
     state.scope.gate?.let { gate ->
         item(key = "scope") { ScopeApprovalCard(gate, state.scope, scopeActions) }
+    }
+    state.recovery.gate?.let { gate ->
+        item(key = "recovery") { RecoverPlanCard(gate, state.recovery, recoveryActions) }
     }
     state.resume.gate?.let { gate ->
         item(key = "resume") { ResumeCard(gate, state.resume, resumeActions) }
@@ -216,6 +234,15 @@ data class RunScopeActions(
  * so the card stays a function of the state it renders.
  */
 data class RunResumeActions(val resume: () -> Unit)
+
+/**
+ * What the plan recovery block does; the screen owns the ViewModel that
+ * implements it, so the card stays a function of the state it renders.
+ */
+data class RunRecoveryActions(
+    val updatePlan: (String) -> Unit,
+    val askReplace: () -> Unit,
+)
 
 /**
  * The plan approval of one run: the profiles the decision must name, and the
@@ -558,6 +585,109 @@ private fun RejectScopeDialog(
         },
         dismissButton = {
             TextButton(onClick = onDismiss, enabled = !submitting) { Text("Cancel") }
+        },
+    )
+}
+
+/**
+ * The plan recovery of one run: why the run offers it, the plan it rejected,
+ * and the replacement the operator writes.
+ *
+ * The block only reaches this composable when the run is eligible and the
+ * capability is not explicitly refused, so everything here is about the
+ * replacement itself: it is counted in UTF-8 bytes against the bound the
+ * gateway published, and it leaves the phone only once the operator confirmed
+ * it — the validator that decides is MetaHarness, not this screen.
+ */
+@Composable
+private fun RecoverPlanCard(
+    gate: PlanRecoveryGate,
+    recovery: RunRecoveryUiState,
+    actions: RunRecoveryActions,
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SectionTitle("RECOVER PLAN")
+            Text(
+                text = "The run holds no executable plan: publish a corrected META PLAN v2 for it.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            recovery.error?.let { message -> Note(message, isError = true) }
+            gate.reason?.let { reason -> Field("REASON", reason) }
+            gate.rejectedPlan?.let { rejected ->
+                var showRejected by remember { mutableStateOf(false) }
+                OutlinedButton(onClick = { showRejected = !showRejected }) {
+                    Text(if (showRejected) "HIDE REJECTED PLAN" else "SHOW REJECTED PLAN")
+                }
+                if (showRejected) Body(rejected, mono = true)
+            }
+            OutlinedTextField(
+                value = recovery.replacementPlan,
+                onValueChange = actions.updatePlan,
+                enabled = !recovery.submitting,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Replacement META PLAN v2") },
+                minLines = 12,
+            )
+            val overLimit = gate.maxBytes != null && recovery.replacementBytes > gate.maxBytes
+            Text(
+                text = "${recovery.replacementBytes} / ${gate.maxBytes ?: DASH} bytes UTF-8",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (overLimit) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+            Button(
+                onClick = actions.askReplace,
+                enabled = !recovery.submitting && replacementPlanAccepted(
+                    recovery.replacementPlan,
+                    recovery.replacementBytes,
+                    gate.maxBytes,
+                ),
+            ) {
+                Text("REPLACE PLAN")
+            }
+            if (recovery.submitting) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text(
+                        text = "Sending the replacement plan…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** The replacement is stated before it is sent, and only then is it sent. */
+@Composable
+private fun RecoverPlanDialog(
+    submitting: Boolean,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = { if (!submitting) onDismiss() },
+        title = { Text("Replace the rejected plan?") },
+        text = { Text(RECOVER_CONFIRMATION_MESSAGE) },
+        confirmButton = {
+            TextButton(onClick = onConfirm, enabled = !submitting) {
+                Text("REPLACE PLAN & CONTINUE")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !submitting) { Text("Keep editing") }
         },
     )
 }

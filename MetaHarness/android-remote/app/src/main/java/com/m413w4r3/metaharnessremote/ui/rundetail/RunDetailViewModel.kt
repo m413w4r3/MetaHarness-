@@ -40,6 +40,8 @@ data class RunDetailUiState(
     val approval: RunApprovalUiState = RunApprovalUiState(),
     /** The scope approval block: what it shows and what it is doing. */
     val scope: RunScopeUiState = RunScopeUiState(),
+    /** The plan recovery block: what it shows and what it is doing. */
+    val recovery: RunRecoveryUiState = RunRecoveryUiState(),
     /** The resume block: what it shows and what it is doing. */
     val resume: RunResumeUiState = RunResumeUiState(),
     /**
@@ -92,6 +94,22 @@ data class RunResumeUiState(
     val error: String? = null,
 )
 
+/** Everything the plan recovery block of the Run Detail screen renders. */
+data class RunRecoveryUiState(
+    /** The gate the last run document exposed, or null when there is no block. */
+    val gate: PlanRecoveryGate? = null,
+    /** The replacement the operator typed, kept across passes. */
+    val replacementPlan: String = "",
+    /** Its UTF-8 size, counted when it was typed. */
+    val replacementBytes: Long = 0L,
+    /** One `POST /v1/runs/{runId}/recover-plan` is in flight: no second one starts. */
+    val submitting: Boolean = false,
+    /** Failure of the last replacement, shown above the form. */
+    val error: String? = null,
+    /** The replacement waits for the confirmation before it is sent. */
+    val confirming: Boolean = false,
+)
+
 /**
  * One run: its detail, its progress, and the decisions it may wait for.
  *
@@ -106,8 +124,9 @@ data class RunResumeUiState(
  * screen entry, and keeps the operator's choices across passes. [approve] and
  * [confirmReject] then send at most one `POST /v1/runs/{runId}/approval` each —
  * never two at a time — and every answer, a refusal and a timeout included, is
- * followed by one more [refreshOnce]. [approveScope], [confirmScopeReject] and
- * [resume] follow the same rule for their own route. Nothing is ever retried.
+ * followed by one more [refreshOnce]. [approveScope], [confirmScopeReject],
+ * [confirmRecoverPlan] and [resume] follow the same rule for their own route.
+ * Nothing is ever retried.
  */
 class RunDetailViewModel(
     private val settingsStore: ServerSettingsStore,
@@ -165,6 +184,7 @@ class RunDetailViewModel(
             pollingStopped = interval == null,
             approval = gates.approval,
             scope = gates.scope,
+            recovery = gates.recovery,
             resume = gates.resume,
         )
         return interval
@@ -181,7 +201,7 @@ class RunDetailViewModel(
      * choices. A pass that read no run document leaves the blocks as they were.
      */
     private suspend fun gatePass(api: MetaHarnessApi, document: JsonObject?): GatePass {
-        if (document == null) return GatePass(state.approval, state.scope, state.resume)
+        if (document == null) return GatePass(state.approval, state.scope, state.recovery, state.resume)
         var approval = state.approval
         if (needsCapabilities(document) && approval.capabilities == null) {
             // A capabilities document that cannot be read never hides the block:
@@ -208,13 +228,17 @@ class RunDetailViewModel(
         return GatePass(
             approval = approval.copy(gate = gate, selection = selection),
             scope = scopePass(document, capabilities),
+            recovery = recoveryPass(document, capabilities),
             resume = resumePass(document, capabilities),
         )
     }
 
     /** True when at least one block needs the capabilities of `GET /v1/config`. */
     private fun needsCapabilities(document: JsonObject): Boolean =
-        awaitingPlanDecision(document) || awaitingScopeDecision(document) || resumableRun(document)
+        awaitingPlanDecision(document) ||
+            awaitingScopeDecision(document) ||
+            resumableRun(document) ||
+            planRecoverable(document)
 
     /** The scope block of one pass: the gate of the last run document. */
     private fun scopePass(document: JsonObject, capabilities: JsonObject?): RunScopeUiState {
@@ -226,6 +250,16 @@ class RunDetailViewModel(
     /** The resume block of one pass: the gate of the last run document. */
     private fun resumePass(document: JsonObject, capabilities: JsonObject?): RunResumeUiState =
         state.resume.copy(gate = resumeGate(document, capabilities))
+
+    /**
+     * The plan recovery block of one pass: the gate of the last run document,
+     * and the replacement the operator typed, which every pass keeps.
+     */
+    private fun recoveryPass(document: JsonObject, capabilities: JsonObject?): RunRecoveryUiState {
+        val gate = planRecoveryGate(document, capabilities)
+        val current = state.recovery
+        return current.copy(gate = gate, confirming = current.confirming && gate != null)
+    }
 
     /** The operator chose the reviewer of the plan. */
     fun selectFinalReviewer(profileId: String) {
@@ -429,6 +463,95 @@ class RunDetailViewModel(
         refreshOnce()
     }
 
+    /**
+     * The operator typed in the replacement field. Nothing is sent: the byte
+     * count follows the text, the previous failure is dropped, and a
+     * confirmation already given no longer covers what the field now holds.
+     */
+    fun updateReplacementPlan(plan: String) {
+        val recovery = state.recovery
+        if (recovery.submitting) return
+        state = state.copy(
+            recovery = recovery.copy(
+                replacementPlan = plan,
+                replacementBytes = replacementPlanBytes(plan),
+                error = null,
+                confirming = false,
+            ),
+        )
+    }
+
+    /**
+     * The operator tapped REPLACE PLAN: the confirmation is asked first, and
+     * only for a replacement that holds text and fits the published bound.
+     */
+    fun askRecoverPlan() {
+        val recovery = state.recovery
+        if (recovery.submitting || !recoveryReady()) return
+        state = state.copy(recovery = recovery.copy(confirming = true, error = null))
+    }
+
+    /** The operator closed the confirmation without sending anything. */
+    fun dismissRecoverPlan() {
+        state = state.copy(recovery = state.recovery.copy(confirming = false))
+    }
+
+    /**
+     * The operator confirmed the replacement: exactly one
+     * `POST /v1/runs/{runId}/recover-plan` is sent, and nothing is sent while
+     * one is in flight.
+     */
+    fun confirmRecoverPlan() {
+        val recovery = state.recovery
+        if (recovery.submitting || !recoveryReady()) return
+        when (val baseUrl = GatewayUrls.normalize(settingsStore.loadServerUrl())) {
+            is GatewayUrls.BaseUrl.Invalid ->
+                state = state.copy(recovery = recovery.copy(error = baseUrl.reason, confirming = false))
+
+            is GatewayUrls.BaseUrl.Valid -> {
+                val token = session.remoteToken
+                if (token.isBlank()) {
+                    state = state.copy(recovery = recovery.copy(error = MISSING_TOKEN, confirming = false))
+                } else {
+                    state = state.copy(
+                        recovery = recovery.copy(submitting = true, error = null, confirming = false),
+                    )
+                    viewModelScope.launch {
+                        sendRecovery(
+                            MetaHarnessApi(baseUrl.value, token, httpClient),
+                            recovery.replacementPlan,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * One replacement plan, reported as it ends.
+     *
+     * The run is read again whatever the answer was — a timeout may have been
+     * accepted, and the refreshed run, not a second replacement, tells what
+     * happened. The plan itself is never sent twice.
+     */
+    private suspend fun sendRecovery(api: MetaHarnessApi, plan: String) {
+        val outcome = attempt { api.recoverPlan(runId, plan) }
+        state = state.copy(
+            recovery = state.recovery.copy(
+                submitting = false,
+                error = outcome.exceptionOrNull()?.let(::recoverFailure),
+            ),
+        )
+        refreshOnce()
+    }
+
+    /** True when the replacement the operator typed may be sent. */
+    private fun recoveryReady(): Boolean {
+        val recovery = state.recovery
+        val maxBytes = recovery.gate?.maxBytes ?: return false
+        return replacementPlanAccepted(recovery.replacementPlan, recovery.replacementBytes, maxBytes)
+    }
+
     private fun changeSelection(change: (ApprovalSelection) -> ApprovalSelection) {
         val approval = state.approval
         val selection = approval.selection ?: return
@@ -449,10 +572,11 @@ class RunDetailViewModel(
     private fun describe(failure: Throwable): String =
         failure.message?.trim()?.takeIf { it.isNotEmpty() } ?: failure.javaClass.simpleName
 
-    /** What one pass found for the three operator blocks. */
+    /** What one pass found for the four operator blocks. */
     private data class GatePass(
         val approval: RunApprovalUiState,
         val scope: RunScopeUiState,
+        val recovery: RunRecoveryUiState,
         val resume: RunResumeUiState,
     )
 
