@@ -35,6 +35,7 @@ max_check_infra_retries = 2
 max_review_transport_retries = 2
 max_workspace_setup_retries = 2
 max_contract_repair_output_corrections = 2
+max_contract_repair_planner_restarts = 1
 
 [recovery.execution_fallbacks]
 mechanical = ["codex-luna-xhigh"]

@@ -660,6 +660,11 @@ def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
         body = "\n".join([
             _artifact_text(run_dir, f"{contracts}steps/{step_id}/contract.md", secrets),
             _artifact_json(run_dir, step + "step.json", secrets),
+            # Worker authority (candidate) vs commit-gate authority (acceptance):
+            # differing hashes are an orchestration bug.
+            _artifact_json(run_dir, step + "step_authority.json", secrets),
+            _artifact_json(run_dir, step + "step_candidate.json", secrets),
+            _artifact_json(run_dir, step + "step_acceptance.json", secrets),
             _artifact_text(run_dir, step + "agent.final.md", secrets),
             _artifact_text(run_dir, step + "agent.stderr.log", secrets, MAX_STDERR_BYTES, tail=True),
             _event_artifact(run_dir, step + "agent.events.jsonl", secrets),
@@ -830,7 +835,7 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
         checkpoint_record = read_checkpoint_record(directory)
         checkpoint_text = _artifact_json(directory, "resume_checkpoint.json", secrets)
         info = resume_info(directory, state)
-        checkpoint_text += "Current resumable status:\n" + _json({"resumable": info.resumable, "phase": info.phase, "review_cycle": info.review_cycle, "step_id": info.step_id, "label": info.label, "reason": info.reason})
+        checkpoint_text += "Current resumable status:\n" + _json({"resumable": info.resumable, "phase": info.phase, "review_cycle": info.review_cycle, "step_id": info.step_id, "label": info.label, "reason": info.reason, "operation": info.operation})
         if checkpoint_record:
             checkpoint_text += f"Checkpoint status: {checkpoint_record[1]}\n"
     except (OSError, ValueError, ResumeCheckpointError) as exc:

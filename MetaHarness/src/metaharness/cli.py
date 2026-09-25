@@ -208,6 +208,8 @@ def _status(run_dir: Path) -> int:
     print(f"resumable: {'yes' if info.resumable else 'no'}")
     print(f"checkpoint: {info.phase or '—'}")
     print(f"resume: {info.label or '—'}")
+    if info.operation:
+        print(f"resume operation: {info.operation}")
     if info.reason:
         print(f"resume refusal: {info.reason}")
     if state.get("failure"):

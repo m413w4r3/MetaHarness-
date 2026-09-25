@@ -53,6 +53,12 @@ from .prompt_contracts import (
     payload_for_rendered_request,
     write_prompt_diagnostics,
 )
+from .repository_topology import (
+    invalid_paths,
+    render_invalid_path_candidates,
+    render_path_candidates,
+    topology_payload,
+)
 from .result import atomic_write_text
 from .step_ids import LAST_STEP_ID, MAX_STEPS, STEP_ID_RE, step_ids
 from .usage import PLANNER_USAGE_ARTIFACT, PLANNER_ATTEMPTS_DIR, add_usage, completion_usage, normalize_usage, planner_usage, write_usage_artifact
@@ -706,6 +712,7 @@ def build_step_contract_repair_prompt(
     identity: StepRepairIdentity,
     future_ownership: str = "NONE",
     repository_evidence: str = "NONE",
+    repository_path_candidates: str = "NONE",
 ) -> str:
     """Build the bounded planner transaction for one worker mismatch."""
 
@@ -756,6 +763,14 @@ scope policy. Preserve step identity, dependency and required checks.
 <BOUNDED REPOSITORY EVIDENCE>
 {repository_evidence}
 </BOUNDED REPOSITORY EVIDENCE>
+<REPOSITORY PATH CANDIDATES>
+{repository_path_candidates}
+</REPOSITORY PATH CANDIDATES>
+
+REPOSITORY PATH CANDIDATES lists, for each path or file name the mismatch
+names that is not a tracked path of CURRENT TREE SHA, the tracked paths with
+that exact basename or suffix. MetaHarness never picks one for you: a
+contract path must be copied exactly from a tracked path you choose.
 
 Return exactly a complete repaired current-step contract. READ_SET may be
 clarified and instructions, objective, VERIFY, FORBIDDEN and anchors may be
@@ -774,6 +789,7 @@ def build_step_contract_repair_correction_prompt(
     mismatch_explanation: str, read_set: str, write_set: str, create_set: str,
     delete_set: str, previous_raw: str, parse_error: str,
     output_attempt: int, max_output_corrections: int,
+    repository_path_candidates: str = "NONE", invalid_path_candidates: str = "",
 ) -> str:
     """Ask for a protocol-valid answer of the same semantic repair.
 
@@ -781,6 +797,7 @@ def build_step_contract_repair_correction_prompt(
     the rejected answer, bounded, so no conversation state is assumed.
     """
 
+    invalid_block = invalid_path_candidates + "\n\n" if invalid_path_candidates else ""
     previous = previous_raw
     if len(previous) > _REPAIR_PREVIOUS_RAW_CHARS:
         previous = previous[:_REPAIR_PREVIOUS_RAW_CHARS] + "\n[TRUNCATED]"
@@ -793,6 +810,13 @@ for the same contract repair; it is not a new repair.
 <PARSE ERROR>
 {parse_error[:_REPAIR_ERROR_CHARS]}
 </PARSE ERROR>
+
+{invalid_block}An INVALID PATH is not tracked in CURRENT TREE SHA. Never guess another
+directory: use one exact tracked candidate below, or remove the path.
+
+<REPOSITORY PATH CANDIDATES>
+{repository_path_candidates}
+</REPOSITORY PATH CANDIDATES>
 
 IMMUTABLE STEP ID:
 {identity.step_id}
@@ -971,6 +995,13 @@ class _RepairInputs:
     write_set: str
     create_set: str
     delete_set: str
+    # Tracked paths of ``current_tree_sha``; evidence only, never a choice.
+    topology: Any = None
+
+    def topology_entries(self, *texts: str, references: Sequence[str] = ()) -> list[dict[str, Any]]:
+        if self.topology is None:
+            return []
+        return self.topology.evidence(self.mismatch_explanation, *texts, references=references)
 
 
 class StepContractRepairPlanner:
@@ -1003,7 +1034,13 @@ class StepContractRepairPlanner:
         on_request: Callable[[int], None] | None = None,
         on_response_durable: Callable[[int], None] | None = None,
         on_output_invalid: Callable[[int, str], None] | None = None,
+        topology: Any = None,
     ) -> ImplementationStep:
+        inputs = _RepairInputs(
+            identity, original_plan_identity, current_contract,
+            mismatch_explanation, current_tree_sha,
+            read_set, write_set, create_set, delete_set, topology,
+        )
         request = build_step_contract_repair_prompt(
             original_spec=original_spec, current_tree_sha=current_tree_sha,
             original_plan_identity=original_plan_identity,
@@ -1013,14 +1050,10 @@ class StepContractRepairPlanner:
             delete_set=delete_set, identity=identity,
             future_ownership=future_ownership,
             repository_evidence=repository_evidence,
+            repository_path_candidates=render_path_candidates(inputs.topology_entries()),
         )
         return self._complete(
-            Path(artifacts_dir), request,
-            _RepairInputs(
-                identity, original_plan_identity, current_contract,
-                mismatch_explanation, current_tree_sha,
-                read_set, write_set, create_set, delete_set,
-            ),
+            Path(artifacts_dir), request, inputs,
             validate=validate, on_request=on_request,
             on_response_durable=on_response_durable, on_output_invalid=on_output_invalid,
         )
@@ -1034,6 +1067,7 @@ class StepContractRepairPlanner:
         on_request: Callable[[int], None] | None = None,
         on_response_durable: Callable[[int], None] | None = None,
         on_output_invalid: Callable[[int, str], None] | None = None,
+        topology: Any = None,
     ) -> ImplementationStep:
         """Complete the exact durable request of an interrupted repair.
 
@@ -1059,7 +1093,7 @@ class StepContractRepairPlanner:
             _RepairInputs(
                 identity, original_plan_identity, current_contract,
                 mismatch_explanation, current_tree_sha,
-                read_set, write_set, create_set, delete_set,
+                read_set, write_set, create_set, delete_set, topology,
             ),
             validate=validate, on_request=on_request,
             on_response_durable=on_response_durable, on_output_invalid=on_output_invalid,
@@ -1119,14 +1153,40 @@ class StepContractRepairPlanner:
             raise StepContractRepairArtifactError(
                 f"contract repair output attempt {number - 1:03d} is not a durable rejection"
             )
+        detail = str(error.get("detail") or "")
         return build_step_contract_repair_correction_prompt(
             identity=inputs.identity, current_tree_sha=inputs.current_tree_sha,
             current_contract=inputs.current_contract,
             mismatch_explanation=inputs.mismatch_explanation,
             read_set=inputs.read_set, write_set=inputs.write_set,
             create_set=inputs.create_set, delete_set=inputs.delete_set,
-            previous_raw=raw, parse_error=str(error.get("detail") or ""),
+            previous_raw=raw, parse_error=detail,
             output_attempt=number, max_output_corrections=self.max_output_corrections,
+            repository_path_candidates=render_path_candidates(
+                inputs.topology_entries(detail, references=invalid_paths(detail))
+            ),
+            invalid_path_candidates=render_invalid_path_candidates(detail, inputs.topology),
+        )
+
+    @staticmethod
+    def _persist_topology(
+        files: StepRepairAttemptFiles, target: Path, inputs: _RepairInputs,
+    ) -> None:
+        """Bounded ``topology_evidence.json`` next to one durable request."""
+
+        if inputs.topology is None:
+            return
+        detail = ""
+        if files.number > 1:
+            error = _read_repair_json(
+                step_repair_attempt_files(target, files.number - 1).parse_error, 64 * 1024,
+            )
+            detail = str(error.get("detail") or "") if isinstance(error, dict) else ""
+        entries = inputs.topology_entries(detail, references=invalid_paths(detail))
+        files.request.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            files.request.parent / "topology_evidence.json",
+            _repair_json(topology_payload(inputs.topology, entries)),
         )
 
     def _call(
@@ -1220,6 +1280,8 @@ class StepContractRepairPlanner:
                 )
                 if on_request is not None:
                     on_request(number)
+                if state != "pending":
+                    self._persist_topology(files, target, inputs)
                 raw = self._call(files, request, inputs.current_tree_sha, pending=state == "pending")
             else:
                 # A paid answer is durable: a resume re-parses it, never re-buys it.

@@ -275,6 +275,7 @@ commit/push, final review, correction planning/steps, and publish. Corruptions, 
 | --- | --- |
 | plan approval, worktree + setup | `initial_step` S01, base tree |
 | operator plan recovery (no planner call) | `plan_approval`, base tree |
+| successful worker of step Sxx | `step_acceptance` Sxx: `step_candidate.json` is durable, HEAD = parent, tree = candidate |
 | implementation step Sxx | next step, or `deterministic_gate`, with the step's tree |
 | deterministic gate | `check_repair` when red, otherwise the next semantic revision or candidate boundary |
 | semantic revision or correction | the next deterministic gate, with the worker tree |
@@ -289,6 +290,26 @@ après `candidate push`, la reprise conserve le même SHA et le même tip distan
 sans nouveau worker ni commit avant la review. Le cycle n’est pas limité à 2.
 
 A `PUBLISHED` (or `COMMITTED`) run marks it `completed`.
+
+### Effective step authority and step acceptance
+
+Validated contract repairs of a step form one `EffectiveStepAuthority`,
+re-derived from `contract_repairs/NN/{transaction,validation}.json` and
+`contract.md` hashes on every use (never from `state.json`). The worker
+prompt and mutable paths, rollback, the commit gate, the accepted record
+(`effective_authority_sha256`, `effective_contract_sha256`,
+`authority_source`, `repair_slot`) and resume all use that same authority.
+A corrupted or unchained repair is `RESUME_INTEGRITY_FAILURE`; the gate stays
+strict (`COMMIT_SCOPE_VIOLATION` etc. in `step_acceptance.json`).
+
+A `step_acceptance` resume calls no worker, planner or reviewer: it re-proves
+the candidate hash, authority hash, step record, report, HEAD/tree/index and
+changed paths, then reruns the commit gate (or only records a commit that a
+crash left on the run branch). A legacy run stranded by
+`COMMIT_GATE_FAILED` "mutable scope violation" whose rejected paths were added
+by validated repairs, and whose worktree is still the successful candidate, is
+shown as `Retry step acceptance (Sxx)` and migrated to `step_acceptance`;
+every other `COMMIT_GATE_FAILED` stays terminal.
 
 ```bash
 metaharness resume --config examples/autowork.toml --run-id <RUN_ID>

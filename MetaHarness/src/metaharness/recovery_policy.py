@@ -75,6 +75,9 @@ class RecoveryBudgets:
     # Protocol corrections of one StepContractRepairPlanner answer inside the
     # same semantic repair slot; never a new ``max_step_contract_repairs``.
     max_contract_repair_output_corrections: int = 2
+    # Self-contained planner restarts of one exhausted output-correction
+    # budget, still inside the same semantic repair slot.
+    max_contract_repair_planner_restarts: int = 1
     execution_fallbacks: ExecutionFallbacks = ExecutionFallbacks()
 
     def __post_init__(self) -> None:
@@ -82,6 +85,7 @@ class RecoveryBudgets:
             "max_transient_attempts", "max_executor_fallbacks",
             "max_check_infra_retries", "max_review_transport_retries",
             "max_workspace_setup_retries", "max_contract_repair_output_corrections",
+            "max_contract_repair_planner_restarts",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10:
@@ -110,6 +114,10 @@ _HARD_STOP_CODES = frozenset({
     "UNEXPECTED_HEAD", "UNEXPECTED_TREE", "TREE_MISMATCH",
     "INTEGRITY_MISMATCH", "HEAD_MISMATCH", "BRANCH_MISMATCH",
     "COMMIT_TREE_MISMATCH", "BASE_MOVED_SINCE_RUN",
+    # A refused step commit under its effective authority is never retried:
+    # scope, parent, tree, worktree, security and verification refusals.
+    "COMMIT_GATE_FAILED", "COMMIT_SCOPE_VIOLATION", "COMMIT_PARENT_MISMATCH",
+    "COMMIT_WORKTREE_DRIFT", "COMMIT_SECURITY_FAILURE", "COMMIT_VERIFICATION_FAILURE",
     "CHECK_MUTATED_FORBIDDEN_FILES",
     "REMOTE_AUTHORITY_MISMATCH",
     "APPROVAL_IDENTITY_MISMATCH", "RESUME_IDENTITY_INVALID",

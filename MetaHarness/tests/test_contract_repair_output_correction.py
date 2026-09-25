@@ -350,12 +350,16 @@ class OutputCorrectionTests(ContractRepairFixtures):
         self.assertEqual(self.state()["failure"]["reason"], "STEP_CONTRACT_REPAIR_OUTPUT_INVALID")
         self.assert_no_false_mismatch()
         self.assertEqual(len(self.workers.calls), 1)
-        self.assertEqual(len(self.planner.requests), 4)
+        # Plan, the answer, two corrections, then one bounded planner restart
+        # of two more corrections -- all inside the same semantic slot.
+        self.assertEqual(len(self.planner.requests), 6)
         self.assertEqual(self.repair_slots(), ["01"])
         transaction = self.transaction()
         self.assertEqual(transaction["status"], "output_correction_exhausted")
-        self.assertEqual(transaction["output_correction_attempt"], 2)
-        for number in (1, 2, 3):
+        self.assertEqual(transaction["output_correction_attempt"], 4)
+        self.assertEqual(transaction["planner_restarts"], 1)
+        self.assertIn("contract_repair.planner_restart", self.trace_names())
+        for number in (1, 2, 3, 4, 5):
             self.assertEqual(self.parse_error(number)["detail"], PARSE_ERROR)
         self.assertFalse((self.slot() / "validation.json").exists())
         self.assertEqual(self.semantic_records(), [])
@@ -366,7 +370,7 @@ class OutputCorrectionTests(ContractRepairFixtures):
         from metaharness.web.api import live_status
 
         live = live_status(self.root / "runs", "run", config=self.config())
-        self.assertEqual(live["current_label"], "Output correction exhausted · S01 · attempt 2 / 2")
+        self.assertEqual(live["current_label"], "Output correction exhausted · S01 · attempt 4 / 4")
 
         resumed = self.resume([repaired_step_contract()], [review()])
 
@@ -374,7 +378,7 @@ class OutputCorrectionTests(ContractRepairFixtures):
         self.assertEqual(len(self.planner.requests), 1)
         self.assertEqual(len(self.workers.calls), 2)
         transaction = self.transaction()
-        self.assertEqual((transaction["output_attempt"], transaction["operator_output_retries"]), (4, 1))
+        self.assertEqual((transaction["output_attempt"], transaction["operator_output_retries"]), (6, 1))
         self.assertEqual(self.repair_slots(), ["01"])
 
     def test_a_raw_answer_durable_before_its_parse_is_parsed_without_a_new_call(self) -> None:

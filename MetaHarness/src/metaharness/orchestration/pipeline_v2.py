@@ -16,6 +16,8 @@ cycles is bounded only by the frozen run options, never by this module.
 
 from __future__ import annotations
 
+import dataclasses
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -265,6 +267,9 @@ class PipelineV2Operations:
         [PipelineV2Context, int, ReviewResult, Mapping[str, Any]], RunResult
     ]
     publish: Callable[[PipelineV2Context, int, Mapping[str, Any]], RunResult]
+    # Accept the durable candidate of a ``STEP_ACCEPTANCE`` checkpoint; it
+    # never calls a worker, a planner or a reviewer.
+    accept_step: Callable[[PipelineV2Context, CyclePlan, int], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -308,6 +313,18 @@ class PipelineV2Coordinator:
     ) -> RunResult | ReviewResult:
         ops, ctx = self.operations, self.context
         ops.begin_cycle(ctx, cycle, fresh)
+        accept_step_id: str | None = None
+        if start is not None and start.phase is ResumePhase.STEP_ACCEPTANCE:
+            # Resumed inside the implementation phase of this cycle: the step
+            # candidate is accepted, then the following steps run normally.
+            accept_step_id = start.step_id
+            start = dataclasses.replace(
+                start,
+                phase=(
+                    ResumePhase.IMPLEMENT_STEP if cycle.kind is CycleKind.INITIAL
+                    else ResumePhase.REVIEW_IMPLEMENTATION
+                ),
+            )
         if start is not None and start.phase is ResumePhase.PUBLISH:
             return ops.publish(ctx, cycle.number, ops.load_candidate(ctx, cycle.number))
 
@@ -355,7 +372,9 @@ class PipelineV2Coordinator:
                 ops.semantic_review_correction(ctx, cycle_plan, previous_review)
                 self._boundary(ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=final_stage)
         elif start is None or start.phase is phase or start.phase is ResumePhase.REVIEW_REPLAN:
-            self._implement(cycle_plan, next_stage=pre_stage or final_stage)
+            self._implement(
+                cycle_plan, next_stage=pre_stage or final_stage, accept_step_id=accept_step_id,
+            )
         if ops.unresolved_mismatches(ctx, cycle_plan) and not semantic_enabled:
             raise PipelineFailure(
                 "UNRESOLVED_CONTRACT_MISMATCH",
@@ -480,17 +499,35 @@ class PipelineV2Coordinator:
 
     # -- phases ----------------------------------------------------------------
 
-    def _implement(self, cycle_plan: CyclePlan, *, next_stage: GateStage) -> None:
+    def _implement(
+        self, cycle_plan: CyclePlan, *, next_stage: GateStage, accept_step_id: str | None = None,
+    ) -> None:
         ops, ctx = self.operations, self.context
         phase = (
             ResumePhase.IMPLEMENT_STEP if cycle_plan.cycle.kind is CycleKind.INITIAL
             else ResumePhase.REVIEW_IMPLEMENTATION
         )
-        done = {record["id"] for record in ops.completed_steps(ctx, cycle_plan)}
         steps = cycle_plan.plan.steps
+        if accept_step_id is not None:
+            if ops.accept_step is None or accept_step_id not in {step.id for step in steps}:
+                raise PipelineFailure(
+                    "RESUME_INTEGRITY_FAILURE",
+                    "the step acceptance checkpoint does not name a step of this cycle",
+                )
+            # Idempotent: a candidate committed before a crash is only
+            # re-recorded, never committed or executed again.
+            ops.accept_step(
+                ctx, cycle_plan, [step.id for step in steps].index(accept_step_id),
+            )
+        done = {record["id"] for record in ops.completed_steps(ctx, cycle_plan)}
         for index, step in enumerate(steps):
             if step.id in done:
                 continue
+            if step.id == accept_step_id:
+                raise PipelineFailure(
+                    "RESUME_INTEGRITY_FAILURE", "the accepted step is not durably completed",
+                    step_id=step.id,
+                )
             self._boundary(phase, cycle_plan, step_id=step.id)
             ops.execute_step(ctx, cycle_plan, index)
         self._boundary(ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=next_stage)

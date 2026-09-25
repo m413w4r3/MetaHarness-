@@ -41,7 +41,11 @@ the initial implementation; every later cycle is one review-driven correction.
 | Artifact | Contents |
 | --- | --- |
 | `cycles/NNN/cycle.json` | Cycle identity. For NNN > 001: the source review cycle, route, candidate SHA and SHA-256 of the accepted `review.json`, and the resulting kind |
-| `cycles/NNN/implementation/steps/Sxx/` | Per-step prompt, events, report, `step.json` (trees, changed paths, usage), `diff.patch` and `token_diagnostics.json` |
+| `cycles/NNN/implementation/steps/Sxx/` | Per-step prompt, events, report, `step.json` (trees, changed paths, usage, effective authority hashes once accepted), `diff.patch` and `token_diagnostics.json` |
+| `.../steps/Sxx/step_candidate.json` | Self-hashed successful worker candidate written before `step_acceptance`: parent, trees, changed paths, effective authority/contract SHA-256, verification |
+| `.../steps/Sxx/step_acceptance.json` | Commit-gate outcome (`accepted` or `refused` with a stable `COMMIT_*` code) and the authority SHA-256 the gate used |
+| `.../steps/Sxx/step_authority.json` | Advisory copy of the effective authority an attempt ran with (recomputed, never trusted) |
+| `.../steps/Sxx/contract_repairs/NN/topology_evidence.json` | Tracked-path candidates (exact basename/suffix) handed to the repair planner for one request |
 | `cycles/NNN/checks/<stage>/` | One deterministic gate: `evidence.json`, `checks.json`, `checks/*.log`, `diff.patch`, `changed-files.txt` |
 | `cycles/NNN/checks/<stage>/accepted.json` | The green tree accepted by that gate: commit, parent, tree, acceptance kind and exact mutable scope with its hash |
 | `cycles/NNN/check-repair/<stage>/attempts/NNN/` | One bounded check-repair attempt: prompt, report, `attempt.json`, trees before/after and the scope it was allowed |

@@ -32,6 +32,9 @@ class ResumePhase(StrEnum):
     PLAN_APPROVAL = "plan_approval"
     WORKTREE_SETUP = "worktree_setup"
     IMPLEMENT_STEP = "implement_step"
+    # A successful worker candidate is durable (``step_candidate.json``);
+    # only its deterministic acceptance and commit remain.  Never a worker.
+    STEP_ACCEPTANCE = "step_acceptance"
     DETERMINISTIC_GATE = "deterministic_gate"
     CHECK_REPAIR = "check_repair"
     SEMANTIC_REVISION = "semantic_revision"
@@ -85,7 +88,10 @@ class ResumeCheckpoint:
             raise ResumeCheckpointError("gate and check-repair checkpoints require a stage")
         if phase not in _STAGED_PHASES and self.stage is not None:
             raise ResumeCheckpointError("checkpoint stage is only valid for gate phases")
-        step_phases = {ResumePhase.IMPLEMENT_STEP, ResumePhase.REVIEW_IMPLEMENTATION}
+        step_phases = {
+            ResumePhase.IMPLEMENT_STEP, ResumePhase.STEP_ACCEPTANCE,
+            ResumePhase.REVIEW_IMPLEMENTATION,
+        }
         if phase in step_phases:
             if not isinstance(self.step_id, str) or STEP_ID_RE.fullmatch(self.step_id) is None:
                 raise ResumeCheckpointError("checkpoint step_id is invalid")
@@ -229,6 +235,7 @@ def mark_checkpoint_completed(run_dir: str | Path) -> None:
 PHASE_STATUS = {phase: "planning" for phase in ResumePhase}
 PHASE_STATUS.update({
     ResumePhase.WORKTREE_SETUP: "preparing", ResumePhase.IMPLEMENT_STEP: "implementing",
+    ResumePhase.STEP_ACCEPTANCE: "implementing",
     ResumePhase.DETERMINISTIC_GATE: "validating", ResumePhase.CHECK_REPAIR: "revising",
     ResumePhase.SEMANTIC_REVISION: "revising", ResumePhase.CANDIDATE_READY: "approved",
     ResumePhase.CANDIDATE_PUSH: "approved", ResumePhase.FINAL_REVIEW: "reviewing",
@@ -243,6 +250,10 @@ _RESUMABLE_STATUSES = frozenset({
 CONTRACT_REPAIR_OPERATION = "contract_repair"
 # A stranded contract repair whose evidence no longer proves its identity.
 CONTRACT_REPAIR_INTEGRITY_OPERATION = "contract_repair_integrity"
+# The deterministic acceptance of a durable, successful worker candidate.
+STEP_ACCEPTANCE_OPERATION = "step_acceptance"
+# A legacy stale-authority commit gate whose candidate evidence diverged.
+STEP_ACCEPTANCE_INTEGRITY_OPERATION = "step_acceptance_integrity"
 _STRANDED_DETAIL = re.compile(r"step=(S[0-9]{2}) contract repair failed: ")
 # Failures that a checkpoint can never repair: the run needs an operator.
 _TERMINAL_FAILURES = frozenset({
@@ -252,6 +263,8 @@ _TERMINAL_FAILURES = frozenset({
     "STAGED_BLOB_SCAN_FAILED", "UNREVIEWABLE_TEXT_DIFF",
     "HEAD_MISMATCH", "TREE_MISMATCH", "UNEXPECTED_HEAD", "UNEXPECTED_TREE",
     "COMMIT_TREE_MISMATCH", "INTEGRITY_MISMATCH",
+    # Only the narrowly proven stale-authority shape (checked first) resumes.
+    "COMMIT_GATE_FAILED",
     "DURABLE_ARTIFACT_CORRUPTED", "CORRUPTED_DURABLE_ARTIFACT",
     "ROLLBACK_FAILED", "ROLLBACK_TREE_MISMATCH",
     "CHECK_MUTATED_FORBIDDEN_FILES",
@@ -264,6 +277,7 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         ResumePhase.CONTEXT: "Retry context", ResumePhase.PLANNER: "Retry planner",
         ResumePhase.PLAN_APPROVAL: "Resume plan approval", ResumePhase.WORKTREE_SETUP: "Retry workspace setup",
         ResumePhase.IMPLEMENT_STEP: f"Retry {checkpoint.step_id}",
+        ResumePhase.STEP_ACCEPTANCE: f"Retry step acceptance ({checkpoint.step_id})",
         ResumePhase.DETERMINISTIC_GATE: f"Retry deterministic gate ({checkpoint.stage})",
         ResumePhase.CHECK_REPAIR: f"Retry check-repair attempt {checkpoint.check_repair_attempt}",
         ResumePhase.SEMANTIC_REVISION: "Retry semantic revision", ResumePhase.CANDIDATE_READY: "Prepare candidate",
@@ -347,6 +361,25 @@ def stranded_contract_repair(run_dir: str | Path, state: Mapping[str, Any]) -> s
 
 
 def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
+    from .orchestration.step_authority import (
+        HISTORICAL_CORRUPT, HISTORICAL_PROVEN, historical_step_acceptance,
+    )
+
+    historical = historical_step_acceptance(run_dir, state)
+    if historical.status == HISTORICAL_CORRUPT:
+        return ResumeInfo(
+            False, reason=f"stranded step acceptance evidence is inconsistent: {historical.reason}",
+            step_id=historical.step_id, operation=STEP_ACCEPTANCE_INTEGRITY_OPERATION,
+        )
+    if historical.status == HISTORICAL_PROVEN:
+        # The worker candidate is proven; only its commit was refused with a
+        # stale authority.  The migration moves the run to STEP_ACCEPTANCE.
+        return ResumeInfo(
+            True, ResumePhase.IMPLEMENT_STEP.value,
+            f"Retry step acceptance ({historical.step_id})",
+            expected_tree=historical.tree_after, review_cycle=historical.review_cycle,
+            step_id=historical.step_id, operation=STEP_ACCEPTANCE_OPERATION,
+        )
     stranded_shape = stranded_contract_repair(run_dir, state)
     stranded = stranded_shape == "proven"
     if stranded_shape == "corrupt":
@@ -377,6 +410,8 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     ):
         operation = CONTRACT_REPAIR_OPERATION
         label = f"Retry contract repair planner ({checkpoint.step_id})"
+    elif checkpoint.phase is ResumePhase.STEP_ACCEPTANCE:
+        operation = STEP_ACCEPTANCE_OPERATION
     return ResumeInfo(
         True, checkpoint.phase.value, label,
         expected_tree=checkpoint.expected_tree_sha,
@@ -404,7 +439,7 @@ class ResumeRequiresOperatorError(ResumeError):
 
 __all__ = [
     "CHECKPOINT_NAME", "CONTRACT_REPAIR_INTEGRITY_OPERATION", "CONTRACT_REPAIR_OPERATION",
-    "PHASE_STATUS", "ResumeCheckpoint",
+    "PHASE_STATUS", "STEP_ACCEPTANCE_INTEGRITY_OPERATION", "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint",
     "ResumeCheckpointError", "ResumeError", "ResumeInfo", "ResumeIntegrityError",
     "ResumeNotAllowedError", "ResumePhase", "ResumeRequiresOperatorError",
     "checkpoint_payload", "mark_checkpoint_completed", "pipeline_version_from_state",

@@ -142,6 +142,8 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
             "tree_before": tree_before,
             "tree_after": tree_after,
             "changed_paths": ["feature.txt"],
+            # A changed step is complete only once its commit was accepted.
+            "commit_sha": "c" * 40,
             "usage": {"output_tokens": 1},
         }), encoding="utf-8")
         (step_dir / "agent.final.md").write_text("RESULT: DONE\n", encoding="utf-8")
@@ -155,6 +157,11 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
         self.assertEqual(record["tree_after"], tree_after)
         self.assertEqual(record["changed_paths"], ["feature.txt"])
         self.assertEqual(record["usage"]["output_tokens"], 1)
+        # A successful worker whose candidate was never committed is not done.
+        payload = json.loads((step_dir / "step.json").read_text(encoding="utf-8"))
+        del payload["commit_sha"]
+        (step_dir / "step.json").write_text(json.dumps(payload), encoding="utf-8")
+        self.assertIsNone(_load_completed_step(step_dir, "S01"))
 
     def test_a_repair_and_semantic_revision_preserve_the_exact_accepted_chain(self) -> None:
         """A red attempt is evidence only; A, B, C and D are linear."""

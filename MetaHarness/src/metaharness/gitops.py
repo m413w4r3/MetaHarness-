@@ -1371,6 +1371,13 @@ def commit_parents(repo: Path, commit_sha: str) -> tuple[str, ...]:
     return tuple(fields[1:])
 
 
+def commit_message(repo: Path, commit_sha: str) -> str:
+    """The raw message of one commit object."""
+
+    commit = _require_object_id(commit_sha, "commit_sha")
+    return _git(repo, "log", "-1", "--format=%B", commit).stdout
+
+
 def is_ancestor(repo: Path, ancestor_sha: str, descendant_sha: str) -> bool:
     """Return whether *ancestor_sha* is an ancestor of *descendant_sha*."""
 

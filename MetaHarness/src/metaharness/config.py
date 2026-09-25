@@ -830,6 +830,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         "max_transient_attempts", "max_executor_fallbacks",
         "max_check_infra_retries", "max_review_transport_retries",
         "max_workspace_setup_retries", "max_contract_repair_output_corrections",
+        "max_contract_repair_planner_restarts",
     }
     unknown_recovery = sorted(set(recovery_data) - recovery_fields - {"execution_fallbacks"})
     if unknown_recovery:

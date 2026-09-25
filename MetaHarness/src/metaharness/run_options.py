@@ -292,9 +292,14 @@ class RunOptions:
             "max_transient_attempts", "max_executor_fallbacks",
             "max_check_infra_retries", "max_review_transport_retries",
             "max_workspace_setup_retries", "max_contract_repair_output_corrections",
+            "max_contract_repair_planner_restarts",
         }
-        # Snapshots frozen before output corrections existed use the default.
-        legacy_recovery_fields = recovery_fields - {"max_contract_repair_output_corrections"}
+        # Snapshots frozen before output corrections or planner restarts
+        # existed use the defaults of the fields they lack.
+        optional_recovery_fields = {
+            "max_contract_repair_output_corrections", "max_contract_repair_planner_restarts",
+        }
+        legacy_recovery_fields = recovery_fields - optional_recovery_fields
         fallback_fields = {
             "mechanical", "reasoning", "agentic", "semantic_reviser", "check_repair",
         }
@@ -302,9 +307,10 @@ class RunOptions:
         fallback_payload = recovery.get("execution_fallbacks", {}) if isinstance(recovery, Mapping) else {}
         if (
             not isinstance(recovery, Mapping)
-            or ("recovery" in value and recovery_keys not in (
-                recovery_fields, recovery_fields | {"execution_fallbacks"},
-                legacy_recovery_fields, legacy_recovery_fields | {"execution_fallbacks"},
+            or ("recovery" in value and not (
+                legacy_recovery_fields
+                <= recovery_keys
+                <= recovery_fields | {"execution_fallbacks"}
             ))
             or ("recovery" not in value and recovery)
             or not isinstance(fallback_payload, Mapping)

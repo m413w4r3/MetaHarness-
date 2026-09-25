@@ -302,6 +302,8 @@ _ATTEMPT_ARTIFACTS = (
     "agent.prompt.txt", "prompt.diagnostics.json", "agent.events.jsonl", "agent.stderr.log", "agent.final.md",
     "agent.result.json", "step.json", TOKEN_DIAGNOSTICS_NAME, "tree_after_failure.txt",
     "usage.json", "results.json", "executor.json", "failure.json",
+    # The authority, candidate and acceptance records of one worker attempt.
+    "step_authority.json", "step_candidate.json", "step_acceptance.json",
 )
 
 

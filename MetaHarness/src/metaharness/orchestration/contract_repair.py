@@ -274,7 +274,8 @@ def episode_summary(directory: Path) -> dict[str, Any]:
     for key in (
         "repair_id", "repair_number", "step_id", "status", "tree_sha",
         "planner_transport_attempt", "output_attempt", "output_correction_attempt",
-        "output_correction_limit", "operator_output_retries", "last_transport_failure",
+        "output_correction_limit", "operator_output_retries", "planner_restarts",
+        "last_transport_failure",
     ):
         if key in transaction:
             summary[key] = transaction[key]
@@ -306,8 +307,8 @@ def episode_summary(directory: Path) -> dict[str, Any]:
     if isinstance(validation, dict):
         summary["validation"] = {
             key: validation.get(key) for key in (
-                "status", "output_attempt", "repaired_contract_sha256",
-                "added_mutable_paths",
+                "status", "output_attempt", "original_step_contract_sha256",
+                "repaired_contract_sha256", "added_mutable_paths",
             ) if key in validation
         }
     return summary

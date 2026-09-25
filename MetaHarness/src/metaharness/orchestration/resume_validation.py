@@ -274,6 +274,10 @@ def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
         record["tree_before"] != record["tree_after"] or changed
     )):
         return None
+    if record["tree_before"] != record["tree_after"] and not _is_object_id(record.get("commit_sha")):
+        # A successful worker whose candidate was not accepted yet: the step
+        # is complete only once its commit crossed the acceptance boundary.
+        return None
     return {
         "id": step_id, "status": status, "profile_id": record.get("profile_id"),
         "tree_before": record["tree_before"], "tree_after": record["tree_after"],
@@ -914,6 +918,16 @@ def _failure_tree_for(
         )
         if isinstance(record, dict) and record.get("status") == "FAILED" and _is_object_id(record.get("tree_after")):
             return record["tree_after"]
+        if (
+            isinstance(record, dict) and record.get("status") == "COMPLETED"
+            and _is_object_id(record.get("tree_after"))
+            and record.get("tree_before") == checkpoint.expected_tree_sha
+            and record.get("tree_after") != record.get("tree_before")
+            and record.get("commit_sha") is None
+        ):
+            # A worker success interrupted before its candidate became
+            # durable: only an exact in-scope rollback is offered.
+            return record["tree_after"]
         return None
     if checkpoint.phase is ResumePhase.SEMANTIC_REVISION:
         return _read_tree_file(semantic_revision_dir(run_dir, number) / "tree_after_failure.txt")
@@ -1105,6 +1119,10 @@ def validate_resume(
                         ),
                         policy=repair_scope,
                     )
+            elif checkpoint.phase is ResumePhase.STEP_ACCEPTANCE:
+                # Committed before the next boundary: the step acceptance
+                # re-proves that commit against its durable candidate.
+                pass
             elif checkpoint.phase is not ResumePhase.CANDIDATE_READY:
                 advanced = False
             if not advanced:

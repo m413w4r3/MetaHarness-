@@ -68,6 +68,7 @@ from .gitops import (
     WorktreeInfo,
     assert_clean,
     branch_exists,
+    commit_message,
     commit_parents,
     publish_fast_forward_base,
     restore_paths_from_tree,
@@ -101,12 +102,17 @@ from .gitops import (
     validate_run_branch,
 )
 from .commit_gate import (
+    COMMIT_GATE_FAILED,
+    COMMIT_PARENT_MISMATCH,
+    COMMIT_TREE_MISMATCH,
     CommitSafetyError,
+    StepVerification,
     accepted_step_record,
     assert_deferred_verifications_resolved,
     commit_safety_gate,
-    parse_deferred_verification,
+    step_verification,
 )
+from .repository_topology import RepositoryTopology
 from .llm.chat import LLMError, OpenAIChatTextClient
 from .integrations.github import (
     GitHubIntegrationError,
@@ -168,7 +174,6 @@ from .planning_v2 import (
     validate_implementation_bundle,
     render_repair_plan_summary,
     render_repair_step_index,
-    parse_step_contract_repair,
 )
 from .plan_repository_validation import (
     PlanRepositoryPreconditionError,
@@ -187,6 +192,8 @@ from .plan_recovery import (
 from .resume import (
     CONTRACT_REPAIR_INTEGRITY_OPERATION,
     PHASE_STATUS,
+    STEP_ACCEPTANCE_INTEGRITY_OPERATION,
+    STEP_ACCEPTANCE_OPERATION,
     ResumeCheckpoint,
     ResumeCheckpointError,
     ResumeError,
@@ -318,7 +325,6 @@ from .orchestration.pipeline_v2 import (
     correction_dir,
     gate_dir,
     gate_acceptance_path,
-    implementation_steps_dir,
     review_dir,
     semantic_revision_dir,
     pre_semantic_gate_stage,
@@ -335,6 +341,19 @@ from .orchestration.check_recovery import CheckInfrastructureRecovery
 from .orchestration import contract_repair
 from .orchestration.contract_repair import ContractRepairIntegrityError
 from .orchestration.review_recovery import ReviewRecovery
+from .orchestration.step_authority import (
+    HISTORICAL_PROVEN,
+    STEP_ACCEPTANCE_NAME,
+    EffectiveStepAuthority,
+    EffectiveStepExecution,
+    StepAuthorityError,
+    build_step_candidate,
+    historical_step_acceptance,
+    read_step_candidate,
+    resolve_effective_step_authority,
+    write_authority_diagnostic,
+    write_step_candidate,
+)
 from .orchestration.worker_recovery import (
     TRANSIENT_WORKER_FAILURES,
     WorkerRecovery,
@@ -2231,6 +2250,7 @@ class Orchestrator:
             load_correction=self._load_correction,
             completed_steps=self._completed_steps,
             execute_step=bind(self._execute_cycle_step, store),
+            accept_step=bind(self._resume_step_acceptance, store),
             unresolved_mismatches=lambda ctx, plan: _has_deferred_contract_mismatches(
                 self._completed_steps(ctx, plan)
             ),
@@ -2624,44 +2644,31 @@ class Orchestrator:
     def _effective_cycle_scope(
         self, ctx: PipelineV2Context, cycle_plan: CyclePlan,
     ) -> tuple[str, ...]:
-        """Include only durable, policy-approved contract-repair additions."""
+        """The approved envelope plus the effective authority of every step.
+
+        A contract repair contributes only through its step's effective
+        authority (hash- and chain-verified); a semantic revision addition
+        only through its own durable policy authority.  Nothing widens the
+        scope merely because a repair exists.
+        """
 
         scope = set(cycle_plan.mutable_scope)
-        root = implementation_steps_dir(ctx.run_dir, cycle_plan.cycle)
-        if not root.is_dir():
-            return tuple(sorted(scope))
-        for step_dir in root.iterdir():
-            repairs = step_dir / "contract_repairs"
-            if not repairs.is_dir():
+        if cycle_plan.cycle.kind is CycleKind.REVIEW_IMPLEMENTATION and cycle_plan.cycle.number > 1:
+            # A direct correction has no steps of its own: it inherits the
+            # accepted authority of the cycle it corrects (as resume does).
+            scope.update(self._effective_cycle_scope(
+                ctx, self._cycle_plan(ctx, cycle_plan.cycle.number - 1),
+            ))
+        count = len(cycle_plan.plan.steps)
+        for step in cycle_plan.plan.steps:
+            artifact_dir = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
+            if not (artifact_dir / "contract_repairs").is_dir():
                 continue
-            for repair_dir in repairs.iterdir():
-                validation = _read_json_artifact(repair_dir / "validation.json", 64 * 1024)
-                if isinstance(validation, dict) and validation.get("status") == "validated":
-                    added = validation.get("added_mutable_paths")
-                    if isinstance(added, list) and all(isinstance(path, str) for path in added):
-                        contract_path = repair_dir / "contract.md"
-                        digest = validation.get("repaired_contract_sha256")
-                        if (
-                            not isinstance(digest, str) or not contract_path.is_file()
-                            or hashlib.sha256(contract_path.read_bytes()).hexdigest() != digest
-                        ):
-                            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "step contract repair contract hash changed")
-                        if added:
-                            policy = self._effective_repair_scope
-                            if policy.policy == "deny-expansion":
-                                raise PipelineFailure("REPAIR_SCOPE_EXPANSION")
-                            if policy.policy == "require-approval" or len(added) > policy.max_added_paths:
-                                delta_path = repair_dir / "scope_delta.json"
-                                delta = _read_json_artifact(delta_path, 64 * 1024)
-                                if not isinstance(delta, dict) or delta.get("added_paths") != sorted(added):
-                                    raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "step contract repair scope delta is malformed")
-                                approval = read_scope_approval(
-                                    repair_dir,
-                                    expected_sha256=hashlib.sha256(delta_path.read_bytes()).hexdigest(),
-                                )
-                                if approval is None or approval.decision is not ApprovalDecision.APPROVE:
-                                    raise ScopeApprovalRequired()
-                        scope.update(added)
+            authority = self._resolve_step_authority(
+                artifact_dir, step, self._approved_step_contract(cycle_plan, step),
+                expected_tree=None, expected_plan_step_count=count,
+            )
+            scope.update(authority.mutable_scope)
         scope.update(_semantic_revision_scope(
             ctx.repo, ctx.run_dir, cycle_plan.cycle.number,
             self._effective_repair_scope,
@@ -2704,10 +2711,7 @@ class Orchestrator:
         step_artifact_dir = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
         # A previous failed attempt of this same step keeps its artifacts.
         _archive_attempt(step_artifact_dir)
-        try:
-            contract = read_approved_step_contract(cycle_plan.contracts_dir, cycle_plan.bundle, step.id)
-        except (V2PlanParseError, OSError, UnicodeError) as exc:
-            raise PipelineFailure("PLAN_APPROVAL_INVALID", str(exc), step_id=step.id) from exc
+        contract = self._approved_step_contract(cycle_plan, step)
         store.update(
             status=RunStatus.IMPLEMENTING, current_step=step.id,
             steps=self._state_steps(ctx, cycle_plan, running=step.id),
@@ -2720,7 +2724,7 @@ class Orchestrator:
         reviewer_profile = profile_for_role(
             self.config, ctx.selection.final_reviewer.profile_id, ExecutionRole.REVIEWER
         )
-        outcome = self._execute_step_attempts(
+        execution = self._execute_step_attempts(
             store=store, run_dir=ctx.run_dir, original_spec=ctx.spec,
             original_plan_identity=_json_text(
                 asdict(checkpoint.plan_identity) if checkpoint and checkpoint.plan_identity else {}
@@ -2740,22 +2744,415 @@ class Orchestrator:
             forbidden_env_names=(planner_profile.api_key_env, reviewer_profile.api_key_env),
             future_ownership=_future_step_ownership(cycle_plan.plan.steps, index),
         )
-        try:
-            self._accept_v2_step_tree(
-                store=store, run_dir=ctx.run_dir, info=ctx.info, step=step,
-                outcome=outcome, parent_sha=parent_sha,
-                future_step_ids=tuple(item.id for item in cycle_plan.plan.steps[index + 1:]),
-                run_id=ctx.run_id, step_dir=step_artifact_dir,
-            )
-        except (CommitSafetyError, GitError) as exc:
-            raise PipelineFailure(
-                "COMMIT_GATE_FAILED", _bounded_parse_detail(exc), step_id=step.id,
-            ) from exc
+        self._accept_step_execution(
+            store, ctx, cycle_plan, index, execution, parent_sha=parent_sha,
+        )
         store.update(
             status=RunStatus.IMPLEMENTING, current_step=None,
             steps=self._state_steps(ctx, cycle_plan),
         )
         self._update_v2_usage(store, ctx.run_dir)
+
+    def _approved_step_contract(self, cycle_plan: CyclePlan, step: ImplementationStep) -> str:
+        """The hash-bound approved contract: immutable evidence of the step."""
+
+        try:
+            return read_approved_step_contract(cycle_plan.contracts_dir, cycle_plan.bundle, step.id)
+        except (V2PlanParseError, OSError, UnicodeError) as exc:
+            raise PipelineFailure("PLAN_APPROVAL_INVALID", str(exc), step_id=step.id) from exc
+
+    def _accept_step_execution(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
+        index: int, execution: EffectiveStepExecution, *, parent_sha: str,
+    ) -> None:
+        """Cross the durable worker-success -> commit boundary of one step.
+
+        A changed tree is first frozen as ``step_candidate.json`` and the
+        checkpoint moves to ``STEP_ACCEPTANCE``; only then does the commit
+        gate run, with the very authority the worker executed under.
+        """
+
+        authority, outcome = execution.authority, execution.outcome
+        step_dir = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, authority.step_id)
+        future = tuple(item.id for item in cycle_plan.plan.steps[index + 1:])
+        accept = functools.partial(
+            self._accept_v2_step_tree,
+            store=store, run_dir=ctx.run_dir, info=ctx.info, authority=authority,
+            outcome=outcome, parent_sha=parent_sha, future_step_ids=future,
+            run_id=ctx.run_id, step_dir=step_dir,
+        )
+        try:
+            if outcome.no_change or outcome.tree_after == outcome.tree_before:
+                # Nothing to commit: no candidate crosses a commit boundary.
+                accept()
+                return
+            verification = self._step_verification(authority, outcome, future)
+            self._persist_step_candidate(
+                ctx, cycle_plan, step_dir, authority, outcome, verification,
+                parent_sha=parent_sha, source="worker_success",
+            )
+            self._write_checkpoint(
+                ctx.run_dir, ResumePhase.STEP_ACCEPTANCE,
+                head=parent_sha, tree=outcome.tree_after, cycle=cycle_plan.cycle.number,
+                step_id=authority.step_id,
+                correction_bundle_sha256=cycle_plan.correction_bundle_sha256,
+            )
+            accept(verification=verification)
+        except (CommitSafetyError, GitError) as exc:
+            raise self._step_acceptance_failure(step_dir, authority, exc) from exc
+
+    def _resume_step_acceptance(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan, index: int,
+    ) -> None:
+        """Accept the durable worker candidate of a ``STEP_ACCEPTANCE`` checkpoint.
+
+        No worker, planner or reviewer is called.  Every proof is re-derived:
+        the checkpoint, the self-hashed candidate, the step record and report,
+        the effective authority (from its artifacts, never from state.json),
+        and the exact Git boundary.  Then the normal commit gate runs.
+        """
+
+        step = cycle_plan.plan.steps[index]
+        step_dir = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
+        worktree = ctx.info.worktree
+
+        def refuse(message: str) -> NoReturn:
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", f"step acceptance: {message}", step_id=step.id,
+            )
+
+        checkpoint = read_checkpoint(ctx.run_dir)
+        if (
+            checkpoint is None or checkpoint.phase is not ResumePhase.STEP_ACCEPTANCE
+            or checkpoint.step_id != step.id
+            or checkpoint.review_cycle != cycle_plan.cycle.number
+        ):
+            refuse("the checkpoint does not name this step")
+        try:
+            candidate = read_step_candidate(step_dir)
+        except StepAuthorityError as exc:
+            refuse(str(exc))
+        if candidate is None:
+            refuse("the durable step candidate is missing")
+        parent_sha, tree_before, tree_after = (
+            candidate["parent_head_sha"], candidate["tree_before"], candidate["tree_after"],
+        )
+        changed = tuple(candidate["changed_paths"])
+        if (
+            candidate["step_id"] != step.id
+            or candidate.get("cycle") != cycle_plan.cycle.number
+            or candidate.get("run_id") != ctx.run_id
+            or parent_sha != checkpoint.expected_head_sha
+            or tree_after != checkpoint.expected_tree_sha
+        ):
+            refuse("the step candidate is not bound to its checkpoint")
+        authority = self._resolve_step_authority(
+            step_dir, step, self._approved_step_contract(cycle_plan, step),
+            expected_tree=tree_before, expected_plan_step_count=len(cycle_plan.plan.steps),
+        )
+        if (
+            authority.authority_sha256 != candidate["effective_authority_sha256"]
+            or authority.effective_contract_sha256 != candidate["effective_contract_sha256"]
+        ):
+            refuse("the effective step authority changed since the worker succeeded")
+        if any(path not in authority.mutable_scope for path in changed):
+            refuse("the candidate changed paths outside its effective authority")
+        try:
+            verification = StepVerification.from_payload(candidate.get("verification"))
+        except ValueError as exc:
+            refuse(str(exc))
+        outcome_refs = candidate["outcome"]
+        record_path, final_path = step_dir / "step.json", step_dir / "agent.final.md"
+        try:
+            record_bytes = record_path.read_bytes()
+            final_bytes = final_path.read_bytes() if final_path.is_file() else None
+        except OSError:
+            refuse("the step record is unreadable")
+        final_sha = hashlib.sha256(final_bytes).hexdigest() if final_bytes is not None else None
+        if final_sha != outcome_refs.get("final_report_sha256"):
+            refuse("the worker report changed")
+        record = _read_json_artifact(record_path, 128 * 1024)
+        if (
+            not isinstance(record, dict) or record.get("id") != step.id
+            or record.get("tree_before") != tree_before or record.get("tree_after") != tree_after
+            or sorted(record.get("changed_paths") or []) != sorted(changed)
+        ):
+            refuse("the step record does not match the candidate")
+        future = tuple(item.id for item in cycle_plan.plan.steps[index + 1:])
+        self._trace_emit(
+            "recovery.resumed", phase="implementation", cycle=cycle_plan.cycle.number,
+            step_id=step.id,
+            data={
+                "operation": "step_acceptance", "tree_after": tree_after,
+                "effective_authority_sha256": authority.authority_sha256,
+                "source": candidate.get("source"),
+            },
+        )
+        try:
+            head = current_head(worktree)
+            if symbolic_head(worktree) != ctx.branch_ref:
+                refuse("the worktree HEAD is not the run branch")
+            if head != parent_sha:
+                self._recover_committed_step(
+                    store, ctx, step_dir, candidate, authority, verification,
+                    head=head, future_step_ids=future,
+                )
+                store.update(
+                    status=RunStatus.IMPLEMENTING, current_step=None,
+                    steps=self._state_steps(ctx, cycle_plan),
+                )
+                return
+            if hashlib.sha256(record_bytes).hexdigest() != outcome_refs.get("step_record_sha256"):
+                refuse("the step record changed")
+            if (
+                resolve_tree(worktree, parent_sha) != tree_before
+                or index_tree_sha(worktree) != tree_after
+                or candidate_tree_sha(worktree) != tree_after
+                or _status_has_unstaged_or_untracked(status_porcelain(worktree))
+                or tuple(sorted(changed_paths_between_trees(ctx.repo, tree_before, tree_after))) != tuple(sorted(changed))
+            ):
+                refuse("the worktree is not exactly the durable worker candidate")
+        except GitError as exc:
+            refuse(f"Git state is unreadable: {exc}")
+        outcome = StepExecutionOutcome(
+            step_id=step.id, profile_id=str(candidate.get("profile_id") or ""),
+            tree_before=tree_before, tree_after=tree_after, changed_paths=changed,
+            usage=normalize_usage(record.get("usage")),
+            final_report=(final_bytes or b"").decode("utf-8", errors="replace"),
+            deferred_verify=str(record.get("deferred_verify") or ""),
+            mismatch_retry_count=int(record.get("mismatch_retry_count") or 0),
+        )
+        store.update(status=RunStatus.IMPLEMENTING, current_step=step.id)
+        try:
+            self._accept_v2_step_tree(
+                store=store, run_dir=ctx.run_dir, info=ctx.info, authority=authority,
+                outcome=outcome, parent_sha=parent_sha, future_step_ids=future,
+                run_id=ctx.run_id, step_dir=step_dir, verification=verification,
+            )
+        except (CommitSafetyError, GitError) as exc:
+            raise self._step_acceptance_failure(step_dir, authority, exc) from exc
+        store.update(
+            status=RunStatus.IMPLEMENTING, current_step=None,
+            steps=self._state_steps(ctx, cycle_plan),
+        )
+        self._update_v2_usage(store, ctx.run_dir)
+
+    def _recover_committed_step(
+        self, store: RunStateStore, ctx: PipelineV2Context, step_dir: Path,
+        candidate: Mapping[str, Any], authority: EffectiveStepAuthority,
+        verification: StepVerification, *, head: str, future_step_ids: Sequence[str],
+    ) -> None:
+        """A crash landed after the step commit: prove it, then only record it."""
+
+        worktree = ctx.info.worktree
+        parent_sha, tree_after = candidate["parent_head_sha"], candidate["tree_after"]
+        message = commit_message(worktree, head)
+        subject = message.splitlines()[0] if message else ""
+        if (
+            commit_parents(worktree, head) != (parent_sha,)
+            or resolve_tree(worktree, head) != tree_after
+            or not subject.startswith(f"metaharness({authority.step_id}):")
+            or f"MetaHarness-Run: {ctx.run_id}" not in message
+            or index_tree_sha(worktree) != tree_after
+            or candidate_tree_sha(worktree) != tree_after
+            or _status_has_unstaged_or_untracked(status_porcelain(worktree))
+        ):
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE",
+                "step acceptance: HEAD moved to a commit that is not this step candidate",
+                step_id=authority.step_id,
+            )
+        record = accepted_step_record(
+            step_id=authority.step_id,
+            verification_status=verification.status,
+            parent_sha=parent_sha,
+            commit_sha=head,
+            tree_before=candidate["tree_before"],
+            tree_after=tree_after,
+            changed_paths=candidate["changed_paths"],
+            deferred=verification.deferred,
+            authority=authority.summary(),
+        )
+        diff_path = step_dir / "diff.patch"
+        self._finalize_accepted_step(
+            store, ctx.run_dir, step_dir, record, future_step_ids=future_step_ids,
+            authority=authority, diff_path=diff_path if diff_path.is_file() else None,
+        )
+
+    def _migrate_historical_step_acceptance(
+        self, run_dir: Path, state: Mapping[str, Any],
+    ) -> ResumeCheckpoint:
+        """Move a proven legacy stale-authority commit refusal to STEP_ACCEPTANCE.
+
+        Only :func:`historical_step_acceptance`'s exact proven shape
+        qualifies.  The modern candidate is synthesized from evidence that was
+        already durable; no model or worker is called and the approved plan
+        and repair artifacts are left untouched.
+        """
+
+        proof = historical_step_acceptance(run_dir, state)
+        if proof.status != HISTORICAL_PROVEN or proof.authority is None:
+            raise ResumeIntegrityError(
+                "stranded step acceptance is no longer provable: " + str(proof.reason or proof.status)
+            )
+        authority = proof.authority
+        step_id = str(proof.step_id)
+        step_dir = cycle_step_dir(run_dir, proof.review_cycle, step_id)
+        record = _read_json_artifact(step_dir / "step.json", 128 * 1024)
+        final_path = step_dir / "agent.final.md"
+        try:
+            record_sha = hashlib.sha256((step_dir / "step.json").read_bytes()).hexdigest()
+            final_bytes = final_path.read_bytes() if final_path.is_file() else None
+        except OSError as exc:
+            raise ResumeIntegrityError(f"stranded step record is unreadable: {exc}") from exc
+        if not isinstance(record, dict):
+            raise ResumeIntegrityError("stranded step record is unreadable")
+        try:
+            verification = step_verification(
+                (final_bytes or b"").decode("utf-8", errors="replace"),
+                step_id=step_id, future_step_ids=proof.future_step_ids,
+                deferred_requested=bool(record.get("deferred_verify")),
+            )
+        except CommitSafetyError as exc:
+            raise ResumeIntegrityError(f"stranded step verification is not acceptable: {exc}") from exc
+        payload = build_step_candidate(
+            run_id=str(state.get("run_id") or run_dir.name), cycle=proof.review_cycle,
+            step_id=step_id, parent_head_sha=str(proof.parent_head_sha),
+            tree_before=str(proof.tree_before), tree_after=str(proof.tree_after),
+            changed_paths=proof.changed_paths, profile_id=str(record.get("profile_id") or ""),
+            authority=authority, verification=verification.payload(),
+            step_record_sha256=record_sha,
+            final_report_sha256=(
+                hashlib.sha256(final_bytes).hexdigest() if final_bytes is not None else None
+            ),
+            source="historical_commit_gate_migration",
+            historical={
+                "failure_reason": "COMMIT_GATE_FAILED",
+                "failure_detail": _bounded_v2_report(str(proof.failure_detail or "")),
+                "stale_unexpected_paths": list(proof.stale_unexpected_paths),
+                "previous_checkpoint_phase": ResumePhase.IMPLEMENT_STEP.value,
+            },
+        )
+        try:
+            write_step_candidate(step_dir, payload)
+        except StepAuthorityError as exc:
+            raise ResumeIntegrityError(str(exc)) from exc
+        write_authority_diagnostic(step_dir, authority)
+        self._write_checkpoint(
+            run_dir, ResumePhase.STEP_ACCEPTANCE,
+            head=proof.parent_head_sha, tree=proof.tree_after,
+            cycle=proof.review_cycle, step_id=step_id,
+        )
+        self._trace_emit(
+            "recovery.migrated", phase="implementation", cycle=proof.review_cycle,
+            step_id=step_id,
+            data={
+                "operation": "step_acceptance", "from_phase": "implement_step",
+                "stale_unexpected_paths": list(proof.stale_unexpected_paths),
+                "effective_authority_sha256": authority.authority_sha256,
+            },
+        )
+        checkpoint = read_checkpoint(run_dir)
+        if checkpoint is None or checkpoint.phase is not ResumePhase.STEP_ACCEPTANCE:
+            raise ResumeIntegrityError("the step acceptance checkpoint could not be written")
+        return checkpoint
+
+    def _step_verification(
+        self, authority: EffectiveStepAuthority, outcome: StepExecutionOutcome,
+        future_step_ids: Sequence[str],
+    ) -> StepVerification:
+        try:
+            return step_verification(
+                outcome.final_report, step_id=authority.step_id,
+                future_step_ids=future_step_ids,
+                reported_status=getattr(outcome, "verification_status", None),
+                deferred_requested=bool(
+                    getattr(outcome, "deferred_verify", "")
+                    or getattr(outcome, "status", "") == "DEFERRED_CONTRACT_MISMATCH"
+                ),
+            )
+        except CommitSafetyError:
+            self._trace_emit(
+                "step.verification.completed", phase="implementation",
+                cycle=getattr(self, "_trace_cycle", 1), step_id=authority.step_id,
+                data={
+                    "status": "failed", "tree_before": outcome.tree_before,
+                    "tree_after": outcome.tree_after, "deferred": False,
+                },
+            )
+            raise
+
+    def _persist_step_candidate(
+        self, ctx: PipelineV2Context, cycle_plan: CyclePlan, step_dir: Path,
+        authority: EffectiveStepAuthority, outcome: StepExecutionOutcome,
+        verification: StepVerification, *, parent_sha: str, source: str,
+        historical: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Freeze a successful worker candidate before its commit boundary."""
+
+        record_path = step_dir / "step.json"
+        final_path = step_dir / "agent.final.md"
+        try:
+            record_sha = hashlib.sha256(record_path.read_bytes()).hexdigest()
+            final_sha = (
+                hashlib.sha256(final_path.read_bytes()).hexdigest()
+                if final_path.is_file() else None
+            )
+        except OSError as exc:
+            raise PipelineFailure(
+                "DURABLE_ARTIFACT_CORRUPTED", f"step record is unreadable: {exc}",
+                step_id=authority.step_id,
+            ) from exc
+        payload = build_step_candidate(
+            run_id=ctx.run_id, cycle=cycle_plan.cycle.number, step_id=authority.step_id,
+            parent_head_sha=parent_sha, tree_before=outcome.tree_before,
+            tree_after=outcome.tree_after, changed_paths=outcome.changed_paths,
+            profile_id=outcome.profile_id, authority=authority,
+            verification=verification.payload(), step_record_sha256=record_sha,
+            final_report_sha256=final_sha, source=source, historical=historical,
+        )
+        try:
+            write_step_candidate(step_dir, payload)
+        except StepAuthorityError as exc:
+            raise PipelineFailure(exc.code, str(exc), step_id=authority.step_id) from exc
+        write_authority_diagnostic(step_dir, authority)
+        self._trace_emit(
+            "step.candidate.persisted", phase="implementation",
+            cycle=cycle_plan.cycle.number, step_id=authority.step_id,
+            data={
+                "tree_after": outcome.tree_after, "source": source,
+                "effective_authority_sha256": authority.authority_sha256,
+                "effective_contract_sha256": authority.effective_contract_sha256,
+                "authority_source": authority.authority_source,
+                "repair_slot": authority.repair_slot,
+            },
+        )
+        return payload
+
+    def _step_acceptance_failure(
+        self, step_dir: Path, authority: EffectiveStepAuthority, exc: Exception,
+    ) -> PipelineFailure:
+        """Record which authority refused the commit; the gate stays strict."""
+
+        code = getattr(exc, "code", None) if isinstance(exc, CommitSafetyError) else None
+        code = code or COMMIT_GATE_FAILED
+        message = _bounded_parse_detail(exc)
+        try:
+            atomic_write_text(step_dir / STEP_ACCEPTANCE_NAME, _json_text({
+                "schema_version": 1, "status": "refused", "step_id": authority.step_id,
+                "code": code, "detail": message,
+                "paths": list(getattr(exc, "paths", ()))[:20],
+                "commit_gate_authority_sha256": authority.authority_sha256,
+                "effective_contract_sha256": authority.effective_contract_sha256,
+                "effective_mutable_paths": list(authority.mutable_scope),
+            }))
+        except OSError:
+            pass
+        return PipelineFailure(
+            "COMMIT_GATE_FAILED",
+            f"{code}: {message} (authority {authority.authority_sha256[:16]})",
+            step_id=authority.step_id,
+        )
 
     def _semantic_revision(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
@@ -3953,22 +4350,26 @@ class Orchestrator:
         fallback_profile_ids: Sequence[str] = (),
         forbidden_env_names: tuple[str | None, ...],
         future_ownership: Mapping[str, tuple[str, ...]] | None = None,
-    ) -> StepExecutionOutcome:
+    ) -> EffectiveStepExecution:
         """Execute a step, repairing semantic contract mismatches in-place.
 
         A mismatch is a recoverable transaction: its attempt artifacts are
         archived, all in-scope edits are restored to the pre-attempt tree, a
         bounded planner repair is validated, and the worker receives the
         effective contract.  The approved plan and original contract remain
-        immutable evidence throughout.
+        immutable evidence throughout.  The result carries the exact
+        :class:`EffectiveStepAuthority` the successful worker executed under,
+        so acceptance never re-derives it from the approved step.
         """
 
-        effective_step = self._load_repaired_step(
-            artifact_dir, step, expected_plan_step_count=expected_plan_step_count,
-        )
-        effective_contract = contract
-        if effective_step is not step:
-            effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
+        def resolve() -> EffectiveStepAuthority:
+            return self._resolve_step_authority(
+                artifact_dir, step, contract, expected_tree=expected_tree,
+                expected_plan_step_count=expected_plan_step_count,
+            )
+
+        authority = resolve()
+        effective_step, effective_contract = authority.effective_step, authority.effective_contract
         # Semantic budget excludes superseded generator bugs and transport retries.
         try:
             repair_count = contract_repair.semantic_repair_count(artifact_dir)
@@ -4043,13 +4444,15 @@ class Orchestrator:
                     },
                 )
             else:
-                effective_step, effective_contract = self._contract_repair_transaction(
+                self._contract_repair_transaction(
                     **repair_context, directory=pending_repair.directory,
                     number=pending_repair.number, step=effective_step,
                     current_contract=effective_contract, mismatch=pending_repair.mismatch,
                     tree_before=pending_repair.tree_sha, profile_id=active_profile_id,
                     resumed=True,
                 )
+                authority = self._repaired_authority(resolve(), pending_repair.number)
+                effective_step, effective_contract = authority.effective_step, authority.effective_contract
         while True:
             common = {
                 "repo": repo, "worktree": worktree, "base_sha": base_sha,
@@ -4062,6 +4465,7 @@ class Orchestrator:
                 "original_spec": original_spec,
             }
             try:
+                write_authority_diagnostic(artifact_dir, authority)
                 outcome = self._run_step_attempt(
                     **common, initial_mismatch=None,
                     mismatch_retry_count=repair_count,
@@ -4070,7 +4474,7 @@ class Orchestrator:
                     recovery.complete(
                         pending_transient, recovered=True, tree_after=outcome.tree_after,
                     )
-                return outcome
+                return EffectiveStepExecution(outcome, authority)
             except StepExecutionFailure as failure:
                 atomic_write_text(artifact_dir / "failure.json", _json_text({
                     "schema_version": 1,
@@ -4102,9 +4506,9 @@ class Orchestrator:
                     failure.step_dir = artifact_dir
                     raise
                 if failure.reason == "AGENT_NO_CHANGE":
-                    return self._finish_no_change_step(
+                    return EffectiveStepExecution(self._finish_no_change_step(
                         failure, artifact_dir, worktree=worktree, expected_head=base_sha,
-                    )
+                    ), authority)
                 if (
                     failure.reason in TRANSIENT_WORKER_FAILURES
                     and recovery.used(retry_key) >= self._run_options.recovery.max_transient_attempts
@@ -4139,9 +4543,7 @@ class Orchestrator:
                         failure.reason = "RESUME_REQUIRES_OPERATOR"
                     failure.step_dir = artifact_dir
                     raise
-                allowed = set(
-                    (*effective_step.write_set, *effective_step.create_set, *effective_step.delete_set)
-                )
+                allowed = set(authority.mutable_scope)
                 changed: list[str] = []
                 if failure.tree_after is not None:
                     try:
@@ -4195,9 +4597,9 @@ class Orchestrator:
                         _SYNTHETIC_NO_CHANGE_MISMATCH,
                         _BOUNDED_NO_CHANGE_MISMATCH,
                     }:
-                        return self._finish_no_change_step(
+                        return EffectiveStepExecution(self._finish_no_change_step(
                             failure, artifact_dir, worktree=worktree, expected_head=base_sha,
-                        )
+                        ), authority)
                     exhausted = classify_failure(
                         "AGENT_CONTRACT_MISMATCH", clean_contract_mismatch=True,
                         budget_exhausted=True,
@@ -4237,12 +4639,14 @@ class Orchestrator:
                     phase="implementation", cycle=cycle_number,
                     step_id=step.id,
                 )
-                effective_step, effective_contract = self._contract_repair_transaction(
+                self._contract_repair_transaction(
                     **repair_context, directory=repair_dir, number=number,
                     step=effective_step, current_contract=effective_contract,
                     mismatch=bounded_mismatch, tree_before=failure.tree_before,
                     profile_id=active_profile_id, resumed=False, usage=failure.usage,
                 )
+                authority = self._repaired_authority(resolve(), number)
+                effective_step, effective_contract = authority.effective_step, authority.effective_contract
                 # The next attempt starts at the exact restored tree and uses
                 # no blind retry addendum.
 
@@ -4297,64 +4701,50 @@ class Orchestrator:
             no_change=True,
         )
 
-    def _load_repaired_step(
-        self, artifact_dir: Path, original: ImplementationStep,
-        *, expected_plan_step_count: int | None = None,
-    ) -> ImplementationStep:
-        root = artifact_dir / "contract_repairs"
-        if not root.is_dir():
-            return original
-        candidates = sorted(
-            (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
-            key=lambda path: int(path.name),
-        )
-        for directory in reversed(candidates):
-            validation = _read_json_artifact(directory / "validation.json", 64 * 1024)
-            contract_path = directory / "contract.md"
-            if not isinstance(validation, dict) or validation.get("status") != "validated" or not contract_path.is_file():
-                continue
-            try:
-                identity = StepRepairIdentity.of(original, expected_plan_step_count)
-                repaired = parse_step_contract_repair(
-                    contract_path.read_text(encoding="utf-8"),
-                    max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
-                    expected_step_id=identity.step_id,
-                    expected_title=identity.title,
-                    expected_execution_class=identity.execution_class,
-                    expected_depends_on=identity.depends_on,
-                    expected_plan_step_count=identity.expected_plan_step_count,
-                )
-            except (OSError, UnicodeError, V2PlanParseError):
-                continue
-            if repaired.id == original.id:
-                return repaired
-        return original
+    def _resolve_step_authority(
+        self, artifact_dir: Path, step: ImplementationStep, contract: str, *,
+        expected_tree: str | None, expected_plan_step_count: int | None,
+    ) -> EffectiveStepAuthority:
+        """The single effective authority of *step*; corruption fails closed."""
 
-    def _read_repaired_contract(self, artifact_dir: Path, step: ImplementationStep) -> str:
-        root = artifact_dir / "contract_repairs"
-        candidates = sorted(
-            (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
-            key=lambda path: int(path.name),
-        ) if root.is_dir() else []
-        for directory in reversed(candidates):
-            path = directory / "contract.md"
-            validation = _read_json_artifact(directory / "validation.json", 64 * 1024)
-            if path.is_file() and isinstance(validation, dict) and validation.get("status") == "validated":
-                try:
-                    identity = StepRepairIdentity.of(step)
-                    parsed = parse_step_contract_repair(
-                        path.read_text(encoding="utf-8"),
-                        max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
-                        expected_step_id=identity.step_id,
-                        expected_title=identity.title,
-                        expected_execution_class=identity.execution_class,
-                        expected_depends_on=identity.depends_on,
-                    )
-                except (OSError, UnicodeError, V2PlanParseError):
-                    continue
-                if parsed.id == step.id:
-                    return path.read_text(encoding="utf-8")
-        return ""
+        try:
+            return resolve_effective_step_authority(
+                artifact_dir, step, contract,
+                max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
+                expected_plan_step_count=expected_plan_step_count,
+                expected_tree_sha=expected_tree,
+                authorize_added=self._authorize_repair_additions,
+            )
+        except StepAuthorityError as exc:
+            raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
+
+    @staticmethod
+    def _repaired_authority(authority: EffectiveStepAuthority, number: int) -> EffectiveStepAuthority:
+        if authority.repair_slot != number:
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE",
+                f"validated contract repair {number:02d} is not the effective step authority",
+                step_id=authority.step_id,
+            )
+        return authority
+
+    def _authorize_repair_additions(self, repair_dir: Path, added: list[str]) -> None:
+        """The frozen scope policy of one validated repair's added paths."""
+
+        policy = self._effective_repair_scope
+        if policy.policy == "deny-expansion":
+            raise PipelineFailure("REPAIR_SCOPE_EXPANSION")
+        if policy.policy == "require-approval" or len(added) > policy.max_added_paths:
+            delta_path = repair_dir / "scope_delta.json"
+            delta = _read_json_artifact(delta_path, 64 * 1024)
+            if not isinstance(delta, dict) or delta.get("added_paths") != sorted(added):
+                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "step contract repair scope delta is malformed")
+            approval = read_scope_approval(
+                repair_dir,
+                expected_sha256=hashlib.sha256(delta_path.read_bytes()).hexdigest(),
+            )
+            if approval is None or approval.decision is not ApprovalDecision.APPROVE:
+                raise ScopeApprovalRequired()
 
     @staticmethod
     def _restore_failed_step_attempt(
@@ -4485,94 +4875,99 @@ class Orchestrator:
                 cycle=cycle, step_id=step.id, data={**data, "error": error},
             )
 
-        try:
-            repaired = self._repair_step_contract(
-                repo=repo, worktree=worktree, run_dir=run_dir,
-                artifact_dir=directory, original_spec=original_spec,
-                original_plan_identity=original_plan_identity,
-                original_step=step, current_contract=current_contract,
-                expected_plan_step_count=expected_plan_step_count,
-                mismatch=mismatch, tree_before=tree_before,
-                future_ownership=future_ownership,
-                resume_request=contract_repair.durable_request_matches(directory, tree_before) is True,
-                max_output_corrections=int(
-                    (contract_repair.read_transaction(directory) or {}).get(
-                        "output_correction_limit", max_corrections,
-                    )
-                ),
-                on_request=on_request, on_response_durable=on_response_durable,
-                on_output_invalid=on_output_invalid,
-            )
-            effective_contract = self._read_repaired_contract(artifact_dir, repaired)
-        except LLMError as exc:
-            detail = redact(str(exc), self._secrets)[:500]
+        while True:
             try:
-                current = contract_repair.read_transaction(directory) or {}
-                if contract_repair.is_awaiting_planner(current):
-                    current = contract_repair.advance(
-                        directory, contract_repair.WAITING_EXTERNAL,
-                        last_transport_failure=detail,
-                    )
-            except ContractRepairIntegrityError as marker:
-                raise PipelineFailure(marker.code, str(marker), step_id=step.id) from exc
-            data = publish("waiting_external", current)
-            self._trace_emit(
-                "recovery.waiting_external", phase="implementation", cycle=cycle,
-                step_id=step.id,
-                data={"operation": "contract_repair", "reason": "LLM_FAILURE", **data},
-            )
-            raise
-        except ScopeApprovalRequired:
-            delta = _read_json_artifact(directory / "scope_delta.json", 64 * 1024)
-            store.update(
-                status=RunStatus.WAITING_SCOPE_APPROVAL,
-                current_step=step.id,
-                scope_delta=delta if isinstance(delta, dict) else {},
-            )
-            raise
-        except (ContractRepairIntegrityError, StepContractRepairArtifactError) as exc:
-            raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
-        except StepContractRepairOutputInvalid as exc:
-            # Never a new AGENT_CONTRACT_MISMATCH: the worker mismatch stays
-            # archived and the slot waits for an operator planner retry.
-            try:
-                current = contract_repair.ensure(
-                    directory, contract_repair.OUTPUT_CORRECTION_EXHAUSTED,
-                    last_output_error={
-                        "code": exc.code, "detail": exc.detail[:500],
-                        "output_attempt": exc.output_attempt,
-                    },
+                repaired = self._repair_step_contract(
+                    repo=repo, worktree=worktree, run_dir=run_dir,
+                    artifact_dir=directory, original_spec=original_spec,
+                    original_plan_identity=original_plan_identity,
+                    original_step=step, current_contract=current_contract,
+                    expected_plan_step_count=expected_plan_step_count,
+                    mismatch=mismatch, tree_before=tree_before,
+                    future_ownership=future_ownership,
+                    resume_request=contract_repair.durable_request_matches(directory, tree_before) is True,
+                    max_output_corrections=int(
+                        (contract_repair.read_transaction(directory) or {}).get(
+                            "output_correction_limit", max_corrections,
+                        )
+                    ),
+                    on_request=on_request, on_response_durable=on_response_durable,
+                    on_output_invalid=on_output_invalid,
                 )
-            except ContractRepairIntegrityError as marker:
-                raise PipelineFailure(marker.code, str(marker), step_id=step.id) from exc
-            data = publish("output_correction_exhausted", current)
-            self._trace_emit(
-                "contract_repair.output_correction.exhausted", phase="implementation",
-                cycle=cycle, step_id=step.id, data=data,
-            )
-            raise PipelineFailure(
-                exc.code,
-                _bounded_v2_report(
-                    f"contract repair {progress['repair_id']} planner output is invalid after "
-                    f"{exc.corrections} of {exc.limit} output corrections: {exc.detail}"
-                ),
-                step_id=step.id,
-            ) from exc
-        except V2PlanParseError as exc:
-            # A planner answer that could not even be made durable.
-            raise PipelineFailure(
-                STEP_CONTRACT_REPAIR_OUTPUT_INVALID,
-                _bounded_v2_report(f"contract repair planner output is unusable: {exc}"),
-                step_id=step.id,
-            ) from exc
-        except (AgentError, GitError, OSError) as exc:
-            raise StepExecutionFailure(
-                "AGENT_CONTRACT_MISMATCH", step.id,
-                _bounded_v2_report(f"contract repair failed: {exc}"),
-                profile_id=profile_id, tree_before=tree_before,
-                tree_after=tree_before, usage=usage, mismatch=mismatch,
-                mismatch_retry_count=semantic_attempt, step_dir=artifact_dir,
-            ) from exc
+                effective_contract = (directory / "contract.md").read_text(encoding="utf-8")
+                break
+            except LLMError as exc:
+                detail = redact(str(exc), self._secrets)[:500]
+                try:
+                    current = contract_repair.read_transaction(directory) or {}
+                    if contract_repair.is_awaiting_planner(current):
+                        current = contract_repair.advance(
+                            directory, contract_repair.WAITING_EXTERNAL,
+                            last_transport_failure=detail,
+                        )
+                except ContractRepairIntegrityError as marker:
+                    raise PipelineFailure(marker.code, str(marker), step_id=step.id) from exc
+                data = publish("waiting_external", current)
+                self._trace_emit(
+                    "recovery.waiting_external", phase="implementation", cycle=cycle,
+                    step_id=step.id,
+                    data={"operation": "contract_repair", "reason": "LLM_FAILURE", **data},
+                )
+                raise
+            except ScopeApprovalRequired:
+                delta = _read_json_artifact(directory / "scope_delta.json", 64 * 1024)
+                store.update(
+                    status=RunStatus.WAITING_SCOPE_APPROVAL,
+                    current_step=step.id,
+                    scope_delta=delta if isinstance(delta, dict) else {},
+                )
+                raise
+            except (ContractRepairIntegrityError, StepContractRepairArtifactError) as exc:
+                raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
+            except StepContractRepairOutputInvalid as exc:
+                # Never a new AGENT_CONTRACT_MISMATCH.  One bounded,
+                # self-contained planner restart first, in this same semantic
+                # slot; then the slot waits for an operator planner retry.
+                if self._restart_contract_repair_planner(directory, cycle, step.id, publish):
+                    continue
+                try:
+                    current = contract_repair.ensure(
+                        directory, contract_repair.OUTPUT_CORRECTION_EXHAUSTED,
+                        last_output_error={
+                            "code": exc.code, "detail": exc.detail[:500],
+                            "output_attempt": exc.output_attempt,
+                        },
+                    )
+                except ContractRepairIntegrityError as marker:
+                    raise PipelineFailure(marker.code, str(marker), step_id=step.id) from exc
+                data = publish("output_correction_exhausted", current)
+                self._trace_emit(
+                    "contract_repair.output_correction.exhausted", phase="implementation",
+                    cycle=cycle, step_id=step.id, data=data,
+                )
+                raise PipelineFailure(
+                    exc.code,
+                    _bounded_v2_report(
+                        f"contract repair {progress['repair_id']} planner output is invalid after "
+                        f"{exc.corrections} of {exc.limit} output corrections: {exc.detail}"
+                    ),
+                    step_id=step.id,
+                ) from exc
+            except V2PlanParseError as exc:
+                # A planner answer that could not even be made durable.
+                raise PipelineFailure(
+                    STEP_CONTRACT_REPAIR_OUTPUT_INVALID,
+                    _bounded_v2_report(f"contract repair planner output is unusable: {exc}"),
+                    step_id=step.id,
+                ) from exc
+            except (AgentError, GitError, OSError) as exc:
+                raise StepExecutionFailure(
+                    "AGENT_CONTRACT_MISMATCH", step.id,
+                    _bounded_v2_report(f"contract repair failed: {exc}"),
+                    profile_id=profile_id, tree_before=tree_before,
+                    tree_after=tree_before, usage=usage, mismatch=mismatch,
+                    mismatch_retry_count=semantic_attempt, step_dir=artifact_dir,
+                ) from exc
         progress = progress_of(contract_repair.read_transaction(directory) or {})
         decision = classify_failure(
             "AGENT_CONTRACT_MISMATCH", clean_contract_mismatch=True, rollback_succeeded=True,
@@ -4609,6 +5004,42 @@ class Orchestrator:
             step_id=step.id, recovered=True,
         )
         return repaired, effective_contract
+
+    def _restart_contract_repair_planner(
+        self, directory: Path, cycle: int, step_id: str,
+        publish: Callable[[str, Mapping[str, Any]], dict[str, Any]],
+    ) -> bool:
+        """Admit one bounded planner restart of an exhausted output budget.
+
+        The restart stays inside the same semantic repair slot: it consumes
+        no ``contract_repairs`` budget, replays no worker, keeps every raw
+        answer, and re-sends a standalone request built from the durable
+        mismatch, tree, identity and repository topology evidence.
+        """
+
+        limit = self._run_options.recovery.max_contract_repair_planner_restarts
+        max_corrections = self._run_options.recovery.max_contract_repair_output_corrections
+        try:
+            current = contract_repair.read_transaction(directory) or {}
+            used = int(current.get("planner_restarts") or 0)
+            if used >= limit:
+                return False
+            attempt = contract_repair.output_attempt(current)
+            current = contract_repair.advance(
+                directory, contract_repair.AWAITING_OUTPUT_CORRECTION,
+                output_attempt=attempt + 1, output_correction_attempt=attempt,
+                output_correction_limit=int(current.get("output_correction_limit") or 0)
+                + max(1, max_corrections),
+                planner_restarts=used + 1, planner_transport_attempt=0,
+            )
+        except ContractRepairIntegrityError as exc:
+            raise PipelineFailure(exc.code, str(exc), step_id=step_id) from exc
+        data = publish("correcting_output", current)
+        self._trace_emit(
+            "contract_repair.planner_restart", phase="implementation",
+            cycle=cycle, step_id=step_id, data={**data, "planner_restarts": used + 1},
+        )
+        return True
 
     def _repair_step_contract(
         self, *, repo: Path, worktree: Path, run_dir: Path,
@@ -4660,11 +5091,17 @@ class Orchestrator:
             "create_set": "\n".join(f"- {item}" for item in original_step.create_set) or "NONE",
             "delete_set": "\n".join(f"- {item}" for item in original_step.delete_set) or "NONE",
         }
+        try:
+            # Deterministic evidence for the planner, never a path decision.
+            topology: RepositoryTopology | None = RepositoryTopology.from_tree(repo, tree_before)
+        except GitError:
+            topology = None
         hooks = {
             "identity": StepRepairIdentity.of(original_step, expected_plan_step_count),
             "validate": validate,
             "on_request": on_request, "on_response_durable": on_response_durable,
             "on_output_invalid": on_output_invalid,
+            "topology": topology,
         }
         if resume_request:
             repaired = planner.resume(
@@ -5227,23 +5664,29 @@ class Orchestrator:
         store: RunStateStore,
         run_dir: Path,
         info: WorktreeInfo,
-        step: ImplementationStep,
+        authority: EffectiveStepAuthority,
         outcome: StepExecutionOutcome,
         parent_sha: str,
         future_step_ids: Sequence[str],
         run_id: str,
         step_dir: Path,
+        verification: StepVerification | None = None,
     ) -> str | None:
         """Run the reusable safety gate and accept one normal step tree.
 
         Worker attempts never call this method until their structural and
         scope gates have passed.  A red/failed attempt therefore remains an
         artifact tree only.  The explicit deferred contract is the sole
-        exception to a passed verification status.
+        exception to a passed verification status.  The commit gate receives
+        the effective authority the worker executed under, never the
+        approved step it was repaired from.
         """
 
+        step_id = authority.step_id
         if current_head(info.worktree) != parent_sha:
-            raise CommitSafetyError("step parent HEAD changed before acceptance")
+            raise CommitSafetyError(
+                "step parent HEAD changed before acceptance", code=COMMIT_PARENT_MISMATCH,
+            )
         if outcome.no_change:
             if (
                 outcome.tree_after != outcome.tree_before
@@ -5251,7 +5694,10 @@ class Orchestrator:
                 or index_tree_sha(info.worktree) != outcome.tree_after
                 or _status_has_unstaged_or_untracked(status_porcelain(info.worktree))
             ):
-                raise CommitSafetyError("no-change outcome does not match the exact current tree")
+                raise CommitSafetyError(
+                    "no-change outcome does not match the exact current tree",
+                    code=COMMIT_TREE_MISMATCH,
+                )
             parent_list = commit_parents(info.worktree, parent_sha)
             expected_parent = parent_list[0] if parent_list else None
             store.update(
@@ -5260,74 +5706,23 @@ class Orchestrator:
                 expected_parent_sha=expected_parent,
                 expected_tree_sha=outcome.tree_after,
                 next_step_id=(future_step_ids[0] if future_step_ids else None),
-                no_change_step=step.id,
+                no_change_step=step_id,
             )
             self._trace_emit(
                 "step.no_change.accepted", phase="implementation",
-                cycle=getattr(self, "_trace_cycle", 1), step_id=step.id,
+                cycle=getattr(self, "_trace_cycle", 1), step_id=step_id,
                 data={"head_sha": parent_sha, "tree_sha": outcome.tree_after},
             )
             return None
-        reported_verification = getattr(outcome, "verification_status", None)
-        if isinstance(reported_verification, str) and reported_verification.casefold() in {
-            "failed", "fail", "red",
-        }:
-            self._trace_emit(
-                "step.verification.completed",
-                phase="implementation",
-                cycle=getattr(self, "_trace_cycle", 1),
-                step_id=step.id,
-                data={
-                    "status": "failed",
-                    "tree_before": outcome.tree_before,
-                    "tree_after": outcome.tree_after,
-                    "deferred": False,
-                },
-            )
-            raise CommitSafetyError("step VERIFY did not pass")
-        verify_failed = re.search(
-            r"^\s*(?:VERIFY|VERIFICATION)\s*(?::|=)\s*(?:FAIL|FAILED|RED)\b",
-            outcome.final_report,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
-        environment_verify_failure = bool(re.search(
-            r"^\s*(?:VERIFY|VERIFICATION)\s*[:=].*\b(?:FAIL|FAILED|RED)\b\s*\(\s*environment\s*:",
-            outcome.final_report,
-            flags=re.IGNORECASE | re.MULTILINE,
-        ))
-        if verify_failed and not environment_verify_failure:
-            self._trace_emit(
-                "step.verification.completed",
-                phase="implementation",
-                cycle=getattr(self, "_trace_cycle", 1),
-                step_id=step.id,
-                data={
-                    "status": "failed",
-                    "tree_before": outcome.tree_before,
-                    "tree_after": outcome.tree_after,
-                    "deferred": False,
-                },
-            )
-            raise CommitSafetyError("step VERIFY did not pass")
-        verification_status = "passed"
-        deferred = None
-        if getattr(outcome, "deferred_verify", "") or getattr(outcome, "status", "") == "DEFERRED_CONTRACT_MISMATCH":
-            deferred = parse_deferred_verification(
-                outcome.final_report,
-                current_step_id=step.id,
-                future_step_ids=future_step_ids,
-            )
-            if deferred is None:
-                raise CommitSafetyError(
-                    "a deferred step must provide the explicit DEFERRED VERIFY DEPENDENCY contract"
-                )
-            verification_status = "deferred"
+        if verification is None:
+            verification = self._step_verification(authority, outcome, future_step_ids)
+        verification_status, deferred = verification.status, verification.deferred
 
         self._trace_emit(
             "step.verification.completed",
             phase="implementation",
             cycle=getattr(self, "_trace_cycle", 1),
-            step_id=step.id,
+            step_id=step_id,
             data={
                 "status": verification_status,
                 "tree_before": outcome.tree_before,
@@ -5340,10 +5735,15 @@ class Orchestrator:
         # new Git state.  There is no legal empty commit; the later candidate
         # gate still sees the durable mismatch artifact.
         if outcome.tree_after == outcome.tree_before:
+            if deferred is None:
+                raise CommitSafetyError(
+                    "an unchanged step tree is neither a no-change nor a deferred outcome",
+                    code=COMMIT_TREE_MISMATCH,
+                )
             state = store.load()
             deferred_records = list(state.get("deferred_verifications") or [])
             deferred_records.append({
-                "step_id": step.id,
+                "step_id": step_id,
                 "verification_status": "deferred",
                 "tree_before": outcome.tree_before,
                 "tree_after": outcome.tree_after,
@@ -5369,7 +5769,7 @@ class Orchestrator:
             info.worktree,
             tree_sha=outcome.tree_after,
             parent_sha=parent_sha,
-            mutable_scope=(*step.write_set, *step.create_set, *step.delete_set),
+            mutable_scope=authority.mutable_scope,
             verification_status=verification_status,
             deferred_reason=deferred.reason if deferred is not None else None,
             dependent_step_ids=deferred.dependent_step_ids if deferred is not None else (),
@@ -5388,12 +5788,12 @@ class Orchestrator:
             info.worktree,
             tree_sha=gate.tree_sha,
             parent_sha=gate.parent_sha,
-            step_id=step.id,
-            step_title=step.title,
+            step_id=step_id,
+            step_title=authority.title,
             body=f"MetaHarness-Run: {run_id}",
         )
         record = accepted_step_record(
-            step_id=step.id,
+            step_id=step_id,
             verification_status=verification_status,
             parent_sha=parent_sha,
             commit_sha=commit_sha,
@@ -5401,47 +5801,72 @@ class Orchestrator:
             tree_after=outcome.tree_after,
             changed_paths=gate.changed_paths,
             deferred=deferred,
+            authority=authority.summary(),
         )
+        self._finalize_accepted_step(
+            store, run_dir, step_dir, record, future_step_ids=future_step_ids,
+            authority=authority, diff_path=diff_path,
+        )
+        return commit_sha
+
+    def _finalize_accepted_step(
+        self, store: RunStateStore, run_dir: Path, step_dir: Path,
+        record: Mapping[str, Any], *, future_step_ids: Sequence[str],
+        authority: EffectiveStepAuthority, diff_path: Path | None,
+    ) -> None:
+        """Record one committed step durably; idempotent across a resume."""
+
+        commit_sha = record["commit_sha"]
         step_path = step_dir / "step.json"
         step_payload = _read_json_artifact(step_path)
         if not isinstance(step_payload, dict):
-            step_payload = {"id": step.id}
+            step_payload = {"id": authority.step_id}
         step_payload.update(record)
-        step_payload["verification_status"] = verification_status
+        step_payload["verification_status"] = record["verification_status"]
         atomic_write_text(step_path, _json_text(step_payload))
 
+        def merged(records: Any) -> list[dict[str, Any]]:
+            kept = [
+                item for item in (records or [])
+                if not (isinstance(item, dict) and item.get("commit_sha") == commit_sha)
+            ]
+            return [*kept, dict(record)]
+
         state = store.load()
-        accepted_steps = list(state.get("accepted_steps") or [])
-        accepted_commits = list(state.get("accepted_commits") or [])
-        accepted_steps.append(record)
-        accepted_commits.append(record)
-        chain = list(accepted_chain_records(run_dir))
-        chain.append(record)
+        chain = merged(accepted_chain_records(run_dir))
         atomic_write_text(run_dir / "accepted-chain.json", _json_text({"commits": chain}))
-        following = future_step_ids[0] if future_step_ids else None
+        atomic_write_text(step_dir / STEP_ACCEPTANCE_NAME, _json_text({
+            "schema_version": 1, "status": "accepted", "step_id": authority.step_id,
+            "commit_sha": commit_sha, "parent_sha": record["parent_sha"],
+            "tree_after": record["tree_after"],
+            "commit_gate_authority_sha256": authority.authority_sha256,
+            "effective_contract_sha256": authority.effective_contract_sha256,
+            "authority_source": authority.authority_source,
+            "repair_slot": authority.repair_slot,
+        }))
         store.update(
             status=RunStatus.IMPLEMENTING,
-            accepted_steps=accepted_steps,
-            accepted_commits=accepted_commits,
+            accepted_steps=merged(state.get("accepted_steps")),
+            accepted_commits=merged(state.get("accepted_commits")),
             expected_head_sha=commit_sha,
-            expected_parent_sha=parent_sha,
-            expected_tree_sha=outcome.tree_after,
-            next_step_id=following,
+            expected_parent_sha=record["parent_sha"],
+            expected_tree_sha=record["tree_after"],
+            next_step_id=future_step_ids[0] if future_step_ids else None,
         )
         self._trace_emit(
             "step.committed",
             phase="implementation",
             cycle=getattr(self, "_trace_cycle", 1),
-            step_id=step.id,
+            step_id=authority.step_id,
             data={
-                "parent_sha": parent_sha,
+                "parent_sha": record["parent_sha"],
                 "commit_sha": commit_sha,
-                "tree_sha": outcome.tree_after,
-                "changed_paths": list(gate.changed_paths),
-                **self._trace_diff_reference(diff_path),
+                "tree_sha": record["tree_after"],
+                "changed_paths": list(record["changed_paths"]),
+                "effective_authority_sha256": authority.authority_sha256,
+                **(self._trace_diff_reference(diff_path) if diff_path is not None else {}),
             },
         )
-        return commit_sha
 
     def _authorize_candidate_tree(
         self, evidence: EvidenceBundle, worktree: Path, parent_sha: str, branch_ref: str,
@@ -6408,7 +6833,9 @@ class Orchestrator:
         self._secrets = config_secret_values(self.config, self._runtime_environment)
         self._begin_trace(run_dir, selected, created=False)
         eligibility = resume_info(run_dir, state)
-        if eligibility.operation == CONTRACT_REPAIR_INTEGRITY_OPERATION:
+        if eligibility.operation in {
+            CONTRACT_REPAIR_INTEGRITY_OPERATION, STEP_ACCEPTANCE_INTEGRITY_OPERATION,
+        }:
             # A stranded contract repair whose evidence no longer proves its
             # identity: fail closed, without any model call.
             failed = store.record_failure(
@@ -6426,6 +6853,24 @@ class Orchestrator:
             raise ResumeNotAllowedError(str(exc)) from exc
         if checkpoint is None:
             raise ResumeNotAllowedError("no resume checkpoint")
+        migration: str | None = None
+        if (
+            eligibility.operation == STEP_ACCEPTANCE_OPERATION
+            and checkpoint.phase is ResumePhase.IMPLEMENT_STEP
+        ):
+            # A legacy commit refusal made with a stale approved authority:
+            # its proven worker candidate moves to STEP_ACCEPTANCE first.
+            try:
+                checkpoint = self._migrate_historical_step_acceptance(run_dir, state)
+            except ResumeIntegrityError as exc:
+                failed = store.record_failure(
+                    exc.code, redact(str(exc), self._secrets),
+                    resume={"status": "refused", "previous_status": state.get("status"),
+                            "previous_failure": state.get("failure")},
+                    current_step=None,
+                )
+                return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
+            migration = "historical_commit_gate_stale_authority"
         previous = state.get("resume") if isinstance(state.get("resume"), dict) else {}
         attempts = previous.get("attempts") if isinstance(previous.get("attempts"), int) else 0
         record = {
@@ -6434,6 +6879,8 @@ class Orchestrator:
             "attempts": attempts + 1,
             "previous_status": state.get("status"),
             "previous_failure": state.get("failure"),
+            **({"migration": migration} if migration else {}),
+            **({"operation": eligibility.operation} if eligibility.operation else {}),
         }
         if checkpoint.phase in {
             ResumePhase.CONTEXT, ResumePhase.PLANNER,
@@ -6460,6 +6907,7 @@ class Orchestrator:
             status=PHASE_STATUS[checkpoint.phase], failure=None, current_step=None,
             resume={**record, "status": "running",
                     "restored_paths": list(resumed.restore_paths)},
+            **({"recovery_resumable": None} if migration else {}),
         )
         if claimed is None:
             raise ResumeError("run state changed while the resume was validated")
