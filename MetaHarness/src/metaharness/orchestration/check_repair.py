@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import os
 import re
 
@@ -36,6 +37,7 @@ from .shared import (
 )
 from ..evidence import (
     EvidenceBundle,
+    extract_failure_evidence,
     required_checks_passed,
     SECRET_IN_DIFF,
     SECRET_IN_STAGED_BLOB,
@@ -157,67 +159,129 @@ def _soft_check_failures(bundle: EvidenceBundle) -> list[str]:
     return failures
 
 
-_MAX_CHECK_SCOPE_LOG_BYTES = 256 * 1024
+_MAX_FAILED_CHECK_LOG_INPUT_BYTES = 4 * 1024 * 1024
+_CHECK_REPAIR_PROOF_BYTES = 24 * 1024
+_MAX_CHANGED_PATH_FALLBACK = 8
 
 
 _CHECK_SCOPE_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:file://)?"
     r"(?:/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*|"
     r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)"
-    r"\.(?:py|pyi|ts|tsx|js|jsx|java|go|rs|rb|php|c|cc|cpp|h|hpp|json|yaml|yml|toml|ini)"
+    r"\.(?:py|pyi|pyx|ts|tsx|js|jsx|mjs|cjs|java|kt|kts|go|rs|rb|php|c|cc|cpp|h|hpp|cs|fs|fsx|swift|scala|sc|vue|svelte|sql|json|yaml|yml|toml|ini|txt|xml|html|css|scss)"
     r"(?::[0-9]+(?::[0-9]+)?)?(?![A-Za-z0-9_.-])"
 )
 
 
-def _read_log_tail(path: Path) -> str:
+def _read_failure_log(path: Path) -> str:
+    """Read a bounded head and tail so summaries and earlier tracebacks survive."""
+
     try:
         with path.open("rb") as stream:
             stream.seek(0, os.SEEK_END)
             size = stream.tell()
-            stream.seek(max(0, size - _MAX_CHECK_SCOPE_LOG_BYTES))
-            return stream.read(_MAX_CHECK_SCOPE_LOG_BYTES).decode("utf-8", errors="replace")
+            if size <= _MAX_FAILED_CHECK_LOG_INPUT_BYTES:
+                stream.seek(0)
+                return stream.read().decode("utf-8", errors="replace")
+            head_bytes = 256 * 1024
+            tail_bytes = _MAX_FAILED_CHECK_LOG_INPUT_BYTES - head_bytes
+            stream.seek(0)
+            head = stream.read(head_bytes)
+            stream.seek(size - tail_bytes)
+            tail = stream.read(tail_bytes)
+            return (
+                head.decode("utf-8", errors="replace")
+                + f"\n[... {size - _MAX_FAILED_CHECK_LOG_INPUT_BYTES} middle bytes omitted; see complete log ...]\n"
+                + tail.decode("utf-8", errors="replace")
+            )
     except OSError:
         return ""
 
 
-def _failed_check_text(
-    *,
-    run_dir: Path,
-    evidence: EvidenceBundle,
-) -> str:
-    """Return only bounded output belonging to failed ordinary checks."""
+def _bound_failure_log(value: str) -> str:
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= _MAX_FAILED_CHECK_LOG_INPUT_BYTES:
+        return value
+    head_bytes = 256 * 1024
+    tail_bytes = _MAX_FAILED_CHECK_LOG_INPUT_BYTES - head_bytes
+    return (
+        encoded[:head_bytes].decode("utf-8", errors="replace")
+        + "\n[... middle bytes omitted; see complete log ...]\n"
+        + encoded[-tail_bytes:].decode("utf-8", errors="replace")
+    )
+
+
+def _failed_check_logs(*, evidence_dir: Path, evidence: EvidenceBundle) -> list[dict[str, Any]]:
+    """Read full-log evidence for failed checks without crossing the artifact root."""
 
     failed_names = {
         failure.split(":", 1)[1]
         for failure in _soft_check_failures(evidence)
         if ":" in failure
     }
-    root = run_dir.resolve()
-    chunks: list[str] = []
-    for check in evidence.checks:
-        payload = dict(check) if isinstance(check, Mapping) else check_result_json(check)
-        if payload.get("name") not in failed_names:
+    root = evidence_dir.resolve()
+    persisted_checks = _read_json_artifact(evidence_dir / "checks.json")
+    persisted_by_name = {
+        item.get("name"): item
+        for item in persisted_checks
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    } if isinstance(persisted_checks, list) else {}
+    records: list[dict[str, Any]] = []
+    for raw_check in evidence.checks:
+        item = dict(raw_check) if isinstance(raw_check, Mapping) else check_result_json(raw_check)
+        name = item.get("name")
+        if name not in failed_names:
             continue
-        if not isinstance(check, Mapping):
-            for key in ("stdout_log", "stderr_log"):
-                value = getattr(check, key, None)
-                if isinstance(value, str):
-                    chunks.append(value[-_MAX_CHECK_SCOPE_LOG_BYTES:])
-        for key in ("stdout_tail", "stderr_tail"):
-            value = payload.get(key)
-            if isinstance(value, str):
-                chunks.append(value)
-        for key in ("stdout_log_path", "stderr_log_path"):
-            raw_path = payload.get(key)
-            if not isinstance(raw_path, str) or not raw_path:
-                continue
-            try:
-                candidate = (root / raw_path).resolve()
-                candidate.relative_to(root)
-            except (OSError, RuntimeError, ValueError):
-                continue
-            chunks.append(_read_log_tail(candidate))
-    return "\n".join(chunk for chunk in chunks if chunk)
+        stored = persisted_by_name.get(name)
+        if isinstance(stored, Mapping):
+            for stream in ("stdout", "stderr"):
+                key = f"{stream}_log_path"
+                if isinstance(stored.get(key), str):
+                    item[key] = stored[key]
+        for stream in ("stdout", "stderr"):
+            path_key = f"{stream}_log_path"
+            candidate: Path | None = None
+            raw_path = item.get(path_key)
+            if isinstance(raw_path, str) and raw_path:
+                try:
+                    candidate = (root / raw_path).resolve()
+                    candidate.relative_to(root)
+                except (OSError, RuntimeError, ValueError):
+                    item.pop(path_key, None)
+                    candidate = None
+                else:
+                    item[path_key] = candidate.as_posix()
+            log_value = item.get(f"{stream}_log")
+            if not isinstance(log_value, str) or not log_value:
+                log_value = getattr(raw_check, f"{stream}_log", "")
+            if not isinstance(log_value, str) or not log_value:
+                log_value = _read_failure_log(candidate) if candidate is not None else ""
+            item[f"{stream}_log"] = _bound_failure_log(log_value) if isinstance(log_value, str) else ""
+        records.append(item)
+    return records
+
+
+def _failure_log_text(records: Sequence[Mapping[str, Any]]) -> str:
+    chunks: list[str] = []
+    per_check_budget = max(1, _CHECK_REPAIR_PROOF_BYTES // max(1, len(records)))
+    for record in records:
+        proof = extract_failure_evidence(
+            stdout_log=str(record.get("stdout_log") or ""),
+            stderr_log=str(record.get("stderr_log") or ""),
+            stdout_tail=str(record.get("stdout_tail") or ""),
+            stderr_tail=str(record.get("stderr_tail") or ""),
+            stdout_log_path=(
+                record.get("stdout_log_path")
+                if isinstance(record.get("stdout_log_path"), str) else None
+            ),
+            stderr_log_path=(
+                record.get("stderr_log_path")
+                if isinstance(record.get("stderr_log_path"), str) else None
+            ),
+            max_bytes=per_check_budget,
+        )
+        chunks.append(f"CHECK {record.get('name')}\n{proof}")
+    return "\n\n".join(chunks)
 
 
 def _resolve_check_path_candidate(
@@ -261,7 +325,7 @@ def _resolve_check_path_candidate(
     return matches[0] if len(matches) == 1 else None
 
 
-def _is_auto_expandable_test_path(path: str) -> bool:
+def _is_test_path(path: str) -> bool:
     if not isinstance(path, str) or not path:
         return False
     parts = PurePosixPath(path).parts
@@ -288,26 +352,27 @@ def _check_repair_scope_candidates(
     repo: Path,
     worktree: Path,
     tree_sha: str,
-    run_dir: Path,
+    evidence_dir: Path,
     evidence: EvidenceBundle,
-    base_mutable_scope: Sequence[str],
+    approved_mutable_scope: Sequence[str],
 ) -> list[str]:
-    """Find tracked test paths named by failing-check evidence only."""
+    """Find approved, existing non-test files implicated by failure evidence."""
 
     tracked = frozenset(tracked_files_in_tree(repo, tree_sha))
-    text = _failed_check_text(run_dir=run_dir, evidence=evidence)
+    text = _failure_log_text(_failed_check_logs(evidence_dir=evidence_dir, evidence=evidence))
     resolved = [
         _resolve_check_path_candidate(
             match.group(0), worktree=worktree, tracked_files=tracked
         )
         for match in _CHECK_SCOPE_PATH_RE.finditer(text)
     ]
-    base = set(base_mutable_scope)
+    approved = set(approved_mutable_scope)
     return sorted({
         path for path in resolved
         if path is not None
-        and path not in base
-        and _is_auto_expandable_test_path(path)
+        and path in approved
+        and path in tracked
+        and not _is_test_path(path)
     })
 
 
@@ -322,41 +387,56 @@ def _hard_failure_items(failures: Any) -> list[str]:
     ]
 
 
-_CHECK_REPAIR_LOG_BYTES = 4 * 1024
-
-
-def _check_repair_problem_context(evidence: EvidenceBundle) -> str:
-    """Render only the failed checks for Claude's corrective prompt."""
+def _check_repair_problem_context(
+    evidence: EvidenceBundle,
+    *,
+    evidence_dir: Path,
+    repo: Path,
+    worktree: Path,
+    tree_sha: str,
+) -> str:
+    """Render bounded root-cause excerpts plus explicit read-only file paths."""
 
     failures = _soft_check_failures(evidence)
-    failed_names = {
-        item.split(":", 1)[1]
-        for item in failures
-        if ":" in item
-    }
+    logs = _failed_check_logs(evidence_dir=evidence_dir, evidence=evidence)
     failed_checks: list[dict[str, Any]] = []
-    for raw_check in _check_payload(evidence):
-        if not isinstance(raw_check, Mapping):
-            continue
+    proof_text = _failure_log_text(logs)
+    tracked = frozenset(tracked_files_in_tree(repo, tree_sha))
+    readable: set[str] = set()
+    for match in _CHECK_SCOPE_PATH_RE.finditer(proof_text):
+        path = _resolve_check_path_candidate(
+            match.group(0), worktree=worktree,
+            tracked_files=tracked,
+        )
+        if path is not None:
+            readable.add(path)
+    proof_budget = max(1, _CHECK_REPAIR_PROOF_BYTES // max(1, len(logs)))
+    for raw_check in logs:
         name = raw_check.get("name")
-        if name not in failed_names:
-            continue
+        failure_proof = extract_failure_evidence(
+            stdout_log=str(raw_check.get("stdout_log") or ""),
+            stderr_log=str(raw_check.get("stderr_log") or ""),
+            stdout_tail=str(raw_check.get("stdout_tail") or ""),
+            stderr_tail=str(raw_check.get("stderr_tail") or ""),
+            stdout_log_path=(raw_check.get("stdout_log_path")
+                             if isinstance(raw_check.get("stdout_log_path"), str) else None),
+            stderr_log_path=(raw_check.get("stderr_log_path")
+                             if isinstance(raw_check.get("stderr_log_path"), str) else None),
+            max_bytes=proof_budget,
+        )
         check: dict[str, Any] = {
             "name": name,
             "exit_code": raw_check.get("exit_code"),
             "timed_out": bool(raw_check.get("timed_out", False)),
             "workspace_mutated": bool(raw_check.get("workspace_mutated", False)),
+            "failure_proof": failure_proof,
         }
-        for key in ("stdout_tail", "stderr_tail"):
-            value = raw_check.get(key)
-            if not isinstance(value, str) or not value:
-                continue
-            data = value.encode("utf-8", errors="replace")
-            if len(data) > _CHECK_REPAIR_LOG_BYTES:
-                data = data[-_CHECK_REPAIR_LOG_BYTES:]
-            check[key] = data.decode("utf-8", errors="replace")
         failed_checks.append(check)
-    return _json_text({"failure_ids": failures, "checks": failed_checks})
+    return _json_text({
+        "failure_ids": failures,
+        "readable_failure_paths": sorted(readable)[:24],
+        "checks": failed_checks,
+    })
 
 
 def _check_repair_prompt(
@@ -366,7 +446,10 @@ def _check_repair_prompt(
     approved_contract_index: str,
     changed_files: str,
     evidence: EvidenceBundle,
-    mutable_scope: list[str],
+    evidence_dir: Path,
+    repo: Path,
+    worktree: Path,
+    effective_repair_scope: Sequence[str],
     candidate_identity: str = "",
     budget_bytes: int = 40_000,
     diagnostics_dir: str | Path | None = None,
@@ -376,13 +459,27 @@ def _check_repair_prompt(
     del plan
     template = (_PROMPTS_DIR / "check_repair.txt").read_text(encoding="utf-8")
     failed_ids = _soft_check_failures(evidence)
+    problem_context = _check_repair_problem_context(
+        evidence, evidence_dir=evidence_dir, repo=repo,
+        worktree=worktree, tree_sha=evidence.staged_tree_sha or "",
+    )
+    try:
+        context_payload = json.loads(problem_context)
+    except (TypeError, json.JSONDecodeError):
+        context_payload = {}
+    readable_paths = context_payload.get("readable_failure_paths", [])
+    read_set = "\n".join(
+        f"- {path} :: named by the failing check output"
+        for path in readable_paths if isinstance(path, str)
+    ) or "Only the bounded failed-check evidence; no repository paths were identified."
     payload = build_check_repair_payload(
         spec=spec,
         failed_check_ids="\n".join(failed_ids) or "NONE",
-        failed_check_evidence=_check_repair_problem_context(evidence),
+        failed_check_evidence=problem_context,
+        read_set=read_set,
         compact_contract_invariants=approved_contract_index,
         changed_files=changed_files,
-        mutable_scope=_json_text(mutable_scope),
+        mutable_scope=_json_text(list(effective_repair_scope)),
         candidate_identity=candidate_identity,
         template=template,
         budget_bytes=budget_bytes,
@@ -392,7 +489,8 @@ def _check_repair_prompt(
     return payload.rendered
 
 
-_AUTO_BOUNDED_SOURCE = "auto-bounded failing-test evidence"
+_EVIDENCE_SCOPE_SOURCE = "failure evidence within approved mutable scope"
+_SCOPE_REQUEST_SOURCE = "explicit META SCOPE REQUEST v1"
 _HUMAN_SCOPE_SOURCE = "human-approved mutable scope"
 _CYCLE_SCOPE_SOURCE = "cycle mutable scope"
 
@@ -405,52 +503,87 @@ def _read_check_repair_scope(
     policy_config: EffectiveRepairScopePolicy,
 ) -> CheckRepairScope:
     payload = _read_json_artifact(directory / "scope.json", 64 * 1024)
-    base = tuple(sorted(set(fallback_base)))
-    if not isinstance(payload, dict) or payload.get("schema_version") != 2:
-        return CheckRepairScope(
-            base_paths=base, added_paths=(), effective_paths=base,
-            policy=policy_config.policy,
-            bound=policy_config.max_added_paths,
-            source=_HUMAN_SCOPE_SOURCE,
-        )
-    raw_base = payload.get("base_mutable_scope")
-    raw_added = payload.get("added_paths")
-    raw_effective = payload.get("effective_mutable_scope")
-    if not all(isinstance(value, list) for value in (raw_base, raw_added, raw_effective)):
+    approved = tuple(sorted(set(fallback_base)))
+    if not isinstance(payload, dict):
         raise ResumeIntegrityError("check-repair scope artifact is malformed")
-    if any(not isinstance(path, str) for paths in (raw_base, raw_added, raw_effective) for path in paths):
+    version = payload.get("schema_version")
+    if version == 2:
+        # Preserve resume compatibility for prior attempts whose base scope
+        # was the entire approved cycle envelope.
+        raw_approved = payload.get("base_mutable_scope")
+        raw_initial = raw_approved
+        raw_added = payload.get("added_paths")
+        raw_effective = payload.get("effective_mutable_scope")
+        legacy = True
+    elif version == 3:
+        raw_approved = payload.get("approved_mutable_scope")
+        raw_initial = payload.get("initial_repair_scope")
+        raw_added = payload.get("added_paths")
+        raw_effective = payload.get("effective_repair_scope")
+        legacy = False
+    else:
+        raise ResumeIntegrityError("check-repair scope artifact has an unsupported schema")
+    if not all(isinstance(value, list) for value in (raw_approved, raw_initial, raw_added, raw_effective)):
+        raise ResumeIntegrityError("check-repair scope artifact is malformed")
+    if any(
+        not isinstance(path, str)
+        for paths in (raw_approved, raw_initial, raw_added, raw_effective)
+        for path in paths
+    ):
         raise ResumeIntegrityError("check-repair scope artifact contains invalid paths")
     if any(
         not path or path.startswith("/") or "\\" in path
         or any(part in {"", ".", ".."} for part in PurePosixPath(path).parts)
-        for paths in (raw_base, raw_added, raw_effective) for path in paths
+        for paths in (raw_approved, raw_initial, raw_added, raw_effective) for path in paths
     ):
         raise ResumeIntegrityError("check-repair scope artifact contains unsafe paths")
-    parsed_base = tuple(sorted(set(raw_base)))
+    parsed_approved = tuple(sorted(set(raw_approved)))
+    parsed_initial = tuple(sorted(set(raw_initial)))
     parsed_added = tuple(sorted(set(raw_added)))
     parsed_effective = tuple(sorted(set(raw_effective)))
     if (
-        raw_base != list(parsed_base)
+        raw_approved != list(parsed_approved)
+        or raw_initial != list(parsed_initial)
         or raw_added != list(parsed_added)
         or raw_effective != list(parsed_effective)
     ):
         raise ResumeIntegrityError("check-repair scope artifact is not canonical")
-    if parsed_base != base or parsed_effective != tuple(sorted(set(parsed_base) | set(parsed_added))):
-        raise ResumeIntegrityError("check-repair scope artifact does not match its base scope")
+    if (
+        parsed_approved != approved
+        or not set(parsed_initial).issubset(parsed_approved)
+        or (not legacy and not set(parsed_added).issubset(parsed_approved))
+        or set(parsed_initial) & set(parsed_added)
+        or parsed_effective != tuple(sorted(set(parsed_initial) | set(parsed_added)))
+    ):
+        raise ResumeIntegrityError("check-repair scope artifact does not match its approved envelope")
     policy = payload.get("policy")
     bound = payload.get("bound")
     source = payload.get("source")
     if policy != policy_config.policy or bound != policy_config.max_added_paths or not isinstance(source, str):
         raise ResumeIntegrityError("check-repair scope policy changed")
-    if source not in {_HUMAN_SCOPE_SOURCE, _AUTO_BOUNDED_SOURCE}:
+    valid_sources = {
+        _HUMAN_SCOPE_SOURCE, _EVIDENCE_SCOPE_SOURCE, _SCOPE_REQUEST_SOURCE,
+        "auto-bounded failing-test evidence",  # schema v2 resume compatibility
+    }
+    if not isinstance(source, str) or source not in valid_sources:
         raise ResumeIntegrityError("check-repair scope artifact has invalid provenance")
-    if parsed_added and source != _AUTO_BOUNDED_SOURCE:
+    if parsed_added and source not in {
+        _SCOPE_REQUEST_SOURCE, "auto-bounded failing-test evidence",
+    }:
         raise ResumeIntegrityError("check-repair added paths have an invalid provenance")
-    if not parsed_added and source != _HUMAN_SCOPE_SOURCE:
-        raise ResumeIntegrityError("check-repair base scope has an invalid provenance")
+    if not parsed_added and source not in {_HUMAN_SCOPE_SOURCE, _EVIDENCE_SCOPE_SOURCE}:
+        raise ResumeIntegrityError("check-repair initial scope has an invalid provenance")
     if len(parsed_added) > policy_config.max_added_paths:
         raise ResumeIntegrityError("check-repair scope bound was exceeded")
-    return CheckRepairScope(parsed_base, parsed_added, parsed_effective, policy, bound, source)
+    return CheckRepairScope(
+        approved_mutable_scope=parsed_approved,
+        initial_repair_scope=parsed_initial,
+        added_paths=parsed_added,
+        effective_repair_scope=parsed_effective,
+        policy=policy,
+        bound=bound,
+        source=source,
+    )
 
 
 def mutable_scope_sha256(paths: Sequence[str]) -> str:
@@ -481,6 +614,7 @@ def gate_mutable_authority(
             effective_paths=base,
             source=_CYCLE_SCOPE_SOURCE,
             sha256=mutable_scope_sha256(base),
+            initial_paths=(),
         )
 
     if through_attempt is not None and (
@@ -506,6 +640,7 @@ def gate_mutable_authority(
             effective_paths=base,
             source=_CYCLE_SCOPE_SOURCE,
             sha256=mutable_scope_sha256(base),
+            initial_paths=(),
         )
     scopes: list[CheckRepairScope] = []
     for expected, directory in enumerate(directories, start=1):
@@ -526,6 +661,8 @@ def gate_mutable_authority(
                 raise ResumeIntegrityError("check-repair attempt is not bound to its scope")
         if scopes and not set(scopes[-1].added_paths).issubset(scope.added_paths):
             raise ResumeIntegrityError("check-repair scope additions are not cumulative")
+        if scopes and scopes[-1].initial_repair_scope != scope.initial_repair_scope:
+            raise ResumeIntegrityError("check-repair initial scope changed between attempts")
         scopes.append(scope)
     if through_attempt is not None and len(scopes) != through_attempt:
         raise ResumeIntegrityError("check-repair scope attempts are not contiguous")
@@ -536,6 +673,7 @@ def gate_mutable_authority(
         effective_paths=final.effective_paths,
         source=final.source,
         sha256=mutable_scope_sha256(final.effective_paths),
+        initial_paths=final.initial_repair_scope,
     )
 
 
@@ -548,7 +686,7 @@ class CheckRepairCoordinator:
     beyond the injected policy's bound.
     """
 
-    effective_repair_scope: EffectiveRepairScopePolicy
+    repair_scope_policy: EffectiveRepairScopePolicy
 
     def resolve_scope(
         self,
@@ -556,33 +694,51 @@ class CheckRepairCoordinator:
         repo: Path,
         worktree: Path,
         tree_sha: str,
-        run_dir: Path,
+        evidence_dir: Path,
         evidence: EvidenceBundle,
-        base_mutable_scope: Sequence[str],
+        approved_mutable_scope: Sequence[str],
         previous: CheckRepairScope | None = None,
     ) -> CheckRepairScope:
         """The scope of the next attempt; earlier attempts' paths are kept."""
 
-        base_paths = tuple(sorted(set(
-            previous.base_paths if previous is not None else base_mutable_scope
-        )))
-        added = set(previous.added_paths) if previous is not None else set()
-        policy = self.effective_repair_scope
-        if policy.policy == "auto-bounded":
-            candidates = _check_repair_scope_candidates(
-                repo=repo, worktree=worktree, tree_sha=tree_sha, run_dir=run_dir,
-                evidence=evidence, base_mutable_scope=tuple(sorted(set(base_paths) | added)),
+        approved = tuple(sorted(set(approved_mutable_scope)))
+        if previous is not None and previous.approved_mutable_scope != approved:
+            raise ResumeIntegrityError("check-repair approved mutable scope changed")
+        if previous is not None:
+            initial = previous.initial_repair_scope
+        else:
+            initial_candidates = _check_repair_scope_candidates(
+                repo=repo, worktree=worktree, tree_sha=tree_sha,
+                evidence_dir=evidence_dir, evidence=evidence,
+                approved_mutable_scope=approved,
             )
-            proposed = added | set(candidates)
-            if len(proposed) <= policy.max_added_paths:
-                added = proposed
+            # When output names no implicated source file, changed paths in
+            # this gate's evidence provide a narrow fallback. A traceback
+            # match always takes priority and keeps unrelated cycle changes
+            # out of the worker's initial WRITE_SET.
+            if not initial_candidates:
+                tracked = frozenset(tracked_files_in_tree(repo, tree_sha))
+                changed_candidates = sorted({
+                    path for path in evidence.changed_files
+                    if path in approved and path in tracked and not _is_test_path(path)
+                })
+                if len(changed_candidates) <= _MAX_CHANGED_PATH_FALLBACK:
+                    initial_candidates = changed_candidates
+            initial = tuple(initial_candidates)
+        added = set(previous.added_paths) if previous is not None else set()
+        policy = self.repair_scope_policy
+        if len(added) > policy.max_added_paths:
+            raise ResumeIntegrityError("check-repair scope bound was exceeded")
         return CheckRepairScope(
-            base_paths=base_paths,
+            approved_mutable_scope=approved,
+            initial_repair_scope=tuple(sorted(initial)),
             added_paths=tuple(sorted(added)),
-            effective_paths=tuple(sorted(set(base_paths) | added)),
+            effective_repair_scope=tuple(sorted(set(initial) | added)),
             policy=policy.policy,
             bound=policy.max_added_paths,
-            source=_AUTO_BOUNDED_SOURCE if added else _HUMAN_SCOPE_SOURCE,
+            source=_SCOPE_REQUEST_SOURCE if added else (
+                _EVIDENCE_SCOPE_SOURCE if initial else _HUMAN_SCOPE_SOURCE
+            ),
         )
 
 

@@ -423,6 +423,7 @@ def build_check_repair_payload(
     spec: str,
     failed_check_ids: str,
     failed_check_evidence: str,
+    read_set: str = "Only paths named in the failed-check evidence and direct local imports.",
     compact_contract_invariants: str,
     changed_files: str,
     mutable_scope: str,
@@ -437,6 +438,7 @@ def build_check_repair_payload(
     sections = (
         _section("spec", spec, True),
         _section("failed_check_ids", failed_check_ids, True),
+        _section("read_set", read_set, True),
         _section("failed_check_evidence", failed_check_evidence, False),
         _section("compact_contract_invariants", compact_contract_invariants, False),
         _section("changed_files", changed_files, False),
@@ -446,6 +448,7 @@ def build_check_repair_payload(
     placeholders = {
         "{{SPEC}}": "spec",
         "{{FAILED_CHECK_IDS}}": "failed_check_ids",
+        "{{READ_SET}}": "read_set",
         "{{CHECK_DETAILS}}": "failed_check_evidence",
         "{{CONTRACT_INVARIANTS}}": "compact_contract_invariants",
         "{{CHANGED_FILES}}": "changed_files",

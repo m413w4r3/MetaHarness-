@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -39,6 +40,142 @@ SECRET_IN_STAGED_BLOB = "SECRET_IN_STAGED_BLOB"
 UNSCANNABLE_STAGED_BLOB = "UNSCANNABLE_STAGED_BLOB"
 UNREVIEWABLE_TEXT_DIFF = "UNREVIEWABLE_TEXT_DIFF"
 MAX_SECRET_SCAN_BLOB_BYTES = 16 * 1024 * 1024
+
+_FAILURE_EVIDENCE_MAX_BYTES = 48 * 1024
+_FAILURE_SUMMARY_MAX_BYTES = 8 * 1024
+
+
+def _bounded_utf8(value: str, budget: int) -> str:
+    data = value.encode("utf-8", errors="replace")
+    if len(data) <= budget:
+        return value
+    marker = "\n[... excerpt shortened ...]\n"
+    marker_size = len(marker.encode("utf-8"))
+    if budget <= marker_size:
+        return data[:budget].decode("utf-8", errors="ignore")
+    head_size = (budget - marker_size) // 2
+    tail_size = budget - marker_size - head_size
+    return (
+        data[:head_size].decode("utf-8", errors="ignore")
+        + marker
+        + data[-tail_size:].decode("utf-8", errors="ignore")
+    )
+
+
+def extract_failure_evidence(
+    *,
+    stdout_log: str = "",
+    stderr_log: str = "",
+    stdout_tail: str = "",
+    stderr_tail: str = "",
+    stdout_log_path: str | None = None,
+    stderr_log_path: str | None = None,
+    max_bytes: int = _FAILURE_EVIDENCE_MAX_BYTES,
+) -> str:
+    """Build a deterministic, bounded excerpt around a failed check's cause.
+
+    The complete log is scanned only when supplied by the check artifact. The
+    result favors pytest/unittest failure sections, tracebacks and compiler
+    diagnostics, with a head/tail fallback for unknown command formats.
+    """
+
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+
+    streams = [("stdout", stdout_log), ("stderr", stderr_log)]
+    nonempty_logs = [(name, value) for name, value in streams if value]
+    all_lines: list[tuple[str, str]] = [
+        (name, line) for name, value in nonempty_logs for line in value.splitlines()
+    ]
+    summary = "\n".join(
+        f"[{name} tail]\n{_bounded_utf8(value, _FAILURE_SUMMARY_MAX_BYTES)}"
+        for name, value in (("stdout", stdout_tail), ("stderr", stderr_tail))
+        if value
+    )
+
+    selected: list[str] = []
+    full_text = "\n".join(line for _name, line in all_lines)
+    pytest_failed = re.search(r"(?m)^FAILED\s+([^\s]+)", full_text)
+    if pytest_failed is None:
+        pytest_failed = re.search(r"(?m)^FAILED\s+([^\s]+)", summary)
+
+    lines = [line for _name, line in all_lines]
+    failure_boundary = re.search(r"(?m)^={3,}\s*FAILURES\s*={3,}\s*$", full_text)
+    pytest_headers = [
+        index for index, line in enumerate(lines)
+        if re.match(r"^_{3,}.*_{3,}\s*$", line)
+    ]
+    if pytest_headers:
+        target = pytest_failed.group(1) if pytest_failed else ""
+        target_name = target.rsplit("::", 1)[-1].split("[", 1)[0]
+        start = next(
+            (
+                index for index in pytest_headers
+                if target and (target in lines[index] or (target_name and target_name in lines[index]))
+            ),
+            None,
+        )
+        if start is None:
+            after_failures = 0
+            if failure_boundary is not None:
+                after_failures = full_text[:failure_boundary.start()].count("\n")
+            start = next((index for index in pytest_headers if index >= after_failures), pytest_headers[0])
+        end = next((index for index in pytest_headers if index > start), len(lines))
+        end = min(
+            end,
+            next((index for index in range(start + 1, len(lines))
+                  if "short test summary info" in lines[index]), len(lines)),
+        )
+        selected = lines[start:end]
+
+    if not selected:
+        unit_header = re.compile(r"^(?:FAIL|ERROR):\s+.*$", re.IGNORECASE)
+        start = next((index for index, line in enumerate(lines) if unit_header.match(line)), None)
+        if start is not None:
+            end = next(
+                (index for index in range(start + 1, len(lines))
+                 if unit_header.match(lines[index]) or lines[index].startswith("=" * 5)),
+                min(len(lines), start + 120),
+            )
+            selected = lines[start:end]
+
+    if not selected:
+        error_pattern = re.compile(
+            r"Traceback \(most recent call last\)|^\s*E\s{2,}|"
+            r"\b(?:fatal\s+)?error:|\b(?:type error|assertionerror|assertion failed)\b|"
+            r"\b(?:FAILED|FAILURE|ERROR)\b",
+            re.IGNORECASE,
+        )
+        anchors = [index for index, line in enumerate(lines) if error_pattern.search(line)]
+        if anchors:
+            anchor = anchors[0]
+            traceback_start = next(
+                (index for index in range(anchor, -1, -1)
+                 if "Traceback (most recent call last)" in lines[index]),
+                None,
+            )
+            start = max(0, (traceback_start if traceback_start is not None else anchor) - 4)
+            end = min(len(lines), max(anchor + 7, (traceback_start or anchor) + 24))
+            selected = lines[start:end]
+
+    if not selected and lines:
+        # Unknown command output: retain a small deterministic head and tail.
+        selected = lines[:10]
+        if len(lines) > 20:
+            selected += ["[... middle omitted ...]"]
+        selected += lines[-10:] if len(lines) > 10 else []
+
+    cause = "\n".join(selected)
+    log_refs = [
+        f"stdout: {stdout_log_path}" if stdout_log_path else "",
+        f"stderr: {stderr_log_path}" if stderr_log_path else "",
+    ]
+    parts = [
+        "SUMMARY TAIL\n" + (summary or "No output tail was recorded."),
+        "FIRST FAILURE / TRACEBACK / DIAGNOSTIC\n" + (cause or "No recognizable diagnostic was found."),
+        "COMPLETE LOGS\n" + ("\n".join(item for item in log_refs if item) or "No complete log path was recorded."),
+    ]
+    return _bounded_utf8("\n\n".join(parts), max_bytes)
 
 _TEXT_DIFF_SUFFIXES = frozenset(
     {

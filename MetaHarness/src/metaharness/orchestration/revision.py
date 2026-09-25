@@ -725,7 +725,6 @@ class RevisionRunner:
     reusable_pre_checks: Callable[[Path, str], dict[str, Any] | None]
     hard_integrity_failures: Callable[[EvidenceBundle], list[str]]
     soft_check_failures: Callable[[EvidenceBundle], list[str]]
-    check_repair_scope_candidates: Callable[..., list[str]]
     check_repair_prompt: Callable[..., str]
 
     def run(
@@ -754,6 +753,7 @@ class RevisionRunner:
         pre_check_evidence: EvidenceBundle | None = None,
         check_repair_evidence: EvidenceBundle | None = None,
         check_repair_scope: CheckRepairScope | None = None,
+        check_evidence_dir: Path | None = None,
     ) -> tuple[Any | None, str | None]:
         """Run one pass and return ``(result, failure_reason)``.
 
@@ -775,29 +775,23 @@ class RevisionRunner:
             return None, "TOCTOU_FAILURE"
         if is_check_repair:
             check_repair_scope = check_repair_scope or CheckRepairScope(
-                base_paths=tuple(mutable_scope), added_paths=(),
-                effective_paths=tuple(mutable_scope),
+                approved_mutable_scope=tuple(mutable_scope),
+                initial_repair_scope=tuple(mutable_scope),
+                added_paths=(),
+                effective_repair_scope=tuple(mutable_scope),
                 policy=self.effective_repair_scope.policy,
                 bound=self.effective_repair_scope.max_added_paths,
                 source="human-approved mutable scope",
             )
             atomic_write_text(artifact_dir / "scope.json", _json_text({
-                "schema_version": 2,
-                "base_mutable_scope": list(check_repair_scope.base_paths),
+                "schema_version": 3,
+                "approved_mutable_scope": list(check_repair_scope.approved_mutable_scope),
+                "initial_repair_scope": list(check_repair_scope.initial_repair_scope),
                 "added_paths": list(check_repair_scope.added_paths),
-                "effective_mutable_scope": list(check_repair_scope.effective_paths),
+                "effective_repair_scope": list(check_repair_scope.effective_repair_scope),
                 "policy": check_repair_scope.policy,
                 "bound": check_repair_scope.bound,
                 "source": check_repair_scope.source,
-                "bound_exceeded": (
-                    check_repair_scope.policy == "auto-bounded"
-                    and not check_repair_scope.added_paths
-                    and len(self.check_repair_scope_candidates(
-                        repo=repo, worktree=info.worktree, tree_sha=tree_before,
-                        run_dir=run_dir, evidence=check_repair_evidence,
-                        base_mutable_scope=check_repair_scope.base_paths,
-                    )) > check_repair_scope.bound
-                ),
             }))
             revision_prompt = self.check_repair_prompt(
                 spec=spec,
@@ -805,7 +799,10 @@ class RevisionRunner:
                 approved_contract_index=_revision_contract_index(plan),
                 changed_files="\n".join(check_repair_evidence.changed_files),
                 evidence=check_repair_evidence,
-                mutable_scope=mutable_scope,
+                evidence_dir=check_evidence_dir or artifact_dir,
+                repo=repo,
+                worktree=info.worktree,
+                effective_repair_scope=mutable_scope,
                 candidate_identity=candidate_identity or tree_before,
                 budget_bytes=self.config.prompt_budget.check_repair_max_bytes,
                 diagnostics_dir=artifact_dir,

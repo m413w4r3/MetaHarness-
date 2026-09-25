@@ -549,12 +549,25 @@ def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
 
 @dataclasses.dataclass(frozen=True)
 class CheckRepairScope:
-    base_paths: tuple[str, ...]
+    approved_mutable_scope: tuple[str, ...]
+    initial_repair_scope: tuple[str, ...]
     added_paths: tuple[str, ...]
-    effective_paths: tuple[str, ...]
+    effective_repair_scope: tuple[str, ...]
     policy: str
     bound: int
     source: str
+
+    @property
+    def base_paths(self) -> tuple[str, ...]:
+        """Compatibility alias for the approved cycle envelope."""
+
+        return self.approved_mutable_scope
+
+    @property
+    def effective_paths(self) -> tuple[str, ...]:
+        """Compatibility alias for the worker's current writable scope."""
+
+        return self.effective_repair_scope
 
 
 @dataclasses.dataclass(frozen=True)
@@ -566,6 +579,7 @@ class GateMutableAuthority:
     effective_paths: tuple[str, ...]
     source: str
     sha256: str
+    initial_paths: tuple[str, ...] = ()
 
 
 

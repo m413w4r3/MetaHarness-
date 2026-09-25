@@ -21,7 +21,9 @@ from metaharness.orchestrator import Orchestrator
 from metaharness.repository_topology import RepositoryTopology
 from metaharness.resume import ResumeNotAllowedError, resume_info
 from metaharness.run_options import RunOptions
-from tests.pipeline_support import PipelineHarness, ScriptedChat, git, plan, review
+from tests.pipeline_support import (
+    PipelineHarness, ScriptedChat, check_repair_result, git, plan, review,
+)
 from tests.test_pipeline_v2_machine import repaired_step_contract
 
 SPEC = "Make feature.txt good.\n"
@@ -126,6 +128,35 @@ class StepAuthorityHarness(PipelineHarness):
             mismatch_for("The step still needs d.txt."),
             writes(*success_paths),
         )
+
+    def test_check_repair_scope_request_cannot_exceed_the_cycle_envelope(self) -> None:
+        scope_request = (
+            "META SCOPE REQUEST v1\n\n"
+            "REASON\nThe source path is needed to resolve the gate failure.\n\n"
+            "PATHS\n- c.txt\n\n"
+            "EVIDENCE\n- The failing check depends on c.txt.\n\n"
+            "END META SCOPE REQUEST"
+        )
+        def fail_feature(request):
+            (request.worktree / "feature.txt").write_text("bad\n", encoding="utf-8")
+            return "implemented with a failing gate\n"
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, fail_feature)
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            lambda _request: scope_request + "\n\n" + check_repair_result(
+                "BLOCKED", "NOT_RUN", "SCOPE", "c.txt is outside approved cycle scope",
+            ),
+        )
+        config = self.config(check_repair=1)
+
+        result = self.run_pipeline(
+            [self.one_step_plan()], config=config, options=self.options(config, max_added=1),
+        )
+
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
+        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
 
 
 class EffectiveAuthorityCommitTests(StepAuthorityHarness):

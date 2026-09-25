@@ -4,6 +4,11 @@ Correct the concrete failed deterministic checks in the current worktree.
 Preserve the SPEC and the contract invariants. Edit only EFFECTIVE MUTABLE
 SCOPE.
 
+Read only the declared READ_SET and direct local imports needed to inspect
+those files. Failing test files may appear in READ_SET for diagnosis, but they
+remain read-only unless a META SCOPE REQUEST explicitly expands the mutable
+scope to include them.
+
 Do not perform a global review, replan the project, change Git, publish, or
 weaken, remove, skip or bypass a check. MetaHarness owns and reruns the
 authoritative deterministic gate; use targeted commands only to diagnose the
@@ -76,6 +81,10 @@ END META SCOPE REQUEST
 <FAILED CHECK IDS>
 {{FAILED_CHECK_IDS}}
 </FAILED CHECK IDS>
+
+<READ_SET>
+{{READ_SET}}
+</READ_SET>
 
 <FAILED CHECK EVIDENCE>
 {{CHECK_DETAILS}}

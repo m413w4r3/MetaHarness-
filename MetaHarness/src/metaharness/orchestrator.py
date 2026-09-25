@@ -302,8 +302,8 @@ from .orchestration.check_repair import (
     CheckRepairAttempt,
     CheckRepairCoordinator,
     GateAcceptanceService,
+    _SCOPE_REQUEST_SOURCE,
     _check_repair_prompt,
-    _check_repair_scope_candidates,
     _hard_integrity_failures,
     gate_mutable_authority,
     _soft_check_failures,
@@ -3261,6 +3261,8 @@ class Orchestrator:
         cycle_plan: CyclePlan,
         artifact_dir: Path,
         current_scope: list[str],
+        *,
+        approved_scope: Sequence[str] | None = None,
     ) -> tuple[str, list[str]]:
         """Persist and apply a strict, policy-bounded reviser scope request."""
 
@@ -3295,6 +3297,11 @@ class Orchestrator:
             raise PipelineFailure("RESUME_REQUIRES_OPERATOR", "scope request tree semantics are unreadable") from exc
         base = tuple(sorted(set(current_scope)))
         requested = tuple(sorted(set(paths)))
+        if approved_scope is not None and not set(requested).issubset(set(approved_scope)):
+            raise PipelineFailure(
+                AGENT_SCOPE_VIOLATION,
+                "scope request exceeds the cycle's approved mutable scope",
+            )
         added = tuple(path for path in requested if path not in base)
         root = artifact_dir / "scope_requests"
         root.mkdir(parents=True, exist_ok=True)
@@ -3753,9 +3760,10 @@ class Orchestrator:
                 require_attempt_records=True,
             )
             previous_scope = CheckRepairScope(
-                base_paths=previous_authority.base_paths,
+                approved_mutable_scope=previous_authority.base_paths,
+                initial_repair_scope=previous_authority.initial_paths,
                 added_paths=previous_authority.added_paths,
-                effective_paths=previous_authority.effective_paths,
+                effective_repair_scope=previous_authority.effective_paths,
                 policy=self._effective_repair_scope.policy,
                 bound=self._effective_repair_scope.max_added_paths,
                 source=previous_authority.source,
@@ -3763,38 +3771,44 @@ class Orchestrator:
         soft = _soft_check_failures(evidence)
         failed_ids = tuple(item.split(":", 1)[1] for item in soft if ":" in item)
         scope = CheckRepairCoordinator(
-            effective_repair_scope=self._effective_repair_scope,
+            repair_scope_policy=self._effective_repair_scope,
         ).resolve_scope(
             repo=ctx.repo, worktree=ctx.info.worktree, tree_sha=evidence.staged_tree_sha,
-            run_dir=ctx.run_dir, evidence=evidence,
-            base_mutable_scope=self._effective_cycle_scope(ctx, cycle_plan), previous=previous_scope,
+            evidence_dir=gate_dir(ctx.run_dir, number, stage), evidence=evidence,
+            approved_mutable_scope=self._effective_cycle_scope(ctx, cycle_plan), previous=previous_scope,
         )
 
         def updated_scope(paths: Sequence[str]) -> CheckRepairScope:
             effective = tuple(sorted(set(paths)))
-            if not set(scope.base_paths).issubset(effective):
+            if not set(scope.initial_repair_scope).issubset(effective):
                 raise PipelineFailure("HUMAN_REQUIRED", "scope request removed existing authority")
-            added = tuple(path for path in effective if path not in set(scope.base_paths))
+            if not set(effective).issubset(scope.approved_mutable_scope):
+                raise PipelineFailure(
+                    AGENT_SCOPE_VIOLATION,
+                    "scope request exceeds the cycle's approved mutable scope",
+                )
+            added = tuple(path for path in effective if path not in set(scope.initial_repair_scope))
             if len(added) > scope.bound:
                 raise PipelineFailure(
                     "HUMAN_REQUIRED", "scope request exceeds the configured check-repair bound",
-                )
+            )
             return CheckRepairScope(
-                base_paths=scope.base_paths,
+                approved_mutable_scope=scope.approved_mutable_scope,
+                initial_repair_scope=scope.initial_repair_scope,
                 added_paths=added,
-                effective_paths=effective,
+                effective_repair_scope=effective,
                 policy=scope.policy,
                 bound=scope.bound,
-                source=("auto-bounded failing-test evidence" if added
-                        else "human-approved mutable scope"),
+                source=(_SCOPE_REQUEST_SOURCE if added else scope.source),
             )
 
         def persist_scope(value: CheckRepairScope) -> None:
             atomic_write_text(attempt_dir / "scope.json", _json_text({
-                "schema_version": 2,
-                "base_mutable_scope": list(value.base_paths),
+                "schema_version": 3,
+                "approved_mutable_scope": list(value.approved_mutable_scope),
+                "initial_repair_scope": list(value.initial_repair_scope),
                 "added_paths": list(value.added_paths),
-                "effective_mutable_scope": list(value.effective_paths),
+                "effective_repair_scope": list(value.effective_repair_scope),
                 "policy": value.policy,
                 "bound": value.bound,
                 "source": value.source,
@@ -3824,7 +3838,8 @@ class Orchestrator:
         )
         if pending_scope_request:
             outcome, mutable_scope = self._authorize_semantic_scope_request(
-                store, ctx, cycle_plan, attempt_dir, list(scope.effective_paths),
+                store, ctx, cycle_plan, attempt_dir, list(scope.effective_repair_scope),
+                approved_scope=scope.approved_mutable_scope,
             )
             if outcome != "expanded":
                 raise PipelineFailure(
@@ -3856,7 +3871,7 @@ class Orchestrator:
             "failure_ids": list(soft),
             "repair_profile_id": selected.profile_id,
             "repair_profile_fingerprint": selected.config_sha256,
-            "mutable_scope": list(scope.effective_paths),
+            "mutable_scope": list(scope.effective_repair_scope),
         }
         self._cycle_update(
             store, cycle_plan.cycle,
@@ -3887,8 +3902,9 @@ class Orchestrator:
                 "info": ctx.info, "branch_ref": ctx.branch_ref,
                 "ownership_before": _git_ownership(ctx.repo, ctx.info.worktree),
                 "selection": ctx.selection, "artifact_dir": attempt_dir,
-                "mutable_scope": list(scope.effective_paths),
+                "mutable_scope": list(scope.effective_repair_scope),
                 "check_repair_evidence": evidence, "check_repair_scope": scope,
+                "check_evidence_dir": gate_dir(ctx.run_dir, number, stage),
                 "check_repair_attempt": attempt,
                 "gate_stage": stage.value,
         }
@@ -3904,17 +3920,18 @@ class Orchestrator:
             if error != _SCOPE_REQUEST_ROUTE:
                 break
             outcome, requested_scope = self._authorize_semantic_scope_request(
-                store, ctx, cycle_plan, attempt_dir, list(scope.effective_paths),
+                store, ctx, cycle_plan, attempt_dir, list(scope.effective_repair_scope),
+                approved_scope=scope.approved_mutable_scope,
             )
-            if outcome != "expanded" or set(requested_scope) == set(scope.effective_paths):
+            if outcome != "expanded" or set(requested_scope) == set(scope.effective_repair_scope):
                 error = "HUMAN_REQUIRED"
                 break
             scope = updated_scope(requested_scope)
             persist_scope(scope)
             _archive_attempt(attempt_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
-            revision_request["mutable_scope"] = list(scope.effective_paths)
+            revision_request["mutable_scope"] = list(scope.effective_repair_scope)
             revision_request["check_repair_scope"] = scope
-            progress["mutable_scope"] = list(scope.effective_paths)
+            progress["mutable_scope"] = list(scope.effective_repair_scope)
             store.update(
                 status=RunStatus.REVISING,
                 check_repair={"status": "running", "attempt_count": len(records), **progress},
@@ -3940,7 +3957,7 @@ class Orchestrator:
                     "failed_check_ids_before": list(failed_ids),
                     "tree_before": evidence.staged_tree_sha,
                     "tree_after": candidate_tree_sha(ctx.info.worktree),
-                    "mutable_scope": list(scope.effective_paths),
+                    "mutable_scope": list(scope.effective_repair_scope),
                     "profile_id": effective_profile_id,
                     "profile_fingerprint": effective_fingerprint,
                     "reason": "CHECK_REPAIR_UNAVAILABLE",
@@ -3968,7 +3985,7 @@ class Orchestrator:
                 "failed_check_ids_before": list(failed_ids),
                 "tree_before": evidence.staged_tree_sha,
                 "tree_after": _safe_candidate_tree(ctx.info.worktree),
-                "mutable_scope": list(scope.effective_paths),
+                "mutable_scope": list(scope.effective_repair_scope),
                 "profile_id": effective_profile_id,
                 "profile_fingerprint": effective_fingerprint,
                 "reason": reason,
@@ -3995,7 +4012,7 @@ class Orchestrator:
             failed_check_ids_before=failed_ids,
             tree_before=evidence.staged_tree_sha,
             tree_after=candidate_tree_sha(ctx.info.worktree),
-            mutable_scope=tuple(scope.effective_paths),
+            mutable_scope=tuple(scope.effective_repair_scope),
             worker_result=protocol.result,
             targeted_check=protocol.targeted_check,
             blocked_kind=protocol.blocked_kind,
@@ -6330,7 +6347,6 @@ class Orchestrator:
             reusable_pre_checks=_reusable_pre_checks,
             hard_integrity_failures=_hard_integrity_failures,
             soft_check_failures=_soft_check_failures,
-            check_repair_scope_candidates=_check_repair_scope_candidates,
             check_repair_prompt=_check_repair_prompt,
         )
 

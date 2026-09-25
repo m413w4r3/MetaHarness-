@@ -629,12 +629,23 @@ class CheckRepairTests(PipelineHarness):
         git(self.repo, "commit", "-qm", "add test fixtures")
         self.base_sha = git(self.repo, "rev-parse", "HEAD")
 
-    def test_repair_scope_is_used_by_commit_gate_and_candidate(self) -> None:
+    @staticmethod
+    def _plan_with_approved_paths(*paths: str) -> str:
+        plan_text = initial_plan(STEP)
+        reads = "".join(f"- {path} :: current content\n" for path in paths)
+        writes = "".join(f"- {path}\n" for path in paths)
+        return plan_text.replace(
+            "- feature.txt :: current content\n",
+            "- feature.txt :: current content\n" + reads,
+            1,
+        ).replace("WRITE_SET\n- feature.txt\n", "WRITE_SET\n- feature.txt\n" + writes, 1)
+
+    def test_failed_test_file_is_readable_but_not_auto_writable(self) -> None:
         self._add_tracked_paths("tests/test_feature.py")
         self.check.write_text(
             "import pathlib, sys\n"
             "if pathlib.Path('feature.txt').read_text().strip() != 'good':\n"
-            "    print('tests/test_feature.py: expected fixture update', file=sys.stderr)\n"
+            "    print('feature.txt: required value; tests/test_feature.py: expected fixture update', file=sys.stderr)\n"
             "    raise SystemExit(1)\n",
             encoding="utf-8",
         )
@@ -654,13 +665,15 @@ class CheckRepairTests(PipelineHarness):
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        accepted = json.loads(
-            (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").read_text()
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
+        repair_request = self.workers.calls[-1]
+        self.assertEqual(repair_request.mutable_paths, ("feature.txt",))
+        self.assertIn("tests/test_feature.py", repair_request.prompt)
+        self.assertIn("remain read-only", repair_request.prompt)
+        self.assertFalse(
+            (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").exists()
         )
-        self.assertEqual(accepted["mutable_scope"], ["feature.txt", "tests/test_feature.py"])
-        self.assertRegex(accepted["mutable_scope_sha256"], r"^[0-9a-f]{64}$")
-        self.assertIn("tests/test_feature.py", git(self.worktree(), "show", "--format=", "--name-only", "HEAD"))
 
     def test_repair_scope_rejects_paths_over_the_auto_bound(self) -> None:
         self._add_tracked_paths("tests/test_feature.py", "tests/test_other.py")
@@ -877,7 +890,7 @@ class CheckRepairTests(PipelineHarness):
         config = self.config(check_repair=1)
         options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
         result = self.orchestrator(
-            config, planner=[initial_plan(STEP)], reviewer=[review()],
+            config, planner=[self._plan_with_approved_paths("other.txt")], reviewer=[review()],
         ).run_text(SPEC, run_id="run", run_options=options)
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
@@ -887,6 +900,106 @@ class CheckRepairTests(PipelineHarness):
         authority = json.loads((attempt / "scope_requests/001/authority.json").read_text())
         self.assertEqual(authority["added_paths"], ["other.txt"])
         self.assertEqual(json.loads((attempt / "scope.json").read_text())["added_paths"], ["other.txt"])
+
+    def test_failure_trace_narrows_repair_and_scope_requests_obey_the_addition_limit(self) -> None:
+        from metaharness.run_options import RunOptions
+
+        modules = [f"src/repair_{index:02}.py" for index in range(38)]
+        approved = ["feature.txt", *modules, "tests/test_failure.py"]
+        self.assertEqual(len(approved), 40)
+        self._add_tracked_paths(*approved)
+        groups = [approved[index:index + 5] for index in range(0, len(approved), 5)]
+        plan_text = initial_plan(*(
+            (f"S{index:02}", group[0], f"Update {group[0]}")
+            for index, group in enumerate(groups, start=1)
+        ))
+        for index, group in enumerate(groups, start=1):
+            primary = group[0]
+            read_entries = "".join(f"- {path} :: current content\n" for path in group)
+            write_entries = "".join(f"- {path}\n" for path in group)
+            plan_text = plan_text.replace(
+                f"READ_SET\n- {primary} :: current content\n",
+                f"READ_SET\n{read_entries}", 1,
+            ).replace(
+                f"WRITE_SET\n- {primary}\n",
+                f"WRITE_SET\n{write_entries}", 1,
+            )
+        counter = self.root / "synthetic-check-count"
+        self.check.write_text(
+            "import pathlib, sys\n"
+            f"counter = pathlib.Path({str(counter)!r})\n"
+            "count = int(counter.read_text()) if counter.exists() else 0\n"
+            "counter.write_text(str(count + 1))\n"
+            "if count == 0:\n"
+            "    print('=== FAILURES ===')\n"
+            "    print('________________ test_gate_failure ________________')\n"
+            "    print('Traceback (most recent call last):')\n"
+            "    print(f'  File {str(pathlib.Path(\"src/repair_00.py\").resolve())!r}, line 12, in run')\n"
+            "    print(f'  File {str(pathlib.Path(\"src/repair_01.py\").resolve())!r}, line 27, in check')\n"
+            "    print('AssertionError: synthetic regression')\n"
+            "    print('E   AssertionError: synthetic regression')\n"
+            "    sys.stdout.write('\\n' * 5000)\n"
+            "    print('FAILED tests/test_failure.py::test_gate_failure - AssertionError')\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        def scope_request_for(path: str) -> str:
+            return (
+                "META SCOPE REQUEST v1\n\n"
+                "REASON\nThe failing assertion depends on this approved source file.\n\n"
+                f"PATHS\n- {path}\n\n"
+                "EVIDENCE\n- The traceback and check output identify the dependency.\n\n"
+                "END META SCOPE REQUEST"
+            )
+
+        def request_third_path(request):
+            self.assertEqual(request.mutable_paths, tuple(modules[:2]))
+            self.assertIn("Traceback (most recent call last)", request.prompt)
+            self.assertIn("src/repair_00.py", request.prompt)
+            self.assertIn("src/repair_01.py", request.prompt)
+            self.assertIn("tests/test_failure.py", request.prompt)
+            self.assertIn("checks/test.stdout.log", request.prompt)
+            return scope_request_for(modules[2]) + "\n\n" + check_repair_result(
+                "BLOCKED", "NOT_RUN", "SCOPE", "The related source path needs authority.",
+            )
+
+        def request_over_limit(request):
+            self.assertEqual(request.mutable_paths, tuple(modules[:3]))
+            return scope_request_for(modules[3]) + "\n\n" + check_repair_result(
+                "BLOCKED", "NOT_RUN", "SCOPE", "A second path needs authority.",
+            )
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, *(
+            write(group[0], "good\n") for group in groups
+        ))
+        self.workers.on(ExecutionRole.REPAIR, request_third_path, request_over_limit)
+        config = self.config(check_repair=1)
+        options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
+        result = self.orchestrator(
+            config, planner=[plan_text], reviewer=[review()],
+        ).run_text(SPEC, run_id="run", run_options=options)
+
+        self.assertEqual(
+            result.status, RunStatus.WAITING_SCOPE_APPROVAL,
+            self.state().get("failure"),
+        )
+        self.assertEqual(self.workers.roles(), ["implementer"] * 8 + ["repair", "repair"])
+        attempt = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts/001"
+        checks = json.loads(
+            (self.run_dir() / "cycles/001/checks/post-implementation/checks.json").read_text()
+        )
+        self.assertEqual(
+            checks[0]["stdout_tail"].strip(),
+            "FAILED tests/test_failure.py::test_gate_failure - AssertionError",
+        )
+        scope = json.loads((attempt / "scope.json").read_text(encoding="utf-8"))
+        self.assertEqual(scope["approved_mutable_scope"], sorted(approved))
+        self.assertEqual(scope["initial_repair_scope"], sorted(modules[:2]))
+        self.assertEqual(scope["added_paths"], [modules[2]])
+        self.assertEqual(scope["effective_repair_scope"], sorted(modules[:3]))
+        attempts = sorted((attempt / "scope_requests").glob("*/authority.json"))
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(json.loads(attempts[1].read_text())["bound"], 1)
 
     def test_gate_docker_outage_waits_without_consuming_check_repair_budget(self) -> None:
         self.check.write_text(

@@ -345,15 +345,19 @@ run again. `CHECK_REPAIR_EXHAUSTED` is terminal after the configured bound.
 The `deny-expansion` and `require-approval` policies govern scope growth
 independently.
 
-Expansion, when it happens, stays as strict as before. When an ordinary
-`CHECK_FAILED:*` output names a path, MetaHarness treats it only as a
-candidate: the path must exist in the exact Git tree, be tracked, and be a
-test or fixture path. The run's `auto-bounded` policy and configured maximum
-apply atomically; production, generated, untracked and ambiguous paths are
-never added. Model output never decides the scope. Paths the first repair
-already earned are carried into later attempts and are never lost, never
-re-added, and never counted twice against the bound. Production paths remain
-the responsibility of the approved plan and reviewer/correction process.
+The repair worker's initial write scope is inferred from the failed check's
+bounded traceback and diagnostic excerpt. Only existing paths named by that
+evidence and already present in the cycle's approved mutable envelope are
+eligible. If no source path can be identified, a small set of changed paths in
+the gate evidence is used as a fallback. Test paths named by a failure remain
+readable for diagnosis but are not writable automatically.
+
+If the worker needs another path inside the approved envelope, it must submit
+`META SCOPE REQUEST v1` with a reason and evidence. The configured maximum
+counts additions from the inferred initial scope; requests beyond that limit
+wait for operator approval and are not sent to the worker. Model output never
+widens the cycle's approved envelope. Paths earned by a valid request remain
+cumulative across attempts and are never counted twice against the bound.
 
 Paths already earned by a repair remain cumulative authority for later attempts, and are never re-added or counted twice. The durable scope artifact is checked on every resume; a divergent or malformed artifact is a `RESUME_INTEGRITY_FAILURE`.
 
