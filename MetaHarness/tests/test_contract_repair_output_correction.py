@@ -18,7 +18,8 @@ from metaharness.planning_v2 import (
     normalize_repair_step_id,
     parse_step_contract_repair,
 )
-from metaharness.resume import ResumeNotAllowedError, resume_info
+from metaharness.orchestration import contract_repair
+from metaharness.resume import CONTRACT_REPAIR_OPERATION, ResumeNotAllowedError, resume_info
 from metaharness.run_options import RunOptions
 from metaharness.state import RunStateStore
 from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
@@ -515,6 +516,53 @@ class PlanCountRepairTests(ContractRepairFixtures):
             raise AssertionError("S05 fixture block was not rendered")
         return raw.replace(before, after, 1)
 
+    def strand_s05(self, repair_raw: str | None = None) -> str:
+        for path in self.STEP_PATHS:
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "-qm", "six-step fixtures")
+        git(self.repo, "push", "-q", "origin", "main")
+
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            *(write(path, f"{path}\n") for path in self.STEP_PATHS[:4]),
+            mismatch,
+            write("feature.txt", "good\n"),
+            write(self.STEP_PATHS[4], "finished\n"),
+        )
+        with mock.patch(
+            "metaharness.planning_v2.parse_step_contract_repair",
+            side_effect=KeyboardInterrupt(),
+        ):
+            interrupted = self.orchestrator(
+                self.config(),
+                planner=[self.plan_with_s05_identity(), repair_raw or s05_repair_response()],
+                reviewer=[review()],
+            ).run_text(SPEC, run_id="run")
+        self.assertEqual(interrupted.status, RunStatus.INTERRUPTED)
+
+        detail = f"step=S05 contract repair failed: {PARSE_ERROR}"
+        RunStateStore(self.run_dir() / "state.json").update(
+            status=RunStatus.WAITING_HUMAN, recovery_resumable=False, current_step=None,
+            failure={"reason": "AGENT_CONTRACT_MISMATCH", "detail": detail},
+        )
+        (self.step_dir() / "step.json").write_text(json.dumps({
+            "id": "S05", "status": "FAILED", "reason": "AGENT_CONTRACT_MISMATCH",
+            "tree_before": self.git_tree(), "tree_after": self.git_tree(), "changed_paths": [],
+        }), encoding="utf-8")
+        self.assertEqual(
+            (self.checkpoint()["phase"], self.checkpoint()["step_id"]),
+            ("implement_step", "S05"),
+        )
+        self.assertEqual(self.transaction()["status"], "planner_response_durable")
+        self.assertEqual(
+            (self.step_dir() / "contract_repairs/01/planner.raw.md").read_text(encoding="utf-8"),
+            repair_raw or s05_repair_response(),
+        )
+        return detail
+
     def test_benign_s05_suffix_retries_worker_without_output_correction(self) -> None:
         for path in self.STEP_PATHS:
             target = self.repo / path
@@ -558,6 +606,72 @@ class PlanCountRepairTests(ContractRepairFixtures):
             }],
         })
         self.assertEqual(self.workers.calls[-2].mutable_paths, ("feature.txt",))
+
+    def test_legacy_s05_failure_uses_strict_detection_then_reuses_paid_raw(self) -> None:
+        detail = self.strand_s05()
+        config = self.config()
+        slot = self.step_dir() / "contract_repairs/01"
+        raw_path = slot / "planner.raw.md"
+        raw_sha = sha256(raw_path)
+
+        self.assertEqual(
+            contract_repair.stranded_output_failure(
+                self.step_dir(), step_id="S05", tree_sha=self.git_tree(),
+                failure_detail=detail,
+                max_read_paths_per_step=config.planning.max_read_paths_per_step,
+            ),
+            contract_repair.STRANDED_PROVEN,
+        )
+        info = resume_info(self.run_dir(), self.state())
+        self.assertTrue(info.resumable, info.reason)
+        self.assertEqual(info.operation, CONTRACT_REPAIR_OPERATION)
+        self.assertIn("Retry contract repair planner (S05)", info.label)
+
+        paid_calls = len(self.planner.requests)
+        self.assertEqual(paid_calls, 2)  # initial plan and the already-paid repair answer
+        self.assertEqual(self.repair_slots(), ["01"])
+        self.assertEqual(self.semantic_records(), [])
+        resumed = self.resume(["planner must not be called"], [review()])
+
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.planner.requests, [])  # no planner call on resume
+        self.assertEqual(len(self.workers.calls), 7)
+        self.assertEqual(
+            [request.artifact_dir.name for request in self.workers.calls],
+            ["S01", "S02", "S03", "S04", "S05", "S05", "S06"],
+        )  # S01-S04 were not replayed; S05 used its repaired contract
+        self.assertEqual(self.repair_slots(), ["01"])
+        self.assertEqual(len(self.semantic_records()), 1)
+        self.assertEqual(self.transaction()["status"], "completed")
+        self.assertEqual(
+            (self.transaction()["output_attempt"], self.transaction()["output_correction_attempt"]),
+            (1, 0),
+        )
+        self.assertEqual(sha256(raw_path), raw_sha)
+        canonical = (slot / "contract.md").read_text(encoding="utf-8")
+        self.assertIn("STEP_ID: S05\n", canonical)
+        self.assertNotIn("S05 / 06", canonical)
+        validation = json.loads((slot / "validation.json").read_text(encoding="utf-8"))
+        self.assertEqual(validation["parser_normalization"]["normalizations"], [{
+            "field": "STEP_ID", "rule": "step_id_with_plan_count_suffix",
+            "raw": "S05 / 06", "canonical": "S05",
+        }])
+        self.assertIn("STEP_ID: S05\n", self.workers.calls[-2].contract or "")
+        self.assertNotIn("S05 / 06", self.workers.calls[-2].contract or "")
+
+    def test_stranded_failure_does_not_accept_a_wrong_real_step_id(self) -> None:
+        detail = self.strand_s05(s05_repair_response("S04"))
+        info = resume_info(self.run_dir(), self.state())
+
+        self.assertFalse(info.resumable)
+        self.assertIsNone(info.operation)
+        self.assertEqual(
+            contract_repair.stranded_output_failure(
+                self.step_dir(), step_id="S05", tree_sha=self.git_tree(),
+                failure_detail=detail, max_read_paths_per_step=8,
+            ),
+            contract_repair.STRANDED_ABSENT,
+        )
 
 
 class StrandedRunRecoveryTests(ContractRepairFixtures):
