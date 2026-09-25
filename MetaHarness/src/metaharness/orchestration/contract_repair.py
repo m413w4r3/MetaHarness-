@@ -398,7 +398,10 @@ def stranded_output_failure(
         if state != "raw" or raw is None:
             return STRANDED_ABSENT
         try:
-            parse_step_contract_repair(raw, max_read_paths_per_step=max_read_paths_per_step)
+            parse_step_contract_repair(
+                raw, max_read_paths_per_step=max_read_paths_per_step,
+                expected_step_id=step_id,
+            )
         except V2PlanParseError as exc:
             if failure_detail == f"step={step_id} {LEGACY_OUTPUT_FAILURE_PREFIX}{exc}":
                 return STRANDED_PROVEN

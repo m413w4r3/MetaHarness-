@@ -2733,6 +2733,7 @@ class Orchestrator:
                 else candidate_tree_sha(ctx.info.worktree)
             ),
             step=step, contract=contract,
+            expected_plan_step_count=len(cycle_plan.plan.steps),
             profile_id=cycle_plan.step_profile_ids[step.id],
             fallback_profile_ids=(cycle_plan.step_fallback_profile_ids or {}).get(step.id, ()),
             artifact_dir=step_artifact_dir,
@@ -3946,6 +3947,7 @@ class Orchestrator:
         expected_tree: str,
         step: ImplementationStep,
         contract: str,
+        expected_plan_step_count: int | None = None,
         profile_id: str,
         artifact_dir: Path,
         fallback_profile_ids: Sequence[str] = (),
@@ -3961,7 +3963,9 @@ class Orchestrator:
         immutable evidence throughout.
         """
 
-        effective_step = self._load_repaired_step(artifact_dir, step)
+        effective_step = self._load_repaired_step(
+            artifact_dir, step, expected_plan_step_count=expected_plan_step_count,
+        )
         effective_contract = contract
         if effective_step is not step:
             effective_contract = self._read_repaired_contract(artifact_dir, effective_step)
@@ -3986,6 +3990,7 @@ class Orchestrator:
             "original_spec": original_spec,
             "original_plan_identity": original_plan_identity,
             "future_ownership": future_ownership, "max_repairs": max_repairs,
+            "expected_plan_step_count": expected_plan_step_count,
         }
         try:
             pending_repair = contract_repair.find_pending(
@@ -4292,7 +4297,10 @@ class Orchestrator:
             no_change=True,
         )
 
-    def _load_repaired_step(self, artifact_dir: Path, original: ImplementationStep) -> ImplementationStep:
+    def _load_repaired_step(
+        self, artifact_dir: Path, original: ImplementationStep,
+        *, expected_plan_step_count: int | None = None,
+    ) -> ImplementationStep:
         root = artifact_dir / "contract_repairs"
         if not root.is_dir():
             return original
@@ -4306,9 +4314,15 @@ class Orchestrator:
             if not isinstance(validation, dict) or validation.get("status") != "validated" or not contract_path.is_file():
                 continue
             try:
+                identity = StepRepairIdentity.of(original, expected_plan_step_count)
                 repaired = parse_step_contract_repair(
                     contract_path.read_text(encoding="utf-8"),
                     max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
+                    expected_step_id=identity.step_id,
+                    expected_title=identity.title,
+                    expected_execution_class=identity.execution_class,
+                    expected_depends_on=identity.depends_on,
+                    expected_plan_step_count=identity.expected_plan_step_count,
                 )
             except (OSError, UnicodeError, V2PlanParseError):
                 continue
@@ -4327,9 +4341,14 @@ class Orchestrator:
             validation = _read_json_artifact(directory / "validation.json", 64 * 1024)
             if path.is_file() and isinstance(validation, dict) and validation.get("status") == "validated":
                 try:
+                    identity = StepRepairIdentity.of(step)
                     parsed = parse_step_contract_repair(
                         path.read_text(encoding="utf-8"),
                         max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
+                        expected_step_id=identity.step_id,
+                        expected_title=identity.title,
+                        expected_execution_class=identity.execution_class,
+                        expected_depends_on=identity.depends_on,
                     )
                 except (OSError, UnicodeError, V2PlanParseError):
                     continue
@@ -4360,6 +4379,7 @@ class Orchestrator:
         original_spec: str, original_plan_identity: str,
         future_ownership: Mapping[str, tuple[str, ...]] | None,
         max_repairs: int, profile_id: str, resumed: bool,
+        expected_plan_step_count: int | None,
         usage: dict[str, int] | None = None,
     ) -> tuple[ImplementationStep, str]:
         """Drive one durable semantic repair slot to ``completed``.
@@ -4471,6 +4491,7 @@ class Orchestrator:
                 artifact_dir=directory, original_spec=original_spec,
                 original_plan_identity=original_plan_identity,
                 original_step=step, current_contract=current_contract,
+                expected_plan_step_count=expected_plan_step_count,
                 mismatch=mismatch, tree_before=tree_before,
                 future_ownership=future_ownership,
                 resume_request=contract_repair.durable_request_matches(directory, tree_before) is True,
@@ -4593,6 +4614,7 @@ class Orchestrator:
         self, *, repo: Path, worktree: Path, run_dir: Path,
         artifact_dir: Path, original_spec: str, original_plan_identity: str,
         original_step: ImplementationStep, current_contract: str,
+        expected_plan_step_count: int | None,
         mismatch: str, tree_before: str,
         future_ownership: Mapping[str, tuple[str, ...]] | None,
         resume_request: bool = False,
@@ -4639,7 +4661,8 @@ class Orchestrator:
             "delete_set": "\n".join(f"- {item}" for item in original_step.delete_set) or "NONE",
         }
         hooks = {
-            "identity": StepRepairIdentity.of(original_step), "validate": validate,
+            "identity": StepRepairIdentity.of(original_step, expected_plan_step_count),
+            "validate": validate,
             "on_request": on_request, "on_response_durable": on_response_durable,
             "on_output_invalid": on_output_invalid,
         }

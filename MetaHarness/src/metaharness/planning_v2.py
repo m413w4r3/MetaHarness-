@@ -396,16 +396,83 @@ _STEP_REPAIR_SECTIONS = frozenset({
     "OBJECTIVE", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET",
     "INSTRUCTIONS", "VERIFY", "FORBIDDEN",
 })
+_STEP_REPAIR_ID_WITH_COUNT = re.compile(r"^(S\d{2})\s*/\s*(\d{1,2})$")
+
+
+def normalize_repair_step_id(
+    value: str,
+    *,
+    expected_step_id: str | None,
+    expected_plan_step_count: int | None,
+) -> str:
+    """Normalize only the approved ``STEP_ID / plan-count`` display form.
+
+    A suffix is accepted only when its primary ID exactly matches the expected
+    step identity.  The general step-ID grammar remains strict everywhere
+    else, including ``step_ids.py``.
+    """
+
+    if expected_plan_step_count is not None and (
+        isinstance(expected_plan_step_count, bool)
+        or not isinstance(expected_plan_step_count, int)
+        or not 1 <= expected_plan_step_count <= MAX_STEPS
+    ):
+        raise V2PlanParseError("expected plan step count is invalid")
+    if not isinstance(value, str):
+        raise V2PlanParseError("step contract repair STEP_ID is invalid")
+    candidate = value.strip()
+    if STEP_ID_RE.fullmatch(candidate) is not None:
+        if expected_step_id is not None and candidate != expected_step_id:
+            raise V2PlanParseError(
+                f"step contract repair STEP_ID changed: expected {expected_step_id!r}, got {candidate!r}"
+            )
+        return candidate
+    match = _STEP_REPAIR_ID_WITH_COUNT.fullmatch(candidate)
+    if match is None:
+        raise V2PlanParseError("step contract repair STEP_ID is invalid")
+    primary_id, count_text = match.groups()
+    if (
+        expected_step_id is None
+        or STEP_ID_RE.fullmatch(expected_step_id) is None
+        or primary_id != expected_step_id
+    ):
+        raise V2PlanParseError("step contract repair STEP_ID is invalid")
+    suffix_count = int(count_text)
+    if (
+        not 1 <= suffix_count <= MAX_STEPS
+        or (expected_plan_step_count is None and len(count_text) != 2)
+        or (
+            expected_plan_step_count is not None
+            and suffix_count != expected_plan_step_count
+        )
+    ):
+        raise V2PlanParseError("step contract repair STEP_ID is invalid")
+    return primary_id
 
 
 def parse_step_contract_repair(
-    raw: str, *, max_read_paths_per_step: int,
+    raw: str,
+    *,
+    max_read_paths_per_step: int,
+    expected_step_id: str | None = None,
+    expected_title: str | None = None,
+    expected_execution_class: str | None = None,
+    expected_depends_on: str | None = None,
+    expected_plan_step_count: int | None = None,
+    _normalizations: list[dict[str, str]] | None = None,
 ) -> ImplementationStep:
     """Parse one complete, standalone repaired step contract."""
 
     if not isinstance(raw, str) or not raw.strip():
         raise V2PlanParseError("step contract repair is empty")
-    lines = _lines(raw)
+    if raw.startswith("\ufeff"):
+        raw = raw[1:]
+        if _normalizations is not None:
+            _normalizations.append({
+                "field": "ENVELOPE", "rule": "single_utf8_bom_prefix",
+                "raw": "\ufeff", "canonical": "",
+            })
+    lines = [line.rstrip() for line in _lines(raw)]
     first = next((index for index, line in enumerate(lines) if line.strip()), None)
     if first is None or lines[first].strip() != _STEP_REPAIR_HEADER:
         raise V2PlanParseError("missing META STEP CONTRACT REPAIR v1 header")
@@ -421,9 +488,23 @@ def parse_step_contract_repair(
         section_names=_STEP_REPAIR_SECTIONS,
         where="step contract repair",
     )
-    step_id = inline.get("STEP_ID", "")
-    if _STEP_ID.fullmatch(step_id) is None:
-        raise V2PlanParseError("step contract repair STEP_ID is invalid")
+    raw_step_id = inline.get("STEP_ID", "")
+    step_id = normalize_repair_step_id(
+        raw_step_id,
+        expected_step_id=expected_step_id,
+        expected_plan_step_count=expected_plan_step_count,
+    )
+    if step_id != raw_step_id and _normalizations is not None:
+        _normalizations.append({
+            "field": "STEP_ID",
+            "rule": (
+                "step_id_with_plan_count_suffix"
+                if expected_plan_step_count is not None
+                else "step_id_with_identity_suffix"
+            ),
+            "raw": raw_step_id,
+            "canonical": step_id,
+        })
     title = _nonempty(inline.get("TITLE", ""), "step contract repair TITLE")
     execution_class = inline.get("EXECUTION_CLASS")
     if execution_class not in {item.value for item in ExecutionClass}:
@@ -431,6 +512,16 @@ def parse_step_contract_repair(
     dependency = inline.get("DEPENDS_ON", "")
     if dependency != "NONE" and _STEP_ID.fullmatch(dependency) is None:
         raise V2PlanParseError("step contract repair DEPENDS_ON is invalid")
+    for name, expected, actual in (
+        ("STEP_ID", expected_step_id, step_id),
+        ("TITLE", expected_title, title),
+        ("EXECUTION_CLASS", expected_execution_class, execution_class),
+        ("DEPENDS_ON", expected_depends_on, dependency),
+    ):
+        if expected is not None and expected != actual:
+            raise V2PlanParseError(
+                f"step contract repair {name} changed: expected {expected!r}, got {actual!r}"
+            )
     for name in _STEP_REPAIR_SECTIONS:
         if not sections.get(name, "").strip():
             raise V2PlanParseError(f"step contract repair is missing {name}")
@@ -495,10 +586,16 @@ class StepRepairIdentity:
     title: str
     execution_class: str
     depends_on: str
+    expected_plan_step_count: int | None = None
 
     @classmethod
-    def of(cls, step: ImplementationStep) -> "StepRepairIdentity":
-        return cls(step.id, step.title, step.execution_class.value, step.depends_on or "NONE")
+    def of(
+        cls, step: ImplementationStep, expected_plan_step_count: int | None = None,
+    ) -> "StepRepairIdentity":
+        return cls(
+            step.id, step.title, step.execution_class.value,
+            step.depends_on or "NONE", expected_plan_step_count,
+        )
 
     def fields(self) -> str:
         return (
@@ -593,8 +690,10 @@ IMMUTABLE DEPENDS_ON: {identity.depends_on}
 
 STEP_ID is the bare MetaHarness step identifier only.
 For this repair it is exactly `{identity.step_id}`.
-Do NOT append the plan step count: `{identity.step_id} / <step count>` is invalid,
-even though CURRENT STEP CONTRACT displays its STEP that way.
+Do NOT append the plan step count: `{identity.step_id} / <step count>` is not
+canonical, even though CURRENT STEP CONTRACT displays its STEP that way. MetaHarness
+accepts that wire-format variation only when the primary ID matches this
+immutable identity and the count matches the approved plan.
 
 The following identity fields are immutable and MUST be copied byte-for-byte:
 {identity.fields()}"""
@@ -969,8 +1068,19 @@ class StepContractRepairPlanner:
     def _checked(
         self, raw: str, inputs: _RepairInputs,
         validate: Callable[[ImplementationStep], None] | None,
+        normalizations: list[dict[str, str]] | None = None,
     ) -> ImplementationStep:
-        step = parse_step_contract_repair(raw, max_read_paths_per_step=self.max_read_paths_per_step)
+        identity = inputs.identity
+        step = parse_step_contract_repair(
+            raw,
+            max_read_paths_per_step=self.max_read_paths_per_step,
+            expected_step_id=identity.step_id,
+            expected_title=identity.title,
+            expected_execution_class=identity.execution_class,
+            expected_depends_on=identity.depends_on,
+            expected_plan_step_count=identity.expected_plan_step_count,
+            _normalizations=normalizations,
+        )
         violation = inputs.identity.violation(step)
         if violation is not None:
             raise V2PlanParseError(violation)
@@ -1118,8 +1228,9 @@ class StepContractRepairPlanner:
             self._response_meta(target, files, raw, "raw")
             if on_response_durable is not None:
                 on_response_durable(number)
+            normalizations: list[dict[str, str]] = []
             try:
-                step = self._checked(raw, inputs, validate)
+                step = self._checked(raw, inputs, validate, normalizations)
             except V2PlanParseError as exc:
                 detail = str(exc)[:_REPAIR_ERROR_CHARS]
                 atomic_write_text(files.parse_error, _repair_json({
@@ -1134,16 +1245,19 @@ class StepContractRepairPlanner:
                 if on_output_invalid is not None:
                     on_output_invalid(number, detail)
                 continue
-            return self._record_validated(target, files, raw, step, inputs, initial_sha)
+            return self._record_validated(
+                target, files, raw, step, inputs, initial_sha, normalizations,
+            )
 
     def _record_validated(
         self, target: Path, files: StepRepairAttemptFiles, raw: str,
         step: ImplementationStep, inputs: _RepairInputs, initial_sha: str,
+        normalizations: list[dict[str, str]],
     ) -> ImplementationStep:
         canonical = render_repaired_step_contract(step)
         raw_sha = _sha256_bytes(raw.encode("utf-8"))
         atomic_write_text(target / "contract.md", canonical)
-        atomic_write_text(target / "validation.json", _repair_json({
+        validation = {
             "status": "planner_validated",
             "request_sha256": initial_sha,
             "output_attempt": files.number,
@@ -1159,7 +1273,14 @@ class StepContractRepairPlanner:
             "write_set": list(step.write_set),
             "create_set": list(step.create_set),
             "delete_set": list(step.delete_set),
-        }))
+        }
+        if normalizations:
+            # Diagnostic only; validation authority remains the canonical
+            # contract and its hash, never these normalization notes.
+            validation["parser_normalization"] = {
+                "schema_version": 1, "normalizations": normalizations[:4],
+            }
+        atomic_write_text(target / "validation.json", _repair_json(validation))
         atomic_write_text(files.meta, _repair_json({
             "status": "validated", "request_sha256": _sha256_bytes(files.request.read_bytes()),
             "raw_sha256": raw_sha, "current_tree_sha": inputs.current_tree_sha,
@@ -2918,7 +3039,7 @@ __all__ = [
     "REPAIR_EVIDENCE_FILENAME", "RepairPlannerV2",
     "persist_planning_artifacts_v2", "persist_planning_v2_artifacts", "persist_recovered_plan_artifacts",
     "read_approved_step_contract", "read_set_paths",
-    "render_plan_summary_v2", "render_repair_plan_summary", "render_repair_step_index", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract", "render_repaired_step_contract", "parse_step_contract_repair", "build_step_contract_repair_prompt", "build_step_contract_repair_correction_prompt", "StepContractRepairPlanner", "StepContractRepairOutputInvalid", "StepContractRepairArtifactError", "StepRepairIdentity", "StepRepairAttemptFiles", "STEP_CONTRACT_REPAIR_OUTPUT_INVALID", "STEP_REPAIR_OUTPUT_ATTEMPTS_DIR", "step_repair_attempt_files", "step_repair_attempt_state",
+    "render_plan_summary_v2", "render_repair_plan_summary", "render_repair_step_index", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract", "render_repaired_step_contract", "normalize_repair_step_id", "parse_step_contract_repair", "build_step_contract_repair_prompt", "build_step_contract_repair_correction_prompt", "StepContractRepairPlanner", "StepContractRepairOutputInvalid", "StepContractRepairArtifactError", "StepRepairIdentity", "StepRepairAttemptFiles", "STEP_CONTRACT_REPAIR_OUTPUT_INVALID", "STEP_REPAIR_OUTPUT_ATTEMPTS_DIR", "step_repair_attempt_files", "step_repair_attempt_state",
     "run_planner_v2", "step_contract_path", "validate_decomposition_policy", "validate_implementation_bundle", "write_implementation_bundle",
     "REQUIRE_STAGED_POLICY_TEXT", "validate_execution_mode_policy",
     "render_decomposition_policy_text",
