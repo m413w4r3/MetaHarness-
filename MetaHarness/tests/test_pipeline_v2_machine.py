@@ -1106,62 +1106,6 @@ class CheckRepairTests(PipelineHarness):
             "a" * 40, ["another-check"], "POST_IMPLEMENTATION",
         ))
 
-    def test_historical_attributeerror_shape_resumes_the_same_gate_checkpoint(self) -> None:
-        counter = self.root / "legacy-gate-count"
-        self.check.write_text(
-            "import pathlib, sys\n"
-            f"counter = pathlib.Path({str(counter)!r})\n"
-            "count = int(counter.read_text()) if counter.exists() else 0\n"
-            "counter.write_text(str(count + 1))\n"
-            "if count < 3:\n"
-            "    print('FAILED tests/test_feature.py::test_behavior')\n"
-            "    raise SystemExit(1)\n",
-            encoding="utf-8",
-        )
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
-        self.workers.on(
-            ExecutionRole.REPAIR,
-            lambda _request: check_repair_result(), lambda _request: check_repair_result(),
-        )
-        config = self.config(check_repair=2)
-        waiting = self.orchestrator(
-            config, planner=[initial_plan(STEP)], reviewer=[review()],
-        ).run_text(SPEC, run_id="run")
-        self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
-        checkpoint_before = self.checkpoint()
-
-        # Present the exact durable state written by the historical bug.
-        state = self.state()
-        state["status"] = "failed"
-        state["failure"] = {
-            "reason": "ATTRIBUTEERROR",
-            "detail": "'dict' object has no attribute 'replace'",
-        }
-        state.pop("recovery_resumable", None)
-        for key in (
-            "candidate_tree", "failed_check_ids", "failure_classification",
-            "latest_evidence_sha256", "next_action", "repair_reports",
-        ):
-            state["check_repair"].pop(key, None)
-        state["check_repair"]["status"] = "completed"
-        (self.run_dir() / "state.json").write_text(json.dumps(state), encoding="utf-8")
-
-        eligible = resume_info(self.run_dir(), state)
-        self.assertTrue(eligible.resumable, eligible.reason)
-        self.assertEqual(eligible.phase, "deterministic_gate")
-        self.assertEqual(eligible.label, "Retry deterministic gate (POST_IMPLEMENTATION)")
-        self.assertEqual(self.checkpoint(), checkpoint_before)
-        roles_before_resume = self.workers.roles()
-        resumed = self.orchestrator(
-            config, planner=[initial_plan(STEP)], reviewer=[review()],
-        ).resume("run")
-
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(self.workers.roles(), roles_before_resume)
-        self.assertEqual(self.planner.requests, [])
-        self.assertEqual(counter.read_text(), "4")
-        self.assertEqual(self.state()["resume"]["migration"], "historical_check_repair_redaction_crash")
-
     def test_corrupt_latest_gate_evidence_fails_resume_integrity(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(

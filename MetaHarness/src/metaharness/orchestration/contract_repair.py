@@ -332,86 +332,6 @@ def durable_request_matches(directory: Path, tree_sha: str) -> bool | None:
     )
 
 
-LEGACY_OUTPUT_FAILURE_PREFIX = "contract repair failed: "
-
-
-STRANDED_PROVEN = "proven"
-STRANDED_CORRUPT = "corrupt"
-STRANDED_ABSENT = "absent"
-
-
-def stranded_output_failure(
-    step_dir: Path, *, step_id: str, tree_sha: str, failure_detail: str,
-    max_read_paths_per_step: int,
-) -> str:
-    """Classify a run stranded by the legacy invalid-answer misclassification.
-
-    Before output corrections existed, a deterministically invalid
-    StepContractRepairPlanner answer was projected as a new
-    ``AGENT_CONTRACT_MISMATCH``.  Such a run is ``proven`` recoverable only
-    when every identity holds: exactly one unfinished slot, last, for this
-    step and tree; intact mismatch evidence, durable request and paid answer;
-    no classification of that answer yet; and the recorded failure detail is
-    byte-for-byte the parse error the durable answer deterministically
-    produces today.  Inconsistent evidence is ``corrupt``; any other shape is
-    ``absent`` (a genuine operator decision).
-    """
-
-    from ..planning_v2 import V2PlanParseError, parse_step_contract_repair
-
-    try:
-        dirs = repair_dirs(step_dir)
-        if not dirs:
-            return STRANDED_ABSENT
-        unfinished = [
-            directory for directory in dirs
-            if (transaction := read_transaction(directory)) is None
-            or transaction["status"] not in FINISHED
-        ]
-        if not unfinished:
-            return STRANDED_ABSENT
-        if len(unfinished) != 1 or unfinished[0] != dirs[-1]:
-            return STRANDED_CORRUPT
-        directory = unfinished[0]
-        transaction = read_transaction(directory)
-        if (
-            transaction is None
-            or transaction.get("status") != PLANNER_RESPONSE_DURABLE
-            or output_attempt(transaction) != 1
-            or (directory / "validation.json").exists()
-        ):
-            return STRANDED_ABSENT
-        archived = _read_json(directory / MISMATCH_NAME)
-        if (
-            transaction.get("step_id") != step_id
-            or transaction.get("tree_sha") != tree_sha
-            or not isinstance(archived, dict)
-            or archived.get("step_id") != step_id
-            or archived.get("tree_before") != tree_sha
-            or not isinstance(archived.get("mismatch"), str)
-            or sha256_text(archived["mismatch"]) != transaction.get("mismatch_sha256")
-            or durable_request_matches(directory, tree_sha) is not True
-        ):
-            return STRANDED_CORRUPT
-        state, raw = step_repair_attempt_state(
-            step_repair_attempt_files(directory, 1), current_tree_sha=tree_sha,
-        )
-        if state != "raw" or raw is None:
-            return STRANDED_ABSENT
-        try:
-            parse_step_contract_repair(
-                raw, max_read_paths_per_step=max_read_paths_per_step,
-            )
-        except V2PlanParseError as exc:
-            if failure_detail == f"step={step_id} {LEGACY_OUTPUT_FAILURE_PREFIX}{exc}":
-                return STRANDED_PROVEN
-        return STRANDED_ABSENT
-    except (ContractRepairIntegrityError, StepContractRepairArtifactError, UnicodeError):
-        return STRANDED_CORRUPT
-    except (OSError, ValueError):
-        return STRANDED_CORRUPT
-
-
 def semantic_repair_count(artifact_dir: Path) -> int:
     """Count semantic slots; superseded generator bugs use no budget."""
 
@@ -658,5 +578,5 @@ __all__ = [
     "SCOPE_WAITING", "SUPERSEDED", "VALIDATED", "WAITING_EXTERNAL", "advance", "begin",
     "durable_request_matches", "ensure", "find_pending", "is_awaiting_planner", "planner_response_durable", "repair_dirs",
     "legacy_prompt_bug_candidate", "legacy_prompt_bug_proven", "next_repair_number", "repair_identity",
-    "semantic_repair_count", "sha256_text", "STRANDED_ABSENT", "STRANDED_CORRUPT", "STRANDED_PROVEN", "stranded_output_failure", "supersede_legacy_prompt_bug",
+    "semantic_repair_count", "sha256_text", "supersede_legacy_prompt_bug",
 ]

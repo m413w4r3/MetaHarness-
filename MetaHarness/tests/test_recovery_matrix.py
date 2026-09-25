@@ -28,7 +28,13 @@ from metaharness.orchestration.recovery import (
     project_exit,
 )
 from metaharness.recovery_policy import RecoveryDisposition as D, classify_failure
-from metaharness.resume import ResumePhase as P, resume_info
+from metaharness.resume import (
+    CHECKPOINT_INTEGRITY_OPERATION,
+    RUN_SCHEMA_UNSUPPORTED,
+    ResumeNotAllowedError,
+    ResumePhase as P,
+    resume_info,
+)
 from metaharness.state import RunStateStore
 
 from pipeline_support import PipelineHarness, initial_plan, review, write
@@ -324,6 +330,55 @@ class RecoveryPathTests(PipelineHarness):
                 self.assertEqual(len(self.planner.requests), 1)
                 self.assertEqual(self.reviewer.requests, [])
                 self.assertEqual(self.workers.calls, [])
+
+    def _wait_at_a_resumable_checkpoint(self) -> None:
+        with mock.patch(
+            "metaharness.orchestrator.PipelineV2Coordinator.run",
+            side_effect=PipelineFailure("AGENT_TIMEOUT", "diagnostic"),
+        ):
+            result = self.orchestrator(
+                self.config(), planner=[initial_plan(STEP)], reviewer=["unused"],
+            ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
+
+    def test_an_older_checkpoint_schema_is_a_plain_refusal(self) -> None:
+        self._wait_at_a_resumable_checkpoint()
+        path = self.run_dir() / "resume_checkpoint.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["schema_version"] -= 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        state_before = (self.run_dir() / "state.json").read_bytes()
+
+        info = resume_info(self.run_dir(), self.state())
+
+        self.assertFalse(info.resumable)
+        self.assertEqual(info.operation, RUN_SCHEMA_UNSUPPORTED)
+        resumed = self.orchestrator(self.config(), planner=["unused"], reviewer=["unused"])
+        with self.assertRaises(ResumeNotAllowedError):
+            resumed.resume("run")
+        # An incompatible runtime is refused, never recorded as an incident.
+        self.assertEqual((self.run_dir() / "state.json").read_bytes(), state_before)
+        self.assertEqual(self.planner.requests, [])
+
+    def test_a_corrupt_current_checkpoint_fails_resume_integrity(self) -> None:
+        self._wait_at_a_resumable_checkpoint()
+        path = self.run_dir() / "resume_checkpoint.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["step_id"] = "not-a-step"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        info = resume_info(self.run_dir(), self.state())
+
+        self.assertFalse(info.resumable)
+        self.assertEqual(info.operation, CHECKPOINT_INTEGRITY_OPERATION)
+        resumed = self.orchestrator(
+            self.config(), planner=["unused"], reviewer=["unused"],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.planner.requests, [])
+        self.assertEqual(self.workers.calls, [])
 
     def test_persistent_worker_timeout_waits_after_its_bounded_retries(self) -> None:
         from metaharness.agent import AgentRunResult

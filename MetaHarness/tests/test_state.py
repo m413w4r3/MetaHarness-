@@ -13,6 +13,15 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.models import RunStatus
+from metaharness.resume import (
+    CHECKPOINT_INTEGRITY_OPERATION,
+    CHECKPOINT_NAME,
+    ResumeCheckpoint,
+    ResumePhase,
+    checkpoint_payload,
+    plan_identity_from_mapping,
+    resume_info,
+)
 from metaharness.run_options import (
     RUN_SCHEMA_UNSUPPORTED,
     SCHEMA_VERSION,
@@ -366,6 +375,83 @@ class FrozenRunOptionsSchemaTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), data)
             self.assertEqual(store.load()["run_options_sha256"], digest)
             self.assertEqual(store.load()["status"], RunStatus.CREATED.value)
+
+
+class FrozenCheckpointSchemaTests(unittest.TestCase):
+    """Only the current checkpoint schema is resumable; older ones stay read-only."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.run_dir = Path(self.temp.name)
+        self.state_path = self.run_dir / "state.json"
+        self.checkpoint_path = self.run_dir / CHECKPOINT_NAME
+
+    def waiting_state(self) -> dict:
+        store = RunStateStore(self.state_path)
+        store.initialize("run")
+        return store.update(
+            status=RunStatus.WAITING_EXTERNAL, planning_protocol="v2",
+            failure={"reason": "AGENT_TIMEOUT", "detail": "timed out"},
+        )
+
+    def checkpoint_bytes(self) -> bytes:
+        checkpoint = ResumeCheckpoint(
+            phase=ResumePhase.IMPLEMENT_STEP,
+            step_id="S01",
+            expected_head_sha="6" * 40,
+            expected_tree_sha="7" * 40,
+            execution_selection_sha256="8" * 64,
+            plan_identity=plan_identity_from_mapping({
+                "raw_sha256": "1" * 64, "contract_sha256": "2" * 64,
+                "bundle_sha256": "3" * 64, "execution_sha256": "4" * 64,
+                "checks_sha256": "5" * 64,
+            }),
+        )
+        return (json.dumps(checkpoint_payload(checkpoint), indent=2, sort_keys=True) + "\n").encode()
+
+    def test_an_older_checkpoint_schema_is_unsupported_and_never_an_incident(self) -> None:
+        state = self.waiting_state()
+        payload = json.loads(self.checkpoint_bytes())
+        payload["schema_version"] -= 1
+        data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+        self.checkpoint_path.write_bytes(data)
+        state_before = self.state_path.read_bytes()
+
+        info = resume_info(self.run_dir, state)
+
+        self.assertFalse(info.resumable)
+        self.assertEqual(info.operation, RUN_SCHEMA_UNSUPPORTED)
+        self.assertIn(RUN_SCHEMA_UNSUPPORTED, info.reason)
+        self.assertNotEqual(info.operation, CHECKPOINT_INTEGRITY_OPERATION)
+        self.assertEqual(self.checkpoint_path.read_bytes(), data)
+        self.assertEqual(self.state_path.read_bytes(), state_before)
+
+    def test_the_current_checkpoint_schema_is_resumable(self) -> None:
+        state = self.waiting_state()
+        self.checkpoint_path.write_bytes(self.checkpoint_bytes())
+
+        info = resume_info(self.run_dir, state)
+
+        self.assertTrue(info.resumable, info.reason)
+        self.assertEqual(info.phase, ResumePhase.IMPLEMENT_STEP.value)
+        self.assertEqual(info.step_id, "S01")
+        self.assertEqual(info.expected_tree, "7" * 40)
+
+    def test_a_corrupt_current_checkpoint_is_an_integrity_failure(self) -> None:
+        state = self.waiting_state()
+        payload = json.loads(self.checkpoint_bytes())
+        payload["step_id"] = "not-a-step"
+        for name, data in (
+            ("incoherent identity", json.dumps(payload, indent=2, sort_keys=True) + "\n"),
+            ("unreadable bytes", "{not json"),
+        ):
+            with self.subTest(corruption=name):
+                self.checkpoint_path.write_text(data, encoding="utf-8")
+                info = resume_info(self.run_dir, state)
+                self.assertFalse(info.resumable)
+                self.assertEqual(info.operation, CHECKPOINT_INTEGRITY_OPERATION)
+                self.assertNotEqual(info.operation, RUN_SCHEMA_UNSUPPORTED)
 
 
 if __name__ == "__main__":

@@ -19,9 +19,8 @@ from metaharness.planning_v2 import (
     parse_step_contract_repair,
 )
 from metaharness.orchestration import contract_repair
-from metaharness.resume import CONTRACT_REPAIR_OPERATION, ResumeNotAllowedError, resume_info
+from metaharness.resume import ResumeNotAllowedError, resume_info
 from metaharness.run_options import RunOptions
-from metaharness.state import RunStateStore
 from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
 from tests.test_contract_repair_transaction import OUTAGE, REPAIR_ID, ContractRepairFixtures, mismatch
 from tests.test_pipeline_v2_machine import SPEC, STEP, repaired_step_contract
@@ -554,53 +553,6 @@ class PlanCountRepairTests(ContractRepairFixtures):
             raise AssertionError("S05 fixture block was not rendered")
         return raw.replace(before, after, 1)
 
-    def strand_s05(self, repair_raw: str | None = None) -> str:
-        for path in self.STEP_PATHS:
-            target = self.repo / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "--all")
-        git(self.repo, "commit", "-qm", "six-step fixtures")
-        git(self.repo, "push", "-q", "origin", "main")
-
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            *(write(path, f"{path}\n") for path in self.STEP_PATHS[:4]),
-            mismatch,
-            write("feature.txt", "good\n"),
-            write(self.STEP_PATHS[4], "finished\n"),
-        )
-        with mock.patch(
-            "metaharness.planning_v2.parse_step_contract_repair",
-            side_effect=KeyboardInterrupt(),
-        ):
-            interrupted = self.orchestrator(
-                self.config(),
-                planner=[self.plan_with_s05_identity(), repair_raw or s05_repair_response()],
-                reviewer=[review()],
-            ).run_text(SPEC, run_id="run")
-        self.assertEqual(interrupted.status, RunStatus.INTERRUPTED)
-
-        detail = f"step=S05 contract repair failed: {PARSE_ERROR}"
-        RunStateStore(self.run_dir() / "state.json").update(
-            status=RunStatus.WAITING_HUMAN, recovery_resumable=False, current_step=None,
-            failure={"reason": "AGENT_CONTRACT_MISMATCH", "detail": detail},
-        )
-        (self.step_dir() / "step.json").write_text(json.dumps({
-            "id": "S05", "status": "FAILED", "reason": "AGENT_CONTRACT_MISMATCH",
-            "tree_before": self.git_tree(), "tree_after": self.git_tree(), "changed_paths": [],
-        }), encoding="utf-8")
-        self.assertEqual(
-            (self.checkpoint()["phase"], self.checkpoint()["step_id"]),
-            ("implement_step", "S05"),
-        )
-        self.assertEqual(self.transaction()["status"], "planner_response_durable")
-        self.assertEqual(
-            (self.step_dir() / "contract_repairs/01/planner.raw.md").read_text(encoding="utf-8"),
-            repair_raw or s05_repair_response(),
-        )
-        return detail
-
     def test_benign_s05_suffix_retries_worker_without_output_correction(self) -> None:
         for path in self.STEP_PATHS:
             target = self.repo / path
@@ -645,169 +597,8 @@ class PlanCountRepairTests(ContractRepairFixtures):
         })
         self.assertEqual(self.workers.calls[-2].mutable_paths, ("feature.txt",))
 
-    def test_legacy_s05_failure_uses_strict_detection_then_reuses_paid_raw(self) -> None:
-        detail = self.strand_s05()
-        config = self.config()
-        slot = self.step_dir() / "contract_repairs/01"
-        raw_path = slot / "planner.raw.md"
-        raw_sha = sha256(raw_path)
-
-        self.assertEqual(
-            contract_repair.stranded_output_failure(
-                self.step_dir(), step_id="S05", tree_sha=self.git_tree(),
-                failure_detail=detail,
-                max_read_paths_per_step=config.planning.max_read_paths_per_step,
-            ),
-            contract_repair.STRANDED_PROVEN,
-        )
-        info = resume_info(self.run_dir(), self.state())
-        self.assertTrue(info.resumable, info.reason)
-        self.assertEqual(info.operation, CONTRACT_REPAIR_OPERATION)
-        self.assertIn("Retry contract repair planner (S05)", info.label)
-
-        paid_calls = len(self.planner.requests)
-        self.assertEqual(paid_calls, 2)  # initial plan and the already-paid repair answer
-        self.assertEqual(self.repair_slots(), ["01"])
-        self.assertEqual(self.semantic_records(), [])
-        resumed = self.resume(["planner must not be called"], [review()])
-
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(self.planner.requests, [])  # no planner call on resume
-        self.assertEqual(len(self.workers.calls), 7)
-        self.assertEqual(
-            [request.artifact_dir.name for request in self.workers.calls],
-            ["S01", "S02", "S03", "S04", "S05", "S05", "S06"],
-        )  # S01-S04 were not replayed; S05 used its repaired contract
-        self.assertEqual(self.repair_slots(), ["01"])
-        self.assertEqual(len(self.semantic_records()), 1)
-        self.assertEqual(self.transaction()["status"], "completed")
-        self.assertEqual(
-            (self.transaction()["output_attempt"], self.transaction()["output_correction_attempt"]),
-            (1, 0),
-        )
-        self.assertEqual(sha256(raw_path), raw_sha)
-        canonical = (slot / "contract.md").read_text(encoding="utf-8")
-        self.assertIn("STEP_ID: S05\n", canonical)
-        self.assertNotIn("S05 / 06", canonical)
-        validation = json.loads((slot / "validation.json").read_text(encoding="utf-8"))
-        self.assertEqual(validation["parser_normalization"]["normalizations"], [{
-            "field": "STEP_ID", "rule": "step_id_with_plan_count_suffix",
-            "raw": "S05 / 06", "canonical": "S05",
-        }])
-        self.assertIn("STEP_ID: S05\n", self.workers.calls[-2].contract or "")
-        self.assertNotIn("S05 / 06", self.workers.calls[-2].contract or "")
-
-    def test_stranded_failure_does_not_accept_a_wrong_real_step_id(self) -> None:
-        detail = self.strand_s05(s05_repair_response("S04"))
-        info = resume_info(self.run_dir(), self.state())
-
-        self.assertFalse(info.resumable)
-        self.assertIsNone(info.operation)
-        self.assertEqual(
-            contract_repair.stranded_output_failure(
-                self.step_dir(), step_id="S05", tree_sha=self.git_tree(),
-                failure_detail=detail, max_read_paths_per_step=8,
-            ),
-            contract_repair.STRANDED_ABSENT,
-        )
-
-
-class StrandedRunRecoveryTests(ContractRepairFixtures):
-    """The historical shape: an invalid answer projected as a worker mismatch."""
-
-    STEPS = (("S01", "other.txt", "Prepare the other file"), ("S02", "feature.txt", "Write the feature"))
-
-    def step_dir(self, run_id: str = "run") -> Path:
-        return self.run_dir(run_id) / "cycles/001/implementation/steps/S02"
-
-    def strand(self) -> str:
-        """Reproduce the legacy stranded state without a legacy code path."""
-
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER, write("other.txt", "one\n"), mismatch,
-            write("feature.txt", "good\n"),
-        )
-        with mock.patch(
-            "metaharness.planning_v2.parse_step_contract_repair", side_effect=KeyboardInterrupt(),
-        ):
-            interrupted = self.orchestrator(
-                self.config(), planner=[initial_plan(*self.STEPS), malformed()],
-                reviewer=["unused"],
-            ).run_text(SPEC, run_id="run")
-        self.assertEqual(interrupted.status, RunStatus.INTERRUPTED)
-        detail = f"step=S02 contract repair failed: {PARSE_ERROR}"
-        RunStateStore(self.run_dir() / "state.json").update(
-            status=RunStatus.WAITING_HUMAN, recovery_resumable=False, current_step=None,
-            failure={"reason": "AGENT_CONTRACT_MISMATCH", "detail": detail},
-        )
-        (self.step_dir() / "step.json").write_text(json.dumps({
-            "id": "S02", "status": "FAILED", "reason": "AGENT_CONTRACT_MISMATCH",
-            "tree_before": self.git_tree(), "tree_after": self.git_tree(), "changed_paths": [],
-        }), encoding="utf-8")
-        self.assertEqual(self.checkpoint()["step_id"], "S02")
-        self.assertEqual(self.transaction()["status"], "planner_response_durable")
-        return git(self.worktree(), "rev-parse", "HEAD")
-
-    def test_a_proven_stranded_run_is_recovered_without_any_replay(self) -> None:
-        s01_commit = self.strand()
-        raw_sha = sha256(self.step_dir() / "contract_repairs/01/planner.raw.md")
-        info = resume_info(self.run_dir(), self.state())
-        self.assertTrue(info.resumable, info.reason)
-        self.assertEqual(info.label, "Retry contract repair planner (S02)")
-        self.assertEqual(info.operation, "contract_repair")
-        valid = repaired_step_contract().replace("STEP_ID: S01", "STEP_ID: S02")
-
-        resumed = self.resume([valid], [review()])
-
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        # S01 and the S02 mismatch worker are never replayed.
-        self.assertEqual(len(self.workers.calls), 3)
-        (correction,) = self.planner.requests
-        self.assertIn("IMMUTABLE STEP ID:\nS02\n", correction)
-        self.assertEqual(self.repair_slots(), ["01"])
-        slot = self.step_dir() / "contract_repairs/01"
-        self.assertEqual(sha256(slot / "planner.raw.md"), raw_sha)
-        error = json.loads((slot / "output_attempts/001/parse_error.json").read_text(encoding="utf-8"))
-        self.assertEqual((error["detail"], error["raw_sha256"]), (PARSE_ERROR, raw_sha))
-        transaction = self.transaction()
-        self.assertEqual(transaction["repair_id"], "contract-repair:cycle-001:S02:01")
-        self.assertEqual(transaction["output_correction_attempt"], 1)
-        self.assertIn(s01_commit, git(self.worktree(), "rev-list", "HEAD"))
-
-    def test_the_run_page_and_diagnostics_show_the_pending_repair(self) -> None:
-        from metaharness.diagnostics import build_run_diagnostics
-        from metaharness.web.api import get_run, live_status
-        from metaharness.web.pages import render_run
-
-        self.strand()
-        config = self.config()
-
-        page = render_run(get_run(self.root / "runs", "run", config=config), "token", config=config)
-        live = live_status(self.root / "runs", "run", config=config)
-        report = build_run_diagnostics(config, self.run_dir())
-
-        self.assertNotIn("RESUME REFUSED", page)
-        self.assertNotIn("Waiting for operator decision", page)
-        self.assertIn("Retry contract repair planner (S02)", page)
-        self.assertIn("contract-repair:cycle-001:S02:01", page)
-        self.assertEqual(live["contract_repair"]["phase"], "Correcting planner output")
-        self.assertEqual(live["current_label"], "Correcting planner output · S02")
-        section = report.split("## CONTRACT REPAIR", 1)[1].split("\n## ", 1)[0]
-        self.assertIn('"repair_id": "contract-repair:cycle-001:S02:01"', section)
-        self.assertIn('"parse_status": "raw"', section)
-        self.assertIn(sha256(self.step_dir() / "contract_repairs/01/planner.raw.md"), section)
-        self.assertNotIn("META STEP CONTRACT REPAIR v1", section)
-
-    def test_a_corrupted_historical_answer_fails_closed_without_a_model_call(self) -> None:
-        self.strand()
-        (self.step_dir() / "contract_repairs/01/planner.raw.md").write_text("tampered\n", encoding="utf-8")
-
-        result = self.resume(["planner must not be called"])
-
-        self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-        self.assertEqual(self.planner.requests, [])
-        self.assertEqual(len(self.workers.calls), 2)
+class ContractRepairOperatorDecisionTests(ContractRepairFixtures):
+    """A genuine operator decision is never resumed automatically."""
 
     def test_a_genuine_waiting_human_stays_non_resumable(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, mismatch, mismatch)

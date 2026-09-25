@@ -13,10 +13,11 @@ from typing import Any, Mapping
 from .approval import ApprovalError, PlanIdentity
 from .models import GateStage
 from .result import atomic_write_text
+from .run_options import RUN_SCHEMA_UNSUPPORTED
 from .step_ids import STEP_ID_RE
 
 CHECKPOINT_NAME = "resume_checkpoint.json"
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -56,6 +57,14 @@ _NO_WORKTREE = _PRE_APPROVAL | frozenset({ResumePhase.WORKTREE_SETUP})
 
 class ResumeCheckpointError(ValueError):
     """A checkpoint is malformed or does not bind the next operation."""
+
+
+class ResumeSchemaUnsupportedError(ResumeCheckpointError):
+    """The checkpoint was written by an incompatible runtime.
+
+    It is never an integrity incident: the run is simply not resumable by
+    this runtime and every artifact stays readable for an operator.
+    """
 
 
 @dataclass(frozen=True)
@@ -188,8 +197,16 @@ def write_checkpoint(run_dir: str | Path, checkpoint: ResumeCheckpoint) -> None:
 
 
 def _parse(payload: Any) -> tuple[ResumeCheckpoint, str]:
-    if not isinstance(payload, dict) or payload.get("schema_version") != _SCHEMA_VERSION:
-        raise ResumeCheckpointError("checkpoint schema_version is unsupported")
+    if not isinstance(payload, dict):
+        raise ResumeCheckpointError("checkpoint is not an object")
+    schema_version = payload.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise ResumeCheckpointError("checkpoint schema_version is not an integer")
+    if schema_version != _SCHEMA_VERSION:
+        raise ResumeSchemaUnsupportedError(
+            f"{RUN_SCHEMA_UNSUPPORTED}: checkpoint schema_version "
+            f"{schema_version} is not {_SCHEMA_VERSION}"
+        )
     status = payload.get("status")
     if status not in {"pending", "completed"}:
         raise ResumeCheckpointError("checkpoint status is invalid")
@@ -249,16 +266,13 @@ _RESUMABLE_STATUSES = frozenset({
 })
 # An operator retry of the StepContractRepairPlanner of one pending slot.
 CONTRACT_REPAIR_OPERATION = "contract_repair"
-# A stranded contract repair whose evidence no longer proves its identity.
-CONTRACT_REPAIR_INTEGRITY_OPERATION = "contract_repair_integrity"
 # The deterministic acceptance of a durable, successful worker candidate.
 STEP_ACCEPTANCE_OPERATION = "step_acceptance"
-# A legacy stale-authority commit gate whose candidate evidence diverged.
-STEP_ACCEPTANCE_INTEGRITY_OPERATION = "step_acceptance_integrity"
-# Exact exhausted check-repair state (including one historical redaction crash).
+# A current checkpoint whose durable identity no longer holds.
+CHECKPOINT_INTEGRITY_OPERATION = "checkpoint_integrity"
+# Exact exhausted check-repair state.
 CHECK_REPAIR_RETRY_OPERATION = "check_repair_retry"
 CHECK_REPAIR_INTEGRITY_OPERATION = "check_repair_integrity"
-_STRANDED_DETAIL = re.compile(r"step=(S[0-9]{2}) contract repair failed: ")
 # Failures that a checkpoint can never repair: the run needs an operator.
 _TERMINAL_FAILURES = frozenset({
     "RESUME_INTEGRITY_FAILURE", "RESUME_REQUIRES_OPERATOR",
@@ -267,7 +281,6 @@ _TERMINAL_FAILURES = frozenset({
     "STAGED_BLOB_SCAN_FAILED", "UNREVIEWABLE_TEXT_DIFF",
     "HEAD_MISMATCH", "TREE_MISMATCH", "UNEXPECTED_HEAD", "UNEXPECTED_TREE",
     "COMMIT_TREE_MISMATCH", "INTEGRITY_MISMATCH",
-    # Only the narrowly proven stale-authority shape (checked first) resumes.
     "COMMIT_GATE_FAILED",
     "DURABLE_ARTIFACT_CORRUPTED", "CORRUPTED_DURABLE_ARTIFACT",
     "ROLLBACK_FAILED", "ROLLBACK_TREE_MISMATCH",
@@ -305,114 +318,41 @@ class ResumeInfo:
     operation: str | None = None
 
 
-def _max_read_paths(run_dir: Path) -> int | None:
-    try:
-        path = run_dir / "run_options.json"
-        if path.stat().st_size > 256 * 1024:
-            return None
-        value = json.loads(path.read_text(encoding="utf-8"))["planning"]["max_read_paths_per_step"]
-    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
-        return None
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
+    """Whether this runtime may resume the run, and at which boundary.
 
-
-def stranded_contract_repair(run_dir: str | Path, state: Mapping[str, Any]) -> str:
-    """``proven``, ``corrupt`` or ``absent`` for a stranded contract repair.
-
-    Only the legacy projection of an invalid StepContractRepairPlanner answer
-    onto ``AGENT_CONTRACT_MISMATCH`` in ``waiting_human`` qualifies, and it is
-    ``proven`` only when the checkpoint, repair slot, durable request, paid
-    answer and recorded parse error all belong together.  Every other
-    ``waiting_human`` state is a genuine operator decision (``absent``) and
-    stays non-resumable.
+    The current checkpoint schema plus its durable identities decide: a
+    checkpoint written by an incompatible runtime is refused as
+    ``RUN_SCHEMA_UNSUPPORTED`` with every artifact left readable, while an
+    incoherent current checkpoint is an integrity incident.
     """
 
-    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-    detail = failure.get("detail")
-    if (
-        state.get("status") != "waiting_human"
-        or state.get("planning_protocol") != "v2"
-        or failure.get("reason") != "AGENT_CONTRACT_MISMATCH"
-        or not isinstance(detail, str)
-    ):
-        return "absent"
-    match = _STRANDED_DETAIL.match(detail)
-    directory = Path(run_dir)
-    max_read_paths = _max_read_paths(directory)
-    if match is None:
-        return "absent"
     try:
-        checkpoint = read_checkpoint(directory)
-    except ResumeCheckpointError:
-        return "corrupt"
-    if (
-        max_read_paths is None
-        or checkpoint is None
-        or checkpoint.phase is not ResumePhase.IMPLEMENT_STEP
-        or checkpoint.step_id != match.group(1)
-        or checkpoint.expected_tree_sha is None
-    ):
-        return "absent"
-    from .orchestration.contract_repair import stranded_output_failure
-
-    step_dir = (
-        directory / "cycles" / f"{checkpoint.review_cycle:03d}" / "implementation"
-        / "steps" / checkpoint.step_id
-    )
-    return stranded_output_failure(
-        step_dir, step_id=checkpoint.step_id, tree_sha=checkpoint.expected_tree_sha,
-        failure_detail=detail, max_read_paths_per_step=max_read_paths,
-    )
-
-
-def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
-    from .orchestration.step_authority import (
-        HISTORICAL_CORRUPT, HISTORICAL_PROVEN, historical_step_acceptance,
-    )
-
-    historical = historical_step_acceptance(run_dir, state)
-    if historical.status == HISTORICAL_CORRUPT:
+        checkpoint = read_checkpoint(run_dir)
+    except ResumeSchemaUnsupportedError as exc:
+        return ResumeInfo(False, reason=str(exc), operation=RUN_SCHEMA_UNSUPPORTED)
+    except ResumeCheckpointError as exc:
         return ResumeInfo(
-            False, reason=f"stranded step acceptance evidence is inconsistent: {historical.reason}",
-            step_id=historical.step_id, operation=STEP_ACCEPTANCE_INTEGRITY_OPERATION,
+            False, reason=f"the current resume checkpoint is inconsistent: {exc}",
+            operation=CHECKPOINT_INTEGRITY_OPERATION,
         )
-    check_repair = _check_repair_exhaustion_info(run_dir, state)
+    check_repair = _check_repair_exhaustion_info(run_dir, state, checkpoint)
     if check_repair is not None:
         return check_repair
-    if historical.status == HISTORICAL_PROVEN:
-        # The worker candidate is proven; only its commit was refused with a
-        # stale authority.  The migration moves the run to STEP_ACCEPTANCE.
-        return ResumeInfo(
-            True, ResumePhase.IMPLEMENT_STEP.value,
-            f"Retry step acceptance ({historical.step_id})",
-            expected_tree=historical.tree_after, review_cycle=historical.review_cycle,
-            step_id=historical.step_id, operation=STEP_ACCEPTANCE_OPERATION,
-        )
-    stranded_shape = stranded_contract_repair(run_dir, state)
-    stranded = stranded_shape == "proven"
-    if stranded_shape == "corrupt":
-        return ResumeInfo(
-            False, reason="pending contract repair evidence is inconsistent",
-            operation=CONTRACT_REPAIR_INTEGRITY_OPERATION,
-        )
-    if state.get("status") not in _RESUMABLE_STATUSES and not stranded:
+    if state.get("status") not in _RESUMABLE_STATUSES:
         return ResumeInfo(False, reason="run has no resumable waiting state")
     if state.get("planning_protocol") != "v2":
         return ResumeInfo(False, reason="only pipeline v2 runs can be resumed")
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     if failure.get("reason") in _TERMINAL_FAILURES:
         return ResumeInfo(False, reason="the run requires an operator")
-    if state.get("recovery_resumable") is False and not stranded:
+    if state.get("recovery_resumable") is False:
         return ResumeInfo(False, reason="the run stopped at a non-resumable failure")
-    try:
-        checkpoint = read_checkpoint(run_dir)
-    except ResumeCheckpointError:
-        return ResumeInfo(False, reason="resume checkpoint is invalid")
     if checkpoint is None:
         return ResumeInfo(False, reason="no resume checkpoint")
     label = resume_label(checkpoint)
     operation = None
-    if stranded or (
+    if (
         state.get("status") == "waiting_contract_repair"
         and checkpoint.phase is ResumePhase.IMPLEMENT_STEP
     ):
@@ -431,23 +371,17 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
 
 def _check_repair_exhaustion_info(
     run_dir: str | Path, state: Mapping[str, Any],
+    checkpoint: ResumeCheckpoint | None,
 ) -> ResumeInfo | None:
-    """Recognize only a proven exhausted gate or its exact legacy redaction crash."""
+    """Recognize only the durable, exhausted deterministic gate."""
 
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     detail = failure.get("detail")
-    legacy = (
-        state.get("status") == "failed"
-        and state.get("planning_protocol") == "v2"
-        and failure.get("reason") == "ATTRIBUTEERROR"
-        and detail == "'dict' object has no attribute 'replace'"
-    )
-    exhausted = (
+    if not (
         state.get("status") == "waiting_check_repair"
         and state.get("planning_protocol") == "v2"
         and failure.get("reason") == "CHECK_REPAIR_EXHAUSTED"
-    )
-    if not (legacy or exhausted):
+    ):
         return None
 
     def invalid(reason: str) -> ResumeInfo:
@@ -457,7 +391,6 @@ def _check_repair_exhaustion_info(
 
     directory = Path(run_dir)
     try:
-        checkpoint = read_checkpoint(directory)
         from .run_options import read_run_options_for_state
         options, _ = read_run_options_for_state(directory, state)
     except (OSError, ValueError):
@@ -561,9 +494,9 @@ def _check_repair_exhaustion_info(
     detail_sha = detail.get("latest_evidence_sha256") if isinstance(detail, Mapping) else None
     if detail_sha is not None and detail_sha != evidence_sha256:
         return invalid("latest failure evidence hash changed")
-    if exhausted and (stored_sha != evidence_sha256 or detail_sha != evidence_sha256):
+    if stored_sha != evidence_sha256 or detail_sha != evidence_sha256:
         return invalid("exhausted check-repair state has no evidence hash authority")
-    if exhausted and (
+    if (
         not isinstance(detail, Mapping)
         or detail.get("attempt_count") != budget
         or detail.get("budget") != budget
@@ -632,11 +565,12 @@ class ResumeRequiresOperatorError(ResumeError):
 
 __all__ = [
     "CHECKPOINT_NAME", "CHECK_REPAIR_INTEGRITY_OPERATION", "CHECK_REPAIR_RETRY_OPERATION",
-    "CONTRACT_REPAIR_INTEGRITY_OPERATION", "CONTRACT_REPAIR_OPERATION",
-    "PHASE_STATUS", "STEP_ACCEPTANCE_INTEGRITY_OPERATION", "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint",
+    "CHECKPOINT_INTEGRITY_OPERATION", "CONTRACT_REPAIR_OPERATION",
+    "PHASE_STATUS", "RUN_SCHEMA_UNSUPPORTED", "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint",
     "ResumeCheckpointError", "ResumeError", "ResumeInfo", "ResumeIntegrityError",
     "ResumeNotAllowedError", "ResumePhase", "ResumeRequiresOperatorError",
+    "ResumeSchemaUnsupportedError",
     "checkpoint_payload", "mark_checkpoint_completed", "pipeline_version_from_state",
     "plan_identity_from_mapping", "read_checkpoint", "read_checkpoint_record",
-    "resume_info", "resume_label", "stranded_contract_repair", "write_checkpoint",
+    "resume_info", "resume_label", "write_checkpoint",
 ]

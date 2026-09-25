@@ -31,7 +31,6 @@ from ..planning_v2 import (
     parse_step_contract_repair,
 )
 from ..result import atomic_write_text
-from ..resume import STEP_ACCEPTANCE_INTEGRITY_OPERATION, STEP_ACCEPTANCE_OPERATION
 from . import contract_repair
 from .shared import StepExecutionOutcome
 
@@ -380,7 +379,7 @@ def build_step_candidate(
     tree_before: str, tree_after: str, changed_paths: Sequence[str], profile_id: str,
     authority: EffectiveStepAuthority, verification: Mapping[str, Any],
     step_record_sha256: str, final_report_sha256: str | None,
-    source: str, historical: Mapping[str, Any] | None = None,
+    source: str,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema_version": STEP_CANDIDATE_SCHEMA_VERSION,
@@ -408,8 +407,6 @@ def build_step_candidate(
         "source": source,
         "created_at": _now(),
     }
-    if historical is not None:
-        payload["historical"] = dict(historical)
     payload["candidate_sha256"] = canonical_sha256(payload)
     return payload
 
@@ -499,174 +496,7 @@ def strict_repair_scope_authorizer(policy: Any) -> Callable[[Path, list[str]], N
     return authorize
 
 
-# -- historical stranded step acceptance -----------------------------------------
-
-HISTORICAL_PROVEN = "proven"
-HISTORICAL_CORRUPT = "corrupt"
-HISTORICAL_ABSENT = "absent"
-_STALE_SCOPE_DETAIL = re.compile(r"^step=(S\d{2}) mutable scope violation: (.+)$", re.DOTALL)
-
-
-@dataclass(frozen=True)
-class HistoricalStepAcceptance:
-    """A pre-``STEP_ACCEPTANCE`` run stranded by a stale-authority commit gate."""
-
-    status: str
-    reason: str | None = None
-    step_id: str | None = None
-    review_cycle: int = 1
-    parent_head_sha: str | None = None
-    tree_before: str | None = None
-    tree_after: str | None = None
-    changed_paths: tuple[str, ...] = ()
-    stale_unexpected_paths: tuple[str, ...] = ()
-    authority: EffectiveStepAuthority | None = field(default=None, repr=False)
-    future_step_ids: tuple[str, ...] = ()
-    failure_detail: str | None = None
-
-
-def historical_step_acceptance(run_dir: str | Path, state: Mapping[str, Any]) -> HistoricalStepAcceptance:
-    """Recognize exactly one provable legacy shape; everything else is absent.
-
-    The shape: a v2 run ``failed`` with ``COMMIT_GATE_FAILED`` "mutable scope
-    violation" at its ``implement_step`` checkpoint, whose last worker attempt
-    succeeded, whose rejected paths were all added by validated contract
-    repairs of that step, and whose repository is still exactly the
-    successful worker candidate.  Only then is it ``proven``; a matching
-    shape whose evidence diverges is ``corrupt``.  A path changed outside
-    the current effective authority stays a genuine, terminal violation.
-    """
-
-    from ..approval import ApprovalError
-    from ..gitops import (
-        GitError, candidate_tree_sha, changed_paths_between_trees, current_head,
-        index_tree_sha, resolve_commit, resolve_tree, status_porcelain, symbolic_head,
-    )
-    from ..planning_v2 import read_approved_step_contract
-    from ..resume import ResumeCheckpointError, ResumePhase, read_checkpoint
-    from ..run_options import RunOptionsError, effective_repair_scope_policy, read_run_options_for_state
-
-    absent = HistoricalStepAcceptance(HISTORICAL_ABSENT)
-    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-    detail = failure.get("detail")
-    if (
-        state.get("status") != "failed"
-        or state.get("planning_protocol") != "v2"
-        or failure.get("reason") != "COMMIT_GATE_FAILED"
-        or not isinstance(detail, str)
-    ):
-        return absent
-    match = _STALE_SCOPE_DETAIL.match(detail)
-    if match is None:
-        return absent
-    directory = Path(run_dir)
-    try:
-        checkpoint = read_checkpoint(directory)
-    except ResumeCheckpointError:
-        return absent
-    step_id = match.group(1)
-    if (
-        checkpoint is None or checkpoint.phase is not ResumePhase.IMPLEMENT_STEP
-        or checkpoint.step_id != step_id or checkpoint.review_cycle != 1
-        or checkpoint.expected_head_sha is None or checkpoint.expected_tree_sha is None
-        or checkpoint.plan_identity is None
-    ):
-        return absent
-    step_dir = directory / "cycles" / "001" / "implementation" / "steps" / step_id
-    record = _read_json(step_dir / "step.json")
-    if (
-        (step_dir / STEP_CANDIDATE_NAME).exists() or (step_dir / STEP_ACCEPTANCE_NAME).exists()
-        or not isinstance(record, dict) or record.get("id") != step_id
-        or record.get("status") != "COMPLETED" or record.get("commit_sha") is not None
-        or record.get("no_change") is True
-        or record.get("tree_before") != checkpoint.expected_tree_sha
-    ):
-        return absent
-
-    def corrupt(reason: str) -> HistoricalStepAcceptance:
-        return HistoricalStepAcceptance(HISTORICAL_CORRUPT, reason, step_id)
-
-    tree_before, tree_after = record["tree_before"], record.get("tree_after")
-    changed = record.get("changed_paths")
-    if (
-        not isinstance(tree_after, str) or _OBJECT_ID.fullmatch(tree_after) is None
-        or tree_after == tree_before
-        or not isinstance(changed, list) or not changed
-        or any(not isinstance(path, str) for path in changed)
-    ):
-        return corrupt("the successful worker record is malformed")
-    stale = tuple(path.strip() for path in match.group(2).split(",") if path.strip())
-    try:
-        bundle_path = directory / "implementation_bundle.json"
-        if _sha256_bytes(bundle_path.read_bytes()) != checkpoint.plan_identity.bundle_sha256:
-            return corrupt("the approved bundle changed")
-        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
-        entries = bundle.get("steps") if isinstance(bundle, dict) else None
-        ids = [item.get("id") for item in entries or () if isinstance(item, dict)]
-        entry = next(item for item in entries if item.get("id") == step_id)
-        contract = read_approved_step_contract(directory, bundle, step_id)
-        options, _digest = read_run_options_for_state(directory, state)
-        approved, count = approved_step_from_contract(
-            contract, depends_on=entry.get("depends_on"),
-            max_read_paths_per_step=options.max_read_paths_per_step,
-        )
-        if count != len(ids):
-            return corrupt("the approved step count changed")
-        authority = resolve_effective_step_authority(
-            step_dir, approved, contract,
-            max_read_paths_per_step=options.max_read_paths_per_step,
-            expected_plan_step_count=count, expected_tree_sha=tree_before,
-            authorize_added=strict_repair_scope_authorizer(effective_repair_scope_policy(options)),
-        )
-    except StepAuthorityError as exc:
-        return corrupt(f"effective step authority is not provable: {exc}")
-    except (OSError, UnicodeError, ValueError, KeyError, TypeError, StopIteration,
-            V2PlanParseError, RunOptionsError, ApprovalError) as exc:
-        return corrupt(f"approved step evidence is unreadable: {type(exc).__name__}")
-    if authority.authority_source != SOURCE_CONTRACT_REPAIR:
-        return absent
-    scope = set(authority.mutable_scope)
-    if any(path not in scope for path in changed):
-        return HistoricalStepAcceptance(
-            HISTORICAL_ABSENT, "a changed path is outside the effective step authority", step_id,
-        )
-    if not stale or any(path not in authority.added_mutable_paths or path not in changed for path in stale):
-        return absent
-    try:
-        worktree = Path(str(state.get("worktree"))).expanduser().resolve()
-        repo = Path(str(state.get("repo"))).expanduser().resolve()
-        branch = state.get("branch")
-        head = current_head(worktree)
-        if (
-            not isinstance(branch, str)
-            or symbolic_head(worktree) != f"refs/heads/{branch}"
-            or resolve_commit(repo, f"refs/heads/{branch}") != head
-            or head != checkpoint.expected_head_sha
-            or resolve_tree(worktree, head) != tree_before
-        ):
-            return corrupt("the run branch is not at the step parent")
-        if index_tree_sha(worktree) != tree_after or candidate_tree_sha(worktree) != tree_after:
-            return corrupt("the worktree is not the successful worker candidate")
-        if any(
-            len(line) < 2 or line[1] != " " or line.startswith("??")
-            for line in status_porcelain(worktree)
-        ):
-            return corrupt("the worktree has unstaged or untracked changes")
-        if sorted(changed_paths_between_trees(worktree, tree_before, tree_after)) != sorted(changed):
-            return corrupt("the recorded changed paths differ from Git")
-    except (GitError, OSError) as exc:
-        return corrupt(f"Git state is unreadable: {type(exc).__name__}")
-    position = ids.index(step_id)
-    return HistoricalStepAcceptance(
-        HISTORICAL_PROVEN, None, step_id, 1, head, tree_before, tree_after,
-        tuple(sorted(changed)), stale, authority, tuple(ids[position + 1:]), detail,
-    )
-
-
 __all__ = [
-    "HISTORICAL_ABSENT", "HISTORICAL_CORRUPT", "HISTORICAL_PROVEN",
-    "HistoricalStepAcceptance", "STEP_ACCEPTANCE_INTEGRITY_OPERATION",
-    "STEP_ACCEPTANCE_OPERATION", "historical_step_acceptance",
     "strict_repair_scope_authorizer",
     "EffectiveStepAuthority", "EffectiveStepExecution", "SOURCE_APPROVED", "SOURCE_CONTRACT_REPAIR",
     "STEP_ACCEPTANCE_NAME", "STEP_AUTHORITY_NAME", "STEP_CANDIDATE_NAME",

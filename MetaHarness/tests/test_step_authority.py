@@ -13,13 +13,12 @@ from pathlib import Path
 from unittest import mock
 
 from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
-from metaharness.commit_gate import CommitSafetyError, commit_safety_gate
+from metaharness.commit_gate import commit_safety_gate
 from metaharness.models import ExecutionRole, RunStatus
-from metaharness.orchestration.pipeline_v2 import PipelineFailure
 from metaharness.orchestration.step_authority import mutable_paths, read_step_candidate
 from metaharness.orchestrator import Orchestrator
 from metaharness.repository_topology import RepositoryTopology
-from metaharness.resume import ResumeNotAllowedError, resume_info
+from metaharness.resume import resume_info
 from metaharness.run_options import RunOptions
 from tests.pipeline_support import (
     PipelineHarness, ScriptedChat, check_repair_result, git, plan, review,
@@ -453,112 +452,6 @@ class StepAcceptanceResumeTests(StepAuthorityHarness):
 
         self.interrupt_before_commit()
         git(self.worktree(), "checkout", "-q", "-b", "operator-branch")
-
-        resumed, planner = self.resume_without_planner()
-
-        self.assertEqual(resumed.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-        self.assertEqual(planner.requests, [])
-
-
-class HistoricalStaleAuthorityTests(StepAuthorityHarness):
-    """CAS 9 / 10: runs stranded by the pre-fix stale-authority commit gate."""
-
-    def two_step_plan(self) -> str:
-        return plan(
-            ("S01", "feature.txt", "Write the feature"),
-            ("S02", "a.txt", "Finish the work"),
-        )
-
-    def legacy_acceptance(self, orchestrator, store, ctx, cycle_plan, index, execution, *, parent_sha):
-        """The pre-fix acceptance: gate scope rebuilt from the approved step."""
-
-        step = cycle_plan.plan.steps[index]
-        try:
-            commit_safety_gate(
-                ctx.info.worktree, tree_sha=execution.outcome.tree_after, parent_sha=parent_sha,
-                mutable_scope=mutable_paths(step), max_diff_bytes=None,
-            )
-        except CommitSafetyError as exc:
-            raise PipelineFailure("COMMIT_GATE_FAILED", str(exc), step_id=step.id) from exc
-        raise AssertionError("the legacy fixture expects a stale-authority refusal")
-
-    def strand(self, *success_paths: str) -> None:
-        self.two_repairs_then_success(*success_paths)
-        legacy = self.legacy_acceptance
-        with mock.patch.object(
-            Orchestrator, "_accept_step_execution",
-            autospec=True, side_effect=lambda *args, **kwargs: legacy(*args, **kwargs),
-        ):
-            result = self.run_pipeline([
-                self.two_step_plan(),
-                repair_contract("c.txt"),
-                repair_contract("c.txt", "d.txt"),
-            ])
-        self.assertEqual(result.status, RunStatus.FAILED)
-        state = self.state()
-        self.assertEqual(state["failure"]["reason"], "COMMIT_GATE_FAILED")
-        self.assertEqual(self.checkpoint()["phase"], "implement_step")
-
-    def test_the_stranded_run_is_adopted_without_replay(self) -> None:
-        """CAS 9."""
-
-        self.strand("feature.txt", "c.txt", "d.txt")
-        state = self.state()
-        self.assertEqual(state["failure"]["detail"], "step=S01 mutable scope violation: c.txt, d.txt")
-        info = resume_info(self.run_dir(), state)
-        self.assertTrue(info.resumable, info.reason)
-        self.assertEqual(
-            (info.operation, info.label, info.phase),
-            ("step_acceptance", "Retry step acceptance (S01)", "implement_step"),
-        )
-        calls = len(self.workers.calls)
-        self.workers.on(ExecutionRole.IMPLEMENTER, writes("a.txt"))
-
-        resumed, planner = self.resume_without_planner()
-
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(planner.requests, [])
-        # Only S02 ran a worker; S01's proven candidate was committed.
-        self.assertEqual(len(self.workers.calls), calls + 1)
-        self.assertEqual(self.workers.calls[-1].artifact_dir.name, "S02")
-        candidate = read_step_candidate(self.step_dir())
-        self.assertEqual(candidate["source"], "historical_commit_gate_migration")
-        self.assertEqual(candidate["historical"]["stale_unexpected_paths"], ["c.txt", "d.txt"])
-        chain = self.json(self.run_dir() / "accepted-chain.json")["commits"]
-        self.assertEqual([item["step_id"] for item in chain], ["S01", "S02"])
-        self.assertEqual(sorted(chain[0]["changed_paths"]), ["c.txt", "d.txt", "feature.txt"])
-        self.assertEqual(chain[0]["effective_authority_sha256"], candidate["effective_authority_sha256"])
-        self.assertEqual(self.state()["resume"]["migration"], "historical_commit_gate_stale_authority")
-
-    def test_a_true_violation_under_the_effective_authority_is_never_adopted(self) -> None:
-        """CAS 10: the stranded candidate also changed E."""
-
-        self.strand("feature.txt", "c.txt", "d.txt")
-        worktree = self.worktree()
-        (worktree / "e.txt").write_text("unauthorized\n", encoding="utf-8")
-        git(worktree, "add", "--all")
-        tree = git(worktree, "write-tree")
-        record_path = self.step_dir() / "step.json"
-        record = self.json(record_path)
-        record["tree_after"] = tree
-        record["changed_paths"] = sorted([*record["changed_paths"], "e.txt"])
-        record_path.write_text(json.dumps(record), encoding="utf-8")
-
-        info = resume_info(self.run_dir(), self.state())
-
-        self.assertFalse(info.resumable)
-        with self.assertRaises(ResumeNotAllowedError):
-            self.resume_without_planner()
-        self.assertFalse((self.step_dir() / "step_candidate.json").exists())
-
-    def test_diverged_candidate_evidence_is_an_integrity_failure(self) -> None:
-        self.strand("feature.txt", "c.txt", "d.txt")
-        (self.worktree() / "c.txt").write_text("drifted\n", encoding="utf-8")
-
-        info = resume_info(self.run_dir(), self.state())
-        self.assertFalse(info.resumable)
-        self.assertEqual(info.operation, "step_acceptance_integrity")
 
         resumed, planner = self.resume_without_planner()
 

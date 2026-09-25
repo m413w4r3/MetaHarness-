@@ -194,12 +194,9 @@ from .plan_recovery import (
     write_plan_recovery_record,
 )
 from .resume import (
+    CHECKPOINT_INTEGRITY_OPERATION,
     CHECK_REPAIR_INTEGRITY_OPERATION,
-    CHECK_REPAIR_RETRY_OPERATION,
-    CONTRACT_REPAIR_INTEGRITY_OPERATION,
     PHASE_STATUS,
-    STEP_ACCEPTANCE_INTEGRITY_OPERATION,
-    STEP_ACCEPTANCE_OPERATION,
     ResumeCheckpoint,
     ResumeCheckpointError,
     ResumeError,
@@ -350,13 +347,11 @@ from .orchestration import contract_repair
 from .orchestration.contract_repair import ContractRepairIntegrityError
 from .orchestration.review_recovery import ReviewRecovery
 from .orchestration.step_authority import (
-    HISTORICAL_PROVEN,
     STEP_ACCEPTANCE_NAME,
     EffectiveStepAuthority,
     EffectiveStepExecution,
     StepAuthorityError,
     build_step_candidate,
-    historical_step_acceptance,
     read_step_candidate,
     resolve_effective_step_authority,
     write_authority_diagnostic,
@@ -2987,84 +2982,6 @@ class Orchestrator:
             authority=authority, diff_path=diff_path if diff_path.is_file() else None,
         )
 
-    def _migrate_historical_step_acceptance(
-        self, run_dir: Path, state: Mapping[str, Any],
-    ) -> ResumeCheckpoint:
-        """Move a proven legacy stale-authority commit refusal to STEP_ACCEPTANCE.
-
-        Only :func:`historical_step_acceptance`'s exact proven shape
-        qualifies.  The modern candidate is synthesized from evidence that was
-        already durable; no model or worker is called and the approved plan
-        and repair artifacts are left untouched.
-        """
-
-        proof = historical_step_acceptance(run_dir, state)
-        if proof.status != HISTORICAL_PROVEN or proof.authority is None:
-            raise ResumeIntegrityError(
-                "stranded step acceptance is no longer provable: " + str(proof.reason or proof.status)
-            )
-        authority = proof.authority
-        step_id = str(proof.step_id)
-        step_dir = cycle_step_dir(run_dir, proof.review_cycle, step_id)
-        record = _read_json_artifact(step_dir / "step.json", 128 * 1024)
-        final_path = step_dir / "agent.final.md"
-        try:
-            record_sha = hashlib.sha256((step_dir / "step.json").read_bytes()).hexdigest()
-            final_bytes = final_path.read_bytes() if final_path.is_file() else None
-        except OSError as exc:
-            raise ResumeIntegrityError(f"stranded step record is unreadable: {exc}") from exc
-        if not isinstance(record, dict):
-            raise ResumeIntegrityError("stranded step record is unreadable")
-        try:
-            verification = step_verification(
-                (final_bytes or b"").decode("utf-8", errors="replace"),
-                step_id=step_id, future_step_ids=proof.future_step_ids,
-                deferred_requested=bool(record.get("deferred_verify")),
-            )
-        except CommitSafetyError as exc:
-            raise ResumeIntegrityError(f"stranded step verification is not acceptable: {exc}") from exc
-        payload = build_step_candidate(
-            run_id=str(state.get("run_id") or run_dir.name), cycle=proof.review_cycle,
-            step_id=step_id, parent_head_sha=str(proof.parent_head_sha),
-            tree_before=str(proof.tree_before), tree_after=str(proof.tree_after),
-            changed_paths=proof.changed_paths, profile_id=str(record.get("profile_id") or ""),
-            authority=authority, verification=verification.payload(),
-            step_record_sha256=record_sha,
-            final_report_sha256=(
-                hashlib.sha256(final_bytes).hexdigest() if final_bytes is not None else None
-            ),
-            source="historical_commit_gate_migration",
-            historical={
-                "failure_reason": "COMMIT_GATE_FAILED",
-                "failure_detail": _bounded_v2_report(str(proof.failure_detail or "")),
-                "stale_unexpected_paths": list(proof.stale_unexpected_paths),
-                "previous_checkpoint_phase": ResumePhase.IMPLEMENT_STEP.value,
-            },
-        )
-        try:
-            write_step_candidate(step_dir, payload)
-        except StepAuthorityError as exc:
-            raise ResumeIntegrityError(str(exc)) from exc
-        write_authority_diagnostic(step_dir, authority)
-        self._write_checkpoint(
-            run_dir, ResumePhase.STEP_ACCEPTANCE,
-            head=proof.parent_head_sha, tree=proof.tree_after,
-            cycle=proof.review_cycle, step_id=step_id,
-        )
-        self._trace_emit(
-            "recovery.migrated", phase="implementation", cycle=proof.review_cycle,
-            step_id=step_id,
-            data={
-                "operation": "step_acceptance", "from_phase": "implement_step",
-                "stale_unexpected_paths": list(proof.stale_unexpected_paths),
-                "effective_authority_sha256": authority.authority_sha256,
-            },
-        )
-        checkpoint = read_checkpoint(run_dir)
-        if checkpoint is None or checkpoint.phase is not ResumePhase.STEP_ACCEPTANCE:
-            raise ResumeIntegrityError("the step acceptance checkpoint could not be written")
-        return checkpoint
-
     def _step_verification(
         self, authority: EffectiveStepAuthority, outcome: StepExecutionOutcome,
         future_step_ids: Sequence[str],
@@ -3094,7 +3011,6 @@ class Orchestrator:
         self, ctx: PipelineV2Context, cycle_plan: CyclePlan, step_dir: Path,
         authority: EffectiveStepAuthority, outcome: StepExecutionOutcome,
         verification: StepVerification, *, parent_sha: str, source: str,
-        historical: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Freeze a successful worker candidate before its commit boundary."""
 
@@ -3117,7 +3033,7 @@ class Orchestrator:
             tree_after=outcome.tree_after, changed_paths=outcome.changed_paths,
             profile_id=outcome.profile_id, authority=authority,
             verification=verification.payload(), step_record_sha256=record_sha,
-            final_report_sha256=final_sha, source=source, historical=historical,
+            final_report_sha256=final_sha, source=source,
         )
         try:
             write_step_candidate(step_dir, payload)
@@ -7142,10 +7058,9 @@ class Orchestrator:
         self._begin_trace(run_dir, selected, created=False)
         eligibility = resume_info(run_dir, state)
         if eligibility.operation in {
-            CONTRACT_REPAIR_INTEGRITY_OPERATION, STEP_ACCEPTANCE_INTEGRITY_OPERATION,
-            CHECK_REPAIR_INTEGRITY_OPERATION,
+            CHECKPOINT_INTEGRITY_OPERATION, CHECK_REPAIR_INTEGRITY_OPERATION,
         }:
-            # A stranded recovery whose durable evidence no longer proves its
+            # A current checkpoint whose durable evidence no longer proves its
             # identity: fail closed, without any model call.
             failed = store.record_failure(
                 "RESUME_INTEGRITY_FAILURE", eligibility.reason,
@@ -7162,30 +7077,6 @@ class Orchestrator:
             raise ResumeNotAllowedError(str(exc)) from exc
         if checkpoint is None:
             raise ResumeNotAllowedError("no resume checkpoint")
-        migration: str | None = None
-        if (
-            eligibility.operation == STEP_ACCEPTANCE_OPERATION
-            and checkpoint.phase is ResumePhase.IMPLEMENT_STEP
-        ):
-            # A legacy commit refusal made with a stale approved authority:
-            # its proven worker candidate moves to STEP_ACCEPTANCE first.
-            try:
-                checkpoint = self._migrate_historical_step_acceptance(run_dir, state)
-            except ResumeIntegrityError as exc:
-                failed = store.record_failure(
-                    exc.code, redact(str(exc), self._secrets),
-                    resume={"status": "refused", "previous_status": state.get("status"),
-                            "previous_failure": state.get("failure")},
-                    current_step=None,
-                )
-                return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
-            migration = "historical_commit_gate_stale_authority"
-        if (
-            eligibility.operation == CHECK_REPAIR_RETRY_OPERATION
-            and isinstance(state.get("failure"), Mapping)
-            and state["failure"].get("reason") == "ATTRIBUTEERROR"
-        ):
-            migration = "historical_check_repair_redaction_crash"
         previous = state.get("resume") if isinstance(state.get("resume"), dict) else {}
         attempts = previous.get("attempts") if isinstance(previous.get("attempts"), int) else 0
         record = {
@@ -7194,7 +7085,6 @@ class Orchestrator:
             "attempts": attempts + 1,
             "previous_status": state.get("status"),
             "previous_failure": state.get("failure"),
-            **({"migration": migration} if migration else {}),
             **({"operation": eligibility.operation} if eligibility.operation else {}),
         }
         if checkpoint.phase in {
@@ -7222,7 +7112,6 @@ class Orchestrator:
             status=PHASE_STATUS[checkpoint.phase], failure=None, current_step=None,
             resume={**record, "status": "running",
                     "restored_paths": list(resumed.restore_paths)},
-            **({"recovery_resumable": None} if migration else {}),
         )
         if claimed is None:
             raise ResumeError("run state changed while the resume was validated")
