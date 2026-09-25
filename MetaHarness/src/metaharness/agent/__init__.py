@@ -36,12 +36,18 @@ from .codex import (
     build_agent_environment,
     classify_codex_failure,
 )
-from .protocol import build_mismatch_retry_addendum, deferred_verify_dependency
+from .protocol import (
+    CheckRepairResult,
+    build_mismatch_retry_addendum,
+    deferred_verify_dependency,
+    parse_check_repair_result,
+)
 from .events import extract_final, extract_usage, parse_event
 from .runtime import CodexRuntimeError, prepare_codex_home
 
 __all__ = [
     "AgentCommittedError",
+    "CheckRepairResult",
     "AgentError",
     "AgentExecutor",
     "AgentExecutorCapabilities",
@@ -78,5 +84,6 @@ __all__ = [
     "extract_final",
     "extract_usage",
     "parse_event",
+    "parse_check_repair_result",
     "prepare_codex_home",
 ]

@@ -14,12 +14,32 @@ it or create a workaround. Emit the required META SCOPE REQUEST protocol.
 
 Work silently. Do not narrate routine file reads, edits or reasoning.
 
-After editing, final output <= 6 lines / 800 characters.
-Return only:
-RESULT: DONE|BLOCKED
-CHANGED: comma-separated repo-relative paths or NONE
-TARGETED CHECK: commands actually run and PASS/FAIL, or NOT_RUN
-NOTE: one short material caveat, or NONE
+After editing, report whether a targeted check actually ran. A zero process
+exit code is not evidence that a repair was verified. If no targeted check ran,
+you must report BLOCKED and NOT_RUN. If Docker or another required service is
+unavailable, report BLOCKED and INFRASTRUCTURE. If the fix needs more scope,
+report BLOCKED and SCOPE, with the META SCOPE REQUEST block before the result.
+Any other inability to complete is BLOCKED and OTHER. Do not claim DONE unless
+a targeted command actually ran; report PASS or FAIL exactly as observed.
+
+Keep the final response concise. Its last block must be exactly this protocol,
+with one non-empty NOTE line and no text after the footer:
+
+META CHECK REPAIR RESULT v1
+
+RESULT
+DONE|BLOCKED
+
+TARGETED_CHECK
+PASS|FAIL|NOT_RUN
+
+BLOCKED_KIND
+NONE|INFRASTRUCTURE|SCOPE|OTHER
+
+NOTE
+<one short non-empty line>
+
+END META CHECK REPAIR RESULT
 
 Do not paste failure logs.
 Do not restate failed check output.
@@ -33,8 +53,8 @@ When a command fails, inspect the smallest useful failure excerpt.
 Do not repeatedly rerun a noisy full suite for diagnosis.
 MetaHarness owns the final authoritative gate.
 
-If a scope request is necessary, this protocol replaces the final output
-entirely:
+If a scope request is necessary, put this block before the required final
+META CHECK REPAIR RESULT block:
 
 META SCOPE REQUEST v1
 

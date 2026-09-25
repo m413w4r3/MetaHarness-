@@ -74,7 +74,11 @@ from ..agent.base import (
     AGENT_START_FAILED,
     AGENT_TIMEOUT,
 )
-from ..agent.protocol import ScopeRequest, parse_scope_request
+from ..agent.protocol import (
+    ScopeRequest,
+    parse_check_repair_result,
+    parse_scope_request,
+)
 
 
 _MAX_PREVIOUS_REVISION_REPORT_BYTES = 16 * 1024
@@ -932,17 +936,57 @@ class RevisionRunner:
         # authorization by itself. The pass is rolled back before policy can
         # authorize a new scope.
         scope_request = parse_scope_request(result.final_message)
+        check_repair_result = (
+            parse_check_repair_result(result.final_message) if is_check_repair else None
+        )
         malformed_scope_request = (
             _SCOPE_REQUEST_HEADER in result.final_message
             and scope_request is None
         )
+        check_repair_unverified = bool(
+            is_check_repair and (
+                check_repair_result is None
+                or (
+                    check_repair_result.result == "DONE"
+                    and check_repair_result.targeted_check == "NOT_RUN"
+                )
+                or (
+                    malformed_scope_request
+                    and not (
+                        check_repair_result is not None
+                        and check_repair_result.result == "BLOCKED"
+                        and check_repair_result.blocked_kind == "SCOPE"
+                    )
+                )
+                or (
+                    scope_request is not None
+                    and (
+                        check_repair_result.result != "BLOCKED"
+                        or check_repair_result.blocked_kind != "SCOPE"
+                    )
+                )
+            )
+        )
         usage = normalize_usage(result.usage)
         revision_state = {
             "profile_id": selected.profile_id,
-            "status": "NO_CHANGE" if tree_after == tree_before else "COMPLETED",
+            "status": (
+                "BLOCKED" if check_repair_result is not None
+                and check_repair_result.result == "BLOCKED" else
+                "UNVERIFIED" if check_repair_unverified else
+                "NO_CHANGE" if tree_after == tree_before else "COMPLETED"
+            ),
             "tree_before": tree_before,
             "tree_after": tree_after,
             "usage": usage,
+            **(
+                {"check_repair_result": dataclasses.asdict(check_repair_result)}
+                if check_repair_result is not None else {}
+            ),
+            **(
+                {"check_repair_protocol_error": "result block missing or invalid"}
+                if check_repair_unverified else {}
+            ),
             **(
                 {
                     "scope_request": _scope_request_payload(scope_request),
@@ -987,6 +1031,20 @@ class RevisionRunner:
             # tree stays durable as evidence and the run stops for an operator.
             _record_failure_tree(artifact_dir, info.worktree)
             return result, "REVISION_SCOPE_VIOLATION"
+        if is_check_repair and check_repair_unverified:
+            _record_failure_tree(artifact_dir, info.worktree)
+            return result, "CHECK_REPAIR_UNAVAILABLE"
+        if is_check_repair and check_repair_result is not None:
+            if check_repair_result.result == "BLOCKED":
+                _record_failure_tree(artifact_dir, info.worktree)
+                if check_repair_result.blocked_kind == "INFRASTRUCTURE":
+                    return result, "CHECK_REPAIR_UNAVAILABLE"
+                if check_repair_result.blocked_kind == "SCOPE":
+                    return result, (
+                        _SCOPE_REQUEST_ROUTE if scope_request is not None
+                        else "HUMAN_REQUIRED"
+                    )
+                return result, "HUMAN_REQUIRED"
         if malformed_scope_request and not is_check_repair:
             # A semantic reviser that emits the scope marker without a valid
             # protocol is not allowed to turn malformed data into authority.

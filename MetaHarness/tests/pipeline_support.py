@@ -150,9 +150,27 @@ class ScriptedChat:
 Script = Callable[[AgentRunRequest], "str | AgentRunResult"]
 
 
+def check_repair_result(
+    result: str = "DONE", targeted_check: str = "PASS", blocked_kind: str = "NONE",
+    note: str = "targeted check completed",
+) -> str:
+    """Render the strict machine result used by scripted repair workers."""
+
+    return (
+        "META CHECK REPAIR RESULT v1\n\n"
+        f"RESULT\n{result}\n\n"
+        f"TARGETED_CHECK\n{targeted_check}\n\n"
+        f"BLOCKED_KIND\n{blocked_kind}\n\n"
+        f"NOTE\n{note}\n"
+        "END META CHECK REPAIR RESULT\n"
+    )
+
+
 def write(path: str, content: str, report: str = "done\n") -> Script:
     def action(request: AgentRunRequest) -> str:
         (request.worktree / path).write_text(content, encoding="utf-8")
+        if request.role is ExecutionRole.REPAIR and report == "done\n":
+            return check_repair_result()
         return report
     return action
 

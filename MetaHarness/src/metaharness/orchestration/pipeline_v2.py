@@ -565,9 +565,9 @@ class PipelineV2Coordinator:
                     "the red gate evidence of the check-repair attempt is missing",
                 )
             attempt = int(start.check_repair_attempt or 1)
-            # The budget is spent from durable attempt records, never from the
-            # checkpoint alone: it names the next attempt, or one already
-            # recorded whose worker is never called again.
+            # Only durable, protocol-verified completed repair records spend
+            # this budget. The checkpoint names a pending attempt or one
+            # already recorded whose worker must never be called again.
             durable = len(ops.check_repair_attempts(ctx, number, stage))
             if attempt not in {durable, durable + 1}:
                 raise PipelineFailure(

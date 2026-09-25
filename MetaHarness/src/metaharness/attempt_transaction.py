@@ -341,6 +341,20 @@ class CandidateAttemptTransaction:
         self.rollback(changed)
         return AttemptRollback(changed, tree_after)
 
+    def discard(self) -> AttemptRollback:
+        """Restore every candidate path touched by a failed worker attempt.
+
+        Callers that use this cleanup path must separately reject any
+        out-of-scope paths after rollback. Unlike :meth:`abort`, discard
+        never lets a scope violation or failed security scan leave mutations
+        in the candidate.
+        """
+
+        self.audit_ownership()
+        tree_after, changed = self.freeze()
+        self.rollback(changed)
+        return AttemptRollback(changed, tree_after)
+
 
 __all__ = [
     "AttemptBoundary", "AttemptRollback", "AttemptViolation",

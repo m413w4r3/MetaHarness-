@@ -12,8 +12,16 @@ from unittest import mock
 
 from metaharness.llm.chat import LLMError, LLMHTTPError
 from metaharness.config import load_config
-from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
-from metaharness.gitops import GitError, remote_run_branch_tip as real_remote_run_branch_tip
+from metaharness.agent.protocol import (
+    CONTRACT_MISMATCH_HEADER,
+    CheckRepairResult,
+    parse_check_repair_result,
+)
+from metaharness.gitops import (
+    GitError,
+    candidate_tree_sha,
+    remote_run_branch_tip as real_remote_run_branch_tip,
+)
 from metaharness.models import ExecutionRole, RunStatus
 from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
 from metaharness.orchestration.pipeline_v2 import PipelineFailure
@@ -21,6 +29,7 @@ from metaharness.run_options import RunOptions
 from metaharness.resume import resume_info
 from tests.pipeline_support import (
     PipelineHarness,
+    check_repair_result,
     correction_plan,
     git,
     initial_plan,
@@ -30,6 +39,29 @@ from tests.pipeline_support import (
 
 SPEC = "Make feature.txt good.\n"
 STEP = ("S01", "feature.txt", "Write the feature")
+
+
+class CheckRepairProtocolTests(unittest.TestCase):
+    def test_check_repair_result_parser_requires_one_final_strict_block(self) -> None:
+        valid = check_repair_result("DONE", "FAIL", "NONE", "targeted test ran and failed")
+        self.assertEqual(
+            parse_check_repair_result("worker summary\n\n" + valid),
+            CheckRepairResult("DONE", "FAIL", "NONE", "targeted test ran and failed"),
+        )
+        blocked = check_repair_result(
+            "BLOCKED", "NOT_RUN", "INFRASTRUCTURE", "Docker daemon unavailable",
+        )
+        self.assertIsNotNone(parse_check_repair_result(blocked))
+        for invalid in (
+            valid + valid,
+            valid + "extra text\n",
+            valid.replace("FAIL\n", "MAYBE\n"),
+            valid.replace("BLOCKED_KIND\nNONE", "BLOCKED_KIND\nINFRASTRUCTURE"),
+            blocked.replace("INFRASTRUCTURE", "NONE"),
+            valid.replace("NOTE\ntargeted test ran and failed", "NOTE\n"),
+        ):
+            with self.subTest(invalid=invalid[:80]):
+                self.assertIsNone(parse_check_repair_result(invalid))
 
 
 def repaired_step_contract() -> str:
@@ -614,7 +646,7 @@ class CheckRepairTests(PipelineHarness):
                 (request.worktree / "tests/test_feature.py").write_text(
                     "repaired test\n", encoding="utf-8",
                 ),
-                "repaired\n",
+                check_repair_result(),
             )[-1],
         )
         config = self.config(check_repair=2)
@@ -652,7 +684,7 @@ class CheckRepairTests(PipelineHarness):
                 (request.worktree / "tests/test_other.py").write_text(
                     "repaired\n", encoding="utf-8",
                 ),
-                "repaired\n",
+                check_repair_result(),
             )[-1],
         )
         config = self.config(check_repair=1)
@@ -680,7 +712,7 @@ class CheckRepairTests(PipelineHarness):
             encoding="utf-8",
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        self.workers.on(ExecutionRole.REPAIR, lambda _request: "no change\n")
+        self.workers.on(ExecutionRole.REPAIR, lambda _request: check_repair_result())
         result = self.orchestrator(
             self.config(check_repair=1), planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
@@ -712,11 +744,58 @@ class CheckRepairTests(PipelineHarness):
         self.assertEqual(self.workers.roles(), ["implementer", "repair"])
 
     def test_every_attempt_of_the_budget_is_used_then_the_gate_is_exhausted(self) -> None:
+        def blocked_after_mutation(request):
+            (request.worktree / "feature.txt").write_text("half repair\n", encoding="utf-8")
+            return check_repair_result(
+                "BLOCKED", "NOT_RUN", "INFRASTRUCTURE", "Docker socket access denied",
+            )
+
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(
             ExecutionRole.REPAIR,
-            write("feature.txt", "still bad\n", report="Docker socket access denied\n"),
-            write("feature.txt", "worse\n", report="Docker socket access denied\n"),
+            blocked_after_mutation,
+            write("feature.txt", "good\n"),
+        )
+        config = self.config(check_repair=2)
+        result = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL, self.state().get("failure"))
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_UNAVAILABLE")
+        self.assertEqual(self.state()["check_repair"]["attempt_count"], 0)
+        attempt = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts/001"
+        self.assertFalse((attempt / "attempt.json").exists())
+        self.assertEqual((self.worktree() / "feature.txt").read_text(encoding="utf-8"), "bad\n")
+        evidence = json.loads(
+            (self.run_dir() / "cycles/001/checks/post-implementation/evidence.json").read_text()
+        )
+        self.assertEqual(candidate_tree_sha(self.worktree()), evidence["staged_tree_sha"])
+        report = json.loads((attempt / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["check_repair_result"]["blocked_kind"], "INFRASTRUCTURE")
+        self.assertNotEqual(report["tree_before"], report["tree_after"])
+        self.assertEqual(
+            (self.checkpoint()["phase"], self.checkpoint()["check_repair_attempt"]),
+            ("check_repair", 1),
+        )
+
+        resumed = self.orchestrator(
+            config, planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
+        self.assertTrue((attempt / "attempt.json").is_file())
+        self.assertTrue((attempt / "attempts/01/report.json").is_file())
+
+    def test_two_verified_check_repairs_can_exhaust_the_budget(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            write("feature.txt", "still bad\n", report=check_repair_result(
+                "DONE", "FAIL", "NONE", "targeted check ran and failed: regression-redaction-secret",
+            )),
+            write("feature.txt", "worse\n", report=check_repair_result(
+                "DONE", "FAIL", "NONE", "targeted check ran and failed: regression-redaction-secret",
+            )),
         )
         with mock.patch(
             "metaharness.orchestrator.config_secret_values",
@@ -761,6 +840,54 @@ class CheckRepairTests(PipelineHarness):
         self.assertEqual(sorted(path.name for path in attempts.iterdir()), ["001", "002"])
         self.assertEqual(self.reviewer.requests, [])
 
+    def test_blocked_scope_request_uses_authority_before_retrying_same_attempt(self) -> None:
+        from metaharness.run_options import RunOptions
+
+        self._add_tracked_paths("other.txt")
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "if (pathlib.Path('feature.txt').read_text().strip() != 'good'\n"
+            "        or pathlib.Path('other.txt').read_text().strip() != 'good'):\n"
+            "    print('feature.txt: required files are not repaired', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        scope_request = (
+            "META SCOPE REQUEST v1\n\n"
+            "REASON\nThe failing check requires the related fixture.\n\n"
+            "PATHS\n- other.txt\n\n"
+            "EVIDENCE\n- The configured test reads other.txt.\n\n"
+            "END META SCOPE REQUEST"
+        )
+
+        def blocked(request):
+            (request.worktree / "feature.txt").write_text("partial\n", encoding="utf-8")
+            return scope_request + "\n\n" + check_repair_result(
+                "BLOCKED", "NOT_RUN", "SCOPE", "other.txt is outside the current authority",
+            )
+
+        def repair(request):
+            self.assertIn("other.txt", request.mutable_paths)
+            (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
+            (request.worktree / "other.txt").write_text("good\n", encoding="utf-8")
+            return check_repair_result()
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, blocked, repair)
+        config = self.config(check_repair=1)
+        options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
+        result = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run", run_options=options)
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
+        attempt = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts/001"
+        self.assertEqual(json.loads((attempt / "attempt.json").read_text())["number"], 1)
+        authority = json.loads((attempt / "scope_requests/001/authority.json").read_text())
+        self.assertEqual(authority["added_paths"], ["other.txt"])
+        self.assertEqual(json.loads((attempt / "scope.json").read_text())["added_paths"], ["other.txt"])
+
     def test_gate_docker_outage_waits_without_consuming_check_repair_budget(self) -> None:
         self.check.write_text(
             "import sys\nprint('Cannot connect to the Docker daemon')\nraise SystemExit(1)\n",
@@ -791,7 +918,7 @@ class CheckRepairTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(
             ExecutionRole.REPAIR,
-            lambda _request: "no change\n", lambda _request: "no change\n",
+            lambda _request: check_repair_result(), lambda _request: check_repair_result(),
         )
         config = self.config(check_repair=2)
         original = self.orchestrator(
@@ -830,7 +957,7 @@ class CheckRepairTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(
             ExecutionRole.REPAIR,
-            lambda _request: "no change\n", lambda _request: "no change\n",
+            lambda _request: check_repair_result(), lambda _request: check_repair_result(),
         )
         config = self.config(check_repair=2)
         waiting = self.orchestrator(
@@ -875,7 +1002,7 @@ class CheckRepairTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(
             ExecutionRole.REPAIR,
-            lambda _request: "no change\n", lambda _request: "no change\n",
+            lambda _request: check_repair_result(), lambda _request: check_repair_result(),
         )
         config = self.config(check_repair=2)
         waiting = self.orchestrator(

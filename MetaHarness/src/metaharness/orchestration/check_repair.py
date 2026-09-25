@@ -69,6 +69,10 @@ class CheckRepairAttempt:
     tree_before: str
     tree_after: str
     mutable_scope: tuple[str, ...]
+    worker_result: str
+    targeted_check: str
+    blocked_kind: str
+    note: str
 
 
 # Gate failures for which a semantic review is pointless or unsafe: the

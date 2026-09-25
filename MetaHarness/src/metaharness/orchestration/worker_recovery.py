@@ -256,6 +256,7 @@ class WorkerRecovery:
             changed = self._rollback_revision(
                 transaction, allowed=allowed, artifact_dir=artifact_dir,
                 allow_requested_paths=(error == _SCOPE_REQUEST_ROUTE),
+                discard_scope_violations=is_check_repair,
             )
             if error in TRANSIENT_WORKER_FAILURES | {AGENT_AUTH_FAILURE}:
                 atomic_write_text(artifact_dir / "failure.json", _json_text({
@@ -306,6 +307,7 @@ class WorkerRecovery:
         allowed: set[str],
         artifact_dir: Path,
         allow_requested_paths: bool,
+        discard_scope_violations: bool = False,
     ) -> bool:
         """Audit a failed revision and restore only a fully in-scope tree."""
 
@@ -319,7 +321,11 @@ class WorkerRecovery:
         if any(not safe_scope_request_path(path) for path in requested):
             raise PipelineFailure("AGENT_SCOPE_VIOLATION", "scope request contains an unsafe path")
         try:
-            rollback = transaction.abort(allowed, requested=requested)
+            if discard_scope_violations:
+                rollback = transaction.discard()
+                transaction.enforce_scope(rollback.changed_paths, set(allowed) | requested)
+            else:
+                rollback = transaction.abort(allowed, requested=requested)
         except AttemptViolation as violation:
             if violation.code == "RESUME_REQUIRES_OPERATOR":
                 _record_failure_tree(artifact_dir, transaction.worktree)

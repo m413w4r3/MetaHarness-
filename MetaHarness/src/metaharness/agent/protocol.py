@@ -16,6 +16,70 @@ class ScopeRequest:
     evidence: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class CheckRepairResult:
+    """Machine-readable completion and targeted-check result of one repair."""
+
+    result: str
+    targeted_check: str
+    blocked_kind: str
+    note: str
+
+
+_CHECK_REPAIR_RESULT_HEADER = "META CHECK REPAIR RESULT v1"
+_CHECK_REPAIR_RESULT_FOOTER = "END META CHECK REPAIR RESULT"
+
+
+def parse_check_repair_result(final_message: str) -> CheckRepairResult | None:
+    """Parse the one strict check-repair result block at the end of a reply.
+
+    Invalid, missing, duplicated, or non-final blocks fail closed as ``None``.
+    The worker's prose before the block is retained as advisory text only.
+    """
+
+    if not isinstance(final_message, str):
+        return None
+    lines = final_message.splitlines()
+    if (
+        lines.count(_CHECK_REPAIR_RESULT_HEADER) != 1
+        or lines.count(_CHECK_REPAIR_RESULT_FOOTER) != 1
+    ):
+        return None
+    start = lines.index(_CHECK_REPAIR_RESULT_HEADER)
+    end = lines.index(_CHECK_REPAIR_RESULT_FOOTER)
+    if end <= start or any(line.strip() for line in lines[end + 1 :]):
+        return None
+    block = lines[start : end + 1]
+    if (
+        len(block) != 14
+        or block[0] != _CHECK_REPAIR_RESULT_HEADER
+        or block[1] != ""
+        or block[2] != "RESULT"
+        or block[4] != ""
+        or block[5] != "TARGETED_CHECK"
+        or block[7] != ""
+        or block[8] != "BLOCKED_KIND"
+        or block[10] != ""
+        or block[11] != "NOTE"
+        or block[13] != _CHECK_REPAIR_RESULT_FOOTER
+    ):
+        return None
+    result, targeted_check, blocked_kind, note = (
+        block[3], block[6], block[9], block[12],
+    )
+    if (
+        result not in {"DONE", "BLOCKED"}
+        or targeted_check not in {"PASS", "FAIL", "NOT_RUN"}
+        or blocked_kind not in {"NONE", "INFRASTRUCTURE", "SCOPE", "OTHER"}
+        or not note.strip()
+        or note != note.strip()
+        or (result == "DONE" and blocked_kind != "NONE")
+        or (result == "BLOCKED" and blocked_kind == "NONE")
+    ):
+        return None
+    return CheckRepairResult(result, targeted_check, blocked_kind, note)
+
+
 _SCOPE_REQUEST_HEADER = "META SCOPE REQUEST v1"
 _SCOPE_REQUEST_FOOTER = "END META SCOPE REQUEST"
 _MAX_SCOPE_REQUEST_PATHS = 32
@@ -204,6 +268,7 @@ def contract_mismatch_explanation(final_message: str) -> str | None:
 
 
 __all__ = [
+    "CheckRepairResult",
     "CONTRACT_MISMATCH_HEADER",
     "DEFERRED_VERIFY_HEADER",
     "MISMATCH_RETRY_ADDENDUM",
@@ -212,4 +277,5 @@ __all__ = [
     "contract_mismatch_explanation",
     "deferred_verify_dependency",
     "parse_scope_request",
+    "parse_check_repair_result",
 ]

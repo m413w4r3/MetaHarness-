@@ -28,7 +28,11 @@ from .agent.base import (
     AgentScopeError,
 )
 from .agent.diagnostics import write_token_diagnostics
-from .agent.protocol import contract_mismatch_explanation, deferred_verify_dependency
+from .agent.protocol import (
+    contract_mismatch_explanation,
+    deferred_verify_dependency,
+    parse_check_repair_result,
+)
 from .prompt_contracts import (
     build_implementer_payload,
     build_final_review_payload,
@@ -3693,12 +3697,21 @@ class Orchestrator:
             failed = payload.get("failed_check_ids_before")
             scope = payload.get("mutable_scope")
             before, after = payload.get("tree_before"), payload.get("tree_after")
+            worker_result = payload.get("worker_result")
+            targeted_check = payload.get("targeted_check")
+            blocked_kind = payload.get("blocked_kind")
+            note = payload.get("note")
             if (
                 isinstance(number, bool) or not isinstance(number, int) or number < 1
                 or number != int(directory.name)
                 or not isinstance(failed, list) or any(not isinstance(item, str) for item in failed)
                 or not isinstance(scope, list) or any(not isinstance(item, str) for item in scope)
                 or not _is_object_id(before) or not _is_object_id(after)
+                or payload.get("status") != "completed"
+                or worker_result != "DONE"
+                or targeted_check not in {"PASS", "FAIL"}
+                or blocked_kind != "NONE"
+                or not isinstance(note, str) or not note.strip()
             ):
                 raise ResumeIntegrityError("check-repair attempt record is invalid")
             records.append(CheckRepairAttempt(
@@ -3707,6 +3720,10 @@ class Orchestrator:
                 tree_before=before,
                 tree_after=after,
                 mutable_scope=tuple(scope),
+                worker_result=worker_result,
+                targeted_check=targeted_check,
+                blocked_kind=blocked_kind,
+                note=note,
             ))
         records.sort(key=lambda item: item.number)
         if any(item.number != index for index, item in enumerate(records, start=1)):
@@ -3721,8 +3738,6 @@ class Orchestrator:
 
         number = cycle_plan.cycle.number
         attempt_dir = check_repair_attempt_dir(ctx.run_dir, number, stage, attempt)
-        # A failed earlier try of this same attempt keeps its artifacts.
-        _archive_attempt_tree(attempt_dir)
         attempt_dir.mkdir(parents=True, exist_ok=True)
         selected = ctx.selection.check_repair
         if selected is None:
@@ -3754,6 +3769,75 @@ class Orchestrator:
             run_dir=ctx.run_dir, evidence=evidence,
             base_mutable_scope=self._effective_cycle_scope(ctx, cycle_plan), previous=previous_scope,
         )
+
+        def updated_scope(paths: Sequence[str]) -> CheckRepairScope:
+            effective = tuple(sorted(set(paths)))
+            if not set(scope.base_paths).issubset(effective):
+                raise PipelineFailure("HUMAN_REQUIRED", "scope request removed existing authority")
+            added = tuple(path for path in effective if path not in set(scope.base_paths))
+            if len(added) > scope.bound:
+                raise PipelineFailure(
+                    "HUMAN_REQUIRED", "scope request exceeds the configured check-repair bound",
+                )
+            return CheckRepairScope(
+                base_paths=scope.base_paths,
+                added_paths=added,
+                effective_paths=effective,
+                policy=scope.policy,
+                bound=scope.bound,
+                source=("auto-bounded failing-test evidence" if added
+                        else "human-approved mutable scope"),
+            )
+
+        def persist_scope(value: CheckRepairScope) -> None:
+            atomic_write_text(attempt_dir / "scope.json", _json_text({
+                "schema_version": 2,
+                "base_mutable_scope": list(value.base_paths),
+                "added_paths": list(value.added_paths),
+                "effective_mutable_scope": list(value.effective_paths),
+                "policy": value.policy,
+                "bound": value.bound,
+                "source": value.source,
+            }))
+
+        # A scope approval may suspend this exact, unconsumed attempt. Keep
+        # its report reachable across resume and apply the existing authority
+        # decision before asking the worker again.
+        report_path = attempt_dir / "report.json"
+        report = _read_json_artifact(report_path, 256 * 1024) if report_path.is_file() else None
+        if not isinstance(report, dict):
+            archived_reports = sorted(
+                (attempt_dir / "attempts").glob("[0-9][0-9]*/report.json"),
+                key=lambda item: item.parent.name,
+            )
+            if archived_reports:
+                archived_scope_report = archived_reports[-1]
+                report = _read_json_artifact(archived_scope_report, 256 * 1024)
+                if isinstance(report, dict):
+                    atomic_write_text(report_path, archived_scope_report.read_text(encoding="utf-8"))
+        protocol_record = report.get("check_repair_result") if isinstance(report, dict) else None
+        pending_scope_request = (
+            isinstance(protocol_record, dict)
+            and protocol_record.get("result") == "BLOCKED"
+            and protocol_record.get("blocked_kind") == "SCOPE"
+            and isinstance(report.get("scope_request"), dict)
+        )
+        if pending_scope_request:
+            outcome, mutable_scope = self._authorize_semantic_scope_request(
+                store, ctx, cycle_plan, attempt_dir, list(scope.effective_paths),
+            )
+            if outcome != "expanded":
+                raise PipelineFailure(
+                    "HUMAN_REQUIRED", "check-repair scope request needs an operator decision",
+                )
+            scope = updated_scope(mutable_scope)
+            persist_scope(scope)
+            _archive_attempt(attempt_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+        else:
+            # Retire artifacts from a previous unverified/failed try without
+            # counting that try against max_check_repair_attempts.
+            _archive_attempt_tree(attempt_dir)
+
         decision = classify_failure(soft[0] if soft else "CHECK_FAILED")
         if decision.disposition is not RecoveryDisposition.CHECK_REPAIR:
             raise PipelineFailure("CHECK_REPAIR_NOT_AUTHORIZED", "check failure is not repairable")
@@ -3789,25 +3873,14 @@ class Orchestrator:
             budget_remaining=max(0, ctx.options.max_check_repair_attempts - attempt + 1),
             phase="validation", cycle=number,
         )
-        # The attempt directories stay the check-repair budget authority.
-        self._recovery(store).record(RecoveryAttempt(
-            phase="validation", reason="CHECK_FAILED", attempt=attempt,
-            budget_key="check_repair_attempts", budget=ctx.options.max_check_repair_attempts,
-            budget_consumed=attempt, disposition=decision.disposition.value,
-            cycle=number, profile_id=selected.profile_id,
-            tree_before=evidence.staged_tree_sha, tree_after=evidence.staged_tree_sha,
-        ))
         self._recovery(store).trace(
             "recovery.started", reason="CHECK_FAILED", decision=decision,
             attempt=attempt, tree_before=evidence.staged_tree_sha,
             tree_after=_safe_candidate_tree(ctx.info.worktree),
-            budget_remaining=max(0, ctx.options.max_check_repair_attempts - attempt),
+            budget_remaining=max(0, ctx.options.max_check_repair_attempts - len(records)),
             phase="validation", cycle=number,
         )
-        try:
-            _result, error = self._run_revision_with_recovery(
-                store=store, cycle=number, is_check_repair=True, attempt=attempt,
-                request={
+        revision_request = {
                 "store": store, "cycle": number, "run_dir": ctx.run_dir, "repo": ctx.repo,
                 "base_sha": ctx.base_sha, "base_tree_sha": ctx.base_tree_sha, "spec": ctx.spec,
                 "plan": cycle_plan.plan, "repository_reference": ctx.repository_reference,
@@ -3818,11 +3891,34 @@ class Orchestrator:
                 "check_repair_evidence": evidence, "check_repair_scope": scope,
                 "check_repair_attempt": attempt,
                 "gate_stage": stage.value,
-                },
+        }
+        while True:
+            try:
+                _result, error = self._run_revision_with_recovery(
+                    store=store, cycle=number, is_check_repair=True, attempt=attempt,
+                    request=revision_request,
+                )
+            except (AgentError, GitError, OSError) as exc:
+                error = getattr(exc, "code", None) or AGENT_RUNTIME_FAILED
+                _record_failure_tree(attempt_dir, ctx.info.worktree)
+            if error != _SCOPE_REQUEST_ROUTE:
+                break
+            outcome, requested_scope = self._authorize_semantic_scope_request(
+                store, ctx, cycle_plan, attempt_dir, list(scope.effective_paths),
             )
-        except (AgentError, GitError, OSError) as exc:
-            error = getattr(exc, "code", None) or AGENT_RUNTIME_FAILED
-            _record_failure_tree(attempt_dir, ctx.info.worktree)
+            if outcome != "expanded" or set(requested_scope) == set(scope.effective_paths):
+                error = "HUMAN_REQUIRED"
+                break
+            scope = updated_scope(requested_scope)
+            persist_scope(scope)
+            _archive_attempt(attempt_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
+            revision_request["mutable_scope"] = list(scope.effective_paths)
+            revision_request["check_repair_scope"] = scope
+            progress["mutable_scope"] = list(scope.effective_paths)
+            store.update(
+                status=RunStatus.REVISING,
+                check_repair={"status": "running", "attempt_count": len(records), **progress},
+            )
         effective_executor = _read_json_artifact(attempt_dir / "executor.json", 16 * 1024)
         effective_profile_id = (
             effective_executor.get("profile_id")
@@ -3835,7 +3931,7 @@ class Orchestrator:
         if error is not None:
             if error in {
                 AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT,
-                AGENT_PROTOCOL_FAILED,
+                AGENT_PROTOCOL_FAILED, "CHECK_REPAIR_UNAVAILABLE",
             }:
                 error_detail = f"CHECK_REPAIR_UNAVAILABLE after {error}"
                 atomic_write_text(attempt_dir / "failure.json", _json_text({
@@ -3853,7 +3949,8 @@ class Orchestrator:
                 store.update(
                     status=RunStatus.REVISING,
                     check_repair={
-                        "status": "unavailable", "error": error[:120], **progress,
+                        "status": "unavailable", "error": error[:120],
+                        "attempt_count": len(records), **progress,
                     },
                 )
                 raise PipelineFailure("CHECK_REPAIR_UNAVAILABLE", error_detail)
@@ -3881,12 +3978,28 @@ class Orchestrator:
                 check_repair={"status": "failed", "error": reason, **progress},
             )
             raise PipelineFailure(reason, ", ".join(soft))
+        protocol = parse_check_repair_result(
+            getattr(_result, "final_message", "") if _result is not None else "",
+        )
+        if (
+            protocol is None or protocol.result != "DONE"
+            or protocol.targeted_check not in {"PASS", "FAIL"}
+            or protocol.blocked_kind != "NONE"
+        ):
+            # RevisionRunner owns rollback for this branch. Reaching it means
+            # the worker result lost its strict proof between orchestration
+            # boundaries, so fail closed before writing an attempt record.
+            raise PipelineFailure("CHECK_REPAIR_UNAVAILABLE", "repair result is not verifiable")
         record = CheckRepairAttempt(
             number=attempt,
             failed_check_ids_before=failed_ids,
             tree_before=evidence.staged_tree_sha,
             tree_after=candidate_tree_sha(ctx.info.worktree),
             mutable_scope=tuple(scope.effective_paths),
+            worker_result=protocol.result,
+            targeted_check=protocol.targeted_check,
+            blocked_kind=protocol.blocked_kind,
+            note=protocol.note,
         )
         atomic_write_text(attempt_dir / "attempt.json", _json_text({
             "schema_version": 1,
@@ -3895,6 +4008,15 @@ class Orchestrator:
             "profile_fingerprint": effective_fingerprint,
             "status": "completed",
         }))
+        # The check-repair budget is consumed only after a verifiable DONE
+        # report and its durable attempt record both exist.
+        self._recovery(store).record(RecoveryAttempt(
+            phase="validation", reason="CHECK_FAILED", attempt=attempt,
+            budget_key="check_repair_attempts", budget=ctx.options.max_check_repair_attempts,
+            budget_consumed=attempt, disposition=decision.disposition.value,
+            cycle=number, profile_id=selected.profile_id,
+            tree_before=evidence.staged_tree_sha, tree_after=record.tree_after,
+        ))
         attempts = [*records, record]
         self._cycle_update(
             store, cycle_plan.cycle,
