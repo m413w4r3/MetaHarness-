@@ -106,12 +106,14 @@ _TERMINAL_LABELS = {
     "waiting_external": "WAITING FOR EXTERNAL AUTHORIZATION",
     "waiting_check_infrastructure": "WAITING FOR CHECK INFRASTRUCTURE",
     "waiting_remote": "WAITING FOR REMOTE",
+    "waiting_contract_repair": "WAITING FOR CONTRACT REPAIR PLANNER",
 }
 _WAITING_LABELS = {
     "waiting_external": "Waiting for external authorization",
     "waiting_check_infrastructure": "Waiting for check infrastructure",
     "waiting_remote": "Waiting for remote",
     "waiting_human": "Waiting for operator decision",
+    "waiting_contract_repair": "Output correction exhausted",
 }
 TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
 AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
@@ -917,6 +919,8 @@ _FAILURE_MESSAGES = {
     "PUSH_FAILED": "Publication push failed",
     "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
+    "STEP_CONTRACT_REPAIR_OUTPUT_INVALID": "Contract repair planner answer remains invalid",
+    "CONTRACT_REPAIR_SCOPE_DENIED": "Contract repair requested scope beyond policy",
     "RESUME_REQUIRES_OPERATOR": "Resume requires an operator",
     "WAITING_REPAIR_EXHAUSTED": "Recovery exhausted: operator decision required",
     "WAITING_SCOPE_APPROVAL": "Additional repair scope needs approval",
@@ -1011,11 +1015,18 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     failure = run.get("failure", state.get("failure"))
     if status not in {
         "failed", "blocked", "interrupted", "waiting_check_infrastructure",
-        "waiting_remote", "waiting_external", "waiting_human",
+        "waiting_remote", "waiting_external", "waiting_human", "waiting_contract_repair",
     } or not isinstance(failure, dict):
         return ""
     reason = str(failure.get("reason") or "")
     resume = overview.get("resume") if isinstance(overview.get("resume"), dict) else {}
+    repair = overview.get("contract_repair") if isinstance(overview.get("contract_repair"), dict) else None
+    waiting_label = _WAITING_LABELS.get(status, status.upper())
+    if repair is not None and resume.get("operation") == "contract_repair":
+        # A proven pending repair slot is not a generic operator decision.
+        waiting_label = f'{repair.get("phase")} · {repair.get("repair_id") or "—"}'
+    elif status == "waiting_human":
+        waiting_label = "Human decision genuinely required"
     recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
     note = (
         "The reviewer requested a correction and the run has no review-correction budget."
@@ -1058,7 +1069,7 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
         )
     detail = failure.get("detail")
     return (
-        f'<div class="card failure-card"><p class="label">{_e(_WAITING_LABELS.get(status, status.upper()))}</p>'
+        f'<div class="card failure-card"><p class="label">{_e(waiting_label)}</p>'
         f'<p class="failure-title"><strong>{_e(_FAILURE_MESSAGES.get(reason, reason or "Run failed"))}</strong></p>'
         f'{action}'
         f'<p class="small"><strong>{_e(reason)}</strong>'
@@ -1118,12 +1129,17 @@ def _run_card(run: dict[str, Any], token: str | None, overview: dict[str, Any], 
     failure = run.get("failure", state.get("failure"))
     live_reason = failure.get("reason") if isinstance(failure, dict) else ""
     polls = run_page_polls(run)
+    status_label = _WAITING_LABELS.get(status, status.upper() or "—")
+    repair = overview.get("contract_repair") if isinstance(overview.get("contract_repair"), dict) else None
+    resume = overview.get("resume") if isinstance(overview.get("resume"), dict) else {}
+    if repair is not None and resume.get("operation") == "contract_repair":
+        status_label = "Contract repair"
     return (
         '<header class="sticky run-card">'
         f'<h1>Run <span class="mono">{_e(run_id)}</span></h1>'
         '<div class="card-grid">'
         f'<div><p class="label">RUN</p><p class="value mono">{_e(_short_id(run_id))}</p></div>'
-        f'<div><p class="label">STATUS</p><p class="value"><span id="live-status" class="badge {style}">{_e(_WAITING_LABELS.get(status, status.upper() or "—"))}</span></p>'
+        f'<div><p class="label">STATUS</p><p class="value"><span id="live-status" class="badge {style}">{_e(status_label)}</span></p>'
         f'<p class="muted small">updated <span id="live-updated" class="mono">{_e(run.get("updated_at"))}</span></p></div>'
         f'<div><p class="label">CURRENT</p><p class="value" id="live-current">{_e(overview.get("current_label") or "—")}</p></div>'
         f'<div><p class="label">NEXT</p><p class="value" id="live-next">{_e(overview.get("next_label") or "—")}</p></div>'

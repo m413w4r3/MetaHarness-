@@ -25,7 +25,9 @@ def mismatch(_request) -> str:
     return CONTRACT_MISMATCH_HEADER + "\nThe step invariants contradict the SPEC."
 
 
-class ContractRepairTransactionTests(PipelineHarness):
+class ContractRepairFixtures(PipelineHarness):
+    """Shared slot readers of the contract repair transaction tests."""
+
     def step_dir(self, run_id: str = "run") -> Path:
         return self.run_dir(run_id) / "cycles/001/implementation/steps/S01"
 
@@ -54,6 +56,11 @@ class ContractRepairTransactionTests(PipelineHarness):
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL, self.state().get("failure"))
 
+    def git_tree(self) -> str:
+        return git(self.worktree(), "rev-parse", "HEAD^{tree}")
+
+
+class ContractRepairTransactionTests(ContractRepairFixtures):
     def test_planner_outage_resumes_the_pending_repair_without_replaying_the_worker(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         self.wait_on_outage()
@@ -309,11 +316,6 @@ class ContractRepairTransactionTests(PipelineHarness):
         self.assertNotEqual(result.status, RunStatus.COMMITTED)
         self.assertEqual(len(self.workers.calls), 1)
         self.assertEqual(self.planner.requests, [])
-
-    def git_tree(self) -> str:
-        from tests.pipeline_support import git
-
-        return git(self.worktree(), "rev-parse", "HEAD^{tree}")
 
 
 class WaitingDiagnosticsTests(PipelineHarness):

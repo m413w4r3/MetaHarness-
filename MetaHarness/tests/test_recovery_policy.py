@@ -45,6 +45,19 @@ FAILURE_POLICY_MATRIX = (
 
 
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_invalid_contract_repair_output_is_never_a_worker_mismatch(self) -> None:
+        code = "STEP_CONTRACT_REPAIR_OUTPUT_INVALID"
+        self.assertEqual(classify_failure(code).disposition, RecoveryDisposition.CONTRACT_REPAIR)
+        exhausted = classify_failure(code, budget_exhausted=True)
+        self.assertEqual(exhausted.disposition, RecoveryDisposition.WAIT_HUMAN)
+        terminal = terminal_state_for(exhausted, failure_code=code, phase=ResumePhase.IMPLEMENT_STEP)
+        self.assertEqual((terminal.status, terminal.resumable), (RunStatus.WAITING_CONTRACT_REPAIR, True))
+        # A genuine decision keeps the non-resumable WAITING_HUMAN projection.
+        for genuine in ("SPEC_DECISION_REQUIRED", "SECURITY_POLICY_DECISION_REQUIRED", "CONTRACT_REPAIR_SCOPE_DENIED"):
+            decision = classify_failure(genuine, budget_exhausted=True)
+            terminal = terminal_state_for(decision, failure_code=genuine, phase=ResumePhase.IMPLEMENT_STEP)
+            self.assertEqual((terminal.status, terminal.resumable), (RunStatus.WAITING_HUMAN, False))
+
     def test_unknown_failure_fails_closed(self) -> None:
         decision = classify_failure("TOTALLY_NEW_FAILURE")
         self.assertEqual(decision.disposition, RecoveryDisposition.HARD_STOP)

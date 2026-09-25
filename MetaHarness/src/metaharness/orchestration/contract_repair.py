@@ -11,6 +11,15 @@ Statuses only move forward.  A transport failure (HTTP 429/5xx, timeout,
 connection loss) parks the slot in ``waiting_external``; a resume re-enters
 ``awaiting_planner`` for the same semantic repair number and only counts a
 new planner transport attempt.
+
+A durable planner answer that is deterministically invalid moves the slot to
+``planner_output_invalid``; the next admitted output correction opens
+``awaiting_output_correction`` for output attempt ``n + 1`` of the *same* slot.
+Ordering is ``(output_attempt, rank)``, so the correction loop is monotone.
+Three counters stay independent: the semantic repair number (the slot), the
+planner transport attempts of the current output attempt, and the output
+corrections.  An exhausted correction budget parks the slot in
+``output_correction_exhausted`` until an operator retries the planner.
 """
 
 from __future__ import annotations
@@ -22,6 +31,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..planning_v2 import (
+    StepContractRepairArtifactError,
+    step_repair_attempt_files,
+    step_repair_attempt_state,
+)
 from ..result import atomic_write_text
 
 TRANSACTION_NAME = "transaction.json"
@@ -31,6 +45,9 @@ SCHEMA_VERSION = 1
 AWAITING_PLANNER = "awaiting_planner"
 WAITING_EXTERNAL = "waiting_external"
 PLANNER_RESPONSE_DURABLE = "planner_response_durable"
+PLANNER_OUTPUT_INVALID = "planner_output_invalid"
+AWAITING_OUTPUT_CORRECTION = "awaiting_output_correction"
+OUTPUT_CORRECTION_EXHAUSTED = "output_correction_exhausted"
 PLANNER_VALIDATED = "planner_validated"
 SCOPE_WAITING = "scope_waiting"
 VALIDATED = "validated"
@@ -39,12 +56,15 @@ SUPERSEDED = "superseded"
 LEGACY_PROMPT_BUG = "legacy_forbidden_as_invariants_prompt_bug"
 
 _RANK = {
-    AWAITING_PLANNER: 0, WAITING_EXTERNAL: 0,
-    PLANNER_RESPONSE_DURABLE: 1, PLANNER_VALIDATED: 2, SCOPE_WAITING: 3,
-    VALIDATED: 4, COMPLETED: 5, SUPERSEDED: 5,
+    AWAITING_PLANNER: 0, WAITING_EXTERNAL: 0, AWAITING_OUTPUT_CORRECTION: 0,
+    PLANNER_RESPONSE_DURABLE: 1, PLANNER_OUTPUT_INVALID: 2,
+    OUTPUT_CORRECTION_EXHAUSTED: 3, PLANNER_VALIDATED: 4, SCOPE_WAITING: 5,
+    VALIDATED: 6, COMPLETED: 7, SUPERSEDED: 7,
 }
 FINISHED = frozenset({VALIDATED, COMPLETED, SUPERSEDED})
-_AWAITING = frozenset({AWAITING_PLANNER, WAITING_EXTERNAL})
+_AWAITING = frozenset({AWAITING_PLANNER, WAITING_EXTERNAL, AWAITING_OUTPUT_CORRECTION})
+# Statuses of one output attempt after which a correction may open.
+_CORRECTABLE = frozenset({PLANNER_RESPONSE_DURABLE, PLANNER_OUTPUT_INVALID, OUTPUT_CORRECTION_EXHAUSTED})
 _MAX_JSON_BYTES = 256 * 1024
 
 
@@ -103,11 +123,27 @@ def read_transaction(directory: Path) -> dict[str, Any] | None:
         or data.get("schema_version") != SCHEMA_VERSION
         or data.get("status") not in _RANK
         or data.get("repair_number") != int(directory.name)
+        or not _positive_int(data.get("output_attempt", 1))
     ):
         raise ContractRepairIntegrityError(
             f"contract repair {directory.name} transaction marker is malformed"
         )
     return data
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def output_attempt(transaction: dict[str, Any]) -> int:
+    """The current output attempt; slots predating corrections are at 1."""
+
+    value = transaction.get("output_attempt", 1)
+    return value if _positive_int(value) else 1
+
+
+def _order(transaction: dict[str, Any]) -> tuple[int, int]:
+    return output_attempt(transaction), _RANK[transaction["status"]]
 
 
 def _write(directory: Path, data: dict[str, Any]) -> None:
@@ -120,6 +156,7 @@ def _write(directory: Path, data: dict[str, Any]) -> None:
 def begin(
     directory: Path, *, number: int, cycle: int, step_id: str,
     current_contract: str, mismatch: str, tree_sha: str,
+    output_correction_limit: int = 0,
 ) -> dict[str, Any]:
     """Durably open one semantic repair slot before any planner call."""
 
@@ -147,6 +184,9 @@ def begin(
         "tree_sha": tree_sha,
         "status": AWAITING_PLANNER,
         "planner_transport_attempt": 0,
+        "output_attempt": 1,
+        "output_correction_attempt": 0,
+        "output_correction_limit": output_correction_limit,
     }
     _write(directory, data)
     return data
@@ -160,12 +200,24 @@ def advance(directory: Path, status: str, **fields: Any) -> dict[str, Any]:
         raise ContractRepairIntegrityError(
             f"contract repair {directory.name} has no transaction marker"
         )
-    if status not in _RANK or _RANK[status] < _RANK[current["status"]]:
+    updated = {**current, **fields, "status": status}
+    before, after = output_attempt(current), updated.get("output_attempt", 1)
+    opens_correction = (
+        after == before + 1
+        and status == AWAITING_OUTPUT_CORRECTION
+        and current["status"] in _CORRECTABLE
+    )
+    if (
+        status not in _RANK
+        or not _positive_int(after)
+        or (after != before and not opens_correction)
+        or _order(updated) < _order(current)
+    ):
         raise ContractRepairIntegrityError(
             f"contract repair {directory.name} cannot move from "
-            f"{current['status']} to {status}"
+            f"{current['status']} (output attempt {before}) to {status} "
+            f"(output attempt {after})"
         )
-    updated = {**current, **fields, "status": status}
     if updated != current:
         _write(directory, updated)
     return updated
@@ -175,8 +227,10 @@ def ensure(directory: Path, status: str, **fields: Any) -> dict[str, Any]:
     """Advance to ``status`` unless the transaction is already beyond it."""
 
     current = read_transaction(directory)
-    if current is not None and _RANK[current["status"]] > _RANK[status]:
-        return current
+    if current is not None:
+        target = (fields.get("output_attempt", output_attempt(current)), _RANK[status])
+        if _order(current) > target:
+            return current
     return advance(directory, status, **fields)
 
 
@@ -184,17 +238,79 @@ def is_awaiting_planner(transaction: dict[str, Any]) -> bool:
     return transaction.get("status") in _AWAITING
 
 
-def planner_response_durable(directory: Path) -> bool:
-    """Whether a paid planner answer for this slot is already durable."""
+def awaiting_status(transaction: dict[str, Any]) -> str:
+    """The awaiting status of the transaction's current output attempt."""
 
-    meta = _read_json(directory / "request.meta.json")
-    raw = directory / "planner.raw.md"
+    return AWAITING_PLANNER if output_attempt(transaction) == 1 else AWAITING_OUTPUT_CORRECTION
+
+
+def planner_response_durable(directory: Path, attempt: int = 1) -> bool:
+    """Whether a paid planner answer of one output attempt is durable."""
+
+    files = step_repair_attempt_files(directory, attempt)
+    meta = _read_json(files.meta)
     if not isinstance(meta, dict) or meta.get("status") not in {"raw", "validated"}:
         return False
     try:
-        return hashlib.sha256(raw.read_bytes()).hexdigest() == meta.get("raw_sha256")
+        return hashlib.sha256(files.raw.read_bytes()).hexdigest() == meta.get("raw_sha256")
     except OSError:
         return False
+
+
+def episode_summary(directory: Path) -> dict[str, Any]:
+    """Bounded, secret-free facts of one repair slot for diagnostics and UI.
+
+    Raw answers stay in their artifacts; only hashes and the bounded
+    deterministic parse error are exposed.  Never raises.
+    """
+
+    summary: dict[str, Any] = {"slot": directory.name}
+    try:
+        transaction = read_transaction(directory)
+    except ContractRepairIntegrityError as exc:
+        return {**summary, "integrity_error": str(exc)}
+    if transaction is None:
+        return {**summary, "transaction": None}
+    for key in (
+        "repair_id", "repair_number", "step_id", "status", "tree_sha",
+        "planner_transport_attempt", "output_attempt", "output_correction_attempt",
+        "output_correction_limit", "operator_output_retries", "last_transport_failure",
+    ):
+        if key in transaction:
+            summary[key] = transaction[key]
+    summary.setdefault("output_attempt", 1)
+    summary.setdefault("output_correction_attempt", 0)
+    attempts: list[dict[str, Any]] = []
+    for number in range(1, output_attempt(transaction) + 1):
+        files = step_repair_attempt_files(directory, number)
+        meta = _read_json(files.meta)
+        item: dict[str, Any] = {"output_attempt": number}
+        try:
+            state, _raw = step_repair_attempt_state(files)
+            item["parse_status"] = state
+        except StepContractRepairArtifactError as exc:
+            item["parse_status"] = "integrity_error"
+            item["integrity_error"] = str(exc)
+        if isinstance(meta, dict):
+            item["request_sha256"] = meta.get("request_sha256")
+            item["raw_sha256"] = meta.get("raw_sha256")
+            if meta.get("status") == "validated":
+                item["parse_status"] = "validated"
+        error = _read_json(files.parse_error)
+        if isinstance(error, dict):
+            item["parse_error_code"] = error.get("code")
+            item["parse_error_detail"] = str(error.get("detail") or "")[:500]
+        attempts.append(item)
+    summary["output_attempts"] = attempts
+    validation = _read_json(directory / "validation.json")
+    if isinstance(validation, dict):
+        summary["validation"] = {
+            key: validation.get(key) for key in (
+                "status", "output_attempt", "repaired_contract_sha256",
+                "added_mutable_paths",
+            ) if key in validation
+        }
+    return summary
 
 
 def durable_request_matches(directory: Path, tree_sha: str) -> bool | None:
@@ -213,6 +329,84 @@ def durable_request_matches(directory: Path, tree_sha: str) -> bool | None:
         and meta.get("request_sha256") == digest
         and meta.get("current_tree_sha") == tree_sha
     )
+
+
+LEGACY_OUTPUT_FAILURE_PREFIX = "contract repair failed: "
+
+
+STRANDED_PROVEN = "proven"
+STRANDED_CORRUPT = "corrupt"
+STRANDED_ABSENT = "absent"
+
+
+def stranded_output_failure(
+    step_dir: Path, *, step_id: str, tree_sha: str, failure_detail: str,
+    max_read_paths_per_step: int,
+) -> str:
+    """Classify a run stranded by the legacy invalid-answer misclassification.
+
+    Before output corrections existed, a deterministically invalid
+    StepContractRepairPlanner answer was projected as a new
+    ``AGENT_CONTRACT_MISMATCH``.  Such a run is ``proven`` recoverable only
+    when every identity holds: exactly one unfinished slot, last, for this
+    step and tree; intact mismatch evidence, durable request and paid answer;
+    no classification of that answer yet; and the recorded failure detail is
+    byte-for-byte the parse error the durable answer deterministically
+    produces today.  Inconsistent evidence is ``corrupt``; any other shape is
+    ``absent`` (a genuine operator decision).
+    """
+
+    from ..planning_v2 import V2PlanParseError, parse_step_contract_repair
+
+    try:
+        dirs = repair_dirs(step_dir)
+        if not dirs:
+            return STRANDED_ABSENT
+        unfinished = [
+            directory for directory in dirs
+            if (transaction := read_transaction(directory)) is None
+            or transaction["status"] not in FINISHED
+        ]
+        if not unfinished:
+            return STRANDED_ABSENT
+        if len(unfinished) != 1 or unfinished[0] != dirs[-1]:
+            return STRANDED_CORRUPT
+        directory = unfinished[0]
+        transaction = read_transaction(directory)
+        if (
+            transaction is None
+            or transaction.get("status") != PLANNER_RESPONSE_DURABLE
+            or output_attempt(transaction) != 1
+            or (directory / "validation.json").exists()
+        ):
+            return STRANDED_ABSENT
+        archived = _read_json(directory / MISMATCH_NAME)
+        if (
+            transaction.get("step_id") != step_id
+            or transaction.get("tree_sha") != tree_sha
+            or not isinstance(archived, dict)
+            or archived.get("step_id") != step_id
+            or archived.get("tree_before") != tree_sha
+            or not isinstance(archived.get("mismatch"), str)
+            or sha256_text(archived["mismatch"]) != transaction.get("mismatch_sha256")
+            or durable_request_matches(directory, tree_sha) is not True
+        ):
+            return STRANDED_CORRUPT
+        state, raw = step_repair_attempt_state(
+            step_repair_attempt_files(directory, 1), current_tree_sha=tree_sha,
+        )
+        if state != "raw" or raw is None:
+            return STRANDED_ABSENT
+        try:
+            parse_step_contract_repair(raw, max_read_paths_per_step=max_read_paths_per_step)
+        except V2PlanParseError as exc:
+            if failure_detail == f"step={step_id} {LEGACY_OUTPUT_FAILURE_PREFIX}{exc}":
+                return STRANDED_PROVEN
+        return STRANDED_ABSENT
+    except (ContractRepairIntegrityError, StepContractRepairArtifactError, UnicodeError):
+        return STRANDED_CORRUPT
+    except (OSError, ValueError):
+        return STRANDED_CORRUPT
 
 
 def semantic_repair_count(artifact_dir: Path) -> int:
@@ -455,10 +649,11 @@ def _adopt_legacy(
 
 
 __all__ = [
-    "AWAITING_PLANNER", "COMPLETED", "ContractRepairIntegrityError", "FINISHED",
+    "AWAITING_OUTPUT_CORRECTION", "AWAITING_PLANNER", "COMPLETED", "OUTPUT_CORRECTION_EXHAUSTED",
+    "PLANNER_OUTPUT_INVALID", "awaiting_status", "episode_summary", "output_attempt", "ContractRepairIntegrityError", "FINISHED",
     "PLANNER_RESPONSE_DURABLE", "PLANNER_VALIDATED", "PendingContractRepair",
     "SCOPE_WAITING", "SUPERSEDED", "VALIDATED", "WAITING_EXTERNAL", "advance", "begin",
     "durable_request_matches", "ensure", "find_pending", "is_awaiting_planner", "planner_response_durable", "repair_dirs",
     "legacy_prompt_bug_candidate", "legacy_prompt_bug_proven", "next_repair_number", "repair_identity",
-    "semantic_repair_count", "sha256_text", "supersede_legacy_prompt_bug",
+    "semantic_repair_count", "sha256_text", "STRANDED_ABSENT", "STRANDED_CORRUPT", "STRANDED_PROVEN", "stranded_output_failure", "supersede_legacy_prompt_bug",
 ]

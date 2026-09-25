@@ -76,6 +76,9 @@ def terminal_state_for(
     if decision.disposition is RecoveryDisposition.HARD_STOP:
         return RecoveryTerminalState(RunStatus.FAILED, False, decision.reason)
     if decision.disposition is RecoveryDisposition.WAIT_HUMAN:
+        if code == "STEP_CONTRACT_REPAIR_OUTPUT_INVALID":
+            # The pending repair slot is intact: its planner can be retried.
+            return RecoveryTerminalState(RunStatus.WAITING_CONTRACT_REPAIR, True, decision.reason)
         return RecoveryTerminalState(RunStatus.WAITING_HUMAN, False, decision.reason)
     if decision.disposition is RecoveryDisposition.WAIT_EXTERNAL:
         if code in _CHECK_INFRA:

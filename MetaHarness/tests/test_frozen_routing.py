@@ -174,6 +174,12 @@ class FrozenRoutingTests(unittest.TestCase):
             RunOptions.from_mapping(legacy_snapshot).recovery,
             RecoveryBudgets(),
         )
+        # Snapshots frozen before output corrections keep their recovery table.
+        pre_correction = json.loads(json.dumps(snapshot))
+        del pre_correction["recovery"]["max_contract_repair_output_corrections"]
+        self.assertEqual(
+            RunOptions.from_mapping(pre_correction).recovery.max_contract_repair_output_corrections, 2,
+        )
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "codex"
             runtime_config = HarnessConfig(

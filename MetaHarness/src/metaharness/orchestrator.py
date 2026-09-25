@@ -152,7 +152,11 @@ from .planning_v2 import (
     PlanParseError,
     PlannerV2,
     RepairPlannerV2,
+    STEP_CONTRACT_REPAIR_OUTPUT_INVALID,
+    StepContractRepairArtifactError,
+    StepContractRepairOutputInvalid,
     StepContractRepairPlanner,
+    StepRepairIdentity,
     TaskPlanV2,
     V2PlanParseError,
     parse_task_plan_v2,
@@ -181,6 +185,7 @@ from .plan_recovery import (
     write_plan_recovery_record,
 )
 from .resume import (
+    CONTRACT_REPAIR_INTEGRITY_OPERATION,
     PHASE_STATUS,
     ResumeCheckpoint,
     ResumeCheckpointError,
@@ -1554,7 +1559,7 @@ class Orchestrator:
             RunStatus.PLAN_REJECTED, RunStatus.WAITING_HUMAN,
             RunStatus.WAITING_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE,
             RunStatus.WAITING_REMOTE, RunStatus.WAITING_SCOPE_APPROVAL,
-            RunStatus.COMMITTED, RunStatus.PUBLISHED,
+            RunStatus.WAITING_CONTRACT_REPAIR, RunStatus.COMMITTED, RunStatus.PUBLISHED,
         }:
             try:
                 write_run_diagnostics(self.config, result.run_dir)
@@ -4212,6 +4217,7 @@ class Orchestrator:
                         repair_dir, number=number, cycle=cycle_number, step_id=step.id,
                         current_contract=effective_contract, mismatch=bounded_mismatch,
                         tree_sha=failure.tree_before,
+                        output_correction_limit=self._run_options.recovery.max_contract_repair_output_corrections,
                     )
                 except (ContractRepairIntegrityError, OSError) as exc:
                     raise PipelineFailure(
@@ -4359,38 +4365,106 @@ class Orchestrator:
         """Drive one durable semantic repair slot to ``completed``.
 
         A planner transport failure parks the slot in ``waiting_external``
-        and propagates; the resume re-enters this same slot.  Only a
-        validated repair consumes the semantic ``contract_repairs`` budget.
+        and propagates; the resume re-enters this same slot.  A durable but
+        invalid planner answer is corrected inside the same slot within
+        ``recovery.max_contract_repair_output_corrections``; it is never a
+        worker contract mismatch.  Only a validated repair consumes the
+        semantic ``contract_repairs`` budget.
         """
 
+        max_corrections = self._run_options.recovery.max_contract_repair_output_corrections
         try:
             semantic_attempt = contract_repair.semantic_repair_count(artifact_dir)
-            if contract_repair.planner_response_durable(directory):
-                contract_repair.ensure(directory, contract_repair.PLANNER_RESPONSE_DURABLE)
             transaction = contract_repair.read_transaction(directory) or {}
+            attempt = contract_repair.output_attempt(transaction)
+            if contract_repair.planner_response_durable(directory, attempt):
+                transaction = contract_repair.ensure(directory, contract_repair.PLANNER_RESPONSE_DURABLE)
+            if "output_correction_limit" not in transaction:
+                # A slot opened before output corrections existed.
+                transaction = contract_repair.advance(
+                    directory, transaction["status"], output_correction_limit=max_corrections,
+                )
+            if resumed and transaction.get("status") == contract_repair.OUTPUT_CORRECTION_EXHAUSTED:
+                # The operator retried the planner: one more bounded round of
+                # output corrections, still inside this semantic slot.
+                transaction = contract_repair.advance(
+                    directory, contract_repair.AWAITING_OUTPUT_CORRECTION,
+                    output_attempt=attempt + 1, output_correction_attempt=attempt,
+                    output_correction_limit=int(transaction["output_correction_limit"]) + max(1, max_corrections),
+                    operator_output_retries=int(transaction.get("operator_output_retries") or 0) + 1,
+                    planner_transport_attempt=0,
+                )
             if contract_repair.is_awaiting_planner(transaction):
                 transaction = contract_repair.advance(
-                    directory, contract_repair.AWAITING_PLANNER,
+                    directory, contract_repair.awaiting_status(transaction),
                     planner_transport_attempt=int(transaction.get("planner_transport_attempt") or 0) + 1,
                 )
         except ContractRepairIntegrityError as exc:
             raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
-        progress = {
-            "step_id": step.id, "attempt": semantic_attempt,
-            "pending_operation": "contract_repair",
-            "contract_repair_number": number,
-            "repair_id": transaction.get("repair_id"),
-            "planner_transport_attempt": transaction.get("planner_transport_attempt"),
-        }
-        store.update(
-            status=RunStatus.CONTRACT_REPAIRING, current_step=step.id,
-            contract_repair={"status": "running", **progress},
+
+        def progress_of(current: Mapping[str, Any]) -> dict[str, Any]:
+            return {
+                "step_id": step.id, "attempt": semantic_attempt,
+                "pending_operation": "contract_repair",
+                "contract_repair_number": number,
+                "repair_id": current.get("repair_id"),
+                "planner_transport_attempt": current.get("planner_transport_attempt"),
+                "output_attempt": contract_repair.output_attempt(dict(current)),
+                "output_correction_attempt": current.get("output_correction_attempt", 0),
+                "output_correction_limit": current.get("output_correction_limit"),
+            }
+
+        def publish(status: str, current: Mapping[str, Any]) -> dict[str, Any]:
+            progress = progress_of(current)
+            store.update(
+                status=RunStatus.CONTRACT_REPAIRING, current_step=step.id,
+                contract_repair={"status": status, **progress},
+            )
+            return progress
+
+        progress = publish(
+            "correcting_output" if contract_repair.output_attempt(transaction) > 1 else "running",
+            transaction,
         )
         if resumed:
             self._trace_emit(
                 "recovery.resumed", phase="implementation", cycle=cycle, step_id=step.id,
                 data={"operation": "contract_repair", "transaction_status": transaction.get("status"), **progress},
             )
+
+        def on_request(output_attempt: int) -> None:
+            current = contract_repair.read_transaction(directory) or {}
+            if contract_repair.output_attempt(current) >= output_attempt:
+                return
+            current = contract_repair.advance(
+                directory, contract_repair.AWAITING_OUTPUT_CORRECTION,
+                output_attempt=output_attempt,
+                output_correction_attempt=output_attempt - 1,
+                planner_transport_attempt=1,
+            )
+            data = publish("correcting_output", current)
+            self._trace_emit(
+                "contract_repair.output_correction.started", phase="implementation",
+                cycle=cycle, step_id=step.id, data=data,
+            )
+
+        def on_response_durable(_output_attempt: int) -> None:
+            contract_repair.ensure(directory, contract_repair.PLANNER_RESPONSE_DURABLE)
+
+        def on_output_invalid(output_attempt: int, detail: str) -> None:
+            error = {
+                "code": STEP_CONTRACT_REPAIR_OUTPUT_INVALID,
+                "detail": detail[:500], "output_attempt": output_attempt,
+            }
+            current = contract_repair.ensure(
+                directory, contract_repair.PLANNER_OUTPUT_INVALID, last_output_error=error,
+            )
+            data = publish("output_invalid", current)
+            self._trace_emit(
+                "contract_repair.output_invalid", phase="implementation",
+                cycle=cycle, step_id=step.id, data={**data, "error": error},
+            )
+
         try:
             repaired = self._repair_step_contract(
                 repo=repo, worktree=worktree, run_dir=run_dir,
@@ -4400,26 +4474,31 @@ class Orchestrator:
                 mismatch=mismatch, tree_before=tree_before,
                 future_ownership=future_ownership,
                 resume_request=contract_repair.durable_request_matches(directory, tree_before) is True,
+                max_output_corrections=int(
+                    (contract_repair.read_transaction(directory) or {}).get(
+                        "output_correction_limit", max_corrections,
+                    )
+                ),
+                on_request=on_request, on_response_durable=on_response_durable,
+                on_output_invalid=on_output_invalid,
             )
             effective_contract = self._read_repaired_contract(artifact_dir, repaired)
         except LLMError as exc:
             detail = redact(str(exc), self._secrets)[:500]
             try:
-                if contract_repair.is_awaiting_planner(contract_repair.read_transaction(directory) or {}):
-                    contract_repair.advance(
+                current = contract_repair.read_transaction(directory) or {}
+                if contract_repair.is_awaiting_planner(current):
+                    current = contract_repair.advance(
                         directory, contract_repair.WAITING_EXTERNAL,
                         last_transport_failure=detail,
                     )
             except ContractRepairIntegrityError as marker:
                 raise PipelineFailure(marker.code, str(marker), step_id=step.id) from exc
-            store.update(
-                status=RunStatus.CONTRACT_REPAIRING, current_step=step.id,
-                contract_repair={"status": "waiting_external", **progress},
-            )
+            data = publish("waiting_external", current)
             self._trace_emit(
                 "recovery.waiting_external", phase="implementation", cycle=cycle,
                 step_id=step.id,
-                data={"operation": "contract_repair", "reason": "LLM_FAILURE", **progress},
+                data={"operation": "contract_repair", "reason": "LLM_FAILURE", **data},
             )
             raise
         except ScopeApprovalRequired:
@@ -4430,9 +4509,42 @@ class Orchestrator:
                 scope_delta=delta if isinstance(delta, dict) else {},
             )
             raise
-        except ContractRepairIntegrityError as exc:
+        except (ContractRepairIntegrityError, StepContractRepairArtifactError) as exc:
             raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
-        except (AgentError, GitError, OSError, V2PlanParseError) as exc:
+        except StepContractRepairOutputInvalid as exc:
+            # Never a new AGENT_CONTRACT_MISMATCH: the worker mismatch stays
+            # archived and the slot waits for an operator planner retry.
+            try:
+                current = contract_repair.ensure(
+                    directory, contract_repair.OUTPUT_CORRECTION_EXHAUSTED,
+                    last_output_error={
+                        "code": exc.code, "detail": exc.detail[:500],
+                        "output_attempt": exc.output_attempt,
+                    },
+                )
+            except ContractRepairIntegrityError as marker:
+                raise PipelineFailure(marker.code, str(marker), step_id=step.id) from exc
+            data = publish("output_correction_exhausted", current)
+            self._trace_emit(
+                "contract_repair.output_correction.exhausted", phase="implementation",
+                cycle=cycle, step_id=step.id, data=data,
+            )
+            raise PipelineFailure(
+                exc.code,
+                _bounded_v2_report(
+                    f"contract repair {progress['repair_id']} planner output is invalid after "
+                    f"{exc.corrections} of {exc.limit} output corrections: {exc.detail}"
+                ),
+                step_id=step.id,
+            ) from exc
+        except V2PlanParseError as exc:
+            # A planner answer that could not even be made durable.
+            raise PipelineFailure(
+                STEP_CONTRACT_REPAIR_OUTPUT_INVALID,
+                _bounded_v2_report(f"contract repair planner output is unusable: {exc}"),
+                step_id=step.id,
+            ) from exc
+        except (AgentError, GitError, OSError) as exc:
             raise StepExecutionFailure(
                 "AGENT_CONTRACT_MISMATCH", step.id,
                 _bounded_v2_report(f"contract repair failed: {exc}"),
@@ -4440,6 +4552,7 @@ class Orchestrator:
                 tree_after=tree_before, usage=usage, mismatch=mismatch,
                 mismatch_retry_count=semantic_attempt, step_dir=artifact_dir,
             ) from exc
+        progress = progress_of(contract_repair.read_transaction(directory) or {})
         decision = classify_failure(
             "AGENT_CONTRACT_MISMATCH", clean_contract_mismatch=True, rollback_succeeded=True,
         )
@@ -4461,7 +4574,10 @@ class Orchestrator:
         self._trace_emit(
             "step.contract_repair.completed", phase="implementation",
             cycle=cycle, step_id=step.id,
-            data={"repair": number, "repair_id": progress["repair_id"], "tree_sha": tree_before},
+            data={
+                "repair": number, "repair_id": progress["repair_id"], "tree_sha": tree_before,
+                "output_corrections": progress["output_correction_attempt"],
+            },
         )
         recovery.trace(
             "recovery.completed", reason="AGENT_CONTRACT_MISMATCH",
@@ -4480,38 +4596,53 @@ class Orchestrator:
         mismatch: str, tree_before: str,
         future_ownership: Mapping[str, tuple[str, ...]] | None,
         resume_request: bool = False,
+        max_output_corrections: int = 0,
+        on_request: Callable[[int], None] | None = None,
+        on_response_durable: Callable[[int], None] | None = None,
+        on_output_invalid: Callable[[int, str], None] | None = None,
     ) -> ImplementationStep:
         """Run and validate one durable StepContractRepairPlanner transaction.
 
         ``resume_request`` re-sends (or re-parses the answer to) the exact
         durable request of an interrupted transaction instead of rebuilding it.
+        Deterministic answer defects (protocol, identity, removed approved
+        paths, anchors absent from the tree) are planner output corrections;
+        a mutable-scope expansion is then decided by the scope policy only.
         """
 
         planner_profile = profile_for_role(
             self.config, self._run_options.planner_profile, ExecutionRole.PLANNER
         )
-        evidence_parts = [
-            "TREE SHA: " + tree_before,
-            "STATUS: " + "; ".join(status_porcelain(worktree)[:20]),
-        ]
-        for path in read_set_paths(original_step.read_set):
-            target = worktree / path
-            try:
-                data = target.read_bytes()[:8192]
-                evidence_parts.append(
-                    f"PATH {path}\n" + data.decode("utf-8", errors="replace")
+        original_mutable = set((*original_step.write_set, *original_step.create_set, *original_step.delete_set))
+
+        def validate(repaired: ImplementationStep) -> None:
+            removed = original_mutable - set((*repaired.write_set, *repaired.create_set, *repaired.delete_set))
+            if removed:
+                raise V2PlanParseError(
+                    "contract repair removed approved mutable paths: " + ", ".join(sorted(removed))[:300]
                 )
-            except (OSError, UnicodeError):
-                evidence_parts.append(f"PATH {path}\n<unavailable>")
+            drift = self._step_contract_drift(repo, tree_before, tree_before, repaired)
+            if drift:
+                raise V2PlanParseError("repaired contract is not executable on current tree: " + drift)
+
         planner = StepContractRepairPlanner(
             self._planner_client or _chat_client(
                 build_llm_endpoint(planner_profile), self._runtime_environment, self._trace_transport
             ),
             max_read_paths_per_step=self.config.planning.max_read_paths_per_step,
+            max_output_corrections=max_output_corrections,
         )
-        def response_durable() -> None:
-            contract_repair.ensure(artifact_dir, contract_repair.PLANNER_RESPONSE_DURABLE)
-
+        sets = {
+            "read_set": "\n".join(f"- {item}" for item in original_step.read_set),
+            "write_set": "\n".join(f"- {item}" for item in original_step.write_set) or "NONE",
+            "create_set": "\n".join(f"- {item}" for item in original_step.create_set) or "NONE",
+            "delete_set": "\n".join(f"- {item}" for item in original_step.delete_set) or "NONE",
+        }
+        hooks = {
+            "identity": StepRepairIdentity.of(original_step), "validate": validate,
+            "on_request": on_request, "on_response_durable": on_response_durable,
+            "on_output_invalid": on_output_invalid,
+        }
         if resume_request:
             repaired = planner.resume(
                 artifacts_dir=artifact_dir,
@@ -4519,42 +4650,47 @@ class Orchestrator:
                 current_contract=current_contract,
                 mismatch_explanation=_bounded_v2_report(mismatch),
                 current_tree_sha=tree_before,
-                on_response_durable=response_durable,
+                **sets, **hooks,
             )
         else:
-            read_set = "\n".join(f"- {item}" for item in original_step.read_set)
+            evidence_parts = [
+                "TREE SHA: " + tree_before,
+                "STATUS: " + "; ".join(status_porcelain(worktree)[:20]),
+            ]
+            for path in read_set_paths(original_step.read_set):
+                target = worktree / path
+                try:
+                    data = target.read_bytes()[:8192]
+                    evidence_parts.append(
+                        f"PATH {path}\n" + data.decode("utf-8", errors="replace")
+                    )
+                except (OSError, UnicodeError):
+                    evidence_parts.append(f"PATH {path}\n<unavailable>")
             repaired = planner.repair(
                 original_spec=original_spec, current_tree_sha=tree_before,
                 original_plan_identity=original_plan_identity,
                 current_contract=current_contract,
                 mismatch_explanation=_bounded_v2_report(mismatch),
-                read_set=read_set,
-                write_set="\n".join(f"- {item}" for item in original_step.write_set) or "NONE",
-                create_set="\n".join(f"- {item}" for item in original_step.create_set) or "NONE",
-                delete_set="\n".join(f"- {item}" for item in original_step.delete_set) or "NONE",
                 future_ownership=_json_text(future_ownership or {}),
                 repository_evidence="\n\n".join(evidence_parts),
                 artifacts_dir=artifact_dir,
-                on_response_durable=response_durable,
+                **sets, **hooks,
             )
         contract_repair.ensure(artifact_dir, contract_repair.PLANNER_VALIDATED)
-        if (
-            repaired.id != original_step.id
-            or repaired.title != original_step.title
-            or repaired.execution_class != original_step.execution_class
-            or repaired.depends_on != original_step.depends_on
-        ):
-            raise V2PlanParseError("contract repair changed step identity or dependency")
-        original_mutable = set((*original_step.write_set, *original_step.create_set, *original_step.delete_set))
         repaired_mutable = set((*repaired.write_set, *repaired.create_set, *repaired.delete_set))
-        removed = original_mutable - repaired_mutable
         added = repaired_mutable - original_mutable
-        if removed:
-            raise V2PlanParseError("contract repair removed approved mutable paths")
         if added:
             policy = self._effective_repair_scope
             if len(added) > policy.max_added_paths or policy.policy == "deny-expansion":
-                raise V2PlanParseError("contract repair requested a disallowed mutable-scope expansion")
+                # A valid answer the scope policy does not authorize: an
+                # operator decision, never a planner output correction.
+                raise PipelineFailure(
+                    "CONTRACT_REPAIR_SCOPE_DENIED",
+                    f"contract repair requested {len(added)} additional mutable path(s) "
+                    f"beyond the {policy.policy} bound of {policy.max_added_paths}: "
+                    + ", ".join(sorted(added))[:500],
+                    step_id=original_step.id,
+                )
             if policy.policy == "require-approval":
                 delta = {
                     "schema_version": 1, "step_id": original_step.id,
@@ -4572,15 +4708,12 @@ class Orchestrator:
                     raise ScopeApprovalRequired()
                 if approval.decision is not ApprovalDecision.APPROVE:
                     raise PipelineFailure("HUMAN_REQUIRED", "contract repair scope rejected")
-        drift = self._step_contract_drift(repo, tree_before, tree_before, repaired)
-        if drift:
-            raise V2PlanParseError("repaired contract is not executable on current tree: " + drift)
         validation_path = artifact_dir / "validation.json"
         validation = _read_json_artifact(validation_path, 64 * 1024)
         if isinstance(validation, dict):
             validation.update({
                 "status": "validated", "added_mutable_paths": sorted(added),
-                "removed_mutable_paths": sorted(removed),
+                "removed_mutable_paths": [],
                 "original_step_contract_sha256": hashlib.sha256(current_contract.encode("utf-8")).hexdigest(),
                 "repaired_contract_sha256": hashlib.sha256(
                     (artifact_dir / "contract.md").read_bytes()
@@ -6252,6 +6385,16 @@ class Orchestrator:
         self._secrets = config_secret_values(self.config, self._runtime_environment)
         self._begin_trace(run_dir, selected, created=False)
         eligibility = resume_info(run_dir, state)
+        if eligibility.operation == CONTRACT_REPAIR_INTEGRITY_OPERATION:
+            # A stranded contract repair whose evidence no longer proves its
+            # identity: fail closed, without any model call.
+            failed = store.record_failure(
+                "RESUME_INTEGRITY_FAILURE", eligibility.reason,
+                resume={"status": "refused", "previous_status": state.get("status"),
+                        "previous_failure": state.get("failure")},
+                current_step=None,
+            )
+            return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
         if not eligibility.resumable:
             raise ResumeNotAllowedError(eligibility.reason or "run is not resumable")
         try:

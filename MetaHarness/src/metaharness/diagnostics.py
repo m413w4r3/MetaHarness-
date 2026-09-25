@@ -310,6 +310,7 @@ def _safe_state(state: Mapping[str, Any]) -> dict[str, Any]:
             for key in (
                 "status", "step_id", "attempt", "pending_operation",
                 "contract_repair_number", "repair_id", "planner_transport_attempt",
+                "output_attempt", "output_correction_attempt", "output_correction_limit",
             )
             if key in contract_repair
         }
@@ -583,6 +584,35 @@ def _event_artifact(run_dir: Path, relative: str, secrets: tuple[str, ...]) -> s
     )
 
 
+_MAX_CONTRACT_REPAIR_SLOTS = 10
+
+
+def _contract_repairs(directory: Path, state: Mapping[str, Any], secrets: tuple[str, ...]) -> str:
+    """Bounded episode facts of the step contract repair slots; no raw answers."""
+
+    from .orchestration.contract_repair import episode_summary, repair_dirs
+
+    slots = sorted(
+        (slot for step_dir in directory.glob("cycles/[0-9][0-9][0-9]/implementation/steps/*")
+         for slot in repair_dirs(step_dir)),
+        key=lambda slot: (slot.parent.parent.parent.parent.parent.name, slot.parent.parent.name, slot.name),
+    )[-_MAX_CONTRACT_REPAIR_SLOTS:]
+    if not slots:
+        return "No step contract repair."
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    waiting = str(state.get("status") or "").startswith("waiting_")
+    items = []
+    for slot in slots:
+        summary = episode_summary(slot)
+        summary["artifact"] = slot.relative_to(directory).as_posix()
+        if waiting and isinstance(state.get("contract_repair"), Mapping) and (
+            state["contract_repair"].get("repair_id") == summary.get("repair_id")
+        ):
+            summary["waiting_reason"] = failure.get("reason")
+        items.append(summary)
+    return _clean(_json(items), secrets)
+
+
 def _cycle_dirs(run_dir: Path) -> list[Path]:
     try:
         return sorted(
@@ -806,6 +836,10 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
     except (OSError, ValueError, ResumeCheckpointError) as exc:
         checkpoint_text = _artifact_json(directory, "resume_checkpoint.json", secrets) + "Resume information unavailable: " + redact(str(exc), secrets)[:500]
     body += _section("RESUME", checkpoint_text)
+    try:
+        body += _section("CONTRACT REPAIR", _contract_repairs(directory, state, secrets))
+    except (OSError, ValueError) as exc:
+        body += _section("CONTRACT REPAIR", "Contract repair information unavailable: " + redact(str(exc), secrets)[:500])
     body += _section("EXECUTION PROFILES", _clean(_json(_profiles(config, state)), secrets))
     body += _section("SPEC", _artifact_text(directory, "spec.md", secrets))
     context_meta = state.get("context") if isinstance(state.get("context"), Mapping) else {}

@@ -237,8 +237,13 @@ PHASE_STATUS.update({
 })
 _RESUMABLE_STATUSES = frozenset({
     "failed", "interrupted", "waiting_scope_approval", "waiting_check_infrastructure",
-    "waiting_remote", "waiting_external",
+    "waiting_remote", "waiting_external", "waiting_contract_repair",
 })
+# An operator retry of the StepContractRepairPlanner of one pending slot.
+CONTRACT_REPAIR_OPERATION = "contract_repair"
+# A stranded contract repair whose evidence no longer proves its identity.
+CONTRACT_REPAIR_INTEGRITY_OPERATION = "contract_repair_integrity"
+_STRANDED_DETAIL = re.compile(r"step=(S[0-9]{2}) contract repair failed: ")
 # Failures that a checkpoint can never repair: the run needs an operator.
 _TERMINAL_FAILURES = frozenset({
     "RESUME_INTEGRITY_FAILURE", "RESUME_REQUIRES_OPERATOR",
@@ -278,17 +283,85 @@ class ResumeInfo:
     expected_tree: str | None = None
     review_cycle: int | None = None
     step_id: str | None = None
+    operation: str | None = None
+
+
+def _max_read_paths(run_dir: Path) -> int | None:
+    try:
+        path = run_dir / "run_options.json"
+        if path.stat().st_size > 256 * 1024:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))["planning"]["max_read_paths_per_step"]
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def stranded_contract_repair(run_dir: str | Path, state: Mapping[str, Any]) -> str:
+    """``proven``, ``corrupt`` or ``absent`` for a stranded contract repair.
+
+    Only the legacy projection of an invalid StepContractRepairPlanner answer
+    onto ``AGENT_CONTRACT_MISMATCH`` in ``waiting_human`` qualifies, and it is
+    ``proven`` only when the checkpoint, repair slot, durable request, paid
+    answer and recorded parse error all belong together.  Every other
+    ``waiting_human`` state is a genuine operator decision (``absent``) and
+    stays non-resumable.
+    """
+
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    detail = failure.get("detail")
+    if (
+        state.get("status") != "waiting_human"
+        or state.get("planning_protocol") != "v2"
+        or failure.get("reason") != "AGENT_CONTRACT_MISMATCH"
+        or not isinstance(detail, str)
+    ):
+        return "absent"
+    match = _STRANDED_DETAIL.match(detail)
+    directory = Path(run_dir)
+    max_read_paths = _max_read_paths(directory)
+    if match is None:
+        return "absent"
+    try:
+        checkpoint = read_checkpoint(directory)
+    except ResumeCheckpointError:
+        return "corrupt"
+    if (
+        max_read_paths is None
+        or checkpoint is None
+        or checkpoint.phase is not ResumePhase.IMPLEMENT_STEP
+        or checkpoint.step_id != match.group(1)
+        or checkpoint.expected_tree_sha is None
+    ):
+        return "absent"
+    from .orchestration.contract_repair import stranded_output_failure
+
+    step_dir = (
+        directory / "cycles" / f"{checkpoint.review_cycle:03d}" / "implementation"
+        / "steps" / checkpoint.step_id
+    )
+    return stranded_output_failure(
+        step_dir, step_id=checkpoint.step_id, tree_sha=checkpoint.expected_tree_sha,
+        failure_detail=detail, max_read_paths_per_step=max_read_paths,
+    )
 
 
 def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
-    if state.get("status") not in _RESUMABLE_STATUSES:
+    stranded_shape = stranded_contract_repair(run_dir, state)
+    stranded = stranded_shape == "proven"
+    if stranded_shape == "corrupt":
+        return ResumeInfo(
+            False, reason="pending contract repair evidence is inconsistent",
+            operation=CONTRACT_REPAIR_INTEGRITY_OPERATION,
+        )
+    if state.get("status") not in _RESUMABLE_STATUSES and not stranded:
         return ResumeInfo(False, reason="run has no resumable waiting state")
     if state.get("planning_protocol") != "v2":
         return ResumeInfo(False, reason="only pipeline v2 runs can be resumed")
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     if failure.get("reason") in _TERMINAL_FAILURES:
         return ResumeInfo(False, reason="the run requires an operator")
-    if state.get("recovery_resumable") is False:
+    if state.get("recovery_resumable") is False and not stranded:
         return ResumeInfo(False, reason="the run stopped at a non-resumable failure")
     try:
         checkpoint = read_checkpoint(run_dir)
@@ -296,11 +369,20 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
         return ResumeInfo(False, reason="resume checkpoint is invalid")
     if checkpoint is None:
         return ResumeInfo(False, reason="no resume checkpoint")
+    label = resume_label(checkpoint)
+    operation = None
+    if stranded or (
+        state.get("status") == "waiting_contract_repair"
+        and checkpoint.phase is ResumePhase.IMPLEMENT_STEP
+    ):
+        operation = CONTRACT_REPAIR_OPERATION
+        label = f"Retry contract repair planner ({checkpoint.step_id})"
     return ResumeInfo(
-        True, checkpoint.phase.value, resume_label(checkpoint),
+        True, checkpoint.phase.value, label,
         expected_tree=checkpoint.expected_tree_sha,
         review_cycle=checkpoint.review_cycle,
         step_id=checkpoint.step_id,
+        operation=operation,
     )
 
 
@@ -321,10 +403,11 @@ class ResumeRequiresOperatorError(ResumeError):
 
 
 __all__ = [
-    "CHECKPOINT_NAME", "PHASE_STATUS", "ResumeCheckpoint",
+    "CHECKPOINT_NAME", "CONTRACT_REPAIR_INTEGRITY_OPERATION", "CONTRACT_REPAIR_OPERATION",
+    "PHASE_STATUS", "ResumeCheckpoint",
     "ResumeCheckpointError", "ResumeError", "ResumeInfo", "ResumeIntegrityError",
     "ResumeNotAllowedError", "ResumePhase", "ResumeRequiresOperatorError",
     "checkpoint_payload", "mark_checkpoint_completed", "pipeline_version_from_state",
     "plan_identity_from_mapping", "read_checkpoint", "read_checkpoint_record",
-    "resume_info", "resume_label", "write_checkpoint",
+    "resume_info", "resume_label", "stranded_contract_repair", "write_checkpoint",
 ]

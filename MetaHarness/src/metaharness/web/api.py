@@ -1256,7 +1256,15 @@ LIVE_STOP_STATUSES = frozenset({
     "waiting_human",
     "awaiting_plan_approval", "waiting_check_infrastructure",
     "waiting_scope_approval", "waiting_remote", "waiting_external",
+    "waiting_contract_repair",
 })
+_CONTRACT_REPAIR_PHASES = {
+    "running": "Contract repair",
+    "correcting_output": "Correcting planner output",
+    "output_invalid": "Correcting planner output",
+    "waiting_external": "Waiting external",
+    "output_correction_exhausted": "Output correction exhausted",
+}
 _DIAGNOSTIC_COUNTERS = (
     "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
     "event_count", "tool_call_count",
@@ -1326,6 +1334,53 @@ def _resume_payload(directory: Path, state: Mapping[str, Any]) -> dict[str, Any]
         "resumable": info.resumable, "phase": info.phase, "label": label,
         "expected_tree": info.expected_tree, "review_cycle": info.review_cycle,
         "step_id": info.step_id, "reason": info.reason,
+        "operation": info.operation,
+    }
+
+
+def contract_repair_view(
+    state: Mapping[str, Any], resume: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Concise live phase of a pending step contract repair, if any.
+
+    A genuine ``waiting_human`` decision never renders as a contract repair:
+    only a proven recoverable slot (``resume.operation``) does.
+    """
+
+    repair = state.get("contract_repair")
+    status = str(state.get("status") or "")
+    if not isinstance(repair, Mapping) or repair.get("status") in {"completed", "superseded"}:
+        return None
+    if status == "waiting_human":
+        if resume.get("operation") != "contract_repair":
+            return None
+        phase = "Correcting planner output"
+    elif status == "waiting_contract_repair":
+        phase = "Output correction exhausted"
+    elif status == "waiting_scope_approval":
+        phase = "Waiting scope approval"
+    elif status in {"contract_repairing", "waiting_external", "interrupted", "failed"}:
+        phase = _CONTRACT_REPAIR_PHASES.get(str(repair.get("status") or ""), "Contract repair")
+    else:
+        return None
+
+    def count(key: str) -> int | None:
+        value = repair.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    step = repair.get("step_id")
+    step_id = step if isinstance(step, str) and _STEP_ID.fullmatch(step) else None
+    corrections, limit = count("output_correction_attempt"), count("output_correction_limit")
+    text = phase + (f" · {step_id}" if step_id else "")
+    if corrections and limit is not None:
+        text += f" · attempt {corrections} / {limit}"
+    repair_id = repair.get("repair_id")
+    return {
+        "phase": phase, "text": text, "step_id": step_id,
+        "repair_id": str(repair_id)[:80] if isinstance(repair_id, str) else None,
+        "status": str(repair.get("status") or "")[:40],
+        "output_correction_attempt": corrections, "output_correction_limit": limit,
+        "planner_transport_attempt": count("planner_transport_attempt"),
     }
 
 
@@ -1576,6 +1631,9 @@ def run_overview(
     resume = _resume_payload(directory, state)
     pipeline = run_pipeline(directory, state, config, resume)
     current, following = _current_and_next(pipeline, state)
+    repair = contract_repair_view(state, resume)
+    if repair is not None:
+        current = repair["text"]
     planner = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
     steps = planner.get("steps") if isinstance(planner.get("steps"), list) else []
     mode = planner.get("execution_mode") or "—"
@@ -1583,6 +1641,7 @@ def run_overview(
     return {
         "resume": resume,
         "pipeline": pipeline,
+        "contract_repair": repair,
         "current_label": current,
         "next_label": following,
         "execution_label": f"{mode} · {len(steps)} step{'s' if len(steps) != 1 else ''}",
@@ -1666,6 +1725,7 @@ def live_status(
         "resumable": overview["resume"]["resumable"],
         "resume_phase": overview["resume"]["phase"],
         "resume_label": overview["resume"]["label"],
+        "contract_repair": overview["contract_repair"],
         "running": status not in LIVE_STOP_STATUSES,
         "token_totals": overview["token_totals"],
         "progress_events": _live_events(

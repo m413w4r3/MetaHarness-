@@ -243,6 +243,7 @@ class RunStatus(StrEnum):
     WAITING_EXTERNAL = "waiting_external"
     WAITING_CHECK_INFRASTRUCTURE = "waiting_check_infrastructure"
     WAITING_REMOTE = "waiting_remote"
+    WAITING_CONTRACT_REPAIR = "waiting_contract_repair"
     PLAN_REJECTED = "plan_rejected"
     WORKTREE_READY = "worktree_ready"
     PREPARING = "preparing"

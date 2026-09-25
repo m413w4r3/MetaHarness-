@@ -72,13 +72,16 @@ class RecoveryBudgets:
     max_check_infra_retries: int = 2
     max_review_transport_retries: int = 2
     max_workspace_setup_retries: int = 2
+    # Protocol corrections of one StepContractRepairPlanner answer inside the
+    # same semantic repair slot; never a new ``max_step_contract_repairs``.
+    max_contract_repair_output_corrections: int = 2
     execution_fallbacks: ExecutionFallbacks = ExecutionFallbacks()
 
     def __post_init__(self) -> None:
         for name in (
             "max_transient_attempts", "max_executor_fallbacks",
             "max_check_infra_retries", "max_review_transport_retries",
-            "max_workspace_setup_retries",
+            "max_workspace_setup_retries", "max_contract_repair_output_corrections",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10:
@@ -202,10 +205,19 @@ def classify_failure(
             RecoveryDisposition.WAIT_EXTERNAL,
             "review is retained at its final-review checkpoint for retry or operator action",
         )
+    if code == "STEP_CONTRACT_REPAIR_OUTPUT_INVALID":
+        # A planner protocol defect of one repair slot, never a worker
+        # contract mismatch: corrected in place, then an operator retry.
+        if budget_exhausted:
+            return decision(
+                RecoveryDisposition.WAIT_HUMAN,
+                "contract repair output corrections were exhausted; retry the contract repair planner",
+            )
+        return decision(RecoveryDisposition.CONTRACT_REPAIR, "contract repair planner output can be corrected", consumes=True)
     if code in {
         "SPEC_DECISION_REQUIRED", "SECURITY_POLICY_DECISION_REQUIRED",
         "ATOMIC_SCOPE_POLICY_LIMIT", "REPAIR_SCOPE_APPROVAL_REQUIRED",
-        "REVIEW_HUMAN_REQUIRED",
+        "REVIEW_HUMAN_REQUIRED", "CONTRACT_REPAIR_SCOPE_DENIED",
     }:
         return decision(RecoveryDisposition.WAIT_HUMAN, "an operator decision is required")
     if code in {"PUSH_FAILED", "CANDIDATE_PUSH_FAILED"}:

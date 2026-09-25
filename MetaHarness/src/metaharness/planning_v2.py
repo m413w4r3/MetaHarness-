@@ -475,10 +475,136 @@ def render_repaired_step_contract(step: ImplementationStep) -> str:
     )) + "\n"
 
 
+STEP_CONTRACT_REPAIR_OUTPUT_INVALID = "STEP_CONTRACT_REPAIR_OUTPUT_INVALID"
+# Paid answers of one semantic repair slot beyond the first:
+# ``contract_repairs/NN/output_attempts/NNN``.
+STEP_REPAIR_OUTPUT_ATTEMPTS_DIR = "output_attempts"
+_REPAIR_PREVIOUS_RAW_CHARS = 24_000
+_REPAIR_ERROR_CHARS = 1_000
+
+
+@dataclass(frozen=True)
+class StepRepairIdentity:
+    """The immutable identity of the step whose contract is repaired.
+
+    It is handed to the planner explicitly: the approved contract renders its
+    step as ``<id> / <count>``, which is display text, never an identity.
+    """
+
+    step_id: str
+    title: str
+    execution_class: str
+    depends_on: str
+
+    @classmethod
+    def of(cls, step: ImplementationStep) -> "StepRepairIdentity":
+        return cls(step.id, step.title, step.execution_class.value, step.depends_on or "NONE")
+
+    def fields(self) -> str:
+        return (
+            f"STEP_ID: {self.step_id}\nTITLE: {self.title}\n"
+            f"EXECUTION_CLASS: {self.execution_class}\nDEPENDS_ON: {self.depends_on}"
+        )
+
+    def violation(self, step: ImplementationStep) -> str | None:
+        """The first identity field the answer changed; never rewritten."""
+
+        for name, expected, actual in (
+            ("STEP_ID", self.step_id, step.id),
+            ("TITLE", self.title, step.title),
+            ("EXECUTION_CLASS", self.execution_class, step.execution_class.value),
+            ("DEPENDS_ON", self.depends_on, step.depends_on or "NONE"),
+        ):
+            if expected != actual:
+                return f"step contract repair {name} changed: expected {expected!r}, got {actual!r}"
+        return None
+
+
+class StepContractRepairOutputInvalid(Exception):
+    """Every admitted StepContractRepairPlanner answer was invalid.
+
+    This is a planner protocol failure of one semantic repair slot, never a
+    worker contract mismatch.
+    """
+
+    code = STEP_CONTRACT_REPAIR_OUTPUT_INVALID
+
+    def __init__(self, detail: str, *, output_attempt: int, corrections: int, limit: int):
+        super().__init__(detail)
+        self.detail = detail
+        self.output_attempt = output_attempt
+        self.corrections = corrections
+        self.limit = limit
+
+
+class StepContractRepairArtifactError(Exception):
+    """Durable repair answers, hashes or metadata are inconsistent."""
+
+    code = "RESUME_INTEGRITY_FAILURE"
+
+
+def _step_repair_template(identity: StepRepairIdentity) -> str:
+    return f"""{_STEP_REPAIR_HEADER}
+{identity.fields()}
+
+OBJECTIVE
+<complete objective>
+
+READ_SET
+- relative/path :: exact symbol or anchor
+
+WRITE_SET
+- relative/path
+
+CREATE_SET
+NONE
+
+DELETE_SET
+NONE
+
+INSTRUCTIONS
+1. <concrete instruction>
+
+VERIFY
+<at most 3 lines>
+
+FORBIDDEN
+- <rule>
+
+{_STEP_REPAIR_END}"""
+
+
+_STEP_REPAIR_FORMAT_LIMITS = """FORMAT LIMITS (checked deterministically):
+- INSTRUCTIONS: at most 6 numbered operations;
+- VERIFY: at most 3 non-empty lines;
+- FORBIDDEN: at most 4 non-empty rules;
+- every section is present and non-empty; empty sets are written NONE."""
+
+
+def _step_repair_identity_rules(identity: StepRepairIdentity) -> str:
+    return f"""{_STEP_REPAIR_FORMAT_LIMITS}
+
+<IMMUTABLE STEP IDENTITY>
+IMMUTABLE STEP ID: {identity.step_id}
+IMMUTABLE TITLE: {identity.title}
+IMMUTABLE EXECUTION CLASS: {identity.execution_class}
+IMMUTABLE DEPENDS_ON: {identity.depends_on}
+</IMMUTABLE STEP IDENTITY>
+
+STEP_ID is the bare MetaHarness step identifier only.
+For this repair it is exactly `{identity.step_id}`.
+Do NOT append the plan step count: `{identity.step_id} / <step count>` is invalid,
+even though CURRENT STEP CONTRACT displays its STEP that way.
+
+The following identity fields are immutable and MUST be copied byte-for-byte:
+{identity.fields()}"""
+
+
 def build_step_contract_repair_prompt(
     *, original_spec: str, current_tree_sha: str, original_plan_identity: str,
     current_contract: str, mismatch_explanation: str,
     read_set: str, write_set: str, create_set: str, delete_set: str,
+    identity: StepRepairIdentity,
     future_ownership: str = "NONE",
     repository_evidence: str = "NONE",
 ) -> str:
@@ -535,39 +661,85 @@ scope policy. Preserve step identity, dependency and required checks.
 Return exactly a complete repaired current-step contract. READ_SET may be
 clarified and instructions, objective, VERIFY, FORBIDDEN and anchors may be
 repaired. Do not change mutation sets unless the requested work truly requires
-it; any such change is subject to MetaHarness scope policy.
+it; any such change is subject to MetaHarness scope policy. An existing file
+that must change belongs to READ_SET and WRITE_SET, never CREATE_SET.
 
-{_STEP_REPAIR_HEADER}
-STEP_ID: <current step ID>
-TITLE: <current title>
-EXECUTION_CLASS: MECHANICAL|REASONING|AGENTIC
-DEPENDS_ON: NONE|earlier step ID
+{_step_repair_identity_rules(identity)}
 
-OBJECTIVE
-<complete objective>
+{_step_repair_template(identity)}
+"""
 
-READ_SET
-- relative/path :: exact symbol or anchor
 
-WRITE_SET
-- relative/path
+def build_step_contract_repair_correction_prompt(
+    *, identity: StepRepairIdentity, current_tree_sha: str, current_contract: str,
+    mismatch_explanation: str, read_set: str, write_set: str, create_set: str,
+    delete_set: str, previous_raw: str, parse_error: str,
+    output_attempt: int, max_output_corrections: int,
+) -> str:
+    """Ask for a protocol-valid answer of the same semantic repair.
 
-CREATE_SET
-NONE
+    The request is standalone: it carries every input the planner needs and
+    the rejected answer, bounded, so no conversation state is assumed.
+    """
 
-DELETE_SET
-NONE
+    previous = previous_raw
+    if len(previous) > _REPAIR_PREVIOUS_RAW_CHARS:
+        previous = previous[:_REPAIR_PREVIOUS_RAW_CHARS] + "\n[TRUNCATED]"
+    return f"""You are the MetaHarness StepContractRepairPlanner.
 
-INSTRUCTIONS
-1. <concrete instruction>
+Your previous StepContractRepair response was rejected deterministically.
+This is output correction {output_attempt - 1} of at most {max_output_corrections}
+for the same contract repair; it is not a new repair.
 
-VERIFY
-<at most 3 lines>
+<PARSE ERROR>
+{parse_error[:_REPAIR_ERROR_CHARS]}
+</PARSE ERROR>
 
-FORBIDDEN
-- <rule>
+IMMUTABLE STEP ID:
+{identity.step_id}
 
-{_STEP_REPAIR_END}
+Do not explain the error.
+Do not emit Markdown fences.
+Return exactly one complete {_STEP_REPAIR_HEADER} ... {_STEP_REPAIR_END}
+envelope and nothing outside it.
+
+Preserve every current mutable path. Add mutable paths only when justified by
+the worker mismatch; an existing file that must change belongs to READ_SET and
+WRITE_SET, never CREATE_SET. Any mutable-scope change remains subject to
+MetaHarness scope policy.
+
+<CURRENT TREE SHA>
+{current_tree_sha}
+</CURRENT TREE SHA>
+
+<CURRENT STEP CONTRACT>
+{current_contract}
+</CURRENT STEP CONTRACT>
+
+<WORKER MISMATCH>
+{mismatch_explanation}
+</WORKER MISMATCH>
+
+<CURRENT READ_SET>
+{read_set}
+</CURRENT READ_SET>
+<CURRENT WRITE_SET>
+{write_set}
+</CURRENT WRITE_SET>
+<CURRENT CREATE_SET>
+{create_set}
+</CURRENT CREATE_SET>
+<CURRENT DELETE_SET>
+{delete_set}
+</CURRENT DELETE_SET>
+
+<REJECTED RESPONSE>
+{previous}
+</REJECTED RESPONSE>
+
+{_step_repair_identity_rules(identity)}
+
+{_step_repair_template(identity)}
 """
 
 
@@ -580,12 +752,145 @@ def _read_repair_json(path: Path, limit: int) -> Any:
         return None
 
 
-class StepContractRepairPlanner:
-    """One bounded, durable planner transaction for a contract mismatch."""
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-    def __init__(self, client: TextCompletionClient, *, max_read_paths_per_step: int):
+
+def _repair_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+
+
+@dataclass(frozen=True)
+class StepRepairAttemptFiles:
+    """Durable files of one paid StepContractRepairPlanner answer.
+
+    Output attempt 001 keeps its historical slot-level request/raw/usage
+    files; every later attempt owns ``output_attempts/NNN``.  Each attempt's
+    ``parse_error.json`` and ``response.meta.json`` live in its own directory.
+    """
+
+    number: int
+    directory: Path
+    request: Path
+    meta: Path
+    raw: Path
+    usage: Path
+
+    @property
+    def parse_error(self) -> Path:
+        return self.directory / "parse_error.json"
+
+    @property
+    def response_meta(self) -> Path:
+        return self.directory / "response.meta.json"
+
+
+def step_repair_attempt_files(slot: str | Path, number: int) -> StepRepairAttemptFiles:
+    slot = Path(slot)
+    directory = slot / STEP_REPAIR_OUTPUT_ATTEMPTS_DIR / f"{number:03d}"
+    if number == 1:
+        return StepRepairAttemptFiles(
+            1, directory, slot / "planner.request.txt", slot / "request.meta.json",
+            slot / "planner.raw.md", slot / "usage.json",
+        )
+    return StepRepairAttemptFiles(
+        number, directory, directory / "planner.request.txt", directory / "request.meta.json",
+        directory / "planner.raw.md", directory / "usage.json",
+    )
+
+
+def step_repair_attempt_state(
+    files: StepRepairAttemptFiles, *, current_tree_sha: str | None = None,
+) -> tuple[str, str | None]:
+    """``(state, raw)`` of one output attempt; inconsistent evidence raises.
+
+    ``none``: no durable request; ``pending``: request durable, no answer;
+    ``raw``: a paid answer is durable and not yet classified; ``invalid``: the
+    answer was deterministically rejected (``parse_error.json``).
+    """
+
+    meta = _read_repair_json(files.meta, 64 * 1024)
+    if meta is None:
+        if files.meta.exists():
+            raise StepContractRepairArtifactError(
+                f"contract repair output attempt {files.number:03d} metadata is unreadable"
+            )
+        return "none", None
+    status = meta.get("status") if isinstance(meta, dict) else None
+    if status not in {"pending", "raw", "validated"}:
+        raise StepContractRepairArtifactError(
+            f"contract repair output attempt {files.number:03d} metadata is malformed"
+        )
+    try:
+        request_sha = _sha256_bytes(files.request.read_bytes())
+    except OSError as exc:
+        raise StepContractRepairArtifactError(
+            f"contract repair output attempt {files.number:03d} request is missing"
+        ) from exc
+    if meta.get("request_sha256") != request_sha or (
+        current_tree_sha is not None and meta.get("current_tree_sha") != current_tree_sha
+    ):
+        raise StepContractRepairArtifactError(
+            f"contract repair output attempt {files.number:03d} request identity changed"
+        )
+    if status == "pending":
+        return "pending", None
+    try:
+        raw_bytes = files.raw.read_bytes()
+    except OSError as exc:
+        raise StepContractRepairArtifactError(
+            f"contract repair output attempt {files.number:03d} raw answer is missing"
+        ) from exc
+    raw_sha = _sha256_bytes(raw_bytes)
+    if raw_sha != meta.get("raw_sha256"):
+        raise StepContractRepairArtifactError(
+            f"contract repair output attempt {files.number:03d} raw answer hash changed"
+        )
+    if files.parse_error.exists():
+        error = _read_repair_json(files.parse_error, 64 * 1024)
+        if (
+            not isinstance(error, dict)
+            or error.get("raw_sha256") != raw_sha
+            or error.get("request_sha256") != request_sha
+            or error.get("code") != STEP_CONTRACT_REPAIR_OUTPUT_INVALID
+        ):
+            raise StepContractRepairArtifactError(
+                f"contract repair output attempt {files.number:03d} parse error does not match its answer"
+            )
+        return "invalid", raw_bytes.decode("utf-8")
+    return "raw", raw_bytes.decode("utf-8")
+
+
+@dataclass(frozen=True)
+class _RepairInputs:
+    identity: StepRepairIdentity
+    original_plan_identity: str
+    current_contract: str
+    mismatch_explanation: str
+    current_tree_sha: str
+    read_set: str
+    write_set: str
+    create_set: str
+    delete_set: str
+
+
+class StepContractRepairPlanner:
+    """One bounded, durable planner transaction for a contract mismatch.
+
+    A deterministically invalid answer is corrected inside the same semantic
+    repair slot, within ``max_output_corrections``; the identity fields are
+    validated, never rewritten.  Callbacks receive the output attempt number:
+    ``on_request`` before any provider call, ``on_response_durable`` once an
+    answer is durable, ``on_output_invalid`` once its rejection is durable.
+    """
+
+    def __init__(
+        self, client: TextCompletionClient, *, max_read_paths_per_step: int,
+        max_output_corrections: int = 0,
+    ):
         self.client = client
         self.max_read_paths_per_step = max_read_paths_per_step
+        self.max_output_corrections = max_output_corrections
         self.last_usage: dict[str, Any] | None = None
 
     def repair(
@@ -594,7 +899,11 @@ class StepContractRepairPlanner:
         mismatch_explanation: str, read_set: str, write_set: str,
         create_set: str, delete_set: str, future_ownership: str,
         repository_evidence: str, artifacts_dir: str | Path,
-        on_response_durable: Callable[[], None] | None = None,
+        identity: StepRepairIdentity,
+        validate: Callable[[ImplementationStep], None] | None = None,
+        on_request: Callable[[int], None] | None = None,
+        on_response_durable: Callable[[int], None] | None = None,
+        on_output_invalid: Callable[[int, str], None] | None = None,
     ) -> ImplementationStep:
         request = build_step_contract_repair_prompt(
             original_spec=original_spec, current_tree_sha=current_tree_sha,
@@ -602,22 +911,30 @@ class StepContractRepairPlanner:
             current_contract=current_contract,
             mismatch_explanation=mismatch_explanation,
             read_set=read_set, write_set=write_set, create_set=create_set,
-            delete_set=delete_set, future_ownership=future_ownership,
+            delete_set=delete_set, identity=identity,
+            future_ownership=future_ownership,
             repository_evidence=repository_evidence,
         )
         return self._complete(
             Path(artifacts_dir), request,
-            original_plan_identity=original_plan_identity,
-            current_contract=current_contract,
-            mismatch_explanation=mismatch_explanation,
-            current_tree_sha=current_tree_sha,
-            on_response_durable=on_response_durable,
+            _RepairInputs(
+                identity, original_plan_identity, current_contract,
+                mismatch_explanation, current_tree_sha,
+                read_set, write_set, create_set, delete_set,
+            ),
+            validate=validate, on_request=on_request,
+            on_response_durable=on_response_durable, on_output_invalid=on_output_invalid,
         )
 
     def resume(
         self, *, artifacts_dir: str | Path, original_plan_identity: str,
         current_contract: str, mismatch_explanation: str, current_tree_sha: str,
-        on_response_durable: Callable[[], None] | None = None,
+        identity: StepRepairIdentity, read_set: str, write_set: str,
+        create_set: str, delete_set: str,
+        validate: Callable[[ImplementationStep], None] | None = None,
+        on_request: Callable[[int], None] | None = None,
+        on_response_durable: Callable[[int], None] | None = None,
+        on_output_invalid: Callable[[int, str], None] | None = None,
     ) -> ImplementationStep:
         """Complete the exact durable request of an interrupted repair.
 
@@ -630,105 +947,224 @@ class StepContractRepairPlanner:
         try:
             request = (target / "planner.request.txt").read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
-            raise V2PlanParseError("durable contract repair request is unavailable") from exc
+            raise StepContractRepairArtifactError("durable contract repair request is unavailable") from exc
         request_sha = hashlib.sha256(request.encode("utf-8")).hexdigest()
         if (
             not isinstance(meta, dict)
             or meta.get("request_sha256") != request_sha
             or meta.get("current_tree_sha") != current_tree_sha
         ):
-            raise V2PlanParseError("durable contract repair request identity changed")
+            raise StepContractRepairArtifactError("durable contract repair request identity changed")
         return self._complete(
             target, request,
-            original_plan_identity=original_plan_identity,
-            current_contract=current_contract,
-            mismatch_explanation=mismatch_explanation,
-            current_tree_sha=current_tree_sha,
-            on_response_durable=on_response_durable,
+            _RepairInputs(
+                identity, original_plan_identity, current_contract,
+                mismatch_explanation, current_tree_sha,
+                read_set, write_set, create_set, delete_set,
+            ),
+            validate=validate, on_request=on_request,
+            on_response_durable=on_response_durable, on_output_invalid=on_output_invalid,
         )
 
-    def _complete(
-        self, target: Path, request: str, *, original_plan_identity: str,
-        current_contract: str, mismatch_explanation: str, current_tree_sha: str,
-        on_response_durable: Callable[[], None] | None,
+    def _checked(
+        self, raw: str, inputs: _RepairInputs,
+        validate: Callable[[ImplementationStep], None] | None,
     ) -> ImplementationStep:
-        target.mkdir(parents=True, exist_ok=True)
-        request_sha = hashlib.sha256(request.encode("utf-8")).hexdigest()
-        meta_path = target / "request.meta.json"
-        existing = _read_repair_json(meta_path, 64 * 1024)
+        step = parse_step_contract_repair(raw, max_read_paths_per_step=self.max_read_paths_per_step)
+        violation = inputs.identity.violation(step)
+        if violation is not None:
+            raise V2PlanParseError(violation)
+        if validate is not None:
+            validate(step)
+        return step
+
+    def _validated(
+        self, target: Path, request_sha: str, inputs: _RepairInputs,
+        validate: Callable[[ImplementationStep], None] | None,
+    ) -> ImplementationStep | None:
         contract_path = target / "contract.md"
+        validation = _read_repair_json(target / "validation.json", 64 * 1024)
         if (
-            isinstance(existing, dict)
-            and existing.get("request_sha256") == request_sha
-            and existing.get("status") == "validated"
-            and contract_path.is_file()
+            not isinstance(validation, dict)
+            or validation.get("status") not in {"planner_validated", "validated"}
+            or validation.get("request_sha256") != request_sha
+            or not contract_path.is_file()
         ):
-            validation = _read_repair_json(target / "validation.json", 64 * 1024)
-            digest = hashlib.sha256(contract_path.read_bytes()).hexdigest()
-            if isinstance(validation, dict) and validation.get("repaired_contract_sha256") == digest:
-                return parse_step_contract_repair(
-                    contract_path.read_text(encoding="utf-8"),
-                    max_read_paths_per_step=self.max_read_paths_per_step,
-                )
-        raw_path = target / "planner.raw.md"
-        reusable_raw = False
-        if (
-            isinstance(existing, dict)
-            and existing.get("request_sha256") == request_sha
-            and existing.get("status") in {"raw", "validated"}
-            and raw_path.is_file()
-        ):
-            raw_digest = hashlib.sha256(raw_path.read_bytes()).hexdigest()
-            reusable_raw = raw_digest == existing.get("raw_sha256")
-        if reusable_raw:
-            # A paid answer is durable: a resume re-parses it, never re-buys it.
-            raw = raw_path.read_text(encoding="utf-8")
-            usage = _read_repair_json(target / "usage.json", 64 * 1024)
-            self.last_usage = usage if isinstance(usage, dict) else None
-        else:
-            atomic_write_text(target / "planner.request.txt", request)
-            write_prompt_diagnostics(target, payload_for_rendered_request("step-contract-repair", request))
-            atomic_write_text(meta_path, json.dumps({
+            return None
+        contract = contract_path.read_bytes()
+        if _sha256_bytes(contract) != validation.get("repaired_contract_sha256"):
+            raise StepContractRepairArtifactError("validated repaired contract hash changed")
+        try:
+            return self._checked(contract.decode("utf-8"), inputs, validate)
+        except (V2PlanParseError, UnicodeError) as exc:
+            raise StepContractRepairArtifactError(
+                f"validated repaired contract no longer validates: {exc}"
+            ) from exc
+
+    def _correction_request(self, target: Path, number: int, inputs: _RepairInputs) -> str:
+        previous = step_repair_attempt_files(target, number - 1)
+        state, raw = step_repair_attempt_state(previous, current_tree_sha=inputs.current_tree_sha)
+        error = _read_repair_json(previous.parse_error, 64 * 1024)
+        if state != "invalid" or raw is None or not isinstance(error, dict):
+            raise StepContractRepairArtifactError(
+                f"contract repair output attempt {number - 1:03d} is not a durable rejection"
+            )
+        return build_step_contract_repair_correction_prompt(
+            identity=inputs.identity, current_tree_sha=inputs.current_tree_sha,
+            current_contract=inputs.current_contract,
+            mismatch_explanation=inputs.mismatch_explanation,
+            read_set=inputs.read_set, write_set=inputs.write_set,
+            create_set=inputs.create_set, delete_set=inputs.delete_set,
+            previous_raw=raw, parse_error=str(error.get("detail") or ""),
+            output_attempt=number, max_output_corrections=self.max_output_corrections,
+        )
+
+    def _call(
+        self, files: StepRepairAttemptFiles, request: str, current_tree_sha: str,
+        *, pending: bool,
+    ) -> str:
+        files.directory.mkdir(parents=True, exist_ok=True)
+        request_sha = _sha256_bytes(request.encode("utf-8"))
+        if not pending:
+            atomic_write_text(files.request, request)
+            write_prompt_diagnostics(
+                files.request.parent,
+                payload_for_rendered_request("step-contract-repair", request),
+            )
+            atomic_write_text(files.meta, _repair_json({
                 "status": "pending", "request_sha256": request_sha,
                 "current_tree_sha": current_tree_sha,
-            }, ensure_ascii=False, indent=2) + "\n")
-            result = self.client.complete(request)
-            self.last_usage = completion_usage(result)
-            raw = result if isinstance(result, str) else getattr(result, "text", None)
-            if not isinstance(raw, str):
-                raise V2PlanParseError("step contract repair planner did not return text")
-            atomic_write_text(raw_path, raw)
-            write_usage_artifact(target / "usage.json", self.last_usage)
-            atomic_write_text(meta_path, json.dumps({
-                "status": "raw", "request_sha256": request_sha,
-                "raw_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
-                "current_tree_sha": current_tree_sha,
-            }, ensure_ascii=False, indent=2) + "\n")
-        if on_response_durable is not None:
-            on_response_durable()
-        step = parse_step_contract_repair(
-            raw, max_read_paths_per_step=self.max_read_paths_per_step
-        )
-        canonical = render_repaired_step_contract(step)
-        atomic_write_text(target / "contract.md", canonical)
-        atomic_write_text(target / "validation.json", json.dumps({
-            "status": "planner_validated",
-            "request_sha256": request_sha,
-            "original_plan_identity": original_plan_identity,
-            "original_contract_sha256": hashlib.sha256(current_contract.encode("utf-8")).hexdigest(),
+            }))
+        elif files.raw.exists():
+            # An answer written before its metadata is never silently lost.
+            orphan = files.raw.read_bytes()
+            atomic_write_text(
+                files.directory / f"planner.raw.orphan-{_sha256_bytes(orphan)[:12]}.md",
+                orphan.decode("utf-8", errors="replace"),
+            )
+        result = self.client.complete(request)
+        self.last_usage = completion_usage(result)
+        raw = result if isinstance(result, str) else getattr(result, "text", None)
+        if not isinstance(raw, str):
+            raise V2PlanParseError("step contract repair planner did not return text")
+        raw_sha = _sha256_bytes(raw.encode("utf-8"))
+        atomic_write_text(files.raw, raw)
+        write_usage_artifact(files.usage, self.last_usage)
+        atomic_write_text(files.meta, _repair_json({
+            "status": "raw", "request_sha256": request_sha, "raw_sha256": raw_sha,
             "current_tree_sha": current_tree_sha,
-            "mismatch_sha256": hashlib.sha256(mismatch_explanation.encode("utf-8")).hexdigest(),
-            "repaired_contract_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        }))
+        return raw
+
+    def _response_meta(
+        self, target: Path, files: StepRepairAttemptFiles, raw: str, status: str,
+    ) -> None:
+        files.directory.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(files.response_meta, _repair_json({
+            "schema_version": 1, "output_attempt": files.number, "status": status,
+            "request_path": files.request.relative_to(target).as_posix(),
+            "request_sha256": _sha256_bytes(files.request.read_bytes()),
+            "raw_path": files.raw.relative_to(target).as_posix(),
+            "raw_sha256": _sha256_bytes(raw.encode("utf-8")),
+        }))
+
+    def _complete(
+        self, target: Path, initial_request: str, inputs: _RepairInputs, *,
+        validate: Callable[[ImplementationStep], None] | None,
+        on_request: Callable[[int], None] | None,
+        on_response_durable: Callable[[int], None] | None,
+        on_output_invalid: Callable[[int, str], None] | None,
+    ) -> ImplementationStep:
+        target.mkdir(parents=True, exist_ok=True)
+        initial_sha = _sha256_bytes(initial_request.encode("utf-8"))
+        validated = self._validated(target, initial_sha, inputs, validate)
+        if validated is not None:
+            return validated
+        number = 1
+        while True:
+            files = step_repair_attempt_files(target, number)
+            state, raw = step_repair_attempt_state(files, current_tree_sha=inputs.current_tree_sha)
+            if number == 1 and state != "none":
+                meta = _read_repair_json(files.meta, 64 * 1024)
+                if not isinstance(meta, dict) or meta.get("request_sha256") != initial_sha:
+                    raise StepContractRepairArtifactError(
+                        "durable contract repair request identity changed"
+                    )
+            if state == "invalid":
+                # A rejected answer is never re-parsed as if it were new: it
+                # is the input of the next admitted output correction.
+                if number - 1 >= self.max_output_corrections:
+                    error = _read_repair_json(files.parse_error, 64 * 1024) or {}
+                    raise StepContractRepairOutputInvalid(
+                        str(error.get("detail") or "step contract repair output is invalid"),
+                        output_attempt=number, corrections=number - 1,
+                        limit=self.max_output_corrections,
+                    )
+                number += 1
+                continue
+            if raw is None:
+                request = (
+                    initial_request if number == 1
+                    else files.request.read_text(encoding="utf-8") if state == "pending"
+                    else self._correction_request(target, number, inputs)
+                )
+                if on_request is not None:
+                    on_request(number)
+                raw = self._call(files, request, inputs.current_tree_sha, pending=state == "pending")
+            else:
+                # A paid answer is durable: a resume re-parses it, never re-buys it.
+                usage = _read_repair_json(files.usage, 64 * 1024)
+                self.last_usage = usage if isinstance(usage, dict) else None
+            self._response_meta(target, files, raw, "raw")
+            if on_response_durable is not None:
+                on_response_durable(number)
+            try:
+                step = self._checked(raw, inputs, validate)
+            except V2PlanParseError as exc:
+                detail = str(exc)[:_REPAIR_ERROR_CHARS]
+                atomic_write_text(files.parse_error, _repair_json({
+                    "schema_version": 1,
+                    "code": STEP_CONTRACT_REPAIR_OUTPUT_INVALID,
+                    "detail": detail,
+                    "output_attempt": number,
+                    "request_sha256": _sha256_bytes(files.request.read_bytes()),
+                    "raw_sha256": _sha256_bytes(raw.encode("utf-8")),
+                }))
+                self._response_meta(target, files, raw, "invalid")
+                if on_output_invalid is not None:
+                    on_output_invalid(number, detail)
+                continue
+            return self._record_validated(target, files, raw, step, inputs, initial_sha)
+
+    def _record_validated(
+        self, target: Path, files: StepRepairAttemptFiles, raw: str,
+        step: ImplementationStep, inputs: _RepairInputs, initial_sha: str,
+    ) -> ImplementationStep:
+        canonical = render_repaired_step_contract(step)
+        raw_sha = _sha256_bytes(raw.encode("utf-8"))
+        atomic_write_text(target / "contract.md", canonical)
+        atomic_write_text(target / "validation.json", _repair_json({
+            "status": "planner_validated",
+            "request_sha256": initial_sha,
+            "output_attempt": files.number,
+            "output_corrections": files.number - 1,
+            "output_request_sha256": _sha256_bytes(files.request.read_bytes()),
+            "raw_sha256": raw_sha,
+            "original_plan_identity": inputs.original_plan_identity,
+            "original_contract_sha256": _sha256_bytes(inputs.current_contract.encode("utf-8")),
+            "current_tree_sha": inputs.current_tree_sha,
+            "mismatch_sha256": _sha256_bytes(inputs.mismatch_explanation.encode("utf-8")),
+            "repaired_contract_sha256": _sha256_bytes(canonical.encode("utf-8")),
             "step_id": step.id,
             "write_set": list(step.write_set),
             "create_set": list(step.create_set),
             "delete_set": list(step.delete_set),
-        }, ensure_ascii=False, indent=2) + "\n")
-        atomic_write_text(meta_path, json.dumps({
-            "status": "validated", "request_sha256": request_sha,
-            "raw_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
-            "current_tree_sha": current_tree_sha,
-        }, ensure_ascii=False, indent=2) + "\n")
+        }))
+        atomic_write_text(files.meta, _repair_json({
+            "status": "validated", "request_sha256": _sha256_bytes(files.request.read_bytes()),
+            "raw_sha256": raw_sha, "current_tree_sha": inputs.current_tree_sha,
+        }))
+        self._response_meta(target, files, raw, "validated")
         return step
 
 
@@ -2482,7 +2918,7 @@ __all__ = [
     "REPAIR_EVIDENCE_FILENAME", "RepairPlannerV2",
     "persist_planning_artifacts_v2", "persist_planning_v2_artifacts", "persist_recovered_plan_artifacts",
     "read_approved_step_contract", "read_set_paths",
-    "render_plan_summary_v2", "render_repair_plan_summary", "render_repair_step_index", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract", "render_repaired_step_contract", "parse_step_contract_repair", "build_step_contract_repair_prompt", "StepContractRepairPlanner",
+    "render_plan_summary_v2", "render_repair_plan_summary", "render_repair_step_index", "render_profile_catalogue", "render_safe_profile_catalogue", "render_step_contract", "render_repaired_step_contract", "parse_step_contract_repair", "build_step_contract_repair_prompt", "build_step_contract_repair_correction_prompt", "StepContractRepairPlanner", "StepContractRepairOutputInvalid", "StepContractRepairArtifactError", "StepRepairIdentity", "StepRepairAttemptFiles", "STEP_CONTRACT_REPAIR_OUTPUT_INVALID", "STEP_REPAIR_OUTPUT_ATTEMPTS_DIR", "step_repair_attempt_files", "step_repair_attempt_state",
     "run_planner_v2", "step_contract_path", "validate_decomposition_policy", "validate_implementation_bundle", "write_implementation_bundle",
     "REQUIRE_STAGED_POLICY_TEXT", "validate_execution_mode_policy",
     "render_decomposition_policy_text",
