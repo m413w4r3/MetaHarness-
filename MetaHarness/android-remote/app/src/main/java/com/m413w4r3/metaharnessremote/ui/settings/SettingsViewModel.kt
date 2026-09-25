@@ -15,6 +15,7 @@ import com.m413w4r3.metaharnessremote.data.ServerSettingsStore
 import com.m413w4r3.metaharnessremote.network.GatewayClient
 import com.m413w4r3.metaharnessremote.network.GatewayUrls
 import com.m413w4r3.metaharnessremote.network.HealthResult
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 sealed interface ConnectionStatus {
@@ -54,18 +55,30 @@ class SettingsViewModel internal constructor(
     var status by mutableStateOf<ConnectionStatus>(ConnectionStatus.Idle)
         private set
 
+    private var connectionTestJob: Job? = null
+    private var connectionTestGeneration: Long = 0
+
+    private fun invalidateConnectionTest() {
+        connectionTestGeneration += 1
+        connectionTestJob?.cancel()
+        connectionTestJob = null
+    }
+
     fun onServerUrlChange(value: String) {
+        invalidateConnectionTest()
         serverUrl = value
         status = ConnectionStatus.Idle
     }
 
     fun onRemoteTokenChange(value: String) {
+        invalidateConnectionTest()
         remoteToken = value
         status = ConnectionStatus.Idle
     }
 
     /** Validates and persists the current draft, then updates the process session. */
     fun saveCredentials(): Boolean {
+        invalidateConnectionTest()
         val normalizedUrl = when (val result = GatewayUrls.normalize(serverUrl)) {
             is GatewayUrls.BaseUrl.Invalid -> {
                 status = ConnectionStatus.Error(result.reason)
@@ -95,6 +108,7 @@ class SettingsViewModel internal constructor(
 
     /** Drops the server URL and encrypted token from the device. */
     fun forgetCredentials() {
+        invalidateConnectionTest()
         settingsStore.saveServerUrl("")
         tokenStore.clearRemoteToken()
         serverUrl = ""
@@ -105,6 +119,10 @@ class SettingsViewModel internal constructor(
 
     /** Tests the current in-memory draft without persisting it. */
     fun testConnection() {
+        connectionTestJob?.cancel()
+        connectionTestJob = null
+        val generation = ++connectionTestGeneration
+
         val baseUrl = when (val result = GatewayUrls.normalize(serverUrl)) {
             is GatewayUrls.BaseUrl.Invalid -> {
                 status = ConnectionStatus.Error(result.reason)
@@ -117,13 +135,20 @@ class SettingsViewModel internal constructor(
             return
         }
 
+        val testedUrl = baseUrl
+        val testedToken = remoteToken
         status = ConnectionStatus.Testing
-        val token = remoteToken
-        viewModelScope.launch {
-            status = when (val result = gatewayClient.health(baseUrl, token)) {
+        connectionTestJob = viewModelScope.launch {
+            val result = gatewayClient.health(testedUrl, testedToken)
+            if (generation != connectionTestGeneration) {
+                return@launch
+            }
+
+            status = when (result) {
                 is HealthResult.Connected -> ConnectionStatus.Connected
                 is HealthResult.Failed -> ConnectionStatus.Error(result.message)
             }
+            connectionTestJob = null
         }
     }
 
