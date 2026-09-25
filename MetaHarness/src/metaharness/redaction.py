@@ -49,10 +49,42 @@ def config_secret_values(
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:
+    if not isinstance(text, str):
+        raise TypeError("redact expects human-readable text")
     for secret in secrets:
         if secret:
             text = text.replace(secret, REDACTED)
     return text
+
+
+def redact_mapping(value: Mapping[str, object], secrets: Iterable[str]) -> dict[str, object]:
+    """Redact every string in structured JSON data without stringifying it."""
+
+    secret_values = tuple(secrets)
+
+    def visit(item: object) -> object:
+        if isinstance(item, str):
+            return redact(item, secret_values)
+        if isinstance(item, Mapping):
+            result: dict[str, object] = {}
+            for key, nested in item.items():
+                if not isinstance(key, str):
+                    raise TypeError("structured failure mapping keys must be strings")
+                redacted_key = redact(key, secret_values)
+                if redacted_key in result:
+                    raise ValueError("secret redaction produced duplicate mapping keys")
+                result[redacted_key] = visit(nested)
+            return result
+        if isinstance(item, (list, tuple)):
+            return [visit(nested) for nested in item]
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        raise TypeError("structured failure mapping must contain JSON data")
+
+    result = visit(value)
+    if not isinstance(result, dict):
+        raise TypeError("structured failure detail must be a mapping")
+    return result
 
 
 def contains_secret(text: str, secrets: Iterable[str]) -> bool:
@@ -96,6 +128,7 @@ __all__ = [
     "config_secret_values",
     "contains_secret",
     "redact",
+    "redact_mapping",
     "redact_file",
     "secret_values",
 ]

@@ -9,7 +9,7 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from .models import RunStatus
 
@@ -193,12 +193,21 @@ class RunStateStore:
         return state
 
     def record_failure(
-        self, reason: str, detail: Any = None, **fields: Any
+        self, reason: str, detail: str | Mapping[str, Any] | None = None, **fields: Any
     ) -> dict[str, Any]:
         """Mark the run FAILED; *fields* are merged in the same write."""
 
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason must be a non-empty string")
+        if detail is not None and not isinstance(detail, (str, Mapping)):
+            raise TypeError("failure detail must be human-readable text or a structured mapping")
+        if isinstance(detail, Mapping):
+            if any(not isinstance(key, str) for key in detail):
+                raise TypeError("structured failure detail keys must be strings")
+            try:
+                json.dumps(detail, ensure_ascii=False)
+            except (TypeError, ValueError) as exc:
+                raise TypeError("structured failure detail must contain JSON data") from exc
         if "status" in fields or "failure" in fields:
             raise ValueError("record_failure owns status and failure")
         failure: dict[str, Any] = {"reason": reason}

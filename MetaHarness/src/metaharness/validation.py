@@ -231,6 +231,35 @@ def _safe_log_stem(name: str, used: set[str]) -> str:
     return candidate
 
 
+def _gate_infrastructure_failure(stdout: str, stderr: str) -> bool:
+    """Recognize explicit Docker/PostgreSQL launch outages from gate output.
+
+    A pytest report naming failed tests is authoritative product evidence even
+    if one log line also mentions a service. Only a clear environment failure
+    with no reported pytest failures is routed to infrastructure recovery.
+    """
+
+    output = f"{stdout}\n{stderr}".casefold()
+    has_pytest_failures = bool(
+        re.search(r"(?m)^\s*FAILED\s+\S+::", output)
+        or re.search(r"\b\d+\s+failed\b", output)
+    )
+    if has_pytest_failures:
+        return False
+    markers = (
+        "docker socket access denied",
+        "permission denied while trying to connect to the docker daemon socket",
+        "cannot connect to the docker daemon",
+        "docker daemon is not running",
+        "error during connect: this error may indicate that the docker daemon is not running",
+        "could not translate host name",
+        "could not connect to server: connection refused",
+        "postgresql server is unavailable",
+        "postgres server is unavailable",
+    )
+    return any(marker in output for marker in markers)
+
+
 def run_checks(
     worktree: str | Path,
     config: HarnessConfig,
@@ -386,12 +415,18 @@ def run_checks(
                     failure_kind = "signal_terminated"
                 elif exit_code == 0:
                     failure_kind = "passed"
+                elif _gate_infrastructure_failure(
+                    read_capped(stdout_path, _IN_MEMORY_LOG_BYTES)[0],
+                    read_capped(stderr_path, _IN_MEMORY_LOG_BYTES)[0],
+                ):
+                    failure_kind = "infrastructure_unavailable"
                 else:
                     failure_kind = "nonzero_exit"
                 final_exit_code = 124 if timed_out else exit_code
                 final_timed_out = timed_out
                 if failure_kind in {
                     "timeout", "missing_executable", "process_start_failed", "signal_terminated",
+                    "infrastructure_unavailable",
                 } and retry_infrastructure is not None and retry_infrastructure(check.id, failure_kind):
                     infra_retries += 1
                     continue

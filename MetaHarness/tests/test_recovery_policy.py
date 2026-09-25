@@ -73,13 +73,19 @@ class RecoveryPolicyTests(unittest.TestCase):
             ("LLM_503", {"budget_exhausted": True}, ResumePhase.FINAL_REVIEW, RunStatus.WAITING_EXTERNAL),
             ("CHECK_TIMEOUT", {"budget_exhausted": True}, ResumePhase.DETERMINISTIC_GATE, RunStatus.WAITING_CHECK_INFRASTRUCTURE),
             ("PUSH_FAILED", {"remote_required": True, "budget_exhausted": True}, ResumePhase.CANDIDATE_PUSH, RunStatus.WAITING_REMOTE),
-            ("CHECK_REPAIR_EXHAUSTED", {}, ResumePhase.DETERMINISTIC_GATE, RunStatus.WAITING_HUMAN),
+            ("CHECK_REPAIR_EXHAUSTED", {}, ResumePhase.DETERMINISTIC_GATE, RunStatus.WAITING_CHECK_REPAIR),
             ("PLAN_REPOSITORY_PRECONDITION_INVALID", {"budget_exhausted": True}, ResumePhase.PLANNER, RunStatus.WAITING_HUMAN),
         )
         for code, options, phase, status in cases:
             with self.subTest(code=code):
                 decision = classify_failure(code, **options)
                 self.assertEqual(terminal_state_for(decision, failure_code=code, phase=phase).status, status)
+        exhausted = terminal_state_for(
+            classify_failure("CHECK_REPAIR_EXHAUSTED"),
+            failure_code="CHECK_REPAIR_EXHAUSTED",
+            phase=ResumePhase.DETERMINISTIC_GATE,
+        )
+        self.assertTrue(exhausted.resumable)
 
     def test_failure_policy_matrix_is_an_architectural_invariant(self) -> None:
         for name, reason, expected, kwargs in FAILURE_POLICY_MATRIX:

@@ -64,6 +64,8 @@ MAX_RECOVERY_ATTEMPT_RECORDS = 256
 
 
 def failure_code(reason: str) -> str:
+    if not isinstance(reason, str) or not reason.strip():
+        raise TypeError("failure reason must be a non-empty reason-code string")
     return reason.split(":", 1)[0].strip().upper()
 
 
@@ -72,6 +74,8 @@ def terminal_state_for(
 ) -> RecoveryTerminalState:
     """Only terminal dispositions may cross the coordinator boundary."""
 
+    if not isinstance(failure_code, str) or not failure_code.strip():
+        raise TypeError("terminal failure_code must be a non-empty reason-code string")
     code = failure_code.split(":", 1)[0].upper()
     if decision.disposition is RecoveryDisposition.HARD_STOP:
         return RecoveryTerminalState(RunStatus.FAILED, False, decision.reason)
@@ -79,6 +83,10 @@ def terminal_state_for(
         if code == "STEP_CONTRACT_REPAIR_OUTPUT_INVALID":
             # The pending repair slot is intact: its planner can be retried.
             return RecoveryTerminalState(RunStatus.WAITING_CONTRACT_REPAIR, True, decision.reason)
+        if code == "CHECK_REPAIR_EXHAUSTED":
+            # The gate checkpoint and candidate are intact; retry runs the gate
+            # only and cannot admit another worker without a new authority.
+            return RecoveryTerminalState(RunStatus.WAITING_CHECK_REPAIR, True, decision.reason)
         return RecoveryTerminalState(RunStatus.WAITING_HUMAN, False, decision.reason)
     if decision.disposition is RecoveryDisposition.WAIT_EXTERNAL:
         if code in _CHECK_INFRA:
@@ -101,6 +109,8 @@ def project_exit(
     that is still not terminal escaped its coordinator and fails closed.
     """
 
+    if not isinstance(reason, str) or not reason.strip():
+        raise TypeError("project_exit expects a stable reason-code string")
     decision = classify_failure(
         reason, budget_exhausted=True,
         remote_required=remote_required, remote_unavailable=remote_required,
@@ -118,6 +128,8 @@ def project_exit(
 def normalize_exit_reason(reason: str) -> str:
     """Collapse provider credential aliases onto one waiting condition."""
 
+    if not isinstance(reason, str) or not reason.strip():
+        raise TypeError("exit reason must be a non-empty reason-code string")
     return "EXTERNAL_AUTH_REQUIRED" if failure_code(reason) in _AUTH_ALIASES else reason
 
 

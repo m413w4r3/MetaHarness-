@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -696,7 +697,7 @@ class CheckRepairTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
+            self.config(check_repair=1), planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
@@ -714,18 +715,184 @@ class CheckRepairTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(
             ExecutionRole.REPAIR,
-            write("feature.txt", "still bad\n"), write("feature.txt", "worse\n"),
-            write("feature.txt", "nope\n"),
+            write("feature.txt", "still bad\n", report="Docker socket access denied\n"),
+            write("feature.txt", "worse\n", report="Docker socket access denied\n"),
         )
-        result = self.orchestrator(
-            self.config(check_repair=3), planner=[initial_plan(STEP)], reviewer=[review()],
-        ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
+        with mock.patch(
+            "metaharness.orchestrator.config_secret_values",
+            return_value=("regression-redaction-secret",),
+        ):
+            result = self.orchestrator(
+                self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
+            ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"))
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
-        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair", "repair"])
+        self.assertIsInstance(self.state()["failure"]["detail"], dict)
+        self.assertEqual(self.state()["failure"]["detail"]["failed_check_ids"], ["test"])
+        self.assertEqual(self.state()["failure"]["detail"]["attempt_count"], 2)
+        self.assertEqual(self.state()["check_repair"]["failure_classification"], "product_check")
+        self.assertEqual(self.state()["check_repair"]["next_action"], "Retry deterministic gate")
+        self.assertRegex(self.state()["check_repair"]["latest_evidence_sha256"], r"^[0-9a-f]{64}$")
+        reports = self.state()["check_repair"]["repair_reports"]
+        self.assertEqual([item["attempt"] for item in reports], [1, 2])
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) for item in reports))
+        checkpoint = self.checkpoint()
+        self.assertEqual(checkpoint["phase"], "deterministic_gate")
+        self.assertEqual(checkpoint["stage"], "POST_IMPLEMENTATION")
+        self.assertEqual(checkpoint["check_repair_attempt"], 2)
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
+        diagnostics_path = self.run_dir() / "diagnostics.md"
+        self.assertTrue(
+            diagnostics_path.is_file(),
+            (self.run_dir() / "diagnostics.error.txt").read_text(encoding="utf-8")
+            if (self.run_dir() / "diagnostics.error.txt").is_file() else "diagnostics missing",
+        )
+        diagnostics = diagnostics_path.read_text(encoding="utf-8")
+        recovery_summary = diagnostics.split("## DETERMINISTIC GATE RECOVERY", 1)[1].split("\n## ", 1)[0]
+        for expected in (
+            "deterministic gate attempt: 3",
+            "check-repair attempts used / budget: 2 / 2",
+            "latest failed check IDs: test",
+            "failure classification: product_check",
+            "next recovery action: Retry deterministic gate",
+        ):
+            self.assertIn(expected, recovery_summary, recovery_summary)
         attempts = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts"
-        self.assertEqual(sorted(path.name for path in attempts.iterdir()), ["001", "002", "003"])
+        self.assertEqual(sorted(path.name for path in attempts.iterdir()), ["001", "002"])
         self.assertEqual(self.reviewer.requests, [])
+
+    def test_gate_docker_outage_waits_without_consuming_check_repair_budget(self) -> None:
+        self.check.write_text(
+            "import sys\nprint('Cannot connect to the Docker daemon')\nraise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.WAITING_CHECK_INFRASTRUCTURE)
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_INFRASTRUCTURE_UNAVAILABLE")
+        self.assertNotIn("attempt_count", self.state().get("check_repair", {}))
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_operator_retry_reruns_gate_without_replaying_steps_or_repair_workers(self) -> None:
+        counter = self.root / "gate-count"
+        self.check.write_text(
+            "import pathlib, sys\n"
+            f"counter = pathlib.Path({str(counter)!r})\n"
+            "count = int(counter.read_text()) if counter.exists() else 0\n"
+            "counter.write_text(str(count + 1))\n"
+            "if count < 3:\n"
+            "    print('FAILED tests/test_feature.py::test_behavior')\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            lambda _request: "no change\n", lambda _request: "no change\n",
+        )
+        config = self.config(check_repair=2)
+        original = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        first_planner = original._planner_client
+        waiting = original.run_text(SPEC, run_id="run")
+        self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
+        retry_info = resume_info(self.run_dir(), self.state())
+        self.assertTrue(retry_info.resumable, retry_info.reason)
+        self.assertEqual(retry_info.label, "Retry deterministic gate (POST_IMPLEMENTATION)")
+        roles_before_resume = self.workers.roles()
+
+        resumed = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), roles_before_resume)
+        self.assertEqual(len(first_planner.requests), 1)
+        self.assertEqual(self.planner.requests, [])
+        self.assertEqual(counter.read_text(), "4")
+
+    def test_historical_attributeerror_shape_resumes_the_same_gate_checkpoint(self) -> None:
+        counter = self.root / "legacy-gate-count"
+        self.check.write_text(
+            "import pathlib, sys\n"
+            f"counter = pathlib.Path({str(counter)!r})\n"
+            "count = int(counter.read_text()) if counter.exists() else 0\n"
+            "counter.write_text(str(count + 1))\n"
+            "if count < 3:\n"
+            "    print('FAILED tests/test_feature.py::test_behavior')\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            lambda _request: "no change\n", lambda _request: "no change\n",
+        )
+        config = self.config(check_repair=2)
+        waiting = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
+        checkpoint_before = self.checkpoint()
+
+        # Present the exact durable state written by the historical bug.
+        state = self.state()
+        state["status"] = "failed"
+        state["failure"] = {
+            "reason": "ATTRIBUTEERROR",
+            "detail": "'dict' object has no attribute 'replace'",
+        }
+        state.pop("recovery_resumable", None)
+        for key in (
+            "candidate_tree", "failed_check_ids", "failure_classification",
+            "latest_evidence_sha256", "next_action", "repair_reports",
+        ):
+            state["check_repair"].pop(key, None)
+        state["check_repair"]["status"] = "completed"
+        (self.run_dir() / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+        eligible = resume_info(self.run_dir(), state)
+        self.assertTrue(eligible.resumable, eligible.reason)
+        self.assertEqual(eligible.phase, "deterministic_gate")
+        self.assertEqual(eligible.label, "Retry deterministic gate (POST_IMPLEMENTATION)")
+        self.assertEqual(self.checkpoint(), checkpoint_before)
+        roles_before_resume = self.workers.roles()
+        resumed = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), roles_before_resume)
+        self.assertEqual(self.planner.requests, [])
+        self.assertEqual(counter.read_text(), "4")
+        self.assertEqual(self.state()["resume"]["migration"], "historical_check_repair_redaction_crash")
+
+    def test_corrupt_latest_gate_evidence_fails_resume_integrity(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            lambda _request: "no change\n", lambda _request: "no change\n",
+        )
+        config = self.config(check_repair=2)
+        waiting = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
+        evidence_path = self.run_dir() / "cycles/001/checks/post-implementation/evidence.json"
+        evidence_path.write_text(evidence_path.read_text() + " ", encoding="utf-8")
+        roles_before_resume = self.workers.roles()
+
+        resumed = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.workers.roles(), roles_before_resume)
 
 
 class ReviewCorrectionCycleTests(PipelineHarness):
@@ -1153,7 +1320,7 @@ class ResumeTests(PipelineHarness):
             side_effect=AssertionError("planner must not run in this setup"),
         ):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.checkpoint()["phase"], "review_replan")
         self.assertEqual(self.checkpoint()["review_cycle"], 2)
 
@@ -1169,7 +1336,14 @@ class ResumeTests(PipelineHarness):
 
         with mock.patch.object(type(original), "_run_gate", side_effect=crash):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
+        failure = self.state()["failure"]
+        self.assertEqual(failure["reason"], "INTERNAL_HARNESS_ERROR")
+        self.assertEqual(failure["detail"]["exception_type"], "RuntimeError")
+        self.assertEqual(failure["detail"]["phase"], "deterministic_gate")
+        self.assertEqual(failure["detail"]["operation"], "pipeline_coordinator")
+        self.assertNotIn("Traceback", json.dumps(failure))
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
         self.assertEqual(self.checkpoint()["phase"], "deterministic_gate")
         self.assertEqual(self.workers.roles(), ["implementer"])
 
@@ -1244,7 +1418,7 @@ class ResumeTests(PipelineHarness):
 
         with mock.patch.object(type(original), "_review_candidate", side_effect=crash_after_push):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         candidate = json.loads(
             (self.run_dir() / "cycles/001/candidate/commit.json").read_text(encoding="utf-8")
         )
@@ -1292,7 +1466,7 @@ class ResumeTests(PipelineHarness):
 
         with mock.patch.object(type(original), "_review_candidate", side_effect=crash_on_cycle_four):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.checkpoint()["review_cycle"], 4)
         self.assertEqual(self.checkpoint()["phase"], "final_review")
 
@@ -1343,7 +1517,7 @@ class ResumeTests(PipelineHarness):
 
         with mock.patch.object(type(original), "_run_gate", side_effect=crash_once):
             failed = original.run_text(SPEC, run_id="run", on_created=change_live_defaults)
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
 
         resumed = self.orchestrator(
             load_config(self.config_path),
@@ -1501,7 +1675,7 @@ class GitChainAndTraceTests(PipelineHarness):
             side_effect=RuntimeError("crash after acceptance"),
         ):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         accepted_path = self.run_dir() / "cycles/001/checks/post-implementation/accepted.json"
         accepted = json.loads(accepted_path.read_text())
         accepted["mutable_scope"] = ["feature.txt", "tests/test_feature.py"]
@@ -1522,7 +1696,7 @@ class GitChainAndTraceTests(PipelineHarness):
         )
         real_gate = original._run_gate
 
-        def unexpected_head(_self, store, ctx, cycle_plan, stage):
+        def unexpected_head(store, ctx, cycle_plan, stage):
             evidence = real_gate(store, ctx, cycle_plan, stage)
             return replace(
                 evidence, deterministic_passed=False,
@@ -1531,7 +1705,7 @@ class GitChainAndTraceTests(PipelineHarness):
 
         with mock.patch.object(type(original), "_run_gate", side_effect=unexpected_head):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.FAILED, self.state().get("failure"))
         self.assertEqual(self.workers.roles(), ["implementer"])
         self.assertEqual(self.reviewer.requests, [])
     def test_reviewer_transport_failure_resumes_at_the_final_review_of_its_cycle(self) -> None:
@@ -1817,7 +1991,7 @@ class ResumeAuthorityTests(PipelineHarness):
         )
         with self._crash_on_review(original, 1):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.checkpoint()["phase"], "final_review", self.state().get("failure"))
         self.assertEqual(git(self.worktree(), "rev-parse", "HEAD"), base)
         return base
@@ -1859,7 +2033,7 @@ class ResumeAuthorityTests(PipelineHarness):
         )
         with self._crash_on_review(original, 1):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         path = self.run_dir() / "cycles/001/candidate/commit.json"
         candidate = json.loads(path.read_text())
         candidate["parent_sha"] = "a" * 40
@@ -1880,7 +2054,7 @@ class ResumeAuthorityTests(PipelineHarness):
         )
         with self._crash_on_review(original, 2):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual((self.checkpoint()["phase"], self.checkpoint()["review_cycle"]), ("final_review", 2))
 
         resumed = self.orchestrator(
@@ -1899,7 +2073,7 @@ class ResumeAuthorityTests(PipelineHarness):
         original = self.orchestrator(self.config(), planner=[initial_plan(STEP)], reviewer=[review()])
         with self._crash_at(original, "candidate_ready"):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertTrue(
             (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").is_file()
         )
@@ -1915,7 +2089,7 @@ class ResumeAuthorityTests(PipelineHarness):
         )
         with self._crash_at(original, "candidate_ready"):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         checkpoint = self.checkpoint()
         self.assertEqual((checkpoint["phase"], checkpoint["check_repair_attempt"]), ("deterministic_gate", 1))
         accepted = json.loads(
@@ -1956,7 +2130,7 @@ class ResumeAuthorityTests(PipelineHarness):
             side_effect=RuntimeError("crash before semantic worker"),
         ):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(
             self.checkpoint()["phase"], "semantic_revision", self.state().get("failure"),
         )
@@ -1995,7 +2169,7 @@ class ResumeAuthorityTests(PipelineHarness):
         )
         with self._crash_on_review(original, 3):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual((self.checkpoint()["phase"], self.checkpoint()["review_cycle"]), ("final_review", 3))
 
     def test_cycle_three_resume_publishes_the_third_candidate(self) -> None:
@@ -2059,7 +2233,7 @@ class ResumeAuthorityTests(PipelineHarness):
         )
         with self._crash_on_review(original, 2):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         path = self.run_dir() / "cycles/002/correction/execution_selection.json"
         payload = json.loads(path.read_text())
         payload["steps"][0]["implementer"]["model"] = "tampered-model"
@@ -2091,7 +2265,7 @@ class ResumeAuthorityTests(PipelineHarness):
             type(original), "_run_check_repair_attempt", crash_before_second,
         ):
             failed = original.run_text(SPEC, run_id="run")
-        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         path = self.run_dir() / "resume_checkpoint.json"
         checkpoint = json.loads(path.read_text())
         self.assertEqual((checkpoint["phase"], checkpoint["check_repair_attempt"]), ("check_repair", 2))

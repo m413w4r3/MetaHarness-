@@ -242,6 +242,7 @@ class RunStatus(StrEnum):
     WAITING_SCOPE_APPROVAL = "waiting_scope_approval"
     WAITING_EXTERNAL = "waiting_external"
     WAITING_CHECK_INFRASTRUCTURE = "waiting_check_infrastructure"
+    WAITING_CHECK_REPAIR = "waiting_check_repair"
     WAITING_REMOTE = "waiting_remote"
     WAITING_CONTRACT_REPAIR = "waiting_contract_repair"
     PLAN_REJECTED = "plan_rejected"

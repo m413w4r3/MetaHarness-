@@ -17,10 +17,12 @@ cycles is bounded only by the frozen run options, never by this module.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, TypeAlias
 
 from ..evidence import EvidenceBundle, required_checks_passed
 from ..gitops import RepositoryReference, WorktreeInfo
@@ -33,6 +35,8 @@ from ..models import (
     RunCycle,
     TaskPlanV2,
 )
+
+FailureDetail: TypeAlias = str | Mapping[str, Any]
 from ..result import RunResult
 from ..resume import ResumeCheckpoint, ResumePhase
 from ..review import ReviewResult
@@ -159,7 +163,20 @@ class PipelineFailure(Exception):
     onto a waiting condition (``WAITING_*``) from the recovery policy.
     """
 
-    def __init__(self, reason: str, detail: Any = None, *, step_id: str | None = None) -> None:
+    def __init__(
+        self, reason: str, detail: FailureDetail | None = None, *, step_id: str | None = None,
+    ) -> None:
+        if not isinstance(reason, str) or not reason.strip():
+            raise TypeError("PipelineFailure reason must be a non-empty reason code string")
+        if detail is not None and not isinstance(detail, (str, Mapping)):
+            raise TypeError("PipelineFailure detail must be text or a structured mapping")
+        if isinstance(detail, Mapping):
+            if any(not isinstance(key, str) for key in detail):
+                raise TypeError("PipelineFailure detail mapping keys must be strings")
+            try:
+                json.dumps(detail, ensure_ascii=False)
+            except (TypeError, ValueError) as exc:
+                raise TypeError("PipelineFailure detail mapping must contain JSON data") from exc
         super().__init__(f"{reason}: {detail}" if detail is not None else reason)
         self.reason = reason
         self.detail = detail
@@ -589,13 +606,24 @@ class PipelineV2Coordinator:
             if budget <= 0:
                 raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
             if attempt > budget:
+                try:
+                    evidence_sha256 = hashlib.sha256(
+                        (gate_dir(ctx.run_dir, number, stage) / "evidence.json").read_bytes()
+                    ).hexdigest()
+                except OSError as exc:
+                    raise PipelineFailure(
+                        "RESUME_INTEGRITY_FAILURE", "latest deterministic evidence is unreadable",
+                    ) from exc
                 raise PipelineFailure(
                     "CHECK_REPAIR_EXHAUSTED",
                     {
-                        "remaining_failed_check_ids": [
+                        "failed_check_ids": [
                             item.split(":", 1)[1] for item in soft if ":" in item
                         ],
-                        "attempts": attempt - 1,
+                        "candidate_tree": evidence.staged_tree_sha,
+                        "attempt_count": attempt - 1,
+                        "budget": budget,
+                        "latest_evidence_sha256": evidence_sha256,
                     },
                 )
             if not repair_boundary_written:

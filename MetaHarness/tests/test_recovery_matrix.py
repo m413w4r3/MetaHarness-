@@ -67,7 +67,7 @@ RECOVERY_MATRIX = (
     ("wait", "required publication remote unavailable", "PUSH_FAILED", {"remote_required": True, "remote_unavailable": True}, D.WAIT_EXTERNAL, P.PUBLISH, RunStatus.WAITING_REMOTE),
     ("wait", "true product decision", "SPEC_DECISION_REQUIRED", {}, D.WAIT_HUMAN, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
     ("wait", "security/policy decision", "SECURITY_POLICY_DECISION_REQUIRED", {}, D.WAIT_HUMAN, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
-    ("wait", "check repair exhausted", "CHECK_REPAIR_EXHAUSTED", {}, D.WAIT_HUMAN, P.DETERMINISTIC_GATE, RunStatus.WAITING_HUMAN),
+    ("wait", "check repair exhausted", "CHECK_REPAIR_EXHAUSTED", {}, D.WAIT_HUMAN, P.DETERMINISTIC_GATE, RunStatus.WAITING_CHECK_REPAIR),
     ("wait", "review repair exhausted", "WAITING_REPAIR_EXHAUSTED", {}, D.WAIT_HUMAN, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
     ("hard", "unknown failure code", "TOTALLY_NEW_FAILURE", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
     ("hard", "secret", "SECRET_IN_DIFF", {}, D.HARD_STOP, P.DETERMINISTIC_GATE, RunStatus.FAILED),
@@ -109,11 +109,11 @@ class RecoveryMatrixTests(unittest.TestCase):
                     code, phase=phase, remote_required=facts.get("remote_required", False),
                 )
                 self.assertEqual(terminal.status, status)
-                # Only external waits are automatically resumable; an operator
-                # decision or a hard stop never resumes by itself.
+                # Waiting states resume only where a durable retry boundary
+                # exists; a genuine operator decision or hard stop does not.
                 self.assertEqual(terminal.resumable, status in {
                     RunStatus.WAITING_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE,
-                    RunStatus.WAITING_REMOTE,
+                    RunStatus.WAITING_REMOTE, RunStatus.WAITING_CHECK_REPAIR,
                 })
                 self.assertNotIn(exit_decision.disposition, _AUTOMATIC)
 
@@ -296,7 +296,6 @@ class RecoveryPathTests(PipelineHarness):
         ("CHECK_INFRASTRUCTURE_UNAVAILABLE", RunStatus.WAITING_CHECK_INFRASTRUCTURE, True),
         ("REVIEWER_TRANSPORT_FAILURE", RunStatus.WAITING_EXTERNAL, True),
         ("SPEC_DECISION_REQUIRED", RunStatus.WAITING_HUMAN, False),
-        ("CHECK_REPAIR_EXHAUSTED", RunStatus.WAITING_HUMAN, False),
         # An escaped automatic recovery is never re-authorized at the exit.
         ("REVIEW_REPLAN", RunStatus.WAITING_HUMAN, False),
         ("AGENT_TIMEOUT", RunStatus.WAITING_EXTERNAL, True),

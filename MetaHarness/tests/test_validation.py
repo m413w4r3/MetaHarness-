@@ -69,6 +69,24 @@ class ValidationTestBase(unittest.TestCase):
 
 
 class ValidationTests(ValidationTestBase):
+    def test_explicit_docker_outage_is_infrastructure_but_pytest_failures_are_product(self) -> None:
+        infra = CheckConfig(
+            "integration",
+            self.command("print('Cannot connect to the Docker daemon'); raise SystemExit(1)"),
+        )
+        result = run_checks(self.repo, self.config((infra,)))[0]
+        self.assertEqual(result.failure_kind, "infrastructure_unavailable")
+
+        product = CheckConfig(
+            "integration",
+            self.command(
+                "print('Cannot connect to the Docker daemon'); "
+                "print('20 failed, 2 passed'); raise SystemExit(1)"
+            ),
+        )
+        result = run_checks(self.repo, self.config((product,)))[0]
+        self.assertEqual(result.failure_kind, "nonzero_exit")
+
     def test_success_failure_and_all_checks_continue(self) -> None:
         marker = Path(self.tempdir.name) / "second-ran"
         checks = (

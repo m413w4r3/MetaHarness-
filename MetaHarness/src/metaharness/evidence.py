@@ -476,6 +476,7 @@ def collect_evidence(
             failures.append(f"CHECK_TIMEOUT:{check.name}")
         elif check.failure_kind in {
             "missing_executable", "process_start_failed", "signal_terminated",
+            "infrastructure_unavailable",
         }:
             failures.append(f"CHECK_INFRA_FAILURE:{check.name}")
         elif check.exit_code != 0:

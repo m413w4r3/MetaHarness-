@@ -190,6 +190,8 @@ from .plan_recovery import (
     write_plan_recovery_record,
 )
 from .resume import (
+    CHECK_REPAIR_INTEGRITY_OPERATION,
+    CHECK_REPAIR_RETRY_OPERATION,
     CONTRACT_REPAIR_INTEGRITY_OPERATION,
     PHASE_STATUS,
     STEP_ACCEPTANCE_INTEGRITY_OPERATION,
@@ -211,7 +213,7 @@ from .resume import (
     write_checkpoint,
 )
 from .usage import normalize_usage, empty_usage, phase_usage_summary, read_usage_artifact
-from .redaction import config_secret_values, redact, redact_file
+from .redaction import config_secret_values, redact, redact_file, redact_mapping
 from .diagnostics import write_run_diagnostics
 from .profiles import (
     ProfileError,
@@ -316,6 +318,7 @@ from .orchestration.candidate import (
 )
 from .orchestration.pipeline_v2 import (
     CyclePlan,
+    FailureDetail,
     PipelineFailure,
     PipelineV2Context,
     PipelineV2Coordinator,
@@ -1561,10 +1564,10 @@ class Orchestrator:
                 },
                 once=True,
             )
-        elif result.status is RunStatus.WAITING_HUMAN:
+        elif result.status in {RunStatus.WAITING_HUMAN, RunStatus.WAITING_CHECK_REPAIR}:
             failure = result.state.get("failure") if isinstance(result.state, Mapping) else None
             self._trace_emit(
-                "run.waiting_human",
+                "run.waiting_check_repair" if result.status is RunStatus.WAITING_CHECK_REPAIR else "run.waiting_human",
                 phase="run",
                 cycle=result.state.get("cycle") if isinstance(result.state, Mapping) else None,
                 data={
@@ -1577,6 +1580,7 @@ class Orchestrator:
             RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.BLOCKED,
             RunStatus.PLAN_REJECTED, RunStatus.WAITING_HUMAN,
             RunStatus.WAITING_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE,
+            RunStatus.WAITING_CHECK_REPAIR,
             RunStatus.WAITING_REMOTE, RunStatus.WAITING_SCOPE_APPROVAL,
             RunStatus.WAITING_CONTRACT_REPAIR, RunStatus.COMMITTED, RunStatus.PUBLISHED,
         }:
@@ -2201,9 +2205,8 @@ class Orchestrator:
         except (ResumeIntegrityError, ResumeRequiresOperatorError):
             raise
         except Exception as exc:
-            return self._v2_failed(
-                store, pipeline.run_dir, _failure_reason(exc), None,
-                redact(str(exc), self._secrets),
+            return self._project_exception(
+                store, pipeline.run_dir, exc, operation="pipeline_coordinator",
             )
 
     def _pipeline_operations(self, store: RunStateStore) -> PipelineV2Operations:
@@ -3541,6 +3544,12 @@ class Orchestrator:
 
         directory = gate_dir(ctx.run_dir, cycle_plan.cycle, stage)
         directory.mkdir(parents=True, exist_ok=True)
+        attempts_dir = directory / "attempts"
+        archived_gate_attempts = sum(
+            1 for item in attempts_dir.iterdir()
+            if item.is_dir() and item.name.isdigit()
+        ) if attempts_dir.is_dir() else 0
+        gate_attempt = archived_gate_attempts + (1 if (directory / "evidence.json").is_file() else 0) + 1
         retry_check = self._check_recovery(store).gate_retries(
             cycle=cycle_plan.cycle.number, stage=stage.value, worktree=ctx.info.worktree,
         )
@@ -3557,6 +3566,7 @@ class Orchestrator:
         )
         gate = {
             "stage": stage.value,
+            "attempt": gate_attempt,
             "passed": evidence.deterministic_passed,
             "required_check_ids": list(evidence.required_check_ids),
             "failures": list(evidence.failures),
@@ -3566,6 +3576,7 @@ class Orchestrator:
             staged_tree_sha=evidence.staged_tree_sha,
             changed_files=list(evidence.changed_files),
             deterministic_gate=gate,
+            deterministic_gate_attempt=gate_attempt,
         )
         self._cycle_update(store, cycle_plan.cycle, deterministic_gate=gate)
         retry_check.settle(evidence)
@@ -6330,7 +6341,7 @@ class Orchestrator:
 
     def _v2_failed(
         self, store: RunStateStore, run_dir: Path, reason: str,
-        step_id: str | None, detail: Any = None, *,
+        step_id: str | None, detail: FailureDetail | None = None, *,
         usage: Mapping[str, int] | None = None,
         profile_id: str | None = None,
         tree_before: str | None = None,
@@ -6372,6 +6383,50 @@ class Orchestrator:
         fields = _terminal_step_fields(
             state, step_id, "waiting" if terminal_status is not RunStatus.FAILED else "failed",
         )
+        if reason == "CHECK_REPAIR_EXHAUSTED" and isinstance(detail, Mapping):
+            failure_detail = dict(detail)
+            evidence_sha = failure_detail.get("latest_evidence_sha256")
+            failed_ids = failure_detail.get("failed_check_ids")
+            candidate_tree = failure_detail.get("candidate_tree")
+            attempt_count = failure_detail.get("attempt_count")
+            budget = failure_detail.get("budget")
+            try:
+                checkpoint = read_checkpoint(run_dir)
+            except ResumeCheckpointError:
+                checkpoint = None
+            reports: list[dict[str, Any]] = []
+            if (
+                checkpoint is not None and checkpoint.stage is not None
+                and isinstance(attempt_count, int) and not isinstance(attempt_count, bool)
+            ):
+                root = check_repair_dir(run_dir, checkpoint.review_cycle, checkpoint.stage) / "attempts"
+                for number in range(1, attempt_count + 1):
+                    report_path = root / f"{number:03d}" / "report.json"
+                    if report_path.is_file():
+                        try:
+                            digest = hashlib.sha256(report_path.read_bytes()).hexdigest()
+                        except OSError:
+                            digest = None
+                        reports.append({
+                            "attempt": number,
+                            "artifact": report_path.relative_to(run_dir).as_posix(),
+                            "sha256": digest,
+                        })
+            failure_detail["repair_reports"] = reports
+            prior_check_repair = state.get("check_repair")
+            fields["check_repair"] = {
+                **(dict(prior_check_repair) if isinstance(prior_check_repair, Mapping) else {}),
+                "status": "exhausted",
+                "attempt_count": attempt_count,
+                "budget": budget,
+                "failed_check_ids": list(failed_ids) if isinstance(failed_ids, list) else [],
+                "candidate_tree": candidate_tree,
+                "repair_reports": reports,
+                "latest_evidence_sha256": evidence_sha,
+                "failure_classification": "product_check",
+                "next_action": "Retry deterministic gate",
+            }
+            detail = failure_detail
         if auto_resumable is not None:
             fields["recovery_resumable"] = auto_resumable
         cycles = list(state.get("cycles") or [])
@@ -6434,12 +6489,17 @@ class Orchestrator:
         return checkpoint.phase if checkpoint is not None else default
 
     def _persist_exit(
-        self, store: RunStateStore, reason: str, detail: Any,
+        self, store: RunStateStore, reason: str, detail: FailureDetail | None,
         status: RunStatus, **fields: Any,
     ) -> dict[str, Any]:
         """Write one terminal or waiting outcome; FAILED only for hard stops."""
 
-        detail = redact(detail, self._secrets) if detail is not None else None
+        if isinstance(detail, str):
+            detail = redact(detail, self._secrets)
+        elif isinstance(detail, Mapping):
+            detail = redact_mapping(detail, self._secrets)
+        elif detail is not None:
+            raise TypeError("failure detail must be text or a structured mapping")
         if status is RunStatus.FAILED:
             return store.record_failure(reason, detail, **fields)
         failure = {"reason": reason}
@@ -6448,19 +6508,58 @@ class Orchestrator:
         return store.update(status=status, failure=failure, **fields)
 
     def _project_exception(
-        self, store: RunStateStore, run_dir: Path, exc: Exception,
+        self, store: RunStateStore, run_dir: Path, exc: Exception, *,
+        operation: str = "orchestrator",
     ) -> RunResult:
         """Project an exception that escaped every recovery loop."""
 
         reason = normalize_exit_reason(_failure_reason(exc))
-        _decision, terminal = project_exit(reason, phase=self._checkpoint_phase(run_dir))
+        phase = self._checkpoint_phase(run_dir)
+        _decision, terminal = project_exit(reason, phase=phase)
+        detail: FailureDetail
+        auto_resumable: bool | None = None
+        if reason == "INTERNAL_HARNESS_ERROR":
+            message = " ".join(str(exc).split())[:500]
+            detail = {
+                "exception_type": type(exc).__name__,
+                "message": message,
+                "phase": phase.value,
+                "operation": operation,
+            }
+            auto_resumable = self._checkpoint_is_retryable(store, run_dir)
+            status = RunStatus.WAITING_EXTERNAL if auto_resumable else RunStatus.FAILED
+        else:
+            detail = " ".join(str(exc).split())[:500]
+            status = terminal.status
         fields = self._closing_step_fields(
-            store, "failed" if terminal.status is RunStatus.FAILED else "waiting",
+            store, "waiting" if status is not RunStatus.FAILED else "failed",
         )
-        # A crash-shaped hard stop stays operator-resumable: resume validation,
-        # not this projection, is the authority over its checkpoint.
-        state = self._persist_exit(store, reason, str(exc), terminal.status, **fields)
-        return RunResult(run_dir, terminal.status, state)
+        if auto_resumable is not None:
+            fields["recovery_resumable"] = auto_resumable
+        state = self._persist_exit(store, reason, detail, status, **fields)
+        return RunResult(run_dir, status, state)
+
+    def _checkpoint_is_retryable(self, store: RunStateStore, run_dir: Path) -> bool:
+        """Only make an internal crash resumable after the full resume gate passes."""
+
+        try:
+            state = store.load()
+            checkpoint = read_checkpoint(run_dir)
+            if checkpoint is None:
+                return False
+            options, _digest = read_run_options_for_state(run_dir, state)
+            config = effective_run_config(self.config, options)
+            validate_resume(
+                config=config,
+                repair_scope=effective_repair_scope_policy(options),
+                run_dir=run_dir,
+                state=state,
+                checkpoint=checkpoint,
+                staging_remote=config.repository.remote,
+            )
+        except Exception:
+            return False
+        return True
 
     def _publication_push_failed(
         self, store: RunStateStore, run_dir: Path, detail: str, *,
@@ -6835,8 +6934,9 @@ class Orchestrator:
         eligibility = resume_info(run_dir, state)
         if eligibility.operation in {
             CONTRACT_REPAIR_INTEGRITY_OPERATION, STEP_ACCEPTANCE_INTEGRITY_OPERATION,
+            CHECK_REPAIR_INTEGRITY_OPERATION,
         }:
-            # A stranded contract repair whose evidence no longer proves its
+            # A stranded recovery whose durable evidence no longer proves its
             # identity: fail closed, without any model call.
             failed = store.record_failure(
                 "RESUME_INTEGRITY_FAILURE", eligibility.reason,
@@ -6871,6 +6971,12 @@ class Orchestrator:
                 )
                 return self._diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
             migration = "historical_commit_gate_stale_authority"
+        if (
+            eligibility.operation == CHECK_REPAIR_RETRY_OPERATION
+            and isinstance(state.get("failure"), Mapping)
+            and state["failure"].get("reason") == "ATTRIBUTEERROR"
+        ):
+            migration = "historical_check_repair_redaction_crash"
         previous = state.get("resume") if isinstance(state.get("resume"), dict) else {}
         attempts = previous.get("attempts") if isinstance(previous.get("attempts"), int) else 0
         record = {
@@ -7431,7 +7537,7 @@ def _failure_reason(exc: Exception) -> str:
         return exc.code
     if isinstance(exc, GitHubIntegrationError):
         return getattr(exc, "code", "GITHUB_WORKSTREAM_FAILURE")
-    return exc.__class__.__name__.upper()
+    return "INTERNAL_HARNESS_ERROR"
 
 
 def run_orchestrator(

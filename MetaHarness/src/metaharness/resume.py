@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -244,7 +245,7 @@ PHASE_STATUS.update({
 })
 _RESUMABLE_STATUSES = frozenset({
     "failed", "interrupted", "waiting_scope_approval", "waiting_check_infrastructure",
-    "waiting_remote", "waiting_external", "waiting_contract_repair",
+    "waiting_remote", "waiting_external", "waiting_contract_repair", "waiting_check_repair",
 })
 # An operator retry of the StepContractRepairPlanner of one pending slot.
 CONTRACT_REPAIR_OPERATION = "contract_repair"
@@ -254,6 +255,9 @@ CONTRACT_REPAIR_INTEGRITY_OPERATION = "contract_repair_integrity"
 STEP_ACCEPTANCE_OPERATION = "step_acceptance"
 # A legacy stale-authority commit gate whose candidate evidence diverged.
 STEP_ACCEPTANCE_INTEGRITY_OPERATION = "step_acceptance_integrity"
+# Exact exhausted check-repair state (including one historical redaction crash).
+CHECK_REPAIR_RETRY_OPERATION = "check_repair_retry"
+CHECK_REPAIR_INTEGRITY_OPERATION = "check_repair_integrity"
 _STRANDED_DETAIL = re.compile(r"step=(S[0-9]{2}) contract repair failed: ")
 # Failures that a checkpoint can never repair: the run needs an operator.
 _TERMINAL_FAILURES = frozenset({
@@ -371,6 +375,9 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
             False, reason=f"stranded step acceptance evidence is inconsistent: {historical.reason}",
             step_id=historical.step_id, operation=STEP_ACCEPTANCE_INTEGRITY_OPERATION,
         )
+    check_repair = _check_repair_exhaustion_info(run_dir, state)
+    if check_repair is not None:
+        return check_repair
     if historical.status == HISTORICAL_PROVEN:
         # The worker candidate is proven; only its commit was refused with a
         # stale authority.  The migration moves the run to STEP_ACCEPTANCE.
@@ -421,6 +428,191 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     )
 
 
+def _check_repair_exhaustion_info(
+    run_dir: str | Path, state: Mapping[str, Any],
+) -> ResumeInfo | None:
+    """Recognize only a proven exhausted gate or its exact legacy redaction crash."""
+
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    detail = failure.get("detail")
+    legacy = (
+        state.get("status") == "failed"
+        and state.get("planning_protocol") == "v2"
+        and failure.get("reason") == "ATTRIBUTEERROR"
+        and detail == "'dict' object has no attribute 'replace'"
+    )
+    exhausted = (
+        state.get("status") == "waiting_check_repair"
+        and state.get("planning_protocol") == "v2"
+        and failure.get("reason") == "CHECK_REPAIR_EXHAUSTED"
+    )
+    if not (legacy or exhausted):
+        return None
+
+    def invalid(reason: str) -> ResumeInfo:
+        return ResumeInfo(
+            False, reason=reason, operation=CHECK_REPAIR_INTEGRITY_OPERATION,
+        )
+
+    directory = Path(run_dir)
+    try:
+        checkpoint = read_checkpoint(directory)
+        from .run_options import read_run_options_for_state
+        options, _ = read_run_options_for_state(directory, state)
+    except (OSError, ValueError):
+        return invalid("exhausted check-repair authority is unreadable")
+    budget = options.max_check_repair_attempts
+    if (
+        checkpoint is None
+        or checkpoint.phase is not ResumePhase.DETERMINISTIC_GATE
+        or checkpoint.stage is None
+        or checkpoint.stage.value != "POST_IMPLEMENTATION"
+        or budget < 1
+        or checkpoint.check_repair_attempt != budget
+        or checkpoint.expected_head_sha is None
+        or checkpoint.expected_tree_sha is None
+    ):
+        return invalid("exhausted check-repair checkpoint does not match its budget")
+
+    cycle = checkpoint.review_cycle
+    stage_dir = checkpoint.stage.value.casefold().replace("_", "-")
+    attempt_path = (
+        directory / "cycles" / f"{cycle:03d}" / "check-repair" / stage_dir
+        / "attempts" / f"{budget:03d}" / "attempt.json"
+    )
+    evidence_path = (
+        directory / "cycles" / f"{cycle:03d}" / "checks" / stage_dir / "evidence.json"
+    )
+    try:
+        if attempt_path.stat().st_size > 128 * 1024 or evidence_path.stat().st_size > 4 * 1024 * 1024:
+            return invalid("latest check-repair evidence exceeds its size limit")
+        attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+        evidence_bytes = evidence_path.read_bytes()
+        evidence = json.loads(evidence_bytes)
+    except (OSError, UnicodeError, ValueError):
+        return invalid("latest check-repair attempt or gate evidence is missing")
+    if (
+        not isinstance(attempt, dict)
+        or attempt.get("number") != budget
+        or attempt.get("tree_after") != checkpoint.expected_tree_sha
+        or not isinstance(attempt.get("failed_check_ids_before"), list)
+        or any(not isinstance(item, str) for item in attempt["failed_check_ids_before"])
+        or not isinstance(evidence, dict)
+        or evidence.get("staged_tree_sha") != checkpoint.expected_tree_sha
+        or evidence.get("deterministic_passed") is not False
+        or not isinstance(evidence.get("failures"), list)
+        or any(
+            not isinstance(item, str) or not item.startswith("CHECK_FAILED:")
+            for item in evidence["failures"]
+        )
+        or not evidence["failures"]
+    ):
+        return invalid("latest gate evidence is not a red product-check result")
+
+    evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
+    failed_ids = [item.split(":", 1)[1] for item in evidence["failures"]]
+    check_repair_state = state.get("check_repair")
+    stored_sha = None
+    if not isinstance(check_repair_state, Mapping):
+        return invalid("check-repair attempt summary is missing")
+    else:
+        stored_sha = check_repair_state.get("latest_evidence_sha256")
+        if stored_sha is not None and stored_sha != evidence_sha256:
+            return invalid("latest deterministic evidence hash changed")
+        stored_attempts = check_repair_state.get("attempt_count")
+        attempt_summaries = check_repair_state.get("attempts")
+        if (
+            stored_attempts != budget
+            or not isinstance(attempt_summaries, list)
+            or len(attempt_summaries) != budget
+            or any(
+                not isinstance(item, Mapping) or item.get("number") != index
+                for index, item in enumerate(attempt_summaries, start=1)
+            )
+        ):
+            return invalid("check-repair attempt count does not match its budget")
+        reports = check_repair_state.get("repair_reports")
+        if reports is not None:
+            if not isinstance(reports, list):
+                return invalid("check-repair report references are malformed")
+            for report in reports:
+                if not isinstance(report, Mapping):
+                    return invalid("check-repair report reference is malformed")
+                number = report.get("attempt")
+                relative = report.get("artifact")
+                digest = report.get("sha256")
+                expected_relative = (
+                    f"cycles/{cycle:03d}/check-repair/{stage_dir}/attempts/{number:03d}/report.json"
+                    if isinstance(number, int) and not isinstance(number, bool) and 1 <= number <= budget
+                    else None
+                )
+                if (
+                    relative != expected_relative
+                    or not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    return invalid("check-repair report reference identity is invalid")
+                try:
+                    if hashlib.sha256((directory / relative).read_bytes()).hexdigest() != digest:
+                        return invalid("check-repair report hash changed")
+                except OSError:
+                    return invalid("check-repair report artifact is unreadable")
+    detail_sha = detail.get("latest_evidence_sha256") if isinstance(detail, Mapping) else None
+    if detail_sha is not None and detail_sha != evidence_sha256:
+        return invalid("latest failure evidence hash changed")
+    if exhausted and (stored_sha != evidence_sha256 or detail_sha != evidence_sha256):
+        return invalid("exhausted check-repair state has no evidence hash authority")
+    if exhausted and (
+        not isinstance(detail, Mapping)
+        or detail.get("attempt_count") != budget
+        or detail.get("budget") != budget
+        or detail.get("candidate_tree") != checkpoint.expected_tree_sha
+        or detail.get("failed_check_ids") != failed_ids
+        or check_repair_state.get("candidate_tree") != checkpoint.expected_tree_sha
+        or check_repair_state.get("failed_check_ids") != failed_ids
+    ):
+        return invalid("exhausted check-repair summary does not match its gate evidence")
+
+    worktree_value = state.get("worktree")
+    if not isinstance(worktree_value, str) or not worktree_value:
+        return invalid("check-repair candidate worktree is missing")
+    try:
+        from .attempt_transaction import status_has_unstaged_or_untracked
+        from .gitops import (
+            candidate_tree_sha, current_head, index_tree_sha, resolve_tree, status_porcelain,
+        )
+        worktree = Path(worktree_value)
+        if (
+            current_head(worktree) != checkpoint.expected_head_sha
+            or candidate_tree_sha(worktree) != checkpoint.expected_tree_sha
+            or index_tree_sha(worktree) != checkpoint.expected_tree_sha
+            or status_has_unstaged_or_untracked(status_porcelain(worktree))
+        ):
+            return invalid("check-repair candidate HEAD or tree changed")
+    except (OSError, ValueError, RuntimeError):
+        return invalid("check-repair candidate integrity cannot be verified")
+
+    if state.get("expected_head_sha") not in {None, checkpoint.expected_head_sha}:
+        return invalid("check-repair expected HEAD does not match its checkpoint")
+    try:
+        head_tree = resolve_tree(worktree, checkpoint.expected_head_sha)
+    except (OSError, ValueError, RuntimeError):
+        return invalid("check-repair expected HEAD tree cannot be verified")
+    if state.get("expected_tree_sha") not in {None, head_tree}:
+        return invalid("check-repair expected tree does not match its accepted HEAD")
+    if state.get("staged_tree_sha") not in {None, checkpoint.expected_tree_sha}:
+        return invalid("check-repair candidate tree does not match its checkpoint")
+
+    return ResumeInfo(
+        True,
+        ResumePhase.DETERMINISTIC_GATE.value,
+        resume_label(checkpoint),
+        expected_tree=checkpoint.expected_tree_sha,
+        review_cycle=cycle,
+        operation=CHECK_REPAIR_RETRY_OPERATION,
+    )
+
+
 class ResumeError(RuntimeError):
     pass
 
@@ -438,7 +630,8 @@ class ResumeRequiresOperatorError(ResumeError):
 
 
 __all__ = [
-    "CHECKPOINT_NAME", "CONTRACT_REPAIR_INTEGRITY_OPERATION", "CONTRACT_REPAIR_OPERATION",
+    "CHECKPOINT_NAME", "CHECK_REPAIR_INTEGRITY_OPERATION", "CHECK_REPAIR_RETRY_OPERATION",
+    "CONTRACT_REPAIR_INTEGRITY_OPERATION", "CONTRACT_REPAIR_OPERATION",
     "PHASE_STATUS", "STEP_ACCEPTANCE_INTEGRITY_OPERATION", "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint",
     "ResumeCheckpointError", "ResumeError", "ResumeInfo", "ResumeIntegrityError",
     "ResumeNotAllowedError", "ResumePhase", "ResumeRequiresOperatorError",

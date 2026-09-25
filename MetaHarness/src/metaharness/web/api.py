@@ -1256,7 +1256,7 @@ LIVE_STOP_STATUSES = frozenset({
     "waiting_human",
     "awaiting_plan_approval", "waiting_check_infrastructure",
     "waiting_scope_approval", "waiting_remote", "waiting_external",
-    "waiting_contract_repair",
+    "waiting_contract_repair", "waiting_check_repair",
 })
 _CONTRACT_REPAIR_PHASES = {
     "running": "Contract repair",

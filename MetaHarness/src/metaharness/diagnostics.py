@@ -21,7 +21,7 @@ from .plan_recovery import PLAN_RECOVERY_ARTIFACT, PLAN_SOURCE_OPERATOR, plan_so
 from .profiles import profiles_for_config, safe_profile_metadata
 from .redaction import config_secret_values, redact
 from .result import atomic_write_text
-from .resume import ResumeCheckpointError, resume_info, read_checkpoint_record
+from .resume import ResumeCheckpointError, read_checkpoint, resume_info, read_checkpoint_record
 from .orchestration.pipeline_v2 import (
     check_repair_root,
     correction_dir,
@@ -557,6 +557,76 @@ def _semantic_revision_status(run_dir: Path, revision_exists: bool) -> str:
     return "Semantic revision artifacts present."
 
 
+def _check_recovery_summary(run_dir: Path, state: Mapping[str, Any]) -> str:
+    """Render the bounded deterministic-gate recovery authority and next step."""
+
+    checkpoint = None
+    try:
+        checkpoint = read_checkpoint(run_dir)
+    except ResumeCheckpointError:
+        pass
+    repair = state.get("check_repair") if isinstance(state.get("check_repair"), Mapping) else {}
+    gate = state.get("deterministic_gate") if isinstance(state.get("deterministic_gate"), Mapping) else {}
+    options = state.get("run_options") if isinstance(state.get("run_options"), Mapping) else {}
+    pipeline = options.get("pipeline") if isinstance(options.get("pipeline"), Mapping) else {}
+    budget = pipeline.get("max_check_repair_attempts")
+    used = repair.get("attempt_count")
+    attempt = gate.get("attempt", state.get("deterministic_gate_attempt"))
+    failures = gate.get("failures") if isinstance(gate.get("failures"), list) else []
+    failed_ids = repair.get("failed_check_ids")
+    if not isinstance(failed_ids, list):
+        failed_ids = [
+            item.split(":", 1)[1] for item in failures
+            if isinstance(item, str) and item.startswith("CHECK_FAILED:")
+        ]
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    reason = failure.get("reason")
+    if any(isinstance(item, str) and item.startswith("CHECK_FAILED:") for item in failures):
+        classification = "product_check"
+    elif (
+        state.get("status") == "waiting_check_infrastructure"
+        or any(isinstance(item, str) and item.startswith(("CHECK_INFRA", "CHECK_TIMEOUT")) for item in failures)
+    ):
+        classification = "infrastructure"
+    elif isinstance(reason, str) and (
+        "INTEGRITY" in reason or "SECURITY" in reason or reason.startswith("SECRET_")
+    ):
+        classification = "security/integrity"
+    elif reason == "INTERNAL_HARNESS_ERROR":
+        classification = "internal_harness_error"
+    else:
+        classification = "unclassified"
+    candidate_tree = repair.get("candidate_tree") or state.get("staged_tree_sha")
+    evidence_sha = repair.get("latest_evidence_sha256")
+    if not isinstance(evidence_sha, str) and checkpoint is not None and checkpoint.stage is not None:
+        gate_dir_path = run_dir / "cycles" / f"{checkpoint.review_cycle:03d}" / "checks" / checkpoint.stage.value.casefold().replace("_", "-")
+        try:
+            evidence_sha = hashlib.sha256((gate_dir_path / "evidence.json").read_bytes()).hexdigest()
+        except OSError:
+            evidence_sha = None
+    if reason == "CHECK_REPAIR_EXHAUSTED" or reason == "ATTRIBUTEERROR" and checkpoint is not None and checkpoint.stage is not None:
+        next_action = "Retry deterministic gate"
+    elif state.get("status") == "waiting_check_infrastructure":
+        next_action = "Retry check infrastructure"
+    else:
+        next_action = repair.get("next_action") or "No automatic recovery action"
+    reports = repair.get("repair_reports") if isinstance(repair.get("repair_reports"), list) else []
+    report_paths = [
+        item.get("artifact") for item in reports
+        if isinstance(item, Mapping) and isinstance(item.get("artifact"), str)
+    ]
+    return "\n".join((
+        f"deterministic gate attempt: {attempt if isinstance(attempt, int) else 'unavailable'}",
+        f"check-repair attempts used / budget: {used if isinstance(used, int) else 0} / {budget if isinstance(budget, int) else 'unavailable'}",
+        f"latest failed check IDs: {', '.join(str(item) for item in failed_ids) if failed_ids else 'none recorded'}",
+        f"latest candidate tree: {candidate_tree if isinstance(candidate_tree, str) else 'unavailable'}",
+        f"latest evidence SHA256: {evidence_sha if isinstance(evidence_sha, str) else 'unavailable'}",
+        f"failure classification: {classification}",
+        f"next recovery action: {next_action}",
+        f"repair reports: {', '.join(report_paths) if report_paths else 'none recorded'}",
+    ))
+
+
 def _repair_scope_policy_status(run_dir: Path) -> str:
     """Render the frozen repair-scope authority of the run."""
 
@@ -841,6 +911,7 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
     except (OSError, ValueError, ResumeCheckpointError) as exc:
         checkpoint_text = _artifact_json(directory, "resume_checkpoint.json", secrets) + "Resume information unavailable: " + redact(str(exc), secrets)[:500]
     body += _section("RESUME", checkpoint_text)
+    body += _section("DETERMINISTIC GATE RECOVERY", _check_recovery_summary(directory, state))
     try:
         body += _section("CONTRACT REPAIR", _contract_repairs(directory, state, secrets))
     except (OSError, ValueError) as exc:

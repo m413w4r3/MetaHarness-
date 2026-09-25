@@ -107,6 +107,7 @@ _TERMINAL_LABELS = {
     "waiting_check_infrastructure": "WAITING FOR CHECK INFRASTRUCTURE",
     "waiting_remote": "WAITING FOR REMOTE",
     "waiting_contract_repair": "WAITING FOR CONTRACT REPAIR PLANNER",
+    "waiting_check_repair": "WAITING FOR DETERMINISTIC GATE RETRY",
 }
 _WAITING_LABELS = {
     "waiting_external": "Waiting for external authorization",
@@ -114,6 +115,7 @@ _WAITING_LABELS = {
     "waiting_remote": "Waiting for remote",
     "waiting_human": "Waiting for operator decision",
     "waiting_contract_repair": "Output correction exhausted",
+    "waiting_check_repair": "Check repair budget exhausted",
 }
 TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
 AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
@@ -1016,6 +1018,7 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     if status not in {
         "failed", "blocked", "interrupted", "waiting_check_infrastructure",
         "waiting_remote", "waiting_external", "waiting_human", "waiting_contract_repair",
+        "waiting_check_repair",
     } or not isinstance(failure, dict):
         return ""
     reason = str(failure.get("reason") or "")
@@ -1032,7 +1035,9 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
         "The reviewer requested a correction and the run has no review-correction budget."
         if reason == "HUMAN_REQUIRED" else
         "Every review-correction cycle of the budget was used; the candidate remains at final review."
-        if reason == "WAITING_REPAIR_EXHAUSTED" else ""
+        if reason == "WAITING_REPAIR_EXHAUSTED" else
+        "The bounded check-repair budget is exhausted. Resume reruns the authoritative deterministic gate without replaying implementation steps or starting another repair worker."
+        if reason == "CHECK_REPAIR_EXHAUSTED" else ""
     )
     action = ""
     if resume.get("resumable"):
@@ -1068,6 +1073,8 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
             '<button class="resume" type="submit">REPLACE PLAN</button></form>'
         )
     detail = failure.get("detail")
+    if isinstance(detail, dict):
+        detail = json.dumps(detail, ensure_ascii=False, sort_keys=True)
     return (
         f'<div class="card failure-card"><p class="label">{_e(waiting_label)}</p>'
         f'<p class="failure-title"><strong>{_e(_FAILURE_MESSAGES.get(reason, reason or "Run failed"))}</strong></p>'
