@@ -1,3 +1,4 @@
+import hashlib
 import fcntl
 import json
 import os
@@ -12,6 +13,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.models import RunStatus
+from metaharness.run_options import (
+    RUN_SCHEMA_UNSUPPORTED,
+    SCHEMA_VERSION,
+    RunOptions,
+    RunOptionsError,
+    read_run_options_for_state,
+)
 from metaharness.state import RunStateStore, _exclusive_state_lock
 from metaharness.web.api import ARTIFACT_ALLOWLIST
 
@@ -314,6 +322,50 @@ class StateLockingTests(unittest.TestCase):
             thread.join(timeout=10)
         self.assertEqual(errors, [])
         self.assertEqual(store.load()["status"], "validating")
+
+class FrozenRunOptionsSchemaTests(unittest.TestCase):
+    """An older snapshot fails closed; the run directory is never rewritten."""
+
+    def older_snapshot_bytes(self) -> bytes:
+        options = RunOptions(
+            schema_version=SCHEMA_VERSION,
+            pipeline_version=2,
+            protocol="v2",
+            decomposition="balanced",
+            execution_mode_policy="auto",
+            single_step_max_mutable_paths=2,
+            staged_step_max_mutable_paths=6,
+            semantic_revision_enabled=False,
+            max_check_repair_attempts=0,
+            max_review_repair_cycles=0,
+            planner_profile="planner",
+            mechanical_profile="worker",
+            reasoning_profile="worker",
+            agentic_profile="worker",
+            final_reviewer_profile="reviewer",
+        )
+        snapshot = options.to_dict()
+        snapshot["schema_version"] = SCHEMA_VERSION - 1
+        return (json.dumps(snapshot, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
+
+    def test_older_schema_run_fails_closed_and_keeps_its_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            store = RunStateStore(directory / "state.json")
+            store.initialize("legacy-run")
+            path = directory / "run_options.json"
+            data = self.older_snapshot_bytes()
+            path.write_bytes(data)
+            digest = hashlib.sha256(data).hexdigest()
+            state = store.update(status=RunStatus.CREATED, run_options_sha256=digest)
+
+            with self.assertRaises(RunOptionsError) as caught:
+                read_run_options_for_state(directory, state)
+
+            self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
+            self.assertEqual(path.read_bytes(), data)
+            self.assertEqual(store.load()["run_options_sha256"], digest)
+            self.assertEqual(store.load()["status"], RunStatus.CREATED.value)
 
 
 if __name__ == "__main__":

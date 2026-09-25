@@ -21,7 +21,12 @@ from metaharness.models import (
     SelectionMode,
     UIConfig,
 )
-from metaharness.run_options import RunOptions
+from metaharness.run_options import (
+    RUN_SCHEMA_UNSUPPORTED,
+    SCHEMA_VERSION,
+    RunOptions,
+    RunOptionsError,
+)
 from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
 
 
@@ -168,18 +173,18 @@ class FrozenRoutingTests(unittest.TestCase):
             RunOptions.from_mapping(snapshot).recovery,
             options.recovery,
         )
-        legacy_snapshot = dict(snapshot)
-        legacy_snapshot.pop("recovery")
-        self.assertEqual(
-            RunOptions.from_mapping(legacy_snapshot).recovery,
-            RecoveryBudgets(),
-        )
-        # Snapshots frozen before output corrections keep their recovery table.
-        pre_correction = json.loads(json.dumps(snapshot))
-        del pre_correction["recovery"]["max_contract_repair_output_corrections"]
-        self.assertEqual(
-            RunOptions.from_mapping(pre_correction).recovery.max_contract_repair_output_corrections, 2,
-        )
+        incomplete = json.loads(json.dumps(snapshot))
+        del incomplete["recovery"]["max_contract_repair_output_corrections"]
+        with self.assertRaisesRegex(RunOptionsError, "missing max_contract_repair_output_corrections"):
+            RunOptions.from_mapping(incomplete)
+        without_recovery = json.loads(json.dumps(snapshot))
+        del without_recovery["recovery"]
+        with self.assertRaisesRegex(RunOptionsError, "missing recovery"):
+            RunOptions.from_mapping(without_recovery)
+        older = json.loads(json.dumps(snapshot))
+        older["schema_version"] = SCHEMA_VERSION - 1
+        with self.assertRaisesRegex(RunOptionsError, RUN_SCHEMA_UNSUPPORTED):
+            RunOptions.from_mapping(older)
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "codex"
             runtime_config = HarnessConfig(

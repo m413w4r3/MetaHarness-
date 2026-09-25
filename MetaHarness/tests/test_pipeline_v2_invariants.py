@@ -45,7 +45,7 @@ from metaharness.orchestrator import Orchestrator
 from metaharness.orchestration.resume_validation import _load_completed_step
 from metaharness.resume import pipeline_version_from_state
 from metaharness.review import parse_review
-from metaharness.run_options import RunOptions
+from metaharness.run_options import SCHEMA_VERSION, RunOptions
 from metaharness.state import RunStateStore
 
 
@@ -234,12 +234,13 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
 
     def test_b_check_repair_budget_is_separate_from_review_budget(self) -> None:
         options = RunOptions(
-            schema_version=2, pipeline_version=2, protocol="v2",
+            schema_version=SCHEMA_VERSION, pipeline_version=2, protocol="v2",
             decomposition="balanced", execution_mode_policy="auto",
             single_step_max_mutable_paths=2, staged_step_max_mutable_paths=6,
             semantic_revision_enabled=True, max_check_repair_attempts=2,
             max_review_repair_cycles=4, planner_profile="planner",
-            default_implementer_profile="worker", check_repair_profile="repair",
+            mechanical_profile="worker", reasoning_profile="worker",
+            agentic_profile="worker", check_repair_profile="repair",
             semantic_reviser_profile="reviser", final_reviewer_profile="reviewer",
         )
         self.assertEqual(options.max_check_repair_attempts, 2)

@@ -17,6 +17,7 @@ from metaharness.orchestration.pipeline_v2 import (
     gate_dir,
 )
 from metaharness.run_options import RunOptions
+from metaharness.run_options import SCHEMA_VERSION as RUN_OPTIONS_SCHEMA_VERSION
 from metaharness.resume import ResumeCheckpoint, ResumeCheckpointError, ResumePhase
 
 
@@ -63,12 +64,13 @@ class GenericArtifactPathTests(unittest.TestCase):
 class GenericSnapshotTests(unittest.TestCase):
     def test_run_options_and_selection_use_only_current_role_names(self) -> None:
         options = RunOptions(
-            schema_version=2, pipeline_version=2, protocol="v2",
+            schema_version=RUN_OPTIONS_SCHEMA_VERSION, pipeline_version=2, protocol="v2",
             decomposition="balanced", execution_mode_policy="auto",
             single_step_max_mutable_paths=2, staged_step_max_mutable_paths=6,
             semantic_revision_enabled=False, max_check_repair_attempts=0,
             max_review_repair_cycles=0, planner_profile="planner",
-            default_implementer_profile="implementer", check_repair_profile=None,
+            mechanical_profile="implementer", reasoning_profile="implementer",
+            agentic_profile="implementer", check_repair_profile=None,
             semantic_reviser_profile=None, final_reviewer_profile="reviewer",
         )
         encoded = options.to_dict()

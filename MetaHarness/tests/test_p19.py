@@ -21,6 +21,7 @@ from metaharness.models import (
     LLMEndpointConfig,
     ModelProfile,
     ProfileDriver,
+    RoutingConfig,
     SelectionMode,
     UIConfig,
 )
@@ -83,6 +84,11 @@ class P19WebTests(unittest.TestCase):
                 default_planner_profile="planner",
                 default_implementer_profile="implementer",
                 default_reviewer_profile="reviewer",
+            ),
+            routing=RoutingConfig(
+                mechanical_profile="implementer",
+                reasoning_profile="implementer",
+                agentic_profile="implementer",
             ),
         )
         self.server = create_server(config, port=0)

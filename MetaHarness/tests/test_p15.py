@@ -21,6 +21,7 @@ from metaharness.models import (
     ModelProfile,
     ExecutionRole,
     ProfileDriver,
+    RoutingConfig,
     SelectionMode,
     UIConfig,
 )
@@ -55,6 +56,11 @@ def config_for(root: Path, *, max_active_runs: int = 1) -> HarnessConfig:
             default_reviewer_profile="reviewer",
         ),
         model_profiles=profiles,
+        routing=RoutingConfig(
+            mechanical_profile="implementer",
+            reasoning_profile="implementer",
+            agentic_profile="implementer",
+        ),
     )
 
 

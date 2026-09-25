@@ -15,6 +15,7 @@ from metaharness.models import (
     HarnessConfig,
     ModelProfile,
     ProfileDriver,
+    RoutingConfig,
     SelectionMode,
     UIConfig,
 )
@@ -165,6 +166,11 @@ class OrchestratorRecommendationTests(unittest.TestCase):
                 enable_profile_recommendation=enabled,
             ),
             model_profiles=profiles,
+            routing=RoutingConfig(
+                mechanical_profile="impl-a",
+                reasoning_profile="impl-a",
+                agentic_profile="impl-a",
+            ),
         )
 
     def test_feature_disabled_and_single_implementer_do_not_call(self) -> None:

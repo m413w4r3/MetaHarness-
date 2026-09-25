@@ -23,9 +23,60 @@ class RunOptionsConflict(RunOptionsError):
     """An immutable run-options artifact already contains different bytes."""
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+# Deterministic refusal code for a snapshot that is not the current schema.
+RUN_SCHEMA_UNSUPPORTED = "RUN_SCHEMA_UNSUPPORTED"
 RUN_OPTIONS_NAME = "run_options.json"
 REPAIR_SCOPE_POLICIES = frozenset({"auto-bounded", "require-approval", "deny-expansion"})
+
+_TOP_LEVEL_FIELDS = frozenset({
+    "schema_version", "pipeline_version", "planning", "pipeline", "profiles", "recovery",
+})
+_PLANNING_FIELDS = frozenset({
+    "protocol", "decomposition", "execution_mode_policy",
+    "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
+    "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
+    "max_preapproval_corrections",
+})
+_PIPELINE_FIELDS = frozenset({
+    "semantic_revision_enabled", "max_check_repair_attempts", "max_review_repair_cycles",
+    "max_step_contract_repairs", "repair_scope_policy", "repair_scope_max_added_paths",
+})
+_PROFILE_FIELDS = frozenset({
+    "planner_profile", "mechanical_profile", "reasoning_profile", "agentic_profile",
+    "check_repair_profile", "semantic_reviser_profile", "final_reviewer_profile",
+})
+_RECOVERY_FIELDS = frozenset({
+    "max_transient_attempts", "max_executor_fallbacks",
+    "max_check_infra_retries", "max_review_transport_retries",
+    "max_workspace_setup_retries", "max_contract_repair_output_corrections",
+    "max_contract_repair_planner_restarts",
+})
+_FALLBACK_FIELDS = frozenset({
+    "mechanical", "reasoning", "agentic", "semantic_reviser", "check_repair",
+})
+
+
+def _require_exact_keys(payload: Any, expected: frozenset[str], where: str) -> None:
+    """One exact key set per section: a missing or extra key is a schema error."""
+
+    if not isinstance(payload, Mapping):
+        raise RunOptionsError(f"{where} schema is invalid")
+    keys = set(payload)
+    missing = sorted(expected - keys)
+    if missing:
+        raise RunOptionsError(f"{where} is missing {missing[0]}")
+    unknown = sorted(keys - expected)
+    if unknown:
+        raise RunOptionsError(f"{where} has unknown key {unknown[0]}")
+
+
+def _fallback_ids(value: Any) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise RunOptionsError("run options recovery.execution_fallbacks must be arrays of profile IDs")
+    if any(not isinstance(profile_id, str) for profile_id in value):
+        raise RunOptionsError("run options recovery.execution_fallbacks must be arrays of profile IDs")
+    return tuple(value)
 
 
 @dataclass(frozen=True)
@@ -70,22 +121,15 @@ class RunOptions:
     max_step_contract_chars: int = 5000
     max_preapproval_corrections: int = 2
     recovery: RecoveryBudgets = RecoveryBudgets()
-    # Constructor-only migration aid. It is never serialized and is not read
-    # by the modern resolver.
-    default_implementer_profile: str | None = None
 
     def __post_init__(self) -> None:
-        if (
-            not self.mechanical_profile and not self.reasoning_profile
-            and not self.agentic_profile
-            and isinstance(self.default_implementer_profile, str)
-            and self.default_implementer_profile.strip()
-        ):
-            object.__setattr__(self, "mechanical_profile", self.default_implementer_profile)
-            object.__setattr__(self, "reasoning_profile", self.default_implementer_profile)
-            object.__setattr__(self, "agentic_profile", self.default_implementer_profile)
-        if self.schema_version != SCHEMA_VERSION or self.pipeline_version != 2:
-            raise RunOptionsError("run options schema or pipeline version is unsupported")
+        if self.schema_version != SCHEMA_VERSION:
+            raise RunOptionsError(
+                f"{RUN_SCHEMA_UNSUPPORTED}: run options schema_version "
+                f"{self.schema_version!r} is not {SCHEMA_VERSION}"
+            )
+        if self.pipeline_version != 2:
+            raise RunOptionsError("run options pipeline_version must be 2")
         if self.protocol != "v2":
             raise RunOptionsError("run options protocol must be v2")
         if self.decomposition not in {"balanced", "aggressive"}:
@@ -154,15 +198,11 @@ class RunOptions:
         unknown = set(overrides) - allowed
         if unknown:
             raise RunOptionsError(f"unknown run option: {sorted(unknown)[0]}")
-        route_defaults = {
+        route_profiles = {
             "mechanical_profile": config.routing.mechanical_profile,
             "reasoning_profile": config.routing.reasoning_profile,
             "agentic_profile": config.routing.agentic_profile,
         }
-        if not all(profile_id in config.model_profiles for profile_id in route_defaults.values()):
-            legacy = config.ui.default_implementer_profile
-            if isinstance(legacy, str) and legacy.strip():
-                route_defaults = {key: legacy for key in route_defaults}
         values: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "pipeline_version": 2,
@@ -180,7 +220,7 @@ class RunOptions:
             "max_review_repair_cycles": config.revision.max_review_repair_cycles,
             "max_step_contract_repairs": config.revision.max_step_contract_repairs,
             "planner_profile": config.ui.default_planner_profile,
-            **route_defaults,
+            **route_profiles,
             "check_repair_profile": config.ui.default_repair_profile,
             "semantic_reviser_profile": config.ui.default_reviser_profile,
             "final_reviewer_profile": config.ui.default_reviewer_profile,
@@ -281,91 +321,42 @@ class RunOptions:
 
     @classmethod
     def from_mapping(cls, value: Any) -> "RunOptions":
-        if not isinstance(value, Mapping) or set(value) not in (
-            {"schema_version", "pipeline_version", "planning", "pipeline", "profiles"},
-            {"schema_version", "pipeline_version", "planning", "pipeline", "profiles", "recovery"},
-        ):
+        """Read the one current snapshot shape; nothing is migrated."""
+
+        if not isinstance(value, Mapping):
             raise RunOptionsError("run options schema is invalid")
-        planning, pipeline, profiles = value["planning"], value["pipeline"], value["profiles"]
-        recovery = value.get("recovery", {})
-        recovery_fields = {
-            "max_transient_attempts", "max_executor_fallbacks",
-            "max_check_infra_retries", "max_review_transport_retries",
-            "max_workspace_setup_retries", "max_contract_repair_output_corrections",
-            "max_contract_repair_planner_restarts",
-        }
-        # Snapshots frozen before output corrections or planner restarts
-        # existed use the defaults of the fields they lack.
-        optional_recovery_fields = {
-            "max_contract_repair_output_corrections", "max_contract_repair_planner_restarts",
-        }
-        legacy_recovery_fields = recovery_fields - optional_recovery_fields
-        fallback_fields = {
-            "mechanical", "reasoning", "agentic", "semantic_reviser", "check_repair",
-        }
-        recovery_keys = set(recovery) if isinstance(recovery, Mapping) else set()
-        fallback_payload = recovery.get("execution_fallbacks", {}) if isinstance(recovery, Mapping) else {}
-        if (
-            not isinstance(recovery, Mapping)
-            or ("recovery" in value and not (
-                legacy_recovery_fields
-                <= recovery_keys
-                <= recovery_fields | {"execution_fallbacks"}
-            ))
-            or ("recovery" not in value and recovery)
-            or not isinstance(fallback_payload, Mapping)
-            or set(fallback_payload) - fallback_fields
-        ):
-            raise RunOptionsError("run options recovery schema is invalid")
-        normalized_recovery: dict[str, Any] = {
-            key: recovery[key] for key in recovery_fields if key in recovery
-        }
+        schema_version = value.get("schema_version")
+        if isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
+            raise RunOptionsError(
+                f"{RUN_SCHEMA_UNSUPPORTED}: run options schema_version "
+                f"{schema_version!r} is not {SCHEMA_VERSION}"
+            )
+        _require_exact_keys(value, _TOP_LEVEL_FIELDS, "run options")
+        planning, pipeline, profiles, recovery = (
+            value["planning"], value["pipeline"], value["profiles"], value["recovery"],
+        )
+        _require_exact_keys(planning, _PLANNING_FIELDS, "run options planning")
+        _require_exact_keys(pipeline, _PIPELINE_FIELDS, "run options pipeline")
+        _require_exact_keys(profiles, _PROFILE_FIELDS, "run options profiles")
+        _require_exact_keys(
+            recovery, _RECOVERY_FIELDS | {"execution_fallbacks"}, "run options recovery",
+        )
+        fallbacks = recovery["execution_fallbacks"]
+        _require_exact_keys(
+            fallbacks, _FALLBACK_FIELDS, "run options recovery.execution_fallbacks",
+        )
+        normalized_recovery: dict[str, Any] = {key: recovery[key] for key in _RECOVERY_FIELDS}
+        normalized_recovery["execution_fallbacks"] = ExecutionFallbacks(
+            **{key: _fallback_ids(fallbacks[key]) for key in _FALLBACK_FIELDS}
+        )
         try:
-            for key, raw in fallback_payload.items():
-                if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)) or any(
-                    not isinstance(profile_id, str) for profile_id in raw
-                ):
-                    raise ValueError
-                normalized_recovery.setdefault("execution_fallbacks", {})[key] = tuple(raw)
-            if "execution_fallbacks" not in normalized_recovery:
-                normalized_recovery["execution_fallbacks"] = ExecutionFallbacks()
-            else:
-                normalized_recovery["execution_fallbacks"] = ExecutionFallbacks(
-                    **normalized_recovery["execution_fallbacks"]
-                )
-        except (TypeError, ValueError) as exc:
-            raise RunOptionsError("run options execution fallback authority is invalid") from exc
-        if not isinstance(planning, Mapping) or set(planning) != {
-            "protocol", "decomposition", "execution_mode_policy",
-            "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
-            "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
-            "max_preapproval_corrections",
-        }:
-            raise RunOptionsError("run options planning schema is invalid")
-        if not isinstance(pipeline, Mapping) or set(pipeline) not in ({
-            "semantic_revision_enabled", "max_check_repair_attempts", "max_review_repair_cycles",
-            "repair_scope_policy", "repair_scope_max_added_paths", "max_step_contract_repairs",
-        }, {
-            # Runs written before contract-repair budgeting used the same
-            # schema version; default the newly introduced bounded budget.
-            "semantic_revision_enabled", "max_check_repair_attempts", "max_review_repair_cycles",
-            "repair_scope_policy", "repair_scope_max_added_paths",
-        }):
-            raise RunOptionsError("run options pipeline schema is invalid")
-        if not isinstance(profiles, Mapping) or set(profiles) != {
-            "planner_profile", "mechanical_profile", "reasoning_profile", "agentic_profile",
-            "check_repair_profile",
-            "semantic_reviser_profile", "final_reviewer_profile",
-        }:
-            raise RunOptionsError("run options profiles schema is invalid")
-        try:
-            if "max_step_contract_repairs" not in pipeline:
-                pipeline = {**pipeline, "max_step_contract_repairs": 2}
             return cls(
-                schema_version=value["schema_version"], pipeline_version=value["pipeline_version"],
+                schema_version=schema_version, pipeline_version=value["pipeline_version"],
                 **planning, **pipeline, **profiles,
                 recovery=RecoveryBudgets(**normalized_recovery),
             )
+        except RunOptionsError:
+            raise
         except (KeyError, TypeError, ValueError) as exc:
             raise RunOptionsError("run options schema is invalid") from exc
 
@@ -464,7 +455,7 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
 
 
 __all__ = [
-    "SCHEMA_VERSION", "RUN_OPTIONS_NAME", "REPAIR_SCOPE_POLICIES",
+    "SCHEMA_VERSION", "RUN_SCHEMA_UNSUPPORTED", "RUN_OPTIONS_NAME", "REPAIR_SCOPE_POLICIES",
     "RunOptions", "RunOptionsConflict", "RunOptionsError",
     "EffectiveRepairScopePolicy", "canonical_run_options_bytes", "run_options_sha256",
     "write_run_options", "read_run_options_for_state", "read_run_options_with_sha256",

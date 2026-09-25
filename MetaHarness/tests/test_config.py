@@ -1,17 +1,27 @@
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.config import ConfigError, load_config
-from metaharness.models import CheckConfig
+from metaharness.models import CheckConfig, RoutingConfig
 from metaharness.planning_v2 import render_safe_check_catalogue
 from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
+from metaharness.run_options import (
+    RUN_SCHEMA_UNSUPPORTED,
+    SCHEMA_VERSION,
+    RunOptions,
+    RunOptionsError,
+    canonical_run_options_bytes,
+)
 
 
 VALID_CONFIG = """
@@ -631,6 +641,102 @@ selection_mode = "cli"
         self.assertEqual(config.model_profiles["implementer-codex"].driver, "external")
         self.assertEqual(config.ui.default_repair_profile, "repair-external")
         self.assertEqual(config.ui.default_reviser_profile, "reviser-claude")
+
+
+class RunOptionsStrictSchemaTests(unittest.TestCase):
+    """`run_options.json` has exactly one shape: schema 3 is read, nothing else."""
+
+    ENVIRONMENT = {
+        "META_PLANNER_BASE_URL": "https://planner.example",
+        "META_PLANNER_ENDPOINT": "/v1/chat",
+        "META_PLANNER_MODEL": "planner-model",
+        "META_NESTED": "nested-value",
+    }
+
+    def config(self):
+        with mock.patch.dict(os.environ, self.ENVIRONMENT):
+            with tempfile.TemporaryDirectory() as directory_name:
+                path = Path(directory_name) / "config.toml"
+                path.write_text(VALID_CONFIG, encoding="utf-8")
+                return load_config(path)
+
+    def snapshot(self) -> dict:
+        return RunOptions.from_config(self.config()).to_dict()
+
+    def test_current_schema_three_round_trips_identically(self) -> None:
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot["schema_version"], SCHEMA_VERSION)
+        options = RunOptions.from_mapping(snapshot)
+        self.assertEqual(options.to_dict(), snapshot)
+        encoded = canonical_run_options_bytes(options)
+        self.assertEqual(
+            canonical_run_options_bytes(RunOptions.from_mapping(json.loads(encoded))),
+            encoded,
+        )
+
+    def test_previous_schema_is_rejected_without_conversion(self) -> None:
+        old_snapshot = self.snapshot()
+        old_snapshot["schema_version"] = 2
+        with self.assertRaises(RunOptionsError) as caught:
+            RunOptions.from_mapping(old_snapshot)
+        self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
+        with self.assertRaises(RunOptionsError) as caught:
+            replace(RunOptions.from_mapping(self.snapshot()), schema_version=2)
+        self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
+
+    def test_missing_recovery_fields_are_rejected(self) -> None:
+        for field in (
+            "max_transient_attempts",
+            "max_contract_repair_planner_restarts",
+            "execution_fallbacks",
+        ):
+            snapshot = self.snapshot()
+            del snapshot["recovery"][field]
+            with self.assertRaisesRegex(RunOptionsError, f"missing {field}"):
+                RunOptions.from_mapping(snapshot)
+        snapshot = self.snapshot()
+        del snapshot["recovery"]
+        with self.assertRaisesRegex(RunOptionsError, "missing recovery"):
+            RunOptions.from_mapping(snapshot)
+
+    def test_historical_default_implementer_profile_is_rejected(self) -> None:
+        self.assertNotIn("default_implementer_profile", RunOptions.__dataclass_fields__)
+        snapshot = self.snapshot()
+        snapshot["profiles"]["default_implementer_profile"] = "implementer-codex"
+        with self.assertRaisesRegex(RunOptionsError, "unknown key default_implementer_profile"):
+            RunOptions.from_mapping(snapshot)
+        with self.assertRaisesRegex(RunOptionsError, "unknown run option: default_implementer_profile"):
+            RunOptions.from_config(self.config(), default_implementer_profile="implementer-codex")
+
+    def test_unknown_routing_profiles_never_fall_back_to_the_legacy_ui_field(self) -> None:
+        config = self.config()
+        legacy_ui = replace(config.ui, default_implementer_profile="implementer-codex")
+        unknown_routing = RoutingConfig(
+            mechanical_profile="ghost",
+            reasoning_profile="ghost",
+            agentic_profile="ghost",
+        )
+        with self.assertRaisesRegex(RunOptionsError, "mechanical_profile is invalid or incompatible"):
+            RunOptions.from_config(replace(config, ui=legacy_ui, routing=unknown_routing))
+
+    def test_unknown_keys_and_missing_sections_are_rejected(self) -> None:
+        for mutate, message in (
+            (lambda snapshot: snapshot.update(topology="unused"), "unknown key topology"),
+            (lambda snapshot: snapshot["planning"].update(repair_rounds=1), "planning has unknown key repair_rounds"),
+            (lambda snapshot: snapshot["profiles"].pop("final_reviewer_profile"), "profiles is missing final_reviewer_profile"),
+            (lambda snapshot: snapshot.pop("profiles"), "missing profiles"),
+            (lambda snapshot: snapshot["recovery"].update(max_extra_attempts=1), "recovery has unknown key max_extra_attempts"),
+        ):
+            snapshot = self.snapshot()
+            mutate(snapshot)
+            with self.assertRaisesRegex(RunOptionsError, message):
+                RunOptions.from_mapping(snapshot)
+
+    def test_pipeline_without_max_step_contract_repairs_is_rejected(self) -> None:
+        snapshot = self.snapshot()
+        del snapshot["pipeline"]["max_step_contract_repairs"]
+        with self.assertRaisesRegex(RunOptionsError, "missing max_step_contract_repairs"):
+            RunOptions.from_mapping(snapshot)
 
 
 if __name__ == "__main__":

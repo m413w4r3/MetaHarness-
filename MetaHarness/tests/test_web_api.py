@@ -23,6 +23,7 @@ from metaharness.models import (
     ModelProfile,
     ExecutionRole,
     ProfileDriver,
+    RoutingConfig,
     SelectionMode,
     UIConfig,
 )
@@ -60,6 +61,11 @@ class WebServerTests(unittest.TestCase):
                 default_reviewer_profile="reviewer",
             ),
             model_profiles=profiles,
+            routing=RoutingConfig(
+                mechanical_profile="implementer",
+                reasoning_profile="implementer",
+                agentic_profile="implementer",
+            ),
         )
         self.server = create_server(self.config, port=0)
         self.thread = threading.Thread(
