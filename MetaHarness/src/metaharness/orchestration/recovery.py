@@ -144,20 +144,24 @@ class RecoveryAttempt:
     budget: int
     budget_consumed: int
     disposition: str
+    operation_id: str
     cycle: int | None = None
     step_id: str | None = None
     profile_id: str | None = None
     tree_before: str | None = None
     tree_after: str | None = None
-    # A stable semantic identity; a resumed operation records it only once.
-    operation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.operation_id, str)
+            or not self.operation_id
+            or len(self.operation_id) > 256
+        ):
+            raise ValueError("recovery attempt operation_id must be a bounded non-empty string")
 
 
 def _attempt_record(attempt: RecoveryAttempt, **overrides: Any) -> dict[str, Any]:
-    record = {**asdict(attempt), **overrides}
-    if record.get("operation_id") is None:
-        record.pop("operation_id", None)
-    return record
+    return {**asdict(attempt), **overrides}
 
 
 _LEGACY_IDENTITY = ("phase", "reason", "attempt", "budget_key", "cycle", "step_id", "tree_before")
@@ -229,22 +233,24 @@ class RecoveryCoordinator:
         if not isinstance(attempts, list):
             raise PipelineFailure("DURABLE_ARTIFACT_CORRUPTED", "recovery attempts are malformed")
         record = _attempt_record(attempt)
-        if attempt.operation_id is not None:
-            if any(
-                isinstance(item, dict) and item.get("operation_id") == attempt.operation_id
-                for item in attempts
-            ):
+        for item in attempts:
+            if isinstance(item, dict) and item.get("operation_id") == attempt.operation_id:
+                if item != record:
+                    raise PipelineFailure(
+                        "DURABLE_ARTIFACT_CORRUPTED",
+                        "recovery operation_id was reused with different attempt data",
+                    )
                 return
-            # Records written before stable identities existed describe the
-            # same semantic operation once per resume; keep only this one.
-            identity = tuple(record.get(key) for key in _LEGACY_IDENTITY)
-            attempts = [
-                item for item in attempts
-                if not (
-                    isinstance(item, dict) and "operation_id" not in item
-                    and tuple(item.get(key) for key in _LEGACY_IDENTITY) == identity
-                )
-            ]
+        # Records written before stable identities existed describe the same
+        # semantic operation once per resume; keep only this one.
+        identity = tuple(record.get(key) for key in _LEGACY_IDENTITY)
+        attempts = [
+            item for item in attempts
+            if not (
+                isinstance(item, dict) and "operation_id" not in item
+                and tuple(item.get(key) for key in _LEGACY_IDENTITY) == identity
+            )
+        ]
         self._store.update(
             status=state.get("status", RunStatus.VALIDATING),
             recovery_attempts=[*attempts, record][-MAX_RECOVERY_ATTEMPT_RECORDS:],
@@ -311,7 +317,9 @@ class RecoveryCoordinator:
         consumed = self.consume(key, RecoveryAttempt(
             phase=phase, reason=reason, attempt=attempt, budget_key=key,
             budget=budget, budget_consumed=used + 1,
-            disposition=decision.disposition.value, cycle=cycle, step_id=step_id,
+            disposition=decision.disposition.value,
+            operation_id=f"recovery:{key}:{attempt:02d}",
+            cycle=cycle, step_id=step_id,
             profile_id=profile_id, tree_before=tree_before, tree_after=tree_after,
         ))
         self.trace(

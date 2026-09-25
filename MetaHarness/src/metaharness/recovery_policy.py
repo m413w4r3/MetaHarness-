@@ -187,6 +187,12 @@ def classify_failure(
         return decision(RecoveryDisposition.HARD_STOP, "tree changed outside approved scope")
     if not rollback_succeeded:
         return decision(RecoveryDisposition.HARD_STOP, "rollback did not restore the expected tree")
+    if code == "CHECK_REPAIR_FIXED_POINT":
+        return decision(
+            RecoveryDisposition.WAIT_HUMAN,
+            "the same candidate and failed checks remain after the repair budget was exhausted; "
+            "code change or additional repair authority is required",
+        )
     if code in {
         "CHECK_REPAIR_EXHAUSTED", "DETERMINISTIC_GATE_FAILED", "WAITING_REPAIR_EXHAUSTED",
         "REVIEW_EVIDENCE_UNRESOLVED", "HUMAN_REQUIRED", "REPOSITORY_EVIDENCE_RECOVERY_EXHAUSTED",

@@ -329,6 +329,7 @@ from .orchestration.pipeline_v2 import (
     PipelineV2Operations,
     check_repair_attempt_dir,
     check_repair_dir,
+    check_repair_fingerprint,
     correction_dir,
     gate_dir,
     gate_acceptance_path,
@@ -3590,6 +3591,12 @@ class Orchestrator:
             deterministic_gate_attempt=gate_attempt,
         )
         self._cycle_update(store, cycle_plan.cycle, deterministic_gate=gate)
+        if evidence.deterministic_passed:
+            current_repair = store.load().get("check_repair")
+            if isinstance(current_repair, Mapping) and "operator_retry_fingerprint" in current_repair:
+                cleared = dict(current_repair)
+                cleared.pop("operator_retry_fingerprint", None)
+                store.update(status=RunStatus.VALIDATING, check_repair=cleared)
         retry_check.settle(evidence)
         return evidence
 
@@ -4031,6 +4038,9 @@ class Orchestrator:
             phase="validation", reason="CHECK_FAILED", attempt=attempt,
             budget_key="check_repair_attempts", budget=ctx.options.max_check_repair_attempts,
             budget_consumed=attempt, disposition=decision.disposition.value,
+            operation_id=(
+                f"check-repair:cycle-{number:03d}:{stage.value}:{attempt:02d}"
+            ),
             cycle=number, profile_id=selected.profile_id,
             tree_before=evidence.staged_tree_sha, tree_after=record.tree_after,
         ))
@@ -6499,6 +6509,40 @@ class Orchestrator:
         the recovery policy: only a hard stop becomes ``FAILED``.
         """
 
+        repeated_fixed_point = False
+        retry_fingerprint: list[Any] | None = None
+        if reason == "CHECK_REPAIR_EXHAUSTED" and isinstance(detail, Mapping):
+            raw_failed_ids = detail.get("failed_check_ids")
+            candidate_tree = detail.get("candidate_tree")
+            try:
+                checkpoint = read_checkpoint(run_dir)
+            except ResumeCheckpointError:
+                checkpoint = None
+            if (
+                isinstance(raw_failed_ids, list)
+                and all(isinstance(item, str) for item in raw_failed_ids)
+                and isinstance(candidate_tree, str)
+                and checkpoint is not None
+                and checkpoint.stage is not None
+            ):
+                fingerprint = check_repair_fingerprint(
+                    candidate_tree, raw_failed_ids, checkpoint.stage,
+                )
+                retry_fingerprint = [fingerprint[0], list(fingerprint[1]), fingerprint[2]]
+                prior_check_repair = store.load().get("check_repair")
+                repeated_fixed_point = (
+                    isinstance(prior_check_repair, Mapping)
+                    and prior_check_repair.get("operator_retry_fingerprint") == retry_fingerprint
+                )
+                if repeated_fixed_point:
+                    reason = "CHECK_REPAIR_FIXED_POINT"
+                    detail = {
+                        **dict(detail),
+                        "fixed_point_fingerprint": retry_fingerprint,
+                        "operator_message": "Code change or additional repair authority required",
+                    }
+                    terminal_status = None
+                    auto_resumable = False
         if terminal_status is None:
             reason = normalize_exit_reason(reason)
             terminal_status = project_exit(
@@ -6513,6 +6557,18 @@ class Orchestrator:
                 data={"reason": reason, "step_id": step_id},
                 once=True,
             )
+        elif reason == "CHECK_REPAIR_FIXED_POINT":
+            self._trace_emit(
+                "check_repair.fixed_point",
+                phase="repair",
+                cycle=getattr(self, "_trace_cycle", 1),
+                data={
+                    "step_id": step_id,
+                    "fingerprint": retry_fingerprint,
+                    "operator_message": "Code change or additional repair authority required",
+                },
+                once=True,
+            )
         try:
             self._update_v2_usage(store, run_dir)
         except (OSError, ValueError):
@@ -6521,7 +6577,7 @@ class Orchestrator:
         fields = _terminal_step_fields(
             state, step_id, "waiting" if terminal_status is not RunStatus.FAILED else "failed",
         )
-        if reason == "CHECK_REPAIR_EXHAUSTED" and isinstance(detail, Mapping):
+        if reason in {"CHECK_REPAIR_EXHAUSTED", "CHECK_REPAIR_FIXED_POINT"} and isinstance(detail, Mapping):
             failure_detail = dict(detail)
             evidence_sha = failure_detail.get("latest_evidence_sha256")
             failed_ids = failure_detail.get("failed_check_ids")
@@ -6552,9 +6608,20 @@ class Orchestrator:
                         })
             failure_detail["repair_reports"] = reports
             prior_check_repair = state.get("check_repair")
+            if retry_fingerprint is None:
+                fingerprint = check_repair_fingerprint(
+                    candidate_tree if isinstance(candidate_tree, str) else "",
+                    failed_ids if isinstance(failed_ids, list) else [],
+                    checkpoint.stage if checkpoint is not None and checkpoint.stage is not None else "",
+                )
+                retry_fingerprint = [fingerprint[0], list(fingerprint[1]), fingerprint[2]]
+            fixed_point = reason == "CHECK_REPAIR_FIXED_POINT"
+            if fixed_point:
+                failure_detail["fixed_point_fingerprint"] = retry_fingerprint
+                failure_detail["operator_message"] = "Code change or additional repair authority required"
             fields["check_repair"] = {
                 **(dict(prior_check_repair) if isinstance(prior_check_repair, Mapping) else {}),
-                "status": "exhausted",
+                "status": "fixed_point" if fixed_point else "exhausted",
                 "attempt_count": attempt_count,
                 "budget": budget,
                 "failed_check_ids": list(failed_ids) if isinstance(failed_ids, list) else [],
@@ -6562,7 +6629,11 @@ class Orchestrator:
                 "repair_reports": reports,
                 "latest_evidence_sha256": evidence_sha,
                 "failure_classification": "product_check",
-                "next_action": "Retry deterministic gate",
+                "operator_retry_fingerprint": retry_fingerprint,
+                "next_action": (
+                    "Code change or additional repair authority required"
+                    if fixed_point else "Retry deterministic gate"
+                ),
             }
             detail = failure_detail
         if auto_resumable is not None:

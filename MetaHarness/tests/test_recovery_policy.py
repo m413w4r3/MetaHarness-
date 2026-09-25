@@ -29,6 +29,7 @@ FAILURE_POLICY_MATRIX = (
     ("semantic reviser unavailable", "SEMANTIC_REVISER_UNAVAILABLE", RecoveryDisposition.CONTINUE_WITH_WARNING, {}),
     ("candidate staging remote unavailable", "CANDIDATE_REMOTE_UNAVAILABLE", RecoveryDisposition.CONTINUE_WITH_WARNING, {}),
     ("ordinary check failed", "CHECK_FAILED:unit", RecoveryDisposition.CHECK_REPAIR, {}),
+    ("check repair fixed point", "CHECK_REPAIR_FIXED_POINT", RecoveryDisposition.WAIT_HUMAN, {}),
     ("review IMPLEMENTATION", "REVIEW_IMPLEMENTATION", RecoveryDisposition.CONTRACT_REPAIR, {}),
     ("review REPLAN", "REVIEW_REPLAN", RecoveryDisposition.REPLAN, {}),
     ("bounded scope request", "BOUNDED_SCOPE_REQUEST", RecoveryDisposition.CONTRACT_REPAIR, {}),
@@ -96,6 +97,15 @@ class RecoveryPolicyTests(unittest.TestCase):
         decision = classify_failure("AGENT_TIMEOUT")
         self.assertEqual(decision.disposition, RecoveryDisposition.RETRY_SAME)
         self.assertTrue(decision.consumes_budget)
+
+    def test_check_repair_fixed_point_requires_human_and_does_not_resume(self) -> None:
+        decision = classify_failure("CHECK_REPAIR_FIXED_POINT")
+        terminal = terminal_state_for(
+            decision, failure_code="CHECK_REPAIR_FIXED_POINT",
+            phase=ResumePhase.DETERMINISTIC_GATE,
+        )
+        self.assertEqual((terminal.status, terminal.resumable), (RunStatus.WAITING_HUMAN, False))
+        self.assertIn("code change or additional repair authority", decision.reason)
 
     def test_runtime_failure_with_scoped_tree_change_requires_rollback(self) -> None:
         decision = classify_failure(

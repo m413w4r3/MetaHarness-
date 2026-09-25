@@ -207,6 +207,15 @@ class OutputCorrectionTests(ContractRepairFixtures):
             config or self.config(), planner=[initial_plan(STEP), *answers], reviewer=[review()],
         ).run_text(SPEC, run_id="run", run_options=options)
 
+    @staticmethod
+    def with_read_paths(contract: str, *paths: str) -> str:
+        additions = "".join(f"- {path} :: fixture content\n" for path in paths)
+        return contract.replace(
+            "- feature.txt :: current content\n",
+            "- feature.txt :: current content\n" + additions,
+            1,
+        )
+
     def assert_no_false_mismatch(self) -> None:
         state = self.state()
         self.assertNotEqual((state.get("failure") or {}).get("reason"), "AGENT_CONTRACT_MISMATCH")
@@ -245,6 +254,31 @@ class OutputCorrectionTests(ContractRepairFixtures):
         self.assertEqual((validation["status"], validation["output_attempt"]), ("validated", 2))
         self.assertEqual(validation["raw_sha256"], sha256(self.output_attempt(2) / "planner.raw.md"))
         self.assertIn("contract_repair.output_invalid", self.trace_names())
+
+    def test_missing_historical_paths_receive_nearest_tracked_repository_facts(self) -> None:
+        invalid_paths = (
+            "frontend/src/features/edition-workflow/EditionDashboard.test.tsx",
+            "frontend/src/features/edition/EditionDashboard.test.tsx",
+        )
+        tracked_path = "frontend/src/features/edition-dashboard/EditionDashboard.test.tsx"
+        self.add_tracked(tracked_path)
+        self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
+
+        result = self.run_repair(
+            self.with_read_paths(repaired_step_contract(), *invalid_paths),
+            repaired_step_contract(),
+        )
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        correction = self.planner.requests[2]
+        facts = correction.split("<REPOSITORY PATH FACTS>", 1)[1].split(
+            "</REPOSITORY PATH FACTS>", 1,
+        )[0]
+        for expected in (*invalid_paths, tracked_path):
+            self.assertIn(expected, facts)
+        self.assertIn("READ/WRITE paths must come from tracked repository paths.", facts)
+        self.assertIn("Only paths explicitly authorized by CREATE_SET may be new.", facts)
+        self.assertIn("facts below are authoritative", correction)
 
     def test_a_wrong_real_step_id_is_never_rewritten(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))

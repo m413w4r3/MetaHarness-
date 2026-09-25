@@ -181,6 +181,7 @@ class RecoveryCoordinatorTests(unittest.TestCase):
             "phase": "implementation", "reason": "AGENT_TIMEOUT", "attempt": 1,
             "budget_key": "agent-step:001:S01", "budget": 2, "budget_consumed": 1,
             "disposition": "retry_same", "cycle": 1, "step_id": "S01",
+            "operation_id": "recovery:agent-step:001:S01:01",
             "profile_id": "worker", "tree_before": "a" * 40, "tree_after": "b" * 40,
         })
 

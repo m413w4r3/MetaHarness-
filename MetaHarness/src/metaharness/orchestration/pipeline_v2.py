@@ -22,7 +22,7 @@ import json
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, TypeAlias
+from typing import Any, Callable, Mapping, Sequence, TypeAlias
 
 from ..evidence import EvidenceBundle, required_checks_passed
 from ..gitops import RepositoryReference, WorktreeInfo
@@ -41,6 +41,15 @@ from ..result import RunResult
 from ..resume import ResumeCheckpoint, ResumePhase
 from ..review import ReviewResult
 from ..run_options import RunOptions
+
+
+def check_repair_fingerprint(
+    candidate_tree_sha: str, failed_check_ids: Sequence[str], stage: GateStage | str,
+) -> tuple[str, tuple[str, ...], str]:
+    """Stable identity of one exhausted deterministic-gate failure."""
+
+    stage_name = stage.value if isinstance(stage, GateStage) else str(stage)
+    return candidate_tree_sha, tuple(sorted(set(failed_check_ids))), stage_name
 
 
 # -- durable artifact layout -------------------------------------------------

@@ -1055,6 +1055,57 @@ class CheckRepairTests(PipelineHarness):
         self.assertEqual(self.planner.requests, [])
         self.assertEqual(counter.read_text(), "4")
 
+    def test_same_red_gate_after_operator_retry_becomes_fixed_point(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            write("feature.txt", "still bad\n", report=check_repair_result(
+                "DONE", "FAIL", "NONE", "targeted check still fails",
+            )),
+        )
+        config = self.config(check_repair=1)
+        waiting = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
+        self.assertEqual(self.state()["check_repair"]["next_action"], "Retry deterministic gate")
+
+        resumed = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).resume("run")
+
+        state = self.state()
+        self.assertEqual(resumed.status, RunStatus.WAITING_HUMAN)
+        self.assertEqual(state["failure"]["reason"], "CHECK_REPAIR_FIXED_POINT")
+        self.assertEqual(state["check_repair"]["status"], "fixed_point")
+        self.assertEqual(
+            state["check_repair"]["next_action"],
+            "Code change or additional repair authority required",
+        )
+        self.assertEqual(
+            state["failure"]["detail"]["operator_message"],
+            "Code change or additional repair authority required",
+        )
+        self.assertFalse(state["recovery_resumable"])
+        self.assertFalse(resume_info(self.run_dir(), state).resumable)
+        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
+
+    def test_fixed_point_fingerprint_changes_with_tree_or_failed_check_set(self) -> None:
+        from metaharness.orchestration.pipeline_v2 import check_repair_fingerprint
+
+        original = check_repair_fingerprint(
+            "a" * 40, ["test-integration"], "POST_IMPLEMENTATION",
+        )
+        self.assertEqual(original, check_repair_fingerprint(
+            "a" * 40, ["test-integration"], "POST_IMPLEMENTATION",
+        ))
+        self.assertNotEqual(original, check_repair_fingerprint(
+            "b" * 40, ["test-integration"], "POST_IMPLEMENTATION",
+        ))
+        self.assertNotEqual(original, check_repair_fingerprint(
+            "a" * 40, ["another-check"], "POST_IMPLEMENTATION",
+        ))
+
     def test_historical_attributeerror_shape_resumes_the_same_gate_checkpoint(self) -> None:
         counter = self.root / "legacy-gate-count"
         self.check.write_text(

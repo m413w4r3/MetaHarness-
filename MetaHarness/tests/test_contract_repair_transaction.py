@@ -19,6 +19,7 @@ from tests.test_pipeline_v2_machine import SPEC, STEP, repaired_step_contract
 
 OUTAGE = "LLM endpoint returned HTTP 503 after 3 attempt(s)"
 REPAIR_ID = "contract-repair:cycle-001:S01:01"
+S04_REPAIR_ID = "contract-repair:cycle-001:S04:01"
 
 
 def mismatch(_request) -> str:
@@ -234,6 +235,76 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
         self.assertEqual(len(self.workers.calls), 2)
         self.assertEqual(self.transaction()["planner_transport_attempt"], 4)
         self.assertEqual([item["operation_id"] for item in self.semantic_records()], [REPAIR_ID])
+
+    def test_s04_recovery_record_is_idempotent_across_interrupted_resume(self) -> None:
+        from metaharness.orchestration.recovery import RecoveryCoordinator
+
+        for name in ("s01.txt", "s02.txt", "s03.txt"):
+            (self.repo / name).write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "-qm", "add staged files")
+        git(self.repo, "push", "-q", "origin", "main")
+        steps = (
+            ("S01", "s01.txt", "First stage"),
+            ("S02", "s02.txt", "Second stage"),
+            ("S03", "s03.txt", "Third stage"),
+            ("S04", "feature.txt", "Repair the final stage"),
+        )
+        plan = initial_plan(*steps)
+        for previous, current in (("S01", "S02"), ("S02", "S03"), ("S03", "S04")):
+            start = plan.index(f"BEGIN STEP {current}")
+            before, after = plan[:start], plan[start:]
+            plan = before + after.replace("DEPENDS_ON: NONE", f"DEPENDS_ON: {previous}", 1)
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("s01.txt", "one\n"), write("s02.txt", "two\n"),
+            write("s03.txt", "three\n"), mismatch, write("feature.txt", "good\n"),
+        )
+        waiting = self.orchestrator(
+            self.config(), planner=[plan, LLMError(OUTAGE)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(waiting.status, RunStatus.WAITING_EXTERNAL)
+        self.assertEqual((self.checkpoint()["phase"], self.checkpoint()["step_id"]), ("implement_step", "S04"))
+
+        original_record = RecoveryCoordinator.record
+        replayed = False
+
+        def duplicate_then_interrupt(coordinator, attempt):
+            nonlocal replayed
+            original_record(coordinator, attempt)
+            if attempt.operation_id == S04_REPAIR_ID and not replayed:
+                replayed = True
+                # Simulate the same durable transaction recording again as a
+                # process resumes after the first atomic state write.
+                original_record(coordinator, attempt)
+                raise KeyboardInterrupt
+
+        with mock.patch(
+            "metaharness.orchestration.recovery.RecoveryCoordinator.record",
+            new=duplicate_then_interrupt,
+        ):
+            interrupted = self.orchestrator(
+                self.config(),
+                planner=[repaired_step_contract().replace(
+                    "STEP_ID: S01\nTITLE: Write the feature\nEXECUTION_CLASS: MECHANICAL\nDEPENDS_ON: NONE",
+                    "STEP_ID: S04\nTITLE: Repair the final stage\nEXECUTION_CLASS: MECHANICAL\nDEPENDS_ON: S03",
+                    1,
+                )],
+                reviewer=[review()],
+            ).resume("run")
+        self.assertEqual(interrupted.status, RunStatus.INTERRUPTED)
+        self.assertTrue(replayed)
+        self.assertEqual([item["operation_id"] for item in self.semantic_records()], [S04_REPAIR_ID])
+        transaction_path = (
+            self.run_dir() / "cycles/001/implementation/steps/S04/contract_repairs/01/transaction.json"
+        )
+        transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+        self.assertEqual(transaction["tree_sha"], self.git_tree())
+
+        resumed = self.resume(["planner must not be called"], [review()])
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual([item["operation_id"] for item in self.semantic_records()], [S04_REPAIR_ID])
+        self.assertEqual(len(self.workers.calls), 5)
 
     def test_two_genuine_repairs_fit_the_budget_and_transport_is_not_counted(self) -> None:
         self.workers.on(

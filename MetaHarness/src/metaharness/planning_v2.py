@@ -57,6 +57,7 @@ from .repository_topology import (
     invalid_paths,
     render_invalid_path_candidates,
     render_path_candidates,
+    render_repository_path_facts,
     topology_payload,
 )
 from .result import atomic_write_text
@@ -790,6 +791,7 @@ def build_step_contract_repair_correction_prompt(
     delete_set: str, previous_raw: str, parse_error: str,
     output_attempt: int, max_output_corrections: int,
     repository_path_candidates: str = "NONE", invalid_path_candidates: str = "",
+    repository_path_facts: str = "",
 ) -> str:
     """Ask for a protocol-valid answer of the same semantic repair.
 
@@ -797,6 +799,7 @@ def build_step_contract_repair_correction_prompt(
     the rejected answer, bounded, so no conversation state is assumed.
     """
 
+    facts_block = repository_path_facts + "\n\n" if repository_path_facts else ""
     invalid_block = invalid_path_candidates + "\n\n" if invalid_path_candidates else ""
     previous = previous_raw
     if len(previous) > _REPAIR_PREVIOUS_RAW_CHARS:
@@ -807,12 +810,16 @@ Your previous StepContractRepair response was rejected deterministically.
 This is output correction {output_attempt - 1} of at most {max_output_corrections}
 for the same contract repair; it is not a new repair.
 
+The deterministic repository path facts below are authoritative. They take
+priority over every path proposal in the rejected response. Copy an exact
+tracked path for READ_SET or WRITE_SET, or remove the invalid path.
+
+{facts_block}{invalid_block}An INVALID PATH is not tracked in CURRENT TREE SHA. Never guess another
+directory: use one exact tracked candidate below, or remove the path.
+
 <PARSE ERROR>
 {parse_error[:_REPAIR_ERROR_CHARS]}
 </PARSE ERROR>
-
-{invalid_block}An INVALID PATH is not tracked in CURRENT TREE SHA. Never guess another
-directory: use one exact tracked candidate below, or remove the path.
 
 <REPOSITORY PATH CANDIDATES>
 {repository_path_candidates}
@@ -1166,6 +1173,7 @@ class StepContractRepairPlanner:
                 inputs.topology_entries(detail, references=invalid_paths(detail))
             ),
             invalid_path_candidates=render_invalid_path_candidates(detail, inputs.topology),
+            repository_path_facts=render_repository_path_facts(detail, inputs.topology),
         )
 
     @staticmethod
