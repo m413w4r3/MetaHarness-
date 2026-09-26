@@ -91,9 +91,7 @@ from .pipeline_v2 import (
     gate_acceptance_path,
 )
 from .recovery import RecoveryAttempt
-from .resume_validation import (
-    load_evidence,
-)
+from .durable_readers import load_evidence
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
 

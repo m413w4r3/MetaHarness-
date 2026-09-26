@@ -44,11 +44,12 @@ from .pipeline_v2 import (
     correction_dir, gate_dir,
     step_dir as cycle_step_dir,
 )
-from .resume_validation import (
-    completed_step_records, load_correction_plan, load_evidence,
-    load_revision,
-    read_candidate_record, read_cycle_record, semantic_revision_scope,
+from .cycle_loader import (
+    load_correction_plan, read_cycle_record, semantic_revision_scope,
     verify_correction_scope,
+)
+from .durable_readers import (
+    completed_step_records, load_evidence, load_revision, read_candidate_record,
 )
 from .run_bootstrap import PreparedV2Run
 from .shared import CycleArtifactService, OrchestrationError, bounded_parse_detail, chat_client

@@ -42,7 +42,7 @@ from metaharness.gitops import (
 )
 from metaharness.models import ExecutionRole, ModelProfile, SelectionMode
 from metaharness.orchestrator import Orchestrator
-from metaharness.orchestration.resume_validation import _load_completed_step
+from metaharness.orchestration.durable_readers import load_completed_step
 from metaharness.resume import pipeline_version_from_state
 from metaharness.review import parse_review
 from metaharness.run_options import SCHEMA_VERSION, RunOptions
@@ -148,7 +148,7 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
         }), encoding="utf-8")
         (step_dir / "agent.final.md").write_text("RESULT: DONE\n", encoding="utf-8")
 
-        record = _load_completed_step(step_dir, "S01")
+        record = load_completed_step(step_dir, "S01")
 
         self.assertIsNotNone(record)
         assert record is not None
@@ -161,7 +161,7 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
         payload = json.loads((step_dir / "step.json").read_text(encoding="utf-8"))
         del payload["commit_sha"]
         (step_dir / "step.json").write_text(json.dumps(payload), encoding="utf-8")
-        self.assertIsNone(_load_completed_step(step_dir, "S01"))
+        self.assertIsNone(load_completed_step(step_dir, "S01"))
 
     def test_a_repair_and_semantic_revision_preserve_the_exact_accepted_chain(self) -> None:
         """A red attempt is evidence only; A, B, C and D are linear."""

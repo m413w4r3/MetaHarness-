@@ -59,12 +59,14 @@ PARSER_PREFIXES = ("parse_", "_parse_", "read_meta", "_read_meta")
 SPLIT_PACKAGES = (PACKAGE / "orchestration", PACKAGE / "planning")
 MODULE_MAX_LINES = 900
 # Landed sizes of the modules that predate the refoundation: frozen ceilings,
-# never raised by accident.  The two replan entries below were raised in the
-# change that made the red-gate rung rewrite a step's contract: the evidence
-# belongs to the ladder that produced the failure, the rewind/re-execution
-# belongs to the step service that owns their artifacts, and a fresh module
-# would have had to reach the shared toolbox through the private imports the
-# table below forbids.
+# never raised by accident.  The resume split deleted the resume_validation
+# entry this table landed with: its durable readers, its cycle loaders and its
+# integrity gate are three bounded modules now.
+# The two replan entries were raised in the change that made the red-gate rung
+# rewrite a step's contract: the evidence belongs to the ladder that produced
+# the failure, the rewind/re-execution belongs to the step service that owns
+# their artifacts, and a fresh module would have had to reach the shared toolbox
+# through the private imports the table below forbids.
 # Raised in the check-replan change: the red-gate recovery ladder gained its
 # last, autonomous rung (a cycle re-decomposition) inside the modules that
 # already own the gate episode, the plan authority and the resume proof, and
@@ -74,7 +76,6 @@ MODULE_MAX_LINES = 900
 # authority learned to read a check-replan's own directory, and the check-replan
 # service keeps its defence-in-depth refusal of an unaffordable rung.
 FROZEN_MODULE_SIZES: Mapping[str, int] = {
-    "orchestration/resume_validation.py": 1392,
     # Raised in the check-repair decomposition: the bounded check-repair
     # prompt moved next to the revision transaction that consumes it, the
     # module that actually builds and injects it.
@@ -89,7 +90,7 @@ PIPELINE_TEST_MAX_LINES = 1000
 
 # Every private import the refoundation landed with: the intra-package toolbox
 # of `orchestration/shared.py`, the explicit primitives its siblings expose, and
-# six module-local names six test modules still reach into.  Frozen: any new
+# five module-local names five test modules still reach into.  Frozen: any new
 # edge fails, and the table may only shrink.
 FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
     "metaharness.orchestration.candidate": {
@@ -105,10 +106,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_read_json_artifact",
         ),
         "metaharness.orchestration.revision": ('_review_payload',),
-        "metaharness.orchestration.resume_validation": (
-            "_accepted_review",
-            "_read_planner_conversation",
-        ),
     },
     "metaharness.orchestration.check_recovery": {
         "metaharness.orchestration.shared": ('_archive_attempt_tree', '_safe_candidate_tree'),
@@ -149,20 +146,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_status_has_unstaged_or_untracked",
         ),
         "metaharness.orchestration.candidate": ('_candidate_commit_path', '_commit_web_url'),
-        "metaharness.orchestration.resume_validation": ('_accepted_review',),
-    },
-    "metaharness.orchestration.resume_validation": {
-        "metaharness.orchestration.shared": (
-            "_MAX_AGENT_REPORT_BYTES",
-            "_MAX_STEP_REPORT_BYTES",
-            "_PLANNER_CONVERSATION",
-            "_is_object_id",
-            "_json_text",
-            "_read_bounded_text",
-            "_read_json_artifact",
-            "_read_tree_file",
-            "_status_has_unstaged_or_untracked",
-        ),
     },
     "metaharness.orchestration.review_correction": {
         "metaharness.orchestration.shared": (
@@ -177,7 +160,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_bounded_previous_revision_report",
             "_review_payload",
         ),
-        "metaharness.orchestration.resume_validation": ('_accepted_review',),
     },
     "metaharness.orchestration.revision": {
         "metaharness.orchestration.shared": (
@@ -202,7 +184,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_record_failure_tree",
             "_safe_candidate_tree",
         ),
-        "metaharness.orchestration.resume_validation": ('_reusable_pre_checks',),
     },
     "metaharness.orchestration.worker_recovery": {
         "metaharness.orchestration.shared": (
@@ -226,9 +207,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
     },
     "tests.test_doctor": {
         "metaharness.cli": ('_usable_secret_value',),
-    },
-    "tests.test_pipeline_v2_invariants": {
-        "metaharness.orchestration.resume_validation": ('_load_completed_step',),
     },
     "tests.test_state": {
         "metaharness.state": ('_exclusive_state_lock',),

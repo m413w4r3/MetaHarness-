@@ -43,7 +43,7 @@ from .pipeline_v2 import (
     check_repair_fingerprint, step_dir as cycle_step_dir,
 )
 from .recovery import normalize_exit_reason, project_exit
-from .resume_validation import validate_resume
+from .resume_integrity import validate_resume
 from .shared import (
     CandidatePushError, CommitBoundaryError, OrchestrationError,
     ScopeApprovalRequired,

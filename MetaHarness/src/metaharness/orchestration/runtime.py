@@ -67,12 +67,13 @@ from .check_recovery import CheckInfrastructureRecovery
 from .check_replan_service import CheckReplanService
 from .contract_recovery import ContractRecoveryService
 from .correction_scope import CorrectionScopeService
+from .durable_readers import read_repository_reference
 from .gates import GateService
 from .publication import PublicationService
 from .recovery import RecoveryCoordinator
-from .resume_validation import ResumedRun, read_repository_reference
 from .review_correction import ReviewCorrectionService
 from .review_recovery import ReviewRecovery
+from .resume_integrity import ResumedRun
 from .run_bootstrap import RunBootstrap
 from .run_composition import RunComposition
 from .run_failure import RunFailure

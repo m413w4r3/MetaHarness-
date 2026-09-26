@@ -81,8 +81,8 @@ from .pipeline_v2 import (
     review_dir,
 )
 from .recovery import project_exit
-from .resume_validation import (
-    _accepted_review,
+from .durable_readers import (
+    accepted_review,
     candidate_evidence,
 )
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
@@ -334,7 +334,7 @@ class PublicationService:
         # Only the exact SHA a durable reviewer PASS names is ever published.
         evidence = candidate_evidence(ctx.run_dir, number)
         review = (
-            _accepted_review(review_dir(ctx.run_dir, number), evidence, candidate["commit_sha"])
+            accepted_review(review_dir(ctx.run_dir, number), evidence, candidate["commit_sha"])
             if evidence is not None and evidence.staged_tree_sha == candidate["tree_sha"]
             else None
         )
@@ -552,13 +552,13 @@ class PublicationService:
                 or not required_checks_passed(final_evidence)
             ):
                 raise GitError("final deterministic gate evidence is missing or failed")
-            accepted_review = _accepted_review(
+            review = accepted_review(
                 review_dir(run_dir, cycle), final_evidence, commit_sha
             )
             if (
-                accepted_review is None
-                or accepted_review.verdict is not ReviewVerdict.PASS
-                or accepted_review.route is not ReviewRoute.NONE
+                review is None
+                or review.verdict is not ReviewVerdict.PASS
+                or review.route is not ReviewRoute.NONE
                 or state.get("reviewed_candidate_sha") != commit_sha
             ):
                 raise GitError("reviewer PASS does not name the exact candidate commit")

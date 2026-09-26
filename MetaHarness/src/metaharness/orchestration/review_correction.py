@@ -77,8 +77,8 @@ from .pipeline_v2 import (
     review_dir,
     semantic_revision_dir,
 )
-from .resume_validation import (
-    _accepted_review,
+from .durable_readers import (
+    accepted_review,
     candidate_evidence,
     load_revision,
     read_candidate_record,
@@ -124,7 +124,7 @@ class ReviewCorrectionService:
         previous = cycle.number - 1
         candidate = read_candidate_record(ctx.run_dir, previous)
         evidence = candidate_evidence(ctx.run_dir, previous)
-        review = _accepted_review(
+        review = accepted_review(
             review_dir(ctx.run_dir, previous), evidence, candidate["commit_sha"]
         ) if evidence is not None else None
         if review is None or review.verdict is not ReviewVerdict.REVISE or review.route is not ReviewRoute.IMPLEMENTATION:
@@ -169,7 +169,7 @@ class ReviewCorrectionService:
         evidence = candidate_evidence(ctx.run_dir, previous)
         if evidence is None or evidence.staged_tree_sha != candidate["tree_sha"]:
             raise ResumeIntegrityError(f"cycle {previous:03d} candidate evidence is missing")
-        review = _accepted_review(review_dir(ctx.run_dir, previous), evidence, candidate["commit_sha"])
+        review = accepted_review(review_dir(ctx.run_dir, previous), evidence, candidate["commit_sha"])
         if review is None or review.verdict is not ReviewVerdict.REVISE or review.route is not ReviewRoute.REPLAN:
             raise ResumeIntegrityError(
                 f"cycle {previous:03d} review did not route replan correction"
@@ -549,4 +549,3 @@ def compact_cycle_summary(text: str) -> str:
         return value
 
     return _json_text(clean(value))
-

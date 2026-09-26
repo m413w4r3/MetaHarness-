@@ -35,6 +35,7 @@ from ..gitops import (
     resolve_commit, resolve_tree,
     stage_all, status_porcelain, symbolic_head,
 )
+from ..llm.chat import LLMConversationHandle
 from ..models import (
     BlockerKind, ExecutionRole, ExecutionSelection, ModelProfile, PlanDecision,
     INTERRUPTED_REASON,
@@ -62,15 +63,27 @@ from ..state import RunStateStore
 from ..usage import read_usage_artifact
 from ..validation import config_with_check_authority
 from ..workspace import prepare_workspace
-from .resume_validation import persist_planner_conversation, read_repository_reference
+from .durable_readers import read_repository_reference
 from .shared import (
-    GitOwnership, OrchestrationError, archive_attempt_tree, chat_client,
-    git_ownership,
-    git_ownership_payload, is_object_id, read_json_artifact,
+    GitOwnership, OrchestrationError, PLANNER_CONVERSATION, archive_attempt_tree,
+    chat_client, git_ownership, git_ownership_payload, is_object_id, json_text,
+    read_json_artifact,
 )
 
 if TYPE_CHECKING:
     from .runtime import RunRuntime
+
+
+def persist_planner_conversation(run_dir: Path, handle: Any) -> None:
+    """Persist a driver-provided planner conversation handle, never a guess."""
+
+    if isinstance(handle, LLMConversationHandle):
+        path = run_dir / PLANNER_CONVERSATION
+        atomic_write_text(path, json_text({
+            "provider_id": handle.provider_id, "conversation_id": handle.conversation_id,
+        }))
+        path.chmod(0o600)
+
 
 @dataclasses.dataclass(frozen=True)
 class PreparedV2Run:

@@ -46,9 +46,9 @@ from .pipeline_v2 import (
     pre_semantic_gate_stage,
     semantic_revision_dir,
 )
-from .resume_validation import (
-    _reusable_pre_checks,
+from .durable_readers import (
     load_evidence,
+    reusable_pre_checks,
 )
 from .revision import (
     RevisionRunner,
@@ -177,7 +177,7 @@ class SemanticRevisionService:
             run_revision=self.runtime.composition.run_revision,
             ensure_revision_artifacts=self.runtime.observability.ensure_revision_artifacts,
             redact_revision_artifacts=self.runtime.observability.redact_revision_artifacts,
-            reusable_pre_checks=_reusable_pre_checks,
+            reusable_pre_checks=reusable_pre_checks,
             hard_integrity_failures=hard_integrity_failures,
             soft_check_failures=soft_check_failures,
             check_repair_prompt=check_repair_prompt,
@@ -276,4 +276,3 @@ class SemanticRevisionService:
             fallbacks_limit=self.runtime.run_options.recovery.max_executor_fallbacks,
             run_attempt=self._run_v2_revision_cycle,
         )
-

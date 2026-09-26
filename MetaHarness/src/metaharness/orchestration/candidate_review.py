@@ -63,13 +63,13 @@ from .pipeline_v2 import (
     gate_dir,
     review_dir,
 )
-from .resume_validation import (
-    _accepted_review,
-    _read_planner_conversation,
+from .cycle_loader import read_cycle_record
+from .durable_readers import (
+    accepted_review,
     candidate_evidence,
     load_revision,
     read_candidate_record,
-    read_cycle_record,
+    read_planner_conversation,
 )
 from .review_correction import (
     compact_cycle_summary,
@@ -124,7 +124,7 @@ class CandidateReviewService:
             load_revision=load_revision,
             read_candidate=_review_candidate_record,
             candidate_evidence=candidate_evidence,
-            accepted_review=_accepted_review,
+            accepted_review=accepted_review,
         )
 
     def review_candidate(
@@ -135,7 +135,7 @@ class CandidateReviewService:
 
         remote_available = self._assert_candidate_review_authority(ctx, candidate, evidence)
         directory = review_dir(ctx.run_dir, cycle_plan.cycle)
-        accepted = _accepted_review(directory, evidence, candidate["commit_sha"])
+        accepted = accepted_review(directory, evidence, candidate["commit_sha"])
         if accepted is not None and accepted.verdict is not ReviewVerdict.FAIL:
             store.update_metadata(
                 reviewed_candidate_sha=candidate["commit_sha"],
@@ -642,7 +642,7 @@ class CandidateReviewService:
         )
         # planner_thread != reviewer_thread: a driver that reports the
         # planner's own conversation for a review breaks independence.
-        planner_thread = _read_planner_conversation(run_dir)
+        planner_thread = read_planner_conversation(run_dir)
         reviewer_thread = getattr(reviewer, "last_conversation", None)
         if planner_thread is not None and reviewer_thread == planner_thread:
             raise ReviewParseError("reviewer reused the planner conversation")

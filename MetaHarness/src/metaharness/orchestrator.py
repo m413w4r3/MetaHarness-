@@ -83,7 +83,7 @@ from .orchestration.pipeline_v2 import (
     PipelineV2Context,
     PipelineV2Coordinator,
 )
-from .orchestration.resume_validation import validate_resume
+from .orchestration.resume_integrity import validate_resume
 from .orchestration.runtime import (
     RunRuntime,
     generate_run_id,
