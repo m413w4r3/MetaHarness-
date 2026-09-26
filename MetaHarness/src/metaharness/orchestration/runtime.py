@@ -418,8 +418,9 @@ class RunRuntime:
         except V2PlanParseError as exc:
             refuse(f"replacement plan is invalid: {exc}")
         try:
-            # An operator plan is bound by the same repository preconditions.
-            validate_plan_repository_topology(repo, base_tree, plan)
+            # An operator plan is bound by the same repository preconditions
+            # and normalized against the same tree as any other plan.
+            plan = validate_plan_repository_topology(repo, base_tree, plan)
         except PlanRepositoryPreconditionError as exc:
             refuse(f"{exc.code}: {exc}")
         except GitError as exc:

@@ -287,8 +287,9 @@ class RunBootstrap:
 
         # Every source of this plan (planner, resumed planner answer, operator
         # recovery) must be possible against the base tree before it can be
-        # offered for approval.  Resume re-enters here, so it is checked again.
-        validate_plan_repository_topology(repo, resolve_tree(repo, base_sha), plan)
+        # offered for approval.  Resume re-enters here, so it is checked again,
+        # and the effective plan it returns is the one approval binds.
+        plan = validate_plan_repository_topology(repo, resolve_tree(repo, base_sha), plan)
         try:
             # REQUIRED_CHECKS has already been parsed against the trusted
             # catalogue.  Materialize those exact trusted definitions before

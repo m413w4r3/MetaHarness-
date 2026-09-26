@@ -13,11 +13,15 @@ from pathlib import PurePosixPath
 from typing import Sequence
 
 from ..models import (
+    ADD_DEFAULT_REQUIRED_CHECK,
     BlockerKind,
     CheckConfig,
+    ContractNormalization,
+    DROP_UNKNOWN_REQUIRED_CHECK,
     ExecutionClass,
     ExecutionMode,
     ImplementationStep,
+    NORMALIZE_STEP_COUNT,
     PlanDecision,
     PlanningConfig,
     TaskPlanV2,
@@ -250,29 +254,18 @@ def _path_set(value: str, *, name: str) -> tuple[str, ...]:
 
 
 def _change_sets(
-    values: dict[str, str], read_set: tuple[str, ...]
+    values: dict[str, str],
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Validate WRITE/CREATE/DELETE sets against READ_SET and each other."""
+    """Parse WRITE/CREATE/DELETE sets.
 
-    reads = set(read_set_paths(read_set))
+    A path listed in several sets, or a mutation left out of READ_SET, is a
+    mechanical declaration defect the deterministic normalizer resolves against
+    the tree; the parser only refuses a step that declares no mutation at all.
+    """
+
     write_set = _path_set(values["WRITE_SET"], name="WRITE_SET")
     create_set = _path_set(values["CREATE_SET"], name="CREATE_SET")
     delete_set = _path_set(values["DELETE_SET"], name="DELETE_SET")
-    if any(path not in reads for path in write_set):
-        raise V2PlanParseError("every WRITE_SET path must also appear in READ_SET")
-    if any(path not in reads for path in delete_set):
-        raise V2PlanParseError("every DELETE_SET path must also appear in READ_SET")
-    if any(path in reads for path in create_set):
-        # A READ_SET path must exist and a CREATE_SET path must not.
-        raise V2PlanParseError("a CREATE_SET path cannot appear in READ_SET")
-    if (
-        set(write_set) & set(create_set)
-        or set(write_set) & set(delete_set)
-        or set(create_set) & set(delete_set)
-    ):
-        raise V2PlanParseError(
-            "a path may appear in only one of WRITE_SET, CREATE_SET and DELETE_SET"
-        )
     if not (write_set or create_set or delete_set):
         raise V2PlanParseError("a step must write, create or delete at least one path")
     return write_set, create_set, delete_set
@@ -307,7 +300,7 @@ def _parse_step(
             raise V2PlanParseError(f"invalid or future dependency in {step_id}")
     objective = _nonempty(values["OBJECTIVE"], f"step {step_id} OBJECTIVE")
     read_set = _read_set(values["READ_SET"], max_paths=max_read_paths_per_step)
-    write_set, create_set, delete_set = _change_sets(values, read_set)
+    write_set, create_set, delete_set = _change_sets(values)
     instructions = _nonempty(values["INSTRUCTIONS"], f"step {step_id} INSTRUCTIONS")
     verify = _nonempty(values["VERIFY"], f"step {step_id} VERIFY")
     forbidden = _nonempty(values["FORBIDDEN"], f"step {step_id} FORBIDDEN")
@@ -491,7 +484,7 @@ def parse_step_contract_repair(
             raise V2PlanParseError(f"step contract repair is missing {name}")
     _validate_step_text_limits(step_id, sections | {"TITLE": title})
     read_set = _read_set(sections["READ_SET"], max_paths=max_read_paths_per_step)
-    write_set, create_set, delete_set = _change_sets(sections, read_set)
+    write_set, create_set, delete_set = _change_sets(sections)
     return ImplementationStep(
         step_id, title, ExecutionClass(execution_class),
         None if dependency == "NONE" else dependency,
@@ -542,12 +535,19 @@ def _parse_required_checks(
     check_catalog: Sequence[CheckConfig],
     default_check_ids: Sequence[str],
     inherited_check_ids: Sequence[str],
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[ContractNormalization, ...]]:
+    """The effective required checks, and every mechanical normalization made.
+
+    The trusted catalogue is the harness authority: a planner can never create
+    a check by naming it, and every configured default is present whether the
+    answer listed it or not.  Both facts are recorded instead of being refused.
+    """
+
     catalog_ids = tuple(check.id for check in check_catalog)
     if len(set(catalog_ids)) != len(catalog_ids):
         raise V2PlanParseError("trusted check catalogue contains duplicate IDs")
     if not catalog_ids:
-        return ()
+        return (), ()
     unknown_required = [
         check_id for check_id in (*default_check_ids, *inherited_check_ids)
         if check_id not in catalog_ids
@@ -557,6 +557,7 @@ def _parse_required_checks(
     lines = [line.strip() for line in value.splitlines() if line.strip()]
     if not lines:
         raise V2PlanParseError("READY plan requires REQUIRED_CHECKS")
+    records: list[ContractNormalization] = []
     selected: list[str] = []
     for line in lines:
         match = re.fullmatch(r"-\s+([A-Za-z0-9][A-Za-z0-9_.-]{0,63})", line)
@@ -564,15 +565,21 @@ def _parse_required_checks(
             raise V2PlanParseError("REQUIRED_CHECKS must contain only '- <catalogue id>' lines")
         check_id = match.group(1)
         if check_id not in catalog_ids:
-            raise V2PlanParseError(f"unknown required check ID: {check_id}")
+            records.append(ContractNormalization(
+                code=DROP_UNKNOWN_REQUIRED_CHECK, detail=f"check={check_id}",
+            ))
+            continue
         if check_id not in selected:
             selected.append(check_id)
     required = tuple(dict.fromkeys((*default_check_ids, *inherited_check_ids)))
-    missing = [check_id for check_id in required if check_id not in selected]
-    if missing:
-        raise V2PlanParseError("REQUIRED_CHECKS is missing defaults: " + ", ".join(missing))
+    for check_id in required:
+        if check_id not in selected:
+            selected.append(check_id)
+            records.append(ContractNormalization(
+                code=ADD_DEFAULT_REQUIRED_CHECK, detail=f"check={check_id}",
+            ))
     # The model chooses membership; the harness owns deterministic ordering.
-    return tuple(check_id for check_id in catalog_ids if check_id in selected)
+    return tuple(check_id for check_id in catalog_ids if check_id in selected), tuple(records)
 
 
 def parse_task_plan_v2(
@@ -646,24 +653,29 @@ def parse_task_plan_v2(
     mode = inline.get("EXECUTION_MODE")
     if mode not in {item.value for item in ExecutionMode}:
         raise V2PlanParseError("EXECUTION_MODE must be exactly SINGLE or STAGED")
-    count_text = inline.get("STEP_COUNT", "")
-    if not re.fullmatch(r"[0-9]+", count_text):
-        raise V2PlanParseError("STEP_COUNT must be an integer")
-    step_count = int(count_text)
+    # The real step blocks are the count: the wire field is redundant metadata
+    # whose mismatch is recorded, never a reason to reject a coherent plan.
+    count_text = inline.get("STEP_COUNT", "").strip()
+    step_count = len(blocks)
     if step_count < 1 or step_count > MAX_STEPS:
         raise V2PlanParseError("STEP_COUNT exceeds protocol bounds")
     if step_count > planning.max_steps_per_plan:
         raise V2PlanParseError(
-            f"STEP_COUNT exceeds planning.max_steps_per_plan ({planning.max_steps_per_plan})"
+            f"plan has {step_count} steps; planning.max_steps_per_plan is "
+            f"{planning.max_steps_per_plan}"
         )
     if mode == ExecutionMode.SINGLE.value and step_count != 1:
         raise V2PlanParseError("SINGLE requires exactly one step")
     if mode == ExecutionMode.STAGED.value and not 2 <= step_count <= MAX_STEPS:
         raise V2PlanParseError(f"STAGED requires between 2 and {MAX_STEPS} steps")
-    if len(blocks) != step_count:
-        raise V2PlanParseError("STEP_COUNT does not match step blocks")
     if [step_id for step_id, _ in blocks] != list(step_ids(step_count)):
         raise V2PlanParseError(f"step IDs must be contiguous {STEP_ID_RANGE}")
+    normalizations: list[ContractNormalization] = []
+    if count_text != str(step_count):
+        normalizations.append(ContractNormalization(
+            code=NORMALIZE_STEP_COUNT,
+            detail=f"declared={count_text[:32] or 'missing'} real={step_count}",
+        ))
     steps: list[ImplementationStep] = []
     for step_id, body in blocks:
         steps.append(
@@ -679,12 +691,13 @@ def parse_task_plan_v2(
             raise V2PlanParseError(f"READY plan is missing {name}")
     if blockers and blockers.casefold() not in {"none", "n/a", "na", "-", "—", "nil"}:
         raise V2PlanParseError("READY plan cannot contain real BLOCKERS")
-    required_checks = _parse_required_checks(
+    required_checks, check_normalizations = _parse_required_checks(
         sections.get("REQUIRED_CHECKS", ""),
         check_catalog=check_catalog,
         default_check_ids=default_check_ids,
         inherited_check_ids=inherited_check_ids,
     )
+    normalizations.extend(check_normalizations)
     plan = TaskPlanV2(
         decision=decision,
         title=title,
@@ -698,6 +711,7 @@ def parse_task_plan_v2(
         blockers=blockers or "NONE",
         raw=raw,
         required_checks=required_checks,
+        normalizations=tuple(normalizations),
         max_step_contract_chars=planning.max_step_contract_chars,
     )
     validate_step_contract_bounds(plan)

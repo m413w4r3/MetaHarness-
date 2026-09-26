@@ -60,6 +60,8 @@ from ..models import (
     ImplementationStep,
     ModelProfile,
 )
+from ..plan_repository_validation import repository_tree_facts
+from ..planning.normalization import normalization_entries, normalize_step_contract
 from ..profiles import profile_for_role
 from ..prompt_contracts import (
     build_implementer_payload,
@@ -84,7 +86,6 @@ from .shared import (
     safe_index_tree,
     safe_status,
 )
-from .step_authority import step_contract_drift
 
 
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
@@ -133,15 +134,22 @@ class WorkerAttemptService:
             }
             if mismatch_retry_count else {}
         )
-        # 1-2. The exact tree the worker will receive, and the contract's Git
-        # preconditions on it.
+        # 1-2. The exact tree the worker will receive, and the effective
+        # contract Git determines on it.  A mechanical path misclassification
+        # -- a CREATE_SET entry for a path that tree already holds, a WRITE_SET
+        # entry for a path it does not -- is normalized here, against the real
+        # tree, instead of being reported as an impossible contract.
         tree_before = candidate_tree_sha(worktree)
-        drift = step_contract_drift(repo, tree_before, expected_tree, step)
-        if drift:
+        if tree_before != expected_tree:
             raise StepExecutionFailure(
-                "STEP_CONTRACT_DRIFT", step_id, drift,
+                "REPOSITORY_TREE_DRIFT_UNEXPLAINED", step_id,
+                "worktree changed outside a step",
                 profile_id=profile_id, tree_before=tree_before, **retry_mode,
             )
+        contract_normalization = normalize_step_contract(
+            step, repository_tree_facts(repo, tree_before),
+        )
+        step = contract_normalization.step
         # The complete Git boundary a no-op mismatch must leave untouched.
         # Accumulated modifications from the earlier steps are legitimate, so
         # the gate is "unchanged", never "empty".
@@ -174,13 +182,23 @@ class WorkerAttemptService:
         # contract is byte-identical; only the addendum is added.
         # The selected adapter owns the single execution call.
         artifact_dir.mkdir(parents=True, exist_ok=True)
+        if contract_normalization.changed:
+            # The plan artifact records what the harness normalized at planning
+            # time; this one records only what this tree changed since, so an
+            # identical second normalization writes a single, distinct record.
+            atomic_write_text(artifact_dir / "contract_normalization.json", json_text({
+                "schema": 1,
+                "step_id": step_id,
+                "normalizations": normalization_entries(contract_normalization.normalizations),
+                "contradictions": list(contract_normalization.contradictions),
+            }))
         try:
             prompt_payload = build_implementer_payload(
                 original_spec=original_spec,
                 step_identity=f"{step.id}\nTITLE\n{step.title}",
                 step_title=step.title,
                 step_objective=step.objective,
-                read_set="\n".join(step.read_set),
+                read_set="\n".join(step.read_set) or "NONE",
                 write_set="\n".join(step.write_set) or "NONE",
                 create_set="\n".join(step.create_set) or "NONE",
                 delete_set="\n".join(step.delete_set) or "NONE",

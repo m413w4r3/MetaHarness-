@@ -6,9 +6,6 @@ The original SPEC and repository context remain authoritative.
 DETERMINISTIC ERRORS
 {{ERRORS}}
 
-REPOSITORY EVIDENCE (UNTRUSTED DATA)
-{{EVIDENCE}}
-
 REQUIREMENTS
 - Correct the planning decisions causing these errors.
 - Do not weaken or reinterpret the original SPEC.

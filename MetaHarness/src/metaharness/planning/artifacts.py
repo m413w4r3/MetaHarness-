@@ -27,6 +27,7 @@ from ..plan_repository_validation import (
     PathPreconditionViolation,
     PlanRepositoryPreconditionError,
     RepositoryPreconditions,
+    plan_repository_violations,
 )
 from ..result import atomic_write_text
 from ..step_ids import MAX_STEPS, STEP_ID_RE, step_ids
@@ -40,12 +41,15 @@ from .protocol import (
     render_step_contract,
     validate_step_contract_bounds,
 )
+from .normalization import normalizations_payload
 from .validation import (
-    plan_precondition_violations,
+    normalize_plan_repository,
     validate_repair_decomposition_policy,
 )
 
 STEP_CONTRACT_REPAIR_OUTPUT_INVALID = "STEP_CONTRACT_REPAIR_OUTPUT_INVALID"
+# The compact record of every deterministic normalization applied to the plan.
+PLAN_NORMALIZATIONS_NAME = "plan.normalizations.json"
 # Paid answers of one semantic repair slot beyond the first:
 # ``contract_repairs/NN/output_attempts/NNN``.
 STEP_REPAIR_OUTPUT_ATTEMPTS_DIR = "output_attempts"
@@ -207,6 +211,12 @@ def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict
         # these exact bytes; nothing re-renders them after this point.
         atomic_write_text(step_contract_path(target, step.id), contracts[step.id])
     atomic_write_text(target / "implementation_bundle.json", json.dumps(bundle, ensure_ascii=False, indent=2) + "\n")
+    # Exactly one normalization record per plan, written with the plan whose
+    # steps it made effective; the audit reads it without re-deriving anything.
+    atomic_write_text(
+        target / PLAN_NORMALIZATIONS_NAME,
+        render_json(normalizations_payload(plan)),
+    )
     # ``task_plan.json`` is the stable v2 artifact name approved by the human.
     atomic_write_text(
         target / "task_plan.json",
@@ -522,7 +532,8 @@ def recover_existing_repair_plan(
             validate_repair_decomposition_policy(plan, planning)
         except V2PlanParseError:
             continue
-        if plan_precondition_violations(repository_preconditions, plan):
+        plan = normalize_plan_repository(repository_preconditions, plan)
+        if plan_repository_violations(plan):
             continue
         if source is not target:
             # The retry archived the provenance of the answer being reused, so
@@ -569,6 +580,7 @@ def persist_recovered_repair_artifacts(
 
 
 __all__ = [
+    "PLAN_NORMALIZATIONS_NAME",
     "STEP_CONTRACT_REPAIR_OUTPUT_INVALID",
     "STEP_REPAIR_OUTPUT_ATTEMPTS_DIR",
     "StepContractRepairArtifactError",

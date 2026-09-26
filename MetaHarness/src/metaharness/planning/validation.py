@@ -19,8 +19,8 @@ from ..models import (
 from ..plan_repository_validation import (
     PathPreconditionViolation,
     RepositoryPreconditions,
+    normalize_plan_contracts,
     plan_repository_violations,
-    render_conflict_evidence,
     render_precondition_correction,
 )
 from ..step_ids import MAX_STEPS
@@ -229,31 +229,31 @@ def validate_repair_decomposition_policy(
             )
 
 
-def plan_precondition_violations(
+def normalize_plan_repository(
     preconditions: RepositoryPreconditions | None, plan: TaskPlanV2,
-) -> tuple[PathPreconditionViolation, ...]:
+) -> TaskPlanV2:
+    """The effective plan after every deterministic contract normalization.
+
+    Without a start tree there is nothing to normalize against, and the plan
+    is returned unchanged: the execution boundary normalizes again against the
+    real tree.
+    """
+
     if preconditions is None:
-        return ()
-    return plan_repository_violations(preconditions.repo, preconditions.start_tree_sha, plan)
+        return plan
+    return normalize_plan_contracts(preconditions.repo, preconditions.start_tree_sha, plan)
 
 
 def render_plan_precondition_correction(
-    preconditions: RepositoryPreconditions,
     violations: Sequence[PathPreconditionViolation],
     previous_raw: str,
 ) -> str:
-    return render_precondition_correction(
-        violations,
-        previous_raw=previous_raw,
-        evidence=render_conflict_evidence(
-            preconditions.repo, preconditions.start_tree_sha, violations,
-        ),
-    )
+    return render_precondition_correction(violations, previous_raw=previous_raw)
 
 
 __all__ = [
     "insert_before_protocol",
-    "plan_precondition_violations",
+    "normalize_plan_repository",
     "render_decomposition_policy_text",
     "render_plan_precondition_correction",
     "render_repair_decomposition_policy_text",

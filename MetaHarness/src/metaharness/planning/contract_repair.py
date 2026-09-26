@@ -360,6 +360,10 @@ class _RepairInputs:
     delete_set: str
     # Tracked paths of ``current_tree_sha``; evidence only, never a choice.
     topology: Any = None
+    # The deterministic contract normalization of the execution boundary.  It
+    # is applied to every parsed answer, before the answer is validated or
+    # recorded, so ``contract.md`` is the single effective repaired contract.
+    normalize: Callable[[ImplementationStep], ImplementationStep] | None = None
 
     def topology_entries(self, *texts: str, references: Sequence[str] = ()) -> list[dict[str, Any]]:
         if self.topology is None:
@@ -398,12 +402,13 @@ class StepContractRepairPlanner:
         on_response_durable: Callable[[int], None] | None = None,
         on_output_invalid: Callable[[int, str], None] | None = None,
         topology: Any = None,
+        normalize: Callable[[ImplementationStep], ImplementationStep] | None = None,
         failure_evidence: str = "NONE",
     ) -> ImplementationStep:
         inputs = _RepairInputs(
             identity, original_plan_identity, current_contract,
             mismatch_explanation, current_tree_sha,
-            read_set, write_set, create_set, delete_set, topology,
+            read_set, write_set, create_set, delete_set, topology, normalize,
         )
         request = build_step_contract_repair_prompt(
             original_spec=original_spec, current_tree_sha=current_tree_sha,
@@ -433,6 +438,7 @@ class StepContractRepairPlanner:
         on_response_durable: Callable[[int], None] | None = None,
         on_output_invalid: Callable[[int, str], None] | None = None,
         topology: Any = None,
+        normalize: Callable[[ImplementationStep], ImplementationStep] | None = None,
     ) -> ImplementationStep:
         """Complete the exact durable request of an interrupted repair.
 
@@ -458,7 +464,7 @@ class StepContractRepairPlanner:
             _RepairInputs(
                 identity, original_plan_identity, current_contract,
                 mismatch_explanation, current_tree_sha,
-                read_set, write_set, create_set, delete_set, topology,
+                read_set, write_set, create_set, delete_set, topology, normalize,
             ),
             validate=validate, on_request=on_request,
             on_response_durable=on_response_durable, on_output_invalid=on_output_invalid,
@@ -483,6 +489,8 @@ class StepContractRepairPlanner:
         violation = inputs.identity.violation(step)
         if violation is not None:
             raise V2PlanParseError(violation)
+        if inputs.normalize is not None:
+            step = inputs.normalize(step)
         if validate is not None:
             validate(step)
         return step

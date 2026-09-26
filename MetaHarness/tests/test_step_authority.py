@@ -319,29 +319,34 @@ class TopologyEvidenceTests(StepAuthorityHarness):
         self.assertEqual(evidence["tree_sha"], self.json(self.step_dir() / "contract_repairs/01/transaction.json")["tree_sha"])
         self.assertEqual(evidence["references"][0]["candidates"], [EDITION])
 
-    def test_a_wrong_directory_is_corrected_with_the_exact_tracked_candidate(self) -> None:
-        """CAS 5: rejected, corrected in the same slot, worker not replayed."""
+    def test_a_wrong_directory_is_normalized_inside_the_same_slot(self) -> None:
+        """CAS 5 under A4: Git classifies the path, so no answer is re-planned."""
 
         wrong = "frontend/src/features/edition-workflow/EditionDashboard.test.tsx"
         self.workers.on(
             ExecutionRole.IMPLEMENTER,
             mismatch_for("EditionDashboard.test.tsx asserts the removed link."),
-            writes("feature.txt", EDITION),
+            writes("feature.txt", wrong),
         )
-        result = self.run_pipeline([self.one_step_plan(), repair_contract(wrong), repair_contract(EDITION)])
+        result = self.run_pipeline([self.one_step_plan(), repair_contract(wrong)])
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        # The original worker plus the post-repair worker only; one repair
+        # answer, never a paid output correction.
         self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(len(self.planner.requests), 2)
         slot = self.step_dir() / "contract_repairs/01"
         self.assertEqual(sorted(path.name for path in slot.parent.iterdir()), ["01"])
-        correction = self.planner.requests[2]
-        self.assertIn(
-            f"INVALID PATH:\n  {wrong}\n\nTRACKED CANDIDATES FOR BASENAME:\n  - {EDITION}",
-            correction,
-        )
-        self.assertTrue((slot / "output_attempts/002/topology_evidence.json").is_file())
-        self.assertEqual(self.json(slot / "validation.json")["added_mutable_paths"], [EDITION])
+        contract = (slot / "contract.md").read_text(encoding="utf-8")
+        self.assertIn(f"CREATE_SET\n- {wrong}", contract)
+        self.assertEqual(self.json(slot / "validation.json")["added_mutable_paths"], [wrong])
         self.assertEqual(self.json(slot / "transaction.json")["status"], "completed")
+        self.assertEqual(
+            [item["code"] for item in
+             self.json(slot / "contract_normalization.json")["normalizations"]],
+            ["WRITE_MISSING_TO_CREATE", "DROP_READ_OF_CREATE"],
+        )
+        self.assertEqual(self.accepted_paths(), sorted(["feature.txt", wrong]))
 
     def test_an_ambiguous_basename_lists_every_candidate_and_chooses_none(self) -> None:
         """CAS 6."""

@@ -14,7 +14,7 @@ from metaharness.llm.chat import (
 from metaharness.plan_repository_validation import PlanRepositoryPreconditionError, RepositoryPreconditions
 from metaharness.planning.planner import PlannerV2
 from tests.pipeline_support import PipelineHarness, git
-from tests.test_plan_repository_validation import meta_plan
+from tests.test_plan_repository_validation import impossible_plan_message, meta_plan
 
 
 class _Chat:
@@ -67,7 +67,11 @@ class PlannerTransactionTests(PipelineHarness):
         )
         git(self.repo, "add", "--all")
         git(self.repo, "commit", "-qm", "other file")
-        self.invalid = meta_plan({"read": ("feature.txt",), "write": ("feature.txt",), "create": ("other.txt",)})
+        self.create_existing = meta_plan(
+            {"read": ("feature.txt",), "write": ("feature.txt",), "create": ("other.txt",)},
+        )
+        # The only mutation is impossible: no Git fact can rescue this plan.
+        self.invalid = impossible_plan_message()
         self.valid = meta_plan({"read": ("feature.txt",), "write": ("feature.txt",)})
 
     @staticmethod
@@ -132,12 +136,17 @@ class PlannerTransactionTests(PipelineHarness):
         self.assertEqual(len(chat.continue_calls), 1)
         self.assertEqual(chat.continue_calls[0][0].conversation_id, "private-conversation-id")
         prompt = chat.continue_calls[0][1]
-        self.assertIn("create_exists", prompt)
-        self.assertIn("other.txt", prompt)
+        self.assertIn("S01: no_mutation", prompt)
+        self.assertIn("Re-emit one COMPLETE META PLAN v2", prompt)
+        # The correction stays a bounded error list, never a plan copy.
+        self.assertNotIn("gone.txt", prompt)
         self.assertNotIn("ORIGINAL SPEC", prompt)
         self.assertNotIn("Make feature.txt good.", prompt)
         self.assertEqual((self.target / "planner.raw.md").read_text(), self.valid)
-        self.assertEqual(json.loads((self.target / "planner-attempts/01/planner.validation.json").read_text())["errors"][0]["code"], "create_exists")
+        self.assertEqual(
+            json.loads((self.target / "planner-attempts/01/planner.validation.json").read_text())["errors"][0]["code"],
+            "no_mutation",
+        )
         self.assertNotIn("private-conversation-id", str(events))
         self.assertEqual((self.target / "planner.session.json").stat().st_mode & 0o777, 0o600)
 
@@ -172,24 +181,37 @@ class PlannerTransactionTests(PipelineHarness):
         chat = _Chat([two_steps, self.valid])
         self.run_plan(chat)
         prompt = chat.continue_calls[0][1]
-        self.assertIn("S01: create_exists", prompt)
-        self.assertIn("S02: create_exists", prompt)
+        self.assertIn("S01: no_mutation", prompt)
+        self.assertIn("S02: no_mutation", prompt)
 
-    def test_aw010_existing_reference_corpus_uses_conversation_c(self) -> None:
+    def test_aw010_existing_reference_corpus_is_normalized_without_a_correction(self) -> None:
+        """Run 20260923T131351Z-e9a34fd827: the file exists, the planner wrote CREATE."""
+
         path = "backend/src/cti_app/domain/reference_corpus.py"
         corpus = self.repo / path
         corpus.parent.mkdir(parents=True)
         corpus.write_text("class ReferenceMember:\n    pass\n", encoding="utf-8")
         git(self.repo, "add", "--all")
         git(self.repo, "commit", "-qm", "reference corpus")
-        invalid = meta_plan({"read": ("feature.txt",), "write": ("feature.txt",), "create": (path,)})
-        chat = _Chat([invalid, self.valid])
-        self.run_plan(chat)
+        answer = meta_plan({"read": ("feature.txt",), "write": ("feature.txt",), "create": (path,)})
+        chat = _Chat([answer])
+
+        plan = self.run_plan(chat)
+
         self.assertEqual(len(chat.complete_calls), 1)
-        self.assertEqual(len(chat.continue_calls), 1)
-        self.assertIn("create_exists", chat.continue_calls[0][1])
-        self.assertIn("class ReferenceMember", chat.continue_calls[0][1])
-        self.assertNotIn(path, (self.target / "implementation_bundle.json").read_text())
+        self.assertEqual(chat.continue_calls, [])
+        (step,) = plan.steps
+        self.assertEqual(step.create_set, ())
+        self.assertEqual(step.write_set, ("feature.txt", path))
+        self.assertEqual(
+            json.loads((self.target / "plan.normalizations.json").read_text())["steps"]["S01"],
+            [
+                {"code": "CREATE_EXISTING_TO_WRITE", "path": path},
+                {"code": "ADD_MUTATION_TO_READ", "path": path},
+            ],
+        )
+        contract = (self.target / "steps/S01/contract.md").read_text(encoding="utf-8")
+        self.assertIn(path, contract.split("WRITE SET", 1)[1].split("CREATE SET", 1)[0])
 
     def test_budget_zero_stops_before_worker_or_bundle(self) -> None:
         chat = _Chat([self.invalid])

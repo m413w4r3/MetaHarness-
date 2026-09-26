@@ -199,7 +199,7 @@ PLAN → implementation step → accepted step commit → …
   has at most `max_read_paths_per_step` unique READ_SET paths (default 8).
   The planner target is approximately 1000-2200 characters per step.
 - Initial and correction-cycle steps run through the same generic step executor, with
-  the same ordered gates and failure reasons (`STEP_CONTRACT_DRIFT`,
+  the same ordered gates and failure reasons (`REPOSITORY_TREE_DRIFT_UNEXPLAINED`,
   `AGENT_AUTH_FAILURE`, `AGENT_GIT_VIOLATION`,
   `AGENT_TIMEOUT`, `AGENT_RUNTIME_FAILED`, `AGENT_NO_CHANGE`,
   `STEP_WRITE_SET_VIOLATION`). The final report never drives a decision.

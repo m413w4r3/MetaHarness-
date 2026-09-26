@@ -29,6 +29,7 @@ from ..models import CheckConfig, PlanDecision, PlanningConfig, TaskPlanV2
 from ..plan_repository_validation import (
     PlanRepositoryPreconditionError,
     RepositoryPreconditions,
+    plan_repository_violations,
 )
 from ..result import atomic_write_text
 from ..usage import (
@@ -49,7 +50,7 @@ from .protocol import (
     render_safe_check_catalogue,
 )
 from .validation import (
-    plan_precondition_violations,
+    normalize_plan_repository,
     render_plan_precondition_correction,
     render_repair_decomposition_policy_text,
     validate_repair_decomposition_policy,
@@ -353,21 +354,23 @@ class CheckReplanTransaction:
             self.publish(facts, recovered)
             return recovered
         request = bundle.inline_prompt
-        plan = self._complete(request, bundle, facts)
+        plan = normalize_plan_repository(
+            self.repository_preconditions, self._complete(request, bundle, facts),
+        )
         corrections = 0
         while self.repository_preconditions is not None:
-            violations = plan_precondition_violations(self.repository_preconditions, plan)
+            violations = plan_repository_violations(plan)
             if not violations:
                 break
             # Exactly one bounded correction, archived like the initial planner's.
-            correction = "\n\n" + render_plan_precondition_correction(
-                self.repository_preconditions, violations, plan.raw,
-            )
+            correction = "\n\n" + render_plan_precondition_correction(violations, plan.raw)
             self._archive_rejected(request, plan, violations)
             if corrections >= 1:
                 raise PlanRepositoryPreconditionError(violations)
             request = request.rstrip("\n") + correction
-            plan = self._complete(request, bundle, facts)
+            plan = normalize_plan_repository(
+                self.repository_preconditions, self._complete(request, bundle, facts),
+            )
             corrections += 1
         self.publish(facts, plan)
         return plan

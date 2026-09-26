@@ -577,9 +577,14 @@ failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,
 `DETERMINISTIC_GATE_FAILED`, `REVIEW_REVISE`, `REVIEW_FAIL`,
 `PLAN_APPROVAL_INVALID`, `WORKSPACE_SETUP_FAILED`, `WORKSPACE_SETUP_TIMEOUT`,
 `WORKSPACE_SETUP_MUTATED`, `AGENT_NO_CHANGE`, `TOCTOU_FAILURE`, `GIT_FAILURE`,
-`STEP_CONTRACT_DRIFT` (a step's READ/WRITE/DELETE path is missing or a CREATE
-path already exists in the tree before Codex), `STEP_WRITE_SET_VIOLATION`
+`REPOSITORY_TREE_DRIFT_UNEXPLAINED` (the worktree changed outside a step),
+`STEP_WRITE_SET_VIOLATION`
 (Git shows a changed path outside the step's WRITE ∪ CREATE ∪ DELETE sets).
+A mechanical path misclassification is never a failure: a CREATE_SET on an
+existing path becomes a WRITE, a WRITE_SET on an absent path becomes a CREATE,
+and an absent READ/DELETE path is dropped, all recorded in
+`plan.normalizations.json`.
+
 A v2 failure detail always starts with `step=Sxx` when a step failed.
 A run stops and leaves the run directory and worktree available for
 inspection; it never retries on its own. When the failure is resumable (see

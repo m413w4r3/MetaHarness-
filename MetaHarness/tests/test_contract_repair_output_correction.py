@@ -256,30 +256,28 @@ class OutputCorrectionTests(ContractRepairFixtures):
         self.assertEqual(validation["raw_sha256"], sha256(self.output_attempt(2) / "planner.raw.md"))
         self.assertIn("contract_repair.output_invalid", self.trace_names())
 
-    def test_missing_historical_paths_receive_nearest_tracked_repository_facts(self) -> None:
-        invalid_paths = (
+    def test_missing_historical_paths_are_normalized_into_creates(self) -> None:
+        missing_paths = (
             "frontend/src/features/edition-workflow/EditionDashboard.test.tsx",
             "frontend/src/features/edition/EditionDashboard.test.tsx",
         )
-        tracked_path = "frontend/src/features/edition-dashboard/EditionDashboard.test.tsx"
-        self.add_tracked(tracked_path)
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
 
-        result = self.run_repair(
-            self.with_read_paths(repaired_step_contract(), *invalid_paths),
-            repaired_step_contract(),
-        )
+        result = self.run_repair(with_paths(repaired_step_contract(), *missing_paths))
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        correction = self.planner.requests[2]
-        facts = correction.split("<REPOSITORY PATH FACTS>", 1)[1].split(
-            "</REPOSITORY PATH FACTS>", 1,
-        )[0]
-        for expected in (*invalid_paths, tracked_path):
-            self.assertIn(expected, facts)
-        self.assertIn("READ/WRITE paths must come from tracked repository paths.", facts)
-        self.assertIn("Only paths explicitly authorized by CREATE_SET may be new.", facts)
-        self.assertIn("facts below are authoritative", correction)
+        # An absent path cannot be written or read yet: the harness creates it
+        # and drops the impossible read, instead of paying a second answer.
+        self.assertEqual(len(self.planner.requests), 2)
+        slot = self.slot()
+        contract = (slot / "contract.md").read_text(encoding="utf-8")
+        created = contract.split("CREATE_SET", 1)[1].split("DELETE_SET", 1)[0]
+        for path in missing_paths:
+            self.assertIn(f"- {path}", created)
+        normalization = json.loads((slot / "contract_normalization.json").read_text(encoding="utf-8"))
+        codes = [item["code"] for item in normalization["normalizations"]]
+        self.assertEqual(codes.count("WRITE_MISSING_TO_CREATE"), len(missing_paths))
+        self.assertEqual(codes.count("DROP_READ_OF_CREATE"), len(missing_paths))
 
     def test_a_wrong_real_step_id_is_never_rewritten(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
@@ -322,19 +320,26 @@ class OutputCorrectionTests(ContractRepairFixtures):
         self.assertEqual(len(self.planner.requests), 3)
         self.assertEqual(len(self.semantic_records()), 1)
 
-    def test_existing_create_path_is_not_moved_to_write_set(self) -> None:
+    def test_create_on_an_existing_path_is_normalized_into_the_write_set(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         create_existing = repaired_step_contract().replace(
             "WRITE_SET\n- feature.txt\n", "WRITE_SET\nNONE\n", 1,
-        ).replace("READ_SET\n- feature.txt :: current content", "READ_SET\nNONE", 1).replace(
-            "CREATE_SET\nNONE", "CREATE_SET\n- feature.txt", 1,
-        )
+        ).replace("CREATE_SET\nNONE", "CREATE_SET\n- feature.txt", 1)
 
-        result = self.run_repair(create_existing, repaired_step_contract())
+        result = self.run_repair(create_existing)
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(self.parse_error(1)["code"], "STEP_CONTRACT_REPAIR_OUTPUT_INVALID")
-        self.assertEqual(len(self.planner.requests), 3)
+        # Git decides the classification, so the answer is never re-planned.
+        self.assertEqual(len(self.planner.requests), 2)
+        self.assertEqual(len(self.workers.calls), 2)
+        slot = self.slot()
+        contract = (slot / "contract.md").read_text(encoding="utf-8")
+        self.assertIn("WRITE_SET\n- feature.txt", contract)
+        self.assertIn("CREATE_SET\nNONE", contract)
+        normalization = json.loads((slot / "contract_normalization.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [item["code"] for item in normalization["normalizations"]], ["CREATE_EXISTING_TO_WRITE"],
+        )
         (record,) = self.semantic_records()
         self.assertEqual((record["attempt"], record["budget_consumed"]), (1, 1))
 

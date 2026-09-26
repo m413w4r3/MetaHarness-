@@ -8,8 +8,6 @@ to re-plan a fact it cannot change.
 
 from __future__ import annotations
 
-import unittest
-
 from metaharness.models import ExecutionRole
 
 from tests.autonomy.support import SPEC, AutonomyHarness, Step, meta_plan
@@ -17,7 +15,6 @@ from tests.pipeline_support import review, write
 
 
 class PlannerCreateNormalizationTests(AutonomyHarness):
-    @unittest.expectedFailure
     def test_a_create_set_on_an_existing_file_does_not_stop_the_run(self) -> None:
         self.commit_files({"existing.py": "base\n"})
         self.green_check()

@@ -196,6 +196,36 @@ class ModelProfile:
             raise ValueError("profile latency_tier is invalid")
 
 
+# Deterministic plan-contract normalization (``planning/normalization.py``):
+# the exact vocabulary of the rules the harness may apply to a planner's
+# mechanical path classification without asking a model.  They live here
+# because both the wire parser and the normalizer must name them.
+CREATE_EXISTING_TO_WRITE = "CREATE_EXISTING_TO_WRITE"
+WRITE_MISSING_TO_CREATE = "WRITE_MISSING_TO_CREATE"
+DROP_MISSING_DELETE = "DROP_MISSING_DELETE"
+DROP_MISSING_READ = "DROP_MISSING_READ"
+RESOLVE_MUTATION_CONFLICT = "RESOLVE_MUTATION_CONFLICT"
+ADD_MUTATION_TO_READ = "ADD_MUTATION_TO_READ"
+DROP_READ_OF_CREATE = "DROP_READ_OF_CREATE"
+DROP_UNKNOWN_REQUIRED_CHECK = "DROP_UNKNOWN_REQUIRED_CHECK"
+ADD_DEFAULT_REQUIRED_CHECK = "ADD_DEFAULT_REQUIRED_CHECK"
+NORMALIZE_STEP_COUNT = "NORMALIZE_STEP_COUNT"
+# The one code that is not a normalization: it names what stays impossible.
+NO_MUTATION_REMAINS = "NO_MUTATION_REMAINS"
+CONTRADICTION_CODES = frozenset({NO_MUTATION_REMAINS})
+
+
+@dataclass(frozen=True)
+class ContractNormalization:
+    """One deterministic normalization the harness applied to a plan."""
+
+    code: str
+    # ``None`` names a plan-level normalization (wire metadata, check set).
+    step_id: str | None = None
+    path: str | None = None
+    detail: str | None = None
+
+
 @dataclass(frozen=True)
 class ImplementationStep:
     id: str
@@ -230,6 +260,9 @@ class TaskPlanV2:
     required_checks: tuple[str, ...] = ()
     max_step_contract_chars: int = 5000
     blocker_kind: BlockerKind | None = None
+    # Every deterministic normalization applied to this plan, in order.  It is
+    # durable evidence for audit; downstream code reads the effective steps.
+    normalizations: tuple[ContractNormalization, ...] = ()
 
 
 class RunStatus(StrEnum):

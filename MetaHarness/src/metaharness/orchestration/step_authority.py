@@ -24,12 +24,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 
-from ..attempt_transaction import paths_detail
-from ..gitops import path_exists_in_tree
 from ..models import ImplementationStep
 from ..planning.artifacts import read_approved_step_contract
 from ..planning.contract_repair import StepRepairIdentity
-from ..planning.protocol import V2PlanParseError, parse_step_contract_repair, read_set_paths
+from ..planning.protocol import V2PlanParseError, parse_step_contract_repair
 from ..result import atomic_write_text
 from . import contract_repair
 from .pipeline_v2 import PipelineFailure
@@ -187,34 +185,6 @@ def approved_step_contract(cycle_plan: "CyclePlan", step: ImplementationStep) ->
         )
     except (V2PlanParseError, OSError, UnicodeError) as exc:
         raise PipelineFailure("PLAN_APPROVAL_INVALID", str(exc), step_id=step.id) from exc
-
-
-def step_contract_drift(
-    repo: Path, before_tree: str, expected_tree: str, step: ImplementationStep,
-) -> str | None:
-    """Check the step's Git preconditions on the tree Codex will receive.
-
-    Every READ/WRITE/DELETE path must exist in *before_tree* and no CREATE
-    path may exist.  The tree must also be exactly the base or the tree
-    frozen after the previous step.
-    """
-
-    if before_tree != expected_tree:
-        return "worktree changed outside a step"
-    problems: list[str] = []
-    for label, paths, must_exist in (
-        ("read_missing", read_set_paths(step.read_set), True),
-        ("write_missing", step.write_set, True),
-        ("delete_missing", step.delete_set, True),
-        ("create_exists", step.create_set, False),
-    ):
-        wrong = [
-            path for path in paths
-            if path_exists_in_tree(repo, before_tree, path) is not must_exist
-        ]
-        if wrong:
-            problems.append(f"{label}={paths_detail(wrong)}")
-    return " ".join(problems) or None
 
 
 def approved_step_authority(

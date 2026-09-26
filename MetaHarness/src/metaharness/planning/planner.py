@@ -38,8 +38,8 @@ from ..plan_repository_validation import (
     PlanRepositoryPreconditionError,
     RepositoryPreconditions,
     archive_rejected_planner_attempt,
+    plan_repository_violations,
     render_blocker_repository_evidence,
-    render_conflict_evidence,
 )
 from ..prompt_contracts import (
     PromptPayload,
@@ -71,7 +71,7 @@ from .artifacts import (
 from .protocol import V2PlanParseError, parse_task_plan_v2, render_safe_check_catalogue
 from .validation import (
     insert_before_protocol,
-    plan_precondition_violations,
+    normalize_plan_repository,
     render_decomposition_policy_text,
     render_plan_precondition_correction,
     render_repair_decomposition_policy_text,
@@ -368,7 +368,7 @@ class PlannerV2:
                     else:
                         validation = read_attempt_validation(previous)
                         previous_raw = (previous / "planner.raw.md").read_text(encoding="utf-8")
-                    short = _correction_request(validation, self.repository_preconditions)
+                    short = _correction_request(validation)
                     handle = planning_session_handle(session)
                     continuation_used = handle is not None and isinstance(self.client, ConversationContinuationClient)
                     fallback_fresh = not continuation_used
@@ -438,7 +438,8 @@ class PlannerV2:
                     check_catalog=self.check_catalog, default_check_ids=self.default_check_ids)
                 validate_execution_mode_policy(plan, self.planning)
                 validate_decomposition_policy(plan, self.planning)
-                violations = plan_precondition_violations(self.repository_preconditions, plan)
+                plan = normalize_plan_repository(self.repository_preconditions, plan)
+                violations = plan_repository_violations(plan)
                 if violations:
                     raise PlanRepositoryPreconditionError(violations)
             except (V2PlanParseError, PlanRepositoryPreconditionError) as exc:
@@ -517,9 +518,7 @@ _REJECTED_PLANNER_ARTIFACTS = (
 )
 
 
-def _correction_request(
-    validation: dict[str, Any], preconditions: RepositoryPreconditions | None,
-) -> str:
+def _correction_request(validation: dict[str, Any]) -> str:
     if validation.get("blocker_kind") == BlockerKind.REPOSITORY_EVIDENCE.value:
         blockers = validation.get("blockers")
         evidence = validation.get("repository_evidence")
@@ -542,7 +541,6 @@ def _correction_request(
     template = (_PROMPTS_DIR / "planner_correction_v2.txt").read_text(encoding="utf-8")
     errors = validation["errors"]
     lines = []
-    violations = []
     for item in errors[:64]:
         if not isinstance(item, dict):
             raise LLMProtocolError("planner validation artifact is invalid")
@@ -551,12 +549,7 @@ def _correction_request(
         path = str(item.get("path", ""))[:400]
         detail = str(item.get("detail", ""))[:1000]
         lines.append(f"{step}: {code}: {path or detail}")
-        if code in {"create_exists", "read_missing", "write_missing", "delete_missing"}:
-            violations.append(PathPreconditionViolation(step, code, path))
-    evidence = render_conflict_evidence(
-        preconditions.repo, preconditions.start_tree_sha, violations,
-    ) if preconditions is not None and violations else ""
-    return template.replace("{{ERRORS}}", "\n".join(lines)).replace("{{EVIDENCE}}", evidence).rstrip() + "\n"
+    return template.replace("{{ERRORS}}", "\n".join(lines)).rstrip() + "\n"
 
 
 def _fresh_correction(initial_request: str, previous_raw: str, correction: str) -> str:
@@ -689,12 +682,13 @@ class RepairPlannerV2:
             tuple(attachments), fallback_candidate_diff, target,
         )
         preconditions = self.repository_preconditions
-        violations = plan_precondition_violations(preconditions, plan)
+        plan = normalize_plan_repository(preconditions, plan)
+        violations = plan_repository_violations(plan)
         if preconditions is not None and violations:
             # Exactly one bounded correction, archived exactly like the
             # initial planner's: the rejected answer never becomes authority.
             correction = "\n\n" + render_plan_precondition_correction(
-                preconditions, violations, plan.raw,
+                violations, plan.raw,
             )
             request = request.rstrip("\n") + correction
             _archive_rejected_plan(target, preconditions, violations)
@@ -703,7 +697,8 @@ class RepairPlannerV2:
                 bundle.evidence_text, tuple(attachments), fallback_candidate_diff, target,
             )
             self.last_usage = add_usage((usage, correction_usage))
-            violations = plan_precondition_violations(preconditions, plan)
+            plan = normalize_plan_repository(preconditions, plan)
+            violations = plan_repository_violations(plan)
             if violations:
                 _archive_rejected_plan(target, preconditions, violations)
                 raise PlanRepositoryPreconditionError(violations)

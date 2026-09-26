@@ -42,10 +42,12 @@ from ..models import (
     RunDisposition,
     SCOPE_APPROVAL_REASON,
 )
+from ..plan_repository_validation import repository_tree_facts
 from ..planning.artifacts import (
     STEP_CONTRACT_REPAIR_OUTPUT_INVALID,
     StepContractRepairArtifactError,
 )
+from ..planning.normalization import normalization_entries, normalize_step_contract
 from ..planning.contract_repair import (
     StepContractRepairOutputInvalid,
     StepContractRepairPlanner,
@@ -83,7 +85,6 @@ from .step_authority import (
     EffectiveStepAuthority,
     StepAuthorityError,
     resolve_effective_step_authority,
-    step_contract_drift,
 )
 
 
@@ -419,6 +420,17 @@ class ContractRecoveryService:
             self.runtime.config, self.runtime.run_options.planner_profile, ExecutionRole.PLANNER
         )
         original_mutable = set((*original_step.write_set, *original_step.create_set, *original_step.delete_set))
+        tree_facts = repository_tree_facts(repo, tree_before)
+        # Every normalization applied to an answer of this slot, so the durable
+        # contract is the effective one and the normalization stays auditable.
+        applied: list[dict[str, str]] = []
+        contradictions: list[str] = []
+
+        def normalize(repaired: ImplementationStep) -> ImplementationStep:
+            contract = normalize_step_contract(repaired, tree_facts)
+            applied[:] = normalization_entries(contract.normalizations) if contract.changed else []
+            contradictions[:] = list(contract.contradictions)
+            return contract.step
 
         def validate(repaired: ImplementationStep) -> None:
             removed = original_mutable - set((*repaired.write_set, *repaired.create_set, *repaired.delete_set))
@@ -431,9 +443,14 @@ class ContractRecoveryService:
                     "contract repair is identical to the contract the deterministic gate "
                     "failed under: a replan repairs the step contract, it never replays it"
                 )
-            drift = step_contract_drift(repo, tree_before, tree_before, repaired)
-            if drift:
-                raise V2PlanParseError("repaired contract is not executable on current tree: " + drift)
+            # The same deterministic authority as the execution boundary: only
+            # a contradiction normalization cannot settle is a defect the
+            # planner must answer again.
+            if contradictions:
+                raise V2PlanParseError(
+                    "repaired contract is not executable on current tree: "
+                    + ", ".join(contradictions)
+                )
 
         planner = StepContractRepairPlanner(
             self.runtime.planner_client
@@ -457,7 +474,7 @@ class ContractRecoveryService:
             "validate": validate,
             "on_request": on_request, "on_response_durable": on_response_durable,
             "on_output_invalid": on_output_invalid,
-            "topology": topology,
+            "topology": topology, "normalize": normalize,
         }
         if resume_request:
             repaired = planner.resume(
@@ -494,6 +511,12 @@ class ContractRecoveryService:
                 **sets, **hooks,
             )
         contract_repair.ensure(artifact_dir, contract_repair.PLANNER_VALIDATED)
+        if applied:
+            # Deterministic given the answer and the tree: a resume rewrites
+            # the same bytes instead of duplicating a record.
+            atomic_write_text(artifact_dir / "contract_normalization.json", json_text({
+                "schema": 1, "step_id": original_step.id, "normalizations": applied,
+            }))
         repaired_mutable = set((*repaired.write_set, *repaired.create_set, *repaired.delete_set))
         added = repaired_mutable - original_mutable
         if added:

@@ -101,11 +101,61 @@ class PlanV2ControlTests(unittest.TestCase):
             "reviewer profile is forbidden": raw.replace(
                 "STEP_COUNT: 1\n", "STEP_COUNT: 1\nREVIEWER_PROFILE: someone-else\n", 1
             ),
-            "unknown check": raw.replace("REQUIRED_CHECKS\n- test", "REQUIRED_CHECKS\n- rm-rf", 1),
         }
         for name, text in cases.items():
             with self.subTest(case=name):
                 self.assertNotEqual(text, raw)
+                with self.assertRaises(V2PlanParseError):
+                    parse(text)
+
+    def test_an_unknown_required_check_is_dropped_never_a_plan_failure(self) -> None:
+        raw = initial_plan(STEP).replace("REQUIRED_CHECKS\n- test", "REQUIRED_CHECKS\n- rm-rf", 1)
+
+        plan = parse_task_plan_v2(raw, check_catalog=CATALOG, default_check_ids=("test",))
+
+        # The planner cannot create a check; the configured default survives.
+        self.assertEqual(plan.required_checks, ("test",))
+        self.assertEqual(
+            [item.code for item in plan.normalizations],
+            ["DROP_UNKNOWN_REQUIRED_CHECK", "ADD_DEFAULT_REQUIRED_CHECK"],
+        )
+
+    def test_a_missing_default_check_is_added_back(self) -> None:
+        raw = initial_plan(STEP).replace("REQUIRED_CHECKS\n- test", "REQUIRED_CHECKS\n- other", 1)
+        catalog = (CheckConfig("test", ("python", "-c", "pass")), CheckConfig("other", ("python", "-c", "pass")))
+
+        plan = parse_task_plan_v2(raw, check_catalog=catalog, default_check_ids=("test",))
+
+        self.assertEqual(plan.required_checks, ("test", "other"))
+        self.assertEqual(
+            [item.code for item in plan.normalizations], ["ADD_DEFAULT_REQUIRED_CHECK"],
+        )
+
+    def test_wrong_step_count_is_metadata_the_real_blocks_decide(self) -> None:
+        raw = initial_plan(STEP).replace("STEP_COUNT: 1", "STEP_COUNT: 4", 1)
+
+        plan = parse(raw)
+
+        self.assertEqual([step.id for step in plan.steps], ["S01"])
+        self.assertEqual(
+            [(item.code, item.detail) for item in plan.normalizations],
+            [("NORMALIZE_STEP_COUNT", "declared=4 real=1")],
+        )
+
+    def test_structural_step_errors_stay_fatal(self) -> None:
+        raw = initial_plan(
+            ("S01", "feature.txt", "Write the feature"),
+            ("S02", "other.txt", "Write the other feature"),
+        )
+        cases = {
+            "duplicate id": raw.replace("BEGIN STEP S02", "BEGIN STEP S01", 1).replace(
+                "END STEP S02", "END STEP S01", 1
+            ),
+            "future dependency": raw.replace("DEPENDS_ON: NONE", "DEPENDS_ON: S02", 1),
+            "non-contiguous ids": raw.replace("STEP S02", "STEP S03"),
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
                 with self.assertRaises(V2PlanParseError):
                     parse(text)
 
