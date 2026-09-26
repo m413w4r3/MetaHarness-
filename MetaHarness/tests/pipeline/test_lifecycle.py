@@ -91,12 +91,22 @@ class LifecycleTests(PipelineHarness):
         self.assertEqual(selection["final_reviewer"]["profile_id"], "reviewer")
 
     def test_red_gate_without_repair_budget_never_reaches_the_reviewer(self) -> None:
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
+        )
         result = self.orchestrator(
             self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
-        self.assertEqual(self.state()["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR)
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        # A zero budget refuses the worker pass; the autonomous replan rung of
+        # the ladder still ran before the operator was asked.
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+        self.assertEqual(ladder_strategies(self), ["replan_step"])
+        self.assertFalse(
+            (self.run_dir() / "cycles/001/check-repair/post-implementation/attempts").exists()
+        )
         self.assertEqual(self.reviewer.requests, [])
         self.assertFalse((self.run_dir() / "cycles/001/candidate/commit.json").exists())
 

@@ -21,7 +21,7 @@ deterministic checks
   │
   ├ FAIL
   │   ↓
-  │ bounded direct check-repair loop
+  │ recovery ladder (repair → replan → fallback)
   │   ↓
   │ deterministic checks
   │

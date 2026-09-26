@@ -1306,7 +1306,14 @@ class CheckRepairLadder:
         failed: tuple[str, ...], proof: tuple[str, ...],
         repair_attempt: int, repair_budget: int,
     ) -> GateRecoveryStep | None:
-        """Materialize the step, or refuse it for these exact facts."""
+        """Materialize the step, or refuse it for these exact facts.
+
+        A refusal is not an outcome: the rung consumes no attempt, produces no
+        report and leaves the ladder free to propose the next distinct
+        strategy.  The frozen ``repair_budget`` is consulted here and only for
+        the rungs that execute a check-repair worker pass; the replan rungs are
+        never bounded by it.
+        """
 
         trail = self._trail(ledger)
         common = {"tree": tree, "failed_check_ids": failed, "consumed": trail}

@@ -9,8 +9,8 @@ candidate commit, a review, the publication) is injected explicitly through
 A run is a sequence of cycles ``001, 002, ...``.  Each cycle executes one
 approved plan (the operator-approved plan for the initial cycle, a
 review-driven correction plan afterwards), optionally a semantic revision,
-one or two deterministic gate episodes with their bounded check-repair
-attempts, the accepted candidate HEAD, its push and one final review.  The number of
+one or two deterministic gate episodes with their recovery ladder, the
+accepted candidate HEAD, its push and one final review.  The number of
 cycles is bounded only by the frozen run options, never by this module.
 """
 
@@ -324,13 +324,20 @@ class PipelineV2Operations:
         [PipelineV2Context, int, ReviewResult, Mapping[str, Any]], RunResult
     ]
     publish: Callable[[PipelineV2Context, int, Mapping[str, Any]], RunResult]
+    # The single red-gate recovery ladder object of the run.  The machine asks
+    # it which distinct strategy to try next and reports each step: every red
+    # deterministic gate runs through it and there is no other engine, so the
+    # frozen check-repair budget only bounds the rungs that run a worker.
+    recovery_operations: "RecoveryOperations"
     # Accept the durable candidate of a ``STEP_ACCEPTANCE`` checkpoint; it
     # never calls a worker, a planner or a reviewer.
     accept_step: Callable[[PipelineV2Context, CyclePlan, int], None] | None = None
-    # The single red-gate recovery ladder object of the run.  The machine asks
-    # it which distinct strategy to try next and reports each step; without it
-    # the deterministic gate keeps its bounded direct check-repair loop.
-    recovery_operations: "RecoveryOperations | None" = None
+
+    def __post_init__(self) -> None:
+        if self.recovery_operations is None:
+            raise TypeError(
+                "PipelineV2Operations requires the red-gate recovery ladder"
+            )
 
 
 # ``RunPhase`` is the state machine's own phase vocabulary: the durable
@@ -621,7 +628,7 @@ class PipelineV2Coordinator:
     def _gate_episode(
         self, cycle_plan: CyclePlan, stage: GateStage, start: ResumeCheckpoint | None,
     ) -> EvidenceBundle:
-        """One deterministic gate and its bounded check-repair attempts."""
+        """One deterministic gate and its recovery ladder."""
 
         ops, ctx = self.operations, self.context
         number = cycle_plan.cycle.number
@@ -675,36 +682,12 @@ class PipelineV2Coordinator:
             soft = ops.soft_failures(evidence)
             if not soft:
                 raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
-            if budget <= 0:
-                raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
-            if recovery is None:
-                if attempt > budget:
-                    raise PipelineFailure(
-                        "CHECK_REPAIR_EXHAUSTED",
-                        self._check_repair_exhaustion_detail(
-                            ctx, cycle_plan, stage, evidence, soft,
-                            attempt=attempt, budget=budget,
-                        ),
-                    )
-                if not repair_boundary_written:
-                    self._boundary(
-                        RunPhase.CHECK_REPAIR, cycle_plan, stage=stage,
-                        check_repair_attempt=attempt, tree=evidence.staged_tree_sha,
-                    )
-                if not attempt_recorded:
-                    ops.check_repair_attempt(ctx, cycle_plan, stage, attempt, evidence)
-                attempt_recorded = False
-                self._boundary(
-                    RunPhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
-                    check_repair_attempt=attempt,
-                )
-                evidence = ops.run_gate(ctx, cycle_plan, stage)
-                attempt += 1
-                repair_boundary_written = False
-                continue
             # Ladder-first: one distinct strategy per red gate, consumed
             # durably before anything runs for it and never proposed twice for
-            # the same candidate tree and failure.
+            # the same candidate tree and failure.  The frozen budget is handed
+            # to the ladder, which consults it only for the rungs that run a
+            # check-repair worker: an inapplicable rung consumes nothing and
+            # the ladder simply advances to the next distinct strategy.
             while True:
                 red = evidence
                 step = recovery.gate_step(

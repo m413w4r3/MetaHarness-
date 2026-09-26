@@ -45,8 +45,11 @@ preamble/postamble are not sent to that agent.
    implementation profile the canonical contract only. Each accepted step is
    committed by the harness after its gate; a failed attempt keeps durable
    tree/diff evidence and never enters the accepted chain.
-7. Run the deterministic checks. A red result enters the bounded direct
-   check-repair loop and is checked again; a green result proceeds to the
+7. Run the deterministic checks. A red result walks its recovery ladder - the
+   bounded check-repair pass the frozen budget allows, the evidence-proven
+   scope expansion, the replans of approved work, the configured executor
+   fallback - and is checked again after every rung that runs; only an
+   exhausted ladder waits for an operator. A green result proceeds to the
    semantic reviser, which compares the candidate with the SPEC and is itself
    followed by deterministic checks.
 8. Freeze the accepted candidate tree and commit SHA, push that exact commit
@@ -68,7 +71,7 @@ The normative v2 sequence is:
 ```text
 SPEC → planner → implementation steps → accepted commits
 → deterministic gate
-   ├ FAIL → bounded direct check repair → deterministic gate
+   ├ FAIL → recovery ladder → deterministic gate
    └ PASS → semantic revision (when enabled) → deterministic gate
 → accepted candidate → exact candidate push → final reviewer
    ├ PASS → publish the exact reviewed SHA
@@ -159,7 +162,7 @@ The normative v2 flow is documented in [pipeline-v2.md](pipeline-v2.md):
 ```text
 PLAN → implementation step → accepted step commit → …
 → deterministic checks
-   ├ FAIL → bounded direct check-repair loop → deterministic checks
+   ├ FAIL → recovery ladder → deterministic checks
    └ PASS → semantic revision → deterministic checks
 → accepted candidate → push run branch → final reviewer
    ├ PASS → publish the exact reviewed SHA

@@ -19,7 +19,7 @@ PLAN SINGLE or STAGED  (execution_mode_policy = "auto" by default)
 implementation steps → accepted step commits
   ↓
 deterministic checks
-  ├ FAIL → bounded direct check-repair loop → deterministic checks
+  ├ FAIL → recovery ladder (check-repair, replan, fallback) → gate rerun
   └ PASS → semantic revision → deterministic checks
   ↓
 accepted candidate D

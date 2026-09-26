@@ -50,7 +50,13 @@ from metaharness.resume import (
     ResumePhase as P,
 )
 from metaharness.state import RunStateStore
-from tests.pipeline_support import PipelineHarness, initial_plan, review, write
+from tests.pipeline_support import (
+    PipelineHarness,
+    initial_plan,
+    ladder_strategies,
+    review,
+    write,
+)
 
 SPEC = "Make feature.txt good.\n"
 STEP = ("S01", "feature.txt", "Write the feature")
@@ -531,13 +537,25 @@ class RecoveryPathTests(PipelineHarness):
         self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
 
     def test_red_gate_without_repair_budget_waits_for_an_operator(self) -> None:
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        """A zero budget refuses the worker rungs, never the autonomous ones."""
+
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
+        )
         result = self.orchestrator(
             self.config(check_repair=0), planner=[initial_plan(STEP)], reviewer=["unused"],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
+        self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR)
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
         self.assertEqual(self.checkpoint()["phase"], P.DETERMINISTIC_GATE.value)
-        self.assertEqual(self.workers.roles(), ["implementer"])
+        # The budgeted repair pass is refused, so the ladder consumes its
+        # autonomous replan rung before the operator is ever asked.
+        self.assertEqual(ladder_strategies(self), ["replan_step"])
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+        self.assertFalse(
+            (self.run_dir() / "cycles/001/check-repair/post-implementation/attempts").exists()
+        )
         self.assertEqual(self.reviewer.requests, [])
         events = [
             json.loads(line) for line in

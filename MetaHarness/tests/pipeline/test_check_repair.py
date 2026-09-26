@@ -588,5 +588,113 @@ class CheckRepairTests(PipelineHarness):
         self.assertFalse((attempt / "failure.json").exists())
         self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
 
+    def test_zero_check_repair_budget_still_reaches_non_worker_recovery(self) -> None:
+        """A zero budget refuses the worker rungs, never the autonomous ones."""
+
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "good\n"),
+        )
+        result = self.orchestrator(
+            self.config(check_repair=0), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+        entries = ladder_ledger(self)["entries"]
+        self.assertEqual([entry["strategy"] for entry in entries], ["replan_step"])
+        self.assertEqual([entry["repair_attempt"] for entry in entries], [None])
+        self.assertFalse(
+            (self.run_dir() / "cycles/001/check-repair/post-implementation/attempts").exists(),
+            "an inapplicable repair rung created an attempt or a report",
+        )
+
+    def test_repair_budget_only_limits_worker_repair_rungs(self) -> None:
+        """The frozen budget bounds the worker rungs and nothing else."""
+
+        from types import SimpleNamespace
+
+        from metaharness.evidence import EvidenceBundle
+        from metaharness.models import GateStage
+        from metaharness.orchestration.check_repair import CheckRepairLadder
+        from metaharness.recovery_policy import RecoveryStrategy
+
+        red = EvidenceBundle(
+            base_sha=self.base_sha, staged_tree_sha=candidate_tree_sha(self.repo),
+            changed_files=("feature.txt",), diff="", checks=(),
+            deterministic_passed=False, failures=("CHECK_FAILED:test",),
+            required_check_ids=("test",),
+        )
+        step = SimpleNamespace(
+            id="S01", write_set=("feature.txt",), create_set=(), delete_set=(),
+        )
+        cycle_plan = SimpleNamespace(
+            cycle=SimpleNamespace(number=1),
+            plan=SimpleNamespace(steps=(step,)),
+            mutable_scope=("feature.txt",),
+        )
+        ctx = SimpleNamespace(
+            run_dir=self.run_dir(), repo=self.repo,
+            info=SimpleNamespace(worktree=self.repo),
+            selection=SimpleNamespace(check_repair_fallbacks=()),
+            options=SimpleNamespace(
+                repair_scope_policy="deny-expansion", repair_scope_max_added_paths=4,
+            ),
+        )
+        ladder = CheckRepairLadder(replay_steps=lambda *args, **kwargs: "b" * 40)
+
+        def gate(attempt: int, budget: int):
+            return ladder.gate_step(
+                ctx=ctx, cycle_plan=cycle_plan, stage=GateStage.POST_IMPLEMENTATION,
+                evidence=red, repair_attempt=attempt, repair_budget=budget,
+            )
+
+        refused = gate(1, 0)
+        self.assertIs(refused.strategy, RecoveryStrategy.REPLAN_STEP)
+        self.assertIsNone(refused.repair_attempt)
+        self.assertFalse(refused.exhausted)
+        # The refused worker rung consumed nothing and reported nothing.
+        ladder_dir = self.run_dir() / "cycles/001/check-repair/post-implementation"
+        self.assertFalse((ladder_dir / "attempts").exists())
+        self.assertFalse((ladder_dir / "ladder.json").exists())
+
+        worker = gate(1, 1)
+        self.assertIs(worker.strategy, RecoveryStrategy.REPAIR_TARGETED)
+        self.assertEqual(worker.repair_attempt, 1)
+
+    def test_red_gate_has_no_legacy_direct_repair_path(self) -> None:
+        """A red gate only ever obeys the ladder, never a direct repair loop."""
+
+        from unittest import mock
+
+        from metaharness.orchestration.check_repair import CheckRepairLadder
+        from metaharness.orchestration.recovery import GateRecoveryStep
+        from metaharness.recovery_policy import RecoveryStrategy
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
+        terminal = GateRecoveryStep(RecoveryStrategy.WAIT_HUMAN, exhausted=True)
+        consulted: list[int] = []
+
+        def gate_step(_ladder, **_kwargs):
+            consulted.append(1)
+            return terminal
+
+        with mock.patch.object(CheckRepairLadder, "gate_step", gate_step):
+            result = self.orchestrator(
+                self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
+            ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(consulted, [1], "the red gate did not ask the recovery ladder")
+        self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"))
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        # Two repair passes were budgeted and a repair worker was scripted: only
+        # the ladder's terminal is obeyed, the legacy loop would have run it.
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertFalse(
+            (self.run_dir() / "cycles/001/check-repair/post-implementation/attempts").exists()
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

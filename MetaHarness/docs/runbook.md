@@ -115,7 +115,7 @@ mode = "run-branch"
 ```text
 PLAN → implementation step → accepted step commit → …
 → deterministic checks
-   ├ FAIL → bounded direct check-repair loop → deterministic checks
+   ├ FAIL → recovery ladder → deterministic checks
    └ PASS → semantic revision → deterministic checks
 → accepted candidate → push run branch → final reviewer
    ├ PASS → publish exact reviewed SHA
@@ -143,9 +143,10 @@ Failures specific to this mode include `CHECK_REPAIR_EXHAUSTED`,
 
 Agent failures are classified through the backend-neutral execution contract;
 the role and profile, not a vendor name, determine the route. Check repair is
-never a planner: a failed deterministic signal gets only the configured
-bounded direct repair attempts. Integrity failures are fail-closed and never
-start an LLM/AgentExecutor repair call.
+never a planner: a failed deterministic signal walks the configured recovery
+ladder, whose check-repair passes stay inside the frozen attempt budget and
+whose replan rungs only replay approved work. Integrity failures are
+fail-closed and never start an LLM/AgentExecutor repair call.
 
 Ne pas confondre réparation de check, révision sémantique et reviewer final.
 `REVISE / IMPLEMENTATION` réutilise le plan et appelle le semantic reviser ;
@@ -217,7 +218,7 @@ after parsing with the same values (`PLANNER_OUTPUT_INVALID` otherwise).
 BASE → isolated run worktree → PLAN STAGED
 → implementation steps → accepted step commits
 → deterministic checks
-   ├ FAIL → bounded direct check-repair loop → deterministic checks
+   ├ FAIL → recovery ladder → deterministic checks
    └ PASS → semantic revision → deterministic checks
 → accepted candidate → push exact SHA → final reviewer
    ├ PASS → publish exact reviewed SHA

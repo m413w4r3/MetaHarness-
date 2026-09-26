@@ -727,8 +727,10 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_commit_is_impossible_without_both_gates(self) -> None:
         _, llm, state = self.run_case(check_fail=True, review=PASS_REVIEW)
-        self.assertEqual(state["status"], RunStatus.WAITING_HUMAN.value)
-        self.assertEqual(state["failure"]["reason"], "DETERMINISTIC_GATE_FAILED")
+        # The default run has no check-repair budget: the ladder refuses the
+        # worker pass and exhausts its autonomous rungs before the operator wait.
+        self.assertEqual(state["status"], RunStatus.WAITING_CHECK_REPAIR.value)
+        self.assertEqual(state["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
         # The deterministic gate precedes the immutable candidate and review.
         self.assertEqual(llm.reviewer_calls, 0)
         self.assertIsNone(state.get("commit_sha"))

@@ -578,7 +578,14 @@ class RecoveryOperations(Protocol):
         self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
         evidence: EvidenceBundle, repair_attempt: int, repair_budget: int,
     ) -> GateRecoveryStep:
-        """The next distinct ladder step of one red gate, or the terminal."""
+        """The next distinct ladder step of one red gate, or the terminal.
+
+        ``repair_budget`` bounds exactly the rungs that execute a check-repair
+        worker; a rung that these facts do not admit is refused without
+        consuming anything, so the ladder always advances to its next distinct
+        strategy, and the terminal is reached only once every such decision was
+        made.
+        """
 
         ...
 

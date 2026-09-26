@@ -287,5 +287,29 @@ class RecoveryPathTests(PipelineHarness):
         self.assertEqual(self.state()["failure"]["reason"], "EXTERNAL_AUTH_REQUIRED")
         self.assertEqual(self.workers.roles(), ["implementer"])
 
+
+class PipelineOperationsContractTests(unittest.TestCase):
+    """The machine cannot be bound without its single recovery ladder."""
+
+    def test_pipeline_operations_requires_recovery_ladder(self) -> None:
+        import dataclasses
+
+        from metaharness.orchestration.pipeline_v2 import PipelineV2Operations
+
+        fields = dataclasses.fields(PipelineV2Operations)
+        ladder = next(item for item in fields if item.name == "recovery_operations")
+        self.assertIs(ladder.default, dataclasses.MISSING)
+        self.assertIs(ladder.default_factory, dataclasses.MISSING)
+        without = {
+            item.name: (lambda *args, **kwargs: None)
+            for item in fields
+            if item.name != "recovery_operations"
+        }
+        with self.assertRaises(TypeError):
+            PipelineV2Operations(**without)
+        with self.assertRaises(TypeError):
+            PipelineV2Operations(recovery_operations=None, **without)
+
+
 if __name__ == "__main__":
     unittest.main()
