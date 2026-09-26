@@ -897,7 +897,7 @@ export const MCP_TOOL_DESCRIPTORS: BackendToolDescriptor[] = [
       reasoning_profile: { type: 'string' }, agentic_profile: { type: 'string' }, final_reviewer_profile: { type: 'string' },
       semantic_reviser_profile: { type: 'string' }, check_repair_profile: { type: 'string' },
       semantic_revision_enabled: { type: 'boolean' }, max_check_repair_attempts: { type: 'integer' },
-      max_review_repair_cycles: { type: 'integer' }, decomposition: { type: 'string' },
+      max_correction_cycles: { type: 'integer' }, decomposition: { type: 'string' },
       execution_mode_policy: { type: 'string' }, single_step_max_mutable_paths: { type: 'integer' },
       staged_step_max_mutable_paths: { type: 'integer' }, repair_scope_policy: { type: 'string' },
       repair_scope_max_added_paths: { type: 'integer' },

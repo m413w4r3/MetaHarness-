@@ -370,7 +370,7 @@ class FrozenRunOptionsSchemaTests(unittest.TestCase):
             staged_step_max_mutable_paths=6,
             semantic_revision_enabled=False,
             max_check_repair_attempts=0,
-            max_review_repair_cycles=0,
+            max_correction_cycles=0,
             planner_profile="planner",
             mechanical_profile="worker",
             reasoning_profile="worker",

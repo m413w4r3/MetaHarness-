@@ -14,6 +14,7 @@ from metaharness.prompt_contracts import (
     build_semantic_revision_payload,
     write_prompt_diagnostics,
 )
+from metaharness.models import CycleKind
 from metaharness.orchestration.revision import EffectivePlanView
 
 
@@ -271,7 +272,7 @@ class PromptContractTests(unittest.TestCase):
             )
             cycle = SimpleNamespace(
                 number=number,
-                kind=SimpleNamespace(value=kind),
+                kind=CycleKind(kind),
             )
             return SimpleNamespace(
                 cycle=cycle,

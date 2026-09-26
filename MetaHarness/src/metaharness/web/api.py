@@ -969,7 +969,7 @@ def approve_run(
         # implicitly: only the immutable creation snapshot decides this.
         semantic_revision_enabled = snapshot.semantic_revision_enabled
         check_repair_required = (
-            snapshot.max_check_repair_attempts > 0 or snapshot.max_review_repair_cycles > 0
+            snapshot.max_check_repair_attempts > 0 or snapshot.max_correction_cycles > 0
         )
         if any(not isinstance(value, str) for value in step_profiles.values()):
             raise WebAPIError(400, "invalid step profile field")
@@ -1142,7 +1142,7 @@ def create_run(
     check_repair_profile: object = None,
     semantic_revision_enabled: object = None,
     max_check_repair_attempts: object = None,
-    max_review_repair_cycles: object = None,
+    max_correction_cycles: object = None,
     decomposition: object = None,
     execution_mode_policy: object = None,
     single_step_max_mutable_paths: object = None,
@@ -1194,7 +1194,7 @@ def create_run(
             "check_repair_profile": optional_profile(check_repair_profile, "check_repair_profile"),
             "semantic_revision_enabled": boolean(semantic_revision_enabled, "semantic_revision_enabled"),
             "max_check_repair_attempts": integer(max_check_repair_attempts, "max_check_repair_attempts"),
-            "max_review_repair_cycles": integer(max_review_repair_cycles, "max_review_repair_cycles"),
+            "max_correction_cycles": integer(max_correction_cycles, "max_correction_cycles"),
             "decomposition": decomposition,
             "execution_mode_policy": execution_mode_policy,
             "single_step_max_mutable_paths": integer(single_step_max_mutable_paths, "single_step_max_mutable_paths"),

@@ -44,8 +44,10 @@ push origin/main A→B              (git push --porcelain origin B:refs/heads/ma
 delete remote run branch           (fast-forward-base only; after publication)
 ```
 
-- `max_check_repair_attempts` et `max_review_repair_cycles` sont deux budgets
-  indépendants et configurables ; le reviewer ne connaît pas ces budgets ;
+- `max_check_repair_attempts` et `max_correction_cycles` sont deux budgets
+  indépendants et configurables ; le second borne tout cycle après `INITIAL`,
+  qu'il vienne d'une review ou d'un gate déterministe ; le reviewer ne connaît
+  pas ces budgets ;
 - une réparation de check corrige uniquement un signal déterministe ; une
   révision sémantique compare le candidat à la SPEC ; le reviewer final ne
   corrige jamais directement ;

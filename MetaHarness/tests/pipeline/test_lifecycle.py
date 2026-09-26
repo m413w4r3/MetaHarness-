@@ -63,7 +63,7 @@ class LifecycleTests(PipelineHarness):
     def test_new_run_writes_only_current_option_and_selection_names(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.orchestrator(
-            self.config(check_repair=1, review_repair=1),
+            self.config(check_repair=1, correction_cycles=1),
             planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
         options = json.loads((self.run_dir() / "run_options.json").read_text())
@@ -156,7 +156,7 @@ class LifecycleTests(PipelineHarness):
     def test_human_route_stops_without_automatic_correction_or_publication(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(review_repair=3), planner=[initial_plan(STEP)],
+            self.config(correction_cycles=3), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "HUMAN")],
         ).run_text(
             "Return either a file containing 'green' or one containing 'blue'; both outcomes are allowed.",
@@ -185,7 +185,7 @@ class LifecycleTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
         result = self.orchestrator(
-            self.config(review_repair=1),
+            self.config(correction_cycles=1),
             planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
             reviewer=[review("REVISE", "REPLAN"), review()],
         ).run_text(SPEC, run_id="run")
@@ -274,7 +274,7 @@ class LifecycleTests(PipelineHarness):
         self.workers.on(ExecutionRole.REVISER, write("feature.txt", "semantic 4\n"))
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "semantic 3\n"))
         result = self.orchestrator(
-            self.config(check_repair=1, semantic_revision=True, review_repair=2, publish=True),
+            self.config(check_repair=1, semantic_revision=True, correction_cycles=2, publish=True),
             planner=[
                 initial_plan(*steps),
                 correction_plan(("S01", "feature.txt", "Replan the feature")),

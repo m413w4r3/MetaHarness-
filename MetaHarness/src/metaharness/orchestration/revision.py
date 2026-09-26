@@ -41,12 +41,15 @@ from ..gitops import (
     status_porcelain,
 )
 from ..models import (
+    CycleKind,
     ExecutionSelection,
     ExecutionRole,
     HarnessConfig,
     ImplementationStep,
     TaskPlanV2,
+    is_replan_cycle,
 )
+from ..planning.check_replan import check_replan_dir
 from ..prompt_contracts import (
     build_semantic_revision_payload,
     write_prompt_diagnostics,
@@ -285,6 +288,19 @@ def _plan_mutable_scope(plan: TaskPlanV2) -> set[str]:
     }
 
 
+def _replan_dir(run_dir: Path, cycle: Any) -> Path:
+    """Where one replan cycle keeps its plan authority and scope delta.
+
+    A red gate re-decomposed cycle plans in its own check-replan directory; a
+    review-driven one in its correction directory.
+    """
+
+    return (
+        check_replan_dir(run_dir, cycle.number)
+        if cycle.kind is CycleKind.CHECK_REPLAN else correction_dir(run_dir, cycle)
+    )
+
+
 def _cycle_kind_value(cycle: Any) -> str:
     kind = getattr(cycle, "kind", "")
     return str(getattr(kind, "value", kind))
@@ -317,7 +333,9 @@ class EffectivePlanView:
             before = set(cumulative_scope)
             current_scope = _plan_mutable_scope(plan)
             cumulative_scope.update(current_scope)
-            if _cycle_kind_value(item.cycle) != "review-replan":
+            # A review replan and a red-gate replan are both accepted
+            # corrections: the view keeps which one produced each of them.
+            if not is_replan_cycle(item.cycle.kind):
                 continue
             plan_sha = (
                 correction_plan_hashes.get(item.cycle.number)
@@ -360,8 +378,7 @@ class EffectivePlanView:
         )
         correction_objective = (
             current.plan.objective
-            if _cycle_kind_value(current.cycle) == "review-replan"
-            else None
+            if is_replan_cycle(current.cycle.kind) else None
         )
         return cls(
             original_objective=original_plan.objective,
@@ -449,11 +466,10 @@ class ReviewContextBuilder:
     ) -> dict[int, str]:
         hashes: dict[int, str] = {}
         for item in plans:
-            if _cycle_kind_value(item.cycle) != "review-replan":
+            if not is_replan_cycle(item.cycle.kind):
                 continue
             text = _read_bounded_text(
-                correction_dir(run_dir, item.cycle.number) / "scope_delta.json",
-                limit=256 * 1024,
+                _replan_dir(run_dir, item.cycle) / "scope_delta.json", limit=256 * 1024,
             )
             try:
                 payload = json.loads(text)
@@ -474,7 +490,7 @@ class ReviewContextBuilder:
         )
         plan_text = effective_plan.render()
         scope_delta = ""
-        if number > 1 and _cycle_kind_value(cycle_plan.cycle) == "review-replan":
+        if number > 1 and is_replan_cycle(cycle_plan.cycle.kind):
             scope_delta = _json_text(
                 effective_plan.accepted_correction_plans[-1]["approved_scope_delta"]
             )

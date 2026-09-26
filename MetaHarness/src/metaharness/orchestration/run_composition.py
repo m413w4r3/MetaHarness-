@@ -21,7 +21,7 @@ from ..execution_selection import (
 )
 from ..gitops import RepositoryReference, WorktreeInfo, candidate_tree_sha, current_head
 from ..llm.chat import LLMError
-from ..models import CycleKind, ExecutionRole, ExecutionSelection, RunCycle
+from ..models import CycleKind, ExecutionRole, ExecutionSelection, RunCycle, is_replan_cycle
 from ..planning.check_replan import check_replan_dir
 from ..planning.protocol import TaskPlanV2
 from ..profiles import build_llm_endpoint, profile_for_role, profiles_for_config
@@ -351,7 +351,7 @@ class RunComposition:
         self, ctx: PipelineV2Context, cycle: RunCycle, plan: TaskPlanV2,
         bundle: Mapping[str, Any], bundle_sha: str, *, creating: bool,
     ) -> CyclePlan:
-        if cycle.kind not in {CycleKind.REVIEW_REPLAN, CycleKind.CHECK_REPLAN}:
+        if not is_replan_cycle(cycle.kind):
             raise PipelineFailure("REPLAN_CYCLE_REQUIRED")
         # A red-gate replan authored its plan in the executing cycle's own
         # check-replan directory; a review replan in its correction one.

@@ -68,7 +68,7 @@ class GenericSnapshotTests(unittest.TestCase):
             decomposition="balanced", execution_mode_policy="auto",
             single_step_max_mutable_paths=2, staged_step_max_mutable_paths=6,
             semantic_revision_enabled=False, max_check_repair_attempts=0,
-            max_review_repair_cycles=0, planner_profile="planner",
+            max_correction_cycles=0, planner_profile="planner",
             mechanical_profile="implementer", reasoning_profile="implementer",
             agentic_profile="implementer", check_repair_profile=None,
             semantic_reviser_profile=None, final_reviewer_profile="reviewer",

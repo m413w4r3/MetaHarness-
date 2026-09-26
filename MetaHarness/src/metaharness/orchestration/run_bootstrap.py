@@ -112,7 +112,7 @@ class RunBootstrap:
         """
 
         revision_enabled = self.runtime.run_options.semantic_revision_enabled
-        repair_enabled = self.runtime.run_options.max_review_repair_cycles > 0
+        repair_enabled = self.runtime.run_options.max_correction_cycles > 0
         check_repair_enabled = self.runtime.run_options.max_check_repair_attempts > 0
         planner_profile_id = planner_profile.id
         if existing_plan is None:

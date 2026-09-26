@@ -95,7 +95,7 @@ export function RunApproval({ runId, data, callBackendTool, disabled, onDecision
   const pipeline = object(runOptions.pipeline);
   const semanticEnabled = pipeline.semantic_revision_enabled === true;
   const repairEnabled = Number(pipeline.max_check_repair_attempts ?? 0) > 0
-    || Number(pipeline.max_review_repair_cycles ?? 0) > 0;
+    || Number(pipeline.max_correction_cycles ?? 0) > 0;
 
   useEffect(() => {
     if (!planPending || !callBackendTool) return;

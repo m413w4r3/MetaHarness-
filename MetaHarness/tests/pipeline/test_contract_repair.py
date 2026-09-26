@@ -133,7 +133,7 @@ class ContractRepairTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, lambda _request: "done\n", lambda _request: "done\n")
         self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(max_step_contract_repairs=1, review_repair=1),
+            self.config(max_step_contract_repairs=1, correction_cycles=1),
             planner=[initial_plan(STEP), repaired_step_contract()],
             reviewer=[review("REVISE", "IMPLEMENTATION"), review()],
         ).run_text(SPEC, run_id="reviewed-no-change")

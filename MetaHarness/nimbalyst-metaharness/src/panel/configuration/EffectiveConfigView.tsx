@@ -75,7 +75,7 @@ export function EffectiveConfigView({ config }: { config: Data }) {
         ['Plan approval', approval.require_plan_approval],
         ['Semantic revision', revision.enabled],
         ['Max check repair attempts', revision.max_check_repair_attempts],
-        ['Max review repair cycles', revision.max_review_repair_cycles],
+        ['Max correction cycles', revision.max_correction_cycles],
       ]} />
       <Group title="Publish" rows={[
         ['Publish', publish.enabled],

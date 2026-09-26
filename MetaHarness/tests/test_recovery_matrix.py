@@ -610,7 +610,7 @@ class RecoveryPathTests(PipelineHarness):
             write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
         )
         result = self.orchestrator(
-            self.config(check_repair=0),
+            self.config(check_repair=0, correction_cycles=1),
             planner=[
                 initial_plan(STEP), repaired_step_contract(),
                 # The last autonomous rung re-decomposes the cycle; the plan it

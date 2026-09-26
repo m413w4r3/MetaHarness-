@@ -58,7 +58,9 @@ Un step accepté ajoute un commit à la chaîne linéaire. Un essai rouge conser
 son arbre, son diff et son résultat de checks pour l’audit, mais ne devient
 jamais un commit accepté. Une correction mécanique est donc toujours bornée
 par `max_check_repair_attempts`. Une correction déclenchée par la review est
-bornée séparément par `max_review_repair_cycles`.
+bornée, comme une re-décomposition déclenchée par un gate rouge, par l'unique
+`max_correction_cycles` : un cycle de correction, quel qu'il soit, consomme une
+unité.
 
 Les checks déterministes sont exécutés avant chaque frontière qui peut
 accepter un arbre. Une mutation du HEAD, de l’index, de l’arbre candidat ou

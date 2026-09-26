@@ -83,7 +83,7 @@ export interface CreateRunInput extends JsonObject {
   check_repair_profile?: string;
   semantic_revision_enabled?: boolean;
   max_check_repair_attempts?: number;
-  max_review_repair_cycles?: number;
+  max_correction_cycles?: number;
   decomposition?: string;
   execution_mode_policy?: string;
   single_step_max_mutable_paths?: number;

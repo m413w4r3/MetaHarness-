@@ -1000,13 +1000,13 @@ def validate_revision_budget(value: int, name: str) -> int:
 
 @dataclass(frozen=True)
 class RevisionConfig:
-    """Independent, bounded semantic-revision and check-repair budgets.
+    """Bounded semantic revision, one correction budget and check repairs.
 
     The default is no correction pipeline: every budget needs its profile.
     """
 
     enabled: bool = False
-    max_review_repair_cycles: int = 0
+    max_correction_cycles: int = 0
     max_check_repair_attempts: int = 0
     max_step_contract_repairs: int = 2
 
@@ -1014,7 +1014,7 @@ class RevisionConfig:
         if not isinstance(self.enabled, bool):
             raise ValueError("revision.enabled must be a boolean")
         validate_revision_budget(
-            self.max_review_repair_cycles, "revision.max_review_repair_cycles"
+            self.max_correction_cycles, "revision.max_correction_cycles"
         )
         validate_revision_budget(
             self.max_check_repair_attempts, "revision.max_check_repair_attempts"
@@ -1269,6 +1269,35 @@ class CycleKind(StrEnum):
     # A red deterministic gate whose bounded repair pass and single-step
     # replan were both durably spent, so the decomposition itself is replanned.
     CHECK_REPLAN = "check-replan"
+
+
+_CORRECTION_CYCLE_KINDS = frozenset({
+    CycleKind.REVIEW_IMPLEMENTATION, CycleKind.REVIEW_REPLAN, CycleKind.CHECK_REPLAN,
+})
+_REPLAN_CYCLE_KINDS = frozenset({CycleKind.REVIEW_REPLAN, CycleKind.CHECK_REPLAN})
+
+
+def is_correction_cycle(kind: CycleKind) -> bool:
+    """Whether one cycle corrects earlier approved work: every kind but ``INITIAL``."""
+
+    return CycleKind(kind) in _CORRECTION_CYCLE_KINDS
+
+
+def is_replan_cycle(kind: CycleKind) -> bool:
+    """Whether one cycle exists because approved work was re-decomposed."""
+
+    return CycleKind(kind) in _REPLAN_CYCLE_KINDS
+
+
+def correction_cycles_used(cycle_number: int) -> int:
+    """The correction units a run reaching ``cycle_number`` has spent.
+
+    Cycle ``001`` is the initial implementation; every later cycle -- one a
+    review opened or one a red deterministic gate re-decomposed -- spends
+    exactly one unit of the run's single correction budget.
+    """
+
+    return cycle_number - 1
 
 
 class GateStage(StrEnum):

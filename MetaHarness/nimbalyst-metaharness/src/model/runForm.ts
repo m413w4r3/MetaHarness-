@@ -21,7 +21,7 @@ export interface RunFormDefaults {
   check_repair_profile: string;
   semantic_revision_enabled: boolean;
   max_check_repair_attempts: number;
-  max_review_repair_cycles: number;
+  max_correction_cycles: number;
   decomposition: string;
   execution_mode_policy: string;
   single_step_max_mutable_paths: number;
@@ -80,7 +80,7 @@ export function defaultsFromServer(profilesResponse: unknown, configResponse: un
     check_repair_profile: profileDefault('check_repair_profile'),
     semantic_revision_enabled: value(revision.enabled, false),
     max_check_repair_attempts: value(revision.max_check_repair_attempts, 0),
-    max_review_repair_cycles: value(revision.max_review_repair_cycles, 0),
+    max_correction_cycles: value(revision.max_correction_cycles, 0),
     decomposition: value(planning.decomposition, 'aggressive'),
     execution_mode_policy: value(planning.execution_mode_policy, 'auto'),
     single_step_max_mutable_paths: value(planning.single_step_max_mutable_paths, 2),
@@ -105,7 +105,7 @@ export function validateRunForm(form: RunFormState, profiles: ModelProfile[]): s
     if (!id && !required) continue;
     if (!profiles.some((profile) => profile.id === id && profile.roles.includes(role))) return `${field.replaceAll('_', ' ')} must use a compatible ${role} profile.`;
   }
-  const zeroAllowed = [form.max_check_repair_attempts, form.max_review_repair_cycles];
+  const zeroAllowed = [form.max_check_repair_attempts, form.max_correction_cycles];
   const positive = [form.single_step_max_mutable_paths, form.staged_step_max_mutable_paths, form.repair_scope_max_added_paths];
   if (zeroAllowed.some((number) => !Number.isInteger(number) || number < 0)) return 'Repair budgets must be integers greater than or equal to zero.';
   if (positive.some((number) => !Number.isInteger(number) || number < 1)) return 'Mutable path limits must be positive integers.';
@@ -121,7 +121,7 @@ export function buildCreateRunInput(form: RunFormState, advanced: boolean): Crea
   if (advanced) {
     input.semantic_revision_enabled = form.semantic_revision_enabled;
     input.max_check_repair_attempts = Number(form.max_check_repair_attempts);
-    input.max_review_repair_cycles = Number(form.max_review_repair_cycles);
+    input.max_correction_cycles = Number(form.max_correction_cycles);
     input.decomposition = form.decomposition;
     input.execution_mode_policy = form.execution_mode_policy;
     input.single_step_max_mutable_paths = Number(form.single_step_max_mutable_paths);

@@ -66,11 +66,15 @@ MODULE_MAX_LINES = 900
 # last, autonomous rung (a cycle re-decomposition) inside the modules that
 # already own the gate episode, the plan authority and the resume proof, and
 # the durable answer itself landed in ``planning/check_replan.py``.
+# Raised in the single-correction-budget change: the ladder's cycle rung is
+# refused against that budget inside the module that owns the rungs, the plan
+# authority learned to read a check-replan's own directory, and the review
+# service keeps its defence-in-depth refusal of an unaffordable rung.
 FROZEN_MODULE_SIZES: Mapping[str, int] = {
-    "orchestration/check_repair.py": 2003,
+    "orchestration/check_repair.py": 2011,
     "orchestration/resume_validation.py": 1392,
-    "orchestration/review_service.py": 1789,
-    "orchestration/revision.py": 1057,
+    "orchestration/review_service.py": 1790,
+    "orchestration/revision.py": 1072,
 }
 
 PIPELINE_TEST_MAX_LINES = 1000

@@ -175,17 +175,18 @@ def write(path: str, content: str, report: str = "done\n") -> Script:
     return action
 
 
-def repaired_step_contract() -> str:
+def repaired_step_contract(title: str = "Write the feature") -> str:
     """A valid repair of the standard one-step plan's contract.
 
     It keeps the approved step identity and mutable scope while changing the
     objective and instructions, so a red-gate replan produces a genuinely
-    different, still bounded contract.
+    different, still bounded contract.  ``title`` must be the title of the
+    approved step the repair answers: a repair never renames that step.
     """
 
-    return """META STEP CONTRACT REPAIR v1
+    return f"""META STEP CONTRACT REPAIR v1
 STEP_ID: S01
-TITLE: Write the feature
+TITLE: {title}
 EXECUTION_CLASS: MECHANICAL
 DEPENDS_ON: NONE
 
@@ -327,14 +328,17 @@ class PipelineHarness(unittest.TestCase):
         self.temp.cleanup()
 
     def config(
-        self, *, check_repair: int = 0, review_repair: int = 0,
+        self, *, check_repair: int = 0, correction_cycles: int = 0,
         max_step_contract_repairs: int = 2,
         semantic_revision: bool = False, scope_policy: str | None = None,
         publish: bool = False, github_pr: bool = False,
     ) -> Any:
         path = self.root / "config.toml"
         self.config_path = path
-        reviser = '\ndefault_reviser_profile = "reviser"' if semantic_revision or review_repair else ""
+        reviser = (
+            '\ndefault_reviser_profile = "reviser"'
+            if semantic_revision or correction_cycles else ""
+        )
         repair = '\ndefault_repair_profile = "repairer"' if check_repair else ""
         path.write_text(f"""
 repo = {str(self.repo)!r}
@@ -349,7 +353,7 @@ protocol = "v2"
 [revision]
 enabled = {'true' if semantic_revision else 'false'}
 max_check_repair_attempts = {check_repair}
-max_review_repair_cycles = {review_repair}
+max_correction_cycles = {correction_cycles}
 max_step_contract_repairs = {max_step_contract_repairs}
 
 [repository]

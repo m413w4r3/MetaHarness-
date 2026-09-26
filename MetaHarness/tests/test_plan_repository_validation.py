@@ -416,7 +416,7 @@ class ReplanPreconditionTests(PipelineHarness):
         invalid = meta_plan({"read": ("feature.txt",), "create": ("new.txt",)}, title="Correct")
         valid = meta_plan({"read": ("new.txt",), "write": ("new.txt",)}, title="Correct")
         result = self.orchestrator(
-            self.config(review_repair=1),
+            self.config(correction_cycles=1),
             planner=[initial, invalid, valid],
             reviewer=[review("REVISE", "REPLAN"), review()],
         ).run_text("Make feature.txt good.\n", run_id="run")
@@ -433,7 +433,7 @@ class ReplanPreconditionTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         invalid = meta_plan({"read": ("missing.txt",), "write": ("missing.txt",)}, title="Correct")
         result = self.orchestrator(
-            self.config(review_repair=1),
+            self.config(correction_cycles=1),
             planner=[meta_plan({"read": ("feature.txt",), "write": ("feature.txt",)}), invalid, invalid],
             reviewer=[review("REVISE", "REPLAN")],
         ).run_text("Make feature.txt good.\n", run_id="run")

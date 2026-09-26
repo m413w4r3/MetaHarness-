@@ -113,7 +113,7 @@ export function NewRunForm({ callBackendTool, settings, onBack, onCreated }: {
 
   const profileOptions = (role: string) => profilesForRole(profiles, role);
   const field = (key: keyof RunFormState, label: string, type: 'number' | 'text' = 'number') => <label className="metaharness-form__field" key={key}>
-    <span>{label}</span><input type={type} min={type === 'number' ? (key === 'max_check_repair_attempts' || key === 'max_review_repair_cycles' ? 0 : 1) : undefined} step={type === 'number' ? 1 : undefined} value={form[key] as string | number} onChange={(event) => update(key, type === 'number' ? (event.target.value === '' ? Number.NaN : Number(event.target.value)) : event.target.value)} />
+    <span>{label}</span><input type={type} min={type === 'number' ? (key === 'max_check_repair_attempts' || key === 'max_correction_cycles' ? 0 : 1) : undefined} step={type === 'number' ? 1 : undefined} value={form[key] as string | number} onChange={(event) => update(key, type === 'number' ? (event.target.value === '' ? Number.NaN : Number(event.target.value)) : event.target.value)} />
   </label>;
 
   return <section className="metaharness-dashboard" aria-labelledby="metaharness-new-run-title">
@@ -138,7 +138,7 @@ export function NewRunForm({ callBackendTool, settings, onBack, onCreated }: {
           <label className="metaharness-form__field"><span>Execution mode policy</span><select value={form.execution_mode_policy} onChange={(event) => update('execution_mode_policy', event.target.value)}><option value="auto">auto</option><option value="require-staged">staged (require-staged)</option></select></label>
           <label className="metaharness-settings__checkbox"><input type="checkbox" checked={form.semantic_revision_enabled} onChange={(event) => update('semantic_revision_enabled', event.target.checked)} />Semantic revision</label>
           {field('max_check_repair_attempts', 'Max check repair attempts')}
-          {field('max_review_repair_cycles', 'Max review repair cycles')}
+          {field('max_correction_cycles', 'Max correction cycles')}
           {field('single_step_max_mutable_paths', 'Single-step max mutable paths')}
           {field('staged_step_max_mutable_paths', 'Staged-step max mutable paths')}
           <label className="metaharness-form__field"><span>Repair scope policy</span><select value={form.repair_scope_policy} onChange={(event) => update('repair_scope_policy', event.target.value)}><option value="auto-bounded">auto-bounded</option><option value="require-approval">require-approval</option><option value="deny-expansion">deny-expansion</option></select></label>

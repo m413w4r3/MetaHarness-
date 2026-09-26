@@ -747,13 +747,13 @@ def _doctor(config_path: Path) -> int:
     if (
         config.revision.enabled
         or config.revision.max_check_repair_attempts > 0
-        or config.revision.max_review_repair_cycles > 0
+        or config.revision.max_correction_cycles > 0
     ):
         print(
             "OK correction pipeline: "
             f"semantic_revision={'enabled' if config.revision.enabled else 'disabled'}, "
             f"max_check_repair_attempts={config.revision.max_check_repair_attempts}, "
-            f"max_review_repair_cycles={config.revision.max_review_repair_cycles}, "
+            f"max_correction_cycles={config.revision.max_correction_cycles}, "
             f"reviser={config.ui.default_reviser_profile}, "
             f"repair={config.ui.default_repair_profile})"
         )

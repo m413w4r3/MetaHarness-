@@ -20,6 +20,7 @@ from tests.pipeline.support import (
     correction_plan,
     git,
     initial_plan,
+    ladder_strategies,
     review,
     write,
 )
@@ -29,7 +30,7 @@ class ReviewCorrectionTests(PipelineHarness):
     def test_reviewer_fail_stops_without_correction_or_publication(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(review_repair=3), planner=[initial_plan(STEP)],
+            self.config(correction_cycles=3), planner=[initial_plan(STEP)],
             reviewer=[review("FAIL", "HUMAN")],
         ).run_text(SPEC, run_id="run")
 
@@ -72,7 +73,7 @@ class ReviewCorrectionTests(PipelineHarness):
             write("feature.txt", "good\n"), write("other.txt", "second\n"),
         )
         result = self.orchestrator(
-            self.config(review_repair=1),
+            self.config(correction_cycles=1),
             planner=[
                 initial_plan(STEP),
                 correction_plan(("S01", "other.txt", "Correct other")),
@@ -145,7 +146,7 @@ class ReviewCorrectionTests(PipelineHarness):
             write("feature.txt", "good\n"),
         )
         result = self.orchestrator(
-            self.config(review_repair=3),
+            self.config(correction_cycles=3),
             planner=[initial_plan(STEP)],
             reviewer=[
                 review("REVISE", "IMPLEMENTATION"), review("REVISE", "IMPLEMENTATION"),
@@ -167,7 +168,7 @@ class ReviewCorrectionTests(PipelineHarness):
         self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
         result = self.orchestrator(
-            self.config(review_repair=2),
+            self.config(correction_cycles=2),
             planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
             reviewer=[review("REVISE", "IMPLEMENTATION"), review("REVISE", "REPLAN"), review()],
         ).run_text(SPEC, run_id="run")
@@ -183,7 +184,7 @@ class ReviewCorrectionTests(PipelineHarness):
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
         result = self.orchestrator(
-            self.config(review_repair=3),
+            self.config(correction_cycles=3),
             planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
             reviewer=[
                 review("REVISE", "IMPLEMENTATION"), review("REVISE", "REPLAN"),
@@ -223,7 +224,7 @@ class ReviewCorrectionTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"), write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(review_repair=2), planner=[initial_plan(STEP)],
+            self.config(correction_cycles=2), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "IMPLEMENTATION")],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
@@ -240,7 +241,7 @@ class ReviewCorrectionTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(review_repair=2, check_repair=0), planner=[initial_plan(STEP)],
+            self.config(correction_cycles=2, check_repair=0), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "IMPLEMENTATION"), review()],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
@@ -248,6 +249,51 @@ class ReviewCorrectionTests(PipelineHarness):
         self.assertIsNone(selection["check_repair"])
         self.assertEqual(selection["semantic_reviser"]["profile_id"], "reviser")
         self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
+
+    def test_review_and_check_replans_share_one_budget(self) -> None:
+        """The unit a review replan spends is the one the gate rung is refused.
+
+        Cycle 001 commits, the review routes it to a whole-plan correction, and
+        that single unit opens cycle 002.  The red gate of that very cycle is
+        then refused the re-decomposition rung it would otherwise be admitted:
+        one budget bounds both, so no third cycle and no planner call exists.
+        """
+
+        counter = self.root / "gate-count"
+        self.check.write_text(
+            "import pathlib, sys\n"
+            f"counter = pathlib.Path({str(counter)!r})\n"
+            "count = int(counter.read_text()) if counter.exists() else 0\n"
+            "counter.write_text(str(count + 1))\n"
+            "sys.exit(0 if count == 0 else 1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
+        self.workers.on(ExecutionRole.REPAIR, write("other.txt", "second\n"))
+        result = self.orchestrator(
+            self.config(check_repair=1, correction_cycles=1),
+            planner=[
+                initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other")),
+            ],
+            reviewer=[review("REVISE", "REPLAN")],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"))
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        self.assertEqual(
+            json.loads((self.run_dir() / "cycles/002/cycle.json").read_text())["kind"],
+            "review-replan",
+        )
+        # The review's own correction cycle is refused the rung that would
+        # spend one more unit: nothing was re-decomposed and nothing planned.
+        self.assertNotIn(
+            "replan_cycle", ladder_strategies(self, cycle=2, stage="post-review-replan"),
+        )
+        self.assertFalse((self.run_dir() / "cycles/003").exists())
+        self.assertEqual(
+            [request for request in self.planner.requests if "re-decomposition" in request], [],
+        )
 
 
 class SemanticRevisionTests(PipelineHarness):
@@ -377,7 +423,7 @@ class SemanticRevisionTests(PipelineHarness):
             lambda _request: "no additional correction needed\n",
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n\n"))
-        config = self.config(semantic_revision=True, review_repair=1)
+        config = self.config(semantic_revision=True, correction_cycles=1)
         options = RunOptions.from_config(config, repair_scope_policy="deny-expansion")
         result = self.orchestrator(
             config,
@@ -484,7 +530,7 @@ class ScopeApprovalTests(PipelineHarness):
 
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
-        config = self.config(review_repair=1)
+        config = self.config(correction_cycles=1)
         options = RunOptions.from_config(config, repair_scope_policy="require-approval")
         waiting = self.orchestrator(
             config,

@@ -39,6 +39,7 @@ from ..models import (
     RunPhase,
     RunTransitionError,
     TaskPlanV2,
+    correction_cycles_used,
     transition,
 )
 from ..recovery_policy import RecoveryStrategy
@@ -582,17 +583,16 @@ class PipelineV2Coordinator:
             return ops.request_human(ctx, cycle.number, review, "HUMAN_REQUIRED")
         if review.route not in {ReviewRoute.IMPLEMENTATION, ReviewRoute.REPLAN}:
             return ops.request_human(ctx, cycle.number, review, "HUMAN_REQUIRED")
-        budget = ctx.options.max_review_repair_cycles
-        # Cycle 001 is the initial implementation; every later cycle spends
-        # one review-repair unit of the frozen budget.
-        corrections_used = cycle.number - 1
+        # One budget bounds every cycle after INITIAL, review or red-gate.
+        budget = ctx.options.max_correction_cycles
+        corrections_used = correction_cycles_used(cycle.number)
         if corrections_used >= budget:
             return ops.review_repair_exhausted(
                 ctx, cycle.number, review,
                 {
                     "last_review_cycle": cycle.number,
                     "corrections_used": corrections_used,
-                    "max_review_repair_cycles": budget,
+                    "max_correction_cycles": budget,
                     "last_route": review.route.value,
                 },
             )
@@ -702,6 +702,7 @@ class PipelineV2Coordinator:
                 step = recovery.gate_step(
                     ctx=ctx, cycle_plan=cycle_plan, stage=stage, evidence=red,
                     repair_attempt=attempt, repair_budget=budget,
+                    correction_budget=ctx.options.max_correction_cycles,
                 )
                 self._require_ladder_step(step, red)
                 if step.exhausted:

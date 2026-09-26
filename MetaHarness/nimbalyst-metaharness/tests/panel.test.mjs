@@ -93,7 +93,7 @@ const modelProfiles = {
   ],
   defaults: { planner_profile: 'plan-a', mechanical: 'impl-a', reasoning: 'impl-a', agentic: 'impl-a', final_reviewer_profile: 'review-a', semantic_reviser_profile: 'revise-a', check_repair_profile: 'repair-a' },
 };
-const configResponse = { planning: { decomposition: 'balanced', execution_mode_policy: 'require-staged', single_step_max_mutable_paths: 3, staged_step_max_mutable_paths: 6 }, revision: { enabled: true, max_check_repair_attempts: 2, max_review_repair_cycles: 3 } };
+const configResponse = { planning: { decomposition: 'balanced', execution_mode_policy: 'require-staged', single_step_max_mutable_paths: 3, staged_step_max_mutable_paths: 6 }, revision: { enabled: true, max_check_repair_attempts: 2, max_correction_cycles: 3 } };
 
 function renderNewRun(callBackendTool, onCreated = () => {}) {
   return render(React.createElement(NewRunForm, { callBackendTool, settings, onBack: () => {}, onCreated }));
@@ -391,7 +391,7 @@ test('server profile and config defaults populate the form reset state', async (
   assert.equal(defaults.decomposition, 'balanced');
   assert.equal(defaults.execution_mode_policy, 'require-staged');
   assert.equal(defaults.semantic_revision_enabled, true);
-  assert.equal(defaults.max_review_repair_cycles, 3);
+  assert.equal(defaults.max_correction_cycles, 3);
   const { callBackendTool, calls } = newRunBackend();
   renderNewRun(callBackendTool);
   await screen.findByRole('heading', { name: 'New Run' });

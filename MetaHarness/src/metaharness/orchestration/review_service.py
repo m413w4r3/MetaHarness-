@@ -65,7 +65,7 @@ from ..models import (
     PlanDecision,
     ReviewRoute,
     ReviewVerdict,
-    RunCycle, RunDisposition, RunMachineState, SCOPE_APPROVAL_REASON,
+    RunCycle, RunDisposition, RunMachineState, SCOPE_APPROVAL_REASON, correction_cycles_used,
 )
 from ..planning.artifacts import validate_implementation_bundle
 from ..planning.check_replan import (
@@ -677,6 +677,12 @@ class ReviewService:
         plan approved still goes through the run's own scope policy.
         """
 
+        if correction_cycles_used(cycle_plan.cycle.number) >= ctx.options.max_correction_cycles:
+            # The single correction budget is spent: fail closed before the
+            # planner transaction, so the ladder advances to its next rung.
+            raise RecoveryStepUnavailable(
+                step.strategy, "the run's correction budget is spent",
+            )
         cycle = RunCycle(cycle_plan.cycle.number + 1, CycleKind.CHECK_REPLAN)
         directory = check_replan_dir(ctx.run_dir, cycle.number)
         facts = _check_replan_facts(

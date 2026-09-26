@@ -232,20 +232,20 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
             git(self.repo, "--git-dir", str(bare), "rev-parse", "refs/heads/main"), d,
         )
 
-    def test_b_check_repair_budget_is_separate_from_review_budget(self) -> None:
+    def test_b_check_repair_budget_is_separate_from_the_correction_budget(self) -> None:
         options = RunOptions(
             schema_version=SCHEMA_VERSION, pipeline_version=2, protocol="v2",
             decomposition="balanced", execution_mode_policy="auto",
             single_step_max_mutable_paths=2, staged_step_max_mutable_paths=6,
             semantic_revision_enabled=True, max_check_repair_attempts=2,
-            max_review_repair_cycles=4, planner_profile="planner",
+            max_correction_cycles=4, planner_profile="planner",
             mechanical_profile="worker", reasoning_profile="worker",
             agentic_profile="worker", check_repair_profile="repair",
             semantic_reviser_profile="reviser", final_reviewer_profile="reviewer",
         )
         self.assertEqual(options.max_check_repair_attempts, 2)
-        self.assertEqual(options.max_review_repair_cycles, 4)
-        self.assertNotEqual(options.max_check_repair_attempts, options.max_review_repair_cycles)
+        self.assertEqual(options.max_correction_cycles, 4)
+        self.assertNotEqual(options.max_check_repair_attempts, options.max_correction_cycles)
 
     def test_c_d_e_review_routes_are_data_and_only_the_selected_route_is_actionable(self) -> None:
         for route in ("IMPLEMENTATION", "REPLAN", "HUMAN"):
@@ -261,7 +261,7 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
             self.assertEqual(result.route.value, route)
             self.assertEqual(result.verdict.value, "REVISE")
         # A reviewer never receives the correction budget as a control input.
-        self.assertNotIn("max_review_repair_cycles", PASS)
+        self.assertNotIn("max_correction_cycles", PASS)
 
     def test_f_integrity_failures_fail_closed_without_an_agent_call(self) -> None:
         calls: list[str] = []

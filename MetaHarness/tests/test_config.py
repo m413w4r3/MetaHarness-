@@ -612,7 +612,7 @@ mechanical = "rescue"
 [revision]
 enabled = true
 max_check_repair_attempts = 1
-max_review_repair_cycles = 1
+max_correction_cycles = 1
 
 [claude_runtime]
 home = "claude-home"
@@ -644,7 +644,7 @@ selection_mode = "cli"
 
 
 class RunOptionsStrictSchemaTests(unittest.TestCase):
-    """`run_options.json` has exactly one shape: schema 3 is read, nothing else."""
+    """`run_options.json` has exactly one shape: schema 4 is read, nothing else."""
 
     ENVIRONMENT = {
         "META_PLANNER_BASE_URL": "https://planner.example",
@@ -663,9 +663,15 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
     def snapshot(self) -> dict:
         return RunOptions.from_config(self.config()).to_dict()
 
-    def test_current_schema_three_round_trips_identically(self) -> None:
+    def test_current_schema_four_round_trips_identically(self) -> None:
         snapshot = self.snapshot()
         self.assertEqual(snapshot["schema_version"], SCHEMA_VERSION)
+        self.assertEqual(SCHEMA_VERSION, 4)
+        self.assertEqual(
+            snapshot["pipeline"]["max_correction_cycles"],
+            self.config().revision.max_correction_cycles,
+        )
+        self.assertNotIn("max_review_repair_cycles", snapshot["pipeline"])
         options = RunOptions.from_mapping(snapshot)
         self.assertEqual(options.to_dict(), snapshot)
         encoded = canonical_run_options_bytes(options)
@@ -676,12 +682,24 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
 
     def test_previous_schema_is_rejected_without_conversion(self) -> None:
         old_snapshot = self.snapshot()
-        old_snapshot["schema_version"] = 2
+        old_snapshot["schema_version"] = 3
         with self.assertRaises(RunOptionsError) as caught:
             RunOptions.from_mapping(old_snapshot)
         self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
         with self.assertRaises(RunOptionsError) as caught:
-            replace(RunOptions.from_mapping(self.snapshot()), schema_version=2)
+            replace(RunOptions.from_mapping(self.snapshot()), schema_version=3)
+        self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
+
+    def test_schema_three_snapshot_is_never_migrated(self) -> None:
+        """The renamed single budget is a clean break: no key is ever converted."""
+
+        legacy = self.snapshot()
+        legacy["schema_version"] = 3
+        legacy["pipeline"]["max_review_repair_cycles"] = legacy["pipeline"].pop(
+            "max_correction_cycles"
+        )
+        with self.assertRaises(RunOptionsError) as caught:
+            RunOptions.from_mapping(legacy)
         self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
 
     def test_missing_recovery_fields_are_rejected(self) -> None:

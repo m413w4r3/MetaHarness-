@@ -37,7 +37,7 @@ private const val DEFAULT_RUN_OPTIONS = """
       "pipeline": {
         "semantic_revision_enabled": false,
         "max_check_repair_attempts": 0,
-        "max_review_repair_cycles": 0
+        "max_correction_cycles": 0
       },
       "profiles": {
         "mechanical_profile": "impl-mech",
@@ -119,7 +119,7 @@ class RunApprovalTest {
         assertTrue(both.semanticRevisionEnabled)
         assertTrue(both.checkRepairEnabled)
 
-        val cycles = gate("""{"pipeline": {"max_review_repair_cycles": "1"}}""")
+        val cycles = gate("""{"pipeline": {"max_correction_cycles": "1"}}""")
         assertFalse(cycles.semanticRevisionEnabled)
         assertTrue(cycles.checkRepairEnabled)
 

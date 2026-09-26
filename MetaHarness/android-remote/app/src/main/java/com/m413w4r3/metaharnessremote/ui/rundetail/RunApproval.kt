@@ -147,7 +147,7 @@ fun planApprovalGate(document: JsonObject, capabilities: JsonObject?): ApprovalG
         steps = approvalSteps(document),
         semanticRevisionEnabled = pipeline?.bool("semantic_revision_enabled") == true,
         checkRepairEnabled = pipeline?.positive("max_check_repair_attempts") == true ||
-            pipeline?.positive("max_review_repair_cycles") == true,
+            pipeline?.positive("max_correction_cycles") == true,
     )
 }
 

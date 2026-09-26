@@ -6,9 +6,18 @@ import json
 import re
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest import mock
 
-from metaharness.models import ExecutionRole, RunStatus
+from metaharness.models import (
+    CycleKind,
+    ExecutionRole,
+    RunStatus,
+    correction_cycles_used,
+    is_correction_cycle,
+    is_replan_cycle,
+)
+from metaharness.orchestration.revision import EffectivePlanView
 from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
 from metaharness.resume import resume_info
 
@@ -18,6 +27,7 @@ from tests.pipeline.support import (
     PipelineHarness,
     check_repair_result,
     correction_plan,
+    git,
     initial_plan,
     ladder_strategies,
     repaired_step_contract,
@@ -64,7 +74,7 @@ class RecoveryPathTests(PipelineHarness):
             write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
         )
         self.workers.on(ExecutionRole.REPAIR, lambda _request: check_repair_result())
-        config = self.config(check_repair=1)
+        config = self.config(check_repair=1, correction_cycles=1)
         original = self.orchestrator(
             config,
             planner=[
@@ -117,7 +127,7 @@ class RecoveryPathTests(PipelineHarness):
                 "DONE", "FAIL", "NONE", "targeted check still fails",
             )),
         )
-        config = self.config(check_repair=1)
+        config = self.config(check_repair=1, correction_cycles=1)
         waiting = self.orchestrator(
             config,
             planner=[
@@ -186,7 +196,7 @@ class RecoveryPathTests(PipelineHarness):
             )),
         )
         result = self.orchestrator(
-            self.config(check_repair=2),
+            self.config(check_repair=2, correction_cycles=1),
             planner=[
                 initial_plan(STEP), repaired_step_contract(),
                 # The last rung re-decomposes the cycle and answers with the
@@ -251,6 +261,59 @@ class RecoveryPathTests(PipelineHarness):
         self.assertEqual(sorted(path.name for path in attempts.iterdir()), ["001", "002"])
         self.assertEqual(self.reviewer.requests, [])
 
+    def test_a_spent_correction_budget_moves_the_ladder_to_its_fallback_rung(self) -> None:
+        """A refused cycle rung is never an immediate human stop.
+
+        This run has no correction unit to spend, so its cycle rung is refused
+        without a planner call; the ladder simply consumes the rungs that
+        follow it, and its frozen fallback executor is the one that turns the
+        deterministic gate green.
+        """
+
+        from metaharness.agent import AgentRunResult
+        from metaharness.gitops import candidate_tree_sha
+
+        def timeout(request):
+            tree = candidate_tree_sha(request.worktree)
+            return AgentRunResult(
+                status="timed_out", exit_reason="AGENT_TIMEOUT", tree_before=tree,
+                tree_after=tree, usage=None, external_session_id=None,
+                report_path=None, timed_out=True,
+            )
+
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
+        )
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            write("feature.txt", "still bad\n"), write("feature.txt", "still bad\n"),
+            timeout, write("feature.txt", "good\n"),
+        )
+        config = self.config(check_repair=3, correction_cycles=0)
+        config = replace(config, recovery=RecoveryBudgets(
+            max_transient_attempts=0,
+            execution_fallbacks=ExecutionFallbacks(check_repair=("live_repairer",)),
+        ))
+        result = self.orchestrator(
+            config,
+            planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        # The rung the budget refused is absent from the episode; the rung that
+        # follows it in the ladder is the one that finished the job.
+        self.assertEqual(
+            ladder_strategies(self),
+            ["repair_targeted", "repair_targeted", "replan_step", "fallback_executor"],
+        )
+        self.assertEqual(self.workers.calls[-2].profile_id, "repairer")
+        self.assertEqual(self.workers.calls[-1].profile_id, "live_repairer")
+        self.assertEqual(
+            [request for request in self.planner.requests if "re-decomposition" in request], [],
+        )
+
 
     def test_a_cycle_replan_that_only_repeats_the_plan_never_loops(self) -> None:
         """The same answer for the same failure facts is spent, never replayed.
@@ -271,7 +334,7 @@ class RecoveryPathTests(PipelineHarness):
             ExecutionRole.REPAIR,
             write("feature.txt", "bad\n"), write("feature.txt", "worse repaired\n"),
         )
-        config = self.config(check_repair=1)
+        config = self.config(check_repair=1, correction_cycles=2)
         original = self.orchestrator(
             config,
             planner=[
@@ -310,6 +373,102 @@ class RecoveryPathTests(PipelineHarness):
         # One plan, one contract replan and one re-decomposition per cycle: the
         # repeated answer was never a second planner completion.
         self.assertEqual(len(original._runtime.planner_client.requests), 4)
+
+    def test_zero_correction_budget_skips_cycle_replan_without_planner_call(self) -> None:
+        """A spent correction budget refuses the cycle rung before any planning.
+
+        The only approved path is a test file the failure names, so no step is
+        proven responsible either: the ladder has no rung left, asks the
+        planner nothing and never opens the cycle the rung would have.
+        """
+
+        target = self.repo / "tests/test_feature.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("base test\n", encoding="utf-8")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "-qm", "add test fixture")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        self.check.write_text(
+            "import sys\n"
+            "print('tests/test_feature.py: the fixture does not match the spec')\n"
+            "raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER, write("tests/test_feature.py", "bad fixture\n"),
+        )
+        result = self.orchestrator(
+            self.config(check_repair=0, correction_cycles=0),
+            planner=[initial_plan(("S01", "tests/test_feature.py", "Write the fixture"))],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"))
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        self.assertEqual(self.state()["failure"]["detail"]["strategies"], [])
+        # No rung was consumed, no planner was asked and no cycle exists: the
+        # budget refused the rung before its transaction could run.
+        self.assertEqual(len(self.planner.requests), 1)
+        self.assertFalse(
+            (self.run_dir() / "cycles/001/check-repair/post-implementation/ladder.json").exists()
+        )
+        self.assertFalse((self.run_dir() / "cycles/002").exists())
+        # No durable trace of a replan exists: no plan artifact, no request and
+        # no planner completion was ever paid for by this red gate.
+        self.assertEqual(list(self.run_dir().glob("cycles/*/check-replan/*")), [])
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_one_correction_budget_allows_exactly_one_check_replan(self) -> None:
+        """One unit admits one cycle replan; the cycle it opened cannot buy a second.
+
+        Cycle 001's red gate spends the run's single correction unit on the
+        re-decomposition that opens cycle 002.  Cycle 002 executes it and fails
+        its own gate, and the rung that would re-decompose once more is refused
+        by the budget the running cycle already paid with: no third cycle, no
+        second re-decomposition and no planner call for one.
+        """
+
+        rewritten = ("S01", "feature.txt", "Rewrite the feature so the configured test passes")
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "worse\n"),
+            write("feature.txt", "worse2\n"), write("feature.txt", "worse3\n"),
+        )
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            write("feature.txt", "worse4\n"), write("feature.txt", "worse5\n"),
+        )
+        result = self.orchestrator(
+            self.config(check_repair=1, correction_cycles=1),
+            planner=[
+                initial_plan(STEP), repaired_step_contract(),
+                correction_plan(rewritten),
+                repaired_step_contract("Rewrite the feature so the configured test passes"),
+            ],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"))
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        # The one unit bought exactly one re-decomposition: the plan cycle 002
+        # executed, answered by the planner exactly once.
+        plans = sorted(self.run_dir().glob("cycles/*/check-replan/check_replan.plan.json"))
+        self.assertEqual([path.parent.parent.name for path in plans], ["002"])
+        self.assertEqual(
+            len([request for request in self.planner.requests if "re-decomposition" in request]),
+            1,
+        )
+        self.assertEqual(
+            json.loads((self.run_dir() / "cycles/002/cycle.json").read_text())["kind"],
+            "check-replan",
+        )
+        # The red gate of that cycle is refused the rung before a third cycle
+        # could exist, and the ladder still reaches its own terminal.
+        self.assertNotIn(
+            "replan_cycle", ladder_strategies(self, cycle=2, stage="post-check-replan"),
+        )
+        self.assertFalse((self.run_dir() / "cycles/003").exists())
+
 
     def test_fixed_point_fingerprint_changes_with_tree_or_failed_check_set(self) -> None:
         from metaharness.orchestration.pipeline_v2 import check_repair_fingerprint
@@ -483,6 +642,89 @@ class PipelineOperationsContractTests(unittest.TestCase):
             PipelineV2Operations(**without)
         with self.assertRaises(TypeError):
             PipelineV2Operations(recovery_operations=None, **without)
+
+
+class CorrectionCycleVocabularyTests(unittest.TestCase):
+    """One canonical pair of predicates decides what a correction cycle is."""
+
+    def test_correction_and_replan_kinds_are_canonical(self) -> None:
+        self.assertEqual(
+            [kind.value for kind in CycleKind if is_correction_cycle(kind)],
+            ["review-implementation", "review-replan", "check-replan"],
+        )
+        self.assertEqual(
+            [kind.value for kind in CycleKind if is_replan_cycle(kind)],
+            ["review-replan", "check-replan"],
+        )
+        self.assertFalse(is_correction_cycle(CycleKind.INITIAL))
+        # The counter every admission reads is derived from the cycle number:
+        # nothing durable can hand a resumed run back a spent unit.
+        self.assertEqual([correction_cycles_used(number) for number in (1, 2, 3)], [0, 1, 2])
+
+
+class EffectivePlanViewTests(unittest.TestCase):
+    """The plan authority treats a red-gate re-decomposition as a correction."""
+
+    @staticmethod
+    def _cycle_plan(number: int, kind: str, path: str) -> SimpleNamespace:
+        plan = SimpleNamespace(
+            title=f"Plan {number}",
+            objective=f"Plan {number} objective",
+            constraints="ORIGINAL CONSTRAINTS",
+            required_checks=("unit", "integration"),
+            steps=(SimpleNamespace(
+                id=f"S{number:02d}",
+                title=f"Step {number}",
+                depends_on=None,
+                objective=f"step objective {number}",
+                write_set=(path,),
+                create_set=(),
+                delete_set=(),
+                verify="run checks",
+                forbidden="do not widen scope",
+            ),),
+        )
+        return SimpleNamespace(
+            cycle=SimpleNamespace(number=number, kind=CycleKind(kind)),
+            plan=plan,
+            correction_bundle_sha256=f"{number:064x}",
+        )
+
+    def test_check_replan_is_present_in_effective_plan_view(self) -> None:
+        initial = self._cycle_plan(1, "initial", "src/initial.py")
+        replan = self._cycle_plan(2, "check-replan", "src/correction.py")
+        view = EffectivePlanView.from_cycle_plans(initial.plan, [initial, replan])
+
+        accepted = view.accepted_correction_plans
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(accepted[0]["cycle"], 2)
+        self.assertEqual(accepted[0]["cycle_kind"], "check-replan")
+        self.assertEqual(accepted[0]["plan_sha256"], replan.correction_bundle_sha256)
+        # The re-decomposed plan is the one in force: the view carries its step
+        # index, its required checks and its objective as the current authority.
+        self.assertEqual([step["id"] for step in view.current_step_index], ["S02"])
+        self.assertEqual(
+            view.required_deterministic_check_ids, ("unit", "integration"),
+        )
+        self.assertEqual(view.current_cycle_correction_objective, "Plan 2 objective")
+
+    def test_check_replan_scope_contributes_to_cumulative_scope(self) -> None:
+        initial = self._cycle_plan(1, "initial", "src/initial.py")
+        review = self._cycle_plan(2, "review-replan", "src/review.py")
+        check = self._cycle_plan(3, "check-replan", "src/check.py")
+        view = EffectivePlanView.from_cycle_plans(initial.plan, [initial, review, check])
+
+        self.assertEqual(
+            view.current_cumulative_approved_mutable_scope,
+            ("src/check.py", "src/initial.py", "src/review.py"),
+        )
+        self.assertEqual(
+            [
+                (item["cycle_kind"], item["approved_scope_delta"]["added_paths"])
+                for item in view.accepted_correction_plans
+            ],
+            [("review-replan", ["src/review.py"]), ("check-replan", ["src/check.py"])],
+        )
 
 
 if __name__ == "__main__":

@@ -168,7 +168,7 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(payload["revision"], {
             "enabled": self.config.revision.enabled,
             "max_check_repair_attempts": self.config.revision.max_check_repair_attempts,
-            "max_review_repair_cycles": self.config.revision.max_review_repair_cycles,
+            "max_correction_cycles": self.config.revision.max_correction_cycles,
         })
         self.assertEqual(payload["ui"]["max_active_runs"], self.config.ui.max_active_runs)
         self.assertEqual(payload["checks"], [{"id": "lint", "description": "Repository lint gate."}])

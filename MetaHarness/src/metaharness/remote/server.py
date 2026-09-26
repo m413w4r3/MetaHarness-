@@ -56,7 +56,7 @@ _CREATE_FIELDS = frozenset({
     "reasoning_profile", "agentic_profile", "final_reviewer_profile",
     "semantic_reviser_profile", "check_repair_profile",
     "semantic_revision_enabled", "max_check_repair_attempts",
-    "max_review_repair_cycles", "decomposition", "execution_mode_policy",
+    "max_correction_cycles", "decomposition", "execution_mode_policy",
     "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
     "repair_scope_policy", "repair_scope_max_added_paths",
 })

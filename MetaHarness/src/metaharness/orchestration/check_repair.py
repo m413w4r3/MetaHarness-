@@ -61,7 +61,7 @@ from ..gitops import (
 )
 from ..commit_gate import CommitSafetyError, commit_safety_gate
 from ..result import atomic_write_text
-from ..models import GateStage, TaskPlanV2
+from ..models import GateStage, TaskPlanV2, correction_cycles_used
 from ..prompt_contracts import build_check_repair_payload, write_prompt_diagnostics
 from ..recovery_policy import (
     FailureClass,
@@ -1271,6 +1271,7 @@ class CheckRepairLadder:
     def gate_step(
         self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
         evidence: EvidenceBundle, repair_attempt: int, repair_budget: int,
+        correction_budget: int,
     ) -> GateRecoveryStep:
         """The next distinct ladder step of this red gate, or its terminal."""
 
@@ -1333,6 +1334,7 @@ class CheckRepairLadder:
                 strategy, ctx=ctx, cycle_plan=cycle_plan, stage=stage_value,
                 evidence=evidence, ledger=ledger, tree=tree, failed=failed, proof=proof,
                 repair_attempt=repair_attempt, repair_budget=repair_budget,
+                correction_budget=correction_budget,
             )
             if step is None:
                 # Deterministically inapplicable for these exact facts:
@@ -1665,7 +1667,7 @@ class CheckRepairLadder:
         self, strategy: RecoveryStrategy, *, ctx: Any, cycle_plan: Any, stage: GateStage,
         evidence: EvidenceBundle, ledger: _LadderLedger, tree: str,
         failed: tuple[str, ...], proof: tuple[str, ...],
-        repair_attempt: int, repair_budget: int,
+        repair_attempt: int, repair_budget: int, correction_budget: int,
     ) -> GateRecoveryStep | None:
         """Materialize the step, or refuse it for these exact facts.
 
@@ -1673,7 +1675,8 @@ class CheckRepairLadder:
         report and leaves the ladder free to propose the next distinct
         strategy.  The frozen ``repair_budget`` is consulted here and only for
         the rungs that execute a check-repair worker pass; the replan rungs are
-        never bounded by it.
+        never bounded by it.  ``REPLAN_CYCLE`` is bounded by the run's single
+        ``correction_budget`` instead, because it opens one more cycle.
         """
 
         trail = self._trail(ledger)
@@ -1704,6 +1707,12 @@ class CheckRepairLadder:
         if strategy in {RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.REPLAN_CYCLE}:
             if strategy is RecoveryStrategy.REPLAN_CYCLE:
                 if self.replan_cycles is None:
+                    return None
+                if correction_cycles_used(cycle_plan.cycle.number) >= correction_budget:
+                    # This rung opens one more cycle after ``INITIAL``, so it
+                    # spends the run's single correction budget; a budget these
+                    # facts have already used up refuses it before any planner
+                    # call, artifact or cycle exists, and the ladder moves on.
                     return None
                 if self._cycle_replan_consumed(ctx, cycle_plan, tree, failed):
                     # These exact facts already re-decomposed a cycle: the same

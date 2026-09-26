@@ -104,7 +104,7 @@ independent network sandbox.
 [revision]
 enabled = true
 max_check_repair_attempts = 2
-max_review_repair_cycles = 1
+max_correction_cycles = 1
 
 [publish]
 enabled = true
@@ -124,9 +124,11 @@ PLAN → implementation step → accepted step commit → …
    └ REVISE / HUMAN → operator
 ```
 
-`max_check_repair_attempts` and `max_review_repair_cycles` are independent
-budgets. Each reviewable candidate is pushed to the `repository.remote` run
-branch before its reviewer, and MetaHarness persists and verifies the exact
+`max_check_repair_attempts` and `max_correction_cycles` are independent
+budgets; the latter bounds every cycle after `INITIAL`, whether a review opened
+it or a red deterministic gate re-decomposed it. Each reviewable candidate is
+pushed to the `repository.remote` run branch before its reviewer, and
+MetaHarness persists and verifies the exact
 remote SHA. This staging push happens even when `publish.enabled = false`;
 publication happens only after the final reviewer PASS and the exact-tree
 candidate gate, and only for the SHA named by the durable reviewer PASS

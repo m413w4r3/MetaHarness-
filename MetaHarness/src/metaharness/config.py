@@ -598,7 +598,7 @@ def _validate_revision(
     profiles: Mapping[str, ModelProfile],
 ) -> None:
     """Validate role/profile presence without coupling roles to drivers."""
-    if (revision.enabled or revision.max_review_repair_cycles > 0) and planning.protocol != "v2":
+    if (revision.enabled or revision.max_correction_cycles > 0) and planning.protocol != "v2":
         raise ConfigError("revision corrections require planning.protocol = 'v2'")
 
     if revision.max_check_repair_attempts > 0:
@@ -609,10 +609,10 @@ def _validate_revision(
         if repair is None or ExecutionRole.REPAIR not in repair.roles:
             raise ConfigError("revision check-repair profile must resolve for repair")
 
-    if revision.enabled or revision.max_review_repair_cycles > 0:
+    if revision.enabled or revision.max_correction_cycles > 0:
         value = ui.default_reviser_profile
         if not isinstance(value, str) or not value.strip():
-            raise ConfigError("revision review budget requires ui.default_reviser_profile")
+            raise ConfigError("revision correction budget requires ui.default_reviser_profile")
         reviser = profiles.get(value)
         if reviser is None or ExecutionRole.REVISER not in reviser.roles:
             raise ConfigError("revision semantic reviser profile must resolve for reviser")
@@ -799,15 +799,15 @@ def load_config(config_path: str | Path) -> HarnessConfig:
 
     revision_data = _table(expanded, "revision")
     allowed_revision = {
-        "enabled", "max_review_repair_cycles", "max_check_repair_attempts",
+        "enabled", "max_correction_cycles", "max_check_repair_attempts",
         "max_step_contract_repairs",
     }
     unknown_revision = sorted(set(revision_data) - allowed_revision)
     if unknown_revision:
         raise ConfigError(f"revision.{unknown_revision[0]} is not allowed")
     revision_enabled = _bool(revision_data, "enabled", False, "revision")
-    review_budget = _revision_budget(
-        revision_data, "max_review_repair_cycles", 1, "revision"
+    correction_budget = _revision_budget(
+        revision_data, "max_correction_cycles", 1, "revision"
     )
     check_budget = _revision_budget(
         revision_data, "max_check_repair_attempts", 2, "revision"
@@ -817,10 +817,10 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     )
     if not revision_data:
         # A config with no [revision] section has no correction pipeline.
-        review_budget = check_budget = contract_budget = 0
+        correction_budget = check_budget = contract_budget = 0
     revision = RevisionConfig(
         enabled=revision_enabled,
-        max_review_repair_cycles=review_budget,
+        max_correction_cycles=correction_budget,
         max_check_repair_attempts=check_budget,
         max_step_contract_repairs=contract_budget,
     )

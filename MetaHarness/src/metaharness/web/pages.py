@@ -182,7 +182,7 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
         for value in range(11)
     )
     review_cycle_options = "".join(
-        f'<option value="{value}"{" selected" if defaults.max_review_repair_cycles == value else ""}>{value}</option>'
+        f'<option value="{value}"{" selected" if defaults.max_correction_cycles == value else ""}>{value}</option>'
         for value in range(11)
     )
     body = f'''<main><p><a href="/">← Tous les runs</a></p><h1>New Run</h1>
@@ -202,7 +202,7 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
 <label for="semantic-revision">Semantic revision</label><select id="semantic-revision" name="semantic_revision_enabled" required><option value="enabled"{" selected" if semantic_revision == "enabled" else ""}>enabled</option><option value="disabled"{" selected" if semantic_revision == "disabled" else ""}>disabled</option></select>
 <label for="reviser-profile">Semantic reviser profile</label><select id="reviser-profile" name="semantic_reviser_profile" aria-describedby="reviser-help">{options["reviser"]}</select><p id="reviser-help" class="muted">The profile's declared role and executor determine whether the selection is valid.</p>
 <label for="check-repair-attempts">Maximum check-repair attempts</label><select id="check-repair-attempts" name="max_check_repair_attempts" required>{check_attempt_options}</select>
-<label for="repair-cycles">Maximum review-repair cycles</label><select id="repair-cycles" name="max_review_repair_cycles" required>{review_cycle_options}</select>
+<label for="repair-cycles">Maximum correction cycles</label><select id="repair-cycles" name="max_correction_cycles" required>{review_cycle_options}</select>
 <label for="repair-profile">Check-repair profile</label><select id="repair-profile" name="check_repair_profile">{options["repair"]}</select>
 <label for="decomposition">Decomposition</label><select id="decomposition" name="decomposition" required><option value="balanced"{" selected" if defaults.decomposition == "balanced" else ""}>balanced</option><option value="aggressive"{" selected" if defaults.decomposition == "aggressive" else ""}>aggressive</option></select>
 <label for="execution-mode-policy">Execution mode</label><select id="execution-mode-policy" name="execution_mode_policy" required><option value="auto"{" selected" if defaults.execution_mode_policy == "auto" else ""}>auto</option><option value="require-staged"{" selected" if defaults.execution_mode_policy == "require-staged" else ""}>require-staged</option></select>
@@ -491,7 +491,7 @@ def _v2_approval_form(
     semantic_revision = bool(pipeline.get("semantic_revision_enabled"))
     check_repair = (
         pipeline.get("max_check_repair_attempts", 0) > 0
-        or pipeline.get("max_review_repair_cycles", 0) > 0
+        or pipeline.get("max_correction_cycles", 0) > 0
     )
     if config is not None and semantic_revision:
         reviser = requested_profiles.get("semantic_reviser_profile")
@@ -976,7 +976,7 @@ def _run_configuration(state: dict[str, Any], config: HarnessConfig | None = Non
         ("STAGED mutable limit", planning.get("staged_step_max_mutable_paths")),
         ("Semantic revision", "on" if pipeline.get("semantic_revision_enabled") else "off"),
         ("check-repair attempts", pipeline.get("max_check_repair_attempts", 0)),
-        ("review-repair cycles", pipeline.get("max_review_repair_cycles")),
+        ("correction cycles", pipeline.get("max_correction_cycles")),
         ("repair scope policy", pipeline.get("repair_scope_policy")),
         ("repair scope max added paths", pipeline.get("repair_scope_max_added_paths")),
     ]

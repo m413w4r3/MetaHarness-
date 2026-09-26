@@ -524,7 +524,7 @@ class CreateRunTests(MutationCase):
             "check_repair_profile": "repairer",
             "semantic_revision_enabled": True,
             "max_check_repair_attempts": 2,
-            "max_review_repair_cycles": 1,
+            "max_correction_cycles": 1,
             "decomposition": "auto",
             "execution_mode_policy": "auto",
             "single_step_max_mutable_paths": 4,

@@ -172,8 +172,9 @@ PLAN → implementation step → accepted step commit → …
 ```
 
 - Correction budgets are independent: `max_check_repair_attempts` bounds
-  check-repair attempts and `max_review_repair_cycles` bounds review-driven
-  correction cycles. `semantic_revision_enabled` only controls semantic
+  check-repair attempts and `max_correction_cycles` bounds every cycle after
+  `INITIAL` -- one a review opened or one a red gate re-decomposed. There is no
+  second cycle budget. `semantic_revision_enabled` only controls semantic
   revision. The reviewer never owns or receives those budgets.
 - Check repair fixes a deterministic signal; semantic revision compares the
   immutable candidate to the SPEC; the final reviewer routes a candidate that

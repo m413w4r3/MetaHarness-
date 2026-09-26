@@ -22,6 +22,7 @@ from tests.pipeline.support import (
     git,
     initial_plan,
     ladder_ledger,
+    ladder_strategies,
     repaired_step_contract,
     review,
     write,
@@ -32,7 +33,7 @@ class ResumeTests(PipelineHarness):
     def _interrupt_before_replan_planner(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         original = self.orchestrator(
-            self.config(review_repair=1),
+            self.config(correction_cycles=1),
             planner=[initial_plan(STEP), LLMError("planner transport down")],
             reviewer=[review("REVISE", "REPLAN")],
         )
@@ -79,7 +80,7 @@ class ResumeTests(PipelineHarness):
         path.write_text(json.dumps(record), encoding="utf-8")
 
         resumed = self.orchestrator(
-            self.config(review_repair=1), planner=["unused"], reviewer=["unused"],
+            self.config(correction_cycles=1), planner=["unused"], reviewer=["unused"],
         )
         result = resumed.resume("run")
         self.assertEqual(result.status, RunStatus.FAILED)
@@ -96,7 +97,7 @@ class ResumeTests(PipelineHarness):
         path.write_text(json.dumps(review_payload), encoding="utf-8")
 
         resumed = self.orchestrator(
-            self.config(review_repair=1), planner=["unused"], reviewer=["unused"],
+            self.config(correction_cycles=1), planner=["unused"], reviewer=["unused"],
         )
         result = resumed.resume("run")
         self.assertEqual(result.status, RunStatus.FAILED)
@@ -113,7 +114,7 @@ class ResumeTests(PipelineHarness):
         path.write_text(json.dumps(record), encoding="utf-8")
 
         resumed = self.orchestrator(
-            self.config(review_repair=1), planner=["unused"], reviewer=["unused"],
+            self.config(correction_cycles=1), planner=["unused"], reviewer=["unused"],
         )
         result = resumed.resume("run")
         self.assertEqual(result.status, RunStatus.FAILED)
@@ -130,7 +131,7 @@ class ResumeTests(PipelineHarness):
             write("feature.txt", "good\n"),
         )
         original = self.orchestrator(
-            self.config(review_repair=3), planner=[initial_plan(STEP)],
+            self.config(correction_cycles=3), planner=[initial_plan(STEP)],
             reviewer=[
                 review("REVISE", "IMPLEMENTATION"), review("REVISE", "IMPLEMENTATION"),
                 review("REVISE", "IMPLEMENTATION"), review(),
@@ -144,7 +145,7 @@ class ResumeTests(PipelineHarness):
         self.assertEqual(self.checkpoint()["phase"], "final_review")
 
         resumed = self.orchestrator(
-            self.config(review_repair=3), planner=["unused"], reviewer=[review()],
+            self.config(correction_cycles=3), planner=["unused"], reviewer=[review()],
         ).resume("run")
         self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.state()["cycle"], 4)
@@ -165,7 +166,7 @@ class ResumeTests(PipelineHarness):
             write("feature.txt", "good semantic\n"), write("feature.txt", "good semantic\n"),
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
-        config = self.config(check_repair=1, review_repair=1, semantic_revision=True)
+        config = self.config(check_repair=1, correction_cycles=1, semantic_revision=True)
 
         def change_live_defaults(_run_dir):
             text = self.config_path.read_text(encoding="utf-8")
@@ -212,7 +213,7 @@ class ResumeTests(PipelineHarness):
     def test_reviewer_transport_failure_resumes_at_the_final_review_of_its_cycle(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"))
-        config = self.config(review_repair=2)
+        config = self.config(correction_cycles=2)
         orchestrator = self.orchestrator(
             config,
             planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
@@ -284,7 +285,7 @@ class ResumeTests(PipelineHarness):
             write("feature.txt", "good\n"),
         )
         self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "bad\n"))
-        config = self.config(check_repair=1)
+        config = self.config(check_repair=1, correction_cycles=1)
         original = self.orchestrator(
             config,
             planner=[
@@ -324,6 +325,56 @@ class ResumeTests(PipelineHarness):
         step = json.loads((root / "cycles/002/implementation/steps/S01/step.json").read_text())
         self.assertEqual(step["status"], "COMPLETED")
         self.assertEqual((self.worktree() / "feature.txt").read_text(), "good\n")
+
+    def test_resume_does_not_reset_correction_budget(self) -> None:
+        """The unit a crash left spent is still spent after the resume.
+
+        Cycle 001 pays the run's single correction unit for the
+        re-decomposition that opens cycle 002, then the process dies before
+        that cycle runs.  The resumed run executes it, fails its gate, and is
+        refused a second re-decomposition by the budget the crash never gave
+        back: no third cycle, no planner call.
+        """
+
+        rewritten = ("S01", "feature.txt", "Rewrite the feature so the configured test passes")
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "worse\n"),
+            write("feature.txt", "worse2\n"), write("feature.txt", "worse3\n"),
+        )
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            write("feature.txt", "worse4\n"), write("feature.txt", "worse5\n"),
+        )
+        config = self.config(check_repair=1, correction_cycles=1)
+        original = self.orchestrator(
+            config,
+            planner=[
+                initial_plan(STEP), repaired_step_contract(), correction_plan(rewritten),
+            ],
+            reviewer=[review()],
+        )
+        with crash_at_checkpoint(original, "check_replan"):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL, self.state().get("failure"))
+        record = self.run_dir() / "cycles/002/check-replan/check_replan.plan.json"
+        self.assertTrue(record.is_file())
+        durable = record.read_bytes()
+
+        resumed = self.orchestrator(
+            config, planner=["unused"], reviewer=[review()],
+        ).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"))
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        # The one durable answer stays the one re-decomposition: the resumed
+        # planner is never asked for another, and no third cycle exists.
+        self.assertEqual(self.planner.requests, [])
+        self.assertEqual(record.read_bytes(), durable)
+        self.assertNotIn(
+            "replan_cycle", ladder_strategies(self, cycle=2, stage="post-check-replan"),
+        )
+        self.assertFalse((self.run_dir() / "cycles/003").exists())
 
     def test_corrupt_latest_gate_evidence_fails_resume_integrity(self) -> None:
         self.workers.on(
@@ -429,7 +480,7 @@ class ResumeAuthorityTests(PipelineHarness):
         # A real correction: the accepted tree differs from the reviewed one.
         self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n\n"))
         original = self.orchestrator(
-            self.config(review_repair=1), planner=[initial_plan(STEP)],
+            self.config(correction_cycles=1), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "IMPLEMENTATION")],
         )
         with crash_on_review(original, 2):
@@ -438,7 +489,7 @@ class ResumeAuthorityTests(PipelineHarness):
         self.assertEqual((self.checkpoint()["phase"], self.checkpoint()["review_cycle"]), ("final_review", 2))
 
         resumed = self.orchestrator(
-            self.config(review_repair=1), planner=["unused"], reviewer=[review()],
+            self.config(correction_cycles=1), planner=["unused"], reviewer=[review()],
         ).resume("run")
         self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
@@ -541,7 +592,7 @@ class ResumeAuthorityTests(PipelineHarness):
             write("feature.txt", "good\n\n"), write("feature.txt", "good\n\n\n"),
         )
         original = self.orchestrator(
-            self.config(review_repair=2), planner=[initial_plan(STEP)],
+            self.config(correction_cycles=2), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "IMPLEMENTATION"), review("REVISE", "IMPLEMENTATION")],
         )
         with crash_on_review(original, 3):
@@ -552,7 +603,7 @@ class ResumeAuthorityTests(PipelineHarness):
     def test_cycle_three_resume_publishes_the_third_candidate(self) -> None:
         self._three_changed_cycles_crashing_at_the_third_review()
         resumed = self.orchestrator(
-            self.config(review_repair=2), planner=["unused"], reviewer=[review()],
+            self.config(correction_cycles=2), planner=["unused"], reviewer=[review()],
         ).resume("run")
         self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         candidates = [
@@ -567,7 +618,7 @@ class ResumeAuthorityTests(PipelineHarness):
         path = self.run_dir() / relative
         path.write_text(json.dumps(tamper(json.loads(path.read_text()))), encoding="utf-8")
         resumed = self.orchestrator(
-            self.config(review_repair=2), planner=["unused"], reviewer=["unused"],
+            self.config(correction_cycles=2), planner=["unused"], reviewer=["unused"],
         ).resume("run")
         self.assertEqual(resumed.status, RunStatus.FAILED)
         self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
@@ -593,7 +644,7 @@ class ResumeAuthorityTests(PipelineHarness):
         payload["steps"][0]["implementer"]["model"] = "tampered-model"
         path.write_text(json.dumps(payload), encoding="utf-8")
         resumed = self.orchestrator(
-            self.config(review_repair=2), planner=["unused"], reviewer=["unused"],
+            self.config(correction_cycles=2), planner=["unused"], reviewer=["unused"],
         ).resume("run")
         self.assertEqual(resumed.status, RunStatus.FAILED)
         self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
@@ -603,7 +654,7 @@ class ResumeAuthorityTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
         original = self.orchestrator(
-            self.config(review_repair=1),
+            self.config(correction_cycles=1),
             planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
             reviewer=[review("REVISE", "REPLAN")],
         )
@@ -615,7 +666,7 @@ class ResumeAuthorityTests(PipelineHarness):
         payload["steps"][0]["implementer"]["model"] = "tampered-model"
         path.write_text(json.dumps(payload), encoding="utf-8")
         resumed = self.orchestrator(
-            self.config(review_repair=1), planner=["unused"], reviewer=["unused"],
+            self.config(correction_cycles=1), planner=["unused"], reviewer=["unused"],
         ).resume("run")
         self.assertEqual(resumed.status, RunStatus.FAILED)
         self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")

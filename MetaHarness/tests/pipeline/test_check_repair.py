@@ -360,7 +360,7 @@ class CheckRepairTests(PipelineHarness):
         )
         self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "bad\n"))
         result = self.orchestrator(
-            self.config(check_repair=1),
+            self.config(check_repair=1, correction_cycles=1),
             planner=[
                 initial_plan(STEP), repaired_step_contract(),
                 correction_plan((
@@ -676,7 +676,7 @@ class CheckRepairTests(PipelineHarness):
         def gate(attempt: int, budget: int):
             return ladder.gate_step(
                 ctx=ctx, cycle_plan=cycle_plan, stage=GateStage.POST_IMPLEMENTATION,
-                evidence=red, repair_attempt=attempt, repair_budget=budget,
+                evidence=red, repair_attempt=attempt, repair_budget=budget, correction_budget=1,
             )
 
         refused = gate(1, 0)
@@ -838,7 +838,7 @@ class CheckRepairTests(PipelineHarness):
             ExecutionRole.IMPLEMENTER, write("tests/test_feature.py", "bad fixture\n"),
         )
         result = self.orchestrator(
-            self.config(check_repair=0),
+            self.config(check_repair=0, correction_cycles=1),
             planner=[
                 initial_plan(("S01", "tests/test_feature.py", "Write the fixture")),
                 # The cycle rung is the one that may still answer a failure no
@@ -897,7 +897,7 @@ class CheckRepairTests(PipelineHarness):
         def gate(evidence: EvidenceBundle):
             return ladder.gate_step(
                 ctx=ctx, cycle_plan=cycle_plan, stage=GateStage.POST_IMPLEMENTATION,
-                evidence=evidence, repair_attempt=1, repair_budget=0,
+                evidence=evidence, repair_attempt=1, repair_budget=0, correction_budget=1,
             )
 
         terminal = gate(facts())
