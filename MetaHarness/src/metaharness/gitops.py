@@ -1606,6 +1606,55 @@ def restore_paths_from_tree(worktree: Path, tree_sha: str, paths: tuple[str, ...
         )
 
 
+def rewind_worktree(worktree: Path, commit_sha: str) -> str:
+    """Move the checked-out branch back to one accepted commit.
+
+    The branch ref, the index and the worktree move together, so the worktree
+    is exactly the tree of *commit_sha* with no staged, unstaged or untracked
+    difference left behind.  Re-executing approved cycle work rewinds to the
+    boundary that work started from; every history-changing command stays in
+    this module and the restored state is proven before returning.
+    """
+
+    root = Path(worktree).expanduser().resolve()
+    commit = _require_object_id(commit_sha, "commit_sha")
+    branch = symbolic_head(root)
+    if branch is None:
+        raise GitError("the worktree HEAD is not on a branch")
+    tree = resolve_tree(root, commit)
+    before = candidate_tree_sha(root)
+    _git(
+        root, "update-ref", "-m", "metaharness: replay boundary", branch, commit,
+        timeout=600,
+    )
+    if before != tree:
+        paths = _tree_diff_paths(root, before, tree)
+        _git(root, "read-tree", tree, timeout=600)
+        present = set(tracked_files_in_tree(root, tree))
+        to_restore = sorted(path for path in paths if path in present)
+        to_remove = sorted(path for path in paths if path not in present)
+        if to_restore:
+            _git(
+                root, "--literal-pathspecs", "restore", "--worktree",
+                f"--source={tree}", "--", *to_restore, timeout=600,
+            )
+        for relative in to_remove:
+            target = root / _validate_relative_path(relative)
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif os.path.lexists(target):
+                raise GitError("the replay boundary encountered a non-file path")
+    _git(root, "clean", "-fdq", timeout=600)
+    if (
+        current_head(root) != commit
+        or candidate_tree_sha(root) != tree
+        or index_tree_sha(root) != tree
+        or _status_records(root)
+    ):
+        raise GitError("the replay boundary did not restore the accepted commit")
+    return tree
+
+
 def _validate_relative_path(relative_path: str) -> str:
     if not isinstance(relative_path, str) or not relative_path:
         raise GitError("relative path must be non-empty")

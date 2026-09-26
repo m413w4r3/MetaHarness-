@@ -33,6 +33,8 @@ from tests.pipeline_support import (
     correction_plan,
     git,
     initial_plan,
+    ladder_ledger,
+    ladder_strategies,
     review,
     write,
 )
@@ -755,6 +757,119 @@ class CheckRepairTests(PipelineHarness):
             "metaharness(check-repair): cycle 1",
         )
         self.assertEqual(self.workers.roles(), ["implementer", "repair"])
+        # The first distinct strategy of a red gate is the targeted repair and
+        # it passed, so no later rung of the ladder was ever consumed.
+        self.assertEqual(ladder_strategies(self), ["repair_targeted"])
+        entries = ladder_ledger(self)["entries"]
+        self.assertEqual(
+            [(entry["state"], entry["repair_attempt"]) for entry in entries],
+            [("done", 1)],
+        )
+        self.assertEqual(entries[0]["tree_after"], candidate_tree_sha(self.worktree()))
+
+    def test_ladder_expands_the_approved_scope_when_evidence_proves_it(self) -> None:
+        related = "fixtures/related.txt"
+        self._add_tracked_paths(related)
+        self.check.write_text(
+            "import pathlib, sys\n"
+            "feature = pathlib.Path('feature.txt').read_text().strip()\n"
+            f"related = pathlib.Path({related!r}).read_text().strip()\n"
+            "if feature != 'good':\n"
+            "    print('feature.txt: the primary file is not repaired', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "if related != 'good':\n"
+            f"    print({related + ': the related approved file is not repaired'!r}, file=sys.stderr)\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+
+        def expanded_repair(request):
+            self.assertEqual(request.mutable_paths, ("feature.txt", related))
+            (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
+            (request.worktree / related).write_text("good\n", encoding="utf-8")
+            return check_repair_result()
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"), expanded_repair)
+        config = self.config(check_repair=2)
+        options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
+        result = self.orchestrator(
+            config, planner=[self._plan_with_approved_paths(related)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run", run_options=options)
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
+        # The first pass repaired the evidenced file only: the new evidence
+        # then named the second approved file, so the ladder expanded the
+        # scope exactly once instead of repeating the targeted repair.
+        self.assertEqual(ladder_strategies(self), ["repair_targeted", "expand_scope"])
+        self.assertEqual(self.state()["check_repair"]["attempt_count"], 2)
+        attempt = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts/002"
+        # The pending pass reads its authorization, then archives it with the
+        # retired artifacts of the attempt it widened.
+        expansions = sorted(attempt.rglob("scope-expansion.json"))
+        self.assertEqual(len(expansions), 1)
+        expansion = json.loads(expansions[0].read_text(encoding="utf-8"))
+        self.assertEqual(expansion["added_paths"], [related])
+        self.assertEqual(expansion["attempt"], 2)
+        self.assertEqual(expansion["bound"], 1)
+        scope = json.loads((attempt / "scope.json").read_text(encoding="utf-8"))
+        self.assertEqual(scope["added_paths"], [related])
+        self.assertEqual(scope["effective_repair_scope"], ["feature.txt", related])
+        self.assertEqual(scope["approved_mutable_scope"], ["feature.txt", related])
+
+    def test_ladder_never_repeats_a_strategy_on_the_same_tree_and_failure(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.REPAIR, lambda _request: check_repair_result())
+        result = self.orchestrator(
+            self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "implementer"])
+        entries = ladder_ledger(self)["entries"]
+        self.assertEqual(
+            [entry["strategy"] for entry in entries], ["repair_targeted", "replan_step"],
+        )
+        # The repair pass left the exact candidate tree and failure unchanged,
+        # so the second budgeted pass was refused and the ladder moved on.
+        self.assertEqual(self.state()["check_repair"]["attempt_count"], 1)
+        identities = [
+            (entry["strategy"], entry["tree"], tuple(entry["failed_check_ids"]))
+            for entry in entries
+        ]
+        self.assertEqual(len(set(identities)), len(identities))
+        self.assertEqual(entries[0]["tree"], entries[1]["tree"])
+
+    def test_replanned_step_opens_new_facts_for_the_ladder(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "nearly good\n"))
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            lambda _request: check_repair_result(), write("feature.txt", "good\n"),
+        )
+        result = self.orchestrator(
+            self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(
+            self.workers.roles(), ["implementer", "repair", "implementer", "repair"],
+        )
+        entries = ladder_ledger(self)["entries"]
+        self.assertEqual(
+            [entry["strategy"] for entry in entries],
+            ["repair_targeted", "replan_step", "repair_targeted"],
+        )
+        # The replan produced a new candidate tree, which is new facts: the
+        # targeted repair is available again for it, the replan rung is not.
+        replanned, replayed = entries[1], entries[2]
+        self.assertNotEqual(replanned["tree"], replanned["tree_after"])
+        self.assertEqual(replayed["tree"], replanned["tree_after"])
+        self.assertNotEqual(replayed["tree"], entries[0]["tree"])
+        self.assertEqual(replayed["repair_attempt"], 2)
+        self.assertEqual(self.state()["check_repair"]["attempt_count"], 2)
 
     def test_every_attempt_of_the_budget_is_used_then_the_gate_is_exhausted(self) -> None:
         def blocked_after_mutation(request):
@@ -800,7 +915,10 @@ class CheckRepairTests(PipelineHarness):
         self.assertTrue((attempt / "attempts/01/report.json").is_file())
 
     def test_two_verified_check_repairs_can_exhaust_the_budget(self) -> None:
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "worse still\n"),
+        )
         self.workers.on(
             ExecutionRole.REPAIR,
             write("feature.txt", "still bad\n", report=check_repair_result(
@@ -822,6 +940,14 @@ class CheckRepairTests(PipelineHarness):
         self.assertIsInstance(self.state()["failure"]["detail"], dict)
         self.assertEqual(self.state()["failure"]["detail"]["failed_check_ids"], ["test"])
         self.assertEqual(self.state()["failure"]["detail"]["attempt_count"], 2)
+        self.assertEqual(
+            self.state()["failure"]["detail"]["strategy"],
+            "repair_targeted+repair_targeted+replan_step",
+        )
+        self.assertEqual(
+            self.state()["failure"]["detail"]["strategies"],
+            ["repair_targeted", "repair_targeted", "replan_step"],
+        )
         self.assertEqual(self.state()["check_repair"]["failure_classification"], "product_check")
         self.assertEqual(self.state()["check_repair"]["next_action"], "Retry deterministic gate")
         self.assertRegex(self.state()["check_repair"]["latest_evidence_sha256"], r"^[0-9a-f]{64}$")
@@ -831,8 +957,18 @@ class CheckRepairTests(PipelineHarness):
         checkpoint = self.checkpoint()
         self.assertEqual(checkpoint["phase"], "deterministic_gate")
         self.assertEqual(checkpoint["stage"], "POST_IMPLEMENTATION")
-        self.assertEqual(checkpoint["check_repair_attempt"], 2)
-        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
+        # The ladder rewrote the tree after the last recorded pass, so the
+        # checkpoint attributes it to no pass at all.
+        self.assertIsNone(checkpoint["check_repair_attempt"])
+        # Two budgeted passes, then the one distinct replan of the responsible
+        # approved step, before the exhausted ladder waits for the operator.
+        self.assertEqual(
+            self.workers.roles(), ["implementer", "repair", "repair", "implementer"],
+        )
+        self.assertEqual(
+            ladder_strategies(self),
+            ["repair_targeted", "repair_targeted", "replan_step"],
+        )
         diagnostics_path = self.run_dir() / "diagnostics.md"
         self.assertTrue(
             diagnostics_path.is_file(),
@@ -842,7 +978,8 @@ class CheckRepairTests(PipelineHarness):
         diagnostics = diagnostics_path.read_text(encoding="utf-8")
         recovery_summary = diagnostics.split("## DETERMINISTIC GATE RECOVERY", 1)[1].split("\n## ", 1)[0]
         for expected in (
-            "deterministic gate attempt: 3",
+            # Two repaired red gates, the replan rung and their reruns.
+            "deterministic gate attempt: 4",
             "check-repair attempts used / budget: 2 / 2",
             "latest failed check IDs: test",
             "failure classification: product_check",
@@ -1015,6 +1152,11 @@ class CheckRepairTests(PipelineHarness):
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_INFRASTRUCTURE_UNAVAILABLE")
         self.assertNotIn("attempt_count", self.state().get("check_repair", {}))
         self.assertEqual(self.workers.roles(), ["implementer"])
+        # An unreachable infrastructure leaves for the external terminal before
+        # any correctness strategy is consumed or counted.
+        self.assertFalse(
+            (self.run_dir() / "cycles/001/check-repair/post-implementation/ladder.json").exists()
+        )
 
     def test_operator_retry_reruns_gate_without_replaying_steps_or_repair_workers(self) -> None:
         counter = self.root / "gate-count"
@@ -1028,18 +1170,24 @@ class CheckRepairTests(PipelineHarness):
             "    raise SystemExit(1)\n",
             encoding="utf-8",
         )
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(
-            ExecutionRole.REPAIR,
-            lambda _request: check_repair_result(), lambda _request: check_repair_result(),
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
         )
-        config = self.config(check_repair=2)
+        self.workers.on(ExecutionRole.REPAIR, lambda _request: check_repair_result())
+        config = self.config(check_repair=1)
         original = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         )
         first_planner = original._planner_client
         waiting = original.run_text(SPEC, run_id="run")
         self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
+        # The ladder walked every distinct strategy of this red gate: the
+        # budgeted pass left the tree unchanged, the replan replayed the
+        # approved step without changing it either.
+        self.assertEqual(ladder_strategies(self), ["repair_targeted", "replan_step"])
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        self.assertEqual(self.checkpoint()["check_repair_attempt"], 1)
         retry_info = resume_info(self.run_dir(), self.state())
         self.assertTrue(retry_info.resumable, retry_info.reason)
         self.assertEqual(retry_info.label, "Retry deterministic gate (POST_IMPLEMENTATION)")
@@ -1056,7 +1204,10 @@ class CheckRepairTests(PipelineHarness):
         self.assertEqual(counter.read_text(), "4")
 
     def test_same_red_gate_after_operator_retry_becomes_fixed_point(self) -> None:
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "still bad\n"),
+        )
         self.workers.on(
             ExecutionRole.REPAIR,
             write("feature.txt", "still bad\n", report=check_repair_result(
@@ -1069,6 +1220,12 @@ class CheckRepairTests(PipelineHarness):
         ).run_text(SPEC, run_id="run")
         self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
         self.assertEqual(self.state()["check_repair"]["next_action"], "Retry deterministic gate")
+        # Every distinct correctness strategy is durably spent before the
+        # operator is asked: the repair left the failed check red and the one
+        # replan of the responsible approved step reproduced that exact tree.
+        self.assertEqual(ladder_strategies(self), ["repair_targeted", "replan_step"])
+        self.assertEqual(self.checkpoint()["check_repair_attempt"], 1)
+        fingerprint = self.state()["check_repair"]["operator_retry_fingerprint"]
 
         resumed = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
@@ -1078,6 +1235,7 @@ class CheckRepairTests(PipelineHarness):
         self.assertEqual(resumed.status, RunStatus.WAITING_HUMAN)
         self.assertEqual(state["failure"]["reason"], "CHECK_REPAIR_FIXED_POINT")
         self.assertEqual(state["check_repair"]["status"], "fixed_point")
+        self.assertEqual(state["failure"]["detail"]["fixed_point_fingerprint"], fingerprint)
         self.assertEqual(
             state["check_repair"]["next_action"],
             "Code change or additional repair authority required",
@@ -1088,7 +1246,10 @@ class CheckRepairTests(PipelineHarness):
         )
         self.assertFalse(state["recovery_resumable"])
         self.assertFalse(resume_info(self.run_dir(), state).resumable)
-        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
+        # The retry only re-ran the deterministic gate: no strategy was
+        # replayed for facts the ladder had already spent.
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "implementer"])
+        self.assertEqual(ladder_strategies(self), ["repair_targeted", "replan_step"])
 
     def test_fixed_point_fingerprint_changes_with_tree_or_failed_check_set(self) -> None:
         from metaharness.orchestration.pipeline_v2 import check_repair_fingerprint
@@ -1105,14 +1266,20 @@ class CheckRepairTests(PipelineHarness):
         self.assertNotEqual(original, check_repair_fingerprint(
             "a" * 40, ["another-check"], "POST_IMPLEMENTATION",
         ))
+        # The ladder position is part of the identity: a retry that stopped
+        # after a different set of distinct strategies is a different fact.
+        self.assertNotEqual(original, check_repair_fingerprint(
+            "a" * 40, ["test-integration"], "POST_IMPLEMENTATION",
+            strategy="repair_targeted+replan_step",
+        ))
 
     def test_corrupt_latest_gate_evidence_fails_resume_integrity(self) -> None:
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(
-            ExecutionRole.REPAIR,
-            lambda _request: check_repair_result(), lambda _request: check_repair_result(),
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
         )
-        config = self.config(check_repair=2)
+        self.workers.on(ExecutionRole.REPAIR, lambda _request: check_repair_result())
+        config = self.config(check_repair=1)
         waiting = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
@@ -1440,7 +1607,7 @@ class SemanticRevisionTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(
             ExecutionRole.REPAIR,
-            write("feature.txt", "bad\n"), write("feature.txt", "good\n"),
+            write("feature.txt", "still bad\n"), write("feature.txt", "good\n"),
         )
         self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good semantic\n"))
         result = self.orchestrator(

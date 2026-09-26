@@ -21,11 +21,14 @@ from typing import (
 from .candidate import accepted_chain_records
 from .pipeline_v2 import (
     PipelineFailure,
+    check_repair_attempt_dir,
     check_repair_attempts_dir,
+    check_repair_dir,
     gate_acceptance_path,
     gate_dir,
     semantic_revision_dir,
 )
+from .recovery import GateRecoveryStep, RecoveryStepUnavailable
 from .shared import (
     CheckRepairScope,
     GateMutableAuthority,
@@ -57,8 +60,18 @@ from ..result import atomic_write_text
 from ..models import GateStage, RunStatus
 from ..planning_v2 import TaskPlanV2
 from ..prompt_contracts import build_check_repair_payload, write_prompt_diagnostics
+from ..recovery_policy import (
+    FailureClass,
+    RecoveryFacts,
+    RecoveryFingerprint,
+    RecoveryProgression,
+    RecoveryStrategy,
+    admitted_strategies,
+    recovery_ladder,
+    terminal_strategy,
+)
 from ..resume import ResumeIntegrityError
-from ..run_options import EffectiveRepairScopePolicy
+from ..run_options import EffectiveRepairScopePolicy, effective_repair_scope_policy
 from ..validation import check_result_json
 
 
@@ -634,14 +647,15 @@ def gate_mutable_authority(
     if not directories:
         if through_attempt:
             raise ResumeIntegrityError("check-repair scope attempts are missing")
-        return GateMutableAuthority(
+        return _with_ladder_expansion(GateMutableAuthority(
             base_paths=base,
             added_paths=(),
             effective_paths=base,
             source=_CYCLE_SCOPE_SOURCE,
             sha256=mutable_scope_sha256(base),
             initial_paths=(),
-        )
+        ), run_dir=run_dir, cycle=cycle, stage=stage, through_attempt=through_attempt,
+            base=base, policy_config=policy_config)
     scopes: list[CheckRepairScope] = []
     for expected, directory in enumerate(directories, start=1):
         if int(directory.name) != expected:
@@ -667,14 +681,15 @@ def gate_mutable_authority(
     if through_attempt is not None and len(scopes) != through_attempt:
         raise ResumeIntegrityError("check-repair scope attempts are not contiguous")
     final = scopes[-1]
-    return GateMutableAuthority(
+    return _with_ladder_expansion(GateMutableAuthority(
         base_paths=final.base_paths,
         added_paths=final.added_paths,
         effective_paths=final.effective_paths,
         source=final.source,
         sha256=mutable_scope_sha256(final.effective_paths),
         initial_paths=final.initial_repair_scope,
-    )
+    ), run_dir=run_dir, cycle=cycle, stage=stage, through_attempt=through_attempt,
+        base=base, policy_config=policy_config)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -740,6 +755,651 @@ class CheckRepairCoordinator:
                 _EVIDENCE_SCOPE_SOURCE if initial else _HUMAN_SCOPE_SOURCE
             ),
         )
+
+
+# -- the deterministic-gate recovery ladder -----------------------------------
+#
+# A red deterministic gate walks one ordered ladder of *distinct* strategies
+# before any operator wait: the bounded targeted repair pass, one bounded
+# evidence-proven scope expansion, a replan of the responsible step, a replan
+# of the cycle, one final pass under the configured executor-fallback authority
+# and only then the operator.  Every step is identified by the exact candidate
+# tree, the failed check set, the stage and the strategy, and the durable
+# ledger below never proposes the same strategy twice for those facts: a new
+# tree or a new failed-check set opens a new progression.
+#
+# The ladder owns no authority of its own.  A repair pass is bounded by the
+# frozen ``max_check_repair_attempts`` budget, an expansion is bounded by the
+# operator-approved plan scope and the run's repair-scope policy, and every
+# replan re-executes only approved plan work.  Nothing here can grant a model a
+# scope the operator did not approve.
+
+_LADDER_ARTIFACT = "ladder.json"
+_EXPANSION_ARTIFACT = "scope-expansion.json"
+_LADDER_SCHEMA_VERSION = 1
+_LADDER_CODE = "CHECK_FAILED"
+_MAX_LADDER_ENTRIES = 64
+_LADDER_STATES = frozenset({"running", "done"})
+_SAFE_PATH_PARTS = frozenset({"", ".", ".."})
+# Strategies the ladder consumes at most once per gate episode.
+_EPISODE_STRATEGIES = frozenset({
+    RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.REPLAN_CYCLE,
+})
+
+
+@dataclasses.dataclass(frozen=True)
+class _LadderEntry:
+    """One durably consumed ladder step of one red gate episode."""
+
+    strategy: RecoveryStrategy
+    state: str
+    tree: str
+    failed_check_ids: tuple[str, ...]
+    repair_attempt: int | None = None
+    step_indices: tuple[int, ...] = ()
+    added_paths: tuple[str, ...] = ()
+    tree_after: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class _LadderLedger:
+    """The frozen facts and the consumed steps of one gate episode."""
+
+    proof_required: bool
+    fallback_executor_available: bool
+    entries: tuple[_LadderEntry, ...] = ()
+
+
+def _ladder_path(run_dir: Path, cycle: int, stage: GateStage) -> Path:
+    return check_repair_dir(run_dir, cycle, stage) / _LADDER_ARTIFACT
+
+
+def _canonical_ladder_paths(paths: Any, *, what: str) -> tuple[str, ...]:
+    if not isinstance(paths, list) or any(not isinstance(item, str) for item in paths):
+        raise ResumeIntegrityError(f"{what} contains invalid paths")
+    canonical = tuple(sorted(set(paths)))
+    if list(canonical) != paths:
+        raise ResumeIntegrityError(f"{what} is not canonical")
+    for item in canonical:
+        if (
+            not item or item.startswith("/") or "\\" in item
+            or any(part in _SAFE_PATH_PARTS for part in PurePosixPath(item).parts)
+        ):
+            raise ResumeIntegrityError(f"{what} contains unsafe paths")
+    return canonical
+
+
+def _read_ladder(path: Path) -> _LadderLedger | None:
+    """Read and validate the ladder ledger; a malformed artifact fails closed."""
+
+    payload = _read_json_artifact(path, 256 * 1024)
+    if payload is None:
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != _LADDER_SCHEMA_VERSION:
+        raise ResumeIntegrityError("gate recovery ladder artifact is malformed")
+    proof = payload.get("proof_required")
+    fallback = payload.get("fallback_executor_available")
+    if not isinstance(proof, bool) or not isinstance(fallback, bool):
+        raise ResumeIntegrityError("gate recovery ladder facts are malformed")
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list) or len(raw_entries) > _MAX_LADDER_ENTRIES:
+        raise ResumeIntegrityError("gate recovery ladder entries are malformed")
+    entries: list[_LadderEntry] = []
+    for item in raw_entries:
+        if not isinstance(item, dict):
+            raise ResumeIntegrityError("gate recovery ladder entry is malformed")
+        try:
+            strategy = RecoveryStrategy(item.get("strategy"))
+        except ValueError as exc:
+            raise ResumeIntegrityError("gate recovery ladder strategy is unknown") from exc
+        state = item.get("state")
+        tree = item.get("tree")
+        failed = item.get("failed_check_ids")
+        attempt = item.get("repair_attempt")
+        indices = item.get("step_indices")
+        if state not in _LADDER_STATES or not isinstance(tree, str) or len(tree) > 128:
+            raise ResumeIntegrityError("gate recovery ladder entry is malformed")
+        if not isinstance(failed, list) or any(not isinstance(name, str) or not name for name in failed):
+            raise ResumeIntegrityError("gate recovery ladder entry has invalid failed checks")
+        if attempt is not None and (
+            isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1
+        ):
+            raise ResumeIntegrityError("gate recovery ladder entry has an invalid repair attempt")
+        if not isinstance(indices, list) or any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in indices
+        ):
+            raise ResumeIntegrityError("gate recovery ladder entry has invalid step indices")
+        added = _canonical_ladder_paths(item.get("added_paths"), what="gate recovery ladder expansion")
+        tree_after = item.get("tree_after")
+        if not isinstance(tree_after, str) or len(tree_after) > 128:
+            raise ResumeIntegrityError("gate recovery ladder entry has an invalid produced tree")
+        entries.append(_LadderEntry(
+            strategy, state, tree, tuple(failed), attempt, tuple(indices), added, tree_after,
+        ))
+    return _LadderLedger(proof, fallback, tuple(entries))
+
+
+def _write_ladder(path: Path, ledger: _LadderLedger) -> None:
+    atomic_write_text(path, _json_text({
+        "schema_version": _LADDER_SCHEMA_VERSION,
+        "proof_required": ledger.proof_required,
+        "fallback_executor_available": ledger.fallback_executor_available,
+        "entries": [
+            {
+                "strategy": entry.strategy.value, "state": entry.state, "tree": entry.tree,
+                "failed_check_ids": list(entry.failed_check_ids),
+                "repair_attempt": entry.repair_attempt,
+                "step_indices": list(entry.step_indices),
+                "added_paths": list(entry.added_paths),
+                "tree_after": entry.tree_after,
+            }
+            for entry in ledger.entries
+        ],
+    }))
+
+
+def _pending_scope_expansion(
+    run_dir: Path, cycle: int, stage: GateStage, attempt: int, *,
+    base: tuple[str, ...], policy_config: EffectiveRepairScopePolicy,
+) -> tuple[str, ...]:
+    """The ladder expansion authorized for one not-yet-recorded repair pass."""
+
+    directory = check_repair_attempt_dir(run_dir, cycle, stage, attempt)
+    if (directory / "scope.json").is_file():
+        # The pass is recorded: its own scope artifact is authoritative.
+        return ()
+    payload = _read_json_artifact(directory / _EXPANSION_ARTIFACT, 64 * 1024)
+    if payload is None:
+        return ()
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ResumeIntegrityError("gate recovery scope expansion artifact is malformed")
+    if payload.get("attempt") != attempt:
+        raise ResumeIntegrityError("gate recovery scope expansion belongs to another attempt")
+    if (
+        payload.get("policy") != policy_config.policy
+        or payload.get("bound") != policy_config.max_added_paths
+    ):
+        raise ResumeIntegrityError("gate recovery scope expansion policy changed")
+    failed = payload.get("failed_check_ids")
+    if not isinstance(failed, list) or any(not isinstance(name, str) or not name for name in failed):
+        raise ResumeIntegrityError("gate recovery scope expansion has invalid failed checks")
+    added = _canonical_ladder_paths(payload.get("added_paths"), what="gate recovery scope expansion")
+    if not added:
+        return ()
+    if len(added) > policy_config.max_added_paths:
+        raise ResumeIntegrityError("gate recovery scope expansion exceeds the configured bound")
+    if not set(added).issubset(set(base)):
+        raise ResumeIntegrityError("gate recovery scope expansion exceeds the approved envelope")
+    return added
+
+
+def _with_ladder_expansion(
+    authority: GateMutableAuthority, *,
+    run_dir: Path, cycle: int, stage: GateStage, through_attempt: int | None,
+    base: tuple[str, ...], policy_config: EffectiveRepairScopePolicy,
+) -> GateMutableAuthority:
+    """Fold the ladder expansion of the pending repair pass into its authority."""
+
+    if through_attempt is None:
+        return authority
+    added = _pending_scope_expansion(
+        run_dir, cycle, stage, through_attempt + 1, base=base, policy_config=policy_config,
+    )
+    if not added:
+        return authority
+    effective = tuple(sorted(set(authority.effective_paths) | set(added)))
+    return GateMutableAuthority(
+        base_paths=authority.base_paths,
+        added_paths=tuple(sorted(set(authority.added_paths) | set(added))),
+        effective_paths=effective,
+        source=_SCOPE_REQUEST_SOURCE,
+        sha256=mutable_scope_sha256(effective),
+        initial_paths=authority.initial_paths,
+    )
+
+
+def _recorded_effective_scope(run_dir: Path, cycle: int, stage: GateStage) -> frozenset[str]:
+    """The effective repair scope of the latest recorded pass, best effort.
+
+    The value only narrows the ladder's own expansion candidates: the
+    authority of every pass is re-derived and validated by the attempt
+    machinery, never by this reader.
+    """
+
+    root = check_repair_attempts_dir(run_dir, cycle, stage)
+    if not root.is_dir():
+        return frozenset()
+    found: frozenset[str] = frozenset()
+    for directory in sorted(
+        (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=lambda path: int(path.name),
+    ):
+        payload = _read_json_artifact(directory / "scope.json", 64 * 1024)
+        if not isinstance(payload, dict):
+            continue
+        raw = payload.get("effective_repair_scope", payload.get("effective_mutable_scope"))
+        if isinstance(raw, list) and all(isinstance(item, str) for item in raw):
+            found = frozenset(raw)
+    return found
+
+
+def _red_gate_identity(evidence: EvidenceBundle) -> tuple[str, tuple[str, ...]]:
+    """The exact candidate tree and repairable failed-check set of one red gate."""
+
+    tree = evidence.staged_tree_sha
+    if not isinstance(tree, str) or not tree:
+        raise ResumeIntegrityError("the red gate evidence has no candidate tree")
+    failed = tuple(
+        item.split(":", 1)[1] for item in _soft_check_failures(evidence) if ":" in item
+    )
+    if not failed:
+        raise ResumeIntegrityError("the red gate evidence has no repairable check failure")
+    return tree, failed
+
+
+def _approved_expansion_scope(
+    *, repo: Path, worktree: Path, tree_sha: str, evidence_dir: Path,
+    evidence: EvidenceBundle, approved: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The evidence-named approved paths, and the pass scope they imply.
+
+    The initial repair scope mirrors the coordinator exactly: the failure
+    evidence's own paths, or the changed approved paths when the output names
+    none.  The implicated set is the union of both; the difference is the proof
+    that the first pass could not reach the failing check.
+    """
+
+    approved_set = set(approved)
+    tracked = frozenset(tracked_files_in_tree(repo, tree_sha))
+    initial = tuple(_check_repair_scope_candidates(
+        repo=repo, worktree=worktree, tree_sha=tree_sha, evidence_dir=evidence_dir,
+        evidence=evidence, approved_mutable_scope=approved,
+    ))
+    changed = sorted({
+        path for path in evidence.changed_files
+        if path in approved_set and path in tracked and not _is_test_path(path)
+    })
+    if not initial and len(changed) <= _MAX_CHANGED_PATH_FALLBACK:
+        initial = tuple(changed)
+    implicated = sorted(set(initial) | set(changed))
+    return tuple(implicated), initial
+
+
+@dataclasses.dataclass(frozen=True)
+class CheckRepairLadder:
+    """The deterministic-gate ladder of one run.
+
+    It is the single object :class:`PipelineV2Operations` references for the
+    red-gate ladder: the machine asks which distinct strategy to try next and
+    reports the step as started and finished.  The durable ledger, the frozen
+    episode facts and the bounded expansion live here; no model, no planner and
+    no worker can widen what the operator already approved.
+
+    ``replay_steps`` is injected by the run: it re-executes approved cycle work
+    for a replan rung and returns the tree it produced, or raises
+    :class:`RecoveryStepUnavailable` when the rung is not applicable.
+    """
+
+    replay_steps: Callable[..., str] | None = None
+
+    def gate_step(
+        self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
+        evidence: EvidenceBundle, repair_attempt: int, repair_budget: int,
+    ) -> GateRecoveryStep:
+        """The next distinct ladder step of this red gate, or its terminal."""
+
+        number = cycle_plan.cycle.number
+        stage_value = GateStage(stage)
+        tree, failed = _red_gate_identity(evidence)
+        fallback_available = bool(ctx.selection.check_repair_fallbacks)
+        proof = self._expansion_paths(ctx, cycle_plan, stage_value, evidence)
+        path = _ladder_path(ctx.run_dir, number, stage_value)
+        ledger = _read_ladder(path)
+        if ledger is None:
+            ledger = _LadderLedger(
+                proof_required=bool(proof), fallback_executor_available=fallback_available,
+            )
+        elif ledger.fallback_executor_available != fallback_available:
+            raise ResumeIntegrityError(
+                "the gate recovery ladder does not match the frozen executor authority"
+            )
+        elif proof and not ledger.proof_required:
+            # The failure evidence has proven that an approved path outside the
+            # frozen repair scope is implicated: the proof is a durable fact of
+            # this gate episode, never a model decision.
+            ledger = dataclasses.replace(ledger, proof_required=True)
+            _write_ladder(path, ledger)
+        pending = next(
+            (entry for entry in reversed(ledger.entries) if entry.state == "running"), None,
+        )
+        if pending is not None:
+            # The strategy of this round is already durable: resume it as such.
+            return GateRecoveryStep(
+                pending.strategy, tree=tree, failed_check_ids=failed,
+                repair_attempt=pending.repair_attempt, step_indices=pending.step_indices,
+                added_paths=pending.added_paths, consumed=self._trail(ledger),
+            )
+        facts = self._facts(ledger, tree=tree, failed=failed, number=number, stage=stage_value)
+        progression = RecoveryProgression(self._consumed(ledger, number=number, stage=stage_value))
+        for strategy in recovery_ladder(FailureClass.CORRECTNESS):
+            if strategy.terminal or not self._policy_admits(strategy, facts):
+                continue
+            if strategy is RecoveryStrategy.REPAIR_TARGETED and proof:
+                # The failure evidence proves an approved path the frozen
+                # repair scope cannot reach: the bounded expansion is the next
+                # distinct strategy, never another pass on the narrow scope.
+                continue
+            if strategy in _EPISODE_STRATEGIES and any(
+                entry.strategy is strategy for entry in ledger.entries
+            ):
+                # A replan rung rewrites approved work: it is one distinct
+                # strategy of this episode, never a loop over fresh trees.
+                continue
+            step = self._admit(
+                strategy, ctx=ctx, cycle_plan=cycle_plan, stage=stage_value,
+                evidence=evidence, ledger=ledger, tree=tree, failed=failed, proof=proof,
+                repair_attempt=repair_attempt, repair_budget=repair_budget,
+            )
+            if step is None:
+                # Deterministically inapplicable for these exact facts:
+                # advance the ladder without executing anything.
+                continue
+            if progression.is_consumed(progression.fingerprint(
+                candidate_tree=tree, failure_class=FailureClass.CORRECTNESS,
+                facts=facts, strategy=strategy,
+            )):
+                # This exact strategy already ran for this tree and failure.
+                continue
+            return step
+        return GateRecoveryStep(
+            terminal_strategy(FailureClass.CORRECTNESS, _LADDER_CODE), tree=tree,
+            failed_check_ids=failed, consumed=self._trail(ledger), exhausted=True,
+        )
+
+    @staticmethod
+    def _policy_admits(strategy: RecoveryStrategy, facts: RecoveryFacts) -> bool:
+        """Whether the ladder policy itself admits this rung for these facts."""
+
+        return strategy in admitted_strategies(FailureClass.CORRECTNESS, facts)
+
+    def begin_step(
+        self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
+        step: GateRecoveryStep, evidence: EvidenceBundle,
+    ) -> None:
+        """Consume one ladder step durably before anything runs for it."""
+
+        number = cycle_plan.cycle.number
+        stage_value = GateStage(stage)
+        tree, failed = _red_gate_identity(evidence)
+        path = _ladder_path(ctx.run_dir, number, stage_value)
+        ledger = _read_ladder(path)
+        if ledger is None:
+            ledger = _LadderLedger(
+                proof_required=bool(self._expansion_paths(
+                    ctx, cycle_plan, stage_value, evidence,
+                )),
+                fallback_executor_available=bool(ctx.selection.check_repair_fallbacks),
+            )
+        entry = _LadderEntry(
+            step.strategy, "running", tree, failed,
+            step.repair_attempt, step.step_indices, step.added_paths,
+        )
+        if not any(
+            item.strategy is entry.strategy and item.tree == entry.tree
+            and item.failed_check_ids == entry.failed_check_ids
+            and item.repair_attempt == entry.repair_attempt
+            and item.step_indices == entry.step_indices
+            for item in ledger.entries
+        ):
+            if len(ledger.entries) >= _MAX_LADDER_ENTRIES:
+                raise ResumeIntegrityError("the gate recovery ladder is full")
+            ledger = dataclasses.replace(ledger, entries=(*ledger.entries, entry))
+        _write_ladder(path, ledger)
+        if (
+            step.strategy is RecoveryStrategy.EXPAND_SCOPE
+            and step.repair_attempt is not None and step.added_paths
+        ):
+            self._authorize_expansion(ctx, cycle_plan, stage_value, step, failed)
+
+    def replay_step(
+        self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
+        step: GateRecoveryStep, evidence: EvidenceBundle,
+    ) -> str:
+        """Re-execute the approved work of one replan rung.
+
+        The ladder owns no scope of its own: the injected replay re-runs only
+        steps of the approved cycle plan, under their own contracts, and the
+        returned tree is what the next gate episode observes.
+        """
+
+        if step.exhausted or step.is_repair_pass or not step.step_indices:
+            raise RecoveryStepUnavailable(step.strategy, "the ladder step is not a replan rung")
+        if self.replay_steps is None:
+            raise RecoveryStepUnavailable(
+                step.strategy, "this run admits no replay of approved cycle work",
+            )
+        number = cycle_plan.cycle.number
+        stage_value = GateStage(stage)
+        tree, _failed = _red_gate_identity(evidence)
+        self._require_replayable(cycle_plan, step)
+        produced = self.replay_steps(ctx, cycle_plan, stage_value, step, tree)
+        if not isinstance(produced, str) or not produced:
+            raise ResumeIntegrityError("the gate recovery replay produced no candidate tree")
+        return produced
+
+    @staticmethod
+    def _require_replayable(cycle_plan: Any, step: GateRecoveryStep) -> None:
+        """A replan rung only replays indices of the approved plan."""
+
+        count = len(cycle_plan.plan.steps)
+        if not step.step_indices or any(
+            index < 0 or index >= count for index in step.step_indices
+        ):
+            raise RecoveryStepUnavailable(
+                step.strategy, "the ladder step does not name approved plan steps",
+            )
+
+    def finish_step(
+        self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
+        step: GateRecoveryStep, evidence: EvidenceBundle, tree_after: str,
+    ) -> None:
+        """Mark a consumed step as executed; the ledger itself never repeats it."""
+
+        number = cycle_plan.cycle.number
+        stage_value = GateStage(stage)
+        tree, _failed = _red_gate_identity(evidence)
+        if not isinstance(tree_after, str) or len(tree_after) > 128:
+            raise ResumeIntegrityError("the gate recovery ladder produced an invalid tree")
+        path = _ladder_path(ctx.run_dir, number, stage_value)
+        ledger = _read_ladder(path)
+        if ledger is None:
+            raise ResumeIntegrityError("the gate recovery ladder artifact is missing")
+        entries: list[_LadderEntry] = []
+        marked = False
+        for entry in ledger.entries:
+            if not marked and (
+                entry.state == "running" and entry.strategy is step.strategy
+                and entry.repair_attempt == step.repair_attempt and entry.tree == tree
+            ):
+                entries.append(dataclasses.replace(entry, state="done", tree_after=tree_after))
+                marked = True
+            else:
+                entries.append(entry)
+        if not marked:
+            raise ResumeIntegrityError("the gate recovery ladder step is not pending")
+        _write_ladder(path, dataclasses.replace(ledger, entries=tuple(entries)))
+
+    # -- deterministic facts -------------------------------------------------
+
+    @staticmethod
+    def _facts(
+        ledger: _LadderLedger, *, tree: str, failed: tuple[str, ...],
+        number: int, stage: GateStage,
+    ) -> RecoveryFacts:
+        return RecoveryFacts(
+            candidate_tree=tree,
+            observed_facts=(
+                ("cycle", f"{number:03d}"),
+                ("failed_checks", ",".join(failed)),
+                ("stage", stage.value),
+            ),
+            proof_required=ledger.proof_required,
+            fallback_executor_available=ledger.fallback_executor_available,
+            # The ladder's first step is a bounded repair pass; the frozen
+            # attempt budget is enforced by this ladder, never by the policy.
+            retry_allowed=True,
+        )
+
+    @classmethod
+    def _consumed(
+        cls, ledger: _LadderLedger, *, number: int, stage: GateStage,
+    ) -> tuple[RecoveryFingerprint, ...]:
+        return tuple(
+            RecoveryFingerprint(
+                entry.tree, FailureClass.CORRECTNESS,
+                cls._facts(
+                    ledger, tree=entry.tree, failed=entry.failed_check_ids,
+                    number=number, stage=stage,
+                ).stable_items(),
+                entry.strategy,
+            )
+            for entry in ledger.entries
+        )
+
+    @staticmethod
+    def _trail(ledger: _LadderLedger) -> tuple[RecoveryStrategy, ...]:
+        return tuple(entry.strategy for entry in ledger.entries)
+
+    def _expansion_paths(
+        self, ctx: Any, cycle_plan: Any, stage: GateStage, evidence: EvidenceBundle,
+    ) -> tuple[str, ...]:
+        """Bounded, evidence-proven additions to the repair scope."""
+
+        tree, _failed = _red_gate_identity(evidence)
+        approved_scope = tuple(cycle_plan.mutable_scope)
+        if not approved_scope:
+            return ()
+        policy = effective_repair_scope_policy(ctx.options)
+        _implicated, evidenced = _approved_expansion_scope(
+            repo=ctx.repo, worktree=ctx.info.worktree, tree_sha=tree,
+            evidence_dir=gate_dir(ctx.run_dir, cycle_plan.cycle.number, stage),
+            evidence=evidence, approved=approved_scope,
+        )
+        recorded = _recorded_effective_scope(ctx.run_dir, cycle_plan.cycle.number, stage)
+        current = set(recorded) if recorded else set(evidenced)
+        return tuple(sorted(set(evidenced) - current))[: policy.max_added_paths]
+
+    @staticmethod
+    def _implicated_paths(
+        ctx: Any, cycle_plan: Any, stage: GateStage, evidence: EvidenceBundle,
+    ) -> tuple[str, ...]:
+        tree, _failed = _red_gate_identity(evidence)
+        implicated, _initial = _approved_expansion_scope(
+            repo=ctx.repo, worktree=ctx.info.worktree, tree_sha=tree,
+            evidence_dir=gate_dir(ctx.run_dir, cycle_plan.cycle.number, stage),
+            evidence=evidence, approved=tuple(cycle_plan.mutable_scope),
+        )
+        return implicated
+
+    def _responsible_step_index(
+        self, ctx: Any, cycle_plan: Any, stage: GateStage, evidence: EvidenceBundle,
+    ) -> int | None:
+        """The first approved step whose mutable paths the failure implicates."""
+
+        implicated = set(self._implicated_paths(ctx, cycle_plan, stage, evidence))
+        if not implicated:
+            return None
+        for index, step in enumerate(cycle_plan.plan.steps):
+            if implicated & set((*step.write_set, *step.create_set, *step.delete_set)):
+                return index
+        return None
+
+    def _admit(
+        self, strategy: RecoveryStrategy, *, ctx: Any, cycle_plan: Any, stage: GateStage,
+        evidence: EvidenceBundle, ledger: _LadderLedger, tree: str,
+        failed: tuple[str, ...], proof: tuple[str, ...],
+        repair_attempt: int, repair_budget: int,
+    ) -> GateRecoveryStep | None:
+        """Materialize the step, or refuse it for these exact facts."""
+
+        trail = self._trail(ledger)
+        common = {"tree": tree, "failed_check_ids": failed, "consumed": trail}
+        if strategy in {
+            RecoveryStrategy.REPAIR_TARGETED, RecoveryStrategy.EXPAND_SCOPE,
+            RecoveryStrategy.FALLBACK_EXECUTOR,
+        } and any(entry.repair_attempt == repair_attempt for entry in ledger.entries):
+            # This bounded pass number is already durably consumed: one pass is
+            # never proposed, executed or counted twice for these facts.
+            return None
+        if strategy is RecoveryStrategy.FALLBACK_EXECUTOR:
+            if not ledger.fallback_executor_available:
+                return None
+            if repair_attempt > repair_budget:
+                return None
+            return GateRecoveryStep(strategy, repair_attempt=repair_attempt, **common)
+        if strategy in {RecoveryStrategy.REPAIR_TARGETED, RecoveryStrategy.EXPAND_SCOPE}:
+            if repair_attempt > repair_budget:
+                return None
+            if strategy is RecoveryStrategy.REPAIR_TARGETED:
+                return GateRecoveryStep(strategy, repair_attempt=repair_attempt, **common)
+            if not proof:
+                return None
+            return GateRecoveryStep(
+                strategy, repair_attempt=repair_attempt, added_paths=proof, **common,
+            )
+        if strategy in {RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.REPLAN_CYCLE}:
+            if self.replay_steps is None:
+                return None
+            if strategy is RecoveryStrategy.REPLAN_STEP:
+                index = self._responsible_step_index(ctx, cycle_plan, stage, evidence)
+                if index is None:
+                    return None
+                # A replan replays the responsible approved step and every
+                # later step of the cycle: a rewritten commit cannot keep
+                # descendants of the work it replaced.
+                return GateRecoveryStep(
+                    strategy,
+                    step_indices=tuple(range(index, len(cycle_plan.plan.steps))), **common,
+                )
+            # A single-step cycle would replay exactly the step replan.
+            if len(cycle_plan.plan.steps) < 2:
+                return None
+            return GateRecoveryStep(
+                strategy, step_indices=tuple(range(len(cycle_plan.plan.steps))), **common,
+            )
+        return None
+
+    @staticmethod
+    def _authorize_expansion(
+        ctx: Any, cycle_plan: Any, stage: GateStage,
+        step: GateRecoveryStep, failed: tuple[str, ...],
+    ) -> None:
+        """Persist the bounded expansion of the pending repair pass."""
+
+        policy = effective_repair_scope_policy(ctx.options)
+        approved = set(cycle_plan.mutable_scope)
+        added = tuple(sorted(set(step.added_paths)))
+        if not added or not set(added).issubset(approved):
+            raise ResumeIntegrityError(
+                "the gate recovery scope expansion exceeds the approved cycle scope"
+            )
+        if len(added) > policy.max_added_paths:
+            raise ResumeIntegrityError(
+                "the gate recovery scope expansion exceeds the configured bound"
+            )
+        directory = check_repair_attempt_dir(
+            ctx.run_dir, cycle_plan.cycle.number, stage, step.repair_attempt,
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(directory / _EXPANSION_ARTIFACT, _json_text({
+            "schema_version": 1,
+            "attempt": step.repair_attempt,
+            "tree": step.tree,
+            "failed_check_ids": list(failed),
+            "added_paths": list(added),
+            "policy": policy.policy,
+            "bound": policy.max_added_paths,
+        }))
 
 
 class GateAcceptanceService:

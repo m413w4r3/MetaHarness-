@@ -22,7 +22,7 @@ import json
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence, TypeAlias
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence, TypeAlias
 
 from ..evidence import EvidenceBundle, required_checks_passed
 from ..gitops import RepositoryReference, WorktreeInfo
@@ -42,14 +42,25 @@ from ..resume import ResumeCheckpoint, ResumePhase
 from ..review import ReviewResult
 from ..run_options import RunOptions
 
+if TYPE_CHECKING:  # pragma: no cover - the ladder protocol lives in recovery.py
+    from .recovery import GateRecoveryStep, RecoveryOperations
+
 
 def check_repair_fingerprint(
     candidate_tree_sha: str, failed_check_ids: Sequence[str], stage: GateStage | str,
-) -> tuple[str, tuple[str, ...], str]:
-    """Stable identity of one exhausted deterministic-gate failure."""
+    strategy: str = "",
+) -> tuple[str, tuple[str, ...], str, str]:
+    """Stable identity of one exhausted deterministic-gate failure.
+
+    The ladder position is part of the identity: two exhausted episodes that
+    stopped after different strategies are different facts, so an operator
+    retry that opened a new rung is never mistaken for a fixed point.
+    """
 
     stage_name = stage.value if isinstance(stage, GateStage) else str(stage)
-    return candidate_tree_sha, tuple(sorted(set(failed_check_ids))), stage_name
+    return (
+        candidate_tree_sha, tuple(sorted(set(failed_check_ids))), stage_name, str(strategy),
+    )
 
 
 # -- durable artifact layout -------------------------------------------------
@@ -162,6 +173,20 @@ def correction_kind(route: ReviewRoute) -> CycleKind:
 
 
 # -- data exchanged with the operations ---------------------------------------
+
+
+class RecoveryStepUnavailable(RuntimeError):
+    """A recovery ladder rung cannot be executed for these exact facts.
+
+    The deterministic gate never guesses and never widens an authority: it
+    consumes the refused rung durably and asks the ladder for the next
+    distinct strategy.
+    """
+
+    def __init__(self, strategy: Any, detail: str) -> None:
+        super().__init__(f"{getattr(strategy, 'value', strategy)}: {detail}")
+        self.strategy = strategy
+        self.detail = detail
 
 
 class PipelineFailure(Exception):
@@ -296,6 +321,10 @@ class PipelineV2Operations:
     # Accept the durable candidate of a ``STEP_ACCEPTANCE`` checkpoint; it
     # never calls a worker, a planner or a reviewer.
     accept_step: Callable[[PipelineV2Context, CyclePlan, int], None] | None = None
+    # The single red-gate recovery ladder object of the run.  The machine asks
+    # it which distinct strategy to try next and reports each step; without it
+    # the deterministic gate keeps its bounded direct check-repair loop.
+    recovery_operations: "RecoveryOperations | None" = None
 
 
 @dataclass(frozen=True)
@@ -589,14 +618,17 @@ class PipelineV2Coordinator:
             evidence = ops.load_accepted_gate_evidence(ctx, number, stage)
             if evidence is None:
                 evidence = ops.run_gate(ctx, cycle_plan, stage)
-            attempt = len(ops.check_repair_attempts(ctx, number, stage)) + 1
+            durable = len(ops.check_repair_attempts(ctx, number, stage))
+            attempt = durable + 1
             repair_boundary_written = False
             attempt_recorded = False
         else:
             evidence = ops.run_gate(ctx, cycle_plan, stage)
-            attempt = len(ops.check_repair_attempts(ctx, number, stage)) + 1
+            durable = len(ops.check_repair_attempts(ctx, number, stage))
+            attempt = durable + 1
             repair_boundary_written = False
             attempt_recorded = False
+        recovery = ops.recovery_operations
         while True:
             hard = ops.hard_failures(evidence)
             if hard:
@@ -614,42 +646,183 @@ class PipelineV2Coordinator:
                 raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
             if budget <= 0:
                 raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
-            if attempt > budget:
-                try:
-                    evidence_sha256 = hashlib.sha256(
-                        (gate_dir(ctx.run_dir, number, stage) / "evidence.json").read_bytes()
-                    ).hexdigest()
-                except OSError as exc:
+            if recovery is None:
+                if attempt > budget:
                     raise PipelineFailure(
-                        "RESUME_INTEGRITY_FAILURE", "latest deterministic evidence is unreadable",
-                    ) from exc
-                raise PipelineFailure(
-                    "CHECK_REPAIR_EXHAUSTED",
-                    {
-                        "failed_check_ids": [
-                            item.split(":", 1)[1] for item in soft if ":" in item
-                        ],
-                        "candidate_tree": evidence.staged_tree_sha,
-                        "attempt_count": attempt - 1,
-                        "budget": budget,
-                        "latest_evidence_sha256": evidence_sha256,
-                    },
-                )
-            if not repair_boundary_written:
+                        "CHECK_REPAIR_EXHAUSTED",
+                        self._check_repair_exhaustion_detail(
+                            ctx, cycle_plan, stage, evidence, soft,
+                            attempt=attempt, budget=budget,
+                        ),
+                    )
+                if not repair_boundary_written:
+                    self._boundary(
+                        ResumePhase.CHECK_REPAIR, cycle_plan, stage=stage,
+                        check_repair_attempt=attempt, tree=evidence.staged_tree_sha,
+                    )
+                if not attempt_recorded:
+                    ops.check_repair_attempt(ctx, cycle_plan, stage, attempt, evidence)
+                attempt_recorded = False
                 self._boundary(
-                    ResumePhase.CHECK_REPAIR, cycle_plan, stage=stage,
-                    check_repair_attempt=attempt, tree=evidence.staged_tree_sha,
+                    ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
+                    check_repair_attempt=attempt,
                 )
-            if not attempt_recorded:
-                ops.check_repair_attempt(ctx, cycle_plan, stage, attempt, evidence)
-            attempt_recorded = False
-            self._boundary(
-                ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
-                check_repair_attempt=attempt,
+                evidence = ops.run_gate(ctx, cycle_plan, stage)
+                attempt += 1
+                repair_boundary_written = False
+                continue
+            # Ladder-first: one distinct strategy per red gate, consumed
+            # durably before anything runs for it and never proposed twice for
+            # the same candidate tree and failure.
+            while True:
+                red = evidence
+                step = recovery.gate_step(
+                    ctx=ctx, cycle_plan=cycle_plan, stage=stage, evidence=red,
+                    repair_attempt=attempt, repair_budget=budget,
+                )
+                self._require_ladder_step(step, red)
+                if step.exhausted:
+                    raise PipelineFailure(
+                        "CHECK_REPAIR_EXHAUSTED",
+                        self._check_repair_exhaustion_detail(
+                            ctx, cycle_plan, stage, red, soft,
+                            attempt=attempt, budget=budget, step=step,
+                        ),
+                    )
+                if step.is_repair_pass and step.repair_attempt != attempt:
+                    # A pending ladder pass the checkpoint predates (a lowered
+                    # operator counter, a boundary written after the rung was
+                    # already consumed) is adopted: a recorded pass is never
+                    # replayed, the pending one still runs exactly once.
+                    attempt = self._adopt_pending_ladder_attempt(
+                        step, attempt=attempt, durable=durable,
+                    )
+                    attempt_recorded = False
+                recovery.begin_step(
+                    ctx=ctx, cycle_plan=cycle_plan, stage=stage, step=step, evidence=red,
+                )
+                if step.is_repair_pass:
+                    if step.repair_attempt != attempt:
+                        raise PipelineFailure(
+                            "RESUME_INTEGRITY_FAILURE",
+                            "the ladder repair pass does not follow the durable check-repair attempts",
+                        )
+                    if not repair_boundary_written:
+                        self._boundary(
+                            ResumePhase.CHECK_REPAIR, cycle_plan, stage=stage,
+                            check_repair_attempt=attempt, tree=red.staged_tree_sha,
+                        )
+                    if not attempt_recorded:
+                        ops.check_repair_attempt(ctx, cycle_plan, stage, attempt, red)
+                    attempt_recorded = False
+                    self._boundary(
+                        ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
+                        check_repair_attempt=attempt,
+                    )
+                    evidence = ops.run_gate(ctx, cycle_plan, stage)
+                    recovery.finish_step(
+                        ctx=ctx, cycle_plan=cycle_plan, stage=stage, step=step,
+                        evidence=red, tree_after=evidence.staged_tree_sha,
+                    )
+                    attempt += 1
+                    repair_boundary_written = False
+                    break
+                # A replan rung re-executes approved cycle work, under the
+                # approved contracts only; a rung that is not applicable for
+                # these exact facts is consumed and the ladder moves on.
+                try:
+                    tree_after = recovery.replay_step(
+                        ctx=ctx, cycle_plan=cycle_plan, stage=stage, step=step, evidence=red,
+                    )
+                except RecoveryStepUnavailable:
+                    recovery.finish_step(
+                        ctx=ctx, cycle_plan=cycle_plan, stage=stage, step=step,
+                        evidence=red, tree_after=red.staged_tree_sha,
+                    )
+                    continue
+                recovery.finish_step(
+                    ctx=ctx, cycle_plan=cycle_plan, stage=stage, step=step,
+                    evidence=red, tree_after=tree_after,
+                )
+                # The checkpoint names the last durable pass only when its
+                # recorded result is exactly the tree this gate verifies: a
+                # rewritten tree is never attributed to a pass that did not
+                # produce it.
+                records = ops.check_repair_attempts(ctx, number, stage)
+                self._boundary(
+                    ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
+                    check_repair_attempt=(
+                        len(records)
+                        if records and records[-1].tree_after == tree_after else None
+                    ),
+                )
+                evidence = ops.run_gate(ctx, cycle_plan, stage)
+                break
+
+    def _require_ladder_step(self, step: GateRecoveryStep, evidence: EvidenceBundle) -> None:
+        """Fail closed when a ladder step does not describe the red gate."""
+
+        if step.exhausted:
+            return
+        failed = tuple(
+            item.split(":", 1)[1] for item in self.operations.soft_failures(evidence) if ":" in item
+        )
+        if step.tree != evidence.staged_tree_sha or step.failed_check_ids != failed:
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE",
+                "the gate recovery ladder step does not describe the red gate evidence",
             )
-            evidence = ops.run_gate(ctx, cycle_plan, stage)
-            attempt += 1
-            repair_boundary_written = False
+
+    @staticmethod
+    def _adopt_pending_ladder_attempt(
+        step: GateRecoveryStep, *, attempt: int, durable: int,
+    ) -> int:
+        """Adopt the pending ladder pass a checkpoint may predate.
+
+        The ladder consumes a rung durably before it runs, so a checkpoint that
+        stopped before that pending pass is reconciled to it instead of the
+        reverse.  A pass that is already recorded is never replayed: only the
+        next unrecorded bounded pass of the ladder is ever adopted.
+        """
+
+        if (
+            step.repair_attempt is not None
+            and step.repair_attempt == durable + 1
+            and attempt <= durable
+        ):
+            return step.repair_attempt
+        raise PipelineFailure(
+            "RESUME_INTEGRITY_FAILURE",
+            "the ladder repair pass does not follow the durable check-repair attempts",
+        )
+
+    @staticmethod
+    def _check_repair_exhaustion_detail(
+        ctx: PipelineV2Context, cycle_plan: CyclePlan, stage: GateStage,
+        evidence: EvidenceBundle, soft: Sequence[str], *,
+        attempt: int, budget: int, step: GateRecoveryStep | None = None,
+    ) -> dict[str, Any]:
+        """The durable detail of one exhausted deterministic gate episode."""
+
+        try:
+            evidence_sha256 = hashlib.sha256(
+                (gate_dir(ctx.run_dir, cycle_plan.cycle.number, stage) / "evidence.json").read_bytes()
+            ).hexdigest()
+        except OSError as exc:
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", "latest deterministic evidence is unreadable",
+            ) from exc
+        detail: dict[str, Any] = {
+            "failed_check_ids": [item.split(":", 1)[1] for item in soft if ":" in item],
+            "candidate_tree": evidence.staged_tree_sha,
+            "attempt_count": attempt - 1,
+            "budget": budget,
+            "latest_evidence_sha256": evidence_sha256,
+        }
+        if step is not None:
+            detail["strategy"] = step.fingerprint_strategy
+            detail["strategies"] = [item.value for item in step.consumed]
+        return detail
 
     # -- durable boundaries ------------------------------------------------------
 
@@ -682,6 +855,7 @@ class PipelineV2Coordinator:
 
 __all__ = [
     "CyclePlan", "PipelineFailure", "PipelineV2Context", "PipelineV2Coordinator",
+    "RecoveryStepUnavailable",
     "PipelineV2Operations", "candidate_dir", "check_repair_attempt_dir",
     "check_repair_attempts_dir", "check_repair_dir", "check_repair_root", "correction_dir", "correction_kind", "cycle_dir",
     "cycle_record_path", "final_gate_stage", "gate_acceptance_path", "gate_dir", "implementation_dir", "implementation_steps_dir",

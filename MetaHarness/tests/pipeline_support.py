@@ -228,6 +228,25 @@ class _Executor:
         return self.workers.run(request)
 
 
+def ladder_ledger(
+    harness: "PipelineHarness", *, cycle: int = 1, stage: str = "post-implementation",
+) -> dict[str, Any]:
+    """The durable red-gate recovery ladder of one gate episode."""
+
+    path = (
+        harness.run_dir() / "cycles" / f"{cycle:03d}" / "check-repair" / stage / "ladder.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def ladder_strategies(
+    harness: "PipelineHarness", *, cycle: int = 1, stage: str = "post-implementation",
+) -> list[str]:
+    """The distinct ladder rungs one red gate consumed, in order."""
+
+    return [entry["strategy"] for entry in ladder_ledger(harness, cycle=cycle, stage=stage)["entries"]]
+
+
 class PipelineHarness(unittest.TestCase):
     """A real repository, a real run directory and scripted models."""
 

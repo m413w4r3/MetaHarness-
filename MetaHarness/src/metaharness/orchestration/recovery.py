@@ -17,9 +17,10 @@ onto the durable run status that waits after it.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Collection, Mapping
+from typing import Any, Callable, Collection, Mapping, Protocol
 
-from ..models import RunStatus
+from ..evidence import EvidenceBundle
+from ..models import GateStage, RunStatus
 from ..recovery_policy import (
     FailureClass,
     RecoveryDecision,
@@ -30,7 +31,7 @@ from ..recovery_policy import (
 )
 from ..resume import ResumePhase
 from ..state import RunStateStore
-from .pipeline_v2 import PipelineFailure
+from .pipeline_v2 import PipelineFailure, RecoveryStepUnavailable
 
 
 @dataclass(frozen=True)
@@ -472,9 +473,135 @@ class RecoveryCoordinator:
         self._emit(event, phase=phase, cycle=cycle, step_id=step_id, data=data)
 
 
+# -- the deterministic-gate ladder interface ----------------------------------
+
+
+@dataclass(frozen=True)
+class GateRecoveryStep:
+    """One distinct ladder strategy a red deterministic gate must try next.
+
+    ``repair_attempt`` names the bounded check-repair pass this step consumes
+    when the step is a repair pass; a step that re-executes approved cycle work
+    names the plan indices it replays instead.  ``exhausted`` is true only once
+    every strategy of the failure class is consumed or deterministically
+    inapplicable for these exact facts; the gate may then wait for an operator.
+    """
+
+    strategy: RecoveryStrategy
+    tree: str = ""
+    failed_check_ids: tuple[str, ...] = ()
+    repair_attempt: int | None = None
+    step_indices: tuple[int, ...] = ()
+    added_paths: tuple[str, ...] = ()
+    consumed: tuple[RecoveryStrategy, ...] = ()
+    exhausted: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy", RecoveryStrategy(self.strategy))
+        if not isinstance(self.tree, str) or len(self.tree) > 128:
+            raise ValueError("gate recovery step tree must be a bounded string")
+        object.__setattr__(
+            self, "failed_check_ids", tuple(str(item) for item in self.failed_check_ids),
+        )
+        if self.repair_attempt is not None and (
+            isinstance(self.repair_attempt, bool)
+            or not isinstance(self.repair_attempt, int)
+            or self.repair_attempt < 1
+        ):
+            raise ValueError("gate recovery repair attempt must be a positive integer")
+        for name in ("step_indices", "added_paths", "consumed"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in self.step_indices
+        ):
+            raise ValueError("gate recovery step indices must be non-negative integers")
+        if any(
+            not isinstance(path, str) or not path or path.startswith("/") or "\\" in path
+            for path in self.added_paths
+        ):
+            raise ValueError("gate recovery added paths must be safe repository paths")
+        object.__setattr__(self, "consumed", tuple(
+            RecoveryStrategy(strategy) for strategy in self.consumed
+        ))
+        if not isinstance(self.exhausted, bool):
+            raise TypeError("gate recovery exhausted flag must be a boolean")
+        if self.exhausted and (self.step_indices or self.repair_attempt is not None):
+            raise ValueError("an exhausted gate recovery step executes nothing")
+
+    @property
+    def is_repair_pass(self) -> bool:
+        """Whether this step is executed by the bounded check-repair operation."""
+
+        return self.repair_attempt is not None
+
+    @property
+    def fingerprint_strategy(self) -> str:
+        """The exact ladder position a fixed-point fingerprint carries.
+
+        The identity of one exhausted gate episode is its consumed ladder
+        trail, never only its last rung: two episodes that reached different
+        positions are different facts even on the same candidate tree.
+        """
+
+        trail = self.consumed if self.exhausted else (*self.consumed, self.strategy)
+        return "+".join(item.value for item in trail)
+
+
+class RecoveryOperations(Protocol):
+    """The single ladder object :class:`PipelineV2Operations` references.
+
+    The machine asks it which distinct strategy one red deterministic gate must
+    try next, then reports the step as started and finished.  The
+    implementation owns the durable ladder ledger, so a strategy consumed for
+    an exact candidate tree and failure is never proposed twice, and it never
+    widens the scope authority the operator already approved.
+    """
+
+    def gate_step(
+        self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
+        evidence: EvidenceBundle, repair_attempt: int, repair_budget: int,
+    ) -> GateRecoveryStep:
+        """The next distinct ladder step of one red gate, or the terminal."""
+
+        ...
+
+    def begin_step(
+        self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
+        step: GateRecoveryStep, evidence: EvidenceBundle,
+    ) -> None:
+        """Consume the step durably before anything is executed for it."""
+
+        ...
+
+    def replay_step(
+        self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
+        step: GateRecoveryStep, evidence: EvidenceBundle,
+    ) -> str:
+        """Execute one replan rung on approved work; return the tree after it.
+
+        The implementation re-executes only steps of the approved cycle plan,
+        under their own approved contracts and effective authority, and raises
+        :class:`RecoveryStepUnavailable` when the rung cannot be executed
+        deterministically.  It never widens a scope.
+        """
+
+        ...
+
+    def finish_step(
+        self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
+        step: GateRecoveryStep, evidence: EvidenceBundle, tree_after: str,
+    ) -> None:
+        """Mark the consumed step as executed, without consuming it twice."""
+
+        ...
+
+
 __all__ = [
     "MAX_RECOVERY_ATTEMPT_RECORDS", "RecoveryAdmission", "RecoveryAttempt",
-    "RecoveryCoordinator", "RecoveryTerminalState", "failure_code",
+    "GateRecoveryStep", "RecoveryCoordinator", "RecoveryOperations",
+    "RecoveryStepUnavailable",
+    "RecoveryTerminalState", "failure_code",
     "normalize_exit_reason", "project_exit", "strategy_terminal_state",
     "terminal_state_for",
 ]
