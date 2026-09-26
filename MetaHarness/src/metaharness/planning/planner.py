@@ -169,9 +169,9 @@ def build_planner_prompt_v2(*args: Any, **kwargs: Any) -> str:
 _REPAIR_EVIDENCE_HEADER = "REPAIR PLANNER EVIDENCE v1"
 _REPAIR_EVIDENCE_FOOTER = "END REPAIR PLANNER EVIDENCE"
 REPAIR_EVIDENCE_FILENAME = "repair-evidence.md"
-# AutoWork runs with retries=2, so attempts 1 and 2 stay inline and only the
-# third — reached exclusively after two retryable HTTP responses — uses files.
-_REPAIR_FILE_FALLBACK_ATTEMPT = 3
+# The inline evidence is always tried first; only a request the provider keeps
+# refusing for over half a minute hands the same evidence over as a file.
+_REPAIR_FILE_FALLBACK_AFTER_SECONDS = 30.0
 
 
 _INLINE_EVIDENCE_DELIVERY = """REPAIR EVIDENCE DELIVERY
@@ -750,7 +750,7 @@ class RepairPlannerV2:
                     "evidence_sha256": hashlib.sha256(
                         evidence_text.encode("utf-8")
                     ).hexdigest(),
-                    "file_fallback_attempt": _REPAIR_FILE_FALLBACK_ATTEMPT,
+                    "file_fallback_after_seconds": _REPAIR_FILE_FALLBACK_AFTER_SECONDS,
                     "candidate_diff_attachment_bytes": len(
                         fallback_candidate_diff.encode("utf-8")
                     ),
@@ -771,7 +771,7 @@ class RepairPlannerV2:
                 request,
                 fallback_prompt=fallback_prompt,
                 attachments=attachments,
-                fallback_attempt=_REPAIR_FILE_FALLBACK_ATTEMPT,
+                fallback_after_seconds=_REPAIR_FILE_FALLBACK_AFTER_SECONDS,
             )
         else:
             result = self.client.complete(request)

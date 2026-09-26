@@ -115,7 +115,10 @@ class RunObservability:
             return
         data = {
             key: observation[key]
-            for key in ("operation", "attempt", "attempts", "http_status", "elapsed_ms")
+            for key in (
+                "operation", "attempt", "attempts", "http_status", "elapsed_ms",
+                "max_wait_seconds",
+            )
             if isinstance(observation.get(key), (str, int))
         }
         self.trace_emit(f"transport.{event}", phase="transport", data=data)

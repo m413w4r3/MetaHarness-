@@ -166,7 +166,6 @@ class ClaudeTests(unittest.TestCase):
             effort="medium",
             permission_mode="acceptEdits",
             timeout_seconds=5,
-            retries=0,
         )
         home = prepare_claude_home(self._config())
         result = ClaudeCodeAgent(executable=str(executable)).run_revision(
@@ -221,7 +220,6 @@ class ClaudeTests(unittest.TestCase):
             effort="medium",
             permission_mode="acceptEdits",
             timeout_seconds=5,
-            retries=0,
         )
         home = prepare_claude_home(self._config())
 
@@ -256,7 +254,6 @@ class ClaudeTests(unittest.TestCase):
             effort="medium",
             permission_mode="acceptEdits",
             timeout_seconds=37,
-            retries=0,
         )
         home = prepare_claude_home(self._config())
         environment = build_claude_environment({"PATH": "/usr/bin"}, claude_home=home)
@@ -314,7 +311,6 @@ class ClaudeTests(unittest.TestCase):
             effort="medium",
             permission_mode="acceptEdits",
             timeout_seconds=5,
-            retries=0,
         )
         ClaudeCodeAgent(executable=str(executable)).run_revision(
             "inspect this", self.repo, artifacts_dir=self.root / "subscription-run",

@@ -97,7 +97,6 @@ from .shared import (
     _json_text,
     _repair_checks_payload,
     bounded_parse_detail,
-    chat_client,
 )
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
@@ -193,9 +192,8 @@ class ReviewCorrectionService:
             "GIT_STATUS": status_porcelain(ctx.info.worktree),
         })
         planner = RepairPlannerV2(
-            self.runtime.planner_client or chat_client(
-                build_llm_endpoint(planner_profile), self.runtime.environment, self.runtime.observability.trace_transport
-            ),
+            self.runtime.planner_client
+            or self.runtime.chat(build_llm_endpoint(planner_profile)),
             planning=self.runtime.config.planning,
             check_catalog=self.runtime.config.check_catalog,
             original_required_check_ids=ctx.plan.required_checks,

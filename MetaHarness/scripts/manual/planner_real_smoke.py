@@ -91,7 +91,6 @@ def provider_run(name: str) -> ProviderRun:
             model="chatgpt-web",
             api_key_env=_optional_api_key_env("META_SMOKE_GPT_API_KEY"),
             timeout_seconds=420,
-            retries=0,
             extra_body={"new_chat": True},
         )
         return ProviderRun("chatgpt", "ChatGPT UI", config)
@@ -103,7 +102,6 @@ def provider_run(name: str) -> ProviderRun:
             model=_required_env("META_SMOKE_GEMINI_MODEL"),
             api_key_env=_optional_api_key_env("META_SMOKE_GEMINI_API_KEY"),
             timeout_seconds=420,
-            retries=0,
             extra_body={},
         )
         return ProviderRun("gemini", "Gemini", config)

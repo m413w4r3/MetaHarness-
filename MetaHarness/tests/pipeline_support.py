@@ -387,7 +387,6 @@ model = "fake-planner"
 selection_mode = "request"
 base_url = "http://127.0.0.1:9"
 endpoint_path = "/v1/chat/completions"
-retries = 0
 
 [model_profiles.reviewer]
 display_name = "Reviewer"
@@ -398,7 +397,6 @@ model = "fake-reviewer"
 selection_mode = "request"
 base_url = "http://127.0.0.1:9"
 endpoint_path = "/v1/chat/completions"
-retries = 0
 
 [model_profiles.worker]
 display_name = "Worker"
@@ -433,7 +431,6 @@ model = "live-planner"
 selection_mode = "request"
 base_url = "http://127.0.0.1:9"
 endpoint_path = "/v1/chat/completions"
-retries = 0
 
 [model_profiles.live_reviewer]
 display_name = "Live Reviewer"
@@ -444,7 +441,6 @@ model = "live-reviewer"
 selection_mode = "request"
 base_url = "http://127.0.0.1:9"
 endpoint_path = "/v1/chat/completions"
-retries = 0
 
 [model_profiles.live_worker]
 display_name = "Live Worker"

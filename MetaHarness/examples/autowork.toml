@@ -28,6 +28,12 @@ max_check_repair_attempts = 2
 max_correction_cycles = 2
 max_step_contract_repairs = 2
 
+[transport]
+# One logical text completion keeps retrying a retryable transport failure
+# (429, 5xx, timeout, interrupted connection, transient network) for at most
+# this long before the transport reports a temporary external exhaustion.
+max_wait_seconds = 1800
+
 [recovery]
 max_transient_attempts = 2
 max_executor_fallbacks = 1
@@ -134,7 +140,6 @@ base_url = "http://127.0.0.1:8001"
 endpoint_path = "/v1/chat/completions"
 api_key_env = "BRIDGE_API_KEY"
 timeout_seconds = 42000
-retries = 2
 description = "Strong semantic planning and review through the ChatGPT bridge."
 strengths = ["planning", "semantic review", "risk analysis"]
 cost_tier = "standard"

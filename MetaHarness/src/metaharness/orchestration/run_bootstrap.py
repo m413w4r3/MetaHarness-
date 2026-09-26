@@ -66,7 +66,7 @@ from ..workspace import prepare_workspace
 from .durable_readers import read_repository_reference
 from .shared import (
     GitOwnership, OrchestrationError, PLANNER_CONVERSATION, archive_attempt_tree,
-    chat_client, git_ownership, git_ownership_payload, is_object_id, json_text,
+    git_ownership, git_ownership_payload, is_object_id, json_text,
     read_json_artifact,
 )
 
@@ -130,7 +130,8 @@ class RunBootstrap:
         planner_profile_id = planner_profile.id
         if existing_plan is None:
             planner = PlannerV2(
-                self.runtime.planner_client or chat_client(build_llm_endpoint(planner_profile), self.runtime.environment, self.runtime.observability.trace_transport),
+                self.runtime.planner_client
+                or self.runtime.chat(build_llm_endpoint(planner_profile)),
                 repository_reference=repository_reference,
                 planning=self.runtime.config.planning,
                 check_catalog=self.runtime.config.check_catalog,
@@ -576,9 +577,8 @@ class RunBootstrap:
             planner_profile = profile_for_role(self.runtime.config, planner_profile_id, ExecutionRole.PLANNER)
             if checkpoint.phase is ResumePhase.PLANNER:
                 planner = PlannerV2(
-                    self.runtime.planner_client or chat_client(
-                        build_llm_endpoint(planner_profile), self.runtime.environment, self.runtime.observability.trace_transport
-                    ),
+                    self.runtime.planner_client
+                    or self.runtime.chat(build_llm_endpoint(planner_profile)),
                     repository_reference=reference, planning=self.runtime.config.planning,
                     check_catalog=self.runtime.config.check_catalog,
                     default_check_ids=self.runtime.config.default_check_ids,
@@ -647,10 +647,17 @@ class RunBootstrap:
             )
             if isinstance(prepared, RunResult):
                 return prepared
-            return self.runtime.composition.execute_v2(
+            outcome = self.runtime.composition.execute_v2(
                 store, run_dir, run_id, spec, repo, base_sha, context, reference,
                 prepared=prepared,
             )
+            if isinstance(outcome, RunResult):
+                return outcome
+            # The prepared run hands back its pipeline and the boundary it
+            # entered: the resumed execution is driven here, exactly as a new
+            # run drives it, so a successful resume returns a RunResult.
+            pipeline, start = outcome
+            return self.runtime.run_pipeline(store, pipeline, start, resumed=True)
         except ResumeRequiresOperatorError as exc:
             failed = store.record_failure(exc.code, redact(str(exc), self.runtime.secrets),
                                           **self.runtime.failure.closing_step_fields(store, "failed"))

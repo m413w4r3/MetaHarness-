@@ -52,7 +52,7 @@ from .durable_readers import (
     completed_step_records, load_evidence, load_revision, read_candidate_record,
 )
 from .run_bootstrap import PreparedV2Run
-from .shared import CycleArtifactService, OrchestrationError, bounded_parse_detail, chat_client
+from .shared import CycleArtifactService, OrchestrationError, bounded_parse_detail
 from .step_authority import approved_step_contract
 
 if TYPE_CHECKING:
@@ -68,9 +68,7 @@ class RunComposition:
         profile = profile_for_role(self.runtime.config, profile_id, ExecutionRole.REVIEWER)
         client = self.runtime.reviewer_client
         if client is None:
-            client = chat_client(
-                build_llm_endpoint(profile), self.runtime.environment, self.runtime.observability.trace_transport
-            )
+            client = self.runtime.chat(build_llm_endpoint(profile))
         return Reviewer(client, allow_format_repair=True)
 
     def _recommender_for_profile(self, profile_id: str) -> ExecutionRecommender:
@@ -80,9 +78,7 @@ class RunComposition:
             # This is deliberately a new client: the recommender has no
             # planner conversation/history, while using the same profile
             # endpoint and transport policy.
-            client = chat_client(
-                build_llm_endpoint(profile), self.runtime.environment, self.runtime.observability.trace_transport
-            )
+            client = self.runtime.chat(build_llm_endpoint(profile))
         return ExecutionRecommender(client)
 
     def _maybe_recommend_profiles(

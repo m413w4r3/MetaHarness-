@@ -14,7 +14,7 @@ hands it to the coordinator; no module of this package imports the façade.
 
 from __future__ import annotations
 
-import hashlib, os, re, uuid
+import dataclasses, hashlib, os, re, uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,9 +30,10 @@ from ..gitops import (
     status_porcelain,
 )
 from ..integrations.github import GitHubWorkstreamClient, NullGitHubWorkstreamClient
+from ..llm.chat import OpenAIChatTextClient
 from ..models import (
-    GateStage, HarnessConfig, PlanDecision, RunCycle, RunDisposition,
-    RunMachineState, RunPhase,
+    GateStage, HarnessConfig, LLMEndpointConfig, PlanDecision, RunCycle,
+    RunDisposition, RunMachineState, RunPhase,
 )
 from ..plan_recovery import (
     PLAN_SOURCE_OPERATOR, PlanRecoveryError, plan_recovery_info,
@@ -48,6 +49,7 @@ from ..planning.protocol import V2PlanParseError, parse_task_plan_v2
 from ..planning.validation import validate_decomposition_policy, validate_execution_mode_policy
 from ..profiles import ProfileError, profiles_for_config
 from ..redaction import redact
+from ..result import RunResult
 from ..resume import (
     ResumeCheckpoint, ResumeCheckpointError, ResumePhase,
     ResumeRequiresOperatorError,
@@ -69,6 +71,7 @@ from .contract_recovery import ContractRecoveryService
 from .correction_scope import CorrectionScopeService
 from .durable_readers import read_repository_reference
 from .gates import GateService
+from .pipeline_v2 import PipelineV2Coordinator, PipelineV2Context
 from .publication import PublicationService
 from .recovery import RecoveryCoordinator
 from .review_correction import ReviewCorrectionService
@@ -81,7 +84,7 @@ from .run_observability import RunObservability
 from .semantic_revision import SemanticRevisionService
 from .shared import (
     OrchestrationError, RECOVERY_ATTEMPT_ARTIFACTS, archive_attempt,
-    archive_attempt_target,
+    archive_attempt_target, chat_client,
     is_object_id, status_has_unstaged_or_untracked,
 )
 from .step_acceptance import StepAcceptanceService
@@ -166,6 +169,32 @@ class RunRuntime:
         self.failure = RunFailure(self)
         self.composition = RunComposition(self)
         self.bootstrap = RunBootstrap(self)
+
+    def chat(self, endpoint: LLMEndpointConfig) -> OpenAIChatTextClient:
+        """The run's one text transport, on the run's one transport horizon.
+
+        ``chat`` is the only place the ``[transport]`` budget is applied, so
+        every consumer of a text endpoint (planner, reviewer, correction and
+        repair planners, recommender) shares the same resilience.
+        """
+
+        return chat_client(
+            dataclasses.replace(
+                endpoint, max_wait_seconds=self.config.transport.max_wait_seconds
+            ),
+            self.environment, self.observability.trace_transport,
+        )
+
+    def run_pipeline(
+        self, store: RunStateStore, pipeline: PipelineV2Context,
+        start: ResumeCheckpoint, *, resumed: bool,
+    ) -> RunResult:
+        """Drive the generic coordinator and project the failure that left it."""
+
+        engine = PipelineV2Coordinator(
+            pipeline, self.composition.pipeline_operations(store)
+        )
+        return self.failure.run_pipeline(store, pipeline, start, engine, resumed=resumed)
 
     def recovery(self, store: RunStateStore) -> RecoveryCoordinator:
         """The recovery coordinator bound to this run's durable state."""

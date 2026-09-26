@@ -200,7 +200,7 @@ class ManualPlannerSmokeTests(unittest.TestCase):
 
     def test_transport_failure_records_redacted_bounded_error(self):
         for error, expected in (
-            (LLMHTTPError("LLM endpoint returned HTTP 401 after 1 attempt(s)"), "HTTP 401"),
+            (LLMHTTPError("LLM endpoint returned HTTP 401"), "HTTP 401"),
             (LLMHTTPError("LLM request failed before receiving an HTTP response (ConnectionRefusedError)"), "ConnectionRefusedError"),
             (LLMHTTPError("LLM request timed out"), "timed out"),
         ):

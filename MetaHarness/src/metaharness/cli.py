@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -141,12 +142,50 @@ def _config_check(config_path: Path) -> int:
     return 0
 
 
-def _run(config_path: Path, spec_path: Path, run_id: str | None) -> int:
+# How long ``--auto-resume`` waits between two resume attempts of the same
+# run.  The wait is owned by the current process: this is no daemon and no
+# persistent scheduler.
+DEFAULT_AUTO_RESUME_INTERVAL_SECONDS = 600.0
+
+
+def _run(
+    config_path: Path, spec_path: Path, run_id: str | None, *,
+    auto_resume: bool = False,
+    auto_resume_interval: float = DEFAULT_AUTO_RESUME_INTERVAL_SECONDS,
+) -> int:
     try:
-        result = run_orchestrator(config_path, spec_path, run_id=run_id)
+        config = load_config(config_path)
+        if auto_resume and not auto_resume_interval > 0:
+            raise ConfigError("--auto-resume-interval must be greater than zero")
+        result = run_orchestrator(config, spec_path, run_id=run_id)
     except (ConfigError, OrchestrationError, OSError, UnicodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    if not auto_resume:
+        return _report_result(result)
+    return _auto_resume(config, result, auto_resume_interval)
+
+
+def _auto_resume(config: HarnessConfig, result: RunResult, interval: float) -> int:
+    """Re-run a run that waits on a temporary external condition, in-process.
+
+    The loop stops as soon as the run leaves ``WAIT_EXTERNAL`` -- a completed
+    run, a human decision or a definitive failure is never retried -- and it
+    reuses ``transport.max_wait_seconds`` as its global ceiling, so one budget
+    bounds both the transport horizon and this loop.
+    """
+
+    budget = config.transport.max_wait_seconds
+    waiting_since = time.monotonic()
+    while result.status is RunStatus.WAITING_EXTERNAL:
+        if time.monotonic() - waiting_since >= budget:
+            break
+        time.sleep(interval)
+        try:
+            result = resume_run(config, result.run_dir.name)
+        except (ConfigError, ResumeError, OrchestrationError, OSError, UnicodeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     return _report_result(result)
 
 
@@ -981,6 +1020,21 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", required=True, type=Path)
     run.add_argument("--spec", required=True, type=Path)
     run.add_argument("--run-id", type=str)
+    run.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help=(
+            "retry the run in this process while it waits on a temporary "
+            "external condition"
+        ),
+    )
+    run.add_argument(
+        "--auto-resume-interval",
+        type=float,
+        default=DEFAULT_AUTO_RESUME_INTERVAL_SECONDS,
+        metavar="SECONDS",
+        help="seconds between two --auto-resume attempts (default: 600)",
+    )
     resume = subparsers.add_parser(
         "resume", help="resume a failed run at its durable checkpoint"
     )
@@ -1031,7 +1085,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "config-check":
         return _config_check(args.config)
     if args.command == "run":
-        return _run(args.config, args.spec, args.run_id)
+        return _run(
+            args.config, args.spec, args.run_id,
+            auto_resume=args.auto_resume,
+            auto_resume_interval=args.auto_resume_interval,
+        )
     if args.command == "resume":
         return _resume(args.config, args.run_id)
     if args.command == "recover-plan":

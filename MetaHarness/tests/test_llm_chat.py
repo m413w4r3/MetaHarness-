@@ -1,11 +1,14 @@
 import base64
+import email.message
+import io
 import json
 import os
-import socket
 import sys
 import threading
 import time
 import unittest
+import urllib.error
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,10 +19,125 @@ from metaharness.llm import chat  # noqa: E402
 from metaharness.llm.chat import (  # noqa: E402
     LLMHTTPError,
     LLMProtocolError,
+    LLMTransportExhaustedError,
     OpenAIChatTextClient,
     TextFileAttachment,
 )
 from metaharness.models import LLMEndpointConfig  # noqa: E402
+
+
+class FakeClock:
+    """A monotonic clock whose sleeps advance it: no test ever waits."""
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.started = start
+        self.now = start
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += max(0.0, seconds)
+
+    @property
+    def elapsed(self) -> float:
+        return self.now - self.started
+
+
+class FakeResponse:
+    """The minimal response surface ``_read_bounded`` consumes."""
+
+    def __init__(self, body: bytes) -> None:
+        self._buffer = io.BytesIO(body)
+
+    def read1(self, size: int = -1) -> bytes:
+        return self._buffer.read1(size)
+
+    def read(self, size: int = -1) -> bytes:
+        return self._buffer.read(size)
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+
+class FakeOpener:
+    """An in-process transport scripted by (status, headers, body) answers.
+
+    No socket is opened: every answer is either an HTTP status the client
+    rejects, a response body, or a local exception the real urllib raises.
+    """
+
+    def __init__(self, answers: list, clock: FakeClock | None = None) -> None:
+        self.answers = list(answers)
+        self.requests: list[dict] = []
+        self.clock = clock
+        # The elapsed transport time of every attempt, so a test can prove no
+        # attempt was ever made after the deadline.
+        self.times: list[float] = []
+
+    def open(self, request, timeout=None):  # noqa: ANN001
+        body = request.data
+        self.requests.append(
+            {"url": request.full_url, "payload": json.loads(body.decode("utf-8"))}
+        )
+        if self.clock is not None:
+            self.times.append(self.clock.elapsed)
+        answer = self.answers[min(len(self.requests) - 1, len(self.answers) - 1)]
+        if isinstance(answer, BaseException):
+            raise answer
+        status, headers, payload = answer
+        if status != 200:
+            raise urllib.error.HTTPError(
+                request.full_url, status, "error", email_message(headers), None,
+            )
+        return FakeResponse(json.dumps(payload).encode("utf-8"))
+
+
+def email_message(headers: dict):
+    message = email.message.Message()
+    for key, value in headers.items():
+        message[key] = value
+    return message
+
+
+def completion(text="ok"):
+    return {"choices": [{"message": {"role": "assistant", "content": text}}]}
+
+
+class HorizonHarness:
+    """One client over a scripted opener and an injected clock."""
+
+    def __init__(self, answers, **overrides) -> None:
+        self.clock = FakeClock()
+        self.opener = FakeOpener(answers, self.clock)
+        values = {
+            "base_url": "http://127.0.0.1:9",
+            "endpoint_path": "/v1/chat/completions",
+            "model": "test-model",
+            "timeout_seconds": 2,
+            "max_wait_seconds": 60,
+        }
+        values.update(overrides)
+        self.endpoint = LLMEndpointConfig(**values)
+        self.observations: list[dict] = []
+
+    def client(self) -> OpenAIChatTextClient:
+        return OpenAIChatTextClient(
+            self.endpoint, environment={}, on_transport=self.observations.append,
+            opener=self.opener,
+        )
+
+    def call(self, prompt: str = "prompt"):
+        with (
+            mock.patch("time.monotonic", self.clock.monotonic),
+            mock.patch("time.sleep", self.clock.sleep),
+        ):
+            return self.client().complete(prompt)
 
 
 class ServerHarness:
@@ -79,7 +197,7 @@ def config(server, **kwargs):
         "endpoint_path": "/v1/chat/completions",
         "model": "test-model",
         "timeout_seconds": 2,
-        "retries": 0,
+        "max_wait_seconds": 60,
     }
     values.update(kwargs)
     return LLMEndpointConfig(**values)
@@ -186,39 +304,6 @@ class ChatClientTests(unittest.TestCase):
             )
             self.assertEqual(client.complete("none").usage, {})
 
-    def test_retryable_500_is_retried_then_succeeds(self):
-        attempts = 0
-        observations = []
-
-        def responder(_handler, _request):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                return 500, {"error": "temporary"}
-            return 200, {"choices": [{"message": {"content": "recovered"}}]}
-
-        with ServerHarness(responder) as server:
-            result = OpenAIChatTextClient(
-                config(server, retries=1), on_transport=observations.append
-            ).complete("prompt")
-        self.assertEqual(result.text, "recovered")
-        self.assertEqual(attempts, 2)
-        self.assertEqual([item["event"] for item in observations], [
-            "request_started", "attempt_started", "http_response", "retrying",
-            "attempt_started", "request_completed",
-        ])
-        self.assertEqual(observations[2]["http_status"], 500)
-        self.assertNotIn("prompt", json.dumps(observations))
-
-    def test_retry_backoff_is_exponential_and_capped(self):
-        with mock.patch.object(chat, "time") as fake_time:
-            for attempt in range(8):
-                chat._sleep_before_retry(attempt)
-        delays = [call.args[0] for call in fake_time.sleep.call_args_list]
-        self.assertEqual(delays[:3], [0.05, 0.1, 0.2])
-        self.assertEqual(delays[-1], 1.0)
-        self.assertEqual(delays, sorted(delays))
-
     def test_401_is_not_retried_and_secret_is_not_in_exception(self):
         def responder(_handler, _request):
             return 401, {"error": "unauthorized"}
@@ -230,7 +315,7 @@ class ChatClientTests(unittest.TestCase):
             with ServerHarness(responder) as server:
                 with self.assertRaises(LLMHTTPError) as raised:
                     OpenAIChatTextClient(
-                        config(server, api_key_env="META_TEST_SECRET", retries=3)
+                        config(server, api_key_env="META_TEST_SECRET")
                     ).complete("prompt")
                 self.assertNotIn(secret, str(raised.exception))
                 self.assertEqual(len(server.requests), 1)
@@ -246,9 +331,11 @@ class ChatClientTests(unittest.TestCase):
             return 200, {"choices": [{"message": {"content": "late"}}]}
 
         with ServerHarness(responder) as server:
+            # A one-second horizon: the retryable timeout is reported as a
+            # temporary exhaustion without waiting for the default budget.
             with self.assertRaises(LLMHTTPError) as raised:
                 OpenAIChatTextClient(
-                    config(server, timeout_seconds=0.02, retries=0)
+                    config(server, timeout_seconds=0.02, max_wait_seconds=1)
                 ).complete("prompt")
         self.assertIn("timed out", str(raised.exception))
         self.assertNotIn("Authorization", str(raised.exception))
@@ -270,109 +357,243 @@ def _content(request):
     return request["payload"]["messages"][0]["content"]
 
 
+def _payload_content(request):
+    return request["payload"]["messages"][0]["content"]
+
+
+class TransportHorizonTests(unittest.TestCase):
+    """The transport retries inside a deadline, never a fixed attempt count."""
+
+    def test_a_transient_503_burst_then_success_retries_with_growing_waits(self):
+        harness = HorizonHarness([
+            (503, {}, {"error": "unavailable"}),
+            (503, {}, {"error": "unavailable"}),
+            (200, {}, completion("recovered")),
+        ])
+
+        result = harness.call()
+
+        self.assertEqual(result.text, "recovered")
+        self.assertEqual(len(harness.opener.requests), 3)
+        self.assertEqual(len(harness.clock.sleeps), 2)
+        self.assertEqual(harness.clock.sleeps, sorted(harness.clock.sleeps))
+        self.assertLess(harness.clock.sleeps[0], harness.clock.sleeps[1])
+        # The whole retry sequence happens inside the configured horizon.
+        self.assertLess(harness.clock.sleeps[-1], harness.endpoint.max_wait_seconds)
+        self.assertEqual(
+            [item["event"] for item in harness.observations],
+            [
+                "request_started", "attempt_started", "http_response", "retrying",
+                "attempt_started", "http_response", "retrying",
+                "attempt_started", "request_completed",
+            ],
+        )
+        self.assertEqual(harness.observations[0]["max_wait_seconds"], 60)
+        self.assertNotIn("prompt", json.dumps(harness.observations))
+
+    def test_a_valid_retry_after_wins_over_the_local_backoff(self):
+        harness = HorizonHarness([
+            (429, {"Retry-After": "7"}, {"error": "slow down"}),
+            (200, {}, completion("accepted")),
+        ])
+
+        result = harness.call()
+
+        self.assertEqual(result.text, "accepted")
+        self.assertEqual(harness.clock.sleeps, [7.0])
+
+    def test_an_http_date_retry_after_is_honoured(self):
+        target = datetime.now(timezone.utc) + timedelta(seconds=9)
+        harness = HorizonHarness([
+            (503, {"Retry-After": target.strftime("%a, %d %b %Y %H:%M:%S GMT")}, {}),
+            (200, {}, completion("accepted")),
+        ])
+
+        result = harness.call()
+
+        self.assertEqual(result.text, "accepted")
+        self.assertEqual(len(harness.clock.sleeps), 1)
+        self.assertAlmostEqual(harness.clock.sleeps[0], 9.0, delta=1.0)
+
+    def test_an_invalid_retry_after_falls_back_to_the_local_backoff(self):
+        for headers in ({"Retry-After": "soon"}, {"Retry-After": ""}, {"Retry-After": "0"}):
+            with self.subTest(headers=headers):
+                harness = HorizonHarness([
+                    (429, headers, {}),
+                    (200, {}, completion("accepted")),
+                ])
+
+                self.assertEqual(harness.call().text, "accepted")
+                # The local backoff starts at two seconds, with bounded jitter.
+                self.assertEqual(len(harness.clock.sleeps), 1)
+                self.assertAlmostEqual(harness.clock.sleeps[0], 2.0, delta=0.5)
+
+    def test_reaching_the_deadline_signals_a_temporary_exhaustion(self):
+        harness = HorizonHarness(
+            [(503, {}, {"error": "unavailable"})], max_wait_seconds=10,
+        )
+
+        with self.assertRaises(LLMTransportExhaustedError) as raised:
+            harness.call()
+
+        self.assertEqual(raised.exception.code, "LLM_TRANSPORT_EXHAUSTED")
+        self.assertIn("horizon of 10s", str(raised.exception))
+        self.assertIn("HTTP 503", str(raised.exception))
+        # No attempt is ever made after the deadline, and the waits grow
+        # instead of spinning: the transport waits out its horizon once.
+        self.assertTrue(harness.opener.times)
+        self.assertTrue(all(offset < 10 for offset in harness.opener.times))
+        self.assertGreaterEqual(harness.clock.elapsed, 10)
+        self.assertLessEqual(len(harness.opener.requests), 4)
+        self.assertGreaterEqual(len(harness.clock.sleeps), 2)
+        self.assertTrue(all(wait > 0 for wait in harness.clock.sleeps))
+        # The final wait is clamped to what the horizon still allowed.
+        self.assertLessEqual(sum(harness.clock.sleeps), 10.0 + 1e-6)
+
+    def test_a_non_retryable_status_is_sent_once_without_sleeping(self):
+        harness = HorizonHarness([(401, {}, {"error": "unauthorized"})])
+
+        with self.assertRaises(LLMHTTPError) as raised:
+            harness.call()
+
+        self.assertNotIsInstance(raised.exception, LLMTransportExhaustedError)
+        self.assertEqual(str(raised.exception), "LLM endpoint returned HTTP 401")
+        self.assertEqual(len(harness.opener.requests), 1)
+        self.assertEqual(harness.clock.sleeps, [])
+
+    def test_a_timeout_then_success_recovers_inside_the_horizon(self):
+        harness = HorizonHarness([
+            TimeoutError("LLM request timed out"),
+            (200, {}, completion("recovered")),
+        ])
+
+        result = harness.call()
+
+        self.assertEqual(result.text, "recovered")
+        self.assertEqual(len(harness.opener.requests), 2)
+        self.assertEqual(len(harness.clock.sleeps), 1)
+
+    def test_a_network_failure_uses_the_same_horizon(self):
+        harness = HorizonHarness(
+            [urllib.error.URLError(OSError("network is unreachable"))],
+            max_wait_seconds=1,
+        )
+
+        with self.assertRaises(LLMTransportExhaustedError) as raised:
+            harness.call()
+
+        self.assertIn("before receiving an HTTP response", str(raised.exception))
+        self.assertEqual(len(harness.opener.requests), 1)
+
+    def test_the_waits_are_jittered_but_stay_bounded(self):
+        random_values = iter([0.0, 0.9])
+        def deterministic_uniform(low, high):
+            return low + next(random_values) * (high - low)
+
+        with mock.patch.object(chat.random, "uniform", deterministic_uniform):
+            first = chat._jittered_delay(2.0)
+            second = chat._jittered_delay(4.0)
+        self.assertGreaterEqual(first, 1.6)
+        self.assertLessEqual(first, 2.4)
+        self.assertGreaterEqual(second, 3.2)
+        self.assertLessEqual(second, 4.8)
+        self.assertLess(first, second)
+
+
 class FileFallbackTests(unittest.TestCase):
     EVIDENCE = TextFileAttachment(
         filename="repair-evidence.md",
         text="EVIDENCE_SENTINEL",
     )
 
-    def setUp(self):
-        # Retry ordering is under test here, not the backoff delay itself
-        # (see test_retry_backoff_is_exponential_and_capped).
-        patcher = mock.patch.object(chat, "_sleep_before_retry")
-        self.backoff = patcher.start()
-        self.addCleanup(patcher.stop)
+    def call(self, harness, **kwargs):
+        with (
+            mock.patch("time.monotonic", harness.clock.monotonic),
+            mock.patch("time.sleep", harness.clock.sleep),
+        ):
+            return harness.client().complete_with_file_fallback(
+                "INLINE_SENTINEL",
+                fallback_prompt="FALLBACK_CONTROL",
+                attachments=(self.EVIDENCE,),
+                **kwargs,
+            )
 
-    def call(self, client):
-        return client.complete_with_file_fallback(
-            "INLINE_SENTINEL",
-            fallback_prompt="FALLBACK_CONTROL",
-            attachments=(self.EVIDENCE,),
-            fallback_attempt=3,
+    def test_the_inline_payload_is_tried_first_and_the_file_after_the_delay(self):
+        harness = HorizonHarness(
+            [
+                (502, {}, {"error": "bad gateway"}),
+                (502, {}, {"error": "bad gateway"}),
+                (200, {}, completion("repaired")),
+            ],
+            max_wait_seconds=120,
         )
 
-    def test_file_fallback_is_used_only_on_third_retryable_attempt(self):
-        attempts = 0
-
-        def responder(_handler, _request):
-            nonlocal attempts
-            attempts += 1
-            if attempts < 3:
-                return 502, {"error": "bad gateway"}
-            return 200, _completion("repaired")
-
-        with ServerHarness(responder) as server:
-            result = self.call(OpenAIChatTextClient(config(server, retries=2)))
+        result = self.call(harness, fallback_after_seconds=5)
 
         self.assertEqual(result.text, "repaired")
-        self.assertEqual(len(server.requests), 3)
-        self.assertEqual([call.args for call in self.backoff.call_args_list], [(0,), (1,)])
-        self.assertEqual(_content(server.requests[0]), "INLINE_SENTINEL")
-        self.assertEqual(_content(server.requests[1]), "INLINE_SENTINEL")
-
-        content = _content(server.requests[2])
-        self.assertIsInstance(content, list)
-        self.assertEqual(content[0], {"type": "text", "text": "FALLBACK_CONTROL"})
-        self.assertEqual(content[1]["type"], "input_file")
-        self.assertEqual(content[1]["file"]["filename"], "repair-evidence.md")
-
-        prefix, encoded = content[1]["file"]["file_data"].split(",", 1)
+        contents = [
+            request["payload"]["messages"][0]["content"]
+            for request in harness.opener.requests
+        ]
+        self.assertEqual(contents[:2], ["INLINE_SENTINEL", "INLINE_SENTINEL"])
+        attachment = contents[2]
+        self.assertIsInstance(attachment, list)
+        self.assertEqual(attachment[0], {"type": "text", "text": "FALLBACK_CONTROL"})
+        self.assertEqual(attachment[1]["type"], "input_file")
+        self.assertEqual(attachment[1]["file"]["filename"], "repair-evidence.md")
+        prefix, encoded = attachment[1]["file"]["file_data"].split(",", 1)
         self.assertEqual(prefix, "data:text/markdown;base64")
         self.assertEqual(base64.b64decode(encoded).decode("utf-8"), "EVIDENCE_SENTINEL")
         # The evidence travels only as a file, never as inline control text.
-        self.assertNotIn("EVIDENCE_SENTINEL", content[0]["text"])
+        self.assertNotIn("EVIDENCE_SENTINEL", attachment[0]["text"])
 
-    def test_a_second_attempt_that_succeeds_never_attaches_a_file(self):
-        attempts = 0
+    def test_a_retry_inside_the_delay_never_attaches_a_file(self):
+        harness = HorizonHarness([
+            (502, {}, {"error": "bad gateway"}),
+            (200, {}, completion()),
+        ])
 
-        def responder(_handler, _request):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                return 502, {"error": "bad gateway"}
-            return 200, _completion()
+        self.call(harness, fallback_after_seconds=3600)
 
-        with ServerHarness(responder) as server:
-            self.call(OpenAIChatTextClient(config(server, retries=2)))
-
-        self.assertEqual(len(server.requests), 2)
-        for request in server.requests:
-            self.assertEqual(_content(request), "INLINE_SENTINEL")
-        self.assertNotIn("input_file", json.dumps(server.requests))
+        self.assertEqual(len(harness.opener.requests), 2)
+        for request in harness.opener.requests:
+            self.assertEqual(_payload_content(request), "INLINE_SENTINEL")
+        self.assertNotIn("input_file", json.dumps(harness.opener.requests))
 
     def test_a_non_retryable_status_never_attaches_a_file(self):
-        def responder(_handler, _request):
-            return 401, {"error": "unauthorized"}
+        harness = HorizonHarness([(401, {}, {"error": "unauthorized"})])
 
-        with ServerHarness(responder) as server:
-            with self.assertRaises(LLMHTTPError):
-                self.call(OpenAIChatTextClient(config(server, retries=2)))
+        with self.assertRaises(LLMHTTPError):
+            self.call(harness)
 
-        self.assertEqual(len(server.requests), 1)
-        self.assertEqual(_content(server.requests[0]), "INLINE_SENTINEL")
-        self.assertNotIn("input_file", json.dumps(server.requests))
+        self.assertEqual(len(harness.opener.requests), 1)
+        self.assertEqual(_payload_content(harness.opener.requests[0]), "INLINE_SENTINEL")
+        self.assertNotIn("input_file", json.dumps(harness.opener.requests))
 
-    def test_the_fallback_attempt_is_never_added_beyond_configured_retries(self):
-        def responder(_handler, _request):
-            return 502, {"error": "bad gateway"}
+    def test_a_failed_completion_still_exhausts_the_same_horizon(self):
+        harness = HorizonHarness(
+            [(502, {}, {"error": "bad gateway"})], max_wait_seconds=5,
+        )
 
-        with ServerHarness(responder) as server:
-            with self.assertRaisesRegex(LLMHTTPError, r"HTTP 502 after 2 attempt\(s\)"):
-                self.call(OpenAIChatTextClient(config(server, retries=1)))
+        with self.assertRaises(LLMTransportExhaustedError):
+            self.call(harness)
 
-        self.assertEqual(len(server.requests), 2)
-        self.assertNotIn("input_file", json.dumps(server.requests))
+        self.assertGreaterEqual(len(harness.opener.requests), 1)
+        self.assertNotIn("input_file", json.dumps(harness.opener.requests))
 
     def test_standard_complete_is_unchanged_by_the_file_fallback_feature(self):
-        def responder(_handler, _request):
-            return 502, {"error": "bad gateway"}
+        harness = HorizonHarness(
+            [(502, {}, {"error": "bad gateway"})], max_wait_seconds=5,
+        )
 
-        with ServerHarness(responder) as server:
-            with self.assertRaises(LLMHTTPError):
-                OpenAIChatTextClient(config(server, retries=2)).complete("prompt")
+        with (
+            mock.patch("time.monotonic", harness.clock.monotonic),
+            mock.patch("time.sleep", harness.clock.sleep),
+            self.assertRaises(LLMHTTPError),
+        ):
+            harness.client().complete("prompt")
 
-        self.assertEqual(len(server.requests), 3)
-        for request in server.requests:
+        for request in harness.opener.requests:
             self.assertEqual(
                 request["payload"],
                 {
@@ -381,6 +602,18 @@ class FileFallbackTests(unittest.TestCase):
                     "stream": False,
                 },
             )
+
+    def test_the_fallback_delay_must_be_a_non_negative_number(self):
+        for value in (-1, "later", True):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    HorizonHarness([(200, {}, completion())]).client(
+                    ).complete_with_file_fallback(
+                        "inline",
+                        fallback_prompt="control",
+                        attachments=(self.EVIDENCE,),
+                        fallback_after_seconds=value,
+                    )
 
     def test_attachment_validation_rejects_unsafe_values(self):
         for filename in ("", "a/b.md", "a\\b.md", "a\x00b", "x" * 129):

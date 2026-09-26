@@ -151,7 +151,6 @@ class ModelProfile:
     endpoint_path: str | None = None
     api_key_env: str | None = None
     timeout_seconds: int = 300
-    retries: int = 2
     extra_body: Mapping[str, Any] = field(default_factory=dict)
     # Trusted argv for the generic external-process driver.  It is never
     # derived from a prompt, model name, provider name, or role.
@@ -826,12 +825,19 @@ class ReviewRoute(StrEnum):
 
 @dataclass(frozen=True)
 class LLMEndpointConfig:
+    """One OpenAI-compatible text endpoint and its transport horizon.
+
+    ``max_wait_seconds`` is the whole retry budget of one logical completion:
+    the transport retries retryable failures while that monotonic horizon has
+    room for another attempt, never a fixed number of times.
+    """
+
     base_url: str
     endpoint_path: str
     model: str
     api_key_env: str | None = None
     timeout_seconds: int = 300
-    retries: int = 2
+    max_wait_seconds: int = 1800
     extra_body: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1082,6 +1088,26 @@ class ApprovalConfig:
 
 
 @dataclass(frozen=True)
+class TransportConfig:
+    """How long one text completion may keep retrying a retryable failure.
+
+    The budget is an environment condition, never a run authority: it is one
+    integer of seconds for every text endpoint of the harness, and the
+    transport never waits past it.
+    """
+
+    max_wait_seconds: int = 1800
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_wait_seconds, bool)
+            or not isinstance(self.max_wait_seconds, int)
+            or self.max_wait_seconds < 1
+        ):
+            raise ValueError("transport.max_wait_seconds must be a positive integer")
+
+
+@dataclass(frozen=True)
 class UIConfig:
     max_active_runs: int = 1
     default_planner_profile: str | None = None
@@ -1180,6 +1206,7 @@ class HarnessConfig:
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     revision: RevisionConfig = field(default_factory=RevisionConfig)
     recovery: RecoveryBudgets = field(default_factory=RecoveryBudgets)
+    transport: TransportConfig = field(default_factory=TransportConfig)
     prompt_budget: PromptBudgetConfig = field(default_factory=PromptBudgetConfig)
     repository: RepositoryConfig = field(default_factory=RepositoryConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)

@@ -76,7 +76,6 @@ from .shared import (
     ScopeApprovalRequired,
     StepExecutionFailure,
     bounded_v2_report,
-    chat_client,
     json_text,
     read_json_artifact,
 )
@@ -437,9 +436,8 @@ class ContractRecoveryService:
                 raise V2PlanParseError("repaired contract is not executable on current tree: " + drift)
 
         planner = StepContractRepairPlanner(
-            self.runtime.planner_client or chat_client(
-                build_llm_endpoint(planner_profile), self.runtime.environment, self.runtime.observability.trace_transport
-            ),
+            self.runtime.planner_client
+            or self.runtime.chat(build_llm_endpoint(planner_profile)),
             max_read_paths_per_step=self.runtime.config.planning.max_read_paths_per_step,
             max_output_corrections=max_output_corrections,
         )

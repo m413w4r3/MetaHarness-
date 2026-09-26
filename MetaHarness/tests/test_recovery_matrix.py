@@ -506,7 +506,7 @@ class RecoveryPathTests(PipelineHarness):
         for index, (code, phase, disposition, status, resumable) in enumerate(self.PATHS):
             run_id = f"path-{index}"
             with self.subTest(code=code), mock.patch(
-                "metaharness.orchestrator.PipelineV2Coordinator.run",
+                "metaharness.orchestration.runtime.PipelineV2Coordinator.run",
                 side_effect=PipelineFailure(code, "diagnostic"),
             ):
                 result = self.orchestrator(
@@ -529,7 +529,7 @@ class RecoveryPathTests(PipelineHarness):
 
     def _wait_at_a_resumable_checkpoint(self) -> None:
         with mock.patch(
-            "metaharness.orchestrator.PipelineV2Coordinator.run",
+            "metaharness.orchestration.runtime.PipelineV2Coordinator.run",
             side_effect=PipelineFailure("AGENT_TIMEOUT", "diagnostic"),
         ):
             result = self.orchestrator(

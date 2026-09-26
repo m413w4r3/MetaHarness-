@@ -18,6 +18,7 @@ from metaharness.llm.chat import (  # noqa: E402
     LLMError,
     LLMHTTPError,
     LLMProtocolError,
+    LLMTransportExhaustedError,
     OpenAIChatTextClient,
     validate_endpoint,
 )
@@ -85,7 +86,9 @@ def endpoint(base_url: str, **overrides) -> LLMEndpointConfig:
         endpoint_path="/v1/chat/completions",
         model="label",
         timeout_seconds=2,
-        retries=0,
+        # One second: a retryable answer ends as a temporary exhaustion in
+        # bounded real time, and no test here waits on a default horizon.
+        max_wait_seconds=1,
     )
     values.update(overrides)
     return LLMEndpointConfig(**values)
@@ -157,33 +160,55 @@ class RequestShapeTests(unittest.TestCase):
 
 
 class RetryTests(unittest.TestCase):
-    def test_retryable_statuses_are_bounded_by_configuration(self) -> None:
+    def test_retryable_statuses_end_in_a_typed_transport_exhaustion(self) -> None:
         for status in (408, 429, 500, 502, 503, 504):
             with self.subTest(status=status):
-                with Server(lambda h, s=status: send_json(h, s, {"error": "x"})) as server, \
-                        mock.patch.object(chat, "_sleep_before_retry") as backoff:
-                    with self.assertRaisesRegex(LLMHTTPError, f"HTTP {status} after 3"):
-                        OpenAIChatTextClient(endpoint(server.base_url, retries=2)).complete("p")
-                self.assertEqual(len(server.requests), 3)
-                # A backoff precedes each retry, never the final failure.
-                self.assertEqual([call.args for call in backoff.call_args_list], [(0,), (1,)])
+                with Server(
+                    lambda h, s=status: send_json(h, s, {"error": "x"})
+                ) as server:
+                    with self.assertRaises(LLMTransportExhaustedError) as raised:
+                        OpenAIChatTextClient(
+                            endpoint(server.base_url, max_wait_seconds=1)
+                        ).complete("p")
+                self.assertEqual(raised.exception.code, "LLM_TRANSPORT_EXHAUSTED")
+                self.assertGreaterEqual(len(server.requests), 1)
+                self.assertIn(f"HTTP {status}", str(raised.exception))
+
+    def test_a_retryable_status_then_a_success_recovers(self) -> None:
+        attempts = 0
+
+        def responder(handler):
+            nonlocal attempts
+            attempts += 1
+            send_json(handler, 503 if attempts == 1 else 200, ok())
+
+        with Server(responder) as server:
+            result = OpenAIChatTextClient(
+                endpoint(server.base_url, max_wait_seconds=30)
+            ).complete("p")
+
+        self.assertEqual(result.text, "answer")
+        self.assertEqual(len(server.requests), 2)
 
     def test_non_retryable_statuses_are_sent_once(self) -> None:
         for status in (400, 401, 403, 404):
             with self.subTest(status=status):
                 with Server(lambda h, s=status: send_json(h, s, {"error": "x"})) as server:
-                    with self.assertRaises(LLMHTTPError):
-                        OpenAIChatTextClient(endpoint(server.base_url, retries=5)).complete("p")
+                    with self.assertRaises(LLMHTTPError) as raised:
+                        OpenAIChatTextClient(endpoint(server.base_url)).complete("p")
+                self.assertNotIsInstance(raised.exception, LLMTransportExhaustedError)
                 self.assertEqual(len(server.requests), 1)
 
-    def test_network_failure_is_not_looped(self) -> None:
+    def test_a_network_failure_stops_at_a_short_horizon(self) -> None:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         started = time.monotonic()
         with self.assertRaisesRegex(LLMHTTPError, "before receiving"):
-            OpenAIChatTextClient(endpoint(f"http://127.0.0.1:{port}", retries=5)).complete("p")
-        self.assertLess(time.monotonic() - started, 2)
+            OpenAIChatTextClient(
+                endpoint(f"http://127.0.0.1:{port}", max_wait_seconds=1)
+            ).complete("p")
+        self.assertLess(time.monotonic() - started, 5)
 
     def test_total_deadline_does_not_depend_on_receiving_bytes(self) -> None:
         def trickle(handler):
@@ -201,8 +226,10 @@ class RetryTests(unittest.TestCase):
         with Server(trickle) as server:
             started = time.monotonic()
             with self.assertRaisesRegex(LLMHTTPError, "timed out"):
-                OpenAIChatTextClient(endpoint(server.base_url, timeout_seconds=0.5)).complete("p")
-            self.assertLess(time.monotonic() - started, 3)
+                OpenAIChatTextClient(
+                    endpoint(server.base_url, timeout_seconds=0.5, max_wait_seconds=1)
+                ).complete("p")
+            self.assertLess(time.monotonic() - started, 5)
 
 
 class SecretTests(unittest.TestCase):
@@ -218,7 +245,7 @@ class SecretTests(unittest.TestCase):
                 with Server(lambda h, s=status: send_json(h, s, {"error": SECRET})) as server, WithSecret():
                     with self.assertRaises(LLMHTTPError) as raised:
                         OpenAIChatTextClient(
-                            endpoint(server.base_url, api_key_env="META_TRANSPORT_KEY", retries=3)
+                            endpoint(server.base_url, api_key_env="META_TRANSPORT_KEY")
                         ).complete("p")
                 self.assert_clean(raised.exception)
                 self.assertEqual(len(server.requests), 1)
@@ -231,7 +258,7 @@ class SecretTests(unittest.TestCase):
             with Server(redirect) as origin, WithSecret():
                 with self.assertRaises(LLMHTTPError) as raised:
                     OpenAIChatTextClient(
-                        endpoint(origin.base_url, api_key_env="META_TRANSPORT_KEY", retries=2)
+                        endpoint(origin.base_url, api_key_env="META_TRANSPORT_KEY")
                     ).complete("p")
             self.assertEqual(target.requests, [])
             self.assert_clean(raised.exception)

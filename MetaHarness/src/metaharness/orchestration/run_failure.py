@@ -113,7 +113,10 @@ def _failure_reason(exc: Exception) -> str:
     if isinstance(exc, ReviewParseError):
         return "REVIEWER_OUTPUT_INVALID"
     if isinstance(exc, LLMError):
-        return "LLM_FAILURE"
+        # A transport that names its own stable condition (the exhausted
+        # horizon) keeps that code; every other transport error stays the
+        # generic ``LLM_FAILURE`` classification.
+        return getattr(exc, "code", "LLM_FAILURE")
     if isinstance(exc, ValidationError):
         return "CHECK_SETUP_INVALID"
     if isinstance(exc, WorkspaceSetupError):

@@ -12,7 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.config import ConfigError, load_config
-from metaharness.models import CheckConfig, RoutingConfig
+from metaharness.models import CheckConfig, RoutingConfig, TransportConfig
 from metaharness.planning.protocol import render_safe_check_catalogue
 from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
 from metaharness.run_options import (
@@ -51,7 +51,6 @@ base_url = "${META_PLANNER_BASE_URL}"
 endpoint_path = "${META_PLANNER_ENDPOINT}"
 api_key_env = "META_PLANNER_API_KEY"
 timeout_seconds = 300
-retries = 2
 
 [model_profiles.planner-chat.extra_body]
 new_chat = true
@@ -78,7 +77,6 @@ selection_mode = "request"
 base_url = "https://review.example"
 endpoint_path = "/v1/chat"
 timeout_seconds = 420
-retries = 2
 
 [context]
 always_files = ["AGENTS.md", "README.md"]
@@ -263,6 +261,42 @@ mechanical = "rescue"
         with tempfile.TemporaryDirectory() as directory_name:
             config_path = self.write_config(Path(directory_name), contents)
             with self.assertRaisesRegex(ConfigError, "execution_fallbacks.mechanical"):
+                load_config(config_path)
+
+    def test_the_transport_horizon_defaults_to_thirty_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), VALID_CONFIG))
+        self.assertEqual(config.transport, TransportConfig())
+        self.assertEqual(config.transport.max_wait_seconds, 1800)
+
+    def test_the_transport_horizon_is_one_positive_integer_seconds_budget(self) -> None:
+        contents = VALID_CONFIG + "\n[transport]\nmax_wait_seconds = 90\n"
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), contents))
+        self.assertEqual(config.transport.max_wait_seconds, 90)
+
+    def test_the_transport_horizon_rejects_invalid_values(self) -> None:
+        for body, message in (
+            ("max_wait_seconds = 0", "greater than zero"),
+            ("max_wait_seconds = -1", "greater than zero"),
+            ("max_wait_seconds = 1.5", "must be an integer"),
+            ("max_wait_seconds = true", "must be an integer"),
+            ("max_wait = 10", "transport.max_wait is not allowed"),
+        ):
+            with self.subTest(body=body):
+                contents = VALID_CONFIG + f"\n[transport]\n{body}\n"
+                with tempfile.TemporaryDirectory() as directory_name:
+                    config_path = self.write_config(Path(directory_name), contents)
+                    with self.assertRaisesRegex(ConfigError, message):
+                        load_config(config_path)
+
+    def test_a_profile_has_no_per_endpoint_attempt_budget(self) -> None:
+        contents = VALID_CONFIG.replace(
+            "timeout_seconds = 300\n", "timeout_seconds = 300\nretries = 3\n",
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            config_path = self.write_config(Path(directory_name), contents)
+            with self.assertRaisesRegex(ConfigError, "retries is not allowed"):
                 load_config(config_path)
 
     def test_recovery_budget_rejects_unknown_keys(self) -> None:

@@ -36,7 +36,22 @@ metaharness run \
   --run-id example-001
 ```
 
+`metaharness run --auto-resume` keeps a run alive while it waits on a
+temporary external condition: after a run reaches `WAIT_EXTERNAL` the same
+process sleeps `--auto-resume-interval` (default 600 s) and resumes it, again
+and again until the run leaves `WAIT_EXTERNAL` or
+`[transport] max_wait_seconds` has elapsed since it started waiting. It is no
+daemon and no scheduler: closing the process ends the loop, and a `resume`
+afterwards behaves exactly as before.
+
 ### Pipeline configuration
+
+`[transport] max_wait_seconds` (default `1800`) is the only budget of the
+text transport: one completion keeps retrying a retryable HTTP status
+(408/429/5xx), a timeout, an interrupted connection or a transient network
+failure while that horizon still has room for another attempt, then reports
+`LLM_TRANSPORT_EXHAUSTED`. See `docs/providers.md` for the exact backoff and
+`Retry-After` rules.
 
 `[revision]` supplies defaults. Every new durable UI
 run captures its effective choices in `run_options.json`: the semantic
@@ -273,7 +288,11 @@ always names the next operation that has not yet succeeded:
 
 At the conceptual level, supported phases are context, planner, plan approval,
 workspace setup, implementation steps, deterministic gates, candidate
-commit/push, final review, correction planning/steps, and publish. Corruptions, identity violations and
+commit/push, final review, correction planning/steps, and publish. The planner
+checkpoint is durable before the planner call, so a temporary provider outage
+(`LLM_TRANSPORT_EXHAUSTED`, a `WAIT_EXTERNAL`) resumes there and pays for one
+fresh planner answer; a valid persisted planner answer is reused instead of
+being paid for twice. Corruptions, identity violations and
 `AGENT_CONTRACT_MISMATCH` are deliberately non-resumable.
 
 | After | Checkpoint |
@@ -550,7 +569,9 @@ empty diffs, and review-boundary changes do not commit. The current pipeline als
 an oversized diff as a gate; v2 uses `max_diff_bytes` only as the inline
 semantic-model diff budget. Common
 failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,
-`REVIEWER_OUTPUT_INVALID`, `LLM_FAILURE`, `AGENT_TIMEOUT`, `AGENT_RUNTIME_FAILED`,
+`REVIEWER_OUTPUT_INVALID`, `LLM_FAILURE`, `LLM_TRANSPORT_EXHAUSTED` (a
+`WAIT_EXTERNAL`: the provider stayed unreachable for the whole
+`[transport] max_wait_seconds` horizon), `AGENT_TIMEOUT`, `AGENT_RUNTIME_FAILED`,
 `AGENT_GIT_VIOLATION`, `CHECK_SETUP_INVALID`,
 `CHECK_MUTATED`, `EMPTY_DIFF`, `DIFF_TOO_LARGE`, `SECRET_IN_DIFF`,
 `DETERMINISTIC_GATE_FAILED`, `REVIEW_REVISE`, `REVIEW_FAIL`,

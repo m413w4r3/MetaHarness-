@@ -50,7 +50,6 @@ def profile(driver: ProfileDriver, role: ExecutionRole) -> ModelProfile:
         effort="high",
         sandbox="workspace-write" if driver is ProfileDriver.CODEX else None,
         permission_mode="acceptEdits" if driver is ProfileDriver.CLAUDE_CODE else None,
-        retries=0 if driver is ProfileDriver.CLAUDE_CODE else 2,
     )
 
 

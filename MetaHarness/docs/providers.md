@@ -39,8 +39,17 @@ Transport rules:
 - Redirects are never followed (the key is never forwarded elsewhere).
 - `timeout_seconds` bounds each attempt, including a slowly trickled body;
   responses above 32 MiB are rejected.
-- Only HTTP 408, 429, 500, 502, 503 and 504 are retried, at most `retries`
-  times; 401/403 and network failures are not retried.
+- One completion is retried over a time horizon, never a fixed attempt
+  count: `[transport] max_wait_seconds` (default `1800`) bounds the whole
+  call. HTTP 408, 429, 500, 502, 503, 504, a timeout, an interrupted
+  connection and a transient DNS/network failure are retried while that
+  horizon still has room for another attempt. A valid `Retry-After` (delta
+  seconds or HTTP-date) wins over the local backoff, which starts near 2 s,
+  doubles up to a 120 s ceiling and carries bounded jitter. 400, 401, 403
+  and every other non-retryable client status fail on their own attempt,
+  and no sleep ever runs past the horizon: an exhausted horizon raises
+  `LLM_TRANSPORT_EXHAUSTED`, the stable signal of a temporary external
+  exhaustion.
 
 ## ChatGPT bridge
 

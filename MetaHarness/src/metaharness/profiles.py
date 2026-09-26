@@ -112,7 +112,6 @@ def profile_execution_fingerprint(
             base_url=profile.base_url,
             endpoint_path=profile.endpoint_path,
             api_key_env=profile.api_key_env,
-            retries=profile.retries,
             extra_body=dict(profile.extra_body),
         )
     elif profile.driver is ProfileDriver.CODEX:
@@ -156,7 +155,6 @@ def profile_execution_fingerprint(
             base_url=profile.base_url,
             endpoint_path=profile.endpoint_path,
             api_key_env=profile.api_key_env,
-            retries=profile.retries,
             extra_body=dict(profile.extra_body),
         )
     try:
@@ -184,7 +182,6 @@ def build_llm_endpoint(profile: ModelProfile) -> LLMEndpointConfig:
         model=profile.model,
         api_key_env=profile.api_key_env,
         timeout_seconds=profile.timeout_seconds,
-        retries=profile.retries,
         extra_body=dict(profile.extra_body),
     )
 
@@ -228,7 +225,6 @@ def build_claude_profile(profile: ModelProfile) -> ModelProfile:
         or profile.base_url is not None
         or profile.endpoint_path is not None
         or profile.api_key_env is not None
-        or profile.retries != 0
         or profile.extra_body
     ):
         raise ProfileError("claude-code profile contains forbidden endpoint or sandbox fields")

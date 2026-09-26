@@ -7,10 +7,12 @@ wall time.  No socket is opened: the configured endpoint is only a label.
 
 from __future__ import annotations
 
+import dataclasses
 import unittest
 
-from metaharness.models import ExecutionRole
+from metaharness.models import ExecutionRole, RunStatus
 from metaharness.orchestrator import Orchestrator
+from metaharness.resume import resume_info
 
 from tests.autonomy.support import (
     SPEC,
@@ -51,7 +53,6 @@ class PlannerTransportOutageTests(AutonomyHarness):
         self.assert_run_completed(result)
         self.assertEqual(transport.attempts, 1)
 
-    @unittest.expectedFailure
     def test_the_transport_outlasts_a_ninety_second_outage(self) -> None:
         """The C4 horizon: retries continue while the injected clock runs."""
 
@@ -67,13 +68,54 @@ class PlannerTransportOutageTests(AutonomyHarness):
         self.assertGreaterEqual(transport.attempts, 2)
         self.assertGreaterEqual(clock.elapsed, self.OUTAGE_SECONDS)
 
-    @unittest.expectedFailure
+    def test_an_outage_past_the_horizon_waits_externally_and_resumes(self) -> None:
+        """An outage longer than the horizon is a resumable external wait.
+
+        The transport itself cannot outlast this outage, so the run must stop
+        at the durable planner checkpoint as ``WAIT_EXTERNAL``, and a later
+        resume -- with the provider back -- must buy the plan the first phase
+        never carried and drive the pipeline to its delivered candidate.
+        """
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        horizon = 30
+        endpoint = dataclasses.replace(chat_endpoint(), max_wait_seconds=horizon)
+        clock = FakeClock()
+        config = self.config()
+
+        failed = Orchestrator(
+            config,
+            planner_client=CompletionOverTransport(
+                endpoint,
+                FlakyHTTPTransport(clock, outage_seconds=horizon + 60.0, answer=self.plan()),
+                clock,
+            ),
+            reviewer_client=ScriptedChat([review()]),
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
+        self.assertEqual(self.failure_reason(), "LLM_TRANSPORT_EXHAUSTED")
+        self.assertEqual(self.checkpoint()["phase"], "planner")
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
+
+        recovered = FlakyHTTPTransport(clock, outage_seconds=0.0, answer=self.plan())
+        resumed = Orchestrator(
+            config,
+            planner_client=CompletionOverTransport(endpoint, recovered, clock),
+            reviewer_client=ScriptedChat([review()]),
+        ).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        # The plan came from the provider once it was reachable again: the
+        # exhausted phase never persisted an answer to replay.
+        self.assertGreaterEqual(recovered.attempts, 1)
+
     def test_a_503_burst_on_the_planner_does_not_end_the_run(self) -> None:
         """The target behaviour: a planner outage is absorbed, the run completes.
 
-        The fixture profiles cap retries at zero, exactly as the live profiles
-        do; only a time-based transport horizon can survive this outage, which
-        is what the C4 transport policy adds.
+        The transport double is the planner client itself: only the
+        transport's own time horizon can survive this outage, and the run
+        never needs a resume, because the completion never fails.
         """
 
         clock = FakeClock()

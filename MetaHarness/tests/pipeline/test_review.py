@@ -60,7 +60,7 @@ class ReviewCorrectionTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(
             self.config(), planner=[initial_plan(STEP)],
-            reviewer=[LLMHTTPError("LLM endpoint returned HTTP 503 after 1 attempt(s)"), review()],
+            reviewer=[LLMHTTPError("LLM endpoint returned HTTP 503"), review()],
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
@@ -79,7 +79,7 @@ class ReviewCorrectionTests(PipelineHarness):
                 correction_plan(("S01", "other.txt", "Correct other")),
             ],
             reviewer=[
-                LLMHTTPError("LLM endpoint returned HTTP 503 after 1 attempt(s)"),
+                LLMHTTPError("LLM endpoint returned HTTP 503"),
                 review("REVISE", "REPLAN"), review(),
             ],
         ).run_text(SPEC, run_id="run")

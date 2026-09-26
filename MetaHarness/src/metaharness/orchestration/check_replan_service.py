@@ -75,7 +75,6 @@ from .shared import (
     OrchestrationError,
     _json_text,
     bounded_parse_detail,
-    chat_client,
 )
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
@@ -199,10 +198,8 @@ class CheckReplanService:
         )
         try:
             plan = CheckReplanTransaction(
-                client=self.runtime.planner_client or chat_client(
-                    build_llm_endpoint(profile), self.runtime.environment,
-                    self.runtime.observability.trace_transport,
-                ),
+                client=self.runtime.planner_client
+                or self.runtime.chat(build_llm_endpoint(profile)),
                 artifacts_dir=directory,
                 planning=self.runtime.config.planning,
                 check_catalog=self.runtime.config.check_catalog,

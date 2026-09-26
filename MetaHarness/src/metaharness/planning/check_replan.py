@@ -399,7 +399,6 @@ class CheckReplanTransaction:
                         filename=EVIDENCE_ARTIFACT, text=bundle.evidence_text, media_type="text/markdown",
                     ),
                 ),
-                fallback_attempt="check-replan",
             )
         else:
             result = self.client.complete(request)

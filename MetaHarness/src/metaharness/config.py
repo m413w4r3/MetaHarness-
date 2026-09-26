@@ -37,6 +37,7 @@ from .models import (
     RevisionConfig,
     RecoveryBudgets,
     SelectionMode,
+    TransportConfig,
     UIConfig,
     WorkspaceSetupCommand,
     profile_driver_name,
@@ -73,9 +74,9 @@ _PROFILE_COMMON_KEYS = frozenset({
 })
 _PROFILE_DRIVER_KEYS = {
     ProfileDriver.OPENAI_CHAT: frozenset({
-        "base_url", "endpoint_path", "api_key_env", "retries", "extra_body",
+        "base_url", "endpoint_path", "api_key_env", "extra_body",
     }),
-    # Codex has no retry policy: ``retries`` would be a silently unused option.
+    # Codex has no retry policy: the transport horizon below is the only one.
     ProfileDriver.CODEX: frozenset({"effort", "sandbox"}),
     ProfileDriver.CLAUDE_CODE: frozenset({"effort", "permission_mode"}),
     # Generic trusted process adapter.  No provider command line protocol is
@@ -289,7 +290,6 @@ def _endpoint(data: Mapping[str, Any], name: str) -> LLMEndpointConfig:
     model = _required_string(data, "model", name)
     api_key_env = _optional_env_name(data, "api_key_env", None, name)
     timeout_seconds = _positive_int(data, "timeout_seconds", 300, name)
-    retries = _nonnegative_int(data, "retries", 2, name)
     try:
         validate_endpoint(base_url, endpoint_path)
     except LLMProtocolError as exc:
@@ -309,7 +309,6 @@ def _endpoint(data: Mapping[str, Any], name: str) -> LLMEndpointConfig:
         model=model,
         api_key_env=api_key_env,
         timeout_seconds=timeout_seconds,
-        retries=retries,
         extra_body=dict(extra_body),
     )
 
@@ -323,7 +322,6 @@ def _profile_endpoint(profile: ModelProfile) -> LLMEndpointConfig:
         model=profile.model,
         api_key_env=profile.api_key_env,
         timeout_seconds=profile.timeout_seconds,
-        retries=profile.retries,
         extra_body=dict(profile.extra_body),
     )
 
@@ -418,7 +416,6 @@ def _model_profiles(
                 endpoint_path=endpoint.endpoint_path,
                 api_key_env=endpoint.api_key_env,
                 timeout_seconds=endpoint.timeout_seconds,
-                retries=endpoint.retries,
                 extra_body=endpoint.extra_body,
                 driver_version=driver_version,
                 description=description,
@@ -443,7 +440,6 @@ def _model_profiles(
                 selection_mode=selection_mode,
                 provider=provider,
                 timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
-                retries=2,
                 effort=effort,
                 sandbox=sandbox,
                 permission_mode=permission_mode,
@@ -467,7 +463,6 @@ def _model_profiles(
                 selection_mode=selection_mode,
                 provider=provider,
                 timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
-                retries=0,
                 effort=effort,
                 permission_mode=permission_mode,
                 driver_version=driver_version,
@@ -491,7 +486,6 @@ def _model_profiles(
                 selection_mode=selection_mode,
                 provider=provider,
                 timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
-                retries=0,
                 argv=argv,
                 effort=_optional_string(profile_data, "effort", None, where),
                 driver_version=driver_version,
@@ -513,7 +507,6 @@ def _model_profiles(
                 selection_mode=selection_mode,
                 provider=provider,
                 timeout_seconds=_positive_int(profile_data, "timeout_seconds", 300, where),
-                retries=0,
                 effort=_optional_string(profile_data, "effort", None, where),
                 driver_version=driver_version,
                 description=description,
@@ -824,6 +817,20 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         max_check_repair_attempts=check_budget,
         max_step_contract_repairs=contract_budget,
     )
+
+    transport_data = _table(expanded, "transport")
+    unknown_transport = sorted(set(transport_data) - {"max_wait_seconds"})
+    if unknown_transport:
+        raise ConfigError(f"transport.{unknown_transport[0]} is not allowed")
+    try:
+        transport = TransportConfig(
+            max_wait_seconds=_positive_int(
+                transport_data, "max_wait_seconds", TransportConfig.max_wait_seconds,
+                "transport",
+            ),
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from None
 
     recovery_data = _table(expanded, "recovery")
     recovery_fields = {
@@ -1137,6 +1144,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         planning=planning,
         revision=revision,
         recovery=recovery,
+        transport=transport,
         prompt_budget=prompt_budget,
         repository=repository,
         github=github,

@@ -10,9 +10,11 @@ artefact.
 from __future__ import annotations
 
 import base64
+import email.utils
 import http.client
 import json
 import os
+import random
 import re
 import socket
 import time
@@ -21,6 +23,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from ..models import LLMEndpointConfig
@@ -36,6 +39,19 @@ class LLMHTTPError(LLMError):
 
 class LLMProtocolError(LLMError):
     """Réponse ou configuration incompatible avec le protocole attendu."""
+
+
+class LLMTransportExhaustedError(LLMHTTPError):
+    """The transport horizon ended before any attempt could succeed.
+
+    This is the stable signal of a *temporary external exhaustion*: the
+    provider refused, timed out or was unreachable for every attempt inside
+    ``transport.max_wait_seconds``.  It says nothing about the request itself,
+    so the orchestration layer decides what the run does next; the transport
+    only refuses to wait forever.
+    """
+
+    code = "LLM_TRANSPORT_EXHAUSTED"
 
 
 class ConversationUnavailableError(LLMError):
@@ -163,8 +179,19 @@ PROTECTED_BODY_KEYS = frozenset(
         "function_call",
     }
 )
-_MAX_BACKOFF_SECONDS = 1.0
-_INITIAL_BACKOFF_SECONDS = 0.05
+# One completion is retried inside a monotonic horizon, never a fixed attempt
+# count: a temporarily saturated bridge may need minutes, not milliseconds.
+_INITIAL_RETRY_DELAY_SECONDS = 2.0
+_MAX_RETRY_DELAY_SECONDS = 120.0
+# Bounded jitter: the base delay doubles between two retries, so a +/-20%
+# spread keeps the waits strictly increasing while unsticking a fleet of
+# clients that failed on the same instant.
+_JITTER_FRACTION = 0.2
+# Below this, waiting can no longer buy an attempt: the horizon is over.
+_MIN_USEFUL_WAIT_SECONDS = 1.0
+# An inline request that has been retried for this long hands its evidence
+# over to an attached file instead of paying for the large inline payload.
+DEFAULT_FILE_FALLBACK_AFTER_SECONDS = 30.0
 _MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _TRUNCATED_FINISH_REASONS = frozenset({"length", "content_filter"})
@@ -231,13 +258,14 @@ class OpenAIChatTextClient:
         *,
         fallback_prompt: str,
         attachments: tuple[TextFileAttachment, ...],
-        fallback_attempt: int = 3,
+        fallback_after_seconds: float = DEFAULT_FILE_FALLBACK_AFTER_SECONDS,
     ) -> TextLLMResult:
         """Send *prompt* inline, moving evidence to files only late.
 
-        The attachments are used exactly when the existing retry loop reaches
-        *fallback_attempt*; no extra attempt is ever added, and a non-retryable
-        status still fails on its own attempt.
+        The attachments are used from the first attempt that starts more than
+        *fallback_after_seconds* after the completion began: the inline payload
+        is always tried first, and a non-retryable status still fails on its
+        own attempt without ever attaching a file.
         """
 
         if not isinstance(prompt, str):
@@ -249,29 +277,28 @@ class OpenAIChatTextClient:
         if any(not isinstance(item, TextFileAttachment) for item in attachments):
             raise TypeError("attachments must contain TextFileAttachment values")
         if (
-            isinstance(fallback_attempt, bool)
-            or not isinstance(fallback_attempt, int)
-            or fallback_attempt < 2
+            isinstance(fallback_after_seconds, bool)
+            or not isinstance(fallback_after_seconds, (int, float))
+            or fallback_after_seconds < 0
         ):
-            raise ValueError("fallback_attempt must be an integer of at least 2")
+            raise ValueError("fallback_after_seconds must be a non-negative number")
 
         response_data = self._request_json_with_factory(
-            lambda attempt: (
-                self._build_request(prompt)
-                if attempt < fallback_attempt
-                else self._build_request(
-                    [
-                        {
-                            "type": "text",
-                            "text": fallback_prompt,
-                        },
-                        *[
-                            _attachment_part(item)
-                            for item in attachments
-                        ],
-                    ]
-                )
-            )
+            lambda attached: self._build_request(
+                prompt
+                if not attached
+                else [
+                    {
+                        "type": "text",
+                        "text": fallback_prompt,
+                    },
+                    *[
+                        _attachment_part(item)
+                        for item in attachments
+                    ],
+                ]
+            ),
+            fallback_after_seconds=float(fallback_after_seconds),
         )
         return _parse_completion_response(response_data)
 
@@ -310,26 +337,50 @@ class OpenAIChatTextClient:
         )
 
     def _request_json(self, request: urllib.request.Request) -> dict[str, Any]:
-        return self._request_json_with_factory(lambda _attempt: request)
+        return self._request_json_with_factory(lambda _attached: request)
 
     def _request_json_with_factory(
         self,
-        request_factory: Callable[[int], urllib.request.Request],
+        request_factory: Callable[[bool], urllib.request.Request],
+        *,
+        fallback_after_seconds: float | None = None,
     ) -> dict[str, Any]:
-        attempts = self.config.retries + 1
+        """One completion over a monotonic horizon, not an attempt count.
+
+        Every retryable failure (429, 5xx, a timeout, an interrupted
+        connection, a temporarily unavailable DNS/network) is retried while
+        ``transport.max_wait_seconds`` still has room for another attempt.  A
+        valid ``Retry-After`` wins over the local backoff, the backoff doubles
+        up to 120s with bounded jitter, and no sleep ever runs past the
+        horizon.  A non-retryable status and a protocol error never retry.
+        """
+
         started = time.monotonic()
-        self._transport_event("request_started", attempts=attempts)
-        for attempt in range(attempts):
-            # 1-based: the factory decides what attempt #N carries.
-            request = request_factory(attempt + 1)
+        deadline = started + self.config.max_wait_seconds
+        delay = _INITIAL_RETRY_DELAY_SECONDS
+        attempts = 0
+        self._transport_event(
+            "request_started", max_wait_seconds=self.config.max_wait_seconds,
+        )
+        while True:
+            attempts += 1
+            attached = (
+                fallback_after_seconds is not None
+                and time.monotonic() - started >= fallback_after_seconds
+            )
+            request = request_factory(attached)
             attempt_started = time.monotonic()
-            self._transport_event("attempt_started", attempt=attempt + 1, attempts=attempts)
+            self._transport_event("attempt_started", attempt=attempts)
+            retry_after: float | None = None
+            failure: str | None = None
             try:
-                deadline = time.monotonic() + self.config.timeout_seconds
                 with self._opener.open(
                     request, timeout=self.config.timeout_seconds
                 ) as response:
-                    body = _read_bounded(response, deadline)
+                    body = _read_bounded(
+                        response, time.monotonic() + self.config.timeout_seconds
+                    )
+                decoded = _decode_json_object(body)
             except urllib.error.HTTPError as exc:
                 status = exc.code
                 elapsed_ms = round((time.monotonic() - attempt_started) * 1000)
@@ -337,48 +388,69 @@ class OpenAIChatTextClient:
                     exc.close()
                 except OSError:
                     pass
-                if status in _RETRYABLE_STATUS_CODES and attempt + 1 < attempts:
-                    self._transport_event("http_response", attempt=attempt + 1, attempts=attempts, http_status=status, elapsed_ms=elapsed_ms)
-                    self._transport_event("retrying", attempt=attempt + 1, attempts=attempts, http_status=status)
-                    _sleep_before_retry(attempt)
-                    continue
-                self._transport_event("http_response", attempt=attempt + 1, attempts=attempts, http_status=status, elapsed_ms=elapsed_ms)
-                self._transport_event("waiting_external", attempt=attempt + 1, attempts=attempts, http_status=status, elapsed_ms=round((time.monotonic() - started) * 1000))
-                raise LLMHTTPError(
-                    f"LLM endpoint returned HTTP {status} after {attempt + 1} attempt(s)"
-                ) from None
+                self._transport_event(
+                    "http_response", attempt=attempts, http_status=status,
+                    elapsed_ms=elapsed_ms,
+                )
+                if status not in _RETRYABLE_STATUS_CODES:
+                    self._transport_event(
+                        "waiting_external", attempt=attempts, http_status=status,
+                        elapsed_ms=round((time.monotonic() - started) * 1000),
+                    )
+                    raise LLMHTTPError(
+                        f"LLM endpoint returned HTTP {status}"
+                    ) from None
+                retry_after = _retry_after_seconds(exc.headers)
+                failure = f"HTTP {status}"
             except LLMError:
                 raise
             except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
-                self._transport_event("waiting_external", attempt=attempt + 1, attempts=attempts, elapsed_ms=round((time.monotonic() - started) * 1000))
-                if _is_timeout_error(exc):
-                    message = "LLM request timed out"
-                else:
-                    reason = getattr(exc, "reason", exc)
-                    message = (
-                        "LLM request failed before receiving an HTTP response "
-                        f"({type(reason).__name__})"
-                    )
-                raise LLMHTTPError(message) from None
+                failure = _transport_failure_message(exc)
+                self._transport_event(
+                    "http_response", attempt=attempts,
+                    transport_error=type(exc).__name__,
+                    elapsed_ms=round((time.monotonic() - attempt_started) * 1000),
+                )
             except (http.client.HTTPException, ValueError) as exc:
                 # http.client errors (and invalid header values) can embed
                 # request data; only the class name is reported.
                 raise LLMHTTPError(
                     f"LLM request failed ({type(exc).__name__})"
                 ) from None
+            else:
+                self._transport_event(
+                    "request_completed", attempt=attempts,
+                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                )
+                return decoded
 
-            try:
-                decoded = json.loads(body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise LLMProtocolError(
-                    "LLM endpoint returned invalid JSON"
-                ) from None
-            if not isinstance(decoded, dict):
-                raise LLMProtocolError("LLM endpoint JSON response must be an object")
-            self._transport_event("request_completed", attempt=attempt + 1, attempts=attempts, elapsed_ms=round((time.monotonic() - started) * 1000))
-            return decoded
+            wait = _jittered_delay(delay) if retry_after is None else retry_after
+            remaining = deadline - time.monotonic()
+            wait = min(wait, remaining)
+            if wait < _MIN_USEFUL_WAIT_SECONDS:
+                # No attempt fits in the horizon any more: signal the
+                # temporary external exhaustion instead of spinning.
+                raise self._exhausted(attempts, started, failure)
+            self._transport_event(
+                "retrying", attempt=attempts, delay_seconds=round(wait, 3),
+            )
+            time.sleep(wait)
+            if time.monotonic() >= deadline:
+                raise self._exhausted(attempts, started, failure)
+            delay = min(delay * 2, _MAX_RETRY_DELAY_SECONDS)
 
-        raise LLMHTTPError("LLM endpoint request failed")  # pragma: no cover
+    def _exhausted(
+        self, attempts: int, started: float, failure: str | None,
+    ) -> LLMTransportExhaustedError:
+        self._transport_event(
+            "waiting_external", attempts=attempts,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+        detail = f"; last failure: {failure}" if failure else ""
+        return LLMTransportExhaustedError(
+            f"LLM transport horizon of {self.config.max_wait_seconds}s exhausted "
+            f"after {attempts} attempt(s){detail}"
+        )
 
 
 def _api_key(env_name: str, environment: Mapping[str, str] | None = None) -> str:
@@ -408,7 +480,8 @@ def _read_bounded(response: Any, deadline: float) -> bytes:
     size = 0
     while True:
         if time.monotonic() > deadline:
-            raise LLMHTTPError("LLM request timed out")
+            # A timeout is one retryable transport failure like any other.
+            raise TimeoutError("LLM request timed out")
         chunk = read(_READ_CHUNK_BYTES)
         if not chunk:
             break
@@ -448,9 +521,51 @@ def _join_url(base_url: str, endpoint_path: str) -> str:
     return f"{base_url.rstrip('/')}/{endpoint_path.lstrip('/')}"
 
 
-def _sleep_before_retry(attempt: int) -> None:
-    delay = min(_INITIAL_BACKOFF_SECONDS * (2**attempt), _MAX_BACKOFF_SECONDS)
-    time.sleep(delay)
+def _jittered_delay(delay: float) -> float:
+    """One bounded, non-inverting jitter around the current backoff."""
+
+    spread = delay * _JITTER_FRACTION
+    return delay + random.uniform(-spread, spread)
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    """The server's own retry hint in seconds, or ``None`` when unusable.
+
+    Both spellings of RFC 9110 are accepted: a delay in seconds and an
+    HTTP-date.  Anything invalid, unparsable or already past returns ``None``
+    so the caller falls back to its own backoff; a hint never breaks the
+    transport.
+    """
+
+    value = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.isdigit():
+        seconds = float(text)
+        return seconds if seconds > 0 else None
+    try:
+        target = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if target is None:
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    seconds = (target - datetime.now(timezone.utc)).total_seconds()
+    return seconds if seconds > 0 else None
+
+
+def _transport_failure_message(error: BaseException) -> str:
+    """A retryable transport failure in bounded, secret-free words."""
+
+    if _is_timeout_error(error):
+        return "LLM request timed out"
+    reason = getattr(error, "reason", error)
+    return (
+        "LLM request failed before receiving an HTTP response "
+        f"({type(reason).__name__})"
+    )
 
 
 def _is_timeout_error(error: BaseException) -> bool:
@@ -458,6 +573,18 @@ def _is_timeout_error(error: BaseException) -> bool:
         return True
     reason = getattr(error, "reason", None)
     return isinstance(reason, (TimeoutError, socket.timeout))
+
+
+def _decode_json_object(body: bytes) -> dict[str, Any]:
+    """Decode one JSON object body, or fail as a protocol error."""
+
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise LLMProtocolError("LLM endpoint returned invalid JSON") from None
+    if not isinstance(decoded, dict):
+        raise LLMProtocolError("LLM endpoint JSON response must be an object")
+    return decoded
 
 
 def _parse_completion_response(response: dict[str, Any]) -> TextLLMResult:

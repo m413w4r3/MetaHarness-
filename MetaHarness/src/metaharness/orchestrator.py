@@ -79,10 +79,7 @@ from .orchestration.shared import (
     CommitBoundaryError,
     OrchestrationError,
 )
-from .orchestration.pipeline_v2 import (
-    PipelineV2Context,
-    PipelineV2Coordinator,
-)
+from .orchestration.pipeline_v2 import PipelineV2Context
 from .orchestration.resume_integrity import validate_resume
 from .orchestration.runtime import (
     RunRuntime,
@@ -290,18 +287,7 @@ class Orchestrator:
         if isinstance(outcome, RunResult):
             return outcome
         pipeline, start = outcome
-        return self._run_pipeline(store, pipeline, start, resumed=False)
-
-    def _run_pipeline(
-        self, store: RunStateStore, pipeline: PipelineV2Context,
-        start: ResumeCheckpoint, *, resumed: bool,
-    ) -> RunResult:
-        """Run the generic coordinator and project a failure that left it."""
-
-        engine = PipelineV2Coordinator(
-            pipeline, self._runtime.composition.pipeline_operations(store),
-        )
-        return self._runtime.failure.run_pipeline(store, pipeline, start, engine, resumed=resumed)
+        return self._runtime.run_pipeline(store, pipeline, start, resumed=False)
 
     def resume(
         self, run_id: str, *, on_claimed: Callable[[Path], None] | None = None,
@@ -412,7 +398,7 @@ class Orchestrator:
                 plan=resumed.plan, bundle=resumed.bundle, selection=resumed.selection,
             )
             return self._runtime.observability.diagnose_result(
-                self._run_pipeline(store, pipeline, checkpoint, resumed=True)
+                self._runtime.run_pipeline(store, pipeline, checkpoint, resumed=True)
             )
         except (ResumeIntegrityError, ResumeRequiresOperatorError) as exc:
             failed = store.record_failure(

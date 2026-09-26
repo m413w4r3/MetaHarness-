@@ -300,14 +300,18 @@ inspects the immutable commit whenever it needs source-level evidence. A correct
 always starts in a fresh conversation; it never continues the initial
 planner thread.
 
-Transport has exactly three attempts, the client's configured
-`retries = 2` plus the first try — no fourth attempt is ever added. The first
-and second HTTP attempts send the same compact inline request. Only when the
-retry loop actually reaches the third attempt, after two retryable HTTP
-responses, does the request move its evidence into an attached
-`repair-evidence.md` and keep a small control prompt inline. A non-retryable
-status, a malformed 200, a parser failure or a network error never triggers
-the file mode. `candidate.diff` is attached to that third attempt only when
+Transport retries over a monotonic horizon, not an attempt count: one
+completion keeps retrying a retryable HTTP status, a timeout, an interrupted
+connection or a transient network failure while `[transport]
+max_wait_seconds` (default 1800 s) still has room for another attempt, and
+stops with a typed `LLM_TRANSPORT_EXHAUSTED` once it does not. The delay
+starts near 2 s, doubles up to a 120 s ceiling with bounded jitter, and a
+valid `Retry-After` wins over it. The inline request is sent first; from the
+first attempt that starts more than `DEFAULT_FILE_FALLBACK_AFTER_SECONDS`
+(30 s) after the completion began, the request moves its evidence into an
+attached `repair-evidence.md` and keeps a small control prompt inline. A
+non-retryable status, a malformed 200 or a parser failure never triggers the
+file mode. `candidate.diff` is attached to that third attempt only when
 remote exploration is unavailable; the full diff is never inline. Before any
 transport, `cycles/<number>/correction/` durably records `planner.request.txt`,
 `planner.request.fallback.txt`, `planner.evidence.md` and

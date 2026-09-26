@@ -407,8 +407,8 @@ class OrchestratorE2ETests(unittest.TestCase):
                 "\"FAKE_CODEX_BEHAVIOR\", \"FAKE_WORKTREE\", \"FAKE_PROMPT\", \"FAKE_FINAL\", "
                 "\"FAKE_CHECK\", \"FAKE_STAGED_SECRET\"]",
                 "[ui]\ndefault_planner_profile = \"planner\"\ndefault_implementer_profile = \"implementer\"\ndefault_reviewer_profile = \"reviewer\"",
-                f"[model_profiles.planner]\ndisplay_name = \"Planner\"\nroles = [\"planner\"]\ndriver = \"openai-chat\"\nprovider = \"test\"\nmodel = \"fake-planner\"\nselection_mode = \"request\"\nbase_url = {llm.base_url!r}\nendpoint_path = \"/planner\"\nretries = 0{key_line}",
-                f"[model_profiles.reviewer]\ndisplay_name = \"Reviewer\"\nroles = [\"reviewer\"]\ndriver = \"openai-chat\"\nprovider = \"test\"\nmodel = \"fake-reviewer\"\nselection_mode = \"request\"\nbase_url = {llm.base_url!r}\nendpoint_path = \"/reviewer\"\nretries = 0",
+                f"[model_profiles.planner]\ndisplay_name = \"Planner\"\nroles = [\"planner\"]\ndriver = \"openai-chat\"\nprovider = \"test\"\nmodel = \"fake-planner\"\nselection_mode = \"request\"\nbase_url = {llm.base_url!r}\nendpoint_path = \"/planner\"{key_line}",
+                f"[model_profiles.reviewer]\ndisplay_name = \"Reviewer\"\nroles = [\"reviewer\"]\ndriver = \"openai-chat\"\nprovider = \"test\"\nmodel = \"fake-reviewer\"\nselection_mode = \"request\"\nbase_url = {llm.base_url!r}\nendpoint_path = \"/reviewer\"",
                 "[model_profiles.implementer]\ndisplay_name = \"Implementer\"\nroles = [\"implementer\"]\ndriver = \"codex\"\nprovider = \"openai\"\nmodel = \"gpt-5.6-luna\"\neffort = \"high\"\nsandbox = \"workspace-write\"\nselection_mode = \"cli\"\ntimeout_seconds = 3",
                 f"[[check_catalog]]\nid = \"test\"\nargv = [{str(sys.executable)!r}, {str(self.check)!r}]\ntimeout_seconds = 1\ncwd = {check_cwd!r}"
                 + (f"\npreflight_argv = [{str(sys.executable)!r}, {str(self.check)!r}]" if check_preflight else ""),

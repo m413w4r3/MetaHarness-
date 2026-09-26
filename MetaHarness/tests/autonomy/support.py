@@ -237,8 +237,8 @@ class FlakyHTTPTransport:
 def chat_endpoint() -> LLMEndpointConfig:
     """The endpoint the fake transport answers for; it is never dialed.
 
-    Its attempt budget is zero, exactly as the live planner profiles configure
-    it: surviving an outage can only come from a time-based horizon.
+    It carries the default transport horizon, exactly as the live profiles
+    do: surviving an outage can only come from the time-based horizon.
     """
 
     return LLMEndpointConfig(
@@ -246,7 +246,6 @@ def chat_endpoint() -> LLMEndpointConfig:
         endpoint_path="/v1/chat/completions",
         model="scripted",
         timeout_seconds=30,
-        retries=0,
     )
 
 

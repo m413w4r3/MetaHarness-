@@ -17,7 +17,7 @@ from metaharness.run_options import RunOptions
 from tests.pipeline.support import SPEC, STEP, repaired_step_contract
 from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
 
-OUTAGE = "LLM endpoint returned HTTP 503 after 3 attempt(s)"
+OUTAGE = "LLM endpoint returned HTTP 503"
 REPAIR_ID = "contract-repair:cycle-001:S01:01"
 S04_REPAIR_ID = "contract-repair:cycle-001:S04:01"
 
@@ -300,7 +300,7 @@ class WaitingDiagnosticsTests(PipelineHarness):
 
     def test_waiting_check_infrastructure_writes_fresh_diagnostics(self) -> None:
         with mock.patch(
-            "metaharness.orchestrator.PipelineV2Coordinator.run",
+            "metaharness.orchestration.runtime.PipelineV2Coordinator.run",
             side_effect=PipelineFailure("CHECK_INFRASTRUCTURE_UNAVAILABLE", "diagnostic"),
         ):
             result = self.orchestrator(
