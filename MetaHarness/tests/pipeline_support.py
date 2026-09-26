@@ -332,6 +332,7 @@ class PipelineHarness(unittest.TestCase):
         max_step_contract_repairs: int = 2,
         semantic_revision: bool = False, scope_policy: str | None = None,
         publish: bool = False, github_pr: bool = False,
+        extra_checks: str = "",
     ) -> Any:
         path = self.root / "config.toml"
         self.config_path = path
@@ -473,7 +474,8 @@ selection_mode = "cli"
 id = "test"
 argv = [{sys.executable!r}, {str(self.check)!r}]
 timeout_seconds = 30
-""", encoding="utf-8")
+
+{extra_checks}""", encoding="utf-8")
         config = load_config(path)
         if scope_policy is not None:
             self.scope_policy = scope_policy

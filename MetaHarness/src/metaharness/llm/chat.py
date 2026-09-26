@@ -192,6 +192,7 @@ class OpenAIChatTextClient:
         *,
         environment: Mapping[str, str] | None = None,
         on_transport: Callable[[dict[str, Any]], None] | None = None,
+        opener: urllib.request.OpenerDirector | None = None,
     ):
         self.config = config
         # ``None`` deliberately retains the old library-level behavior for
@@ -204,7 +205,7 @@ class OpenAIChatTextClient:
             raise LLMProtocolError(
                 f"extra_body cannot override protected request keys: {keys}"
             )
-        self._opener = _opener()
+        self._opener = opener if opener is not None else _opener()
         self._on_transport = on_transport
 
     def _transport_event(self, name: str, **data: Any) -> None:
