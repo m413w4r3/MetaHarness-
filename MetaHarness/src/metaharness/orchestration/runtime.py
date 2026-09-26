@@ -188,7 +188,7 @@ from ..review import (
     Reviewer,
     ReviewParseError,
 )
-from ..recovery_policy import RecoveryDisposition
+from ..recovery_policy import RecoveryStrategy
 from ..state import RunStateStore
 from ..workspace import (
     WorkspaceSetupError,
@@ -2495,7 +2495,7 @@ class RunRuntime:
                 tree_before=tree, tree_after=_safe_candidate_tree(pipeline.info.worktree),
             )
             if (
-                initial.disposition is not RecoveryDisposition.HARD_STOP
+                initial.strategy is not RecoveryStrategy.HARD_STOP
                 or terminal.status is not RunStatus.FAILED
             ):
                 recovery.trace(

@@ -7,7 +7,10 @@ The recovery ladder is the autonomy contract: one failure *code* maps to exactly
 one :class:`FailureClass`, every class owns one ordered tuple of
 :class:`RecoveryStrategy`, and a strategy already consumed for an exact
 :class:`RecoveryFingerprint` is never proposed twice.  A new candidate tree or
-new stable failure facts open a new progression.
+new stable failure facts open a new progression.  :class:`RecoveryStrategy` is
+the only vocabulary a decision speaks: :func:`classify_failure` returns the
+first ladder strategy the observed facts admit, never a second posture the
+callers would have to translate.
 """
 
 from __future__ import annotations
@@ -56,47 +59,34 @@ _TERMINAL_STRATEGIES = frozenset({
 })
 
 
-class RecoveryDisposition(StrEnum):
-    RETRY_SAME = "retry_same"
-    RETRY_AFTER_ROLLBACK = "retry_after_rollback"
-    FALLBACK_EXECUTOR = "fallback_executor"
-    CONTRACT_REPAIR = "contract_repair"
-    CHECK_REPAIR = "check_repair"
-    REPLAN = "replan"
-    WAIT_EXTERNAL = "wait_external"
-    WAIT_HUMAN = "wait_human"
-    CONTINUE_WITH_WARNING = "continue_with_warning"
-    HARD_STOP = "hard_stop"
-
-
 @dataclass(frozen=True)
 class RecoveryDecision:
-    """One classification: what the pipeline may do, and the ladder position.
+    """One classification: the class, the admitted ladder step, and why.
 
-    ``disposition`` is the durable vocabulary of the recovery loops that exist
-    today.  ``failure_class`` and ``strategy`` carry the deterministic ladder
-    position of the same failure code: an exhausted bounded step exposes the
-    following step instead of only an operator wait.
+    ``strategy`` is the deterministic decision: the first step of the failure
+    class's ladder these exact facts admit.  A terminal strategy ends the run's
+    autonomous progression; any other strategy is executed inside the recovery
+    loop that owns its operation.
     """
 
-    disposition: RecoveryDisposition
+    failure_class: FailureClass
+    strategy: RecoveryStrategy
     reason: str
-    consumes_budget: bool
-    rollback_required: bool
-    failure_class: FailureClass = FailureClass.UNKNOWN
-    strategy: RecoveryStrategy = RecoveryStrategy.HARD_STOP
+    consumes_budget: bool = False
+    rollback_required: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.disposition, RecoveryDisposition):
-            raise TypeError("recovery disposition must be a RecoveryDisposition")
-        if not isinstance(self.reason, str):
-            raise TypeError("recovery decision reason must be a string")
-        if not self.reason.strip():
-            raise ValueError("recovery decision reason must not be empty")
         if not isinstance(self.failure_class, FailureClass):
             raise TypeError("recovery failure class must be a FailureClass")
         if not isinstance(self.strategy, RecoveryStrategy):
             raise TypeError("recovery strategy must be a RecoveryStrategy")
+        if not isinstance(self.reason, str):
+            raise TypeError("recovery decision reason must be a string")
+        if not self.reason.strip():
+            raise ValueError("recovery decision reason must not be empty")
+        for name in ("consumes_budget", "rollback_required"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"recovery decision {name} must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -370,29 +360,18 @@ _RECOVERY_LADDERS: Mapping[FailureClass, tuple[RecoveryStrategy, ...]] = {
     FailureClass.UNKNOWN: (RecoveryStrategy.HARD_STOP,),
 }
 
-# The ladder steps one disposition names, most specific first.  A step
-# that is not a member of the class ladder or not admitted by the facts is
-# skipped, so the same disposition projects onto the step its class owns.
-_DISPOSITION_LADDER_STEPS: Mapping[RecoveryDisposition, tuple[RecoveryStrategy, ...]] = {
-    RecoveryDisposition.RETRY_SAME: (
-        RecoveryStrategy.RETRY_TARGETED, RecoveryStrategy.EXPAND_SCOPE,
-        RecoveryStrategy.REPAIR_TARGETED,
-    ),
-    RecoveryDisposition.RETRY_AFTER_ROLLBACK: (
-        RecoveryStrategy.RETRY_TARGETED, RecoveryStrategy.EXPAND_SCOPE,
-        RecoveryStrategy.REPAIR_TARGETED,
-    ),
-    RecoveryDisposition.FALLBACK_EXECUTOR: (
-        RecoveryStrategy.FALLBACK_EXECUTOR, RecoveryStrategy.RETRY_TARGETED,
-    ),
-    RecoveryDisposition.CONTRACT_REPAIR: (
-        RecoveryStrategy.REPAIR_TARGETED, RecoveryStrategy.REPLAN_STEP,
-    ),
-    RecoveryDisposition.CHECK_REPAIR: (RecoveryStrategy.REPAIR_TARGETED,),
-    RecoveryDisposition.REPLAN: (
-        RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.RETRY_TARGETED,
-    ),
-}
+# The steps one occurrence asks for, most specific first: the decision is the
+# first entry the class ladder owns and these facts admit.  Nothing else
+# decides a strategy; a code that names a step its class does not have falls
+# through to the class ladder at the position these facts allow.
+_RETRY_STEPS = (
+    RecoveryStrategy.RETRY_TARGETED, RecoveryStrategy.EXPAND_SCOPE,
+    RecoveryStrategy.REPAIR_TARGETED,
+)
+_REPAIR_STEPS = (RecoveryStrategy.REPAIR_TARGETED,)
+_FALLBACK_STEPS = (RecoveryStrategy.FALLBACK_EXECUTOR, RecoveryStrategy.RETRY_TARGETED)
+_CONTRACT_STEPS = (RecoveryStrategy.REPAIR_TARGETED, RecoveryStrategy.REPLAN_STEP)
+_REPLAN_STEPS = (RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.RETRY_TARGETED)
 
 
 def _stable_code(code: object) -> str:
@@ -583,47 +562,32 @@ def _advance(
     return steps[0] if steps else terminal
 
 
-def project_strategy(
+def _first_admitted(
     failure_class: FailureClass,
-    disposition: RecoveryDisposition,
     facts: RecoveryFacts,
+    steps: tuple[RecoveryStrategy, ...],
     *,
-    code: str = "",
+    terminal: RecoveryStrategy,
 ) -> RecoveryStrategy:
-    """Project one classification onto the ladder position it authorizes.
+    """The first asked-for step the class ladder owns and these facts admit."""
 
-    A step the pipeline may execute now is projected as that step.  A bounded
-    step that was exhausted advances to the following step of the class ladder
-    instead of collapsing onto an operator wait.  A stopped run, a waiting
-    condition and a boundary that existing authority refuses project their own
-    terminal: authority always outranks the ladder of the failure code.
-    """
-
-    fclass = FailureClass(failure_class)
-    if not isinstance(disposition, RecoveryDisposition):
-        raise TypeError("recovery disposition must be a RecoveryDisposition")
-    if not isinstance(facts, RecoveryFacts):
-        raise TypeError("recovery facts must be a RecoveryFacts instance")
-    if disposition is RecoveryDisposition.HARD_STOP:
-        return RecoveryStrategy.HARD_STOP
-    if disposition is RecoveryDisposition.WAIT_EXTERNAL:
-        return RecoveryStrategy.WAIT_EXTERNAL
-    if disposition is RecoveryDisposition.CONTINUE_WITH_WARNING:
-        # The run continues without the optional external capability; the
-        # ladder exposes no autonomous step for a missing capability.
-        return terminal_strategy(fclass, code)
-    ladder = recovery_ladder(fclass)
-    terminal = terminal_strategy(fclass, code)
-    if disposition is RecoveryDisposition.WAIT_HUMAN:
-        return _advance(
-            admitted_strategies(fclass, facts),
-            after=RecoveryStrategy.REPAIR_TARGETED,
-            terminal=terminal,
-        )
-    for step in _DISPOSITION_LADDER_STEPS[disposition]:
+    ladder = recovery_ladder(failure_class)
+    for step in steps:
         if step in ladder and _admitted(step, facts):
             return step
-    return _advance(admitted_strategies(fclass, facts), after=None, terminal=terminal)
+    return _advance(admitted_strategies(failure_class, facts), after=None, terminal=terminal)
+
+
+def _following_admitted(
+    failure_class: FailureClass,
+    facts: RecoveryFacts,
+    *,
+    after: RecoveryStrategy,
+    terminal: RecoveryStrategy,
+) -> RecoveryStrategy:
+    """The next autonomous step of the class ladder after one spent step."""
+
+    return _advance(admitted_strategies(failure_class, facts), after=after, terminal=terminal)
 
 
 @dataclass(frozen=True)
@@ -750,7 +714,7 @@ def classify_failure(
     ``failure`` may include a check ID suffix (for example
     ``CHECK_FAILED:unit``); only its stable code is consulted.  The returned
     decision always carries the deterministic failure class of that code and
-    the ladder position the classification authorizes.
+    the first strategy its ladder admits for these exact facts.
     """
 
     if not isinstance(failure, str) or not failure.strip():
@@ -763,28 +727,52 @@ def classify_failure(
         budget_exhausted=budget_exhausted,
         fallback_executor_available=fallback_executor_available,
     )
+    # The terminal the existing authority allows for this occurrence: only a
+    # boundary table picks between HARD_STOP and WAIT_HUMAN, and only an
+    # unavailable external class waits outside.
+    terminal = terminal_strategy(failure_class, code)
 
     def decision(
-        disposition: RecoveryDisposition, reason: str, *, consumes: bool = False,
+        strategy: RecoveryStrategy, reason: str, *, consumes: bool = False,
         rollback: bool = False,
     ) -> RecoveryDecision:
         return RecoveryDecision(
-            disposition, reason, consumes, rollback, failure_class,
-            project_strategy(failure_class, disposition, ladder_facts, code=code),
+            failure_class, strategy, reason, consumes, rollback,
+        )
+
+    def admitted(
+        steps: tuple[RecoveryStrategy, ...], reason: str, *, consumes: bool = False,
+        rollback: bool = False,
+    ) -> RecoveryDecision:
+        """The first strategy of ``steps`` the class ladder and facts admit."""
+
+        return decision(
+            _first_admitted(failure_class, ladder_facts, steps, terminal=terminal),
+            reason, consumes=consumes, rollback=rollback,
+        )
+
+    def spent(reason: str) -> RecoveryDecision:
+        """The step that follows the spent bounded repair step, or the class terminal."""
+
+        return decision(
+            _following_admitted(
+                failure_class, ladder_facts,
+                after=RecoveryStrategy.REPAIR_TARGETED, terminal=terminal,
+            ),
+            reason,
         )
 
     if (
         code in _HARD_STOP_CODES
         or code.startswith(("SECRET_", "SECURITY_VIOLATION", "DURABLE_ARTIFACT_CORRUPTED"))
     ):
-        return decision(RecoveryDisposition.HARD_STOP, "authority, integrity, or security boundary failed")
+        return decision(RecoveryStrategy.HARD_STOP, "authority, integrity, or security boundary failed")
     if tree_changed_out_of_scope:
-        return decision(RecoveryDisposition.HARD_STOP, "tree changed outside approved scope")
+        return decision(RecoveryStrategy.HARD_STOP, "tree changed outside approved scope")
     if not rollback_succeeded:
-        return decision(RecoveryDisposition.HARD_STOP, "rollback did not restore the expected tree")
+        return decision(RecoveryStrategy.HARD_STOP, "rollback did not restore the expected tree")
     if code == "CHECK_REPAIR_FIXED_POINT":
-        return decision(
-            RecoveryDisposition.WAIT_HUMAN,
+        return spent(
             "the same candidate and failed checks remain after the repair budget was exhausted; "
             "code change or additional repair authority is required",
         )
@@ -792,128 +780,129 @@ def classify_failure(
         "CHECK_REPAIR_EXHAUSTED", "DETERMINISTIC_GATE_FAILED", "WAITING_REPAIR_EXHAUSTED",
         "REVIEW_EVIDENCE_UNRESOLVED", "HUMAN_REQUIRED", "REPOSITORY_EVIDENCE_RECOVERY_EXHAUSTED",
     }:
-        return decision(RecoveryDisposition.WAIT_HUMAN, "correctness repair or operator decision is required")
+        return spent("correctness repair or operator decision is required")
     if code == "CHECK_INFRA_RETRIES_EXHAUSTED":
-        return decision(RecoveryDisposition.WAIT_EXTERNAL, "check infrastructure retries were exhausted")
+        return decision(RecoveryStrategy.WAIT_EXTERNAL, "check infrastructure retries were exhausted")
     if code == "TRANSIENT_ATTEMPTS_EXHAUSTED":
-        return decision(RecoveryDisposition.WAIT_EXTERNAL, "external executor retries were exhausted")
+        return decision(RecoveryStrategy.WAIT_EXTERNAL, "external executor retries were exhausted")
     if code == "CHECK_REPAIR_UNAVAILABLE":
-        return decision(RecoveryDisposition.WAIT_EXTERNAL, "check repair executor is unavailable")
+        return decision(RecoveryStrategy.WAIT_EXTERNAL, "check repair executor is unavailable")
     if code in {
         "CHECK_INFRASTRUCTURE_UNAVAILABLE", "CHECK_SIDE_EFFECT_REPEATED",
         "CHECK_SIDE_EFFECT_UNSTABLE",
     }:
-        return decision(RecoveryDisposition.WAIT_EXTERNAL, "check infrastructure needs operator or environment recovery")
+        return decision(RecoveryStrategy.WAIT_EXTERNAL, "check infrastructure needs operator or environment recovery")
     if budget_exhausted and code in {
         "CHECK_TIMEOUT", "CHECK_PREFLIGHT_FAILED", "CHECK_INFRA_FAILURE",
         "WORKSPACE_SETUP_FAILED", "WORKSPACE_SETUP_TIMEOUT",
     }:
-        return decision(RecoveryDisposition.WAIT_EXTERNAL, "bounded infrastructure retries were exhausted")
+        return decision(RecoveryStrategy.WAIT_EXTERNAL, "bounded infrastructure retries were exhausted")
     if code == "REVIEWER_TRANSPORT_FAILURE" and budget_exhausted:
         return decision(
-            RecoveryDisposition.WAIT_EXTERNAL,
+            RecoveryStrategy.WAIT_EXTERNAL,
             "review is retained at its final-review checkpoint for retry or operator action",
         )
     if code == "STEP_CONTRACT_REPAIR_OUTPUT_INVALID":
         # A planner protocol defect of one repair slot, never a worker
         # contract mismatch: corrected in place, then an operator retry.
         if budget_exhausted:
-            return decision(
-                RecoveryDisposition.WAIT_HUMAN,
+            return spent(
                 "contract repair output corrections were exhausted; retry the contract repair planner",
             )
-        return decision(RecoveryDisposition.CONTRACT_REPAIR, "contract repair planner output can be corrected", consumes=True)
+        return admitted(_CONTRACT_STEPS, "contract repair planner output can be corrected", consumes=True)
     if code in {
         "SPEC_DECISION_REQUIRED", "SECURITY_POLICY_DECISION_REQUIRED",
         "ATOMIC_SCOPE_POLICY_LIMIT", "REPAIR_SCOPE_APPROVAL_REQUIRED",
         "REVIEW_HUMAN_REQUIRED", "CONTRACT_REPAIR_SCOPE_DENIED",
     }:
-        return decision(RecoveryDisposition.WAIT_HUMAN, "an operator decision is required")
+        return decision(terminal, "an operator decision is required")
     if code in {"PUSH_FAILED", "CANDIDATE_PUSH_FAILED"}:
         if not remote_required:
-            return decision(RecoveryDisposition.CONTINUE_WITH_WARNING, "optional remote publication failed")
+            # The run continues without the optional remote capability; the
+            # ladder owns no autonomous step for a capability nobody required.
+            return decision(terminal, "optional remote publication failed")
         if remote_unavailable:
-            return decision(RecoveryDisposition.WAIT_EXTERNAL, "required remote is temporarily unavailable")
+            return decision(RecoveryStrategy.WAIT_EXTERNAL, "required remote is temporarily unavailable")
         if budget_exhausted:
-            return decision(RecoveryDisposition.WAIT_EXTERNAL, "required remote publication retries were exhausted")
-        return decision(RecoveryDisposition.RETRY_SAME, "required remote publication did not complete", consumes=True)
+            return decision(RecoveryStrategy.WAIT_EXTERNAL, "required remote publication retries were exhausted")
+        return admitted(_RETRY_STEPS, "required remote publication did not complete", consumes=True)
     if code in _AUTH_CODES or code.startswith(("LLM_401", "LLM_403")):
-        return decision(RecoveryDisposition.WAIT_EXTERNAL, "credentials or external authorization required")
+        return decision(RecoveryStrategy.WAIT_EXTERNAL, "credentials or external authorization required")
     if budget_exhausted:
         if code in _TRANSIENT_AGENT_CODES or code in _TRANSIENT_EXTERNAL_CODES or code.startswith(("LLM_5", "LLM_429", "LLM_HTTP_5", "LLM_HTTP_429")) or code in {"REVIEW_TRANSPORT_FAILURE", "REVIEWER_TRANSPORT_FAILURE"}:
-            return decision(RecoveryDisposition.WAIT_EXTERNAL, "external recovery budget exhausted")
+            return decision(RecoveryStrategy.WAIT_EXTERNAL, "external recovery budget exhausted")
         if code.startswith(("REVIEW_FORMAT_INVALID", "REVIEWER_OUTPUT_INVALID", "REVIEW_PARSE")):
-            return decision(RecoveryDisposition.WAIT_HUMAN, "review repair budget exhausted")
+            return spent("review repair budget exhausted")
         if code == "REVIEW_EVIDENCE_RETRY":
-            return decision(RecoveryDisposition.WAIT_HUMAN, "reviewer evidence recovery was exhausted")
+            return spent("reviewer evidence recovery was exhausted")
         if code in _CORRECTNESS_REPAIR_CODES or code.startswith("CHECK_FAILED"):
-            return decision(RecoveryDisposition.WAIT_HUMAN, "bounded correctness repair was exhausted")
+            return spent("bounded correctness repair was exhausted")
         if code.startswith(("PLANNER_FORMAT_INVALID", "PLANNER_OUTPUT_INVALID")):
-            return decision(RecoveryDisposition.WAIT_HUMAN, "planner correction budget exhausted")
+            return spent("planner correction budget exhausted")
         if code in {"PLAN_REPOSITORY_PRECONDITION_INVALID", "PLAN_REPOSITORY_PRECONDITION_ERROR", "PLANNER_REPOSITORY_PRECONDITION_ERROR"}:
-            return decision(RecoveryDisposition.WAIT_HUMAN, "planning correction budget exhausted")
-        return decision(RecoveryDisposition.HARD_STOP, "bounded recovery budget exhausted")
+            return spent("planning correction budget exhausted")
+        return decision(RecoveryStrategy.HARD_STOP, "bounded recovery budget exhausted")
 
     if code in {"CANDIDATE_REMOTE_UNAVAILABLE", "REMOTE_UNAVAILABLE"}:
         return decision(
-            RecoveryDisposition.WAIT_EXTERNAL if remote_required else RecoveryDisposition.CONTINUE_WITH_WARNING,
+            terminal,
             "candidate remote availability depends on publication authority",
         )
     if code in {"AGENT_CONTRACT_MISMATCH", "CONTRACT_INSUFFICIENT", "CONTRACT_INSUFFICIENCY"}:
         if clean_contract_mismatch:
-            return decision(RecoveryDisposition.CONTRACT_REPAIR, "clean contract mismatch is repairable", consumes=True)
-        return decision(RecoveryDisposition.REPLAN, "contract facts require a bounded replan", consumes=True)
+            return admitted(_CONTRACT_STEPS, "clean contract mismatch is repairable", consumes=True)
+        return admitted(_REPLAN_STEPS, "contract facts require a bounded replan", consumes=True)
     if code in {"REVIEW_IMPLEMENTATION", "BOUNDED_SCOPE_REQUEST"}:
-        return decision(RecoveryDisposition.CONTRACT_REPAIR, "bounded implementation correction is available", consumes=True)
+        return admitted(_CONTRACT_STEPS, "bounded implementation correction is available", consumes=True)
     if code == "REVIEW_REPLAN":
-        return decision(RecoveryDisposition.REPLAN, "review requested a bounded planning correction", consumes=True)
+        return admitted(_REPLAN_STEPS, "review requested a bounded planning correction", consumes=True)
     if code.startswith("CHECK_FAILED"):
-        return decision(RecoveryDisposition.CHECK_REPAIR, "deterministic check failed", consumes=True)
+        return admitted(_REPAIR_STEPS, "deterministic check failed", consumes=True)
     if code in {"CHECK_TIMEOUT", "CHECK_PREFLIGHT_FAILED", "CHECK_INFRA_FAILURE"}:
-        return decision(RecoveryDisposition.RETRY_SAME, "check infrastructure can be retried", consumes=True)
+        return admitted(_RETRY_STEPS, "check infrastructure can be retried", consumes=True)
     if code == "REVIEW_EVIDENCE_RETRY":
-        return decision(
-            RecoveryDisposition.RETRY_SAME,
+        return admitted(
+            _RETRY_STEPS,
             "reviewer FAIL is retried once on rebuilt local evidence", consumes=True,
         )
     if code.startswith(("REVIEW_PARSE", "REVIEWER_OUTPUT_INVALID", "REVIEW_FORMAT_INVALID")):
-        return decision(RecoveryDisposition.CONTRACT_REPAIR, "review output format can be repaired", consumes=True)
+        return admitted(_CONTRACT_STEPS, "review output format can be repaired", consumes=True)
     if code.startswith(("PLANNER_FORMAT_INVALID", "PLANNER_PROTOCOL_FAILED", "PLANNER_OUTPUT_INVALID")):
-        return decision(RecoveryDisposition.REPLAN, "planner protocol can be retried", consumes=True)
+        return admitted(_REPLAN_STEPS, "planner protocol can be retried", consumes=True)
     if code == "PLANNER_REPOSITORY_EVIDENCE":
-        return decision(RecoveryDisposition.REPLAN, "named immutable repository evidence can repair the plan", consumes=True)
+        return admitted(_REPLAN_STEPS, "named immutable repository evidence can repair the plan", consumes=True)
     if code in {
         "PLAN_REPOSITORY_PRECONDITION_ERROR", "PLAN_REPOSITORY_PRECONDITION_INVALID",
         "PLANNER_REPOSITORY_PRECONDITION_ERROR",
     }:
-        return decision(RecoveryDisposition.REPLAN, "repository precondition needs a bounded replan", consumes=True)
+        return admitted(_REPLAN_STEPS, "repository precondition needs a bounded replan", consumes=True)
     if code in {"WORKSPACE_SETUP_FAILED", "WORKSPACE_SETUP_TIMEOUT"}:
-        return decision(RecoveryDisposition.RETRY_SAME, "workspace setup can be retried", consumes=True)
+        return admitted(_RETRY_STEPS, "workspace setup can be retried", consumes=True)
     if code in _TRANSIENT_AGENT_CODES:
         if fallback_executor_available:
-            return decision(RecoveryDisposition.FALLBACK_EXECUTOR, "another authorized executor is available", consumes=True)
+            return admitted(_FALLBACK_STEPS, "another authorized executor is available", consumes=True)
         if tree_changed_in_scope:
-            return decision(
-                RecoveryDisposition.RETRY_AFTER_ROLLBACK,
+            return admitted(
+                _RETRY_STEPS,
                 "agent failed after an in-scope tree change", consumes=True, rollback=True,
             )
-        return decision(RecoveryDisposition.RETRY_SAME, "transient agent failure", consumes=True)
+        return admitted(_RETRY_STEPS, "transient agent failure", consumes=True)
     if code == "SEMANTIC_REVISER_UNAVAILABLE":
-        return decision(RecoveryDisposition.CONTINUE_WITH_WARNING, "semantic reviser is unavailable; deterministic checks remain authoritative")
+        return decision(terminal, "semantic reviser is unavailable; deterministic checks remain authoritative")
     if (
         code in _TRANSIENT_EXTERNAL_CODES
         or code.startswith(("LLM_5", "LLM_429", "LLM_HTTP_5", "LLM_HTTP_429"))
     ):
-        return decision(RecoveryDisposition.RETRY_SAME, "transient provider or network failure", consumes=True)
+        return admitted(_RETRY_STEPS, "transient provider or network failure", consumes=True)
     if code in {"REVIEWER_TRANSPORT_FAILURE", "REVIEW_TRANSPORT_FAILURE"}:
-        return decision(RecoveryDisposition.RETRY_SAME, "review transport can be retried", consumes=True)
+        return admitted(_RETRY_STEPS, "review transport can be retried", consumes=True)
 
-    return decision(RecoveryDisposition.HARD_STOP, "unclassified failure has no authorized automatic recovery")
+    return decision(RecoveryStrategy.HARD_STOP, "unclassified failure has no authorized automatic recovery")
 
 
 __all__ = [
     "ExecutionFallbacks", "FailureClass", "RecoveryBudgets", "RecoveryDecision",
-    "RecoveryDisposition", "RecoveryFacts", "RecoveryFingerprint", "RecoveryProgression",
+    "RecoveryFacts", "RecoveryFingerprint", "RecoveryProgression",
     "RecoveryStrategy", "admitted_strategies", "classify_failure", "failure_class_for",
-    "project_strategy", "recovery_ladder", "terminal_strategy",
+    "recovery_ladder", "terminal_strategy",
 ]

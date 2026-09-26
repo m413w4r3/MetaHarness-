@@ -30,7 +30,7 @@ from ..attempt_transaction import (
 )
 from ..gitops import GitError, candidate_tree_sha, index_tree_sha, status_porcelain
 from ..models import ExecutionRole, ImplementationStep, RunStatus
-from ..recovery_policy import RecoveryBudgets, RecoveryDisposition, classify_failure
+from ..recovery_policy import RecoveryBudgets, RecoveryStrategy, classify_failure
 from ..result import atomic_write_text
 from ..state import RunStateStore
 from .pipeline_v2 import PipelineFailure
@@ -50,9 +50,9 @@ from .shared import (
 TRANSIENT_WORKER_FAILURES = frozenset({
     AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT, AGENT_PROTOCOL_FAILED,
 })
-_RETRY_DISPOSITIONS = frozenset({
-    RecoveryDisposition.RETRY_SAME, RecoveryDisposition.RETRY_AFTER_ROLLBACK,
-})
+# The only ladder step this recovery loop may execute: a same-executor retry on
+# the exact pre-attempt tree it just restored.
+_RETRY_STRATEGIES = frozenset({RecoveryStrategy.RETRY_TARGETED})
 
 
 def safe_scope_request_path(path: str) -> bool:
@@ -108,7 +108,7 @@ class WorkerRecovery:
         attempt = self._recovery.used(retry_key) + 1
         if reason not in TRANSIENT_WORKER_FAILURES | {AGENT_AUTH_FAILURE}:
             facts = {"tree_changed_out_of_scope": reason == AGENT_SCOPE_VIOLATION}
-            if classify_failure(reason, **facts).disposition is RecoveryDisposition.HARD_STOP:
+            if classify_failure(reason, **facts).strategy is RecoveryStrategy.HARD_STOP:
                 self._recovery.stop(
                     reason, attempt=attempt, tree_before=before,
                     tree_after=failure.tree_after or _safe_candidate_tree(worktree),
@@ -163,7 +163,7 @@ class WorkerRecovery:
         admission = self._recovery.admit(
             retry_key, reason=reason, budget=self._budgets.max_transient_attempts,
             profile_id=failure.profile_id, tree_before=before, tree_after=before,
-            allowed=_RETRY_DISPOSITIONS,
+            allowed=_RETRY_STRATEGIES,
             facts={"tree_changed_in_scope": rollback.changed}, **trace,
         )
         if not admission.admitted:

@@ -113,7 +113,7 @@ from ..result import (
     atomic_write_text,
 )
 from ..recovery_policy import (
-    RecoveryDisposition,
+    RecoveryStrategy,
     classify_failure,
 )
 from ..state import RunStateStore
@@ -1170,7 +1170,7 @@ class ImplementationService:
                     phase="implementation", cycle=cycle_number,
                     step_id=step.id,
                 )
-                if recovery_decision.disposition is not RecoveryDisposition.CONTRACT_REPAIR:
+                if recovery_decision.strategy is not RecoveryStrategy.REPAIR_TARGETED:
                     failure.step_dir = artifact_dir
                     raise
                 _archive_attempt(artifact_dir)
@@ -1557,7 +1557,7 @@ class ImplementationService:
             phase="implementation", reason="AGENT_CONTRACT_MISMATCH",
             attempt=semantic_attempt, budget_key="contract_repairs",
             budget=max_repairs, budget_consumed=semantic_attempt,
-            disposition=decision.disposition.value,
+            strategy=decision.strategy.value,
             cycle=cycle, step_id=step.id, profile_id=profile_id,
             tree_before=tree_before, tree_after=tree_before,
             operation_id=progress["repair_id"],

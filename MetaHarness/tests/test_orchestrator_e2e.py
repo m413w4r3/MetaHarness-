@@ -680,11 +680,12 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.assertEqual(sum(item["event"] == "recovery.completed" for item in recovery), 2)
         self.assertEqual(sum(item["event"] == "recovery.exhausted" for item in recovery), 1)
         exhausted = next(item["data"] for item in recovery if item["event"] == "recovery.exhausted")
-        self.assertEqual(exhausted["terminal_disposition"], "wait_external")
+        self.assertEqual(exhausted["terminal_strategy"], "wait_external")
         self.assertEqual(exhausted["terminal_status"], RunStatus.WAITING_EXTERNAL.value)
         self.assertEqual(exhausted["checkpoint_phase"], "implement_step")
         self.assertTrue(all(
-            {"reason", "disposition", "attempt", "tree_before", "tree_after", "budget_remaining"}
+            {"reason", "strategy", "failure_class", "attempt", "tree_before", "tree_after",
+             "budget_remaining"}
             <= set(item["data"])
             for item in recovery
         ))

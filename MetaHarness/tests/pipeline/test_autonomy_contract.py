@@ -16,10 +16,9 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from metaharness.models import ExecutionRole, RunDisposition, RunPhase, RunStatus
-from metaharness.orchestration.recovery import terminal_state_for
+from metaharness.orchestration.recovery import project_exit, terminal_state_for
 from metaharness.recovery_policy import (
     FailureClass,
-    RecoveryDisposition,
     RecoveryFacts,
     RecoveryProgression,
     RecoveryStrategy,
@@ -47,65 +46,66 @@ class Route:
     label: str
     code: str
     failure_class: FailureClass
-    immediate: RecoveryDisposition
-    immediate_strategy: RecoveryStrategy
+    # The ladder strategy the policy exposes the moment the failure occurs.
+    strategy: RecoveryStrategy
     # The durable reason the bounded loop records once its budget is exhausted.
     consumed_reason: str
-    exhausted: RecoveryDisposition
+    # The terminal strategy that exhausted loop projects onto.
+    exhausted: RecoveryStrategy
     exhausted_status: RunStatus
     phase: RunPhase
     resumable: bool
 
 
 # The only postures an exhausted bounded loop may leave behind.
-EXHAUSTED_RUN_DISPOSITIONS: Mapping[RecoveryDisposition, RunDisposition] = {
-    RecoveryDisposition.WAIT_HUMAN: RunDisposition.WAIT_HUMAN,
-    RecoveryDisposition.WAIT_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
-    RecoveryDisposition.HARD_STOP: RunDisposition.FAILED,
+EXHAUSTED_RUN_DISPOSITIONS: Mapping[RecoveryStrategy, RunDisposition] = {
+    RecoveryStrategy.WAIT_HUMAN: RunDisposition.WAIT_HUMAN,
+    RecoveryStrategy.WAIT_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
+    RecoveryStrategy.HARD_STOP: RunDisposition.FAILED,
 }
 
 
 AUTONOMY_ROUTES: tuple[Route, ...] = (
     Route(
         "correctness failure", "CHECK_FAILED:unit", FailureClass.CORRECTNESS,
-        RecoveryDisposition.CHECK_REPAIR, RecoveryStrategy.REPAIR_TARGETED,
-        "CHECK_REPAIR_EXHAUSTED", RecoveryDisposition.WAIT_HUMAN,
+        RecoveryStrategy.REPAIR_TARGETED,
+        "CHECK_REPAIR_EXHAUSTED", RecoveryStrategy.WAIT_HUMAN,
         RunStatus.WAITING_CHECK_REPAIR, RunPhase.DETERMINISTIC_GATE, True,
     ),
     Route(
         "contract failure", "AGENT_CONTRACT_MISMATCH", FailureClass.CONTRACT,
-        RecoveryDisposition.REPLAN, RecoveryStrategy.REPLAN_STEP,
-        "AGENT_CONTRACT_MISMATCH", RecoveryDisposition.WAIT_HUMAN,
+        RecoveryStrategy.REPLAN_STEP,
+        "AGENT_CONTRACT_MISMATCH", RecoveryStrategy.WAIT_HUMAN,
         RunStatus.WAITING_HUMAN, RunPhase.IMPLEMENT_STEP, False,
     ),
     Route(
         "model protocol failure", "PLANNER_FORMAT_INVALID", FailureClass.MODEL_PROTOCOL,
-        RecoveryDisposition.REPLAN, RecoveryStrategy.RETRY_TARGETED,
-        "PLANNER_FORMAT_INVALID", RecoveryDisposition.WAIT_HUMAN,
+        RecoveryStrategy.RETRY_TARGETED,
+        "PLANNER_FORMAT_INVALID", RecoveryStrategy.WAIT_HUMAN,
         RunStatus.WAITING_HUMAN, RunPhase.PLANNER, False,
     ),
     Route(
         "model protocol failure (review answer)", "REVIEW_FORMAT_INVALID",
-        FailureClass.MODEL_PROTOCOL, RecoveryDisposition.CONTRACT_REPAIR,
-        RecoveryStrategy.REPAIR_TARGETED, "REVIEW_FORMAT_INVALID",
-        RecoveryDisposition.WAIT_HUMAN, RunStatus.WAITING_HUMAN, RunPhase.FINAL_REVIEW, False,
+        FailureClass.MODEL_PROTOCOL, RecoveryStrategy.REPAIR_TARGETED,
+        "REVIEW_FORMAT_INVALID", RecoveryStrategy.WAIT_HUMAN,
+        RunStatus.WAITING_HUMAN, RunPhase.FINAL_REVIEW, False,
     ),
     Route(
         "external unavailability", "AGENT_TIMEOUT", FailureClass.EXTERNAL,
-        RecoveryDisposition.RETRY_SAME, RecoveryStrategy.RETRY_TARGETED,
-        "AGENT_TIMEOUT", RecoveryDisposition.WAIT_EXTERNAL,
+        RecoveryStrategy.RETRY_TARGETED,
+        "AGENT_TIMEOUT", RecoveryStrategy.WAIT_EXTERNAL,
         RunStatus.WAITING_EXTERNAL, RunPhase.IMPLEMENT_STEP, True,
     ),
     Route(
         "external unavailability (check infrastructure)", "DOCKER_DAEMON_UNAVAILABLE",
-        FailureClass.EXTERNAL, RecoveryDisposition.RETRY_SAME, RecoveryStrategy.RETRY_TARGETED,
-        "CHECK_INFRA_RETRIES_EXHAUSTED", RecoveryDisposition.WAIT_EXTERNAL,
+        FailureClass.EXTERNAL, RecoveryStrategy.RETRY_TARGETED,
+        "CHECK_INFRA_RETRIES_EXHAUSTED", RecoveryStrategy.WAIT_EXTERNAL,
         RunStatus.WAITING_CHECK_INFRASTRUCTURE, RunPhase.DETERMINISTIC_GATE, True,
     ),
     Route(
         "spec ambiguity", "SPEC_DECISION_REQUIRED", FailureClass.SPEC_DECISION,
-        RecoveryDisposition.WAIT_HUMAN, RecoveryStrategy.WAIT_HUMAN,
-        "SPEC_DECISION_REQUIRED", RecoveryDisposition.WAIT_HUMAN,
+        RecoveryStrategy.WAIT_HUMAN,
+        "SPEC_DECISION_REQUIRED", RecoveryStrategy.WAIT_HUMAN,
         RunStatus.WAITING_HUMAN, RunPhase.PLANNER, False,
     ),
 )
@@ -152,10 +152,10 @@ class AutonomyRouteTests(unittest.TestCase):
             with self.subTest(route=route.label):
                 self.assertIs(failure_class_for(route.code), route.failure_class)
                 decision = classify_failure(route.code)
-                self.assertIs(decision.disposition, route.immediate)
-                self.assertIs(decision.strategy, route.immediate_strategy)
-                if route.immediate is RecoveryDisposition.WAIT_HUMAN:
-                    self.assertIs(route.immediate_strategy, RecoveryStrategy.WAIT_HUMAN)
+                self.assertIs(decision.strategy, route.strategy)
+                if route.strategy.terminal:
+                    # Only an operator decision waits the moment it occurs.
+                    self.assertIs(route.strategy, RecoveryStrategy.WAIT_HUMAN)
                 else:
                     self.assertFalse(
                         decision.strategy.terminal,
@@ -168,9 +168,11 @@ class AutonomyRouteTests(unittest.TestCase):
         for route in AUTONOMY_ROUTES:
             with self.subTest(route=route.label):
                 decision = classify_failure(route.consumed_reason, budget_exhausted=True)
-                self.assertIs(decision.disposition, route.exhausted, decision.reason)
-                terminal = terminal_state_for(
-                    decision, failure_code=route.consumed_reason, phase=route.phase,
+                projected, terminal = project_exit(route.consumed_reason, phase=route.phase)
+                self.assertTrue(projected.strategy.terminal)
+                self.assertIs(
+                    projected.strategy, route.exhausted,
+                    f"{route.label}: {decision.strategy.value} -> {projected.strategy.value}",
                 )
                 self.assertIs(
                     terminal.disposition, EXHAUSTED_RUN_DISPOSITIONS[route.exhausted],
@@ -209,7 +211,7 @@ class AutonomyRouteTests(unittest.TestCase):
                 immediate = classify_failure(code)
                 self.assertFalse(immediate.strategy.terminal, immediate.reason)
                 exhausted = classify_failure(code, budget_exhausted=True)
-                self.assertIs(exhausted.disposition, RecoveryDisposition.WAIT_EXTERNAL)
+                self.assertIs(exhausted.strategy, RecoveryStrategy.WAIT_EXTERNAL)
                 for phase in (RunPhase.IMPLEMENT_STEP, RunPhase.DETERMINISTIC_GATE):
                     terminal = terminal_state_for(exhausted, failure_code=code, phase=phase)
                     self.assertIs(terminal.disposition, RunDisposition.WAIT_EXTERNAL)
@@ -222,7 +224,6 @@ class AutonomyRouteTests(unittest.TestCase):
     def test_an_operator_decision_is_the_only_immediate_human_wait(self) -> None:
         decision = classify_failure("SPEC_DECISION_REQUIRED")
         self.assertIs(decision.failure_class, FailureClass.SPEC_DECISION)
-        self.assertIs(decision.disposition, RecoveryDisposition.WAIT_HUMAN)
         self.assertIs(decision.strategy, RecoveryStrategy.WAIT_HUMAN)
         self.assertEqual(
             recovery_ladder(FailureClass.SPEC_DECISION), (RecoveryStrategy.WAIT_HUMAN,),
@@ -243,7 +244,7 @@ class AutonomyRouteTests(unittest.TestCase):
                     {FailureClass.SECURITY, FailureClass.INTEGRITY, FailureClass.AUTHORITY},
                 )
                 decision = classify_failure(code)
-                self.assertIs(decision.disposition, RecoveryDisposition.HARD_STOP, decision.reason)
+                self.assertIs(decision.strategy, RecoveryStrategy.HARD_STOP, decision.reason)
                 self.assertTrue(all(step.terminal for step in recovery_ladder(decision.failure_class)))
                 terminal = terminal_state_for(
                     decision, failure_code=code, phase=RunPhase.DETERMINISTIC_GATE,

@@ -3,13 +3,13 @@
 :func:`metaharness.recovery_policy.classify_failure` classifies stable failure
 codes.  :class:`RecoveryCoordinator` applies that classification: it owns the
 durable recovery budgets, records every consumed attempt with its tree
-boundary, emits the ``recovery.*`` trace and projects a disposition that left
-its recovery loop onto one durable run status.
+boundary, emits the ``recovery.*`` trace and projects a terminal strategy that
+left its recovery loop onto one durable run status.
 
 It never runs a model, interprets the SPEC, chooses a mutable scope, repairs a
 tree or touches an authority artifact: phase services own those actions and
 ask this coordinator only whether a bounded automatic recovery is admitted.
-Its ladder vocabulary stays inside
+Its admission vocabulary is :class:`RecoveryStrategy`, straight from
 :mod:`metaharness.recovery_policy`: this module only projects a ladder terminal
 onto the durable run status that waits after it.
 """
@@ -33,10 +33,10 @@ from ..models import (
 from ..recovery_policy import (
     FailureClass,
     RecoveryDecision,
-    RecoveryDisposition,
     RecoveryStrategy,
     classify_failure,
     failure_class_for,
+    terminal_strategy,
 )
 from ..state import RunStateStore
 from .pipeline_v2 import PipelineFailure, RecoveryStepUnavailable
@@ -86,32 +86,33 @@ def failure_code(reason: str) -> str:
     return reason.split(":", 1)[0].strip().upper()
 
 
-# The only postures a terminal recovery decision may leave behind.  Every
-# finer distinction (which infrastructure is down, which bounded pass a human
-# may retry) stays in the failure reason and the phase.
-_TERMINAL_DISPOSITION = {
-    RecoveryDisposition.HARD_STOP: RunDisposition.FAILED,
-    RecoveryDisposition.WAIT_HUMAN: RunDisposition.WAIT_HUMAN,
-    RecoveryDisposition.WAIT_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
+# The only postures a terminal recovery strategy may leave behind.  Every finer
+# distinction (which infrastructure is down, which bounded pass a human may
+# retry) stays in the failure reason and the phase.
+_TERMINAL_RUN_DISPOSITIONS = {
+    RecoveryStrategy.HARD_STOP: RunDisposition.FAILED,
+    RecoveryStrategy.WAIT_HUMAN: RunDisposition.WAIT_HUMAN,
+    RecoveryStrategy.WAIT_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
 }
 
 
 def terminal_state_for(
     decision: RecoveryDecision, *, failure_code: str, phase: RunPhase,
 ) -> RecoveryTerminalState:
-    """Only terminal dispositions may cross the coordinator boundary.
+    """Only a terminal strategy may cross the coordinator boundary.
 
-    The decision names one of the five run dispositions; the projected status
-    and resumability are derived from it, the phase and the failure reason.
+    The decision names one terminal ladder step; the projected run disposition,
+    status and resumability are derived from it, the phase and the reason.
     """
 
     if not isinstance(failure_code, str) or not failure_code.strip():
         raise TypeError("terminal failure_code must be a non-empty reason-code string")
+    if not isinstance(decision, RecoveryDecision):
+        raise TypeError("terminal projection requires a recovery decision")
     code = failure_code.split(":", 1)[0].upper()
-    try:
-        disposition = _TERMINAL_DISPOSITION[decision.disposition]
-    except KeyError as exc:
-        raise ValueError(f"recovery disposition {decision.disposition} is not terminal") from exc
+    if not decision.strategy.terminal:
+        raise ValueError(f"recovery strategy {decision.strategy.value} is not terminal")
+    disposition = _TERMINAL_RUN_DISPOSITIONS[decision.strategy]
     event = (
         RunEvent.fail(reason=code)
         if disposition is RunDisposition.FAILED
@@ -126,19 +127,10 @@ def terminal_state_for(
     )
 
 
-# Terminal ladder steps only: an autonomous step is executed inside its own
-# recovery loop and can never cross this boundary.
-_TERMINAL_DISPOSITIONS = {
-    RecoveryStrategy.HARD_STOP: RecoveryDisposition.HARD_STOP,
-    RecoveryStrategy.WAIT_HUMAN: RecoveryDisposition.WAIT_HUMAN,
-    RecoveryStrategy.WAIT_EXTERNAL: RecoveryDisposition.WAIT_EXTERNAL,
-}
-
-
 def strategy_terminal_state(
     strategy: RecoveryStrategy, *, failure_code: str, phase: RunPhase,
 ) -> RecoveryTerminalState:
-    """Project one ladder terminal onto the durable status that waits after it.
+    """Project one ladder terminal onto the durable run status that waits after it.
 
     An autonomous step is refused: the ladder may only end a run on a terminal
     step the existing authority already allowed for that failure code.
@@ -147,9 +139,8 @@ def strategy_terminal_state(
     if not isinstance(strategy, RecoveryStrategy) or not strategy.terminal:
         raise ValueError(f"recovery strategy {strategy!r} is not terminal")
     decision = RecoveryDecision(
-        _TERMINAL_DISPOSITIONS[strategy],
-        "recovery ladder reached a terminal step", False, False,
         failure_class_for(failure_code), strategy,
+        "recovery ladder reached a terminal step",
     )
     return terminal_state_for(decision, failure_code=failure_code, phase=phase)
 
@@ -160,8 +151,10 @@ def project_exit(
     """Project a failure that left its recovery loop onto a durable status.
 
     Every automatic recovery is consumed inside its own loop, so a failure
-    reaching this boundary is classified as budget-exhausted.  A disposition
-    that is still not terminal escaped its coordinator and fails closed.
+    reaching this boundary is classified as budget-exhausted.  A decision that
+    still exposes an autonomous rung cannot run it here: the run lands on the
+    strategy that ends autonomous progression for this occurrence, chosen by
+    the same authority tables the ladder already applies.
     """
 
     if not isinstance(reason, str) or not reason.strip():
@@ -170,14 +163,27 @@ def project_exit(
         reason, budget_exhausted=True,
         remote_required=remote_required, remote_unavailable=remote_required,
     )
-    try:
-        return decision, terminal_state_for(decision, failure_code=reason, phase=phase)
-    except ValueError:
-        decision = RecoveryDecision(
-            RecoveryDisposition.HARD_STOP,
-            "recovery operation escaped its coordinator", False, False,
-        )
-        return decision, terminal_state_for(decision, failure_code=reason, phase=phase)
+    decision = terminal_decision(decision, reason=reason)
+    return decision, terminal_state_for(decision, failure_code=reason, phase=phase)
+
+
+def terminal_decision(decision: RecoveryDecision, *, reason: str) -> RecoveryDecision:
+    """The same decision, landed on the terminal that ends its progression.
+
+    A decision that still exposes an autonomous rung cannot run it at the exit
+    boundary; the terminal is picked by the same authority tables the ladder
+    already applies, and the failure class and reason are preserved.
+    """
+
+    if not isinstance(decision, RecoveryDecision):
+        raise TypeError("terminal projection requires a recovery decision")
+    if decision.strategy.terminal:
+        return decision
+    return RecoveryDecision(
+        decision.failure_class,
+        terminal_strategy(decision.failure_class, reason),
+        decision.reason,
+    )
 
 
 def normalize_exit_reason(reason: str) -> str:
@@ -198,7 +204,7 @@ class RecoveryAttempt:
     budget_key: str
     budget: int
     budget_consumed: int
-    disposition: str
+    strategy: str
     operation_id: str
     cycle: int | None = None
     step_id: str | None = None
@@ -335,13 +341,14 @@ class RecoveryCoordinator:
         tree_before: str | None = None,
         tree_after: str | None = None,
         decision: RecoveryDecision | None = None,
-        allowed: Collection[RecoveryDisposition] | None = None,
+        allowed: Collection[RecoveryStrategy] | None = None,
         facts: Mapping[str, Any] | None = None,
     ) -> RecoveryAdmission:
         """Classify one failure and consume its budget when recovery is allowed.
 
-        ``allowed`` restricts the dispositions the caller can execute; any
-        other disposition is returned unadmitted without consuming budget.
+        ``allowed`` restricts the ladder strategies the caller can execute; a
+        decision naming any other strategy is returned unadmitted without
+        consuming budget.
         """
 
         facts = dict(facts or {})
@@ -360,7 +367,7 @@ class RecoveryCoordinator:
             "attempt": attempt, "budget": budget, "reason": reason, "phase": phase,
             "cycle": cycle, "step_id": step_id, "tree_before": tree_before,
         }
-        if allowed is not None and decision.disposition not in allowed:
+        if allowed is not None and decision.strategy not in allowed:
             return RecoveryAdmission(False, decision, used=used, **admission)
         if used >= budget:
             exhausted = classify_failure(reason, **{**facts, "budget_exhausted": True})
@@ -372,7 +379,7 @@ class RecoveryCoordinator:
         consumed = self.consume(key, RecoveryAttempt(
             phase=phase, reason=reason, attempt=attempt, budget_key=key,
             budget=budget, budget_consumed=used + 1,
-            disposition=decision.disposition.value,
+            strategy=decision.strategy.value,
             operation_id=f"recovery:{key}:{attempt:02d}",
             cycle=cycle, step_id=step_id,
             profile_id=profile_id, tree_before=tree_before, tree_after=tree_after,
@@ -407,9 +414,8 @@ class RecoveryCoordinator:
         tree_after: str | None = None,
     ) -> RecoveryDecision:
         decision = RecoveryDecision(
-            RecoveryDisposition.FALLBACK_EXECUTOR,
-            "primary executor transient retry budget exhausted", True, False,
             FailureClass.EXTERNAL, RecoveryStrategy.FALLBACK_EXECUTOR,
+            "primary executor transient retry budget exhausted", True,
         )
         self.trace(
             "recovery.executor_selected", reason=reason, decision=decision,
@@ -464,7 +470,8 @@ class RecoveryCoordinator:
 
         data: dict[str, Any] = {
             "reason": reason,
-            "disposition": decision.disposition.value,
+            "strategy": decision.strategy.value,
+            "failure_class": decision.failure_class.value,
             "attempt": attempt,
             "tree_before": tree_before,
             "tree_after": tree_after,
@@ -474,14 +481,15 @@ class RecoveryCoordinator:
             data["recovered"] = recovered
         if event == "recovery.exhausted":
             checkpoint_phase = checkpoint_phase or _TRACE_CHECKPOINT.get(phase)
+            terminal = terminal_decision(decision, reason=reason)
             if terminal_status is None and checkpoint_phase is not None:
                 try:
                     terminal_status = terminal_state_for(
-                        decision, failure_code=reason, phase=checkpoint_phase,
+                        terminal, failure_code=reason, phase=checkpoint_phase,
                     ).status
                 except ValueError:
                     terminal_status = RunStatus.FAILED
-            data["terminal_disposition"] = decision.disposition.value
+            data["terminal_strategy"] = terminal.strategy.value
             data["terminal_status"] = (
                 terminal_status.value if terminal_status else RunStatus.FAILED.value
             )
@@ -645,5 +653,5 @@ __all__ = [
     "RecoveryStepUnavailable",
     "RecoveryTerminalState", "failure_code",
     "normalize_exit_reason", "project_exit", "strategy_terminal_state",
-    "terminal_state_for",
+    "terminal_decision", "terminal_state_for",
 ]

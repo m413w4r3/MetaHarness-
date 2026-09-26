@@ -371,7 +371,7 @@ class SemanticRecoveryIdentityTests(PipelineHarness):
         archived = {
             "phase": "implementation", "reason": "AGENT_CONTRACT_MISMATCH", "attempt": 1,
             "budget_key": "contract_repairs", "budget": 2, "budget_consumed": 1,
-            "disposition": "contract_repair", "cycle": 1, "step_id": "S04",
+            "strategy": "repair_targeted", "cycle": 1, "step_id": "S04",
             "profile_id": "worker", "tree_before": "a" * 40, "tree_after": "a" * 40,
         }
         other = {**archived, "step_id": "S03"}

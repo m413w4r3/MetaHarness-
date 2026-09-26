@@ -4,15 +4,15 @@ import ast
 import inspect
 import re
 import unittest
+from collections.abc import Mapping
 
 from metaharness import recovery_policy
-from metaharness.models import RunStatus
-from metaharness.orchestration.recovery import terminal_state_for
+from metaharness.models import RunDisposition, RunStatus
+from metaharness.orchestration.recovery import project_exit, terminal_state_for
 from metaharness.recovery_policy import (
     FailureClass,
     RecoveryBudgets,
     RecoveryDecision,
-    RecoveryDisposition,
     RecoveryFacts,
     RecoveryFingerprint,
     RecoveryProgression,
@@ -26,44 +26,52 @@ from metaharness.resume import ResumePhase
 
 # One central architecture table covers all pipeline outcomes. Changes to the
 # classifier must update this policy invariant and its path-level tests.
+# (name, code, kwargs, failure class, strategy)
 FAILURE_POLICY_MATRIX = (
-    ("planner format", "PLANNER_FORMAT_INVALID", RecoveryDisposition.REPLAN, {}),
-    ("planner topology", "PLAN_REPOSITORY_PRECONDITION_INVALID", RecoveryDisposition.REPLAN, {}),
-    ("planner repository evidence blocker", "PLANNER_REPOSITORY_EVIDENCE", RecoveryDisposition.REPLAN, {}),
-    ("contract mismatch", "AGENT_CONTRACT_MISMATCH", RecoveryDisposition.CONTRACT_REPAIR, {"clean_contract_mismatch": True}),
-    ("agent timeout", "AGENT_TIMEOUT", RecoveryDisposition.RETRY_SAME, {}),
-    ("agent runtime", "AGENT_RUNTIME_FAILED", RecoveryDisposition.RETRY_SAME, {}),
-    ("workspace setup timeout", "WORKSPACE_SETUP_TIMEOUT", RecoveryDisposition.RETRY_SAME, {}),
-    ("check preflight", "CHECK_PREFLIGHT_FAILED", RecoveryDisposition.RETRY_SAME, {}),
-    ("check timeout", "CHECK_TIMEOUT", RecoveryDisposition.RETRY_SAME, {}),
-    ("review format", "REVIEW_FORMAT_INVALID", RecoveryDisposition.CONTRACT_REPAIR, {}),
-    ("review transport", "REVIEWER_TRANSPORT_FAILURE", RecoveryDisposition.RETRY_SAME, {}),
-    ("semantic reviser unavailable", "SEMANTIC_REVISER_UNAVAILABLE", RecoveryDisposition.CONTINUE_WITH_WARNING, {}),
-    ("candidate staging remote unavailable", "CANDIDATE_REMOTE_UNAVAILABLE", RecoveryDisposition.CONTINUE_WITH_WARNING, {}),
-    ("ordinary check failed", "CHECK_FAILED:unit", RecoveryDisposition.CHECK_REPAIR, {}),
-    ("check repair fixed point", "CHECK_REPAIR_FIXED_POINT", RecoveryDisposition.WAIT_HUMAN, {}),
-    ("review IMPLEMENTATION", "REVIEW_IMPLEMENTATION", RecoveryDisposition.CONTRACT_REPAIR, {}),
-    ("review REPLAN", "REVIEW_REPLAN", RecoveryDisposition.REPLAN, {}),
-    ("bounded scope request", "BOUNDED_SCOPE_REQUEST", RecoveryDisposition.CONTRACT_REPAIR, {}),
-    ("secret", "SECRET_IN_DIFF", RecoveryDisposition.HARD_STOP, {}),
-    ("out-of-scope mutation", "AGENT_SCOPE_VIOLATION", RecoveryDisposition.HARD_STOP, {}),
-    ("Git ownership mutation", "AGENT_GIT_VIOLATION", RecoveryDisposition.HARD_STOP, {}),
-    ("corrupt durable artifact", "DURABLE_ARTIFACT_CORRUPTED", RecoveryDisposition.HARD_STOP, {}),
-    ("approval identity mismatch", "PLAN_APPROVAL_IDENTITY_MISMATCH", RecoveryDisposition.HARD_STOP, {}),
-    ("resume identity mismatch", "RESUME_IDENTITY_MISMATCH", RecoveryDisposition.HARD_STOP, {}),
-    ("true SPEC decision", "SPEC_DECISION_REQUIRED", RecoveryDisposition.WAIT_HUMAN, {}),
-    ("security policy decision", "SECURITY_POLICY_DECISION_REQUIRED", RecoveryDisposition.WAIT_HUMAN, {}),
-    ("scope configured require-approval", "REPAIR_SCOPE_APPROVAL_REQUIRED", RecoveryDisposition.WAIT_HUMAN, {}),
+    ("planner format", "PLANNER_FORMAT_INVALID", {}, FailureClass.MODEL_PROTOCOL, RecoveryStrategy.RETRY_TARGETED),
+    ("planner topology", "PLAN_REPOSITORY_PRECONDITION_INVALID", {}, FailureClass.CONTRACT, RecoveryStrategy.REPLAN_STEP),
+    ("planner repository evidence blocker", "PLANNER_REPOSITORY_EVIDENCE", {}, FailureClass.CORRECTNESS, RecoveryStrategy.REPLAN_STEP),
+    ("contract mismatch", "AGENT_CONTRACT_MISMATCH", {"clean_contract_mismatch": True}, FailureClass.CONTRACT, RecoveryStrategy.REPAIR_TARGETED),
+    ("agent timeout", "AGENT_TIMEOUT", {}, FailureClass.EXTERNAL, RecoveryStrategy.RETRY_TARGETED),
+    ("agent runtime", "AGENT_RUNTIME_FAILED", {}, FailureClass.EXTERNAL, RecoveryStrategy.RETRY_TARGETED),
+    ("workspace setup timeout", "WORKSPACE_SETUP_TIMEOUT", {}, FailureClass.EXTERNAL, RecoveryStrategy.RETRY_TARGETED),
+    ("check preflight", "CHECK_PREFLIGHT_FAILED", {}, FailureClass.EXTERNAL, RecoveryStrategy.RETRY_TARGETED),
+    ("check timeout", "CHECK_TIMEOUT", {}, FailureClass.EXTERNAL, RecoveryStrategy.RETRY_TARGETED),
+    ("review format", "REVIEW_FORMAT_INVALID", {}, FailureClass.MODEL_PROTOCOL, RecoveryStrategy.REPAIR_TARGETED),
+    ("review transport", "REVIEWER_TRANSPORT_FAILURE", {}, FailureClass.EXTERNAL, RecoveryStrategy.RETRY_TARGETED),
+    ("semantic reviser unavailable", "SEMANTIC_REVISER_UNAVAILABLE", {}, FailureClass.EXTERNAL, RecoveryStrategy.WAIT_EXTERNAL),
+    ("candidate staging remote unavailable", "CANDIDATE_REMOTE_UNAVAILABLE", {}, FailureClass.EXTERNAL, RecoveryStrategy.WAIT_EXTERNAL),
+    ("ordinary check failed", "CHECK_FAILED:unit", {}, FailureClass.CORRECTNESS, RecoveryStrategy.REPAIR_TARGETED),
+    ("check repair fixed point", "CHECK_REPAIR_FIXED_POINT", {}, FailureClass.CORRECTNESS, RecoveryStrategy.REPLAN_STEP),
+    ("review IMPLEMENTATION", "REVIEW_IMPLEMENTATION", {}, FailureClass.CORRECTNESS, RecoveryStrategy.REPAIR_TARGETED),
+    ("review REPLAN", "REVIEW_REPLAN", {}, FailureClass.CORRECTNESS, RecoveryStrategy.REPLAN_STEP),
+    ("bounded scope request", "BOUNDED_SCOPE_REQUEST", {}, FailureClass.CORRECTNESS, RecoveryStrategy.REPAIR_TARGETED),
+    ("secret", "SECRET_IN_DIFF", {}, FailureClass.SECURITY, RecoveryStrategy.HARD_STOP),
+    ("out-of-scope mutation", "AGENT_SCOPE_VIOLATION", {}, FailureClass.AUTHORITY, RecoveryStrategy.HARD_STOP),
+    ("Git ownership mutation", "AGENT_GIT_VIOLATION", {}, FailureClass.AUTHORITY, RecoveryStrategy.HARD_STOP),
+    ("corrupt durable artifact", "DURABLE_ARTIFACT_CORRUPTED", {}, FailureClass.INTEGRITY, RecoveryStrategy.HARD_STOP),
+    ("approval identity mismatch", "PLAN_APPROVAL_IDENTITY_MISMATCH", {}, FailureClass.AUTHORITY, RecoveryStrategy.HARD_STOP),
+    ("resume identity mismatch", "RESUME_IDENTITY_MISMATCH", {}, FailureClass.AUTHORITY, RecoveryStrategy.HARD_STOP),
+    ("true SPEC decision", "SPEC_DECISION_REQUIRED", {}, FailureClass.SPEC_DECISION, RecoveryStrategy.WAIT_HUMAN),
+    ("security policy decision", "SECURITY_POLICY_DECISION_REQUIRED", {}, FailureClass.SECURITY, RecoveryStrategy.WAIT_HUMAN),
+    ("scope configured require-approval", "REPAIR_SCOPE_APPROVAL_REQUIRED", {}, FailureClass.AUTHORITY, RecoveryStrategy.WAIT_HUMAN),
 )
+
+# The only durable postures a terminal strategy may project onto.
+TERMINAL_RUN_DISPOSITIONS: Mapping[RecoveryStrategy, RunDisposition] = {
+    RecoveryStrategy.WAIT_HUMAN: RunDisposition.WAIT_HUMAN,
+    RecoveryStrategy.WAIT_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
+    RecoveryStrategy.HARD_STOP: RunDisposition.FAILED,
+}
 
 
 class RecoveryPolicyTests(unittest.TestCase):
     def test_invalid_contract_repair_output_is_never_a_worker_mismatch(self) -> None:
         code = "STEP_CONTRACT_REPAIR_OUTPUT_INVALID"
-        self.assertEqual(classify_failure(code).disposition, RecoveryDisposition.CONTRACT_REPAIR)
+        self.assertEqual(classify_failure(code).strategy, RecoveryStrategy.REPAIR_TARGETED)
         exhausted = classify_failure(code, budget_exhausted=True)
-        self.assertEqual(exhausted.disposition, RecoveryDisposition.WAIT_HUMAN)
-        terminal = terminal_state_for(exhausted, failure_code=code, phase=ResumePhase.IMPLEMENT_STEP)
+        self.assertIs(exhausted.strategy, RecoveryStrategy.WAIT_HUMAN)
+        _decision, terminal = project_exit(code, phase=ResumePhase.IMPLEMENT_STEP)
         self.assertEqual((terminal.status, terminal.resumable), (RunStatus.WAITING_CONTRACT_REPAIR, True))
         # A genuine decision keeps the non-resumable WAITING_HUMAN projection.
         for genuine in ("SPEC_DECISION_REQUIRED", "SECURITY_POLICY_DECISION_REQUIRED", "CONTRACT_REPAIR_SCOPE_DENIED"):
@@ -73,7 +81,8 @@ class RecoveryPolicyTests(unittest.TestCase):
 
     def test_unknown_failure_fails_closed(self) -> None:
         decision = classify_failure("TOTALLY_NEW_FAILURE")
-        self.assertEqual(decision.disposition, RecoveryDisposition.HARD_STOP)
+        self.assertIs(decision.failure_class, FailureClass.UNKNOWN)
+        self.assertIs(decision.strategy, RecoveryStrategy.HARD_STOP)
         self.assertFalse(decision.consumes_budget)
         self.assertEqual(
             terminal_state_for(decision, failure_code="TOTALLY_NEW_FAILURE", phase=ResumePhase.IMPLEMENT_STEP).status,
@@ -91,30 +100,50 @@ class RecoveryPolicyTests(unittest.TestCase):
         )
         for code, options, phase, status in cases:
             with self.subTest(code=code):
-                decision = classify_failure(code, **options)
-                self.assertEqual(terminal_state_for(decision, failure_code=code, phase=phase).status, status)
-        exhausted = terminal_state_for(
-            classify_failure("CHECK_REPAIR_EXHAUSTED"),
-            failure_code="CHECK_REPAIR_EXHAUSTED",
-            phase=ResumePhase.DETERMINISTIC_GATE,
+                decision, terminal = project_exit(
+                    code, phase=phase, remote_required=options.get("remote_required", False),
+                )
+                self.assertTrue(decision.strategy.terminal)
+                self.assertEqual(terminal.status, status)
+        _decision, exhausted = project_exit(
+            "CHECK_REPAIR_EXHAUSTED", phase=ResumePhase.DETERMINISTIC_GATE,
         )
         self.assertTrue(exhausted.resumable)
 
     def test_failure_policy_matrix_is_an_architectural_invariant(self) -> None:
-        for name, reason, expected, kwargs in FAILURE_POLICY_MATRIX:
+        for name, reason, kwargs, failure_class, strategy in FAILURE_POLICY_MATRIX:
             with self.subTest(policy=name):
-                self.assertEqual(classify_failure(reason, **kwargs).disposition, expected)
+                decision = classify_failure(reason, **kwargs)
+                self.assertIs(decision.failure_class, failure_class)
+                self.assertIs(decision.strategy, strategy)
+                self.assertIn(strategy, recovery_ladder(failure_class))
+
+    def test_every_terminal_route_projects_its_durable_disposition(self) -> None:
+        """A terminal strategy names the durable posture, with no layer between."""
+
+        for name, reason, kwargs, _failure_class, strategy in FAILURE_POLICY_MATRIX:
+            if not strategy.terminal:
+                continue
+            with self.subTest(policy=name):
+                decision = classify_failure(reason, **kwargs)
+                terminal = terminal_state_for(
+                    decision, failure_code=reason, phase=ResumePhase.IMPLEMENT_STEP,
+                )
+                self.assertIs(terminal.disposition, TERMINAL_RUN_DISPOSITIONS[strategy])
+                self.assertIs(terminal.phase, ResumePhase.IMPLEMENT_STEP)
 
     def test_agent_timeout_retries_same_executor(self) -> None:
         decision = classify_failure("AGENT_TIMEOUT")
-        self.assertEqual(decision.disposition, RecoveryDisposition.RETRY_SAME)
+        self.assertIs(decision.strategy, RecoveryStrategy.RETRY_TARGETED)
         self.assertTrue(decision.consumes_budget)
 
     def test_check_repair_fixed_point_requires_human_and_does_not_resume(self) -> None:
-        decision = classify_failure("CHECK_REPAIR_FIXED_POINT")
-        terminal = terminal_state_for(
-            decision, failure_code="CHECK_REPAIR_FIXED_POINT",
-            phase=ResumePhase.DETERMINISTIC_GATE,
+        self.assertIs(
+            classify_failure("CHECK_REPAIR_FIXED_POINT").strategy,
+            RecoveryStrategy.REPLAN_STEP,
+        )
+        decision, terminal = project_exit(
+            "CHECK_REPAIR_FIXED_POINT", phase=ResumePhase.DETERMINISTIC_GATE,
         )
         self.assertEqual((terminal.status, terminal.resumable), (RunStatus.WAITING_HUMAN, False))
         self.assertIn("code change or additional repair authority", decision.reason)
@@ -123,7 +152,7 @@ class RecoveryPolicyTests(unittest.TestCase):
         decision = classify_failure(
             "AGENT_RUNTIME_FAILED", tree_changed_in_scope=True,
         )
-        self.assertEqual(decision.disposition, RecoveryDisposition.RETRY_AFTER_ROLLBACK)
+        self.assertIs(decision.strategy, RecoveryStrategy.RETRY_TARGETED)
         self.assertTrue(decision.rollback_required)
 
     def test_authority_and_security_failures_stop(self) -> None:
@@ -136,20 +165,20 @@ class RecoveryPolicyTests(unittest.TestCase):
         ):
             with self.subTest(reason=reason):
                 self.assertEqual(
-                    classify_failure(reason).disposition,
-                    RecoveryDisposition.HARD_STOP,
+                    classify_failure(reason).strategy,
+                    RecoveryStrategy.HARD_STOP,
                 )
 
     def test_checks_repair_only_test_failures_and_retry_infrastructure(self) -> None:
         self.assertEqual(
-            classify_failure("CHECK_FAILED:unit").disposition,
-            RecoveryDisposition.CHECK_REPAIR,
+            classify_failure("CHECK_FAILED:unit").strategy,
+            RecoveryStrategy.REPAIR_TARGETED,
         )
         for reason in ("CHECK_TIMEOUT:unit", "CHECK_PREFLIGHT_FAILED:unit"):
             with self.subTest(reason=reason):
                 self.assertEqual(
-                    classify_failure(reason).disposition,
-                    RecoveryDisposition.RETRY_SAME,
+                    classify_failure(reason).strategy,
+                    RecoveryStrategy.RETRY_TARGETED,
                 )
         for reason in (
             "CHECK_INFRASTRUCTURE_UNAVAILABLE:unit",
@@ -157,47 +186,47 @@ class RecoveryPolicyTests(unittest.TestCase):
         ):
             with self.subTest(reason=reason):
                 self.assertEqual(
-                    classify_failure(reason).disposition,
-                    RecoveryDisposition.WAIT_EXTERNAL,
+                    classify_failure(reason).strategy,
+                    RecoveryStrategy.WAIT_EXTERNAL,
                 )
         self.assertEqual(
-            classify_failure("CHECK_TIMEOUT", budget_exhausted=True).disposition,
-            RecoveryDisposition.WAIT_EXTERNAL,
+            classify_failure("CHECK_TIMEOUT", budget_exhausted=True).strategy,
+            RecoveryStrategy.WAIT_EXTERNAL,
         )
 
     def test_clean_contract_and_review_format_failures_are_recoverable(self) -> None:
         self.assertEqual(
             classify_failure(
                 "AGENT_CONTRACT_MISMATCH", clean_contract_mismatch=True,
-            ).disposition,
-            RecoveryDisposition.CONTRACT_REPAIR,
+            ).strategy,
+            RecoveryStrategy.REPAIR_TARGETED,
         )
         self.assertEqual(
-            classify_failure("REVIEW_PARSE_INVALID").disposition,
-            RecoveryDisposition.CONTRACT_REPAIR,
+            classify_failure("REVIEW_PARSE_INVALID").strategy,
+            RecoveryStrategy.REPAIR_TARGETED,
         )
 
     def test_push_depends_on_remote_authority(self) -> None:
         self.assertEqual(
-            classify_failure("PUSH_FAILED", remote_required=False).disposition,
-            RecoveryDisposition.CONTINUE_WITH_WARNING,
+            classify_failure("PUSH_FAILED", remote_required=False).strategy,
+            RecoveryStrategy.WAIT_EXTERNAL,
         )
         self.assertEqual(
-            classify_failure("PUSH_FAILED", remote_required=True).disposition,
-            RecoveryDisposition.RETRY_SAME,
+            classify_failure("PUSH_FAILED", remote_required=True).strategy,
+            RecoveryStrategy.RETRY_TARGETED,
         )
         self.assertEqual(
             classify_failure(
                 "PUSH_FAILED", remote_required=True, remote_unavailable=True,
-            ).disposition,
-            RecoveryDisposition.WAIT_EXTERNAL,
+            ).strategy,
+            RecoveryStrategy.WAIT_EXTERNAL,
         )
 
     def test_authentication_waits_for_external_change(self) -> None:
         for reason in ("AGENT_AUTH_FAILURE", "LLM_401", "LLM_403", "MISSING_PROVIDER_CREDENTIALS"):
             with self.subTest(reason=reason):
                 decision = classify_failure(reason)
-                self.assertEqual(decision.disposition, RecoveryDisposition.WAIT_EXTERNAL)
+                self.assertEqual(decision.strategy, RecoveryStrategy.WAIT_EXTERNAL)
                 self.assertFalse(decision.consumes_budget)
 
     def test_protocol_planning_workspace_and_transport_failures_are_bounded(self) -> None:
@@ -209,12 +238,12 @@ class RecoveryPolicyTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertTrue(classify_failure(reason).consumes_budget)
         self.assertEqual(
-            classify_failure("PLAN_REPOSITORY_PRECONDITION_INVALID").disposition,
-            RecoveryDisposition.REPLAN,
+            classify_failure("PLAN_REPOSITORY_PRECONDITION_INVALID").strategy,
+            RecoveryStrategy.REPLAN_STEP,
         )
         self.assertEqual(
-            classify_failure("CANDIDATE_REMOTE_UNAVAILABLE").disposition,
-            RecoveryDisposition.CONTINUE_WITH_WARNING,
+            classify_failure("CANDIDATE_REMOTE_UNAVAILABLE").strategy,
+            RecoveryStrategy.WAIT_EXTERNAL,
         )
 
     def test_budgets_have_bounded_durable_defaults(self) -> None:
@@ -367,7 +396,7 @@ class RecoveryLadderTests(unittest.TestCase):
         # Exhaustion no longer collapses onto a flat operator wait: it exposes
         # the following step of the same ladder.
         exhausted = classify_failure("CHECK_FAILED:unit", budget_exhausted=True)
-        self.assertIs(exhausted.disposition, RecoveryDisposition.WAIT_HUMAN)
+        self.assertIs(exhausted.failure_class, FailureClass.CORRECTNESS)
         self.assertIs(exhausted.strategy, RecoveryStrategy.REPLAN_STEP)
         proven = classify_failure(
             "CHECK_FAILED:unit", budget_exhausted=True, proof_required=True,
@@ -540,19 +569,23 @@ class RecoveryLadderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RecoveryFacts(observed_facts=["unit"])
 
-    def test_a_decision_refuses_a_foreign_ladder_vocabulary(self) -> None:
+    def test_a_decision_refuses_any_other_vocabulary_than_a_strategy(self) -> None:
         with self.assertRaises(TypeError):
             RecoveryDecision(
-                RecoveryDisposition.CHECK_REPAIR, "deterministic check failed",
-                True, False, "correctness",
+                "correctness", RecoveryStrategy.REPAIR_TARGETED,
+                "deterministic check failed",
             )
         with self.assertRaises(TypeError):
             RecoveryDecision(
-                RecoveryDisposition.CHECK_REPAIR, "deterministic check failed",
-                True, False, FailureClass.CORRECTNESS, "repair",
+                FailureClass.CORRECTNESS, "repair", "deterministic check failed",
             )
         with self.assertRaises(ValueError):
-            RecoveryDecision(RecoveryDisposition.CHECK_REPAIR, "   ", True, False)
+            RecoveryDecision(FailureClass.CORRECTNESS, RecoveryStrategy.REPAIR_TARGETED, "   ")
+        with self.assertRaises(TypeError):
+            RecoveryDecision(
+                FailureClass.CORRECTNESS, RecoveryStrategy.REPAIR_TARGETED,
+                "deterministic check failed", "yes",
+            )
 
     def test_no_classification_exposes_an_autonomous_step_off_its_ladder(self) -> None:
         fact_cases = (
@@ -571,7 +604,7 @@ class RecoveryLadderTests(unittest.TestCase):
                     decision = classify_failure(code, **facts)
                     if decision.strategy is RecoveryStrategy.HARD_STOP:
                         # A stopped boundary exposes no ladder step at all.
-                        self.assertIs(decision.disposition, RecoveryDisposition.HARD_STOP)
+                        self.assertFalse(decision.consumes_budget)
                         continue
                     self.assertIn(decision.strategy, recovery_ladder(decision.failure_class))
 
@@ -586,11 +619,9 @@ class RecoveryLadderTests(unittest.TestCase):
             for code in ("CHECK_FAILED:unit", "AGENT_CONTRACT_MISMATCH", "LLM_429"):
                 with self.subTest(code=code, facts=facts):
                     decision = classify_failure(code, **facts)
-                    self.assertIs(decision.disposition, RecoveryDisposition.HARD_STOP)
                     self.assertIs(decision.strategy, RecoveryStrategy.HARD_STOP)
         escaped = classify_failure("SEMANTIC_REVISER_UNAVAILABLE", budget_exhausted=True)
         self.assertEqual(escaped.failure_class, FailureClass.EXTERNAL)
-        self.assertIs(escaped.disposition, RecoveryDisposition.HARD_STOP)
         self.assertIs(escaped.strategy, RecoveryStrategy.HARD_STOP)
 
     def test_recovery_facts_are_derived_from_codes_only(self) -> None:

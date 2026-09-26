@@ -52,7 +52,7 @@ from ..resume import (
 )
 from ..result import atomic_write_text
 from ..recovery_policy import (
-    RecoveryDisposition,
+    RecoveryStrategy,
     classify_failure,
 )
 from ..state import RunStateStore
@@ -414,7 +414,7 @@ class GateService:
             _archive_attempt_tree(attempt_dir)
 
         decision = classify_failure(soft[0] if soft else "CHECK_FAILED")
-        if decision.disposition is not RecoveryDisposition.CHECK_REPAIR:
+        if decision.strategy is not RecoveryStrategy.REPAIR_TARGETED:
             raise PipelineFailure("CHECK_REPAIR_NOT_AUTHORIZED", "check failure is not repairable")
         atomic_write_text(
             attempt_dir / "failed_check_evidence_before.json",
@@ -590,7 +590,7 @@ class GateService:
         self.runtime.recovery(store).record(RecoveryAttempt(
             phase="validation", reason="CHECK_FAILED", attempt=attempt,
             budget_key="check_repair_attempts", budget=ctx.options.max_check_repair_attempts,
-            budget_consumed=attempt, disposition=decision.disposition.value,
+            budget_consumed=attempt, strategy=decision.strategy.value,
             operation_id=(
                 f"check-repair:cycle-{number:03d}:{stage.value}:{attempt:02d}"
             ),
