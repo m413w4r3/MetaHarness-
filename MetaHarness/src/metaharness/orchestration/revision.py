@@ -51,6 +51,7 @@ from ..models import (
 )
 from ..planning.check_replan import check_replan_dir
 from ..prompt_contracts import (
+    build_check_repair_payload,
     build_semantic_revision_payload,
     write_prompt_diagnostics,
 )
@@ -61,6 +62,10 @@ from ..state import RunStateStore
 from ..usage import normalize_usage
 from ..validation import config_with_check_authority
 from ..review import ReviewResult
+from .check_failure import (
+    check_repair_problem_context,
+    soft_check_failures,
+)
 from .pipeline_v2 import (
     check_repair_root,
     correction_dir,
@@ -610,6 +615,56 @@ def _revision_prompt(
         mutable_scope=mutable_scope,
         bounded_diff_evidence=bounded_diff_evidence or "NONE\n",
         reviewer_correction_evidence=reviewer_correction_evidence or "NONE\n",
+        template=template,
+        budget_bytes=budget_bytes,
+    )
+    if diagnostics_dir is not None:
+        write_prompt_diagnostics(diagnostics_dir, payload)
+    return payload.rendered
+
+
+def check_repair_prompt(
+    *,
+    spec: str,
+    plan: TaskPlanV2,
+    approved_contract_index: str,
+    changed_files: str,
+    evidence: EvidenceBundle,
+    evidence_dir: Path,
+    repo: Path,
+    worktree: Path,
+    effective_repair_scope: Sequence[str],
+    candidate_identity: str = "",
+    budget_bytes: int = 40_000,
+    diagnostics_dir: str | Path | None = None,
+) -> str:
+    """Build the bounded prompt for one automatic check-repair pass."""
+
+    del plan
+    template = (_PROMPTS_DIR / "check_repair.txt").read_text(encoding="utf-8")
+    failed_ids = soft_check_failures(evidence)
+    problem_context = check_repair_problem_context(
+        evidence, evidence_dir=evidence_dir, repo=repo,
+        worktree=worktree, tree_sha=evidence.staged_tree_sha or "",
+    )
+    try:
+        context_payload = json.loads(problem_context)
+    except (TypeError, json.JSONDecodeError):
+        context_payload = {}
+    readable_paths = context_payload.get("readable_failure_paths", [])
+    read_set = "\n".join(
+        f"- {path} :: named by the failing check output"
+        for path in readable_paths if isinstance(path, str)
+    ) or "Only the bounded failed-check evidence; no repository paths were identified."
+    payload = build_check_repair_payload(
+        spec=spec,
+        failed_check_ids="\n".join(failed_ids) or "NONE",
+        failed_check_evidence=problem_context,
+        read_set=read_set,
+        compact_contract_invariants=approved_contract_index,
+        changed_files=changed_files,
+        mutable_scope=_json_text(list(effective_repair_scope)),
+        candidate_identity=candidate_identity,
         template=template,
         budget_bytes=budget_bytes,
     )

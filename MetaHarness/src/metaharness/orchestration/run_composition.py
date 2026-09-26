@@ -32,11 +32,13 @@ from ..resume import ResumeIntegrityError
 from ..review import Reviewer
 from ..state import RunStateStore
 from .candidate import CandidateLifecycle
-from .check_repair import (
-    CheckRepairLadder, GateAcceptanceService, gate_mutable_authority,
+from .check_failure import (
     hard_integrity_failures,
     soft_check_failures,
 )
+from .check_scope import gate_mutable_authority
+from .gate_acceptance import GateAcceptanceService
+from .gate_recovery import CheckRepairLadder
 from .pipeline_v2 import (
     CyclePlan, PipelineFailure, PipelineV2Context, PipelineV2Operations,
     correction_dir, gate_dir,

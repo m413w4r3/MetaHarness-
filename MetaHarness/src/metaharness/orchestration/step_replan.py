@@ -41,7 +41,7 @@ from ..resume import ResumePhase, read_checkpoint
 from ..state import RunStateStore
 from . import contract_repair
 from .candidate import accepted_chain_records
-from .check_repair import (
+from .check_failure import (
     replan_failure_evidence,
     replan_mismatch,
     replan_problem,

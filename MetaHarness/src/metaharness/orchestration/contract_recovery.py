@@ -65,7 +65,7 @@ from ..repository_topology import RepositoryTopology
 from ..result import atomic_write_text
 from ..state import RunStateStore
 from . import contract_repair
-from .check_repair import replan_slot_origin
+from .check_failure import replan_slot_origin
 from .contract_repair import ContractRepairIntegrityError
 from .pipeline_v2 import PipelineFailure
 from .recovery import (

@@ -20,10 +20,8 @@ from typing import (
     Mapping,
     NoReturn,
 )
-from .check_repair import (
-    _hard_failure_items,
-    gate_mutable_authority,
-)
+from .check_failure import hard_failure_items
+from .check_scope import gate_mutable_authority
 from .pipeline_v2 import (
     candidate_dir,
     check_repair_attempt_dir,
@@ -165,7 +163,7 @@ def _reusable_pre_checks(artifact_dir: Path, tree: str) -> dict[str, Any] | None
     failures = payload.get("failures")
     if not isinstance(failures, list) or any(not isinstance(item, str) for item in failures):
         return None
-    if _hard_failure_items(failures):
+    if hard_failure_items(failures):
         return None
     evidence = _read_json_artifact(artifact_dir / "evidence.json")
     if not isinstance(evidence, dict) or evidence.get("staged_tree_sha") != tree:

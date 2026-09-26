@@ -4,7 +4,8 @@
 the modules in this package are its internal sub-domains and must never
 import it back.  The dependency order is one-way::
 
-    shared <- revision <- check_repair <- resume_validation
+    shared <- check_failure <- check_scope <- gate_recovery, gate_acceptance
+    shared <- revision <- resume_validation, gates
     shared <- candidate, scope_repair
     pipeline_v2 <- recovery <- worker_recovery, check_recovery, review_recovery
     pipeline_v2 <- step_authority <- worker_attempt <- step_execution

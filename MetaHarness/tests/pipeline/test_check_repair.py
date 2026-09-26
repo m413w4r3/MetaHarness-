@@ -14,7 +14,7 @@ from metaharness.evidence import EvidenceBundle
 from metaharness.gitops import candidate_tree_sha
 from metaharness.llm.chat import LLMError
 from metaharness.models import ExecutionRole, GateStage, RunStatus
-from metaharness.orchestration.check_repair import CheckRepairLadder
+from metaharness.orchestration.gate_recovery import CheckRepairLadder
 from metaharness.orchestration.recovery import GateRecoveryStep
 from metaharness.recovery_policy import RecoveryBudgets, RecoveryStrategy
 from metaharness.resume import resume_info

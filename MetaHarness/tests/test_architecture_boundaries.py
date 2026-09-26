@@ -42,7 +42,10 @@ ORCHESTRATOR_MAX_LINES = 500
 ORCHESTRATOR_FORBIDDEN_IMPORTS = (
     "metaharness.planning",
     "metaharness.review",
-    "metaharness.orchestration.check_repair",
+    "metaharness.orchestration.check_failure",
+    "metaharness.orchestration.check_scope",
+    "metaharness.orchestration.gate_acceptance",
+    "metaharness.orchestration.gate_recovery",
 )
 PROTOCOL_MARKERS = (
     "META PLAN", "END META PLAN", "META REVIEW", "CHECK REPAIR", "BEGIN STEP", "END STEP",
@@ -71,10 +74,12 @@ MODULE_MAX_LINES = 900
 # authority learned to read a check-replan's own directory, and the review
 # service keeps its defence-in-depth refusal of an unaffordable rung.
 FROZEN_MODULE_SIZES: Mapping[str, int] = {
-    "orchestration/check_repair.py": 2011,
     "orchestration/resume_validation.py": 1392,
     "orchestration/review_service.py": 1790,
-    "orchestration/revision.py": 1072,
+    # Raised in the check-repair decomposition: the bounded check-repair
+    # prompt moved next to the revision transaction that consumes it, the
+    # module that actually builds and injects it.
+    "orchestration/revision.py": 1104,
 }
 
 PIPELINE_TEST_MAX_LINES = 1000
@@ -94,14 +99,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
     "metaharness.orchestration.check_recovery": {
         "metaharness.orchestration.shared": ('_archive_attempt_tree', '_safe_candidate_tree'),
     },
-    "metaharness.orchestration.check_repair": {
-        "metaharness.orchestration.shared": (
-            "_PROMPTS_DIR",
-            "_is_object_id",
-            "_json_text",
-            "_read_json_artifact",
-        ),
-    },
     "metaharness.orchestration.gates": {
         "metaharness.orchestration.shared": (
             "_CHECK_ATTEMPT_ARTIFACTS",
@@ -116,9 +113,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_record_failure_tree",
             "_safe_candidate_tree",
         ),
-        "metaharness.orchestration.check_repair": (
-            "_SCOPE_REQUEST_SOURCE",
-        ),
     },
     "metaharness.orchestration.publication": {
         "metaharness.orchestration.shared": (
@@ -131,7 +125,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
         "metaharness.orchestration.resume_validation": ('_accepted_review',),
     },
     "metaharness.orchestration.resume_validation": {
-        "metaharness.orchestration.check_repair": ('_hard_failure_items',),
         "metaharness.orchestration.shared": (
             "_MAX_AGENT_REPORT_BYTES",
             "_MAX_STEP_REPORT_BYTES",
@@ -162,9 +155,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
         "metaharness.orchestration.revision": (
             "_bounded_previous_revision_report",
             "_review_payload",
-        ),
-        "metaharness.orchestration.check_repair": (
-            "_check_repair_prompt",
         ),
         "metaharness.orchestration.scope_repair": ('_build_scope_delta',),
         "metaharness.orchestration.resume_validation": (

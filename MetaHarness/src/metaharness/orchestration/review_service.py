@@ -131,18 +131,18 @@ from .revision import (
     ReviewCycleInput,
     RevisionRunner,
     SCOPE_REQUEST_ROUTE,
+    check_repair_prompt,
     _bounded_previous_revision_report,
     _review_payload,
     review_cycle_revision_report,
 )
-from .check_repair import (
-    _check_repair_prompt,
-    hard_integrity_failures,
+from .check_failure import (
     check_failure_proofs,
-    consumed_ladder_strategies,
-    gate_mutable_authority,
+    hard_integrity_failures,
     soft_check_failures,
 )
+from .check_scope import gate_mutable_authority
+from .gate_recovery import consumed_ladder_strategies
 from .recovery import GateRecoveryStep, RecoveryStepUnavailable
 from .scope_repair import (
     _build_scope_delta,
@@ -1684,7 +1684,7 @@ class ReviewService:
             reusable_pre_checks=_reusable_pre_checks,
             hard_integrity_failures=hard_integrity_failures,
             soft_check_failures=soft_check_failures,
-            check_repair_prompt=_check_repair_prompt,
+            check_repair_prompt=check_repair_prompt,
         )
     def _run_v2_revision_cycle(
         self, *, cycle: int, check_repair_attempt: int | None = None, **request: Any,

@@ -72,12 +72,14 @@ from .shared import (
 from .revision import (
     SCOPE_REQUEST_ROUTE,
 )
-from .check_repair import (
+from .check_failure import (
     CheckRepairAttempt,
-    CheckRepairCoordinator,
-    _SCOPE_REQUEST_SOURCE,
-    gate_mutable_authority,
     soft_check_failures,
+)
+from .check_scope import (
+    CheckRepairCoordinator,
+    SCOPE_REQUEST_SOURCE,
+    gate_mutable_authority,
 )
 from .pipeline_v2 import (
     CyclePlan,
@@ -358,7 +360,7 @@ class GateService:
                 effective_repair_scope=effective,
                 policy=scope.policy,
                 bound=scope.bound,
-                source=(_SCOPE_REQUEST_SOURCE if added else scope.source),
+                source=(SCOPE_REQUEST_SOURCE if added else scope.source),
             )
 
         def persist_scope(value: CheckRepairScope) -> None:

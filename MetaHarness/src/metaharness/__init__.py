@@ -121,7 +121,7 @@ from .integrations.github import (
     GitHubWorkstreamError,
     NullGitHubWorkstreamClient,
 )
-from .orchestration.check_repair import CheckRepairAttempt
+from .orchestration.check_failure import CheckRepairAttempt
 from .review import Reviewer, ReviewParseError, ReviewResult, parse_review
 from .result import RunResult
 from .run_options import (
