@@ -23,6 +23,10 @@ from metaharness.agent import (
     executor_for_profile,
 )
 from metaharness.agent.base import AgentResult
+from metaharness.agent.protocol import (
+    CheckRepairResult,
+    parse_check_repair_result,
+)
 from metaharness.models import ExecutionRole, ModelProfile, ProfileDriver, SelectionMode
 from metaharness.orchestrator import Orchestrator, ResumeError
 from metaharness.resume import pipeline_version_from_state
@@ -135,6 +139,45 @@ class AgentExecutionContractTests(unittest.TestCase):
                 result = CodexExecutor(selected, runtime, agent=_CodexDouble(error)).run(self.request)
                 self.assertEqual(result.exit_reason, expected)
                 self.assertEqual(result.status, "failed")
+
+
+class CheckRepairProtocolTests(unittest.TestCase):
+    """The strict check-repair result the repair worker must end with."""
+
+    @staticmethod
+    def result(
+        result: str = "DONE", targeted_check: str = "PASS", blocked_kind: str = "NONE",
+        note: str = "targeted test ran and failed",
+    ) -> str:
+        return (
+            "META CHECK REPAIR RESULT v1\n\n"
+            f"RESULT\n{result}\n\n"
+            f"TARGETED_CHECK\n{targeted_check}\n\n"
+            f"BLOCKED_KIND\n{blocked_kind}\n\n"
+            f"NOTE\n{note}\n"
+            "END META CHECK REPAIR RESULT\n"
+        )
+
+    def test_check_repair_result_parser_requires_one_final_strict_block(self) -> None:
+        valid = self.result()
+        self.assertEqual(
+            parse_check_repair_result("worker summary\n\n" + valid),
+            CheckRepairResult("DONE", "PASS", "NONE", "targeted test ran and failed"),
+        )
+        blocked = self.result(
+            "BLOCKED", "NOT_RUN", "INFRASTRUCTURE", "Docker daemon unavailable",
+        )
+        self.assertIsNotNone(parse_check_repair_result(blocked))
+        for invalid in (
+            valid + valid,
+            valid + "extra text\n",
+            valid.replace("PASS\n", "MAYBE\n"),
+            valid.replace("NONE\n\nNOTE", "INFRASTRUCTURE\n\nNOTE"),
+            blocked.replace("INFRASTRUCTURE", "NONE"),
+            valid.replace("NOTE\ntargeted test ran and failed", "NOTE\n"),
+        ):
+            with self.subTest(invalid=invalid[:80]):
+                self.assertIsNone(parse_check_repair_result(invalid))
 
 
 if __name__ == "__main__":

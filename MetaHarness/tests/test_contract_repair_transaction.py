@@ -14,8 +14,8 @@ from metaharness.orchestration.pipeline_v2 import PipelineFailure
 from metaharness.orchestration import contract_repair
 from metaharness.resume import resume_info
 from metaharness.run_options import RunOptions
+from tests.pipeline.support import SPEC, STEP, repaired_step_contract
 from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
-from tests.test_pipeline_v2_machine import SPEC, STEP, repaired_step_contract
 
 OUTAGE = "LLM endpoint returned HTTP 503 after 3 attempt(s)"
 REPAIR_ID = "contract-repair:cycle-001:S01:01"

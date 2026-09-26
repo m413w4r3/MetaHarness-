@@ -11,6 +11,7 @@ Usage::
     python scripts/test_parallel.py            # min(cpu_count, 8) workers
     python scripts/test_parallel.py -j 4
     python scripts/test_parallel.py test_state test_procutil
+    python scripts/test_parallel.py pipeline/test_lifecycle pipeline.test_check_repair
 
 The exit status is non-zero as soon as one module fails.
 """
@@ -56,17 +57,32 @@ class ModuleResult:
         return sum(int(n) for k, n in _COUNTS.findall(self.summary_line) if k == kind)
 
 
+def _module_key(path: Path) -> str:
+    """The dotted module path of one test file, relative to ``tests``."""
+
+    return path.relative_to(TESTS).with_suffix("").as_posix().replace("/", ".")
+
+
 def discover(selected: list[str]) -> list[str]:
-    modules = sorted(TESTS.glob("test_*.py"), key=lambda path: path.stat().st_size, reverse=True)
-    names = [path.stem for path in modules]
+    modules = sorted(TESTS.rglob("test_*.py"), key=lambda path: path.stat().st_size, reverse=True)
+    names = [_module_key(path) for path in modules]
     if selected:
-        wanted = {name.removeprefix("tests.").removesuffix(".py") for name in selected}
+        wanted = {_selection_key(name) for name in selected}
         unknown = wanted - set(names)
         if unknown:
             raise SystemExit(f"unknown test modules: {', '.join(sorted(unknown))}")
         names = [name for name in names if name in wanted]
     # Largest files first: long modules start early and do not end the run alone.
     return names
+
+
+def _selection_key(value: str) -> str:
+    """Accept ``test_x``, ``tests/test_x.py`` and ``pipeline/test_x`` alike."""
+
+    text = value.strip().replace("\\", "/").removesuffix(".py")
+    while text.startswith("tests/") or text.startswith("tests."):
+        text = text.split("/", 1)[1] if text.startswith("tests/") else text[6:]
+    return text.replace("/", ".")
 
 
 def run_module(module: str, verbose: bool) -> ModuleResult:

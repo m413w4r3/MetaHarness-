@@ -23,9 +23,9 @@ from metaharness.planning.protocol import (
 from metaharness.orchestration import contract_repair
 from metaharness.resume import ResumeNotAllowedError, resume_info
 from metaharness.run_options import RunOptions
+from tests.pipeline.support import SPEC, STEP, repaired_step_contract
 from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
 from tests.test_contract_repair_transaction import OUTAGE, REPAIR_ID, ContractRepairFixtures, mismatch
-from tests.test_pipeline_v2_machine import SPEC, STEP, repaired_step_contract
 
 FIXTURES = (
     "frontend/src/components/ProductionStateTransfer.test.tsx",

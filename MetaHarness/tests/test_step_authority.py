@@ -21,10 +21,10 @@ from metaharness.orchestrator import Orchestrator
 from metaharness.repository_topology import RepositoryTopology
 from metaharness.resume import resume_info
 from metaharness.run_options import RunOptions
+from tests.pipeline.support import repaired_step_contract
 from tests.pipeline_support import (
     PipelineHarness, ScriptedChat, check_repair_result, git, plan, review,
 )
-from tests.test_pipeline_v2_machine import repaired_step_contract
 
 SPEC = "Make feature.txt good.\n"
 EDITION = "frontend/src/features/edition-dashboard/EditionDashboard.test.tsx"

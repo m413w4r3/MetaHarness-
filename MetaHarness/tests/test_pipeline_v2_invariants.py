@@ -344,5 +344,17 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
         )
 
 
+class PipelineV2SourceInvariantTests(unittest.TestCase):
+    """The v2 coordinator source names no concrete backend or provider."""
+
+    def test_the_v2_coordinator_source_stays_backend_neutral(self) -> None:
+        source = (
+            Path(__file__).parents[1]
+            / "src" / "metaharness" / "orchestration" / "pipeline_v2.py"
+        ).read_text(encoding="utf-8")
+        for forbidden in ("CodexAgent", "ClaudeCodeAgent", "C01", "C02"):
+            self.assertNotIn(forbidden, source)
+
+
 if __name__ == "__main__":
     unittest.main()
