@@ -9,6 +9,9 @@ its recovery loop onto one durable run status.
 It never runs a model, interprets the SPEC, chooses a mutable scope, repairs a
 tree or touches an authority artifact: phase services own those actions and
 ask this coordinator only whether a bounded automatic recovery is admitted.
+Its ladder vocabulary stays inside
+:mod:`metaharness.recovery_policy`: this module only projects a ladder terminal
+onto the durable run status that waits after it.
 """
 
 from __future__ import annotations
@@ -17,7 +20,14 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Collection, Mapping
 
 from ..models import RunStatus
-from ..recovery_policy import RecoveryDecision, RecoveryDisposition, classify_failure
+from ..recovery_policy import (
+    FailureClass,
+    RecoveryDecision,
+    RecoveryDisposition,
+    RecoveryStrategy,
+    classify_failure,
+    failure_class_for,
+)
 from ..resume import ResumePhase
 from ..state import RunStateStore
 from .pipeline_v2 import PipelineFailure
@@ -97,6 +107,34 @@ def terminal_state_for(
             status = RunStatus.WAITING_EXTERNAL
         return RecoveryTerminalState(status, True, decision.reason)
     raise ValueError(f"recovery disposition {decision.disposition} is not terminal")
+
+
+# Terminal ladder steps only: an autonomous step is executed inside its own
+# recovery loop and can never cross this boundary.
+_TERMINAL_DISPOSITIONS = {
+    RecoveryStrategy.HARD_STOP: RecoveryDisposition.HARD_STOP,
+    RecoveryStrategy.WAIT_HUMAN: RecoveryDisposition.WAIT_HUMAN,
+    RecoveryStrategy.WAIT_EXTERNAL: RecoveryDisposition.WAIT_EXTERNAL,
+}
+
+
+def strategy_terminal_state(
+    strategy: RecoveryStrategy, *, failure_code: str, phase: ResumePhase,
+) -> RecoveryTerminalState:
+    """Project one ladder terminal onto the durable status that waits after it.
+
+    An autonomous step is refused: the ladder may only end a run on a terminal
+    step the existing authority already allowed for that failure code.
+    """
+
+    if not isinstance(strategy, RecoveryStrategy) or not strategy.terminal:
+        raise ValueError(f"recovery strategy {strategy!r} is not terminal")
+    decision = RecoveryDecision(
+        _TERMINAL_DISPOSITIONS[strategy],
+        "recovery ladder reached a terminal step", False, False,
+        failure_class_for(failure_code), strategy,
+    )
+    return terminal_state_for(decision, failure_code=failure_code, phase=phase)
 
 
 def project_exit(
@@ -354,6 +392,7 @@ class RecoveryCoordinator:
         decision = RecoveryDecision(
             RecoveryDisposition.FALLBACK_EXECUTOR,
             "primary executor transient retry budget exhausted", True, False,
+            FailureClass.EXTERNAL, RecoveryStrategy.FALLBACK_EXECUTOR,
         )
         self.trace(
             "recovery.executor_selected", reason=reason, decision=decision,
@@ -436,5 +475,6 @@ class RecoveryCoordinator:
 __all__ = [
     "MAX_RECOVERY_ATTEMPT_RECORDS", "RecoveryAdmission", "RecoveryAttempt",
     "RecoveryCoordinator", "RecoveryTerminalState", "failure_code",
-    "normalize_exit_reason", "project_exit", "terminal_state_for",
+    "normalize_exit_reason", "project_exit", "strategy_terminal_state",
+    "terminal_state_for",
 ]

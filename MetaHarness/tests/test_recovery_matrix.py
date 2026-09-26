@@ -26,18 +26,29 @@ from metaharness.orchestration.pipeline_v2 import PipelineFailure
 from metaharness.orchestration.recovery import (
     RecoveryCoordinator,
     project_exit,
+    strategy_terminal_state,
+    terminal_state_for,
 )
-from metaharness.recovery_policy import RecoveryDisposition as D, classify_failure
+from metaharness.recovery_policy import (
+    FailureClass,
+    RecoveryFacts,
+    RecoveryProgression,
+    RecoveryStrategy,
+    classify_failure,
+    recovery_ladder,
+)
+from metaharness.recovery_policy import RecoveryDisposition as D
 from metaharness.resume import (
     CHECKPOINT_INTEGRITY_OPERATION,
     RUN_SCHEMA_UNSUPPORTED,
     ResumeNotAllowedError,
-    ResumePhase as P,
     resume_info,
 )
+from metaharness.resume import (
+    ResumePhase as P,
+)
 from metaharness.state import RunStateStore
-
-from pipeline_support import PipelineHarness, initial_plan, review, write
+from tests.pipeline_support import PipelineHarness, initial_plan, review, write
 
 SPEC = "Make feature.txt good.\n"
 STEP = ("S01", "feature.txt", "Write the feature")
@@ -139,6 +150,103 @@ class RecoveryMatrixTests(unittest.TestCase):
         decision, terminal = project_exit("SEMANTIC_REVISER_UNAVAILABLE", phase=P.SEMANTIC_REVISION)
         self.assertIs(decision.disposition, D.HARD_STOP)
         self.assertIs(terminal.status, RunStatus.FAILED)
+
+
+# (name, code, facts, failure class, next strategy, exit phase, exit status)
+# ``None`` status: the ladder step is executed inside its loop, never at exit.
+LADDER_MATRIX = (
+    ("check failed", "CHECK_FAILED:unit", {}, FailureClass.CORRECTNESS, RecoveryStrategy.REPAIR_TARGETED, P.DETERMINISTIC_GATE, None),
+    ("check repair exhausted", "CHECK_FAILED:unit", {"budget_exhausted": True}, FailureClass.CORRECTNESS, RecoveryStrategy.REPLAN_STEP, P.DETERMINISTIC_GATE, None),
+    ("check repair with proof", "CHECK_FAILED:unit", {"budget_exhausted": True, "proof_required": True}, FailureClass.CORRECTNESS, RecoveryStrategy.EXPAND_SCOPE, P.DETERMINISTIC_GATE, None),
+    ("review evidence retry", "REVIEW_EVIDENCE_RETRY", {}, FailureClass.CORRECTNESS, RecoveryStrategy.EXPAND_SCOPE, P.FINAL_REVIEW, None),
+    ("review evidence unresolved", "REVIEW_EVIDENCE_UNRESOLVED", {}, FailureClass.CORRECTNESS, RecoveryStrategy.EXPAND_SCOPE, P.FINAL_REVIEW, None),
+    ("clean contract mismatch", "AGENT_CONTRACT_MISMATCH", {"clean_contract_mismatch": True}, FailureClass.CONTRACT, RecoveryStrategy.REPAIR_TARGETED, P.IMPLEMENT_STEP, None),
+    ("contract mismatch replan", "AGENT_CONTRACT_MISMATCH", {}, FailureClass.CONTRACT, RecoveryStrategy.REPLAN_STEP, P.IMPLEMENT_STEP, None),
+    ("contract repair exhausted", "AGENT_CONTRACT_MISMATCH", {"clean_contract_mismatch": True, "budget_exhausted": True}, FailureClass.CONTRACT, RecoveryStrategy.REPLAN_STEP, P.IMPLEMENT_STEP, None),
+    ("planner format", "PLANNER_FORMAT_INVALID", {}, FailureClass.MODEL_PROTOCOL, RecoveryStrategy.RETRY_TARGETED, P.PLANNER, None),
+    ("planner correction exhausted", "PLANNER_FORMAT_INVALID", {"budget_exhausted": True}, FailureClass.MODEL_PROTOCOL, RecoveryStrategy.WAIT_HUMAN, P.PLANNER, RunStatus.WAITING_HUMAN),
+    ("transient provider", "LLM_503", {}, FailureClass.EXTERNAL, RecoveryStrategy.RETRY_TARGETED, P.FINAL_REVIEW, None),
+    ("executor fallback", "AGENT_RUNTIME_FAILED", {"fallback_executor_available": True}, FailureClass.EXTERNAL, RecoveryStrategy.FALLBACK_EXECUTOR, P.IMPLEMENT_STEP, None),
+    ("persistent provider outage", "LLM_503", {"budget_exhausted": True}, FailureClass.EXTERNAL, RecoveryStrategy.WAIT_EXTERNAL, P.FINAL_REVIEW, RunStatus.WAITING_EXTERNAL),
+    ("missing credentials", "AGENT_AUTH_FAILURE", {}, FailureClass.EXTERNAL, RecoveryStrategy.WAIT_EXTERNAL, P.IMPLEMENT_STEP, RunStatus.WAITING_EXTERNAL),
+    ("product decision", "SPEC_DECISION_REQUIRED", {}, FailureClass.SPEC_DECISION, RecoveryStrategy.WAIT_HUMAN, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
+    ("policy decision", "SECURITY_POLICY_DECISION_REQUIRED", {}, FailureClass.SECURITY, RecoveryStrategy.WAIT_HUMAN, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
+    ("secret in diff", "SECRET_IN_DIFF", {}, FailureClass.SECURITY, RecoveryStrategy.HARD_STOP, P.DETERMINISTIC_GATE, RunStatus.FAILED),
+    ("tree mismatch", "TREE_MISMATCH", {}, FailureClass.INTEGRITY, RecoveryStrategy.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
+    ("scope violation", "AGENT_SCOPE_VIOLATION", {}, FailureClass.AUTHORITY, RecoveryStrategy.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
+    ("scope approval required", "REPAIR_SCOPE_APPROVAL_REQUIRED", {}, FailureClass.AUTHORITY, RecoveryStrategy.WAIT_HUMAN, P.SEMANTIC_REVISION, RunStatus.WAITING_HUMAN),
+    ("unknown failure code", "TOTALLY_NEW_FAILURE", {}, FailureClass.UNKNOWN, RecoveryStrategy.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
+)
+
+
+class LadderMatrixTests(unittest.TestCase):
+    """Each ladder row states its class, its next step and its exit status."""
+
+    def test_each_row_exposes_its_class_and_next_strategy(self) -> None:
+        for name, code, facts, failure_class, strategy, phase, status in LADDER_MATRIX:
+            with self.subTest(failure=name):
+                decision = classify_failure(code, **facts)
+                self.assertIs(decision.failure_class, failure_class)
+                self.assertIs(decision.strategy, strategy)
+                self.assertIn(strategy, recovery_ladder(failure_class))
+                if status is None:
+                    with self.assertRaises(ValueError):
+                        strategy_terminal_state(strategy, failure_code=code, phase=phase)
+                    continue
+                self.assertEqual(
+                    strategy_terminal_state(strategy, failure_code=code, phase=phase).status,
+                    status,
+                )
+                # The ladder terminal and the disposition projection agree on
+                # the durable outcome they project.
+                self.assertEqual(
+                    strategy_terminal_state(strategy, failure_code=code, phase=phase).status,
+                    terminal_state_for(decision, failure_code=code, phase=phase).status,
+                )
+
+    def test_check_failed_walks_its_ladder_before_a_human_wait(self) -> None:
+        tree = "a" * 40
+        facts = RecoveryFacts(
+            candidate_tree=tree, proof_required=True, fallback_executor_available=True,
+        )
+        progression = RecoveryProgression()
+        walked = []
+        while True:
+            strategy = progression.next_strategy(
+                candidate_tree=tree, failure_class=FailureClass.CORRECTNESS,
+                facts=facts, code="CHECK_FAILED:unit",
+            )
+            walked.append(strategy)
+            if strategy.terminal:
+                break
+            progression.consume(
+                candidate_tree=tree, failure_class=FailureClass.CORRECTNESS,
+                facts=facts, strategy=strategy,
+            )
+        self.assertEqual(walked, [
+            RecoveryStrategy.REPAIR_TARGETED, RecoveryStrategy.EXPAND_SCOPE,
+            RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.REPLAN_CYCLE,
+            RecoveryStrategy.FALLBACK_EXECUTOR, RecoveryStrategy.WAIT_HUMAN,
+        ])
+        terminal = strategy_terminal_state(
+            walked[-1], failure_code="CHECK_FAILED:unit", phase=P.DETERMINISTIC_GATE,
+        )
+        self.assertEqual((terminal.status, terminal.resumable), (RunStatus.WAITING_HUMAN, False))
+        # The same fingerprint never proposes a consumed step again.
+        self.assertIs(
+            progression.next_strategy(
+                candidate_tree=tree, failure_class=FailureClass.CORRECTNESS,
+                facts=facts, code="CHECK_FAILED:unit",
+            ),
+            RecoveryStrategy.WAIT_HUMAN,
+        )
+
+    def test_boundary_classes_never_expose_an_autonomous_step(self) -> None:
+        for code in ("SECRET_IN_DIFF", "TREE_MISMATCH", "AGENT_SCOPE_VIOLATION"):
+            with self.subTest(code=code):
+                decision = classify_failure(code)
+                self.assertTrue(all(step.terminal for step in recovery_ladder(decision.failure_class)))
+                self.assertTrue(decision.strategy.terminal)
 
 
 class RecoveryCoordinatorTests(unittest.TestCase):
