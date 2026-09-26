@@ -186,7 +186,7 @@ class Orchestrator:
             options_sha256 = write_run_options(run_dir, run_options)
             store = RunStateStore(run_dir / "state.json")
             store.initialize(selected_run_id, pipeline_version=2)
-            self._runtime.begin_trace(run_dir, selected_run_id, created=True)
+            self._runtime.observability.begin_trace(run_dir, selected_run_id, created=True)
             # This is the first durable boundary.  It intentionally carries
             # no Git/plan identity yet: context and repository discovery are
             # themselves resumable operations.
@@ -213,7 +213,7 @@ class Orchestrator:
             )
             if on_created is not None:
                 on_created(run_dir)
-            return self._runtime.diagnose_result(
+            return self._runtime.observability.diagnose_result(
                 self._execute(store, run_dir, selected_run_id, spec_content)
             )
         except KeyboardInterrupt:
@@ -222,13 +222,13 @@ class Orchestrator:
             state = store.update(
                 status=RunStatus.INTERRUPTED,
                 failure={"reason": "INTERRUPTED"},
-                **self._runtime.closing_step_fields(store, "interrupted"),
+                **self._runtime.failure.closing_step_fields(store, "interrupted"),
             )
-            return self._runtime.diagnose_result(RunResult(run_dir, RunStatus.INTERRUPTED, state))
+            return self._runtime.observability.diagnose_result(RunResult(run_dir, RunStatus.INTERRUPTED, state))
         except Exception as exc:
             if store is None:
                 raise
-            return self._runtime.diagnose_result(self._runtime.project_exception(store, run_dir, exc))
+            return self._runtime.observability.diagnose_result(self._runtime.failure.project_exception(store, run_dir, exc))
 
     def _execute(
         self,
@@ -278,7 +278,7 @@ class Orchestrator:
         self._runtime.write_checkpoint(
             run_dir, ResumePhase.PLANNER, head=base_sha, tree=base_tree_sha
         )
-        outcome = self._runtime.execute_v2(
+        outcome = self._runtime.composition.execute_v2(
             store, run_dir, run_id, spec, repo, base_sha, context,
             repository_reference,
         )
@@ -294,9 +294,9 @@ class Orchestrator:
         """Run the generic coordinator and project a failure that left it."""
 
         engine = PipelineV2Coordinator(
-            pipeline, self._runtime.pipeline_operations(store),
+            pipeline, self._runtime.composition.pipeline_operations(store),
         )
-        return self._runtime.run_pipeline(store, pipeline, start, engine, resumed=resumed)
+        return self._runtime.failure.run_pipeline(store, pipeline, start, engine, resumed=resumed)
 
     def resume(
         self, run_id: str, *, on_claimed: Callable[[Path], None] | None = None,
@@ -333,7 +333,7 @@ class Orchestrator:
         except RunOptionsError as exc:
             raise ResumeNotAllowedError("run options are missing or invalid") from exc
         self._runtime.secrets = config_secret_values(self._runtime.config, self._runtime.environment)
-        self._runtime.begin_trace(run_dir, selected, created=False)
+        self._runtime.observability.begin_trace(run_dir, selected, created=False)
         eligibility = resume_info(run_dir, state)
         if eligibility.operation in {
             CHECKPOINT_INTEGRITY_OPERATION, CHECK_REPAIR_INTEGRITY_OPERATION,
@@ -346,7 +346,7 @@ class Orchestrator:
                         "previous_failure": state.get("failure")},
                 current_step=None,
             )
-            return self._runtime.diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
+            return self._runtime.observability.diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
         if not eligibility.resumable:
             raise ResumeNotAllowedError(eligibility.reason or "run is not resumable")
         try:
@@ -369,7 +369,7 @@ class Orchestrator:
             ResumePhase.CONTEXT, ResumePhase.PLANNER,
             ResumePhase.PLAN_APPROVAL, ResumePhase.WORKTREE_SETUP,
         }:
-            return self._runtime.diagnose_result(self._runtime.resume_pre_execution(
+            return self._runtime.observability.diagnose_result(self._runtime.bootstrap.resume_pre_execution(
                 store, run_dir, selected, state, checkpoint, record,
                 on_claimed=on_claimed,
             ))
@@ -384,7 +384,7 @@ class Orchestrator:
                 exc.code, redact(str(exc), self._runtime.secrets),
                 resume={**record, "status": "refused"}, current_step=None,
             )
-            return self._runtime.diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
+            return self._runtime.observability.diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
         claimed = store.transition_if(
             state.get("status", RunStatus.FAILED), state.get("updated_at"),
             status=PHASE_STATUS[checkpoint.phase], failure=None, current_step=None,
@@ -398,7 +398,7 @@ class Orchestrator:
         try:
             if resumed.restore_paths:
                 self._runtime.restore_checkpoint_tree(resumed)
-            pipeline = self._runtime.pipeline_context(
+            pipeline = self._runtime.composition.pipeline_context(
                 run_dir=run_dir, run_id=selected, spec=resumed.spec,
                 context=resumed.context, repo=resumed.info.source_repo,
                 info=resumed.info, base_sha=resumed.info.base_sha,
@@ -406,24 +406,24 @@ class Orchestrator:
                 repository_reference=resumed.repository_reference,
                 plan=resumed.plan, bundle=resumed.bundle, selection=resumed.selection,
             )
-            return self._runtime.diagnose_result(
+            return self._runtime.observability.diagnose_result(
                 self._run_pipeline(store, pipeline, checkpoint, resumed=True)
             )
         except (ResumeIntegrityError, ResumeRequiresOperatorError) as exc:
             failed = store.record_failure(
                 exc.code, redact(str(exc), self._runtime.secrets),
-                **self._runtime.closing_step_fields(store, "failed"),
+                **self._runtime.failure.closing_step_fields(store, "failed"),
             )
-            return self._runtime.diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
+            return self._runtime.observability.diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
         except KeyboardInterrupt:
             interrupted = store.update(
                 status=RunStatus.INTERRUPTED,
                 failure={"reason": "INTERRUPTED"},
-                **self._runtime.closing_step_fields(store, "interrupted"),
+                **self._runtime.failure.closing_step_fields(store, "interrupted"),
             )
-            return self._runtime.diagnose_result(RunResult(run_dir, RunStatus.INTERRUPTED, interrupted))
+            return self._runtime.observability.diagnose_result(RunResult(run_dir, RunStatus.INTERRUPTED, interrupted))
         except Exception as exc:
-            return self._runtime.diagnose_result(self._runtime.project_exception(store, run_dir, exc))
+            return self._runtime.observability.diagnose_result(self._runtime.failure.project_exception(store, run_dir, exc))
 
     def recover_plan(
         self, run_id: str, replacement_raw: str, *,

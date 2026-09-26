@@ -140,11 +140,11 @@ from .revision import (
 )
 from .check_repair import (
     _check_repair_prompt,
-    _hard_integrity_failures,
+    hard_integrity_failures,
     check_failure_proofs,
     consumed_ladder_strategies,
     gate_mutable_authority,
-    _soft_check_failures,
+    soft_check_failures,
 )
 from .recovery import GateRecoveryStep, RecoveryStepUnavailable
 from .scope_repair import (
@@ -166,8 +166,8 @@ from .pipeline_v2 import (
 from .worker_recovery import safe_scope_request_path
 from .resume_validation import (
     _accepted_review,
-    _load_evidence,
-    _load_revision,
+    load_evidence,
+    load_revision,
     _read_planner_conversation,
     _reusable_pre_checks,
     candidate_evidence,
@@ -361,7 +361,7 @@ def _check_replan_facts(
     return CheckReplanFacts(
         cycle=cycle, stage=stage.value, candidate_tree_sha=tree,
         failed_check_ids=tuple(
-            item.split(":", 1)[1] for item in _soft_check_failures(evidence) if ":" in item
+            item.split(":", 1)[1] for item in soft_check_failures(evidence) if ":" in item
         ),
         plan_identity_before=plan_identity(cycle_plan.plan),
         approved_mutable_envelope=tuple(approved_scope),
@@ -424,7 +424,7 @@ class ReviewService:
             raise ResumeIntegrityError(
                 f"cycle {cycle.number:03d} does not start from the reviewed candidate"
             )
-        previous_plan = self.runtime.cycle_plan(ctx, previous)
+        previous_plan = self.runtime.composition.cycle_plan(ctx, previous)
         return CyclePlan(
             cycle=cycle,
             plan=previous_plan.plan,
@@ -442,7 +442,7 @@ class ReviewService:
             # The red gate's own planning transaction already produced this
             # decomposition; a cycle boundary only reloads and verifies it, so
             # no second planner call can ever happen for one replan.
-            return self.runtime.load_plan_correction(ctx, cycle)
+            return self.runtime.composition.load_plan_correction(ctx, cycle)
         previous = cycle.number - 1
         repair_dir = correction_dir(ctx.run_dir, cycle)
         repair_dir.mkdir(parents=True, exist_ok=True)
@@ -466,7 +466,7 @@ class ReviewService:
         planner_profile = profile_for_role(
             self.runtime.config, ctx.selection.planner.profile_id, ExecutionRole.PLANNER
         )
-        approved_scope = self.runtime.approved_scope_before(ctx, cycle.number)
+        approved_scope = self.runtime.composition.approved_scope_before(ctx, cycle.number)
         store.update(status=RunStatus.PLANNING, current_step=None)
         current_state = _json_text({
             "BASE_SHA": ctx.base_sha,
@@ -477,7 +477,7 @@ class ReviewService:
         })
         planner = RepairPlannerV2(
             self.runtime.planner_client or chat_client(
-                build_llm_endpoint(planner_profile), self.runtime.environment, self.runtime.trace_transport
+                build_llm_endpoint(planner_profile), self.runtime.environment, self.runtime.observability.trace_transport
             ),
             planning=self.runtime.config.planning,
             check_catalog=self.runtime.config.check_catalog,
@@ -494,15 +494,15 @@ class ReviewService:
             and immutable_commit_web_url(ctx.repository_reference, head) is not None
             and compare_commits_web_url(ctx.repository_reference, ctx.base_sha, head) is not None
         )
-        started_at, started_mono = self.runtime.trace_time(), time.perf_counter()
-        planner_selected = self.runtime.trace_selected_profile(
+        started_at, started_mono = self.runtime.observability.trace_time(), time.perf_counter()
+        planner_selected = self.runtime.observability.trace_selected_profile(
             ctx.selection.planner.profile_id, ExecutionRole.PLANNER
         )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "plan.started", phase="planning", cycle=cycle.number,
             data={
                 "kind": cycle.kind.value, "tree_before": tree_before,
-                "session": self.runtime.trace_session(
+                "session": self.runtime.observability.trace_session(
                     profile=planner_profile, selected=planner_selected,
                     role=ExecutionRole.PLANNER, prompt_bytes=None,
                     started_at=started_at, started_mono=started_mono,
@@ -526,7 +526,7 @@ class ReviewService:
                 ),
                 previous_cycle_checks=_json_text(_repair_checks_payload(evidence)),
                 previous_revision_report=_bounded_previous_revision_report(
-                    review_cycle_revision_report(ctx.run_dir, previous, _load_revision) or "NONE"
+                    review_cycle_revision_report(ctx.run_dir, previous, load_revision) or "NONE"
                 ),
                 original_approved_mutable_scope=_json_text(approved_scope),
                 reviewer_result=_json_text(_review_payload(review)),
@@ -537,11 +537,11 @@ class ReviewService:
             raise PipelineFailure(exc.code, bounded_parse_detail(exc)) from exc
         except V2PlanParseError as exc:
             raise PipelineFailure("PLANNER_OUTPUT_INVALID", bounded_parse_detail(exc)) from exc
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "plan.completed", phase="planning", cycle=cycle.number,
             data={
                 "kind": cycle.kind.value, "decision": plan.decision.value, "title": plan.title,
-                "session": self.runtime.trace_finished_model_session(
+                "session": self.runtime.observability.trace_finished_model_session(
                     profile=planner_profile, selected=planner_selected,
                     role=ExecutionRole.PLANNER,
                     prompt_bytes=(
@@ -565,7 +565,7 @@ class ReviewService:
         self._authorize_correction_scope(
             store, ctx, cycle, plan, bundle_sha, candidate["commit_sha"], review, approved_scope,
         )
-        return self.runtime.correction_cycle_plan(
+        return self.runtime.composition.correction_cycle_plan(
             ctx, cycle, plan, bundle, bundle_sha, creating=True,
         )
     def _authorize_correction_scope(
@@ -682,7 +682,7 @@ class ReviewService:
         directory = check_replan_dir(ctx.run_dir, cycle.number)
         facts = _check_replan_facts(
             ctx=ctx, cycle_plan=cycle_plan, cycle=cycle.number, stage=stage,
-            evidence=evidence, approved_scope=self.runtime.approved_scope_before(
+            evidence=evidence, approved_scope=self.runtime.composition.approved_scope_before(
                 ctx, cycle.number,
             ),
         )
@@ -690,15 +690,15 @@ class ReviewService:
             self.runtime.config, ctx.selection.planner.profile_id, ExecutionRole.PLANNER
         )
         store.update(status=RunStatus.PLANNING, current_step=None)
-        started_at, started_mono = self.runtime.trace_time(), time.perf_counter()
-        selected = self.runtime.trace_selected_profile(
+        started_at, started_mono = self.runtime.observability.trace_time(), time.perf_counter()
+        selected = self.runtime.observability.trace_selected_profile(
             ctx.selection.planner.profile_id, ExecutionRole.PLANNER
         )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "plan.started", phase="planning", cycle=cycle.number,
             data={
                 "kind": cycle.kind.value, "tree_before": facts.candidate_tree_sha,
-                "session": self.runtime.trace_session(
+                "session": self.runtime.observability.trace_session(
                     profile=profile, selected=selected, role=ExecutionRole.PLANNER,
                     prompt_bytes=None, started_at=started_at, started_mono=started_mono,
                     tree_before=facts.candidate_tree_sha,
@@ -709,7 +709,7 @@ class ReviewService:
             plan = CheckReplanTransaction(
                 client=self.runtime.planner_client or chat_client(
                     build_llm_endpoint(profile), self.runtime.environment,
-                    self.runtime.trace_transport,
+                    self.runtime.observability.trace_transport,
                 ),
                 artifacts_dir=directory,
                 planning=self.runtime.config.planning,
@@ -723,11 +723,11 @@ class ReviewService:
             raise PipelineFailure(exc.code, bounded_parse_detail(exc)) from exc
         except V2PlanParseError as exc:
             raise PipelineFailure("PLANNER_OUTPUT_INVALID", bounded_parse_detail(exc)) from exc
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "plan.completed", phase="planning", cycle=cycle.number,
             data={
                 "kind": cycle.kind.value, "decision": plan.decision.value, "title": plan.title,
-                "session": self.runtime.trace_finished_model_session(
+                "session": self.runtime.observability.trace_finished_model_session(
                     profile=profile, selected=selected, role=ExecutionRole.PLANNER,
                     prompt_bytes=(
                         (directory / "planner.request.txt").stat().st_size
@@ -769,7 +769,7 @@ class ReviewService:
             store, ctx, cycle, plan, directory, delta, content,
             list(facts.approved_mutable_envelope), facts.candidate_tree_sha,
         )
-        return self.runtime.correction_cycle_plan(
+        return self.runtime.composition.correction_cycle_plan(
             ctx, cycle, plan, bundle, bundle_sha, creating=True,
         )
 
@@ -780,10 +780,10 @@ class ReviewService:
 
         number = cycle_plan.cycle.number
         artifact_dir = semantic_revision_dir(ctx.run_dir, number)
-        steps = self.runtime.completed_steps(ctx, cycle_plan)
-        mutable_scope = list(self.runtime.effective_cycle_scope(ctx, cycle_plan))
+        steps = self.runtime.composition.completed_steps(ctx, cycle_plan)
+        mutable_scope = list(self.runtime.composition.effective_cycle_scope(ctx, cycle_plan))
         pre_stage = pre_semantic_gate_stage(cycle_plan.cycle.kind)
-        pre_check_evidence = _load_evidence(
+        pre_check_evidence = load_evidence(
             gate_dir(ctx.run_dir, cycle_plan.cycle, pre_stage)
         )
         if pre_check_evidence is None:
@@ -812,7 +812,7 @@ class ReviewService:
             except PipelineFailure:
                 raise
             except (AgentScopeError, AgentError) as exc:
-                self.runtime.redact_revision_artifacts(artifact_dir)
+                self.runtime.observability.redact_revision_artifacts(artifact_dir)
                 _record_failure_tree(artifact_dir, ctx.info.worktree)
                 raise PipelineFailure(
                     getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self.runtime.secrets),
@@ -1050,12 +1050,12 @@ class ReviewService:
         if review is None or review.route is not ReviewRoute.IMPLEMENTATION:
             raise ResumeIntegrityError("direct semantic correction has no implementation review")
         number = cycle_plan.cycle.number
-        previous_plan = self.runtime.cycle_plan(ctx, number - 1)
+        previous_plan = self.runtime.composition.cycle_plan(ctx, number - 1)
         candidate = read_candidate_record(ctx.run_dir, number - 1)
         evidence = candidate_evidence(ctx.run_dir, number - 1)
         if evidence is None or evidence.staged_tree_sha != candidate["tree_sha"]:
             raise ResumeIntegrityError(f"cycle {number - 1:03d} candidate evidence is missing")
-        approved_scope = self.runtime.approved_scope_before(ctx, number)
+        approved_scope = self.runtime.composition.approved_scope_before(ctx, number)
         code_evidence = review_code_evidence(
             repository_reference=ctx.repository_reference,
             base_sha=ctx.base_sha,
@@ -1080,8 +1080,8 @@ class ReviewService:
             "CORRECTION EVIDENCE\n" + code_evidence,
         ))
         artifact_dir = semantic_revision_dir(ctx.run_dir, number)
-        mutable_scope = list(self.runtime.effective_cycle_scope(ctx, cycle_plan))
-        step_results = self.runtime.completed_steps(ctx, previous_plan)
+        mutable_scope = list(self.runtime.composition.effective_cycle_scope(ctx, cycle_plan))
+        step_results = self.runtime.composition.completed_steps(ctx, previous_plan)
         while True:
             _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
             try:
@@ -1111,7 +1111,7 @@ class ReviewService:
             except PipelineFailure:
                 raise
             except AgentError as exc:
-                self.runtime.redact_revision_artifacts(artifact_dir)
+                self.runtime.observability.redact_revision_artifacts(artifact_dir)
                 raise PipelineFailure(
                     getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self.runtime.secrets),
                 ) from exc
@@ -1158,9 +1158,9 @@ class ReviewService:
             return
     def _review_context_builder(self) -> ReviewContextBuilder:
         return ReviewContextBuilder(
-            cycle_plan=self.runtime.cycle_plan,
-            completed_steps=self.runtime.completed_steps,
-            load_revision=_load_revision,
+            cycle_plan=self.runtime.composition.cycle_plan,
+            completed_steps=self.runtime.composition.completed_steps,
+            load_revision=load_revision,
             read_candidate=_review_candidate_record,
             candidate_evidence=candidate_evidence,
             accepted_review=_accepted_review,
@@ -1217,7 +1217,7 @@ class ReviewService:
     ) -> ReviewResult:
         """Retry transient reviewer transport on this candidate only."""
 
-        reviewer = self.runtime.reviewer_for_profile(ctx.selection.final_reviewer.profile_id)
+        reviewer = self.runtime.composition.reviewer_for_profile(ctx.selection.final_reviewer.profile_id)
         return self.runtime.review_recovery(store).with_transport_retries(
             cycle=cycle_plan.cycle.number,
             candidate_tree=candidate.get("tree_sha"),
@@ -1292,7 +1292,7 @@ class ReviewService:
             parents = commit_parents(ctx.info.worktree, stored_candidate["commit_sha"])
             authority = gate_mutable_authority(
                 ctx.run_dir, number, stage,
-                base_paths=self.runtime.effective_cycle_scope(ctx, cycle_plan),
+                base_paths=self.runtime.composition.effective_cycle_scope(ctx, cycle_plan),
                 policy_config=self.runtime.repair_scope,
                 require_attempt_records=True,
             )
@@ -1438,7 +1438,7 @@ class ReviewService:
             store, number, status="reviewed",
             checks=_check_payload(evidence), reviewer_conclusion=_review_payload(review),
         )
-        self.runtime.update_v2_usage(store, ctx.run_dir)
+        self.runtime.observability.update_v2_usage(store, ctx.run_dir)
     def request_human(
         self, store: RunStateStore, ctx: PipelineV2Context, number: int,
         review: ReviewResult, reason: str,
@@ -1470,7 +1470,7 @@ class ReviewService:
             "existing_worktree": str(ctx.info.worktree),
             "run_id": ctx.run_id,
         })
-        return self.runtime.v2_failed(store, ctx.run_dir, reason, None)
+        return self.runtime.failure.v2_failed(store, ctx.run_dir, reason, None)
     def review_repair_exhausted(
         self, store: RunStateStore, ctx: PipelineV2Context, number: int,
         review: ReviewResult, detail: Mapping[str, Any],
@@ -1497,7 +1497,7 @@ class ReviewService:
                     " ".join(review.findings.split()).casefold()
                 )
 
-        return self.runtime.v2_failed(
+        return self.runtime.failure.v2_failed(
             store, ctx.run_dir, "WAITING_REPAIR_EXHAUSTED", None,
             {
                 **detail,
@@ -1609,7 +1609,7 @@ class ReviewService:
         reviewer_profile = None
         reviewer_selected = None
         if reviewer_profile_id is not None:
-            reviewer_selected = self.runtime.trace_selected_profile(
+            reviewer_selected = self.runtime.observability.trace_selected_profile(
                 reviewer_profile_id, ExecutionRole.REVIEWER
             )
             try:
@@ -1618,16 +1618,16 @@ class ReviewService:
                 )
             except ProfileError:
                 reviewer_profile = None
-        review_started_at = self.runtime.trace_time()
+        review_started_at = self.runtime.observability.trace_time()
         review_started_mono = time.perf_counter()
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "review.started",
             phase="review",
             cycle=self.runtime.trace_cycle,
             data={
                 "candidate_sha": candidate_sha,
                 "tree_sha": evidence.staged_tree_sha,
-                "session": self.runtime.trace_session(
+                "session": self.runtime.observability.trace_session(
                     profile=reviewer_profile,
                     selected=reviewer_selected,
                     role=ExecutionRole.REVIEWER,
@@ -1649,7 +1649,7 @@ class ReviewService:
             reviewer_usage = read_usage_artifact(
                 artifacts_dir / "reviewer.usage.json"
             )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "review.completed",
             phase="review",
             cycle=self.runtime.trace_cycle,
@@ -1658,7 +1658,7 @@ class ReviewService:
                 "tree_sha": evidence.staged_tree_sha,
                 "verdict": review.verdict.value,
                 "route": review.route.value,
-                "session": self.runtime.trace_finished_model_session(
+                "session": self.runtime.observability.trace_finished_model_session(
                     profile=reviewer_profile,
                     selected=reviewer_selected,
                     role=ExecutionRole.REVIEWER,
@@ -1687,12 +1687,12 @@ class ReviewService:
             secrets=self.runtime.secrets,
             effective_repair_scope=self.runtime.repair_scope,
             approved_check_authority_sha256=self.runtime.approved_check_authority_sha256,
-            run_revision=self.runtime.run_revision,
-            ensure_revision_artifacts=self.runtime.ensure_revision_artifacts,
-            redact_revision_artifacts=self.runtime.redact_revision_artifacts,
+            run_revision=self.runtime.composition.run_revision,
+            ensure_revision_artifacts=self.runtime.observability.ensure_revision_artifacts,
+            redact_revision_artifacts=self.runtime.observability.redact_revision_artifacts,
             reusable_pre_checks=_reusable_pre_checks,
-            hard_integrity_failures=_hard_integrity_failures,
-            soft_check_failures=_soft_check_failures,
+            hard_integrity_failures=hard_integrity_failures,
+            soft_check_failures=soft_check_failures,
             check_repair_prompt=_check_repair_prompt,
         )
     def _run_v2_revision_cycle(
@@ -1711,19 +1711,19 @@ class ReviewService:
             except ProfileError:
                 profile = None
         tree_before = _safe_candidate_tree(request["info"].worktree)
-        started_at = self.runtime.trace_time()
+        started_at = self.runtime.observability.trace_time()
         started_mono = time.perf_counter()
         phase = "repair" if is_check_repair else "revision"
         prefix = "check_repair" if is_check_repair else "revision"
 
         def session(**extra: Any) -> dict[str, Any]:
-            return self.runtime.trace_session(
+            return self.runtime.observability.trace_session(
                 profile=profile, selected=selected, role=role,
                 started_at=started_at, started_mono=started_mono,
                 tree_before=tree_before, **extra,
             )
 
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             f"{prefix}.started", phase=phase, cycle=cycle,
             data={
                 "tree_before": tree_before,
@@ -1734,7 +1734,7 @@ class ReviewService:
         try:
             result, error = self._revision_runner().run(**request)
         except Exception as exc:
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 f"{prefix}.agent.completed", phase=phase, cycle=cycle,
                 data={
                     "status": "failed",
@@ -1745,7 +1745,7 @@ class ReviewService:
             raise
         artifact_path = Path(request["artifact_dir"])
         prompt_path = artifact_path / "agent.prompt.txt"
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             f"{prefix}.agent.completed", phase=phase, cycle=cycle,
             data={
                 "status": "completed" if error is None else "failed",
@@ -1758,7 +1758,7 @@ class ReviewService:
         )
         pre_checks = _read_json_artifact(artifact_path / "pre_checks.json")
         if not is_check_repair and isinstance(pre_checks, dict):
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "revision.checks.completed", phase=phase, cycle=cycle,
                 data={
                     "passed": bool(pre_checks.get("deterministic_passed", False)),

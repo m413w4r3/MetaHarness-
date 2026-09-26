@@ -180,7 +180,7 @@ def _reusable_pre_checks(artifact_dir: Path, tree: str) -> dict[str, Any] | None
     return payload
 
 
-def _load_evidence(directory: Path) -> EvidenceBundle | None:
+def load_evidence(directory: Path) -> EvidenceBundle | None:
     """Rebuild a frozen evidence bundle from ``evidence.json``."""
 
     payload = _read_json_artifact(directory / "evidence.json")
@@ -314,7 +314,7 @@ def completed_step_records(
     return records
 
 
-def _load_revision(directory: Path) -> _PersistedRevision | None:
+def load_revision(directory: Path) -> _PersistedRevision | None:
     report = _read_json_artifact(directory / "report.json", 1024 * 1024)
     if not isinstance(report, dict) or report.get("status") not in {"COMPLETED", "NO_CHANGE"}:
         return None
@@ -470,7 +470,7 @@ def candidate_evidence(run_dir: Path, number: int) -> EvidenceBundle | None:
 
     stage = read_candidate_record(run_dir, number).get("gate_stage")
     try:
-        return _load_evidence(gate_dir(run_dir, number, stage))
+        return load_evidence(gate_dir(run_dir, number, stage))
     except ValueError:
         return None
 
@@ -495,7 +495,7 @@ def _validate_gate_acceptance(
     )
     no_change = payload.get("no_change", False) if isinstance(payload, dict) else False
     parent_sha = payload.get("parent_sha") if isinstance(payload, dict) else None
-    evidence = _load_evidence(gate_dir(run_dir, number, stage))
+    evidence = load_evidence(gate_dir(run_dir, number, stage))
     parent_valid = _is_object_id(parent_sha) or (
         no_change is True
         and parent_sha is None
@@ -603,7 +603,7 @@ def verify_correction_scope(
     return list(added)
 
 
-def _read_repository_reference(run_dir: Path) -> RepositoryReference | None:
+def read_repository_reference(run_dir: Path) -> RepositoryReference | None:
     payload = _read_json_artifact(run_dir / "repository_reference.json", 16 * 1024)
     if not isinstance(payload, dict) or set(payload) != {"remote_name", "web_url", "base_sha", "immutable_url"}:
         return None
@@ -614,7 +614,7 @@ def _read_repository_reference(run_dir: Path) -> RepositoryReference | None:
     return RepositoryReference(**payload)
 
 
-def _persist_planner_conversation(run_dir: Path, handle: Any) -> None:
+def persist_planner_conversation(run_dir: Path, handle: Any) -> None:
     """Persist a driver-provided planner conversation handle, never a guess."""
 
     if isinstance(handle, LLMConversationHandle):
@@ -707,7 +707,7 @@ def _contract_repair_scope(
     return scope
 
 
-def _semantic_revision_scope(
+def semantic_revision_scope(
     repo: Path,
     run_dir: Path,
     number: int,
@@ -848,7 +848,7 @@ def _approved_scope(
     cycle_base_scopes: dict[int, tuple[str, ...]] = {1: tuple(sorted(scope))}
     cycle_kinds: dict[int, CycleKind] = {1: CycleKind.INITIAL}
     cycle_semantic_scopes: dict[int, set[str]] = {
-        1: _semantic_revision_scope(config.repo, run_dir, 1, policy),
+        1: semantic_revision_scope(config.repo, run_dir, 1, policy),
     }
     scope |= cycle_semantic_scopes[1]
     for number in range(2, checkpoint.review_cycle + 1):
@@ -857,7 +857,7 @@ def _approved_scope(
             # Direct semantic corrections reuse the preceding approved plan,
             # while their final gate may still have its own check-repair
             # authority.
-            cycle_semantic_scopes[number] = _semantic_revision_scope(
+            cycle_semantic_scopes[number] = semantic_revision_scope(
                 config.repo, run_dir, number, policy,
             )
             scope |= cycle_semantic_scopes[number]
@@ -879,7 +879,7 @@ def _approved_scope(
         cycle_base_scopes[number] = tuple(sorted(
             set(cycle_base_scopes[number]) | _contract_repair_scope(run_dir, number, policy)
         ))
-        semantic_added = _semantic_revision_scope(config.repo, run_dir, number, policy)
+        semantic_added = semantic_revision_scope(config.repo, run_dir, number, policy)
         cycle_semantic_scopes[number] = semantic_added
         cycle_scopes[number] = tuple(sorted(set(cycle_base_scopes[number]) | semantic_added))
         cycle_kinds[number] = cycle.kind
@@ -918,14 +918,14 @@ def _cycle_base_scope(
     ))
     if number > 1 or include_current_semantic:
         current = tuple(sorted(
-            set(current) | _semantic_revision_scope(config.repo, run_dir, 1, policy)
+            set(current) | semantic_revision_scope(config.repo, run_dir, 1, policy)
         ))
     for cycle_number in range(2, number + 1):
         cycle = read_cycle_record(run_dir, cycle_number)
         if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
             if cycle_number != number or include_current_semantic:
                 current = tuple(sorted(
-                    set(current) | _semantic_revision_scope(config.repo, run_dir, cycle_number, policy)
+                    set(current) | semantic_revision_scope(config.repo, run_dir, cycle_number, policy)
                 ))
             continue
         correction, _bundle, _bundle_sha = load_correction_plan(
@@ -936,7 +936,7 @@ def _cycle_base_scope(
         current = tuple(sorted(set(current) | _contract_repair_scope(run_dir, cycle_number, policy)))
         if cycle_number != number or include_current_semantic:
             current = tuple(sorted(
-                set(current) | _semantic_revision_scope(config.repo, run_dir, cycle_number, policy)
+                set(current) | semantic_revision_scope(config.repo, run_dir, cycle_number, policy)
             ))
     return current
 
@@ -1046,7 +1046,7 @@ def validate_resume(
     base_sha = state.get("base_sha")
     if not _is_object_id(base_sha):
         _refuse("run base SHA is invalid")
-    reference = _read_repository_reference(run_dir)
+    reference = read_repository_reference(run_dir)
     if reference is None or reference.base_sha != base_sha:
         _refuse("the base SHA changed for this run")
     try:
@@ -1340,7 +1340,7 @@ def validate_resume(
                 policy=repair_scope,
             )
         if checkpoint.phase is ResumePhase.CHECK_REPAIR:
-            evidence = _load_evidence(gate_dir(run_dir, number, checkpoint.stage))
+            evidence = load_evidence(gate_dir(run_dir, number, checkpoint.stage))
             if evidence is None or evidence.staged_tree_sha != expected_tree:
                 _refuse("the red gate evidence is missing or not for the checkpoint tree")
         if checkpoint.phase is ResumePhase.DETERMINISTIC_GATE and checkpoint.check_repair_attempt is not None:

@@ -78,7 +78,7 @@ from .check_repair import (
     CheckRepairCoordinator,
     _SCOPE_REQUEST_SOURCE,
     gate_mutable_authority,
-    _soft_check_failures,
+    soft_check_failures,
 )
 from .pipeline_v2 import (
     CyclePlan,
@@ -91,7 +91,7 @@ from .pipeline_v2 import (
 )
 from .recovery import RecoveryAttempt
 from .resume_validation import (
-    _load_evidence,
+    load_evidence,
 )
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
@@ -170,7 +170,7 @@ class GateService:
             payload = _read_json_artifact(acceptance_path)
             evidence_path = directory / "evidence.json"
             evidence_bytes = evidence_path.read_bytes()
-            evidence = _load_evidence(directory)
+            evidence = load_evidence(directory)
             current = current_head(ctx.info.worktree)
             current_tree = resolve_tree(ctx.info.worktree, current)
             parents = commit_parents(ctx.info.worktree, current)
@@ -314,7 +314,7 @@ class GateService:
         if records:
             previous_authority = gate_mutable_authority(
                 ctx.run_dir, number, stage,
-                base_paths=self.runtime.effective_cycle_scope(ctx, cycle_plan),
+                base_paths=self.runtime.composition.effective_cycle_scope(ctx, cycle_plan),
                 policy_config=self.runtime.repair_scope,
                 through_attempt=len(records),
                 require_attempt_records=True,
@@ -328,14 +328,14 @@ class GateService:
                 bound=self.runtime.repair_scope.max_added_paths,
                 source=previous_authority.source,
             )
-        soft = _soft_check_failures(evidence)
+        soft = soft_check_failures(evidence)
         failed_ids = tuple(item.split(":", 1)[1] for item in soft if ":" in item)
         scope = CheckRepairCoordinator(
             repair_scope_policy=self.runtime.repair_scope,
         ).resolve_scope(
             repo=ctx.repo, worktree=ctx.info.worktree, tree_sha=evidence.staged_tree_sha,
             evidence_dir=gate_dir(ctx.run_dir, number, stage), evidence=evidence,
-            approved_mutable_scope=self.runtime.effective_cycle_scope(ctx, cycle_plan), previous=previous_scope,
+            approved_mutable_scope=self.runtime.composition.effective_cycle_scope(ctx, cycle_plan), previous=previous_scope,
         )
 
         def updated_scope(paths: Sequence[str]) -> CheckRepairScope:
@@ -503,7 +503,7 @@ class GateService:
             and isinstance(effective_executor.get("profile_id"), str)
             else selected.profile_id
         )
-        effective_selected = self.runtime.trace_selected_profile(effective_profile_id, ExecutionRole.REPAIR)
+        effective_selected = self.runtime.observability.trace_selected_profile(effective_profile_id, ExecutionRole.REPAIR)
         effective_fingerprint = getattr(effective_selected, "config_sha256", None)
         if error is not None:
             if error in {
@@ -619,7 +619,7 @@ class GateService:
             budget_remaining=max(0, ctx.options.max_check_repair_attempts - attempt),
             phase="validation", cycle=number, recovered=True,
         )
-        self.runtime.update_v2_usage(store, ctx.run_dir)
+        self.runtime.observability.update_v2_usage(store, ctx.run_dir)
     def replan_responsible_step(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
         stage: GateStage, step: Any, evidence: EvidenceBundle,
@@ -659,7 +659,7 @@ class GateService:
         """
 
         if reuse:
-            stored = _load_evidence(evidence_dir)
+            stored = load_evidence(evidence_dir)
             if (
                 stored is not None
                 and stored.base_sha == base_sha
@@ -667,7 +667,7 @@ class GateService:
                 and stored.staged_tree_sha == index_tree_sha(worktree)
                 and stored.staged_tree_sha == candidate_tree_sha(worktree)
             ):
-                self.runtime.trace_emit(
+                self.runtime.observability.trace_emit(
                     "checks.completed",
                     phase="validation",
                     cycle=self.runtime.trace_cycle,
@@ -682,10 +682,10 @@ class GateService:
                     },
                 )
                 return stored
-        checks_started_at = self.runtime.trace_time()
+        checks_started_at = self.runtime.observability.trace_time()
         checks_started_mono = time.perf_counter()
         checks_tree_before = _safe_candidate_tree(worktree)
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "checks.started",
             phase="validation",
             cycle=self.runtime.trace_cycle,
@@ -714,7 +714,7 @@ class GateService:
                 retry_check_infrastructure=retry_check_infrastructure,
             )
         except Exception as exc:
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "checks.completed",
                 phase="validation",
                 cycle=self.runtime.trace_cycle,
@@ -727,7 +727,7 @@ class GateService:
                 },
             )
             raise
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "checks.completed",
             phase="validation",
             cycle=self.runtime.trace_cycle,

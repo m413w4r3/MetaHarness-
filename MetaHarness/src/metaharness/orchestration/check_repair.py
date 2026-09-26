@@ -149,7 +149,7 @@ _HARD_FAILURE_PREFIXES = (
 )
 
 
-def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
+def hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
     """Return the failures that close a gate episode without repair.
 
     A normal configured check failure is soft: it may open a bounded
@@ -161,7 +161,7 @@ def _hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
     return _hard_failure_items(bundle.failures)
 
 
-def _soft_check_failures(bundle: EvidenceBundle) -> list[str]:
+def soft_check_failures(bundle: EvidenceBundle) -> list[str]:
     """Return ordinary deterministic check failures eligible for one repair.
 
     This deliberately accepts only the exact ``CHECK_FAILED:<name>`` family.
@@ -169,7 +169,7 @@ def _soft_check_failures(bundle: EvidenceBundle) -> list[str]:
     never be handed to the corrective Claude pass.
     """
 
-    if _hard_integrity_failures(bundle) or bundle.deterministic_passed:
+    if hard_integrity_failures(bundle) or bundle.deterministic_passed:
         return []
     failures = list(bundle.failures)
     if not failures or any(
@@ -237,7 +237,7 @@ def _failed_check_logs(*, evidence_dir: Path, evidence: EvidenceBundle) -> list[
 
     failed_names = {
         failure.split(":", 1)[1]
-        for failure in _soft_check_failures(evidence)
+        for failure in soft_check_failures(evidence)
         if ":" in failure
     }
     root = evidence_dir.resolve()
@@ -418,7 +418,7 @@ def _check_repair_problem_context(
 ) -> str:
     """Render bounded root-cause excerpts plus explicit read-only file paths."""
 
-    failures = _soft_check_failures(evidence)
+    failures = soft_check_failures(evidence)
     logs = _failed_check_logs(evidence_dir=evidence_dir, evidence=evidence)
     failed_checks: list[dict[str, Any]] = []
     proof_text = _failure_log_text(logs)
@@ -479,7 +479,7 @@ def _check_repair_prompt(
 
     del plan
     template = (_PROMPTS_DIR / "check_repair.txt").read_text(encoding="utf-8")
-    failed_ids = _soft_check_failures(evidence)
+    failed_ids = soft_check_failures(evidence)
     problem_context = _check_repair_problem_context(
         evidence, evidence_dir=evidence_dir, repo=repo,
         worktree=worktree, tree_sha=evidence.staged_tree_sha or "",
@@ -988,7 +988,7 @@ def _red_gate_identity(evidence: EvidenceBundle) -> tuple[str, tuple[str, ...]]:
     if not isinstance(tree, str) or not tree:
         raise ResumeIntegrityError("the red gate evidence has no candidate tree")
     failed = tuple(
-        item.split(":", 1)[1] for item in _soft_check_failures(evidence) if ":" in item
+        item.split(":", 1)[1] for item in soft_check_failures(evidence) if ":" in item
     )
     if not failed:
         raise ResumeIntegrityError("the red gate evidence has no repairable check failure")

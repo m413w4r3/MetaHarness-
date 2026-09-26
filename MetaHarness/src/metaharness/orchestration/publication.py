@@ -187,14 +187,14 @@ class PublicationService:
             event = "workstream.issue.created"
 
         state = store.update(status=state.get("status", RunStatus.CREATED), issue_number=number)
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             event,
             phase="setup",
             cycle=1,
             data={"issue_number": number},
             once=True,
         )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "workstream.metadata",
             phase="setup",
             cycle=1,
@@ -292,7 +292,7 @@ class PublicationService:
             remote_branch=info.branch,
             pull_request_number=number,
         )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "workstream.pull_request.created",
             phase="publication",
             cycle=cycle,
@@ -303,7 +303,7 @@ class PublicationService:
             },
             once=True,
         )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "workstream.metadata",
             phase="publication",
             cycle=cycle,
@@ -363,7 +363,7 @@ class PublicationService:
                 current_step=None,
             )
             mark_checkpoint_completed(ctx.run_dir)
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "run.completed_no_change", phase="run", cycle=number,
                 data={"candidate_sha": candidate["commit_sha"], "tree_sha": candidate["tree_sha"]},
                 once=True,
@@ -402,7 +402,7 @@ class PublicationService:
 
         return CandidateRemoteStaging(
             self.runtime.recovery(store), store=store, budgets=self.runtime.run_options.recovery,
-            emit=self.runtime.trace_emit, remote=self.runtime.config.repository.remote,
+            emit=self.runtime.observability.trace_emit, remote=self.runtime.config.repository.remote,
             remote_required=self.runtime.config.publish.enabled or (
                 self.runtime.config.github.enabled
                 and self.runtime.config.github.pull_request_mode == "create"
@@ -426,7 +426,7 @@ class PublicationService:
             budget_remaining=0, phase="publication", cycle=cycle,
             terminal_status=terminal.status, checkpoint_phase=ResumePhase.PUBLISH,
         )
-        state = self.runtime.persist_exit(
+        state = self.runtime.failure.persist_exit(
             store, "PUSH_FAILED", detail, terminal.status,
             recovery_resumable=terminal.resumable, **fields,
         )
@@ -593,7 +593,7 @@ class PublicationService:
             head=commit_sha, tree=approved_tree,
             expected_parent_sha=expected_parent,
         )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "publish.started",
             phase="publication",
             cycle=cycle,
@@ -616,7 +616,7 @@ class PublicationService:
             )
             state = store.update(status=RunStatus.COMMITTED, **fields)
             mark_checkpoint_completed(run_dir)
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "publish.completed",
                 phase="publication",
                 cycle=cycle,
@@ -719,7 +719,7 @@ class PublicationService:
             **fields,
         )
         mark_checkpoint_completed(run_dir)
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "publish.completed",
             phase="publication",
             cycle=cycle,

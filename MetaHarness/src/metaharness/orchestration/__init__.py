@@ -7,6 +7,15 @@ import it back.  The dependency order is one-way::
     shared <- revision <- check_repair <- resume_validation
     shared <- candidate, scope_repair
     pipeline_v2 <- recovery <- worker_recovery, check_recovery, review_recovery
+    run_bootstrap <- run_composition <- runtime
+    run_observability, run_failure <- runtime
+
+The run authorities sit next to the kernel that composes them: ``run_bootstrap``
+owns the planning, approval, worktree and setup of a new run,
+``run_composition`` the immutable context, the ``PipelineV2Operations`` wiring
+and the cycle authority, ``run_failure`` the durable projection of a failure
+that left its recovery loop and ``run_observability`` the trace, the session
+metadata and the diagnostics of a run.
 
 ``recovery`` applies :func:`metaharness.recovery_policy.classify_failure`:
 it owns durable recovery budgets, attempt records, the ``recovery.*`` trace

@@ -72,7 +72,6 @@ FROZEN_MODULE_SIZES: Mapping[str, int] = {
     "orchestration/resume_validation.py": 1392,
     "orchestration/review_service.py": 1789,
     "orchestration/revision.py": 1057,
-    "orchestration/runtime.py": 2540,
 }
 
 PIPELINE_TEST_MAX_LINES = 1000
@@ -117,9 +116,7 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
         ),
         "metaharness.orchestration.check_repair": (
             "_SCOPE_REQUEST_SOURCE",
-            "_soft_check_failures",
         ),
-        "metaharness.orchestration.resume_validation": ('_load_evidence',),
     },
     "metaharness.orchestration.implementation": {
         "metaharness.orchestration.shared": (
@@ -185,14 +182,10 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
         ),
         "metaharness.orchestration.check_repair": (
             "_check_repair_prompt",
-            "_hard_integrity_failures",
-            "_soft_check_failures",
         ),
         "metaharness.orchestration.scope_repair": ('_build_scope_delta',),
         "metaharness.orchestration.resume_validation": (
             "_accepted_review",
-            "_load_evidence",
-            "_load_revision",
             "_read_planner_conversation",
             "_reusable_pre_checks",
         ),
@@ -207,34 +200,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_ownership_violations",
             "_read_bounded_text",
             "_record_failure_tree",
-        ),
-    },
-    "metaharness.orchestration.runtime": {
-        "metaharness.orchestration.shared": (
-            "_AGENT_ARTIFACTS",
-            "_RECOVERY_ATTEMPT_ARTIFACTS",
-            "_REVISION_ARTIFACTS",
-            "_archive_attempt",
-            "_archive_attempt_target",
-            "_archive_attempt_tree",
-            "_git_ownership",
-            "_git_ownership_payload",
-            "_is_object_id",
-            "_json_text",
-            "_read_json_artifact",
-            "_safe_candidate_tree",
-            "_status_has_unstaged_or_untracked",
-        ),
-        "metaharness.orchestration.check_repair": (
-            "_hard_integrity_failures",
-            "_soft_check_failures",
-        ),
-        "metaharness.orchestration.resume_validation": (
-            "_load_evidence",
-            "_load_revision",
-            "_persist_planner_conversation",
-            "_read_repository_reference",
-            "_semantic_revision_scope",
         ),
     },
     "metaharness.orchestration.scope_repair": {

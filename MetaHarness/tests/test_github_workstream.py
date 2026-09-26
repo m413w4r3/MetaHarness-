@@ -18,6 +18,7 @@ from metaharness.integrations.github import (  # noqa: E402
 )
 from metaharness.models import GitHubConfig, PublishConfig, RunStatus  # noqa: E402
 from metaharness.orchestration.publication import PublicationService  # noqa: E402
+from metaharness.orchestration.run_observability import RunObservability  # noqa: E402
 from metaharness.orchestration.runtime import RunRuntime  # noqa: E402
 from metaharness.state import RunStateStore  # noqa: E402
 
@@ -57,7 +58,8 @@ def _orchestrator(root: Path, github: GitHubConfig, client: object) -> Publicati
     runtime.trace_sink = None
     runtime.trace_cycle = 1
     runtime.secrets = ()
-    runtime.begin_trace(root, "run-1", created=False)
+    runtime.observability = RunObservability(runtime)
+    runtime.observability.begin_trace(root, "run-1", created=False)
     return PublicationService(runtime)
 
 

@@ -209,7 +209,7 @@ class ImplementationService:
         contract = self.approved_step_contract(cycle_plan, step)
         store.update(
             status=RunStatus.IMPLEMENTING, current_step=step.id,
-            steps=self.runtime.state_steps(ctx, cycle_plan, running=step.id),
+            steps=self.runtime.composition.state_steps(ctx, cycle_plan, running=step.id),
         )
         checkpoint = read_checkpoint(ctx.run_dir)
         parent_sha = current_head(ctx.info.worktree)
@@ -244,9 +244,9 @@ class ImplementationService:
         )
         store.update(
             status=RunStatus.IMPLEMENTING, current_step=None,
-            steps=self.runtime.state_steps(ctx, cycle_plan),
+            steps=self.runtime.composition.state_steps(ctx, cycle_plan),
         )
-        self.runtime.update_v2_usage(store, ctx.run_dir)
+        self.runtime.observability.update_v2_usage(store, ctx.run_dir)
     def replan_cycle_step(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
         stage: GateStage, step: GateRecoveryStep, evidence: EvidenceBundle,
@@ -386,7 +386,7 @@ class ImplementationService:
             ),
             repair_number,
         )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "recovery.replanned", phase="implementation", cycle=number,
             step_id=steps[first].id,
             data={
@@ -731,7 +731,7 @@ class ImplementationService:
         ):
             refuse("the step record does not match the candidate")
         future = tuple(item.id for item in cycle_plan.plan.steps[index + 1:])
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "recovery.resumed", phase="implementation", cycle=cycle_plan.cycle.number,
             step_id=step.id,
             data={
@@ -751,7 +751,7 @@ class ImplementationService:
                 )
                 store.update(
                     status=RunStatus.IMPLEMENTING, current_step=None,
-                    steps=self.runtime.state_steps(ctx, cycle_plan),
+                    steps=self.runtime.composition.state_steps(ctx, cycle_plan),
                 )
                 return
             if hashlib.sha256(record_bytes).hexdigest() != outcome_refs.get("step_record_sha256"):
@@ -785,9 +785,9 @@ class ImplementationService:
             raise self._step_acceptance_failure(step_dir, authority, exc) from exc
         store.update(
             status=RunStatus.IMPLEMENTING, current_step=None,
-            steps=self.runtime.state_steps(ctx, cycle_plan),
+            steps=self.runtime.composition.state_steps(ctx, cycle_plan),
         )
-        self.runtime.update_v2_usage(store, ctx.run_dir)
+        self.runtime.observability.update_v2_usage(store, ctx.run_dir)
     def _recover_committed_step(
         self, store: RunStateStore, ctx: PipelineV2Context, step_dir: Path,
         candidate: Mapping[str, Any], authority: EffectiveStepAuthority,
@@ -844,7 +844,7 @@ class ImplementationService:
                 ),
             )
         except CommitSafetyError:
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "step.verification.completed", phase="implementation",
                 cycle=self.runtime.trace_cycle, step_id=authority.step_id,
                 data={
@@ -886,7 +886,7 @@ class ImplementationService:
         except StepAuthorityError as exc:
             raise PipelineFailure(exc.code, str(exc), step_id=authority.step_id) from exc
         write_authority_diagnostic(step_dir, authority)
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "step.candidate.persisted", phase="implementation",
             cycle=cycle_plan.cycle.number, step_id=authority.step_id,
             data={
@@ -1265,7 +1265,7 @@ class ImplementationService:
                if failure.initial_mismatch else {}),
             "usage": usage,
         }))
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "step.completed_no_change", phase="implementation",
             cycle=self.runtime.trace_cycle, step_id=failure.step_id,
             data={"tree_sha": after, "mismatch_retry_count": failure.mismatch_retry_count},
@@ -1415,7 +1415,7 @@ class ImplementationService:
             transaction,
         )
         if resumed:
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "recovery.resumed", phase="implementation", cycle=cycle, step_id=step.id,
                 data={"operation": "contract_repair", "transaction_status": transaction.get("status"), **progress},
             )
@@ -1431,7 +1431,7 @@ class ImplementationService:
                 planner_transport_attempt=1,
             )
             data = publish("correcting_output", current)
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "contract_repair.output_correction.started", phase="implementation",
                 cycle=cycle, step_id=step.id, data=data,
             )
@@ -1448,7 +1448,7 @@ class ImplementationService:
                 directory, contract_repair.PLANNER_OUTPUT_INVALID, last_output_error=error,
             )
             data = publish("output_invalid", current)
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "contract_repair.output_invalid", phase="implementation",
                 cycle=cycle, step_id=step.id, data={**data, "error": error},
             )
@@ -1488,7 +1488,7 @@ class ImplementationService:
                 except ContractRepairIntegrityError as marker:
                     raise PipelineFailure(marker.code, str(marker), step_id=step.id) from exc
                 data = publish("waiting_external", current)
-                self.runtime.trace_emit(
+                self.runtime.observability.trace_emit(
                     "recovery.waiting_external", phase="implementation", cycle=cycle,
                     step_id=step.id,
                     data={"operation": "contract_repair", "reason": "LLM_FAILURE", **data},
@@ -1521,7 +1521,7 @@ class ImplementationService:
                 except ContractRepairIntegrityError as marker:
                     raise PipelineFailure(marker.code, str(marker), step_id=step.id) from exc
                 data = publish("output_correction_exhausted", current)
-                self.runtime.trace_emit(
+                self.runtime.observability.trace_emit(
                     "contract_repair.output_correction.exhausted", phase="implementation",
                     cycle=cycle, step_id=step.id, data=data,
                 )
@@ -1567,7 +1567,7 @@ class ImplementationService:
             status=RunStatus.CONTRACT_REPAIRING, current_step=step.id,
             contract_repair={"status": "completed", **progress},
         )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "step.contract_repair.completed", phase="implementation",
             cycle=cycle, step_id=step.id,
             data={
@@ -1614,7 +1614,7 @@ class ImplementationService:
         except ContractRepairIntegrityError as exc:
             raise PipelineFailure(exc.code, str(exc), step_id=step_id) from exc
         data = publish("correcting_output", current)
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "contract_repair.planner_restart", phase="implementation",
             cycle=cycle, step_id=step_id, data={**data, "planner_restarts": used + 1},
         )
@@ -1668,7 +1668,7 @@ class ImplementationService:
 
         planner = StepContractRepairPlanner(
             self.runtime.planner_client or chat_client(
-                build_llm_endpoint(planner_profile), self.runtime.environment, self.runtime.trace_transport
+                build_llm_endpoint(planner_profile), self.runtime.environment, self.runtime.observability.trace_transport
             ),
             max_read_paths_per_step=self.runtime.config.planning.max_read_paths_per_step,
             max_output_corrections=max_output_corrections,
@@ -1843,12 +1843,12 @@ class ImplementationService:
         status_before = status_porcelain(worktree)
         # 3-4. Approved profile and isolated environment.
         profile, step_role = self._step_profile(profile_id)
-        executor = self.runtime.executor_for_profile(
+        executor = self.runtime.composition.executor_for_profile(
             profile.id,
             step_role,
             forbidden_env_names=forbidden_env_names,
         )
-        selected_executor = self.runtime.trace_selected_profile(profile.id, step_role, step_id=step_id)
+        selected_executor = self.runtime.observability.trace_selected_profile(profile.id, step_role, step_id=step_id)
         selection_source = "primary execution authority"
         frozen_selection = self.runtime.last_selection
         if frozen_selection is not None and step_id is not None:
@@ -1892,10 +1892,10 @@ class ImplementationService:
             )
             request_prompt = prompt_payload.rendered
             write_prompt_diagnostics(artifact_dir, prompt_payload)
-            trace_started_at = self.runtime.trace_time()
+            trace_started_at = self.runtime.observability.trace_time()
             trace_started_mono = time.perf_counter()
             trace_selected = selected_executor
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "step.started",
                 phase="implementation",
                 cycle=self.runtime.trace_cycle,
@@ -1903,7 +1903,7 @@ class ImplementationService:
                 data={
                     "attempt": mismatch_retry_count + 1,
                     "tree_before": tree_before,
-                    "session": self.runtime.trace_session(
+                    "session": self.runtime.observability.trace_session(
                         profile=profile,
                         selected=trace_selected,
                         role=step_role,
@@ -1930,7 +1930,7 @@ class ImplementationService:
                 )
             )
         except AgentScopeError as exc:
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "step.agent.completed",
                 phase="implementation",
                 cycle=self.runtime.trace_cycle,
@@ -1938,7 +1938,7 @@ class ImplementationService:
                 data={
                     "attempt": mismatch_retry_count + 1,
                     "status": "failed",
-                    "session": self.runtime.trace_session(
+                    "session": self.runtime.observability.trace_session(
                         profile=profile,
                         selected=trace_selected,
                         role=step_role,
@@ -1950,7 +1950,7 @@ class ImplementationService:
                     ),
                 },
             )
-            self.runtime.redact_step_artifacts(artifact_dir)
+            self.runtime.observability.redact_step_artifacts(artifact_dir)
             raise StepExecutionFailure(
                 AGENT_SCOPE_VIOLATION, step_id, redact(str(exc), self.runtime.secrets),
                 profile_id=profile.id, tree_before=tree_before, **retry_mode,
@@ -1969,7 +1969,7 @@ class ImplementationService:
                     *step.write_set, *step.create_set, *step.delete_set,
                 }),
             }))
-            self.runtime.redact_step_artifacts(artifact_dir)
+            self.runtime.observability.redact_step_artifacts(artifact_dir)
             raise StepExecutionFailure(
                 reason, step_id, redact(str(exc), self.runtime.secrets),
                 profile_id=profile.id, tree_before=tree_before,
@@ -1977,14 +1977,14 @@ class ImplementationService:
                 **retry_mode,
             ) from None
         # 6. Complete and redact the durable artifacts.
-        self.runtime.ensure_step_artifacts(artifact_dir, result)
-        self.runtime.redact_step_artifacts(artifact_dir)
+        self.runtime.observability.ensure_step_artifacts(artifact_dir, result)
+        self.runtime.observability.redact_step_artifacts(artifact_dir)
         result = dataclasses.replace(
             result,
             final_message=redact(result.final_message, self.runtime.secrets),
             stderr_tail=redact(result.stderr_tail, self.runtime.secrets),
         )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "step.agent.completed",
             phase="implementation",
             cycle=self.runtime.trace_cycle,
@@ -1992,7 +1992,7 @@ class ImplementationService:
             data={
                 "attempt": mismatch_retry_count + 1,
                 "status": result.status,
-                "session": self.runtime.trace_session(
+                "session": self.runtime.observability.trace_session(
                     profile=profile,
                     selected=trace_selected,
                     role=step_role,
@@ -2259,7 +2259,7 @@ class ImplementationService:
                 next_step_id=(future_step_ids[0] if future_step_ids else None),
                 no_change_step=step_id,
             )
-            self.runtime.trace_emit(
+            self.runtime.observability.trace_emit(
                 "step.no_change.accepted", phase="implementation",
                 cycle=self.runtime.trace_cycle, step_id=step_id,
                 data={"head_sha": parent_sha, "tree_sha": outcome.tree_after},
@@ -2269,7 +2269,7 @@ class ImplementationService:
             verification = self._step_verification(authority, outcome, future_step_ids)
         verification_status, deferred = verification.status, verification.deferred
 
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "step.verification.completed",
             phase="implementation",
             cycle=self.runtime.trace_cycle,
@@ -2403,7 +2403,7 @@ class ImplementationService:
             expected_tree_sha=record["tree_after"],
             next_step_id=future_step_ids[0] if future_step_ids else None,
         )
-        self.runtime.trace_emit(
+        self.runtime.observability.trace_emit(
             "step.committed",
             phase="implementation",
             cycle=self.runtime.trace_cycle,
@@ -2414,7 +2414,7 @@ class ImplementationService:
                 "tree_sha": record["tree_after"],
                 "changed_paths": list(record["changed_paths"]),
                 "effective_authority_sha256": authority.authority_sha256,
-                **(self.runtime.trace_diff_reference(diff_path) if diff_path is not None else {}),
+                **(self.runtime.observability.trace_diff_reference(diff_path) if diff_path is not None else {}),
             },
         )
     def _step_contract_drift(

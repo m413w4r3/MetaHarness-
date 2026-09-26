@@ -485,9 +485,9 @@ class OrchestratorE2ETests(unittest.TestCase):
         from metaharness import orchestrator
 
         progressed = threading.Event()
-        from metaharness.orchestration import runtime as orchestration_runtime
+        from metaharness.orchestration import run_bootstrap
 
-        real_wait = orchestration_runtime.wait_for_plan_approval
+        real_wait = run_bootstrap.wait_for_plan_approval
 
         def hooked_wait(*args: Any, **kwargs: Any) -> Any:
             # AWAITING_PLAN_APPROVAL is persisted before this call.
@@ -502,7 +502,10 @@ class OrchestratorE2ETests(unittest.TestCase):
             finally:
                 progressed.set()
 
-        patcher = mock.patch("metaharness.orchestration.runtime.wait_for_plan_approval", side_effect=hooked_wait)
+        patcher = mock.patch(
+            "metaharness.orchestration.run_bootstrap.wait_for_plan_approval",
+            side_effect=hooked_wait,
+        )
         patcher.start()
         self.addCleanup(patcher.stop)
         # Daemon: a failing assertion must not leave the suite blocked on
@@ -607,7 +610,7 @@ class OrchestratorE2ETests(unittest.TestCase):
         config = load_config(self.config_file(llm, run_id=run_id, require_plan_approval=True))
         try:
             with mock.patch(
-                "metaharness.orchestration.runtime.wait_for_plan_approval",
+                "metaharness.orchestration.run_bootstrap.wait_for_plan_approval",
                 side_effect=KeyboardInterrupt,
             ):
                 result = Orchestrator(config).run(self.spec, run_id=run_id)

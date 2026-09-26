@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from metaharness.agent.base import AgentRunResult
 from metaharness.models import ExecutionRole, ModelProfile, ProfileDriver, SelectionMode
+from metaharness.orchestration.run_observability import RunObservability
 from metaharness.orchestration.runtime import RunRuntime
 from metaharness.trace import TraceEvent, TraceStream
 
@@ -92,7 +93,8 @@ class TraceTests(unittest.TestCase):
             codex_runtime=SimpleNamespace(home=None),
             claude_runtime=SimpleNamespace(home=None),
         )
-        session = owner.trace_session(
+        owner.observability = RunObservability(owner)
+        session = owner.observability.trace_session(
             profile=profile,
             selected=SimpleNamespace(
                 profile_id="codex-profile",

@@ -579,3 +579,19 @@ class GateMutableAuthority:
 
 
 _status_has_unstaged_or_untracked = status_has_unstaged_or_untracked
+
+
+# The public spelling of the toolbox the run authorities import: the sibling
+# services keep reading the private names above, while `run_bootstrap`, the
+# composition root, the failure projection, the observability stream and the
+# runtime kernel reach the same objects through their public names.
+AGENT_ARTIFACTS = _AGENT_ARTIFACTS
+REVISION_ARTIFACTS = _REVISION_ARTIFACTS
+RECOVERY_ATTEMPT_ARTIFACTS = _RECOVERY_ATTEMPT_ARTIFACTS
+json_text = _json_text
+git_ownership_payload = _git_ownership_payload
+read_json_artifact = _read_json_artifact
+safe_candidate_tree = _safe_candidate_tree
+archive_attempt = _archive_attempt
+archive_attempt_target = _archive_attempt_target
+archive_attempt_tree = _archive_attempt_tree
