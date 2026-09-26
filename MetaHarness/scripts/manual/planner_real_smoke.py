@@ -35,11 +35,8 @@ from metaharness.models import (  # noqa: E402
     PlanDecision,
     TaskPlanV2,
 )
-from metaharness.planning_v2 import (  # noqa: E402
-    PlanParseError,
-    build_planner_payload_v2,
-    parse_task_plan_v2,
-)
+from metaharness.planning.planner import build_planner_payload_v2  # noqa: E402
+from metaharness.planning.protocol import PlanParseError, parse_task_plan_v2  # noqa: E402
 
 
 DEFAULT_OUTPUT_ROOT = REPOSITORY_ROOT / "manual-results"

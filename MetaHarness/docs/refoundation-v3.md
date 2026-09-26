@@ -74,6 +74,14 @@ implementations move to `orchestration/` services; trace/diagnostics stay in
 
 ## 2. `src/metaharness/planning_v2.py` — 3118 lines
 
+> **LANDED.** This module no longer exists. It was split by authority into
+> `src/metaharness/planning/`: `protocol.py` (grammar, parsing, step contracts),
+> `validation.py` (plan constraints and repository preconditions),
+> `artifacts.py` (artifact persistence, hashes, identities), `planner.py`
+> (`PlannerV2`, `RepairPlannerV2`, transport and bounded correction) and
+> `contract_repair.py` (`StepContractRepairPlanner`). Every non-`__all__`
+> behaviour below is preserved; the line numbers stay those of the base commit.
+
 **RESPONSIBILITY**
 The META PLAN v2 protocol: strict parsing of the planner answer
 (`parse_task_plan_v2`), step-contract rendering, the step-contract-repair

@@ -45,7 +45,8 @@ from ..models import (
 )
 from ..progress import display_event, sync_progress
 from ..redaction import config_secret_values
-from ..planning_v2 import V2PlanParseError, step_contract_path, validate_implementation_bundle
+from ..planning.artifacts import step_contract_path, validate_implementation_bundle
+from ..planning.protocol import V2PlanParseError
 from ..profiles import ProfileError, profiles_for_config, safe_profile_metadata
 from ..run_options import RunOptions, RunOptionsError, effective_run_config, read_run_options_for_state
 from ..state import RunStateStore

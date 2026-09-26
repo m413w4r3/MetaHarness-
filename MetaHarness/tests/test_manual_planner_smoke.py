@@ -9,7 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.llm.chat import LLMHTTPError, TextLLMResult  # noqa: E402
-from metaharness.planning_v2 import PlanParseError  # noqa: E402
+from metaharness.planning.protocol import PlanParseError  # noqa: E402
 from scripts.manual import planner_real_smoke as smoke  # noqa: E402
 from tests.pipeline_support import plan  # noqa: E402
 

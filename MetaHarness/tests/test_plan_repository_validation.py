@@ -32,7 +32,7 @@ from metaharness.plan_repository_validation import (
     render_violations,
     validate_plan_repository_topology,
 )
-from metaharness.planning_v2 import PlannerV2
+from metaharness.planning.planner import PlannerV2
 from metaharness.usage import phase_usage_summary
 from tests.pipeline_support import PipelineHarness, git, review, write
 

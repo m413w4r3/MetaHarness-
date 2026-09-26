@@ -57,8 +57,7 @@ from ..gitops import (
 )
 from ..commit_gate import CommitSafetyError, commit_safety_gate
 from ..result import atomic_write_text
-from ..models import GateStage, RunStatus
-from ..planning_v2 import TaskPlanV2
+from ..models import GateStage, RunStatus, TaskPlanV2
 from ..prompt_contracts import build_check_repair_payload, write_prompt_diagnostics
 from ..recovery_policy import (
     FailureClass,

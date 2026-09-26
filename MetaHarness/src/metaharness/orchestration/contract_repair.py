@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..planning_v2 import (
+from ..planning.artifacts import (
     StepContractRepairArtifactError,
     step_repair_attempt_files,
     step_repair_attempt_state,

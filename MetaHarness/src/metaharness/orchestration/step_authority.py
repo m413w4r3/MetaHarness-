@@ -25,11 +25,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ..models import ImplementationStep
-from ..planning_v2 import (
-    StepRepairIdentity,
-    V2PlanParseError,
-    parse_step_contract_repair,
-)
+from ..planning.contract_repair import StepRepairIdentity
+from ..planning.protocol import V2PlanParseError, parse_step_contract_repair
 from ..result import atomic_write_text
 from . import contract_repair
 from .shared import StepExecutionOutcome

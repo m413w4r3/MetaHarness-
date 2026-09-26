@@ -9,12 +9,14 @@ from unittest import mock
 
 from metaharness.llm.chat import LLMError
 from metaharness.models import ExecutionRole, RunStatus
-from metaharness.planning_v2 import (
-    StepContractRepairArtifactError,
+from metaharness.planning.artifacts import StepContractRepairArtifactError
+from metaharness.planning.contract_repair import (
     StepContractRepairPlanner,
     StepRepairIdentity,
-    V2PlanParseError,
     build_step_contract_repair_prompt,
+)
+from metaharness.planning.protocol import (
+    V2PlanParseError,
     normalize_repair_step_id,
     parse_step_contract_repair,
 )
@@ -417,7 +419,8 @@ class OutputCorrectionTests(ContractRepairFixtures):
     def test_a_raw_answer_durable_before_its_parse_is_parsed_without_a_new_call(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         with mock.patch(
-            "metaharness.planning_v2.parse_step_contract_repair", side_effect=KeyboardInterrupt(),
+            "metaharness.planning.contract_repair.parse_step_contract_repair",
+            side_effect=KeyboardInterrupt(),
         ):
             interrupted = self.run_repair(malformed())
         self.assertEqual(interrupted.status, RunStatus.INTERRUPTED)
@@ -440,11 +443,11 @@ class OutputCorrectionTests(ContractRepairFixtures):
             interrupted = self.run_repair(malformed())
         self.assertEqual(interrupted.status, RunStatus.INTERRUPTED)
         self.assertEqual(self.transaction()["status"], "planner_output_invalid")
-        from metaharness import planning_v2
+        from metaharness.planning import contract_repair as step_contract_repair
 
         with mock.patch(
-            "metaharness.planning_v2.parse_step_contract_repair",
-            wraps=planning_v2.parse_step_contract_repair,
+            "metaharness.planning.contract_repair.parse_step_contract_repair",
+            wraps=step_contract_repair.parse_step_contract_repair,
         ) as parse:
             resumed = self.resume([repaired_step_contract()], [review()])
 

@@ -9,7 +9,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.models import BlockerKind, CheckConfig, PlanDecision, PlanningConfig  # noqa: E402
-from metaharness.planning_v2 import V2PlanParseError, parse_task_plan_v2  # noqa: E402
+from metaharness.planning.protocol import (  # noqa: E402
+    V2PlanParseError,
+    parse_task_plan_v2,
+)
 from tests.pipeline_support import initial_plan  # noqa: E402
 
 STEP = ("S01", "feature.txt", "Write the feature")

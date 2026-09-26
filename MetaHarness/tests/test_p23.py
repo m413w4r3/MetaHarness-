@@ -15,12 +15,9 @@ from metaharness.gitops import (  # noqa: E402
     repository_reference_dict,
 )
 from metaharness.models import PlanningConfig, RepositoryConfig  # noqa: E402
-from metaharness.planning_v2 import (  # noqa: E402
-    V2PlanParseError,
-    build_planner_prompt_v2,
-    parse_task_plan_v2,
-    validate_decomposition_policy,
-)
+from metaharness.planning.planner import build_planner_prompt_v2  # noqa: E402
+from metaharness.planning.protocol import V2PlanParseError, parse_task_plan_v2  # noqa: E402
+from metaharness.planning.validation import validate_decomposition_policy  # noqa: E402
 
 
 def _step(number: int) -> str:

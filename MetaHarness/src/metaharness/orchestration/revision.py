@@ -47,8 +47,8 @@ from ..models import (
     HarnessConfig,
     ImplementationStep,
     RunStatus,
+    TaskPlanV2,
 )
-from ..planning_v2 import TaskPlanV2
 from ..prompt_contracts import (
     build_semantic_revision_payload,
     write_prompt_diagnostics,

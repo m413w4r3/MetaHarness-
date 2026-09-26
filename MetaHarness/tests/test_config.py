@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.config import ConfigError, load_config
 from metaharness.models import CheckConfig, RoutingConfig
-from metaharness.planning_v2 import render_safe_check_catalogue
+from metaharness.planning.protocol import render_safe_check_catalogue
 from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
 from metaharness.run_options import (
     RUN_SCHEMA_UNSUPPORTED,

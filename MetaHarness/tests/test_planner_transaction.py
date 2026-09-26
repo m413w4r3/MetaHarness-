@@ -12,7 +12,7 @@ from metaharness.llm.chat import (
     ConversationUnavailableError, LLMConversationHandle, TextLLMResult,
 )
 from metaharness.plan_repository_validation import PlanRepositoryPreconditionError, RepositoryPreconditions
-from metaharness.planning_v2 import PlannerV2
+from metaharness.planning.planner import PlannerV2
 from tests.pipeline_support import PipelineHarness, git
 from tests.test_plan_repository_validation import meta_plan
 
@@ -212,7 +212,7 @@ class PlannerTransactionTests(PipelineHarness):
 
     def test_resume_reuses_paid_raw_before_validation(self) -> None:
         chat = _Chat([self.valid])
-        with mock.patch("metaharness.planning_v2.parse_task_plan_v2", side_effect=RuntimeError("crash")):
+        with mock.patch("metaharness.planning.planner.parse_task_plan_v2", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):
                 self.run_plan(chat)
         self.run_plan(chat)
@@ -220,7 +220,7 @@ class PlannerTransactionTests(PipelineHarness):
 
     def test_resume_reuses_raw_if_usage_persistence_crashes(self) -> None:
         chat = _Chat([self.valid])
-        with mock.patch("metaharness.planning_v2.write_usage_artifact", side_effect=OSError("crash")):
+        with mock.patch("metaharness.planning.planner.write_usage_artifact", side_effect=OSError("crash")):
             with self.assertRaises(OSError):
                 self.run_plan(chat)
         self.assertEqual((self.target / "planner.raw.md").read_text(), self.valid)
@@ -239,7 +239,9 @@ class PlannerTransactionTests(PipelineHarness):
 
     def test_resume_reuses_paid_correction_raw(self) -> None:
         chat = _Chat([self.invalid, self.valid])
-        original = __import__("metaharness.planning_v2", fromlist=["parse_task_plan_v2"]).parse_task_plan_v2
+        original = __import__(
+            "metaharness.planning.planner", fromlist=["parse_task_plan_v2"]
+        ).parse_task_plan_v2
         calls = 0
         def parse_then_crash(*args, **kwargs):
             nonlocal calls
@@ -247,7 +249,7 @@ class PlannerTransactionTests(PipelineHarness):
             if calls == 2:
                 raise RuntimeError("crash")
             return original(*args, **kwargs)
-        with mock.patch("metaharness.planning_v2.parse_task_plan_v2", side_effect=parse_then_crash):
+        with mock.patch("metaharness.planning.planner.parse_task_plan_v2", side_effect=parse_then_crash):
             with self.assertRaises(RuntimeError):
                 self.run_plan(chat)
         self.run_plan(chat)

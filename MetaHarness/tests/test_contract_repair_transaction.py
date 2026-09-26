@@ -196,7 +196,7 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
     def test_a_durable_raw_answer_is_reparsed_without_a_provider_call(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         with mock.patch(
-            "metaharness.planning_v2.parse_step_contract_repair",
+            "metaharness.planning.contract_repair.parse_step_contract_repair",
             side_effect=KeyboardInterrupt(),
         ):
             # The process is interrupted after the paid answer became durable.

@@ -14,7 +14,7 @@ from .shared import (
     _create_file_once,
     _json_text,
 )
-from ..planning_v2 import TaskPlanV2
+from ..models import TaskPlanV2
 from ..resume import ResumeIntegrityError
 from ..review import ReviewResult
 

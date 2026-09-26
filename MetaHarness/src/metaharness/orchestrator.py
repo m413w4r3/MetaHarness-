@@ -160,26 +160,30 @@ from .models import (
     RunStatus,
     profile_driver_name,
 )
-from .planning_v2 import (
-    PlanParseError,
-    PlannerV2,
-    RepairPlannerV2,
+from .planning.artifacts import (
     STEP_CONTRACT_REPAIR_OUTPUT_INVALID,
     StepContractRepairArtifactError,
+    persist_recovered_plan_artifacts,
+    read_approved_step_contract,
+    validate_implementation_bundle,
+)
+from .planning.contract_repair import (
     StepContractRepairOutputInvalid,
     StepContractRepairPlanner,
     StepRepairIdentity,
-    TaskPlanV2,
+)
+from .planning.planner import PlannerV2, RepairPlannerV2
+from .planning.protocol import (
+    PlanParseError,
     V2PlanParseError,
     parse_task_plan_v2,
-    persist_recovered_plan_artifacts,
-    read_approved_step_contract,
     read_set_paths,
-    validate_decomposition_policy,
-    validate_execution_mode_policy,
-    validate_implementation_bundle,
     render_repair_plan_summary,
     render_repair_step_index,
+)
+from .planning.validation import (
+    validate_decomposition_policy,
+    validate_execution_mode_policy,
 )
 from .plan_repository_validation import (
     PlanRepositoryPreconditionError,
