@@ -40,10 +40,13 @@ from ..agent.protocol import (
     deferred_verify_dependency,
 )
 from ..attempt_transaction import (
+    AttemptViolation,
     GitOwnership,
+    audit_git_mutation,
     git_ownership,
     ownership_violations,
     paths_detail,
+    recover_worker_git_state,
     status_has_unstaged_or_untracked,
 )
 from ..gitops import (
@@ -52,6 +55,7 @@ from ..gitops import (
     changed_paths_between_trees,
     current_head,
     index_tree_sha,
+    restore_paths_from_tree,
     stage_all,
     status_porcelain,
 )
@@ -61,6 +65,7 @@ from ..models import (
     ModelProfile,
 )
 from ..plan_repository_validation import repository_tree_facts
+from ..scope import ScopeViolation
 from ..planning.normalization import normalization_entries, normalize_step_contract
 from ..profiles import profile_for_role
 from ..prompt_contracts import (
@@ -116,6 +121,7 @@ class WorkerAttemptService:
         original_spec: str = "",
         initial_mismatch: str | None = None,
         mismatch_retry_count: int = 0,
+        retry_addendum: str | None = None,
     ) -> StepExecutionOutcome:
         """The single authoritative execution of one step, in any cycle.
 
@@ -212,6 +218,7 @@ class WorkerAttemptService:
                 instructions=step.instructions,
                 verify_contract=step.verify,
                 forbidden_contract=step.forbidden,
+                retry_addendum=retry_addendum or "",
                 budget_bytes=self.runtime.config.prompt_budget.implementer_max_bytes,
             )
             request_prompt = prompt_payload.rendered
@@ -250,7 +257,7 @@ class WorkerAttemptService:
                     ),
                     prompt_mode="raw",
                     contract=contract,
-                    retry_addendum=None,
+                    retry_addendum=retry_addendum,
                 )
             )
         except AgentScopeError as exc:
@@ -345,6 +352,31 @@ class WorkerAttemptService:
         # A clean mismatch is allowed to defer only when the complete Git
         # boundary is untouched.
         ownership_after = git_ownership(repo, worktree)
+        mutation = audit_git_mutation(
+            ownership_before, ownership_after, branch_ref=branch_ref, base_sha=base_sha,
+            repo=repo,
+        )
+        if mutation.fatal_code is not None:
+            record_failure_tree(artifact_dir, worktree)
+            raise StepExecutionFailure(
+                mutation.fatal_code, step_id, mutation.fatal_detail,
+                profile_id=profile.id, tree_before=tree_before,
+                tree_after=safe_candidate_tree(worktree), usage=usage, **retry_mode,
+            )
+        if mutation.recoverable:
+            # A local commit or a parasite branch is not a boundary: the
+            # harness takes Git back, keeps the worker's content and goes on.
+            try:
+                recover_worker_git_state(
+                    repo, worktree, mutation, branch_ref=branch_ref, base_sha=base_sha,
+                )
+            except AttemptViolation as violation:
+                raise StepExecutionFailure(
+                    violation.code, step_id, violation.detail,
+                    profile_id=profile.id, tree_before=tree_before,
+                    tree_after=safe_candidate_tree(worktree), usage=usage, **retry_mode,
+                ) from None
+            ownership_after = git_ownership(repo, worktree)
         boundary_violations = ownership_violations(
             ownership_before, ownership_after, branch_ref=branch_ref, base_sha=base_sha
         )
@@ -495,16 +527,47 @@ class WorkerAttemptService:
                 bounded_v2_report(result.final_message) or "candidate delta is empty",
                 tree_after=tree_after, index_tree_after=safe_index_tree(worktree), **failed,
             )
-        # 15-16. Git, not the prompt, is the scope barrier: every changed path
-        # must be authorized by this step's WRITE, CREATE or DELETE set.
+        # 15-16. Git, not the prompt, is the scope authority.  A forbidden
+        # path is fatal in both modes; an ordinary path outside the declared
+        # sets is a signal: it is admitted and recorded (``soft``) or restored
+        # to its pre-attempt content (``strict``).
         changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
-        allowed = {*step.write_set, *step.create_set, *step.delete_set}
-        unexpected = [path for path in changed_paths if path not in allowed]
-        if unexpected:
+        policy = self.runtime.config.scope
+        try:
+            policy.check(changed_paths, worktree=worktree)
+        except ScopeViolation as violation:
             raise StepExecutionFailure(
-                AGENT_SCOPE_VIOLATION, step_id,
-                f"unexpected={paths_detail(unexpected)}", **failed, tree_after=tree_after,
-            )
+                violation.code, step_id, violation.detail,
+                **failed, tree_after=tree_after,
+            ) from None
+        allowed = {*step.write_set, *step.create_set, *step.delete_set}
+        unexpected = sorted(path for path in changed_paths if path not in allowed)
+        if unexpected and policy.strict:
+            try:
+                restore_paths_from_tree(worktree, tree_before, unexpected)
+                stage_all(worktree)
+            except (GitError, OSError) as exc:
+                raise StepExecutionFailure(
+                    "ROLLBACK_FAILED", step_id,
+                    f"out-of-scope paths could not be discarded: {exc}",
+                    **failed, tree_after=safe_candidate_tree(worktree),
+                ) from None
+            tree_after = index_tree_sha(worktree)
+            if tree_after == tree_before:
+                # Nothing but out-of-scope work: the step is retried, with the
+                # bounded feedback the discarded paths carry.
+                raise StepExecutionFailure(
+                    AGENT_SCOPE_VIOLATION, step_id,
+                    "changes outside mutable scope were discarded: "
+                    + paths_detail(unexpected),
+                    retry_feedback=(
+                        "changes outside mutable scope were discarded: "
+                        + paths_detail(unexpected)
+                    ),
+                    **failed, tree_after=tree_after,
+                )
+            changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
+        out_of_scope_paths = () if policy.strict else tuple(unexpected)
         # 17-18. Durable step record, then the outcome.  A deferred verify
         # dependency is recorded as data for the reviser and the reviewer; it never
         # relaxes a deterministic gate.
@@ -515,6 +578,7 @@ class WorkerAttemptService:
             "id": step_id, "status": "COMPLETED", "profile_id": profile.id,
             "tree_before": tree_before, "tree_after": tree_after,
             "changed_paths": list(changed_paths),
+            "out_of_scope_paths": list(out_of_scope_paths),
             **({"mismatch_retry_count": mismatch_retry_count}
                if mismatch_retry_count else {}),
             **({"initial_mismatch": bounded_v2_report(initial_mismatch)}
@@ -532,6 +596,7 @@ class WorkerAttemptService:
             final_report=result.final_message,
             deferred_verify=deferred_verify,
             mismatch_retry_count=mismatch_retry_count,
+            out_of_scope_paths=out_of_scope_paths,
         )
     def _step_profile(self, profile_id: str) -> tuple[ModelProfile, ExecutionRole]:
         """The approved implementation profile of one plan step."""

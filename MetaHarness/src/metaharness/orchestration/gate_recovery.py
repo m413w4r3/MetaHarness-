@@ -40,16 +40,12 @@ from ..planning.check_replan import (
 from ..recovery_policy import RecoveryStrategy, classify_failure
 from ..result import atomic_write_text
 from ..resume import ResumeIntegrityError
-from ..run_options import effective_repair_scope_policy
-from .check_failure import red_gate_identity
-from .check_scope import (
-    authorize_scope_expansion,
-    canonical_scope_paths,
-    evidence_proven_expansion,
-    responsible_step_index,
-)
+from .check_failure import implicated_repair_paths, red_gate_identity
+from .durable_readers import GATE_SCOPE_EXPANSION_ARTIFACT
 from .pipeline_v2 import (
     CyclePlan,
+    check_repair_attempt_dir,
+    check_repair_attempts_dir,
     check_repair_dir,
     gate_dir,
 )
@@ -61,6 +57,7 @@ from .shared import (
     json_text,
     read_json_artifact,
 )
+from ..scope import normalize_repo_paths
 
 
 _LADDER_ARTIFACT = "ladder.json"
@@ -107,6 +104,126 @@ def _ladder_path(run_dir: Path, cycle: int, stage: GateStage) -> Path:
     return check_repair_dir(run_dir, cycle, stage) / _LADDER_ARTIFACT
 
 
+def _canonical_scope_paths(paths: Any, *, what: str) -> tuple[str, ...]:
+    """The canonical, safe path list of one durable scope expansion."""
+
+    if not isinstance(paths, list) or any(not isinstance(item, str) for item in paths):
+        raise ResumeIntegrityError(f"{what} contains invalid paths")
+    canonical = tuple(sorted(set(paths)))
+    if list(canonical) != paths:
+        raise ResumeIntegrityError(f"{what} is not canonical")
+    try:
+        normalize_repo_paths(canonical)
+    except ValueError as exc:
+        raise ResumeIntegrityError(f"{what} contains unsafe paths") from exc
+    return canonical
+
+
+def authorize_scope_expansion(
+    *,
+    run_dir: Path,
+    cycle: int,
+    stage: GateStage | str,
+    attempt: int,
+    tree: str,
+    added_paths: Sequence[str],
+    approved: Sequence[str],
+    failed: Sequence[str],
+) -> None:
+    """Persist the evidence-proven expansion of one pending repair pass."""
+
+    try:
+        added = tuple(sorted(set(normalize_repo_paths(added_paths))))
+    except ValueError as exc:
+        raise ResumeIntegrityError("the gate recovery scope expansion is unsafe") from exc
+    if not added:
+        raise ResumeIntegrityError("the gate recovery scope expansion is empty")
+    directory = check_repair_attempt_dir(run_dir, cycle, GateStage(stage), attempt)
+    directory.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(directory / GATE_SCOPE_EXPANSION_ARTIFACT, json_text({
+        "schema_version": 1,
+        "attempt": attempt,
+        "tree": tree,
+        "failed_check_ids": list(failed),
+        "added_paths": list(added),
+    }))
+
+
+def _recorded_effective_scope(run_dir: Path, cycle: int, stage: GateStage) -> frozenset[str]:
+    """The effective repair scope of the latest recorded pass, best effort.
+
+    The value only narrows the ladder's own expansion candidates: the
+    authority of every pass is re-derived and validated by the attempt
+    machinery, never by this reader.
+    """
+
+    root = check_repair_attempts_dir(run_dir, cycle, stage)
+    if not root.is_dir():
+        return frozenset()
+    found: frozenset[str] = frozenset()
+    for directory in sorted(
+        (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=lambda path: int(path.name),
+    ):
+        payload = read_json_artifact(directory / "scope.json", 64 * 1024)
+        if not isinstance(payload, dict):
+            continue
+        raw = payload.get("effective_repair_scope", payload.get("effective_mutable_scope"))
+        if isinstance(raw, list) and all(isinstance(item, str) for item in raw):
+            found = frozenset(raw)
+    return found
+
+
+def evidence_proven_expansion(
+    *,
+    run_dir: Path,
+    cycle: int,
+    stage: GateStage,
+    repo: Path,
+    worktree: Path,
+    evidence_dir: Path,
+    evidence: EvidenceBundle,
+    approved: Sequence[str],
+) -> tuple[str, ...]:
+    """Evidence-proven additions to the repair scope, beyond the recorded ones."""
+
+    approved_scope = tuple(approved)
+    if not approved_scope:
+        return ()
+    tree, _failed = red_gate_identity(evidence)
+    _implicated, evidenced = implicated_repair_paths(
+        repo=repo, worktree=worktree, tree_sha=tree, evidence_dir=evidence_dir,
+        evidence=evidence, approved=approved_scope,
+    )
+    recorded = _recorded_effective_scope(run_dir, cycle, stage)
+    current = set(recorded) if recorded else set(evidenced)
+    return tuple(sorted(set(evidenced) - current))
+
+
+def responsible_step_index(
+    *,
+    repo: Path,
+    worktree: Path,
+    evidence_dir: Path,
+    evidence: EvidenceBundle,
+    approved: Sequence[str],
+    steps: Sequence[Any],
+) -> int | None:
+    """The first approved step whose mutable paths the failure implicates."""
+
+    tree, _failed = red_gate_identity(evidence)
+    implicated, _initial = implicated_repair_paths(
+        repo=repo, worktree=worktree, tree_sha=tree, evidence_dir=evidence_dir,
+        evidence=evidence, approved=approved,
+    )
+    if not implicated:
+        return None
+    for index, step in enumerate(steps):
+        if set(implicated) & set((*step.write_set, *step.create_set, *step.delete_set)):
+            return index
+    return None
+
+
 def _read_ladder(path: Path) -> _LadderLedger | None:
     """Read and validate the ladder ledger; a malformed artifact fails closed."""
 
@@ -147,7 +264,9 @@ def _read_ladder(path: Path) -> _LadderLedger | None:
             isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in indices
         ):
             raise ResumeIntegrityError("gate recovery ladder entry has invalid step indices")
-        added = canonical_scope_paths(item.get("added_paths"), what="gate recovery ladder expansion")
+        added = _canonical_scope_paths(
+            item.get("added_paths"), what="gate recovery ladder expansion",
+        )
         tree_after = item.get("tree_after")
         if not isinstance(tree_after, str) or len(tree_after) > 128:
             raise ResumeIntegrityError("gate recovery ladder entry has an invalid produced tree")
@@ -337,7 +456,6 @@ class CheckRepairLadder:
                 run_dir=ctx.run_dir, cycle=number, stage=stage_value,
                 attempt=step.repair_attempt, tree=step.tree, added_paths=step.added_paths,
                 approved=tuple(cycle_plan.mutable_scope), failed=failed,
-                policy=effective_repair_scope_policy(ctx.options),
             )
 
     def replan_step(
@@ -520,14 +638,13 @@ class CheckRepairLadder:
     def _expansion_paths(
         self, ctx: Any, cycle_plan: Any, stage: GateStage, evidence: EvidenceBundle,
     ) -> tuple[str, ...]:
-        """Bounded, evidence-proven additions to the repair scope."""
+        """Evidence-proven additions to the repair scope."""
 
         return evidence_proven_expansion(
             run_dir=ctx.run_dir, cycle=cycle_plan.cycle.number, stage=stage,
             repo=ctx.repo, worktree=ctx.info.worktree,
             evidence_dir=gate_dir(ctx.run_dir, cycle_plan.cycle.number, stage),
             evidence=evidence, approved=tuple(cycle_plan.mutable_scope),
-            policy=effective_repair_scope_policy(ctx.options),
         )
 
     @staticmethod

@@ -21,7 +21,6 @@ from typing import (
 from ..agent.base import (
     AGENT_RUNTIME_FAILED,
     AGENT_PROTOCOL_FAILED,
-    AGENT_SCOPE_VIOLATION,
     AGENT_START_FAILED,
     AGENT_TIMEOUT,
     AgentError,
@@ -74,12 +73,8 @@ from .revision import (
 )
 from .check_failure import (
     CheckRepairAttempt,
+    implicated_repair_paths,
     soft_check_failures,
-)
-from .check_scope import (
-    CheckRepairCoordinator,
-    SCOPE_REQUEST_SOURCE,
-    gate_mutable_authority,
 )
 from .pipeline_v2 import (
     CyclePlan,
@@ -91,11 +86,61 @@ from .pipeline_v2 import (
     gate_acceptance_path,
 )
 from .recovery import RecoveryAttempt
-from .durable_readers import load_evidence
+from .durable_readers import (
+    CYCLE_SCOPE_SOURCE,
+    EVIDENCE_SCOPE_SOURCE,
+    SCOPE_REQUEST_SOURCE,
+    gate_mutable_authority,
+    load_evidence,
+)
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
 
 
+
+
+def resolve_repair_scope(
+    *,
+    repo: Path,
+    worktree: Path,
+    tree_sha: str,
+    evidence_dir: Path,
+    evidence: EvidenceBundle,
+    approved_mutable_scope: Sequence[str],
+    previous: CheckRepairScope | None = None,
+) -> CheckRepairScope:
+    """The scope of the next check-repair attempt; earlier additions are kept.
+
+    The initial scope is the evidence-derived one -- an implicated source file
+    or, failing that, the changed paths of this gate -- and every later attempt
+    only adds to it.  A pass that asks for more does so through the one scope
+    authority; this function only fixes the starting envelope.
+    """
+
+    approved = tuple(sorted(set(approved_mutable_scope)))
+    if previous is not None and previous.approved_mutable_scope != approved:
+        raise ResumeIntegrityError("check-repair approved mutable scope changed")
+    if previous is not None:
+        initial = previous.initial_repair_scope
+    else:
+        # When the output names no implicated source file, the changed paths of
+        # this gate's evidence provide a narrow fallback.  A traceback match
+        # always takes priority and keeps unrelated cycle changes out of the
+        # worker's initial WRITE_SET.
+        _implicated, initial = implicated_repair_paths(
+            repo=repo, worktree=worktree, tree_sha=tree_sha,
+            evidence_dir=evidence_dir, evidence=evidence, approved=approved,
+        )
+    added = set(previous.added_paths) if previous is not None else set()
+    return CheckRepairScope(
+        approved_mutable_scope=approved,
+        initial_repair_scope=tuple(sorted(initial)),
+        added_paths=tuple(sorted(added)),
+        effective_repair_scope=tuple(sorted(set(initial) | added)),
+        source=SCOPE_REQUEST_SOURCE if added else (
+            EVIDENCE_SCOPE_SOURCE if initial else CYCLE_SCOPE_SOURCE
+        ),
+    )
 
 
 class GateService:
@@ -314,7 +359,6 @@ class GateService:
             previous_authority = gate_mutable_authority(
                 ctx.run_dir, number, stage,
                 base_paths=self.runtime.composition.effective_cycle_scope(ctx, cycle_plan),
-                policy_config=self.runtime.repair_scope,
                 through_attempt=len(records),
                 require_attempt_records=True,
             )
@@ -323,59 +367,53 @@ class GateService:
                 initial_repair_scope=previous_authority.initial_paths,
                 added_paths=previous_authority.added_paths,
                 effective_repair_scope=previous_authority.effective_paths,
-                policy=self.runtime.repair_scope.policy,
-                bound=self.runtime.repair_scope.max_added_paths,
                 source=previous_authority.source,
             )
         soft = soft_check_failures(evidence)
         failed_ids = tuple(item.split(":", 1)[1] for item in soft if ":" in item)
-        scope = CheckRepairCoordinator(
-            repair_scope_policy=self.runtime.repair_scope,
-        ).resolve_scope(
+        scope = resolve_repair_scope(
             repo=ctx.repo, worktree=ctx.info.worktree, tree_sha=evidence.staged_tree_sha,
             evidence_dir=gate_dir(ctx.run_dir, number, stage), evidence=evidence,
             approved_mutable_scope=self.runtime.composition.effective_cycle_scope(ctx, cycle_plan), previous=previous_scope,
         )
 
         def updated_scope(paths: Sequence[str]) -> CheckRepairScope:
+            """Admit one recorded scope request for this repair episode.
+
+            The paths were already parsed and checked against the one scope
+            authority; an addition widens this episode's envelope and nothing
+            else: the durable plan and later steps keep their own scope.
+            """
+
             effective = tuple(sorted(set(paths)))
             if not set(scope.initial_repair_scope).issubset(effective):
-                raise PipelineFailure("HUMAN_REQUIRED", "scope request removed existing authority")
-            if not set(effective).issubset(scope.approved_mutable_scope):
                 raise PipelineFailure(
-                    AGENT_SCOPE_VIOLATION,
-                    "scope request exceeds the cycle's approved mutable scope",
+                    "AGENT_SCOPE_VIOLATION", "scope request removed existing authority",
                 )
             added = tuple(path for path in effective if path not in set(scope.initial_repair_scope))
-            if len(added) > scope.bound:
-                raise PipelineFailure(
-                    "HUMAN_REQUIRED", "scope request exceeds the configured check-repair bound",
-            )
             return CheckRepairScope(
-                approved_mutable_scope=scope.approved_mutable_scope,
+                approved_mutable_scope=tuple(
+                    sorted(set(scope.approved_mutable_scope) | set(effective))
+                ),
                 initial_repair_scope=scope.initial_repair_scope,
                 added_paths=added,
                 effective_repair_scope=effective,
-                policy=scope.policy,
-                bound=scope.bound,
                 source=(SCOPE_REQUEST_SOURCE if added else scope.source),
             )
 
         def persist_scope(value: CheckRepairScope) -> None:
             atomic_write_text(attempt_dir / "scope.json", _json_text({
-                "schema_version": 3,
+                "schema_version": 4,
                 "approved_mutable_scope": list(value.approved_mutable_scope),
                 "initial_repair_scope": list(value.initial_repair_scope),
                 "added_paths": list(value.added_paths),
                 "effective_repair_scope": list(value.effective_repair_scope),
-                "policy": value.policy,
-                "bound": value.bound,
                 "source": value.source,
             }))
 
-        # A scope approval may suspend this exact, unconsumed attempt. Keep
-        # its report reachable across resume and apply the existing authority
-        # decision before asking the worker again.
+        # A scope request suspends this exact, unconsumed attempt. Keep its
+        # report reachable across resume and admit the requested paths before
+        # asking the worker again.
         report_path = attempt_dir / "report.json"
         report = _read_json_artifact(report_path, 256 * 1024) if report_path.is_file() else None
         if not isinstance(report, dict):
@@ -396,14 +434,9 @@ class GateService:
             and isinstance(report.get("scope_request"), dict)
         )
         if pending_scope_request:
-            outcome, mutable_scope = self.runtime.correction_scope.authorize_semantic_scope_request(
+            _outcome, mutable_scope = self.runtime.composition.admit_scope_request(
                 store, ctx, cycle_plan, attempt_dir, list(scope.effective_repair_scope),
-                approved_scope=scope.approved_mutable_scope,
             )
-            if outcome != "expanded":
-                raise PipelineFailure(
-                    "HUMAN_REQUIRED", "check-repair scope request needs an operator decision",
-                )
             scope = updated_scope(mutable_scope)
             persist_scope(scope)
             _archive_attempt(attempt_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
@@ -477,12 +510,11 @@ class GateService:
                 _record_failure_tree(attempt_dir, ctx.info.worktree)
             if error != SCOPE_REQUEST_ROUTE:
                 break
-            outcome, requested_scope = self.runtime.correction_scope.authorize_semantic_scope_request(
+            _outcome, requested_scope = self.runtime.composition.admit_scope_request(
                 store, ctx, cycle_plan, attempt_dir, list(scope.effective_repair_scope),
-                approved_scope=scope.approved_mutable_scope,
             )
-            if outcome != "expanded" or set(requested_scope) == set(scope.effective_repair_scope):
-                error = "HUMAN_REQUIRED"
+            if set(requested_scope) == set(scope.effective_repair_scope):
+                error = "REVISION_SCOPE_UNCHANGED"
                 break
             scope = updated_scope(requested_scope)
             persist_scope(scope)

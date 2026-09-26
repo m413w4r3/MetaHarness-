@@ -47,7 +47,7 @@ _FIXED_TARGETS = {
     "/v1/model-profiles": "/api/v1/model-profiles",
     "/v1/runs": "/api/v1/runs",
 }
-_MUTATION_SUFFIXES = ("approval", "scope-approval", "resume", "recover-plan")
+_MUTATION_SUFFIXES = ("approval", "resume", "recover-plan")
 # The statuses a mutation relays from MetaHarness; any other status, and any
 # non-object body, is reported as an upstream failure instead.
 _RELAYED_STATUSES = frozenset({200, 202, 400, 403, 404, 409, 413, 500, 503})
@@ -58,7 +58,6 @@ _CREATE_FIELDS = frozenset({
     "semantic_revision_enabled", "max_check_repair_attempts",
     "max_correction_cycles", "decomposition", "execution_mode_policy",
     "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
-    "repair_scope_policy", "repair_scope_max_added_paths",
 })
 _APPROVAL_FIELDS = frozenset({
     "decision", "final_reviewer_profile", "semantic_reviser_profile",
@@ -232,15 +231,6 @@ def _approval_payload(payload: dict[str, object]) -> dict[str, object]:
     return local
 
 
-def _scope_decision(payload: dict[str, object]) -> str:
-    """Return the single decision of an exact scope-approval body."""
-
-    decision = payload.get("decision")
-    if set(payload) != {"decision"} or decision not in _DECISIONS:
-        raise _RouteError(400, "invalid_request", "decision must be APPROVE or REJECT")
-    return decision
-
-
 def _require_empty_body(payload: dict[str, object]) -> None:
     if payload:
         raise _RouteError(400, "invalid_request", "resume body must be an empty JSON object")
@@ -395,8 +385,6 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
             return client.create_run(_create_payload(payload))
         if action == "approval":
             return client.approve_run(run_id, _approval_payload(payload))
-        if action == "scope-approval":
-            return client.approve_scope(run_id, _scope_decision(payload))
         if action == "resume":
             _require_empty_body(payload)
             return client.resume_run(run_id)

@@ -134,7 +134,7 @@ class CheckRepairTests(PipelineHarness):
             )[-1],
         )
         config = self.config(check_repair=1)
-        options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
+        options = RunOptions.from_config(config)
         result = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run", run_options=options)
@@ -197,7 +197,7 @@ class CheckRepairTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"), expanded_repair)
         config = self.config(check_repair=2)
-        options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
+        options = RunOptions.from_config(config)
         result = self.orchestrator(
             config, planner=[self._plan_with_approved_paths(related)], reviewer=[review()],
         ).run_text(SPEC, run_id="run", run_options=options)
@@ -217,7 +217,6 @@ class CheckRepairTests(PipelineHarness):
         expansion = json.loads(expansions[0].read_text(encoding="utf-8"))
         self.assertEqual(expansion["added_paths"], [related])
         self.assertEqual(expansion["attempt"], 2)
-        self.assertEqual(expansion["bound"], 1)
         scope = json.loads((attempt / "scope.json").read_text(encoding="utf-8"))
         self.assertEqual(scope["added_paths"], [related])
         self.assertEqual(scope["effective_repair_scope"], ["feature.txt", related])
@@ -451,7 +450,7 @@ class CheckRepairTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(ExecutionRole.REPAIR, blocked, repair)
         config = self.config(check_repair=1)
-        options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
+        options = RunOptions.from_config(config)
         result = self.orchestrator(
             config, planner=[self._plan_with_approved_paths("other.txt")], reviewer=[review()],
         ).run_text(SPEC, run_id="run", run_options=options)
@@ -517,11 +516,10 @@ class CheckRepairTests(PipelineHarness):
 
         def request_third_path(request):
             self.assertEqual(request.mutable_paths, tuple(modules[:2]))
-            self.assertIn("Traceback (most recent call last)", request.prompt)
-            self.assertIn("src/repair_00.py", request.prompt)
-            self.assertIn("src/repair_01.py", request.prompt)
-            self.assertIn("tests/test_failure.py", request.prompt)
-            self.assertIn("checks/test.stdout.log", request.prompt)
+            for expected in ("Traceback (most recent call last)", "src/repair_00.py",
+                             "src/repair_01.py", "tests/test_failure.py",
+                             "checks/test.stdout.log"):
+                self.assertIn(expected, request.prompt)
             return scope_request_for(modules[2]) + "\n\n" + check_repair_result(
                 "BLOCKED", "NOT_RUN", "SCOPE", "The related source path needs authority.",
             )
@@ -535,34 +533,37 @@ class CheckRepairTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, *(
             write(group[0], "good\n") for group in groups
         ))
-        self.workers.on(ExecutionRole.REPAIR, request_third_path, request_over_limit)
+        def repair_all(request):
+            self.assertEqual(request.mutable_paths, tuple(sorted(modules[:4])))
+            for path in modules[:4]:
+                (request.worktree / path).write_text("good\n", encoding="utf-8")
+            return check_repair_result()
+
+        self.workers.on(ExecutionRole.REPAIR, request_third_path, request_over_limit, repair_all)
         config = self.config(check_repair=1)
-        options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
+        options = RunOptions.from_config(config)
         result = self.orchestrator(
             config, planner=[plan_text], reviewer=[review()],
         ).run_text(SPEC, run_id="run", run_options=options)
 
+        # Every requested path is auto-admitted: a scope request is a signal,
+        # never an operator gate, whatever the number of added paths.
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(
-            result.status, RunStatus.WAITING_SCOPE_APPROVAL,
-            self.state().get("failure"),
+            self.workers.roles(), ["implementer"] * 8 + ["repair"] * 3,
         )
-        self.assertEqual(self.workers.roles(), ["implementer"] * 8 + ["repair", "repair"])
-        attempt = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts/001"
-        checks = json.loads(
-            (self.run_dir() / "cycles/001/checks/post-implementation/checks.json").read_text()
-        )
-        self.assertEqual(
-            checks[0]["stdout_tail"].strip(),
-            "FAILED tests/test_failure.py::test_gate_failure - AssertionError",
-        )
-        scope = json.loads((attempt / "scope.json").read_text(encoding="utf-8"))
-        self.assertEqual(scope["approved_mutable_scope"], sorted(approved))
-        self.assertEqual(scope["initial_repair_scope"], sorted(modules[:2]))
-        self.assertEqual(scope["added_paths"], [modules[2]])
-        self.assertEqual(scope["effective_repair_scope"], sorted(modules[:3]))
-        attempts = sorted((attempt / "scope_requests").glob("*/authority.json"))
-        self.assertEqual(len(attempts), 2)
-        self.assertEqual(json.loads(attempts[1].read_text())["bound"], 1)
+        attempt = self.run_dir() / "cycles/001/check-repair/post-implementation"
+        scopes = [json.loads(item.read_text(encoding="utf-8")) for item in attempt.rglob("scope.json")]
+        self.assertTrue(scopes)
+        for scope in scopes:
+            self.assertEqual(scope["approved_mutable_scope"], sorted(approved))
+            self.assertEqual(scope["initial_repair_scope"], sorted(modules[:2]))
+            self.assertEqual(scope["source"], "explicit META SCOPE REQUEST v1")
+        self.assertEqual(sorted({tuple(scope["added_paths"]) for scope in scopes}), [tuple(sorted(modules[2:4]))])
+        requests = sorted(attempt.rglob("scope_requests/*/decision.json"))
+        self.assertEqual(len(requests), 2)
+        for request in requests:
+            self.assertEqual(json.loads(request.read_text())["decision"], "auto-admitted")
 
     def test_check_repair_infrastructure_exhaustion_resumes_at_the_red_gate(self) -> None:
         from metaharness.agent import AgentRunResult
@@ -670,7 +671,6 @@ class CheckRepairTests(PipelineHarness):
             info=SimpleNamespace(worktree=self.repo),
             selection=SimpleNamespace(check_repair_fallbacks=()),
             options=SimpleNamespace(
-                repair_scope_policy="deny-expansion", repair_scope_max_added_paths=4,
             ),
         )
         ladder = CheckRepairLadder(replan_steps=lambda *args, **kwargs: "b" * 40)
@@ -882,7 +882,6 @@ class CheckRepairTests(PipelineHarness):
             info=SimpleNamespace(worktree=self.repo),
             selection=SimpleNamespace(check_repair_fallbacks=()),
             options=SimpleNamespace(
-                repair_scope_policy="deny-expansion", repair_scope_max_added_paths=4,
             ),
         )
 

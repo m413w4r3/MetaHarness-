@@ -59,8 +59,8 @@ from .check_failure import (
     check_failure_proofs,
     soft_check_failures,
 )
-from .correction_scope import build_scope_delta
 from .gate_recovery import consumed_ladder_strategies
+from .cycle_loader import build_scope_delta
 from .pipeline_v2 import (
     CyclePlan,
     PipelineFailure,
@@ -254,11 +254,10 @@ class CheckReplanService:
             )
         except OrchestrationError as exc:
             raise PipelineFailure(str(exc)) from exc
-        self.runtime.correction_scope.apply(
+        self.runtime.composition.apply_correction_scope(
             store, ctx, cycle, plan, directory, delta, content,
             list(facts.approved_mutable_envelope), facts.candidate_tree_sha,
         )
         return self.runtime.composition.correction_cycle_plan(
             ctx, cycle, plan, bundle, bundle_sha, creating=True,
         )
-

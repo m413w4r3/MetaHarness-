@@ -57,7 +57,6 @@ from ..prompt_contracts import (
 )
 from ..redaction import redact
 from ..result import atomic_write_text
-from ..run_options import EffectiveRepairScopePolicy
 from ..state import RunStateStore
 from ..usage import normalize_usage
 from ..validation import config_with_check_authority
@@ -81,7 +80,6 @@ from ..agent.base import (
     AGENT_TIMEOUT,
 )
 from ..agent.protocol import (
-    ScopeRequest,
     parse_check_repair_result,
     parse_scope_request,
 )
@@ -121,25 +119,6 @@ def _bounded_previous_revision_report(text: str) -> str:
     ].decode("utf-8", errors="ignore")
 
     return head + marker.decode("utf-8")
-
-
-def _scope_request_payload(request: ScopeRequest) -> dict[str, Any]:
-    return {
-        "reason": request.reason,
-        "paths": list(request.paths),
-        "evidence": list(request.evidence),
-        "authoritative": False,
-        "requires_scope_decision": True,
-    }
-
-
-def _scope_request_diagnostic(request: ScopeRequest) -> str:
-    return "\n".join([
-        "The revision worker requested scope expansion:",
-        f"  paths: {len(request.paths)}",
-        "  authoritative: NO",
-        "  requires operator decision: YES",
-    ])
 
 
 def _revision_execution_anomalies(results: list[dict[str, Any]]) -> str:
@@ -757,7 +736,6 @@ class RevisionRunner:
 
     config: HarnessConfig
     secrets: tuple[str, ...]
-    effective_repair_scope: EffectiveRepairScopePolicy
     approved_check_authority_sha256: Callable[[Path], str | None]
     run_revision: Callable[..., Any]
     ensure_revision_artifacts: Callable[[Path, Any], None]
@@ -817,18 +795,14 @@ class RevisionRunner:
                 initial_repair_scope=tuple(mutable_scope),
                 added_paths=(),
                 effective_repair_scope=tuple(mutable_scope),
-                policy=self.effective_repair_scope.policy,
-                bound=self.effective_repair_scope.max_added_paths,
-                source="human-approved mutable scope",
+                source="cycle mutable scope",
             )
             atomic_write_text(artifact_dir / "scope.json", _json_text({
-                "schema_version": 3,
+                "schema_version": 4,
                 "approved_mutable_scope": list(check_repair_scope.approved_mutable_scope),
                 "initial_repair_scope": list(check_repair_scope.initial_repair_scope),
                 "added_paths": list(check_repair_scope.added_paths),
                 "effective_repair_scope": list(check_repair_scope.effective_repair_scope),
-                "policy": check_repair_scope.policy,
-                "bound": check_repair_scope.bound,
                 "source": check_repair_scope.source,
             }))
             revision_prompt = self.check_repair_prompt(
@@ -848,7 +822,7 @@ class RevisionRunner:
         else:
             atomic_write_text(artifact_dir / "scope.json", _json_text({
                 "approved_mutable_scope": mutable_scope,
-                "source": "human-approved mutable scope",
+                "source": "cycle mutable scope",
             }))
             pre_payload = self.reusable_pre_checks(artifact_dir, tree_before)
             if pre_check_evidence is not None:
@@ -1018,8 +992,11 @@ class RevisionRunner:
             ),
             **(
                 {
-                    "scope_request": _scope_request_payload(scope_request),
-                    "scope_request_diagnostic": _scope_request_diagnostic(scope_request),
+                    "scope_request": {
+                        "reason": scope_request.reason,
+                        "paths": list(scope_request.paths),
+                        "evidence": list(scope_request.evidence),
+                    },
                 }
                 if scope_request is not None else {}
             ),
@@ -1039,21 +1016,26 @@ class RevisionRunner:
                if is_check_repair else {}),
         }))
         store.update_metadata(revision=revision_state)
+        def rollback() -> bool:
+            """Restore exactly the pre-attempt tree; ``False`` when unproven."""
+
+            try:
+                restore_paths_from_tree(info.worktree, tree_before, list(changed_paths))
+                stage_all(info.worktree)
+                return (
+                    candidate_tree_sha(info.worktree) == tree_before
+                    and index_tree_sha(info.worktree) == index_before
+                    and status_porcelain(info.worktree) == status_before
+                )
+            except (GitError, OSError):
+                return False
+
         if outside_scope:
             requested_paths = set(scope_request.paths) if scope_request is not None else set()
             unrequested = [path for path in outside_scope if path not in requested_paths]
             if scope_request is not None and not unrequested:
                 _record_failure_tree(artifact_dir, info.worktree)
-                try:
-                    restore_paths_from_tree(info.worktree, tree_before, list(changed_paths))
-                    stage_all(info.worktree)
-                    if (
-                        candidate_tree_sha(info.worktree) != tree_before
-                        or index_tree_sha(info.worktree) != index_before
-                        or status_porcelain(info.worktree) != status_before
-                    ):
-                        raise GitError("scope-request rollback did not restore the exact tree")
-                except (GitError, OSError):
+                if not rollback():
                     return result, "RESUME_REQUIRES_OPERATOR"
                 return result, SCOPE_REQUEST_ROUTE
             # A successful transport with an unsafe candidate: the exact failed
@@ -1078,27 +1060,13 @@ class RevisionRunner:
             # A semantic reviser that emits the scope marker without a valid
             # protocol is not allowed to turn malformed data into authority.
             _record_failure_tree(artifact_dir, info.worktree)
-            try:
-                restore_paths_from_tree(info.worktree, tree_before, list(changed_paths))
-                stage_all(info.worktree)
-            except (GitError, OSError):
-                pass
+            rollback()
             return result, "HUMAN_REQUIRED"
         if scope_request is not None:
             # A valid request is advisory evidence, never an authorization
             # delta.  Even an in-scope attempt is rolled back atomically, so
             # the durable candidate stays the tree the gate answered for.
             _record_failure_tree(artifact_dir, info.worktree)
-            try:
-                restore_paths_from_tree(info.worktree, tree_before, list(changed_paths))
-                stage_all(info.worktree)
-                if (
-                    candidate_tree_sha(info.worktree) != tree_before
-                    or index_tree_sha(info.worktree) != index_before
-                    or status_porcelain(info.worktree) != status_before
-                ):
-                    raise GitError("scope-request rollback did not restore the exact tree")
-            except (GitError, OSError):
-                pass
+            rollback()
             return result, SCOPE_REQUEST_ROUTE
         return result, None

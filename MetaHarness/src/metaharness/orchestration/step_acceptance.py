@@ -182,8 +182,6 @@ class StepAcceptanceService:
             or authority.effective_contract_sha256 != candidate["effective_contract_sha256"]
         ):
             refuse("the effective step authority changed since the worker succeeded")
-        if any(path not in authority.mutable_scope for path in changed):
-            refuse("the candidate changed paths outside its effective authority")
         try:
             verification = StepVerification.from_payload(candidate.get("verification"))
         except ValueError as exc:
@@ -205,6 +203,12 @@ class StepAcceptanceService:
             or sorted(record.get("changed_paths") or []) != sorted(changed)
         ):
             refuse("the step record does not match the candidate")
+        extra = record.get("out_of_scope_paths") or []
+        if not isinstance(extra, list) or any(not isinstance(path, str) for path in extra):
+            refuse("the step record has an invalid out-of-scope audit field")
+        admitted = {*authority.mutable_scope, *extra}
+        if any(path not in admitted for path in changed):
+            refuse("the candidate changed paths outside its effective authority")
         future = tuple(item.id for item in cycle_plan.plan.steps[index + 1:])
         self.runtime.observability.trace_emit(
             "recovery.resumed", phase="implementation", cycle=cycle_plan.cycle.number,
@@ -244,6 +248,7 @@ class StepAcceptanceService:
         outcome = StepExecutionOutcome(
             step_id=step.id, profile_id=str(candidate.get("profile_id") or ""),
             tree_before=tree_before, tree_after=tree_after, changed_paths=changed,
+            out_of_scope_paths=tuple(extra),
             usage=normalize_usage(record.get("usage")),
             final_report=(final_bytes or b"").decode("utf-8", errors="replace"),
             deferred_verify=str(record.get("deferred_verify") or ""),
@@ -506,7 +511,9 @@ class StepAcceptanceService:
             info.worktree,
             tree_sha=outcome.tree_after,
             parent_sha=parent_sha,
-            mutable_scope=authority.mutable_scope,
+            mutable_scope=(
+                *authority.mutable_scope, *outcome.out_of_scope_paths
+            ),
             verification_status=verification_status,
             deferred_reason=deferred.reason if deferred is not None else None,
             dependent_step_ids=deferred.dependent_step_ids if deferred is not None else (),

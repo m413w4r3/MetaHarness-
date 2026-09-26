@@ -18,8 +18,8 @@ from metaharness.claude.agent import (  # noqa: E402
     ClaudeCodeAgent,
     build_claude_environment,
     build_revision_prompt,
-    parse_scope_request,
 )
+from metaharness.agent.protocol import parse_scope_request  # noqa: E402
 from metaharness.claude.auth import check_claude_authentication  # noqa: E402
 from metaharness.claude.runtime import (  # noqa: E402
     ClaudeRuntimeError,

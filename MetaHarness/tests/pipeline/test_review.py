@@ -361,7 +361,7 @@ class SemanticRevisionTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.REVISER, lambda _request: request, use_added_scope)
         config = self.config(semantic_revision=True)
-        options = RunOptions.from_config(config, repair_scope_max_added_paths=1)
+        options = RunOptions.from_config(config)
         result = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run", run_options=options)
@@ -374,9 +374,7 @@ class SemanticRevisionTests(PipelineHarness):
         self.assertEqual(authority["added_paths"], ["other.txt"])
         self.assertEqual(git(self.worktree(), "show", "HEAD:other.txt").strip(), "authorized")
 
-    def test_semantic_scope_request_waits_for_approval_then_resumes(self) -> None:
-        from metaharness.web.api import approve_repair_scope
-
+    def test_semantic_scope_request_never_waits_for_an_operator(self) -> None:
         request = (
             "META SCOPE REQUEST v1\n\n"
             "REASON\nThe correction depends on the related file.\n\n"
@@ -387,32 +385,28 @@ class SemanticRevisionTests(PipelineHarness):
 
         def use_added_scope(agent_request):
             self.assertIn("other.txt", agent_request.mutable_paths)
-            (agent_request.worktree / "other.txt").write_text("approved\n", encoding="utf-8")
-            return "updated within approved scope\n"
+            (agent_request.worktree / "other.txt").write_text("admitted\n", encoding="utf-8")
+            return "updated within the auto-admitted scope\n"
 
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.REVISER, lambda _request: request, use_added_scope)
         config = self.config(semantic_revision=True)
-        options = RunOptions.from_config(
-            config, repair_scope_policy="require-approval", repair_scope_max_added_paths=1,
-        )
-        waiting = self.orchestrator(
+        options = RunOptions.from_config(config)
+        result = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run", run_options=options)
 
-        self.assertEqual(waiting.status, RunStatus.WAITING_SCOPE_APPROVAL)
-        approval_artifact = self.state()["scope_delta"]["approval_artifact"]
-        self.assertTrue((self.run_dir() / approval_artifact).is_file())
-        approve_repair_scope(self.root / "runs", "run", "APPROVE")
-
-        resumed = self.orchestrator(
-            config, planner=["unused"], reviewer=[review()],
-        ).resume("run")
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        # One pass, no human decision, no approval artifact, no wait state.
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser"])
-        self.assertEqual(git(self.worktree(), "show", "HEAD:other.txt").strip(), "approved")
+        self.assertEqual(git(self.worktree(), "show", "HEAD:other.txt").strip(), "admitted")
+        self.assertEqual(list(self.run_dir().rglob("scope_approval.json")), [])
+        decision = json.loads((
+            self.run_dir() / "cycles/001/semantic-revision/scope_requests/001/decision.json"
+        ).read_text())
+        self.assertEqual(decision["decision"], "auto-admitted")
 
-    def test_denied_semantic_scope_expansion_routes_to_replan(self) -> None:
+    def test_an_auto_admitted_semantic_scope_patch_reaches_the_commit(self) -> None:
         request = (
             "META SCOPE REQUEST v1\n\n"
             "REASON\nThe correction depends on the related file.\n\n"
@@ -420,15 +414,21 @@ class SemanticRevisionTests(PipelineHarness):
             "EVIDENCE\n- The related file supplies required context.\n\n"
             "END META SCOPE REQUEST"
         )
+        def use_added_scope(agent_request):
+            self.assertIn("other.txt", agent_request.mutable_paths)
+            (agent_request.worktree / "other.txt").write_text("revised\n", encoding="utf-8")
+            return "the correction also updates the related file\n"
+
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        self.workers.on(
-            ExecutionRole.REVISER,
-            lambda _request: request,
-            lambda _request: "no additional correction needed\n",
-        )
+        self.workers.on(ExecutionRole.REVISER, lambda _request: request, use_added_scope)
+        # The auto-admitted patch is a real change, so the reviewed candidate
+        # keeps it and the correction cycle runs the corrected plan normally.
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n\n"))
+        self.workers.on(
+            ExecutionRole.REVISER, lambda _request: "no additional correction needed\n",
+        )
         config = self.config(semantic_revision=True, correction_cycles=1)
-        options = RunOptions.from_config(config, repair_scope_policy="deny-expansion")
+        options = RunOptions.from_config(config)
         result = self.orchestrator(
             config,
             planner=[initial_plan(STEP), correction_plan(STEP)],
@@ -437,8 +437,16 @@ class SemanticRevisionTests(PipelineHarness):
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.state()["cycle"], 2)
-        self.assertIn("SEMANTIC REVISION: SCOPE EXPANSION DENIED\nroute=REPLAN", self.reviewer.requests[0])
-        self.assertEqual(self.workers.roles(), ["implementer", "reviser", "implementer", "reviser"])
+        self.assertEqual(
+            self.workers.roles(),
+            ["implementer", "reviser", "reviser", "implementer", "reviser"],
+        )
+        authority = json.loads((
+            self.run_dir() / "cycles/001/semantic-revision/scope_requests/001/authority.json"
+        ).read_text())
+        self.assertEqual(authority["added_paths"], ["other.txt"])
+        # The admitted path survives the next reviewed candidate and its commit.
+        self.assertEqual(git(self.worktree(), "show", "HEAD:other.txt").strip(), "revised")
 
     def test_gate_before_revision_has_the_exact_target_order(self) -> None:
         self.check.write_text(
@@ -527,32 +535,26 @@ class SemanticRevisionTests(PipelineHarness):
         )
 
 
-class ScopeApprovalTests(PipelineHarness):
-    def test_a_correction_scope_expansion_waits_for_approval_then_resumes(self) -> None:
+class CorrectionScopeAdmissionTests(PipelineHarness):
+    def test_a_correction_scope_expansion_is_auto_admitted(self) -> None:
         from metaharness.run_options import RunOptions
-        from metaharness.web.api import approve_repair_scope
 
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.IMPLEMENTER, write("other.txt", "second\n"))
         config = self.config(correction_cycles=1)
-        options = RunOptions.from_config(config, repair_scope_policy="require-approval")
-        waiting = self.orchestrator(
+        options = RunOptions.from_config(config)
+        result = self.orchestrator(
             config,
             planner=[initial_plan(STEP), correction_plan(("S01", "other.txt", "Correct other"))],
-            reviewer=[review("REVISE", "REPLAN")],
+            reviewer=[review("REVISE", "REPLAN"), review()],
         ).run_text(SPEC, run_id="run", run_options=options)
-        self.assertEqual(waiting.status, RunStatus.WAITING_SCOPE_APPROVAL)
-        checkpoint = self.checkpoint()
-        self.assertEqual((checkpoint["phase"], checkpoint["review_cycle"]), ("review_replan", 2))
+
+        # The correction plan widens the envelope as a recorded signal: no
+        # operator decision, no approval artifact, no waiting state.
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         delta = json.loads((self.run_dir() / "cycles/002/correction/scope_delta.json").read_text())
         self.assertEqual(delta["added_paths"], ["other.txt"])
-        self.assertEqual(self.workers.roles(), ["implementer"])
-
-        approve_repair_scope(self.root / "runs", "run", "APPROVE")
-        resumed = self.orchestrator(config, planner=["unused"], reviewer=[review()]).resume("run")
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        # The durable correction answer is reused: no second planner call.
-        self.assertEqual(self.planner.requests, [])
+        self.assertEqual(list(self.run_dir().rglob("scope_approval.json")), [])
         self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
 
 if __name__ == "__main__":

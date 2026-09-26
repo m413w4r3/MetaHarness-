@@ -70,7 +70,6 @@ from .state import RunStateStore
 from .run_options import (
     RunOptions,
     RunOptionsError,
-    effective_repair_scope_policy,
     effective_run_config,
     read_run_options_for_state,
     write_run_options,
@@ -79,7 +78,6 @@ from .orchestration.shared import (
     CommitBoundaryError,
     OrchestrationError,
 )
-from .orchestration.pipeline_v2 import PipelineV2Context
 from .orchestration.resume_integrity import validate_resume
 from .orchestration.runtime import (
     RunRuntime,
@@ -190,7 +188,6 @@ class Orchestrator:
             # All downstream methods use this frozen per-run view.  The
             # caller's HarnessConfig object is never mutated.
             self._runtime.run_options = run_options
-            self._runtime.repair_scope = effective_repair_scope_policy(run_options)
             self._runtime.config = effective_run_config(original_config, run_options)
             store.update_metadata(
                 spec_path="spec.md",
@@ -319,7 +316,6 @@ class Orchestrator:
         try:
             options, _ = read_run_options_for_state(run_dir, state)
             self._runtime.run_options = options
-            self._runtime.repair_scope = effective_repair_scope_policy(options)
             self._runtime.config = effective_run_config(self._runtime.config, options)
         except RunOptionsError as exc:
             raise ResumeNotAllowedError("run options are missing or invalid") from exc
@@ -366,7 +362,7 @@ class Orchestrator:
             ))
         try:
             resumed = validate_resume(
-                config=self._runtime.config, repair_scope=self._runtime.repair_scope,
+                config=self._runtime.config,
                 run_dir=run_dir, state=state, checkpoint=checkpoint,
                 staging_remote=self._runtime.config.repository.remote,
             )

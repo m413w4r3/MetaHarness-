@@ -24,14 +24,19 @@ from typing import Collection, Sequence
 from .gitops import (
     CandidateState,
     GitError,
+    all_refs,
     candidate_ownership_matches,
     candidate_state_changed_paths,
     candidate_tree_sha,
     changed_paths_between_trees,
+    checkout_branch,
     current_head,
+    delete_ref,
     index_tree_sha,
+    is_ancestor,
     local_branches,
     registered_worktrees,
+    reset_worktree_soft,
     restore_candidate_state,
     restore_paths_from_tree,
     snapshot_candidate_state,
@@ -58,6 +63,9 @@ class GitOwnership:
     head: str
     branches: frozenset[str]
     worktrees: frozenset[str]
+    # Every ref with its object ID.  It is what proves a push: a push writes
+    # ``refs/remotes/**``, which no branch snapshot can see.
+    refs: frozenset[tuple[str, str]] = frozenset()
 
 
 def git_ownership(repo: Path, worktree: Path) -> GitOwnership:
@@ -66,7 +74,143 @@ def git_ownership(repo: Path, worktree: Path) -> GitOwnership:
         head=current_head(worktree),
         branches=local_branches(repo),
         worktrees=registered_worktrees(repo),
+        refs=all_refs(repo),
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class GitMutationAudit:
+    """What one untrusted process did to the Git boundary of its attempt.
+
+    ``fatal`` is the stable code and detail of a mutation the harness may not
+    recover from, or ``None``.  The remaining fields describe the mutations the
+    harness takes back: the commits of the run branch, a branch the worker
+    created -- and possibly checked out -- and every new local ref.
+    """
+
+    fatal_code: str | None = None
+    fatal_detail: str = ""
+    worker_commits: bool = False
+    created_branches: tuple[str, ...] = ()
+    adopted_branch: str | None = None
+
+    @property
+    def recoverable(self) -> bool:
+        return self.fatal_code is None and bool(
+            self.worker_commits or self.created_branches or self.adopted_branch
+        )
+
+
+# The run branch moved forward; the harness rewinds it with ``reset --soft``.
+REMOTE_AUTHORITY_MISMATCH = "REMOTE_AUTHORITY_MISMATCH"
+BRANCH_MODIFIED_OUTSIDE_AUTHORITY = "BRANCH_MODIFIED_OUTSIDE_AUTHORITY"
+HEAD_MODIFIED_OUTSIDE_AUTHORITY = "HEAD_MODIFIED_OUTSIDE_AUTHORITY"
+
+
+def audit_git_mutation(
+    before: GitOwnership, after: GitOwnership, *, branch_ref: str, base_sha: str,
+    repo: Path | None = None,
+) -> GitMutationAudit:
+    """Classify one attempt's Git mutations: recoverable or fatal.
+
+    A local commit on the run branch, or on a new branch the worker created and
+    checked out, is recoverable: the change stays, the commit does not.  A
+    push, a foreign ref, a deleted ref, a rewritten history and a worktree
+    change are not.
+    """
+
+    created = tuple(sorted(after.branches - before.branches))
+    deleted = tuple(sorted(before.branches - after.branches))
+    if deleted:
+        return GitMutationAudit(
+            BRANCH_MODIFIED_OUTSIDE_AUTHORITY,
+            "branch(es) deleted: " + ", ".join(deleted),
+        )
+    if _remote_refs(after) != _remote_refs(before):
+        return GitMutationAudit(
+            REMOTE_AUTHORITY_MISMATCH,
+            "remote-tracking refs changed: the worker pushed or fetched",
+        )
+    foreign = _foreign_ref_changes(before, after, branch_ref=branch_ref, created=created)
+    if foreign:
+        return GitMutationAudit(
+            BRANCH_MODIFIED_OUTSIDE_AUTHORITY,
+            "ref(s) modified outside the run branch: " + ", ".join(foreign),
+        )
+    roots = {
+        name for name, _value in before.refs
+    }
+    adopted = (
+        after.head_ref
+        if after.head_ref is not None
+        and after.head_ref != branch_ref
+        and after.head_ref in created
+        and after.head_ref not in roots
+        else None
+    )
+    if after.head_ref not in {branch_ref, adopted}:
+        return GitMutationAudit(
+            HEAD_MODIFIED_OUTSIDE_AUTHORITY,
+            f"worktree HEAD switched to {after.head_ref or 'a detached HEAD'}",
+        )
+    if after.head != base_sha:
+        moved = _moves_forward(before.head, after.head, base_sha, repo=repo)
+        if adopted is None and after.head_ref != branch_ref:
+            return GitMutationAudit(
+                HEAD_MODIFIED_OUTSIDE_AUTHORITY, "worktree HEAD commit changed",
+            )
+        if not moved:
+            return GitMutationAudit(
+                HEAD_MODIFIED_OUTSIDE_AUTHORITY,
+                "the run branch no longer descends from the expected commit",
+            )
+        return GitMutationAudit(
+            worker_commits=True, created_branches=created, adopted_branch=adopted,
+        )
+    return GitMutationAudit(created_branches=created, adopted_branch=adopted)
+
+
+def _remote_refs(ownership: GitOwnership) -> frozenset[tuple[str, str]]:
+    return frozenset(
+        item for item in ownership.refs if item[0].startswith("refs/remotes/")
+    )
+
+
+def _foreign_ref_changes(
+    before: GitOwnership, after: GitOwnership, *, branch_ref: str, created: tuple[str, ...],
+) -> list[str]:
+    """Ref changes no recovery may absorb: everything but the run branch.
+
+    A branch the worker created is recoverable and deleted after the fact; a
+    pre-existing ref that changed is not.
+    """
+
+    previous = dict(before.refs)
+    current = dict(after.refs)
+    changes: list[str] = []
+    for name, value in sorted(current.items()):
+        if name == branch_ref or name in created or name.startswith("refs/remotes/"):
+            continue
+        if name not in previous:
+            changes.append(f"created {name}")
+        elif previous[name] != value:
+            changes.append(f"moved {name}")
+    for name in sorted(set(previous) - set(current)):
+        if name == branch_ref or name in created or name.startswith("refs/remotes/"):
+            continue
+        changes.append(f"deleted {name}")
+    return changes
+
+
+def _moves_forward(
+    previous_head: str, head: str, base_sha: str, *, repo: Path | None,
+) -> bool:
+    if previous_head != base_sha or head == base_sha or repo is None:
+        return False
+    try:
+        return is_ancestor(repo, base_sha, head)
+    except GitError:
+        return False
 
 
 def ownership_violations(
@@ -120,6 +264,44 @@ def paths_detail(paths: Sequence[str]) -> str:
     shown = [safe_path_label(path) for path in paths[:MAX_REPORTED_PATHS]]
     extra = len(paths) - len(shown)
     return ",".join(shown) + (f" (+{extra} more)" if extra > 0 else "")
+
+
+def recover_worker_git_state(
+    repo: Path, worktree: Path, audit: GitMutationAudit, *, branch_ref: str, base_sha: str,
+) -> None:
+    """Take back one recoverable worker Git mutation, content preserved.
+
+    The worker's commits are removed from the branch (`reset --soft`), HEAD is
+    re-attached to the run branch, and every branch the attempt created is
+    deleted.  The index and the files keep the worker's content, so the change
+    stays exploitable; only the history changes.
+    """
+
+    try:
+        if current_head(worktree) != base_sha:
+            reset_worktree_soft(worktree, base_sha)
+        if symbolic_head(worktree) != branch_ref:
+            checkout_branch(worktree, branch_ref)
+        for branch in audit.created_branches:
+            delete_ref(repo, branch)
+    except GitError as exc:
+        raise AttemptViolation(
+            "ROLLBACK_FAILED", f"worker Git mutation is not recoverable: {exc}",
+        ) from None
+    try:
+        restored = (
+            current_head(worktree) == base_sha
+            and symbolic_head(worktree) == branch_ref
+            and not (local_branches(repo) & set(audit.created_branches))
+        )
+    except GitError as exc:
+        raise AttemptViolation(
+            "ROLLBACK_FAILED", f"worker Git recovery could not be read back: {exc}",
+        ) from None
+    if not restored:
+        raise AttemptViolation(
+            "ROLLBACK_FAILED", "worker Git recovery was not proven",
+        )
 
 
 # -- trusted processes ---------------------------------------------------
@@ -358,6 +540,9 @@ class CandidateAttemptTransaction:
 
 __all__ = [
     "AttemptBoundary", "AttemptRollback", "AttemptViolation",
+    "BRANCH_MODIFIED_OUTSIDE_AUTHORITY", "GitMutationAudit",
+    "HEAD_MODIFIED_OUTSIDE_AUTHORITY", "REMOTE_AUTHORITY_MISMATCH",
+    "audit_git_mutation", "recover_worker_git_state",
     "CandidateAttemptTransaction", "GitOwnership", "SideEffect",
     "MAX_REPORTED_PATHS", "contain_trusted_process", "git_ownership",
     "observe_side_effects", "ownership_violations", "paths_detail", "restore_exact",

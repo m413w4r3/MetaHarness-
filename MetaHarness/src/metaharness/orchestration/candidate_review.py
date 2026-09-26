@@ -54,7 +54,6 @@ from ..review import (
 )
 from ..state import RunStateStore
 from ..usage import read_usage_artifact
-from .check_scope import gate_mutable_authority
 from .pipeline_v2 import (
     CyclePlan,
     PipelineFailure,
@@ -67,6 +66,7 @@ from .cycle_loader import read_cycle_record
 from .durable_readers import (
     accepted_review,
     candidate_evidence,
+    gate_mutable_authority,
     load_revision,
     read_candidate_record,
     read_planner_conversation,
@@ -256,7 +256,6 @@ class CandidateReviewService:
             authority = gate_mutable_authority(
                 ctx.run_dir, number, stage,
                 base_paths=self.runtime.composition.effective_cycle_scope(ctx, cycle_plan),
-                policy_config=self.runtime.repair_scope,
                 require_attempt_records=True,
             )
         except (OSError, UnicodeError, ValueError, GitError, TypeError) as exc:
@@ -415,13 +414,7 @@ class CandidateReviewService:
         authorized_classes = {
             "PRODUCT_SPEC_AMBIGUITY", "SECURITY_POLICY_DECISION", "AUTHORITY_CONFLICT",
         }
-        if reason_class == "SCOPE_EXPANSION_REQUIRE_APPROVAL":
-            if self.runtime.repair_scope.policy != "require-approval":
-                raise PipelineFailure(
-                    "REVIEW_FORMAT_INVALID",
-                    "HUMAN scope approval was requested outside the configured require-approval policy",
-                )
-        elif reason_class not in authorized_classes:
+        if reason_class not in authorized_classes:
             raise PipelineFailure(
                 "REVIEW_FORMAT_INVALID", "HUMAN route lacks an authorized structured reason",
             )

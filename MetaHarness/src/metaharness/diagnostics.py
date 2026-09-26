@@ -32,7 +32,6 @@ from .orchestration.pipeline_v2 import (
 )
 from .run_options import (
     RunOptionsError,
-    effective_repair_scope_policy,
     read_run_options_with_sha256,
 )
 from .step_ids import is_step_id
@@ -627,26 +626,6 @@ def _check_recovery_summary(run_dir: Path, state: Mapping[str, Any]) -> str:
     ))
 
 
-def _repair_scope_policy_status(run_dir: Path) -> str:
-    """Render the frozen repair-scope authority of the run."""
-
-    try:
-        options, _digest = read_run_options_with_sha256(run_dir)
-        effective = effective_repair_scope_policy(options)
-    except RunOptionsError as exc:
-        return "\n".join([
-            "Repair scope policy:",
-            "  effective policy: unavailable",
-            f"  error: {type(exc).__name__}",
-        ])
-    return "\n".join([
-        "Repair scope policy:",
-        f"  effective policy: {effective.policy}",
-        f"  max added paths: {effective.max_added_paths}",
-        f"  source: {effective.source}",
-    ])
-
-
 def _event_artifact(run_dir: Path, relative: str, secrets: tuple[str, ...]) -> str:
     item = _artifact(run_dir, relative)
     return _artifact_header(item) + "Summarized events (tool arguments omitted):\n" + (
@@ -715,7 +694,6 @@ def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
             _plan_summary(run_dir, secrets, f"{correction}/task_plan_v2.json"),
             _bundle_summary(run_dir, secrets, f"{correction}/implementation_bundle.json"),
             _artifact_json(run_dir, f"{correction}/scope_delta.json", secrets),
-            _artifact_json(run_dir, f"{correction}/scope_approval.json", secrets),
         ])
     parts.append(_section("Plan", plan_body))
     steps_root = implementation_steps_dir(run_dir, cycle)
@@ -900,7 +878,6 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
         summary_body += f"\n[TRUNCATED: original {_state_size} bytes]\n"
     body += _section("RUN SUMMARY", summary_body)
     body += _section("RUN OPTIONS", _safe_json_artifact(directory, "run_options.json", secrets, ("schema_version", "planning", "pipeline", "profiles")))
-    body += _section("REPAIR SCOPE POLICY", _repair_scope_policy_status(directory))
     try:
         checkpoint_record = read_checkpoint_record(directory)
         checkpoint_text = _artifact_json(directory, "resume_checkpoint.json", secrets)

@@ -25,10 +25,6 @@ from typing import (
     TYPE_CHECKING,
 )
 from ..agent.base import AgentError
-from ..approval import (
-    ApprovalDecision,
-    read_scope_approval,
-)
 from ..gitops import (
     GitError,
     candidate_tree_sha,
@@ -38,9 +34,6 @@ from ..llm.chat import LLMError
 from ..models import (
     ExecutionRole,
     ImplementationStep,
-    RunMachineState,
-    RunDisposition,
-    SCOPE_APPROVAL_REASON,
 )
 from ..plan_repository_validation import repository_tree_facts
 from ..planning.artifacts import (
@@ -75,7 +68,6 @@ from .recovery import (
     RecoveryCoordinator,
 )
 from .shared import (
-    ScopeApprovalRequired,
     StepExecutionFailure,
     bounded_v2_report,
     json_text,
@@ -259,17 +251,6 @@ class ContractRecoveryService:
                     "recovery.waiting_external", phase="implementation", cycle=cycle,
                     step_id=step.id,
                     data={"operation": "contract_repair", "reason": "LLM_FAILURE", **data},
-                )
-                raise
-            except ScopeApprovalRequired:
-                delta = read_json_artifact(directory / "scope_delta.json", 64 * 1024)
-                store.set_run_state(
-                    RunMachineState(
-                        disposition=RunDisposition.WAIT_HUMAN,
-                        reason=SCOPE_APPROVAL_REASON,
-                    ),
-                    current_step=step.id,
-                    scope_delta=delta if isinstance(delta, dict) else {},
                 )
                 raise
             except (ContractRepairIntegrityError, StepContractRepairArtifactError) as exc:
@@ -520,34 +501,9 @@ class ContractRecoveryService:
         repaired_mutable = set((*repaired.write_set, *repaired.create_set, *repaired.delete_set))
         added = repaired_mutable - original_mutable
         if added:
-            policy = self.runtime.repair_scope
-            if len(added) > policy.max_added_paths or policy.policy == "deny-expansion":
-                # A valid answer the scope policy does not authorize: an
-                # operator decision, never a planner output correction.
-                raise PipelineFailure(
-                    "CONTRACT_REPAIR_SCOPE_DENIED",
-                    f"contract repair requested {len(added)} additional mutable path(s) "
-                    f"beyond the {policy.policy} bound of {policy.max_added_paths}: "
-                    + ", ".join(sorted(added))[:500],
-                    step_id=original_step.id,
-                )
-            if policy.policy == "require-approval":
-                delta = {
-                    "schema_version": 1, "step_id": original_step.id,
-                    "added_paths": sorted(added), "tree_sha": tree_before,
-                    "repair_number": int(artifact_dir.name),
-                }
-                delta_path = artifact_dir / "scope_delta.json"
-                atomic_write_text(delta_path, json_text(delta))
-                approval = read_scope_approval(
-                    artifact_dir,
-                    expected_sha256=hashlib.sha256(delta_path.read_bytes()).hexdigest(),
-                )
-                if approval is None:
-                    contract_repair.ensure(artifact_dir, contract_repair.SCOPE_WAITING)
-                    raise ScopeApprovalRequired()
-                if approval.decision is not ApprovalDecision.APPROVE:
-                    raise PipelineFailure("HUMAN_REQUIRED", "contract repair scope rejected")
+            # The added paths are admitted for this repaired step and recorded;
+            # the shared scope authority is the only refusal left.
+            self._authorize_repair_additions(artifact_dir, sorted(added))
         validation_path = artifact_dir / "validation.json"
         validation = read_json_artifact(validation_path, 64 * 1024)
         if isinstance(validation, dict):
@@ -588,22 +544,12 @@ class ContractRecoveryService:
             )
         return authority
     def _authorize_repair_additions(self, repair_dir: Path, added: list[str]) -> None:
-        """The frozen scope policy of one validated repair's added paths."""
+        """Check one validated repair's added paths with the scope authority."""
 
-        policy = self.runtime.repair_scope
-        if policy.policy == "deny-expansion":
-            raise PipelineFailure("REPAIR_SCOPE_EXPANSION")
-        if policy.policy == "require-approval" or len(added) > policy.max_added_paths:
-            delta_path = repair_dir / "scope_delta.json"
-            delta = read_json_artifact(delta_path, 64 * 1024)
-            if not isinstance(delta, dict) or delta.get("added_paths") != sorted(added):
-                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "step contract repair scope delta is malformed")
-            approval = read_scope_approval(
-                repair_dir,
-                expected_sha256=hashlib.sha256(delta_path.read_bytes()).hexdigest(),
-            )
-            if approval is None or approval.decision is not ApprovalDecision.APPROVE:
-                raise ScopeApprovalRequired()
+        try:
+            self.runtime.config.scope.check(added)
+        except ScopeViolation as violation:
+            raise PipelineFailure(violation.code, violation.detail) from None
     @staticmethod
     def repair_failure_evidence(directory: Path) -> str:
         """The durable failure evidence of a slot a red gate opened, if any."""

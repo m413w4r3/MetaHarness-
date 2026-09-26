@@ -27,8 +27,6 @@ SCHEMA_VERSION = 4
 # Deterministic refusal code for a snapshot that is not the current schema.
 RUN_SCHEMA_UNSUPPORTED = "RUN_SCHEMA_UNSUPPORTED"
 RUN_OPTIONS_NAME = "run_options.json"
-REPAIR_SCOPE_POLICIES = frozenset({"auto-bounded", "require-approval", "deny-expansion"})
-
 _TOP_LEVEL_FIELDS = frozenset({
     "schema_version", "pipeline_version", "planning", "pipeline", "profiles", "recovery",
 })
@@ -40,7 +38,7 @@ _PLANNING_FIELDS = frozenset({
 })
 _PIPELINE_FIELDS = frozenset({
     "semantic_revision_enabled", "max_check_repair_attempts", "max_correction_cycles",
-    "max_step_contract_repairs", "repair_scope_policy", "repair_scope_max_added_paths",
+    "max_step_contract_repairs",
 })
 _PROFILE_FIELDS = frozenset({
     "planner_profile", "mechanical_profile", "reasoning_profile", "agentic_profile",
@@ -80,21 +78,6 @@ def _fallback_ids(value: Any) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
-class EffectiveRepairScopePolicy:
-    policy: str
-    max_added_paths: int
-    source: str
-
-    def __post_init__(self) -> None:
-        if self.policy not in REPAIR_SCOPE_POLICIES:
-            raise RunOptionsError("effective repair scope policy is invalid")
-        if not isinstance(self.max_added_paths, int) or isinstance(self.max_added_paths, bool) or self.max_added_paths <= 0:
-            raise RunOptionsError("effective repair scope max_added_paths must be greater than zero")
-        if self.source != "run-options":
-            raise RunOptionsError("effective repair scope policy source is invalid")
-
-
-@dataclass(frozen=True)
 class RunOptions:
     schema_version: int
     pipeline_version: int
@@ -116,8 +99,6 @@ class RunOptions:
     check_repair_profile: str | None = None
     semantic_reviser_profile: str | None = None
     final_reviewer_profile: str = ""
-    repair_scope_policy: str = "auto-bounded"
-    repair_scope_max_added_paths: int = 4
     max_steps_per_plan: int = 8
     max_read_paths_per_step: int = 8
     max_step_contract_chars: int = 5000
@@ -178,10 +159,6 @@ class RunOptions:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise RunOptionsError(f"run options {name} is invalid")
-        if self.repair_scope_policy not in REPAIR_SCOPE_POLICIES:
-            raise RunOptionsError("run options repair_scope_policy is invalid")
-        if not isinstance(self.repair_scope_max_added_paths, int) or isinstance(self.repair_scope_max_added_paths, bool) or self.repair_scope_max_added_paths <= 0:
-            raise RunOptionsError("run options repair_scope_max_added_paths must be greater than zero")
 
     @classmethod
     def from_config(cls, config: HarnessConfig, **overrides: Any) -> "RunOptions":
@@ -192,7 +169,6 @@ class RunOptions:
             "max_correction_cycles", "planner_profile", "mechanical_profile",
             "reasoning_profile", "agentic_profile",
             "check_repair_profile", "semantic_reviser_profile", "final_reviewer_profile",
-            "repair_scope_policy", "repair_scope_max_added_paths",
             "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
             "max_preapproval_corrections", "max_step_contract_repairs",
             "recovery",
@@ -226,8 +202,6 @@ class RunOptions:
             "check_repair_profile": config.ui.default_repair_profile,
             "semantic_reviser_profile": config.ui.default_reviser_profile,
             "final_reviewer_profile": config.ui.default_reviewer_profile,
-            "repair_scope_policy": "auto-bounded",
-            "repair_scope_max_added_paths": 4,
             "recovery": config.recovery,
         }
         values.update(overrides)
@@ -306,8 +280,6 @@ class RunOptions:
                 "max_check_repair_attempts": self.max_check_repair_attempts,
                 "max_correction_cycles": self.max_correction_cycles,
                 "max_step_contract_repairs": self.max_step_contract_repairs,
-                "repair_scope_policy": self.repair_scope_policy,
-                "repair_scope_max_added_paths": self.repair_scope_max_added_paths,
             },
             "recovery": asdict(self.recovery),
             "profiles": {
@@ -420,10 +392,6 @@ def read_run_options_with_sha256(run_dir: str | Path, expected_sha256: str | Non
     return options, digest
 
 
-def effective_repair_scope_policy(options: RunOptions) -> EffectiveRepairScopePolicy:
-    return EffectiveRepairScopePolicy(options.repair_scope_policy, options.repair_scope_max_added_paths, "run-options")
-
-
 def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessConfig:
     options.validate_profiles(config)
     planning = PlanningConfig(
@@ -461,10 +429,10 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
 
 
 __all__ = [
-    "SCHEMA_VERSION", "RUN_SCHEMA_UNSUPPORTED", "RUN_OPTIONS_NAME", "REPAIR_SCOPE_POLICIES",
+    "SCHEMA_VERSION", "RUN_SCHEMA_UNSUPPORTED", "RUN_OPTIONS_NAME",
     "RunOptions", "RunOptionsConflict", "RunOptionsError",
-    "EffectiveRepairScopePolicy", "canonical_run_options_bytes", "run_options_sha256",
+    "canonical_run_options_bytes", "run_options_sha256",
     "write_run_options", "read_run_options_for_state", "read_run_options_with_sha256",
     "read_run_options_with_sha256_and_raw",
-    "effective_repair_scope_policy", "effective_run_config",
+    "effective_run_config",
 ]

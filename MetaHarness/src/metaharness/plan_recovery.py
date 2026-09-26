@@ -47,7 +47,7 @@ _MAX_RECORD_BYTES = 16 * 1024
 # Any of these proves the run went past planning: replacing the plan would
 # orphan an approval, a selection or execution evidence derived from it.
 _EXECUTION_ARTIFACTS = (
-    "plan_approval.json", "execution_selection.json", "scope_approval.json",
+    "plan_approval.json", "execution_selection.json",
     "agent.prompt.txt", "agent.events.jsonl", "agent.result.json", "agent.final.md",
     "agent.stderr.log", "evidence.json", "checks.json", "changed-files.txt", "diff.patch",
     "reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json", "review.json",

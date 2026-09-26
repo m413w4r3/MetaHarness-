@@ -13,7 +13,6 @@ from metaharness.models import ExecutionRole, RunDisposition, RunMachineState, R
 from metaharness.orchestration.pipeline_v2 import PipelineFailure
 from metaharness.orchestration import contract_repair
 from metaharness.resume import resume_info
-from metaharness.run_options import RunOptions
 from tests.pipeline.support import SPEC, STEP, repaired_step_contract
 from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
 
@@ -323,29 +322,25 @@ class WaitingDiagnosticsTests(PipelineHarness):
         self.assertEqual(result.status, RunStatus.WAITING_REMOTE)
         self.assert_fresh(RunStatus.WAITING_REMOTE, None)
 
-    def test_waiting_scope_approval_of_a_contract_repair_writes_fresh_diagnostics(self) -> None:
+    def test_an_expanded_contract_repair_is_applied_without_an_operator(self) -> None:
         expanded = repaired_step_contract().replace(
             "WRITE_SET\n- feature.txt\n", "WRITE_SET\n- feature.txt\n- other.txt\n",
         ).replace(
             "- feature.txt :: current content\n",
             "- feature.txt :: current content\n- other.txt :: current content\n",
         )
-        self.workers.on(ExecutionRole.IMPLEMENTER, mismatch)
-        config = self.config()
-        options = RunOptions.from_config(
-            config, repair_scope_policy="require-approval", repair_scope_max_added_paths=1,
-        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            config, planner=[initial_plan(STEP), expanded], reviewer=["unused"],
-        ).run_text(SPEC, run_id="run", run_options=options)
-        self.assertEqual(
-            result.status, RunStatus.WAITING_SCOPE_APPROVAL, self.state().get("failure"),
-        )
-        self.assert_fresh(RunStatus.WAITING_SCOPE_APPROVAL, None)
+            self.config(), planner=[initial_plan(STEP), expanded], reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        # A repaired WRITE_SET is a signal for the audit, never an operator gate.
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         transaction = json.loads((
             self.run_dir() / "cycles/001/implementation/steps/S01/contract_repairs/01/transaction.json"
         ).read_text(encoding="utf-8"))
-        self.assertEqual(transaction["status"], "scope_waiting")
+        self.assertEqual(transaction["status"], "completed")
+        self.assertEqual(list(self.run_dir().rglob("scope_approval.json")), [])
 
     def test_web_run_detail_rebuilds_diagnostics_read_only(self) -> None:
         from metaharness.web.api import get_run

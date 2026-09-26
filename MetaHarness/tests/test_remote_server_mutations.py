@@ -67,20 +67,17 @@ UPSTREAM_MEMORY_PORT = 8765
 
 CREATE_PATH = "/v1/runs"
 APPROVAL_PATH = f"/v1/runs/{RUN_ID}/approval"
-SCOPE_PATH = f"/v1/runs/{RUN_ID}/scope-approval"
 RESUME_PATH = f"/v1/runs/{RUN_ID}/resume"
 RECOVERY_PATH = f"/v1/runs/{RUN_ID}/recover-plan"
-MUTATION_PATHS = (CREATE_PATH, APPROVAL_PATH, SCOPE_PATH, RESUME_PATH, RECOVERY_PATH)
+MUTATION_PATHS = (CREATE_PATH, APPROVAL_PATH, RESUME_PATH, RECOVERY_PATH)
 
 LOCAL_CREATE = "/api/v1/runs"
 LOCAL_APPROVAL = f"/api/v1/runs/{RUN_ID}/approval"
-LOCAL_SCOPE = f"/api/v1/runs/{RUN_ID}/scope-approval"
 LOCAL_RESUME = f"/api/v1/runs/{RUN_ID}/resume"
 LOCAL_RECOVERY = f"/api/v1/runs/{RUN_ID}/recover-plan"
 LOCAL_TARGETS = {
     CREATE_PATH: LOCAL_CREATE,
     APPROVAL_PATH: LOCAL_APPROVAL,
-    SCOPE_PATH: LOCAL_SCOPE,
     RESUME_PATH: LOCAL_RESUME,
     RECOVERY_PATH: LOCAL_RECOVERY,
 }
@@ -89,7 +86,6 @@ CREATE_RESULT = {
     "ok": True, "run_id": RUN_ID, "location": f"/runs/{RUN_ID}", "accepted": True,
 }
 APPROVAL_RESULT = {"ok": True, "decision": "APPROVE"}
-SCOPE_RESULT = {"ok": True, "decision": "APPROVE", "scope_delta_sha256": "0" * 64}
 RESUME_RESULT = {
     "ok": True, "run_id": RUN_ID, "location": f"/runs/{RUN_ID}", "accepted": True,
 }
@@ -98,7 +94,6 @@ RECOVERY_RESULT = RESUME_RESULT
 DEFAULT_RESPONSES = {
     ("POST", LOCAL_CREATE): (202, CREATE_RESULT),
     ("POST", LOCAL_APPROVAL): (200, APPROVAL_RESULT),
-    ("POST", LOCAL_SCOPE): (200, SCOPE_RESULT),
     ("POST", LOCAL_RESUME): (202, RESUME_RESULT),
     ("POST", LOCAL_RECOVERY): (202, RECOVERY_RESULT),
 }
@@ -110,7 +105,6 @@ VALID_BODIES: dict[str, dict[str, object]] = {
         "final_reviewer_profile": "final-reviewer",
         "step_profiles": {"S01": "implementer"},
     },
-    SCOPE_PATH: {"decision": "APPROVE"},
     RESUME_PATH: {},
     RECOVERY_PATH: {"plan": "# META PLAN v2\n"},
 }
@@ -529,8 +523,6 @@ class CreateRunTests(MutationCase):
             "execution_mode_policy": "auto",
             "single_step_max_mutable_paths": 4,
             "staged_step_max_mutable_paths": 8,
-            "repair_scope_policy": "strict",
-            "repair_scope_max_added_paths": 2,
         }
         response = self.post(CREATE_PATH, payload)
         self.assertEqual(response.status, 202)
@@ -727,43 +719,6 @@ class ApprovalTests(MutationCase):
         self.assertEqual(response.status, 409)
         self.assertEqual(response.payload, refusal)
         self.assert_single_call(APPROVAL_PATH)
-
-
-# ---------------------------------------------------------------------------
-# SCOPE APPROVAL
-# ---------------------------------------------------------------------------
-
-
-class ScopeApprovalTests(MutationCase):
-    def test_scope_decisions_are_forwarded_exactly(self) -> None:
-        for decision in ("APPROVE", "REJECT"):
-            with self.subTest(decision=decision):
-                self.upstream.reset()
-                response = self.post(SCOPE_PATH, {"decision": decision})
-                self.assertEqual(response.status, 200)
-                self.assertEqual(
-                    response.payload,
-                    {"ok": True, "decision": "APPROVE", "scope_delta_sha256": "0" * 64},
-                )
-                self.assertEqual(self.local_body(SCOPE_PATH), {"decision": decision})
-
-    def test_scope_body_must_be_exactly_one_decision(self) -> None:
-        cases = (
-            {}, {"decision": "APPROVE", "reason": "ok"},
-            {"decision": "approve"}, {"decision": None},
-        )
-        for payload in cases:
-            with self.subTest(payload=payload):
-                response = self.post(SCOPE_PATH, payload)
-                self.assertEqual(response.status, 400)
-                self.assertEqual(
-                    response.payload,
-                    {
-                        "error": "invalid_request",
-                        "message": "decision must be APPROVE or REJECT",
-                    },
-                )
-        self.assert_upstream_untouched()
 
 
 # ---------------------------------------------------------------------------

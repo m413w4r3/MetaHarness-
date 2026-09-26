@@ -4,10 +4,10 @@
 the modules in this package are its internal sub-domains and must never
 import it back.  The dependency order is one-way::
 
-    shared <- check_failure <- check_scope <- gate_recovery, gate_acceptance
+    shared <- check_failure <- durable_readers <- gate_recovery, gate_acceptance
     shared <- revision <- durable_readers, cycle_loader, gates
     durable_readers, cycle_loader <- resume_integrity
-    shared <- candidate, correction_scope
+    shared <- candidate
     pipeline_v2 <- recovery <- worker_recovery, check_recovery, review_recovery
     pipeline_v2 <- step_authority <- worker_attempt <- step_execution
     contract_recovery <- step_execution, step_replan
@@ -41,9 +41,11 @@ evidence recovery); the Git transaction every attempt shares lives in
 The review domain is split by authority: ``candidate_review`` owns the
 reviewer decision, ``review_correction`` the review-driven correction routes
 and the candidate evidence they read, ``check_replan_service`` the red-gate
-cycle replan -- which never consults the reviewer -- ``correction_scope`` the
-one mutable-scope policy every correction applies, and ``semantic_revision``
-the semantic revision pass and its reviser/repair worker transaction.
+cycle replan -- which never consults the reviewer -- and ``semantic_revision``
+the semantic revision pass and its reviser/repair worker transaction.  The one
+mutable-scope record every correction binds lives with the cycle authority in
+``run_composition``, next to the correction scope delta the ``cycle_loader``
+builds and re-proves.
 
 The resume domain is split the same way: ``durable_readers`` owns every
 fail-closed reader of a durable artifact, ``cycle_loader`` the cycle records,

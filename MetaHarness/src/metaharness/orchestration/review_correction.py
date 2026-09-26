@@ -277,7 +277,7 @@ class ReviewCorrectionService:
         bundle, bundle_sha = validate_implementation_bundle(
             repair_dir, expected_step_ids=[step.id for step in plan.steps]
         )
-        self.runtime.correction_scope.authorize_review_correction(
+        self.runtime.composition.authorize_review_correction(
             store, ctx, cycle, plan, bundle_sha, candidate["commit_sha"], review, approved_scope,
         )
         return self.runtime.composition.correction_cycle_plan(
@@ -303,7 +303,6 @@ class ReviewCorrectionService:
         evidence = candidate_evidence(ctx.run_dir, number - 1)
         if evidence is None or evidence.staged_tree_sha != candidate["tree_sha"]:
             raise ResumeIntegrityError(f"cycle {number - 1:03d} candidate evidence is missing")
-        approved_scope = self.runtime.composition.approved_scope_before(ctx, number)
         code_evidence = review_code_evidence(
             repository_reference=ctx.repository_reference,
             base_sha=ctx.base_sha,
@@ -358,15 +357,12 @@ class ReviewCorrectionService:
                     getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self.runtime.secrets),
                 ) from exc
             if error == SCOPE_REQUEST_ROUTE:
-                outcome, mutable_scope = self.runtime.correction_scope.authorize_semantic_scope_request(
+                outcome, mutable_scope = self.runtime.composition.admit_scope_request(
                     store, ctx, cycle_plan, artifact_dir, mutable_scope,
                 )
                 if outcome == "expanded":
                     _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
                     continue
-                if outcome == "replan":
-                    _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
-                    return
                 _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
                 self.runtime.cycle_update(
                     store, cycle_plan.cycle, status="revised",

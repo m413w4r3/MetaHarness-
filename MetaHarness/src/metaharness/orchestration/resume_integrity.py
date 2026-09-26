@@ -18,7 +18,6 @@ from typing import (
     Mapping,
     NoReturn,
 )
-from .check_scope import gate_mutable_authority
 from .cycle_loader import (
     check_replan_binding,
     load_correction_plan,
@@ -28,8 +27,10 @@ from .cycle_loader import (
     verify_correction_scope,
 )
 from .durable_readers import (
+    gate_mutable_authority,
     accepted_review,
     candidate_evidence,
+    completed_step_records,
     load_evidence,
     read_candidate_record,
     read_repository_reference,
@@ -57,7 +58,6 @@ from ..approval import (
     compute_plan_identity_from_run,
     read_check_authority,
     read_plan_approval,
-    read_scope_approval,
 )
 from ..attempt_transaction import status_has_unstaged_or_untracked
 from ..evidence import required_checks_passed
@@ -112,7 +112,6 @@ from ..resume import (
     ResumeRequiresOperatorError,
     plan_identity_from_mapping,
 )
-from ..run_options import EffectiveRepairScopePolicy
 from ..validation import ValidationError, config_with_check_authority, resolve_check_cwd
 
 
@@ -151,9 +150,18 @@ def _plan_scope(plan: TaskPlanV2) -> set[str]:
     }
 
 
-def _contract_repair_scope(
-    run_dir: Path, number: int, policy: EffectiveRepairScopePolicy,
-) -> set[str]:
+def _recorded_soft_scope(run_dir: Path, number: int, plan: TaskPlanV2) -> set[str]:
+    """The out-of-scope paths durably admitted for one cycle's accepted steps."""
+
+    scope: set[str] = set()
+    for record in completed_step_records(
+        run_dir, number, [step.id for step in plan.steps],
+    ):
+        scope.update(record.get("out_of_scope_paths") or ())
+    return scope
+
+
+def _contract_repair_scope(run_dir: Path, number: int) -> set[str]:
     """Read durable mutable paths approved by step-contract repairs."""
 
     scope: set[str] = set()
@@ -185,28 +193,13 @@ def _contract_repair_scope(
                 raise ResumeIntegrityError("step contract repair contract is unreadable") from exc
             if actual != digest:
                 raise ResumeIntegrityError("step contract repair contract hash changed")
-            if added:
-                if policy.policy == "deny-expansion":
-                    raise ResumeIntegrityError("step contract repair scope expansion is denied")
-                if policy.policy == "require-approval" or len(added) > policy.max_added_paths:
-                    delta_path = repair / "scope_delta.json"
-                    delta = read_json_artifact(delta_path, 64 * 1024)
-                    if not isinstance(delta, dict) or delta.get("added_paths") != added:
-                        raise ResumeIntegrityError("step contract repair scope delta is malformed")
-                    try:
-                        delta_sha = hashlib.sha256(delta_path.read_bytes()).hexdigest()
-                        approval = read_scope_approval(repair, expected_sha256=delta_sha)
-                    except (OSError, ApprovalError) as exc:
-                        raise ResumeIntegrityError("step contract repair scope approval is invalid") from exc
-                    if approval is None or approval.decision is not ApprovalDecision.APPROVE:
-                        raise ResumeIntegrityError("step contract repair scope was not approved")
             scope.update(added)
     return scope
 
 
 def _validate_gate_acceptance(
     run_dir: Path, number: int, stage: Any, *, tree: str | None, head: str | None,
-    base_scope: tuple[str, ...], policy: EffectiveRepairScopePolicy,
+    base_scope: tuple[str, ...],
 ) -> None:
     """Require the durable accepted state for a completed gate boundary."""
 
@@ -219,7 +212,6 @@ def _validate_gate_acceptance(
     authority = gate_mutable_authority(
         run_dir, number, stage,
         base_paths=base_scope,
-        policy_config=policy,
         require_attempt_records=True,
     )
     no_change = payload.get("no_change", False) if isinstance(payload, dict) else False
@@ -271,71 +263,76 @@ def _validate_gate_acceptance(
         _refuse("the gate acceptance artifact is missing or invalid")
 
 
+def _cycle_scopes(
+    config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
+    plan: TaskPlanV2, checkpoint: ResumeCheckpoint,
+) -> tuple[dict[int, tuple[str, ...]], dict[int, tuple[str, ...]], dict[int, CycleKind]]:
+    """The approved mutable scope of every durable cycle ``1..n``.
+
+    ``base`` is the plan, step-contract-repair and recorded soft-scope
+    authority of one cycle; ``full`` adds the semantic-revision authority of
+    that same cycle.  A direct semantic correction reuses the preceding
+    approved plan, while its own final gate may still own a check-repair
+    authority.  A cycle whose correction plan is still being written has no
+    authority yet and is absent from both.
+    """
+
+    pending = (
+        checkpoint.review_cycle if checkpoint.phase is ResumePhase.REVIEW_REPLAN else None
+    )
+    base = tuple(sorted(
+        set(_plan_scope(plan)) | _contract_repair_scope(run_dir, 1)
+        | _recorded_soft_scope(run_dir, 1, plan)
+    ))
+    bases: dict[int, tuple[str, ...]] = {1: base}
+    full: dict[int, tuple[str, ...]] = {
+        1: tuple(sorted(set(base) | semantic_revision_scope(run_dir, 1))),
+    }
+    kinds: dict[int, CycleKind] = {1: CycleKind.INITIAL}
+    for number in range(2, checkpoint.review_cycle + 1):
+        cycle = read_cycle_record(run_dir, number)
+        kinds[number] = cycle.kind
+        if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
+            base = full[number - 1]
+        elif number == pending:
+            # The correction plan of this cycle is not an authority yet: it
+            # may still record its scope additions.
+            del kinds[number]
+            continue
+        else:
+            correction, _bundle, bundle_sha = load_correction_plan(
+                config, selection, run_dir, number,
+                inherited_check_ids=plan.required_checks,
+            )
+            verify_correction_scope(run_dir, number, bundle_sha)
+            base = tuple(sorted(
+                set(_plan_scope(correction)) | _contract_repair_scope(run_dir, number)
+                | _recorded_soft_scope(run_dir, number, correction)
+            ))
+        bases[number] = base
+        full[number] = tuple(sorted(set(base) | semantic_revision_scope(run_dir, number)))
+    return bases, full, kinds
+
+
 def _approved_scope(
     config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
-    plan: TaskPlanV2, checkpoint: ResumeCheckpoint, policy: EffectiveRepairScopePolicy,
+    plan: TaskPlanV2, checkpoint: ResumeCheckpoint,
 ) -> set[str]:
     """Every path any durable authority of cycles ``1..n`` approved."""
 
-    scope = set(_plan_scope(plan))
-    scope |= _contract_repair_scope(run_dir, 1, policy)
-    cycle_scopes: dict[int, tuple[str, ...]] = {1: tuple(sorted(scope))}
-    cycle_base_scopes: dict[int, tuple[str, ...]] = {1: tuple(sorted(scope))}
-    cycle_kinds: dict[int, CycleKind] = {1: CycleKind.INITIAL}
-    cycle_semantic_scopes: dict[int, set[str]] = {
-        1: semantic_revision_scope(config.repo, run_dir, 1, policy),
-    }
-    scope |= cycle_semantic_scopes[1]
-    for number in range(2, checkpoint.review_cycle + 1):
-        cycle = read_cycle_record(run_dir, number)
-        if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
-            # Direct semantic corrections reuse the preceding approved plan,
-            # while their final gate may still have its own check-repair
-            # authority.
-            cycle_semantic_scopes[number] = semantic_revision_scope(
-                config.repo, run_dir, number, policy,
-            )
-            scope |= cycle_semantic_scopes[number]
-            cycle_base_scopes[number] = tuple(sorted(set(cycle_scopes[number - 1])))
-            cycle_scopes[number] = tuple(sorted(
-                set(cycle_base_scopes[number]) | cycle_semantic_scopes[number]
-            ))
-            cycle_kinds[number] = cycle.kind
-            continue
-        if number == checkpoint.review_cycle and checkpoint.phase is ResumePhase.REVIEW_REPLAN:
-            # The correction plan of this cycle is not an authority yet: it
-            # may still await its scope approval.
-            continue
-        correction, _bundle, bundle_sha = load_correction_plan(
-            config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
-        )
-        verify_correction_scope(run_dir, number, bundle_sha, policy)
-        cycle_base_scopes[number] = tuple(sorted(_plan_scope(correction)))
-        cycle_base_scopes[number] = tuple(sorted(
-            set(cycle_base_scopes[number]) | _contract_repair_scope(run_dir, number, policy)
-        ))
-        semantic_added = semantic_revision_scope(config.repo, run_dir, number, policy)
-        cycle_semantic_scopes[number] = semantic_added
-        cycle_scopes[number] = tuple(sorted(set(cycle_base_scopes[number]) | semantic_added))
-        cycle_kinds[number] = cycle.kind
-        scope |= _plan_scope(correction)
-        scope |= _contract_repair_scope(run_dir, number, policy)
-        scope |= semantic_added
-    for number, base in cycle_base_scopes.items():
-        kind = cycle_kinds[number]
+    bases, full, kinds = _cycle_scopes(config, selection, run_dir, plan, checkpoint)
+    scope = {path for paths in full.values() for path in paths}
+    for number, base in bases.items():
+        kind = kinds[number]
+        last = final_gate_stage(kind)
         stages = (
-            (final_gate_stage(kind),)
-            if kind is CycleKind.REVIEW_IMPLEMENTATION
-            else (pre_semantic_gate_stage(kind), final_gate_stage(kind))
+            (last,) if kind is CycleKind.REVIEW_IMPLEMENTATION
+            else (pre_semantic_gate_stage(kind), last)
         )
         for stage in dict.fromkeys(stages):
-            stage_scope = set(base)
-            if stage == final_gate_stage(kind):
-                stage_scope |= cycle_semantic_scopes.get(number, set())
             authority = gate_mutable_authority(
                 run_dir, number, stage,
-                base_paths=stage_scope,
-                policy_config=policy,
+                base_paths=(full[number] if stage == last else base),
             )
             scope |= set(authority.effective_paths)
     return scope
@@ -343,37 +340,13 @@ def _approved_scope(
 
 def _cycle_base_scope(
     config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
-    plan: TaskPlanV2, number: int, policy: EffectiveRepairScopePolicy,
+    plan: TaskPlanV2, checkpoint: ResumeCheckpoint, number: int,
     *, include_current_semantic: bool = True,
 ) -> tuple[str, ...]:
     """Return the approved plan scope which is the base for one cycle."""
 
-    current = tuple(sorted(
-        set(_plan_scope(plan)) | _contract_repair_scope(run_dir, 1, policy)
-    ))
-    if number > 1 or include_current_semantic:
-        current = tuple(sorted(
-            set(current) | semantic_revision_scope(config.repo, run_dir, 1, policy)
-        ))
-    for cycle_number in range(2, number + 1):
-        cycle = read_cycle_record(run_dir, cycle_number)
-        if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
-            if cycle_number != number or include_current_semantic:
-                current = tuple(sorted(
-                    set(current) | semantic_revision_scope(config.repo, run_dir, cycle_number, policy)
-                ))
-            continue
-        correction, _bundle, _bundle_sha = load_correction_plan(
-            config, selection, run_dir, cycle_number,
-            inherited_check_ids=plan.required_checks,
-        )
-        current = tuple(sorted(_plan_scope(correction)))
-        current = tuple(sorted(set(current) | _contract_repair_scope(run_dir, cycle_number, policy)))
-        if cycle_number != number or include_current_semantic:
-            current = tuple(sorted(
-                set(current) | semantic_revision_scope(config.repo, run_dir, cycle_number, policy)
-            ))
-    return current
+    bases, full, _kinds = _cycle_scopes(config, selection, run_dir, plan, checkpoint)
+    return full[number] if include_current_semantic else bases[number]
 
 
 def _failure_tree_for(
@@ -462,7 +435,6 @@ def _validate_check_replan_authority(
 def validate_resume(
     *,
     config: HarnessConfig,
-    repair_scope: EffectiveRepairScopePolicy,
     run_dir: Path,
     state: Mapping[str, Any],
     checkpoint: ResumeCheckpoint,
@@ -577,7 +549,7 @@ def validate_resume(
         read_candidate_record(run_dir, earlier)
     validate_correction_bindings(run_dir, number)
     current_cycle = read_cycle_record(run_dir, number) if number > 1 else RunCycle(1, CycleKind.INITIAL)
-    scope = _approved_scope(config, selection, run_dir, plan, checkpoint, repair_scope)
+    scope = _approved_scope(config, selection, run_dir, plan, checkpoint)
     if current_cycle.kind is CycleKind.CHECK_REPLAN:
         # A cycle one red gate re-decomposed plans before it opens, so its
         # checkpoint never has to carry the plan: the durable answer does.
@@ -636,13 +608,12 @@ def validate_resume(
                     _validate_gate_acceptance(
                         run_dir, number, checkpoint.stage, tree=expected_tree, head=head,
                         base_scope=_cycle_base_scope(
-                            config, selection, run_dir, plan, number, repair_scope,
+                            config, selection, run_dir, plan, checkpoint, number,
                             include_current_semantic=(
                                 current_cycle.kind is CycleKind.REVIEW_IMPLEMENTATION
                                 or checkpoint.stage != pre_semantic_gate_stage(current_cycle.kind)
                             ),
                         ),
-                        policy=repair_scope,
                     )
             elif checkpoint.phase is ResumePhase.STEP_ACCEPTANCE:
                 # Committed before the next boundary: the step acceptance
@@ -718,14 +689,14 @@ def validate_resume(
             except (KeyError, TypeError, ValueError):
                 _refuse("the candidate gate stage is invalid")
             cycle_base_scope = _cycle_base_scope(
-                config, selection, run_dir, plan, number, repair_scope,
+                config, selection, run_dir, plan, checkpoint, number,
                 include_current_semantic=(
                     candidate_stage is final_gate_stage(current_cycle.kind)
                 ),
             )
             _validate_gate_acceptance(
                 run_dir, number, candidate_stage, tree=expected_tree, head=head,
-                base_scope=cycle_base_scope, policy=repair_scope,
+                base_scope=cycle_base_scope,
             )
             remote_required = config.publish.enabled or (
                 config.github.enabled and config.github.pull_request_mode == "create"
@@ -769,10 +740,9 @@ def validate_resume(
                 run_dir, number, pre_semantic_gate_stage(current_cycle.kind),
                 tree=resolve_tree(repo, pre_head), head=pre_head,
                 base_scope=_cycle_base_scope(
-                    config, selection, run_dir, plan, number, repair_scope,
+                    config, selection, run_dir, plan, checkpoint, number,
                     include_current_semantic=False,
                 ),
-                policy=repair_scope,
             )
         if checkpoint.phase is ResumePhase.CHECK_REPAIR:
             evidence = load_evidence(gate_dir(run_dir, number, checkpoint.stage))

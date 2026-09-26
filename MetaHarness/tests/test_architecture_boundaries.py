@@ -43,7 +43,6 @@ ORCHESTRATOR_FORBIDDEN_IMPORTS = (
     "metaharness.planning",
     "metaharness.review",
     "metaharness.orchestration.check_failure",
-    "metaharness.orchestration.check_scope",
     "metaharness.orchestration.gate_acceptance",
     "metaharness.orchestration.gate_recovery",
 )
@@ -112,16 +111,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
     },
     "metaharness.orchestration.check_replan_service": {
         "metaharness.orchestration.shared": ('_json_text',),
-    },
-    "metaharness.orchestration.correction_scope": {
-        "metaharness.orchestration.shared": (
-            "_REVISION_ATTEMPT_ARTIFACTS",
-            "_archive_attempt",
-            "_create_file_once",
-            "_is_object_id",
-            "_json_text",
-            "_read_json_artifact",
-        ),
     },
     "metaharness.orchestration.gates": {
         "metaharness.orchestration.shared": (
@@ -221,7 +210,9 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
 # they share: runtime-neutral by construction.
 CORE_STATE_MODULES = ("models.py", "state.py", "checkpoint_identity.py")
 CORE_STATE_ALLOWED_INTERNAL_IMPORTS: Mapping[str, frozenset[str]] = {
-    "models.py": frozenset({"metaharness.recovery_policy"}),
+    # scope.py is the one path/hard-deny policy leaf: it owns no Git runtime,
+    # only the primitives gitops already exposes.
+    "models.py": frozenset({"metaharness.recovery_policy", "metaharness.scope"}),
     "state.py": frozenset({"metaharness.models", "metaharness.checkpoint_identity"}),
     "checkpoint_identity.py": frozenset({"metaharness.models"}),
 }

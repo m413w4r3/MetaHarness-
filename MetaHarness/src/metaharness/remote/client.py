@@ -116,16 +116,6 @@ class LocalMetaHarnessClient:
             "POST", f"{_API_PREFIX}/runs/{target}/approval", payload
         )
 
-    def approve_scope(self, run_id: str, decision: str) -> tuple[int, object]:
-        """Answer the scope gate of *run_id* with one local POST."""
-
-        target = _validated_run_id(run_id)
-        if decision not in ("APPROVE", "REJECT"):
-            raise ValueError("decision must be APPROVE or REJECT")
-        return self._request_json(
-            "POST", f"{_API_PREFIX}/runs/{target}/scope-approval", {"decision": decision}
-        )
-
     def resume_run(self, run_id: str) -> tuple[int, object]:
         """Resume *run_id* with one local POST carrying exactly ``{}``."""
 

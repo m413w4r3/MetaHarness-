@@ -622,6 +622,36 @@ def local_branches(repo: Path) -> frozenset[str]:
     return frozenset(line for line in output.splitlines() if line)
 
 
+def all_refs(repo: Path) -> frozenset[tuple[str, str]]:
+    """Every ref of the repository with its object ID, HEAD included.
+
+    One bounded ``for-each-ref``: it is the only way to prove that an untrusted
+    process changed a ref -- a push writes ``refs/remotes/**``, a branch
+    creation writes ``refs/heads/**`` -- without walking the repository.
+    """
+
+    output = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)").stdout
+    refs: set[tuple[str, str]] = set()
+    for line in output.splitlines():
+        name, separator, value = line.partition(" ")
+        if not separator or not name or not value:
+            raise GitError("git for-each-ref returned malformed output")
+        refs.add((name, value))
+    return frozenset(refs)
+
+
+def short_branch_name(branch_ref: str) -> str:
+    """The short name of one ``refs/heads/...`` ref, as Git commands take it."""
+
+    prefix = "refs/heads/"
+    if not isinstance(branch_ref, str) or not branch_ref.startswith(prefix):
+        raise GitError("branch ref must be a full refs/heads ref")
+    name = branch_ref[len(prefix) :]
+    if not name or name.startswith("-") or ".." in name or chr(92) in name:
+        raise GitError("branch ref is not a valid branch name")
+    return name
+
+
 def registered_worktrees(repo: Path) -> frozenset[str]:
     """Return the paths of every worktree registered in the repository."""
 
@@ -1598,6 +1628,42 @@ def restore_paths_from_tree(worktree: Path, tree_sha: str, paths: tuple[str, ...
             root, "--literal-pathspecs", "restore", f"--source={tree}",
             "--staged", "--worktree", "--", *present, timeout=600,
         )
+
+
+def reset_worktree_soft(worktree: Path, commit_sha: str) -> None:
+    """Move the checked-out branch back to *commit_sha*, keeping index and files.
+
+    The pair ``reset --soft`` then a re-attached HEAD is how the harness takes
+    an unwanted worker commit back: the branch ref returns to the expected
+    commit while the worker's content stays staged and exploitable.
+    """
+
+    root = Path(worktree).expanduser().resolve()
+    commit = _require_object_id(commit_sha, "commit_sha")
+    _git(root, "reset", "--soft", commit, timeout=600)
+    if current_head(root) != commit:
+        raise GitError("the soft reset did not restore the expected HEAD")
+
+
+def checkout_branch(worktree: Path, branch_ref: str) -> None:
+    """Re-attach HEAD to *branch_ref* without touching the index or the files."""
+
+    root = Path(worktree).expanduser().resolve()
+    name = short_branch_name(branch_ref)
+    _git(root, "checkout", "--quiet", name, timeout=600)
+    if symbolic_head(root) != branch_ref:
+        raise GitError("the worktree HEAD could not be re-attached to the run branch")
+
+
+def delete_ref(repo: Path, ref: str) -> None:
+    """Delete exactly one full ref name and prove it is gone."""
+
+    root = Path(repo).expanduser().resolve()
+    if not isinstance(ref, str) or not ref.startswith("refs/") or " " in ref:
+        raise GitError("only a full ref name can be deleted")
+    _git(root, "update-ref", "-d", ref, timeout=600)
+    if ref in {name for name, _value in all_refs(root)}:
+        raise GitError("the ref could not be deleted")
 
 
 def rewind_worktree(worktree: Path, commit_sha: str) -> str:

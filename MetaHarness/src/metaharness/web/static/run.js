@@ -17,7 +17,6 @@
     plan_rejected: true, interrupted: true, awaiting_plan_approval: true,
     waiting_human: true, waiting_external: true,
     waiting_check_infrastructure: true, waiting_remote: true,
-    waiting_scope_approval: true, waiting_contract_repair: true,
     waiting_check_repair: true
   };
   var WAITING_LABELS = {

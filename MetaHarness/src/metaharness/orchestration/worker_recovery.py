@@ -31,6 +31,7 @@ from ..gitops import GitError, candidate_tree_sha, index_tree_sha, status_porcel
 from ..models import ExecutionRole, ImplementationStep
 from ..recovery_policy import RecoveryBudgets, RecoveryStrategy, classify_failure
 from ..result import atomic_write_text
+from ..scope import ScopePolicy, ScopeViolation
 from ..state import RunStateStore
 from .pipeline_v2 import PipelineFailure
 from .recovery import RecoveryAdmission, RecoveryCoordinator
@@ -56,16 +57,6 @@ _RETRY_STRATEGIES = frozenset({RecoveryStrategy.RETRY_TARGETED})
 _CONTRACT_ROUTE = frozenset({"AGENT_CONTRACT_MISMATCH", "AGENT_NO_CHANGE"})
 
 
-def safe_scope_request_path(path: str) -> bool:
-    return bool(
-        isinstance(path, str) and path and path == path.strip()
-        and path not in {".", ".."}
-        and "\x00" not in path and "\\" not in path
-        and not path.startswith("/") and "//" not in path
-        and all(part not in {"", ".", "..", ".git"} for part in Path(path).parts)
-    )
-
-
 class WorkerRecovery:
     """Transient-failure recovery of one run's untrusted worker attempts."""
 
@@ -76,11 +67,13 @@ class WorkerRecovery:
         store: RunStateStore,
         budgets: RecoveryBudgets,
         secrets: Sequence[str],
+        scope: ScopePolicy,
     ) -> None:
         self._recovery = recovery
         self._store = store
         self._budgets = budgets
         self._secrets = tuple(secrets)
+        self._scope = scope
 
     # -- implementation steps -------------------------------------------
 
@@ -311,8 +304,14 @@ class WorkerRecovery:
             paths = scope_request.get("paths") if isinstance(scope_request, dict) else None
             if isinstance(paths, list) and all(isinstance(path, str) for path in paths):
                 requested = set(paths)
-        if any(not safe_scope_request_path(path) for path in requested):
-            raise PipelineFailure("AGENT_SCOPE_VIOLATION", "scope request contains an unsafe path")
+        if requested:
+            # The one scope authority owns both refusals: a path that escapes
+            # the repository and a hard-denied path are fatal here, exactly as
+            # they are everywhere else.
+            try:
+                self._scope.check(sorted(requested), worktree=transaction.worktree)
+            except ScopeViolation as violation:
+                raise PipelineFailure(violation.code, violation.detail) from None
         try:
             if discard_scope_violations:
                 transaction.enforce_scope(
@@ -329,4 +328,4 @@ class WorkerRecovery:
         )
 
 
-__all__ = ["TRANSIENT_WORKER_FAILURES", "WorkerRecovery", "safe_scope_request_path"]
+__all__ = ["TRANSIENT_WORKER_FAILURES", "WorkerRecovery"]

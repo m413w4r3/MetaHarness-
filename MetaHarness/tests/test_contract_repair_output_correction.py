@@ -498,7 +498,7 @@ class OutputCorrectionTests(ContractRepairFixtures):
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         config = self.config()
         options = RunOptions.from_config(
-            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=4,
+            config,
         )
 
         result = self.run_repair(
@@ -512,25 +512,23 @@ class OutputCorrectionTests(ContractRepairFixtures):
         self.assertEqual(validation["create_set"], [])
         self.assertTrue(set(FIXTURES) <= set(self.workers.calls[-1].mutable_paths))
 
-    def test_scope_over_the_auto_bound_is_not_authorized(self) -> None:
+    def test_many_scope_additions_are_auto_admitted(self) -> None:
         extra = tuple(f"fixtures/f{index}.txt" for index in range(5))
         self.add_tracked(*extra)
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         config = self.config()
-        options = RunOptions.from_config(
-            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=4,
-        )
+        options = RunOptions.from_config(config)
 
         result = self.run_repair(
             with_paths(repaired_step_contract(), *extra), options=options, config=config,
         )
 
-        # A denied scope is a fixable planner answer, never a human decision.
-        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
-        self.assertEqual(self.state()["failure"]["reason"], "CONTRACT_REPAIR_SCOPE_DENIED")
+        # A repaired scope is a signal for the audit, whatever its size.
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        validation = json.loads((self.slot() / "validation.json").read_text(encoding="utf-8"))
+        self.assertEqual(validation["added_mutable_paths"], sorted(extra))
+        self.assertTrue(set(extra) <= set(self.workers.calls[-1].mutable_paths))
         self.assert_no_false_mismatch()
-        self.assertEqual(len(self.workers.calls), 1)
-        self.assertEqual(len(self.planner.requests), 2)
 
 
 class PlanCountRepairTests(ContractRepairFixtures):

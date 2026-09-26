@@ -50,7 +50,6 @@ class WorkerToleranceTests(AutonomyHarness):
     def change_a_plan(self) -> str:
         return meta_plan(Step(id="S01", title="Change a", read=("src/a.py",), write=("src/a.py",)))
 
-    @unittest.expectedFailure
     def test_a_neighbour_file_edit_completes_the_step_as_out_of_scope(self) -> None:
         self.commit_files({"src/a.py": "a = 1\n", "tests/test_a.py": NEIGHBOUR})
         self.green_check()
@@ -71,10 +70,11 @@ class WorkerToleranceTests(AutonomyHarness):
             NEIGHBOUR_TOUCHED,
         )
 
-    @unittest.expectedFailure
     def test_a_worker_commit_leaves_the_harness_in_control_of_git(self) -> None:
         self.commit_files({"src/a.py": "a = 1\n"})
         self.green_check()
+        # The only commit that must sit under the run's own commit.
+        expected_parent = git(self.repo, "rev-parse", "HEAD")
         self.workers.on(ExecutionRole.IMPLEMENTER, edit_and_commit())
 
         result = self.orchestrator(
@@ -90,5 +90,6 @@ class WorkerToleranceTests(AutonomyHarness):
             (self.worktree() / "src/a.py").read_text(encoding="utf-8"), "a = 2\n",
         )
         self.assertNotIn(PARASITE_COMMIT, git(self.worktree(), "log", "--format=%s").splitlines())
-        self.assertEqual(git(self.worktree(), "rev-parse", "HEAD^"), self.base_sha)
+        self.assertEqual(git(self.worktree(), "rev-parse", "HEAD^"), expected_parent)
+        self.assertEqual(git(self.worktree(), "log", "--format=%s").splitlines()[-1], "base")
         self.assertEqual(self.state()["commit_sha"], git(self.worktree(), "rev-parse", "HEAD"))

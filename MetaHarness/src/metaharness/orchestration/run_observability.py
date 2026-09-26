@@ -447,7 +447,7 @@ class RunObservability:
             RunStatus.WAITING_HUMAN,
             RunStatus.WAITING_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE,
             RunStatus.WAITING_CHECK_REPAIR,
-            RunStatus.WAITING_REMOTE, RunStatus.WAITING_SCOPE_APPROVAL,
+            RunStatus.WAITING_REMOTE,
             RunStatus.WAITING_CONTRACT_REPAIR, RunStatus.COMMITTED, RunStatus.PUBLISHED,
         }:
             try:

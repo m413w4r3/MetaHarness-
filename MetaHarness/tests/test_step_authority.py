@@ -82,9 +82,8 @@ class StepAuthorityHarness(PipelineHarness):
         git(self.repo, "push", "-q", "origin", "main")
 
     def options(self, config, *, max_added: int = 4) -> RunOptions:
-        return RunOptions.from_config(
-            config, repair_scope_policy="auto-bounded", repair_scope_max_added_paths=max_added,
-        )
+        del max_added
+        return RunOptions.from_config(config)
 
     def one_step_plan(self, *extra: str) -> str:
         """S01 approved on feature.txt (A) and *extra* (B...)."""
@@ -129,7 +128,7 @@ class StepAuthorityHarness(PipelineHarness):
             writes(*success_paths),
         )
 
-    def test_check_repair_scope_request_cannot_exceed_the_cycle_envelope(self) -> None:
+    def test_check_repair_scope_request_is_auto_admitted_beyond_the_cycle_envelope(self) -> None:
         scope_request = (
             "META SCOPE REQUEST v1\n\n"
             "REASON\nThe source path is needed to resolve the gate failure.\n\n"
@@ -141,23 +140,36 @@ class StepAuthorityHarness(PipelineHarness):
             (request.worktree / "feature.txt").write_text("bad\n", encoding="utf-8")
             return "implemented with a failing gate\n"
 
+        def repair(request):
+            if "c.txt" not in request.mutable_paths:
+                return scope_request + "\n\n" + check_repair_result(
+                    "BLOCKED", "NOT_RUN", "SCOPE", "c.txt is outside approved cycle scope",
+                )
+            (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
+            (request.worktree / "c.txt").write_text("changed\n", encoding="utf-8")
+            return check_repair_result()
+
         self.workers.on(ExecutionRole.IMPLEMENTER, fail_feature)
-        self.workers.on(
-            ExecutionRole.REPAIR,
-            lambda _request: scope_request + "\n\n" + check_repair_result(
-                "BLOCKED", "NOT_RUN", "SCOPE", "c.txt is outside approved cycle scope",
-            ),
-        )
+        self.workers.on(ExecutionRole.REPAIR, repair, repair)
         config = self.config(check_repair=1)
 
         result = self.run_pipeline(
             [self.one_step_plan()], config=config, options=self.options(config, max_added=1),
         )
 
-        # The refused scope request is an ordinary fixable failure, never fatal.
-        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
-        self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
-        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
+        # A scope request above the cycle envelope is a signal: no operator
+        # decision, no wait, and the requested path is admitted for the repair.
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
+        self.assertIn("c.txt", self.workers.calls[-1].mutable_paths)
+        decisions = sorted(
+            (self.run_dir() / "cycles/001/check-repair").rglob("scope_requests/*/decision.json")
+        )
+        self.assertEqual(len(decisions), 1)
+        decision = json.loads(decisions[0].read_text(encoding="utf-8"))
+        self.assertEqual(decision["decision"], "auto-admitted")
+        self.assertEqual(decision["added_paths"], ["c.txt"])
+        self.assertEqual(list(self.run_dir().rglob("scope_approval.json")), [])
 
 
 class EffectiveAuthorityCommitTests(StepAuthorityHarness):
@@ -218,8 +230,8 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
         self.assertEqual(validation["added_mutable_paths"], sorted([TRANSFER, EDITION]))
         self.assertEqual(self.accepted_paths(), sorted(["feature.txt", "a.txt", TRANSFER, EDITION]))
 
-    def test_a_path_outside_the_effective_authority_stays_a_violation(self) -> None:
-        """CAS 3: effective A..D, worker writes E: never adopted."""
+    def test_a_safe_path_outside_the_effective_authority_is_a_recordable_signal(self) -> None:
+        """CAS 3: effective A..D, worker writes E: recorded, never a boundary."""
 
         self.two_repairs_then_success("feature.txt", "c.txt", "d.txt", "e.txt")
         result = self.run_pipeline([
@@ -228,14 +240,21 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
             repair_contract("a.txt", "c.txt", "d.txt"),
         ])
 
-        # Never adopted: the step is rolled back and settled, the run goes on.
-        self.assertNotEqual(result.status, RunStatus.FAILED)
+        # E is an ordinary path: the change is admitted for this step, the
+        # commit gate is widened for exactly this attempt, and the audit is fed.
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         step = self.json(self.step_dir() / "step.json")
-        self.assertEqual((step["status"], step["reason"]), ("FAILED_CONTINUED", "AGENT_SCOPE_VIOLATION"))
-        self.assertIn("e.txt", step["detail"])
+        self.assertEqual(step["status"], "COMPLETED")
+        self.assertEqual(step["out_of_scope_paths"], ["e.txt"])
+        self.assertEqual(step["changed_paths"], ["c.txt", "d.txt", "e.txt", "feature.txt"])
+        self.assertEqual(self.accepted_paths(), ["c.txt", "d.txt", "e.txt", "feature.txt"])
         self.assertEqual(git(self.worktree(), "status", "--porcelain"), "")
-        self.assertNotIn("e.txt", git(self.worktree(), "diff", "--name-only", "main"))
-        self.assertFalse((self.step_dir() / "step_candidate.json").exists())
+        # The extra path widens nothing durable: the recorded authority stays
+        # the effective one and the approval envelope is untouched.
+        self.assertEqual(
+            self.json(self.step_dir() / "step_authority.json")["effective_mutable_paths"],
+            ["a.txt", "c.txt", "d.txt", "feature.txt"],
+        )
 
     def test_the_commit_gate_itself_still_refuses_an_unauthorized_path(self) -> None:
         """CAS 3 at the commit boundary: the gate is strict, not permissive."""

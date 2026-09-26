@@ -36,7 +36,6 @@ FALSE_HUMAN_STOP_STATUSES = frozenset({
     RunStatus.WAITING_CHECK_REPAIR,
     RunStatus.WAITING_CONTRACT_REPAIR,
     RunStatus.WAITING_CHECK_INFRASTRUCTURE,
-    RunStatus.WAITING_SCOPE_APPROVAL,
 })
 
 # The postures of a run that delivered its accepted candidate.

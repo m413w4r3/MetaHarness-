@@ -24,7 +24,6 @@ from ..attempt_transaction import (
     GitOwnership,
     git_ownership,
     ownership_violations,
-    paths_detail,
     status_has_unstaged_or_untracked,
 )
 from ..evidence import EvidenceBundle
@@ -53,12 +52,6 @@ class OrchestrationError(RuntimeError):
 
 class CommitBoundaryError(OrchestrationError):
     """A commit precondition does not hold immediately before the commit."""
-
-
-class ScopeApprovalRequired(OrchestrationError):
-    """A scope expansion is durably paused until its exact delta is approved."""
-
-    code = "WAITING_SCOPE_APPROVAL"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -207,8 +200,6 @@ def chat_client(
     return constructor(endpoint, **kwargs)
 
 
-_paths_detail = paths_detail
-
 
 _git_ownership = git_ownership
 _ownership_violations = ownership_violations
@@ -240,6 +231,10 @@ class StepExecutionOutcome:
     deferred_verify: str = ""
     mismatch_retry_count: int = 0
     no_change: bool = False
+    # Paths this attempt changed outside its declared mutable scope and the
+    # harness admitted.  They authorize this attempt's diff only: they never
+    # widen the durable contract nor the authority of a later step.
+    out_of_scope_paths: tuple[str, ...] = ()
 
 
 _SYNTHETIC_NO_CHANGE_MISMATCH = (
@@ -275,6 +270,7 @@ class StepExecutionFailure(OrchestrationError):
         index_tree_after: str | None = None,
         status_before: tuple[str, ...] | None = None,
         step_dir: Path | None = None,
+        retry_feedback: str | None = None,
     ) -> None:
         super().__init__(f"{reason}: step={step_id}")
         self.reason = reason
@@ -291,6 +287,9 @@ class StepExecutionFailure(OrchestrationError):
         self.index_tree_after = index_tree_after
         self.status_before = status_before
         self.step_dir = step_dir
+        # The bounded feedback the next same-executor attempt receives when
+        # this failure discarded something the worker must not produce again.
+        self.retry_feedback = retry_feedback
 
 
 _GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -555,12 +554,17 @@ def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
 
 @dataclasses.dataclass(frozen=True)
 class CheckRepairScope:
+    """The mutable scope of one check-repair pass.
+
+    ``added_paths`` are the paths the pass admitted beyond its initial,
+    evidence-derived scope.  They authorize this gate episode only: the durable
+    plan and the authority of a later step never inherit them.
+    """
+
     approved_mutable_scope: tuple[str, ...]
     initial_repair_scope: tuple[str, ...]
     added_paths: tuple[str, ...]
     effective_repair_scope: tuple[str, ...]
-    policy: str
-    bound: int
     source: str
 
 
@@ -594,6 +598,7 @@ json_text = _json_text
 git_ownership_payload = _git_ownership_payload
 read_bounded_text = _read_bounded_text
 read_json_artifact = _read_json_artifact
+create_file_once = _create_file_once
 read_tree_file = _read_tree_file
 safe_candidate_tree = _safe_candidate_tree
 archive_attempt = _archive_attempt

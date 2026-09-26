@@ -57,7 +57,7 @@ from ..resume import (
     run_identity,
 )
 from ..run_options import (
-    EffectiveRepairScopePolicy, RunOptions, RunOptionsError,
+    RunOptions, RunOptionsError,
     effective_run_config,
     read_run_options_for_state,
 )
@@ -68,7 +68,6 @@ from .candidate_review import CandidateReviewService
 from .check_recovery import CheckInfrastructureRecovery
 from .check_replan_service import CheckReplanService
 from .contract_recovery import ContractRecoveryService
-from .correction_scope import CorrectionScopeService
 from .durable_readers import read_repository_reference
 from .gates import GateService
 from .pipeline_v2 import PipelineV2Coordinator, PipelineV2Context
@@ -140,7 +139,6 @@ class RunRuntime:
         )
         self.run_options: RunOptions | None = None
         self.secrets: tuple[str, ...] = ()
-        self.repair_scope = EffectiveRepairScopePolicy("deny-expansion", 4, "run-options")
         self.last_selection: Any | None = None
         self.trace: TraceStream | None = None
         self.trace_cycle = 1
@@ -158,7 +156,6 @@ class RunRuntime:
         # the semantic revision pass and the red-gate cycle replan.
         self.reviews = CandidateReviewService(self)
         self.review_correction = ReviewCorrectionService(self)
-        self.correction_scope = CorrectionScopeService(self)
         self.semantic_revision = SemanticRevisionService(self)
         self.check_replan = CheckReplanService(self)
         self.publication = PublicationService(self)
@@ -213,6 +210,7 @@ class RunRuntime:
         return WorkerRecovery(
             self.recovery(store), store=store,
             budgets=self.run_options.recovery, secrets=self.secrets,
+            scope=self.config.scope,
         )
 
     @staticmethod

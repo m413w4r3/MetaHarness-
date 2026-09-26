@@ -32,6 +32,7 @@ from ..attempt_transaction import (
     CandidateAttemptTransaction,
     git_ownership,
     ownership_violations,
+    paths_detail,
     status_has_unstaged_or_untracked,
 )
 from ..gitops import (
@@ -75,7 +76,6 @@ from .shared import (
     archive_attempt,
     bounded_v2_report,
     json_text,
-    paths_detail,
     safe_candidate_tree,
 )
 from .step_authority import (
@@ -298,6 +298,10 @@ class StepExecutionService:
         fallback_index = 0
         retry_key = recovery.budget_key("agent-step", f"{cycle_number:03d}", step.id)
         pending_transient: RecoveryAdmission | None = None
+        # The bounded feedback of the previous attempt: a same-step retry
+        # carries the exact reason the harness discarded work, and nothing
+        # else about that attempt.
+        retry_addendum: str | None = None
         repair_context = {
             "store": store, "recovery": recovery, "repo": repo, "worktree": worktree,
             "run_dir": run_dir, "artifact_dir": artifact_dir, "cycle": cycle_number,
@@ -351,6 +355,7 @@ class StepExecutionService:
                 "forbidden_env_names": forbidden_env_names,
                 "future_ownership": future_ownership,
                 "original_spec": original_spec,
+                "retry_addendum": retry_addendum,
             }
             try:
                 write_authority_diagnostic(artifact_dir, authority)
@@ -387,6 +392,7 @@ class StepExecutionService:
                 )
                 if retry is not None:
                     pending_transient = retry
+                    retry_addendum = failure.retry_feedback or retry_addendum
                     continue
                 if failure.reason == AGENT_AUTH_FAILURE:
                     failure.reason = "EXTERNAL_AUTH_REQUIRED"

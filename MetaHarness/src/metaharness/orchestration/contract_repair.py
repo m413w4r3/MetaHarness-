@@ -48,7 +48,6 @@ PLANNER_OUTPUT_INVALID = "planner_output_invalid"
 AWAITING_OUTPUT_CORRECTION = "awaiting_output_correction"
 OUTPUT_CORRECTION_EXHAUSTED = "output_correction_exhausted"
 PLANNER_VALIDATED = "planner_validated"
-SCOPE_WAITING = "scope_waiting"
 VALIDATED = "validated"
 COMPLETED = "completed"
 SUPERSEDED = "superseded"
@@ -56,8 +55,8 @@ SUPERSEDED = "superseded"
 _RANK = {
     AWAITING_PLANNER: 0, WAITING_EXTERNAL: 0, AWAITING_OUTPUT_CORRECTION: 0,
     PLANNER_RESPONSE_DURABLE: 1, PLANNER_OUTPUT_INVALID: 2,
-    OUTPUT_CORRECTION_EXHAUSTED: 3, PLANNER_VALIDATED: 4, SCOPE_WAITING: 5,
-    VALIDATED: 6, COMPLETED: 7, SUPERSEDED: 7,
+    OUTPUT_CORRECTION_EXHAUSTED: 3, PLANNER_VALIDATED: 4,
+    VALIDATED: 5, COMPLETED: 6, SUPERSEDED: 6,
 }
 FINISHED = frozenset({VALIDATED, COMPLETED, SUPERSEDED})
 _AWAITING = frozenset({AWAITING_PLANNER, WAITING_EXTERNAL, AWAITING_OUTPUT_CORRECTION})
@@ -413,7 +412,7 @@ __all__ = [
     "AWAITING_OUTPUT_CORRECTION", "AWAITING_PLANNER", "COMPLETED", "OUTPUT_CORRECTION_EXHAUSTED",
     "PLANNER_OUTPUT_INVALID", "awaiting_status", "episode_summary", "output_attempt", "ContractRepairIntegrityError", "FINISHED",
     "PLANNER_RESPONSE_DURABLE", "PLANNER_VALIDATED", "PendingContractRepair",
-    "SCOPE_WAITING", "SUPERSEDED", "VALIDATED", "WAITING_EXTERNAL", "advance", "begin",
+    "SUPERSEDED", "VALIDATED", "WAITING_EXTERNAL", "advance", "begin",
     "durable_request_matches", "ensure", "find_pending", "is_awaiting_planner", "planner_response_durable", "repair_dirs",
     "next_repair_number", "repair_identity",
     "semantic_repair_count", "sha256_text",

@@ -208,8 +208,6 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
 <label for="execution-mode-policy">Execution mode</label><select id="execution-mode-policy" name="execution_mode_policy" required><option value="auto"{" selected" if defaults.execution_mode_policy == "auto" else ""}>auto</option><option value="require-staged"{" selected" if defaults.execution_mode_policy == "require-staged" else ""}>require-staged</option></select>
 <label for="single-limit">SINGLE mutable paths</label><input id="single-limit" name="single_step_max_mutable_paths" type="number" min="1" step="1" value="{_e(defaults.single_step_max_mutable_paths)}" required>
 <label for="staged-limit">STAGED mutable paths</label><input id="staged-limit" name="staged_step_max_mutable_paths" type="number" min="1" step="1" value="{_e(defaults.staged_step_max_mutable_paths)}" required>
-<label for="repair-scope-policy">Repair scope policy</label><select id="repair-scope-policy" name="repair_scope_policy" required><option value="auto-bounded"{" selected" if defaults.repair_scope_policy == "auto-bounded" else ""}>auto-bounded</option><option value="require-approval"{" selected" if defaults.repair_scope_policy == "require-approval" else ""}>require-approval</option><option value="deny-expansion"{" selected" if defaults.repair_scope_policy == "deny-expansion" else ""}>deny-expansion</option></select>
-<label for="repair-scope-bound">Maximum added repair paths</label><input id="repair-scope-bound" name="repair_scope_max_added_paths" type="number" min="1" step="1" value="{_e(defaults.repair_scope_max_added_paths)}" required>
 </section><br><button type="submit">CREATE RUN</button></form></main>'''
     return _page("New Run", body, nonce=nonce)
 
@@ -908,10 +906,8 @@ _FAILURE_MESSAGES = {
     "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
     "STEP_CONTRACT_REPAIR_OUTPUT_INVALID": "Contract repair planner answer remains invalid",
-    "CONTRACT_REPAIR_SCOPE_DENIED": "Contract repair requested scope beyond policy",
     "RESUME_REQUIRES_OPERATOR": "Resume requires an operator",
     "WAITING_REPAIR_EXHAUSTED": "Recovery exhausted: operator decision required",
-    "WAITING_SCOPE_APPROVAL": "Additional repair scope needs approval",
     "REVISION_SCOPE_VIOLATION": "A repair pass needed a path outside its scope",
     "INTERRUPTED": "Run interrupted",
 }
@@ -974,8 +970,6 @@ def _run_configuration(state: dict[str, Any], config: HarnessConfig | None = Non
         ("Semantic revision", "on" if pipeline.get("semantic_revision_enabled") else "off"),
         ("check-repair attempts", pipeline.get("max_check_repair_attempts", 0)),
         ("correction cycles", pipeline.get("max_correction_cycles")),
-        ("repair scope policy", pipeline.get("repair_scope_policy")),
-        ("repair scope max added paths", pipeline.get("repair_scope_max_added_paths")),
     ]
     requested_roles = (
         ("planner_profile", "planner"),
@@ -1067,41 +1061,6 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
         f'{action}'
         f'<p class="small"><strong>{_e(reason)}</strong>'
         f'{"<br>" + _e(note) if note else ""}{"<br>" + _e(detail) if detail is not None else ""}</p></div>'
-    )
-
-
-def _scope_approval_card(run: dict[str, Any], token: str | None) -> str:
-    state = run.get("state") if isinstance(run.get("state"), dict) else {}
-    if state.get("status") != "waiting_scope_approval":
-        return ""
-    delta = run.get("scope_delta") if isinstance(run.get("scope_delta"), dict) else {}
-    snapshot = state.get("run_options") if isinstance(state.get("run_options"), dict) else {}
-    pipeline = snapshot.get("pipeline") if isinstance(snapshot.get("pipeline"), dict) else {}
-    automatic_limit = pipeline.get("repair_scope_max_added_paths", "—")
-    added_paths = delta.get("added_paths") if isinstance(delta.get("added_paths"), list) else []
-    reasons = delta.get("added_path_reasons") if isinstance(delta.get("added_path_reasons"), dict) else {}
-    rows = []
-    for path in added_paths:
-        item = reasons.get(path) if isinstance(reasons.get(path), dict) else {}
-        rows.append(
-            f'<tr><td class="mono">{_e(path)}</td><td>{_e(item.get("reason"))}</td>'
-            f'<td>{_e(item.get("source_finding"))}</td></tr>'
-        )
-    actions = (
-        f'<form action="/runs/{_e(run.get("run_id"))}/scope-approval" method="post">'
-        f'<input type="hidden" name="_token" value="{_e(token)}">'
-        '<button class="approve" name="decision" value="APPROVE" type="submit">APPROVE REPAIR SCOPE</button> '
-        '<button class="reject" name="decision" value="REJECT" type="submit">REJECT</button></form>'
-        if token else ""
-    )
-    return (
-        '<section class="card"><h2>REQUESTED ADDITIONAL MUTABLE SCOPE</h2>'
-        '<p>Repair requires additional mutable scope beyond automatic limit.</p>'
-        f'<p>Automatic limit: {_e(automatic_limit)}<br>'
-        f'Requested additional paths: {_e(len(added_paths))}</p>'
-        '<table><thead><tr><th>path</th><th>reason</th><th>review finding</th></tr></thead>'
-        f'<tbody>{"".join(rows)}</tbody></table>{actions}'
-        '<p class="muted">Approval is bound to this exact scope delta; paths cannot be edited here.</p></section>'
     )
 
 
@@ -1205,7 +1164,6 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
     plan_open = " open" if _section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER")) else ""
     body = f'''<main id="run" data-run-id="{_e(run_id)}" data-status="{_e(status)}"><p><a href="/">← Tous les runs</a></p>
 {_run_card(run, token, overview, is_v2)}
-{_scope_approval_card(run, token)}
 {_publish_section(state)}
 {_pipeline_section(overview)}
 {_run_configuration(state, config)}

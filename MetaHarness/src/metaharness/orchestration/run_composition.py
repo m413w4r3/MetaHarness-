@@ -9,6 +9,7 @@ cycle is allowed to touch.
 from __future__ import annotations
 
 import functools
+import hashlib
 from pathlib import Path
 from typing import Any, Mapping, TYPE_CHECKING
 from ..agent.base import AgentRunRequest
@@ -19,24 +20,31 @@ from ..execution_selection import (
     resolve_cycle_execution_selection,
     validate_cycle_execution_selection,
 )
-from ..gitops import RepositoryReference, WorktreeInfo, candidate_tree_sha, current_head
+from ..gitops import (
+    RepositoryReference,
+    WorktreeInfo,
+    candidate_tree_sha,
+    current_head,
+)
 from ..llm.chat import LLMError
-from ..models import CycleKind, ExecutionRole, ExecutionSelection, RunCycle, is_replan_cycle
+from ..models import (
+    CycleKind, ExecutionRole, ExecutionSelection, RunCycle, TaskPlanV2, is_replan_cycle,
+)
 from ..planning.check_replan import check_replan_dir
-from ..planning.protocol import TaskPlanV2
 from ..profiles import build_llm_endpoint, profile_for_role, profiles_for_config
 from ..recommendation import ExecutionRecommender, RecommendationError, write_recommendation_error
 from ..redaction import redact
-from ..result import RunResult
+from ..result import RunResult, atomic_write_text
+from ..review import ReviewResult, Reviewer
 from ..resume import ResumeIntegrityError
-from ..review import Reviewer
+from ..scope import ScopeViolation
 from ..state import RunStateStore
+from ..validation import config_with_check_authority
 from .candidate import CandidateLifecycle
 from .check_failure import (
     hard_integrity_failures,
     soft_check_failures,
 )
-from .check_scope import gate_mutable_authority
 from .gate_acceptance import GateAcceptanceService
 from .gate_recovery import CheckRepairLadder
 from .pipeline_v2 import (
@@ -45,15 +53,23 @@ from .pipeline_v2 import (
     step_dir as cycle_step_dir,
 )
 from .cycle_loader import (
-    load_correction_plan, read_cycle_record, semantic_revision_scope,
+    build_scope_delta, ensure_scope_delta, load_correction_plan, read_cycle_record,
+    semantic_revision_scope,
     verify_correction_scope,
 )
 from .durable_readers import (
     completed_step_records, load_evidence, load_revision, read_candidate_record,
-    settled_step_status,
+    gate_mutable_authority, settled_step_status,
 )
 from .run_bootstrap import PreparedV2Run
-from .shared import CycleArtifactService, OrchestrationError, bounded_parse_detail
+from .shared import (
+    CycleArtifactService,
+    OrchestrationError,
+    bounded_parse_detail,
+    is_object_id,
+    json_text,
+    read_json_artifact,
+)
 from .step_authority import approved_step_contract
 
 if TYPE_CHECKING:
@@ -221,7 +237,6 @@ class RunComposition:
             gate_mutable_authority=lambda ctx, cycle_plan, stage: gate_mutable_authority(
                 ctx.run_dir, cycle_plan.cycle.number, stage,
                 base_paths=self.effective_cycle_scope(ctx, cycle_plan),
-                policy_config=self.runtime.repair_scope,
                 require_attempt_records=True,
             ),
             push_tree=self.runtime.publication.push_candidate,
@@ -229,7 +244,6 @@ class RunComposition:
         )
         gate_acceptance = GateAcceptanceService(
             secrets=self.runtime.secrets,
-            repair_scope_policy=self.runtime.repair_scope,
             authorize_candidate_tree=self.runtime.publication.authorize_candidate_tree,
             check_repair_attempts=self.runtime.gates.check_repair_attempt_records,
             load_revision=load_revision,
@@ -338,7 +352,7 @@ class RunComposition:
             self.runtime.config, ctx.selection, ctx.run_dir, cycle.number,
             inherited_check_ids=ctx.plan.required_checks,
         )
-        verify_correction_scope(ctx.run_dir, cycle.number, bundle_sha, self.runtime.repair_scope)
+        verify_correction_scope(ctx.run_dir, cycle.number, bundle_sha)
         return self.correction_cycle_plan(
             ctx, cycle, plan, bundle, bundle_sha, creating=False,
         )
@@ -416,7 +430,7 @@ class RunComposition:
         )
         if expected_sha is None or bundle_sha != expected_sha:
             raise ResumeIntegrityError(f"cycle {cycle.number:03d} correction plan changed")
-        verify_correction_scope(ctx.run_dir, cycle.number, bundle_sha, self.runtime.repair_scope)
+        verify_correction_scope(ctx.run_dir, cycle.number, bundle_sha)
         return self.correction_cycle_plan(
             ctx, cycle, plan, bundle, bundle_sha, creating=False,
         )
@@ -465,10 +479,197 @@ class RunComposition:
             )
             scope.update(authority.mutable_scope)
         scope.update(semantic_revision_scope(
-            ctx.repo, ctx.run_dir, cycle_plan.cycle.number,
-            self.runtime.repair_scope,
+            ctx.run_dir, cycle_plan.cycle.number,
         ))
+        # A step whose worker reached one ordinary path beyond its declared
+        # sets had that exact path durably recorded as an audit signal; the
+        # boundary of this cycle admits it so the accepted diff can be
+        # committed.  No step contract and no later step scope changes.
+        for record in completed_step_records(
+            ctx.run_dir, cycle_plan.cycle.number,
+            [step.id for step in cycle_plan.plan.steps],
+        ):
+            scope.update(record.get("out_of_scope_paths") or ())
         return tuple(sorted(scope))
+
+    def authorize_review_correction(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle: RunCycle,
+        plan: TaskPlanV2, bundle_sha: str, candidate_sha: str, review: ReviewResult,
+        approved_scope: list[str],
+    ) -> None:
+        """Record one review-driven correction's scope delta and admit its paths."""
+
+        repair_dir = correction_dir(ctx.run_dir, cycle)
+        try:
+            delta, content = build_scope_delta(
+                repair_dir, original_scope=approved_scope, plan=plan,
+                candidate_commit_sha=candidate_sha, repair_bundle_sha=bundle_sha,
+                justification=review.required_fixes.strip() or review.findings.strip(),
+            )
+        except OrchestrationError as exc:
+            raise PipelineFailure(str(exc)) from exc
+        self.apply_correction_scope(
+            store, ctx, cycle, plan, repair_dir, delta, content, approved_scope, candidate_sha,
+        )
+
+    def apply_correction_scope(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle: RunCycle,
+        plan: TaskPlanV2, repair_dir: Path, delta: Mapping[str, Any], content: str,
+        approved_scope: list[str], candidate_sha: str,
+    ) -> None:
+        """Record one correction scope delta and admit its added paths.
+
+        A review-driven correction and a red-gate cycle replan widen the
+        approved envelope through this one path.  The delta is derived from the
+        parsed plan alone and created once; the paths it adds are admitted for
+        this correction and audited, and the only refusal is the shared scope
+        authority's.
+        """
+
+        # Created once; on every later pass (resume included) the persisted
+        # bytes are only compared, never repaired.
+        delta_sha = ensure_scope_delta(repair_dir, content, expected_sha256=None)
+        requested = sorted({
+            path for step in plan.steps
+            for path in (*step.write_set, *step.create_set, *step.delete_set)
+        })
+        try:
+            self.runtime.config.scope.check(
+                (*requested, *delta["added_paths"]), worktree=ctx.info.worktree,
+            )
+        except ScopeViolation as violation:
+            raise PipelineFailure(violation.code, violation.detail) from None
+        atomic_write_text(repair_dir / "scope.json", json_text({
+            "repair_mutable_scope": requested,
+            "approved_mutable_scope_before": approved_scope,
+            "scope_delta_sha256": delta_sha,
+        }))
+        if delta["added_paths"]:
+            self.runtime.cycle_update(
+                store, cycle, status="scope_recorded", scope_delta=delta,
+            )
+        # The correction plan may require trusted checks the initial plan did
+        # not; their config-only preflights run before any expensive worker.
+        check_config, check_ids = config_with_check_authority(
+            self.runtime.config, ctx.run_dir, requested_check_ids=plan.required_checks,
+            expected_sha256=self.runtime.approved_check_authority_sha256(ctx.run_dir),
+        )
+        preflight_failures = self.runtime.gates.run_check_preflights_recoverably(
+            store=store, worktree=ctx.info.worktree, check_config=check_config,
+            check_ids=check_ids or plan.required_checks,
+            counter_key=f"check-preflight:cycle:{cycle.number:03d}",
+            phase="planning", cycle=cycle.number,
+        )
+        if preflight_failures:
+            raise PipelineFailure(
+                preflight_failures[0].split(":", 1)[0], preflight_failures[0],
+            )
+
+    def admit_scope_request(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
+        artifact_dir: Path, current_scope: list[str],
+    ) -> tuple[str, list[str]]:
+        """Admit the paths of one durable ``META SCOPE REQUEST`` automatically.
+
+        The request is parsed, its paths normalized and checked against the one
+        scope authority, and then admitted for this correction: no operator
+        decision, no second model call, no wait.  The durable record stays so a
+        resume re-derives the same scope.
+        """
+
+        report = read_json_artifact(artifact_dir / "report.json", 256 * 1024)
+        request = report.get("scope_request") if isinstance(report, dict) else None
+        paths = request.get("paths") if isinstance(request, dict) else None
+        reason = request.get("reason") if isinstance(request, dict) else None
+        evidence = request.get("evidence") if isinstance(request, dict) else None
+        tree_sha = report.get("tree_before") if isinstance(report, dict) else None
+        if (
+            not isinstance(paths, list) or not paths or any(
+                not isinstance(path, str) for path in paths
+            ) or len(paths) != len(set(paths))
+            or not isinstance(reason, str) or not reason.strip()
+            or not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence)
+            or not isinstance(tree_sha, str) or not is_object_id(tree_sha)
+        ):
+            raise PipelineFailure("AGENT_SCOPE_VIOLATION", "semantic scope request is malformed")
+        try:
+            requested = self.runtime.config.scope.check(paths, worktree=ctx.info.worktree)
+        except ScopeViolation as violation:
+            raise PipelineFailure(violation.code, violation.detail) from None
+        source_report = artifact_dir / "report.json"
+        try:
+            source_report_sha = hashlib.sha256(source_report.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise PipelineFailure(
+                "RESUME_REQUIRES_OPERATOR", "semantic scope request report is unreadable",
+            ) from exc
+        base = tuple(sorted(set(current_scope)))
+        requested = tuple(sorted(set(requested)))
+        added = tuple(path for path in requested if path not in base)
+        root = artifact_dir / "scope_requests"
+        root.mkdir(parents=True, exist_ok=True)
+        next_number = 1
+        prior_request_dir: Path | None = None
+        for path in sorted(root.iterdir(), key=lambda item: item.name):
+            if not path.is_dir() or not path.name.isdigit():
+                continue
+            next_number = max(next_number, int(path.name) + 1)
+            saved = read_json_artifact(path / "authority.json", 64 * 1024)
+            if isinstance(saved, dict) and (
+                saved.get("tree_sha") == tree_sha
+                and saved.get("base_mutable_scope") == list(base)
+                and saved.get("requested_paths") == list(requested)
+                and saved.get("reason") == reason
+                and saved.get("evidence") == [item[:1000] for item in evidence[:16]]
+            ):
+                prior_request_dir = path
+        target = prior_request_dir or root / f"{next_number:03d}"
+        target.mkdir(parents=True, exist_ok=True)
+        authority = {
+            "schema_version": 1,
+            "cycle": cycle_plan.cycle.number,
+            "tree_sha": tree_sha,
+            "source_report_sha256": source_report_sha,
+            "base_mutable_scope": list(base),
+            "requested_paths": list(requested),
+            "added_paths": list(added),
+            "reason": reason[:2000],
+            "evidence": [item[:1000] for item in evidence[:16]],
+        }
+        authority_path = target / "authority.json"
+        if authority_path.exists():
+            saved_authority = read_json_artifact(authority_path, 64 * 1024)
+            saved_semantics = (
+                {key: value for key, value in saved_authority.items()
+                 if key != "source_report_sha256"}
+                if isinstance(saved_authority, dict) else None
+            )
+            current_semantics = {
+                key: value for key, value in authority.items()
+                if key != "source_report_sha256"
+            }
+            if saved_semantics != current_semantics:
+                raise PipelineFailure(
+                    "RESUME_INTEGRITY_FAILURE", "semantic scope request authority changed",
+                )
+            authority = saved_authority
+        else:
+            atomic_write_text(authority_path, json_text(authority))
+        atomic_write_text(target / "decision.json", json_text({
+            **authority, "decision": "auto-admitted",
+        }))
+        if not added:
+            atomic_write_text(artifact_dir / "status.json", json_text({
+                "status": "SCOPE_REQUEST_RECORDED",
+                "reason": reason[:2000],
+                "requested_paths": list(requested),
+            }))
+            return "recorded", current_scope
+        self.runtime.cycle_update(
+            store, cycle_plan.cycle,
+            status="scope_recorded", semantic_revision_status="SCOPE_REQUEST_RECORDED",
+        )
+        return "expanded", sorted(set(current_scope) | set(added))
 
     def state_steps(
         self, ctx: PipelineV2Context, cycle_plan: CyclePlan, *, running: str | None = None,

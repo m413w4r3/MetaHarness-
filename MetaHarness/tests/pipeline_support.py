@@ -330,7 +330,7 @@ class PipelineHarness(unittest.TestCase):
     def config(
         self, *, check_repair: int = 0, correction_cycles: int = 0,
         max_step_contract_repairs: int = 2,
-        semantic_revision: bool = False, scope_policy: str | None = None,
+        semantic_revision: bool = False, scope_mode: str = "soft",
         publish: bool = False, github_pr: bool = False,
         extra_checks: str = "",
     ) -> Any:
@@ -363,6 +363,9 @@ planner_remote_exploration = true
 
 [approval]
 require_plan_approval = false
+
+[scope]
+mode = {scope_mode!r}
 
 [context]
 always_files = []
@@ -472,10 +475,7 @@ argv = [{sys.executable!r}, {str(self.check)!r}]
 timeout_seconds = 30
 
 {extra_checks}""", encoding="utf-8")
-        config = load_config(path)
-        if scope_policy is not None:
-            self.scope_policy = scope_policy
-        return config
+        return load_config(path)
 
     def orchestrator(
         self, config: Any, *, planner: list[Any], reviewer: list[Any],

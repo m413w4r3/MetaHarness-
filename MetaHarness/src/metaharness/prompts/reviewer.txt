@@ -42,9 +42,8 @@ For REVISE:
 - maximum 6 required fixes;
 - maximum 4 missing tests.
 - REVISE / HUMAN is only for `PRODUCT_SPEC_AMBIGUITY`,
-  `SECURITY_POLICY_DECISION`, `SCOPE_EXPANSION_REQUIRE_APPROVAL`, or
-  `AUTHORITY_CONFLICT`. Put the reason class at the start of FINDINGS as
-  `CLASS | concise evidence`.
+  `SECURITY_POLICY_DECISION`, or `AUTHORITY_CONFLICT`. Put the reason class at
+  the start of FINDINGS as `CLASS | concise evidence`.
 
 For FAIL:
 - ROUTE must be NONE;

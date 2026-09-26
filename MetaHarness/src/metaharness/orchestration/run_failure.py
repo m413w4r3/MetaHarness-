@@ -30,7 +30,7 @@ from ..resume import (
 )
 from ..review import ReviewParseError
 from ..run_options import (
-    effective_repair_scope_policy, effective_run_config,
+    effective_run_config,
     read_run_options_for_state,
 )
 from ..state import RunStateStore
@@ -46,7 +46,6 @@ from .recovery import normalize_exit_reason, project_exit
 from .resume_integrity import validate_resume
 from .shared import (
     CandidatePushError, CommitBoundaryError, OrchestrationError,
-    ScopeApprovalRequired,
     StepExecutionFailure, bounded_v2_report, json_text, safe_candidate_tree,
 )
 
@@ -464,7 +463,6 @@ class RunFailure:
             config = effective_run_config(self.runtime.config, options)
             validate_resume(
                 config=config,
-                repair_scope=effective_repair_scope_policy(options),
                 run_dir=run_dir,
                 state=state,
                 checkpoint=checkpoint,
@@ -517,8 +515,6 @@ class RunFailure:
             )
         except StepExecutionFailure as failure:
             return self.step_failed(store, pipeline.run_dir, failure)
-        except ScopeApprovalRequired:
-            return RunResult.of(pipeline.run_dir, store.load())
         except (ResumeIntegrityError, ResumeRequiresOperatorError):
             raise
         except Exception as exc:

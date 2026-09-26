@@ -44,6 +44,12 @@ from .models import (
     validate_revision_budget,
 )
 from .recovery_policy import ExecutionFallbacks
+from .scope import (
+    DEFAULT_HARD_DENY_PATTERNS,
+    SCOPE_MODES,
+    ScopePolicy,
+    config_path_in_repo,
+)
 
 
 class ConfigError(ValueError):
@@ -1023,6 +1029,25 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         ),
     )
 
+    scope_data = _table(expanded, "scope")
+    unknown_scope = sorted(set(scope_data) - {"mode", "hard_deny"})
+    if unknown_scope:
+        raise ConfigError(f"scope.{unknown_scope[0]} is not allowed")
+    scope_mode = scope_data.get("mode", "soft")
+    if not isinstance(scope_mode, str) or scope_mode not in SCOPE_MODES:
+        raise ConfigError("scope.mode must be 'soft' or 'strict'")
+    scope_hard_deny = _string_array(
+        scope_data, "hard_deny", DEFAULT_HARD_DENY_PATTERNS, "scope"
+    )
+    try:
+        scope = ScopePolicy(
+            mode=scope_mode,
+            hard_deny=tuple(scope_hard_deny),
+            config_path=config_path_in_repo(repo, path),
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from None
+
     approval_data = _table(expanded, "approval")
     approval = ApprovalConfig(
         require_plan_approval=_bool(
@@ -1144,6 +1169,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         planning=planning,
         revision=revision,
         recovery=recovery,
+        scope=scope,
         transport=transport,
         prompt_budget=prompt_budget,
         repository=repository,

@@ -118,15 +118,12 @@ class SemanticRevisionService:
                     getattr(exc, "code", AGENT_RUNTIME_FAILED), redact(str(exc), self.runtime.secrets),
                 ) from exc
             if error == SCOPE_REQUEST_ROUTE:
-                outcome, mutable_scope = self.runtime.correction_scope.authorize_semantic_scope_request(
+                outcome, mutable_scope = self.runtime.composition.admit_scope_request(
                     store, ctx, cycle_plan, artifact_dir, mutable_scope,
                 )
                 if outcome == "expanded":
                     _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
                     continue
-                if outcome == "replan":
-                    _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
-                    return
                 report = _read_json_artifact(artifact_dir / "report.json", 256 * 1024)
                 final = report.get("final", "") if isinstance(report, dict) else ""
                 _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
@@ -172,7 +169,6 @@ class SemanticRevisionService:
         return RevisionRunner(
             config=self.runtime.config,
             secrets=self.runtime.secrets,
-            effective_repair_scope=self.runtime.repair_scope,
             approved_check_authority_sha256=self.runtime.approved_check_authority_sha256,
             run_revision=self.runtime.composition.run_revision,
             ensure_revision_artifacts=self.runtime.observability.ensure_revision_artifacts,

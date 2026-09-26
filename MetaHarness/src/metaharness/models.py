@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .recovery_policy import RecoveryBudgets
+from .scope import ScopePolicy
 
 
 class ProfileDriver(StrEnum):
@@ -276,7 +277,6 @@ class RunStatus(StrEnum):
     PLANNING = "planning"
     WAITING_HUMAN = "waiting_human"
     AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
-    WAITING_SCOPE_APPROVAL = "waiting_scope_approval"
     WAITING_EXTERNAL = "waiting_external"
     WAITING_CHECK_INFRASTRUCTURE = "waiting_check_infrastructure"
     WAITING_CHECK_REPAIR = "waiting_check_repair"
@@ -366,7 +366,6 @@ RUN_CHECKPOINT_NAME = "resume_checkpoint.json"
 # reason, never as a status.
 CONTRACT_REPAIR_WAIT_REASON = "STEP_CONTRACT_REPAIR_OUTPUT_INVALID"
 CHECK_REPAIR_WAIT_REASON = "CHECK_REPAIR_EXHAUSTED"
-SCOPE_APPROVAL_REASON = "WAITING_SCOPE_APPROVAL"
 PLAN_REJECTED_REASON = "PLAN_REJECTED"
 INTERRUPTED_REASON = "INTERRUPTED"
 
@@ -734,8 +733,6 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
         else:
             status = RunStatus.WAITING_EXTERNAL
         return RunOutcome(phase, disposition, status, True, True)
-    if reason == SCOPE_APPROVAL_REASON:
-        return RunOutcome(phase, disposition, RunStatus.WAITING_SCOPE_APPROVAL, True, True)
     if reason == PLAN_REJECTED_REASON:
         return RunOutcome(phase, disposition, RunStatus.PLAN_REJECTED, False, False)
     return RunOutcome(phase, disposition, RunStatus.WAITING_HUMAN, False, False)
@@ -747,7 +744,6 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.PLANNING: RunDisposition.RUNNING,
     RunStatus.WAITING_HUMAN: RunDisposition.WAIT_HUMAN,
     RunStatus.AWAITING_PLAN_APPROVAL: RunDisposition.RUNNING,
-    RunStatus.WAITING_SCOPE_APPROVAL: RunDisposition.WAIT_HUMAN,
     RunStatus.WAITING_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_CHECK_INFRASTRUCTURE: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_CHECK_REPAIR: RunDisposition.WAIT_EXTERNAL,
@@ -768,13 +764,6 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
 }
 
 
-# A waiting status names the operator gate it stopped at when the failure
-# reason alone does not carry it.
-_STATUS_WAIT_REASONS: Mapping[RunStatus, str] = {
-    RunStatus.WAITING_SCOPE_APPROVAL: "WAITING_SCOPE_APPROVAL",
-}
-
-
 def disposition_for_status(status: RunStatus | str) -> RunDisposition:
     """The disposition a recorded, projected status stands for.
 
@@ -786,15 +775,6 @@ def disposition_for_status(status: RunStatus | str) -> RunDisposition:
         return _STATUS_DISPOSITIONS[RunStatus(status)]
     except (TypeError, ValueError) as exc:
         raise RunTransitionError(f"run status {status!r} is unknown") from exc
-
-
-def wait_reason_for_status(status: RunStatus | str) -> str | None:
-    """The operator gate a durable waiting status stands for."""
-
-    try:
-        return _STATUS_WAIT_REASONS.get(RunStatus(status))
-    except (TypeError, ValueError):
-        return None
 
 
 def assemble_run_state(
@@ -810,7 +790,7 @@ def assemble_run_state(
     The checkpoint owns the phase.  The posture is the recorded disposition,
     or the single status bridge for a state file written before the canonical
     vocabulary.  The reason is the explicit machine reason, with the recorded
-    failure reason and the operator gate as its documented fallbacks.
+    failure reason as its documented fallback.
     """
 
     if disposition is None:
@@ -820,7 +800,7 @@ def assemble_run_state(
     posture = RunDisposition(disposition)
     resolved = reason or failure_reason
     if not isinstance(resolved, str) or not resolved:
-        resolved = wait_reason_for_status(status) if posture.waiting else None
+        resolved = None
     return RunMachineState(phase, posture, resolved)
 
 
@@ -1240,6 +1220,10 @@ class HarnessConfig:
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     revision: RevisionConfig = field(default_factory=RevisionConfig)
     recovery: RecoveryBudgets = field(default_factory=RecoveryBudgets)
+    # How a path outside a step's declared mutable scope is treated: admitted
+    # and recorded (``soft``) or restored (``strict``).  The forbidden-path
+    # list is part of the same policy and is fatal in both modes.
+    scope: ScopePolicy = field(default_factory=ScopePolicy)
     transport: TransportConfig = field(default_factory=TransportConfig)
     prompt_budget: PromptBudgetConfig = field(default_factory=PromptBudgetConfig)
     repository: RepositoryConfig = field(default_factory=RepositoryConfig)

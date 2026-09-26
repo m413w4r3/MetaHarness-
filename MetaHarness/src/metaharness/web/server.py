@@ -25,7 +25,6 @@ from ..step_ids import is_step_id
 from .api import (
     WebAPIError,
     approve_run,
-    approve_repair_scope,
     create_run,
     get_artifact,
     get_run,
@@ -500,7 +499,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 or (
                     len(parts) == 4
                     and parts[1] == "runs"
-                    and parts[3] in {"approval", "scope-approval", "resume", "recover-plan"}
+                    and parts[3] in {"approval", "resume", "recover-plan"}
                 )
             )
             self._check_origin(allow_opaque=html_form_route)
@@ -514,7 +513,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     "semantic_revision_enabled", "max_check_repair_attempts",
                     "max_correction_cycles", "decomposition", "execution_mode_policy",
                     "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
-                    "repair_scope_policy", "repair_scope_max_added_paths",
                 }
                 if set(payload) - allowed:
                     raise WebAPIError(400, "unknown request field")
@@ -535,8 +533,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     execution_mode_policy=payload.get("execution_mode_policy"),
                     single_step_max_mutable_paths=payload.get("single_step_max_mutable_paths"),
                     staged_step_max_mutable_paths=payload.get("staged_step_max_mutable_paths"),
-                    repair_scope_policy=payload.get("repair_scope_policy"),
-                    repair_scope_max_added_paths=payload.get("repair_scope_max_added_paths"),
                 )
                 self._json(202, {**result, "accepted": True})
                 return
@@ -562,16 +558,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                         run_id, payload["plan"],
                     )
                     self._json(202, {**result, "accepted": True})
-                    return
-                if action == "scope-approval":
-                    payload = self._body()
-                    if set(payload) != {"decision"} or not isinstance(
-                        payload.get("decision"), str
-                    ):
-                        raise WebAPIError(400, "decision must be APPROVE or REJECT")
-                    self._json(200, approve_repair_scope(
-                        self.server.config.runs_root, run_id, payload["decision"]
-                    ))
                     return
                 if action == "approval":
                     payload = self._body()
@@ -602,7 +588,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     "decomposition",
                     "execution_mode_policy", "single_step_max_mutable_paths",
                     "staged_step_max_mutable_paths",
-                    "repair_scope_policy", "repair_scope_max_added_paths",
                 }
                 unknown = set(payload) - allowed
                 if unknown:
@@ -625,8 +610,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     execution_mode_policy=payload.get("execution_mode_policy"),
                     single_step_max_mutable_paths=payload.get("single_step_max_mutable_paths"),
                     staged_step_max_mutable_paths=payload.get("staged_step_max_mutable_paths"),
-                    repair_scope_policy=payload.get("repair_scope_policy"),
-                    repair_scope_max_added_paths=payload.get("repair_scope_max_added_paths"),
                 )
                 self._json(202, result)
                 return
@@ -640,7 +623,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     "decomposition",
                     "execution_mode_policy", "single_step_max_mutable_paths",
                     "staged_step_max_mutable_paths",
-                    "repair_scope_policy", "repair_scope_max_added_paths",
                 }, exact=False)
                 if not {"_token", "spec", "run_id", "planner_profile"}.issubset(payload):
                     raise WebAPIError(400, "missing request field")
@@ -663,8 +645,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     execution_mode_policy=payload.get("execution_mode_policy"),
                     single_step_max_mutable_paths=payload.get("single_step_max_mutable_paths"),
                     staged_step_max_mutable_paths=payload.get("staged_step_max_mutable_paths"),
-                    repair_scope_policy=payload.get("repair_scope_policy"),
-                    repair_scope_max_added_paths=payload.get("repair_scope_max_added_paths"),
                 )
                 self._redirect(result["location"])
                 return
@@ -706,14 +686,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     payload["plan"],
                 ))
                 return
-            if len(parts) == 4 and parts[1] == "runs" and parts[3] == "scope-approval":
-                payload = self._form({"_token", "decision"})
-                self._authorized_form(payload.get("_token"))
-                approve_repair_scope(
-                    self.server.config.runs_root, self._run_id(parts[2]), payload.get("decision", "")
-                )
-                self._redirect(f"/runs/{self._run_id(parts[2])}")
-                return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "approval":
                 run_id = self._run_id(parts[2])
                 payload = self._form(
@@ -741,15 +713,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     **_approval_profiles(payload),
                 )
                 self._redirect(f"/runs/{run_id}")
-                return
-            if len(parts) == 5 and parts[1:3] == ["api", "runs"] and parts[4] == "scope-approval":
-                self._authorized_api()
-                payload = self._body()
-                if set(payload) != {"decision"} or not isinstance(payload.get("decision"), str):
-                    raise WebAPIError(400, "decision must be APPROVE or REJECT")
-                self._json(200, approve_repair_scope(
-                    self.server.config.runs_root, self._run_id(parts[3]), payload["decision"]
-                ))
                 return
             if len(parts) != 5 or parts[1:3] != ["api", "runs"] or parts[4] != "approval":
                 raise WebAPIError(404, "not found")
@@ -880,8 +843,6 @@ def configuration_description(
             "plan_approval": bool(config.approval.require_plan_approval),
             "semantic_revision": bool(revision.enabled),
             "resume": callable(resume_run_request),
-            "scope_approval": revision.max_correction_cycles > 0
-                and callable(approve_repair_scope),
             "recover_plan": callable(recover_plan_request),
             "cancel": False,
             "publish": bool(config.publish.enabled),

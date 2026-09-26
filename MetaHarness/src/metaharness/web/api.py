@@ -22,8 +22,6 @@ from ..approval import (
     ApprovalError,
     PlanIdentity,
     compute_plan_identity_from_run,
-    read_scope_approval,
-    write_scope_approval,
     write_plan_approval,
 )
 from ..execution_selection import (
@@ -41,8 +39,6 @@ from ..models import (
     ExecutionSelection,
     HarnessConfig,
     PublishMode,
-    RunDisposition,
-    RunMachineState,
     RunStatus,
 )
 from ..progress import display_event, sync_progress
@@ -400,18 +396,7 @@ def get_run(
     )
     checks_path, review_path = f"{gate_root}/checks.json", f"{root}/review/review.json"
     scope_delta_path = _artifact_path(directory, f"{root}/correction/scope_delta.json")
-    scope_approval_path = _artifact_path(directory, f"{root}/correction/scope_approval.json")
     scope_delta = _load_json(scope_delta_path, max_bytes=256 * 1024)
-    scope_approval_payload = _load_json(scope_approval_path, max_bytes=16 * 1024)
-    try:
-        with scope_delta_path.open("rb") as stream:
-            scope_delta_bytes = stream.read(256 * 1024 + 1)
-        scope_delta_sha256 = hashlib.sha256(scope_delta_bytes).hexdigest() if len(scope_delta_bytes) <= 256 * 1024 else None
-    except OSError:
-        scope_delta_sha256 = None
-    scope_approval_recorded = isinstance(scope_approval_payload, dict) and scope_approval_payload.get("decision") in {
-        ApprovalDecision.APPROVE.value, ApprovalDecision.REJECT.value,
-    } and scope_approval_payload.get("scope_delta_sha256") == scope_delta_sha256 and scope_delta_sha256 is not None
     reviewer_raw = _load_text(_artifact_path(directory, f"{root}/review/reviewer.raw.md"))
     revision_path = f"{root}/semantic-revision/report.json"
     changed_path, diff_path = f"{gate_root}/changed-files.txt", f"{gate_root}/diff.patch"
@@ -479,10 +464,6 @@ def get_run(
         ),
         "repair_task": _load_text(_artifact_path(directory, "repair_task.md")),
         "scope_delta": scope_delta,
-        "scope_approval": {
-            "recorded": scope_approval_recorded,
-            "decision": scope_approval_payload.get("decision") if scope_approval_recorded else None,
-        },
         "failure": state.get("failure"),
         "publish": _load_json(_artifact_path(directory, "publish.json")),
         "approval": {"recorded": approval_decision is not None, "decision": approval_decision},
@@ -1146,8 +1127,6 @@ def create_run(
     execution_mode_policy: object = None,
     single_step_max_mutable_paths: object = None,
     staged_step_max_mutable_paths: object = None,
-    repair_scope_policy: object = None,
-    repair_scope_max_added_paths: object = None,
 ) -> dict[str, str]:
     content = validate_spec(spec)
     try:
@@ -1198,8 +1177,6 @@ def create_run(
             "execution_mode_policy": execution_mode_policy,
             "single_step_max_mutable_paths": integer(single_step_max_mutable_paths, "single_step_max_mutable_paths"),
             "staged_step_max_mutable_paths": integer(staged_step_max_mutable_paths, "staged_step_max_mutable_paths"),
-            "repair_scope_policy": repair_scope_policy,
-            "repair_scope_max_added_paths": integer(repair_scope_max_added_paths, "repair_scope_max_added_paths"),
         }
         overrides = {key: value for key, value in overrides.items() if value is not None}
         options = RunOptions.from_config(manager._config, **overrides)
@@ -1246,7 +1223,7 @@ LIVE_STOP_STATUSES = frozenset({
     "committed", "published", "failed", "blocked", "plan_rejected", "interrupted",
     "waiting_human",
     "awaiting_plan_approval", "waiting_check_infrastructure",
-    "waiting_scope_approval", "waiting_remote", "waiting_external",
+    "waiting_remote", "waiting_external",
     "waiting_contract_repair", "waiting_check_repair",
 })
 _CONTRACT_REPAIR_PHASES = {
@@ -1347,8 +1324,6 @@ def contract_repair_view(
         phase = "Correcting planner output"
     elif status == "waiting_contract_repair":
         phase = "Output correction exhausted"
-    elif status == "waiting_scope_approval":
-        phase = "Waiting scope approval"
     elif status in {"contract_repairing", "waiting_external", "interrupted", "failed"}:
         phase = _CONTRACT_REPAIR_PHASES.get(str(repair.get("status") or ""), "Contract repair")
     else:
@@ -1492,8 +1467,6 @@ def run_pipeline(
                 planned, frozenset({"review_replan"}), frozenset({"planning"}),
                 ("REPAIR", "PLANNER", "LLM_FAILURE", "HUMAN_REQUIRED"), cycle,
             )
-            if status == "waiting_scope_approval" and cycle == current:
-                value = "resumable"
             add(f"c{cycle}-planner", f"{label} · correction planner ({_cycle_kind(directory, cycle)})", value)
         steps = _step_statuses(directory, cycle, state)
         for step_id, step_status in steps:
@@ -1780,71 +1753,6 @@ def recover_plan_request(
     return {"ok": True, "run_id": safe_id, "location": f"/runs/{safe_id}"}
 
 
-def approve_repair_scope(
-    runs_root: Path, run_id: str, decision: str,
-) -> dict[str, Any]:
-    """Record APPROVE/REJECT for the exact planner-derived correction delta."""
-
-    try:
-        selected = ApprovalDecision(decision)
-    except (TypeError, ValueError) as exc:
-        raise WebAPIError(400, "decision must be APPROVE or REJECT") from exc
-    directory = _run_dir(runs_root, run_id)
-    state = _load_state(directory)
-    if state.get("status") != RunStatus.WAITING_SCOPE_APPROVAL.value:
-        raise WebAPIError(409, "run is not waiting for scope approval")
-    correction = _cycle_root(directory, _state_cycle(state)) / "correction"
-    delta_path = correction / "scope_delta.json"
-    approval_dir = correction
-    state_delta = state.get("scope_delta") if isinstance(state.get("scope_delta"), dict) else {}
-    requested_artifact = state_delta.get("approval_artifact")
-    if isinstance(requested_artifact, str) and requested_artifact:
-        candidate = (directory / requested_artifact).resolve()
-        try:
-            candidate.relative_to(directory.resolve())
-        except ValueError as exc:
-            raise WebAPIError(409, "scope approval artifact is invalid") from exc
-        if candidate.is_file():
-            delta_path, approval_dir = candidate, candidate.parent
-    if not delta_path.is_file():
-        candidates = sorted(
-            (
-                path for path in (_cycle_root(directory, _state_cycle(state)) / "implementation" / "steps").glob(
-                    "*/contract_repairs/*/scope_delta.json"
-                ) if path.is_file()
-            ),
-            key=lambda path: path.stat().st_mtime_ns,
-        )
-        candidates.extend(
-            path for path in (
-                _cycle_root(directory, _state_cycle(state)) / "semantic-revision" / "scope_requests"
-            ).glob("*/scope_delta.json") if path.is_file()
-        )
-        candidates.sort(key=lambda path: path.stat().st_mtime_ns)
-        if candidates:
-            delta_path = candidates[-1]
-            approval_dir = delta_path.parent
-    try:
-        delta_hash = hashlib.sha256(delta_path.read_bytes()).hexdigest()
-        if not isinstance(_load_json(delta_path, max_bytes=256 * 1024), dict):
-            raise ValueError
-        existing = read_scope_approval(approval_dir, expected_sha256=delta_hash)
-        if existing is not None:
-            raise WebAPIError(409, "scope approval already exists")
-        write_scope_approval(approval_dir, decision=selected,
-                             scope_delta_sha256=delta_hash, source="web-ui")
-    except WebAPIError:
-        raise
-    except (OSError, ValueError, ApprovalError) as exc:
-        raise WebAPIError(409, "scope delta is invalid") from exc
-    if selected is ApprovalDecision.REJECT:
-        RunStateStore(directory / "state.json").set_run_state(
-            RunMachineState(disposition=RunDisposition.FAILED, reason="HUMAN_REQUIRED"),
-            failure={"reason": "HUMAN_REQUIRED", "detail": "repair scope rejected"},
-        )
-    return {"ok": True, "decision": selected.value, "scope_delta_sha256": delta_hash}
-
-
 AWAITING_APPROVAL = RunStatus.AWAITING_PLAN_APPROVAL.value
 
 
@@ -1859,7 +1767,6 @@ __all__ = [
     "publish_target",
     "recover_plan_request",
     "resume_run_request",
-    "approve_repair_scope",
     "run_overview",
     "run_pipeline",
     "MAX_SPEC_BYTES",

@@ -575,8 +575,6 @@ PROJECTION_MATRIX = (
     (R.FINAL_REVIEW, D.WAIT_HUMAN, "CHECK_REPAIR_EXHAUSTED", RunStatus.WAITING_HUMAN, False, False),
     # An operator gate owns its durable pending operation; a human wait with
     # no gate and no repair slot owns nothing to resume.
-    (R.SEMANTIC_REVISION, D.WAIT_HUMAN, "WAITING_SCOPE_APPROVAL", RunStatus.WAITING_SCOPE_APPROVAL, True, True),
-    (R.IMPLEMENT_STEP, D.WAIT_HUMAN, "WAITING_SCOPE_APPROVAL", RunStatus.WAITING_SCOPE_APPROVAL, True, True),
     (R.SEMANTIC_REVISION, D.WAIT_HUMAN, None, RunStatus.WAITING_HUMAN, False, False),
     (R.IMPLEMENT_STEP, D.WAIT_HUMAN, "SPEC_DECISION_REQUIRED", RunStatus.WAITING_HUMAN, False, False),
     (R.FINAL_REVIEW, D.WAIT_HUMAN, "SECURITY_POLICY_DECISION_REQUIRED", RunStatus.WAITING_HUMAN, False, False),

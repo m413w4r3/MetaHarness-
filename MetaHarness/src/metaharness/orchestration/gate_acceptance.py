@@ -33,16 +33,15 @@ from ..gitops import (
 )
 from ..models import GateStage
 from ..result import atomic_write_text
-from ..run_options import EffectiveRepairScopePolicy
 from .candidate import accepted_chain_records
 from .check_failure import CheckRepairAttempt
-from .check_scope import gate_mutable_authority
 from .pipeline_v2 import (
     PipelineFailure,
     gate_acceptance_path,
     gate_dir,
     semantic_revision_dir,
 )
+from .durable_readers import gate_mutable_authority
 from .shared import (
     is_object_id,
     json_text,
@@ -57,7 +56,6 @@ class GateAcceptanceService:
         self,
         *,
         secrets: tuple[str, ...],
-        repair_scope_policy: EffectiveRepairScopePolicy,
         authorize_candidate_tree: Callable[..., None],
         check_repair_attempts: Callable[..., tuple[CheckRepairAttempt, ...]],
         load_revision: Callable[[Path], Any],
@@ -65,7 +63,6 @@ class GateAcceptanceService:
         bounded_detail: Callable[[Exception], str],
     ) -> None:
         self._secrets = secrets
-        self._repair_scope_policy = repair_scope_policy
         self._authorize_candidate_tree = authorize_candidate_tree
         self._check_repair_attempts = check_repair_attempts
         self._load_revision = load_revision
@@ -96,7 +93,6 @@ class GateAcceptanceService:
             base_paths=(
                 cycle_plan.mutable_scope if base_paths is None else base_paths
             ),
-            policy_config=self._repair_scope_policy,
             require_attempt_records=True,
         )
         stored = read_json_artifact(path) if path.is_file() else None

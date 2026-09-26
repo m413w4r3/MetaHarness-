@@ -27,20 +27,17 @@ from .pipeline_v2 import (
     semantic_revision_dir,
 )
 from .shared import (
+    OrchestrationError,
+    create_file_once,
     is_object_id,
+    json_text,
     read_json_artifact,
-)
-from ..approval import (
-    ApprovalDecision,
-    ApprovalError,
-    read_scope_approval,
 )
 from ..execution_selection import (
     ExecutionSelectionError,
     read_cycle_execution_selection,
     validate_cycle_execution_selection,
 )
-from ..gitops import path_exists_in_tree
 from ..models import (
     CycleKind,
     ExecutionSelection,
@@ -58,8 +55,8 @@ from ..planning.check_replan import (
 )
 from ..planning.protocol import V2PlanParseError, parse_task_plan_v2
 from ..resume import ResumeIntegrityError
+from ..scope import normalize_repo_paths
 from ..review import ReviewResult
-from ..run_options import EffectiveRepairScopePolicy
 
 
 def _refuse(message: str) -> NoReturn:
@@ -220,10 +217,112 @@ def load_correction_plan(
     return plan, bundle, bundle_sha
 
 
-def verify_correction_scope(
-    run_dir: Path, number: int, bundle_sha: str, policy: EffectiveRepairScopePolicy,
-) -> list[str]:
-    """The added paths of one correction scope delta, with their authority."""
+def _correction_mutation_sets(plan: TaskPlanV2) -> tuple[list[str], list[str], list[str]]:
+    """The correction's plan-declared mutation sets, canonical and sorted.
+
+    The plan grammar already refused a glob and validated every path as
+    repository-relative; the scope authority is the one that refuses a path
+    this delta may not admit, so nothing is re-validated here.
+    """
+
+    return (
+        sorted({path for step in plan.steps for path in step.write_set}),
+        sorted({path for step in plan.steps for path in step.create_set}),
+        sorted({path for step in plan.steps for path in step.delete_set}),
+    )
+
+
+def build_scope_delta(
+    repair_dir: Path, *, original_scope: list[str], plan: TaskPlanV2,
+    candidate_commit_sha: str, repair_bundle_sha: str, justification: str,
+) -> tuple[dict[str, Any], str]:
+    """The canonical scope delta, in memory only: from the parsed plan sets.
+
+    The delta is derived from the parsed plan alone; *justification* names the
+    durable failure the added paths answer, and is never reviewer or planner
+    prose.  Every plan that may widen an approved envelope -- a review
+    correction and a red-gate cycle replan alike -- goes through this one
+    builder, so the same plan always produces the same delta bytes.
+    """
+
+    writes, creates, deletes = _correction_mutation_sets(plan)
+    requested = sorted(set(writes) | set(creates) | set(deletes))
+    original = sorted(set(original_scope))
+    added = sorted(set(requested) - set(original))
+    findings = justification.strip()
+    reasons: dict[str, Any] = {}
+    for path in added:
+        step = next(
+            step for step in plan.steps
+            if path in set(step.write_set) | set(step.create_set) | set(step.delete_set)
+        )
+        reasons[path] = {
+            "reason": f"{step.title}: {step.objective}",
+            "source_finding": findings,
+        }
+    try:
+        plan_sha = hashlib.sha256((repair_dir / "planner.raw.md").read_bytes()).hexdigest()
+    except OSError as exc:
+        raise OrchestrationError("REPAIR_SCOPE_PLAN_UNREADABLE") from exc
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "original_mutable_paths": original,
+        "requested_write_paths": writes,
+        "requested_create_paths": creates,
+        "requested_delete_paths": deletes,
+        "added_paths": added,
+        "unchanged_paths": sorted(set(requested) & set(original)),
+        "added_path_reasons": reasons,
+        "source_finding": findings,
+        "candidate_commit_sha": candidate_commit_sha,
+        "repair_plan_sha256": plan_sha,
+        "correction_bundle_sha256": repair_bundle_sha,
+    }
+    return payload, json_text(payload)
+
+
+def ensure_scope_delta(
+    repair_dir: Path, content: str, *, expected_sha256: str | None,
+) -> str:
+    """Persist ``scope_delta.json`` exactly once, then only verify it.
+
+    The first creation writes the canonical bytes atomically.  An existing
+    artifact is never rewritten: its bytes must equal the canonical bytes and,
+    when the checkpoint binds one, the checkpoint hash.  Any difference is a
+    :class:`ResumeIntegrityError` and the file is left as found.
+    """
+
+    expected = content.encode("utf-8")
+    digest = hashlib.sha256(expected).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise ResumeIntegrityError("the correction scope delta changed")
+    path = repair_dir / "scope_delta.json"
+    if expected_sha256 is None:
+        try:
+            create_file_once(path, expected)
+            return digest
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise OrchestrationError("REPAIR_SCOPE_DELTA_UNWRITABLE") from exc
+    try:
+        if path.stat().st_size > 256 * 1024:
+            raise ResumeIntegrityError("the correction scope delta is too large")
+        existing = path.read_bytes()
+    except OSError as exc:
+        raise ResumeIntegrityError(f"the correction scope delta is unreadable: {exc}") from exc
+    if existing != expected:
+        raise ResumeIntegrityError("the correction scope delta changed")
+    return digest
+
+
+def verify_correction_scope(run_dir: Path, number: int, bundle_sha: str) -> list[str]:
+    """The added paths of one correction scope delta, with their authority.
+
+    The delta itself is the authority: it is derived from the parsed plan and
+    recorded once, so a resume only re-proves that the recorded bytes are the
+    canonical, path-safe ones it would derive again.
+    """
 
     directory = _correction_plan_dir(run_dir, number)
     delta = read_json_artifact(directory / "scope_delta.json", 256 * 1024)
@@ -232,34 +331,23 @@ def verify_correction_scope(
     added = delta.get("added_paths")
     if not isinstance(added, list) or any(not isinstance(path, str) for path in added):
         raise ResumeIntegrityError(f"cycle {number:03d} scope delta is malformed")
-    if added:
-        if policy.policy == "deny-expansion":
-            raise ResumeIntegrityError(f"cycle {number:03d} scope expansion is denied by the run policy")
-        if policy.policy == "require-approval" or len(added) > policy.max_added_paths:
-            digest = hashlib.sha256((directory / "scope_delta.json").read_bytes()).hexdigest()
-            try:
-                approval = read_scope_approval(directory, expected_sha256=digest)
-            except ApprovalError as exc:
-                raise ResumeIntegrityError(f"cycle {number:03d} scope approval is invalid: {exc}") from exc
-            if approval is None or approval.decision is not ApprovalDecision.APPROVE:
-                raise ResumeIntegrityError(f"cycle {number:03d} scope expansion was not approved")
+    try:
+        canonical = sorted(set(normalize_repo_paths(added)))
+    except ValueError as exc:
+        raise ResumeIntegrityError(f"cycle {number:03d} scope delta has invalid paths") from exc
+    if added != canonical:
+        raise ResumeIntegrityError(f"cycle {number:03d} scope delta is not canonical")
     return list(added)
 
 
-def semantic_revision_scope(
-    repo: Path,
-    run_dir: Path,
-    number: int,
-    policy: EffectiveRepairScopePolicy,
-) -> set[str]:
-    """Read reviser-requested paths only when durable policy authorized them."""
+def semantic_revision_scope(run_dir: Path, number: int) -> set[str]:
+    """Read the reviser-requested paths one cycle durably auto-admitted."""
 
     root = semantic_revision_dir(run_dir, number) / "scope_requests"
     if not root.is_dir():
         return set()
     revision_dir = semantic_revision_dir(run_dir, number)
     scope: set[str] = set()
-    added_total: set[str] = set()
     for request_dir in sorted(root.iterdir(), key=lambda item: item.name):
         if not request_dir.is_dir() or not request_dir.name.isdigit():
             continue
@@ -270,16 +358,11 @@ def semantic_revision_scope(
         requested = authority.get("requested_paths")
         tree_sha = authority.get("tree_sha")
         source_report_sha = authority.get("source_report_sha256")
-        existing = authority.get("existing_paths")
-        creates = authority.get("create_paths")
         if (
             authority.get("schema_version") != 1
             or authority.get("cycle") != number
-            or authority.get("policy") != policy.policy
-            or authority.get("bound") != policy.max_added_paths
             or not isinstance(added, list) or not isinstance(requested, list)
-            or not isinstance(existing, list) or not isinstance(creates, list)
-            or any(not _safe_semantic_scope_path(path) for path in (*added, *requested, *existing, *creates))
+            or any(not _safe_semantic_scope_path(path) for path in (*added, *requested))
             or not isinstance(tree_sha, str) or not is_object_id(tree_sha)
             or not isinstance(source_report_sha, str)
             or not re.fullmatch(r"[0-9a-f]{64}", source_report_sha)
@@ -288,8 +371,6 @@ def semantic_revision_scope(
         if (
             added != sorted(set(added))
             or requested != sorted(set(requested))
-            or set(existing) | set(creates) != set(requested)
-            or set(existing) & set(creates)
             or set(added) - set(requested)
         ):
             _refuse("semantic scope authority is not canonical")
@@ -329,50 +410,24 @@ def semantic_revision_scope(
                 break
         if not source_matches:
             _refuse("semantic scope authority is not bound to its reviser report")
-        for path in requested:
-            if path_exists_in_tree(repo, tree_sha, path) != (path in existing):
-                _refuse("semantic scope tree existence semantics changed")
         decision = read_json_artifact(request_dir / "decision.json", 64 * 1024)
-        if isinstance(decision, dict) and decision.get("decision") == "denied-expansion":
-            if policy.policy != "deny-expansion" or decision.get("added_paths") != added:
-                _refuse("semantic denied-scope record is invalid")
-            continue
-        if added and policy.policy == "deny-expansion":
-            _refuse("semantic scope expansion is denied")
-        added_total.update(added)
-        needs_approval = (
-            bool(added) and (
-                policy.policy == "require-approval"
-                or (policy.policy == "auto-bounded" and len(added_total) > policy.max_added_paths)
-            )
-        )
-        if needs_approval:
-            delta_path = request_dir / "scope_delta.json"
-            delta = read_json_artifact(delta_path, 64 * 1024)
-            if not isinstance(delta, dict) or delta.get("added_paths") != added:
-                _refuse("semantic scope delta is malformed")
-            try:
-                approval = read_scope_approval(
-                    request_dir, expected_sha256=hashlib.sha256(delta_path.read_bytes()).hexdigest(),
-                )
-            except (OSError, ApprovalError) as exc:
-                _refuse(f"semantic scope approval is invalid: {exc}")
-            if approval is None:
-                continue
-            if approval.decision is not ApprovalDecision.APPROVE:
-                _refuse("semantic scope request was rejected")
+        if (
+            not isinstance(decision, dict)
+            or decision.get("decision") != "auto-admitted"
+            or decision.get("added_paths") != added
+        ):
+            _refuse("semantic scope decision is missing or invalid")
         scope.update(added)
     return scope
 
 
 def _safe_semantic_scope_path(path: Any) -> bool:
-    return bool(
-        isinstance(path, str) and path and path == path.strip()
-        and path not in {".", ".."} and not path.startswith("/")
-        and "\x00" not in path and "\\" not in path and "//" not in path
-        and all(part not in {"", ".", "..", ".git"} for part in Path(path).parts)
-        and not any(char in path for char in "*?[]{}")
-    )
+    """Whether one requested path already is its own canonical repository path."""
+
+    try:
+        return normalize_repo_paths((path,))[0] == path
+    except ValueError:
+        return False
 
 
 __all__ = [
