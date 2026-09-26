@@ -282,6 +282,9 @@ class RunPhase(StrEnum):
     STEP_ACCEPTANCE = "step_acceptance"
     DETERMINISTIC_GATE = "deterministic_gate"
     CHECK_REPAIR = "check_repair"
+    # The cycle a red gate's cycle replan opened: its approved decomposition is
+    # loaded from the durable check-replan transaction and its steps run.
+    CHECK_REPLAN = "check_replan"
     SEMANTIC_REVISION = "semantic_revision"
     CANDIDATE_READY = "candidate_ready"
     CANDIDATE_PUSH = "candidate_push"
@@ -442,9 +445,12 @@ _RUN_PHASE_SUCCESSORS: Mapping[RunPhase, frozenset[RunPhase]] = {
     RunPhase.STEP_ACCEPTANCE: frozenset({RunPhase.IMPLEMENT_STEP, RunPhase.DETERMINISTIC_GATE}),
     RunPhase.DETERMINISTIC_GATE: frozenset({
         RunPhase.DETERMINISTIC_GATE, RunPhase.CHECK_REPAIR,
-        RunPhase.SEMANTIC_REVISION, RunPhase.CANDIDATE_READY,
+        RunPhase.SEMANTIC_REVISION, RunPhase.CANDIDATE_READY, RunPhase.CHECK_REPLAN,
     }),
     RunPhase.CHECK_REPAIR: frozenset({RunPhase.CHECK_REPAIR, RunPhase.DETERMINISTIC_GATE}),
+    # A new decomposition is implemented by its own cycle and returns to the
+    # deterministic gate, exactly like every other cycle of the pipeline.
+    RunPhase.CHECK_REPLAN: frozenset({RunPhase.IMPLEMENT_STEP, RunPhase.DETERMINISTIC_GATE}),
     RunPhase.SEMANTIC_REVISION: frozenset({RunPhase.DETERMINISTIC_GATE, RunPhase.CANDIDATE_READY}),
     RunPhase.CANDIDATE_READY: frozenset({RunPhase.CANDIDATE_PUSH}),
     RunPhase.CANDIDATE_PUSH: frozenset({RunPhase.FINAL_REVIEW}),
@@ -544,6 +550,7 @@ _RUNNING_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.STEP_ACCEPTANCE: RunStatus.IMPLEMENTING,
     RunPhase.DETERMINISTIC_GATE: RunStatus.VALIDATING,
     RunPhase.CHECK_REPAIR: RunStatus.REVISING,
+    RunPhase.CHECK_REPLAN: RunStatus.IMPLEMENTING,
     RunPhase.SEMANTIC_REVISION: RunStatus.REVISING,
     RunPhase.CANDIDATE_READY: RunStatus.APPROVED,
     RunPhase.CANDIDATE_PUSH: RunStatus.APPROVED,
@@ -1142,6 +1149,9 @@ class CycleKind(StrEnum):
     INITIAL = "initial"
     REVIEW_IMPLEMENTATION = "review-implementation"
     REVIEW_REPLAN = "review-replan"
+    # A red deterministic gate whose bounded repair pass and single-step
+    # replan were both durably spent, so the decomposition itself is replanned.
+    CHECK_REPLAN = "check-replan"
 
 
 class GateStage(StrEnum):
@@ -1152,6 +1162,7 @@ class GateStage(StrEnum):
 
     POST_IMPLEMENTATION = "POST_IMPLEMENTATION"
     POST_SEMANTIC_REVISION = "POST_SEMANTIC_REVISION"
+    POST_CHECK_REPLAN = "POST_CHECK_REPLAN"
     POST_REVIEW_IMPLEMENTATION = "POST_REVIEW_IMPLEMENTATION"
     POST_REVIEW_REPLAN = "POST_REVIEW_REPLAN"
 

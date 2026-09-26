@@ -546,15 +546,20 @@ class RecoveryPathTests(PipelineHarness):
         )
         result = self.orchestrator(
             self.config(check_repair=0),
-            planner=[initial_plan(STEP), repaired_step_contract()],
+            planner=[
+                initial_plan(STEP), repaired_step_contract(),
+                # The last autonomous rung re-decomposes the cycle; the plan it
+                # answers with is the one already in force, so it is spent.
+                initial_plan(STEP),
+            ],
             reviewer=["unused"],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR)
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
         self.assertEqual(self.checkpoint()["phase"], P.DETERMINISTIC_GATE.value)
-        # The budgeted repair pass is refused, so the ladder consumes its
-        # autonomous replan rung before the operator is ever asked.
-        self.assertEqual(ladder_strategies(self), ["replan_step"])
+        # The budgeted repair pass is refused, so the ladder consumes both
+        # autonomous replan rungs before the operator is ever asked.
+        self.assertEqual(ladder_strategies(self), ["replan_step", "replan_cycle"])
         self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
         self.assertFalse(
             (self.run_dir() / "cycles/001/check-repair/post-implementation/attempts").exists()

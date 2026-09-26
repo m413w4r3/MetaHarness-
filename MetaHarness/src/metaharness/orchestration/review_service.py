@@ -61,6 +61,7 @@ from ..gitops import (
 from ..models import (
     CycleKind,
     ExecutionRole,
+    GateStage,
     PlanDecision,
     ReviewRoute,
     ReviewVerdict,
@@ -68,6 +69,15 @@ from ..models import (
     RunStatus,
 )
 from ..planning.artifacts import validate_implementation_bundle
+from ..planning.check_replan import (
+    CheckReplanFacts,
+    CheckReplanTransaction,
+    bounded_check_proofs,
+    bounded_diff_summary,
+    check_replan_dir,
+    plan_identity,
+    render_path_facts,
+)
 from ..planning.planner import RepairPlannerV2
 from ..planning.protocol import (
     V2PlanParseError,
@@ -131,12 +141,16 @@ from .revision import (
 from .check_repair import (
     _check_repair_prompt,
     _hard_integrity_failures,
+    check_failure_proofs,
+    consumed_ladder_strategies,
     gate_mutable_authority,
     _soft_check_failures,
 )
+from .recovery import GateRecoveryStep, RecoveryStepUnavailable
 from .scope_repair import (
     _build_scope_delta,
-    _ensure_scope_delta,
+    build_scope_delta,
+    ensure_scope_delta,
 )
 from .pipeline_v2 import (
     CyclePlan,
@@ -158,11 +172,26 @@ from .resume_validation import (
     _reusable_pre_checks,
     candidate_evidence,
     read_candidate_record,
+    read_cycle_record,
 )
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
 
 _MAX_REVIEW_FALLBACK_DIFF_BYTES = 32 * 1024
+
+def _review_candidate_record(run_dir: Path, number: int) -> Mapping[str, Any] | None:
+    """The candidate of an earlier cycle, or ``None`` when a replan replaced it.
+
+    A cycle whose red deterministic gate exhausted its ladder was answered by a
+    new decomposition in the next cycle and never reached a candidate; the
+    reviewer reads that cycle as replaced instead of as a reviewed history.
+    """
+
+    following = run_dir / "cycles" / f"{number + 1:03d}" / "cycle.json"
+    if following.is_file() and read_cycle_record(run_dir, number + 1).kind is CycleKind.CHECK_REPLAN:
+        return None
+    return read_candidate_record(run_dir, number)
+
 
 def _required_checks_summary(evidence: EvidenceBundle) -> str:
     """Keep required-check authority while excluding stdout/stderr blobs."""
@@ -305,6 +334,64 @@ def review_code_evidence(
     return _json_text(payload)
 
 
+# The bounded path facts one red gate may show a planner.
+_MAX_REPLAN_PATH_FACTS = 24
+
+
+def _check_replan_facts(
+    *, ctx: PipelineV2Context, cycle_plan: CyclePlan, cycle: int, stage: GateStage,
+    evidence: EvidenceBundle, approved_scope: Sequence[str],
+) -> CheckReplanFacts:
+    """The bounded facts one red deterministic gate hands a re-decomposition.
+
+    Every field is read from durable artifacts -- the gate evidence, its
+    archived check logs, the plan in force, the ladder ledger and Git objects
+    -- and never from the current worktree content, so a resume rebuilds byte
+    for byte the same request and the same anti-loop fingerprint.  The facts
+    name the approved envelope without widening it: a plan that needs a path no
+    earlier plan approved still asks the run's own scope policy.
+    """
+
+    tree = evidence.staged_tree_sha
+    declared = {
+        path for step in cycle_plan.plan.steps
+        for path in (*step.write_set, *step.create_set, *step.delete_set)
+    }
+    in_question = sorted(set(approved_scope) | declared | set(evidence.changed_files))
+    return CheckReplanFacts(
+        cycle=cycle, stage=stage.value, candidate_tree_sha=tree,
+        failed_check_ids=tuple(
+            item.split(":", 1)[1] for item in _soft_check_failures(evidence) if ":" in item
+        ),
+        plan_identity_before=plan_identity(cycle_plan.plan),
+        approved_mutable_envelope=tuple(approved_scope),
+        repository_reference=render_repository_reference(ctx.repository_reference),
+        original_spec=ctx.spec,
+        repository_state=_json_text({
+            "BASE_SHA": ctx.base_sha,
+            "CANDIDATE_TREE_SHA": tree,
+            "CHANGED_FILES": changed_paths_between_trees(
+                ctx.repo, ctx.base_tree_sha, tree,
+            ),
+        }),
+        approved_plan_summary=render_repair_plan_summary(cycle_plan.plan),
+        approved_step_index=render_repair_step_index(cycle_plan.plan),
+        check_failure_proofs=bounded_check_proofs(check_failure_proofs(
+            evidence=evidence,
+            evidence_dir=gate_dir(ctx.run_dir, cycle_plan.cycle.number, stage),
+            repo=ctx.repo, worktree=ctx.info.worktree, tree_sha=tree,
+        )),
+        candidate_diff_summary=bounded_diff_summary(evidence.diff),
+        repository_path_facts=render_path_facts([
+            {"path": path, "exists": path_exists_in_tree(ctx.repo, tree, path)}
+            for path in in_question[:_MAX_REPLAN_PATH_FACTS]
+        ]),
+        consumed_strategies=consumed_ladder_strategies(
+            ctx.run_dir, cycle_plan.cycle.number, stage,
+        ),
+    )
+
+
 class ReviewService:
     """One owner of the pipeline operations described in this module."""
 
@@ -351,6 +438,11 @@ class ReviewService:
     ) -> CyclePlan:
         """Plan one review-driven correction cycle from the reviewed candidate."""
 
+        if cycle.kind is CycleKind.CHECK_REPLAN:
+            # The red gate's own planning transaction already produced this
+            # decomposition; a cycle boundary only reloads and verifies it, so
+            # no second planner call can ever happen for one replan.
+            return self.runtime.load_plan_correction(ctx, cycle)
         previous = cycle.number - 1
         repair_dir = correction_dir(ctx.run_dir, cycle)
         repair_dir.mkdir(parents=True, exist_ok=True)
@@ -492,16 +584,35 @@ class ReviewService:
             )
         except OrchestrationError as exc:
             raise PipelineFailure(str(exc)) from exc
+        self._apply_correction_scope(
+            store, ctx, cycle, plan, repair_dir, delta, content, approved_scope, candidate_sha,
+        )
+
+    def _apply_correction_scope(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle: RunCycle,
+        plan: TaskPlanV2, repair_dir: Path, delta: Mapping[str, Any], content: str,
+        approved_scope: list[str], candidate_sha: str,
+    ) -> None:
+        """Persist one correction scope delta and let the run's policy decide.
+
+        A review-driven correction and a red-gate cycle replan widen an
+        approved envelope through this one path: the delta is derived from the
+        parsed plan alone, created once, and never approved by its producer.
+        """
+
         # Created once; on every later pass (resume included) the persisted
         # bytes are only compared, never repaired.
-        delta_sha = _ensure_scope_delta(repair_dir, content, expected_sha256=None)
+        delta_sha = ensure_scope_delta(repair_dir, content, expected_sha256=None)
         for path in delta["requested_write_paths"] + delta["requested_delete_paths"]:
             if not path_exists_in_tree(ctx.repo, candidate_sha, path):
                 raise PipelineFailure("REPAIR_SCOPE_EXISTING_PATH_MISSING", path)
         for path in delta["requested_create_paths"]:
             if path_exists_in_tree(ctx.repo, candidate_sha, path):
                 raise PipelineFailure("REPAIR_SCOPE_CREATE_PATH_EXISTS", path)
-        if delta["added_paths"] and not review.required_fixes.strip() and not review.findings.strip():
+        # A widening is only ever justified by the durable failure it answers:
+        # the delta carries that finding itself, so a producer cannot approve
+        # its own expansion and an empty finding can never widen a scope.
+        if delta["added_paths"] and not str(delta.get("source_finding") or "").strip():
             raise PipelineFailure("REPAIR_SCOPE_UNJUSTIFIED")
         requested = sorted({
             path for step in plan.steps
@@ -549,6 +660,119 @@ class ReviewService:
             raise PipelineFailure(
                 preflight_failures[0].split(":", 1)[0], preflight_failures[0],
             )
+    def replan_cycle(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
+        stage: GateStage, step: GateRecoveryStep, evidence: EvidenceBundle,
+    ) -> CyclePlan:
+        """Answer one spent red gate with a new decomposition of its cycle.
+
+        The rung that reaches this method is the last one of the episode: the
+        bounded repair pass and the single-step replan were durably spent and
+        the gate is still red, so the failure proves the decomposition wrong
+        rather than one of its steps.  The bounded facts and the one planning
+        transaction are the check-replan ones; the answer becomes the plan of
+        the cycle that executes it, written before that cycle exists so a crash
+        resumes the very same answer instead of paying for a second one.  The
+        planner may restructure the steps, correct their contracts and reuse
+        every approved path -- it names no new authority, so a path no earlier
+        plan approved still goes through the run's own scope policy.
+        """
+
+        cycle = RunCycle(cycle_plan.cycle.number + 1, CycleKind.CHECK_REPLAN)
+        directory = check_replan_dir(ctx.run_dir, cycle.number)
+        facts = _check_replan_facts(
+            ctx=ctx, cycle_plan=cycle_plan, cycle=cycle.number, stage=stage,
+            evidence=evidence, approved_scope=self.runtime.approved_scope_before(
+                ctx, cycle.number,
+            ),
+        )
+        profile = profile_for_role(
+            self.runtime.config, ctx.selection.planner.profile_id, ExecutionRole.PLANNER
+        )
+        store.update(status=RunStatus.PLANNING, current_step=None)
+        started_at, started_mono = self.runtime.trace_time(), time.perf_counter()
+        selected = self.runtime.trace_selected_profile(
+            ctx.selection.planner.profile_id, ExecutionRole.PLANNER
+        )
+        self.runtime.trace_emit(
+            "plan.started", phase="planning", cycle=cycle.number,
+            data={
+                "kind": cycle.kind.value, "tree_before": facts.candidate_tree_sha,
+                "session": self.runtime.trace_session(
+                    profile=profile, selected=selected, role=ExecutionRole.PLANNER,
+                    prompt_bytes=None, started_at=started_at, started_mono=started_mono,
+                    tree_before=facts.candidate_tree_sha,
+                ),
+            },
+        )
+        try:
+            plan = CheckReplanTransaction(
+                client=self.runtime.planner_client or chat_client(
+                    build_llm_endpoint(profile), self.runtime.environment,
+                    self.runtime.trace_transport,
+                ),
+                artifacts_dir=directory,
+                planning=self.runtime.config.planning,
+                check_catalog=self.runtime.config.check_catalog,
+                original_required_check_ids=ctx.plan.required_checks,
+                repository_preconditions=RepositoryPreconditions(
+                    ctx.repo, facts.candidate_tree_sha,
+                ),
+            ).plan(facts)
+        except PlanRepositoryPreconditionError as exc:
+            raise PipelineFailure(exc.code, bounded_parse_detail(exc)) from exc
+        except V2PlanParseError as exc:
+            raise PipelineFailure("PLANNER_OUTPUT_INVALID", bounded_parse_detail(exc)) from exc
+        self.runtime.trace_emit(
+            "plan.completed", phase="planning", cycle=cycle.number,
+            data={
+                "kind": cycle.kind.value, "decision": plan.decision.value, "title": plan.title,
+                "session": self.runtime.trace_finished_model_session(
+                    profile=profile, selected=selected, role=ExecutionRole.PLANNER,
+                    prompt_bytes=(
+                        (directory / "planner.request.txt").stat().st_size
+                        if (directory / "planner.request.txt").is_file() else None
+                    ),
+                    started_at=started_at, started_mono=started_mono,
+                    usage=None, tree_before=facts.candidate_tree_sha,
+                    tree_after=facts.candidate_tree_sha, final_message=getattr(plan, "raw", None),
+                ),
+            },
+        )
+        self.runtime.cycle_update(store, cycle, status="planning", plan_summary=plan.title)
+        if plan.decision is PlanDecision.BLOCKED:
+            self.runtime.cycle_update(store, cycle, status="blocked", blockers=plan.blockers)
+            raise PipelineFailure("REPAIR_PLANNER_BLOCKED", plan.blockers)
+        if plan_identity(plan) == facts.plan_identity_before:
+            # The planner answered the very decomposition already in force:
+            # executing it would replay approved work.  The rung is spent and
+            # its durable record keeps these exact facts from being re-planned.
+            self.runtime.cycle_update(
+                store, cycle, status="failed", failure="CHECK_REPLAN_UNCHANGED",
+            )
+            raise RecoveryStepUnavailable(
+                step.strategy, "the cycle replan re-decomposed nothing",
+            )
+        bundle, bundle_sha = validate_implementation_bundle(
+            directory, expected_step_ids=[step.id for step in plan.steps]
+        )
+        try:
+            delta, content = build_scope_delta(
+                directory, original_scope=list(facts.approved_mutable_envelope),
+                plan=plan, candidate_commit_sha=facts.candidate_tree_sha,
+                repair_bundle_sha=bundle_sha,
+                justification=f"{stage.value}: {' '.join(facts.failed_check_ids)}",
+            )
+        except OrchestrationError as exc:
+            raise PipelineFailure(str(exc)) from exc
+        self._apply_correction_scope(
+            store, ctx, cycle, plan, directory, delta, content,
+            list(facts.approved_mutable_envelope), facts.candidate_tree_sha,
+        )
+        return self.runtime.correction_cycle_plan(
+            ctx, cycle, plan, bundle, bundle_sha, creating=True,
+        )
+
     def semantic_revision(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
     ) -> None:
@@ -937,7 +1161,7 @@ class ReviewService:
             cycle_plan=self.runtime.cycle_plan,
             completed_steps=self.runtime.completed_steps,
             load_revision=_load_revision,
-            read_candidate=read_candidate_record,
+            read_candidate=_review_candidate_record,
             candidate_evidence=candidate_evidence,
             accepted_review=_accepted_review,
         )

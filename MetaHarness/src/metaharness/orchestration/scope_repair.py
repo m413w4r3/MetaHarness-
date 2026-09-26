@@ -40,14 +40,34 @@ def _build_scope_delta(
     repair_dir: Path, *, original_scope: list[str], plan: TaskPlanV2,
     candidate_commit_sha: str, review: ReviewResult, repair_bundle_sha: str,
 ) -> tuple[dict[str, Any], str]:
-    """The canonical scope delta, in memory only: from parsed plan sets, never reviewer prose."""
+    """The canonical scope delta of one review-driven correction cycle."""
+
+    return build_scope_delta(
+        repair_dir, original_scope=original_scope, plan=plan,
+        candidate_commit_sha=candidate_commit_sha, repair_bundle_sha=repair_bundle_sha,
+        justification=review.required_fixes.strip() or review.findings.strip(),
+    )
+
+
+def build_scope_delta(
+    repair_dir: Path, *, original_scope: list[str], plan: TaskPlanV2,
+    candidate_commit_sha: str, repair_bundle_sha: str, justification: str,
+) -> tuple[dict[str, Any], str]:
+    """The canonical scope delta, in memory only: from parsed plan sets.
+
+    The delta is derived from the parsed plan alone; *justification* names the
+    durable failure the added paths answer, and is never reviewer or planner
+    prose.  Every plan that may widen an approved envelope -- a review
+    correction and a red-gate cycle replan alike -- goes through this one
+    builder, so the same plan always produces the same delta bytes.
+    """
 
     writes, creates, deletes = _repair_mutation_sets(plan)
     requested = sorted(set(writes) | set(creates) | set(deletes))
     original = sorted(set(original_scope))
     added = sorted(set(requested) - set(original))
     unchanged = sorted(set(requested) & set(original))
-    findings = review.required_fixes.strip() or review.findings.strip()
+    findings = justification.strip()
     reasons: dict[str, Any] = {}
     for path in added:
         steps = [step for step in plan.steps if path in set(step.write_set) | set(step.create_set) | set(step.delete_set)]
@@ -78,7 +98,7 @@ def _build_scope_delta(
     return payload, _json_text(payload)
 
 
-def _ensure_scope_delta(
+def ensure_scope_delta(
     repair_dir: Path, content: str, *, expected_sha256: str | None,
 ) -> str:
     """Persist ``scope_delta.json`` exactly once, then only verify it.

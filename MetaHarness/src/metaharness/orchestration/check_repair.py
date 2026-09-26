@@ -20,6 +20,7 @@ from typing import (
 )
 from .candidate import accepted_chain_records
 from .pipeline_v2 import (
+    CyclePlan,
     PipelineFailure,
     check_repair_attempt_dir,
     check_repair_attempts_dir,
@@ -74,6 +75,11 @@ from ..recovery_policy import (
 )
 from ..resume import ResumeIntegrityError
 from ..run_options import EffectiveRepairScopePolicy, effective_repair_scope_policy
+from ..planning.check_replan import (
+    PLAN_ARTIFACT as CHECK_REPLAN_PLAN_ARTIFACT,
+    check_replan_dir,
+    plan_identity,
+)
 from ..validation import check_result_json
 
 
@@ -1094,6 +1100,48 @@ def replan_problem(
     )
 
 
+def check_failure_proofs(
+    *, evidence: EvidenceBundle, evidence_dir: Path, repo: Path, worktree: Path,
+    tree_sha: str,
+) -> tuple[tuple[str, str], ...]:
+    """The first useful proof of every failed check of one red gate.
+
+    Read from the durable gate evidence, its archived check logs and Git
+    objects, never from the worktree content, so a resume rebuilds exactly the
+    same proofs.  A plan that re-decomposes a whole cycle needs them all, not
+    only the first: each failing check is one fact the new split must answer.
+    """
+
+    try:
+        context = json.loads(_check_repair_problem_context(
+            evidence, evidence_dir=evidence_dir, repo=repo, worktree=worktree,
+            tree_sha=tree_sha,
+        ))
+    except (TypeError, ValueError):
+        return ()
+    checks = context.get("checks") if isinstance(context, dict) else None
+    return tuple(
+        (str(item["name"]), str(item["failure_proof"]))
+        for item in (checks or ())
+        if isinstance(item, Mapping)
+        and isinstance(item.get("name"), str)
+        and str(item.get("failure_proof") or "").strip()
+    )
+
+
+def consumed_ladder_strategies(
+    run_dir: str | Path, cycle: int, stage: GateStage | str,
+) -> tuple[str, ...]:
+    """The distinct ladder rungs one gate episode already consumed, in order.
+
+    Read from the episode's own durable ledger, so the same episode always
+    reports the same strategies to a planner and to a resume alike.
+    """
+
+    ledger = _read_ladder(_ladder_path(Path(run_dir), cycle, GateStage(stage)))
+    return tuple(entry.strategy.value for entry in (ledger.entries if ledger else ()))
+
+
 def replan_mismatch(
     *, problem: ReplanProblem, step_id: str, cycle: int, stage: GateStage,
     anchor_tree: str,
@@ -1206,11 +1254,19 @@ class CheckRepairLadder:
     identifies the responsible step, produces a new bounded contract from the
     red-gate evidence through the existing durable contract-repair
     transaction, re-executes that step under its new validated authority with
-    its necessary descendants, and returns the tree it produced.  It raises
-    :class:`RecoveryStepUnavailable` when the rung is not applicable.
+    its necessary descendants, and returns the tree it produced.
+
+    ``replan_cycles`` is the last rung: once a step's contract replan is spent
+    too, the whole decomposition of the cycle is replanned through the durable
+    check-replan planning transaction and the new cycle it opens is returned.
+
+    Both raise :class:`RecoveryStepUnavailable` when the rung is not
+    applicable for these exact facts, so the ladder advances instead of
+    looping.
     """
 
     replan_steps: Callable[..., str] | None = None
+    replan_cycles: Callable[..., CyclePlan] | None = None
 
     def gate_step(
         self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
@@ -1259,11 +1315,19 @@ class CheckRepairLadder:
                 # repair scope cannot reach: the bounded expansion is the next
                 # distinct strategy, never another pass on the narrow scope.
                 continue
-            if strategy in _EPISODE_STRATEGIES and any(
+            recorded = strategy in _EPISODE_STRATEGIES and any(
                 entry.strategy is strategy for entry in ledger.entries
-            ):
-                # A replan rung rewrites approved work: it is one distinct
-                # strategy of this episode, never a loop over fresh trees.
+            )
+            # A cycle rung whose durable answer already exists is the *resume*
+            # of that one rung, never a second answer: the plan it produced is
+            # recovered and judged, so neither the episode rule nor the
+            # progression refuses it -- while any other recorded rung stays
+            # spent for these exact facts.
+            resuming = bool(
+                recorded and strategy is RecoveryStrategy.REPLAN_CYCLE
+                and self._cycle_replan_open(ctx, cycle_plan, tree, failed)
+            )
+            if recorded and not resuming:
                 continue
             step = self._admit(
                 strategy, ctx=ctx, cycle_plan=cycle_plan, stage=stage_value,
@@ -1274,7 +1338,7 @@ class CheckRepairLadder:
                 # Deterministically inapplicable for these exact facts:
                 # advance the ladder without executing anything.
                 continue
-            if progression.is_consumed(progression.fingerprint(
+            if not resuming and progression.is_consumed(progression.fingerprint(
                 candidate_tree=tree, failure_class=FailureClass.CORRECTNESS,
                 facts=facts, strategy=strategy,
             )):
@@ -1314,16 +1378,26 @@ class CheckRepairLadder:
             step.strategy, "running", tree, failed,
             step.repair_attempt, step.step_indices, step.added_paths,
         )
-        if not any(
-            item.strategy is entry.strategy and item.tree == entry.tree
-            and item.failed_check_ids == entry.failed_check_ids
-            and item.repair_attempt == entry.repair_attempt
-            and item.step_indices == entry.step_indices
-            for item in ledger.entries
-        ):
+        def same(item: _LadderEntry) -> bool:
+            return (
+                item.strategy is entry.strategy and item.tree == entry.tree
+                and item.failed_check_ids == entry.failed_check_ids
+                and item.repair_attempt == entry.repair_attempt
+                and item.step_indices == entry.step_indices
+            )
+
+        existing = next((item for item in ledger.entries if same(item)), None)
+        if existing is None:
             if len(ledger.entries) >= _MAX_LADDER_ENTRIES:
                 raise ResumeIntegrityError("the gate recovery ladder is full")
             ledger = dataclasses.replace(ledger, entries=(*ledger.entries, entry))
+        elif existing.state != "running":
+            # A rung that opens a whole cycle is re-admitted after a crash
+            # between its durable answer and that cycle: it is running again,
+            # and the ledger is the one place that says so.
+            ledger = dataclasses.replace(ledger, entries=tuple(
+                entry if same(item) else item for item in ledger.entries
+            ))
         _write_ladder(path, ledger)
         if (
             step.strategy is RecoveryStrategy.EXPAND_SCOPE
@@ -1371,6 +1445,44 @@ class CheckRepairLadder:
         if not isinstance(produced, str) or not produced:
             raise ResumeIntegrityError("the gate recovery replan produced no candidate tree")
         return produced
+
+    def replan_cycle(
+        self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
+        step: GateRecoveryStep, evidence: EvidenceBundle,
+    ) -> CyclePlan:
+        """Re-decompose the whole cycle of one rung and open its new cycle.
+
+        The rung is the last one of the episode: the bounded repair pass and
+        the contract replan of the responsible step were both durably spent
+        and the gate is still red, so the decomposition itself is what failed.
+        The injected transaction produces the new plan from this gate's own
+        bounded failure evidence, inside the approved envelope, and returns the
+        durable plan of the cycle that executes it -- a plan whose authority is
+        never the one already in force.  A rung these facts do not admit is
+        refused before anything runs, so the ladder advances without looping.
+        """
+
+        if step.exhausted or step.is_repair_pass or step.step_indices:
+            raise RecoveryStepUnavailable(
+                step.strategy, "the ladder step is not a cycle replan",
+            )
+        if step.strategy is not RecoveryStrategy.REPLAN_CYCLE:
+            raise RecoveryStepUnavailable(
+                step.strategy, "only a whole cycle is re-decomposed by this rung",
+            )
+        if self.replan_cycles is None:
+            raise RecoveryStepUnavailable(
+                step.strategy, "this run admits no cycle replan of approved work",
+            )
+        tree, failed = _red_gate_identity(evidence)
+        if step.tree != tree or step.failed_check_ids != failed:
+            raise RecoveryStepUnavailable(
+                step.strategy, "the rung does not describe the red gate evidence",
+            )
+        planned = self.replan_cycles(ctx, cycle_plan, GateStage(stage), step, evidence)
+        if planned is None:
+            raise RecoveryStepUnavailable(step.strategy, "the cycle replan produced no plan")
+        return planned
 
     def finish_step(
         self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
@@ -1442,6 +1554,68 @@ class CheckRepairLadder:
     @staticmethod
     def _trail(ledger: _LadderLedger) -> tuple[RecoveryStrategy, ...]:
         return tuple(entry.strategy for entry in ledger.entries)
+
+    @staticmethod
+    def _cycle_replan_record(ctx: Any, cycle: int) -> dict[str, Any] | None:
+        """The durable check-replan answer one cycle holds, if any."""
+
+        record = _read_json_artifact(
+            check_replan_dir(ctx.run_dir, cycle) / CHECK_REPLAN_PLAN_ARTIFACT
+        )
+        return record if isinstance(record, dict) else None
+
+    @staticmethod
+    def _cycle_replan_answers(
+        record: Mapping[str, Any], tree: str, failed: tuple[str, ...], identity: str,
+    ) -> bool:
+        """Whether one durable record answers exactly these red-gate facts."""
+
+        return (
+            record.get("candidate_tree_sha") == tree
+            and tuple(record.get("failed_check_ids") or ()) == tuple(sorted(failed))
+            and record.get("plan_identity_before") == identity
+        )
+
+    @classmethod
+    def _cycle_replan_consumed(
+        cls, ctx: Any, cycle_plan: Any, tree: str, failed: tuple[str, ...],
+    ) -> bool:
+        """Whether these exact facts already opened a cycle replan.
+
+        The fingerprint is this gate's candidate tree, its failed checks and
+        the identity of the plan already in force: the same plan produced again
+        for the same facts never opens a second cycle.  Every earlier answer is
+        read from its own durable record, so a resume reaches the same decision.
+        """
+
+        identity = plan_identity(cycle_plan.plan)
+        for earlier in range(2, cycle_plan.cycle.number + 1):
+            record = cls._cycle_replan_record(ctx, earlier)
+            if record is not None and cls._cycle_replan_answers(
+                record, tree, failed, identity,
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _cycle_replan_open(
+        cls, ctx: Any, cycle_plan: Any, tree: str, failed: tuple[str, ...],
+    ) -> bool:
+        """Whether this rung already produced the plan of the cycle it opens.
+
+        The rung ends the gate episode and the cycle only starts afterwards, so
+        a crash in between leaves a durable answer without a running ladder
+        entry.  That answer is replayed -- recovered, never re-planned -- while
+        one that re-decomposed nothing leaves the rung spent.
+        """
+
+        record = cls._cycle_replan_record(ctx, cycle_plan.cycle.number + 1)
+        return record is not None and (
+            record.get("plan_identity_after") != record.get("plan_identity_before")
+            and cls._cycle_replan_answers(
+                record, tree, failed, plan_identity(cycle_plan.plan),
+            )
+        )
 
     def _expansion_paths(
         self, ctx: Any, cycle_plan: Any, stage: GateStage, evidence: EvidenceBundle,
@@ -1529,10 +1703,13 @@ class CheckRepairLadder:
             )
         if strategy in {RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.REPLAN_CYCLE}:
             if strategy is RecoveryStrategy.REPLAN_CYCLE:
-                # A cycle replan is not implemented yet: rather than pretend
-                # to replan and re-execute approved work unchanged, the rung
-                # is deterministically inapplicable and the ladder advances.
-                return None
+                if self.replan_cycles is None:
+                    return None
+                if self._cycle_replan_consumed(ctx, cycle_plan, tree, failed):
+                    # These exact facts already re-decomposed a cycle: the same
+                    # failure under the same plan never opens a second one.
+                    return None
+                return GateRecoveryStep(strategy, **common)
             if self.replan_steps is None:
                 return None
             index = self._responsible_step_index(ctx, cycle_plan, stage, evidence)

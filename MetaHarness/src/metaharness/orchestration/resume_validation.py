@@ -98,6 +98,11 @@ from ..models import (
     TaskPlanV2,
 )
 from ..planning.artifacts import validate_implementation_bundle
+from ..planning.check_replan import (
+    PLAN_ARTIFACT as CHECK_REPLAN_PLAN_ARTIFACT,
+    check_replan_dir,
+    plan_identity,
+)
 from ..profiles import ProfileError
 from ..planning.protocol import V2PlanParseError, parse_task_plan_v2
 from ..result import atomic_write_text
@@ -359,11 +364,56 @@ def _accepted_review_binding(run_dir: Path, number: int) -> tuple[dict[str, Any]
     return candidate, review, digest
 
 
+# The source route a re-decomposed cycle records: its plan was decided by a red
+# deterministic gate, never by a review.
+CHECK_REPLAN_ROUTE = "check-replan"
+
+
+def _check_replan_binding(run_dir: Path, number: int) -> dict[str, Any]:
+    """The durable binding of a cycle one red gate re-decomposed."""
+
+    path = check_replan_dir(run_dir, number) / CHECK_REPLAN_PLAN_ARTIFACT
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ResumeIntegrityError(
+            f"cycle {number:03d} has no durable check-replan plan"
+        ) from exc
+    record = _read_json_artifact(path, 64 * 1024)
+    if (
+        not isinstance(record, dict)
+        or record.get("cycle") != number
+        or not _is_object_id(record.get("candidate_tree_sha"))
+    ):
+        raise ResumeIntegrityError(f"cycle {number:03d} check-replan record is invalid")
+    return {
+        "source_review_cycle": number - 1,
+        "source_route": CHECK_REPLAN_ROUTE,
+        "source_candidate_sha": record["candidate_tree_sha"],
+        "source_check_replan_sha256": digest,
+        "kind": CycleKind.CHECK_REPLAN.value,
+    }
+
+
+def _correction_plan_dir(run_dir: Path, number: int) -> Path:
+    """Where the plan authority of correction cycle *number* lives."""
+
+    if number > 1 and read_cycle_record(run_dir, number).kind is CycleKind.CHECK_REPLAN:
+        return check_replan_dir(run_dir, number)
+    return correction_dir(run_dir, number)
+
+
 def correction_binding(run_dir: Path, number: int) -> dict[str, Any]:
     """Return the exact durable binding required by correction cycle number."""
 
     if number < 2:
         raise ValueError("correction cycle number must be greater than one")
+    if not (candidate_dir(run_dir, number - 1) / "commit.json").is_file():
+        # The cycle this one corrects never reached a candidate: it ended on a
+        # red deterministic gate whose ladder re-decomposed it.  A source cycle
+        # that *did* reach a candidate is bound by its accepted review, never by
+        # a later gate episode of that same cycle.
+        return _check_replan_binding(run_dir, number)
     candidate, review, review_sha256 = _accepted_review_binding(run_dir, number - 1)
     kind = (
         CycleKind.REVIEW_IMPLEMENTATION
@@ -498,7 +548,7 @@ def load_correction_plan(
 ) -> tuple[TaskPlanV2, dict[str, Any], str]:
     """Parse the durable correction plan of cycle *number* (> 1)."""
 
-    directory = correction_dir(run_dir, number)
+    directory = _correction_plan_dir(run_dir, number)
     try:
         plan = parse_task_plan_v2(
             (directory / "planner.raw.md").read_text(encoding="utf-8"),
@@ -532,7 +582,7 @@ def verify_correction_scope(
 ) -> list[str]:
     """The added paths of one correction scope delta, with their authority."""
 
-    directory = correction_dir(run_dir, number)
+    directory = _correction_plan_dir(run_dir, number)
     delta = _read_json_artifact(directory / "scope_delta.json", 256 * 1024)
     if not isinstance(delta, dict) or delta.get("correction_bundle_sha256") != bundle_sha:
         raise ResumeIntegrityError(f"cycle {number:03d} scope delta is missing or not bound to its plan")
@@ -934,6 +984,46 @@ def _failure_tree_for(
     return None
 
 
+def _replaced_by_replan(run_dir: Path, number: int) -> bool:
+    """True when cycle *number* ended on a red gate that re-decomposed it."""
+
+    try:
+        following = read_cycle_record(run_dir, number + 1)
+    except (ResumeIntegrityError, OSError):
+        return False
+    return following.kind is CycleKind.CHECK_REPLAN
+
+
+def _validate_check_replan_authority(
+    config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
+    number: int, plan: TaskPlanV2,
+) -> None:
+    """Prove the durable re-decomposition of cycle *number* is intact.
+
+    The record is the one durable answer a red gate paid for; it must still
+    name the cycle record's own digest, must differ from the plan it replaced
+    and must bind exactly the bundle its steps read.
+    """
+
+    # The record is the durability proof: the cycle record names its digest and
+    # the re-parsed answer must still render it.
+    _check_replan_binding(run_dir, number)
+    record = _read_json_artifact(
+        check_replan_dir(run_dir, number) / CHECK_REPLAN_PLAN_ARTIFACT, 64 * 1024,
+    )
+    plan_value, _bundle, bundle_sha = load_correction_plan(
+        config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
+    )
+    if (
+        not isinstance(record, dict)
+        or record.get("implementation_bundle_sha256") != bundle_sha
+        or record.get("plan_identity_after") is None
+        or record.get("plan_identity_after") == record.get("plan_identity_before")
+        or record.get("plan_identity_after") != plan_identity(plan_value)
+    ):
+        _refuse("the check-replan plan changed")
+
+
 def validate_resume(
     *,
     config: HarnessConfig,
@@ -1047,11 +1137,17 @@ def validate_resume(
     for earlier in range(2, number + 1):
         read_cycle_record(run_dir, earlier)
     for earlier in range(1, number):
+        if _replaced_by_replan(run_dir, earlier):
+            continue
         read_candidate_record(run_dir, earlier)
     validate_correction_bindings(run_dir, number)
     current_cycle = read_cycle_record(run_dir, number) if number > 1 else RunCycle(1, CycleKind.INITIAL)
     scope = _approved_scope(config, selection, run_dir, plan, checkpoint, repair_scope)
-    if (
+    if current_cycle.kind is CycleKind.CHECK_REPLAN:
+        # A cycle one red gate re-decomposed plans before it opens, so its
+        # checkpoint never has to carry the plan: the durable answer does.
+        _validate_check_replan_authority(config, selection, run_dir, number, plan)
+    elif (
         checkpoint.phase not in {ResumePhase.REVIEW_REPLAN, *_STEP_PHASES}
         and number > 1
         and current_cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION
@@ -1127,8 +1223,12 @@ def validate_resume(
         ):
             _refuse("HEAD parent differs from the checkpoint parent")
         # Every earlier reviewed candidate is a real commit with its recorded
-        # tree and parent, and the run branch still descends from it.
+        # tree and parent, and the run branch still descends from it.  A cycle
+        # a red gate re-decomposed never reached one: its successor owns that
+        # authority instead.
         for earlier in range(1, number):
+            if _replaced_by_replan(run_dir, earlier):
+                continue
             record = read_candidate_record(run_dir, earlier)
             earlier_parents = (
                 (record["parent_sha"],) if record.get("parent_sha") is not None else ()

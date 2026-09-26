@@ -614,6 +614,22 @@ class RecoveryOperations(Protocol):
 
         ...
 
+    def replan_cycle(
+        self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
+        step: GateRecoveryStep, evidence: EvidenceBundle,
+    ) -> Any:
+        """Re-decompose the cycle of one rung; return its durable handoff.
+
+        The implementation runs the bounded check-replan planning transaction
+        from this gate's own failure evidence, inside the operator-approved
+        scope, and returns the durable facts of the cycle the new plan opened.
+        It raises :class:`RecoveryStepUnavailable` when these exact facts do
+        not admit a cycle replan -- an answer identical to the plan already in
+        force included -- and never widens a scope.
+        """
+
+        ...
+
     def finish_step(
         self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
         step: GateRecoveryStep, evidence: EvidenceBundle, tree_after: str,

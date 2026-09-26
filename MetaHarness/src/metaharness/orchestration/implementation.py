@@ -580,8 +580,8 @@ class ImplementationService:
         """The step-phase boundary of a cycle's own step execution."""
 
         return (
-            ResumePhase.IMPLEMENT_STEP if cycle_plan.cycle.kind is CycleKind.INITIAL
-            else ResumePhase.REVIEW_IMPLEMENTATION
+            ResumePhase.REVIEW_IMPLEMENTATION if cycle_plan.cycle.kind is CycleKind.REVIEW_IMPLEMENTATION
+            else ResumePhase.IMPLEMENT_STEP
         )
 
     def _execute_replanned_suffix(

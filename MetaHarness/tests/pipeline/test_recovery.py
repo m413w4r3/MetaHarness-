@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -16,6 +17,7 @@ from tests.pipeline.support import (
     STEP,
     PipelineHarness,
     check_repair_result,
+    correction_plan,
     initial_plan,
     ladder_strategies,
     repaired_step_contract,
@@ -65,16 +67,25 @@ class RecoveryPathTests(PipelineHarness):
         config = self.config(check_repair=1)
         original = self.orchestrator(
             config,
-            planner=[initial_plan(STEP), repaired_step_contract()],
+            planner=[
+                initial_plan(STEP), repaired_step_contract(),
+                # The re-decomposition rung answers with the plan already in
+                # force: the same decomposition for the same facts is refused
+                # and spends the rung instead of replaying approved steps.
+                initial_plan(STEP),
+            ],
             reviewer=[review()],
         )
         first_planner = original._runtime.planner_client
         waiting = original.run_text(SPEC, run_id="run")
         self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
         # The ladder walked every distinct strategy of this red gate: the
-        # budgeted pass left the tree unchanged, and the one replan of the
-        # responsible approved step rewrote its contract and re-ran it.
-        self.assertEqual(ladder_strategies(self), ["repair_targeted", "replan_step"])
+        # budgeted pass left the tree unchanged, the one replan of the
+        # responsible approved step rewrote its contract and re-ran it, and the
+        # cycle replan re-decomposed nothing.
+        self.assertEqual(
+            ladder_strategies(self), ["repair_targeted", "replan_step", "replan_cycle"],
+        )
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
         self.assertEqual(self.checkpoint()["check_repair_attempt"], 1)
         retry_info = resume_info(self.run_dir(), self.state())
@@ -88,9 +99,10 @@ class RecoveryPathTests(PipelineHarness):
 
         self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles(), roles_before_resume)
-        # The first run bought the plan and its one contract replan; the
-        # operator retry re-ran the deterministic gate and nothing else.
-        self.assertEqual(len(first_planner.requests), 2)
+        # The first run bought the plan, its one contract replan and its one
+        # re-decomposition; the operator retry re-ran the deterministic gate
+        # and nothing else.
+        self.assertEqual(len(first_planner.requests), 3)
         self.assertEqual(self.planner.requests, [])
         self.assertEqual(counter.read_text(), "4")
 
@@ -108,15 +120,25 @@ class RecoveryPathTests(PipelineHarness):
         config = self.config(check_repair=1)
         waiting = self.orchestrator(
             config,
-            planner=[initial_plan(STEP), repaired_step_contract()],
+            planner=[
+                initial_plan(STEP), repaired_step_contract(), initial_plan(STEP),
+            ],
             reviewer=[review()],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
         self.assertEqual(self.state()["check_repair"]["next_action"], "Retry deterministic gate")
         # Every distinct correctness strategy is durably spent before the
-        # operator is asked: the repair left the failed check red and the one
-        # replan of the responsible approved step reproduced that exact tree.
-        self.assertEqual(ladder_strategies(self), ["repair_targeted", "replan_step"])
+        # operator is asked: the repair left the failed check red, the one
+        # replan of the responsible approved step reproduced that exact tree,
+        # and the re-decomposition answered nothing new.
+        self.assertEqual(
+            ladder_strategies(self), ["repair_targeted", "replan_step", "replan_cycle"],
+        )
+        unchanged = json.loads(
+            (self.run_dir() / "cycles/002/check-replan/check_replan.plan.json").read_text()
+        )
+        self.assertEqual(unchanged["plan_identity_after"], unchanged["plan_identity_before"])
+        self.assertNotIn("implementation_bundle_sha256", unchanged)
         self.assertEqual(self.checkpoint()["check_repair_attempt"], 1)
         fingerprint = self.state()["check_repair"]["operator_retry_fingerprint"]
 
@@ -124,6 +146,9 @@ class RecoveryPathTests(PipelineHarness):
             config, planner=["unused"], reviewer=[review()],
         ).resume("run")
 
+        # The identical answer is durable: the retry re-ran the gate and asked
+        # the planner nothing.
+        self.assertEqual(self.planner.requests, [])
         state = self.state()
         self.assertEqual(resumed.status, RunStatus.WAITING_HUMAN)
         self.assertEqual(state["failure"]["reason"], "CHECK_REPAIR_FIXED_POINT")
@@ -142,7 +167,149 @@ class RecoveryPathTests(PipelineHarness):
         # The retry only re-ran the deterministic gate: no strategy was
         # replayed for facts the ladder had already spent.
         self.assertEqual(self.workers.roles(), ["implementer", "repair", "implementer"])
-        self.assertEqual(ladder_strategies(self), ["repair_targeted", "replan_step"])
+        self.assertEqual(
+            ladder_strategies(self), ["repair_targeted", "replan_step", "replan_cycle"],
+        )
+
+    def test_two_verified_check_repairs_can_exhaust_the_budget(self) -> None:
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "worse still\n"),
+        )
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            write("feature.txt", "still bad\n", report=check_repair_result(
+                "DONE", "FAIL", "NONE", "first targeted repair ran and failed",
+            )),
+            write("feature.txt", "worse\n", report=check_repair_result(
+                "DONE", "FAIL", "NONE", "second targeted repair ran and failed",
+            )),
+        )
+        result = self.orchestrator(
+            self.config(check_repair=2),
+            planner=[
+                initial_plan(STEP), repaired_step_contract(),
+                # The last rung re-decomposes the cycle and answers with the
+                # plan already in force: it is refused instead of replaying it.
+                initial_plan(STEP),
+            ],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"))
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        self.assertIsInstance(self.state()["failure"]["detail"], dict)
+        self.assertEqual(self.state()["failure"]["detail"]["failed_check_ids"], ["test"])
+        self.assertEqual(self.state()["failure"]["detail"]["attempt_count"], 2)
+        self.assertEqual(
+            self.state()["failure"]["detail"]["strategy"],
+            "repair_targeted+repair_targeted+replan_step+replan_cycle",
+        )
+        self.assertEqual(
+            self.state()["failure"]["detail"]["strategies"],
+            ["repair_targeted", "repair_targeted", "replan_step", "replan_cycle"],
+        )
+        self.assertEqual(self.state()["check_repair"]["failure_classification"], "product_check")
+        self.assertEqual(self.state()["check_repair"]["next_action"], "Retry deterministic gate")
+        self.assertRegex(self.state()["check_repair"]["latest_evidence_sha256"], r"^[0-9a-f]{64}$")
+        reports = self.state()["check_repair"]["repair_reports"]
+        self.assertEqual([item["attempt"] for item in reports], [1, 2])
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) for item in reports))
+        checkpoint = self.checkpoint()
+        self.assertEqual(checkpoint["phase"], "deterministic_gate")
+        self.assertEqual(checkpoint["stage"], "POST_IMPLEMENTATION")
+        # The ladder rewrote the tree after the last recorded pass, so the
+        # checkpoint attributes it to no pass at all.
+        self.assertIsNone(checkpoint["check_repair_attempt"])
+        # Two budgeted passes, then the one distinct replan of the responsible
+        # approved step and the one re-decomposition of the cycle, before the
+        # exhausted ladder waits for the operator.
+        self.assertEqual(
+            self.workers.roles(), ["implementer", "repair", "repair", "implementer"],
+        )
+        self.assertEqual(
+            ladder_strategies(self),
+            ["repair_targeted", "repair_targeted", "replan_step", "replan_cycle"],
+        )
+        diagnostics_path = self.run_dir() / "diagnostics.md"
+        self.assertTrue(
+            diagnostics_path.is_file(),
+            (self.run_dir() / "diagnostics.error.txt").read_text(encoding="utf-8")
+            if (self.run_dir() / "diagnostics.error.txt").is_file() else "diagnostics missing",
+        )
+        diagnostics = diagnostics_path.read_text(encoding="utf-8")
+        recovery_summary = diagnostics.split("## DETERMINISTIC GATE RECOVERY", 1)[1].split("\n## ", 1)[0]
+        for expected in (
+            # Two repaired red gates, the replan rung and their reruns.
+            "deterministic gate attempt: 4",
+            "check-repair attempts used / budget: 2 / 2",
+            "latest failed check IDs: test",
+            "failure classification: product_check",
+            "next recovery action: Retry deterministic gate",
+        ):
+            self.assertIn(expected, recovery_summary, recovery_summary)
+        attempts = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts"
+        self.assertEqual(sorted(path.name for path in attempts.iterdir()), ["001", "002"])
+        self.assertEqual(self.reviewer.requests, [])
+
+
+    def test_a_cycle_replan_that_only_repeats_the_plan_never_loops(self) -> None:
+        """The same answer for the same failure facts is spent, never replayed.
+
+        Cycle 002 fails its own gate under the decomposition it just executed,
+        so its re-decomposition rung is admitted -- and an answer that only
+        repeats the plan already in force for these exact facts is refused and
+        durably bound to them instead of opening a third cycle.
+        """
+
+        rewritten = ("S01", "feature.txt", "Rewrite the feature so the configured test passes")
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
+            write("feature.txt", "worse\n"),
+        )
+        self.workers.on(
+            ExecutionRole.REPAIR,
+            write("feature.txt", "bad\n"), write("feature.txt", "worse repaired\n"),
+        )
+        config = self.config(check_repair=1)
+        original = self.orchestrator(
+            config,
+            planner=[
+                initial_plan(STEP), repaired_step_contract(),
+                correction_plan(rewritten), correction_plan(rewritten),
+            ],
+            reviewer=[review()],
+        )
+        waiting = original.run_text(SPEC, run_id="run")
+
+        self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"))
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        self.assertEqual(
+            ladder_strategies(self, cycle=2, stage="post-check-replan"),
+            ["repair_targeted", "replan_step", "replan_cycle"],
+        )
+        first = json.loads(
+            (self.run_dir() / "cycles/002/check-replan/check_replan.plan.json").read_text()
+        )
+        second = json.loads(
+            (self.run_dir() / "cycles/003/check-replan/check_replan.plan.json").read_text()
+        )
+        # Cycle 002 executed a genuinely new decomposition; cycle 003 was
+        # refused the one already in force, so nothing was replayed.
+        self.assertNotEqual(first["plan_identity_after"], first["plan_identity_before"])
+        self.assertEqual(second["plan_identity_before"], first["plan_identity_after"])
+        self.assertEqual(second["plan_identity_after"], second["plan_identity_before"])
+        self.assertEqual(second["ladder_fingerprint"], [
+            second["candidate_tree_sha"], ["test"], "replan_cycle",
+            second["plan_identity_before"],
+        ])
+        self.assertFalse((self.run_dir() / "cycles/003/cycle.json").exists())
+        self.assertEqual(
+            self.workers.roles(), ["implementer", "repair", "implementer", "implementer", "repair"],
+        )
+        # One plan, one contract replan and one re-decomposition per cycle: the
+        # repeated answer was never a second planner completion.
+        self.assertEqual(len(original._runtime.planner_client.requests), 4)
 
     def test_fixed_point_fingerprint_changes_with_tree_or_failed_check_set(self) -> None:
         from metaharness.orchestration.pipeline_v2 import check_repair_fingerprint

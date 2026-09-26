@@ -25,6 +25,7 @@ from tests.pipeline.support import (
     STEP,
     PipelineHarness,
     check_repair_result,
+    correction_plan,
     crash_at_checkpoint,
     git,
     initial_plan,
@@ -343,79 +344,75 @@ class CheckRepairTests(PipelineHarness):
         self.assertEqual(self.reviewer.requests, [])
         self.assertFalse((self.run_dir() / "cycles/001/check-repair").exists())
 
-    def test_two_verified_check_repairs_can_exhaust_the_budget(self) -> None:
+    def test_a_spent_ladder_re_decomposes_the_cycle_and_takes_it_to_the_gate(self) -> None:
+        """Red gate, spent repair and spent replan, then a genuinely new plan.
+
+        The third rung is the only one left: the decomposition itself is what
+        failed, so it is answered by a new plan in a new cycle -- which
+        implements its own step, under its own contract, and only then reaches
+        the deterministic gate that judges it.
+        """
+
         self.workers.on(
             ExecutionRole.IMPLEMENTER,
-            write("feature.txt", "bad\n"), write("feature.txt", "worse still\n"),
+            write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
+            write("feature.txt", "good\n"),
         )
-        self.workers.on(
-            ExecutionRole.REPAIR,
-            write("feature.txt", "still bad\n", report=check_repair_result(
-                "DONE", "FAIL", "NONE", "first targeted repair ran and failed",
-            )),
-            write("feature.txt", "worse\n", report=check_repair_result(
-                "DONE", "FAIL", "NONE", "second targeted repair ran and failed",
-            )),
-        )
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "bad\n"))
         result = self.orchestrator(
-            self.config(check_repair=2),
-            planner=[initial_plan(STEP), repaired_step_contract()],
+            self.config(check_repair=1),
+            planner=[
+                initial_plan(STEP), repaired_step_contract(),
+                correction_plan((
+                    "S01", "feature.txt",
+                    "Rewrite the feature so the configured test passes",
+                )),
+            ],
             reviewer=[review()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"))
-        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
-        self.assertIsInstance(self.state()["failure"]["detail"], dict)
-        self.assertEqual(self.state()["failure"]["detail"]["failed_check_ids"], ["test"])
-        self.assertEqual(self.state()["failure"]["detail"]["attempt_count"], 2)
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(
-            self.state()["failure"]["detail"]["strategy"],
-            "repair_targeted+repair_targeted+replan_step",
+            ladder_strategies(self), ["repair_targeted", "replan_step", "replan_cycle"],
         )
-        self.assertEqual(
-            self.state()["failure"]["detail"]["strategies"],
-            ["repair_targeted", "repair_targeted", "replan_step"],
+        # The new cycle names its own source and its own durable answer.
+        record = json.loads(
+            (self.run_dir() / "cycles/002/check-replan/check_replan.plan.json").read_text()
         )
-        self.assertEqual(self.state()["check_repair"]["failure_classification"], "product_check")
-        self.assertEqual(self.state()["check_repair"]["next_action"], "Retry deterministic gate")
-        self.assertRegex(self.state()["check_repair"]["latest_evidence_sha256"], r"^[0-9a-f]{64}$")
-        reports = self.state()["check_repair"]["repair_reports"]
-        self.assertEqual([item["attempt"] for item in reports], [1, 2])
-        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) for item in reports))
-        checkpoint = self.checkpoint()
-        self.assertEqual(checkpoint["phase"], "deterministic_gate")
-        self.assertEqual(checkpoint["stage"], "POST_IMPLEMENTATION")
-        # The ladder rewrote the tree after the last recorded pass, so the
-        # checkpoint attributes it to no pass at all.
-        self.assertIsNone(checkpoint["check_repair_attempt"])
-        # Two budgeted passes, then the one distinct replan of the responsible
-        # approved step, before the exhausted ladder waits for the operator.
-        self.assertEqual(
-            self.workers.roles(), ["implementer", "repair", "repair", "implementer"],
-        )
-        self.assertEqual(
-            ladder_strategies(self),
-            ["repair_targeted", "repair_targeted", "replan_step"],
-        )
-        diagnostics_path = self.run_dir() / "diagnostics.md"
+        cycle = json.loads((self.run_dir() / "cycles/002/cycle.json").read_text())
+        self.assertEqual(cycle["kind"], "check-replan")
+        self.assertEqual(cycle["source_candidate_sha"], record["candidate_tree_sha"])
+        self.assertEqual(record["step_ids"], ["S01"])
+        self.assertNotEqual(record["plan_identity_after"], record["plan_identity_before"])
+        # The anti-loop fingerprint binds the facts this answer is paid for.
+        self.assertEqual(record["ladder_fingerprint"], [
+            record["candidate_tree_sha"], ["test"], "replan_cycle",
+            record["plan_identity_before"],
+        ])
+        # The new decomposition implemented its own step, under its own
+        # contract, before the gate of its own cycle accepted it.
         self.assertTrue(
-            diagnostics_path.is_file(),
-            (self.run_dir() / "diagnostics.error.txt").read_text(encoding="utf-8")
-            if (self.run_dir() / "diagnostics.error.txt").is_file() else "diagnostics missing",
+            (self.run_dir() / "cycles/002/correction/execution_selection.json").is_file()
         )
-        diagnostics = diagnostics_path.read_text(encoding="utf-8")
-        recovery_summary = diagnostics.split("## DETERMINISTIC GATE RECOVERY", 1)[1].split("\n## ", 1)[0]
-        for expected in (
-            # Two repaired red gates, the replan rung and their reruns.
-            "deterministic gate attempt: 4",
-            "check-repair attempts used / budget: 2 / 2",
-            "latest failed check IDs: test",
-            "failure classification: product_check",
-            "next recovery action: Retry deterministic gate",
-        ):
-            self.assertIn(expected, recovery_summary, recovery_summary)
-        attempts = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts"
-        self.assertEqual(sorted(path.name for path in attempts.iterdir()), ["001", "002"])
-        self.assertEqual(self.reviewer.requests, [])
+        step = json.loads(
+            (self.run_dir() / "cycles/002/implementation/steps/S01/step.json").read_text()
+        )
+        self.assertEqual(step["status"], "COMPLETED")
+        contract = (self.run_dir() / "cycles/002/check-replan/steps/S01/contract.md").read_text()
+        self.assertIn("Rewrite the feature so the configured test passes", contract)
+        self.assertEqual(
+            self.workers.calls[-1].contract.splitlines()[0],
+            "META IMPLEMENTATION STEP v1",
+        )
+        self.assertIn("Rewrite the feature", self.workers.calls[-1].contract)
+        evidence = json.loads(
+            (self.run_dir() / "cycles/002/checks/post-check-replan/evidence.json").read_text()
+        )
+        self.assertTrue(evidence["deterministic_passed"])
+        self.assertEqual((self.worktree() / "feature.txt").read_text(), "good\n")
+        # One plan, one contract replan, one re-decomposition: the new cycle
+        # never asked the planner for anything at its own boundary.
+        self.assertEqual(len(self.planner.requests), 3)
 
     def test_blocked_scope_request_uses_authority_before_retrying_same_attempt(self) -> None:
         from metaharness.run_options import RunOptions
@@ -842,7 +839,13 @@ class CheckRepairTests(PipelineHarness):
         )
         result = self.orchestrator(
             self.config(check_repair=0),
-            planner=[initial_plan(("S01", "tests/test_feature.py", "Write the fixture"))],
+            planner=[
+                initial_plan(("S01", "tests/test_feature.py", "Write the fixture")),
+                # The cycle rung is the one that may still answer a failure no
+                # single step owns; the plan already in force re-decomposes
+                # nothing, so it is refused rather than replayed.
+                initial_plan(("S01", "tests/test_feature.py", "Write the fixture")),
+            ],
             reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
@@ -850,13 +853,12 @@ class CheckRepairTests(PipelineHarness):
             result.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"),
         )
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
-        self.assertEqual(self.state()["failure"]["detail"]["strategies"], [])
+        # The single-step rung needs an evidence-proven responsible step and
+        # this gate proves none, so it is never proposed or recorded.
+        self.assertEqual(self.state()["failure"]["detail"]["strategies"], ["replan_cycle"])
         self.assertEqual(self.workers.roles(), ["implementer"])
-        self.assertEqual(len(self.planner.requests), 1)
-        self.assertFalse(
-            (self.run_dir() / "cycles/001/check-repair/post-implementation/ladder.json").exists(),
-            "an inapplicable rung was recorded as a replan",
-        )
+        self.assertEqual(len(self.planner.requests), 2)
+        self.assertEqual(ladder_strategies(self), ["replan_cycle"])
         self.assertFalse(
             self._replan_slot().parent.exists(),
             "an inapplicable replan rung opened a contract repair",

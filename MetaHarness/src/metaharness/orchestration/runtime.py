@@ -257,6 +257,7 @@ from .recovery import (
 from .check_recovery import CheckInfrastructureRecovery
 from .review_recovery import ReviewRecovery
 from .worker_recovery import WorkerRecovery
+from ..planning.check_replan import check_replan_dir
 from .resume_validation import (
     ResumedRun,
     _load_evidence,
@@ -1541,6 +1542,7 @@ class RunRuntime:
             publish=bind(self.publication.publish_candidate, store),
             recovery_operations=CheckRepairLadder(
                 replan_steps=functools.partial(self.gates.replan_responsible_step, store),
+                replan_cycles=functools.partial(self.reviews.replan_cycle, store),
             ),
         )
 
@@ -1582,12 +1584,34 @@ class RunRuntime:
         return self.correction_cycle_plan(
             ctx, cycle, plan, bundle, bundle_sha, creating=False,
         )
+    def load_plan_correction(self, ctx: PipelineV2Context, cycle: RunCycle) -> CyclePlan:
+        """Read back the durable plan authority of one correction cycle.
+
+        A check-replan cycle never plans at its own boundary: the red gate's
+        durable transaction already produced this decomposition, so opening the
+        cycle reloads and verifies it exactly as a resume does.
+        """
+
+        plan, bundle, bundle_sha = load_correction_plan(
+            self.config, ctx.selection, ctx.run_dir, cycle.number,
+            inherited_check_ids=ctx.plan.required_checks,
+        )
+        verify_correction_scope(ctx.run_dir, cycle.number, bundle_sha, self.repair_scope)
+        return self.correction_cycle_plan(
+            ctx, cycle, plan, bundle, bundle_sha, creating=False,
+        )
     def correction_cycle_plan(
         self, ctx: PipelineV2Context, cycle: RunCycle, plan: TaskPlanV2,
         bundle: Mapping[str, Any], bundle_sha: str, *, creating: bool,
     ) -> CyclePlan:
-        if cycle.kind is not CycleKind.REVIEW_REPLAN:
+        if cycle.kind not in {CycleKind.REVIEW_REPLAN, CycleKind.CHECK_REPLAN}:
             raise PipelineFailure("REPLAN_CYCLE_REQUIRED")
+        # A red-gate replan authored its plan in the executing cycle's own
+        # check-replan directory; a review replan in its correction one.
+        contracts_dir = (
+            check_replan_dir(ctx.run_dir, cycle.number)
+            if cycle.kind is CycleKind.CHECK_REPLAN else correction_dir(ctx.run_dir, cycle)
+        )
         planned_profile_ids = {
             step.id: self.config.routing.profile_for(step.execution_class) for step in plan.steps
         }
@@ -1623,8 +1647,7 @@ class RunRuntime:
             for item in cycle_selection.steps
         }
         return CyclePlan(
-            cycle=cycle, plan=plan, bundle=bundle,
-            contracts_dir=correction_dir(ctx.run_dir, cycle),
+            cycle=cycle, plan=plan, bundle=bundle, contracts_dir=contracts_dir,
             step_profile_ids=step_profile_ids,
             correction_bundle_sha256=bundle_sha,
             step_fallback_profile_ids=step_fallback_profile_ids,

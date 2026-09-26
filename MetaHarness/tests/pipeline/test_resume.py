@@ -14,13 +14,14 @@ from tests.pipeline.support import (
     SPEC,
     STEP,
     PipelineHarness,
-    correction_plan,
     check_repair_result,
+    correction_plan,
     crash_at_checkpoint,
     crash_on_review,
     crash_on_revision,
     git,
     initial_plan,
+    ladder_ledger,
     repaired_step_contract,
     review,
     write,
@@ -273,6 +274,57 @@ class ResumeTests(PipelineHarness):
         self.assertEqual(self.workers.roles(), ["implementer"])
         self.assertEqual(self.reviewer.requests, [])
 
+    def test_resume_after_the_re_decomposition_never_buys_a_second_plan(self) -> None:
+        """A crash after the new plan artifact reuses it instead of re-planning."""
+
+        rewritten = ("S01", "feature.txt", "Rewrite the feature so the configured test passes")
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
+            write("feature.txt", "good\n"),
+        )
+        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "bad\n"))
+        config = self.config(check_repair=1)
+        original = self.orchestrator(
+            config,
+            planner=[
+                initial_plan(STEP), repaired_step_contract(), correction_plan(rewritten),
+            ],
+            reviewer=[review()],
+        )
+        with crash_at_checkpoint(original, "check_replan"):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL, self.state().get("failure"))
+        self.assertEqual(len(original._runtime.planner_client.requests), 3)
+        root = self.run_dir()
+        record = root / "cycles/002/check-replan/check_replan.plan.json"
+        durable = record.read_bytes()
+        self.assertTrue(record.is_file())
+        # The rung is durably done and nothing of its new cycle was executed:
+        # the crash landed between the new plan and its implementation.
+        self.assertEqual(
+            [entry["state"] for entry in ladder_ledger(self)["entries"]],
+            ["done", "done", "done"],
+        )
+        self.assertFalse((root / "cycles/002/implementation/steps/S01/step.json").exists())
+        self.assertTrue(resume_info(root, self.state()).resumable)
+
+        resumed = self.orchestrator(
+            config, planner=["unused"], reviewer=[review()],
+        ).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        # The one durable answer is the plan the resumed run executed: the
+        # planner was never asked again for it.
+        self.assertEqual(self.planner.requests, [])
+        self.assertEqual(record.read_bytes(), durable)
+        self.assertEqual(
+            json.loads((root / "cycles/002/cycle.json").read_text())["kind"], "check-replan",
+        )
+        step = json.loads((root / "cycles/002/implementation/steps/S01/step.json").read_text())
+        self.assertEqual(step["status"], "COMPLETED")
+        self.assertEqual((self.worktree() / "feature.txt").read_text(), "good\n")
+
     def test_corrupt_latest_gate_evidence_fails_resume_integrity(self) -> None:
         self.workers.on(
             ExecutionRole.IMPLEMENTER,
@@ -281,7 +333,13 @@ class ResumeTests(PipelineHarness):
         self.workers.on(ExecutionRole.REPAIR, lambda _request: check_repair_result())
         config = self.config(check_repair=1)
         waiting = self.orchestrator(
-            config, planner=[initial_plan(STEP), repaired_step_contract()],
+            config,
+            planner=[
+                initial_plan(STEP), repaired_step_contract(),
+                # The last rung re-decomposes the cycle; the plan already in
+                # force re-decomposes nothing, so it is refused and spent.
+                initial_plan(STEP),
+            ],
             reviewer=[review()],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)

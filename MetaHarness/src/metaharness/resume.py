@@ -292,6 +292,7 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         ResumePhase.STEP_ACCEPTANCE: f"Retry step acceptance ({checkpoint.step_id})",
         ResumePhase.DETERMINISTIC_GATE: f"Retry deterministic gate ({checkpoint.stage})",
         ResumePhase.CHECK_REPAIR: f"Retry check-repair attempt {checkpoint.check_repair_attempt}",
+        ResumePhase.CHECK_REPLAN: "Retry re-decomposition planner",
         ResumePhase.SEMANTIC_REVISION: "Retry semantic revision", ResumePhase.CANDIDATE_READY: "Prepare candidate",
         ResumePhase.CANDIDATE_PUSH: "Push candidate", ResumePhase.FINAL_REVIEW: "Retry final review",
         ResumePhase.REVIEW_IMPLEMENTATION: f"Retry correction {checkpoint.step_id}",

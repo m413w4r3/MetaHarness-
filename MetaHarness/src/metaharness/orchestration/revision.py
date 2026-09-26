@@ -438,7 +438,9 @@ class ReviewContextBuilder:
     cycle_plan: Callable[[Any, int], Any]
     completed_steps: Callable[[Any, Any], list[dict[str, Any]]]
     load_revision: Callable[[Path], Any]
-    read_candidate: Callable[[Path, int], Mapping[str, Any]]
+    # ``None`` is the honest record of a cycle a red gate re-decomposed: that
+    # cycle never reached a candidate, so it has no reviewed history.
+    read_candidate: Callable[[Path, int], Mapping[str, Any] | None]
     candidate_evidence: Callable[[Path, int], EvidenceBundle | None]
     accepted_review: Callable[[Path, EvidenceBundle, str], ReviewResult | None]
 
@@ -482,6 +484,15 @@ class ReviewContextBuilder:
         for item in plans[:-1]:
             earlier = item.cycle.number
             candidate = self.read_candidate(ctx.run_dir, earlier)
+            if candidate is None:
+                history[f"{earlier:03d}"] = {
+                    "cycle_kind": _cycle_kind_value(item.cycle),
+                    "previous_route": "check-replan",
+                    "previous_check_state": None,
+                    "previous_candidate_sha": None,
+                    "changed_paths": [],
+                }
+                continue
             evidence = self.candidate_evidence(ctx.run_dir, earlier)
             review = (
                 self.accepted_review(

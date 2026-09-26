@@ -8,9 +8,9 @@ candidate commit, a review, the publication) is injected explicitly through
 
 A run is a sequence of cycles ``001, 002, ...``.  Each cycle executes one
 approved plan (the operator-approved plan for the initial cycle, a
-review-driven correction plan afterwards), optionally a semantic revision,
-one or two deterministic gate episodes with their recovery ladder, the
-accepted candidate HEAD, its push and one final review.  The number of
+review-driven or red-gate correction plan afterwards), optionally a semantic
+revision, one or two deterministic gate episodes with their recovery ladder,
+the accepted candidate HEAD, its push and one final review.  The number of
 cycles is bounded only by the frozen run options, never by this module.
 """
 
@@ -41,12 +41,13 @@ from ..models import (
     TaskPlanV2,
     transition,
 )
-
-FailureDetail: TypeAlias = str | Mapping[str, Any]
+from ..recovery_policy import RecoveryStrategy
 from ..result import RunResult
 from ..resume import ResumeCheckpoint
 from ..review import ReviewResult
 from ..run_options import RunOptions
+
+FailureDetail: TypeAlias = str | Mapping[str, Any]
 
 if TYPE_CHECKING:  # pragma: no cover - the ladder protocol lives in recovery.py
     from .recovery import GateRecoveryStep, RecoveryOperations
@@ -158,6 +159,7 @@ def pre_semantic_gate_stage(kind: CycleKind) -> GateStage:
     return {
         CycleKind.INITIAL: GateStage.POST_IMPLEMENTATION,
         CycleKind.REVIEW_REPLAN: GateStage.POST_REVIEW_REPLAN,
+        CycleKind.CHECK_REPLAN: GateStage.POST_CHECK_REPLAN,
     }[CycleKind(kind)]
 
 
@@ -193,6 +195,11 @@ class RecoveryStepUnavailable(RuntimeError):
         super().__init__(f"{getattr(strategy, 'value', strategy)}: {detail}")
         self.strategy = strategy
         self.detail = detail
+
+
+# The phases that restate a cycle boundary, and the ordinary step cycles.
+_CYCLE_ENTRY_PHASES = frozenset({RunPhase.REVIEW_REPLAN, RunPhase.CHECK_REPLAN})
+_IMPLEMENT_PHASES = frozenset({CycleKind.INITIAL, CycleKind.CHECK_REPLAN})
 
 
 class PipelineFailure(Exception):
@@ -282,8 +289,7 @@ class PipelineV2Operations:
     # The flag is true when the correction itself is about to run, false
     # when a later checkpoint of the same cycle is resumed.
     review_implementation_correction: Callable[
-        [PipelineV2Context, RunCycle, bool], tuple[CyclePlan, ReviewResult]
-    ]
+        [PipelineV2Context, RunCycle, bool], tuple[CyclePlan, ReviewResult]]
     plan_correction: Callable[[PipelineV2Context, RunCycle], CyclePlan]
     load_correction: Callable[[PipelineV2Context, RunCycle, str | None], CyclePlan]
     # Implementation.
@@ -291,58 +297,46 @@ class PipelineV2Operations:
     execute_step: Callable[[PipelineV2Context, CyclePlan, int], None]
     unresolved_mismatches: Callable[[PipelineV2Context, CyclePlan], bool]
     semantic_revision: Callable[[PipelineV2Context, CyclePlan], None]
-    semantic_review_correction: Callable[
-        [PipelineV2Context, CyclePlan, ReviewResult], None
-    ]
+    semantic_review_correction: Callable[[PipelineV2Context, CyclePlan, ReviewResult], None]
     # Deterministic gate episode.
     run_gate: Callable[[PipelineV2Context, CyclePlan, GateStage], EvidenceBundle]
     load_gate_evidence: Callable[[PipelineV2Context, int, GateStage], EvidenceBundle | None]
     load_accepted_gate_evidence: Callable[
-        [PipelineV2Context, int, GateStage], EvidenceBundle | None
-    ]
+        [PipelineV2Context, int, GateStage], EvidenceBundle | None]
     accept_gate_state: Callable[
-        [PipelineV2Context, CyclePlan, GateStage, EvidenceBundle], Mapping[str, Any]
-    ]
+        [PipelineV2Context, CyclePlan, GateStage, EvidenceBundle], Mapping[str, Any]]
     check_repair_attempts: Callable[[PipelineV2Context, int, GateStage], tuple[Any, ...]]
     check_repair_attempt: Callable[
-        [PipelineV2Context, CyclePlan, GateStage, int, EvidenceBundle], None
-    ]
+        [PipelineV2Context, CyclePlan, GateStage, int, EvidenceBundle], None]
     hard_failures: Callable[[EvidenceBundle], list[str]]
     soft_failures: Callable[[EvidenceBundle], list[str]]
     # Candidate, review and publication.
     create_candidate: Callable[
-        [PipelineV2Context, CyclePlan, GateStage, EvidenceBundle], Mapping[str, Any]
-    ]
+        [PipelineV2Context, CyclePlan, GateStage, EvidenceBundle], Mapping[str, Any]]
     load_candidate: Callable[[PipelineV2Context, int], Mapping[str, Any]]
     push_candidate: Callable[[PipelineV2Context, int, Mapping[str, Any]], Mapping[str, Any]]
     review_candidate: Callable[
-        [PipelineV2Context, CyclePlan, Mapping[str, Any], EvidenceBundle], ReviewResult
-    ]
+        [PipelineV2Context, CyclePlan, Mapping[str, Any], EvidenceBundle], ReviewResult]
     record_review: Callable[[PipelineV2Context, int, ReviewResult, EvidenceBundle], None]
     request_human: Callable[[PipelineV2Context, int, ReviewResult, str], RunResult]
     review_repair_exhausted: Callable[
-        [PipelineV2Context, int, ReviewResult, Mapping[str, Any]], RunResult
-    ]
+        [PipelineV2Context, int, ReviewResult, Mapping[str, Any]], RunResult]
     publish: Callable[[PipelineV2Context, int, Mapping[str, Any]], RunResult]
-    # The single red-gate recovery ladder object of the run.  The machine asks
-    # it which distinct strategy to try next and reports each step: every red
-    # deterministic gate runs through it and there is no other engine, so the
-    # frozen check-repair budget only bounds the rungs that run a worker.
+    # The single red-gate recovery ladder object of the run: every red
+    # deterministic gate asks it which distinct strategy to try next and
+    # reports each step, and there is no other engine.
     recovery_operations: "RecoveryOperations"
-    # Accept the durable candidate of a ``STEP_ACCEPTANCE`` checkpoint; it
-    # never calls a worker, a planner or a reviewer.
+    # Accept the durable candidate of a ``STEP_ACCEPTANCE``: no model call.
     accept_step: Callable[[PipelineV2Context, CyclePlan, int], None] | None = None
 
     def __post_init__(self) -> None:
         if self.recovery_operations is None:
-            raise TypeError(
-                "PipelineV2Operations requires the red-gate recovery ladder"
-            )
+            raise TypeError("PipelineV2Operations requires the red-gate recovery ladder")
 
 
-# ``RunPhase`` is the state machine's own phase vocabulary: the durable
-# operation, never a posture.  The phase this module may hand over to is
-# decided by :func:`metaharness.models.transition`, in one place.
+# ``RunPhase`` is the state machine's own phase vocabulary, never a posture:
+# the phase this module may hand over to is decided by
+# :func:`metaharness.models.transition`, in one place.
 
 
 @dataclass(frozen=True)
@@ -390,7 +384,11 @@ class PipelineV2Coordinator:
             outcome = self._run_cycle(cycle, entry, fresh=fresh)
             if isinstance(outcome, RunResult):
                 return outcome
-            cycle = RunCycle(cycle.number + 1, correction_kind(outcome.route))
+            if isinstance(outcome, CyclePlan):
+                # A re-decomposed cycle: its plan is already durable.
+                cycle = outcome.cycle
+            else:
+                cycle = RunCycle(cycle.number + 1, correction_kind(outcome.route))
             entry, fresh = None, True
 
     # -- one cycle -----------------------------------------------------------
@@ -402,7 +400,7 @@ class PipelineV2Coordinator:
 
     def _run_cycle(
         self, cycle: RunCycle, start: ResumeCheckpoint | None, *, fresh: bool,
-    ) -> RunResult | ReviewResult:
+    ) -> RunResult | ReviewResult | CyclePlan:
         ops, ctx = self.operations, self.context
         ops.begin_cycle(ctx, cycle, fresh)
         accept_step_id: str | None = None
@@ -413,7 +411,7 @@ class PipelineV2Coordinator:
             start = dataclasses.replace(
                 start,
                 phase=(
-                    RunPhase.IMPLEMENT_STEP if cycle.kind is CycleKind.INITIAL
+                    RunPhase.IMPLEMENT_STEP if cycle.kind in _IMPLEMENT_PHASES
                     else RunPhase.REVIEW_IMPLEMENTATION
                 ),
             )
@@ -427,11 +425,17 @@ class PipelineV2Coordinator:
             cycle_plan, previous_review = ops.review_implementation_correction(
                 ctx, cycle, start is None or start.phase is RunPhase.SEMANTIC_REVISION,
             )
-        elif start is None or start.phase is RunPhase.REVIEW_REPLAN:
+        elif start is None or start.phase in _CYCLE_ENTRY_PHASES:
             if start is None:
-                self._phase(RunPhase.REVIEW_REPLAN)
+                # A cycle boundary names its own kind: both kinds recover an
+                # already durable plan here, never a second planner call.
+                entry = (
+                    RunPhase.CHECK_REPLAN if cycle.kind is CycleKind.CHECK_REPLAN
+                    else RunPhase.REVIEW_REPLAN
+                )
+                self._phase(entry)
                 ops.checkpoint(
-                    ctx, RunPhase.REVIEW_REPLAN, cycle=cycle.number,
+                    ctx, entry, cycle=cycle.number,
                     head=ops.current_head(ctx), tree=ops.candidate_tree(ctx),
                 )
             cycle_plan = ops.plan_correction(ctx, cycle)
@@ -442,7 +446,7 @@ class PipelineV2Coordinator:
 
         phase = (
             RunPhase.IMPLEMENT_STEP
-            if cycle.kind is CycleKind.INITIAL
+            if cycle.kind in _IMPLEMENT_PHASES
             else (
                 RunPhase.SEMANTIC_REVISION
                 if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION
@@ -464,7 +468,7 @@ class PipelineV2Coordinator:
                 self._boundary(phase, cycle_plan)
                 ops.semantic_review_correction(ctx, cycle_plan, previous_review)
                 self._boundary(RunPhase.DETERMINISTIC_GATE, cycle_plan, stage=final_stage)
-        elif start is None or start.phase is phase or start.phase is RunPhase.REVIEW_REPLAN:
+        elif start is None or start.phase is phase or start.phase in _CYCLE_ENTRY_PHASES:
             self._implement(
                 cycle_plan, next_stage=pre_stage or final_stage, accept_step_id=accept_step_id,
             )
@@ -476,17 +480,19 @@ class PipelineV2Coordinator:
 
         # Initial and replan cycles have a gate before semantic revision.
         if pre_stage is not None and (
-            start is None or start.phase in {phase, RunPhase.REVIEW_REPLAN}
+            start is None or start.phase is phase or start.phase in _CYCLE_ENTRY_PHASES
             or self._is_gate_checkpoint(start, pre_stage)
         ):
-            self._gate_episode(
+            outcome = self._gate_episode(
                 cycle_plan, pre_stage,
                 start if self._is_gate_checkpoint(start, pre_stage) else None,
             )
+            if isinstance(outcome, CyclePlan):
+                return outcome
 
         if semantic_enabled and cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION and (
             start is None or start.phase in {
-                phase, RunPhase.REVIEW_REPLAN, RunPhase.SEMANTIC_REVISION,
+                phase, RunPhase.SEMANTIC_REVISION, *_CYCLE_ENTRY_PHASES,
             } or self._is_gate_checkpoint(start, pre_stage)
         ):
             self._boundary(RunPhase.SEMANTIC_REVISION, cycle_plan)
@@ -498,19 +504,22 @@ class PipelineV2Coordinator:
             final_start is not None
             or start is None
             or start.phase is phase
-            or start.phase is RunPhase.REVIEW_REPLAN
+            or start.phase in _CYCLE_ENTRY_PHASES
             or start.phase is RunPhase.SEMANTIC_REVISION
             or self._is_gate_checkpoint(start, pre_stage)
         )
         if semantic_enabled:
-            # A pre-semantic gate was already consumed above; the final gate is
-            # still needed after the revision.  A final gate checkpoint resumes
-            # its own episode without replaying the revision.
-            evidence = self._gate_episode(cycle_plan, final_stage, final_start) if should_run_final_gate else None
+            # A pre-semantic gate was consumed above; the final gate is still
+            # needed after the revision, and its own checkpoint resumes that
+            # episode without replaying the revision.
+            outcome = self._gate_episode(cycle_plan, final_stage, final_start) if should_run_final_gate else None
         elif pre_stage is not None:
-            evidence = ops.load_gate_evidence(ctx, cycle.number, pre_stage)
+            outcome = ops.load_gate_evidence(ctx, cycle.number, pre_stage)
         else:
-            evidence = self._gate_episode(cycle_plan, final_stage, final_start) if should_run_final_gate else None
+            outcome = self._gate_episode(cycle_plan, final_stage, final_start) if should_run_final_gate else None
+        if isinstance(outcome, CyclePlan):
+            return outcome
+        evidence = outcome
         if evidence is None:
             evidence = ops.load_gate_evidence(ctx, cycle.number, final_stage if semantic_enabled else (pre_stage or final_stage))
         if evidence is None:
@@ -526,9 +535,8 @@ class PipelineV2Coordinator:
         else:
             candidate = ops.load_candidate(ctx, cycle.number)
         if start is None or start.phase in {
-            phase, RunPhase.REVIEW_REPLAN, RunPhase.SEMANTIC_REVISION,
-            RunPhase.DETERMINISTIC_GATE, RunPhase.CHECK_REPAIR,
-            RunPhase.CANDIDATE_READY,
+            phase, RunPhase.SEMANTIC_REVISION, RunPhase.DETERMINISTIC_GATE,
+            RunPhase.CHECK_REPAIR, RunPhase.CANDIDATE_READY, *_CYCLE_ENTRY_PHASES,
         }:
             self._candidate_boundary(RunPhase.CANDIDATE_PUSH, cycle_plan, candidate)
             candidate = ops.push_candidate(ctx, cycle.number, candidate)
@@ -536,8 +544,8 @@ class PipelineV2Coordinator:
             candidate = ops.push_candidate(ctx, cycle.number, candidate)
         if start is None or start.phase in {
             phase, RunPhase.SEMANTIC_REVISION, RunPhase.DETERMINISTIC_GATE,
-            RunPhase.CHECK_REPAIR, RunPhase.CANDIDATE_READY,
-            RunPhase.CANDIDATE_PUSH, RunPhase.FINAL_REVIEW,
+            RunPhase.CHECK_REPAIR, RunPhase.CANDIDATE_READY, RunPhase.CANDIDATE_PUSH,
+            RunPhase.FINAL_REVIEW, *_CYCLE_ENTRY_PHASES,
         }:
             self._candidate_boundary(RunPhase.FINAL_REVIEW, cycle_plan, candidate)
         review = ops.review_candidate(ctx, cycle_plan, candidate, evidence)
@@ -597,7 +605,7 @@ class PipelineV2Coordinator:
     ) -> None:
         ops, ctx = self.operations, self.context
         phase = (
-            RunPhase.IMPLEMENT_STEP if cycle_plan.cycle.kind is CycleKind.INITIAL
+            RunPhase.IMPLEMENT_STEP if cycle_plan.cycle.kind in _IMPLEMENT_PHASES
             else RunPhase.REVIEW_IMPLEMENTATION
         )
         steps = cycle_plan.plan.steps
@@ -627,8 +635,10 @@ class PipelineV2Coordinator:
 
     def _gate_episode(
         self, cycle_plan: CyclePlan, stage: GateStage, start: ResumeCheckpoint | None,
-    ) -> EvidenceBundle:
-        """One deterministic gate and its recovery ladder."""
+    ) -> EvidenceBundle | CyclePlan:
+        """One deterministic gate and its recovery ladder; a red gate whose
+        rungs are durably spent returns the new cycle plan it re-decomposed.
+        """
 
         ops, ctx = self.operations, self.context
         number = cycle_plan.cycle.number
@@ -684,10 +694,9 @@ class PipelineV2Coordinator:
                 raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
             # Ladder-first: one distinct strategy per red gate, consumed
             # durably before anything runs for it and never proposed twice for
-            # the same candidate tree and failure.  The frozen budget is handed
-            # to the ladder, which consults it only for the rungs that run a
-            # check-repair worker: an inapplicable rung consumes nothing and
-            # the ladder simply advances to the next distinct strategy.
+            # the same candidate tree and failure.  The frozen budget only
+            # bounds the rungs that run a check-repair worker: an inapplicable
+            # rung consumes nothing and the ladder advances.
             while True:
                 red = evidence
                 step = recovery.gate_step(
@@ -704,10 +713,9 @@ class PipelineV2Coordinator:
                         ),
                     )
                 if step.is_repair_pass and step.repair_attempt != attempt:
-                    # A pending ladder pass the checkpoint predates (a lowered
-                    # operator counter, a boundary written after the rung was
-                    # already consumed) is adopted: a recorded pass is never
-                    # replayed, the pending one still runs exactly once.
+                    # A pending ladder pass the checkpoint predates is adopted:
+                    # a recorded pass is never replayed, the pending one still
+                    # runs exactly once.
                     attempt = self._adopt_pending_ladder_attempt(
                         step, attempt=attempt, durable=durable,
                     )
@@ -741,11 +749,23 @@ class PipelineV2Coordinator:
                     attempt += 1
                     repair_boundary_written = False
                     break
-                # A replan rung rewrites the responsible step's contract from
-                # this gate's own failure evidence and re-executes it; a rung
-                # that these exact facts do not admit is consumed and the
-                # ladder moves on.
+                # A replan rung rewrites approved work -- the responsible
+                # step's contract, or once that rung is spent too the whole
+                # decomposition -- from this gate's failure evidence.  A rung
+                # these facts do not admit is consumed and the ladder moves on.
                 try:
+                    if step.strategy is RecoveryStrategy.REPLAN_CYCLE:
+                        # The new plan is durable before the rung is done, so a
+                        # crash here resumes it without paying again.
+                        planned = recovery.replan_cycle(
+                            ctx=ctx, cycle_plan=cycle_plan, stage=stage, step=step,
+                            evidence=red,
+                        )
+                        recovery.finish_step(
+                            ctx=ctx, cycle_plan=cycle_plan, stage=stage, step=step,
+                            evidence=red, tree_after=red.staged_tree_sha,
+                        )
+                        return planned
                     tree_after = recovery.replan_step(
                         ctx=ctx, cycle_plan=cycle_plan, stage=stage, step=step, evidence=red,
                     )
@@ -760,9 +780,7 @@ class PipelineV2Coordinator:
                     evidence=red, tree_after=tree_after,
                 )
                 # The checkpoint names the last durable pass only when its
-                # recorded result is exactly the tree this gate verifies: a
-                # rewritten tree is never attributed to a pass that did not
-                # produce it.
+                # recorded result is exactly the tree this gate verifies.
                 records = ops.check_repair_attempts(ctx, number, stage)
                 self._boundary(
                     RunPhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
