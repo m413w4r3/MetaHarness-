@@ -15,7 +15,7 @@ from unittest import mock
 from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
 from metaharness.commit_gate import commit_safety_gate
 from metaharness.models import ExecutionRole, RunStatus
-from metaharness.orchestration.implementation import ImplementationService
+from metaharness.orchestration.step_acceptance import StepAcceptanceService
 from metaharness.orchestration.step_authority import mutable_paths, read_step_candidate
 from metaharness.orchestrator import Orchestrator
 from metaharness.repository_topology import RepositoryTopology
@@ -170,7 +170,7 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
             captured.append(tuple(kwargs["mutable_scope"]))
             return commit_safety_gate(*args, **kwargs)
 
-        with mock.patch("metaharness.orchestration.implementation.commit_safety_gate", side_effect=spy):
+        with mock.patch("metaharness.orchestration.step_acceptance.commit_safety_gate", side_effect=spy):
             result = self.run_pipeline([
                 self.one_step_plan("a.txt"),
                 repair_contract("a.txt", "c.txt"),
@@ -244,7 +244,7 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
             kwargs["mutable_scope"] = ("a.txt",)
             return original(*args, **kwargs)
 
-        with mock.patch("metaharness.orchestration.implementation.commit_safety_gate", side_effect=narrowed):
+        with mock.patch("metaharness.orchestration.step_acceptance.commit_safety_gate", side_effect=narrowed):
             result = self.run_pipeline([self.one_step_plan()])
 
         self.assertEqual(result.status, RunStatus.FAILED)
@@ -363,7 +363,7 @@ class StepAcceptanceResumeTests(StepAuthorityHarness):
             writes("feature.txt", "c.txt"),
         )
         with mock.patch(
-            "metaharness.orchestration.implementation.commit_safety_gate", side_effect=KeyboardInterrupt(),
+            "metaharness.orchestration.step_acceptance.commit_safety_gate", side_effect=KeyboardInterrupt(),
         ):
             result = self.run_pipeline([self.one_step_plan(), repair_contract("c.txt")])
         self.assertEqual(result.status, RunStatus.INTERRUPTED)
@@ -394,7 +394,7 @@ class StepAcceptanceResumeTests(StepAuthorityHarness):
             writes("feature.txt", "c.txt"),
         )
         with mock.patch.object(
-            ImplementationService, "_finalize_accepted_step", side_effect=KeyboardInterrupt(),
+            StepAcceptanceService, "_finalize_accepted_step", side_effect=KeyboardInterrupt(),
         ):
             result = self.run_pipeline([self.one_step_plan(), repair_contract("c.txt")])
         self.assertEqual(result.status, RunStatus.INTERRUPTED)

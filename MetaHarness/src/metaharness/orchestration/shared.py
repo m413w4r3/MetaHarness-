@@ -583,8 +583,9 @@ _status_has_unstaged_or_untracked = status_has_unstaged_or_untracked
 
 # The public spelling of the toolbox the run authorities import: the sibling
 # services keep reading the private names above, while `run_bootstrap`, the
-# composition root, the failure projection, the observability stream and the
-# runtime kernel reach the same objects through their public names.
+# composition root, the failure projection, the observability stream, the
+# runtime kernel and the step services reach the same objects through their
+# public names.
 AGENT_ARTIFACTS = _AGENT_ARTIFACTS
 REVISION_ARTIFACTS = _REVISION_ARTIFACTS
 RECOVERY_ATTEMPT_ARTIFACTS = _RECOVERY_ATTEMPT_ARTIFACTS
@@ -595,3 +596,9 @@ safe_candidate_tree = _safe_candidate_tree
 archive_attempt = _archive_attempt
 archive_attempt_target = _archive_attempt_target
 archive_attempt_tree = _archive_attempt_tree
+BOUNDED_NO_CHANGE_MISMATCH = _BOUNDED_NO_CHANGE_MISMATCH
+SYNTHETIC_NO_CHANGE_MISMATCH = _SYNTHETIC_NO_CHANGE_MISMATCH
+new_status_lines = _new_status_lines
+record_failure_tree = _record_failure_tree
+safe_index_tree = _safe_index_tree
+safe_status = _safe_status

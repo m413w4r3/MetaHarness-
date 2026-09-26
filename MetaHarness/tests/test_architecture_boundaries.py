@@ -68,7 +68,6 @@ MODULE_MAX_LINES = 900
 # the durable answer itself landed in ``planning/check_replan.py``.
 FROZEN_MODULE_SIZES: Mapping[str, int] = {
     "orchestration/check_repair.py": 2003,
-    "orchestration/implementation.py": 2443,
     "orchestration/resume_validation.py": 1392,
     "orchestration/review_service.py": 1789,
     "orchestration/revision.py": 1057,
@@ -112,28 +111,9 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_read_json_artifact",
             "_record_failure_tree",
             "_safe_candidate_tree",
-            "_status_has_unstaged_or_untracked",
         ),
         "metaharness.orchestration.check_repair": (
             "_SCOPE_REQUEST_SOURCE",
-        ),
-    },
-    "metaharness.orchestration.implementation": {
-        "metaharness.orchestration.shared": (
-            "_BOUNDED_NO_CHANGE_MISMATCH",
-            "_SYNTHETIC_NO_CHANGE_MISMATCH",
-            "_archive_attempt",
-            "_git_ownership",
-            "_json_text",
-            "_new_status_lines",
-            "_ownership_violations",
-            "_paths_detail",
-            "_read_json_artifact",
-            "_record_failure_tree",
-            "_safe_candidate_tree",
-            "_safe_index_tree",
-            "_safe_status",
-            "_status_has_unstaged_or_untracked",
         ),
     },
     "metaharness.orchestration.publication": {

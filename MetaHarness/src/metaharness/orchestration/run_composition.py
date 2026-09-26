@@ -51,6 +51,7 @@ from .resume_validation import (
 from .revision import has_deferred_contract_mismatches
 from .run_bootstrap import PreparedV2Run
 from .shared import CycleArtifactService, OrchestrationError, bounded_parse_detail, chat_client
+from .step_authority import approved_step_contract
 
 if TYPE_CHECKING:
     from .runtime import RunRuntime
@@ -256,8 +257,8 @@ class RunComposition:
             plan_correction=bind(self.runtime.reviews.plan_correction, store),
             load_correction=self._load_correction,
             completed_steps=self.completed_steps,
-            execute_step=bind(self.runtime.implementation.execute_cycle_step, store),
-            accept_step=bind(self.runtime.implementation.resume_step_acceptance, store),
+            execute_step=bind(self.runtime.step_execution.execute_cycle_step, store),
+            accept_step=bind(self.runtime.step_acceptance.resume_step_acceptance, store),
             unresolved_mismatches=lambda ctx, plan: has_deferred_contract_mismatches(
                 self.completed_steps(ctx, plan)
             ),
@@ -454,8 +455,8 @@ class RunComposition:
             artifact_dir = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
             if not (artifact_dir / "contract_repairs").is_dir():
                 continue
-            authority = self.runtime.implementation.resolve_step_authority(
-                artifact_dir, step, self.runtime.implementation.approved_step_contract(cycle_plan, step),
+            authority = self.runtime.contract_recovery.resolve_step_authority(
+                artifact_dir, step, approved_step_contract(cycle_plan, step),
                 expected_tree=None, expected_plan_step_count=count,
             )
             scope.update(authority.mutable_scope)

@@ -413,8 +413,8 @@ immediate human wait; a security, integrity or authority boundary fails closed;
 and one exact recovery fingerprint never consumes the same strategy twice.
 
 The `FROZEN_*` tables of the guard module are ratchets: they record the debt the
-refoundation landed with — six oversized `orchestration/` modules, the
-`orchestration/shared.py` private toolbox, and six test modules reading
-module-local names — and those entries may only shrink. Growing one is a design
-decision that must be taken explicitly, by editing the frozen table in the same
-change.
+refoundation landed with — the oversized `orchestration/` modules the later
+per-transaction splits did not dissolve yet, the `orchestration/shared.py`
+private toolbox, and six test modules reading module-local names — and those
+entries may only shrink. Growing one is a design decision that must be taken
+explicitly, by editing the frozen table in the same change.

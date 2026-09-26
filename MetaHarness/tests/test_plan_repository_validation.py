@@ -21,7 +21,7 @@ from metaharness.models import (
     RunStatus,
     TaskPlanV2,
 )
-from metaharness.orchestration.implementation import ImplementationService
+from metaharness.orchestration.step_authority import step_contract_drift
 from metaharness.plan_recovery import PlanRecoveryError, plan_recovery_info
 from metaharness.plan_repository_validation import (
     PathPreconditionViolation,
@@ -456,14 +456,10 @@ class RuntimeDriftGateTests(_Repo):
         creates = step("S01", read=("README.md",), create=(X,))
         validate_plan_repository_topology(self.repo, self.without_x, task_plan(creates))
         # The worktree then really drifts: X appears after approval.
-        drift = ImplementationService._step_contract_drift(
-            object(), self.repo, self.with_x, self.with_x, creates,  # type: ignore[arg-type]
-        )
+        drift = step_contract_drift(self.repo, self.with_x, self.with_x, creates)
         self.assertEqual(drift, f"create_exists={X}")
         self.assertEqual(
-            ImplementationService._step_contract_drift(
-                object(), self.repo, self.with_x, self.without_x, creates,  # type: ignore[arg-type]
-            ),
+            step_contract_drift(self.repo, self.with_x, self.without_x, creates),
             "worktree changed outside a step",
         )
 

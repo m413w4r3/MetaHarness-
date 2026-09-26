@@ -59,8 +59,8 @@ from ..state import RunStateStore
 from ..trace import TraceSink, TraceStream
 from ..validation import ValidationError
 from .check_recovery import CheckInfrastructureRecovery
+from .contract_recovery import ContractRecoveryService
 from .gates import GateService
-from .implementation import ImplementationService
 from .publication import PublicationService
 from .recovery import RecoveryCoordinator
 from .resume_validation import ResumedRun, read_repository_reference
@@ -75,6 +75,10 @@ from .shared import (
     archive_attempt_target,
     is_object_id, status_has_unstaged_or_untracked,
 )
+from .step_acceptance import StepAcceptanceService
+from .step_execution import StepExecutionService
+from .step_replan import StepReplanService
+from .worker_attempt import WorkerAttemptService
 from .worker_recovery import WorkerRecovery
 
 def generate_run_id() -> str:
@@ -128,7 +132,14 @@ class RunRuntime:
         self.last_selection: Any | None = None
         self.trace: TraceStream | None = None
         self.trace_cycle = 1
-        self.implementation = ImplementationService(self)
+        # The step services of this run: the step execution ladder, the one
+        # worker attempt it drives, the durable acceptance boundary, the
+        # semantic contract repair transaction and the red-gate step replan.
+        self.step_execution = StepExecutionService(self)
+        self.worker_attempt = WorkerAttemptService(self)
+        self.step_acceptance = StepAcceptanceService(self)
+        self.contract_recovery = ContractRecoveryService(self)
+        self.step_replan = StepReplanService(self)
         self.gates = GateService(self)
         self.reviews = ReviewService(self)
         self.publication = PublicationService(self)

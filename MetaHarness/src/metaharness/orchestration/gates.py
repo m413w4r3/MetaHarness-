@@ -634,7 +634,7 @@ class GateService:
         delegates to the step execution owner and keeps the ladder contract.
         """
 
-        return self.runtime.implementation.replan_cycle_step(
+        return self.runtime.step_replan.replan_cycle_step(
             store, ctx, cycle_plan, stage, step, evidence,
         )
     def _final_evidence(
