@@ -51,7 +51,7 @@ from metaharness.resume import (
 from metaharness.resume import (
     ResumePhase as P,
 )
-from metaharness.state import RunStateStore
+from metaharness.state import RunCheckpointError, RunStateStore
 from tests.pipeline_support import (
     PipelineHarness,
     initial_plan,
@@ -575,6 +575,15 @@ class RecoveryPathTests(PipelineHarness):
         self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
         self.assertEqual(self.planner.requests, [])
         self.assertEqual(self.workers.calls, [])
+        # Same refusal once the file cannot even be parsed: the failure stays
+        # recordable, the fallback phase stays descriptive, and no control read
+        # nor any later resume may read it back.
+        path.write_text("{not json", encoding="utf-8")
+        store = RunStateStore(self.run_dir() / "state.json")
+        self.assertIs(store.reported_machine_state().phase, P.IMPLEMENT_STEP)
+        with self.assertRaises(RunCheckpointError):
+            store.machine_state()
+        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
 
     def test_persistent_worker_timeout_waits_after_its_bounded_retries(self) -> None:
         from metaharness.agent import AgentRunResult

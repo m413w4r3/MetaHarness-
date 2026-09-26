@@ -7,8 +7,9 @@ import unittest
 
 from metaharness.config import load_config
 from metaharness.llm.chat import LLMError
-from metaharness.models import ExecutionRole, RunStatus
+from metaharness.models import ExecutionRole, RunDisposition, RunMachineState, RunPhase, RunStatus
 from metaharness.resume import resume_info
+from metaharness.state import RunCheckpointError, RunStateStore
 
 from tests.pipeline.support import (
     SPEC,
@@ -745,6 +746,45 @@ class ResumeAuthorityTests(PipelineHarness):
                 self.config(semantic_revision=True), planner=["unused"], reviewer=["unused"],
             ).resume("run")
         self.assertEqual(self.workers.roles(), ["implementer"])
+
+    def test_a_corrupt_checkpoint_refuses_control_writes_and_never_falls_back(self) -> None:
+        """A checkpoint that exists is the phase authority, corruption included."""
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        original = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+        )
+        with crash_at_checkpoint(original, "deterministic_gate"):
+            original.run_text(SPEC, run_id="run")
+        store = RunStateStore(self.run_dir() / "state.json")
+        phase = RunPhase(self.checkpoint()["phase"])
+        self.assertIs(store.machine_state().phase, phase)
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
+
+        (self.run_dir() / "resume_checkpoint.json").write_text("{not json", encoding="utf-8")
+        for name, mutate in (
+            ("machine_state", lambda: store.machine_state()),
+            ("identity", lambda: store.identity()),
+            ("update_metadata", lambda: store.update_metadata(marker=True)),
+            ("set_run_state", lambda: store.set_run_state(RunMachineState(RunPhase.PUBLISH))),
+        ):
+            with self.subTest(operation=name), self.assertRaises(RunCheckpointError):
+                mutate()
+
+        # The terminal reporting read still describes the last recorded phase,
+        # and the recorded phase can never make the run resumable again.
+        reported = store.reported_machine_state()
+        self.assertIs(reported.phase, phase)
+        failed = store.record_failure("RESUME_INTEGRITY_FAILURE", "the checkpoint is unreadable")
+        self.assertEqual(failed["disposition"], RunDisposition.FAILED.value)
+        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
+        resumed = self.orchestrator(
+            self.config(), planner=["unused"], reviewer=["unused"],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.workers.roles(), ["implementer"])
+
 
 if __name__ == "__main__":
     unittest.main()

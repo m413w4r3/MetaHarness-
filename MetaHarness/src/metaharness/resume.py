@@ -18,6 +18,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .approval import ApprovalError, PlanIdentity
+from .checkpoint_identity import (
+    CHECKPOINT_SCHEMA_VERSION,
+    CheckpointFormatError,
+    checkpoint_sha256,
+    read_checkpoint_file,
+    stamp_from_payload,
+)
 from .models import (
     CHECK_REPAIR_WAIT_REASON,
     CONTRACT_REPAIR_WAIT_REASON,
@@ -35,7 +42,6 @@ from .run_options import RUN_SCHEMA_UNSUPPORTED
 from .step_ids import STEP_ID_RE
 
 CHECKPOINT_NAME = RUN_CHECKPOINT_NAME
-_SCHEMA_VERSION = 4
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -173,7 +179,7 @@ def plan_identity_from_mapping(value: Any) -> PlanIdentity:
 
 def checkpoint_payload(checkpoint: ResumeCheckpoint, *, status: str = "pending") -> dict[str, Any]:
     return {
-        "schema_version": _SCHEMA_VERSION,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "status": status,
         "phase": checkpoint.phase.value,
         "review_cycle": checkpoint.review_cycle,
@@ -199,44 +205,49 @@ def write_checkpoint(run_dir: str | Path, checkpoint: ResumeCheckpoint) -> None:
     )
 
 
-def _parse(payload: Any) -> tuple[ResumeCheckpoint, str]:
-    if not isinstance(payload, dict):
-        raise ResumeCheckpointError("checkpoint is not an object")
-    schema_version = payload.get("schema_version")
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
-        raise ResumeCheckpointError("checkpoint schema_version is not an integer")
-    if schema_version != _SCHEMA_VERSION:
+def _parse(payload: Any, *, sha256: str) -> tuple[ResumeCheckpoint, str]:
+    """The business identity of one decoded checkpoint.
+
+    The structural frame (schema, status, phase) and the digest come from the
+    shared reader this module and the state store both use; only the business
+    validation below is owned here.
+    """
+
+    try:
+        stamp = stamp_from_payload(payload, sha256=sha256)
+    except CheckpointFormatError as exc:
+        raise ResumeCheckpointError(str(exc)) from exc
+    if stamp.schema_version != CHECKPOINT_SCHEMA_VERSION:
         raise ResumeSchemaUnsupportedError(
             f"{RUN_SCHEMA_UNSUPPORTED}: checkpoint schema_version "
-            f"{schema_version} is not {_SCHEMA_VERSION}"
+            f"{stamp.schema_version} is not {CHECKPOINT_SCHEMA_VERSION}"
         )
-    status = payload.get("status")
-    if status not in {"pending", "completed"}:
-        raise ResumeCheckpointError("checkpoint status is invalid")
-    try:
-        checkpoint = ResumeCheckpoint(
-            phase=payload["phase"], review_cycle=payload.get("review_cycle", 1),
-            stage=payload.get("stage"), step_id=payload.get("step_id"),
-            next_step_id=payload.get("next_step_id"), check_repair_attempt=payload.get("check_repair_attempt"),
-            expected_head_sha=payload.get("expected_head_sha"), expected_parent_sha=payload.get("expected_parent_sha"),
-            expected_tree_sha=payload.get("expected_tree_sha"), execution_selection_sha256=payload.get("execution_selection_sha256"),
-            plan_identity=(plan_identity_from_mapping(payload["plan_identity"]) if payload.get("plan_identity") is not None else None),
-            correction_bundle_sha256=payload.get("correction_bundle_sha256"),
-        )
-    except KeyError as exc:
-        raise ResumeCheckpointError("checkpoint schema is incomplete") from exc
-    return checkpoint, status
+    checkpoint = ResumeCheckpoint(
+        phase=stamp.phase, review_cycle=payload.get("review_cycle", 1),
+        stage=payload.get("stage"), step_id=payload.get("step_id"),
+        next_step_id=payload.get("next_step_id"), check_repair_attempt=payload.get("check_repair_attempt"),
+        expected_head_sha=payload.get("expected_head_sha"), expected_parent_sha=payload.get("expected_parent_sha"),
+        expected_tree_sha=payload.get("expected_tree_sha"), execution_selection_sha256=payload.get("execution_selection_sha256"),
+        plan_identity=(plan_identity_from_mapping(payload["plan_identity"]) if payload.get("plan_identity") is not None else None),
+        correction_bundle_sha256=payload.get("correction_bundle_sha256"),
+    )
+    return checkpoint, stamp.status
 
 
 def read_checkpoint_record(run_dir: str | Path) -> tuple[ResumeCheckpoint, str] | None:
-    path = Path(run_dir) / CHECKPOINT_NAME
+    """The full record of the run's checkpoint, or ``None`` when it has none.
+
+    A checkpoint that exists but cannot be read is refused here, never treated
+    as absent: the resume gate maps that refusal to ``RESUME_INTEGRITY_FAILURE``.
+    """
+
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+        checkpoint = read_checkpoint_file(run_dir)
+    except CheckpointFormatError as exc:
+        raise ResumeCheckpointError(str(exc)) from exc
+    if checkpoint is None:
         return None
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ResumeCheckpointError("checkpoint is unreadable") from exc
-    return _parse(payload)
+    return _parse(checkpoint.payload, sha256=checkpoint.sha256)
 
 
 def read_checkpoint(run_dir: str | Path) -> ResumeCheckpoint | None:
@@ -345,15 +356,6 @@ def machine_state_for_run(
         )
     except ValueError as exc:
         raise ResumeCheckpointError("the durable run state is unreadable") from exc
-
-
-def checkpoint_sha256(run_dir: str | Path) -> str | None:
-    """The exact bytes of the checkpoint one observation was built from."""
-
-    try:
-        return hashlib.sha256((Path(run_dir) / CHECKPOINT_NAME).read_bytes()).hexdigest()
-    except OSError:
-        return None
 
 
 def run_identity(

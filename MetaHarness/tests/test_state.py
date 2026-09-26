@@ -45,7 +45,7 @@ from metaharness.run_options import (
     RunOptionsError,
     read_run_options_for_state,
 )
-from metaharness.state import RunStateStore, _exclusive_state_lock
+from metaharness.state import RunCheckpointError, RunStateStore, _exclusive_state_lock
 from metaharness.web.api import ARTIFACT_ALLOWLIST
 
 
@@ -906,6 +906,134 @@ class RunStateProjectionTests(unittest.TestCase):
         self.assertEqual(claimed["disposition"], RunDisposition.RUNNING.value)
         self.assertEqual(claimed["phase"], waiting["phase"])
         self.assertIsNone(claimed["reason"])
+
+
+class CheckpointAuthorityTests(unittest.TestCase):
+    """A checkpoint that exists is the only phase authority.
+
+    Every control read and write refuses one it cannot read; the terminal
+    reporting path still describes the last recorded phase, and that
+    description can never be turned back into a resumable boundary.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.run_dir = Path(self.temp.name)
+        self.state_path = self.run_dir / "state.json"
+        self.checkpoint_path = self.run_dir / CHECKPOINT_NAME
+        self.store = RunStateStore(self.state_path)
+        self.store.initialize("run")
+
+    def write_checkpoint_at(self, phase: RunPhase, *, schema_version: int | None = None) -> None:
+        """A structurally valid checkpoint, coherent for *phase*."""
+
+        payload = checkpoint_payload(ResumeCheckpoint(phase=phase))
+        if schema_version is not None:
+            payload["schema_version"] = schema_version
+        self.checkpoint_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+        )
+
+    def test_a_missing_checkpoint_keeps_the_recorded_phase_until_the_first_one(self) -> None:
+        # Before the first durable checkpoint the recorded phase is the only
+        # boundary the run has, and it stays writable.
+        state = self.store.set_run_state(RunMachineState(RunPhase.IMPLEMENT_STEP))
+        self.assertEqual(state["phase"], RunPhase.IMPLEMENT_STEP.value)
+        self.assertIs(self.store.machine_state().phase, RunPhase.IMPLEMENT_STEP)
+        self.assertEqual(
+            self.store.update_metadata(marker=True)["phase"], RunPhase.IMPLEMENT_STEP.value,
+        )
+        # The first checkpoint then owns the phase: the recorded one is stale.
+        self.write_checkpoint_at(ResumePhase.CONTEXT)
+        self.assertIs(self.store.machine_state().phase, ResumePhase.CONTEXT)
+        self.assertEqual(
+            self.store.update_metadata(marker=False)["phase"], ResumePhase.CONTEXT.value,
+        )
+
+    def test_a_valid_checkpoint_wins_over_a_contradicting_recorded_phase(self) -> None:
+        self.store.set_run_state(RunMachineState(RunPhase.IMPLEMENT_STEP))
+        self.write_checkpoint_at(ResumePhase.CONTEXT)
+
+        self.assertIs(self.store.machine_state().phase, ResumePhase.CONTEXT)
+        self.assertIs(self.store.identity().phase, ResumePhase.CONTEXT)
+        # A machine state that names the recorded phase is a contradiction,
+        # never a merge: nothing is written and the checkpoint keeps the phase.
+        with self.assertRaises(ValueError):
+            self.store.set_run_state(RunMachineState(RunPhase.IMPLEMENT_STEP))
+        healed = self.store.set_run_state(
+            RunMachineState(disposition=D.WAIT_EXTERNAL, reason="AGENT_TIMEOUT"),
+        )
+        self.assertEqual(healed["phase"], ResumePhase.CONTEXT.value)
+
+    def test_a_corrupt_checkpoint_refuses_every_control_read_and_write(self) -> None:
+        self.store.set_run_state(
+            RunMachineState(RunPhase.IMPLEMENT_STEP, D.FAILED, "LLM_FAILURE"),
+        )
+        expected = self.store.identity()
+        self.checkpoint_path.write_text("{not json", encoding="utf-8")
+        before = self.state_path.read_bytes()
+
+        for name, mutate in (
+            ("machine_state", lambda: self.store.machine_state()),
+            ("identity", lambda: self.store.identity()),
+            ("update_metadata", lambda: self.store.update_metadata(marker=True)),
+            ("set_run_state", lambda: self.store.set_run_state(RunMachineState(RunPhase.PUBLISH))),
+            ("transition_run", lambda: self.store.transition_run(RunEvent.resume(), expected=expected)),
+        ):
+            with self.subTest(operation=name), self.assertRaises(RunCheckpointError):
+                mutate()
+        self.assertEqual(self.state_path.read_bytes(), before)
+
+    def test_a_foreign_checkpoint_schema_is_never_a_phase_authority(self) -> None:
+        self.store.set_run_state(RunMachineState(RunPhase.IMPLEMENT_STEP))
+        self.write_checkpoint_at(ResumePhase.CONTEXT, schema_version=3)
+
+        for name, mutate in (
+            ("machine_state", lambda: self.store.machine_state()),
+            ("update_metadata", lambda: self.store.update_metadata(marker=True)),
+            ("set_run_state", lambda: self.store.set_run_state(RunMachineState(RunPhase.PUBLISH))),
+        ):
+            with self.subTest(operation=name), self.assertRaises(RunCheckpointError):
+                mutate()
+
+    def test_a_corrupt_checkpoint_still_allows_the_terminal_failure_report(self) -> None:
+        self.store.set_run_state(
+            RunMachineState(RunPhase.IMPLEMENT_STEP, D.WAIT_EXTERNAL, "AGENT_TIMEOUT"),
+            planning_protocol="v2",
+            failure={"reason": "AGENT_TIMEOUT"},
+        )
+        corruptions = (
+            ("unreadable bytes", "{not json"),
+            ("missing phase", json.dumps({"schema_version": 4, "status": "pending"})),
+            ("unknown phase", json.dumps(
+                {"schema_version": 4, "status": "pending", "phase": "no_such_phase"},
+            )),
+            ("wrong object", json.dumps(["not", "an", "object"])),
+        )
+        for name, data in corruptions:
+            with self.subTest(corruption=name):
+                self.checkpoint_path.write_text(data, encoding="utf-8")
+                failed = self.store.record_failure(
+                    "RESUME_INTEGRITY_FAILURE", "the checkpoint is unreadable",
+                )
+                # The diagnostic is durable, and its phase is descriptive only.
+                self.assertEqual(failed["disposition"], D.FAILED.value)
+                self.assertEqual(failed["phase"], RunPhase.IMPLEMENT_STEP.value)
+                self.assertIs(self.store.reported_machine_state().phase, RunPhase.IMPLEMENT_STEP)
+                # It can never become an authority again: no control read, no
+                # transition and no resume may read that fallback.
+                with self.assertRaises(RunCheckpointError):
+                    self.store.machine_state()
+                expected = RunIdentity.of(RunMachineState(
+                    RunPhase.IMPLEMENT_STEP, D.FAILED, "RESUME_INTEGRITY_FAILURE",
+                ))
+                with self.assertRaises(RunCheckpointError):
+                    self.store.transition_run(RunEvent.resume(), expected=expected)
+                info = resume_info(self.run_dir, self.store.load())
+                self.assertFalse(info.resumable)
+                self.assertEqual(info.operation, CHECKPOINT_INTEGRITY_OPERATION)
+
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ peut donc lui faire contredire la disposition.
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 import tempfile
@@ -20,8 +19,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+from .checkpoint_identity import (
+    CHECKPOINT_SCHEMA_VERSION,
+    CheckpointFormatError,
+    CheckpointStamp,
+    read_checkpoint_stamp,
+)
 from .models import (
-    RUN_CHECKPOINT_NAME,
     RunDisposition,
     RunEvent,
     RunIdentity,
@@ -67,6 +71,17 @@ def _exclusive_state_lock(lock_path: Path) -> Iterator[None]:
         os.close(fd)
 
 
+class RunCheckpointError(ValueError):
+    """A run checkpoint exists but cannot be the phase authority.
+
+    The store refuses here instead of reading the phase the state file happens
+    to record: one command has one authority, and a corrupt checkpoint is an
+    incident rather than a gap.  Only the terminal reporting path
+    (:meth:`RunStateStore.record_failure`, :meth:`RunStateStore.reported_machine_state`)
+    survives it, and only to describe where the run stopped.
+    """
+
+
 class RunStateStore:
     """Store one run state in a JSON file, using atomic replacements.
 
@@ -78,6 +93,14 @@ class RunStateStore:
     checkpoint owns the phase, the file records the posture and its reason, and
     ``status`` is only ever the projection of the two.  No caller can name a
     status, and a metadata mutation can never move the machine.
+
+    Two reads are named explicitly.  The control read
+    (:meth:`machine_state`, :meth:`identity`, :meth:`update_metadata`,
+    :meth:`set_run_state`, :meth:`transition_run`) treats the checkpoint as the
+    sole phase authority and refuses a checkpoint it cannot read; the terminal
+    reporting read (:meth:`record_failure`, :meth:`reported_machine_state`)
+    still describes the last recorded phase so a corruption never prevents its
+    own diagnostic.
     """
 
     def __init__(self, path: str | Path):
@@ -169,9 +192,11 @@ class RunStateStore:
 
         The phase, the disposition, the reason and the projected status are
         re-derived from the durable facts, so a metadata writer can never
-        contradict the checkpoint or pilot the run.  With *expected*, the merge
-        happens only while the run still has exactly that canonical identity;
-        ``None`` is returned without writing otherwise.
+        contradict the checkpoint or pilot the run.  It reads the phase through
+        the strict control checkpoint: a corrupt or foreign one refuses the
+        write instead of merging under a guessed phase.  With *expected*, the
+        merge happens only while the run still has exactly that canonical
+        identity; ``None`` is returned without writing otherwise.
         """
 
         self._refuse_control_fields(fields)
@@ -179,8 +204,9 @@ class RunStateStore:
             raise TypeError("update_metadata expects a RunIdentity expectation")
         with _exclusive_state_lock(self.lock_path):
             state = self.load()
-            machine = self._recorded_machine(state)
-            if expected is not None and self._identity(state, machine) != expected:
+            stamp = self._control_stamp()
+            machine = self._recorded_machine(state, stamp)
+            if expected is not None and self._identity(state, machine, stamp) != expected:
                 return None
             self._apply(state, machine, fields)
             self._write(state)
@@ -192,7 +218,8 @@ class RunStateStore:
         The phase authority itself lives in the run checkpoint: this store
         only records the posture and its projection, so no second field can
         ever contradict the checkpoint's phase.  A machine state that names a
-        phase the checkpoint does not own is refused, never silently applied.
+        phase the checkpoint does not own is refused, never silently applied,
+        and so is a checkpoint this runtime cannot read.
         """
 
         if not isinstance(machine, RunMachineState):
@@ -200,7 +227,8 @@ class RunStateStore:
         self._refuse_control_fields(fields)
         with _exclusive_state_lock(self.lock_path):
             state = self.load()
-            self._apply(state, self._resolved_machine(state, machine), fields)
+            stamp = self._control_stamp()
+            self._apply(state, self._resolved_machine(state, stamp, machine), fields)
             self._write(state)
         return state
 
@@ -213,7 +241,8 @@ class RunStateStore:
         has exactly the observed identity (phase, posture, state generation
         and checkpoint bytes); otherwise apply the event through the single
         state machine, merge *fields* and write atomically.  An illegal event
-        is refused by :func:`~metaharness.models.transition` alone.
+        is refused by :func:`~metaharness.models.transition` alone; a checkpoint
+        this runtime cannot read refuses the transition before it is considered.
         """
 
         if not isinstance(event, RunEvent):
@@ -223,8 +252,9 @@ class RunStateStore:
         self._refuse_control_fields(fields)
         with _exclusive_state_lock(self.lock_path):
             state = self.load()
-            machine = self._recorded_machine(state)
-            if self._identity(state, machine) != expected:
+            stamp = self._control_stamp()
+            machine = self._recorded_machine(state, stamp)
+            if self._identity(state, machine, stamp) != expected:
                 return None
             self._apply(state, transition(machine, event), fields)
             self._write(state)
@@ -238,6 +268,11 @@ class RunStateStore:
         It is the terminal projection of an exception, not a transition: the
         reason it carries is the machine reason, the posture becomes FAILED and
         *fields* are merged in the same write.
+
+        The read is the terminal reporting one: it describes the last recorded
+        phase and never refuses, so a corrupt checkpoint cannot stop the
+        diagnostic that explains the run.  That phase stays descriptive — no
+        RESUME or ADVANCE ever reads it back.
         """
 
         if not isinstance(reason, str) or not reason.strip():
@@ -260,7 +295,8 @@ class RunStateStore:
         with _exclusive_state_lock(self.lock_path):
             state = self.load()
             machine = RunMachineState(
-                self._recorded_phase(state), RunDisposition.FAILED, reason,
+                self._recorded_phase(state, self._reporting_stamp()),
+                RunDisposition.FAILED, reason,
             )
             self._apply(state, machine, {**fields, "failure": failure})
             self._write(state)
@@ -269,9 +305,28 @@ class RunStateStore:
     # -- canonical reads -------------------------------------------------
 
     def machine_state(self) -> RunMachineState:
-        """The canonical state of this run: the checkpoint phase and posture."""
+        """The canonical state of this run: the checkpoint phase and posture.
 
-        return self._recorded_machine(self.load())
+        Once a checkpoint exists it is the only phase authority.  A checkpoint
+        this runtime cannot read refuses the read instead of silently falling
+        back to the phase the state file records.
+        """
+
+        state = self.load()
+        return self._recorded_machine(state, self._control_stamp())
+
+    def reported_machine_state(self) -> RunMachineState:
+        """The descriptive state a terminal report may still be written from.
+
+        It is the reporting twin of :meth:`machine_state`: it never refuses, so
+        a checkpoint that cannot be read degrades to the last recorded phase
+        and the failure that explains the run stays recordable.  Nothing may
+        decide from it — a transition, a resume and a metadata write all read
+        :meth:`machine_state`.
+        """
+
+        state = self.load()
+        return self._recorded_machine(state, self._reporting_stamp())
 
     def outcome(self) -> RunOutcome:
         """The projected view of the canonical state; never stored as a source."""
@@ -282,7 +337,8 @@ class RunStateStore:
         """The canonical identity a compare-and-set claim must observe."""
 
         state = self.load()
-        return self._identity(state, self._recorded_machine(state))
+        stamp = self._control_stamp()
+        return self._identity(state, self._recorded_machine(state, stamp), stamp)
 
     # -- internals -------------------------------------------------------
 
@@ -295,41 +351,49 @@ class RunStateStore:
                 + "; use set_run_state or transition_run"
             )
 
-    def _checkpoint_phase(self) -> RunPhase | None:
-        """The phase the checkpoint owns, or ``None`` when it records none.
+    # -- the phase authority ---------------------------------------------
 
-        The read is deliberately tolerant: an unreadable checkpoint must never
-        make the state file unwritable, because the failure path still has to
-        record why the run stopped.
+    def _control_stamp(self) -> CheckpointStamp | None:
+        """The checkpoint that owns the phase, or ``None`` before the first one.
+
+        Every control read and write goes through here, so the read is strict
+        by construction: a checkpoint that is unreadable, structurally invalid
+        or written by a foreign schema refuses the operation.  ``None`` means
+        exactly one thing — no durable checkpoint was written yet, and the
+        recorded phase is then the only boundary the run has.
         """
 
         try:
-            payload = json.loads(
-                (self.path.parent / RUN_CHECKPOINT_NAME).read_text(encoding="utf-8")
+            stamp = read_checkpoint_stamp(self.path.parent)
+        except CheckpointFormatError as exc:
+            raise RunCheckpointError(
+                f"the run checkpoint cannot own the phase: {exc}"
+            ) from exc
+        if stamp is None:
+            return None
+        if not stamp.current_schema:
+            raise RunCheckpointError(
+                f"the run checkpoint schema {stamp.schema_version} is not "
+                f"{CHECKPOINT_SCHEMA_VERSION}: this runtime cannot read its phase"
             )
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, Mapping):
-            return None
+        return stamp
+
+    def _reporting_stamp(self) -> CheckpointStamp | None:
+        """The checkpoint a terminal report may still describe; it never refuses.
+
+        Only :meth:`record_failure` and :meth:`reported_machine_state` read
+        through here: a run whose checkpoint was corrupted must still be able
+        to write why it stopped.  The result is descriptive — it names the
+        last recorded phase — and it can never authorize RESUME or ADVANCE.
+        """
+
         try:
-            return RunPhase(payload.get("phase"))
-        except (TypeError, ValueError):
+            return read_checkpoint_stamp(self.path.parent)
+        except CheckpointFormatError:
             return None
 
-    def _checkpoint_sha256(self) -> str | None:
-        try:
-            return hashlib.sha256(
-                (self.path.parent / RUN_CHECKPOINT_NAME).read_bytes()
-            ).hexdigest()
-        except OSError:
-            return None
-
-    def _recorded_phase(self, state: Mapping[str, Any]) -> RunPhase | None:
-        """The checkpoint phase when it exists, otherwise the recorded one."""
-
-        phase = self._checkpoint_phase()
-        if phase is not None:
-            return phase
+    @staticmethod
+    def _phase_recorded_in(state: Mapping[str, Any]) -> RunPhase | None:
         recorded = state.get("phase")
         if not isinstance(recorded, str):
             return None
@@ -338,10 +402,21 @@ class RunStateStore:
         except ValueError:
             return None
 
-    def _recorded_machine(self, state: Mapping[str, Any]) -> RunMachineState:
+    def _recorded_phase(
+        self, state: Mapping[str, Any], stamp: CheckpointStamp | None,
+    ) -> RunPhase | None:
+        """The phase one operation must use: the checkpoint's, else the recorded one."""
+
+        if stamp is not None:
+            return stamp.phase
+        return self._phase_recorded_in(state)
+
+    def _recorded_machine(
+        self, state: Mapping[str, Any], stamp: CheckpointStamp | None,
+    ) -> RunMachineState:
         failure = state.get("failure")
         return assemble_run_state(
-            self._recorded_phase(state),
+            self._recorded_phase(state, stamp),
             disposition=state.get("disposition"),
             status=state.get("status"),
             reason=state.get("reason"),
@@ -351,26 +426,29 @@ class RunStateStore:
         )
 
     def _resolved_machine(
-        self, state: Mapping[str, Any], machine: RunMachineState,
+        self, state: Mapping[str, Any], stamp: CheckpointStamp | None,
+        machine: RunMachineState,
     ) -> RunMachineState:
         """Bind *machine* to the checkpoint phase, or refuse the contradiction."""
 
-        owned = self._checkpoint_phase()
-        if owned is not None:
-            if machine.phase is not None and machine.phase is not owned:
+        if stamp is not None:
+            if machine.phase is not None and machine.phase is not stamp.phase:
                 raise ValueError(
-                    f"the checkpoint owns the {owned.value} phase, not {machine.phase.value}"
+                    f"the checkpoint owns the {stamp.phase.value} phase, not {machine.phase.value}"
                 )
-            return RunMachineState(owned, machine.disposition, machine.reason)
-        phase = machine.phase if machine.phase is not None else self._recorded_phase(state)
+            return RunMachineState(stamp.phase, machine.disposition, machine.reason)
+        phase = machine.phase if machine.phase is not None else self._phase_recorded_in(state)
         return RunMachineState(phase, machine.disposition, machine.reason)
 
-    def _identity(self, state: Mapping[str, Any], machine: RunMachineState) -> RunIdentity:
+    @staticmethod
+    def _identity(
+        state: Mapping[str, Any], machine: RunMachineState, stamp: CheckpointStamp | None,
+    ) -> RunIdentity:
         updated_at = state.get("updated_at")
         return RunIdentity.of(
             machine,
             updated_at=updated_at if isinstance(updated_at, str) else None,
-            checkpoint_sha256=self._checkpoint_sha256(),
+            checkpoint_sha256=stamp.sha256 if stamp is not None else None,
         )
 
     @staticmethod

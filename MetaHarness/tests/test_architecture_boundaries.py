@@ -224,11 +224,13 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
 # invariants 1, 2, 5, 6, 8: authority layering and the clean v3 break
 # ---------------------------------------------------------------------------
 
-# The state vocabulary and its durable store: runtime-neutral by construction.
-CORE_STATE_MODULES = ("models.py", "state.py")
+# The state vocabulary, its durable store and the structural checkpoint reader
+# they share: runtime-neutral by construction.
+CORE_STATE_MODULES = ("models.py", "state.py", "checkpoint_identity.py")
 CORE_STATE_ALLOWED_INTERNAL_IMPORTS: Mapping[str, frozenset[str]] = {
     "models.py": frozenset({"metaharness.recovery_policy"}),
-    "state.py": frozenset({"metaharness.models"}),
+    "state.py": frozenset({"metaharness.models", "metaharness.checkpoint_identity"}),
+    "checkpoint_identity.py": frozenset({"metaharness.models"}),
 }
 CORE_STATE_FORBIDDEN_MODULES = frozenset({
     "gitops", "web", "agent", "llm", "remote", "integrations", "orchestration",
