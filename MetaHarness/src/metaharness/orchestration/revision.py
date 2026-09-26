@@ -23,7 +23,6 @@ from .shared import (
     _ownership_violations,
     _read_bounded_text,
     _record_failure_tree,
-    _status_has_unstaged_or_untracked,
 )
 from ..evidence import (
     EvidenceBundle,
@@ -260,31 +259,6 @@ def _review_payload(review: ReviewResult) -> dict[str, Any]:
     payload["route"] = review.route.value
     payload.pop("raw", None)
     return payload
-
-
-def _compact_approved_plan_text(plan: TaskPlanV2) -> str:
-    """Render the reviewer-visible plan index, never worker prompt bodies."""
-
-    return _json_text({
-        "title": plan.title,
-        "objective": plan.objective,
-        "constraints": plan.constraints,
-        "required_checks": list(plan.required_checks),
-        "steps": [
-            {
-                "id": step.id,
-                "title": step.title,
-                "depends_on": step.depends_on,
-                "objective": step.objective,
-                "invariants": step.forbidden,
-                "writes": list(step.write_set),
-                "creates": list(step.create_set),
-                "deletes": list(step.delete_set),
-                "verify": step.verify,
-            }
-            for step in plan.steps
-        ],
-    })
 
 
 def _review_step_reports_text(results: list[dict[str, Any]]) -> str:

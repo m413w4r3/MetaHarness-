@@ -148,10 +148,8 @@ class RunStateStore:
     def update(self, *, status: RunStatus | str, **fields: Any) -> dict[str, Any]:
         """Merge *fields* under one *status*; the disposition follows it.
 
-        ``status`` is the legacy, projected spelling of a run state.  The
-        durable posture is derived from it here, so the two can never
-        disagree;  the orchestrator migrates to
-        :meth:`set_run_state` and this bridge then disappears.
+        ``status`` is the projected spelling of a run state.  The durable
+        posture is derived from it here, so the two can never disagree.
         """
 
         new_status = RunStatus(status)

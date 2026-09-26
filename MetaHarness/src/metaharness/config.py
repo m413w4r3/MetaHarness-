@@ -35,7 +35,6 @@ from .models import (
     RoutingConfig,
     RepositoryConfig,
     RevisionConfig,
-    ExecutionFallbacks,
     RecoveryBudgets,
     SelectionMode,
     UIConfig,
@@ -43,6 +42,7 @@ from .models import (
     profile_driver_name,
     validate_revision_budget,
 )
+from .recovery_policy import ExecutionFallbacks
 
 
 class ConfigError(ValueError):
@@ -527,14 +527,14 @@ def _model_profiles(
 def _routing(data: Mapping[str, Any], profiles: Mapping[str, ModelProfile]) -> RoutingConfig:
     raw = data.get("routing")
     if raw is None:
-        # Configs written before class routing was introduced can still be
-        # loaded while their run snapshot is upgraded to the modern shape.
-        legacy = _table(data, "ui").get("default_implementer_profile")
-        if isinstance(legacy, str) and legacy.strip():
+        # Without a [routing] table, every execution class routes to the ui
+        # implementer default.
+        ui_default = _table(data, "ui").get("default_implementer_profile")
+        if isinstance(ui_default, str) and ui_default.strip():
             raw = {
-                "mechanical_profile": legacy,
-                "reasoning_profile": legacy,
-                "agentic_profile": legacy,
+                "mechanical_profile": ui_default,
+                "reasoning_profile": ui_default,
+                "agentic_profile": ui_default,
             }
         else:
             raise ConfigError("ui.default_implementer_profile is required")
@@ -986,9 +986,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     planner_default = _check_default(
         model_profiles, ui_data.get("default_planner_profile"), ExecutionRole.PLANNER
     )
-    # Implementer selection is class-based and comes from [routing].  The
-    # former ui.default_implementer_profile is intentionally not consulted.
-    implementer_default = None
     reviewer_default = _check_default(
         model_profiles, ui_data.get("default_reviewer_profile"), ExecutionRole.REVIEWER
     )
@@ -1044,7 +1041,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             maximum=4,
         ),
         default_planner_profile=planner_default,
-        default_implementer_profile=implementer_default,
         default_reviewer_profile=reviewer_default,
         default_reviser_profile=reviser_default,
         default_repair_profile=repair_default,

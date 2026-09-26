@@ -438,12 +438,6 @@ def staged_changes(worktree: Path) -> tuple[StagedChange, ...]:
     return tuple(changes)
 
 
-def staged_submodule_paths(worktree: Path) -> frozenset[str]:
-    """Return changed staged gitlink paths, whose objects are commits, not blobs."""
-
-    return frozenset(change.path for change in staged_changes(worktree) if change.is_gitlink)
-
-
 def _blob_sizes(worktree: Path, object_ids: tuple[str, ...]) -> dict[str, int]:
     """Size every object with one ``git cat-file --batch-check`` process."""
 

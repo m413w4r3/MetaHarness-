@@ -21,12 +21,10 @@ from typing import (
     Mapping,
 )
 from ..attempt_transaction import (
-    MAX_REPORTED_PATHS,
     GitOwnership,
     git_ownership,
     ownership_violations,
     paths_detail,
-    safe_path_label,
     status_has_unstaged_or_untracked,
 )
 from ..evidence import EvidenceBundle
@@ -117,9 +115,6 @@ class CycleArtifactService:
             )
 
 
-_COMMIT_SUBJECT_LIMIT = 72
-
-
 _MAX_AGENT_REPORT_BYTES = 32_000
 
 
@@ -144,16 +139,6 @@ _REVISION_ARTIFACTS = (
     "agent.final.md",
     "agent.result.json",
 )
-
-
-def _commit_subject(title: str) -> str:
-    """One Git subject line of at most 72 characters from the plan title."""
-
-    first = next((line for line in title.splitlines() if line.strip()), "")
-    subject = " ".join(first.split()).strip("#*_` ") or "MetaHarness change"
-    if len(subject) > _COMMIT_SUBJECT_LIMIT:
-        subject = subject[: _COMMIT_SUBJECT_LIMIT - 3].rstrip() + "..."
-    return subject
 
 
 def _bounded_report(text: str) -> str:
@@ -223,8 +208,6 @@ def chat_client(
     return constructor(endpoint, **kwargs)
 
 
-_MAX_REPORTED_PATHS = MAX_REPORTED_PATHS
-_safe_path_label = safe_path_label
 _paths_detail = paths_detail
 
 
@@ -258,30 +241,6 @@ class StepExecutionOutcome:
     deferred_verify: str = ""
     mismatch_retry_count: int = 0
     no_change: bool = False
-
-
-class DeferredStepExecutionOutcome:
-    """A clean mismatch result without widening the normal outcome schema."""
-
-    status = "DEFERRED_CONTRACT_MISMATCH"
-
-    def __init__(
-        self, *, step_id: str, profile_id: str, tree_before: str,
-        tree_after: str, changed_paths: tuple[str, ...], usage: dict[str, int],
-        final_report: str, mismatch: str, initial_mismatch: str = "",
-        mismatch_retry_count: int = 0, deferred_verify: str = "",
-    ) -> None:
-        self.step_id = step_id
-        self.profile_id = profile_id
-        self.tree_before = tree_before
-        self.tree_after = tree_after
-        self.changed_paths = changed_paths
-        self.usage = usage
-        self.final_report = final_report
-        self.mismatch = mismatch
-        self.initial_mismatch = initial_mismatch
-        self.mismatch_retry_count = mismatch_retry_count
-        self.deferred_verify = deferred_verify
 
 
 _SYNTHETIC_NO_CHANGE_MISMATCH = (
@@ -598,18 +557,6 @@ class CheckRepairScope:
     policy: str
     bound: int
     source: str
-
-    @property
-    def base_paths(self) -> tuple[str, ...]:
-        """Compatibility alias for the approved cycle envelope."""
-
-        return self.approved_mutable_scope
-
-    @property
-    def effective_paths(self) -> tuple[str, ...]:
-        """Compatibility alias for the worker's current writable scope."""
-
-        return self.effective_repair_scope
 
 
 @dataclasses.dataclass(frozen=True)

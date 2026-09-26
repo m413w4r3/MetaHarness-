@@ -37,7 +37,6 @@ from .protocol import (
     V2PlanParseError,
     parse_task_plan_v2,
     render_plan_summary_v2,
-    render_safe_profile_catalogue,
     render_step_contract,
     validate_step_contract_bounds,
 )
@@ -325,8 +324,6 @@ def validate_implementation_bundle(
     return payload, hashlib.sha256(bundle_bytes).hexdigest()
 
 
-persist_implementation_bundle = write_implementation_bundle
-render_profile_catalogue = render_safe_profile_catalogue
 
 
 def persist_planning_v2_artifacts(
@@ -355,7 +352,6 @@ def persist_planning_v2_artifacts(
         write_implementation_bundle(target, plan)
 
 
-persist_planning_artifacts_v2 = persist_planning_v2_artifacts
 
 
 def write_task_plan_v2(target: Path, plan: TaskPlanV2) -> None:
@@ -577,8 +573,6 @@ __all__ = [
     "STEP_REPAIR_OUTPUT_ATTEMPTS_DIR",
     "StepContractRepairArtifactError",
     "StepRepairAttemptFiles",
-    "persist_implementation_bundle",
-    "persist_planning_artifacts_v2",
     "persist_planning_v2_artifacts",
     "persist_recovered_plan_artifacts",
     "persist_recovered_repair_artifacts",
@@ -589,7 +583,6 @@ __all__ = [
     "read_planning_session",
     "recover_existing_repair_plan",
     "render_json",
-    "render_profile_catalogue",
     "sha256_bytes",
     "step_contract_path",
     "step_repair_attempt_files",

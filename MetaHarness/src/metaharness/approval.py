@@ -124,7 +124,7 @@ def compute_plan_identity(
 
 def _check_authority_payload(
     checks: tuple[CheckConfig, ...],
-    required_check_ids: tuple[str, ...] | None = None,
+    required_check_ids: tuple[str, ...],
 ) -> dict[str, object]:
     entries: list[dict[str, object]] = []
     for check in checks:
@@ -139,17 +139,9 @@ def _check_authority_payload(
         if check.description:
             entry["description"] = check.description
         entries.append(entry)
-    # Schema 1 froze exactly the initially selected checks, so the selection
-    # and the catalogue were the same list.  Schema 2 freezes the whole
-    # trusted catalogue and names the initial selection separately, so a
-    # correction plan can request another approved check without reaching today's
-    # configuration for its argv.
-    if required_check_ids is None:
-        return {
-            "schema_version": 1,
-            "required_check_ids": [check.id for check in checks],
-            "checks": entries,
-        }
+    # The schema 2 artifact freezes the whole trusted catalogue and names the
+    # initial selection separately, so a correction plan can request another
+    # approved check without reaching today's configuration for its argv.
     return {
         "schema_version": 2,
         "required_check_ids": list(required_check_ids),
@@ -159,7 +151,7 @@ def _check_authority_payload(
 
 def _canonical_check_authority(
     checks: tuple[CheckConfig, ...],
-    required_check_ids: tuple[str, ...] | None = None,
+    required_check_ids: tuple[str, ...],
 ) -> bytes:
     return (
         json.dumps(

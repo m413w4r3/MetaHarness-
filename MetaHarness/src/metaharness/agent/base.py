@@ -116,22 +116,3 @@ class AgentProtocolError(AgentError):
     """The worker produced an invalid execution protocol result."""
 
     code = AGENT_PROTOCOL_FAILED
-
-
-def normalized_failure_reason(result: AgentRunResult) -> str | None:
-    """Return the generic durable reason for a normalized result."""
-
-    if result.timed_out or result.exit_reason == AGENT_TIMEOUT:
-        return AGENT_TIMEOUT
-    if result.exit_reason in {
-        AGENT_START_FAILED,
-        AGENT_RUNTIME_FAILED,
-        AGENT_PROTOCOL_FAILED,
-        AGENT_SCOPE_VIOLATION,
-    }:
-        return result.exit_reason
-    if result.exit_code not in (None, 0):
-        return AGENT_RUNTIME_FAILED
-    if result.status not in {"completed", "success", "ok"}:
-        return AGENT_RUNTIME_FAILED
-    return None

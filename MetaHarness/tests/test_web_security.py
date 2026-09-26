@@ -44,7 +44,7 @@ def _config(root: Path, runs: Path) -> HarnessConfig:
         context=ContextConfig(),
         check_catalog=(),
         allow_no_required_checks=True,
-        ui=UIConfig(default_planner_profile="planner", default_implementer_profile="implementer", default_reviewer_profile="reviewer"),
+        ui=UIConfig(default_planner_profile="planner", default_reviewer_profile="reviewer"),
         model_profiles=profiles,
         routing=RoutingConfig(
             mechanical_profile="implementer",
@@ -122,7 +122,7 @@ class LocalServerHardeningTests(unittest.TestCase):
                 with self.subTest(host=host, path=path):
                     status, _headers, content = self.request("GET", path, {"Host": host})
                     self.assertEqual(status, 403)
-                    self.assertNotIn(self.server.token, content)
+                    self.assertNotIn(self.server.browser_token, content)
 
     def test_missing_or_duplicated_host_is_rejected(self) -> None:
         connection = HTTPConnection("127.0.0.1", self.port)
@@ -149,7 +149,7 @@ class LocalServerHardeningTests(unittest.TestCase):
         status, _headers, _content = self.request(
             "POST",
             "/api/runs/waiting/approval",
-            {"Host": f"evil.example:{self.port}", "X-MetaHarness-Token": self.server.token},
+            {"Host": f"evil.example:{self.port}", "X-MetaHarness-Token": self.server.browser_token},
             {"decision": "APPROVE"},
         )
         self.assertEqual(status, 403)
@@ -170,7 +170,7 @@ class LocalServerHardeningTests(unittest.TestCase):
                 status, _headers, _content = self.request(
                     "POST",
                     "/api/runs/waiting/approval",
-                    {"Origin": origin, "X-MetaHarness-Token": self.server.token},
+                    {"Origin": origin, "X-MetaHarness-Token": self.server.browser_token},
                     {"decision": "APPROVE"},
                 )
                 self.assertEqual(status, 403)
@@ -181,7 +181,7 @@ class LocalServerHardeningTests(unittest.TestCase):
             {
                 "Host": f"localhost:{self.port}",
                 "Origin": f"http://localhost:{self.port}",
-                "X-MetaHarness-Token": self.server.token,
+                "X-MetaHarness-Token": self.server.browser_token,
             },
             {"decision": "REJECT"},
         )
@@ -195,7 +195,7 @@ class LocalServerHardeningTests(unittest.TestCase):
             {
                 "Host": f"127.0.0.1:{self.port}",
                 "Origin": "null",
-                "X-MetaHarness-Token": self.server.token,
+                "X-MetaHarness-Token": self.server.browser_token,
             },
             {"spec": "do it", "run_id": "opaque-origin"},
         )
@@ -210,7 +210,7 @@ class LocalServerHardeningTests(unittest.TestCase):
             {
                 "Host": f"127.0.0.1:{self.port}",
                 "Origin": "null",
-                "X-MetaHarness-Token": self.server.token,
+                "X-MetaHarness-Token": self.server.browser_token,
             },
             {"decision": "REJECT"},
         )
@@ -225,7 +225,7 @@ class LocalServerHardeningTests(unittest.TestCase):
             {
                 "Host": f"127.0.0.1:{self.port}",
                 "Origin": "http://evil.example",
-                "X-MetaHarness-Token": self.server.token,
+                "X-MetaHarness-Token": self.server.browser_token,
             },
             {"spec": "do it", "run_id": "foreign-origin"},
         )
@@ -237,7 +237,7 @@ class LocalServerHardeningTests(unittest.TestCase):
         status, _headers, _content = self.request(
             "POST",
             "/api/runs/waiting/approval",
-            {"X-MetaHarness-Token": self.server.token},
+            {"X-MetaHarness-Token": self.server.browser_token},
             {"decision": "REJECT"},
         )
         self.assertEqual(status, 200)
@@ -248,10 +248,10 @@ class LocalServerHardeningTests(unittest.TestCase):
         status, _headers, content = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn("waiting", content)
-        self.assertNotIn(self.server.token, content)
+        self.assertNotIn(self.server.browser_token, content)
         self.assertNotIn("META_TOKEN", content)
         status, _headers, content = self.request("GET", "/api/runs")
-        self.assertNotIn(self.server.token, content)
+        self.assertNotIn(self.server.browser_token, content)
 
     def test_token_only_on_run_page_that_can_decide(self) -> None:
         self.awaiting_run()
@@ -260,15 +260,15 @@ class LocalServerHardeningTests(unittest.TestCase):
         done.update(status="committed", commit_sha="a" * 40)
         status, _headers, awaiting_page = self.request("GET", "/runs/waiting")
         self.assertEqual(status, 200)
-        self.assertIn(self.server.token, awaiting_page)
+        self.assertIn(self.server.browser_token, awaiting_page)
         status, _headers, done_page = self.request("GET", "/runs/done")
         self.assertEqual(status, 200)
-        self.assertNotIn(self.server.token, done_page)
+        self.assertNotIn(self.server.browser_token, done_page)
         self.assertNotIn('name="_token"', done_page)
         self.assertNotIn("<script", done_page)
         for path in ("/api/runs/waiting", "/api/runs/done", "/api/runs/waiting/progress"):
             _status, _headers, content = self.request("GET", path)
-            self.assertNotIn(self.server.token, content)
+            self.assertNotIn(self.server.browser_token, content)
 
     def test_defense_headers_and_nonce_csp(self) -> None:
         self.awaiting_run()

@@ -119,16 +119,6 @@ _WAITING_LABELS = {
 }
 TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
 AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
-# Elements updated in place by /static/run.js (textContent/classList/hidden).
-RUN_PAGE_DYNAMIC_IDS: tuple[str, ...] = (
-    "live-status", "live-updated", "live-current", "live-next", "live-failure",
-    "live-tokens-planner", "live-tokens-implementer", "live-tokens-check_repair",
-    "live-tokens-semantic_reviser", "live-tokens-final_reviewer",
-    "live-events", "refresh-details",
-)
-STATE_POLL_MS = 2000
-
-
 def refresh_seconds_for_run(run: dict[str, Any]) -> int | None:
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = str(state.get("status", run.get("status", "")))
@@ -425,7 +415,6 @@ def _profile_options(
     return "".join(result)
 
 
-_HIGH_WORKER_INPUT_TOKENS = 100_000
 _HIGH_CONTEXT_WARNING = '<span class="danger">High worker context usage</span>'
 _STEP_ICONS = {"completed": "✓", "failed": "✗", "interrupted": "✗", "running": "▶"}
 
@@ -1239,4 +1228,4 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
 <details><summary>Timeline</summary><ul class="timeline">{_timeline_items(status)}</ul></details></section></main>'''
     return _page(f"Run {run_id}", body, nonce=nonce, script=polls)
 
-__all__ = ["AWAITING_APPROVAL_STATUS", "RUN_PAGE_DYNAMIC_IDS", "STATE_POLL_MS", "TERMINAL_STATUSES", "refresh_seconds_for_run", "render_index", "render_new_run", "render_run", "run_page_polls"]
+__all__ = ["AWAITING_APPROVAL_STATUS", "TERMINAL_STATUSES", "refresh_seconds_for_run", "render_index", "render_new_run", "render_run", "run_page_polls"]

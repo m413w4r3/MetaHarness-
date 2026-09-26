@@ -754,7 +754,7 @@ class RunStateProjectionTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.store.set_run_state("publishing")
 
-    def test_every_legacy_status_still_records_its_disposition(self) -> None:
+    def test_every_durable_status_still_records_its_disposition(self) -> None:
         for status in RunStatus:
             with self.subTest(status=status.value):
                 state = self.store.update(status=status)

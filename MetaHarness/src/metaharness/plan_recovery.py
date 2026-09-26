@@ -33,22 +33,18 @@ PLAN_RECOVERY_ARTIFACT = "planner_recovery.json"
 PLAN_RECOVERY_SCHEMA_VERSION = 1
 MAX_REPLACEMENT_PLAN_BYTES = 2 * 1024 * 1024
 # State/failure pairs whose PLANNER checkpoint proves that no executable plan
-# crossed the approval boundary.  The pair is authoritative: a
-# ``PLANNER_BLOCKED`` failure in any other state is not recoverable here.
+# crossed the approval boundary.  The pair is authoritative: a planner failure
+# recorded in any other state is not recoverable here.
 RECOVERABLE_PLANNER_STATE_PAIRS = frozenset({
     ("failed", "PLANNER_OUTPUT_INVALID"),
     # Both planner answers violated the repository preconditions.
     ("failed", "PLAN_REPOSITORY_PRECONDITION_INVALID"),
     ("failed", "LLM_FAILURE"),
-    # The same planner failures once projected onto their waiting conditions.
+    # Terminal recovery projects the same failures onto their waiting states.
     ("waiting_human", "PLANNER_OUTPUT_INVALID"),
     ("waiting_human", "PLAN_REPOSITORY_PRECONDITION_INVALID"),
     ("waiting_external", "LLM_FAILURE"),
-    ("blocked", "PLANNER_BLOCKED"),
 })
-RECOVERABLE_PLANNER_FAILURES = frozenset(
-    reason for _status, reason in RECOVERABLE_PLANNER_STATE_PAIRS
-)
 PLAN_SOURCE_OPERATOR = "operator_recovery"
 PLAN_SOURCE_PLANNER = "planner_model"
 _MAX_RECORD_BYTES = 16 * 1024
@@ -204,7 +200,6 @@ __all__ = [
     "PLAN_SOURCE_PLANNER",
     "PlanRecoveryError",
     "PlanRecoveryInfo",
-    "RECOVERABLE_PLANNER_FAILURES",
     "RECOVERABLE_PLANNER_STATE_PAIRS",
     "plan_recovery_info",
     "plan_source",

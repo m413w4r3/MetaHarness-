@@ -38,7 +38,6 @@ from .codex import (
 )
 from .protocol import (
     CheckRepairResult,
-    build_mismatch_retry_addendum,
     deferred_verify_dependency,
     parse_check_repair_result,
 )
@@ -68,7 +67,6 @@ __all__ = [
     "CodexAuthStatus",
     "CodexAgent",
     "build_agent_environment",
-    "build_mismatch_retry_addendum",
     "classify_codex_failure",
     "check_codex_authentication",
     "deferred_verify_dependency",

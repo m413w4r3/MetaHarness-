@@ -44,8 +44,8 @@ def pipeline_version_from_state(state: Mapping[str, Any]) -> int:
     return 2
 
 
-# The canonical phase vocabulary lives in the model (``RunPhase``); this
-# historical name stays as an alias for the imports that predate it.
+# The canonical phase vocabulary lives in the model (``RunPhase``); the
+# checkpoint exposes the same vocabulary as ``ResumePhase``.
 ResumePhase = RunPhase
 
 
@@ -251,7 +251,7 @@ def mark_checkpoint_completed(run_dir: str | Path) -> None:
         )
 
 
-# Derived, never authored: the legacy status of a phase that is still running.
+# Derived, never authored: the status of a phase that is still running.
 PHASE_STATUS = {
     phase: project_run_outcome(
         RunMachineState(phase, RunDisposition.RUNNING),
@@ -318,9 +318,9 @@ def machine_state_for_run(
 ) -> RunMachineState:
     """Assemble the durable run state: one phase, one disposition.
 
-    The checkpoint owns the phase; the run state owns the posture.  A run
-    written before the canonical vocabulary existed is read through the single
-    legacy bridge :func:`~metaharness.models.disposition_for_status`.
+    The checkpoint owns the phase; the run state owns the posture.  A stored
+    status is read through the single bridge
+    :func:`~metaharness.models.disposition_for_status`.
     """
 
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}

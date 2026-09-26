@@ -454,7 +454,7 @@ def _validate_gate_acceptance(
     )
     if (
         not isinstance(payload, dict)
-        or payload.get("schema_version") not in {1, 2}
+        or payload.get("schema_version") != 2
         or payload.get("review_cycle") != number
         or payload.get("stage") != getattr(stage, "value", stage)
         or not _is_object_id(payload.get("tree_sha"))
@@ -487,10 +487,7 @@ def _validate_gate_acceptance(
                 or not required_checks_passed(evidence)
             )
         )
-        or (
-            payload.get("schema_version") == 2
-            and payload.get("evidence_sha256") != evidence_sha256
-        )
+        or payload.get("evidence_sha256") != evidence_sha256
     ):
         _refuse("the gate acceptance artifact is missing or invalid")
 

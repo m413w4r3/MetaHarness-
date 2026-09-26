@@ -6,7 +6,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping
 
-from .recovery_policy import ExecutionFallbacks, RecoveryBudgets
+from .recovery_policy import RecoveryBudgets
 
 
 class ProfileDriver(StrEnum):
@@ -533,7 +533,7 @@ def transition(current: RunMachineState, event: RunEvent) -> RunMachineState:
 
 # -- the single derived projection -------------------------------------------
 
-# The legacy status of a running phase.  It is the only place these strings
+# The status of a running phase.  It is the only place these strings
 # are chosen; every waiting or terminal status is derived below.
 _RUNNING_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.CONTEXT: RunStatus.PLANNING,
@@ -582,7 +582,7 @@ _SCOPE_APPROVAL_REASON = "WAITING_SCOPE_APPROVAL"
 
 @dataclass(frozen=True)
 class RunOutcome:
-    """The derived, legacy view of one durable run state."""
+    """The derived status view of one durable run state."""
 
     phase: RunPhase | None
     disposition: RunDisposition
@@ -629,9 +629,8 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
         return RunOutcome(phase, disposition, RunStatus.WAITING_SCOPE_APPROVAL, True, True)
     return RunOutcome(phase, disposition, RunStatus.WAITING_HUMAN, False, False)
 
-# The single legacy bridge: a durable status written by code that predates the
-# canonical vocabulary still names exactly one disposition.  Nothing else maps
-# a status onto a disposition.
+# The single status bridge: a durable status names exactly one disposition.
+# Nothing else maps a status onto a disposition.
 _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.CREATED: RunDisposition.RUNNING,
     RunStatus.PLANNING: RunDisposition.RUNNING,
@@ -663,16 +662,15 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
 }
 
 
-# A waiting status written before the canonical vocabulary existed names the
-# operator gate it stopped at; every other wait is already carried by the
-# failure reason.
+# A waiting status names the operator gate it stopped at when the failure
+# reason alone does not carry it.
 _STATUS_WAIT_REASONS: Mapping[RunStatus, str] = {
     RunStatus.WAITING_SCOPE_APPROVAL: "WAITING_SCOPE_APPROVAL",
 }
 
 
 def disposition_for_status(status: RunStatus | str) -> RunDisposition:
-    """The disposition a durable legacy status stands for."""
+    """The disposition a durable run status stands for."""
 
     try:
         return _STATUS_DISPOSITIONS[RunStatus(status)]
@@ -681,7 +679,7 @@ def disposition_for_status(status: RunStatus | str) -> RunDisposition:
 
 
 def wait_reason_for_status(status: RunStatus | str) -> str | None:
-    """The operator gate a durable legacy waiting status stands for."""
+    """The operator gate a durable waiting status stands for."""
 
     try:
         return _STATUS_WAIT_REASONS.get(RunStatus(status))
@@ -963,7 +961,6 @@ class ApprovalConfig:
 class UIConfig:
     max_active_runs: int = 1
     default_planner_profile: str | None = None
-    default_implementer_profile: str | None = None
     default_reviewer_profile: str | None = None
     default_reviser_profile: str | None = None
     default_repair_profile: str | None = None

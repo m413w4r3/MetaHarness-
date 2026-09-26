@@ -335,8 +335,6 @@ class CodexAgent:
         )
         return result
 
-    execute = run
-
     @staticmethod
     def _head(worktree: Path) -> str:
         try:
@@ -382,25 +380,10 @@ class CodexAgent:
             raise AgentError(f"could not start Codex: {exc}") from exc
 
 
-def run_codex(
-    plan: str,
-    worktree: str | Path,
-    artifacts_dir: str | Path,
-    *,
-    config: AgentConfig | None = None,
-    base_sha: str | None = None,
-    env: dict[str, str] | None = None,
-) -> AgentResult:
-    """Functional convenience wrapper for one Codex execution."""
-
-    return CodexAgent(config).run(plan, worktree, artifacts_dir, base_sha=base_sha, env=env)
-
-
 __all__ = [
     "AgentCommittedError",
     "CodexAgent",
     "build_agent_environment",
     "classify_codex_failure",
     "build_implementer_payload",
-    "run_codex",
 ]

@@ -370,7 +370,7 @@ _RECOVERY_LADDERS: Mapping[FailureClass, tuple[RecoveryStrategy, ...]] = {
     FailureClass.UNKNOWN: (RecoveryStrategy.HARD_STOP,),
 }
 
-# The ladder steps one legacy disposition names, most specific first.  A step
+# The ladder steps one disposition names, most specific first.  A step
 # that is not a member of the class ladder or not admitted by the facts is
 # skipped, so the same disposition projects onto the step its class owns.
 _DISPOSITION_LADDER_STEPS: Mapping[RecoveryDisposition, tuple[RecoveryStrategy, ...]] = {

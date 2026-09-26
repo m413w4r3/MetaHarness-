@@ -432,7 +432,6 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
     ui = replace(
         config.ui,
         default_planner_profile=options.planner_profile,
-        default_implementer_profile=None,
         default_reviewer_profile=options.final_reviewer_profile,
         default_reviser_profile=options.semantic_reviser_profile,
         default_repair_profile=options.check_repair_profile,

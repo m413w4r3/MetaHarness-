@@ -57,7 +57,6 @@ class WebServerTests(unittest.TestCase):
             runtime_environment={"API_KEY": "secret-test-value"},
             ui=UIConfig(
                 default_planner_profile="planner",
-                default_implementer_profile="implementer",
                 default_reviewer_profile="reviewer",
             ),
             model_profiles=profiles,
@@ -285,7 +284,7 @@ class WebServerTests(unittest.TestCase):
             )
             for path, body in mutations:
                 with self.subTest(path=path):
-                    status, payload, raw = self.request("POST", path, body, self.server.token)
+                    status, payload, raw = self.request("POST", path, body, self.server.browser_token)
                     self.assertIn(status, (200, 202))
                     self.assertTrue(raw)
                     self.assertIn("application/json", self.last_content_type)
@@ -313,7 +312,7 @@ class WebServerTests(unittest.TestCase):
                 self.assertEqual(status, 403)
                 self.assertEqual(set(payload), {"error", "message"})
         status, payload, _ = self.request(
-            "POST", "/api/v1/runs", {"spec": "x", "arbitrary": True}, self.server.token
+            "POST", "/api/v1/runs", {"spec": "x", "arbitrary": True}, self.server.browser_token
         )
         self.assertEqual(status, 400)
         self.assertEqual(set(payload), {"error", "message"})
@@ -326,7 +325,7 @@ class WebServerTests(unittest.TestCase):
         )
         for path, body in cases:
             with self.subTest(path=path):
-                status, payload, _ = self.request("POST", path, body, self.server.token)
+                status, payload, _ = self.request("POST", path, body, self.server.browser_token)
                 self.assertEqual(status, 400)
                 self.assertIn("application/json", self.last_content_type)
                 self.assertIsNone(self.last_location)
@@ -337,7 +336,7 @@ class WebServerTests(unittest.TestCase):
         self.assertIn("application/json", self.last_content_type)
         self.assertEqual(set(payload), {"error", "message"})
         status, payload, _ = self.request(
-            "POST", "/api/v1/runs/r1/resume", {"unexpected": True}, self.server.token
+            "POST", "/api/v1/runs/r1/resume", {"unexpected": True}, self.server.browser_token
         )
         self.assertEqual(status, 400)
         self.assertEqual(set(payload), {"error", "message"})
@@ -381,7 +380,7 @@ class WebServerTests(unittest.TestCase):
             "POST",
             "/api/runs/waiting/approval",
             {"decision": "REJECT"},
-            self.server.token,
+            self.server.browser_token,
         )
         self.assertEqual(status, 409)
 
@@ -440,7 +439,7 @@ class WebServerTests(unittest.TestCase):
                 "final_reviewer_profile": "reviewer",
                 "step_profile__S01": "implementer",
             },
-            self.server.token,
+            self.server.browser_token,
         )
 
     def test_v2_approval_publishes_the_complete_same_plan_identity(self) -> None:
@@ -483,7 +482,7 @@ class WebServerTests(unittest.TestCase):
             json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),
             encoding="utf-8",
         )
-        fields = {"_token": self.server.token, "decision": "APPROVE", "final_reviewer_profile": "r"}
+        fields = {"_token": self.server.browser_token, "decision": "APPROVE", "final_reviewer_profile": "r"}
         twelve = {f"step_profile__S{number:02d}": "luna" for number in range(1, 13)}
         # The fields for the actual bundle are accepted; the gate then refuses
         # this deliberately incomplete synthetic run.
@@ -512,7 +511,7 @@ class WebServerTests(unittest.TestCase):
     def test_wrong_state_is_conflict(self) -> None:
         self.create_run("done", "committed")
         status, _payload, _ = self.request(
-            "POST", "/api/runs/done/approval", {"decision": "APPROVE"}, self.server.token
+            "POST", "/api/runs/done/approval", {"decision": "APPROVE"}, self.server.browser_token
         )
         self.assertEqual(status, 409)
 
@@ -672,7 +671,7 @@ class WebServerTests(unittest.TestCase):
         self.assertNotIn('action="/runs/before/approval"', page)
         self.assertNotIn('http-equiv="refresh"', page)
         self.assertIn("/static/run.js", page)
-        self.assertNotIn(self.server.token, page)
+        self.assertNotIn(self.server.browser_token, page)
 
         self._create_v2_approval_run("gate")
         page = self.get_html("/runs/gate")

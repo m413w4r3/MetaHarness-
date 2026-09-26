@@ -708,16 +708,15 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(RunOptionsError, "unknown run option: default_implementer_profile"):
             RunOptions.from_config(self.config(), default_implementer_profile="implementer-codex")
 
-    def test_unknown_routing_profiles_never_fall_back_to_the_legacy_ui_field(self) -> None:
+    def test_unknown_routing_profiles_are_rejected(self) -> None:
         config = self.config()
-        legacy_ui = replace(config.ui, default_implementer_profile="implementer-codex")
         unknown_routing = RoutingConfig(
             mechanical_profile="ghost",
             reasoning_profile="ghost",
             agentic_profile="ghost",
         )
         with self.assertRaisesRegex(RunOptionsError, "mechanical_profile is invalid or incompatible"):
-            RunOptions.from_config(replace(config, ui=legacy_ui, routing=unknown_routing))
+            RunOptions.from_config(replace(config, routing=unknown_routing))
 
     def test_unknown_keys_and_missing_sections_are_rejected(self) -> None:
         for mutate, message in (

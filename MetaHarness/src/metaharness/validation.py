@@ -536,9 +536,3 @@ def check_result_json(result: CheckResult, *, log_stem: str | None = None) -> di
         data["stdout_log_path"] = f"checks/{log_stem}.stdout.log"
         data["stderr_log_path"] = f"checks/{log_stem}.stderr.log"
     return data
-
-
-# Descriptive aliases make the boundary easy to find for callers.
-execute_checks = run_checks
-validate_checks = run_checks
-validate = run_checks

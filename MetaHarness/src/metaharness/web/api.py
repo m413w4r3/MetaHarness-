@@ -130,7 +130,6 @@ PROGRESS_MAX_SKIP_BYTES = 8 * 1024 * 1024
 _PROGRESS_SCAN_CHUNK_BYTES = 64 * 1024
 OVERSIZED_EVENT = "[oversized Codex event omitted]"
 MAX_SPEC_BYTES = 48 * 1024
-MAX_DIAGNOSTIC_TAIL_BYTES = 32 * 1024
 MAX_DIFF_BYTES = 64 * 1024
 MAX_RESULT_BYTES = 128 * 1024
 MAX_ARTIFACT_READ_BYTES = 512 * 1024
@@ -925,17 +924,6 @@ def cycle_step_progress_tail(
         return []
     path = _cycle_root(Path(run_dir), cycle) / "implementation" / "steps" / step_id / "agent.events.jsonl"
     return _tail_events(path, max_events, summarize_step_event)
-
-
-def step_progress_tail(
-    run_dir: Path,
-    step_id: str,
-    *,
-    max_events: int = STEP_EVENTS_MAX,
-) -> list[str]:
-    """Latest compact events of one step of the initial cycle."""
-
-    return cycle_step_progress_tail(run_dir, 1, step_id, max_events=max_events)
 
 
 def approve_run(
@@ -1874,7 +1862,6 @@ __all__ = [
     "run_pipeline",
     "MAX_SPEC_BYTES",
     "MAX_STEP_CONTRACT_BYTES",
-    "MAX_DIAGNOSTIC_TAIL_BYTES",
     "MAX_DIFF_BYTES",
     "OVERSIZED_EVENT",
     "PROGRESS_MAX_BYTES",
@@ -1889,7 +1876,6 @@ __all__ = [
     "list_runs",
     "progress",
     "progress_tail",
-    "step_progress_tail",
     "validate_run_id",
     "validate_spec",
 ]

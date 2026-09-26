@@ -49,8 +49,6 @@ architectural discovery.
 """
 
 
-REQUIRE_STAGED_POLICY_TEXT = render_require_staged_policy_text()
-
 
 def render_decomposition_policy_text(
     single_step_max_mutable_paths: int, staged_step_max_mutable_paths: int
@@ -140,40 +138,6 @@ def insert_before_protocol(prompt: str, text: str) -> str:
     if index < 0:
         return prompt.rstrip("\n") + "\n\n" + text
     return prompt[:index] + text + "\n" + prompt[index:]
-
-
-def _apply_execution_mode_policy(
-    prompt: str,
-    policy: str,
-    max_steps_per_plan: int = PlanningConfig.max_steps_per_plan,
-) -> str:
-    """Insert the configured EXECUTION_MODE policy before the wire protocol."""
-
-    if policy == ExecutionModePolicy.AUTO.value:
-        return prompt
-    if policy != ExecutionModePolicy.REQUIRE_STAGED.value:
-        raise ValueError("unknown execution mode policy")
-    return insert_before_protocol(prompt, render_require_staged_policy_text(max_steps_per_plan))
-
-
-def _apply_decomposition_policy(
-    prompt: str,
-    decomposition: str,
-    single_step_max_mutable_paths: int,
-    staged_step_max_mutable_paths: int,
-) -> str:
-    """Insert the AGGRESSIVE mutable-scope policy before the wire protocol."""
-
-    if decomposition == "balanced":
-        return prompt
-    if decomposition != "aggressive":
-        raise ValueError("unknown planning decomposition")
-    return insert_before_protocol(
-        prompt,
-        render_decomposition_policy_text(
-            single_step_max_mutable_paths, staged_step_max_mutable_paths
-        ),
-    )
 
 
 def validate_execution_mode_policy(plan: TaskPlanV2, planning: PlanningConfig) -> None:
@@ -288,7 +252,6 @@ def render_plan_precondition_correction(
 
 
 __all__ = [
-    "REQUIRE_STAGED_POLICY_TEXT",
     "insert_before_protocol",
     "plan_precondition_violations",
     "render_decomposition_policy_text",

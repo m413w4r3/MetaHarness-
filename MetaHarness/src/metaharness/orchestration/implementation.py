@@ -163,28 +163,10 @@ from .step_authority import (
     write_step_candidate,
 )
 from .worker_recovery import TRANSIENT_WORKER_FAILURES
+
+
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
-
-def _archived_step_mismatches(artifact_dir: Path, step_id: str) -> list[str]:
-    """Archived worker mismatch reports of a step, newest attempt first."""
-
-    root = artifact_dir / "attempts"
-    if not root.is_dir():
-        return []
-    reports: list[str] = []
-    for attempt in sorted(
-        (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
-        key=lambda path: int(path.name), reverse=True,
-    ):
-        record = _read_json_artifact(attempt / "step.json", 256 * 1024)
-        if (
-            isinstance(record, dict) and record.get("id") == step_id
-            and record.get("reason") == "AGENT_CONTRACT_MISMATCH"
-            and isinstance(record.get("mismatch"), str)
-        ):
-            reports.append(bounded_v2_report(record["mismatch"]))
-    return reports
 
 
 class ImplementationService:
@@ -603,7 +585,7 @@ class ImplementationService:
 
         authority = resolve()
         effective_step, effective_contract = authority.effective_step, authority.effective_contract
-        # Semantic budget excludes superseded generator bugs and transport retries.
+        # Semantic budget excludes superseded slots and transport retries.
         try:
             repair_count = contract_repair.semantic_repair_count(artifact_dir)
         except ContractRepairIntegrityError as exc:
@@ -630,7 +612,6 @@ class ImplementationService:
             pending_repair = contract_repair.find_pending(
                 artifact_dir, cycle=cycle_number, step_id=step.id,
                 current_contract=effective_contract,
-                legacy_mismatch_sources=_archived_step_mismatches(artifact_dir, step.id),
             )
         except ContractRepairIntegrityError as exc:
             raise PipelineFailure(exc.code, str(exc), step_id=step.id) from exc
@@ -648,44 +629,15 @@ class ImplementationService:
                     f"pending contract repair {pending_repair.number:02d}: {drift}",
                     step_id=step.id,
                 )
-            if contract_repair.legacy_prompt_bug_candidate(artifact_dir):
-                if (
-                    any(field.name == "invariants" for field in dataclasses.fields(ImplementationStep))
-                    or contract_repair.planner_response_durable(pending_repair.directory)
-                    or not contract_repair.legacy_prompt_bug_proven(
-                        pending_repair, step_forbidden=effective_step.forbidden,
-                    )
-                ):
-                    raise PipelineFailure(
-                        "RESUME_INTEGRITY_FAILURE",
-                        "legacy implementer prompt bug evidence is incomplete; operator decision required",
-                        step_id=step.id,
-                    )
-                try:
-                    contract_repair.supersede_legacy_prompt_bug(pending_repair)
-                except (ContractRepairIntegrityError, OSError) as exc:
-                    raise PipelineFailure(
-                        "RESUME_INTEGRITY_FAILURE", str(exc), step_id=step.id,
-                    ) from exc
-                repair_count = contract_repair.semantic_repair_count(artifact_dir)
-                store.update(
-                    status=RunStatus.IMPLEMENTING, current_step=step.id,
-                    contract_repair={
-                        "status": "superseded",
-                        "repair_id": pending_repair.transaction["repair_id"],
-                        "contract_repair_number": pending_repair.number,
-                    },
-                )
-            else:
-                self._contract_repair_transaction(
-                    **repair_context, directory=pending_repair.directory,
-                    number=pending_repair.number, step=effective_step,
-                    current_contract=effective_contract, mismatch=pending_repair.mismatch,
-                    tree_before=pending_repair.tree_sha, profile_id=active_profile_id,
-                    resumed=True,
-                )
-                authority = self._repaired_authority(resolve(), pending_repair.number)
-                effective_step, effective_contract = authority.effective_step, authority.effective_contract
+            self._contract_repair_transaction(
+                **repair_context, directory=pending_repair.directory,
+                number=pending_repair.number, step=effective_step,
+                current_contract=effective_contract, mismatch=pending_repair.mismatch,
+                tree_before=pending_repair.tree_sha, profile_id=active_profile_id,
+                resumed=True,
+            )
+            authority = self._repaired_authority(resolve(), pending_repair.number)
+            effective_step, effective_contract = authority.effective_step, authority.effective_contract
         while True:
             common = {
                 "repo": repo, "worktree": worktree, "base_sha": base_sha,

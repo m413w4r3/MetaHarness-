@@ -161,7 +161,6 @@ class OrchestratorRecommendationTests(unittest.TestCase):
             allow_no_required_checks=True,
             ui=UIConfig(
                 default_planner_profile="planner",
-                default_implementer_profile="impl-a",
                 default_reviewer_profile="review-a",
                 enable_profile_recommendation=enabled,
             ),

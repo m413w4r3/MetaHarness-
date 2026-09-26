@@ -14,7 +14,6 @@ from typing import Any
 from .agent.events import parse_event, summarize_step_event
 from .redaction import REDACTED, redact
 
-PROGRESS_RELATIVE_PATH = "progress/events.v1.jsonl"
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_EVENTS = 20_000
 MAX_MESSAGE = 300

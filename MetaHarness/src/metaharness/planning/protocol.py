@@ -18,11 +18,9 @@ from ..models import (
     ExecutionClass,
     ExecutionMode,
     ImplementationStep,
-    ModelProfile,
     PlanDecision,
     PlanningConfig,
     TaskPlanV2,
-    profile_driver_name,
 )
 from ..plan_repository_validation import MAX_BLOCKERS_CHARS
 from ..step_ids import LAST_STEP_ID, MAX_STEPS, STEP_ID_RE, step_ids
@@ -40,9 +38,6 @@ _STEP_ID = STEP_ID_RE
 STEP_ID_RANGE = f"S01 through {LAST_STEP_ID}"
 _INLINE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*:\s*(.*)$")
 
-_TEXT_SECTIONS = frozenset(
-    {"OBJECTIVE", "CONSTRAINTS", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS"}
-)
 _ENVELOPE_INLINE = frozenset({"STATUS", "TITLE", "EXECUTION_MODE", "STEP_COUNT", "BLOCKER_KIND"})
 _ENVELOPE_SECTIONS = frozenset({"OBJECTIVE", "CONSTRAINTS", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS", "REQUIRED_CHECKS"})
 _STEP_INLINE = frozenset({"TITLE", "EXECUTION_CLASS", "DEPENDS_ON"})
@@ -797,35 +792,6 @@ def render_repair_step_index(plan: TaskPlanV2) -> str:
     )
 
 
-def render_safe_profile_catalogue(profiles: Sequence[ModelProfile]) -> str:
-    """Render planner-visible profile metadata, excluding endpoint credentials."""
-
-    output: list[str] = []
-    for profile in profiles:
-        if not isinstance(profile, ModelProfile):
-            raise TypeError("profiles must contain ModelProfile values")
-        output.append(
-            "\n".join(
-                (
-                    "PROFILE",
-                    f"ID: {profile.id}",
-                    f"DISPLAY_NAME: {profile.display_name}",
-                    f"DRIVER: {profile_driver_name(profile.driver)}",
-                    f"MODEL_LABEL: {profile.model}",
-                    f"EFFORT: {profile.effort or 'NONE'}",
-                    f"DESCRIPTION: {profile.description}",
-                    "STRENGTHS:",
-                    *(f"- {item}" for item in profile.strengths),
-                    f"COST_TIER: {profile.cost_tier}",
-                    f"LATENCY_TIER: {profile.latency_tier}",
-                    f"SELECTION_MODE: {profile.selection_mode.value}",
-                    "END PROFILE",
-                )
-            )
-        )
-    return "\n\n".join(output)
-
-
 def render_safe_check_catalogue(checks: Sequence[CheckConfig]) -> str:
     """Render only trusted check IDs and human descriptions for the planner."""
 
@@ -861,7 +827,6 @@ __all__ = [
     "render_repair_step_index",
     "render_repaired_step_contract",
     "render_safe_check_catalogue",
-    "render_safe_profile_catalogue",
     "render_step_contract",
     "validate_step_contract_bounds",
 ]

@@ -2,7 +2,7 @@
 
 Each row states the recovery disposition the policy must choose, then the
 durable run state a failure that left its recovery loop must project onto:
-one phase, one run disposition, and the derived legacy status.  No row states
+one phase, one run disposition, and the derived status.  No row states
 a status without the phase and disposition it is derived from.  Path-level
 rows drive the real façade with a failure escaping the coordinator and check
 the checkpoint, the disposition and the model calls.

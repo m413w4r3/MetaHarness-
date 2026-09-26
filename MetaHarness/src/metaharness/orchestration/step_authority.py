@@ -305,65 +305,6 @@ def resolve_effective_step_authority(
     return current
 
 
-# -- the approved step, re-read from its hash-bound contract --------------------
-
-_APPROVED_SECTIONS = (
-    ("OBJECTIVE", "OBJECTIVE"), ("READ SET", "READ_SET"), ("WRITE SET", "WRITE_SET"),
-    ("CREATE SET", "CREATE_SET"), ("DELETE SET", "DELETE_SET"),
-    ("INSTRUCTIONS", "INSTRUCTIONS"), ("VERIFY", "VERIFY"), ("FORBIDDEN", "FORBIDDEN"),
-)
-
-
-def approved_step_from_contract(
-    contract: str, *, depends_on: str | None, max_read_paths_per_step: int,
-) -> tuple[ImplementationStep, int]:
-    """Re-read an approved ``META IMPLEMENTATION STEP v1`` contract.
-
-    The contract is MetaHarness' own rendering (hash-bound by the approved
-    bundle); its fixed section order is the only structure relied on.  The
-    result is parsed by the same strict repair parser, never trusted as text.
-    """
-
-    text = contract.replace("\r\n", "\n")
-    if not text.startswith("META IMPLEMENTATION STEP v1\n\n"):
-        raise V2PlanParseError("approved step contract header is invalid")
-    header_step = re.search(r"\n\nSTEP\n(S\d{2}) / (\d{2})\n\nTITLE\n(.+?)\n\nEXECUTION CLASS\n([A-Z]+)\n\n", text)
-    if header_step is None:
-        raise V2PlanParseError("approved step contract identity is invalid")
-    step_id, count, title, execution_class = header_step.groups()
-    position = header_step.end() - 2
-    bodies: dict[str, str] = {}
-    labels = [label for label, _ in _APPROVED_SECTIONS] + ["END META IMPLEMENTATION STEP"]
-    for index, (label, _canonical) in enumerate(_APPROVED_SECTIONS):
-        opening = f"\n\n{label}\n"
-        if not text.startswith(opening, position):
-            raise V2PlanParseError(f"approved step contract section {label} is missing")
-        start = position + len(opening)
-        closing = f"\n\n{labels[index + 1]}\n"
-        end = text.find(closing, start)
-        if end < 0:
-            raise V2PlanParseError(f"approved step contract section {label} is unterminated")
-        bodies[label] = text[start:end]
-        position = end
-    repair = "\n\n".join((
-        "META STEP CONTRACT REPAIR v1",
-        f"STEP_ID: {step_id}",
-        f"TITLE: {title}",
-        f"EXECUTION_CLASS: {execution_class}",
-        f"DEPENDS_ON: {depends_on or 'NONE'}",
-        *(f"{canonical}\n{bodies[label]}" for label, canonical in _APPROVED_SECTIONS),
-        "END META STEP CONTRACT REPAIR",
-    )) + "\n"
-    step = parse_step_contract_repair(
-        repair, max_read_paths_per_step=max_read_paths_per_step,
-        expected_step_id=step_id, expected_title=title,
-        expected_execution_class=execution_class,
-        expected_depends_on=depends_on or "NONE",
-        expected_plan_step_count=int(count),
-    )
-    return step, int(count)
-
-
 # -- the durable step candidate ----------------------------------------------------
 
 
@@ -461,43 +402,10 @@ def write_authority_diagnostic(step_dir: Path, authority: EffectiveStepAuthority
     )
 
 
-# -- scope policy of repair additions ---------------------------------------------
-
-
-def strict_repair_scope_authorizer(policy: Any) -> Callable[[Path, list[str]], None]:
-    """Re-check a validated repair's additions against the frozen scope policy.
-
-    Used where no operator interaction can happen (resume, status): a
-    missing approval of a validated repair is an integrity failure.
-    """
-
-    from ..approval import ApprovalDecision, ApprovalError, read_scope_approval
-
-    def authorize(directory: Path, added: list[str]) -> None:
-        if policy.policy == "deny-expansion":
-            raise _refuse(directory, "scope expansion is denied by the run policy")
-        if policy.policy == "require-approval" or len(added) > policy.max_added_paths:
-            delta_path = directory / "scope_delta.json"
-            delta = _read_json(delta_path)
-            if not isinstance(delta, dict) or delta.get("added_paths") != sorted(added):
-                raise _refuse(directory, "scope delta is malformed")
-            try:
-                approval = read_scope_approval(
-                    directory, expected_sha256=_sha256_bytes(delta_path.read_bytes()),
-                )
-            except (OSError, ApprovalError) as exc:
-                raise _refuse(directory, "scope approval is invalid") from exc
-            if approval is None or approval.decision is not ApprovalDecision.APPROVE:
-                raise _refuse(directory, "scope expansion was not approved")
-
-    return authorize
-
-
 __all__ = [
-    "strict_repair_scope_authorizer",
     "EffectiveStepAuthority", "EffectiveStepExecution", "SOURCE_APPROVED", "SOURCE_CONTRACT_REPAIR",
     "STEP_ACCEPTANCE_NAME", "STEP_AUTHORITY_NAME", "STEP_CANDIDATE_NAME",
-    "StepAuthorityError", "approved_step_authority", "approved_step_from_contract",
+    "StepAuthorityError", "approved_step_authority",
     "build_step_candidate", "canonical_sha256", "mutable_paths", "read_step_candidate",
     "resolve_effective_step_authority", "write_authority_diagnostic", "write_step_candidate",
 ]

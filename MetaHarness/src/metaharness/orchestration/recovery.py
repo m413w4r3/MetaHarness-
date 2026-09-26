@@ -46,8 +46,8 @@ from .pipeline_v2 import PipelineFailure, RecoveryStepUnavailable
 class RecoveryTerminalState:
     """One terminal projection: the disposition, and its derived status.
 
-    ``status`` is the legacy spelling of the projection; ``disposition`` and
-    ``phase`` are the durable state it was derived from.
+    ``status`` is the RunStatus spelling of the projection; ``disposition``
+    and ``phase`` are the durable state it was derived from.
     """
 
     status: RunStatus
@@ -219,7 +219,7 @@ def _attempt_record(attempt: RecoveryAttempt, **overrides: Any) -> dict[str, Any
     return {**asdict(attempt), **overrides}
 
 
-_LEGACY_IDENTITY = ("phase", "reason", "attempt", "budget_key", "cycle", "step_id", "tree_before")
+_ATTEMPT_IDENTITY = ("phase", "reason", "attempt", "budget_key", "cycle", "step_id", "tree_before")
 
 
 @dataclass(frozen=True)
@@ -296,14 +296,14 @@ class RecoveryCoordinator:
                         "recovery operation_id was reused with different attempt data",
                     )
                 return
-        # Records written before stable identities existed describe the same
-        # semantic operation once per resume; keep only this one.
-        identity = tuple(record.get(key) for key in _LEGACY_IDENTITY)
+        # Records without a stable operation_id describe the same semantic
+        # operation once per resume; keep only this one.
+        identity = tuple(record.get(key) for key in _ATTEMPT_IDENTITY)
         attempts = [
             item for item in attempts
             if not (
                 isinstance(item, dict) and "operation_id" not in item
-                and tuple(item.get(key) for key in _LEGACY_IDENTITY) == identity
+                and tuple(item.get(key) for key in _ATTEMPT_IDENTITY) == identity
             )
         ]
         self._store.update(

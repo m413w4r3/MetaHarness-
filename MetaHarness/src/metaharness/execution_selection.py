@@ -92,27 +92,6 @@ def _selected(config: HarnessConfig, profile_id: str, role: ExecutionRole) -> Se
     )
 
 
-def _canonical_step_items(step_profile_ids: Mapping[str, str]) -> list[tuple[str, str]]:
-    if not isinstance(step_profile_ids, Mapping) or not step_profile_ids:
-        raise ExecutionSelectionError("execution selection steps are required")
-    items = list(step_profile_ids.items())
-    if len(items) > MAX_STEPS:
-        raise ExecutionSelectionError(f"execution selection may contain at most {MAX_STEPS} steps")
-    if any(
-        not isinstance(step_id, str)
-        or STEP_ID_RE.fullmatch(step_id) is None
-        or not isinstance(profile_id, str)
-        or not profile_id.strip()
-        for step_id, profile_id in items
-    ):
-        raise ExecutionSelectionError("execution selection step is invalid")
-    items.sort(key=lambda item: int(item[0][1:]))
-    ids = [item[0] for item in items]
-    if ids != list(step_ids(len(ids))):
-        raise ExecutionSelectionError("execution selection step IDs must be contiguous from S01")
-    return items
-
-
 def resolve_execution_selection(
     config: HarnessConfig,
     *,

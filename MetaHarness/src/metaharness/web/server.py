@@ -163,12 +163,6 @@ class MetaHarnessHTTPServer(ThreadingHTTPServer):
         )
         super().__init__(address, MetaHarnessRequestHandler)
 
-    @property
-    def token(self) -> str:
-        """Compatibility alias for the token embedded in browser forms."""
-
-        return self.browser_token
-
 
 def load_or_create_control_token(token_file: str | Path) -> str:
     """Read one bounded token or atomically create a private token file."""

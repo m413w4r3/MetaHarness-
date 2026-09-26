@@ -632,9 +632,3 @@ def collect_evidence(
     if evidence_dir is not None:
         persist_evidence(bundle, evidence_dir, write_logs=False, secrets=secrets)
     return bundle
-
-
-# Names that read naturally at call sites and preserve a small, stable API.
-build_evidence = collect_evidence
-build_evidence_bundle = collect_evidence
-freeze_evidence = collect_evidence

@@ -160,13 +160,6 @@ def payload_for_rendered_request(
     )
 
 
-def _section_block(name: str, text: str) -> str:
-    # Tags make the contract visible to a model and keep identical section
-    # names unambiguous in the rendered request.
-    label = name.upper().replace("_", " ")
-    return f"<{label}>\n{text}\n</{label}>"
-
-
 def _render_template(template: str, values: Mapping[str, str]) -> str:
     """Single, non-recursive placeholder substitution."""
 

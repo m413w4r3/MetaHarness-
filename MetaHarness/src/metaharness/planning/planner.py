@@ -164,10 +164,7 @@ def build_planner_prompt_v2(*args: Any, **kwargs: Any) -> str:
     return build_planner_payload_v2(*args, **kwargs).rendered
 
 
-# Diagnostic target, not a parser gate: a typical repair request must
-# stay under it because duplicated evidence was removed, never by truncating
-# the SPEC, the reviewer result, the approved scope or the required checks.
-REPAIR_PLANNER_INLINE_TARGET_BYTES = 96 * 1024
+
 
 _REPAIR_EVIDENCE_HEADER = "REPAIR PLANNER EVIDENCE v1"
 _REPAIR_EVIDENCE_FOOTER = "END REPAIR PLANNER EVIDENCE"
@@ -296,49 +293,6 @@ def build_repair_planner_prompt_bundle(
         fallback_prompt=render(_FILE_EVIDENCE_DELIVERY, _MOVED_EVIDENCE_PLACEHOLDER),
         evidence_text=evidence_text,
     )
-
-
-def build_repair_planner_prompt(
-    *,
-    repository_reference: str,
-    original_spec: str,
-    original_plan_summary: str,
-    original_step_index: str,
-    current_repository_state: str,
-    candidate_code_evidence: str,
-    previous_cycle_checks: str,
-    previous_revision_report: str,
-    original_approved_mutable_scope: str,
-    reviewer_result: str,
-    template: str | None = None,
-    check_catalog: Sequence[CheckConfig] = (),
-    original_required_check_ids: Sequence[str] = (),
-    staged_step_max_mutable_paths: int = PlanningConfig.staged_step_max_mutable_paths,
-    max_steps_per_plan: int = PlanningConfig.max_steps_per_plan,
-    max_read_paths_per_step: int = PlanningConfig.max_read_paths_per_step,
-    max_step_contract_chars: int = PlanningConfig.max_step_contract_chars,
-) -> str:
-    """Build the bounded corrective planner request delivered inline."""
-
-    return build_repair_planner_prompt_bundle(
-        repository_reference=repository_reference,
-        original_spec=original_spec,
-        original_plan_summary=original_plan_summary,
-        original_step_index=original_step_index,
-        current_repository_state=current_repository_state,
-        candidate_code_evidence=candidate_code_evidence,
-        previous_cycle_checks=previous_cycle_checks,
-        previous_revision_report=previous_revision_report,
-        original_approved_mutable_scope=original_approved_mutable_scope,
-        reviewer_result=reviewer_result,
-        template=template,
-        check_catalog=check_catalog,
-        original_required_check_ids=original_required_check_ids,
-        staged_step_max_mutable_paths=staged_step_max_mutable_paths,
-        max_steps_per_plan=max_steps_per_plan,
-        max_read_paths_per_step=max_read_paths_per_step,
-        max_step_contract_chars=max_step_contract_chars,
-    ).inline_prompt
 
 
 class PlannerV2:
@@ -835,37 +789,12 @@ class RepairPlannerV2:
         return plan, normalize_usage(self.last_usage)
 
 
-def run_planner_v2(
-    client: TextCompletionClient,
-    spec: str,
-    context: str,
-    *,
-    repository_reference: RepositoryReference | None = None,
-    planning: PlanningConfig | None = None,
-    artifacts_dir: str | Path | None = None,
-    template: str | None = None,
-    check_catalog: Sequence[CheckConfig] = (),
-    default_check_ids: Sequence[str] = (),
-) -> TaskPlanV2:
-    return PlannerV2(
-        client,
-        repository_reference=repository_reference,
-        planning=planning,
-        template=template,
-        check_catalog=check_catalog,
-        default_check_ids=default_check_ids,
-    ).plan(spec, context, artifacts_dir=artifacts_dir)
-
-
 __all__ = [
     "REPAIR_EVIDENCE_FILENAME",
-    "REPAIR_PLANNER_INLINE_TARGET_BYTES",
     "PlannerV2",
     "RepairPlannerPromptBundle",
     "RepairPlannerV2",
     "build_planner_payload_v2",
     "build_planner_prompt_v2",
-    "build_repair_planner_prompt",
     "build_repair_planner_prompt_bundle",
-    "run_planner_v2",
 ]

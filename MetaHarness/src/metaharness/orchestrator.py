@@ -440,7 +440,6 @@ class Orchestrator:
 
         self._runtime.persist_recovered_plan(run_id, replacement_raw)
         return self.resume(run_id, on_claimed=on_claimed)
-    execute = run
 
 
 def run_orchestrator(

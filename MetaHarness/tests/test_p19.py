@@ -82,7 +82,6 @@ class P19WebTests(unittest.TestCase):
             model_profiles=profiles,
             ui=UIConfig(
                 default_planner_profile="planner",
-                default_implementer_profile="implementer",
                 default_reviewer_profile="reviewer",
             ),
             routing=RoutingConfig(
@@ -138,7 +137,7 @@ class P19WebTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertNotIn(b"<script", index)
         self.assertIn(b'meta http-equiv="refresh" content="5"', index)
-        self.assertNotIn(self.server.token.encode(), index)
+        self.assertNotIn(self.server.browser_token.encode(), index)
         self.assertIn("script-src 'none'", headers["Content-Security-Policy"])
         self.assertIn("form-action 'self'", headers["Content-Security-Policy"])
 

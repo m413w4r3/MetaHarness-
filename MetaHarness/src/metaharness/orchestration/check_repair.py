@@ -33,7 +33,6 @@ from .shared import (
     CheckRepairScope,
     GateMutableAuthority,
     _PROMPTS_DIR,
-    _check_payload,
     _is_object_id,
     _json_text,
     _read_json_artifact,
@@ -519,20 +518,11 @@ def _read_check_repair_scope(
     if not isinstance(payload, dict):
         raise ResumeIntegrityError("check-repair scope artifact is malformed")
     version = payload.get("schema_version")
-    if version == 2:
-        # Preserve resume compatibility for prior attempts whose base scope
-        # was the entire approved cycle envelope.
-        raw_approved = payload.get("base_mutable_scope")
-        raw_initial = raw_approved
-        raw_added = payload.get("added_paths")
-        raw_effective = payload.get("effective_mutable_scope")
-        legacy = True
-    elif version == 3:
+    if version == 3:
         raw_approved = payload.get("approved_mutable_scope")
         raw_initial = payload.get("initial_repair_scope")
         raw_added = payload.get("added_paths")
         raw_effective = payload.get("effective_repair_scope")
-        legacy = False
     else:
         raise ResumeIntegrityError("check-repair scope artifact has an unsupported schema")
     if not all(isinstance(value, list) for value in (raw_approved, raw_initial, raw_added, raw_effective)):
@@ -563,7 +553,7 @@ def _read_check_repair_scope(
     if (
         parsed_approved != approved
         or not set(parsed_initial).issubset(parsed_approved)
-        or (not legacy and not set(parsed_added).issubset(parsed_approved))
+        or not set(parsed_added).issubset(parsed_approved)
         or set(parsed_initial) & set(parsed_added)
         or parsed_effective != tuple(sorted(set(parsed_initial) | set(parsed_added)))
     ):
@@ -575,13 +565,10 @@ def _read_check_repair_scope(
         raise ResumeIntegrityError("check-repair scope policy changed")
     valid_sources = {
         _HUMAN_SCOPE_SOURCE, _EVIDENCE_SCOPE_SOURCE, _SCOPE_REQUEST_SOURCE,
-        "auto-bounded failing-test evidence",  # schema v2 resume compatibility
     }
     if not isinstance(source, str) or source not in valid_sources:
         raise ResumeIntegrityError("check-repair scope artifact has invalid provenance")
-    if parsed_added and source not in {
-        _SCOPE_REQUEST_SOURCE, "auto-bounded failing-test evidence",
-    }:
+    if parsed_added and source != _SCOPE_REQUEST_SOURCE:
         raise ResumeIntegrityError("check-repair added paths have an invalid provenance")
     if not parsed_added and source not in {_HUMAN_SCOPE_SOURCE, _EVIDENCE_SCOPE_SOURCE}:
         raise ResumeIntegrityError("check-repair initial scope has an invalid provenance")
@@ -669,7 +656,7 @@ def gate_mutable_authority(
             if (
                 not isinstance(attempt, dict)
                 or attempt.get("number") != expected
-                or attempt.get("mutable_scope") != list(scope.effective_paths)
+                or attempt.get("mutable_scope") != list(scope.effective_repair_scope)
             ):
                 raise ResumeIntegrityError("check-repair attempt is not bound to its scope")
         if scopes and not set(scopes[-1].added_paths).issubset(scope.added_paths):
@@ -681,11 +668,11 @@ def gate_mutable_authority(
         raise ResumeIntegrityError("check-repair scope attempts are not contiguous")
     final = scopes[-1]
     return _with_ladder_expansion(GateMutableAuthority(
-        base_paths=final.base_paths,
+        base_paths=final.approved_mutable_scope,
         added_paths=final.added_paths,
-        effective_paths=final.effective_paths,
+        effective_paths=final.effective_repair_scope,
         source=final.source,
-        sha256=mutable_scope_sha256(final.effective_paths),
+        sha256=mutable_scope_sha256(final.effective_repair_scope),
         initial_paths=final.initial_repair_scope,
     ), run_dir=run_dir, cycle=cycle, stage=stage, through_attempt=through_attempt,
         base=base, policy_config=policy_config)
@@ -1464,7 +1451,7 @@ class GateAcceptanceService:
             evidence_sha256 = self._durable_evidence_sha256(directory)
             if (
                 not isinstance(stored, dict)
-                or stored.get("schema_version") not in {1, 2}
+                or stored.get("schema_version") != 2
                 or stored.get("review_cycle") != cycle_plan.cycle.number
                 or not all(_is_object_id(stored.get(key)) for key in ("tree_sha", "commit_sha"))
                 or not isinstance(stored_no_change, bool)
@@ -1484,10 +1471,7 @@ class GateAcceptanceService:
                 or stored.get("tree_sha") != evidence.staged_tree_sha
                 or stored.get("mutable_scope") != list(authority.effective_paths)
                 or stored.get("mutable_scope_sha256") != authority.sha256
-                or (
-                    stored.get("schema_version") == 2
-                    and stored.get("evidence_sha256") != evidence_sha256
-                )
+                or stored.get("evidence_sha256") != evidence_sha256
             ):
                 raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "gate acceptance does not match evidence")
             if current_head(worktree) != stored["commit_sha"]:

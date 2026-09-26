@@ -27,7 +27,6 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +52,6 @@ SCOPE_WAITING = "scope_waiting"
 VALIDATED = "validated"
 COMPLETED = "completed"
 SUPERSEDED = "superseded"
-LEGACY_PROMPT_BUG = "legacy_forbidden_as_invariants_prompt_bug"
 
 _RANK = {
     AWAITING_PLANNER: 0, WAITING_EXTERNAL: 0, AWAITING_OUTPUT_CORRECTION: 0,
@@ -333,7 +331,7 @@ def durable_request_matches(directory: Path, tree_sha: str) -> bool | None:
 
 
 def semantic_repair_count(artifact_dir: Path) -> int:
-    """Count semantic slots; superseded generator bugs use no budget."""
+    """Count the semantic repair slots that consume the repair budget."""
 
     return sum(
         (transaction := read_transaction(directory)) is None
@@ -347,114 +345,10 @@ def next_repair_number(artifact_dir: Path) -> int:
     return int(dirs[-1].name) + 1 if dirs else 1
 
 
-def _prompt_section(prompt: bytes, label: bytes) -> bytes | None:
-    opening = b"<" + label + b">\n"
-    closing = b"\n</" + label + b">"
-    if prompt.count(opening) != 1 or prompt.count(closing) != 1:
-        return None
-    after = prompt.split(opening, 1)[1]
-    return after.split(closing, 1)[0] if closing in after else None
-
-
-def _latest_attempt(artifact_dir: Path) -> Path | None:
-    root = artifact_dir / "attempts"
-    if not root.is_dir():
-        return None
-    attempts = [path for path in root.iterdir() if path.is_dir() and path.name.isdigit()]
-    return max(attempts, key=lambda path: int(path.name)) if attempts else None
-
-
-def legacy_prompt_bug_candidate(artifact_dir: Path) -> bool:
-    attempt = _latest_attempt(artifact_dir)
-    if attempt is None:
-        return False
-    diagnostics = _read_json(attempt / "prompt.diagnostics.json")
-    if not isinstance(diagnostics, dict) or diagnostics.get("role") != "implementer":
-        return False
-    sections = diagnostics.get("sections")
-    return isinstance(sections, list) and any(
-        isinstance(item, dict) and item.get("name") == "step_invariants"
-        for item in sections
-    )
-
-
-def legacy_prompt_bug_proven(
-    pending: PendingContractRepair, *, step_forbidden: str,
-) -> bool:
-    """Prove the archived worker received forbidden bytes under two labels."""
-
-    attempt = _latest_attempt(pending.directory.parent.parent)
-    if attempt is None:
-        return False
-    for attempt in (attempt,):
-        record = _read_json(attempt / "step.json")
-        diagnostics = _read_json(attempt / "prompt.diagnostics.json")
-        if not isinstance(record, dict) or not isinstance(diagnostics, dict):
-            continue
-        if (
-            record.get("id") != pending.step_id
-            or record.get("reason") != "AGENT_CONTRACT_MISMATCH"
-            or record.get("tree_before") != pending.tree_sha
-            or record.get("tree_after") != pending.tree_sha
-            or record.get("mismatch") != pending.mismatch
-            or diagnostics.get("role") != "implementer"
-        ):
-            continue
-        sections = diagnostics.get("sections")
-        if not isinstance(sections, list):
-            continue
-        by_name = {
-            item.get("name"): item for item in sections
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        }
-        invariants = by_name.get("step_invariants")
-        forbidden = by_name.get("forbidden_contract")
-        if not isinstance(invariants, dict) or not isinstance(forbidden, dict):
-            continue
-        try:
-            prompt = (attempt / "agent.prompt.txt").read_bytes()
-        except OSError:
-            continue
-        invariant_bytes = _prompt_section(prompt, b"STEP INVARIANTS")
-        forbidden_bytes = _prompt_section(prompt, b"FORBIDDEN CONTRACT")
-        if invariant_bytes is None or forbidden_bytes is None:
-            continue
-        digest = hashlib.sha256(invariant_bytes).hexdigest()
-        if (
-            invariant_bytes == forbidden_bytes == step_forbidden.encode("utf-8")
-            and digest == invariants.get("sha256") == forbidden.get("sha256")
-            and len(invariant_bytes) == invariants.get("bytes") == forbidden.get("bytes")
-            and invariants.get("authority") is True
-            and forbidden.get("authority") is True
-            and invariants.get("truncated") is False
-            and forbidden.get("truncated") is False
-            and len(prompt) == diagnostics.get("prompt_bytes")
-        ):
-            return True
-    return False
-
-
-def supersede_legacy_prompt_bug(pending: PendingContractRepair) -> dict[str, Any]:
-    if pending.transaction.get("status") not in _AWAITING or planner_response_durable(pending.directory):
-        raise ContractRepairIntegrityError("only a pending planner repair can be superseded")
-    return advance(
-        pending.directory, SUPERSEDED,
-        superseded_reason=LEGACY_PROMPT_BUG,
-        superseded_at=datetime.now(timezone.utc).isoformat(),
-        tree_sha=pending.tree_sha,
-        repair_id=pending.transaction["repair_id"],
-    )
-
-
 def find_pending(
     artifact_dir: Path, *, cycle: int, step_id: str, current_contract: str,
-    legacy_mismatch_sources: list[str],
 ) -> PendingContractRepair | None:
-    """The single unfinished repair slot of a step, if any.
-
-    ``legacy_mismatch_sources`` are archived worker mismatch reports (newest
-    first), used only to adopt a slot created before transaction markers.
-    """
+    """The single unfinished repair slot of a step, if any."""
 
     dirs = repair_dirs(artifact_dir)
     pending: list[Path] = []
@@ -477,9 +371,9 @@ def find_pending(
     directory = pending[0]
     transaction = read_transaction(directory)
     if transaction is None:
-        transaction = _adopt_legacy(
-            directory, cycle=cycle, step_id=step_id, current_contract=current_contract,
-            legacy_mismatch_sources=legacy_mismatch_sources,
+        raise ContractRepairIntegrityError(
+            f"contract repair {directory.name} has no transaction marker; "
+            "operator decision required"
         )
     return _verified(directory, transaction, step_id=step_id, current_contract=current_contract)
 
@@ -515,68 +409,12 @@ def _verified(
     )
 
 
-def _adopt_legacy(
-    directory: Path, *, cycle: int, step_id: str, current_contract: str,
-    legacy_mismatch_sources: list[str],
-) -> dict[str, Any]:
-    """Adopt a pre-transaction slot only when its identity is provable.
-
-    The durable request must be intact and must embed both the current
-    contract and one archived worker mismatch verbatim; otherwise the slot
-    is left untouched and the operator is asked to decide.
-    """
-
-    meta = _read_json(directory / "request.meta.json")
-    tree_sha = meta.get("current_tree_sha") if isinstance(meta, dict) else None
-    if not isinstance(tree_sha, str) or durable_request_matches(directory, tree_sha) is not True:
-        raise ContractRepairIntegrityError(
-            f"contract repair {directory.name} predates transaction markers and "
-            "has no intact durable request; operator decision required"
-        )
-    request = (directory / "planner.request.txt").read_text(encoding="utf-8")
-    mismatch = next(
-        (text for text in legacy_mismatch_sources if text and text in request), None,
-    )
-    if current_contract not in request or mismatch is None:
-        raise ContractRepairIntegrityError(
-            f"contract repair {directory.name} predates transaction markers and "
-            "its mismatch or contract cannot be identified; operator decision required"
-        )
-    number = int(directory.name)
-    status = AWAITING_PLANNER
-    if planner_response_durable(directory):
-        status = PLANNER_RESPONSE_DURABLE
-    validation = _read_json(directory / "validation.json")
-    if isinstance(validation, dict) and validation.get("status") == "planner_validated":
-        status = PLANNER_VALIDATED
-    atomic_write_text(directory / MISMATCH_NAME, json.dumps({
-        "schema_version": SCHEMA_VERSION, "step_id": step_id,
-        "tree_before": tree_sha, "mismatch": mismatch,
-        "mismatch_sha256": sha256_text(mismatch),
-    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-    data = {
-        "schema_version": SCHEMA_VERSION,
-        "repair_id": repair_identity(cycle, step_id, number),
-        "repair_number": number,
-        "cycle": cycle,
-        "step_id": step_id,
-        "original_contract_sha256": sha256_text(current_contract),
-        "mismatch_sha256": sha256_text(mismatch),
-        "tree_sha": tree_sha,
-        "status": status,
-        "planner_transport_attempt": 1,
-        "adopted_legacy_slot": True,
-    }
-    _write(directory, data)
-    return data
-
-
 __all__ = [
     "AWAITING_OUTPUT_CORRECTION", "AWAITING_PLANNER", "COMPLETED", "OUTPUT_CORRECTION_EXHAUSTED",
     "PLANNER_OUTPUT_INVALID", "awaiting_status", "episode_summary", "output_attempt", "ContractRepairIntegrityError", "FINISHED",
     "PLANNER_RESPONSE_DURABLE", "PLANNER_VALIDATED", "PendingContractRepair",
     "SCOPE_WAITING", "SUPERSEDED", "VALIDATED", "WAITING_EXTERNAL", "advance", "begin",
     "durable_request_matches", "ensure", "find_pending", "is_awaiting_planner", "planner_response_durable", "repair_dirs",
-    "legacy_prompt_bug_candidate", "legacy_prompt_bug_proven", "next_repair_number", "repair_identity",
-    "semantic_repair_count", "sha256_text", "supersede_legacy_prompt_bug",
+    "next_repair_number", "repair_identity",
+    "semantic_repair_count", "sha256_text",
 ]

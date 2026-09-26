@@ -52,7 +52,6 @@ def config_for(root: Path, *, max_active_runs: int = 1) -> HarnessConfig:
         ui=UIConfig(
             max_active_runs=max_active_runs,
             default_planner_profile="planner",
-            default_implementer_profile="implementer",
             default_reviewer_profile="reviewer",
         ),
         model_profiles=profiles,
@@ -309,7 +308,7 @@ class HTTPSecurityP15Tests(unittest.TestCase):
         status, index = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn('href="/new">NEW RUN', index)
-        self.assertNotIn(self.server.token, index)
+        self.assertNotIn(self.server.browser_token, index)
         status, page = self.request("GET", "/new")
         self.assertEqual(status, 200)
         self.assertIn("New Run", page)
@@ -317,7 +316,7 @@ class HTTPSecurityP15Tests(unittest.TestCase):
         self.assertIn('<form action="/runs" method="post"', page)
         self.assertNotIn("<script", page)
         self.assertNotIn('http-equiv="refresh"', page)
-        self.assertIn(self.server.token, page)
+        self.assertIn(self.server.browser_token, page)
         self.assertNotIn("innerHTML", page)
 
     def test_post_api_runs_no_token_is_forbidden(self) -> None:
@@ -339,7 +338,7 @@ class HTTPSecurityP15Tests(unittest.TestCase):
                 "Host": "evil.example",
                 "Content-Type": "application/json",
                 "Content-Length": str(len(body)),
-                "X-MetaHarness-Token": self.server.token,
+                "X-MetaHarness-Token": self.server.browser_token,
             },
             body,
         )
@@ -354,7 +353,7 @@ class HTTPSecurityP15Tests(unittest.TestCase):
                 "Origin": "http://evil.example",
                 "Content-Type": "application/json",
                 "Content-Length": str(len(body)),
-                "X-MetaHarness-Token": self.server.token,
+                "X-MetaHarness-Token": self.server.browser_token,
             },
             body,
         )
@@ -368,7 +367,7 @@ class HTTPSecurityP15Tests(unittest.TestCase):
             {
                 "Content-Type": "application/json",
                 "Content-Length": str(len(body)),
-                "X-MetaHarness-Token": self.server.token,
+                "X-MetaHarness-Token": self.server.browser_token,
             },
             body,
         )
