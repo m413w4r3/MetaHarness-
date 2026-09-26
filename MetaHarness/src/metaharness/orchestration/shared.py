@@ -374,8 +374,14 @@ def _read_tree_file(path: Path) -> str | None:
     return value if _GIT_OBJECT_ID.fullmatch(value) else None
 
 
-def _is_object_id(value: Any) -> bool:
+def is_object_id(value: Any) -> bool:
+    """Whether `value` names one Git object; the siblings' public spelling."""
+
     return isinstance(value, str) and _GIT_OBJECT_ID.fullmatch(value) is not None
+
+
+# The refoundation's frozen importers still reach for the private spelling.
+_is_object_id = is_object_id
 
 
 def _safe_candidate_tree(worktree: Path) -> str | None:

@@ -145,8 +145,10 @@ Agent failures are classified through the backend-neutral execution contract;
 the role and profile, not a vendor name, determine the route. Check repair is
 never a planner: a failed deterministic signal walks the configured recovery
 ladder, whose check-repair passes stay inside the frozen attempt budget and
-whose replan rungs only replay approved work. Integrity failures are
-fail-closed and never start an LLM/AgentExecutor repair call.
+whose replan rungs rewrite the responsible step contract through the durable
+contract-repair transaction, inside the approved scope, before re-executing
+that step. Integrity failures are fail-closed and never start an
+LLM/AgentExecutor repair call.
 
 Ne pas confondre réparation de check, révision sémantique et reviewer final.
 `REVISE / IMPLEMENTATION` réutilise le plan et appelle le semantic reviser ;

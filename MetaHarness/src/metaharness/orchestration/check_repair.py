@@ -48,10 +48,14 @@ from ..evidence import (
 )
 from ..gitops import tracked_files_in_tree
 from ..gitops import (
+    GitError,
+    changed_paths_between_trees,
     commit_parents,
     commit_repair_tree,
     commit_revision_tree,
     current_head,
+    path_exists_in_tree,
+    read_file_at_commit,
     resolve_tree,
 )
 from ..commit_gate import CommitSafetyError, commit_safety_gate
@@ -747,18 +751,20 @@ class CheckRepairCoordinator:
 #
 # A red deterministic gate walks one ordered ladder of *distinct* strategies
 # before any operator wait: the bounded targeted repair pass, one bounded
-# evidence-proven scope expansion, a replan of the responsible step, a replan
-# of the cycle, one final pass under the configured executor-fallback authority
-# and only then the operator.  Every step is identified by the exact candidate
-# tree, the failed check set, the stage and the strategy, and the durable
-# ledger below never proposes the same strategy twice for those facts: a new
-# tree or a new failed-check set opens a new progression.
+# evidence-proven scope expansion, a contract replan of the evidence-proven
+# responsible step, a replan of the cycle, one final pass under the configured
+# executor-fallback authority and only then the operator.  Every step is
+# identified by the exact candidate tree, the failed check set, the stage and
+# the strategy, and the durable ledger below never proposes the same strategy
+# twice for those facts: a new tree or a new failed-check set opens a new
+# progression.
 #
 # The ladder owns no authority of its own.  A repair pass is bounded by the
 # frozen ``max_check_repair_attempts`` budget, an expansion is bounded by the
 # operator-approved plan scope and the run's repair-scope policy, and every
-# replan re-executes only approved plan work.  Nothing here can grant a model a
-# scope the operator did not approve.
+# replan rewrites one approved step contract through the durable contract
+# repair transaction, inside the scope the operator approved.  Nothing here can
+# grant a model a scope the operator did not approve.
 
 _LADDER_ARTIFACT = "ladder.json"
 _EXPANSION_ARTIFACT = "scope-expansion.json"
@@ -1011,6 +1017,181 @@ def _approved_expansion_scope(
     return tuple(implicated), initial
 
 
+# The bounded evidence one red gate hands to a step contract replan.  Every
+# field is a deterministic fact of this gate episode: the failed check
+# identities, the bounded proof the check itself produced, the implicated
+# approved paths, the diff the step produced between its own boundary tree and
+# the red tree, the Git facts of its declared paths and the bounded summaries
+# of its earlier repairs.  Full logs, cycle history and worker narration never
+# cross this boundary.
+_REPLAN_EVIDENCE_BYTES = 16 * 1024
+_REPLAN_DIFF_FILE_BYTES = 2048
+_MAX_REPLAN_DIFF_PATHS = 8
+_MAX_REPLAN_PATH_FACTS = 16
+_MAX_REPLAN_PREVIOUS_REPAIRS = 2
+_REPLAN_ORIGIN = "deterministic_gate_replan"
+
+
+def _bounded_proof(value: str, limit: int) -> str:
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return value
+    return encoded[:limit].decode("utf-8", errors="replace") + "\n[TRUNCATED]"
+
+
+def _file_in_tree(repo: Path, tree_sha: str, path: str) -> str:
+    """Read one path from a tree object; a missing path is empty, never an error."""
+
+    try:
+        return read_file_at_commit(repo, commit_sha=tree_sha, relative_path=path)
+    except (GitError, OSError, UnicodeError):
+        return ""
+
+
+@dataclasses.dataclass(frozen=True)
+class ReplanProblem:
+    """The durable red-gate facts one contract replan is opened on."""
+
+    red_tree: str
+    failed_check_ids: tuple[str, ...]
+    failure_proof: str
+    implicated_paths: tuple[str, ...]
+
+
+def replan_problem(
+    *, evidence: EvidenceBundle, evidence_dir: Path, repo: Path, worktree: Path,
+    approved_scope: Sequence[str],
+) -> ReplanProblem:
+    """The bounded failure facts of one red gate episode, rebuilt on every resume.
+
+    Everything is read from the durable gate evidence, its archived check logs
+    and Git objects, never from the current worktree content, so a resume
+    rebuilds exactly the same facts.
+    """
+
+    tree, failed = _red_gate_identity(evidence)
+    try:
+        context = json.loads(_check_repair_problem_context(
+            evidence, evidence_dir=evidence_dir, repo=repo, worktree=worktree,
+            tree_sha=tree,
+        ))
+    except (TypeError, ValueError):
+        context = {}
+    checks = context.get("checks") if isinstance(context, dict) else None
+    proofs = [
+        str(item.get("failure_proof"))
+        for item in (checks or ())
+        if isinstance(item, Mapping) and str(item.get("failure_proof") or "").strip()
+    ]
+    implicated, _initial = _approved_expansion_scope(
+        repo=repo, worktree=worktree, tree_sha=tree, evidence_dir=evidence_dir,
+        evidence=evidence, approved=approved_scope,
+    )
+    return ReplanProblem(
+        red_tree=tree, failed_check_ids=failed,
+        failure_proof=_bounded_proof(proofs[0], 4000) if proofs else "",
+        implicated_paths=tuple(implicated),
+    )
+
+
+def replan_mismatch(
+    *, problem: ReplanProblem, step_id: str, cycle: int, stage: GateStage,
+    anchor_tree: str,
+) -> str:
+    """The durable identity of one red-gate contract replan.
+
+    The text is the transaction's mismatch identity: it names the exact gate
+    episode, the step and the two trees, so a resume finds the slot it opened
+    instead of opening a second one.
+    """
+
+    return _json_text({
+        "origin": _REPLAN_ORIGIN,
+        "cycle": cycle,
+        "stage": GateStage(stage).value,
+        "step_id": step_id,
+        "candidate_tree_sha": problem.red_tree,
+        "step_boundary_tree_sha": anchor_tree,
+        "failed_check_ids": list(problem.failed_check_ids),
+        "implicated_paths": list(problem.implicated_paths),
+        "note": (
+            "The deterministic gate stayed red after this approved step ran. "
+            "Repair this step's own contract so its work can satisfy the "
+            "failing check; the failure evidence is authoritative."
+        ),
+    })
+
+
+def replan_slot_origin(mismatch: str) -> Mapping[str, Any] | None:
+    """The parsed origin facts of a contract repair a red gate opened."""
+
+    try:
+        payload = json.loads(mismatch)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("origin") != _REPLAN_ORIGIN:
+        return None
+    return payload
+
+
+def replan_failure_evidence(
+    *, problem: ReplanProblem, repo: Path, step: Any, anchor_tree: str,
+    previous_repairs: Sequence[Mapping[str, Any]] = (),
+) -> str:
+    """The bounded red-gate evidence of one responsible-step contract replan.
+
+    It carries the failed check identities, the first useful failure proof,
+    the implicated approved paths, the diff the step produced between its own
+    accepted boundary tree and the red candidate tree, the Git facts of its
+    declared paths and the bounded summaries of its earlier repairs.  Full
+    logs, cycle history and worker narration never cross this boundary.
+    """
+
+    red_tree = problem.red_tree
+    step_paths = tuple(sorted({
+        *getattr(step, "write_set", ()), *getattr(step, "create_set", ()),
+        *getattr(step, "delete_set", ()),
+    }))
+    try:
+        changed = changed_paths_between_trees(repo, anchor_tree, red_tree)
+    except GitError:
+        changed = ()
+    diff_paths = sorted(set(changed) & set(step_paths))[:_MAX_REPLAN_DIFF_PATHS]
+    return _bounded_proof(_json_text({
+        "failed_check_ids": list(problem.failed_check_ids),
+        "candidate_tree_sha": red_tree,
+        "step_boundary_tree_sha": anchor_tree,
+        "first_failure_proof": problem.failure_proof,
+        "implicated_paths": list(problem.implicated_paths),
+        "step_paths": [
+            {
+                "path": path,
+                "in_step_boundary_tree": path_exists_in_tree(repo, anchor_tree, path),
+                "in_candidate_tree": path_exists_in_tree(repo, red_tree, path),
+            }
+            for path in step_paths[:_MAX_REPLAN_PATH_FACTS]
+        ],
+        "step_diff": {
+            "changed_paths": diff_paths,
+            "files": [
+                {
+                    "path": path,
+                    "before": _bounded_proof(
+                        _file_in_tree(repo, anchor_tree, path), _REPLAN_DIFF_FILE_BYTES,
+                    ),
+                    "after": _bounded_proof(
+                        _file_in_tree(repo, red_tree, path), _REPLAN_DIFF_FILE_BYTES,
+                    ),
+                }
+                for path in diff_paths
+            ],
+        },
+        "previous_repairs": [
+            dict(item) for item in previous_repairs[:_MAX_REPLAN_PREVIOUS_REPAIRS]
+        ],
+    }), _REPLAN_EVIDENCE_BYTES)
+
+
 @dataclasses.dataclass(frozen=True)
 class CheckRepairLadder:
     """The deterministic-gate ladder of one run.
@@ -1021,12 +1202,15 @@ class CheckRepairLadder:
     episode facts and the bounded expansion live here; no model, no planner and
     no worker can widen what the operator already approved.
 
-    ``replay_steps`` is injected by the run: it re-executes approved cycle work
-    for a replan rung and returns the tree it produced, or raises
+    ``replan_steps`` is injected by the run: for one ``REPLAN_STEP`` rung it
+    identifies the responsible step, produces a new bounded contract from the
+    red-gate evidence through the existing durable contract-repair
+    transaction, re-executes that step under its new validated authority with
+    its necessary descendants, and returns the tree it produced.  It raises
     :class:`RecoveryStepUnavailable` when the rung is not applicable.
     """
 
-    replay_steps: Callable[..., str] | None = None
+    replan_steps: Callable[..., str] | None = None
 
     def gate_step(
         self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
@@ -1147,43 +1331,46 @@ class CheckRepairLadder:
         ):
             self._authorize_expansion(ctx, cycle_plan, stage_value, step, failed)
 
-    def replay_step(
+    def replan_step(
         self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
         step: GateRecoveryStep, evidence: EvidenceBundle,
     ) -> str:
-        """Re-execute the approved work of one replan rung.
+        """Rewrite and re-execute the responsible approved step of one rung.
 
-        The ladder owns no scope of its own: the injected replay re-runs only
-        steps of the approved cycle plan, under their own contracts, and the
-        returned tree is what the next gate episode observes.
+        The ladder owns no scope of its own.  The rung must name exactly the
+        evidence-proven responsible step and the descendants its rewritten
+        commit invalidates, and the injected replan owns the durable contract
+        repair, the new validated authority and the re-execution; the returned
+        tree is what the next gate episode observes.  A rung whose facts no
+        longer hold is refused without touching the repository.
         """
 
         if step.exhausted or step.is_repair_pass or not step.step_indices:
             raise RecoveryStepUnavailable(step.strategy, "the ladder step is not a replan rung")
-        if self.replay_steps is None:
+        if step.strategy is not RecoveryStrategy.REPLAN_STEP:
             raise RecoveryStepUnavailable(
-                step.strategy, "this run admits no replay of approved cycle work",
+                step.strategy, "only a single responsible step is replanned for now",
             )
-        number = cycle_plan.cycle.number
+        if self.replan_steps is None:
+            raise RecoveryStepUnavailable(
+                step.strategy, "this run admits no contract replan of approved work",
+            )
         stage_value = GateStage(stage)
         tree, _failed = _red_gate_identity(evidence)
-        self._require_replayable(cycle_plan, step)
-        produced = self.replay_steps(ctx, cycle_plan, stage_value, step, tree)
-        if not isinstance(produced, str) or not produced:
-            raise ResumeIntegrityError("the gate recovery replay produced no candidate tree")
-        return produced
-
-    @staticmethod
-    def _require_replayable(cycle_plan: Any, step: GateRecoveryStep) -> None:
-        """A replan rung only replays indices of the approved plan."""
-
         count = len(cycle_plan.plan.steps)
-        if not step.step_indices or any(
-            index < 0 or index >= count for index in step.step_indices
-        ):
+        first = step.step_indices[0]
+        if step.step_indices != tuple(range(first, count)):
             raise RecoveryStepUnavailable(
-                step.strategy, "the ladder step does not name approved plan steps",
+                step.strategy, "the rung does not replan a responsible step and its descendants",
             )
+        if self._responsible_step_index(ctx, cycle_plan, stage_value, evidence) != first:
+            raise RecoveryStepUnavailable(
+                step.strategy, "the rung does not name the evidence-proven responsible step",
+            )
+        produced = self.replan_steps(ctx, cycle_plan, stage_value, step, evidence)
+        if not isinstance(produced, str) or not produced:
+            raise ResumeIntegrityError("the gate recovery replan produced no candidate tree")
+        return produced
 
     def finish_step(
         self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
@@ -1341,24 +1528,24 @@ class CheckRepairLadder:
                 strategy, repair_attempt=repair_attempt, added_paths=proof, **common,
             )
         if strategy in {RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.REPLAN_CYCLE}:
-            if self.replay_steps is None:
+            if strategy is RecoveryStrategy.REPLAN_CYCLE:
+                # A cycle replan is not implemented yet: rather than pretend
+                # to replan and re-execute approved work unchanged, the rung
+                # is deterministically inapplicable and the ladder advances.
                 return None
-            if strategy is RecoveryStrategy.REPLAN_STEP:
-                index = self._responsible_step_index(ctx, cycle_plan, stage, evidence)
-                if index is None:
-                    return None
-                # A replan replays the responsible approved step and every
-                # later step of the cycle: a rewritten commit cannot keep
-                # descendants of the work it replaced.
-                return GateRecoveryStep(
-                    strategy,
-                    step_indices=tuple(range(index, len(cycle_plan.plan.steps))), **common,
-                )
-            # A single-step cycle would replay exactly the step replan.
-            if len(cycle_plan.plan.steps) < 2:
+            if self.replan_steps is None:
                 return None
+            index = self._responsible_step_index(ctx, cycle_plan, stage, evidence)
+            if index is None:
+                # No step is proven responsible by the failure evidence: a
+                # replan would guess, so this rung is refused for these exact
+                # facts and the ladder proposes its next distinct strategy.
+                return None
+            # A replan rewrites the responsible approved step and re-executes
+            # it with the descendants its rewritten commit invalidates.
             return GateRecoveryStep(
-                strategy, step_indices=tuple(range(len(cycle_plan.plan.steps))), **common,
+                strategy,
+                step_indices=tuple(range(index, len(cycle_plan.plan.steps))), **common,
             )
         return None
 

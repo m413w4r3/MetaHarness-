@@ -497,8 +497,9 @@ class GateRecoveryStep:
     """One distinct ladder strategy a red deterministic gate must try next.
 
     ``repair_attempt`` names the bounded check-repair pass this step consumes
-    when the step is a repair pass; a step that re-executes approved cycle work
-    names the plan indices it replays instead.  ``exhausted`` is true only once
+    when the step is a repair pass; a step that rewrites and re-executes
+    approved cycle work names the plan indices it replans instead.
+    ``exhausted`` is true only once
     every strategy of the failure class is consumed or deterministically
     inapplicable for these exact facts; the gate may then wait for an operator.
     """
@@ -597,16 +598,18 @@ class RecoveryOperations(Protocol):
 
         ...
 
-    def replay_step(
+    def replan_step(
         self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
         step: GateRecoveryStep, evidence: EvidenceBundle,
     ) -> str:
-        """Execute one replan rung on approved work; return the tree after it.
+        """Replan the responsible approved step of one rung; return its tree.
 
-        The implementation re-executes only steps of the approved cycle plan,
-        under their own approved contracts and effective authority, and raises
-        :class:`RecoveryStepUnavailable` when the rung cannot be executed
-        deterministically.  It never widens a scope.
+        The implementation rewrites that step's contract through the durable
+        contract repair transaction, from this gate's bounded failure evidence
+        and inside the operator-approved scope, proves the new authority
+        durably and re-executes the step with its necessary descendants.  It
+        raises :class:`RecoveryStepUnavailable` when the rung cannot be
+        executed deterministically and never widens a scope.
         """
 
         ...

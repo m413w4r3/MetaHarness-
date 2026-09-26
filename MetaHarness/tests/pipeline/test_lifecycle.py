@@ -20,6 +20,7 @@ from tests.pipeline.support import (
     initial_plan,
     ladder_ledger,
     ladder_strategies,
+    repaired_step_contract,
     review,
     write,
 )
@@ -96,12 +97,15 @@ class LifecycleTests(PipelineHarness):
             write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
         )
         result = self.orchestrator(
-            self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
+            self.config(),
+            planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=[review()],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR)
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
         # A zero budget refuses the worker pass; the autonomous replan rung of
-        # the ladder still ran before the operator was asked.
+        # the ladder still rewrote and re-ran the step before the operator was
+        # asked, and the re-run stayed red.
         self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
         self.assertEqual(ladder_strategies(self), ["replan_step"])
         self.assertFalse(

@@ -18,6 +18,7 @@ from tests.pipeline.support import (
     check_repair_result,
     initial_plan,
     ladder_strategies,
+    repaired_step_contract,
     review,
     write,
 )
@@ -63,14 +64,16 @@ class RecoveryPathTests(PipelineHarness):
         self.workers.on(ExecutionRole.REPAIR, lambda _request: check_repair_result())
         config = self.config(check_repair=1)
         original = self.orchestrator(
-            config, planner=[initial_plan(STEP)], reviewer=[review()],
+            config,
+            planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=[review()],
         )
         first_planner = original._runtime.planner_client
         waiting = original.run_text(SPEC, run_id="run")
         self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
         # The ladder walked every distinct strategy of this red gate: the
-        # budgeted pass left the tree unchanged, the replan replayed the
-        # approved step without changing it either.
+        # budgeted pass left the tree unchanged, and the one replan of the
+        # responsible approved step rewrote its contract and re-ran it.
         self.assertEqual(ladder_strategies(self), ["repair_targeted", "replan_step"])
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
         self.assertEqual(self.checkpoint()["check_repair_attempt"], 1)
@@ -85,7 +88,9 @@ class RecoveryPathTests(PipelineHarness):
 
         self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles(), roles_before_resume)
-        self.assertEqual(len(first_planner.requests), 1)
+        # The first run bought the plan and its one contract replan; the
+        # operator retry re-ran the deterministic gate and nothing else.
+        self.assertEqual(len(first_planner.requests), 2)
         self.assertEqual(self.planner.requests, [])
         self.assertEqual(counter.read_text(), "4")
 
@@ -102,7 +107,9 @@ class RecoveryPathTests(PipelineHarness):
         )
         config = self.config(check_repair=1)
         waiting = self.orchestrator(
-            config, planner=[initial_plan(STEP)], reviewer=[review()],
+            config,
+            planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=[review()],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
         self.assertEqual(self.state()["check_repair"]["next_action"], "Retry deterministic gate")
@@ -114,7 +121,7 @@ class RecoveryPathTests(PipelineHarness):
         fingerprint = self.state()["check_repair"]["operator_retry_fingerprint"]
 
         resumed = self.orchestrator(
-            config, planner=[initial_plan(STEP)], reviewer=[review()],
+            config, planner=["unused"], reviewer=[review()],
         ).resume("run")
 
         state = self.state()

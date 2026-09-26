@@ -54,6 +54,7 @@ from tests.pipeline_support import (
     PipelineHarness,
     initial_plan,
     ladder_strategies,
+    repaired_step_contract,
     review,
     write,
 )
@@ -544,7 +545,9 @@ class RecoveryPathTests(PipelineHarness):
             write("feature.txt", "bad\n"), write("feature.txt", "bad\n"),
         )
         result = self.orchestrator(
-            self.config(check_repair=0), planner=[initial_plan(STEP)], reviewer=["unused"],
+            self.config(check_repair=0),
+            planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=["unused"],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR)
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")

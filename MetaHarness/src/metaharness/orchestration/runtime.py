@@ -1540,7 +1540,7 @@ class RunRuntime:
             review_repair_exhausted=bind(self.reviews.review_repair_exhausted, store),
             publish=bind(self.publication.publish_candidate, store),
             recovery_operations=CheckRepairLadder(
-                replay_steps=functools.partial(self.gates.replay_approved_steps, store),
+                replan_steps=functools.partial(self.gates.replan_responsible_step, store),
             ),
         )
 

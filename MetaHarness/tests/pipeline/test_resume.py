@@ -281,7 +281,8 @@ class ResumeTests(PipelineHarness):
         self.workers.on(ExecutionRole.REPAIR, lambda _request: check_repair_result())
         config = self.config(check_repair=1)
         waiting = self.orchestrator(
-            config, planner=[initial_plan(STEP)], reviewer=[review()],
+            config, planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=[review()],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
         evidence_path = self.run_dir() / "cycles/001/checks/post-implementation/evidence.json"
@@ -289,7 +290,7 @@ class ResumeTests(PipelineHarness):
         roles_before_resume = self.workers.roles()
 
         resumed = self.orchestrator(
-            config, planner=[initial_plan(STEP)], reviewer=[review()],
+            config, planner=["unused"], reviewer=[review()],
         ).resume("run")
 
         self.assertEqual(resumed.status, RunStatus.FAILED)

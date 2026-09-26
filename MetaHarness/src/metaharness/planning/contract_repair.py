@@ -172,8 +172,15 @@ def build_step_contract_repair_prompt(
     future_ownership: str = "NONE",
     repository_evidence: str = "NONE",
     repository_path_candidates: str = "NONE",
+    failure_evidence: str = "NONE",
 ) -> str:
-    """Build the bounded planner transaction for one worker mismatch."""
+    """Build the bounded planner transaction for one contract repair.
+
+    ``mismatch_explanation`` names why the current contract could not be
+    executed; ``failure_evidence`` carries the bounded deterministic-gate
+    facts when a red gate, not a worker, opened the repair.  Both are inputs
+    of the same single repair protocol.
+    """
 
     return f"""You are the MetaHarness StepContractRepairPlanner.
 
@@ -203,6 +210,10 @@ scope policy. Preserve step identity, dependency and required checks.
 <WORKER MISMATCH>
 {mismatch_explanation}
 </WORKER MISMATCH>
+
+<DETERMINISTIC GATE FAILURE EVIDENCE>
+{failure_evidence}
+</DETERMINISTIC GATE FAILURE EVIDENCE>
 
 <CURRENT READ_SET>
 {read_set}
@@ -236,6 +247,11 @@ clarified and instructions, objective, VERIFY, FORBIDDEN and anchors may be
 repaired. Do not change mutation sets unless the requested work truly requires
 it; any such change is subject to MetaHarness scope policy. An existing file
 that must change belongs to READ_SET and WRITE_SET, never CREATE_SET.
+
+DETERMINISTIC GATE FAILURE EVIDENCE is the bounded, unedited output of the
+failing check that ran after this step: it is authoritative about what failed
+and must never be paraphrased away. Repair the contract so the step's own work
+can satisfy it.
 
 {_step_repair_identity_rules(identity)}
 
@@ -382,6 +398,7 @@ class StepContractRepairPlanner:
         on_response_durable: Callable[[int], None] | None = None,
         on_output_invalid: Callable[[int, str], None] | None = None,
         topology: Any = None,
+        failure_evidence: str = "NONE",
     ) -> ImplementationStep:
         inputs = _RepairInputs(
             identity, original_plan_identity, current_contract,
@@ -398,6 +415,7 @@ class StepContractRepairPlanner:
             future_ownership=future_ownership,
             repository_evidence=repository_evidence,
             repository_path_candidates=render_path_candidates(inputs.topology_entries()),
+            failure_evidence=failure_evidence,
         )
         return self._complete(
             Path(artifacts_dir), request, inputs,

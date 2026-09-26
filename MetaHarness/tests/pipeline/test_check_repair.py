@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
+from metaharness.evidence import EvidenceBundle
 from metaharness.gitops import candidate_tree_sha
-from metaharness.models import ExecutionRole, RunStatus
-from metaharness.recovery_policy import RecoveryBudgets
+from metaharness.llm.chat import LLMError
+from metaharness.models import ExecutionRole, GateStage, RunStatus
+from metaharness.orchestration.check_repair import CheckRepairLadder
+from metaharness.orchestration.recovery import GateRecoveryStep
+from metaharness.recovery_policy import RecoveryBudgets, RecoveryStrategy
+from metaharness.resume import resume_info
 from metaharness.run_options import RunOptions
 
 from tests.pipeline.support import (
@@ -16,13 +25,29 @@ from tests.pipeline.support import (
     STEP,
     PipelineHarness,
     check_repair_result,
+    crash_at_checkpoint,
     git,
     initial_plan,
     ladder_ledger,
     ladder_strategies,
+    repaired_step_contract,
     review,
     write,
 )
+
+
+def _unchanged_repair() -> str:
+    """A planner answer that leaves the failed contract's work untouched."""
+
+    return (
+        repaired_step_contract()
+        .replace("Write feature.txt with the SPEC-required content.", "Write the feature")
+        .replace("1. Set the file to the required content.", "1. Write the feature")
+        .replace(
+            "Do not edit paths outside the approved set.",
+            "Do not change paths outside the declared sets.",
+        )
+    )
 
 
 class CheckRepairTests(PipelineHarness):
@@ -200,7 +225,9 @@ class CheckRepairTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.REPAIR, lambda _request: check_repair_result())
         result = self.orchestrator(
-            self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
+            self.config(check_repair=2),
+            planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
@@ -210,7 +237,8 @@ class CheckRepairTests(PipelineHarness):
             [entry["strategy"] for entry in entries], ["repair_targeted", "replan_step"],
         )
         # The repair pass left the exact candidate tree and failure unchanged,
-        # so the second budgeted pass was refused and the ladder moved on.
+        # so the second budgeted pass was refused and the ladder moved on to a
+        # replan that rewrote the step's contract instead of replaying it.
         self.assertEqual(self.state()["check_repair"]["attempt_count"], 1)
         identities = [
             (entry["strategy"], entry["tree"], tuple(entry["failed_check_ids"]))
@@ -218,6 +246,11 @@ class CheckRepairTests(PipelineHarness):
         ]
         self.assertEqual(len(set(identities)), len(identities))
         self.assertEqual(entries[0]["tree"], entries[1]["tree"])
+        self.assertNotEqual(entries[1]["tree_after"], entries[1]["tree"])
+        self.assertNotEqual(
+            self.workers.calls[0].prompt, self.workers.calls[-1].prompt,
+            "the replanned step was replayed unchanged instead of re-contracted",
+        )
 
     def test_replanned_step_opens_new_facts_for_the_ladder(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
@@ -227,7 +260,9 @@ class CheckRepairTests(PipelineHarness):
             lambda _request: check_repair_result(), write("feature.txt", "good\n"),
         )
         result = self.orchestrator(
-            self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
+            self.config(check_repair=2),
+            planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
@@ -323,7 +358,9 @@ class CheckRepairTests(PipelineHarness):
             )),
         )
         result = self.orchestrator(
-            self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
+            self.config(check_repair=2),
+            planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=[review()],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"))
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
@@ -596,7 +633,9 @@ class CheckRepairTests(PipelineHarness):
             write("feature.txt", "bad\n"), write("feature.txt", "good\n"),
         )
         result = self.orchestrator(
-            self.config(check_repair=0), planner=[initial_plan(STEP)], reviewer=[review()],
+            self.config(check_repair=0),
+            planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
@@ -608,16 +647,10 @@ class CheckRepairTests(PipelineHarness):
             (self.run_dir() / "cycles/001/check-repair/post-implementation/attempts").exists(),
             "an inapplicable repair rung created an attempt or a report",
         )
+        self.assertNotEqual(self.workers.calls[0].prompt, self.workers.calls[-1].prompt)
 
     def test_repair_budget_only_limits_worker_repair_rungs(self) -> None:
         """The frozen budget bounds the worker rungs and nothing else."""
-
-        from types import SimpleNamespace
-
-        from metaharness.evidence import EvidenceBundle
-        from metaharness.models import GateStage
-        from metaharness.orchestration.check_repair import CheckRepairLadder
-        from metaharness.recovery_policy import RecoveryStrategy
 
         red = EvidenceBundle(
             base_sha=self.base_sha, staged_tree_sha=candidate_tree_sha(self.repo),
@@ -641,7 +674,7 @@ class CheckRepairTests(PipelineHarness):
                 repair_scope_policy="deny-expansion", repair_scope_max_added_paths=4,
             ),
         )
-        ladder = CheckRepairLadder(replay_steps=lambda *args, **kwargs: "b" * 40)
+        ladder = CheckRepairLadder(replan_steps=lambda *args, **kwargs: "b" * 40)
 
         def gate(attempt: int, budget: int):
             return ladder.gate_step(
@@ -662,14 +695,277 @@ class CheckRepairTests(PipelineHarness):
         self.assertIs(worker.strategy, RecoveryStrategy.REPAIR_TARGETED)
         self.assertEqual(worker.repair_attempt, 1)
 
+    def _replan_slot(self, step_id: str = "S01", number: int = 1) -> Path:
+        return (
+            self.run_dir() / "cycles/001/implementation/steps" / step_id
+            / "contract_repairs" / f"{number:02d}"
+        )
+
+    def _replanned_run(self, *, check_repair: int = 0):
+        """Run one cycle whose first red gate replans the responsible step."""
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        return self.orchestrator(
+            self.config(check_repair=check_repair),
+            planner=[initial_plan(STEP), repaired_step_contract()],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+    def test_a_red_gate_replans_the_responsible_step_contract(self) -> None:
+        """A red gate rewrites, validates and persists one new bounded contract."""
+
+        result = self._replanned_run()
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+        strategies = ladder_strategies(self)
+        self.assertEqual(strategies, ["replan_step"])
+        self.assertNotIn("replan_cycle", strategies)
+        entries = ladder_ledger(self)["entries"]
+        self.assertEqual(entries[0]["step_indices"], [0])
+        self.assertEqual(entries[0]["state"], "done")
+        self.assertNotEqual(entries[0]["tree"], entries[0]["tree_after"])
+        self.assertEqual(entries[0]["tree_after"], candidate_tree_sha(self.worktree()))
+
+        slot = self._replan_slot()
+        repaired = (slot / "contract.md").read_text(encoding="utf-8")
+        self.assertIn("Write feature.txt with the SPEC-required content.", repaired)
+        self.assertNotEqual(
+            repaired, (self.run_dir() / "steps/S01/contract.md").read_text(encoding="utf-8"),
+        )
+        validation = json.loads((slot / "validation.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            validation["repaired_contract_sha256"],
+            hashlib.sha256(repaired.encode("utf-8")).hexdigest(),
+        )
+        transaction = json.loads((slot / "transaction.json").read_text(encoding="utf-8"))
+        self.assertEqual(transaction["status"], "completed")
+        self.assertEqual(transaction["repair_id"], "contract-repair:cycle-001:S01:01")
+        # The slot was validated on the step's own accepted boundary tree: the
+        # very commit the red candidate tree had been built on.
+        archived = json.loads(
+            (
+                self.run_dir()
+                / "cycles/001/implementation/steps/S01/attempts/01/step.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(archived["tree_after"], entries[0]["tree"])
+        self.assertEqual(archived["tree_before"], transaction["tree_sha"])
+        record = json.loads(
+            (
+                self.run_dir() / "cycles/001/implementation/steps/S01/step.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(record["authority_source"], "contract_repair")
+        self.assertNotEqual(
+            record["effective_contract_sha256"], record["approved_contract_sha256"],
+        )
+        # The planner received this gate's bounded facts, never a full log.
+        request = (slot / "planner.request.txt").read_text(encoding="utf-8")
+        self.assertIn("<DETERMINISTIC GATE FAILURE EVIDENCE>", request)
+        for field in (
+            "failed_check_ids", "candidate_tree_sha", "step_boundary_tree_sha",
+            "first_failure_proof", "implicated_paths", "step_diff", "previous_repairs",
+        ):
+            self.assertIn(field, request)
+        self.assertIn("recovery.replanned", self.trace_names())
+
+    def test_the_replanned_step_worker_receives_the_new_contract(self) -> None:
+        """The re-executed step runs under the repaired authority, not the old one."""
+
+        result = self._replanned_run()
+
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        first, second = self.workers.calls
+        marker = "Write feature.txt with the SPEC-required content."
+        self.assertNotIn(marker, first.prompt)
+        self.assertIn(marker, second.prompt)
+        self.assertIn("Do not edit paths outside the approved set.", second.prompt)
+        self.assertEqual(second.mutable_paths, ("feature.txt",))
+        self.assertEqual(second.role, ExecutionRole.IMPLEMENTER)
+        self.assertNotEqual(first.prompt, second.prompt)
+        self.assertEqual(second.artifact_dir.name, "S01")
+
+    def test_a_resumed_contract_replan_reuses_its_slot_and_operation_id(self) -> None:
+        """A resume continues the durable repair; it never buys a second one."""
+
+        config = self.config(check_repair=0)
+        original = self.orchestrator(
+            config, planner=[initial_plan(STEP), repaired_step_contract()], reviewer=[review()],
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        with crash_at_checkpoint(original, "implement_step", occurrence=3):
+            failed = original.run_text(SPEC, run_id="run")
+
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL, self.state().get("failure"))
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
+        self.assertEqual(self.checkpoint()["phase"], "implement_step")
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(len(original._runtime.planner_client.requests), 2)
+        slot = self._replan_slot()
+        repair_id = json.loads((slot / "transaction.json").read_text())["repair_id"]
+        self.assertEqual(self.state()["contract_repair"]["repair_id"], repair_id)
+
+        resumed = self.orchestrator(
+            config, planner=["unused"], reviewer=[review()],
+        ).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.planner.requests, [], "the resume asked for a second repair")
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+        self.assertEqual([item.name for item in sorted(slot.parent.iterdir())], ["01"])
+        self.assertEqual(
+            json.loads((slot / "transaction.json").read_text())["repair_id"], repair_id,
+        )
+        self.assertEqual(self.state()["contract_repair"]["repair_id"], repair_id)
+        self.assertEqual(
+            [event["event"] for event in self.trace_events()].count("recovery.replanned"), 1,
+        )
+
+    def test_a_red_gate_without_a_proven_responsible_step_skips_the_replan_rung(self) -> None:
+        """No step is proven responsible: the rung is inapplicable, not a replay."""
+
+        # The only approved path this cycle may write is a test file, and the
+        # failing evidence names exactly that file: no approved product path
+        # proves a responsible step, so the replan rung is inapplicable.
+        self._add_tracked_paths("tests/test_feature.py")
+        self.check.write_text(
+            "import sys\n"
+            "print('tests/test_feature.py: the fixture does not match the spec')\n"
+            "raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER, write("tests/test_feature.py", "bad fixture\n"),
+        )
+        result = self.orchestrator(
+            self.config(check_repair=0),
+            planner=[initial_plan(("S01", "tests/test_feature.py", "Write the fixture"))],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(
+            result.status, RunStatus.WAITING_CHECK_REPAIR, self.state().get("failure"),
+        )
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        self.assertEqual(self.state()["failure"]["detail"]["strategies"], [])
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(len(self.planner.requests), 1)
+        self.assertFalse(
+            (self.run_dir() / "cycles/001/check-repair/post-implementation/ladder.json").exists(),
+            "an inapplicable rung was recorded as a replan",
+        )
+        self.assertFalse(
+            self._replan_slot().parent.exists(),
+            "an inapplicable replan rung opened a contract repair",
+        )
+
+    def test_an_unproven_responsible_step_consumes_no_replan_rung(self) -> None:
+        """The rung is refused for these facts; the same facts with a proven
+        responsible step admit it.  REPLAN_CYCLE never claims a replan."""
+
+        step = SimpleNamespace(
+            id="S01", write_set=("feature.txt",), create_set=(), delete_set=(),
+        )
+        cycle_plan = SimpleNamespace(
+            cycle=SimpleNamespace(number=1), plan=SimpleNamespace(steps=(step,)),
+            mutable_scope=("feature.txt",),
+        )
+        ctx = SimpleNamespace(
+            run_dir=self.run_dir(), repo=self.repo,
+            info=SimpleNamespace(worktree=self.repo),
+            selection=SimpleNamespace(check_repair_fallbacks=()),
+            options=SimpleNamespace(
+                repair_scope_policy="deny-expansion", repair_scope_max_added_paths=4,
+            ),
+        )
+
+        def facts(*changed: str) -> EvidenceBundle:
+            return EvidenceBundle(
+                base_sha=self.base_sha, staged_tree_sha=candidate_tree_sha(self.repo),
+                changed_files=changed, diff="", checks=(),
+                deterministic_passed=False, failures=("CHECK_FAILED:test",),
+                required_check_ids=("test",),
+            )
+
+        ladder = CheckRepairLadder(replan_steps=lambda *args, **kwargs: "b" * 40)
+
+        def gate(evidence: EvidenceBundle):
+            return ladder.gate_step(
+                ctx=ctx, cycle_plan=cycle_plan, stage=GateStage.POST_IMPLEMENTATION,
+                evidence=evidence, repair_attempt=1, repair_budget=0,
+            )
+
+        terminal = gate(facts())
+        self.assertTrue(terminal.exhausted)
+        self.assertIs(terminal.strategy, RecoveryStrategy.WAIT_HUMAN)
+        self.assertEqual(terminal.consumed, ())
+        ladder_dir = self.run_dir() / "cycles/001/check-repair/post-implementation"
+        self.assertFalse((ladder_dir / "ladder.json").exists())
+        self.assertFalse((ladder_dir / "attempts").exists())
+
+        # The very same episode with an evidence-proven responsible path.
+        admitted = gate(facts("feature.txt"))
+        self.assertIs(admitted.strategy, RecoveryStrategy.REPLAN_STEP)
+        self.assertEqual(admitted.step_indices, (0,))
+        self.assertIsNot(admitted.strategy, RecoveryStrategy.REPLAN_CYCLE)
+        self.assertNotIn(RecoveryStrategy.REPLAN_CYCLE, admitted.consumed)
+
+    def test_a_replan_answer_identical_to_the_failed_contract_is_never_a_replay(self) -> None:
+        """An unchanged planner answer is refused, never replayed as a replan."""
+
+        unchanged = _unchanged_repair()
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(check_repair=0), planner=[initial_plan(STEP), unchanged],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(
+            result.status, RunStatus.WAITING_CONTRACT_REPAIR, self.state().get("failure"),
+        )
+        failure = self.state()["failure"]
+        self.assertEqual(failure["reason"], "STEP_CONTRACT_REPAIR_OUTPUT_INVALID")
+        self.assertIn("identical", failure["detail"])
+        # The step was never replayed under the contract that produced the red
+        # gate, and the slot holds no validated contract.
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        slot = self._replan_slot()
+        self.assertTrue((slot / "transaction.json").is_file())
+        self.assertFalse((slot / "contract.md").exists())
+
+    def test_a_resumed_replan_still_refuses_the_contract_the_gate_failed_under(self) -> None:
+        """A planner outage resumes the one slot; an unchanged answer is refused."""
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        config = self.config(check_repair=0)
+        waiting = self.orchestrator(
+            config, planner=[initial_plan(STEP), LLMError("planner offline")],
+            reviewer=[review()],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(waiting.status, RunStatus.WAITING_EXTERNAL, self.state().get("failure"))
+        slot = self._replan_slot()
+
+        resumed = self.orchestrator(
+            config, planner=[_unchanged_repair()], reviewer=[review()],
+        ).resume("run")
+
+        self.assertEqual(
+            resumed.status, RunStatus.WAITING_CONTRACT_REPAIR, self.state().get("failure"),
+        )
+        self.assertIn("identical", self.state()["failure"]["detail"])
+        # The interrupted replan resumed its one slot; the step was never
+        # replayed under the very contract that produced the red gate.
+        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(sorted(item.name for item in slot.parent.iterdir()), ["01"])
+        self.assertFalse((slot / "contract.md").exists())
+
     def test_red_gate_has_no_legacy_direct_repair_path(self) -> None:
         """A red gate only ever obeys the ladder, never a direct repair loop."""
-
-        from unittest import mock
-
-        from metaharness.orchestration.check_repair import CheckRepairLadder
-        from metaharness.orchestration.recovery import GateRecoveryStep
-        from metaharness.recovery_policy import RecoveryStrategy
 
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))

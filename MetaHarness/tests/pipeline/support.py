@@ -24,6 +24,7 @@ from tests.pipeline_support import (
     ladder_ledger,
     ladder_strategies,
     plan,
+    repaired_step_contract,
     review,
     write,
 )
@@ -39,41 +40,6 @@ __all__ = [
     "divergent_run_branch", "move_run_branch", "reject_pushes",
     "crash_at_checkpoint", "crash_on_review", "crash_on_revision",
 ]
-
-
-def repaired_step_contract() -> str:
-    return """META STEP CONTRACT REPAIR v1
-STEP_ID: S01
-TITLE: Write the feature
-EXECUTION_CLASS: MECHANICAL
-DEPENDS_ON: NONE
-
-OBJECTIVE
-Write feature.txt with the SPEC-required content.
-
-READ_SET
-- feature.txt :: current content
-
-WRITE_SET
-- feature.txt
-
-CREATE_SET
-NONE
-
-DELETE_SET
-NONE
-
-INSTRUCTIONS
-1. Set the file to the required content.
-
-VERIFY
-- Run the configured test.
-
-FORBIDDEN
-- Do not edit paths outside the approved set.
-
-END META STEP CONTRACT REPAIR
-"""
 
 
 # --- the git transport port -------------------------------------------------

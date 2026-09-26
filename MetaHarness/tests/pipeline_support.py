@@ -175,6 +175,48 @@ def write(path: str, content: str, report: str = "done\n") -> Script:
     return action
 
 
+def repaired_step_contract() -> str:
+    """A valid repair of the standard one-step plan's contract.
+
+    It keeps the approved step identity and mutable scope while changing the
+    objective and instructions, so a red-gate replan produces a genuinely
+    different, still bounded contract.
+    """
+
+    return """META STEP CONTRACT REPAIR v1
+STEP_ID: S01
+TITLE: Write the feature
+EXECUTION_CLASS: MECHANICAL
+DEPENDS_ON: NONE
+
+OBJECTIVE
+Write feature.txt with the SPEC-required content.
+
+READ_SET
+- feature.txt :: current content
+
+WRITE_SET
+- feature.txt
+
+CREATE_SET
+NONE
+
+DELETE_SET
+NONE
+
+INSTRUCTIONS
+1. Set the file to the required content.
+
+VERIFY
+- Run the configured test.
+
+FORBIDDEN
+- Do not edit paths outside the approved set.
+
+END META STEP CONTRACT REPAIR
+"""
+
+
 class ScriptedWorkers:
     """Every worker role answers from its own queue of scripted actions."""
 

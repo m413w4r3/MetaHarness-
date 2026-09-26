@@ -741,11 +741,12 @@ class PipelineV2Coordinator:
                     attempt += 1
                     repair_boundary_written = False
                     break
-                # A replan rung re-executes approved cycle work, under the
-                # approved contracts only; a rung that is not applicable for
-                # these exact facts is consumed and the ladder moves on.
+                # A replan rung rewrites the responsible step's contract from
+                # this gate's own failure evidence and re-executes it; a rung
+                # that these exact facts do not admit is consumed and the
+                # ladder moves on.
                 try:
-                    tree_after = recovery.replay_step(
+                    tree_after = recovery.replan_step(
                         ctx=ctx, cycle_plan=cycle_plan, stage=stage, step=step, evidence=red,
                     )
                 except RecoveryStepUnavailable:

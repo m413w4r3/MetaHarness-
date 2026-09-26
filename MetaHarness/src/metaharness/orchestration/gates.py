@@ -39,23 +39,16 @@ from ..gitops import (
     candidate_tree_sha,
     current_head,
     index_tree_sha,
-    is_ancestor,
-    rewind_worktree,
     resolve_tree,
-    status_porcelain,
-    symbolic_head,
 )
 from ..models import (
-    CycleKind,
     ExecutionRole,
     GateStage,
     HarnessConfig,
-    ImplementationStep,
     RunStatus,
 )
 from ..resume import (
     ResumeIntegrityError,
-    ResumePhase,
 )
 from ..result import atomic_write_text
 from ..recovery_policy import (
@@ -76,7 +69,6 @@ from .shared import (
     _read_json_artifact,
     _record_failure_tree,
     _safe_candidate_tree,
-    _status_has_unstaged_or_untracked,
 )
 from .revision import (
     SCOPE_REQUEST_ROUTE,
@@ -88,7 +80,6 @@ from .check_repair import (
     gate_mutable_authority,
     _soft_check_failures,
 )
-from .candidate import accepted_chain_records
 from .pipeline_v2 import (
     CyclePlan,
     PipelineFailure,
@@ -97,15 +88,10 @@ from .pipeline_v2 import (
     check_repair_dir,
     gate_dir,
     gate_acceptance_path,
-    step_dir as cycle_step_dir,
 )
-from .recovery import (
-    RecoveryAttempt,
-    RecoveryStepUnavailable,
-)
+from .recovery import RecoveryAttempt
 from .resume_validation import (
     _load_evidence,
-    read_candidate_record,
 )
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
@@ -634,157 +620,23 @@ class GateService:
             phase="validation", cycle=number, recovered=True,
         )
         self.runtime.update_v2_usage(store, ctx.run_dir)
-    def replay_approved_steps(
+    def replan_responsible_step(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
-        stage: GateStage, step: Any, red_tree: str,
+        stage: GateStage, step: Any, evidence: EvidenceBundle,
     ) -> str:
-        """Re-execute approved cycle work for one replan ladder rung.
+        """Replan one responsible approved step and re-execute it.
 
-        The run branch is rewound to the tree the responsible approved step
-        received, every replayed step then runs again under its own approved
-        contract and effective authority, and the produced tree is what the
-        next gate episode observes.  Only approved plan work is touched: the
-        rung can never widen a scope, and a step without a replayable durable
-        record refuses the rung instead of guessing.
+        The rung is not a replay: the responsible step's contract is rewritten
+        through the durable contract repair transaction from this gate's own
+        failure evidence, its new authority is proven durably, and only then is
+        the step re-executed with the descendants its rewritten commit
+        invalidates.  The gate implementation itself owns none of that; it
+        delegates to the step execution owner and keeps the ladder contract.
         """
 
-        worktree = ctx.info.worktree
-        steps = list(cycle_plan.plan.steps)
-        indices = tuple(step.step_indices)
-        if not indices or indices != tuple(range(indices[0], len(steps))):
-            raise RecoveryStepUnavailable(
-                step.strategy, "the rung does not replay a suffix of the approved cycle",
-            )
-        first = indices[0]
-        records: list[dict[str, Any]] = []
-        for index in indices:
-            record = _read_json_artifact(
-                cycle_step_dir(ctx.run_dir, cycle_plan.cycle, steps[index].id) / "step.json",
-                128 * 1024,
-            )
-            if (
-                not isinstance(record, dict) or record.get("id") != steps[index].id
-                or not _is_object_id(record.get("tree_before"))
-                or not _is_object_id(record.get("tree_after"))
-            ):
-                raise RecoveryStepUnavailable(
-                    step.strategy, f"step {steps[index].id} has no replayable durable record",
-                )
-            records.append(record)
-        target_tree = records[0]["tree_before"]
-        reset_commit = self._replay_reset_commit(ctx, cycle_plan, steps, first)
-        if reset_commit is None or resolve_tree(worktree, reset_commit) != target_tree:
-            raise RecoveryStepUnavailable(
-                step.strategy, "the approved step boundary is not an accepted commit",
-            )
-        replayed = self._rewind_to_replay_boundary(
-            store, ctx, cycle_plan, reset_commit=reset_commit, target_tree=target_tree,
+        return self.runtime.implementation.replan_cycle_step(
+            store, ctx, cycle_plan, stage, step, evidence,
         )
-        self.runtime.trace_emit(
-            "recovery.replayed", phase="implementation", cycle=cycle_plan.cycle.number,
-            data={
-                "strategy": step.strategy.value, "stage": stage.value,
-                "reset_commit": reset_commit, "tree_before": target_tree,
-                "red_tree": red_tree, "step_ids": [steps[index].id for index in indices],
-                "rewound_commits": list(replayed),
-            },
-        )
-        self.runtime.write_checkpoint(
-            ctx.run_dir,
-            (
-                ResumePhase.IMPLEMENT_STEP
-                if cycle_plan.cycle.kind is CycleKind.INITIAL
-                else ResumePhase.REVIEW_IMPLEMENTATION
-            ),
-            head=reset_commit, tree=target_tree, cycle=cycle_plan.cycle.number,
-            step_id=steps[first].id,
-            correction_bundle_sha256=cycle_plan.correction_bundle_sha256,
-        )
-        for index in indices:
-            self.runtime.implementation.execute_cycle_step(store, ctx, cycle_plan, index)
-        return candidate_tree_sha(worktree)
-    def _replay_reset_commit(
-        self, ctx: PipelineV2Context, cycle_plan: CyclePlan,
-        steps: Sequence[ImplementationStep], first: int,
-    ) -> str | None:
-        """The accepted commit the first replayed step started from."""
-
-        if first > 0:
-            record = _read_json_artifact(
-                cycle_step_dir(ctx.run_dir, cycle_plan.cycle, steps[first - 1].id) / "step.json",
-                128 * 1024,
-            )
-            if isinstance(record, dict) and _is_object_id(record.get("commit_sha")):
-                return record["commit_sha"]
-        number = cycle_plan.cycle.number
-        if number == 1:
-            return ctx.base_sha
-        previous = read_candidate_record(ctx.run_dir, number - 1)
-        commit = previous.get("commit_sha") if isinstance(previous, Mapping) else None
-        return commit if isinstance(commit, str) and _is_object_id(commit) else None
-    @staticmethod
-    def _rewind_to_replay_boundary(
-        store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
-        *, reset_commit: str, target_tree: str,
-    ) -> tuple[str, ...]:
-        """Rewind the run branch and drop the durable records it replaced."""
-
-        worktree = ctx.info.worktree
-        if symbolic_head(worktree) != ctx.branch_ref:
-            raise PipelineFailure(
-                "RESUME_INTEGRITY_FAILURE", "the replay boundary is not the run branch",
-            )
-        chain = accepted_chain_records(ctx.run_dir)
-        head = current_head(worktree)
-        replaced = tuple(
-            record["commit_sha"] for record in chain
-            if isinstance(record, dict)
-            and isinstance(record.get("commit_sha"), str)
-            and record["commit_sha"] != reset_commit
-            and is_ancestor(worktree, reset_commit, record["commit_sha"])
-        )
-        try:
-            rewind_worktree(worktree, reset_commit)
-        except GitError as exc:
-            raise PipelineFailure(
-                "RESUME_INTEGRITY_FAILURE", f"the replay boundary could not be restored: {exc}",
-            ) from exc
-        if (
-            current_head(worktree) != reset_commit
-            or candidate_tree_sha(worktree) != target_tree
-            or _status_has_unstaged_or_untracked(status_porcelain(worktree))
-        ):
-            raise PipelineFailure(
-                "RESUME_INTEGRITY_FAILURE", "the replay boundary does not match the approved step tree",
-            )
-        if head == reset_commit:
-            replaced = ()
-        kept = [
-            record for record in chain
-            if isinstance(record, dict) and record.get("commit_sha") not in set(replaced)
-        ]
-        state = store.load()
-
-        def pruned(records: Any) -> list[dict[str, Any]]:
-            return [
-                item for item in (records or [])
-                if not (isinstance(item, dict) and item.get("commit_sha") in set(replaced))
-            ]
-
-        chain_path = ctx.run_dir / "accepted-chain.json"
-        if kept:
-            atomic_write_text(chain_path, _json_text({"commits": kept}))
-        elif chain_path.exists():
-            # An empty chain covers no commit: the artifact is the absence of
-            # a record, never a malformed one.
-            chain_path.unlink()
-        store.update(
-            status=RunStatus.IMPLEMENTING,
-            accepted_steps=pruned(state.get("accepted_steps")),
-            accepted_commits=pruned(state.get("accepted_commits")),
-            expected_head_sha=reset_commit, expected_tree_sha=target_tree,
-        )
-        return replaced
     def _final_evidence(
         self,
         worktree: Path,
