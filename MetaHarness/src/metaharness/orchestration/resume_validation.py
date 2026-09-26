@@ -40,7 +40,6 @@ from .pipeline_v2 import (
 )
 from .shared import (
     _MAX_AGENT_REPORT_BYTES,
-    _MAX_STEP_REPORT_BYTES,
     _PLANNER_CONVERSATION,
     bounded_v2_report,
     _is_object_id,
@@ -248,27 +247,19 @@ def _accepted_review(
 
 
 def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
-    """One completed or cleanly deferred step record."""
+    """One completed step record."""
 
     record = _read_json_artifact(step_dir / "step.json", 128 * 1024)
     if not isinstance(record, dict) or record.get("id") != step_id:
         return None
     status = record.get("status")
-    if status not in {"COMPLETED", "DEFERRED_CONTRACT_MISMATCH"}:
+    if status != "COMPLETED":
         return None
     changed = record.get("changed_paths")
     if (
         not _is_object_id(record.get("tree_before"))
         or not _is_object_id(record.get("tree_after"))
         or not isinstance(changed, list) or any(not isinstance(item, str) for item in changed)
-    ):
-        return None
-    if status == "DEFERRED_CONTRACT_MISMATCH" and (
-        record["tree_before"] != record["tree_after"]
-        or changed
-        or not isinstance(record.get("mismatch"), str)
-        or not record["mismatch"].strip()
-        or len(record["mismatch"].encode("utf-8", errors="replace")) > _MAX_STEP_REPORT_BYTES
     ):
         return None
     no_change = record.get("no_change", False)
@@ -287,8 +278,6 @@ def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
         **({"no_change": True} if no_change else {}),
         "usage": normalize_usage(record.get("usage")),
         "final": bounded_v2_report(_read_bounded_text(step_dir / "agent.final.md")),
-        **({"mismatch": bounded_v2_report(record["mismatch"])}
-           if status == "DEFERRED_CONTRACT_MISMATCH" else {}),
         **({"initial_mismatch": bounded_v2_report(str(record["initial_mismatch"]))}
            if isinstance(record.get("initial_mismatch"), str) and record["initial_mismatch"].strip()
            else {}),

@@ -296,7 +296,6 @@ class PipelineV2Operations:
     # Implementation.
     completed_steps: Callable[[PipelineV2Context, CyclePlan], list[dict[str, Any]]]
     execute_step: Callable[[PipelineV2Context, CyclePlan, int], None]
-    unresolved_mismatches: Callable[[PipelineV2Context, CyclePlan], bool]
     semantic_revision: Callable[[PipelineV2Context, CyclePlan], None]
     semantic_review_correction: Callable[[PipelineV2Context, CyclePlan, ReviewResult], None]
     # Deterministic gate episode.
@@ -473,12 +472,6 @@ class PipelineV2Coordinator:
             self._implement(
                 cycle_plan, next_stage=pre_stage or final_stage, accept_step_id=accept_step_id,
             )
-        if ops.unresolved_mismatches(ctx, cycle_plan) and not semantic_enabled:
-            raise PipelineFailure(
-                "UNRESOLVED_CONTRACT_MISMATCH",
-                "HUMAN_REQUIRED: semantic revision is disabled while contract mismatches are deferred",
-            )
-
         # Initial and replan cycles have a gate before semantic revision.
         if pre_stage is not None and (
             start is None or start.phase is phase or start.phase in _CYCLE_ENTRY_PHASES

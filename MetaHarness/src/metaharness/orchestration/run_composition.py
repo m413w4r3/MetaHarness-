@@ -48,7 +48,6 @@ from .resume_validation import (
     read_candidate_record, read_cycle_record, semantic_revision_scope,
     verify_correction_scope,
 )
-from .revision import has_deferred_contract_mismatches
 from .run_bootstrap import PreparedV2Run
 from .shared import CycleArtifactService, OrchestrationError, bounded_parse_detail, chat_client
 from .step_authority import approved_step_contract
@@ -257,9 +256,6 @@ class RunComposition:
             completed_steps=self.completed_steps,
             execute_step=bind(self.runtime.step_execution.execute_cycle_step, store),
             accept_step=bind(self.runtime.step_acceptance.resume_step_acceptance, store),
-            unresolved_mismatches=lambda ctx, plan: has_deferred_contract_mismatches(
-                self.completed_steps(ctx, plan)
-            ),
             semantic_revision=bind(self.runtime.reviews.semantic_revision, store),
             semantic_review_correction=bind(self.runtime.reviews.semantic_review_correction, store),
             run_gate=bind(self.runtime.gates.run_gate, store),
@@ -480,7 +476,7 @@ class RunComposition:
             }
             if record is not None:
                 row.update(
-                    status="deferred" if record["status"] == "DEFERRED_CONTRACT_MISMATCH" else "completed",
+                    status="completed",
                     no_change=record.get("no_change", False),
                     usage=record["usage"],
                     input_tokens=record["usage"]["input_tokens"],

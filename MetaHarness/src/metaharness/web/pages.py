@@ -577,10 +577,7 @@ def _step_card(item: dict[str, Any], artifact: dict[str, Any]) -> str:
     event_items = "".join(f"<li>{_e(event)}</li>" for event in events) or '<li class="muted">No event yet.</li>'
     reason = artifact.get("failure_reason")
     reason_line = f'<p class="danger">failure: {_e(reason)}</p>' if reason else ""
-    mismatch_line = (
-        f'<p class="warning"><strong>DEFERRED CONTRACT MISMATCH</strong>: {_e(artifact.get("mismatch"))}</p>'
-        if status == "deferred" and artifact.get("mismatch") else ""
-    )
+    mismatch_line = ""
     if artifact.get("mismatch_retry_count"):
         mismatch_line += (
             f'<p class="muted small">bounded mismatch retries: '
@@ -592,7 +589,7 @@ def _step_card(item: dict[str, Any], artifact: dict[str, Any]) -> str:
             f'{_e(artifact.get("deferred_verify"))}</p>'
         )
     return (
-        f'<details class="card step {_e(status)}"{" open" if status in {"running", "failed", "deferred"} else ""}>'
+        f'<details class="card step {_e(status)}"{" open" if status in {"running", "failed"} else ""}>'
         f'<summary>{_e(item.get("id"))} {icon} — {_e(item.get("title"))} · '
         f'{_e(usage.get("input_tokens", 0))} input / {_e(usage.get("output_tokens", 0))} output{warning}</summary>'
         f'<p>profile: <span class="mono">{_e(item.get("profile_id"))}</span></p>'
@@ -885,14 +882,13 @@ def run_page_polls(run: dict[str, Any]) -> bool:
 
 
 _PIPELINE_SYMBOLS = {
-    "complete": "✓", "running": "▶", "failed": "✗", "deferred": "⚠", "waiting": "·", "resumable": "↻", "skipped": "–",
+    "complete": "✓", "running": "▶", "failed": "✗", "waiting": "·", "resumable": "↻", "skipped": "–",
 }
 _FAILURE_MESSAGES = {
     "AGENT_TIMEOUT": "Worker timed out",
     "AGENT_RUNTIME_FAILED": "Worker failed",
     "AGENT_SCOPE_VIOLATION": "Worker changed Git history or scope",
     "AGENT_NO_CHANGE": "Step changed nothing",
-    "UNRESOLVED_CONTRACT_MISMATCH": "Deferred contract mismatch needs semantic revision or an operator",
     "STEP_WRITE_SET_VIOLATION": "Step changed an unauthorized path",
     "CHECK_REPAIR_EXHAUSTED": "Recovery exhausted: checks still fail",
     "CHECK_INFRASTRUCTURE_UNAVAILABLE": "Deterministic check infrastructure is unavailable",
@@ -940,7 +936,7 @@ def _pipeline_section(overview: dict[str, Any]) -> str:
     return (
         '<section class="pipeline"><h2>EXECUTION PIPELINE</h2>'
         f'<ol class="pipeline-list">{"".join(rows)}</ol>'
-        '<p class="muted small">✓ complete · ▶ running · ⚠ deferred · ✗ failed · · waiting · ↻ resumable</p></section>'
+        '<p class="muted small">✓ complete · ▶ running · ✗ failed · · waiting · ↻ resumable</p></section>'
     )
 
 

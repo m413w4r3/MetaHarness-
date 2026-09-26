@@ -245,9 +245,9 @@ class ReviewTests(unittest.TestCase):
         prompt = review_payload(diff="diff sentinel").rendered
         self.assertIn("diff sentinel", prompt)
 
-    def test_deferred_mismatch_is_substituted(self):
-        prompt = review_payload(summary="DEFERRED CONTRACT MISMATCHES\nDEFERRED_SENTINEL").rendered
-        self.assertIn("DEFERRED_SENTINEL", prompt)
+    def test_cycle_summary_is_substituted(self):
+        prompt = review_payload(summary="CYCLE SUMMARY\nSUMMARY_SENTINEL").rendered
+        self.assertIn("SUMMARY_SENTINEL", prompt)
         self.assertNotIn("{{CYCLE_SUMMARY}}", prompt)
 
     def test_code_evidence_substitution_is_not_recursive(self):

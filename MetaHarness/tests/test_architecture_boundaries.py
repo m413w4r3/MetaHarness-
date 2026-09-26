@@ -161,7 +161,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
         ),
         "metaharness.orchestration.revision": (
             "_bounded_previous_revision_report",
-            "_deferred_contract_mismatches",
             "_review_payload",
         ),
         "metaharness.orchestration.check_repair": (
@@ -281,9 +280,13 @@ REMOVED_COMPATIBILITY_SYMBOLS = (
 REMOVED_SYMBOLS_PER_PACKAGE: Mapping[str, tuple[str, ...]] = {
     "planning": ("render_profile_catalogue",),
 }
-# Durable migration labels of the deleted resume and recovery paths.
+# Durable migration labels of the deleted resume and recovery paths, and the
+# two dead contract-mismatch statuses: a clean mismatch is repaired inside its
+# step and a disabled semantic reviser never turns one into a human wait.
 REMOVED_COMPATIBILITY_LITERALS = (
     "auto-bounded failing-test evidence",
+    "DEFERRED_CONTRACT_MISMATCH",
+    "UNRESOLVED_CONTRACT_MISMATCH",
     "historical_check_repair_redaction_crash",
     "historical_commit_gate_stale_authority",
     "legacy_prompt_bug_candidate",

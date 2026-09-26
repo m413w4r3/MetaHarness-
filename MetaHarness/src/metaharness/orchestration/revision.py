@@ -189,7 +189,7 @@ def _revision_contract_index(plan: TaskPlanV2) -> str:
     return "\n".join(lines) + ("\n" if lines else "NONE\n")
 
 
-def _deferred_contract_mismatches(
+def _deferred_verify_dependencies(
     plan: TaskPlanV2, results: list[dict[str, Any]],
 ) -> str:
     """Render bounded summaries for the semantic reviser and the reviewer."""
@@ -197,39 +197,29 @@ def _deferred_contract_mismatches(
     steps = {step.id: step for step in plan.steps}
     summaries: list[dict[str, Any]] = []
     for item in results:
-        deferred = item.get("status") == "DEFERRED_CONTRACT_MISMATCH"
         verify = bounded_v2_report(str(item.get("deferred_verify") or ""))
-        if not deferred and not verify:
+        if not verify:
             continue
         step = steps.get(item.get("id"))
         if step is None:
             continue
-        scope = {
-            "write": list(step.write_set),
-            "create": list(step.create_set),
-            "delete": list(step.delete_set),
-        }
+        # The step completed inside its approved scope but one VERIFY command
+        # still fails on a path a later step owns.  The reviser and the
+        # reviewer must decide; nothing here accepts that failure.
         record: dict[str, Any] = {
             "step_id": step.id,
             "step_title": step.title,
-            "kind": (
-                "DEFERRED_CONTRACT_MISMATCH" if deferred
-                else "DEFERRED_VERIFY_DEPENDENCY"
-            ),
-            "original_scope": scope,
+            "original_scope": {
+                "write": list(step.write_set),
+                "create": list(step.create_set),
+                "delete": list(step.delete_set),
+            },
+            "deferred_verify_dependency": verify,
         }
-        if deferred:
-            record["mismatch"] = bounded_v2_report(str(item.get("mismatch") or ""))
-            record["tree_at_mismatch"] = item.get("tree_before")
         if item.get("initial_mismatch"):
             record["initial_mismatch"] = bounded_v2_report(str(item["initial_mismatch"]))
         if item.get("mismatch_retry_count"):
             record["mismatch_retry_count"] = item["mismatch_retry_count"]
-        if verify:
-            # The step completed inside its approved scope but one VERIFY
-            # command still fails on a path a later step owns.  The reviser
-            # and the reviewer must decide; nothing here accepts that failure.
-            record["deferred_verify_dependency"] = verify
         summaries.append(record)
     return _json_text(summaries) if summaries else "NONE\n"
 
@@ -249,10 +239,6 @@ def future_step_ownership(
         if paths:
             ownership[step.id] = paths
     return ownership
-
-
-def has_deferred_contract_mismatches(results: list[dict[str, Any]]) -> bool:
-    return any(item.get("status") == "DEFERRED_CONTRACT_MISMATCH" for item in results)
 
 
 def _review_payload(review: ReviewResult) -> dict[str, Any]:
@@ -444,7 +430,7 @@ class ReviewCycleInput:
     revision_report: str
     cycle_history: str
     scope_delta: str = ""
-    deferred_mismatches: str = ""
+    deferred_verifications: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -539,8 +525,8 @@ class ReviewContextBuilder:
                 f"{review_cycle_revision_report(ctx.run_dir, item.cycle.number, self.load_revision) or 'NONE'}"
             )
             mismatches.append(
-                f"CYCLE {label} DEFERRED CONTRACT MISMATCHES\n"
-                f"{_deferred_contract_mismatches(item.plan, steps)}"
+                f"CYCLE {label} DEFERRED VERIFY DEPENDENCIES\n"
+                f"{_deferred_verify_dependencies(item.plan, steps)}"
             )
         return ReviewCycleInput(
             iteration=number,
@@ -549,7 +535,7 @@ class ReviewContextBuilder:
             revision_report="\n".join(revision_reports),
             cycle_history=cycle_history,
             scope_delta=scope_delta,
-            deferred_mismatches="\n".join(mismatches),
+            deferred_verifications="\n".join(mismatches),
         )
 
 
@@ -608,7 +594,6 @@ def _revision_prompt(
     execution_anomalies: str,
     pre_checks: str,
     mutable_scope: str,
-    deferred_mismatches: str,
     candidate_identity: str = "",
     bounded_diff_evidence: str = "",
     reviewer_correction_evidence: str = "NONE\n",
@@ -745,8 +730,6 @@ class RevisionRunner:
         artifact_dir: Path,
         mutable_scope: list[str],
         step_results: Sequence[dict[str, Any]] = (),
-        deferred_mismatches: str | None = None,
-        deferred_mismatch_present: bool = False,
         reviewer_correction_evidence: str | None = None,
         candidate_identity: str | None = None,
         bounded_diff_evidence: str | None = None,
@@ -850,11 +833,6 @@ class RevisionRunner:
                 }
                 atomic_write_text(artifact_dir / "pre_checks.json", _json_text(pre_payload))
                 pre_hard = self.hard_integrity_failures(pre_evidence)
-                # A clean deferred mismatch intentionally leaves no candidate
-                # delta for the pre-revision gate.  The semantic reviser owns
-                # that recovery, so EMPTY_DIFF is evidence here, not a gate.
-                if deferred_mismatch_present:
-                    pre_hard = [item for item in pre_hard if item != "EMPTY_DIFF"]
                 if pre_hard:
                     return None, pre_hard[0].split(":", 1)[0]
             revision_prompt = _revision_prompt(
@@ -865,7 +843,6 @@ class RevisionRunner:
                 execution_anomalies=_revision_execution_anomalies(list(step_results)),
                 pre_checks=_revision_check_context(pre_payload),
                 mutable_scope=_json_text(mutable_scope),
-                deferred_mismatches=deferred_mismatches or "NONE\n",
                 candidate_identity=tree_before,
                 # The semantic reviser can inspect the current worktree
                 # directly.  Keep the secondary diff excerpt optional so a

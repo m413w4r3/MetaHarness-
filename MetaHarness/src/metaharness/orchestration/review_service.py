@@ -132,8 +132,6 @@ from .revision import (
     RevisionRunner,
     SCOPE_REQUEST_ROUTE,
     _bounded_previous_revision_report,
-    _deferred_contract_mismatches,
-    has_deferred_contract_mismatches,
     _review_payload,
     review_cycle_revision_report,
 )
@@ -809,8 +807,6 @@ class ReviewService:
                 "ownership_before": _git_ownership(ctx.repo, ctx.info.worktree),
                 "selection": ctx.selection, "artifact_dir": artifact_dir,
                 "mutable_scope": mutable_scope, "step_results": steps,
-                "deferred_mismatches": _deferred_contract_mismatches(cycle_plan.plan, steps),
-                "deferred_mismatch_present": has_deferred_contract_mismatches(steps),
                 "pre_check_evidence": pre_check_evidence,
                     },
                 )
@@ -1099,12 +1095,6 @@ class ReviewService:
                 "selection": ctx.selection, "artifact_dir": artifact_dir,
                 "mutable_scope": mutable_scope,
                 "step_results": step_results,
-                "deferred_mismatches": _deferred_contract_mismatches(
-                    previous_plan.plan, step_results
-                ),
-                "deferred_mismatch_present": has_deferred_contract_mismatches(
-                    step_results
-                ),
                 "reviewer_correction_evidence": reviewer_evidence,
                 "candidate_identity": candidate_identity,
                 "bounded_diff_evidence": bounded_semantic_diff(evidence.diff, 16 * 1024)[0],
@@ -1597,8 +1587,8 @@ class ReviewService:
                 + (input.revision_report or "NONE")
                 + "\n"
                 + input.step_reports
-                + "\nDEFERRED CONTRACT MISMATCHES\n"
-                + input.deferred_mismatches
+                + "\nDEFERRED VERIFY DEPENDENCIES\n"
+                + input.deferred_verifications
             ),
             repository_reference=_json_text(repository_reference_dict(repository_reference)),
             budget_bytes=self.runtime.config.prompt_budget.final_review_max_bytes,

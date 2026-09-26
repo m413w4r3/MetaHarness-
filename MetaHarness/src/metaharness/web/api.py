@@ -567,7 +567,6 @@ def _bundle_entries(path: Path) -> list[dict[str, Any]]:
 
 _DURABLE_STEP_STATUS = {
     "COMPLETED": "completed",
-    "DEFERRED_CONTRACT_MISMATCH": "deferred",
     "FAILED": "failed",
 }
 
@@ -1271,7 +1270,6 @@ _PUBLISH_FAILURES = frozenset({
 })
 _PIPELINE_STEP_STATE = {
     "completed": "complete", "running": "running", "failed": "failed",
-    "deferred": "deferred",
     "interrupted": "failed", "waiting": "waiting",
 }
 

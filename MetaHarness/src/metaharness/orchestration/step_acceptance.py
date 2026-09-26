@@ -312,10 +312,7 @@ class StepAcceptanceService:
                 outcome.final_report, step_id=authority.step_id,
                 future_step_ids=future_step_ids,
                 reported_status=getattr(outcome, "verification_status", None),
-                deferred_requested=bool(
-                    getattr(outcome, "deferred_verify", "")
-                    or getattr(outcome, "status", "") == "DEFERRED_CONTRACT_MISMATCH"
-                ),
+                deferred_requested=bool(getattr(outcome, "deferred_verify", "")),
             )
         except CommitSafetyError:
             self.runtime.observability.trace_emit(

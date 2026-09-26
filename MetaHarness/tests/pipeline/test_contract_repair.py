@@ -65,6 +65,14 @@ class ContractRepairTests(PipelineHarness):
         self.assertEqual(
             validation["current_tree_sha"], git(self.repo, "rev-parse", "HEAD^{tree}"),
         )
+        # The mismatch is resolved inside its own step: the durable record is
+        # COMPLETED and no step status ever reports a deferred contract.
+        step = self.run_dir("contract-repair") / "cycles/001/implementation/steps/S01/step.json"
+        self.assertEqual(json.loads(step.read_text())["status"], "COMPLETED")
+        self.assertEqual(
+            [row["status"] for row in self.state("contract-repair")["steps"]],
+            ["completed"],
+        )
 
     def test_residual_mismatch_edits_roll_back_to_the_exact_pre_step_tree(self) -> None:
         def mismatch_with(content: str):
