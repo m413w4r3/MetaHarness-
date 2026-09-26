@@ -233,7 +233,7 @@ class LifecycleTests(PipelineHarness):
     def test_initial_gate_runs_before_semantic_revision(self) -> None:
         self.check.write_text(
             "import pathlib, sys\n"
-            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'good', 'good semantic'} else 1)\n",
+            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'base', 'good', 'good semantic'} else 1)\n",
             encoding="utf-8",
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
@@ -257,7 +257,7 @@ class LifecycleTests(PipelineHarness):
     def test_accepted_git_chain_contains_only_reviewable_green_trees(self) -> None:
         self.check.write_text(
             "import pathlib, sys\n"
-            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'good', 'semantic', 'semantic 2', 'semantic 3', 'semantic 4'} else 1)\n",
+            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'base', 'good', 'semantic', 'semantic 2', 'semantic 3', 'semantic 4'} else 1)\n",
             encoding="utf-8",
         )
         steps = (

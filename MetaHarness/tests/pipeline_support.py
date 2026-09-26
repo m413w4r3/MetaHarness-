@@ -312,10 +312,12 @@ class PipelineHarness(unittest.TestCase):
         git(self.repo, "remote", "add", "origin", str(self.remote))
         git(self.repo, "push", "-q", "-u", "origin", "main")
         self.check = self.root / "check.py"
-        # The gate is green only when feature.txt holds exactly "good".
+        # The gate is green on the base content and on the delivered one: the
+        # baseline comparison only ever counts a *new* failure.
         self.check.write_text(
             "import pathlib, sys\n"
-            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() == 'good' else 1)\n",
+            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip()"
+            " in {'base', 'good'} else 1)\n",
             encoding="utf-8",
         )
         self.workers = ScriptedWorkers()
@@ -332,10 +334,16 @@ class PipelineHarness(unittest.TestCase):
         max_step_contract_repairs: int = 2,
         semantic_revision: bool = False, scope_mode: str = "soft",
         publish: bool = False, github_pr: bool = False,
-        extra_checks: str = "",
+        extra_checks: str = "", per_step_gate: str | tuple[str, ...] = "",
     ) -> Any:
         path = self.root / "config.toml"
         self.config_path = path
+        gate_ids = (per_step_gate,) if isinstance(per_step_gate, str) else tuple(per_step_gate)
+        gate_ids = tuple(item for item in gate_ids if item)
+        gate = ""
+        if gate_ids:
+            rendered = ", ".join(f'"{item}"' for item in gate_ids)
+            gate = f"\n[gate]\nper_step = [{rendered}]\n"
         reviser = (
             '\ndefault_reviser_profile = "reviser"'
             if semantic_revision or correction_cycles else ""
@@ -347,7 +355,7 @@ base_ref = "main"
 runs_root = {str(self.root / 'runs')!r}
 worktrees_root = {str(self.root / 'worktrees')!r}
 require_clean_base = true
-
+{gate}
 [planning]
 protocol = "v2"
 

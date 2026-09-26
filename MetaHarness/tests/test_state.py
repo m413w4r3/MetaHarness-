@@ -564,8 +564,10 @@ PROJECTION_MATRIX = (
     # The failure reason names the flavour of an external wait; a reason that
     # belongs to another phase stays a plain external wait.
     (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, "AGENT_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
-    (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_CHECK_INFRASTRUCTURE, True, True),
-    (R.FINAL_REVIEW, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_CHECK_INFRASTRUCTURE, True, True),
+    # A check infrastructure reason is an ordinary external wait: a skipped
+    # check is a durable warning, never a gate infrastructure status.
+    (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
+    (R.FINAL_REVIEW, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
     (R.CANDIDATE_PUSH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_REMOTE, True, True),
     (R.PUBLISH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_REMOTE, True, True),
     (R.FINAL_REVIEW, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_EXTERNAL, True, True),
@@ -694,7 +696,6 @@ class RunMachineTests(unittest.TestCase):
                 self.assertIsInstance(disposition_for_status(status), RunDisposition)
         for status, disposition in (
             ("waiting_external", D.WAIT_EXTERNAL),
-            ("waiting_check_infrastructure", D.WAIT_EXTERNAL),
             ("waiting_remote", D.WAIT_EXTERNAL),
             ("waiting_human", D.WAIT_HUMAN),
             ("waiting_contract_repair", D.WAIT_EXTERNAL),
@@ -722,7 +723,7 @@ class RunMachineTests(unittest.TestCase):
         machine = machine_state_for_run(state, checkpoint)
         self.assertIs(machine.phase, RunPhase.DETERMINISTIC_GATE)
         self.assertIs(machine.disposition, D.WAIT_EXTERNAL)
-        self.assertIs(project_run_outcome(machine).status, RunStatus.WAITING_CHECK_INFRASTRUCTURE)
+        self.assertIs(project_run_outcome(machine).status, RunStatus.WAITING_EXTERNAL)
         # Without a checkpoint there is no phase authority at all.
         self.assertIsNone(machine_state_for_run(state, None).phase)
 
@@ -876,7 +877,7 @@ class RunStateProjectionTests(unittest.TestCase):
         # The UI keeps reading a status: it is a projection of the machine, so a
         # gate reason keeps naming its operator-facing flavour.
         for reason, status in (
-            ("CHECK_TIMEOUT", RunStatus.WAITING_CHECK_INFRASTRUCTURE),
+            ("CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL),
             ("PUSH_FAILED", RunStatus.WAITING_REMOTE),
             ("AGENT_TIMEOUT", RunStatus.WAITING_EXTERNAL),
         ):

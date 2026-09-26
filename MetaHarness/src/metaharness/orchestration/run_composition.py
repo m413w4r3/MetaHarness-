@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, TYPE_CHECKING
 from ..agent.base import AgentRunRequest
 from ..agent.execution import ExecutorRuntimeConfig, executor_for_profile
+from ..baseline import BaselineCache, baseline_payload
 from ..execution_selection import (
     ExecutionSelectionError, ensure_cycle_execution_selection,
     read_cycle_execution_selection,
@@ -554,16 +555,27 @@ class RunComposition:
             self.runtime.config, ctx.run_dir, requested_check_ids=plan.required_checks,
             expected_sha256=self.runtime.approved_check_authority_sha256(ctx.run_dir),
         )
-        preflight_failures = self.runtime.gates.run_check_preflights_recoverably(
-            store=store, worktree=ctx.info.worktree, check_config=check_config,
-            check_ids=check_ids or plan.required_checks,
-            counter_key=f"check-preflight:cycle:{cycle.number:03d}",
+        selected_check_ids = tuple(check_ids or plan.required_checks)
+        skipped_checks = self.runtime.gates.run_check_preflights_recoverably(
+            store=store, run_dir=ctx.run_dir, worktree=ctx.info.worktree,
+            check_config=check_config, check_ids=selected_check_ids,
             phase="planning", cycle=cycle.number,
         )
-        if preflight_failures:
-            raise PipelineFailure(
-                preflight_failures[0].split(":", 1)[0], preflight_failures[0],
-            )
+        # A check this cycle only now requires still gets its own baseline on
+        # the unchanged base commit, before any worker runs for it.
+        baseline = BaselineCache(self.runtime.config.runs_root).ensure(
+            repo=ctx.info.worktree, base_sha=ctx.base_sha, config=check_config,
+            check_ids=tuple(dict.fromkeys(
+                (*selected_check_ids, *self.runtime.config.gate.per_step)
+            )),
+            environment=self.runtime.environment,
+            setup_commands=self.runtime.config.workspace_setup,
+            secrets=self.runtime.secrets,
+            skipped={check_id: "PREFLIGHT_FAILED" for check_id in skipped_checks},
+        )
+        store.update_metadata(
+            skipped_checks=list(skipped_checks), baseline=baseline_payload(baseline),
+        )
 
     def admit_scope_request(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,

@@ -23,6 +23,7 @@ from .models import (
     EnvironmentConfig,
     ExecutionModePolicy,
     ExecutionRole,
+    GateConfig,
     GitHubConfig,
     HarnessConfig,
     LLMEndpointConfig,
@@ -637,10 +638,20 @@ def _checks(value: Any, *, catalogue: bool = False) -> tuple[CheckConfig, ...]:
         timeout = _positive_int(item, "timeout_seconds", 3600, where)
         required = _bool(item, "required", True, where)
         preflight_argv = _string_array(item, "preflight_argv", (), where)
+        blocking = _bool(item, "blocking", False, where)
+        junit_xml = item.get("junit_xml", "")
+        if (
+            not isinstance(junit_xml, str)
+            or (junit_xml and (Path(junit_xml).is_absolute() or ".." in Path(junit_xml).parts))
+        ):
+            raise ConfigError(f"{where}.junit_xml must be a repository-relative path")
         description = item.get("description", "")
         if not isinstance(description, str) or len(description) > 300:
             raise ConfigError(f"{where}.description must be a string of at most 300 characters")
-        result.append(CheckConfig(name, argv, cwd, timeout, required, preflight_argv, description))
+        result.append(CheckConfig(
+            name, argv, cwd, timeout, required, preflight_argv, description,
+            blocking, junit_xml,
+        ))
     return tuple(result)
 
 
@@ -1136,6 +1147,15 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             raise ConfigError("claude_runtime.home must not overlap managed CODEX_HOME")
     else:
         raise ConfigError("claude_runtime.home must not overlap managed CODEX_HOME")
+    gate_data = _table(expanded, "gate")
+    per_step_ids = _string_array(gate_data, "per_step", (), "gate")
+    unknown_gate_checks = [item for item in per_step_ids if item not in catalogue_ids]
+    if unknown_gate_checks:
+        raise ConfigError(
+            "gate.per_step contains unknown trusted check ID(s): "
+            + ", ".join(unknown_gate_checks)
+        )
+    gate = GateConfig(per_step=tuple(per_step_ids))
     workspace_setup = _workspace_setup(expanded.get("workspace_setup", []))
     allow_no_required_checks = _bool(
         expanded, "allow_no_required_checks", False, "root"
@@ -1166,6 +1186,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         codex_runtime=codex_runtime,
         claude_runtime=claude_runtime,
         workspace_setup=workspace_setup,
+        gate=gate,
         planning=planning,
         revision=revision,
         recovery=recovery,

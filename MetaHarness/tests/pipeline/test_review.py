@@ -262,13 +262,12 @@ class ReviewCorrectionTests(PipelineHarness):
         one budget bounds both, so no third cycle and no planner call exists.
         """
 
-        counter = self.root / "gate-count"
         self.check.write_text(
             "import pathlib, sys\n"
-            f"counter = pathlib.Path({str(counter)!r})\n"
-            "count = int(counter.read_text()) if counter.exists() else 0\n"
-            "counter.write_text(str(count + 1))\n"
-            "sys.exit(0 if count == 0 else 1)\n",
+            "# The base commit and the first cycle are green; the reviewed\n"
+            "# correction of cycle 002 is the regression the gate must catch.\n"
+            "other = pathlib.Path('other.txt').read_text().strip()\n"
+            "sys.exit(0 if other == 'base' else 1)\n",
             encoding="utf-8",
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
@@ -451,7 +450,7 @@ class SemanticRevisionTests(PipelineHarness):
     def test_gate_before_revision_has_the_exact_target_order(self) -> None:
         self.check.write_text(
             "import pathlib, sys\n"
-            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'good', 'good semantic'} else 1)\n",
+            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'base', 'good', 'good semantic'} else 1)\n",
             encoding="utf-8",
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))

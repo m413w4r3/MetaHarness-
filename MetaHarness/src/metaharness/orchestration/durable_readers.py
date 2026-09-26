@@ -119,6 +119,12 @@ def load_evidence(directory: Path) -> EvidenceBundle | None:
             item for item in payload.get("required_check_ids", [])
             if isinstance(item, str)
         ),
+        warnings=tuple(
+            item for item in payload.get("warnings", []) if isinstance(item, str)
+        ),
+        baseline_cleared=tuple(
+            item for item in payload.get("baseline_cleared", []) if isinstance(item, str)
+        ),
     )
 
 

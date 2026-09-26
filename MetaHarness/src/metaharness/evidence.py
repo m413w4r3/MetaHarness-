@@ -8,7 +8,7 @@ import re
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .gitops import (
     StagedChange,
@@ -24,7 +24,7 @@ from .gitops import (
     staged_diff,
     staged_diff_from,
 )
-from .models import HarnessConfig
+from .models import CheckConfig, HarnessConfig
 from .redaction import contains_secret, redact
 from .validation import (
     DEFAULT_TAIL_BYTES,
@@ -315,10 +315,21 @@ class EvidenceBundle:
     deterministic_passed: bool
     failures: tuple[str, ...]
     required_check_ids: tuple[str, ...] = ()
+    # Durable, non-blocking facts about this episode: a check skipped for
+    # unavailable infrastructure, a failure already red on the base commit.
+    warnings: tuple[str, ...] = ()
+    # Required checks whose candidate failure the baseline comparison cleared
+    # (the same failure, or a subset of it, already present on the base
+    # commit).  They count as answered evidence, never as a hidden PASS.
+    baseline_cleared: tuple[str, ...] = ()
 
 
 def required_checks_passed(bundle: EvidenceBundle) -> bool:
-    """Verify every required ID has a durable normal PASS result."""
+    """Verify every required ID has a durable normal PASS result.
+
+    A check whose trusted preflight proved its infrastructure unavailable is
+    explicitly *skipped*: it counts as answered, and its warning is durable.
+    """
 
     by_name: dict[str, Any] = {}
     for raw in bundle.checks:
@@ -331,6 +342,10 @@ def required_checks_passed(bundle: EvidenceBundle) -> bool:
         if result is None:
             return False
         get = result.get if isinstance(result, dict) else lambda key, default=None: getattr(result, key, default)
+        if get("failure_kind", "passed") == "skipped_infra":
+            continue
+        if check_id in set(bundle.baseline_cleared):
+            continue
         if (
             get("exit_code") != 0
             or bool(get("timed_out", False))
@@ -542,8 +557,15 @@ def collect_evidence(
     enforce_diff_size: bool = True,
     allow_empty_diff: bool = False,
     retry_check_infrastructure: Callable[[str, str], bool] | None = None,
+    skip_checks: Mapping[str, str] | None = None,
+    judge_check: Callable[[CheckConfig, CheckResult], tuple[str | None, str | None]] | None = None,
 ) -> EvidenceBundle:
-    """Run all configured checks, then stage and freeze the submitted tree."""
+    """Run all configured checks, then stage and freeze the submitted tree.
+
+    *judge_check* is the gate's comparison of one check against its baseline:
+    it returns the failure code to record, if any, and a durable warning.  A
+    check it clears is not a failure, whatever the exit status was.
+    """
 
     if not isinstance(config, HarnessConfig):
         raise TypeError("config must be a HarnessConfig")
@@ -565,6 +587,7 @@ def collect_evidence(
         root, config, required_check_ids=required_check_ids,
         logs_dir=logs_dir, tail_bytes=tail_bytes, secrets=secrets,
         retry_infrastructure=retry_check_infrastructure,
+        skip=skip_checks,
     )
 
     head_matches = current_head(root) == (expected_head_sha or base_sha)
@@ -597,6 +620,8 @@ def collect_evidence(
         selected_configs = config.select_checks(required_check_ids)
     except ValueError as exc:
         raise EvidenceError(str(exc)) from exc
+    warnings: list[str] = []
+    cleared: list[str] = []
     for check, check_config in zip(checks, selected_configs):
         # A safely rolled back mutation is archived in check evidence, then
         # the exact check is rerun. Only an unrecovered mutation can close the
@@ -605,6 +630,13 @@ def collect_evidence(
             failures.append(f"CHECK_SIDE_EFFECT_REPEATED:{check.name}")
         elif check.workspace_mutated and not check.mutation_recovered:
             failures.append(f"CHECK_MUTATED:{check.name}")
+        # A check whose trusted preflight answered "no" never ran: the run
+        # keeps that fact as a durable warning instead of a red gate.
+        if check.failure_kind == "skipped_infra":
+            warnings.append(
+                f"skipped:{check.name}:{check.skipped_reason or 'infrastructure unavailable'}"
+            )
+            continue
         # P42 selection itself is the mandatory contract.  ``required`` is
         # metadata for the trusted catalogue and does not alter selection.
         if required_check_ids is None and not check_config.required:
@@ -617,7 +649,16 @@ def collect_evidence(
         }:
             failures.append(f"CHECK_INFRA_FAILURE:{check.name}")
         elif check.exit_code != 0:
-            failures.append(f"CHECK_FAILED:{check.name}")
+            if judge_check is None:
+                failures.append(f"CHECK_FAILED:{check.name}")
+                continue
+            failure, warning = judge_check(check_config, check)
+            if warning:
+                warnings.append(warning)
+            if failure:
+                failures.append(failure)
+            else:
+                cleared.append(check.name)
 
     bundle = EvidenceBundle(
         base_sha=base_sha,
@@ -628,6 +669,8 @@ def collect_evidence(
         deterministic_passed=not failures,
         failures=tuple(failures),
         required_check_ids=tuple(check.id for check in selected_configs),
+        warnings=tuple(warnings),
+        baseline_cleared=tuple(cleared),
     )
     if evidence_dir is not None:
         persist_evidence(bundle, evidence_dir, write_logs=False, secrets=secrets)

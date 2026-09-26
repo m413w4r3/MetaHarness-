@@ -597,6 +597,7 @@ class WorkerAttemptService:
             deferred_verify=deferred_verify,
             mismatch_retry_count=mismatch_retry_count,
             out_of_scope_paths=out_of_scope_paths,
+            status_before=tuple(status_before),
         )
     def _step_profile(self, profile_id: str) -> tuple[ModelProfile, ExecutionRole]:
         """The approved implementation profile of one plan step."""

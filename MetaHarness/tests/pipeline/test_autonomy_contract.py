@@ -32,7 +32,8 @@ class CorrectnessRouteIsAutonomousTests(PipelineHarness):
             f"counter = pathlib.Path({str(counter)!r})\n"
             "count = int(counter.read_text()) if counter.exists() else 0\n"
             "counter.write_text(str(count + 1))\n"
-            "raise SystemExit(1 if count < 1 else 0)\n",
+            "feature = pathlib.Path('feature.txt').read_text().strip()\n"
+            "raise SystemExit(1 if feature == 'bad' else 0)\n",
             encoding="utf-8",
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))

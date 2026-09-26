@@ -67,6 +67,33 @@ accepter un arbre. Une mutation du HEAD, de l’index, de l’arbre candidat ou
 d’un état protégé est une erreur d’intégrité : le run se ferme sans nouvel
 appel LLM/AgentExecutor pour « réparer » cette erreur.
 
+### Baseline de checks
+
+Avant le premier step, le harness exécute les checks requis par le plan sur le
+contenu exact de `base_sha`, dans un worktree détaché jetable, et enregistre
+le résultat sous `<runs_root>/.baseline/<base_sha>-<check_config_sha>.json`.
+La clé est `(base_sha, check_config_sha)` : deux runs sur le même commit avec
+le même catalogue réutilisent la baseline, une définition de check qui change
+(argv, timeout, preflight, `blocking`, `junit_xml`) en invalide le cache. Le
+gate ne bloque alors que les *nouvelles* régressions ; une panne déjà rouge
+sur la base produit `PASS_WITH_BASELINE_WARNING`, et une base dont les IDs de
+test ne sont pas parsables (`baseline_red`) ne bloque jamais le nouveau
+travail. L'écriture du cache est atomique ; un cache corrompu est ignoré et
+reconstruit.
+
+Un check dont le `preflight_argv` échoue est `SKIPPED_INFRA` avec un warning
+durable : le preflight n'est évalué qu'une fois par run et l'argv réel n'est
+jamais exécuté. Si ce check est déclaré `blocking = true`, le run part en
+`WAIT_EXTERNAL` (`CHECK_INFRASTRUCTURE_UNAVAILABLE`) au lieu de prétendre que
+le gate est vert ; il n'existe pas de porte humaine dédiée à
+l'infrastructure de check.
+
+`[gate] per_step` nomme les checks payés après la mutation d'un step et
+*avant* son commit : seule une nouvelle régression refuse le step, qui repart
+avec le feedback borné (id du check, IDs de test nouveaux, court extrait,
+chemins modifiés). Le worker ne prouve jamais qu'il a lancé un check : le
+harness rerun et juge.
+
 Le candidat est un objet immutable. Tous les candidats reviewables sont
 poussés sur le remote configuré par `repository.remote` avant la review finale;
 le tip distant est relu et doit être exactement égal au `commit_sha`. Le

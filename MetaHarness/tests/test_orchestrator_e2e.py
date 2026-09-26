@@ -965,7 +965,7 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_check_mutation_fails_before_review(self) -> None:
         _, llm, state = self.run_case(check_mode="mutate", run_id="mutate")
-        self.assertEqual(state["status"], RunStatus.WAITING_CHECK_INFRASTRUCTURE.value)
+        self.assertEqual(state["status"], RunStatus.WAITING_EXTERNAL.value)
         self.assertEqual(state["failure"]["reason"], "CHECK_SIDE_EFFECT_REPEATED")
         self.assertEqual(llm.reviewer_calls, 0)
         self.assertIsNone(state.get("commit_sha"))
@@ -1006,7 +1006,7 @@ class OrchestratorE2ETests(unittest.TestCase):
         )
         run_dir = self.root / "runs" / run_id
         worktree = self.root / "worktrees" / run_id
-        self.assertEqual(state["status"], RunStatus.WAITING_CHECK_INFRASTRUCTURE.value)
+        self.assertEqual(state["status"], RunStatus.WAITING_EXTERNAL.value)
         self.assertEqual(state["failure"]["reason"], "CHECK_INFRASTRUCTURE_UNAVAILABLE")
         self.assertTrue(resume_info(run_dir, state).resumable)
         self.assertEqual(candidate_tree_sha(worktree), state["staged_tree_sha"])
@@ -1029,18 +1029,24 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.assertEqual(llm.planner_calls, 1)
         self.assertEqual(llm.reviewer_calls, 1)
 
-    def test_preflight_recovers_without_replanning_or_restarting_run(self) -> None:
+    def test_a_failed_preflight_skips_its_check_once_without_retrying(self) -> None:
         _, llm, state = self.run_case(
             check_preflight=True,
             env={"FAKE_PREFLIGHT": "fail-once"},
             run_id="preflight-retry",
         )
+        # The preflight is evaluated exactly once per run: a failed one skips
+        # its check as SKIPPED_INFRA with a durable warning, and the run still
+        # delivers its candidate.
         self.assertEqual(state["status"], RunStatus.COMMITTED.value)
         self.assertEqual(llm.planner_calls, 1)
         self.assertEqual(llm.reviewer_calls, 1)
-        self.assertGreaterEqual(
-            int((self.root / "preflight-retry-preflight-state").read_text()), 2,
+        self.assertEqual(
+            int((self.root / "preflight-retry-preflight-state").read_text()), 1,
         )
+        self.assertEqual(state["checks"][0]["failure_kind"], "skipped_infra")
+        self.assertEqual(state["skipped_checks"], ["test"])
+        self.assertTrue(any("PREFLIGHT_FAILED" in item for item in state["check_warnings"]))
 
     def test_workspace_setup_transient_failure_retries_in_place(self) -> None:
         _, llm, state = self.run_case(
@@ -1066,7 +1072,7 @@ class OrchestratorE2ETests(unittest.TestCase):
             workspace_setup_mode="fail_always", run_id="setup-wait",
         )
         run_dir = self.root / "runs" / "setup-wait"
-        self.assertEqual(state["status"], RunStatus.WAITING_CHECK_INFRASTRUCTURE.value)
+        self.assertEqual(state["status"], RunStatus.WAITING_EXTERNAL.value)
         self.assertEqual(state["failure"]["reason"], "CHECK_INFRASTRUCTURE_UNAVAILABLE")
         self.assertEqual(resume_info(run_dir, state).phase, "worktree_setup")
         self.assertFalse((self.root / "worktrees/setup-wait/feature.txt").exists())

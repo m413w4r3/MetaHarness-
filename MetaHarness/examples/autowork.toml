@@ -28,6 +28,12 @@ max_check_repair_attempts = 2
 max_correction_cycles = 2
 max_step_contract_repairs = 2
 
+[gate]
+# The fast gate a step pays *before* its own commit.  Only the *new*
+# regressions of these checks refuse the step; the harness reruns and judges
+# them, and the worker never has to prove that it ran anything.
+per_step = ["lint", "typecheck"]
+
 [transport]
 # One logical text completion keeps retrying a retryable transport failure
 # (429, 5xx, timeout, interrupted connection, transient network) for at most
@@ -91,6 +97,9 @@ enable_profile_recommendation = true
 default_planner_profile = "planner-chatgpt"
 default_reviewer_profile = "planner-chatgpt"
 default_reviser_profile = "claude-opus-5-medium"
+# The transverse final check repair reads the whole failure history of a run:
+# recommend a high-tier profile there ("codex-sol-high" or
+# "claude-opus-5-medium"), while the fast per-step gate stays cheap.
 default_repair_profile = "codex-luna-high"
 
 [context]
@@ -294,6 +303,10 @@ description = "PostgreSQL-backed integration test gate."
 argv = ["make", "test-integration"]
 timeout_seconds = 54000
 preflight_argv = ["docker", "info"]
+# Without its infrastructure this check is skipped with a durable warning.
+# Declaring it blocking makes that condition an external wait instead
+# (never a human gate, never a silent pass).
+blocking = true
 
 [[check_catalog]]
 id = "frontend-e2e"

@@ -1222,7 +1222,7 @@ _LIVE_EVENT_WINDOW_BYTES = 256 * 1024
 LIVE_STOP_STATUSES = frozenset({
     "committed", "published", "failed", "blocked", "plan_rejected", "interrupted",
     "waiting_human",
-    "awaiting_plan_approval", "waiting_check_infrastructure",
+    "awaiting_plan_approval",
     "waiting_remote", "waiting_external",
     "waiting_contract_repair", "waiting_check_repair",
 })

@@ -8,15 +8,18 @@ become ``CHECK_INFRASTRUCTURE_UNAVAILABLE``, a waiting condition.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ..attempt_transaction import AttemptViolation, contain_trusted_process
+from ..baseline import PREFLIGHT_FILE, PREFLIGHT_SCHEMA_VERSION, preflight_fingerprint
 from ..evidence import EvidenceBundle
 from ..gitops import snapshot_candidate_state
-from ..models import HarnessConfig
+from ..models import CheckConfig, HarnessConfig
 from ..recovery_policy import RecoveryBudgets
+from ..result import ResultArtifactError, atomic_write_text
 from ..state import RunStateStore
 from ..validation import run_check_preflights
 from ..workspace import WorkspaceSetupError
@@ -89,51 +92,76 @@ class CheckInfrastructureRecovery:
     def run_preflights(
         self,
         *,
+        run_dir: Path,
         worktree: Path,
         check_config: HarnessConfig,
         check_ids: Sequence[str],
-        counter_key: str,
         phase: str,
         cycle: int | None = None,
     ) -> tuple[str, ...]:
-        """Retry each trusted preflight itself under a durable infra budget."""
+        """Evaluate every trusted preflight exactly once per run.
 
-        budget = self._budgets.max_check_infra_retries
+        The verdict is durable, so Docker availability is never probed again on
+        a resume or a later cycle.  A failed preflight means the check does not
+        run: its ID is returned for the gate to record as ``SKIPPED_INFRA``
+        with a durable warning.  Only a check that explicitly declares itself
+        ``blocking`` turns that condition into the external wait the ladder
+        already owns.
+        """
+
         try:
             selected = check_config.select_checks(check_ids)
         except ValueError as exc:
             raise OrchestrationError("CHECK_PREFLIGHT_FAILED: trusted check selection invalid") from exc
+        store = _PreflightStore(run_dir)
+        skipped: list[str] = []
+        warnings: list[str] = []
         for check in selected:
             if not check.preflight_argv:
                 continue
-            key = self._recovery.budget_key(counter_key, check.id)
-            while True:
-                before = snapshot_candidate_state(worktree)
-                failures = run_check_preflights(worktree, check_config, [check.id])
-                after = snapshot_candidate_state(worktree)
-                if before != after:
-                    # run_check_preflights restores its own side effects.
-                    raise OrchestrationError(
-                        "ROLLBACK_TREE_MISMATCH: preflight did not preserve candidate state"
-                    )
-                if not failures:
-                    break
-                failure = failures[0]
-                reason = (
-                    "CHECK_PREFLIGHT_FAILED"
-                    if failure.startswith("CHECK_PREFLIGHT_FAILED:")
-                    else "CHECK_INFRA_FAILURE"
+            fingerprint = preflight_fingerprint(check)
+            verdict = store.verdict(check.id, fingerprint)
+            if verdict is None:
+                verdict = self._evaluate_preflight(
+                    worktree=worktree, check_config=check_config, check=check,
                 )
-                admission = self._recovery.admit(
-                    key, reason=f"{reason}:{check.id}", budget=budget, phase=phase,
-                    cycle=cycle, tree_before=before.candidate_tree,
-                    tree_after=after.candidate_tree,
+                store.record(check.id, fingerprint, verdict)
+            if verdict["status"] == "PASS":
+                continue
+            if check.blocking:
+                raise OrchestrationError(
+                    "CHECK_INFRASTRUCTURE_UNAVAILABLE: CHECK_PREFLIGHT_FAILED:"
+                    f"{check.id}; the check declares itself blocking"
                 )
-                if not admission.admitted:
-                    raise OrchestrationError(
-                        f"CHECK_INFRASTRUCTURE_UNAVAILABLE: {failure}; retry budget exhausted"
-                    )
-        return ()
+            skipped.append(check.id)
+            warnings.append(
+                f"check:{check.id}:PREFLIGHT_FAILED: skipped with SKIPPED_INFRA"
+            )
+        if warnings:
+            self._store.update_metadata(check_warnings=warnings)
+        return tuple(skipped)
+
+    def _evaluate_preflight(
+        self, *, worktree: Path, check_config: HarnessConfig, check: CheckConfig,
+    ) -> Mapping[str, Any]:
+        """Run one preflight once, contained, and describe its verdict."""
+
+        before = snapshot_candidate_state(worktree)
+        failures = run_check_preflights(worktree, check_config, [check.id])
+        after = snapshot_candidate_state(worktree)
+        if before != after:
+            # run_check_preflights restores its own side effects.
+            raise OrchestrationError(
+                "ROLLBACK_TREE_MISMATCH: preflight did not preserve candidate state"
+            )
+        if not failures:
+            return {"status": "PASS", "exit_code": 0, "detail": ""}
+        failure = failures[0]
+        if not failure.startswith("CHECK_PREFLIGHT_FAILED:"):
+            # A preflight that mutates the candidate is an integrity problem,
+            # never an infrastructure condition to skip.
+            raise OrchestrationError(failure)
+        return {"status": "FAIL", "exit_code": -1, "detail": failure}
 
     def gate_retries(self, *, cycle: int, stage: str, worktree: Path) -> "GateInfraRetries":
         return GateInfraRetries(self, cycle=cycle, stage=stage, worktree=worktree)
@@ -194,3 +222,51 @@ class GateInfraRetries:
 
 
 __all__ = ["CheckInfrastructureRecovery", "GateInfraRetries"]
+
+
+class _PreflightStore:
+    """The durable, tolerant cache of one run's preflight verdicts."""
+
+    def __init__(self, run_dir: Path) -> None:
+        self.path = Path(run_dir) / PREFLIGHT_FILE
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != PREFLIGHT_SCHEMA_VERSION
+            or not isinstance(payload.get("checks"), dict)
+        ):
+            return {}
+        return payload["checks"]
+
+    def verdict(self, check_id: str, fingerprint: str) -> Mapping[str, Any] | None:
+        """The cached verdict of one preflight, never a stale one."""
+
+        entry = self._load().get(check_id)
+        if (
+            not isinstance(entry, dict)
+            or entry.get("fingerprint") != fingerprint
+            or entry.get("status") not in {"PASS", "FAIL"}
+            or not isinstance(entry.get("exit_code"), int)
+        ):
+            return None
+        return entry
+
+    def record(self, check_id: str, fingerprint: str, verdict: Mapping[str, Any]) -> None:
+        checks = self._load()
+        checks[check_id] = {
+            "status": verdict["status"], "exit_code": verdict["exit_code"],
+            "detail": str(verdict.get("detail", ""))[:200], "fingerprint": fingerprint,
+        }
+        try:
+            atomic_write_text(self.path, json.dumps({
+                "schema_version": PREFLIGHT_SCHEMA_VERSION, "checks": checks,
+            }, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+        except (OSError, ResultArtifactError) as exc:
+            raise OrchestrationError(
+                f"DURABLE_ARTIFACT_CORRUPTED: could not record preflight verdicts: {exc}"
+            ) from None

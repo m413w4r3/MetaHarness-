@@ -278,7 +278,6 @@ class RunStatus(StrEnum):
     WAITING_HUMAN = "waiting_human"
     AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
     WAITING_EXTERNAL = "waiting_external"
-    WAITING_CHECK_INFRASTRUCTURE = "waiting_check_infrastructure"
     WAITING_CHECK_REPAIR = "waiting_check_repair"
     WAITING_REMOTE = "waiting_remote"
     WAITING_CONTRACT_REPAIR = "waiting_contract_repair"
@@ -664,13 +663,10 @@ _COMPLETED_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.PUBLISH: RunStatus.PUBLISHED,
 }
 # Failure reasons that name *what* an external wait waits for; the phase stays
-# the operation to retry, the reason carries the business meaning.
-_CHECK_INFRASTRUCTURE_REASONS = frozenset({
-    "CHECK_TIMEOUT", "CHECK_PREFLIGHT_FAILED", "CHECK_INFRA_FAILURE",
-    "CHECK_INFRA_RETRIES_EXHAUSTED", "CHECK_INFRASTRUCTURE_UNAVAILABLE",
-    "CHECK_SIDE_EFFECT_REPEATED", "CHECK_SIDE_EFFECT_UNSTABLE",
-    "WORKSPACE_SETUP_FAILED", "WORKSPACE_SETUP_TIMEOUT",
-})
+# the operation to retry, the reason carries the business meaning.  An
+# infrastructure reason is an ordinary external wait: a skipped check is a
+# durable warning, and only a check that declares itself blocking may stop the
+# run for an infrastructure it cannot reach.
 _REMOTE_REASONS = frozenset({
     "PUSH_FAILED", "CANDIDATE_PUSH_FAILED", "CANDIDATE_REMOTE_UNAVAILABLE",
     "REMOTE_UNAVAILABLE", "REMOTE_TEMPORARILY_UNAVAILABLE",
@@ -726,8 +722,6 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
         if slot is not None:
             # An exhausted repair slot is retried by a resume, never decided.
             status = slot
-        elif reason in _CHECK_INFRASTRUCTURE_REASONS:
-            status = RunStatus.WAITING_CHECK_INFRASTRUCTURE
         elif reason in _REMOTE_REASONS and phase in _REMOTE_PHASES:
             status = RunStatus.WAITING_REMOTE
         else:
@@ -745,7 +739,6 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.WAITING_HUMAN: RunDisposition.WAIT_HUMAN,
     RunStatus.AWAITING_PLAN_APPROVAL: RunDisposition.RUNNING,
     RunStatus.WAITING_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
-    RunStatus.WAITING_CHECK_INFRASTRUCTURE: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_CHECK_REPAIR: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_REMOTE: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_CONTRACT_REPAIR: RunDisposition.WAIT_EXTERNAL,
@@ -1140,6 +1133,15 @@ class CheckConfig:
     required: bool = True
     preflight_argv: tuple[str, ...] = ()
     description: str = ""
+    # A check without its infrastructure is skipped with a durable warning.
+    # Only a check that explicitly declares it *blocking* may stop autonomously
+    # progressing: its unavailable infrastructure then routes to WAIT_EXTERNAL
+    # instead of becoming a silent skip.
+    blocking: bool = False
+    # Repository-relative JUnit XML report this check naturally writes, when it
+    # does: the gate then compares exact failing case ids instead of guessing
+    # them from the rendered output.  Empty means "parse the output".
+    junit_xml: str = ""
 
     @property
     def id(self) -> str:
@@ -1183,6 +1185,29 @@ class WorkspaceSetupCommand:
 
 
 @dataclass(frozen=True)
+class GateConfig:
+    """The optional fast gate a step pays before its own commit.
+
+    ``per_step`` names check IDs of the trusted catalogue.  They run against
+    the mutated step tree, before the step commit, and are compared to their
+    baseline: a new regression sends the step back to its worker instead of
+    spending a whole cycle on it.  The empty default keeps the deterministic
+    gate the only gate.
+    """
+
+    per_step: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if isinstance(self.per_step, str) or not isinstance(self.per_step, tuple):
+            raise ValueError("gate.per_step must be an array of check IDs")
+        if len(set(self.per_step)) != len(self.per_step):
+            raise ValueError("gate.per_step check IDs must be unique")
+        for check_id in self.per_step:
+            if not isinstance(check_id, str) or not check_id.strip():
+                raise ValueError("gate.per_step must contain non-empty check IDs")
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     repo: Path
     base_ref: str
@@ -1217,6 +1242,7 @@ class HarnessConfig:
         )
     )
     workspace_setup: tuple[WorkspaceSetupCommand, ...] = ()
+    gate: GateConfig = field(default_factory=GateConfig)
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     revision: RevisionConfig = field(default_factory=RevisionConfig)
     recovery: RecoveryBudgets = field(default_factory=RecoveryBudgets)

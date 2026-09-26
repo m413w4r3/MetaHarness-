@@ -83,7 +83,6 @@ class GateBaselineTests(AutonomyHarness):
         )
         return [line for line in completed.stdout.splitlines() if line.startswith("FAILED ")]
 
-    @unittest.expectedFailure
     def test_a_baseline_red_test_is_not_a_regression(self) -> None:
         self.commit_files({
             "component.py": "VALUE = 1\n",
@@ -115,7 +114,6 @@ class GateBaselineTests(AutonomyHarness):
         self.assertEqual(self.failing_tests(), [OLD_FAILURE])
         self.assertIn("baseline", self.durable_report().casefold())
 
-    @unittest.expectedFailure
     def test_a_check_without_its_infrastructure_is_skipped_not_fatal(self) -> None:
         self.green_check()
         marker = self.root / "integration-ran.txt"

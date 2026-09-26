@@ -19,6 +19,7 @@ from metaharness.models import (
 )
 from metaharness.orchestration.revision import EffectivePlanView
 from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
+from metaharness.run_options import RunOptions
 from metaharness.resume import resume_info
 
 from tests.pipeline.support import (
@@ -47,7 +48,7 @@ class RecoveryPathTests(PipelineHarness):
             self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.WAITING_CHECK_INFRASTRUCTURE)
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "CHECK_INFRASTRUCTURE_UNAVAILABLE")
         self.assertNotIn("attempt_count", self.state().get("check_repair", {}))
         self.assertEqual(self.workers.roles(), ["implementer"])
@@ -57,6 +58,42 @@ class RecoveryPathTests(PipelineHarness):
             (self.run_dir() / "cycles/001/check-repair/post-implementation/ladder.json").exists()
         )
 
+    def test_check_repair_infrastructure_exhaustion_resumes_at_the_red_gate(self) -> None:
+        from metaharness.agent import AgentRunResult
+        from metaharness.gitops import candidate_tree_sha
+
+        def timeout(request):
+            tree = candidate_tree_sha(request.worktree)
+            return AgentRunResult(
+                status="timed_out", exit_reason="AGENT_TIMEOUT", tree_before=tree,
+                tree_after=tree, usage=None, external_session_id=None,
+                report_path=None, timed_out=True,
+            )
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+        self.workers.on(ExecutionRole.REPAIR, timeout, write("feature.txt", "good\n"))
+        config = self.config(check_repair=1)
+        options = RunOptions.from_config(
+            config,
+            recovery=RecoveryBudgets(max_transient_attempts=0, max_executor_fallbacks=0),
+        )
+        failed = self.orchestrator(
+            config, planner=[initial_plan(STEP)], reviewer=[review()],
+        ).run_text(SPEC, run_id="run", run_options=options)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
+        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_UNAVAILABLE")
+        self.assertEqual(
+            (self.checkpoint()["phase"], self.checkpoint()["check_repair_attempt"]),
+            ("check_repair", 1),
+        )
+        self.assertFalse((self.run_dir() / "cycles/001/candidate/commit.json").exists())
+
+        resumed = self.orchestrator(
+            config, planner=["unused"], reviewer=[review()],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
+
     def test_operator_retry_reruns_gate_without_replaying_steps_or_repair_workers(self) -> None:
         counter = self.root / "gate-count"
         self.check.write_text(
@@ -64,7 +101,11 @@ class RecoveryPathTests(PipelineHarness):
             f"counter = pathlib.Path({str(counter)!r})\n"
             "count = int(counter.read_text()) if counter.exists() else 0\n"
             "counter.write_text(str(count + 1))\n"
-            "if count < 3:\n"
+            "# The first execution belongs to the baseline of the base commit:\n"
+            "# the base content is green, and the delivered content stays red\n"
+            "# for the three gate passes this ladder consumes.\n"
+            "feature = pathlib.Path('feature.txt').read_text().strip()\n"
+            "if feature == 'bad' and count < 4:\n"
             "    print('FAILED tests/test_feature.py::test_behavior')\n"
             "    raise SystemExit(1)\n",
             encoding="utf-8",
@@ -114,7 +155,7 @@ class RecoveryPathTests(PipelineHarness):
         # and nothing else.
         self.assertEqual(len(first_planner.requests), 3)
         self.assertEqual(self.planner.requests, [])
-        self.assertEqual(counter.read_text(), "4")
+        self.assertEqual(counter.read_text(), "5")
 
     def test_same_red_gate_after_operator_retry_becomes_fixed_point(self) -> None:
         self.workers.on(
@@ -390,9 +431,10 @@ class RecoveryPathTests(PipelineHarness):
         git(self.repo, "commit", "-qm", "add test fixture")
         self.base_sha = git(self.repo, "rev-parse", "HEAD")
         self.check.write_text(
-            "import sys\n"
-            "print('tests/test_feature.py: the fixture does not match the spec')\n"
-            "raise SystemExit(1)\n",
+            "import pathlib, sys\n"
+            "if pathlib.Path('tests/test_feature.py').read_text().strip() == 'bad fixture':\n"
+            "    print('tests/test_feature.py: the fixture does not match the spec')\n"
+            "    raise SystemExit(1)\n",
             encoding="utf-8",
         )
         self.workers.on(

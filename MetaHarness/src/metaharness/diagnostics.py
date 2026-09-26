@@ -583,7 +583,7 @@ def _check_recovery_summary(run_dir: Path, state: Mapping[str, Any]) -> str:
     if any(isinstance(item, str) and item.startswith("CHECK_FAILED:") for item in failures):
         classification = "product_check"
     elif (
-        state.get("status") == "waiting_check_infrastructure"
+        reason == "CHECK_INFRASTRUCTURE_UNAVAILABLE"
         or any(isinstance(item, str) and item.startswith(("CHECK_INFRA", "CHECK_TIMEOUT")) for item in failures)
     ):
         classification = "infrastructure"
@@ -605,7 +605,7 @@ def _check_recovery_summary(run_dir: Path, state: Mapping[str, Any]) -> str:
             evidence_sha = None
     if reason == "CHECK_REPAIR_EXHAUSTED" or reason == "ATTRIBUTEERROR" and checkpoint is not None and checkpoint.stage is not None:
         next_action = "Retry deterministic gate"
-    elif state.get("status") == "waiting_check_infrastructure":
+    elif reason == "CHECK_INFRASTRUCTURE_UNAVAILABLE":
         next_action = "Retry check infrastructure"
     else:
         next_action = repair.get("next_action") or "No automatic recovery action"

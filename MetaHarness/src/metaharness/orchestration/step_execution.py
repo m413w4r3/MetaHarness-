@@ -363,6 +363,25 @@ class StepExecutionService:
                     **common, initial_mismatch=None,
                     mismatch_retry_count=repair_count,
                 )
+                # The optional fast gate runs on the mutated step tree, before
+                # this step's own commit, and only its *new* regressions count.
+                per_step = self.runtime.gates.run_per_step_gate(
+                    run_dir=run_dir, worktree=worktree, base_sha=base_sha,
+                    step_dir=artifact_dir,
+                    check_ids=self.runtime.config.gate.per_step,
+                    changed_paths=outcome.changed_paths,
+                )
+                if not per_step.passed:
+                    raise StepExecutionFailure(
+                        "PER_STEP_GATE_REGRESSION", step_id=step.id,
+                        detail=per_step.feedback,
+                        profile_id=active_profile_id,
+                        tree_before=outcome.tree_before, tree_after=outcome.tree_after,
+                        status_before=outcome.status_before,
+                        retry_feedback=per_step.feedback,
+                    )
+                if per_step.warnings:
+                    self.runtime.gates.record_step_warnings(store, per_step.warnings)
                 if pending_transient is not None:
                     recovery.complete(
                         pending_transient, recovered=True, tree_after=outcome.tree_after,

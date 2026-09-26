@@ -18,6 +18,7 @@ from ..approval import (
     read_plan_approval, wait_for_plan_approval,
     write_check_authority,
 )
+from ..baseline import BaselineCache, baseline_payload
 from ..context import build_context, render_context
 from ..execution_selection import (
     ExecutionSelectionError,
@@ -463,13 +464,25 @@ class RunBootstrap:
         check_config, check_ids = config_with_check_authority(
             self.runtime.config, run_dir, expected_sha256=durable_identity.checks_sha256,
         )
-        preflight_failures = self.runtime.gates.run_check_preflights_recoverably(
-            store=store, worktree=info.worktree, check_config=check_config,
-            check_ids=check_ids or plan.required_checks,
-            counter_key="check-preflight:workspace", phase="preparing",
+        selected_check_ids = tuple(check_ids or plan.required_checks)
+        skipped_checks = self.runtime.gates.run_check_preflights_recoverably(
+            store=store, run_dir=run_dir, worktree=info.worktree,
+            check_config=check_config, check_ids=selected_check_ids, phase="preparing",
         )
-        if preflight_failures:
-            raise OrchestrationError(preflight_failures[0])
+        store.update_metadata(skipped_checks=list(skipped_checks))
+        # The baseline of the base commit comes before the first implementation
+        # step: no later gate ever has to guess whether a failure is new.
+        baseline_ids = tuple(dict.fromkeys(
+            (*selected_check_ids, *self.runtime.config.gate.per_step)
+        ))
+        baseline = BaselineCache(self.runtime.config.runs_root).ensure(
+            repo=info.worktree, base_sha=info.base_sha, config=check_config,
+            check_ids=baseline_ids, environment=self.runtime.environment,
+            setup_commands=self.runtime.config.workspace_setup,
+            secrets=self.runtime.secrets,
+            skipped={check_id: "PREFLIGHT_FAILED" for check_id in skipped_checks},
+        )
+        store.update_metadata(baseline=baseline_payload(baseline))
         # Worktree and setup complete: still the first step.
         if checkpoint is not None:
             write_checkpoint(run_dir, checkpoint)

@@ -235,6 +235,9 @@ class StepExecutionOutcome:
     # harness admitted.  They authorize this attempt's diff only: they never
     # widen the durable contract nor the authority of a later step.
     out_of_scope_paths: tuple[str, ...] = ()
+    # The exact porcelain status this attempt started from, so a fast-gate
+    # refusal can be rolled back on the same boundary as any other failure.
+    status_before: tuple[str, ...] = ()
 
 
 _SYNTHETIC_NO_CHANGE_MISMATCH = (

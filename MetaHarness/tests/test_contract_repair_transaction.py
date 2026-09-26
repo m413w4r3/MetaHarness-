@@ -299,7 +299,7 @@ class WaitingDiagnosticsTests(PipelineHarness):
         self.assertIn('"pending_operation": "contract_repair"', report)
         self.assertIn('"step_id": "S01"', report)
 
-    def test_waiting_check_infrastructure_writes_fresh_diagnostics(self) -> None:
+    def test_check_infrastructure_unavailability_writes_fresh_diagnostics(self) -> None:
         with mock.patch(
             "metaharness.orchestration.runtime.PipelineV2Coordinator.run",
             side_effect=PipelineFailure("CHECK_INFRASTRUCTURE_UNAVAILABLE", "diagnostic"),
@@ -307,8 +307,8 @@ class WaitingDiagnosticsTests(PipelineHarness):
             result = self.orchestrator(
                 self.config(), planner=[initial_plan(STEP)], reviewer=["unused"],
             ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.WAITING_CHECK_INFRASTRUCTURE)
-        self.assert_fresh(RunStatus.WAITING_CHECK_INFRASTRUCTURE, "CHECK_INFRASTRUCTURE_UNAVAILABLE")
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
+        self.assert_fresh(RunStatus.WAITING_EXTERNAL, "CHECK_INFRASTRUCTURE_UNAVAILABLE")
 
     def test_waiting_remote_writes_fresh_diagnostics(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))

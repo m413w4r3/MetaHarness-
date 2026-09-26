@@ -157,7 +157,7 @@ class ResumeTests(PipelineHarness):
     def test_profile_selection_snapshot_survives_live_default_changes(self) -> None:
         self.check.write_text(
             "import pathlib, sys\n"
-            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'good', 'good semantic'} else 1)\n",
+            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'base', 'good', 'good semantic'} else 1)\n",
             encoding="utf-8",
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))

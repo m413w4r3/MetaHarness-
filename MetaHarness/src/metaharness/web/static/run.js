@@ -16,12 +16,11 @@
     committed: true, published: true, failed: true, blocked: true,
     plan_rejected: true, interrupted: true, awaiting_plan_approval: true,
     waiting_human: true, waiting_external: true,
-    waiting_check_infrastructure: true, waiting_remote: true,
+    waiting_remote: true,
     waiting_check_repair: true
   };
   var WAITING_LABELS = {
     waiting_external: "Waiting for external authorization",
-    waiting_check_infrastructure: "Waiting for check infrastructure",
     waiting_remote: "Waiting for remote",
     waiting_human: "Waiting for operator decision",
     waiting_contract_repair: "Output correction exhausted",

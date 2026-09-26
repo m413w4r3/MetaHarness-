@@ -1757,3 +1757,48 @@ def read_file_at_commit(
     # ``cat-file blob`` returns raw blob bytes only: a directory (tree) is an
     # error instead of a listing, and no textconv/filter is applied.
     return _git(repo, "cat-file", "blob", f"{commit_sha}:{path}").stdout
+
+
+def create_detached_worktree(
+    repo: Path,
+    *,
+    commit_sha: str,
+    worktree_path: Path,
+) -> Path:
+    """Check out *commit_sha* into a throwaway detached worktree.
+
+    The baseline of the deterministic checks needs the exact content of a
+    commit without touching the run's implementation worktree or its branch.
+    The path must not exist yet; the caller owns its removal.
+    """
+
+    source_repo = git_root(repo)
+    resolved = resolve_commit(source_repo, commit_sha)
+    worktree = Path(worktree_path).expanduser().resolve()
+    if os.path.lexists(worktree):
+        raise GitError(f"worktree path already exists: {worktree}")
+    try:
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise GitError(f"could not create worktree parent: {exc}") from exc
+    _git(
+        source_repo, "worktree", "add", "--detach", "-q", str(worktree), resolved,
+        timeout=600,
+    )
+    if current_head(worktree) != resolved:
+        raise GitError("detached worktree HEAD does not match the requested commit")
+    return worktree
+
+
+def remove_detached_worktree(repo: Path, worktree_path: Path) -> None:
+    """Remove one throwaway worktree; a missing worktree is already removed."""
+
+    source_repo = git_root(repo)
+    worktree = Path(worktree_path).expanduser().resolve()
+    if not os.path.lexists(worktree):
+        return
+    try:
+        _git(source_repo, "worktree", "remove", "--force", str(worktree), timeout=600)
+    except GitError:
+        shutil.rmtree(worktree, ignore_errors=True)
+        _git(source_repo, "worktree", "prune", timeout=600)

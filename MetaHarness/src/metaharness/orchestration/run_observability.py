@@ -445,8 +445,7 @@ class RunObservability:
         if result.status in {
             RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.PLAN_REJECTED,
             RunStatus.WAITING_HUMAN,
-            RunStatus.WAITING_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE,
-            RunStatus.WAITING_CHECK_REPAIR,
+            RunStatus.WAITING_EXTERNAL, RunStatus.WAITING_CHECK_REPAIR,
             RunStatus.WAITING_REMOTE,
             RunStatus.WAITING_CONTRACT_REPAIR, RunStatus.COMMITTED, RunStatus.PUBLISHED,
         }:

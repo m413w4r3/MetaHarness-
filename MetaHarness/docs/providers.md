@@ -86,6 +86,11 @@ default_reviewer_profile = "chat"
 default_implementer_profile = "worker"
 ```
 
+La réparation transverse des checks (`[ui] default_repair_profile`, ou tout
+profil portant le rôle `repair`) lit l'historique de panne d'un run entier :
+recommandez-y un profil *high-tier*. Les retries bornés du gate rapide par
+step, eux, peuvent rester sur un profil mécanique bon marché.
+
 The `model` value may be only a label interpreted by the bridge. MetaHarness
 does not verify or guarantee that it names a native model, and no model name
 is invented here.

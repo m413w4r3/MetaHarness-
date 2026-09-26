@@ -31,7 +31,16 @@ from ..evidence import (
     collect_evidence,
     required_checks_passed,
 )
-from ..validation import config_with_check_authority
+from ..baseline import (
+    BaselineCache,
+    BaselineRecord,
+    CheckVerdict,
+    baseline_of_result,
+    compare_check,
+    junit_report_path,
+    preflight_skips,
+)
+from ..validation import config_with_check_authority, run_checks
 from ..gitops import (
     GitError,
     commit_parents,
@@ -75,6 +84,11 @@ from .check_failure import (
     CheckRepairAttempt,
     implicated_repair_paths,
     soft_check_failures,
+)
+from .per_step_gate import (
+    PerStepGateOutcome,
+    record_step_warnings,
+    run_per_step_gate,
 )
 from .pipeline_v2 import (
     CyclePlan,
@@ -149,6 +163,31 @@ class GateService:
     def __init__(self, runtime: "RunRuntime") -> None:
         self.runtime = runtime
 
+    def run_per_step_gate(
+        self,
+        *,
+        run_dir: Path,
+        worktree: Path,
+        base_sha: str,
+        step_dir: Path,
+        check_ids: Sequence[str],
+        changed_paths: Sequence[str],
+    ) -> PerStepGateOutcome:
+        """The fast gate a step pays *before* its own commit.
+
+        Only the configured ``gate.per_step`` checks run, only their *new*
+        regressions count, and the worker receives the bounded evidence of a
+        refusal -- never the whole log.
+        """
+
+        return run_per_step_gate(
+            self, run_dir=run_dir, worktree=worktree, base_sha=base_sha,
+            step_dir=step_dir, check_ids=check_ids, changed_paths=changed_paths,
+        )
+
+    # The fast gate is its own authority: this service only delegates to it.
+    record_step_warnings = staticmethod(record_step_warnings)
+
     def run_gate(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
         stage: GateStage,
@@ -169,8 +208,8 @@ class GateService:
 
         _archive_attempt(directory, names=_CHECK_ATTEMPT_ARTIFACTS)
         store.update_metadata(current_step=None)
-        evidence = self._final_evidence(
-            ctx.info.worktree, ctx.base_sha, directory,
+        evidence, baseline_payload = self._final_evidence(
+            ctx.info.worktree, ctx.base_sha, directory, run_dir=ctx.run_dir,
             check_failures_hard=False, reuse=True, stage=stage,
             expected_head_sha=current_head(ctx.info.worktree),
             required_check_ids=cycle_plan.plan.required_checks or None,
@@ -190,6 +229,7 @@ class GateService:
             changed_files=list(evidence.changed_files),
             deterministic_gate=gate,
             deterministic_gate_attempt=gate_attempt,
+            baseline=baseline_payload,
         )
         self.runtime.cycle_update(store, cycle_plan.cycle, deterministic_gate=gate)
         if evidence.deterministic_passed:
@@ -270,18 +310,18 @@ class GateService:
         self,
         *,
         store: RunStateStore,
+        run_dir: Path,
         worktree: Path,
         check_config: HarnessConfig,
         check_ids: Sequence[str],
-        counter_key: str,
         phase: str,
         cycle: int | None = None,
     ) -> tuple[str, ...]:
-        """Retry each trusted preflight itself under a durable infra budget."""
+        """Evaluate each trusted preflight once per run; return the skipped IDs."""
 
         return self.runtime.check_recovery(store).run_preflights(
-            worktree=worktree, check_config=check_config, check_ids=check_ids,
-            counter_key=counter_key, phase=phase, cycle=cycle,
+            run_dir=run_dir, worktree=worktree, check_config=check_config,
+            check_ids=check_ids, phase=phase, cycle=cycle,
         )
     @staticmethod
     def check_repair_attempt_records(
@@ -321,7 +361,7 @@ class GateService:
                 or not _is_object_id(before) or not _is_object_id(after)
                 or payload.get("status") != "completed"
                 or worker_result != "DONE"
-                or targeted_check not in {"PASS", "FAIL"}
+                or targeted_check not in {"PASS", "FAIL", "NOT_RUN"}
                 or blocked_kind != "NONE"
                 or not isinstance(note, str) or not note.strip()
             ):
@@ -587,12 +627,13 @@ class GateService:
         )
         if (
             protocol is None or protocol.result != "DONE"
-            or protocol.targeted_check not in {"PASS", "FAIL"}
             or protocol.blocked_kind != "NONE"
         ):
             # RevisionRunner owns rollback for this branch. Reaching it means
-            # the worker result lost its strict proof between orchestration
-            # boundaries, so fail closed before writing an attempt record.
+            # the worker result lost its report between orchestration
+            # boundaries, so fail closed before writing an attempt record.  What
+            # the worker says about a targeted command it may or may not have
+            # run is informative only: the harness reruns and judges the checks.
             raise PipelineFailure("CHECK_REPAIR_UNAVAILABLE", "repair result is not verifiable")
         record = CheckRepairAttempt(
             number=attempt,
@@ -663,12 +704,37 @@ class GateService:
         return self.runtime.step_replan.replan_cycle_step(
             store, ctx, cycle_plan, stage, step, evidence,
         )
+    def gate_baseline(
+        self,
+        *,
+        run_dir: Path,
+        worktree: Path,
+        base_sha: str,
+        check_config: HarnessConfig,
+        checks: Sequence[Any],
+        skipped: Mapping[str, str],
+    ) -> BaselineRecord:
+        """The run's baseline for one check subset, captured at most once.
+
+        The baseline is always established *before* the subset is judged, so a
+        gate never has to guess what the base commit already answered.
+        """
+
+        return BaselineCache(self.runtime.config.runs_root).ensure(
+            repo=worktree, base_sha=base_sha, config=check_config,
+            check_ids=[check.id for check in checks],
+            environment=self.runtime.environment,
+            setup_commands=self.runtime.config.workspace_setup,
+            secrets=self.runtime.secrets, skipped=skipped,
+        )
+
     def _final_evidence(
         self,
         worktree: Path,
         base_sha: str,
         evidence_dir: Path,
         *,
+        run_dir: Path,
         check_failures_hard: bool,
         reuse: bool,
         expected_head_sha: str | None = None,
@@ -676,12 +742,13 @@ class GateService:
         enforce_diff_size: bool = False,
         stage: GateStage | None = None,
         retry_check_infrastructure: Callable[[str, str], bool] | None = None,
-    ) -> EvidenceBundle:
+    ) -> tuple[EvidenceBundle, dict[str, Any]]:
         """Final checks for the exact current candidate.
 
         With *reuse*, durable evidence already frozen for exactly this index
         tree is reused: checks are never replayed for a tree whose evidence is
-        complete.
+        complete.  Every candidate check is judged against the baseline of the
+        base commit: only a *new* regression can close the gate.
         """
 
         if reuse:
@@ -707,7 +774,7 @@ class GateService:
                         "changed_paths": list(stored.changed_files),
                     },
                 )
-                return stored
+                return stored, {}
         checks_started_at = self.runtime.observability.trace_time()
         checks_started_mono = time.perf_counter()
         checks_tree_before = _safe_candidate_tree(worktree)
@@ -725,6 +792,42 @@ class GateService:
             self.runtime.config, evidence_dir, requested_check_ids=required_check_ids,
             expected_sha256=self.runtime.approved_check_authority_sha256(evidence_dir),
         )
+        selected = check_config.select_checks(check_ids)
+        skipped = preflight_skips(run_dir, selected)
+        baseline = self.gate_baseline(
+            run_dir=run_dir, worktree=worktree, base_sha=base_sha,
+            check_config=check_config, checks=selected, skipped=skipped,
+        )
+        verdicts: list[dict[str, Any]] = []
+        recorded: set[str] = set()
+
+        def record(check: Any, result: Any) -> Any:
+            """Compare one candidate check against its baseline, once."""
+
+            candidate = baseline_of_result(
+                check.id, result, junit_path=junit_report_path(check, result),
+            )
+            judgement = compare_check(check.id, candidate, baseline.entry(check.id))
+            recorded.add(check.id)
+            verdicts.append({
+                "id": check.id,
+                "verdict": judgement.verdict.value,
+                "baseline_status": (
+                    baseline.entry(check.id).status if baseline.entry(check.id) else None
+                ),
+                "candidate_status": candidate.status,
+                "exit_code": candidate.exit_code,
+                "failure_ids": list(candidate.failure_ids),
+                "failure_ids_parsed": candidate.failure_ids_parsed,
+                "new_failure_ids": list(judgement.new_failure_ids),
+                "warning": judgement.warning,
+            })
+            return judgement
+
+        def judge(check: Any, result: Any) -> tuple[str | None, str | None]:
+            judgement = record(check, result)
+            return judgement.failure, judgement.warning
+
         try:
             evidence = collect_evidence(
                 worktree, base_sha, check_config, evidence_dir=evidence_dir,
@@ -738,6 +841,7 @@ class GateService:
                     stage is not None or current_head(worktree) != base_sha
                 ),
                 retry_check_infrastructure=retry_check_infrastructure,
+                skip_checks=skipped, judge_check=judge,
             )
         except Exception as exc:
             self.runtime.observability.trace_emit(
@@ -768,4 +872,19 @@ class GateService:
                 "started_at": checks_started_at,
             },
         )
-        return evidence
+        for check, result in zip(selected, evidence.checks):
+            # A green candidate check is judged too: the durable baseline
+            # artifact describes every check of this gate, never only the red
+            # ones the failure callback happens to see.
+            if check.id not in recorded:
+                record(check, result)
+        payload = {
+            "schema_version": 1,
+            "base_sha": baseline.base_sha,
+            "check_config_sha": baseline.check_config_sha,
+            "baseline_unavailable_reason": baseline.unavailable_reason,
+            "checks": verdicts,
+            "warnings": list(evidence.warnings),
+        }
+        atomic_write_text(evidence_dir / "baseline.json", _json_text(payload))
+        return evidence, payload

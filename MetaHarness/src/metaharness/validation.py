@@ -16,7 +16,7 @@ import dataclasses
 import functools
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .approval import ApprovalError, read_check_authority
 from .attempt_transaction import (
@@ -129,6 +129,9 @@ class CheckResult:
     mutated_tree_sha: str | None = None
     mutated_paths: tuple[str, ...] = ()
     infrastructure_retries: int = 0
+    # Set exactly when the check never ran because its trusted preflight
+    # answered "no": the run keeps a durable warning instead of a red gate.
+    skipped_reason: str = ""
 
 
 def bounded_tail(value: str, max_bytes: int = DEFAULT_TAIL_BYTES) -> str:
@@ -260,6 +263,17 @@ def _gate_infrastructure_failure(stdout: str, stderr: str) -> bool:
     return any(marker in output for marker in markers)
 
 
+def skipped_check_result(check: CheckConfig, reason: str) -> CheckResult:
+    """The durable result of a check whose trusted preflight already said no."""
+
+    return CheckResult(
+        name=check.name, argv=tuple(check.argv), cwd=check.cwd, exit_code=-1,
+        timed_out=False, duration_seconds=0.0, stdout_log="", stderr_log="",
+        stdout_tail="", stderr_tail="", workspace_mutated=False,
+        failure_kind="skipped_infra", skipped_reason=reason,
+    )
+
+
 def run_checks(
     worktree: str | Path,
     config: HarnessConfig,
@@ -269,6 +283,7 @@ def run_checks(
     tail_bytes: int = DEFAULT_TAIL_BYTES,
     secrets: tuple[str, ...] = (),
     retry_infrastructure: Callable[[str, str], bool] | None = None,
+    skip: Mapping[str, str] | None = None,
 ) -> tuple[CheckResult, ...]:
     """Run every configured check, continuing after failures and timeouts.
 
@@ -276,6 +291,10 @@ def run_checks(
     written to log files; its whole group is terminated at the deadline and
     after it exits.  The candidate tree is snapshotted before and after each
     check to detect any mutation of the submitted code.
+
+    A check listed in *skip* is never executed: its trusted preflight already
+    answered "infrastructure unavailable", and the run records that as a
+    warning instead of a failure.
     """
 
     if not isinstance(config, HarnessConfig):
@@ -302,6 +321,10 @@ def run_checks(
         log_root = output_dir if output_dir is not None else Path(scratch)
         log_root.mkdir(parents=True, exist_ok=True)
         for check, cwd in zip(selected, cwds):
+            skipped_reason = (skip or {}).get(check.id)
+            if skipped_reason:
+                results.append(skipped_check_result(check, skipped_reason))
+                continue
             stem = _safe_log_stem(check.name, used_log_stems)
             canonical_stdout = log_root / f"{stem}.stdout.log"
             canonical_stderr = log_root / f"{stem}.stderr.log"

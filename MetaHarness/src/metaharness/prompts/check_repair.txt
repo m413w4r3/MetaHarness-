@@ -19,13 +19,13 @@ it or create a workaround. Emit the required META SCOPE REQUEST protocol.
 
 Work silently. Do not narrate routine file reads, edits or reasoning.
 
-After editing, report whether a targeted check actually ran. A zero process
-exit code is not evidence that a repair was verified. If no targeted check ran,
-you must report BLOCKED and NOT_RUN. If Docker or another required service is
-unavailable, report BLOCKED and INFRASTRUCTURE. If the fix needs more scope,
-report BLOCKED and SCOPE, with the META SCOPE REQUEST block before the result.
-Any other inability to complete is BLOCKED and OTHER. Do not claim DONE unless
-a targeted command actually ran; report PASS or FAIL exactly as observed.
+Edit the code according to the supplied deterministic failure evidence. The
+harness reruns and judges the checks itself: your report of a targeted command
+is informative only. If no targeted check could run, say so in NOTE and still
+report the edit you made. If the fix needs more scope, report BLOCKED and
+SCOPE with the META SCOPE REQUEST block first. Report BLOCKED and
+INFRASTRUCTURE only when the required service itself is unavailable, and
+BLOCKED and OTHER for any other real inability.
 
 Keep the final response concise. Its last block must be exactly this protocol,
 with one non-empty NOTE line and no text after the footer:
@@ -42,7 +42,7 @@ BLOCKED_KIND
 NONE|INFRASTRUCTURE|SCOPE|OTHER
 
 NOTE
-<one short non-empty line>
+<one short non-empty line: what you changed, or why you could not run a check>
 
 END META CHECK REPAIR RESULT
 

@@ -137,6 +137,10 @@ def _check_authority_payload(
         }
         if check.description:
             entry["description"] = check.description
+        if check.blocking:
+            entry["blocking"] = True
+        if check.junit_xml:
+            entry["junit_xml"] = check.junit_xml
         entries.append(entry)
     # The schema 2 artifact freezes the whole trusted catalogue and names the
     # initial selection separately, so a correction plan can request another
@@ -168,6 +172,7 @@ def _validate_check_authority_check(value: object, index: int) -> CheckConfig:
         raise ApprovalError(f"check authority checks[{index}] must be an object")
     allowed = {
         "id", "argv", "cwd", "timeout_seconds", "preflight_argv", "required", "description",
+        "blocking", "junit_xml",
     }
     if set(value) - allowed:
         raise ApprovalError(f"check authority checks[{index}] contains an unknown field")
@@ -196,10 +201,20 @@ def _validate_check_authority_check(value: object, index: int) -> CheckConfig:
     description = value.get("description", "")
     if not isinstance(description, str) or len(description) > 300:
         raise ApprovalError(f"check authority checks[{index}].description is invalid")
+    blocking = value.get("blocking", False)
+    if not isinstance(blocking, bool):
+        raise ApprovalError(f"check authority checks[{index}].blocking is invalid")
+    junit_xml = value.get("junit_xml", "")
+    if (
+        not isinstance(junit_xml, str)
+        or (junit_xml and (Path(junit_xml).is_absolute() or ".." in Path(junit_xml).parts))
+    ):
+        raise ApprovalError(f"check authority checks[{index}].junit_xml is invalid")
     try:
         return CheckConfig(
             name=check_id, argv=tuple(argv), cwd=cwd, timeout_seconds=timeout,
             preflight_argv=tuple(preflight), required=required, description=description,
+            blocking=blocking, junit_xml=junit_xml,
         )
     except (TypeError, ValueError) as exc:
         raise ApprovalError(f"check authority checks[{index}] is invalid") from exc

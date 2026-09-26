@@ -104,14 +104,12 @@ _TERMINAL_LABELS = {
     "blocked": "BLOCKED", "plan_rejected": "REJECTED", "failed": "FAILED",
     "interrupted": "INTERRUPTED", "waiting_human": "WAITING FOR OPERATOR",
     "waiting_external": "WAITING FOR EXTERNAL AUTHORIZATION",
-    "waiting_check_infrastructure": "WAITING FOR CHECK INFRASTRUCTURE",
     "waiting_remote": "WAITING FOR REMOTE",
     "waiting_contract_repair": "WAITING FOR CONTRACT REPAIR PLANNER",
     "waiting_check_repair": "WAITING FOR DETERMINISTIC GATE RETRY",
 }
 _WAITING_LABELS = {
     "waiting_external": "Waiting for external authorization",
-    "waiting_check_infrastructure": "Waiting for check infrastructure",
     "waiting_remote": "Waiting for remote",
     "waiting_human": "Waiting for operator decision",
     "waiting_contract_repair": "Output correction exhausted",
@@ -996,8 +994,8 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     status = str(state.get("status", run.get("status", "")) or "")
     failure = run.get("failure", state.get("failure"))
     if status not in {
-        "failed", "blocked", "interrupted", "waiting_check_infrastructure",
-        "waiting_remote", "waiting_external", "waiting_human", "waiting_contract_repair",
+        "failed", "blocked", "interrupted", "waiting_remote", "waiting_external",
+        "waiting_human", "waiting_contract_repair",
         "waiting_check_repair",
     } or not isinstance(failure, dict):
         return ""

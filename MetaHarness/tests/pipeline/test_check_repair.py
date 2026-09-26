@@ -76,7 +76,7 @@ class CheckRepairTests(PipelineHarness):
         self._add_tracked_paths("tests/test_feature.py")
         self.check.write_text(
             "import pathlib, sys\n"
-            "if pathlib.Path('feature.txt').read_text().strip() != 'good':\n"
+            "if pathlib.Path('feature.txt').read_text().strip() == 'bad':\n"
             "    print('feature.txt: required value; tests/test_feature.py: expected fixture update', file=sys.stderr)\n"
             "    raise SystemExit(1)\n",
             encoding="utf-8",
@@ -112,9 +112,10 @@ class CheckRepairTests(PipelineHarness):
         self._add_tracked_paths("tests/test_feature.py", "tests/test_other.py")
         self.check.write_text(
             "import pathlib, sys\n"
-            "if not (pathlib.Path('feature.txt').read_text().strip() == 'good'\n"
-            "        and pathlib.Path('tests/test_feature.py').read_text().strip() == 'repaired'\n"
-            "        and pathlib.Path('tests/test_other.py').read_text().strip() == 'repaired'):\n"
+            "feature = pathlib.Path('feature.txt').read_text().strip()\n"
+            "names = ('tests/test_feature.py', 'tests/test_other.py')\n"
+            "repaired = all(pathlib.Path(name).read_text().strip() == 'repaired' for name in names)\n"
+            "if feature == 'bad' or (feature == 'good' and not repaired):\n"
             "    print('tests/test_feature.py tests/test_other.py', file=sys.stderr)\n"
             "    raise SystemExit(1)\n",
             encoding="utf-8",
@@ -147,13 +148,14 @@ class CheckRepairTests(PipelineHarness):
         )
 
     def test_noop_repair_attempt_is_existing_head_not_an_empty_repair_commit(self) -> None:
-        counter = self.root / "flaky-count"
+        marker = self.root / "flaky-seen"
         self.check.write_text(
             "import pathlib, sys\n"
-            f"counter = pathlib.Path({str(counter)!r})\n"
-            "count = int(counter.read_text()) if counter.exists() else 0\n"
-            "counter.write_text(str(count + 1))\n"
-            "if count == 0:\n"
+            f"marker = pathlib.Path({str(marker)!r})\n"
+            "feature = pathlib.Path('feature.txt').read_text().strip()\n"
+            "# The delivered content is red exactly once.\n"
+            "if feature == 'good' and not marker.exists():\n"
+            "    marker.write_text('seen')\n"
             "    print('tests/test_feature.py: flaky failure', file=sys.stderr)\n"
             "    raise SystemExit(1)\n",
             encoding="utf-8",
@@ -179,10 +181,10 @@ class CheckRepairTests(PipelineHarness):
             "import pathlib, sys\n"
             "feature = pathlib.Path('feature.txt').read_text().strip()\n"
             f"related = pathlib.Path({related!r}).read_text().strip()\n"
-            "if feature != 'good':\n"
+            "if feature == 'bad':\n"
             "    print('feature.txt: the primary file is not repaired', file=sys.stderr)\n"
             "    raise SystemExit(1)\n"
-            "if related != 'good':\n"
+            "if feature == 'good' and related != 'good':\n"
             f"    print({related + ': the related approved file is not repaired'!r}, file=sys.stderr)\n"
             "    raise SystemExit(1)\n",
             encoding="utf-8",
@@ -421,9 +423,13 @@ class CheckRepairTests(PipelineHarness):
         self._add_tracked_paths("other.txt")
         self.check.write_text(
             "import pathlib, sys\n"
-            "if (pathlib.Path('feature.txt').read_text().strip() != 'good'\n"
-            "        or pathlib.Path('other.txt').read_text().strip() != 'good'):\n"
+            "feature = pathlib.Path('feature.txt').read_text().strip()\n"
+            "other = pathlib.Path('other.txt').read_text().strip()\n"
+            "if feature == 'bad' or (feature == 'partial' and other != 'good'):\n"
             "    print('feature.txt: required files are not repaired', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "if feature == 'good' and other != 'good':\n"
+            "    print('feature.txt other.txt: required files are not repaired', file=sys.stderr)\n"
             "    raise SystemExit(1)\n",
             encoding="utf-8",
         )
@@ -486,13 +492,15 @@ class CheckRepairTests(PipelineHarness):
                 f"WRITE_SET\n- {primary}\n",
                 f"WRITE_SET\n{write_entries}", 1,
             )
-        counter = self.root / "synthetic-check-count"
         self.check.write_text(
             "import pathlib, sys\n"
-            f"counter = pathlib.Path({str(counter)!r})\n"
-            "count = int(counter.read_text()) if counter.exists() else 0\n"
-            "counter.write_text(str(count + 1))\n"
-            "if count == 0:\n"
+            "\n"
+            "def value(path):\n"
+            "    return pathlib.Path(path).read_text().strip()\n"
+            "\n"
+            "\n"
+            "modules = [f'src/repair_{index:02}.py' for index in range(4)]\n"
+            "if value('src/repair_04.py') == 'good' and any(value(item) != 'good' for item in modules):\n"
             "    print('=== FAILURES ===')\n"
             "    print('________________ test_gate_failure ________________')\n"
             "    print('Traceback (most recent call last):')\n"
@@ -564,42 +572,6 @@ class CheckRepairTests(PipelineHarness):
         self.assertEqual(len(requests), 2)
         for request in requests:
             self.assertEqual(json.loads(request.read_text())["decision"], "auto-admitted")
-
-    def test_check_repair_infrastructure_exhaustion_resumes_at_the_red_gate(self) -> None:
-        from metaharness.agent import AgentRunResult
-        from metaharness.gitops import candidate_tree_sha
-
-        def timeout(request):
-            tree = candidate_tree_sha(request.worktree)
-            return AgentRunResult(
-                status="timed_out", exit_reason="AGENT_TIMEOUT", tree_before=tree,
-                tree_after=tree, usage=None, external_session_id=None,
-                report_path=None, timed_out=True,
-            )
-
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
-        self.workers.on(ExecutionRole.REPAIR, timeout, write("feature.txt", "good\n"))
-        config = self.config(check_repair=1)
-        options = RunOptions.from_config(
-            config,
-            recovery=RecoveryBudgets(max_transient_attempts=0, max_executor_fallbacks=0),
-        )
-        failed = self.orchestrator(
-            config, planner=[initial_plan(STEP)], reviewer=[review()],
-        ).run_text(SPEC, run_id="run", run_options=options)
-        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
-        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_UNAVAILABLE")
-        self.assertEqual(
-            (self.checkpoint()["phase"], self.checkpoint()["check_repair_attempt"]),
-            ("check_repair", 1),
-        )
-        self.assertFalse((self.run_dir() / "cycles/001/candidate/commit.json").exists())
-
-        resumed = self.orchestrator(
-            config, planner=["unused"], reviewer=[review()],
-        ).resume("run")
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
 
     def test_a_dirty_check_repair_timeout_rolls_back_and_retries_exact_contract(self) -> None:
         def timeout(request):  # the repair worker edits in scope, then times out
@@ -831,9 +803,11 @@ class CheckRepairTests(PipelineHarness):
         # proves a responsible step, so the replan rung is inapplicable.
         self._add_tracked_paths("tests/test_feature.py")
         self.check.write_text(
-            "import sys\n"
-            "print('tests/test_feature.py: the fixture does not match the spec')\n"
-            "raise SystemExit(1)\n",
+            "import pathlib, sys\n"
+            "target = pathlib.Path('tests/test_feature.py').read_text().strip()\n"
+            "if target == 'bad fixture':\n"
+            "    print('tests/test_feature.py: the fixture does not match the spec')\n"
+            "    raise SystemExit(1)\n",
             encoding="utf-8",
         )
         self.workers.on(
