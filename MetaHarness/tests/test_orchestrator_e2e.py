@@ -14,14 +14,27 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.cli import main  # noqa: E402
 from metaharness.agent import AgentExecutorCapabilities, register_executor_driver  # noqa: E402
 from metaharness.config import load_config  # noqa: E402
-from metaharness.models import RunStatus  # noqa: E402
+from metaharness.models import (  # noqa: E402
+    ContextConfig,
+    ExecutionRole,
+    HarnessConfig,
+    LLMEndpointConfig,
+    ModelProfile,
+    ProfileDriver,
+    RoutingConfig,
+    RunStatus,
+    SelectionMode,
+    UIConfig,
+)
 from metaharness.orchestrator import Orchestrator  # noqa: E402
+from metaharness.state import RunStateStore  # noqa: E402
 from metaharness.web.api import approve_run  # noqa: E402
 from tests.proc_support import process_is_gone, read_pid  # noqa: E402
 
@@ -731,13 +744,20 @@ class OrchestratorE2ETests(unittest.TestCase):
 
     def test_commit_is_impossible_without_both_gates(self) -> None:
         _, llm, state = self.run_case(check_fail=True, review=PASS_REVIEW)
-        # The default run has no check-repair budget: the ladder refuses the
-        # worker pass and exhausts its autonomous rungs before the operator wait.
-        self.assertEqual(state["status"], RunStatus.WAITING_CHECK_REPAIR.value)
-        self.assertEqual(state["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
+        # A red deterministic gate never accepts a candidate: whichever
+        # operator wait the recovery ladder ends on, no gate evidence is
+        # accepted, no harness commit exists and nothing is published.
+        run_dir = self.root / "runs" / "run-1"
+        self.assertNotEqual(state["status"], RunStatus.COMMITTED.value)
+        self.assertFalse(
+            (run_dir / "cycles/001/checks/post-implementation/accepted.json").exists()
+        )
+        self.assertIsNone(state.get("commit_sha"))
+        self.assertEqual(self.harness_commits("run-1"), 0)
+        self.assertFalse((run_dir / "publish.json").exists())
+        self.assertFalse(state.get("published"))
         # The deterministic gate precedes the immutable candidate and review.
         self.assertEqual(llm.reviewer_calls, 0)
-        self.assertIsNone(state.get("commit_sha"))
 
     def test_revise_fail_and_empty_diff_never_publish(self) -> None:
         _, _, revise = self.run_case(review=REVISE_REVIEW, run_id="revise")
@@ -1153,6 +1173,87 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.assertEqual(llm.planner_calls, 1)
         self.assertEqual(llm.reviewer_calls, 1)
         self.assertEqual(self.commits("repair"), 2)
+
+
+def run_text_config(root: Path) -> HarnessConfig:
+    """A minimal profile-aware configuration for the ``run_text`` contract."""
+
+    endpoint = LLMEndpointConfig("https://example.invalid", "/chat", "model")
+    profiles = {
+        "planner": ModelProfile(
+            "planner", "Planner", (ExecutionRole.PLANNER,), ProfileDriver.OPENAI_CHAT,
+            "planner", SelectionMode.REQUEST, base_url=endpoint.base_url,
+            endpoint_path=endpoint.endpoint_path,
+        ),
+        "implementer": ModelProfile(
+            "implementer", "Implementer", (ExecutionRole.IMPLEMENTER,), ProfileDriver.EXTERNAL,
+            "worker", SelectionMode.CLI, argv=("true",),
+        ),
+        "reviewer": ModelProfile(
+            "reviewer", "Reviewer", (ExecutionRole.REVIEWER,), ProfileDriver.OPENAI_CHAT,
+            "reviewer", SelectionMode.REQUEST, base_url=endpoint.base_url,
+            endpoint_path=endpoint.endpoint_path,
+        ),
+    }
+    return HarnessConfig(
+        repo=root,
+        base_ref="HEAD",
+        runs_root=root / "runs",
+        worktrees_root=root / "worktrees",
+        require_clean_base=True,
+        context=ContextConfig(),
+        check_catalog=(),
+        allow_no_required_checks=True,
+        ui=UIConfig(default_planner_profile="planner", default_reviewer_profile="reviewer"),
+        model_profiles=profiles,
+        routing=RoutingConfig(
+            mechanical_profile="implementer",
+            reasoning_profile="implementer",
+            agentic_profile="implementer",
+        ),
+    )
+
+
+class RunTextTests(unittest.TestCase):
+    """``Orchestrator.run_text``: one exact spec and one created run state."""
+
+    def test_run_file_delegates_to_run_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            spec_path = Path(directory) / "SPEC.md"
+            spec_path.write_text("exact\n", encoding="utf-8")
+            orchestrator = Orchestrator.__new__(Orchestrator)
+            expected = object()
+            orchestrator.run_text = Mock(return_value=expected)  # type: ignore[method-assign]
+            self.assertIs(orchestrator.run(spec_path, run_id="r"), expected)
+            orchestrator.run_text.assert_called_once_with("exact\n", run_id="r")
+
+    def test_run_text_persists_exact_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = run_text_config(root)
+            config.runs_root.mkdir()
+            orchestrator = Orchestrator(config)
+            orchestrator._execute = Mock(return_value=object())  # type: ignore[method-assign]
+            spec = "# SPEC\n\ntext with trailing spaces  \n"
+            orchestrator.run_text(spec, run_id="exact")
+            run_dir = config.runs_root / "exact"
+            self.assertEqual((run_dir / "spec.md").read_text(encoding="utf-8"), spec)
+
+    def test_on_created_runs_after_initial_state_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = run_text_config(root)
+            config.runs_root.mkdir()
+            orchestrator = Orchestrator(config)
+            orchestrator._execute = Mock(return_value=object())  # type: ignore[method-assign]
+            observed: list[tuple[Path, str, str]] = []
+
+            def on_created(run_dir: Path) -> None:
+                state = RunStateStore(run_dir / "state.json").load()
+                observed.append((run_dir, (run_dir / "spec.md").read_text(), state["status"]))
+
+            orchestrator.run_text("body", run_id="created", on_created=on_created)
+            self.assertEqual(observed, [(config.runs_root / "created", "body", "created")])
 
 
 if __name__ == "__main__":

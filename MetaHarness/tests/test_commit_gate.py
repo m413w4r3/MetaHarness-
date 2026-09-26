@@ -12,11 +12,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.evidence import EvidenceBundle  # noqa: E402
+from metaharness.commit_gate import (  # noqa: E402
+    CommitSafetyError,
+    accepted_step_record,
+    commit_safety_gate,
+)
 from metaharness.gitops import (  # noqa: E402
+    GitError,
+    commit_step_tree,
     create_run_worktree,
     current_head,
     index_tree_sha,
     stage_all,
+    validate_linear_commit_chain,
 )
 from metaharness.orchestrator import CommitBoundaryError  # noqa: E402
 from metaharness.orchestration.publication import PublicationService  # noqa: E402
@@ -175,6 +183,102 @@ class CandidateGateTests(unittest.TestCase):
     def test_branch_switched(self) -> None:
         run_git(self.worktree, "switch", "-q", "-c", "elsewhere")
         self.assert_refused("HEAD changed")
+
+
+class AcceptedStepChainTests(unittest.TestCase):
+    """Accepted step trees are one linear chain behind the commit safety gate."""
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tempdir.name) / "repo"
+        self.repo.mkdir()
+        run_git(self.repo, "init", "-q")
+        run_git(self.repo, "config", "user.name", "MetaHarness tests")
+        run_git(self.repo, "config", "user.email", "tests@example.invalid")
+        (self.repo / "state.txt").write_text("base\n", encoding="utf-8")
+        run_git(self.repo, "add", "--all")
+        run_git(self.repo, "commit", "-qm", "base")
+        self.base = current_head(self.repo)
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def accept_step(self, step_id: str, value: str) -> tuple[str, dict[str, object]]:
+        path = self.repo / f"{step_id}.txt"
+        path.write_text(value, encoding="utf-8")
+        stage_all(self.repo)
+        tree = index_tree_sha(self.repo)
+        parent = current_head(self.repo)
+        gate = commit_safety_gate(
+            self.repo,
+            tree_sha=tree,
+            parent_sha=parent,
+            mutable_scope=(f"{step_id}.txt",),
+        )
+        commit = commit_step_tree(
+            self.repo,
+            tree_sha=tree,
+            parent_sha=parent,
+            step_id=step_id,
+            step_title=f"step {step_id}",
+        )
+        record = accepted_step_record(
+            step_id=step_id,
+            verification_status="passed",
+            parent_sha=parent,
+            commit_sha=commit,
+            tree_before=run_git(self.repo, "rev-parse", f"{parent}^{{tree}}"),
+            tree_after=tree,
+            changed_paths=gate.changed_paths,
+        )
+        return commit, record
+
+    def test_five_accepted_steps_are_one_linear_chain(self) -> None:
+        records = []
+        for number in range(1, 6):
+            _commit, record = self.accept_step(f"S{number:02d}", f"{number}\n")
+            records.append(record)
+        tip = current_head(self.repo)
+        self.assertEqual(
+            validate_linear_commit_chain(
+                self.repo,
+                base_sha=self.base,
+                tip_sha=tip,
+                accepted_commits=records,
+                approved_tree_sha=records[-1]["tree_after"],
+            )[-1],
+            tip,
+        )
+        for previous, current in zip(records, records[1:]):
+            self.assertEqual(current["parent_sha"], previous["commit_sha"])
+
+    def test_failed_verification_does_not_create_a_commit(self) -> None:
+        (self.repo / "red.txt").write_text("red\n", encoding="utf-8")
+        stage_all(self.repo)
+        with self.assertRaises(CommitSafetyError):
+            commit_safety_gate(
+                self.repo,
+                tree_sha=index_tree_sha(self.repo),
+                parent_sha=self.base,
+                mutable_scope=("red.txt",),
+                verification_status="failed",
+            )
+        self.assertEqual(current_head(self.repo), self.base)
+
+    def test_merge_commit_is_rejected_from_the_accepted_chain(self) -> None:
+        accepted, record = self.accept_step("S01", "green\n")
+        tree = run_git(self.repo, "rev-parse", f"{accepted}^{{tree}}")
+        merge = run_git(
+            self.repo, "commit-tree", tree, "-p", self.base, "-p", accepted, "-m", "merge",
+        )
+        run_git(self.repo, "update-ref", "HEAD", merge, accepted)
+        with self.assertRaisesRegex(GitError, "merge"):
+            validate_linear_commit_chain(
+                self.repo,
+                base_sha=self.base,
+                tip_sha=merge,
+                accepted_commits=[record],
+            )
 
 
 if __name__ == "__main__":

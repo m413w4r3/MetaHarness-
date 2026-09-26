@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ from metaharness.gitops import (  # noqa: E402
     assert_agent_did_not_commit,
     assert_clean,
     branch_exists,
+    build_repository_reference,
     candidate_tree_sha,
     commit_candidate_tree,
     create_run_worktree,
@@ -22,7 +24,10 @@ from metaharness.gitops import (  # noqa: E402
     git_root,
     index_tree_sha,
     local_branches,
+    normalize_github_web_url,
     read_file_at_commit,
+    render_repository_reference,
+    repository_reference_dict,
     resolve_commit,
     remote_run_branch_tip,
     stage_all,
@@ -33,7 +38,9 @@ from metaharness.gitops import (  # noqa: E402
     status_porcelain,
     symbolic_head,
     tracked_files_in_tree,
+    validate_run_branch,
 )
+from metaharness.models import RepositoryConfig  # noqa: E402
 
 
 def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -503,6 +510,68 @@ class GitOpsTests(unittest.TestCase):
             read_file_at_commit(
                 self.repo, commit_sha=current_head(self.repo), relative_path="dir"
             )
+
+
+class RepositoryReferenceTests(unittest.TestCase):
+    """The credential-free repository reference the planner receives."""
+
+    def test_supported_github_transports(self) -> None:
+        expected = "https://github.com/OWNER/REPO"
+        for value in (
+            "git@github.com:OWNER/REPO.git",
+            "ssh://git@github.com/OWNER/REPO.git",
+            "https://github.com/OWNER/REPO.git",
+            "https://github.com/OWNER/REPO",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(normalize_github_web_url(value), expected)
+
+    def test_url_rejection_and_unsupported_auto_detection(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_github_web_url("https://token@github.com/OWNER/REPO")
+        with self.assertRaises(ValueError):
+            normalize_github_web_url("https://github.com/OWNER/REPO?token=x")
+        with self.assertRaises(ValueError):
+            normalize_github_web_url("https://github.com/OWNER/REPO#readme")
+        self.assertIsNone(normalize_github_web_url("git@example.com:OWNER/REPO.git"))
+
+    def test_reference_uses_exact_sha_and_never_raw_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            run_git(repo, "init", "-q")
+            run_git(repo, "remote", "add", "origin", "git@github.com:OWNER/REPO.git")
+            sha = "a" * 40
+            reference = build_repository_reference(
+                repo, base_sha=sha, config=RepositoryConfig()
+            )
+        self.assertEqual(reference.immutable_url, f"https://github.com/OWNER/REPO/tree/{sha}")
+        artifact = json.dumps(repository_reference_dict(reference))
+        self.assertNotIn("git@", artifact)
+        self.assertNotIn(".git", artifact)
+        self.assertNotIn("token", artifact)
+
+    def test_explicit_https_web_url_is_accepted_and_canonicalized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            run_git(repo, "init", "-q")
+            run_git(repo, "remote", "add", "origin", "https://example.invalid/OWNER/REPO")
+            reference = build_repository_reference(
+                repo,
+                base_sha="c" * 40,
+                config=RepositoryConfig(web_url="https://github.com/OWNER/REPO.git"),
+            )
+        self.assertEqual(reference.web_url, "https://github.com/OWNER/REPO")
+        self.assertIn("BASE SHA:", render_repository_reference(reference))
+
+
+class RunBranchNamespaceTests(unittest.TestCase):
+    """Only the harness run-branch namespace is a valid publication target."""
+
+    def test_protected_and_foreign_branch_names_are_refused(self) -> None:
+        for branch in ("main", "master", "tag", "feature/run", "harness//run"):
+            with self.subTest(branch=branch):
+                with self.assertRaises(GitError):
+                    validate_run_branch(branch)
 
 
 if __name__ == "__main__":

@@ -113,7 +113,9 @@ class PromptContractTests(unittest.TestCase):
         prompts = Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts"
         expected = {
             "implementer.txt": ("at most 8 lines", "1200 characters"),
-            "check_repair.txt": ("<= 6 lines", "800 characters"),
+            # The check-repair worker answers with the bounded v1 result block
+            # the harness parses exactly; that fixed protocol is its bound.
+            "check_repair.txt": ("keep the final response concise", "no text after the footer"),
             "reviser.txt": ("at most 10 lines", "1500 characters"),
         }
         forbidden = ("detailed report", "full explanation", "comprehensive summary")
@@ -143,6 +145,19 @@ class PromptContractTests(unittest.TestCase):
             mutable_scope="src/a.py",
         )
         self.assertNotIn("repair planner", payload.rendered.casefold())
+
+    def test_check_repair_delegates_the_authoritative_gate_to_metaharness(self) -> None:
+        payload = build_check_repair_payload(
+            spec="SPEC",
+            failed_check_ids="CHECK_FAILED:unit",
+            failed_check_evidence="FAILED",
+            compact_contract_invariants="INVARIANT",
+            changed_files="src/a.py",
+            mutable_scope="src/a.py",
+        )
+        normalized = " ".join(payload.rendered.split())
+        self.assertIn("MetaHarness owns and reruns the authoritative deterministic gate", normalized)
+        self.assertIn("MetaHarness owns the final authoritative gate.", normalized)
 
     def test_sections_are_deterministic_and_hash_injected_bytes(self) -> None:
         kwargs = dict(

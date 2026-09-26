@@ -582,6 +582,15 @@ mechanical = "rescue"
                 with self.assertRaisesRegex(ConfigError, f"ui.{key} is required"):
                     load_config(self.write_config(Path(directory_name), contents))
 
+    def test_ui_active_run_capacity_is_bounded_and_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_config(Path(directory_name), VALID_CONFIG)
+            self.assertEqual(load_config(path).ui.max_active_runs, 1)
+        contents = VALID_CONFIG.replace("[ui]\n", "[ui]\nmax_active_runs = 5\n", 1)
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, "at most 4"):
+                load_config(self.write_config(Path(directory_name), contents))
+
     def test_old_sections_and_check_table_are_rejected(self) -> None:
         for section in ("planner", "reviewer", "agent"):
             contents = VALID_CONFIG + f"\n[{section}]\nmodel = \"old\"\n"

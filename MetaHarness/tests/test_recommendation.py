@@ -1,3 +1,5 @@
+"""Profile recommendation: parsing, catalogue rendering and the fail-open call."""
+
 from __future__ import annotations
 
 import tempfile

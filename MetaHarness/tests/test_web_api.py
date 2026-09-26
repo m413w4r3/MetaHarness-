@@ -438,9 +438,7 @@ class WebServerTests(unittest.TestCase):
         actual = compute_plan_identity_from_run(run_dir)
         stored = actual.__dict__.copy()
         stored["checks_sha256"] = stored_checks_sha256
-        RunStateStore(run_dir / "state.json").update(
-            status="awaiting_plan_approval",
-            planning_protocol="v2",
+        RunStateStore(run_dir / "state.json").update_metadata(
             plan_identity=stored,
             run_options_sha256=options_sha256,
             execution={"planner": {"profile_id": "planner"}},
@@ -492,8 +490,8 @@ class WebServerTests(unittest.TestCase):
 
     def test_approval_fields_follow_the_actual_12_step_bundle(self) -> None:
         run_dir = self.create_run("form-steps", "committed")
-        RunStateStore(run_dir / "state.json").update(
-            status="committed", execution={"planner": {"profile_id": "planner"}},
+        RunStateStore(run_dir / "state.json").update_metadata(
+            execution={"planner": {"profile_id": "planner"}},
         )
         (run_dir / "implementation_bundle.json").write_text(
             json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),
@@ -513,9 +511,7 @@ class WebServerTests(unittest.TestCase):
             json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),
             encoding="utf-8",
         )
-        RunStateStore(page_dir / "state.json").update(
-            status="awaiting_plan_approval",
-            planning_protocol="v2",
+        RunStateStore(page_dir / "state.json").update_metadata(
             planner={
                 "execution_mode": "STAGED",
                 "steps": [{"id": f"S{number:02d}", "title": f"Step {number}"} for number in range(1, 13)],

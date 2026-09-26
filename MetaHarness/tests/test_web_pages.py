@@ -1,3 +1,5 @@
+"""Server-rendered web pages: forms, tokens, redirects and bounded artifacts."""
+
 from __future__ import annotations
 
 import json

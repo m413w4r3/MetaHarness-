@@ -1,19 +1,17 @@
+"""The web run manager and the run-creation API contracts."""
+
 from __future__ import annotations
 
 import tempfile
 import threading
 import time
 import unittest
-from http.client import HTTPConnection
-import json
 from pathlib import Path
-from unittest.mock import Mock
 
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from metaharness.config import ConfigError, load_config
 from metaharness.models import (
     ContextConfig,
     HarnessConfig,
@@ -25,12 +23,10 @@ from metaharness.models import (
     SelectionMode,
     UIConfig,
 )
-from metaharness.orchestrator import Orchestrator
 from metaharness.run_options import RunOptions
 from metaharness.state import RunStateStore
 from metaharness.web.api import WebAPIError, create_run, validate_spec
 from metaharness.web.run_manager import RunCapacityError, RunManager
-from metaharness.web.server import create_server
 
 
 def config_for(root: Path, *, max_active_runs: int = 1) -> HarnessConfig:
@@ -63,47 +59,7 @@ def config_for(root: Path, *, max_active_runs: int = 1) -> HarnessConfig:
     )
 
 
-class CoreP15Tests(unittest.TestCase):
-    def test_run_file_delegates_to_run_text(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            spec_path = Path(directory) / "SPEC.md"
-            spec_path.write_text("exact\n", encoding="utf-8")
-            orchestrator = Orchestrator.__new__(Orchestrator)
-            expected = object()
-            orchestrator.run_text = Mock(return_value=expected)  # type: ignore[method-assign]
-            self.assertIs(orchestrator.run(spec_path, run_id="r"), expected)
-            orchestrator.run_text.assert_called_once_with("exact\n", run_id="r")
-
-    def test_run_text_persists_exact_spec(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = config_for(root)
-            config.runs_root.mkdir()
-            orchestrator = Orchestrator(config)
-            orchestrator._execute = Mock(return_value=object())  # type: ignore[method-assign]
-            spec = "# SPEC\n\ntext with trailing spaces  \n"
-            orchestrator.run_text(spec, run_id="exact")
-            run_dir = config.runs_root / "exact"
-            self.assertEqual((run_dir / "spec.md").read_text(encoding="utf-8"), spec)
-
-    def test_on_created_runs_after_initial_state_exists(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = config_for(root)
-            config.runs_root.mkdir()
-            orchestrator = Orchestrator(config)
-            orchestrator._execute = Mock(return_value=object())  # type: ignore[method-assign]
-            observed: list[tuple[Path, str, str]] = []
-
-            def on_created(run_dir: Path) -> None:
-                state = RunStateStore(run_dir / "state.json").load()
-                observed.append((run_dir, (run_dir / "spec.md").read_text(), state["status"]))
-
-            orchestrator.run_text("body", run_id="created", on_created=on_created)
-            self.assertEqual(observed, [(config.runs_root / "created", "body", "created")])
-
-
-class ManagerP15Tests(unittest.TestCase):
+class RunManagerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -175,7 +131,7 @@ class ManagerP15Tests(unittest.TestCase):
         )
 
 
-class APIP15Tests(unittest.TestCase):
+class CreateRunAPITests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -250,128 +206,6 @@ class APIP15Tests(unittest.TestCase):
     def test_validate_spec_preserves_original_text(self) -> None:
         value = "  keep whitespace  \n"
         self.assertEqual(validate_spec(value), value)
-
-
-class ConfigP15Tests(unittest.TestCase):
-    def test_ui_capacity_is_bounded_and_defaults(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            content = (
-                f'repo = "{root}"\nbase_ref = "HEAD"\nruns_root = "{root / "runs"}"\n'
-                f'worktrees_root = "{root / "worktrees"}"\nallow_no_required_checks = true\n'
-                '[ui]\ndefault_planner_profile = "planner"\ndefault_implementer_profile = "worker"\ndefault_reviewer_profile = "reviewer"\n'
-                '[model_profiles.planner]\ndisplay_name = "Planner"\nroles = ["planner"]\ndriver = "openai-chat"\nprovider = "test"\nmodel = "p"\nselection_mode = "request"\nbase_url = "https://example.invalid"\nendpoint_path = "/chat"\n'
-                '[model_profiles.worker]\ndisplay_name = "Worker"\nroles = ["implementer"]\ndriver = "external"\nprovider = "test"\nmodel = "worker"\nselection_mode = "cli"\nargv = ["worker"]\n'
-                '[model_profiles.reviewer]\ndisplay_name = "Reviewer"\nroles = ["reviewer"]\ndriver = "openai-chat"\nprovider = "test"\nmodel = "r"\nselection_mode = "request"\nbase_url = "https://example.invalid"\nendpoint_path = "/chat"\n'
-            )
-            path = root / "config.toml"
-            path.write_text(content, encoding="utf-8")
-            self.assertEqual(load_config(path).ui.max_active_runs, 1)
-            path.write_text(content.replace("[ui]\n", "[ui]\nmax_active_runs = 5\n", 1), encoding="utf-8")
-            with self.assertRaisesRegex(ConfigError, "at most 4"):
-                load_config(path)
-
-
-class HTTPSecurityP15Tests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
-        self.config = config_for(self.root)
-        self.config.runs_root.mkdir()
-        self.server = create_server(self.config, port=0)
-        self.thread = threading.Thread(
-            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
-        )
-        self.thread.start()
-
-    def tearDown(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
-        self.temp.cleanup()
-
-    def request(
-        self,
-        method: str,
-        path: str,
-        headers: dict[str, str] | None = None,
-        body: bytes | None = None,
-    ) -> tuple[int, str]:
-        connection = HTTPConnection("127.0.0.1", self.server.server_port)
-        connection.request(method, path, body=body, headers=headers or {})
-        response = connection.getresponse()
-        content = response.read().decode("utf-8")
-        connection.close()
-        return response.status, content
-
-    def test_new_page_and_index_token_rules(self) -> None:
-        status, index = self.request("GET", "/")
-        self.assertEqual(status, 200)
-        self.assertIn('href="/new">NEW RUN', index)
-        self.assertNotIn(self.server.browser_token, index)
-        status, page = self.request("GET", "/new")
-        self.assertEqual(status, 200)
-        self.assertIn("New Run", page)
-        self.assertIn("CREATE RUN", page)
-        self.assertIn('<form action="/runs" method="post"', page)
-        self.assertNotIn("<script", page)
-        self.assertNotIn('http-equiv="refresh"', page)
-        self.assertIn(self.server.browser_token, page)
-        self.assertNotIn("innerHTML", page)
-
-    def test_post_api_runs_no_token_is_forbidden(self) -> None:
-        body = json.dumps({"spec": "body"}).encode()
-        status, _ = self.request(
-            "POST",
-            "/api/runs",
-            {"Content-Type": "application/json", "Content-Length": str(len(body))},
-            body,
-        )
-        self.assertEqual(status, 403)
-
-    def test_post_api_runs_bad_host_is_forbidden(self) -> None:
-        body = json.dumps({"spec": "body"}).encode()
-        status, _ = self.request(
-            "POST",
-            "/api/runs",
-            {
-                "Host": "evil.example",
-                "Content-Type": "application/json",
-                "Content-Length": str(len(body)),
-                "X-MetaHarness-Token": self.server.browser_token,
-            },
-            body,
-        )
-        self.assertEqual(status, 403)
-
-    def test_post_api_runs_bad_origin_is_forbidden(self) -> None:
-        body = json.dumps({"spec": "body"}).encode()
-        status, _ = self.request(
-            "POST",
-            "/api/runs",
-            {
-                "Origin": "http://evil.example",
-                "Content-Type": "application/json",
-                "Content-Length": str(len(body)),
-                "X-MetaHarness-Token": self.server.browser_token,
-            },
-            body,
-        )
-        self.assertEqual(status, 403)
-
-    def test_post_api_runs_rejects_unknown_fields(self) -> None:
-        body = json.dumps({"spec": "body", "extra": True}).encode()
-        status, _ = self.request(
-            "POST",
-            "/api/runs",
-            {
-                "Content-Type": "application/json",
-                "Content-Length": str(len(body)),
-                "X-MetaHarness-Token": self.server.browser_token,
-            },
-            body,
-        )
-        self.assertEqual(status, 400)
 
 
 if __name__ == "__main__":
