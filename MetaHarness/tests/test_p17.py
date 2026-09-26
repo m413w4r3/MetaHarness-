@@ -190,7 +190,7 @@ class OrchestratorRecommendationTests(unittest.TestCase):
                 store = RunStateStore(run / "state.json")
                 store.initialize("run")
                 client = Client()
-                Orchestrator(self._config(root, enabled=enabled, multiple=multiple), recommender_client=client)._maybe_recommend_profiles(store, run, "planner")
+                Orchestrator(self._config(root, enabled=enabled, multiple=multiple), recommender_client=client)._runtime._maybe_recommend_profiles(store, run, "planner")
                 self.assertEqual(client.calls, 0)
 
     def test_transport_failure_is_fail_open(self) -> None:
@@ -205,7 +205,7 @@ class OrchestratorRecommendationTests(unittest.TestCase):
             (run / "implementation_contract.md").write_text("contract", encoding="utf-8")
             store = RunStateStore(run / "state.json")
             store.initialize("run")
-            Orchestrator(self._config(root), recommender_client=Client())._maybe_recommend_profiles(store, run, "planner")
+            Orchestrator(self._config(root), recommender_client=Client())._runtime._maybe_recommend_profiles(store, run, "planner")
             state = store.load()
             self.assertEqual(state["status"], "planning")
             self.assertEqual(state["recommendation"]["status"], "FAILED")

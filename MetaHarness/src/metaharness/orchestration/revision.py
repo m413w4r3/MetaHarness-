@@ -16,7 +16,7 @@ from .shared import (
     CheckRepairScope,
     _PROMPTS_DIR,
     _bounded_report,
-    _bounded_v2_report,
+    bounded_v2_report,
     _check_payload,
     _git_ownership,
     _json_text,
@@ -87,7 +87,7 @@ _MAX_PREVIOUS_REVISION_REPORT_BYTES = 16 * 1024
 _SCOPE_REQUEST_HEADER = "META SCOPE REQUEST v1"
 
 
-_SCOPE_REQUEST_ROUTE = AGENT_SCOPE_REQUEST
+SCOPE_REQUEST_ROUTE = AGENT_SCOPE_REQUEST
 
 
 def _bounded_previous_revision_report(text: str) -> str:
@@ -164,7 +164,7 @@ def _revision_execution_anomalies(results: list[dict[str, Any]]) -> str:
         }
         for key in ("mismatch", "initial_mismatch", "deferred_verify"):
             if item.get(key):
-                record[key] = _bounded_v2_report(str(item[key]))
+                record[key] = bounded_v2_report(str(item[key]))
         if item.get("mismatch_retry_count"):
             record["mismatch_retry_count"] = item["mismatch_retry_count"]
         records.append(record)
@@ -197,7 +197,7 @@ def _deferred_contract_mismatches(
     summaries: list[dict[str, Any]] = []
     for item in results:
         deferred = item.get("status") == "DEFERRED_CONTRACT_MISMATCH"
-        verify = _bounded_v2_report(str(item.get("deferred_verify") or ""))
+        verify = bounded_v2_report(str(item.get("deferred_verify") or ""))
         if not deferred and not verify:
             continue
         step = steps.get(item.get("id"))
@@ -218,10 +218,10 @@ def _deferred_contract_mismatches(
             "original_scope": scope,
         }
         if deferred:
-            record["mismatch"] = _bounded_v2_report(str(item.get("mismatch") or ""))
+            record["mismatch"] = bounded_v2_report(str(item.get("mismatch") or ""))
             record["tree_at_mismatch"] = item.get("tree_before")
         if item.get("initial_mismatch"):
-            record["initial_mismatch"] = _bounded_v2_report(str(item["initial_mismatch"]))
+            record["initial_mismatch"] = bounded_v2_report(str(item["initial_mismatch"]))
         if item.get("mismatch_retry_count"):
             record["mismatch_retry_count"] = item["mismatch_retry_count"]
         if verify:
@@ -233,7 +233,7 @@ def _deferred_contract_mismatches(
     return _json_text(summaries) if summaries else "NONE\n"
 
 
-def _future_step_ownership(
+def future_step_ownership(
     steps: Sequence[ImplementationStep], index: int,
 ) -> dict[str, tuple[str, ...]]:
     """The mutation paths the approved plan assigns to the remaining steps.
@@ -250,7 +250,7 @@ def _future_step_ownership(
     return ownership
 
 
-def _has_deferred_contract_mismatches(results: list[dict[str, Any]]) -> bool:
+def has_deferred_contract_mismatches(results: list[dict[str, Any]]) -> bool:
     return any(item.get("status") == "DEFERRED_CONTRACT_MISMATCH" for item in results)
 
 
@@ -297,7 +297,7 @@ def _review_step_reports_text(results: list[dict[str, Any]]) -> str:
         }
         for key in ("mismatch", "initial_mismatch", "deferred_verify"):
             if item.get(key):
-                record[key] = _bounded_v2_report(str(item.get(key) or ""))
+                record[key] = bounded_v2_report(str(item.get(key) or ""))
         if item.get("mismatch_retry_count"):
             record["mismatch_retry_count"] = item["mismatch_retry_count"]
         records.append(record)
@@ -1023,7 +1023,7 @@ class RevisionRunner:
                         raise GitError("scope-request rollback did not restore the exact tree")
                 except (GitError, OSError):
                     return result, "RESUME_REQUIRES_OPERATOR"
-                return result, _SCOPE_REQUEST_ROUTE
+                return result, SCOPE_REQUEST_ROUTE
             # A successful transport with an unsafe candidate: the exact failed
             # tree stays durable as evidence and the run stops for an operator.
             _record_failure_tree(artifact_dir, info.worktree)
@@ -1038,7 +1038,7 @@ class RevisionRunner:
                     return result, "CHECK_REPAIR_UNAVAILABLE"
                 if check_repair_result.blocked_kind == "SCOPE":
                     return result, (
-                        _SCOPE_REQUEST_ROUTE if scope_request is not None
+                        SCOPE_REQUEST_ROUTE if scope_request is not None
                         else "HUMAN_REQUIRED"
                     )
                 return result, "HUMAN_REQUIRED"
@@ -1068,5 +1068,5 @@ class RevisionRunner:
                     raise GitError("scope-request rollback did not restore the exact tree")
             except (GitError, OSError):
                 pass
-            return result, _SCOPE_REQUEST_ROUTE
+            return result, SCOPE_REQUEST_ROUTE
         return result, None

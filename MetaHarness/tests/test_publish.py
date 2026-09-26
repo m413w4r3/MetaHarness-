@@ -6,14 +6,14 @@ import inspect
 import unittest
 
 from metaharness.gitops import commit_candidate_tree, push_run_branch
-from metaharness.orchestrator import Orchestrator
+from metaharness.orchestration.publication import PublicationService
 
 
 class PublicationBoundaryTests(unittest.TestCase):
     def test_candidate_primitives_and_final_publication_are_separate(self) -> None:
         self.assertTrue(callable(commit_candidate_tree))
         self.assertTrue(callable(push_run_branch))
-        source = inspect.getsource(Orchestrator._complete_candidate_publication)
+        source = inspect.getsource(PublicationService._complete_candidate_publication)
         self.assertIn("publish_fast_forward_base", source)
         self.assertNotIn("commit_candidate_tree", source)
 

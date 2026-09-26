@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from metaharness.models import ReviewRoute, ReviewVerdict
 from metaharness.evidence import EvidenceBundle
 from metaharness.gitops import RepositoryReference
-from metaharness.orchestrator import _review_code_evidence
+from metaharness.orchestration.review_service import review_code_evidence
 from metaharness.prompt_contracts import build_final_review_payload
 from metaharness.review import (
     Reviewer,
@@ -282,7 +282,7 @@ class ReviewTests(unittest.TestCase):
             deterministic_passed=True,
             failures=(),
         )
-        payload = json.loads(_review_code_evidence(
+        payload = json.loads(review_code_evidence(
             repository_reference=RepositoryReference("origin", None, "a" * 40, None),
             base_sha="a" * 40,
             candidate_sha="b" * 40,

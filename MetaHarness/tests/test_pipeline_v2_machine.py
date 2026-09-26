@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import unittest
+from contextlib import contextmanager, ExitStack
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -27,6 +28,25 @@ from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
 from metaharness.orchestration.pipeline_v2 import PipelineFailure
 from metaharness.run_options import RunOptions
 from metaharness.resume import resume_info
+# Every module that owns a remote-tip call site; the Git transport is one
+# dependency even though several services resolve it.
+REMOTE_TIP_OWNERS = (
+    "metaharness.orchestration.publication",
+    "metaharness.orchestration.review_service",
+    "metaharness.orchestration.resume_validation",
+)
+
+
+@contextmanager
+def patch_remote_tip(**kwargs):
+    """Patch the remote run-branch tip in every owner of the call site."""
+
+    with ExitStack() as stack:
+        for module in REMOTE_TIP_OWNERS:
+            stack.enter_context(mock.patch(f"{module}.remote_run_branch_tip", **kwargs))
+        yield stack
+
+
 from tests.pipeline_support import (
     PipelineHarness,
     check_repair_result,
@@ -140,8 +160,7 @@ class SingleCycleTests(PipelineHarness):
 
     def test_optional_candidate_push_failure_uses_local_review_and_commits(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        with mock.patch(
-            "metaharness.orchestrator.remote_run_branch_tip",
+        with patch_remote_tip(
             side_effect=GitError("simulated network outage"),
         ):
             result = self.orchestrator(
@@ -163,8 +182,7 @@ class SingleCycleTests(PipelineHarness):
 
     def test_different_remote_tip_does_not_block_local_candidate_review(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        with mock.patch(
-            "metaharness.orchestrator.remote_run_branch_tip",
+        with patch_remote_tip(
             return_value="d" * 40,
         ):
             result = self.orchestrator(
@@ -192,8 +210,7 @@ class SingleCycleTests(PipelineHarness):
 
     def test_required_candidate_push_waits_and_resumes_at_candidate_push(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        with mock.patch(
-            "metaharness.orchestrator.remote_run_branch_tip",
+        with patch_remote_tip(
             side_effect=GitError("simulated network outage"),
         ):
             waiting = self.orchestrator(
@@ -352,8 +369,7 @@ class SingleCycleTests(PipelineHarness):
 
     def test_pr_creation_requires_remote_candidate_before_review(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        with mock.patch(
-            "metaharness.orchestrator.remote_run_branch_tip",
+        with patch_remote_tip(
             side_effect=GitError("simulated network outage"),
         ):
             waiting = self.orchestrator(
@@ -375,8 +391,7 @@ class SingleCycleTests(PipelineHarness):
             actual = real_remote_run_branch_tip(repo, remote=remote, branch=branch)
             return "d" * 40 if calls >= 4 else actual
 
-        with mock.patch(
-            "metaharness.orchestrator.remote_run_branch_tip",
+        with patch_remote_tip(
             side_effect=moved_after_review,
         ):
             result = self.orchestrator(
@@ -612,7 +627,7 @@ class SingleCycleTests(PipelineHarness):
             self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
         )
         reviewer = CorruptingReviewer()
-        orchestrator._reviewer_client = reviewer
+        orchestrator._runtime.reviewer_client = reviewer
         result = orchestrator.run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.FAILED)
@@ -1179,7 +1194,7 @@ class CheckRepairTests(PipelineHarness):
         original = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         )
-        first_planner = original._planner_client
+        first_planner = original._runtime.planner_client
         waiting = original.run_text(SPEC, run_id="run")
         self.assertEqual(waiting.status, RunStatus.WAITING_CHECK_REPAIR)
         # The ladder walked every distinct strategy of this red gate: the
@@ -1718,7 +1733,7 @@ class ResumeTests(PipelineHarness):
             reviewer=[review("REVISE", "REPLAN")],
         )
         with mock.patch.object(
-            type(original), "_plan_correction",
+            type(original._runtime.reviews), "plan_correction",
             side_effect=AssertionError("planner must not run in this setup"),
         ):
             failed = original.run_text(SPEC, run_id="run")
@@ -1736,7 +1751,7 @@ class ResumeTests(PipelineHarness):
         def crash(_self, *_args):
             raise RuntimeError("crash after worker before checks")
 
-        with mock.patch.object(type(original), "_run_gate", side_effect=crash):
+        with mock.patch.object(type(original._runtime.gates), "run_gate", side_effect=crash):
             failed = original.run_text(SPEC, run_id="run")
         self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         failure = self.state()["failure"]
@@ -1818,7 +1833,7 @@ class ResumeTests(PipelineHarness):
         def crash_after_push(owner, *_args, **_kwargs):
             raise RuntimeError("crash after candidate push")
 
-        with mock.patch.object(type(original), "_review_candidate", side_effect=crash_after_push):
+        with mock.patch.object(type(original._runtime.reviews), "review_candidate", side_effect=crash_after_push):
             failed = original.run_text(SPEC, run_id="run")
         self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         candidate = json.loads(
@@ -1831,7 +1846,7 @@ class ResumeTests(PipelineHarness):
             self.config(publish=True), planner=["unused"], reviewer=[review()],
         )
         with mock.patch(
-            "metaharness.orchestrator.push_run_branch",
+            "metaharness.orchestration.publication.push_run_branch",
             side_effect=AssertionError("resume must not repush an exact remote SHA"),
         ):
             resumed = resumed.resume("run")
@@ -1857,16 +1872,17 @@ class ResumeTests(PipelineHarness):
         )
         initial_planner = self.planner
         calls = 0
-        real_review = type(original)._review_candidate
+        reviews = original._runtime.reviews
+        real_review = type(reviews).review_candidate
 
         def crash_on_cycle_four(owner, *args, **kwargs):
             nonlocal calls
             calls += 1
             if calls == 4:
                 raise RuntimeError("crash at cycle four review")
-            return real_review(original, owner, *args, **kwargs)
+            return real_review(reviews, owner, *args, **kwargs)
 
-        with mock.patch.object(type(original), "_review_candidate", side_effect=crash_on_cycle_four):
+        with mock.patch.object(type(reviews), "review_candidate", side_effect=crash_on_cycle_four):
             failed = original.run_text(SPEC, run_id="run")
         self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.checkpoint()["review_cycle"], 4)
@@ -1917,7 +1933,7 @@ class ResumeTests(PipelineHarness):
         def crash_once(_self, *_args):
             raise RuntimeError("crash before first checks")
 
-        with mock.patch.object(type(original), "_run_gate", side_effect=crash_once):
+        with mock.patch.object(type(original._runtime.gates), "run_gate", side_effect=crash_once):
             failed = original.run_text(SPEC, run_id="run", on_created=change_live_defaults)
         self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
 
@@ -2096,7 +2112,7 @@ class GitChainAndTraceTests(PipelineHarness):
         original = self.orchestrator(
             self.config(check_repair=2), planner=[initial_plan(STEP)], reviewer=[review()],
         )
-        real_gate = original._run_gate
+        real_gate = original._runtime.gates.run_gate
 
         def unexpected_head(store, ctx, cycle_plan, stage):
             evidence = real_gate(store, ctx, cycle_plan, stage)
@@ -2105,7 +2121,7 @@ class GitChainAndTraceTests(PipelineHarness):
                 failures=("UNEXPECTED_HEAD: moved",),
             )
 
-        with mock.patch.object(type(original), "_run_gate", side_effect=unexpected_head):
+        with mock.patch.object(type(original._runtime.gates), "run_gate", side_effect=unexpected_head):
             failed = original.run_text(SPEC, run_id="run")
         self.assertEqual(failed.status, RunStatus.FAILED, self.state().get("failure"))
         self.assertEqual(self.workers.roles(), ["implementer"])
@@ -2357,7 +2373,8 @@ class ResumeAuthorityTests(PipelineHarness):
     def _crash_at(self, orchestrator, phase):
         from metaharness.resume import ResumePhase
 
-        real = type(orchestrator)._write_checkpoint
+        runtime = orchestrator._runtime
+        real = type(runtime).write_checkpoint
         fired: list[bool] = []
 
         def write(run_dir, next_phase, **fields):
@@ -2366,20 +2383,21 @@ class ResumeAuthorityTests(PipelineHarness):
                 raise RuntimeError(f"crash before {phase}")
             return real(run_dir, next_phase, **fields)
 
-        return mock.patch.object(type(orchestrator), "_write_checkpoint", staticmethod(write))
+        return mock.patch.object(type(runtime), "write_checkpoint", staticmethod(write))
 
     def _crash_on_review(self, orchestrator, number):
         calls = 0
-        real = type(orchestrator)._review_candidate
+        reviews = orchestrator._runtime.reviews
+        real = type(reviews).review_candidate
 
         def review_or_crash(owner, *args, **kwargs):
             nonlocal calls
             calls += 1
             if calls == number:
                 raise RuntimeError("crash at final review")
-            return real(orchestrator, owner, *args, **kwargs)
+            return real(reviews, owner, *args, **kwargs)
 
-        return mock.patch.object(type(orchestrator), "_review_candidate", side_effect=review_or_crash)
+        return mock.patch.object(type(reviews), "review_candidate", side_effect=review_or_crash)
 
     def _crash_before_no_change_review(self) -> str:
         (self.repo / "feature.txt").write_text("good\n", encoding="utf-8")
@@ -2528,7 +2546,7 @@ class ResumeAuthorityTests(PipelineHarness):
             self.config(semantic_revision=True), planner=[initial_plan(STEP)], reviewer=[review()],
         )
         with mock.patch.object(
-            original, "_run_revision_with_recovery",
+            original._runtime.reviews, "run_revision_with_recovery",
             side_effect=RuntimeError("crash before semantic worker"),
         ):
             failed = original.run_text(SPEC, run_id="run")
@@ -2656,7 +2674,8 @@ class ResumeAuthorityTests(PipelineHarness):
         original = self.orchestrator(
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         )
-        real = type(original)._run_check_repair_attempt
+        gates = original._runtime.gates
+        real = type(gates).run_check_repair_attempt
 
         def crash_before_second(owner, *args, **kwargs):
             if len(args) >= 5 and args[4] == 2:
@@ -2664,7 +2683,7 @@ class ResumeAuthorityTests(PipelineHarness):
             return real(owner, *args, **kwargs)
 
         with mock.patch.object(
-            type(original), "_run_check_repair_attempt", crash_before_second,
+            type(gates), "run_check_repair_attempt", crash_before_second,
         ):
             failed = original.run_text(SPEC, run_id="run")
         self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
@@ -2753,7 +2772,9 @@ class ObservationAndPublicationAuthorityTests(PipelineHarness):
         orchestrator = self.orchestrator(
             self.config(publish=True), planner=[initial_plan(STEP)], reviewer=[review()],
         )
-        with mock.patch("metaharness.orchestrator._accepted_review", return_value=None):
+        with mock.patch(
+            "metaharness.orchestration.publication._accepted_review", return_value=None,
+        ):
             result = orchestrator.run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.FAILED)
         self.assertEqual(self.state()["failure"]["reason"], "REVIEW_AUTHORITY_MISSING")

@@ -18,7 +18,7 @@ from ..recovery_policy import RecoveryBudgets
 from ..review import ReviewParseError, ReviewResult, structured_review_reason
 from .pipeline_v2 import PipelineFailure
 from .recovery import RecoveryCoordinator
-from .shared import _bounded_v2_report
+from .shared import bounded_v2_report
 
 _RETRYABLE_HTTP = frozenset({408, 429, 500, 502, 503, 504})
 
@@ -109,7 +109,7 @@ class ReviewRecovery:
                 "REVIEW_EVIDENCE_UNRESOLVED",
                 {
                     "reason_class": reason_class,
-                    "findings": _bounded_v2_report(first_review.findings),
+                    "findings": bounded_v2_report(first_review.findings),
                 },
             )
         archive_attempt()
@@ -120,7 +120,7 @@ class ReviewRecovery:
                 {
                     "first_reason_class": reason_class,
                     "retry_reason_class": structured_review_reason(review.findings),
-                    "findings": _bounded_v2_report(review.findings),
+                    "findings": bounded_v2_report(review.findings),
                 },
             )
         return review

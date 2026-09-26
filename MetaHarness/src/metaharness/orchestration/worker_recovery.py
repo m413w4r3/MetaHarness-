@@ -35,7 +35,7 @@ from ..result import atomic_write_text
 from ..state import RunStateStore
 from .pipeline_v2 import PipelineFailure
 from .recovery import RecoveryAdmission, RecoveryCoordinator
-from .revision import _SCOPE_REQUEST_ROUTE
+from .revision import SCOPE_REQUEST_ROUTE
 from .shared import (
     StepExecutionFailure,
     _REVISION_ATTEMPT_ARTIFACTS,
@@ -255,7 +255,7 @@ class WorkerRecovery:
             failed_tree_after = _safe_candidate_tree(worktree)
             changed = self._rollback_revision(
                 transaction, allowed=allowed, artifact_dir=artifact_dir,
-                allow_requested_paths=(error == _SCOPE_REQUEST_ROUTE),
+                allow_requested_paths=(error == SCOPE_REQUEST_ROUTE),
                 discard_scope_violations=is_check_repair,
             )
             if error in TRANSIENT_WORKER_FAILURES | {AGENT_AUTH_FAILURE}:

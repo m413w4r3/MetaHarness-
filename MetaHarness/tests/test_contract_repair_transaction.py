@@ -425,7 +425,7 @@ class WaitingDiagnosticsTests(PipelineHarness):
     def test_waiting_remote_writes_fresh_diagnostics(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         with mock.patch(
-            "metaharness.orchestrator.remote_run_branch_tip",
+            "metaharness.orchestration.publication.remote_run_branch_tip",
             side_effect=GitError("simulated network outage"),
         ):
             result = self.orchestrator(

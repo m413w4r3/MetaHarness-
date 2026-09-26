@@ -42,7 +42,7 @@ from .shared import (
     _MAX_AGENT_REPORT_BYTES,
     _MAX_STEP_REPORT_BYTES,
     _PLANNER_CONVERSATION,
-    _bounded_v2_report,
+    bounded_v2_report,
     _is_object_id,
     _json_text,
     _read_bounded_text,
@@ -281,15 +281,15 @@ def _load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
         "changed_paths": list(changed),
         **({"no_change": True} if no_change else {}),
         "usage": normalize_usage(record.get("usage")),
-        "final": _bounded_v2_report(_read_bounded_text(step_dir / "agent.final.md")),
-        **({"mismatch": _bounded_v2_report(record["mismatch"])}
+        "final": bounded_v2_report(_read_bounded_text(step_dir / "agent.final.md")),
+        **({"mismatch": bounded_v2_report(record["mismatch"])}
            if status == "DEFERRED_CONTRACT_MISMATCH" else {}),
-        **({"initial_mismatch": _bounded_v2_report(str(record["initial_mismatch"]))}
+        **({"initial_mismatch": bounded_v2_report(str(record["initial_mismatch"]))}
            if isinstance(record.get("initial_mismatch"), str) and record["initial_mismatch"].strip()
            else {}),
         **({"mismatch_retry_count": record["mismatch_retry_count"]}
            if isinstance(record.get("mismatch_retry_count"), int) else {}),
-        **({"deferred_verify": _bounded_v2_report(str(record["deferred_verify"]))}
+        **({"deferred_verify": bounded_v2_report(str(record["deferred_verify"]))}
            if isinstance(record.get("deferred_verify"), str) and record["deferred_verify"].strip()
            else {}),
     }
@@ -359,7 +359,7 @@ def _accepted_review_binding(run_dir: Path, number: int) -> tuple[dict[str, Any]
     return candidate, review, digest
 
 
-def _correction_binding(run_dir: Path, number: int) -> dict[str, Any]:
+def correction_binding(run_dir: Path, number: int) -> dict[str, Any]:
     """Return the exact durable binding required by correction cycle number."""
 
     if number < 2:
@@ -386,7 +386,7 @@ def validate_correction_bindings(run_dir: Path, through_cycle: int) -> None:
         return
     for number in range(2, through_cycle + 1):
         payload = _read_json_artifact(cycle_record_path(run_dir, number), 4096)
-        expected = _correction_binding(run_dir, number)
+        expected = correction_binding(run_dir, number)
         if (
             not isinstance(payload, dict)
             or payload.get("schema_version") != 2
@@ -1289,7 +1289,7 @@ def validate_resume(
 
 
 __all__ = [
-    "ResumedRun", "candidate_evidence", "completed_step_records", "load_correction_plan",
-    "read_candidate_record", "read_cycle_record", "validate_correction_bindings", "validate_resume",
-    "verify_correction_scope",
+    "ResumedRun", "candidate_evidence", "completed_step_records", "correction_binding",
+    "load_correction_plan", "read_candidate_record", "read_cycle_record",
+    "validate_correction_bindings", "validate_resume", "verify_correction_scope",
 ]

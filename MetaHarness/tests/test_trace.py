@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from metaharness.agent.base import AgentRunResult
 from metaharness.models import ExecutionRole, ModelProfile, ProfileDriver, SelectionMode
-from metaharness.orchestrator import Orchestrator
+from metaharness.orchestration.runtime import RunRuntime
 from metaharness.trace import TraceEvent, TraceStream
 
 
@@ -86,13 +86,13 @@ class TraceTests(unittest.TestCase):
             provider="openai",
             driver_version="local-test-driver",
         )
-        owner = object.__new__(Orchestrator)
+        owner = object.__new__(RunRuntime)
         owner.config = SimpleNamespace(
             agent=SimpleNamespace(env_allowlist=()),
             codex_runtime=SimpleNamespace(home=None),
             claude_runtime=SimpleNamespace(home=None),
         )
-        session = owner._trace_session(
+        session = owner.trace_session(
             profile=profile,
             selected=SimpleNamespace(
                 profile_id="codex-profile",

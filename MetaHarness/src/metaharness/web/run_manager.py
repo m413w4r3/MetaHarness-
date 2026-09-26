@@ -6,7 +6,7 @@ import threading
 from typing import Callable
 
 from ..config import HarnessConfig
-from ..orchestrator import Orchestrator, OrchestrationError, _safe_run_id, generate_run_id
+from ..orchestrator import Orchestrator, OrchestrationError, generate_run_id, safe_run_id
 from ..plan_recovery import PlanRecoveryError
 from ..resume import ResumeNotAllowedError
 from ..run_options import RunOptions
@@ -52,7 +52,7 @@ class RunManager:
         run_options: RunOptions | None = None,
     ) -> str:
         try:
-            selected_run_id = _safe_run_id(run_id) if run_id else generate_run_id()
+            selected_run_id = safe_run_id(run_id) if run_id else generate_run_id()
         except (OrchestrationError, TypeError) as exc:
             raise RunManagerError(str(exc)) from exc
 
@@ -142,7 +142,7 @@ class RunManager:
         failure: str,
     ) -> str:
         try:
-            selected_run_id = _safe_run_id(run_id)
+            selected_run_id = safe_run_id(run_id)
         except (OrchestrationError, TypeError) as exc:
             raise RunManagerError(str(exc)) from exc
         with self._lock:

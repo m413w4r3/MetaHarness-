@@ -17,7 +17,8 @@ from metaharness.integrations.github import (  # noqa: E402
     NullGitHubWorkstreamClient,
 )
 from metaharness.models import GitHubConfig, PublishConfig, RunStatus  # noqa: E402
-from metaharness.orchestrator import Orchestrator  # noqa: E402
+from metaharness.orchestration.publication import PublicationService  # noqa: E402
+from metaharness.orchestration.runtime import RunRuntime  # noqa: E402
 from metaharness.state import RunStateStore  # noqa: E402
 
 
@@ -42,16 +43,22 @@ class _FakeGitHub:
         return {"number": 456}
 
 
-def _orchestrator(root: Path, github: GitHubConfig, client: object) -> Orchestrator:
-    owner = object.__new__(Orchestrator)
-    owner.config = SimpleNamespace(
+def _orchestrator(root: Path, github: GitHubConfig, client: object) -> PublicationService:
+    """A real publication service on a duck-typed runtime, as the tests use it."""
+
+    runtime = object.__new__(RunRuntime)
+    runtime.config = SimpleNamespace(
         github=github,
         base_ref="main",
         publish=PublishConfig(enabled=True, mode="run-branch"),
     )
-    owner._github_client = client
-    owner._begin_trace(root, "run-1", created=False)
-    return owner
+    runtime.github_client = client
+    runtime.trace = None
+    runtime.trace_sink = None
+    runtime.trace_cycle = 1
+    runtime.secrets = ()
+    runtime.begin_trace(root, "run-1", created=False)
+    return PublicationService(runtime)
 
 
 class GitHubWorkstreamTests(unittest.TestCase):
@@ -82,7 +89,7 @@ class GitHubWorkstreamTests(unittest.TestCase):
                 raise AssertionError(name)
 
         owner = _orchestrator(self.root, GitHubConfig(), MustNotCall())
-        owner._ensure_github_issue_metadata(
+        owner.ensure_github_issue_metadata(
             store=self.store, run_id="run-1", plan_title="SPEC title", info=self.info,
         )
         owner._ensure_github_pull_request_metadata(
@@ -101,7 +108,7 @@ class GitHubWorkstreamTests(unittest.TestCase):
             GitHubConfig(enabled=True, issue_mode="link-existing", issue_number=123),
             client,
         )
-        owner._ensure_github_issue_metadata(
+        owner.ensure_github_issue_metadata(
             store=self.store, run_id="run-1", plan_title="SPEC title", info=self.info,
         )
         state_text = (self.root / "state.json").read_text(encoding="utf-8")
@@ -126,8 +133,8 @@ class GitHubWorkstreamTests(unittest.TestCase):
             reviewed_candidate_sha="b" * 40,
         )
         with (
-            mock.patch("metaharness.orchestrator.current_head", return_value="b" * 40),
-            mock.patch("metaharness.orchestrator.remote_run_branch_tip", return_value="b" * 40),
+            mock.patch("metaharness.orchestration.publication.current_head", return_value="b" * 40),
+            mock.patch("metaharness.orchestration.publication.remote_run_branch_tip", return_value="b" * 40),
         ):
             owner._ensure_github_pull_request_metadata(
                 store=self.store,
@@ -168,8 +175,8 @@ class GitHubWorkstreamTests(unittest.TestCase):
             reviewed_candidate_sha="b" * 40,
         )
         with (
-            mock.patch("metaharness.orchestrator.current_head", return_value="b" * 40),
-            mock.patch("metaharness.orchestrator.remote_run_branch_tip", return_value="c" * 40),
+            mock.patch("metaharness.orchestration.publication.current_head", return_value="b" * 40),
+            mock.patch("metaharness.orchestration.publication.remote_run_branch_tip", return_value="c" * 40),
             self.assertRaisesRegex(GitHubWorkstreamError, "remote run branch tip"),
         ):
             owner._ensure_github_pull_request_metadata(

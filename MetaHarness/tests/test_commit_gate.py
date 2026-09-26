@@ -18,7 +18,8 @@ from metaharness.gitops import (  # noqa: E402
     index_tree_sha,
     stage_all,
 )
-from metaharness.orchestrator import CommitBoundaryError, Orchestrator  # noqa: E402
+from metaharness.orchestrator import CommitBoundaryError  # noqa: E402
+from metaharness.orchestration.publication import PublicationService  # noqa: E402
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "metaharness"
 
@@ -92,7 +93,7 @@ class CommitPathStructureTests(unittest.TestCase):
                     self.assertIsNotNone(gate, f"{function.name} commits without the safety gate")
                     self.assertLess(gate, first, function.name)
         self.assertEqual(found, {
-            "commit_step_tree": ["orchestrator.py:_accept_v2_step_tree"],
+            "commit_step_tree": ["implementation.py:_accept_v2_step_tree"],
             "commit_repair_tree": ["check_repair.py:accept"],
             "commit_revision_tree": ["check_repair.py:accept"],
         })
@@ -130,8 +131,8 @@ class CandidateGateTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def authorize(self, evidence: EvidenceBundle | None = None) -> str:
-        owner = object.__new__(Orchestrator)
-        return owner._authorize_candidate_tree(
+        owner = object.__new__(PublicationService)
+        return owner.authorize_candidate_tree(
             evidence or self.evidence, self.worktree, self.base, "refs/heads/harness/t/run",
         )
 

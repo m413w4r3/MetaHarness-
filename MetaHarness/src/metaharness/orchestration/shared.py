@@ -8,6 +8,7 @@ durable artifact name tuples every component archives.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import os
 import re
@@ -45,6 +46,7 @@ from ..resume import ResumeIntegrityError
 from .pipeline_v2 import cycle_record_path
 from ..validation import check_result_json
 from ..agent.diagnostics import TOKEN_DIAGNOSTICS_NAME
+from ..llm.chat import OpenAIChatTextClient
 
 
 class OrchestrationError(RuntimeError):
@@ -81,10 +83,10 @@ class CycleArtifactService:
         else:
             # The source review is the authority for the correction kind. The
             # planner is never allowed to choose or repair this binding.
-            from .resume_validation import _correction_binding, validate_correction_bindings
+            from .resume_validation import correction_binding, validate_correction_bindings
 
             validate_correction_bindings(ctx.run_dir, cycle.number - 1)
-            binding = _correction_binding(ctx.run_dir, cycle.number)
+            binding = correction_binding(ctx.run_dir, cycle.number)
             if binding["kind"] != cycle.kind.value:
                 raise ResumeIntegrityError(
                     f"cycle {cycle.number:03d} kind does not match its review route"
@@ -165,7 +167,7 @@ def _bounded_report(text: str) -> str:
     return f"{head}\n[... {omitted} bytes truncated; full report in agent.final.md ...]"
 
 
-def _bounded_v2_report(text: str) -> str:
+def bounded_v2_report(text: str) -> str:
     """Bound an individual staged-step report for every semantic prompt."""
 
     limit = _MAX_STEP_REPORT_BYTES
@@ -179,6 +181,46 @@ def _bounded_v2_report(text: str) -> str:
 
 def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def bounded_parse_detail(exc: Exception) -> str:
+    """Keep a parser failure readable without persisting an unbounded message."""
+
+    return " ".join(str(exc).split())[:500]
+
+
+def chat_client(
+    endpoint: Any, environment: Mapping[str, str],
+    on_transport: Callable[[dict[str, Any]], None] | None = None,
+) -> OpenAIChatTextClient:
+    """Construct the production chat client with the runtime mapping.
+
+    The constructor is inspected once so embedded clients can receive the
+    runtime environment or the transport observer when they declare them.
+    """
+
+    constructor = OpenAIChatTextClient
+    try:
+        parameters = inspect.signature(constructor).parameters.values()
+        accepts_environment = any(
+            parameter.name == "environment"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        accepts_transport = any(
+            parameter.name == "on_transport"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        accepts_environment = True
+        accepts_transport = True
+    kwargs: dict[str, Any] = {}
+    if accepts_environment:
+        kwargs["environment"] = environment
+    if accepts_transport:
+        kwargs["on_transport"] = on_transport
+    return constructor(endpoint, **kwargs)
 
 
 _MAX_REPORTED_PATHS = MAX_REPORTED_PATHS
