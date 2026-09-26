@@ -389,3 +389,29 @@ or mutable scope, and the bootstrap does not inject it into model prompts.
 Only `remote_branch`, `issue_number`, and `pull_request_number` are persisted
 or emitted in workstream metadata. Tokens, authorization headers, credential
 helper output, and secret environment values are never durable artifacts.
+
+## Architectural guardrails
+
+`tests/test_architecture_boundaries.py` turns the refoundation objectives of
+`docs/refoundation-v3.md` into mechanical checks: the façade budget
+(`orchestrator.py` at most 500 lines, no protocol parsing, no regex engine),
+the 900-line budget of new `orchestration/` and `planning/` modules, the
+1000-line budget of `tests/pipeline/`, the absence of cross-package private
+imports, the dependency layers of `planning/protocol.py`, `recovery_policy.py`
+and the core state modules, the `PipelineV2Coordinator` → `Orchestrator`
+independence, and the absence of every compatibility symbol and migration label
+the v3 format deleted.
+
+`tests/pipeline/test_autonomy_contract.py` proves the autonomy contract
+table-driven: a correctness, contract or model-protocol failure never routes to
+a human wait while an autonomous ladder rung remains; an unavailable external
+waits externally after its bounded retries; a spec ambiguity is the only
+immediate human wait; a security, integrity or authority boundary fails closed;
+and one exact recovery fingerprint never consumes the same strategy twice.
+
+The `FROZEN_*` tables of the guard module are ratchets: they record the debt the
+refoundation landed with — six oversized `orchestration/` modules, the
+`orchestration/shared.py` private toolbox, and six test modules reading
+module-local names — and those entries may only shrink. Growing one is a design
+decision that must be taken explicitly, by editing the frozen table in the same
+change.

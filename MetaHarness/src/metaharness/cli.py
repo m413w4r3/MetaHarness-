@@ -29,7 +29,7 @@ from .agent.auth import check_codex_authentication
 from .agent.codex import build_agent_environment
 from .agent.runtime import CodexRuntimeError, prepare_codex_home
 from .claude.agent import (
-    _REVISION_TOOLS,
+    REVISION_TOOLS,
     build_claude_environment,
 )
 from .claude.auth import check_claude_authentication
@@ -440,7 +440,7 @@ def _probe_claude_capabilities(
         "--safe-mode",
         "--restricted",
         "--tools",
-        _REVISION_TOOLS,
+        REVISION_TOOLS,
         "--no-session-persistence",
         "--no-chrome",
         "--disable-slash-commands",
