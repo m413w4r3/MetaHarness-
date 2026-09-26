@@ -263,6 +263,432 @@ class RunStatus(StrEnum):
     INTERRUPTED = "interrupted"
 
 
+class RunPhase(StrEnum):
+    """The durable operation a run is at: the one running, or the next one.
+
+    A phase names an operation, never a posture.  ``DETERMINISTIC_GATE`` stays
+    the phase while a red gate waits for a repaired tree, and ``CHECK_REPAIR``
+    names the bounded repair pass itself.  The posture of the run is
+    :class:`RunDisposition`; the business detail is the failure reason.
+    """
+
+    CONTEXT = "context"
+    PLANNER = "planner"
+    PLAN_APPROVAL = "plan_approval"
+    WORKTREE_SETUP = "worktree_setup"
+    IMPLEMENT_STEP = "implement_step"
+    # A successful worker candidate is durable (``step_candidate.json``);
+    # only its deterministic acceptance and commit remain.  Never a worker.
+    STEP_ACCEPTANCE = "step_acceptance"
+    DETERMINISTIC_GATE = "deterministic_gate"
+    CHECK_REPAIR = "check_repair"
+    SEMANTIC_REVISION = "semantic_revision"
+    CANDIDATE_READY = "candidate_ready"
+    CANDIDATE_PUSH = "candidate_push"
+    FINAL_REVIEW = "final_review"
+    REVIEW_IMPLEMENTATION = "review_implementation"
+    REVIEW_REPLAN = "review_replan"
+    PUBLISH = "publish"
+
+
+class RunDisposition(StrEnum):
+    """The only postures a durable run can be in.
+
+    Every finer business state is a ``(phase, disposition, reason)`` triple:
+    no ``WAITING_CHECK_REPAIR``, ``REVALIDATING`` or ``CONTRACT_REPAIRING``
+    posture exists, because those name an operation or a failure detail.
+    """
+
+    RUNNING = "RUNNING"
+    WAIT_EXTERNAL = "WAIT_EXTERNAL"
+    WAIT_HUMAN = "WAIT_HUMAN"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+    @property
+    def waiting(self) -> bool:
+        """Whether the run is stopped until something outside it changes."""
+
+        return self in {RunDisposition.WAIT_EXTERNAL, RunDisposition.WAIT_HUMAN}
+
+    @property
+    def terminal(self) -> bool:
+        """Whether no event may ever follow this disposition."""
+
+        return self in {RunDisposition.COMPLETED, RunDisposition.FAILED}
+
+
+class RunTransitionError(ValueError):
+    """One invalid run transition.  Every refusal happens in ``transition``."""
+
+
+def _run_reason(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise RunTransitionError("run reason must be a non-empty reason code or null")
+    return value.strip()
+
+
+@dataclass(frozen=True)
+class RunMachineState:
+    """The durable identity of one run: one phase, one disposition.
+
+    ``reason`` is the business detail (a stable failure reason code) that
+    :func:`project_run_outcome` needs to name a waiting flavour.  It is never
+    a status, and it never competes with the disposition.
+    """
+
+    phase: RunPhase | None = None
+    disposition: RunDisposition = RunDisposition.RUNNING
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.phase is not None and not isinstance(self.phase, RunPhase):
+            try:
+                object.__setattr__(self, "phase", RunPhase(self.phase))
+            except (TypeError, ValueError) as exc:
+                raise RunTransitionError("run phase is unknown") from exc
+        if not isinstance(self.disposition, RunDisposition):
+            try:
+                object.__setattr__(self, "disposition", RunDisposition(self.disposition))
+            except (TypeError, ValueError) as exc:
+                raise RunTransitionError("run disposition is unknown") from exc
+        object.__setattr__(self, "reason", _run_reason(self.reason))
+
+
+class RunEventKind(StrEnum):
+    """What a run can be told; the strategy detail stays in the failure."""
+
+    ADVANCE = "advance"
+    WAIT = "wait"
+    FAIL = "fail"
+    COMPLETE = "complete"
+    RESUME = "resume"
+
+
+@dataclass(frozen=True)
+class RunEvent:
+    """One event applied to a :class:`RunMachineState`."""
+
+    kind: RunEventKind
+    target: RunPhase | None = None
+    disposition: RunDisposition | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, RunEventKind):
+            try:
+                object.__setattr__(self, "kind", RunEventKind(self.kind))
+            except (TypeError, ValueError) as exc:
+                raise RunTransitionError("run event kind is unknown") from exc
+        if self.target is not None and not isinstance(self.target, RunPhase):
+            try:
+                object.__setattr__(self, "target", RunPhase(self.target))
+            except (TypeError, ValueError) as exc:
+                raise RunTransitionError("run event target is unknown") from exc
+        if self.disposition is not None and not isinstance(self.disposition, RunDisposition):
+            try:
+                object.__setattr__(self, "disposition", RunDisposition(self.disposition))
+            except (TypeError, ValueError) as exc:
+                raise RunTransitionError("run event disposition is unknown") from exc
+        object.__setattr__(self, "reason", _run_reason(self.reason))
+
+    @classmethod
+    def advance(cls, target: RunPhase | str) -> "RunEvent":
+        """The current operation succeeded; *target* is the next one."""
+
+        return cls(RunEventKind.ADVANCE, target=target)
+
+    @classmethod
+    def wait(
+        cls, disposition: RunDisposition | str, *, reason: str | None = None,
+    ) -> "RunEvent":
+        """The run stops without failing, at its current operation."""
+
+        return cls(RunEventKind.WAIT, disposition=disposition, reason=reason)
+
+    @classmethod
+    def fail(cls, *, reason: str | None = None) -> "RunEvent":
+        """The run stops for good, at its current operation."""
+
+        return cls(RunEventKind.FAIL, reason=reason)
+
+    @classmethod
+    def complete(cls) -> "RunEvent":
+        """The final operation of the run succeeded."""
+
+        return cls(RunEventKind.COMPLETE)
+
+    @classmethod
+    def resume(cls) -> "RunEvent":
+        """A waiting run is claimed again; its phase is unchanged."""
+
+        return cls(RunEventKind.RESUME)
+
+
+# The one phase graph of the pipeline: the operation each phase may hand over
+# to.  Self-transitions are explicit: a cycle implements several steps, a gate
+# episode runs several attempts.
+_RUN_PHASE_SUCCESSORS: Mapping[RunPhase, frozenset[RunPhase]] = {
+    RunPhase.CONTEXT: frozenset({RunPhase.PLANNER}),
+    RunPhase.PLANNER: frozenset({RunPhase.PLAN_APPROVAL}),
+    RunPhase.PLAN_APPROVAL: frozenset({RunPhase.WORKTREE_SETUP}),
+    RunPhase.WORKTREE_SETUP: frozenset({RunPhase.IMPLEMENT_STEP, RunPhase.REVIEW_IMPLEMENTATION}),
+    RunPhase.IMPLEMENT_STEP: frozenset({
+        RunPhase.IMPLEMENT_STEP, RunPhase.STEP_ACCEPTANCE,
+        RunPhase.DETERMINISTIC_GATE, RunPhase.REVIEW_IMPLEMENTATION,
+    }),
+    RunPhase.STEP_ACCEPTANCE: frozenset({RunPhase.IMPLEMENT_STEP, RunPhase.DETERMINISTIC_GATE}),
+    RunPhase.DETERMINISTIC_GATE: frozenset({
+        RunPhase.DETERMINISTIC_GATE, RunPhase.CHECK_REPAIR,
+        RunPhase.SEMANTIC_REVISION, RunPhase.CANDIDATE_READY,
+    }),
+    RunPhase.CHECK_REPAIR: frozenset({RunPhase.CHECK_REPAIR, RunPhase.DETERMINISTIC_GATE}),
+    RunPhase.SEMANTIC_REVISION: frozenset({RunPhase.DETERMINISTIC_GATE, RunPhase.CANDIDATE_READY}),
+    RunPhase.CANDIDATE_READY: frozenset({RunPhase.CANDIDATE_PUSH}),
+    RunPhase.CANDIDATE_PUSH: frozenset({RunPhase.FINAL_REVIEW}),
+    RunPhase.FINAL_REVIEW: frozenset({
+        RunPhase.PUBLISH, RunPhase.SEMANTIC_REVISION,
+        RunPhase.REVIEW_IMPLEMENTATION, RunPhase.REVIEW_REPLAN,
+    }),
+    RunPhase.REVIEW_IMPLEMENTATION: frozenset({
+        RunPhase.REVIEW_IMPLEMENTATION, RunPhase.DETERMINISTIC_GATE, RunPhase.SEMANTIC_REVISION,
+    }),
+    RunPhase.REVIEW_REPLAN: frozenset({
+        RunPhase.IMPLEMENT_STEP, RunPhase.REVIEW_IMPLEMENTATION, RunPhase.DETERMINISTIC_GATE,
+    }),
+    RunPhase.PUBLISH: frozenset(),
+}
+# The operations that can end a run successfully: the reviewed candidate
+# commit itself, or its publication.
+_RUN_COMPLETABLE_PHASES = frozenset({RunPhase.CANDIDATE_PUSH, RunPhase.PUBLISH})
+
+
+def phase_successors(phase: RunPhase | str) -> frozenset[RunPhase]:
+    """The operations *phase* may legally hand over to."""
+
+    try:
+        return _RUN_PHASE_SUCCESSORS[RunPhase(phase)]
+    except (TypeError, ValueError) as exc:
+        raise RunTransitionError("run phase is unknown") from exc
+
+
+def transition(current: RunMachineState, event: RunEvent) -> RunMachineState:
+    """Apply *event* to *current*; the single place an invalid one fails.
+
+    Pure: it reads nothing durable, writes nothing, and returns the next
+    state.  Every illegal combination raises :class:`RunTransitionError`
+    here, so no caller ever needs its own compatibility matrix.
+    """
+
+    if not isinstance(current, RunMachineState):
+        raise RunTransitionError("transition expects a RunMachineState")
+    if not isinstance(event, RunEvent):
+        raise RunTransitionError("transition expects a RunEvent")
+    if current.disposition.terminal:
+        raise RunTransitionError(
+            f"a {current.disposition.value} run accepts no further event"
+        )
+    if event.kind is RunEventKind.ADVANCE:
+        if event.target is None:
+            raise RunTransitionError("advance requires a target phase")
+        if current.disposition is not RunDisposition.RUNNING:
+            raise RunTransitionError(
+                f"a {current.disposition.value} run must be resumed before it advances"
+            )
+        if current.phase is None:
+            raise RunTransitionError("a run without a phase cannot advance")
+        if event.target not in _RUN_PHASE_SUCCESSORS[current.phase]:
+            raise RunTransitionError(
+                f"{current.phase.value} never advances to {event.target.value}"
+            )
+        return RunMachineState(event.target, RunDisposition.RUNNING)
+    if event.kind is RunEventKind.WAIT:
+        if event.disposition is None or not event.disposition.waiting:
+            raise RunTransitionError(
+                "a wait event requires the WAIT_EXTERNAL or WAIT_HUMAN disposition"
+            )
+        return RunMachineState(current.phase, event.disposition, event.reason)
+    if event.kind is RunEventKind.FAIL:
+        return RunMachineState(current.phase, RunDisposition.FAILED, event.reason)
+    if event.kind is RunEventKind.COMPLETE:
+        if current.disposition is not RunDisposition.RUNNING:
+            raise RunTransitionError(
+                f"a {current.disposition.value} run must be resumed before it completes"
+            )
+        if current.phase not in _RUN_COMPLETABLE_PHASES:
+            raise RunTransitionError(
+                "only a reviewed candidate push or its publication completes a run"
+            )
+        return RunMachineState(current.phase, RunDisposition.COMPLETED)
+    if event.kind is RunEventKind.RESUME:
+        if not current.disposition.waiting:
+            raise RunTransitionError(
+                f"a {current.disposition.value} run is not waiting and cannot be resumed"
+            )
+        return RunMachineState(current.phase, RunDisposition.RUNNING)
+    raise RunTransitionError(f"run event {event.kind!r} is unknown")
+
+
+# -- the single derived projection -------------------------------------------
+
+# The legacy status of a running phase.  It is the only place these strings
+# are chosen; every waiting or terminal status is derived below.
+_RUNNING_STATUS: Mapping[RunPhase, RunStatus] = {
+    RunPhase.CONTEXT: RunStatus.PLANNING,
+    RunPhase.PLANNER: RunStatus.PLANNING,
+    RunPhase.PLAN_APPROVAL: RunStatus.AWAITING_PLAN_APPROVAL,
+    RunPhase.WORKTREE_SETUP: RunStatus.PREPARING,
+    RunPhase.IMPLEMENT_STEP: RunStatus.IMPLEMENTING,
+    RunPhase.STEP_ACCEPTANCE: RunStatus.IMPLEMENTING,
+    RunPhase.DETERMINISTIC_GATE: RunStatus.VALIDATING,
+    RunPhase.CHECK_REPAIR: RunStatus.REVISING,
+    RunPhase.SEMANTIC_REVISION: RunStatus.REVISING,
+    RunPhase.CANDIDATE_READY: RunStatus.APPROVED,
+    RunPhase.CANDIDATE_PUSH: RunStatus.APPROVED,
+    RunPhase.FINAL_REVIEW: RunStatus.REVIEWING,
+    RunPhase.REVIEW_IMPLEMENTATION: RunStatus.IMPLEMENTING,
+    RunPhase.REVIEW_REPLAN: RunStatus.PLANNING,
+    RunPhase.PUBLISH: RunStatus.PUBLISHING,
+}
+_COMPLETED_STATUS: Mapping[RunPhase, RunStatus] = {
+    RunPhase.CANDIDATE_PUSH: RunStatus.COMMITTED,
+    RunPhase.PUBLISH: RunStatus.PUBLISHED,
+}
+# Failure reasons that name *what* an external wait waits for; the phase stays
+# the operation to retry, the reason carries the business meaning.
+_CHECK_INFRASTRUCTURE_REASONS = frozenset({
+    "CHECK_TIMEOUT", "CHECK_PREFLIGHT_FAILED", "CHECK_INFRA_FAILURE",
+    "CHECK_INFRA_RETRIES_EXHAUSTED", "CHECK_INFRASTRUCTURE_UNAVAILABLE",
+    "CHECK_SIDE_EFFECT_REPEATED", "CHECK_SIDE_EFFECT_UNSTABLE",
+    "WORKSPACE_SETUP_FAILED", "WORKSPACE_SETUP_TIMEOUT",
+})
+_REMOTE_REASONS = frozenset({
+    "PUSH_FAILED", "CANDIDATE_PUSH_FAILED", "CANDIDATE_REMOTE_UNAVAILABLE",
+    "REMOTE_UNAVAILABLE", "REMOTE_TEMPORARILY_UNAVAILABLE",
+})
+_REMOTE_PHASES = frozenset({RunPhase.CANDIDATE_PUSH, RunPhase.PUBLISH})
+# A human wait that still owns a durable retry slot: the bounded repair pass
+# it refused is pending, so an operator retry resumes exactly that pass.
+_REPAIR_SLOT_WAITS: Mapping[tuple[str, RunPhase], RunStatus] = {
+    ("STEP_CONTRACT_REPAIR_OUTPUT_INVALID", RunPhase.IMPLEMENT_STEP): RunStatus.WAITING_CONTRACT_REPAIR,
+    ("CHECK_REPAIR_EXHAUSTED", RunPhase.DETERMINISTIC_GATE): RunStatus.WAITING_CHECK_REPAIR,
+}
+# A human wait that owns a durable operator gate: the exact delta of the
+# expansion is pending, so the operator's answer resumes the same operation.
+_SCOPE_APPROVAL_REASON = "WAITING_SCOPE_APPROVAL"
+
+
+@dataclass(frozen=True)
+class RunOutcome:
+    """The derived, legacy view of one durable run state."""
+
+    phase: RunPhase | None
+    disposition: RunDisposition
+    status: RunStatus
+    # A durable retry boundary remains for exactly this outcome.
+    resumable: bool
+    # A resume may claim the run; the failure reason decides whether it may.
+    resume_eligible: bool
+
+
+def project_run_outcome(state: RunMachineState) -> RunOutcome:
+    """Derive the durable status of one run state; never stored as a source.
+
+    Pure and total: the phase says which operation, the disposition says the
+    posture, and the failure reason names the waiting flavour.  No caller
+    derives a status, and no caller compares a status to a phase.
+    """
+
+    if not isinstance(state, RunMachineState):
+        raise RunTransitionError("project_run_outcome expects a RunMachineState")
+    phase, disposition, reason = state.phase, state.disposition, state.reason
+    if disposition is RunDisposition.RUNNING:
+        status = _RUNNING_STATUS[phase] if phase is not None else RunStatus.CREATED
+        return RunOutcome(phase, disposition, status, False, False)
+    if disposition is RunDisposition.COMPLETED:
+        return RunOutcome(
+            phase, disposition, _COMPLETED_STATUS.get(phase, RunStatus.PUBLISHED), False, False,
+        )
+    if disposition is RunDisposition.FAILED:
+        # The failure reason decides whether a resume may still claim the run.
+        return RunOutcome(phase, disposition, RunStatus.FAILED, False, True)
+    if disposition is RunDisposition.WAIT_EXTERNAL:
+        if reason in _CHECK_INFRASTRUCTURE_REASONS:
+            status = RunStatus.WAITING_CHECK_INFRASTRUCTURE
+        elif reason in _REMOTE_REASONS and phase in _REMOTE_PHASES:
+            status = RunStatus.WAITING_REMOTE
+        else:
+            status = RunStatus.WAITING_EXTERNAL
+        return RunOutcome(phase, disposition, status, True, True)
+    slot = _REPAIR_SLOT_WAITS.get((reason or "", phase))
+    if slot is not None:
+        return RunOutcome(phase, disposition, slot, True, True)
+    if reason == _SCOPE_APPROVAL_REASON:
+        return RunOutcome(phase, disposition, RunStatus.WAITING_SCOPE_APPROVAL, True, True)
+    return RunOutcome(phase, disposition, RunStatus.WAITING_HUMAN, False, False)
+
+# The single legacy bridge: a durable status written by code that predates the
+# canonical vocabulary still names exactly one disposition.  Nothing else maps
+# a status onto a disposition.
+_STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
+    RunStatus.CREATED: RunDisposition.RUNNING,
+    RunStatus.PLANNING: RunDisposition.RUNNING,
+    RunStatus.BLOCKED: RunDisposition.WAIT_HUMAN,
+    RunStatus.WAITING_HUMAN: RunDisposition.WAIT_HUMAN,
+    RunStatus.AWAITING_PLAN_APPROVAL: RunDisposition.RUNNING,
+    RunStatus.WAITING_SCOPE_APPROVAL: RunDisposition.WAIT_HUMAN,
+    RunStatus.WAITING_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
+    RunStatus.WAITING_CHECK_INFRASTRUCTURE: RunDisposition.WAIT_EXTERNAL,
+    RunStatus.WAITING_CHECK_REPAIR: RunDisposition.WAIT_HUMAN,
+    RunStatus.WAITING_REMOTE: RunDisposition.WAIT_EXTERNAL,
+    RunStatus.WAITING_CONTRACT_REPAIR: RunDisposition.WAIT_HUMAN,
+    RunStatus.PLAN_REJECTED: RunDisposition.WAIT_HUMAN,
+    RunStatus.WORKTREE_READY: RunDisposition.RUNNING,
+    RunStatus.PREPARING: RunDisposition.RUNNING,
+    RunStatus.IMPLEMENTING: RunDisposition.RUNNING,
+    RunStatus.CONTRACT_REPAIRING: RunDisposition.RUNNING,
+    RunStatus.VALIDATING: RunDisposition.RUNNING,
+    RunStatus.PRE_REVISION_VALIDATING: RunDisposition.RUNNING,
+    RunStatus.REVISING: RunDisposition.RUNNING,
+    RunStatus.REVALIDATING: RunDisposition.RUNNING,
+    RunStatus.REVIEWING: RunDisposition.RUNNING,
+    RunStatus.APPROVED: RunDisposition.RUNNING,
+    RunStatus.PUBLISHING: RunDisposition.RUNNING,
+    RunStatus.PUBLISHED: RunDisposition.COMPLETED,
+    RunStatus.COMMITTED: RunDisposition.COMPLETED,
+    RunStatus.FAILED: RunDisposition.FAILED,
+    RunStatus.INTERRUPTED: RunDisposition.FAILED,
+}
+
+
+# A waiting status written before the canonical vocabulary existed names the
+# operator gate it stopped at; every other wait is already carried by the
+# failure reason.
+_STATUS_WAIT_REASONS: Mapping[RunStatus, str] = {
+    RunStatus.WAITING_SCOPE_APPROVAL: "WAITING_SCOPE_APPROVAL",
+}
+
+
+def disposition_for_status(status: RunStatus | str) -> RunDisposition:
+    """The disposition a durable legacy status stands for."""
+
+    try:
+        return _STATUS_DISPOSITIONS[RunStatus(status)]
+    except (TypeError, ValueError) as exc:
+        raise RunTransitionError(f"run status {status!r} is unknown") from exc
+
+
+def wait_reason_for_status(status: RunStatus | str) -> str | None:
+    """The operator gate a durable legacy waiting status stands for."""
+
+    try:
+        return _STATUS_WAIT_REASONS.get(RunStatus(status))
+    except (TypeError, ValueError):
+        return None
+
+
 class ReviewVerdict(StrEnum):
     PASS = "PASS"
     REVISE = "REVISE"

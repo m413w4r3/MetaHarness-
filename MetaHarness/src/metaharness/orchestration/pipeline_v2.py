@@ -33,12 +33,18 @@ from ..models import (
     ReviewRoute,
     ReviewVerdict,
     RunCycle,
+    RunDisposition,
+    RunEvent,
+    RunMachineState,
+    RunPhase,
+    RunTransitionError,
     TaskPlanV2,
+    transition,
 )
 
 FailureDetail: TypeAlias = str | Mapping[str, Any]
 from ..result import RunResult
-from ..resume import ResumeCheckpoint, ResumePhase
+from ..resume import ResumeCheckpoint
 from ..review import ReviewResult
 from ..run_options import RunOptions
 
@@ -327,12 +333,36 @@ class PipelineV2Operations:
     recovery_operations: "RecoveryOperations | None" = None
 
 
+# ``RunPhase`` is the state machine's own phase vocabulary: the durable
+# operation, never a posture.  The phase this module may hand over to is
+# decided by :func:`metaharness.models.transition`, in one place.
+
+
 @dataclass(frozen=True)
 class PipelineV2Coordinator:
     """Sequence the generic cycles of one prepared pipeline-v2 run."""
 
     context: PipelineV2Context
     operations: PipelineV2Operations
+    # The phase this coordinator made durable last, in this pass: the single
+    # transition table decides which phase may follow it.
+    _cursor: list[RunPhase] = dataclasses.field(
+        default_factory=list, repr=False, compare=False,
+    )
+
+    def _phase(self, target: RunPhase) -> RunPhase:
+        """Validate one durable phase against the single transition table."""
+
+        if self._cursor:
+            try:
+                transition(
+                    RunMachineState(self._cursor[-1], RunDisposition.RUNNING),
+                    RunEvent.advance(target),
+                )
+            except RunTransitionError as exc:
+                raise PipelineFailure("INVALID_PHASE_TRANSITION", str(exc)) from exc
+        self._cursor.append(target)
+        return target
 
     def run(self, start: ResumeCheckpoint, *, resumed: bool) -> RunResult:
         """Execute from *start*: the first step of a new run, or a checkpoint.
@@ -342,8 +372,8 @@ class PipelineV2Coordinator:
         """
 
         if start.phase in {
-            ResumePhase.CONTEXT, ResumePhase.PLANNER, ResumePhase.PLAN_APPROVAL,
-            ResumePhase.WORKTREE_SETUP,
+            RunPhase.CONTEXT, RunPhase.PLANNER, RunPhase.PLAN_APPROVAL,
+            RunPhase.WORKTREE_SETUP,
         }:
             raise ValueError(f"{start.phase.value} is not an execution checkpoint")
         cycle = self._cycle_at(start)
@@ -369,18 +399,18 @@ class PipelineV2Coordinator:
         ops, ctx = self.operations, self.context
         ops.begin_cycle(ctx, cycle, fresh)
         accept_step_id: str | None = None
-        if start is not None and start.phase is ResumePhase.STEP_ACCEPTANCE:
+        if start is not None and start.phase is RunPhase.STEP_ACCEPTANCE:
             # Resumed inside the implementation phase of this cycle: the step
             # candidate is accepted, then the following steps run normally.
             accept_step_id = start.step_id
             start = dataclasses.replace(
                 start,
                 phase=(
-                    ResumePhase.IMPLEMENT_STEP if cycle.kind is CycleKind.INITIAL
-                    else ResumePhase.REVIEW_IMPLEMENTATION
+                    RunPhase.IMPLEMENT_STEP if cycle.kind is CycleKind.INITIAL
+                    else RunPhase.REVIEW_IMPLEMENTATION
                 ),
             )
-        if start is not None and start.phase is ResumePhase.PUBLISH:
+        if start is not None and start.phase is RunPhase.PUBLISH:
             return ops.publish(ctx, cycle.number, ops.load_candidate(ctx, cycle.number))
 
         if cycle.kind is CycleKind.INITIAL:
@@ -388,12 +418,13 @@ class PipelineV2Coordinator:
             previous_review = None
         elif cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
             cycle_plan, previous_review = ops.review_implementation_correction(
-                ctx, cycle, start is None or start.phase is ResumePhase.SEMANTIC_REVISION,
+                ctx, cycle, start is None or start.phase is RunPhase.SEMANTIC_REVISION,
             )
-        elif start is None or start.phase is ResumePhase.REVIEW_REPLAN:
+        elif start is None or start.phase is RunPhase.REVIEW_REPLAN:
             if start is None:
+                self._phase(RunPhase.REVIEW_REPLAN)
                 ops.checkpoint(
-                    ctx, ResumePhase.REVIEW_REPLAN, cycle=cycle.number,
+                    ctx, RunPhase.REVIEW_REPLAN, cycle=cycle.number,
                     head=ops.current_head(ctx), tree=ops.candidate_tree(ctx),
                 )
             cycle_plan = ops.plan_correction(ctx, cycle)
@@ -403,12 +434,12 @@ class PipelineV2Coordinator:
             previous_review = None
 
         phase = (
-            ResumePhase.IMPLEMENT_STEP
+            RunPhase.IMPLEMENT_STEP
             if cycle.kind is CycleKind.INITIAL
             else (
-                ResumePhase.SEMANTIC_REVISION
+                RunPhase.SEMANTIC_REVISION
                 if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION
-                else ResumePhase.REVIEW_IMPLEMENTATION
+                else RunPhase.REVIEW_IMPLEMENTATION
             )
         )
         pre_stage = (
@@ -425,8 +456,8 @@ class PipelineV2Coordinator:
             if start is None or start.phase is phase:
                 self._boundary(phase, cycle_plan)
                 ops.semantic_review_correction(ctx, cycle_plan, previous_review)
-                self._boundary(ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=final_stage)
-        elif start is None or start.phase is phase or start.phase is ResumePhase.REVIEW_REPLAN:
+                self._boundary(RunPhase.DETERMINISTIC_GATE, cycle_plan, stage=final_stage)
+        elif start is None or start.phase is phase or start.phase is RunPhase.REVIEW_REPLAN:
             self._implement(
                 cycle_plan, next_stage=pre_stage or final_stage, accept_step_id=accept_step_id,
             )
@@ -438,7 +469,7 @@ class PipelineV2Coordinator:
 
         # Initial and replan cycles have a gate before semantic revision.
         if pre_stage is not None and (
-            start is None or start.phase in {phase, ResumePhase.REVIEW_REPLAN}
+            start is None or start.phase in {phase, RunPhase.REVIEW_REPLAN}
             or self._is_gate_checkpoint(start, pre_stage)
         ):
             self._gate_episode(
@@ -448,20 +479,20 @@ class PipelineV2Coordinator:
 
         if semantic_enabled and cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION and (
             start is None or start.phase in {
-                phase, ResumePhase.REVIEW_REPLAN, ResumePhase.SEMANTIC_REVISION,
+                phase, RunPhase.REVIEW_REPLAN, RunPhase.SEMANTIC_REVISION,
             } or self._is_gate_checkpoint(start, pre_stage)
         ):
-            self._boundary(ResumePhase.SEMANTIC_REVISION, cycle_plan)
+            self._boundary(RunPhase.SEMANTIC_REVISION, cycle_plan)
             ops.semantic_revision(ctx, cycle_plan)
-            self._boundary(ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=final_stage)
+            self._boundary(RunPhase.DETERMINISTIC_GATE, cycle_plan, stage=final_stage)
 
         final_start = start if self._is_gate_checkpoint(start, final_stage) else None
         should_run_final_gate = (
             final_start is not None
             or start is None
             or start.phase is phase
-            or start.phase is ResumePhase.REVIEW_REPLAN
-            or start.phase is ResumePhase.SEMANTIC_REVISION
+            or start.phase is RunPhase.REVIEW_REPLAN
+            or start.phase is RunPhase.SEMANTIC_REVISION
             or self._is_gate_checkpoint(start, pre_stage)
         )
         if semantic_enabled:
@@ -480,28 +511,28 @@ class PipelineV2Coordinator:
 
         stage = final_stage if semantic_enabled else (pre_stage or final_stage)
         if start is None or start.phase not in {
-            ResumePhase.CANDIDATE_READY, ResumePhase.CANDIDATE_PUSH,
-            ResumePhase.FINAL_REVIEW, ResumePhase.PUBLISH,
+            RunPhase.CANDIDATE_READY, RunPhase.CANDIDATE_PUSH,
+            RunPhase.FINAL_REVIEW, RunPhase.PUBLISH,
         }:
-            self._boundary(ResumePhase.CANDIDATE_READY, cycle_plan, tree=evidence.staged_tree_sha)
+            self._boundary(RunPhase.CANDIDATE_READY, cycle_plan, tree=evidence.staged_tree_sha)
             candidate = ops.create_candidate(ctx, cycle_plan, stage, evidence)
         else:
             candidate = ops.load_candidate(ctx, cycle.number)
         if start is None or start.phase in {
-            phase, ResumePhase.REVIEW_REPLAN, ResumePhase.SEMANTIC_REVISION,
-            ResumePhase.DETERMINISTIC_GATE, ResumePhase.CHECK_REPAIR,
-            ResumePhase.CANDIDATE_READY,
+            phase, RunPhase.REVIEW_REPLAN, RunPhase.SEMANTIC_REVISION,
+            RunPhase.DETERMINISTIC_GATE, RunPhase.CHECK_REPAIR,
+            RunPhase.CANDIDATE_READY,
         }:
-            self._candidate_boundary(ResumePhase.CANDIDATE_PUSH, cycle_plan, candidate)
+            self._candidate_boundary(RunPhase.CANDIDATE_PUSH, cycle_plan, candidate)
             candidate = ops.push_candidate(ctx, cycle.number, candidate)
-        elif start.phase is ResumePhase.CANDIDATE_PUSH:
+        elif start.phase is RunPhase.CANDIDATE_PUSH:
             candidate = ops.push_candidate(ctx, cycle.number, candidate)
         if start is None or start.phase in {
-            phase, ResumePhase.SEMANTIC_REVISION, ResumePhase.DETERMINISTIC_GATE,
-            ResumePhase.CHECK_REPAIR, ResumePhase.CANDIDATE_READY,
-            ResumePhase.CANDIDATE_PUSH, ResumePhase.FINAL_REVIEW,
+            phase, RunPhase.SEMANTIC_REVISION, RunPhase.DETERMINISTIC_GATE,
+            RunPhase.CHECK_REPAIR, RunPhase.CANDIDATE_READY,
+            RunPhase.CANDIDATE_PUSH, RunPhase.FINAL_REVIEW,
         }:
-            self._candidate_boundary(ResumePhase.FINAL_REVIEW, cycle_plan, candidate)
+            self._candidate_boundary(RunPhase.FINAL_REVIEW, cycle_plan, candidate)
         review = ops.review_candidate(ctx, cycle_plan, candidate, evidence)
         ops.record_review(ctx, cycle.number, review, evidence)
         return self._route(cycle_plan, candidate, evidence, review)
@@ -512,7 +543,7 @@ class PipelineV2Coordinator:
     ) -> bool:
         return bool(
             start is not None and stage is not None
-            and start.phase in {ResumePhase.DETERMINISTIC_GATE, ResumePhase.CHECK_REPAIR}
+            and start.phase in {RunPhase.DETERMINISTIC_GATE, RunPhase.CHECK_REPAIR}
             and start.stage is stage
         )
 
@@ -559,8 +590,8 @@ class PipelineV2Coordinator:
     ) -> None:
         ops, ctx = self.operations, self.context
         phase = (
-            ResumePhase.IMPLEMENT_STEP if cycle_plan.cycle.kind is CycleKind.INITIAL
-            else ResumePhase.REVIEW_IMPLEMENTATION
+            RunPhase.IMPLEMENT_STEP if cycle_plan.cycle.kind is CycleKind.INITIAL
+            else RunPhase.REVIEW_IMPLEMENTATION
         )
         steps = cycle_plan.plan.steps
         if accept_step_id is not None:
@@ -585,7 +616,7 @@ class PipelineV2Coordinator:
                 )
             self._boundary(phase, cycle_plan, step_id=step.id)
             ops.execute_step(ctx, cycle_plan, index)
-        self._boundary(ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=next_stage)
+        self._boundary(RunPhase.DETERMINISTIC_GATE, cycle_plan, stage=next_stage)
 
     def _gate_episode(
         self, cycle_plan: CyclePlan, stage: GateStage, start: ResumeCheckpoint | None,
@@ -595,7 +626,7 @@ class PipelineV2Coordinator:
         ops, ctx = self.operations, self.context
         number = cycle_plan.cycle.number
         budget = ctx.options.max_check_repair_attempts
-        if start is not None and start.phase is ResumePhase.CHECK_REPAIR:
+        if start is not None and start.phase is RunPhase.CHECK_REPAIR:
             evidence = ops.load_gate_evidence(ctx, number, stage)
             if evidence is None or evidence.staged_tree_sha != start.expected_tree_sha:
                 raise PipelineFailure(
@@ -614,7 +645,7 @@ class PipelineV2Coordinator:
                 )
             repair_boundary_written = True
             attempt_recorded = attempt == durable
-        elif start is not None and start.phase is ResumePhase.DETERMINISTIC_GATE:
+        elif start is not None and start.phase is RunPhase.DETERMINISTIC_GATE:
             evidence = ops.load_accepted_gate_evidence(ctx, number, stage)
             if evidence is None:
                 evidence = ops.run_gate(ctx, cycle_plan, stage)
@@ -657,14 +688,14 @@ class PipelineV2Coordinator:
                     )
                 if not repair_boundary_written:
                     self._boundary(
-                        ResumePhase.CHECK_REPAIR, cycle_plan, stage=stage,
+                        RunPhase.CHECK_REPAIR, cycle_plan, stage=stage,
                         check_repair_attempt=attempt, tree=evidence.staged_tree_sha,
                     )
                 if not attempt_recorded:
                     ops.check_repair_attempt(ctx, cycle_plan, stage, attempt, evidence)
                 attempt_recorded = False
                 self._boundary(
-                    ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
+                    RunPhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
                     check_repair_attempt=attempt,
                 )
                 evidence = ops.run_gate(ctx, cycle_plan, stage)
@@ -709,14 +740,14 @@ class PipelineV2Coordinator:
                         )
                     if not repair_boundary_written:
                         self._boundary(
-                            ResumePhase.CHECK_REPAIR, cycle_plan, stage=stage,
+                            RunPhase.CHECK_REPAIR, cycle_plan, stage=stage,
                             check_repair_attempt=attempt, tree=red.staged_tree_sha,
                         )
                     if not attempt_recorded:
                         ops.check_repair_attempt(ctx, cycle_plan, stage, attempt, red)
                     attempt_recorded = False
                     self._boundary(
-                        ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
+                        RunPhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
                         check_repair_attempt=attempt,
                     )
                     evidence = ops.run_gate(ctx, cycle_plan, stage)
@@ -750,7 +781,7 @@ class PipelineV2Coordinator:
                 # produce it.
                 records = ops.check_repair_attempts(ctx, number, stage)
                 self._boundary(
-                    ResumePhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
+                    RunPhase.DETERMINISTIC_GATE, cycle_plan, stage=stage,
                     check_repair_attempt=(
                         len(records)
                         if records and records[-1].tree_after == tree_after else None
@@ -827,11 +858,12 @@ class PipelineV2Coordinator:
     # -- durable boundaries ------------------------------------------------------
 
     def _boundary(
-        self, phase: ResumePhase, cycle_plan: CyclePlan, *, stage: GateStage | None = None,
+        self, phase: RunPhase, cycle_plan: CyclePlan, *, stage: GateStage | None = None,
         step_id: str | None = None, check_repair_attempt: int | None = None,
         tree: str | None = None,
     ) -> None:
         ctx = self.context
+        self._phase(phase)
         self.operations.checkpoint(
             ctx, phase,
             cycle=cycle_plan.cycle.number,
@@ -842,8 +874,9 @@ class PipelineV2Coordinator:
         )
 
     def _candidate_boundary(
-        self, phase: ResumePhase, cycle_plan: CyclePlan, candidate: Mapping[str, Any],
+        self, phase: RunPhase, cycle_plan: CyclePlan, candidate: Mapping[str, Any],
     ) -> None:
+        self._phase(phase)
         self.operations.checkpoint(
             self.context, phase,
             cycle=cycle_plan.cycle.number,

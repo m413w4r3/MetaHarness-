@@ -1,9 +1,11 @@
 """The architectural recovery matrix, from classification to durable outcome.
 
-Each category row states the disposition the policy must choose, the run
-status a failure that left its recovery loop must project onto, and whether
-the run may still be resumed.  Path-level rows drive the real façade with a
-failure escaping the coordinator and check the checkpoint and model calls.
+Each row states the recovery disposition the policy must choose, then the
+durable run state a failure that left its recovery loop must project onto:
+one phase, one run disposition, and the derived legacy status.  No row states
+a status without the phase and disposition it is derived from.  Path-level
+rows drive the real façade with a failure escaping the coordinator and check
+the checkpoint, the disposition and the model calls.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from metaharness.attempt_transaction import (
     contain_trusted_process,
 )
 from metaharness.gitops import snapshot_candidate_state
-from metaharness.models import ExecutionRole, RunStatus
+from metaharness.models import ExecutionRole, RunDisposition, RunStatus
 from metaharness.orchestration.pipeline_v2 import PipelineFailure
 from metaharness.orchestration.recovery import (
     RecoveryCoordinator,
@@ -53,52 +55,55 @@ from tests.pipeline_support import PipelineHarness, initial_plan, review, write
 SPEC = "Make feature.txt good.\n"
 STEP = ("S01", "feature.txt", "Write the feature")
 
-# (category, name, code, facts, disposition, exit phase, exit status or None)
-# ``None`` exit: the disposition is consumed in its loop and never ends a run.
+# The durable vocabulary every row of this matrix is written in.
+RD = RunDisposition
+
+# (category, name, code, facts, disposition, exit phase, exit disposition, status or None)
+# ``None`` exit: the recovery disposition is consumed in its loop and never ends a run.
 RECOVERY_MATRIX = (
-    ("auto", "planner format", "PLANNER_FORMAT_INVALID", {}, D.REPLAN, P.PLANNER, RunStatus.WAITING_HUMAN),
-    ("auto", "planner repository precondition", "PLAN_REPOSITORY_PRECONDITION_INVALID", {}, D.REPLAN, P.PLANNER, RunStatus.WAITING_HUMAN),
-    ("auto", "repository evidence blocker", "PLANNER_REPOSITORY_EVIDENCE", {}, D.REPLAN, P.PLANNER, RunStatus.WAITING_HUMAN),
-    ("auto", "clean contract mismatch", "AGENT_CONTRACT_MISMATCH", {"clean_contract_mismatch": True}, D.CONTRACT_REPAIR, P.IMPLEMENT_STEP, RunStatus.WAITING_HUMAN),
-    ("auto", "agent timeout", "AGENT_TIMEOUT", {}, D.RETRY_SAME, P.IMPLEMENT_STEP, RunStatus.WAITING_EXTERNAL),
-    ("auto", "agent runtime", "AGENT_RUNTIME_FAILED", {}, D.RETRY_SAME, P.IMPLEMENT_STEP, RunStatus.WAITING_EXTERNAL),
-    ("auto", "agent runtime after scoped edit", "AGENT_RUNTIME_FAILED", {"tree_changed_in_scope": True}, D.RETRY_AFTER_ROLLBACK, P.IMPLEMENT_STEP, RunStatus.WAITING_EXTERNAL),
-    ("auto", "workspace setup transient", "WORKSPACE_SETUP_FAILED", {}, D.RETRY_SAME, P.WORKTREE_SETUP, RunStatus.WAITING_CHECK_INFRASTRUCTURE),
-    ("auto", "check preflight transient", "CHECK_PREFLIGHT_FAILED:unit", {}, D.RETRY_SAME, P.DETERMINISTIC_GATE, RunStatus.WAITING_CHECK_INFRASTRUCTURE),
-    ("auto", "check timeout", "CHECK_TIMEOUT:unit", {}, D.RETRY_SAME, P.DETERMINISTIC_GATE, RunStatus.WAITING_CHECK_INFRASTRUCTURE),
-    ("auto", "review format", "REVIEW_FORMAT_INVALID", {}, D.CONTRACT_REPAIR, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
-    ("auto", "review transport", "REVIEWER_TRANSPORT_FAILURE", {}, D.RETRY_SAME, P.FINAL_REVIEW, RunStatus.WAITING_EXTERNAL),
-    ("auto", "review evidence", "REVIEW_EVIDENCE_RETRY", {}, D.RETRY_SAME, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
-    ("auto", "semantic reviser unavailable", "SEMANTIC_REVISER_UNAVAILABLE", {}, D.CONTINUE_WITH_WARNING, P.SEMANTIC_REVISION, None),
-    ("auto", "optional remote unavailable", "CANDIDATE_REMOTE_UNAVAILABLE", {}, D.CONTINUE_WITH_WARNING, P.CANDIDATE_PUSH, None),
-    ("auto", "optional push failed", "PUSH_FAILED", {"remote_required": False}, D.CONTINUE_WITH_WARNING, P.CANDIDATE_PUSH, None),
-    ("model", "ordinary check failure", "CHECK_FAILED:unit", {}, D.CHECK_REPAIR, P.DETERMINISTIC_GATE, RunStatus.WAITING_HUMAN),
-    ("model", "review IMPLEMENTATION", "REVIEW_IMPLEMENTATION", {}, D.CONTRACT_REPAIR, P.REVIEW_IMPLEMENTATION, RunStatus.WAITING_HUMAN),
-    ("model", "review REPLAN", "REVIEW_REPLAN", {}, D.REPLAN, P.REVIEW_REPLAN, RunStatus.WAITING_HUMAN),
-    ("model", "bounded approved scope request", "BOUNDED_SCOPE_REQUEST", {}, D.CONTRACT_REPAIR, P.SEMANTIC_REVISION, RunStatus.WAITING_HUMAN),
-    ("wait", "auth", "AGENT_AUTH_FAILURE", {}, D.WAIT_EXTERNAL, P.IMPLEMENT_STEP, RunStatus.WAITING_EXTERNAL),
-    ("wait", "external auth required", "EXTERNAL_AUTH_REQUIRED", {}, D.WAIT_EXTERNAL, P.FINAL_REVIEW, RunStatus.WAITING_EXTERNAL),
-    ("wait", "persistent provider outage", "LLM_503", {"budget_exhausted": True}, D.WAIT_EXTERNAL, P.FINAL_REVIEW, RunStatus.WAITING_EXTERNAL),
-    ("wait", "persistent check infrastructure", "CHECK_INFRASTRUCTURE_UNAVAILABLE", {}, D.WAIT_EXTERNAL, P.DETERMINISTIC_GATE, RunStatus.WAITING_CHECK_INFRASTRUCTURE),
-    ("wait", "required remote unavailable", "PUSH_FAILED", {"remote_required": True, "remote_unavailable": True}, D.WAIT_EXTERNAL, P.CANDIDATE_PUSH, RunStatus.WAITING_REMOTE),
-    ("wait", "required publication remote unavailable", "PUSH_FAILED", {"remote_required": True, "remote_unavailable": True}, D.WAIT_EXTERNAL, P.PUBLISH, RunStatus.WAITING_REMOTE),
-    ("wait", "true product decision", "SPEC_DECISION_REQUIRED", {}, D.WAIT_HUMAN, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
-    ("wait", "security/policy decision", "SECURITY_POLICY_DECISION_REQUIRED", {}, D.WAIT_HUMAN, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
-    ("wait", "check repair exhausted", "CHECK_REPAIR_EXHAUSTED", {}, D.WAIT_HUMAN, P.DETERMINISTIC_GATE, RunStatus.WAITING_CHECK_REPAIR),
-    ("wait", "review repair exhausted", "WAITING_REPAIR_EXHAUSTED", {}, D.WAIT_HUMAN, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
-    ("hard", "unknown failure code", "TOTALLY_NEW_FAILURE", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
-    ("hard", "secret", "SECRET_IN_DIFF", {}, D.HARD_STOP, P.DETERMINISTIC_GATE, RunStatus.FAILED),
-    ("hard", "unscannable staged source", "UNSCANNABLE_STAGED_BLOB", {}, D.HARD_STOP, P.DETERMINISTIC_GATE, RunStatus.FAILED),
-    ("hard", "scope violation", "AGENT_SCOPE_VIOLATION", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
-    ("hard", "Git ownership violation", "AGENT_GIT_VIOLATION", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
-    ("hard", "check authority tampering", "CHECK_AUTHORITY_TAMPERING", {}, D.HARD_STOP, P.DETERMINISTIC_GATE, RunStatus.FAILED),
-    ("hard", "corrupt artifact", "DURABLE_ARTIFACT_CORRUPTED", {}, D.HARD_STOP, P.FINAL_REVIEW, RunStatus.FAILED),
-    ("hard", "approval mismatch", "PLAN_APPROVAL_IDENTITY_MISMATCH", {}, D.HARD_STOP, P.PLAN_APPROVAL, RunStatus.FAILED),
-    ("hard", "resume mismatch", "RESUME_IDENTITY_MISMATCH", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
-    ("hard", "unexplained repository drift", "REPOSITORY_TREE_DRIFT_UNEXPLAINED", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
-    ("hard", "rollback failure", "ROLLBACK_FAILED", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
-    ("hard", "rollback not exact", "AGENT_RUNTIME_FAILED", {"rollback_succeeded": False}, D.HARD_STOP, None, None),
-    ("hard", "out-of-scope tree change", "AGENT_TIMEOUT", {"tree_changed_out_of_scope": True}, D.HARD_STOP, None, None),
+    ("auto", "planner format", "PLANNER_FORMAT_INVALID", {}, D.REPLAN, P.PLANNER, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("auto", "planner repository precondition", "PLAN_REPOSITORY_PRECONDITION_INVALID", {}, D.REPLAN, P.PLANNER, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("auto", "repository evidence blocker", "PLANNER_REPOSITORY_EVIDENCE", {}, D.REPLAN, P.PLANNER, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("auto", "clean contract mismatch", "AGENT_CONTRACT_MISMATCH", {"clean_contract_mismatch": True}, D.CONTRACT_REPAIR, P.IMPLEMENT_STEP, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("auto", "agent timeout", "AGENT_TIMEOUT", {}, D.RETRY_SAME, P.IMPLEMENT_STEP, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL),
+    ("auto", "agent runtime", "AGENT_RUNTIME_FAILED", {}, D.RETRY_SAME, P.IMPLEMENT_STEP, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL),
+    ("auto", "agent runtime after scoped edit", "AGENT_RUNTIME_FAILED", {"tree_changed_in_scope": True}, D.RETRY_AFTER_ROLLBACK, P.IMPLEMENT_STEP, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL),
+    ("auto", "workspace setup transient", "WORKSPACE_SETUP_FAILED", {}, D.RETRY_SAME, P.WORKTREE_SETUP, RD.WAIT_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE),
+    ("auto", "check preflight transient", "CHECK_PREFLIGHT_FAILED:unit", {}, D.RETRY_SAME, P.DETERMINISTIC_GATE, RD.WAIT_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE),
+    ("auto", "check timeout", "CHECK_TIMEOUT:unit", {}, D.RETRY_SAME, P.DETERMINISTIC_GATE, RD.WAIT_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE),
+    ("auto", "review format", "REVIEW_FORMAT_INVALID", {}, D.CONTRACT_REPAIR, P.FINAL_REVIEW, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("auto", "review transport", "REVIEWER_TRANSPORT_FAILURE", {}, D.RETRY_SAME, P.FINAL_REVIEW, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL),
+    ("auto", "review evidence", "REVIEW_EVIDENCE_RETRY", {}, D.RETRY_SAME, P.FINAL_REVIEW, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("auto", "semantic reviser unavailable", "SEMANTIC_REVISER_UNAVAILABLE", {}, D.CONTINUE_WITH_WARNING, P.SEMANTIC_REVISION, None, None),
+    ("auto", "optional remote unavailable", "CANDIDATE_REMOTE_UNAVAILABLE", {}, D.CONTINUE_WITH_WARNING, P.CANDIDATE_PUSH, None, None),
+    ("auto", "optional push failed", "PUSH_FAILED", {"remote_required": False}, D.CONTINUE_WITH_WARNING, P.CANDIDATE_PUSH, None, None),
+    ("model", "ordinary check failure", "CHECK_FAILED:unit", {}, D.CHECK_REPAIR, P.DETERMINISTIC_GATE, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("model", "review IMPLEMENTATION", "REVIEW_IMPLEMENTATION", {}, D.CONTRACT_REPAIR, P.REVIEW_IMPLEMENTATION, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("model", "review REPLAN", "REVIEW_REPLAN", {}, D.REPLAN, P.REVIEW_REPLAN, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("model", "bounded approved scope request", "BOUNDED_SCOPE_REQUEST", {}, D.CONTRACT_REPAIR, P.SEMANTIC_REVISION, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("wait", "auth", "AGENT_AUTH_FAILURE", {}, D.WAIT_EXTERNAL, P.IMPLEMENT_STEP, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL),
+    ("wait", "external auth required", "EXTERNAL_AUTH_REQUIRED", {}, D.WAIT_EXTERNAL, P.FINAL_REVIEW, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL),
+    ("wait", "persistent provider outage", "LLM_503", {"budget_exhausted": True}, D.WAIT_EXTERNAL, P.FINAL_REVIEW, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL),
+    ("wait", "persistent check infrastructure", "CHECK_INFRASTRUCTURE_UNAVAILABLE", {}, D.WAIT_EXTERNAL, P.DETERMINISTIC_GATE, RD.WAIT_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE),
+    ("wait", "required remote unavailable", "PUSH_FAILED", {"remote_required": True, "remote_unavailable": True}, D.WAIT_EXTERNAL, P.CANDIDATE_PUSH, RD.WAIT_EXTERNAL, RunStatus.WAITING_REMOTE),
+    ("wait", "required publication remote unavailable", "PUSH_FAILED", {"remote_required": True, "remote_unavailable": True}, D.WAIT_EXTERNAL, P.PUBLISH, RD.WAIT_EXTERNAL, RunStatus.WAITING_REMOTE),
+    ("wait", "true product decision", "SPEC_DECISION_REQUIRED", {}, D.WAIT_HUMAN, P.FINAL_REVIEW, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("wait", "security/policy decision", "SECURITY_POLICY_DECISION_REQUIRED", {}, D.WAIT_HUMAN, P.FINAL_REVIEW, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("wait", "check repair exhausted", "CHECK_REPAIR_EXHAUSTED", {}, D.WAIT_HUMAN, P.DETERMINISTIC_GATE, RD.WAIT_HUMAN, RunStatus.WAITING_CHECK_REPAIR),
+    ("wait", "review repair exhausted", "WAITING_REPAIR_EXHAUSTED", {}, D.WAIT_HUMAN, P.FINAL_REVIEW, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("hard", "unknown failure code", "TOTALLY_NEW_FAILURE", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED),
+    ("hard", "secret", "SECRET_IN_DIFF", {}, D.HARD_STOP, P.DETERMINISTIC_GATE, RD.FAILED, RunStatus.FAILED),
+    ("hard", "unscannable staged source", "UNSCANNABLE_STAGED_BLOB", {}, D.HARD_STOP, P.DETERMINISTIC_GATE, RD.FAILED, RunStatus.FAILED),
+    ("hard", "scope violation", "AGENT_SCOPE_VIOLATION", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED),
+    ("hard", "Git ownership violation", "AGENT_GIT_VIOLATION", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED),
+    ("hard", "check authority tampering", "CHECK_AUTHORITY_TAMPERING", {}, D.HARD_STOP, P.DETERMINISTIC_GATE, RD.FAILED, RunStatus.FAILED),
+    ("hard", "corrupt artifact", "DURABLE_ARTIFACT_CORRUPTED", {}, D.HARD_STOP, P.FINAL_REVIEW, RD.FAILED, RunStatus.FAILED),
+    ("hard", "approval mismatch", "PLAN_APPROVAL_IDENTITY_MISMATCH", {}, D.HARD_STOP, P.PLAN_APPROVAL, RD.FAILED, RunStatus.FAILED),
+    ("hard", "resume mismatch", "RESUME_IDENTITY_MISMATCH", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED),
+    ("hard", "unexplained repository drift", "REPOSITORY_TREE_DRIFT_UNEXPLAINED", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED),
+    ("hard", "rollback failure", "ROLLBACK_FAILED", {}, D.HARD_STOP, P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED),
+    ("hard", "rollback not exact", "AGENT_RUNTIME_FAILED", {"rollback_succeeded": False}, D.HARD_STOP, None, None, None),
+    ("hard", "out-of-scope tree change", "AGENT_TIMEOUT", {"tree_changed_out_of_scope": True}, D.HARD_STOP, None, None, None),
 )
 _MODEL_DISPOSITIONS = {D.CONTRACT_REPAIR, D.CHECK_REPAIR, D.REPLAN}
 _AUTOMATIC = {
@@ -109,7 +114,7 @@ _AUTOMATIC = {
 
 class RecoveryMatrixTests(unittest.TestCase):
     def test_each_category_has_its_disposition_and_exit_status(self) -> None:
-        for category, name, code, facts, disposition, phase, status in RECOVERY_MATRIX:
+        for category, name, code, facts, disposition, phase, exit_disposition, status in RECOVERY_MATRIX:
             with self.subTest(category=category, failure=name):
                 decision = classify_failure(code, **facts)
                 self.assertEqual(decision.disposition, disposition)
@@ -125,13 +130,18 @@ class RecoveryMatrixTests(unittest.TestCase):
                 exit_decision, terminal = project_exit(
                     code, phase=phase, remote_required=facts.get("remote_required", False),
                 )
+                # The durable state is the (phase, disposition) pair; the
+                # status is only its derived projection.
+                self.assertIs(terminal.phase, phase)
+                self.assertIs(terminal.disposition, exit_disposition)
                 self.assertEqual(terminal.status, status)
-                # Waiting states resume only where a durable retry boundary
-                # exists; a genuine operator decision or hard stop does not.
-                self.assertEqual(terminal.resumable, status in {
-                    RunStatus.WAITING_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE,
-                    RunStatus.WAITING_REMOTE, RunStatus.WAITING_CHECK_REPAIR,
-                })
+                # A waiting run owns a durable retry boundary only where its
+                # phase still owns the operation a retry would run.
+                self.assertIs(terminal.resumable, exit_disposition is RD.WAIT_EXTERNAL or (
+                    exit_disposition is RD.WAIT_HUMAN and status in {
+                        RunStatus.WAITING_CHECK_REPAIR, RunStatus.WAITING_CONTRACT_REPAIR,
+                    }
+                ))
                 self.assertNotIn(exit_decision.disposition, _AUTOMATIC)
 
     def test_every_automatic_recovery_is_explicitly_allowlisted(self) -> None:
@@ -152,30 +162,30 @@ class RecoveryMatrixTests(unittest.TestCase):
         self.assertIs(terminal.status, RunStatus.FAILED)
 
 
-# (name, code, facts, failure class, next strategy, exit phase, exit status)
-# ``None`` status: the ladder step is executed inside its loop, never at exit.
+# (name, code, facts, failure class, next strategy, exit phase, exit disposition, status)
+# ``None`` exit: the ladder step is executed inside its loop, never at exit.
 LADDER_MATRIX = (
-    ("check failed", "CHECK_FAILED:unit", {}, FailureClass.CORRECTNESS, RecoveryStrategy.REPAIR_TARGETED, P.DETERMINISTIC_GATE, None),
-    ("check repair exhausted", "CHECK_FAILED:unit", {"budget_exhausted": True}, FailureClass.CORRECTNESS, RecoveryStrategy.REPLAN_STEP, P.DETERMINISTIC_GATE, None),
-    ("check repair with proof", "CHECK_FAILED:unit", {"budget_exhausted": True, "proof_required": True}, FailureClass.CORRECTNESS, RecoveryStrategy.EXPAND_SCOPE, P.DETERMINISTIC_GATE, None),
-    ("review evidence retry", "REVIEW_EVIDENCE_RETRY", {}, FailureClass.CORRECTNESS, RecoveryStrategy.EXPAND_SCOPE, P.FINAL_REVIEW, None),
-    ("review evidence unresolved", "REVIEW_EVIDENCE_UNRESOLVED", {}, FailureClass.CORRECTNESS, RecoveryStrategy.EXPAND_SCOPE, P.FINAL_REVIEW, None),
-    ("clean contract mismatch", "AGENT_CONTRACT_MISMATCH", {"clean_contract_mismatch": True}, FailureClass.CONTRACT, RecoveryStrategy.REPAIR_TARGETED, P.IMPLEMENT_STEP, None),
-    ("contract mismatch replan", "AGENT_CONTRACT_MISMATCH", {}, FailureClass.CONTRACT, RecoveryStrategy.REPLAN_STEP, P.IMPLEMENT_STEP, None),
-    ("contract repair exhausted", "AGENT_CONTRACT_MISMATCH", {"clean_contract_mismatch": True, "budget_exhausted": True}, FailureClass.CONTRACT, RecoveryStrategy.REPLAN_STEP, P.IMPLEMENT_STEP, None),
-    ("planner format", "PLANNER_FORMAT_INVALID", {}, FailureClass.MODEL_PROTOCOL, RecoveryStrategy.RETRY_TARGETED, P.PLANNER, None),
-    ("planner correction exhausted", "PLANNER_FORMAT_INVALID", {"budget_exhausted": True}, FailureClass.MODEL_PROTOCOL, RecoveryStrategy.WAIT_HUMAN, P.PLANNER, RunStatus.WAITING_HUMAN),
-    ("transient provider", "LLM_503", {}, FailureClass.EXTERNAL, RecoveryStrategy.RETRY_TARGETED, P.FINAL_REVIEW, None),
-    ("executor fallback", "AGENT_RUNTIME_FAILED", {"fallback_executor_available": True}, FailureClass.EXTERNAL, RecoveryStrategy.FALLBACK_EXECUTOR, P.IMPLEMENT_STEP, None),
-    ("persistent provider outage", "LLM_503", {"budget_exhausted": True}, FailureClass.EXTERNAL, RecoveryStrategy.WAIT_EXTERNAL, P.FINAL_REVIEW, RunStatus.WAITING_EXTERNAL),
-    ("missing credentials", "AGENT_AUTH_FAILURE", {}, FailureClass.EXTERNAL, RecoveryStrategy.WAIT_EXTERNAL, P.IMPLEMENT_STEP, RunStatus.WAITING_EXTERNAL),
-    ("product decision", "SPEC_DECISION_REQUIRED", {}, FailureClass.SPEC_DECISION, RecoveryStrategy.WAIT_HUMAN, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
-    ("policy decision", "SECURITY_POLICY_DECISION_REQUIRED", {}, FailureClass.SECURITY, RecoveryStrategy.WAIT_HUMAN, P.FINAL_REVIEW, RunStatus.WAITING_HUMAN),
-    ("secret in diff", "SECRET_IN_DIFF", {}, FailureClass.SECURITY, RecoveryStrategy.HARD_STOP, P.DETERMINISTIC_GATE, RunStatus.FAILED),
-    ("tree mismatch", "TREE_MISMATCH", {}, FailureClass.INTEGRITY, RecoveryStrategy.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
-    ("scope violation", "AGENT_SCOPE_VIOLATION", {}, FailureClass.AUTHORITY, RecoveryStrategy.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
-    ("scope approval required", "REPAIR_SCOPE_APPROVAL_REQUIRED", {}, FailureClass.AUTHORITY, RecoveryStrategy.WAIT_HUMAN, P.SEMANTIC_REVISION, RunStatus.WAITING_HUMAN),
-    ("unknown failure code", "TOTALLY_NEW_FAILURE", {}, FailureClass.UNKNOWN, RecoveryStrategy.HARD_STOP, P.IMPLEMENT_STEP, RunStatus.FAILED),
+    ("check failed", "CHECK_FAILED:unit", {}, FailureClass.CORRECTNESS, RecoveryStrategy.REPAIR_TARGETED, P.DETERMINISTIC_GATE, None, None),
+    ("check repair exhausted", "CHECK_FAILED:unit", {"budget_exhausted": True}, FailureClass.CORRECTNESS, RecoveryStrategy.REPLAN_STEP, P.DETERMINISTIC_GATE, None, None),
+    ("check repair with proof", "CHECK_FAILED:unit", {"budget_exhausted": True, "proof_required": True}, FailureClass.CORRECTNESS, RecoveryStrategy.EXPAND_SCOPE, P.DETERMINISTIC_GATE, None, None),
+    ("review evidence retry", "REVIEW_EVIDENCE_RETRY", {}, FailureClass.CORRECTNESS, RecoveryStrategy.EXPAND_SCOPE, P.FINAL_REVIEW, None, None),
+    ("review evidence unresolved", "REVIEW_EVIDENCE_UNRESOLVED", {}, FailureClass.CORRECTNESS, RecoveryStrategy.EXPAND_SCOPE, P.FINAL_REVIEW, None, None),
+    ("clean contract mismatch", "AGENT_CONTRACT_MISMATCH", {"clean_contract_mismatch": True}, FailureClass.CONTRACT, RecoveryStrategy.REPAIR_TARGETED, P.IMPLEMENT_STEP, None, None),
+    ("contract mismatch replan", "AGENT_CONTRACT_MISMATCH", {}, FailureClass.CONTRACT, RecoveryStrategy.REPLAN_STEP, P.IMPLEMENT_STEP, None, None),
+    ("contract repair exhausted", "AGENT_CONTRACT_MISMATCH", {"clean_contract_mismatch": True, "budget_exhausted": True}, FailureClass.CONTRACT, RecoveryStrategy.REPLAN_STEP, P.IMPLEMENT_STEP, None, None),
+    ("planner format", "PLANNER_FORMAT_INVALID", {}, FailureClass.MODEL_PROTOCOL, RecoveryStrategy.RETRY_TARGETED, P.PLANNER, None, None),
+    ("planner correction exhausted", "PLANNER_FORMAT_INVALID", {"budget_exhausted": True}, FailureClass.MODEL_PROTOCOL, RecoveryStrategy.WAIT_HUMAN, P.PLANNER, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("transient provider", "LLM_503", {}, FailureClass.EXTERNAL, RecoveryStrategy.RETRY_TARGETED, P.FINAL_REVIEW, None, None),
+    ("executor fallback", "AGENT_RUNTIME_FAILED", {"fallback_executor_available": True}, FailureClass.EXTERNAL, RecoveryStrategy.FALLBACK_EXECUTOR, P.IMPLEMENT_STEP, None, None),
+    ("persistent provider outage", "LLM_503", {"budget_exhausted": True}, FailureClass.EXTERNAL, RecoveryStrategy.WAIT_EXTERNAL, P.FINAL_REVIEW, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL),
+    ("missing credentials", "AGENT_AUTH_FAILURE", {}, FailureClass.EXTERNAL, RecoveryStrategy.WAIT_EXTERNAL, P.IMPLEMENT_STEP, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL),
+    ("product decision", "SPEC_DECISION_REQUIRED", {}, FailureClass.SPEC_DECISION, RecoveryStrategy.WAIT_HUMAN, P.FINAL_REVIEW, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("policy decision", "SECURITY_POLICY_DECISION_REQUIRED", {}, FailureClass.SECURITY, RecoveryStrategy.WAIT_HUMAN, P.FINAL_REVIEW, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("secret in diff", "SECRET_IN_DIFF", {}, FailureClass.SECURITY, RecoveryStrategy.HARD_STOP, P.DETERMINISTIC_GATE, RD.FAILED, RunStatus.FAILED),
+    ("tree mismatch", "TREE_MISMATCH", {}, FailureClass.INTEGRITY, RecoveryStrategy.HARD_STOP, P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED),
+    ("scope violation", "AGENT_SCOPE_VIOLATION", {}, FailureClass.AUTHORITY, RecoveryStrategy.HARD_STOP, P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED),
+    ("scope approval required", "REPAIR_SCOPE_APPROVAL_REQUIRED", {}, FailureClass.AUTHORITY, RecoveryStrategy.WAIT_HUMAN, P.SEMANTIC_REVISION, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN),
+    ("unknown failure code", "TOTALLY_NEW_FAILURE", {}, FailureClass.UNKNOWN, RecoveryStrategy.HARD_STOP, P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED),
 )
 
 
@@ -183,7 +193,7 @@ class LadderMatrixTests(unittest.TestCase):
     """Each ladder row states its class, its next step and its exit status."""
 
     def test_each_row_exposes_its_class_and_next_strategy(self) -> None:
-        for name, code, facts, failure_class, strategy, phase, status in LADDER_MATRIX:
+        for name, code, facts, failure_class, strategy, phase, exit_disposition, status in LADDER_MATRIX:
             with self.subTest(failure=name):
                 decision = classify_failure(code, **facts)
                 self.assertIs(decision.failure_class, failure_class)
@@ -193,15 +203,15 @@ class LadderMatrixTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         strategy_terminal_state(strategy, failure_code=code, phase=phase)
                     continue
-                self.assertEqual(
-                    strategy_terminal_state(strategy, failure_code=code, phase=phase).status,
-                    status,
-                )
+                terminal = strategy_terminal_state(strategy, failure_code=code, phase=phase)
+                self.assertIs(terminal.disposition, exit_disposition)
+                self.assertEqual(terminal.status, status)
                 # The ladder terminal and the disposition projection agree on
-                # the durable outcome they project.
+                # the durable state and the status derived from it.
+                projected = terminal_state_for(decision, failure_code=code, phase=phase)
                 self.assertEqual(
-                    strategy_terminal_state(strategy, failure_code=code, phase=phase).status,
-                    terminal_state_for(decision, failure_code=code, phase=phase).status,
+                    (projected.phase, projected.disposition, projected.status),
+                    (terminal.phase, terminal.disposition, terminal.status),
                 )
 
     def test_check_failed_walks_its_ladder_before_a_human_wait(self) -> None:
@@ -231,7 +241,10 @@ class LadderMatrixTests(unittest.TestCase):
         terminal = strategy_terminal_state(
             walked[-1], failure_code="CHECK_FAILED:unit", phase=P.DETERMINISTIC_GATE,
         )
-        self.assertEqual((terminal.status, terminal.resumable), (RunStatus.WAITING_HUMAN, False))
+        self.assertEqual(
+            (terminal.disposition, terminal.status, terminal.resumable),
+            (RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN, False),
+        )
         # The same fingerprint never proposes a consumed step again.
         self.assertIs(
             progression.next_strategy(
@@ -402,22 +415,23 @@ class AttemptTransactionTests(unittest.TestCase):
 class RecoveryPathTests(PipelineHarness):
     """A failure escaping the coordinator: status, checkpoint, model calls."""
 
+    # (code, durable phase, durable disposition, derived status, resumable)
     PATHS = (
-        ("TOTALLY_NEW_FAILURE", RunStatus.FAILED, False),
-        ("SECRET_IN_DIFF", RunStatus.FAILED, False),
-        ("AGENT_SCOPE_VIOLATION", RunStatus.FAILED, False),
-        ("ROLLBACK_FAILED", RunStatus.FAILED, False),
-        ("AGENT_AUTH_FAILURE", RunStatus.WAITING_EXTERNAL, True),
-        ("CHECK_INFRASTRUCTURE_UNAVAILABLE", RunStatus.WAITING_CHECK_INFRASTRUCTURE, True),
-        ("REVIEWER_TRANSPORT_FAILURE", RunStatus.WAITING_EXTERNAL, True),
-        ("SPEC_DECISION_REQUIRED", RunStatus.WAITING_HUMAN, False),
+        ("TOTALLY_NEW_FAILURE", P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED, False),
+        ("SECRET_IN_DIFF", P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED, False),
+        ("AGENT_SCOPE_VIOLATION", P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED, False),
+        ("ROLLBACK_FAILED", P.IMPLEMENT_STEP, RD.FAILED, RunStatus.FAILED, False),
+        ("AGENT_AUTH_FAILURE", P.IMPLEMENT_STEP, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL, True),
+        ("CHECK_INFRASTRUCTURE_UNAVAILABLE", P.IMPLEMENT_STEP, RD.WAIT_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE, True),
+        ("REVIEWER_TRANSPORT_FAILURE", P.IMPLEMENT_STEP, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL, True),
+        ("SPEC_DECISION_REQUIRED", P.IMPLEMENT_STEP, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN, False),
         # An escaped automatic recovery is never re-authorized at the exit.
-        ("REVIEW_REPLAN", RunStatus.WAITING_HUMAN, False),
-        ("AGENT_TIMEOUT", RunStatus.WAITING_EXTERNAL, True),
+        ("REVIEW_REPLAN", P.IMPLEMENT_STEP, RD.WAIT_HUMAN, RunStatus.WAITING_HUMAN, False),
+        ("AGENT_TIMEOUT", P.IMPLEMENT_STEP, RD.WAIT_EXTERNAL, RunStatus.WAITING_EXTERNAL, True),
     )
 
     def test_escaped_failures_project_without_calling_models(self) -> None:
-        for index, (code, status, resumable) in enumerate(self.PATHS):
+        for index, (code, phase, disposition, status, resumable) in enumerate(self.PATHS):
             run_id = f"path-{index}"
             with self.subTest(code=code), mock.patch(
                 "metaharness.orchestrator.PipelineV2Coordinator.run",
@@ -429,11 +443,13 @@ class RecoveryPathTests(PipelineHarness):
                 state = self.state(run_id)
                 self.assertEqual(result.status, status)
                 self.assertEqual(state["status"], status.value)
+                self.assertEqual(state["disposition"], disposition.value)
                 self.assertEqual(state["failure"]["reason"], (
                     "EXTERNAL_AUTH_REQUIRED" if code == "AGENT_AUTH_FAILURE" else code
                 ))
-                # The exact pre-execution checkpoint is preserved for a resume.
-                self.assertEqual(self.checkpoint(run_id)["phase"], P.IMPLEMENT_STEP.value)
+                # The exact pre-execution checkpoint is preserved for a resume,
+                # and it is the phase authority of the run.
+                self.assertEqual(self.checkpoint(run_id)["phase"], phase.value)
                 self.assertEqual(resume_info(self.run_dir(run_id), state).resumable, resumable)
                 self.assertEqual(len(self.planner.requests), 1)
                 self.assertEqual(self.reviewer.requests, [])

@@ -1,4 +1,12 @@
-"""Durable, provider-neutral checkpoints for the pipeline v2 state machine."""
+"""Durable, provider-neutral checkpoints for the pipeline v2 state machine.
+
+Le checkpoint porte la phase qui fait autorité : l'opération courante ou
+prochaine.  ``state.json`` n'en stocke qu'une projection dérivée (la posture et
+son statut historique), calculée par
+:func:`~metaharness.models.project_run_outcome`.  Aucune matrice implicite
+status/phase ne subsiste : :func:`machine_state_for_run` assemble l'état
+durable, :func:`resume_info` le projette.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +14,20 @@ import json
 import re
 import hashlib
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping
 
 from .approval import ApprovalError, PlanIdentity
-from .models import GateStage
+from .models import (
+    GateStage,
+    RunDisposition,
+    RunMachineState,
+    RunPhase,
+    RunStatus,
+    disposition_for_status,
+    project_run_outcome,
+    wait_reason_for_status,
+)
 from .result import atomic_write_text
 from .run_options import RUN_SCHEMA_UNSUPPORTED
 from .step_ids import STEP_ID_RE
@@ -28,24 +44,9 @@ def pipeline_version_from_state(state: Mapping[str, Any]) -> int:
     return 2
 
 
-class ResumePhase(StrEnum):
-    CONTEXT = "context"
-    PLANNER = "planner"
-    PLAN_APPROVAL = "plan_approval"
-    WORKTREE_SETUP = "worktree_setup"
-    IMPLEMENT_STEP = "implement_step"
-    # A successful worker candidate is durable (``step_candidate.json``);
-    # only its deterministic acceptance and commit remain.  Never a worker.
-    STEP_ACCEPTANCE = "step_acceptance"
-    DETERMINISTIC_GATE = "deterministic_gate"
-    CHECK_REPAIR = "check_repair"
-    SEMANTIC_REVISION = "semantic_revision"
-    CANDIDATE_READY = "candidate_ready"
-    CANDIDATE_PUSH = "candidate_push"
-    FINAL_REVIEW = "final_review"
-    REVIEW_IMPLEMENTATION = "review_implementation"
-    REVIEW_REPLAN = "review_replan"
-    PUBLISH = "publish"
+# The canonical phase vocabulary lives in the model (``RunPhase``); this
+# historical name stays as an alias for the imports that predate it.
+ResumePhase = RunPhase
 
 
 _GATE_STAGES = frozenset(stage.value for stage in GateStage)
@@ -250,20 +251,13 @@ def mark_checkpoint_completed(run_dir: str | Path) -> None:
         )
 
 
-PHASE_STATUS = {phase: "planning" for phase in ResumePhase}
-PHASE_STATUS.update({
-    ResumePhase.WORKTREE_SETUP: "preparing", ResumePhase.IMPLEMENT_STEP: "implementing",
-    ResumePhase.STEP_ACCEPTANCE: "implementing",
-    ResumePhase.DETERMINISTIC_GATE: "validating", ResumePhase.CHECK_REPAIR: "revising",
-    ResumePhase.SEMANTIC_REVISION: "revising", ResumePhase.CANDIDATE_READY: "approved",
-    ResumePhase.CANDIDATE_PUSH: "approved", ResumePhase.FINAL_REVIEW: "reviewing",
-    ResumePhase.REVIEW_IMPLEMENTATION: "implementing", ResumePhase.REVIEW_REPLAN: "planning",
-    ResumePhase.PUBLISH: "publishing",
-})
-_RESUMABLE_STATUSES = frozenset({
-    "failed", "interrupted", "waiting_scope_approval", "waiting_check_infrastructure",
-    "waiting_remote", "waiting_external", "waiting_contract_repair", "waiting_check_repair",
-})
+# Derived, never authored: the legacy status of a phase that is still running.
+PHASE_STATUS = {
+    phase: project_run_outcome(
+        RunMachineState(phase, RunDisposition.RUNNING),
+    ).status.value
+    for phase in ResumePhase
+}
 # An operator retry of the StepContractRepairPlanner of one pending slot.
 CONTRACT_REPAIR_OPERATION = "contract_repair"
 # The deterministic acceptance of a durable, successful worker candidate.
@@ -316,6 +310,36 @@ class ResumeInfo:
     review_cycle: int | None = None
     step_id: str | None = None
     operation: str | None = None
+    disposition: str | None = None
+
+
+def machine_state_for_run(
+    state: Mapping[str, Any], checkpoint: ResumeCheckpoint | None = None,
+) -> RunMachineState:
+    """Assemble the durable run state: one phase, one disposition.
+
+    The checkpoint owns the phase; the run state owns the posture.  A run
+    written before the canonical vocabulary existed is read through the single
+    legacy bridge :func:`~metaharness.models.disposition_for_status`.
+    """
+
+    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+    reason = failure.get("reason")
+    stored = state.get("disposition")
+    if isinstance(stored, str):
+        try:
+            disposition = RunDisposition(stored)
+        except ValueError as exc:
+            raise ResumeCheckpointError("run disposition is unknown") from exc
+    else:
+        disposition = disposition_for_status(state.get("status"))
+    if not isinstance(reason, str) or not reason:
+        reason = wait_reason_for_status(state.get("status")) if disposition.waiting else None
+    return RunMachineState(
+        checkpoint.phase if checkpoint is not None else None,
+        disposition,
+        reason,
+    )
 
 
 def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
@@ -339,7 +363,15 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     check_repair = _check_repair_exhaustion_info(run_dir, state, checkpoint)
     if check_repair is not None:
         return check_repair
-    if state.get("status") not in _RESUMABLE_STATUSES:
+    try:
+        machine = machine_state_for_run(state, checkpoint)
+        outcome = project_run_outcome(machine)
+    except (ValueError, TypeError) as exc:
+        return ResumeInfo(
+            False, reason=f"the durable run state is unreadable: {exc}",
+            operation=CHECKPOINT_INTEGRITY_OPERATION,
+        )
+    if not outcome.resume_eligible:
         return ResumeInfo(False, reason="run has no resumable waiting state")
     if state.get("planning_protocol") != "v2":
         return ResumeInfo(False, reason="only pipeline v2 runs can be resumed")
@@ -352,13 +384,15 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
         return ResumeInfo(False, reason="no resume checkpoint")
     label = resume_label(checkpoint)
     operation = None
+    # The projected outcome names the durable boundary; no caller compares the
+    # stored status to the checkpoint phase any more.
     if (
-        state.get("status") == "waiting_contract_repair"
-        and checkpoint.phase is ResumePhase.IMPLEMENT_STEP
+        outcome.status is RunStatus.WAITING_CONTRACT_REPAIR
+        and checkpoint.phase is RunPhase.IMPLEMENT_STEP
     ):
         operation = CONTRACT_REPAIR_OPERATION
         label = f"Retry contract repair planner ({checkpoint.step_id})"
-    elif checkpoint.phase is ResumePhase.STEP_ACCEPTANCE:
+    elif checkpoint.phase is RunPhase.STEP_ACCEPTANCE:
         operation = STEP_ACCEPTANCE_OPERATION
     return ResumeInfo(
         True, checkpoint.phase.value, label,
@@ -366,6 +400,7 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
         review_cycle=checkpoint.review_cycle,
         step_id=checkpoint.step_id,
         operation=operation,
+        disposition=outcome.disposition.value,
     )
 
 
@@ -378,9 +413,11 @@ def _check_repair_exhaustion_info(
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     detail = failure.get("detail")
     if not (
-        state.get("status") == "waiting_check_repair"
-        and state.get("planning_protocol") == "v2"
+        state.get("planning_protocol") == "v2"
         and failure.get("reason") == "CHECK_REPAIR_EXHAUSTED"
+        and checkpoint is not None
+        and project_run_outcome(machine_state_for_run(state, checkpoint)).status
+        is RunStatus.WAITING_CHECK_REPAIR
     ):
         return None
 
@@ -566,7 +603,7 @@ class ResumeRequiresOperatorError(ResumeError):
 __all__ = [
     "CHECKPOINT_NAME", "CHECK_REPAIR_INTEGRITY_OPERATION", "CHECK_REPAIR_RETRY_OPERATION",
     "CHECKPOINT_INTEGRITY_OPERATION", "CONTRACT_REPAIR_OPERATION",
-    "PHASE_STATUS", "RUN_SCHEMA_UNSUPPORTED", "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint",
+    "PHASE_STATUS", "RUN_SCHEMA_UNSUPPORTED", "machine_state_for_run", "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint",
     "ResumeCheckpointError", "ResumeError", "ResumeInfo", "ResumeIntegrityError",
     "ResumeNotAllowedError", "ResumePhase", "ResumeRequiresOperatorError",
     "ResumeSchemaUnsupportedError",

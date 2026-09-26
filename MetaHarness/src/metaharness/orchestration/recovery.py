@@ -20,7 +20,16 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Collection, Mapping, Protocol
 
 from ..evidence import EvidenceBundle
-from ..models import GateStage, RunStatus
+from ..models import (
+    GateStage,
+    RunDisposition,
+    RunEvent,
+    RunMachineState,
+    RunPhase,
+    RunStatus,
+    project_run_outcome,
+    transition,
+)
 from ..recovery_policy import (
     FailureClass,
     RecoveryDecision,
@@ -29,46 +38,43 @@ from ..recovery_policy import (
     classify_failure,
     failure_class_for,
 )
-from ..resume import ResumePhase
 from ..state import RunStateStore
 from .pipeline_v2 import PipelineFailure, RecoveryStepUnavailable
 
 
 @dataclass(frozen=True)
 class RecoveryTerminalState:
+    """One terminal projection: the disposition, and its derived status.
+
+    ``status`` is the legacy spelling of the projection; ``disposition`` and
+    ``phase`` are the durable state it was derived from.
+    """
+
     status: RunStatus
     resumable: bool
     reason: str
+    disposition: RunDisposition
+    phase: RunPhase | None = None
 
 
-_CHECK_INFRA = frozenset({
-    "CHECK_TIMEOUT", "CHECK_PREFLIGHT_FAILED", "CHECK_INFRA_FAILURE",
-    "CHECK_INFRA_RETRIES_EXHAUSTED", "CHECK_INFRASTRUCTURE_UNAVAILABLE",
-    "CHECK_SIDE_EFFECT_REPEATED", "CHECK_SIDE_EFFECT_UNSTABLE",
-    "WORKSPACE_SETUP_FAILED", "WORKSPACE_SETUP_TIMEOUT",
-})
-_REMOTE = frozenset({
-    "PUSH_FAILED", "CANDIDATE_PUSH_FAILED", "CANDIDATE_REMOTE_UNAVAILABLE",
-    "REMOTE_UNAVAILABLE", "REMOTE_TEMPORARILY_UNAVAILABLE",
-})
 # Provider credentials are an external waiting condition, never a retry.
 _AUTH_ALIASES = frozenset({
     "AGENT_AUTH_FAILURE", "LLM_401", "LLM_403", "LLM_AUTH_FAILURE",
     "MISSING_PROVIDER_CREDENTIALS", "PROVIDER_CREDENTIALS_MISSING",
 })
-# The trace phase of a recovery loop names its durable checkpoint phase.
+# The trace phase of a recovery loop names its durable phase.
 _TRACE_CHECKPOINT = {
-    "implementation": ResumePhase.IMPLEMENT_STEP,
-    "workspace setup": ResumePhase.WORKTREE_SETUP,
-    "preparing": ResumePhase.WORKTREE_SETUP,
-    "review": ResumePhase.FINAL_REVIEW,
-    "final_review": ResumePhase.FINAL_REVIEW,
-    "checks": ResumePhase.DETERMINISTIC_GATE,
-    "validation": ResumePhase.DETERMINISTIC_GATE,
-    "check-repair": ResumePhase.CHECK_REPAIR,
-    "semantic-revision": ResumePhase.SEMANTIC_REVISION,
-    "candidate_push": ResumePhase.CANDIDATE_PUSH,
-    "planning": ResumePhase.PLANNER,
+    "implementation": RunPhase.IMPLEMENT_STEP,
+    "workspace setup": RunPhase.WORKTREE_SETUP,
+    "preparing": RunPhase.WORKTREE_SETUP,
+    "review": RunPhase.FINAL_REVIEW,
+    "final_review": RunPhase.FINAL_REVIEW,
+    "checks": RunPhase.DETERMINISTIC_GATE,
+    "validation": RunPhase.DETERMINISTIC_GATE,
+    "check-repair": RunPhase.CHECK_REPAIR,
+    "semantic-revision": RunPhase.SEMANTIC_REVISION,
+    "candidate_push": RunPhase.CANDIDATE_PUSH,
+    "planning": RunPhase.PLANNER,
 }
 # Bounded durable attempt history; the counters stay the budget authority.
 MAX_RECOVERY_ATTEMPT_RECORDS = 256
@@ -80,34 +86,44 @@ def failure_code(reason: str) -> str:
     return reason.split(":", 1)[0].strip().upper()
 
 
+# The only postures a terminal recovery decision may leave behind.  Every
+# finer distinction (which infrastructure is down, which bounded pass a human
+# may retry) stays in the failure reason and the phase.
+_TERMINAL_DISPOSITION = {
+    RecoveryDisposition.HARD_STOP: RunDisposition.FAILED,
+    RecoveryDisposition.WAIT_HUMAN: RunDisposition.WAIT_HUMAN,
+    RecoveryDisposition.WAIT_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
+}
+
+
 def terminal_state_for(
-    decision: RecoveryDecision, *, failure_code: str, phase: ResumePhase,
+    decision: RecoveryDecision, *, failure_code: str, phase: RunPhase,
 ) -> RecoveryTerminalState:
-    """Only terminal dispositions may cross the coordinator boundary."""
+    """Only terminal dispositions may cross the coordinator boundary.
+
+    The decision names one of the five run dispositions; the projected status
+    and resumability are derived from it, the phase and the failure reason.
+    """
 
     if not isinstance(failure_code, str) or not failure_code.strip():
         raise TypeError("terminal failure_code must be a non-empty reason-code string")
     code = failure_code.split(":", 1)[0].upper()
-    if decision.disposition is RecoveryDisposition.HARD_STOP:
-        return RecoveryTerminalState(RunStatus.FAILED, False, decision.reason)
-    if decision.disposition is RecoveryDisposition.WAIT_HUMAN:
-        if code == "STEP_CONTRACT_REPAIR_OUTPUT_INVALID":
-            # The pending repair slot is intact: its planner can be retried.
-            return RecoveryTerminalState(RunStatus.WAITING_CONTRACT_REPAIR, True, decision.reason)
-        if code == "CHECK_REPAIR_EXHAUSTED":
-            # The gate checkpoint and candidate are intact; retry runs the gate
-            # only and cannot admit another worker without a new authority.
-            return RecoveryTerminalState(RunStatus.WAITING_CHECK_REPAIR, True, decision.reason)
-        return RecoveryTerminalState(RunStatus.WAITING_HUMAN, False, decision.reason)
-    if decision.disposition is RecoveryDisposition.WAIT_EXTERNAL:
-        if code in _CHECK_INFRA:
-            status = RunStatus.WAITING_CHECK_INFRASTRUCTURE
-        elif code in _REMOTE and phase in {ResumePhase.CANDIDATE_PUSH, ResumePhase.PUBLISH}:
-            status = RunStatus.WAITING_REMOTE
-        else:
-            status = RunStatus.WAITING_EXTERNAL
-        return RecoveryTerminalState(status, True, decision.reason)
-    raise ValueError(f"recovery disposition {decision.disposition} is not terminal")
+    try:
+        disposition = _TERMINAL_DISPOSITION[decision.disposition]
+    except KeyError as exc:
+        raise ValueError(f"recovery disposition {decision.disposition} is not terminal") from exc
+    event = (
+        RunEvent.fail(reason=code)
+        if disposition is RunDisposition.FAILED
+        else RunEvent.wait(disposition, reason=code)
+    )
+    outcome = project_run_outcome(
+        transition(RunMachineState(phase, RunDisposition.RUNNING), event)
+    )
+    return RecoveryTerminalState(
+        outcome.status, outcome.resumable, decision.reason,
+        outcome.disposition, outcome.phase,
+    )
 
 
 # Terminal ladder steps only: an autonomous step is executed inside its own
@@ -120,7 +136,7 @@ _TERMINAL_DISPOSITIONS = {
 
 
 def strategy_terminal_state(
-    strategy: RecoveryStrategy, *, failure_code: str, phase: ResumePhase,
+    strategy: RecoveryStrategy, *, failure_code: str, phase: RunPhase,
 ) -> RecoveryTerminalState:
     """Project one ladder terminal onto the durable status that waits after it.
 
@@ -139,7 +155,7 @@ def strategy_terminal_state(
 
 
 def project_exit(
-    reason: str, *, phase: ResumePhase, remote_required: bool = False,
+    reason: str, *, phase: RunPhase, remote_required: bool = False,
 ) -> tuple[RecoveryDecision, RecoveryTerminalState]:
     """Project a failure that left its recovery loop onto a durable status.
 
@@ -442,7 +458,7 @@ class RecoveryCoordinator:
         step_id: str | None = None,
         recovered: bool | None = None,
         terminal_status: RunStatus | None = None,
-        checkpoint_phase: ResumePhase | None = None,
+        checkpoint_phase: RunPhase | None = None,
     ) -> None:
         """Record one secret-free recovery transition with its tree boundary."""
 

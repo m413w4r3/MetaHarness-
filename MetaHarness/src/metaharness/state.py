@@ -1,4 +1,12 @@
-"""Persistance atomique de l'état d'un run."""
+"""Persistance atomique de l'état d'un run.
+
+Un run n'a qu'une source durable d'état : sa phase (l'opération courante ou
+prochaine, portée par le checkpoint) et sa disposition
+(:class:`~metaharness.models.RunDisposition`, l'une des cinq postures).  Le
+``status`` stocké ici n'est qu'une projection dérivée, calculée en un seul
+endroit (:func:`~metaharness.models.project_run_outcome`) ; aucun écrivain ne
+peut donc lui faire contredire la disposition.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +19,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-from .models import RunStatus
+from .models import (
+    RunDisposition,
+    RunMachineState,
+    RunStatus,
+    disposition_for_status,
+    project_run_outcome,
+)
 
 # Lock file serializing every read/modify/write of ``state.json``.  It is an
 # internal coordination file: it never contains state and is never served.
@@ -75,6 +89,7 @@ class RunStateStore:
             "pipeline_version": pipeline_version,
             "run_id": run_id,
             "status": RunStatus.CREATED.value,
+            "disposition": RunDisposition.RUNNING.value,
             "started_at": started,
             "updated_at": started,
             "base_sha": base_sha,
@@ -131,10 +146,41 @@ class RunStateStore:
         return state
 
     def update(self, *, status: RunStatus | str, **fields: Any) -> dict[str, Any]:
-        new_status = RunStatus(status).value
+        """Merge *fields* under one *status*; the disposition follows it.
+
+        ``status`` is the legacy, projected spelling of a run state.  The
+        durable posture is derived from it here, so the two can never
+        disagree;  the orchestrator migrates to
+        :meth:`set_run_state` and this bridge then disappears.
+        """
+
+        new_status = RunStatus(status)
         with _exclusive_state_lock(self.lock_path):
             state = self.load()
-            state["status"] = new_status
+            state["status"] = new_status.value
+            state["disposition"] = disposition_for_status(new_status).value
+            state.update(fields)
+            state["updated_at"] = _now()
+            self._write(state)
+        return state
+
+    def set_run_state(self, machine: RunMachineState, **fields: Any) -> dict[str, Any]:
+        """Persist one canonical run state; the status is derived from it.
+
+        The phase authority itself lives in the run checkpoint: this store
+        only records the posture and its projection, so no second field can
+        ever contradict the checkpoint's phase.
+        """
+
+        if not isinstance(machine, RunMachineState):
+            raise TypeError("set_run_state expects a RunMachineState")
+        if fields.keys() & {"status", "disposition", "phase"}:
+            raise ValueError("set_run_state owns status and disposition")
+        outcome = project_run_outcome(machine)
+        with _exclusive_state_lock(self.lock_path):
+            state = self.load()
+            state["status"] = outcome.status.value
+            state["disposition"] = outcome.disposition.value
             state.update(fields)
             state["updated_at"] = _now()
             self._write(state)
@@ -181,12 +227,13 @@ class RunStateStore:
         """
 
         expected = RunStatus(expected_status).value
-        new_status = RunStatus(status).value
+        new_status = RunStatus(status)
         with _exclusive_state_lock(self.lock_path):
             state = self.load()
             if state.get("status") != expected or state.get("updated_at") != expected_updated_at:
                 return None
-            state["status"] = new_status
+            state["status"] = new_status.value
+            state["disposition"] = disposition_for_status(new_status).value
             state.update(fields)
             state["updated_at"] = _now()
             self._write(state)
@@ -217,6 +264,7 @@ class RunStateStore:
             state = self.load()
             state.update(fields)
             state["status"] = RunStatus.FAILED.value
+            state["disposition"] = RunDisposition.FAILED.value
             state["failure"] = failure
             state["updated_at"] = _now()
             self._write(state)
