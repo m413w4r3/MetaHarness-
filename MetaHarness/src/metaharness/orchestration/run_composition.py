@@ -252,14 +252,14 @@ class RunComposition:
             begin_cycle=bind(cycle_artifacts.begin, store),
             load_cycle=lambda ctx, number: read_cycle_record(ctx.run_dir, number),
             initial_plan=self._initial_cycle_plan,
-            review_implementation_correction=self.runtime.reviews.review_implementation_correction,
-            plan_correction=bind(self.runtime.reviews.plan_correction, store),
+            review_implementation_correction=self.runtime.review_correction.review_implementation_correction,
+            plan_correction=bind(self.runtime.review_correction.plan_correction, store),
             load_correction=self._load_correction,
             completed_steps=self.completed_steps,
             execute_step=bind(self.runtime.step_execution.execute_cycle_step, store),
             accept_step=bind(self.runtime.step_acceptance.resume_step_acceptance, store),
-            semantic_revision=bind(self.runtime.reviews.semantic_revision, store),
-            semantic_review_correction=bind(self.runtime.reviews.semantic_review_correction, store),
+            semantic_revision=bind(self.runtime.semantic_revision.semantic_revision, store),
+            semantic_review_correction=bind(self.runtime.review_correction.semantic_review_correction, store),
             run_gate=bind(self.runtime.gates.run_gate, store),
             load_gate_evidence=lambda ctx, number, stage: load_evidence(
                 gate_dir(ctx.run_dir, number, stage)
@@ -285,7 +285,7 @@ class RunComposition:
             publish=bind(self.runtime.publication.publish_candidate, store),
             recovery_operations=CheckRepairLadder(
                 replan_steps=functools.partial(self.runtime.gates.replan_responsible_step, store),
-                replan_cycles=functools.partial(self.runtime.reviews.replan_cycle, store),
+                replan_cycles=functools.partial(self.runtime.check_replan.replan_cycle, store),
             ),
         )
 

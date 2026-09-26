@@ -71,11 +71,10 @@ MODULE_MAX_LINES = 900
 # the durable answer itself landed in ``planning/check_replan.py``.
 # Raised in the single-correction-budget change: the ladder's cycle rung is
 # refused against that budget inside the module that owns the rungs, the plan
-# authority learned to read a check-replan's own directory, and the review
+# authority learned to read a check-replan's own directory, and the check-replan
 # service keeps its defence-in-depth refusal of an unaffordable rung.
 FROZEN_MODULE_SIZES: Mapping[str, int] = {
     "orchestration/resume_validation.py": 1392,
-    "orchestration/review_service.py": 1790,
     # Raised in the check-repair decomposition: the bounded check-repair
     # prompt moved next to the revision transaction that consumes it, the
     # module that actually builds and injects it.
@@ -96,8 +95,36 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
     "metaharness.orchestration.candidate": {
         "metaharness.orchestration.shared": ('_json_text', '_read_json_artifact'),
     },
+    "metaharness.orchestration.candidate_review": {
+        "metaharness.orchestration.shared": (
+            "_REVIEW_ATTEMPT_ARTIFACTS",
+            "_archive_attempt",
+            "_check_payload",
+            "_is_object_id",
+            "_json_text",
+            "_read_json_artifact",
+        ),
+        "metaharness.orchestration.revision": ('_review_payload',),
+        "metaharness.orchestration.resume_validation": (
+            "_accepted_review",
+            "_read_planner_conversation",
+        ),
+    },
     "metaharness.orchestration.check_recovery": {
         "metaharness.orchestration.shared": ('_archive_attempt_tree', '_safe_candidate_tree'),
+    },
+    "metaharness.orchestration.check_replan_service": {
+        "metaharness.orchestration.shared": ('_json_text',),
+    },
+    "metaharness.orchestration.correction_scope": {
+        "metaharness.orchestration.shared": (
+            "_REVISION_ATTEMPT_ARTIFACTS",
+            "_archive_attempt",
+            "_create_file_once",
+            "_is_object_id",
+            "_json_text",
+            "_read_json_artifact",
+        ),
     },
     "metaharness.orchestration.gates": {
         "metaharness.orchestration.shared": (
@@ -137,31 +164,20 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_status_has_unstaged_or_untracked",
         ),
     },
-    "metaharness.orchestration.review_service": {
+    "metaharness.orchestration.review_correction": {
         "metaharness.orchestration.shared": (
-            "_REVIEW_ATTEMPT_ARTIFACTS",
             "_REVISION_ATTEMPT_ARTIFACTS",
             "_archive_attempt",
             "_bounded_report",
-            "_check_payload",
             "_git_ownership",
-            "_is_object_id",
             "_json_text",
-            "_read_json_artifact",
-            "_record_failure_tree",
             "_repair_checks_payload",
-            "_safe_candidate_tree",
         ),
         "metaharness.orchestration.revision": (
             "_bounded_previous_revision_report",
             "_review_payload",
         ),
-        "metaharness.orchestration.scope_repair": ('_build_scope_delta',),
-        "metaharness.orchestration.resume_validation": (
-            "_accepted_review",
-            "_read_planner_conversation",
-            "_reusable_pre_checks",
-        ),
+        "metaharness.orchestration.resume_validation": ('_accepted_review',),
     },
     "metaharness.orchestration.revision": {
         "metaharness.orchestration.shared": (
@@ -175,8 +191,18 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_record_failure_tree",
         ),
     },
-    "metaharness.orchestration.scope_repair": {
-        "metaharness.orchestration.shared": ('_create_file_once', '_json_text'),
+    "metaharness.orchestration.semantic_revision": {
+        "metaharness.orchestration.shared": (
+            "_REVISION_ATTEMPT_ARTIFACTS",
+            "_archive_attempt",
+            "_bounded_report",
+            "_git_ownership",
+            "_json_text",
+            "_read_json_artifact",
+            "_record_failure_tree",
+            "_safe_candidate_tree",
+        ),
+        "metaharness.orchestration.resume_validation": ('_reusable_pre_checks',),
     },
     "metaharness.orchestration.worker_recovery": {
         "metaharness.orchestration.shared": (

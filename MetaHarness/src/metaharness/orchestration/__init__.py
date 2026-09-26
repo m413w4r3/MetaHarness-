@@ -6,7 +6,7 @@ import it back.  The dependency order is one-way::
 
     shared <- check_failure <- check_scope <- gate_recovery, gate_acceptance
     shared <- revision <- resume_validation, gates
-    shared <- candidate, scope_repair
+    shared <- candidate, correction_scope
     pipeline_v2 <- recovery <- worker_recovery, check_recovery, review_recovery
     pipeline_v2 <- step_authority <- worker_attempt <- step_execution
     contract_recovery <- step_execution, step_replan
@@ -36,4 +36,11 @@ The ``*_recovery`` services run the phase-specific actions (worker rollback
 and executor fallback, check infrastructure retries, reviewer transport and
 evidence recovery); the Git transaction every attempt shares lives in
 :mod:`metaharness.attempt_transaction`.
+
+The review domain is split by authority: ``candidate_review`` owns the
+reviewer decision, ``review_correction`` the review-driven correction routes
+and the candidate evidence they read, ``check_replan_service`` the red-gate
+cycle replan -- which never consults the reviewer -- ``correction_scope`` the
+one mutable-scope policy every correction applies, and ``semantic_revision``
+the semantic revision pass and its reviser/repair worker transaction.
 """

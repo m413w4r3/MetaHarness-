@@ -62,18 +62,22 @@ from ..run_options import (
 from ..state import RunStateStore
 from ..trace import TraceSink, TraceStream
 from ..validation import ValidationError
+from .candidate_review import CandidateReviewService
 from .check_recovery import CheckInfrastructureRecovery
+from .check_replan_service import CheckReplanService
 from .contract_recovery import ContractRecoveryService
+from .correction_scope import CorrectionScopeService
 from .gates import GateService
 from .publication import PublicationService
 from .recovery import RecoveryCoordinator
 from .resume_validation import ResumedRun, read_repository_reference
+from .review_correction import ReviewCorrectionService
 from .review_recovery import ReviewRecovery
-from .review_service import ReviewService
 from .run_bootstrap import RunBootstrap
 from .run_composition import RunComposition
 from .run_failure import RunFailure
 from .run_observability import RunObservability
+from .semantic_revision import SemanticRevisionService
 from .shared import (
     OrchestrationError, RECOVERY_ATTEMPT_ARTIFACTS, archive_attempt,
     archive_attempt_target,
@@ -145,7 +149,14 @@ class RunRuntime:
         self.contract_recovery = ContractRecoveryService(self)
         self.step_replan = StepReplanService(self)
         self.gates = GateService(self)
-        self.reviews = ReviewService(self)
+        # The review domain, split by authority: the reviewer decision, the
+        # review-driven corrections, the one scope policy a correction applies,
+        # the semantic revision pass and the red-gate cycle replan.
+        self.reviews = CandidateReviewService(self)
+        self.review_correction = ReviewCorrectionService(self)
+        self.correction_scope = CorrectionScopeService(self)
+        self.semantic_revision = SemanticRevisionService(self)
+        self.check_replan = CheckReplanService(self)
         self.publication = PublicationService(self)
 
         # The four run authorities; each one owns its own module and reads the

@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from metaharness.models import ReviewRoute, ReviewVerdict
 from metaharness.evidence import EvidenceBundle
 from metaharness.gitops import RepositoryReference
-from metaharness.orchestration.review_service import review_code_evidence
+from metaharness.orchestration.review_correction import review_code_evidence
 from metaharness.prompt_contracts import build_final_review_payload
 from metaharness.review import (
     Reviewer,

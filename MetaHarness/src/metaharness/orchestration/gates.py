@@ -398,7 +398,7 @@ class GateService:
             and isinstance(report.get("scope_request"), dict)
         )
         if pending_scope_request:
-            outcome, mutable_scope = self.runtime.reviews.authorize_semantic_scope_request(
+            outcome, mutable_scope = self.runtime.correction_scope.authorize_semantic_scope_request(
                 store, ctx, cycle_plan, attempt_dir, list(scope.effective_repair_scope),
                 approved_scope=scope.approved_mutable_scope,
             )
@@ -470,7 +470,7 @@ class GateService:
         }
         while True:
             try:
-                _result, error = self.runtime.reviews.run_revision_with_recovery(
+                _result, error = self.runtime.semantic_revision.run_revision_with_recovery(
                     store=store, cycle=number, is_check_repair=True, attempt=attempt,
                     request=revision_request,
                 )
@@ -479,7 +479,7 @@ class GateService:
                 _record_failure_tree(attempt_dir, ctx.info.worktree)
             if error != SCOPE_REQUEST_ROUTE:
                 break
-            outcome, requested_scope = self.runtime.reviews.authorize_semantic_scope_request(
+            outcome, requested_scope = self.runtime.correction_scope.authorize_semantic_scope_request(
                 store, ctx, cycle_plan, attempt_dir, list(scope.effective_repair_scope),
                 approved_scope=scope.approved_mutable_scope,
             )

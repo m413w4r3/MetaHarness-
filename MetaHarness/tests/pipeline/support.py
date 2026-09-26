@@ -147,8 +147,8 @@ def crash_on_review(orchestrator, number: int = 1):
 def crash_on_revision(orchestrator):
     """Interrupt the run before the semantic reviser runs."""
 
-    reviews = orchestrator._runtime.reviews
+    revisions = orchestrator._runtime.semantic_revision
     return mock.patch.object(
-        type(reviews), "run_revision_with_recovery",
+        type(revisions), "run_revision_with_recovery",
         side_effect=RuntimeError("crash before semantic worker"),
     )
