@@ -45,7 +45,6 @@ from ..models import (
     ExecutionRole,
     GateStage,
     HarnessConfig,
-    RunStatus,
 )
 from ..resume import (
     ResumeIntegrityError,
@@ -124,7 +123,7 @@ class GateService:
         )
 
         _archive_attempt(directory, names=_CHECK_ATTEMPT_ARTIFACTS)
-        store.update(status=RunStatus.VALIDATING, current_step=None)
+        store.update_metadata(current_step=None)
         evidence = self._final_evidence(
             ctx.info.worktree, ctx.base_sha, directory,
             check_failures_hard=False, reuse=True, stage=stage,
@@ -140,8 +139,8 @@ class GateService:
             "required_check_ids": list(evidence.required_check_ids),
             "failures": list(evidence.failures),
         }
-        store.update(
-            status=RunStatus.VALIDATING, checks=_check_payload(evidence),
+        store.update_metadata(
+            checks=_check_payload(evidence),
             staged_tree_sha=evidence.staged_tree_sha,
             changed_files=list(evidence.changed_files),
             deterministic_gate=gate,
@@ -153,7 +152,7 @@ class GateService:
             if isinstance(current_repair, Mapping) and "operator_retry_fingerprint" in current_repair:
                 cleared = dict(current_repair)
                 cleared.pop("operator_retry_fingerprint", None)
-                store.update(status=RunStatus.VALIDATING, check_repair=cleared)
+                store.update_metadata(check_repair=cleared)
         retry_check.settle(evidence)
         return evidence
     @staticmethod
@@ -437,8 +436,7 @@ class GateService:
             store, cycle_plan.cycle,
             check_repair={"status": "running", "attempt_count": len(records), **progress},
         )
-        store.update(
-            status=RunStatus.REVISING,
+        store.update_metadata(
             check_repair={"status": "running", "attempt_count": len(records), **progress},
         )
         self.runtime.recovery(store).trace(
@@ -492,8 +490,7 @@ class GateService:
             revision_request["mutable_scope"] = list(scope.effective_repair_scope)
             revision_request["check_repair_scope"] = scope
             progress["mutable_scope"] = list(scope.effective_repair_scope)
-            store.update(
-                status=RunStatus.REVISING,
+            store.update_metadata(
                 check_repair={"status": "running", "attempt_count": len(records), **progress},
             )
         effective_executor = _read_json_artifact(attempt_dir / "executor.json", 16 * 1024)
@@ -523,8 +520,7 @@ class GateService:
                     "reason": "CHECK_REPAIR_UNAVAILABLE",
                     "infrastructure_reason": error[:120],
                 }))
-                store.update(
-                    status=RunStatus.REVISING,
+                store.update_metadata(
                     check_repair={
                         "status": "unavailable", "error": error[:120],
                         "attempt_count": len(records), **progress,
@@ -550,8 +546,7 @@ class GateService:
                 "profile_fingerprint": effective_fingerprint,
                 "reason": reason,
             }))
-            store.update(
-                status=RunStatus.REVISING,
+            store.update_metadata(
                 check_repair={"status": "failed", "error": reason, **progress},
             )
             raise PipelineFailure(reason, ", ".join(soft))
@@ -605,8 +600,7 @@ class GateService:
                 "attempts": [asdict(item) for item in attempts], **progress,
             },
         )
-        store.update(
-            status=RunStatus.REVALIDATING,
+        store.update_metadata(
             check_repair={
                 "status": "completed", "attempt_count": len(attempts),
                 "attempts": [asdict(item) for item in attempts], **progress,

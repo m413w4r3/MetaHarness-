@@ -35,7 +35,6 @@ from ..gitops import (
 from ..models import (
     CycleKind,
     GateStage,
-    RunStatus,
 )
 from ..result import atomic_write_text
 from ..resume import ResumePhase, read_checkpoint
@@ -391,8 +390,7 @@ class StepReplanService:
 
         for step_id in step_ids:
             archive_attempt(cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step_id))
-        store.update(
-            status=RunStatus.IMPLEMENTING,
+        store.update_metadata(
             accepted_steps=pruned(state.get("accepted_steps")),
             accepted_commits=pruned(state.get("accepted_commits")),
             expected_head_sha=anchor_commit, expected_tree_sha=anchor_tree,

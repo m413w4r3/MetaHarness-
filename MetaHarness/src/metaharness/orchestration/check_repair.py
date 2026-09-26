@@ -61,7 +61,7 @@ from ..gitops import (
 )
 from ..commit_gate import CommitSafetyError, commit_safety_gate
 from ..result import atomic_write_text
-from ..models import GateStage, RunStatus, TaskPlanV2
+from ..models import GateStage, TaskPlanV2
 from ..prompt_contracts import build_check_repair_payload, write_prompt_diagnostics
 from ..recovery_policy import (
     FailureClass,
@@ -1968,8 +1968,7 @@ class GateAcceptanceService:
             if not any(item.get("commit_sha") == commit_sha for item in chain if isinstance(item, dict)):
                 chain.append({"commit_sha": commit_sha, "tree_sha": evidence.staged_tree_sha, "parent_sha": parent_sha})
                 atomic_write_text(ctx.run_dir / "accepted-chain.json", _json_text({"commits": chain}))
-        store.update(
-            status=store.load().get("status", RunStatus.VALIDATING),
+        store.update_metadata(
             approved_tree_sha=evidence.staged_tree_sha,
             expected_head_sha=commit_sha,
             expected_parent_sha=parent_sha,

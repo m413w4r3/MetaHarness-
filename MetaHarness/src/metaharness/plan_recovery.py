@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .result import atomic_write_text
+from .models import RunDisposition, RunMachineState, assemble_run_state
 from .resume import (
     ResumeCheckpointError,
     ResumeNotAllowedError,
@@ -32,18 +33,18 @@ from .step_ids import is_step_id
 PLAN_RECOVERY_ARTIFACT = "planner_recovery.json"
 PLAN_RECOVERY_SCHEMA_VERSION = 1
 MAX_REPLACEMENT_PLAN_BYTES = 2 * 1024 * 1024
-# State/failure pairs whose PLANNER checkpoint proves that no executable plan
-# crossed the approval boundary.  The pair is authoritative: a planner failure
-# recorded in any other state is not recoverable here.
-RECOVERABLE_PLANNER_STATE_PAIRS = frozenset({
-    ("failed", "PLANNER_OUTPUT_INVALID"),
+# Canonical (disposition, reason) pairs whose PLANNER checkpoint proves that no
+# executable plan crossed the approval boundary.  The pair is authoritative: a
+# planner failure recorded in any other posture is not recoverable here.
+RECOVERABLE_PLANNER_STATES = frozenset({
+    (RunDisposition.FAILED, "PLANNER_OUTPUT_INVALID"),
     # Both planner answers violated the repository preconditions.
-    ("failed", "PLAN_REPOSITORY_PRECONDITION_INVALID"),
-    ("failed", "LLM_FAILURE"),
-    # Terminal recovery projects the same failures onto their waiting states.
-    ("waiting_human", "PLANNER_OUTPUT_INVALID"),
-    ("waiting_human", "PLAN_REPOSITORY_PRECONDITION_INVALID"),
-    ("waiting_external", "LLM_FAILURE"),
+    (RunDisposition.FAILED, "PLAN_REPOSITORY_PRECONDITION_INVALID"),
+    (RunDisposition.FAILED, "LLM_FAILURE"),
+    # The waiting postures project the same failures onto their retry boundary.
+    (RunDisposition.WAIT_HUMAN, "PLANNER_OUTPUT_INVALID"),
+    (RunDisposition.WAIT_HUMAN, "PLAN_REPOSITORY_PRECONDITION_INVALID"),
+    (RunDisposition.WAIT_EXTERNAL, "LLM_FAILURE"),
 })
 PLAN_SOURCE_OPERATOR = "operator_recovery"
 PLAN_SOURCE_PLANNER = "planner_model"
@@ -100,8 +101,7 @@ def plan_recovery_info(run_dir: str | Path, state: Mapping[str, Any]) -> PlanRec
     directory = Path(run_dir)
     if state.get("planning_protocol") != "v2":
         return PlanRecoveryInfo(False, "only META PLAN v2 runs can recover a plan")
-    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-    if (state.get("status"), failure.get("reason")) not in RECOVERABLE_PLANNER_STATE_PAIRS:
+    if not recoverable_plan_failure(state):
         return PlanRecoveryInfo(False, "failure is not a recoverable planner failure")
     try:
         record = read_checkpoint_record(directory)
@@ -118,12 +118,30 @@ def plan_recovery_info(run_dir: str | Path, state: Mapping[str, Any]) -> PlanRec
     return PlanRecoveryInfo(True)
 
 
-def recoverable_plan_source_status(state: Mapping[str, Any]) -> str | None:
-    """Return the exact source status for a recoverable planner failure."""
+def recoverable_plan_failure(state: Mapping[str, Any]) -> bool:
+    """Whether the durable machine state is exactly a recoverable planner failure."""
+
+    machine = _recorded_machine(state)
+    return (
+        machine is not None
+        and (machine.disposition, machine.reason) in RECOVERABLE_PLANNER_STATES
+    )
+
+
+def _recorded_machine(state: Mapping[str, Any]) -> RunMachineState | None:
+    """The canonical state one recorded mapping stands for, when readable."""
 
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-    pair = (state.get("status"), failure.get("reason"))
-    return pair[0] if pair in RECOVERABLE_PLANNER_STATE_PAIRS else None
+    try:
+        return assemble_run_state(
+            state.get("phase"),
+            disposition=state.get("disposition"),
+            status=state.get("status"),
+            reason=state.get("reason"),
+            failure_reason=failure.get("reason") if isinstance(failure, Mapping) else None,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def validate_replacement_text(value: object) -> str:
@@ -200,10 +218,10 @@ __all__ = [
     "PLAN_SOURCE_PLANNER",
     "PlanRecoveryError",
     "PlanRecoveryInfo",
-    "RECOVERABLE_PLANNER_STATE_PAIRS",
+    "RECOVERABLE_PLANNER_STATES",
     "plan_recovery_info",
     "plan_source",
-    "recoverable_plan_source_status",
+    "recoverable_plan_failure",
     "read_plan_recovery_record",
     "validate_replacement_text",
     "write_plan_recovery_record",

@@ -21,7 +21,7 @@ from ..execution_selection import (
 )
 from ..gitops import RepositoryReference, WorktreeInfo, candidate_tree_sha, current_head
 from ..llm.chat import LLMError
-from ..models import CycleKind, ExecutionRole, ExecutionSelection, RunCycle, RunStatus
+from ..models import CycleKind, ExecutionRole, ExecutionSelection, RunCycle
 from ..planning.check_replan import check_replan_dir
 from ..planning.protocol import TaskPlanV2
 from ..profiles import build_llm_endpoint, profile_for_role, profiles_for_config
@@ -115,13 +115,11 @@ class RunComposition:
                 write_recommendation_error(run_dir, warning)
             except (OSError, UnicodeError):
                 pass
-            store.update(
-                status=RunStatus.PLANNING,
+            store.update_metadata(
                 recommendation={"status": "FAILED", "warning": warning},
             )
             return
-        store.update(
-            status=RunStatus.PLANNING,
+        store.update_metadata(
             recommendation={
                 "status": "READY",
                 "implementer_profile": recommendation.implementer_profile,

@@ -17,6 +17,7 @@ from metaharness.models import (
     RunDisposition,
     RunEvent,
     RunEventKind,
+    RunIdentity,
     RunMachineState,
     RunPhase,
     RunStatus,
@@ -61,8 +62,11 @@ class StateTests(unittest.TestCase):
             self.assertIsNone(initial["failure"])
             self.assertEqual(json.loads(state_path.read_text())["status"], "created")
 
-            store.update(status=RunStatus.PLANNING, planner={"request_id": "p1"})
-            store.update(status="validating", checks=[{"name": "test", "ok": True}])
+            store.update_metadata(planner={"request_id": "p1"})
+            store.set_run_state(
+                RunMachineState(RunPhase.DETERMINISTIC_GATE),
+                checks=[{"name": "test", "ok": True}],
+            )
             loaded = store.load()
 
             self.assertEqual(loaded["status"], "validating")
@@ -159,7 +163,7 @@ class StateLockingTests(unittest.TestCase):
 
     def test_lock_file_is_internal_and_never_served(self) -> None:
         store = self.store()
-        store.update(status=RunStatus.PLANNING)
+        store.set_run_state(RunMachineState(RunPhase.PLANNER))
         self.assertEqual(store.lock_path, self.root / "run" / "state.lock")
         self.assertTrue(store.lock_path.exists())
         self.assertNotIn("state.lock", ARTIFACT_ALLOWLIST)
@@ -170,7 +174,7 @@ class StateLockingTests(unittest.TestCase):
         finished = threading.Event()
 
         def writer() -> None:
-            store.update(status=RunStatus.PLANNING, marker=True)
+            store.update_metadata(marker=True)
             finished.set()
 
         with _exclusive_state_lock(store.lock_path), probe.install():
@@ -184,23 +188,22 @@ class StateLockingTests(unittest.TestCase):
         self.assertTrue(finished.is_set())
         self.assertTrue(store.load()["marker"])
 
-    def test_update_if_status_is_compare_and_set(self) -> None:
+    def test_update_metadata_is_compare_and_set_on_the_canonical_identity(self) -> None:
         store = self.store()
-        store.update(status=RunStatus.AWAITING_PLAN_APPROVAL)
-        written = store.update_if_status(
-            RunStatus.AWAITING_PLAN_APPROVAL, execution={"owner": "web"}
-        )
+        store.set_run_state(RunMachineState(RunPhase.PLAN_APPROVAL))
+        gate = store.identity()
+        written = store.update_metadata(expected=gate, execution={"owner": "web"})
         self.assertIsNotNone(written)
         self.assertEqual(written["status"], "awaiting_plan_approval")
-        store.update(status=RunStatus.PLANNING, execution={"owner": "orchestrator"})
-        self.assertIsNone(
-            store.update_if_status("awaiting_plan_approval", execution={"owner": "late web"})
+        store.set_run_state(
+            RunMachineState(RunPhase.PLANNER), execution={"owner": "orchestrator"},
         )
+        self.assertIsNone(store.update_metadata(expected=gate, execution={"owner": "late web"}))
         final = store.load()
         self.assertEqual(final["status"], "planning")
         self.assertEqual(final["execution"], {"owner": "orchestrator"})
         with self.assertRaises(ValueError):
-            store.update_if_status(RunStatus.PLANNING, status="failed")
+            store.update_metadata(expected=store.identity(), status="failed")
 
     def run_interleaved(self, store: RunStateStore, first: tuple, second: tuple) -> dict:
         """Park *first* inside the lock, prove *second* blocks, then release.
@@ -234,12 +237,14 @@ class StateLockingTests(unittest.TestCase):
 
     def test_web_metadata_never_resurrects_the_approval_gate(self) -> None:
         def orchestrator() -> dict:
-            store.update(status=RunStatus.PLANNING, execution={"owner": "orchestrator"})
-            return store.update(status=RunStatus.WORKTREE_READY, branch="harness/x")
+            store.update_metadata(execution={"owner": "orchestrator"})
+            return store.set_run_state(
+                RunMachineState(RunPhase.WORKTREE_SETUP), branch="harness/x",
+            )
 
         def web() -> dict | None:
-            return store.update_if_status(
-                RunStatus.AWAITING_PLAN_APPROVAL,
+            return store.update_metadata(
+                expected=gate,
                 plan_identity={"web": True},
                 execution={"owner": "web"},
             )
@@ -247,11 +252,12 @@ class StateLockingTests(unittest.TestCase):
         # The web holds the lock with the gate still open: its write is legal,
         # and the orchestrator's later writes are merged on top of it.
         store = self.store("web-first")
-        store.update(status=RunStatus.AWAITING_PLAN_APPROVAL)
+        store.set_run_state(RunMachineState(RunPhase.PLAN_APPROVAL))
+        gate = store.identity()
         results = self.run_interleaved(store, ("web", web), ("orchestrator", orchestrator))
         self.assertIsNotNone(results["web"])
         final = store.load()
-        self.assertEqual(final["status"], "worktree_ready")
+        self.assertEqual(final["status"], "preparing")
         self.assertEqual(final["branch"], "harness/x")
         self.assertEqual(final["execution"], {"owner": "orchestrator"})
         self.assertEqual(final["plan_identity"], {"web": True})
@@ -259,24 +265,25 @@ class StateLockingTests(unittest.TestCase):
         # The orchestrator holds the lock with a read of the open gate: the web
         # must then observe the closed gate and write nothing.
         store = self.store("orchestrator-first")
-        store.update(status=RunStatus.AWAITING_PLAN_APPROVAL)
+        store.set_run_state(RunMachineState(RunPhase.PLAN_APPROVAL))
+        gate = store.identity()
         results = self.run_interleaved(store, ("orchestrator", orchestrator), ("web", web))
         self.assertIsNone(results["web"])
         final = store.load()
-        self.assertEqual(final["status"], "worktree_ready")
+        self.assertEqual(final["status"], "preparing")
         self.assertEqual(final["branch"], "harness/x")
         self.assertEqual(final["execution"], {"owner": "orchestrator"})
         self.assertIsNone(final["plan_identity"])
         # Once the orchestrator left the gate, the gate never reappears.
         self.assertIsNone(web())
-        self.assertEqual(store.load()["status"], "worktree_ready")
+        self.assertEqual(store.load()["status"], "preparing")
 
     def test_concurrent_updates_never_lose_fields(self) -> None:
         store = self.store()
 
         def writer(thread_index: int) -> None:
             for item in range(20):
-                store.update(status=RunStatus.IMPLEMENTING, **{f"k{thread_index}_{item}": item})
+                store.update_metadata(**{f"k{thread_index}_{item}": item})
 
         threads = [threading.Thread(target=writer, args=(index,)) for index in range(6)]
         for thread in threads:
@@ -296,7 +303,7 @@ class StateLockingTests(unittest.TestCase):
                 store = self.store(f"failure-{order[0]}-first")
                 targets = {
                     "fail": lambda: store.record_failure("AGENT_RUNTIME_FAILED", "exit status 1"),
-                    "stale": lambda: store.update(status=RunStatus.IMPLEMENTING, extra=order[0]),
+                    "stale": lambda: store.update_metadata(extra=order[0]),
                 }
                 self.run_interleaved(
                     store, (order[0], targets[order[0]]), (order[1], targets[order[1]]),
@@ -332,7 +339,9 @@ class StateLockingTests(unittest.TestCase):
 
         def writer() -> None:
             for item in range(40):
-                store.update(status=RunStatus.VALIDATING, payload="x" * (item * 50))
+                store.set_run_state(
+                    RunMachineState(RunPhase.DETERMINISTIC_GATE), payload="x" * (item * 50),
+                )
 
         readers = [threading.Thread(target=reader) for _ in range(2)]
         writers = [threading.Thread(target=writer) for _ in range(3)]
@@ -381,7 +390,7 @@ class FrozenRunOptionsSchemaTests(unittest.TestCase):
             data = self.older_snapshot_bytes()
             path.write_bytes(data)
             digest = hashlib.sha256(data).hexdigest()
-            state = store.update(status=RunStatus.CREATED, run_options_sha256=digest)
+            state = store.update_metadata(run_options_sha256=digest)
 
             with self.assertRaises(RunOptionsError) as caught:
                 read_run_options_for_state(directory, state)
@@ -405,8 +414,9 @@ class FrozenCheckpointSchemaTests(unittest.TestCase):
     def waiting_state(self) -> dict:
         store = RunStateStore(self.state_path)
         store.initialize("run")
-        return store.update(
-            status=RunStatus.WAITING_EXTERNAL, planning_protocol="v2",
+        return store.set_run_state(
+            RunMachineState(disposition=D.WAIT_EXTERNAL, reason="AGENT_TIMEOUT"),
+            planning_protocol="v2",
             failure={"reason": "AGENT_TIMEOUT", "detail": "timed out"},
         )
 
@@ -534,7 +544,8 @@ INVALID_TRANSITIONS = (
     (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.wait(D.RUNNING), "requires the WAIT_EXTERNAL or WAIT_HUMAN"),
     (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.resume(), "is not waiting"),
     (RunMachineState(R.PUBLISH, D.COMPLETED), RunEvent.fail(), "accepts no further event"),
-    (RunMachineState(R.IMPLEMENT_STEP, D.FAILED), RunEvent.resume(), "accepts no further event"),
+    (RunMachineState(R.PUBLISH, D.COMPLETED), RunEvent.resume(), "accepts no further event"),
+    (RunMachineState(R.IMPLEMENT_STEP, D.FAILED), RunEvent.advance(R.STEP_ACCEPTANCE), "accepts no further event"),
 )
 
 # (phase, disposition, reason, status, resumable, resume eligible)
@@ -633,16 +644,33 @@ class RunMachineTests(unittest.TestCase):
                 self.assertIsInstance(caught.exception, ValueError)
 
     def test_a_terminal_run_never_accepts_another_event(self) -> None:
-        for disposition in (D.COMPLETED, D.FAILED):
-            for event in (
-                RunEvent.advance(R.PUBLISH), RunEvent.wait(D.WAIT_HUMAN),
-                RunEvent.fail(), RunEvent.complete(), RunEvent.resume(),
+        for event in (
+            RunEvent.advance(R.PUBLISH), RunEvent.wait(D.WAIT_HUMAN),
+            RunEvent.fail(), RunEvent.complete(), RunEvent.resume(),
+        ):
+            with (
+                self.subTest(disposition=D.COMPLETED.value, event=event.kind.value),
+                self.assertRaises(RunTransitionError),
             ):
-                with (
-                    self.subTest(disposition=disposition.value, event=event.kind.value),
-                    self.assertRaises(RunTransitionError),
-                ):
-                    transition(RunMachineState(R.PUBLISH, disposition), event)
+                transition(RunMachineState(R.PUBLISH, D.COMPLETED), event)
+
+    def test_only_a_failed_run_may_be_resumed_from_a_terminal_posture(self) -> None:
+        # The resume gate has validated the durable retry boundary: RESUME is
+        # the one event that re-claims a failure, and every other event stops.
+        resumed = transition(
+            RunMachineState(R.IMPLEMENT_STEP, D.FAILED, "LLM_FAILURE"), RunEvent.resume(),
+        )
+        self.assertEqual((resumed.phase, resumed.disposition), (R.IMPLEMENT_STEP, D.RUNNING))
+        self.assertIsNone(resumed.reason)
+        for event in (
+            RunEvent.advance(R.STEP_ACCEPTANCE), RunEvent.wait(D.WAIT_HUMAN),
+            RunEvent.fail(), RunEvent.complete(),
+        ):
+            with (
+                self.subTest(event=event.kind.value),
+                self.assertRaises(RunTransitionError),
+            ):
+                transition(RunMachineState(R.IMPLEMENT_STEP, D.FAILED), event)
 
     def test_the_projection_is_the_only_reader_of_a_phase_and_disposition(self) -> None:
         for phase, disposition, reason, status, resumable, eligible in PROJECTION_MATRIX:
@@ -745,7 +773,8 @@ class RunStateProjectionTests(unittest.TestCase):
         )
         self.assertEqual(state["status"], RunStatus.WAITING_CHECK_REPAIR.value)
         self.assertEqual(state["disposition"], D.WAIT_HUMAN.value)
-        self.assertNotIn("phase", state)
+        self.assertEqual(state["phase"], RunPhase.DETERMINISTIC_GATE.value)
+        self.assertEqual(state["reason"], "CHECK_REPAIR_EXHAUSTED")
         self.assertEqual(self.store.load()["status"], RunStatus.WAITING_CHECK_REPAIR.value)
 
     def test_set_run_state_owns_the_status(self) -> None:
@@ -754,26 +783,129 @@ class RunStateProjectionTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.store.set_run_state("publishing")
 
-    def test_every_durable_status_still_records_its_disposition(self) -> None:
-        for status in RunStatus:
+    def test_every_recorded_status_is_the_projection_of_its_machine_state(self) -> None:
+        for phase, disposition, reason, status, _resumable, _eligible in PROJECTION_MATRIX:
             with self.subTest(status=status.value):
-                state = self.store.update(status=status)
+                state = self.store.set_run_state(RunMachineState(phase, disposition, reason))
                 self.assertEqual(state["status"], status.value)
-                self.assertEqual(state["disposition"], disposition_for_status(status).value)
+                self.assertEqual(state["disposition"], disposition.value)
+                self.assertEqual(state["phase"], phase.value if phase else None)
 
     def test_a_recorded_failure_is_a_failed_posture(self) -> None:
         state = self.store.record_failure("AGENT_SCOPE_VIOLATION", "out of scope")
         self.assertEqual(state["disposition"], RunDisposition.FAILED.value)
 
-    def test_a_claimed_run_updates_its_posture_with_its_status(self) -> None:
-        self.store.update(status=RunStatus.WAITING_EXTERNAL, failure={"reason": "AGENT_TIMEOUT"})
-        claimed = self.store.transition_if(
-            RunStatus.WAITING_EXTERNAL, self.store.load()["updated_at"],
-            status=PHASE_STATUS[RunPhase.IMPLEMENT_STEP], failure=None,
+    def test_a_metadata_update_never_moves_the_machine_state(self) -> None:
+        before = self.store.set_run_state(
+            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_HUMAN, "CHECK_REPAIR_EXHAUSTED"),
+        )
+        machine_before = self.store.machine_state()
+        after = self.store.update_metadata(checks=[{"name": "test", "ok": True}])
+        self.assertEqual(after["checks"], [{"name": "test", "ok": True}])
+        for field in ("status", "disposition", "phase", "reason"):
+            self.assertEqual(after[field], before[field], field)
+        self.assertEqual(self.store.machine_state(), machine_before)
+        self.assertEqual(
+            self.store.outcome().status, RunStatus.WAITING_CHECK_REPAIR,
+        )
+
+    def test_no_caller_can_author_the_status_or_the_machine_state(self) -> None:
+        machine = RunMachineState(RunPhase.IMPLEMENT_STEP, D.WAIT_EXTERNAL, "AGENT_TIMEOUT")
+        for mutate in (
+            lambda: self.store.update_metadata(status="committed"),
+            lambda: self.store.update_metadata(disposition="COMPLETED"),
+            lambda: self.store.update_metadata(phase=RunPhase.PUBLISH),
+            lambda: self.store.update_metadata(reason="AGENT_TIMEOUT"),
+            lambda: self.store.set_run_state(machine, status="committed"),
+            lambda: self.store.record_failure("AGENT_TIMEOUT", disposition="COMPLETED"),
+            lambda: self.store.transition_run(
+                RunEvent.resume(), expected=self.store.identity(), status="implementing",
+            ),
+        ):
+            with self.assertRaises(ValueError):
+                mutate()
+        self.assertEqual(self.store.load()["status"], RunStatus.CREATED.value)
+
+    def test_a_recorded_status_is_re_derived_and_never_trusted(self) -> None:
+        # A recorded status that contradicts the posture is not authority: the
+        # next write re-derives it from the machine state alone.
+        payload = self.store.load()
+        payload.update(
+            status="committed",
+            disposition=RunDisposition.RUNNING.value,
+            phase=RunPhase.IMPLEMENT_STEP.value,
+        )
+        self.store.path.write_text(json.dumps(payload), encoding="utf-8")
+        state = self.store.update_metadata(marker=True)
+        self.assertEqual(state["status"], RunStatus.IMPLEMENTING.value)
+        self.assertEqual(state["disposition"], RunDisposition.RUNNING.value)
+        self.assertEqual(state["marker"], True)
+
+    def test_the_checkpoint_phase_is_never_contradicted_by_a_machine_state(self) -> None:
+        self.store.path.parent.joinpath(CHECKPOINT_NAME).write_text(
+            json.dumps(
+                checkpoint_payload(
+                    ResumeCheckpoint(
+                        phase=ResumePhase.DETERMINISTIC_GATE,
+                        stage=GateStage.POST_IMPLEMENTATION,
+                        execution_selection_sha256="8" * 64,
+                        expected_head_sha="6" * 40, expected_tree_sha="7" * 40,
+                        plan_identity=plan_identity_from_mapping({
+                            "raw_sha256": "1" * 64, "contract_sha256": "2" * 64,
+                            "bundle_sha256": "3" * 64, "execution_sha256": "4" * 64,
+                            "checks_sha256": "5" * 64,
+                        }),
+                    )
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError):
+            self.store.set_run_state(RunMachineState(RunPhase.PUBLISH))
+        self.assertEqual(self.store.machine_state().phase, RunPhase.DETERMINISTIC_GATE)
+
+    def test_an_invalid_event_is_refused_by_the_transition_alone(self) -> None:
+        self.store.set_run_state(RunMachineState(RunPhase.PUBLISH, D.RUNNING))
+        before = self.store.load()
+        with self.assertRaises(RunTransitionError):
+            self.store.transition_run(RunEvent.resume(), expected=self.store.identity())
+        self.assertEqual(self.store.load(), before)
+
+    def test_a_wait_external_gate_reason_still_projects_the_ui_status(self) -> None:
+        # The UI keeps reading a status: it is a projection of the machine, so a
+        # gate reason keeps naming its operator-facing flavour.
+        for reason, status in (
+            ("CHECK_TIMEOUT", RunStatus.WAITING_CHECK_INFRASTRUCTURE),
+            ("PUSH_FAILED", RunStatus.WAITING_REMOTE),
+            ("AGENT_TIMEOUT", RunStatus.WAITING_EXTERNAL),
+        ):
+            with self.subTest(reason=reason):
+                phase = (
+                    RunPhase.CANDIDATE_PUSH if reason == "PUSH_FAILED"
+                    else RunPhase.DETERMINISTIC_GATE
+                )
+                state = self.store.set_run_state(
+                    RunMachineState(phase, D.WAIT_EXTERNAL, reason),
+                )
+                self.assertEqual(state["status"], status.value)
+                self.assertEqual(state["disposition"], D.WAIT_EXTERNAL.value)
+
+    def test_a_claimed_run_moves_its_posture_and_keeps_its_phase(self) -> None:
+        waiting = self.store.set_run_state(
+            RunMachineState(RunPhase.IMPLEMENT_STEP, D.WAIT_EXTERNAL, "AGENT_TIMEOUT"),
+            failure={"reason": "AGENT_TIMEOUT"},
+        )
+        claimed = self.store.transition_run(
+            RunEvent.resume(), expected=self.store.identity(), failure=None,
         )
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed["status"], RunStatus.IMPLEMENTING.value)
         self.assertEqual(claimed["disposition"], RunDisposition.RUNNING.value)
+        self.assertEqual(claimed["phase"], waiting["phase"])
+        self.assertIsNone(claimed["reason"])
 
 
 if __name__ == "__main__":

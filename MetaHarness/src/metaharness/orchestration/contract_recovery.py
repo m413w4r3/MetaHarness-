@@ -38,7 +38,9 @@ from ..llm.chat import LLMError
 from ..models import (
     ExecutionRole,
     ImplementationStep,
-    RunStatus,
+    RunMachineState,
+    RunDisposition,
+    SCOPE_APPROVAL_REASON,
 )
 from ..planning.artifacts import (
     STEP_CONTRACT_REPAIR_OUTPUT_INVALID,
@@ -169,8 +171,8 @@ class ContractRecoveryService:
 
         def publish(status: str, current: Mapping[str, Any]) -> dict[str, Any]:
             progress = progress_of(current)
-            store.update(
-                status=RunStatus.CONTRACT_REPAIRING, current_step=step.id,
+            store.update_metadata(
+                current_step=step.id,
                 contract_repair={"status": status, **progress},
             )
             return progress
@@ -261,8 +263,11 @@ class ContractRecoveryService:
                 raise
             except ScopeApprovalRequired:
                 delta = read_json_artifact(directory / "scope_delta.json", 64 * 1024)
-                store.update(
-                    status=RunStatus.WAITING_SCOPE_APPROVAL,
+                store.set_run_state(
+                    RunMachineState(
+                        disposition=RunDisposition.WAIT_HUMAN,
+                        reason=SCOPE_APPROVAL_REASON,
+                    ),
                     current_step=step.id,
                     scope_delta=delta if isinstance(delta, dict) else {},
                 )
@@ -328,8 +333,8 @@ class ContractRecoveryService:
             operation_id=progress["repair_id"],
         ))
         contract_repair.ensure(directory, contract_repair.COMPLETED)
-        store.update(
-            status=RunStatus.CONTRACT_REPAIRING, current_step=step.id,
+        store.update_metadata(
+            current_step=step.id,
             contract_repair={"status": "completed", **progress},
         )
         self.runtime.observability.trace_emit(

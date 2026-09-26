@@ -26,6 +26,7 @@ from metaharness.recommendation import (
     parse_execution_recommendation,
     render_profile_catalogue,
 )
+from metaharness.resume import ResumeCheckpoint, ResumePhase, write_checkpoint
 from metaharness.state import RunStateStore
 
 
@@ -204,6 +205,9 @@ class OrchestratorRecommendationTests(unittest.TestCase):
             (run / "implementation_contract.md").write_text("contract", encoding="utf-8")
             store = RunStateStore(run / "state.json")
             store.initialize("run")
+            # The run owns the planner phase; the recommendation only records
+            # a fact, so "planning" stays the checkpoint's projection.
+            write_checkpoint(run, ResumeCheckpoint(phase=ResumePhase.PLANNER))
             Orchestrator(self._config(root), recommender_client=Client())._runtime.composition._maybe_recommend_profiles(store, run, "planner")
             state = store.load()
             self.assertEqual(state["status"], "planning")

@@ -16,7 +16,9 @@ from metaharness.integrations.github import (  # noqa: E402
     GitHubWorkstreamError,
     NullGitHubWorkstreamClient,
 )
-from metaharness.models import GitHubConfig, PublishConfig, RunStatus  # noqa: E402
+from metaharness.models import (  # noqa: E402
+    GitHubConfig, PublishConfig, RunMachineState, RunPhase,
+)
 from metaharness.orchestration.publication import PublicationService  # noqa: E402
 from metaharness.orchestration.run_observability import RunObservability  # noqa: E402
 from metaharness.orchestration.runtime import RunRuntime  # noqa: E402
@@ -127,9 +129,9 @@ class GitHubWorkstreamTests(unittest.TestCase):
             GitHubConfig(enabled=True, pull_request_mode="create"),
             client,
         )
-        self.store.update(status=RunStatus.PUBLISHING, planner={"title": "Approved plan"})
-        self.store.update(
-            status=RunStatus.REVIEWING,
+        self.store.update_metadata(planner={"title": "Approved plan"})
+        self.store.set_run_state(
+            RunMachineState(RunPhase.FINAL_REVIEW),
             review={"verdict": "PASS", "route": "NONE"},
             candidate_commit_sha="b" * 40,
             reviewed_candidate_sha="b" * 40,
@@ -170,8 +172,8 @@ class GitHubWorkstreamTests(unittest.TestCase):
             GitHubConfig(enabled=True, pull_request_mode="create"),
             client,
         )
-        self.store.update(
-            status=RunStatus.REVIEWING,
+        self.store.set_run_state(
+            RunMachineState(RunPhase.FINAL_REVIEW),
             review={"verdict": "PASS", "route": "NONE"},
             candidate_commit_sha="b" * 40,
             reviewed_candidate_sha="b" * 40,
@@ -199,8 +201,8 @@ class GitHubWorkstreamTests(unittest.TestCase):
                     GitHubConfig(enabled=True, pull_request_mode="create"),
                     client,
                 )
-                self.store.update(
-                    status=RunStatus.REVIEWING,
+                self.store.set_run_state(
+                    RunMachineState(RunPhase.FINAL_REVIEW),
                     review={"verdict": verdict, "route": route},
                     candidate_commit_sha="b" * 40,
                     reviewed_candidate_sha="b" * 40,

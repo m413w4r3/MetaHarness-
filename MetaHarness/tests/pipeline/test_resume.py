@@ -688,7 +688,7 @@ class ResumeAuthorityTests(PipelineHarness):
         payload["max_check_repair_attempts"] = 9
         options.write_text(json.dumps(payload), encoding="utf-8")
         store = RunStateStore(self.run_dir() / "state.json")
-        store.update(status=store.load()["status"], run_options_sha256=None)
+        store.update_metadata(run_options_sha256=None)
         with self.assertRaises(ResumeNotAllowedError):
             self.orchestrator(
                 self.config(semantic_revision=True), planner=["unused"], reviewer=["unused"],

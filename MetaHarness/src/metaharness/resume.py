@@ -19,20 +19,22 @@ from typing import Any, Mapping
 
 from .approval import ApprovalError, PlanIdentity
 from .models import (
+    CHECK_REPAIR_WAIT_REASON,
+    CONTRACT_REPAIR_WAIT_REASON,
     GateStage,
     RunDisposition,
+    RunIdentity,
     RunMachineState,
     RunPhase,
-    RunStatus,
-    disposition_for_status,
+    RUN_CHECKPOINT_NAME,
+    assemble_run_state,
     project_run_outcome,
-    wait_reason_for_status,
 )
 from .result import atomic_write_text
 from .run_options import RUN_SCHEMA_UNSUPPORTED
 from .step_ids import STEP_ID_RE
 
-CHECKPOINT_NAME = "resume_checkpoint.json"
+CHECKPOINT_NAME = RUN_CHECKPOINT_NAME
 _SCHEMA_VERSION = 4
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -321,25 +323,56 @@ def machine_state_for_run(
 
     The checkpoint owns the phase; the run state owns the posture.  A stored
     status is read through the single bridge
-    :func:`~metaharness.models.disposition_for_status`.
+    :func:`~metaharness.models.assemble_run_state`.
     """
 
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-    reason = failure.get("reason")
-    stored = state.get("disposition")
-    if isinstance(stored, str):
-        try:
-            disposition = RunDisposition(stored)
-        except ValueError as exc:
-            raise ResumeCheckpointError("run disposition is unknown") from exc
-    else:
-        disposition = disposition_for_status(state.get("status"))
-    if not isinstance(reason, str) or not reason:
-        reason = wait_reason_for_status(state.get("status")) if disposition.waiting else None
-    return RunMachineState(
-        checkpoint.phase if checkpoint is not None else None,
-        disposition,
-        reason,
+    phase = checkpoint.phase if checkpoint is not None else None
+    if phase is None:
+        recorded = state.get("phase")
+        if recorded is not None:
+            try:
+                phase = RunPhase(recorded)
+            except (TypeError, ValueError) as exc:
+                raise ResumeCheckpointError("the recorded run phase is unknown") from exc
+    try:
+        return assemble_run_state(
+            phase,
+            disposition=state.get("disposition"),
+            status=state.get("status"),
+            reason=state.get("reason"),
+            failure_reason=failure.get("reason"),
+        )
+    except ValueError as exc:
+        raise ResumeCheckpointError("the durable run state is unreadable") from exc
+
+
+def checkpoint_sha256(run_dir: str | Path) -> str | None:
+    """The exact bytes of the checkpoint one observation was built from."""
+
+    try:
+        return hashlib.sha256((Path(run_dir) / CHECKPOINT_NAME).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def run_identity(
+    state: Mapping[str, Any], run_dir: str | Path,
+    checkpoint: ResumeCheckpoint | None = None,
+) -> RunIdentity:
+    """The canonical identity of one observed run.
+
+    A claim compares the machine state, its generation (``updated_at``) and the
+    exact checkpoint bytes it was validated against; a status spelling is never
+    part of it.
+    """
+
+    machine = machine_state_for_run(state, checkpoint)
+    updated_at = state.get("updated_at")
+    return RunIdentity.of(
+        machine,
+        updated_at=updated_at if isinstance(updated_at, str) else None,
+        checkpoint_sha256=checkpoint_sha256(run_dir),
     )
 
 
@@ -388,7 +421,7 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     # The projected outcome names the durable boundary; no caller compares the
     # stored status to the checkpoint phase any more.
     if (
-        outcome.status is RunStatus.WAITING_CONTRACT_REPAIR
+        machine.reason == CONTRACT_REPAIR_WAIT_REASON
         and checkpoint.phase is RunPhase.IMPLEMENT_STEP
     ):
         operation = CONTRACT_REPAIR_OPERATION
@@ -415,10 +448,10 @@ def _check_repair_exhaustion_info(
     detail = failure.get("detail")
     if not (
         state.get("planning_protocol") == "v2"
-        and failure.get("reason") == "CHECK_REPAIR_EXHAUSTED"
+        and failure.get("reason") == CHECK_REPAIR_WAIT_REASON
         and checkpoint is not None
-        and project_run_outcome(machine_state_for_run(state, checkpoint)).status
-        is RunStatus.WAITING_CHECK_REPAIR
+        and machine_state_for_run(state, checkpoint).disposition
+        is RunDisposition.WAIT_HUMAN
     ):
         return None
 
@@ -604,7 +637,8 @@ class ResumeRequiresOperatorError(ResumeError):
 __all__ = [
     "CHECKPOINT_NAME", "CHECK_REPAIR_INTEGRITY_OPERATION", "CHECK_REPAIR_RETRY_OPERATION",
     "CHECKPOINT_INTEGRITY_OPERATION", "CONTRACT_REPAIR_OPERATION",
-    "PHASE_STATUS", "RUN_SCHEMA_UNSUPPORTED", "machine_state_for_run", "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint",
+    "PHASE_STATUS", "RUN_SCHEMA_UNSUPPORTED", "checkpoint_sha256", "machine_state_for_run",
+    "run_identity", "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint",
     "ResumeCheckpointError", "ResumeError", "ResumeInfo", "ResumeIntegrityError",
     "ResumeNotAllowedError", "ResumePhase", "ResumeRequiresOperatorError",
     "ResumeSchemaUnsupportedError",

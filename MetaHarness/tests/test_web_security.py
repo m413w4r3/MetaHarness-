@@ -20,6 +20,9 @@ from metaharness.models import (
     ModelProfile,
     ExecutionRole,
     ProfileDriver,
+    RunDisposition,
+    RunMachineState,
+    RunPhase,
     RoutingConfig,
     SelectionMode,
     UIConfig,
@@ -96,8 +99,8 @@ class LocalServerHardeningTests(unittest.TestCase):
         raw, contract = "STATUS: READY\n", "# contract\n"
         (run_dir / "planner.raw.md").write_text(raw, encoding="utf-8")
         (run_dir / "implementation_contract.md").write_text(contract, encoding="utf-8")
-        store.update(
-            status="awaiting_plan_approval",
+        store.set_run_state(
+            RunMachineState(RunPhase.PLAN_APPROVAL),
             planning_protocol="v2",
             plan_identity=compute_plan_identity(raw, contract).__dict__,
         )
@@ -257,7 +260,10 @@ class LocalServerHardeningTests(unittest.TestCase):
         self.awaiting_run()
         done = RunStateStore(self.runs / "done" / "state.json")
         done.initialize("done")
-        done.update(status="committed", commit_sha="a" * 40)
+        done.set_run_state(
+            RunMachineState(RunPhase.CANDIDATE_PUSH, RunDisposition.COMPLETED),
+            commit_sha="a" * 40,
+        )
         status, _headers, awaiting_page = self.request("GET", "/runs/waiting")
         self.assertEqual(status, 200)
         self.assertIn(self.server.browser_token, awaiting_page)

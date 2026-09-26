@@ -41,7 +41,7 @@ from ..gitops import (
     stage_all,
     status_porcelain,
 )
-from ..models import ExecutionRole, ImplementationStep, RunStatus
+from ..models import ExecutionRole, ImplementationStep
 from ..profiles import profile_for_role
 from ..recovery_policy import (
     RecoveryStrategy,
@@ -100,8 +100,8 @@ class StepExecutionService:
         # A previous failed attempt of this same step keeps its artifacts.
         archive_attempt(step_artifact_dir)
         contract = approved_step_contract(cycle_plan, step)
-        store.update(
-            status=RunStatus.IMPLEMENTING, current_step=step.id,
+        store.update_metadata(
+            current_step=step.id,
             steps=self.runtime.composition.state_steps(ctx, cycle_plan, running=step.id),
         )
         checkpoint = read_checkpoint(ctx.run_dir)
@@ -135,8 +135,8 @@ class StepExecutionService:
         self.runtime.step_acceptance.accept_execution(
             store, ctx, cycle_plan, index, execution, parent_sha=parent_sha,
         )
-        store.update(
-            status=RunStatus.IMPLEMENTING, current_step=None,
+        store.update_metadata(
+            current_step=None,
             steps=self.runtime.composition.state_steps(ctx, cycle_plan),
         )
         self.runtime.observability.update_v2_usage(store, ctx.run_dir)
@@ -319,7 +319,7 @@ class StepExecutionService:
                         "role": "implementer",
                         "selection_source": "frozen execution fallback authority",
                     }))
-                    store.update(status=RunStatus.IMPLEMENTING, current_step=step.id)
+                    store.update_metadata(current_step=step.id)
                     continue
                 if failure.reason != "AGENT_CONTRACT_MISMATCH":
                     failure.step_dir = artifact_dir

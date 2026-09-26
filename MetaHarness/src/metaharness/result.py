@@ -7,9 +7,9 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-from .models import RunStatus
+from .models import RunStatus, status_of_run_state
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,16 @@ class RunResult:
     run_dir: Path
     status: RunStatus
     state: dict[str, Any]
+
+    @classmethod
+    def of(cls, run_dir: str | Path, state: Mapping[str, Any]) -> "RunResult":
+        """The result of one run, projected from its durable machine state.
+
+        The status is derived by the single projection, so a caller that holds
+        a recorded state never names one.
+        """
+
+        return cls(Path(run_dir), status_of_run_state(state), dict(state))
 
     @property
     def committed(self) -> bool:

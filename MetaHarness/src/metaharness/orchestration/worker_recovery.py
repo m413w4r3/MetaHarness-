@@ -29,7 +29,7 @@ from ..attempt_transaction import (
     GitOwnership,
 )
 from ..gitops import GitError, candidate_tree_sha, index_tree_sha, status_porcelain
-from ..models import ExecutionRole, ImplementationStep, RunStatus
+from ..models import ExecutionRole, ImplementationStep
 from ..recovery_policy import RecoveryBudgets, RecoveryStrategy, classify_failure
 from ..result import atomic_write_text
 from ..state import RunStateStore
@@ -174,7 +174,7 @@ class WorkerRecovery:
                 )
             failure.step_dir = artifact_dir
             return None
-        self._store.update(status=RunStatus.IMPLEMENTING, current_step=step.id)
+        self._store.update_metadata(current_step=step.id)
         _archive_attempt(artifact_dir)
         return admission
 

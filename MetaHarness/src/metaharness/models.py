@@ -234,9 +234,14 @@ class TaskPlanV2:
 
 
 class RunStatus(StrEnum):
+    """The operator-facing view of one :class:`RunMachineState`.
+
+    It holds exactly the spellings :func:`project_run_outcome` may derive; a
+    run never stores one as a decision, and no service ever writes one.
+    """
+
     CREATED = "created"
     PLANNING = "planning"
-    BLOCKED = "blocked"
     WAITING_HUMAN = "waiting_human"
     AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
     WAITING_SCOPE_APPROVAL = "waiting_scope_approval"
@@ -246,14 +251,10 @@ class RunStatus(StrEnum):
     WAITING_REMOTE = "waiting_remote"
     WAITING_CONTRACT_REPAIR = "waiting_contract_repair"
     PLAN_REJECTED = "plan_rejected"
-    WORKTREE_READY = "worktree_ready"
     PREPARING = "preparing"
     IMPLEMENTING = "implementing"
-    CONTRACT_REPAIRING = "contract_repairing"
     VALIDATING = "validating"
-    PRE_REVISION_VALIDATING = "pre_revision_validating"
     REVISING = "revising"
-    REVALIDATING = "revalidating"
     REVIEWING = "reviewing"
     APPROVED = "approved"
     PUBLISHING = "publishing"
@@ -325,6 +326,19 @@ class RunTransitionError(ValueError):
     """One invalid run transition.  Every refusal happens in ``transition``."""
 
 
+# The one file that owns the durable phase of a run: the checkpoint, not the
+# projected status.  It lives here so the store and the resume reader share it.
+RUN_CHECKPOINT_NAME = "resume_checkpoint.json"
+# Failure reasons that name a durable operator boundary instead of an
+# operation; the projection and the resume gate both read them as the machine
+# reason, never as a status.
+CONTRACT_REPAIR_WAIT_REASON = "STEP_CONTRACT_REPAIR_OUTPUT_INVALID"
+CHECK_REPAIR_WAIT_REASON = "CHECK_REPAIR_EXHAUSTED"
+SCOPE_APPROVAL_REASON = "WAITING_SCOPE_APPROVAL"
+PLAN_REJECTED_REASON = "PLAN_REJECTED"
+INTERRUPTED_REASON = "INTERRUPTED"
+
+
 def _run_reason(value: Any) -> str | None:
     if value is None:
         return None
@@ -358,6 +372,54 @@ class RunMachineState:
             except (TypeError, ValueError) as exc:
                 raise RunTransitionError("run disposition is unknown") from exc
         object.__setattr__(self, "reason", _run_reason(self.reason))
+
+
+@dataclass(frozen=True)
+class RunIdentity:
+    """The canonical identity a compare-and-set claim must observe.
+
+    Two observations name the same durable run exactly when their phase, their
+    posture, their state generation (``updated_at``) and their checkpoint bytes
+    agree.  A status spelling is never part of it: a claim can only ever be
+    written against the state machine itself.
+    """
+
+    phase: RunPhase | None = None
+    disposition: RunDisposition = RunDisposition.RUNNING
+    reason: str | None = None
+    updated_at: str | None = None
+    checkpoint_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.phase is not None and not isinstance(self.phase, RunPhase):
+            try:
+                object.__setattr__(self, "phase", RunPhase(self.phase))
+            except (TypeError, ValueError) as exc:
+                raise RunTransitionError("run identity phase is unknown") from exc
+        if not isinstance(self.disposition, RunDisposition):
+            try:
+                object.__setattr__(self, "disposition", RunDisposition(self.disposition))
+            except (TypeError, ValueError) as exc:
+                raise RunTransitionError("run identity disposition is unknown") from exc
+        object.__setattr__(self, "reason", _run_reason(self.reason))
+        for name in ("updated_at", "checkpoint_sha256"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise RunTransitionError(f"run identity {name} is invalid")
+
+    @classmethod
+    def of(
+        cls, machine: RunMachineState, *,
+        updated_at: str | None = None, checkpoint_sha256: str | None = None,
+    ) -> "RunIdentity":
+        """The identity of one observed machine state, with its generation."""
+
+        if not isinstance(machine, RunMachineState):
+            raise RunTransitionError("run identity requires a RunMachineState")
+        return cls(
+            machine.phase, machine.disposition, machine.reason,
+            updated_at, checkpoint_sha256,
+        )
 
 
 class RunEventKind(StrEnum):
@@ -492,7 +554,12 @@ def transition(current: RunMachineState, event: RunEvent) -> RunMachineState:
         raise RunTransitionError("transition expects a RunMachineState")
     if not isinstance(event, RunEvent):
         raise RunTransitionError("transition expects a RunEvent")
-    if current.disposition.terminal:
+    # ``RESUME`` is the one event a failed run accepts: the resume gate has
+    # already validated the durable retry boundary the checkpoint names.
+    resumable_failure = (
+        event.kind is RunEventKind.RESUME and current.disposition is RunDisposition.FAILED
+    )
+    if current.disposition.terminal and not resumable_failure:
         raise RunTransitionError(
             f"a {current.disposition.value} run accepts no further event"
         )
@@ -529,7 +596,7 @@ def transition(current: RunMachineState, event: RunEvent) -> RunMachineState:
             )
         return RunMachineState(current.phase, RunDisposition.COMPLETED)
     if event.kind is RunEventKind.RESUME:
-        if not current.disposition.waiting:
+        if not current.disposition.waiting and not resumable_failure:
             raise RunTransitionError(
                 f"a {current.disposition.value} run is not waiting and cannot be resumed"
             )
@@ -559,8 +626,10 @@ _RUNNING_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.REVIEW_REPLAN: RunStatus.PLANNING,
     RunPhase.PUBLISH: RunStatus.PUBLISHING,
 }
+# The operation a completed run stopped at names its completion: only the
+# publication of the reviewed candidate is a publication, every earlier
+# operation (the candidate push itself) stops at the committed candidate.
 _COMPLETED_STATUS: Mapping[RunPhase, RunStatus] = {
-    RunPhase.CANDIDATE_PUSH: RunStatus.COMMITTED,
     RunPhase.PUBLISH: RunStatus.PUBLISHED,
 }
 # Failure reasons that name *what* an external wait waits for; the phase stays
@@ -579,12 +648,9 @@ _REMOTE_PHASES = frozenset({RunPhase.CANDIDATE_PUSH, RunPhase.PUBLISH})
 # A human wait that still owns a durable retry slot: the bounded repair pass
 # it refused is pending, so an operator retry resumes exactly that pass.
 _REPAIR_SLOT_WAITS: Mapping[tuple[str, RunPhase], RunStatus] = {
-    ("STEP_CONTRACT_REPAIR_OUTPUT_INVALID", RunPhase.IMPLEMENT_STEP): RunStatus.WAITING_CONTRACT_REPAIR,
-    ("CHECK_REPAIR_EXHAUSTED", RunPhase.DETERMINISTIC_GATE): RunStatus.WAITING_CHECK_REPAIR,
+    (CONTRACT_REPAIR_WAIT_REASON, RunPhase.IMPLEMENT_STEP): RunStatus.WAITING_CONTRACT_REPAIR,
+    (CHECK_REPAIR_WAIT_REASON, RunPhase.DETERMINISTIC_GATE): RunStatus.WAITING_CHECK_REPAIR,
 }
-# A human wait that owns a durable operator gate: the exact delta of the
-# expansion is pending, so the operator's answer resumes the same operation.
-_SCOPE_APPROVAL_REASON = "WAITING_SCOPE_APPROVAL"
 
 
 @dataclass(frozen=True)
@@ -616,11 +682,14 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
         return RunOutcome(phase, disposition, status, False, False)
     if disposition is RunDisposition.COMPLETED:
         return RunOutcome(
-            phase, disposition, _COMPLETED_STATUS.get(phase, RunStatus.PUBLISHED), False, False,
+            phase, disposition, _COMPLETED_STATUS.get(phase, RunStatus.COMMITTED), False, False,
         )
     if disposition is RunDisposition.FAILED:
         # The failure reason decides whether a resume may still claim the run.
-        return RunOutcome(phase, disposition, RunStatus.FAILED, False, True)
+        status = (
+            RunStatus.INTERRUPTED if reason == INTERRUPTED_REASON else RunStatus.FAILED
+        )
+        return RunOutcome(phase, disposition, status, False, True)
     if disposition is RunDisposition.WAIT_EXTERNAL:
         if reason in _CHECK_INFRASTRUCTURE_REASONS:
             status = RunStatus.WAITING_CHECK_INFRASTRUCTURE
@@ -632,8 +701,10 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
     slot = _REPAIR_SLOT_WAITS.get((reason or "", phase))
     if slot is not None:
         return RunOutcome(phase, disposition, slot, True, True)
-    if reason == _SCOPE_APPROVAL_REASON:
+    if reason == SCOPE_APPROVAL_REASON:
         return RunOutcome(phase, disposition, RunStatus.WAITING_SCOPE_APPROVAL, True, True)
+    if reason == PLAN_REJECTED_REASON:
+        return RunOutcome(phase, disposition, RunStatus.PLAN_REJECTED, False, False)
     return RunOutcome(phase, disposition, RunStatus.WAITING_HUMAN, False, False)
 
 # The single status bridge: a durable status names exactly one disposition.
@@ -641,7 +712,6 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
 _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.CREATED: RunDisposition.RUNNING,
     RunStatus.PLANNING: RunDisposition.RUNNING,
-    RunStatus.BLOCKED: RunDisposition.WAIT_HUMAN,
     RunStatus.WAITING_HUMAN: RunDisposition.WAIT_HUMAN,
     RunStatus.AWAITING_PLAN_APPROVAL: RunDisposition.RUNNING,
     RunStatus.WAITING_SCOPE_APPROVAL: RunDisposition.WAIT_HUMAN,
@@ -651,14 +721,10 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.WAITING_REMOTE: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_CONTRACT_REPAIR: RunDisposition.WAIT_HUMAN,
     RunStatus.PLAN_REJECTED: RunDisposition.WAIT_HUMAN,
-    RunStatus.WORKTREE_READY: RunDisposition.RUNNING,
     RunStatus.PREPARING: RunDisposition.RUNNING,
     RunStatus.IMPLEMENTING: RunDisposition.RUNNING,
-    RunStatus.CONTRACT_REPAIRING: RunDisposition.RUNNING,
     RunStatus.VALIDATING: RunDisposition.RUNNING,
-    RunStatus.PRE_REVISION_VALIDATING: RunDisposition.RUNNING,
     RunStatus.REVISING: RunDisposition.RUNNING,
-    RunStatus.REVALIDATING: RunDisposition.RUNNING,
     RunStatus.REVIEWING: RunDisposition.RUNNING,
     RunStatus.APPROVED: RunDisposition.RUNNING,
     RunStatus.PUBLISHING: RunDisposition.RUNNING,
@@ -677,7 +743,11 @@ _STATUS_WAIT_REASONS: Mapping[RunStatus, str] = {
 
 
 def disposition_for_status(status: RunStatus | str) -> RunDisposition:
-    """The disposition a durable run status stands for."""
+    """The disposition a recorded, projected status stands for.
+
+    It is a read bridge only: a stored status of an older state file is
+    translated into the canonical posture, never used to command one.
+    """
 
     try:
         return _STATUS_DISPOSITIONS[RunStatus(status)]
@@ -692,6 +762,53 @@ def wait_reason_for_status(status: RunStatus | str) -> str | None:
         return _STATUS_WAIT_REASONS.get(RunStatus(status))
     except (TypeError, ValueError):
         return None
+
+
+def assemble_run_state(
+    phase: RunPhase | str | None,
+    *,
+    disposition: RunDisposition | str | None = None,
+    status: RunStatus | str | None = None,
+    reason: str | None = None,
+    failure_reason: str | None = None,
+) -> RunMachineState:
+    """Assemble the one durable state of a run from its recorded facts.
+
+    The checkpoint owns the phase.  The posture is the recorded disposition,
+    or the single status bridge for a state file written before the canonical
+    vocabulary.  The reason is the explicit machine reason, with the recorded
+    failure reason and the operator gate as its documented fallbacks.
+    """
+
+    if disposition is None:
+        disposition = (
+            disposition_for_status(status) if status is not None else RunDisposition.RUNNING
+        )
+    posture = RunDisposition(disposition)
+    resolved = reason or failure_reason
+    if not isinstance(resolved, str) or not resolved:
+        resolved = wait_reason_for_status(status) if posture.waiting else None
+    return RunMachineState(phase, posture, resolved)
+
+
+def status_of_run_state(state: Mapping[str, Any]) -> RunStatus:
+    """The derived status of one recorded run state; never an authored one.
+
+    The one read bridge for a recorded mapping: it assembles the canonical
+    machine state and projects it, so a caller that only holds durable records
+    still never picks a status.
+    """
+
+    failure = state.get("failure")
+    return project_run_outcome(
+        assemble_run_state(
+            state.get("phase"),
+            disposition=state.get("disposition"),
+            status=state.get("status"),
+            reason=state.get("reason"),
+            failure_reason=failure.get("reason") if isinstance(failure, Mapping) else None,
+        )
+    ).status
 
 
 class ReviewVerdict(StrEnum):

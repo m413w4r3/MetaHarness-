@@ -45,7 +45,6 @@ from ..models import (
     ExecutionRole,
     HarnessConfig,
     ImplementationStep,
-    RunStatus,
     TaskPlanV2,
 )
 from ..prompt_contracts import (
@@ -813,7 +812,7 @@ class RevisionRunner:
                 }
                 atomic_write_text(artifact_dir / "pre_checks.json", _json_text(pre_payload))
             elif pre_payload is None:
-                store.update(status=RunStatus.PRE_REVISION_VALIDATING, current_step=None)
+                store.update_metadata(current_step=None)
                 check_config, check_ids = config_with_check_authority(
                     self.config, run_dir, requested_check_ids=plan.required_checks or None,
                     expected_sha256=self.approved_check_authority_sha256(run_dir),
@@ -860,7 +859,7 @@ class RevisionRunner:
                 diagnostics_dir=artifact_dir,
                 budget_bytes=self.config.prompt_budget.semantic_revision_max_bytes,
             )
-        store.update(status=RunStatus.REVISING, current_step=None)
+        store.update_metadata(current_step=None)
         atomic_write_text(artifact_dir / "tree_before.txt", tree_before.rstrip() + "\n")
         selected = selection.check_repair if is_check_repair else selection.semantic_reviser
         if selected is None:
@@ -991,7 +990,7 @@ class RevisionRunner:
             **({"failure_ids": self.soft_check_failures(check_repair_evidence)}
                if is_check_repair else {}),
         }))
-        store.update(status=RunStatus.REVISING, revision=revision_state)
+        store.update_metadata(revision=revision_state)
         if outside_scope:
             requested_paths = set(scope_request.paths) if scope_request is not None else set()
             unrequested = [path for path in outside_scope if path not in requested_paths]

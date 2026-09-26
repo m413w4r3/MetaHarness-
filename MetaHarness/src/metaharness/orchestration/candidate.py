@@ -18,7 +18,7 @@ from ..gitops import (
 )
 from ..evidence import required_checks_passed
 from ..result import atomic_write_text
-from ..models import GateStage, RunStatus
+from ..models import GateStage
 from ..recovery_policy import RecoveryBudgets
 
 
@@ -176,8 +176,8 @@ class CandidateLifecycle:
         atomic_write_text(path, _json_text(payload))
         candidate_state = dict(store.load().get("candidate") or {})
         candidate_state[f"{cycle_plan.cycle.number:03d}"] = payload
-        store.update(
-            status=RunStatus.APPROVED, candidate=candidate_state,
+        store.update_metadata(
+            candidate=candidate_state,
             candidate_commit_sha=head, approved_tree_sha=evidence.staged_tree_sha,
             expected_head_sha=head,
             expected_parent_sha=None if no_change else parents[0],
@@ -193,7 +193,7 @@ class CandidateLifecycle:
             atomic_write_text(_candidate_commit_path(ctx.run_dir, number), _json_text(skipped))
             candidates = dict(store.load().get("candidate") or {})
             candidates[f"{number:03d}"] = skipped
-            store.update(status=store.load().get("status", RunStatus.APPROVED), candidate=candidates)
+            store.update_metadata(candidate=candidates)
             self._cycle_update(store, number, status="candidate_no_change")
             return skipped
         try:
@@ -306,8 +306,7 @@ class CandidateRemoteStaging:
         atomic_write_text(_candidate_commit_path(run_dir, cycle), _json_text(candidate))
         candidate_state = dict(store.load().get("candidate") or {})
         candidate_state[f"{cycle:03d}"] = candidate
-        store.update(
-            status=store.load().get("status", RunStatus.APPROVED),
+        store.update_metadata(
             candidate=candidate_state,
             remote_branch=info.branch,
             remote_sha=candidate["commit_sha"],
@@ -343,8 +342,7 @@ class CandidateRemoteStaging:
         state = self._store.load()
         candidate_state = dict(state.get("candidate") or {})
         candidate_state[f"{cycle:03d}"] = unavailable
-        self._store.update(
-            status=state.get("status", RunStatus.APPROVED),
+        self._store.update_metadata(
             candidate=candidate_state,
             remote_branch=info.branch,
             remote_sha=None,

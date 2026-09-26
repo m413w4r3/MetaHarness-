@@ -9,7 +9,7 @@ from unittest import mock
 from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
 from metaharness.gitops import GitError
 from metaharness.llm.chat import LLMError
-from metaharness.models import ExecutionRole, RunStatus
+from metaharness.models import ExecutionRole, RunDisposition, RunMachineState, RunStatus
 from metaharness.orchestration.pipeline_v2 import PipelineFailure
 from metaharness.orchestration import contract_repair
 from metaharness.resume import resume_info
@@ -375,7 +375,10 @@ class SemanticRecoveryIdentityTests(PipelineHarness):
             "profile_id": "worker", "tree_before": "a" * 40, "tree_after": "a" * 40,
         }
         other = {**archived, "step_id": "S03"}
-        store.update(status=RunStatus.WAITING_EXTERNAL, recovery_attempts=[archived, archived, other, archived])
+        store.set_run_state(
+            RunMachineState(disposition=RunDisposition.WAIT_EXTERNAL, reason="AGENT_TIMEOUT"),
+            recovery_attempts=[archived, archived, other, archived],
+        )
         coordinator = RecoveryCoordinator(store, emit=lambda *_args, **_kwargs: None)
         attempt = RecoveryAttempt(**archived, operation_id="contract-repair:cycle-001:S04:01")
         coordinator.record(attempt)

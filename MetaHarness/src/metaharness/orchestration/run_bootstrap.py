@@ -37,7 +37,11 @@ from ..gitops import (
 )
 from ..models import (
     BlockerKind, ExecutionRole, ExecutionSelection, ModelProfile, PlanDecision,
-    RunStatus,
+    INTERRUPTED_REASON,
+    PLAN_REJECTED_REASON,
+    RunDisposition,
+    RunEvent,
+    RunMachineState,
 )
 from ..plan_recovery import plan_source
 from ..plan_repository_validation import RepositoryPreconditions, validate_plan_repository_topology
@@ -48,9 +52,10 @@ from ..profiles import ProfileError, build_llm_endpoint, profile_for_role
 from ..redaction import redact
 from ..result import RunResult, atomic_write_text
 from ..resume import (
-    PHASE_STATUS, ResumeCheckpoint, ResumeCheckpointError, ResumeError,
+    ResumeCheckpoint, ResumeCheckpointError, ResumeError,
     ResumeIntegrityError,
     ResumePhase, ResumeRequiresOperatorError, plan_identity_from_mapping,
+    run_identity,
     write_checkpoint,
 )
 from ..state import RunStateStore
@@ -184,8 +189,7 @@ class RunBootstrap:
             # Resume of PLANNER has already produced and durably parsed this
             # plan.  Re-entering setup must never call the planner again.
             plan = existing_plan
-        store.update(
-            status=RunStatus.PLANNING,
+        store.update_metadata(
             planning_protocol="v2",
             planner={
                 "decision": plan.decision.value,
@@ -259,11 +263,13 @@ class RunBootstrap:
             else:
                 reason = "PLANNER_BLOCKED_REQUIRES_OPERATOR"
                 detail = {"blocker_kind": None, "blockers": plan.blockers}
-            state = store.update(
-                status=RunStatus.WAITING_HUMAN,
+            state = store.set_run_state(
+                RunMachineState(
+                    disposition=RunDisposition.WAIT_HUMAN, reason=reason,
+                ),
                 failure={"reason": reason, "detail": detail},
             )
-            return RunResult(run_dir, RunStatus.WAITING_HUMAN, state)
+            return RunResult.of(run_dir, state)
 
         # Every source of this plan (planner, resumed planner answer, operator
         # recovery) must be possible against the base tree before it can be
@@ -285,21 +291,23 @@ class RunBootstrap:
             plan_identity = compute_plan_identity_from_run(run_dir)
         except (ApprovalError, V2PlanParseError, OSError, UnicodeError) as exc:
             raise ApprovalError(f"invalid v2 plan artifacts: {exc}") from exc
-        store.update(status=RunStatus.PLANNING, plan_identity=asdict(plan_identity))
+        store.update_metadata(plan_identity=asdict(plan_identity))
         self.runtime.write_checkpoint(
             run_dir, ResumePhase.PLAN_APPROVAL, head=base_sha,
             tree=resolve_tree(repo, base_sha), plan_identity=plan_identity,
         )
 
         if self.runtime.config.approval.require_plan_approval:
-            store.update(status=RunStatus.AWAITING_PLAN_APPROVAL)
+            store.update_metadata()
             approval = wait_for_plan_approval(
                 run_dir, identity=plan_identity,
                 poll_interval_seconds=self.runtime.config.approval.poll_interval_seconds,
             )
             if approval.decision is ApprovalDecision.REJECT:
-                state = store.update(status=RunStatus.PLAN_REJECTED)
-                return RunResult(run_dir, RunStatus.PLAN_REJECTED, state)
+                state = store.set_run_state(RunMachineState(
+                    disposition=RunDisposition.WAIT_HUMAN, reason=PLAN_REJECTED_REASON,
+                ))
+                return RunResult.of(run_dir, state)
             try:
                 selection, execution_sha = read_execution_selection_with_sha256(run_dir)
                 validate_execution_selection(self.runtime.config, selection)
@@ -366,8 +374,8 @@ class RunBootstrap:
         if selection.check_repair is not None:
             execution_state["check_repair"] = asdict(selection.check_repair)
         execution_state["final_reviewer"] = asdict(selection.final_reviewer)
-        store.update(status=RunStatus.PLANNING, execution=execution_state,
-                     plan_identity=asdict(durable_identity))
+        store.update_metadata(execution=execution_state,
+                              plan_identity=asdict(durable_identity))
         self.runtime.observability.trace_emit(
             "plan.approved",
             phase="planning",
@@ -396,8 +404,8 @@ class RunBootstrap:
             )
         else:
             info = existing_info
-        store.update(status=RunStatus.WORKTREE_READY, branch=info.branch,
-                     worktree=str(info.worktree), base_sha=info.base_sha)
+        store.update_metadata(branch=info.branch,
+                              worktree=str(info.worktree), base_sha=info.base_sha)
         self.runtime.publication.ensure_github_issue_metadata(
             store=store, run_id=run_id, plan_title=plan.title, info=info,
         )
@@ -417,10 +425,7 @@ class RunBootstrap:
         ownership_before = git_ownership(repo, info.worktree)
         # Persisted with an explicit status so a later resume has the stronger
         # durable ownership proof of the pre-execution boundary.
-        store.update(
-            status=RunStatus.PREPARING,
-            git_ownership=git_ownership_payload(ownership_before),
-        )
+        store.update_metadata(git_ownership=git_ownership_payload(ownership_before))
         setup_results = self.runtime.check_recovery(store).prepare_workspace(
             worktree=info.worktree, run_dir=run_dir,
             run_setup=lambda: prepare_workspace(
@@ -429,8 +434,9 @@ class RunBootstrap:
                 secrets=self.runtime.secrets,
             ),
         )
-        store.update(status=RunStatus.PREPARING,
-                     workspace_setup=[asdict(result) for result in setup_results])
+        store.update_metadata(
+            workspace_setup=[asdict(result) for result in setup_results],
+        )
         # The candidate starts as the base tree and all later gates use the
         # actual index identity, never an inferred file list.
         stage_all(info.worktree)
@@ -484,9 +490,9 @@ class RunBootstrap:
         def refuse(message: str) -> NoReturn:
             raise ResumeIntegrityError(message)
 
-        claimed = store.transition_if(
-            state.get("status", RunStatus.FAILED), state.get("updated_at"),
-            status=PHASE_STATUS[checkpoint.phase], failure=None, current_step=None,
+        claimed = store.transition_run(
+            RunEvent.resume(), expected=run_identity(state, run_dir, checkpoint),
+            failure=None, current_step=None,
             resume={**record, "status": "running"},
         )
         if claimed is None:
@@ -502,7 +508,7 @@ class RunBootstrap:
             if base_sha is None:
                 base_sha = resolve_commit(repo, self.runtime.config.base_ref)
                 base_tree = resolve_tree(repo, base_sha)
-                store.update(status=RunStatus.PLANNING, repo=str(repo), base_sha=base_sha)
+                store.update_metadata(repo=str(repo), base_sha=base_sha)
             else:
                 if not is_object_id(base_sha):
                     refuse("run base SHA is invalid")
@@ -532,7 +538,7 @@ class RunBootstrap:
                 context_bundle = build_context(repo, base_sha, spec, self.runtime.config.context)
                 context = render_context(context_bundle)
                 atomic_write_text(context_path, context)
-                store.update(status=RunStatus.PLANNING, context={
+                store.update_metadata(context={
                     "base_sha": context_bundle.base_sha,
                     "locator_used": context_bundle.locator_used,
                     "locator_warning": context_bundle.locator_warning,
@@ -635,12 +641,16 @@ class RunBootstrap:
         except ResumeRequiresOperatorError as exc:
             failed = store.record_failure(exc.code, redact(str(exc), self.runtime.secrets),
                                           **self.runtime.failure.closing_step_fields(store, "failed"))
-            return RunResult(run_dir, RunStatus.FAILED, failed)
+            return RunResult.of(run_dir, failed)
         except KeyboardInterrupt:
-            interrupted = store.update(status=RunStatus.INTERRUPTED,
-                                       failure={"reason": "INTERRUPTED"},
-                                       **self.runtime.failure.closing_step_fields(store, "interrupted"))
-            return RunResult(run_dir, RunStatus.INTERRUPTED, interrupted)
+            interrupted = store.set_run_state(
+                RunMachineState(
+                    disposition=RunDisposition.FAILED, reason=INTERRUPTED_REASON,
+                ),
+                failure={"reason": INTERRUPTED_REASON},
+                **self.runtime.failure.closing_step_fields(store, "interrupted"),
+            )
+            return RunResult.of(run_dir, interrupted)
         except Exception as exc:
             return self.runtime.failure.project_exception(store, run_dir, exc)
 

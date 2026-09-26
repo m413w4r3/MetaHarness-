@@ -48,7 +48,8 @@ from ..models import (
     PublishMode,
     ReviewRoute,
     ReviewVerdict,
-    RunStatus,
+    RunDisposition,
+    RunMachineState,
 )
 from ..resume import (
     ResumePhase,
@@ -186,7 +187,8 @@ class PublicationService:
             number = self._github_result_number(issue, "issue")
             event = "workstream.issue.created"
 
-        state = store.update(status=state.get("status", RunStatus.CREATED), issue_number=number)
+        store.update_metadata(issue_number=number)
+        state = store.load()
         self.runtime.observability.trace_emit(
             event,
             phase="setup",
@@ -287,11 +289,11 @@ class PublicationService:
             raise GitHubWorkstreamError("GitHub pull-request operation failed") from None
         number = self._github_result_number(pull_request, "pull request")
 
-        state = store.update(
-            status=state.get("status", RunStatus.CREATED),
+        store.update_metadata(
             remote_branch=info.branch,
             pull_request_number=number,
         )
+        state = store.load()
         self.runtime.observability.trace_emit(
             "workstream.pull_request.created",
             phase="publication",
@@ -352,8 +354,8 @@ class PublicationService:
                     "no-change PASS must explicitly confirm SPEC_ALREADY_SATISFIED",
                 )
             self.runtime.cycle_update(store, number, status="completed_no_change")
-            state = store.update(
-                status=RunStatus.COMMITTED,
+            state = store.set_run_state(
+                RunMachineState(disposition=RunDisposition.COMPLETED),
                 no_change=True,
                 no_change_candidate_sha=candidate["commit_sha"],
                 reviewed_candidate_sha=candidate["commit_sha"],
@@ -368,12 +370,10 @@ class PublicationService:
                 data={"candidate_sha": candidate["commit_sha"], "tree_sha": candidate["tree_sha"]},
                 once=True,
             )
-            return RunResult(ctx.run_dir, RunStatus.COMMITTED, state)
+            return RunResult.of(ctx.run_dir, state)
         approved_tree = candidate["tree_sha"]
         self.runtime.cycle_update(store, number, status="approved")
-        store.update(
-            status=RunStatus.APPROVED, approved_tree_sha=approved_tree, current_step=None,
-        )
+        store.update_metadata(approved_tree_sha=approved_tree, current_step=None)
         return self._complete_candidate_publication(
             store=store, run_dir=ctx.run_dir, info=ctx.info,
             approved_tree=approved_tree, commit_sha=candidate["commit_sha"],
@@ -430,7 +430,7 @@ class PublicationService:
             store, "PUSH_FAILED", detail, terminal.status,
             recovery_resumable=terminal.resumable, **fields,
         )
-        return RunResult(run_dir, terminal.status, state)
+        return RunResult.of(run_dir, state)
     def _cleanup_published_run_branch(
         self,
         *,
@@ -495,7 +495,7 @@ class PublicationService:
             "run_branch_cleanup": cleanup,
         }
         atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
-        return store.update(status=RunStatus.PUBLISHED, publish=publish_payload)
+        return store.update_metadata(publish=publish_payload)
     def _complete_candidate_publication(
         self,
         *,
@@ -529,7 +529,7 @@ class PublicationService:
             )
         except (CommitSafetyError, GitError) as exc:
             state = store.record_failure("COMMIT_TREE_MISMATCH", str(exc), **fields)
-            return RunResult(run_dir, RunStatus.FAILED, state)
+            return RunResult.of(run_dir, state)
         try:
             if state.get("approved_tree_sha") != approved_tree:
                 raise GitError("durable approved tree differs from candidate tree")
@@ -586,13 +586,8 @@ class PublicationService:
                 repository_remote_url(info.worktree, self.runtime.config.publish.remote)
         except (GitError, OSError, ValueError):
             state = store.record_failure("COMMIT_TREE_MISMATCH", "candidate identity is not exact", **fields)
-            return RunResult(run_dir, RunStatus.FAILED, state)
+            return RunResult.of(run_dir, state)
 
-        self.runtime.write_checkpoint(
-            run_dir, ResumePhase.PUBLISH, cycle=cycle,
-            head=commit_sha, tree=approved_tree,
-            expected_parent_sha=expected_parent,
-        )
         self.runtime.observability.trace_emit(
             "publish.started",
             phase="publication",
@@ -614,7 +609,9 @@ class PublicationService:
                 commit_sha=commit_sha,
                 cycle=cycle,
             )
-            state = store.update(status=RunStatus.COMMITTED, **fields)
+            state = store.set_run_state(
+                RunMachineState(disposition=RunDisposition.COMPLETED), **fields,
+            )
             mark_checkpoint_completed(run_dir)
             self.runtime.observability.trace_emit(
                 "publish.completed",
@@ -628,9 +625,16 @@ class PublicationService:
                 },
                 once=True,
             )
-            return RunResult(run_dir, RunStatus.COMMITTED, state)
+            return RunResult.of(run_dir, state)
 
-        store.update(status=RunStatus.PUBLISHING, **fields)
+        # Publication is this run's operation from here on: the checkpoint
+        # owns that phase, and the store projects its status.
+        self.runtime.write_checkpoint(
+            run_dir, ResumePhase.PUBLISH, cycle=cycle,
+            head=commit_sha, tree=approved_tree,
+            expected_parent_sha=expected_parent,
+        )
+        store.update_metadata(**fields)
         base_branch = self.runtime.config.base_ref
         try:
             fast_forward = self.runtime.config.publish.mode == PublishMode.FAST_FORWARD_BASE.value
@@ -686,7 +690,7 @@ class PublicationService:
                          "remote": self.runtime.config.publish.remote, "commit_sha": commit_sha,
                          "status": "refused", "local_base_updated": False}, **fields,
             )
-            return RunResult(run_dir, RunStatus.FAILED, state)
+            return RunResult.of(run_dir, state)
         except BasePushError as exc:
             detail = "push did not complete"
             if exc.local_base_updated:
@@ -712,8 +716,8 @@ class PublicationService:
         )
         atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
         metadata_fields = {"remote_branch": info.branch} if self.runtime.config.github.enabled else {}
-        state = store.update(
-            status=RunStatus.PUBLISHED,
+        state = store.set_run_state(
+            RunMachineState(disposition=RunDisposition.COMPLETED),
             publish=publish_payload,
             **metadata_fields,
             **fields,
@@ -738,6 +742,6 @@ class PublicationService:
                 store=store, run_dir=run_dir, info=info, commit_sha=commit_sha,
                 publish_payload=publish_payload,
             )
-        return RunResult(run_dir, RunStatus.PUBLISHED, state)
+        return RunResult.of(run_dir, state)
 
     # -- resume ------------------------------------------------------------

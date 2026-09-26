@@ -17,7 +17,7 @@ from ..execution_selection import ExecutionSelectionError
 from ..gitops import GitError
 from ..integrations.github import GitHubIntegrationError
 from ..llm.chat import LLMError
-from ..models import RunStatus
+from ..models import RunDisposition, RunMachineState
 from ..plan_repository_validation import PlanRepositoryPreconditionError
 from ..planning.protocol import PlanParseError
 from ..recovery_policy import RecoveryStrategy
@@ -167,7 +167,7 @@ class RunFailure:
             initial_mismatch=failure.initial_mismatch,
             index_tree_after=failure.index_tree_after,
             step_dir=failure.step_dir,
-            terminal_status=terminal.status,
+            terminal_disposition=terminal.disposition,
             auto_resumable=terminal.resumable,
         )
 
@@ -184,13 +184,13 @@ class RunFailure:
         initial_mismatch: str | None = None,
         index_tree_after: str | None = None,
         step_dir: Path | None = None,
-        terminal_status: RunStatus | None = None,
+        terminal_disposition: RunDisposition | None = None,
         auto_resumable: bool | None = None,
     ) -> RunResult:
         """Persist a failure that left its recovery loop, with its step record.
 
-        Without an explicit ``terminal_status`` the failure is projected by
-        the recovery policy: only a hard stop becomes ``FAILED``.
+        Without an explicit ``terminal_disposition`` the failure is projected
+        by the recovery policy: only a hard stop becomes ``FAILED``.
         """
 
         repeated_fixed_point = False
@@ -229,14 +229,14 @@ class RunFailure:
                         "fixed_point_fingerprint": retry_fingerprint,
                         "operator_message": "Code change or additional repair authority required",
                     }
-                    terminal_status = None
+                    terminal_disposition = None
                     auto_resumable = False
-        if terminal_status is None:
+        if terminal_disposition is None:
             reason = normalize_exit_reason(reason)
-            terminal_status = project_exit(
+            terminal_disposition = project_exit(
                 reason, phase=self.checkpoint_phase(run_dir),
                 remote_required=reason == "PUSH_FAILED",
-            )[1].status
+            )[1].disposition
         if reason == "CHECK_REPAIR_EXHAUSTED":
             self.runtime.observability.trace_emit(
                 "check_repair.exhausted",
@@ -263,7 +263,8 @@ class RunFailure:
             pass
         state = store.load()
         fields = _terminal_step_fields(
-            state, step_id, "waiting" if terminal_status is not RunStatus.FAILED else "failed",
+            state, step_id,
+            "waiting" if terminal_disposition is not RunDisposition.FAILED else "failed",
         )
         if reason in {"CHECK_REPAIR_EXHAUSTED", "CHECK_REPAIR_FIXED_POINT"} and isinstance(detail, Mapping):
             failure_detail = dict(detail)
@@ -332,7 +333,13 @@ class RunFailure:
         current_cycle = state.get("cycle", 1)
         for index, cycle in enumerate(cycles):
             if isinstance(cycle, dict) and cycle.get("number") == current_cycle:
-                cycles[index] = {**cycle, "status": "waiting" if terminal_status is not RunStatus.FAILED else "failed", "failure": reason}
+                cycles[index] = {
+                    **cycle,
+                    "status": (
+                        "waiting" if terminal_disposition is not RunDisposition.FAILED else "failed"
+                    ),
+                    "failure": reason,
+                }
                 break
         if cycles:
             fields["cycles"] = cycles
@@ -374,8 +381,8 @@ class RunFailure:
                        if index_tree_after else {}),
                     "usage": step_usage,
                 }))
-        state = self.persist_exit(store, reason, detail, terminal_status, **fields)
-        return RunResult(run_dir, terminal_status, state)
+        state = self.persist_exit(store, reason, detail, terminal_disposition, **fields)
+        return RunResult.of(run_dir, state)
 
     @staticmethod
     def checkpoint_phase(
@@ -389,7 +396,7 @@ class RunFailure:
 
     def persist_exit(
         self, store: RunStateStore, reason: str, detail: FailureDetail | None,
-        status: RunStatus, **fields: Any,
+        disposition: RunDisposition, **fields: Any,
     ) -> dict[str, Any]:
         """Write one terminal or waiting outcome; FAILED only for hard stops."""
 
@@ -399,12 +406,15 @@ class RunFailure:
             detail = redact_mapping(detail, self.runtime.secrets)
         elif detail is not None:
             raise TypeError("failure detail must be text or a structured mapping")
-        if status is RunStatus.FAILED:
+        if disposition is RunDisposition.FAILED:
             return store.record_failure(reason, detail, **fields)
         failure = {"reason": reason}
         if detail is not None:
             failure["detail"] = detail
-        return store.update(status=status, failure=failure, **fields)
+        return store.set_run_state(
+            RunMachineState(disposition=disposition, reason=reason),
+            failure=failure, **fields,
+        )
 
     def project_exception(
         self, store: RunStateStore, run_dir: Path, exc: Exception, *,
@@ -426,17 +436,19 @@ class RunFailure:
                 "operation": operation,
             }
             auto_resumable = self._checkpoint_is_retryable(store, run_dir)
-            status = RunStatus.WAITING_EXTERNAL if auto_resumable else RunStatus.FAILED
+            disposition = (
+                RunDisposition.WAIT_EXTERNAL if auto_resumable else RunDisposition.FAILED
+            )
         else:
             detail = " ".join(str(exc).split())[:500]
-            status = terminal.status
+            disposition = terminal.disposition
         fields = self.closing_step_fields(
-            store, "waiting" if status is not RunStatus.FAILED else "failed",
+            store, "waiting" if disposition is not RunDisposition.FAILED else "failed",
         )
         if auto_resumable is not None:
             fields["recovery_resumable"] = auto_resumable
-        state = self.persist_exit(store, reason, detail, status, **fields)
-        return RunResult(run_dir, status, state)
+        state = self.persist_exit(store, reason, detail, disposition, **fields)
+        return RunResult.of(run_dir, state)
 
     def _checkpoint_is_retryable(self, store: RunStateStore, run_dir: Path) -> bool:
         """Only make an internal crash resumable after the full resume gate passes."""
@@ -492,7 +504,7 @@ class RunFailure:
             )
             if (
                 initial.strategy is not RecoveryStrategy.HARD_STOP
-                or terminal.status is not RunStatus.FAILED
+                or terminal.disposition is not RunDisposition.FAILED
             ):
                 recovery.trace(
                     "recovery.exhausted", reason=failure.reason, decision=decision,
@@ -504,13 +516,13 @@ class RunFailure:
                 )
             return self.v2_failed(
                 store, pipeline.run_dir, failure.reason, failure.step_id, failure.detail,
-                terminal_status=terminal.status,
+                terminal_disposition=terminal.disposition,
                 auto_resumable=terminal.resumable,
             )
         except StepExecutionFailure as failure:
             return self.step_failed(store, pipeline.run_dir, failure)
         except ScopeApprovalRequired:
-            return RunResult(pipeline.run_dir, RunStatus.WAITING_SCOPE_APPROVAL, store.load())
+            return RunResult.of(pipeline.run_dir, store.load())
         except (ResumeIntegrityError, ResumeRequiresOperatorError):
             raise
         except Exception as exc:

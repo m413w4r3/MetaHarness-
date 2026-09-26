@@ -34,12 +34,14 @@ from .integrations.github import GitHubWorkstreamClient
 from .models import (
     ExecutionRole,
     HarnessConfig,
-    RunStatus,
+    INTERRUPTED_REASON,
+    RunDisposition,
+    RunEvent,
+    RunMachineState,
 )
 from .resume import (
     CHECKPOINT_INTEGRITY_OPERATION,
     CHECK_REPAIR_INTEGRITY_OPERATION,
-    PHASE_STATUS,
     ResumeCheckpoint,
     ResumeCheckpointError,
     ResumeError,
@@ -51,6 +53,7 @@ from .resume import (
     pipeline_version_from_state,
     resume_info,
     resume_label,
+    run_identity,
     write_checkpoint,
 )
 from .redaction import (
@@ -187,17 +190,12 @@ class Orchestrator:
             store = RunStateStore(run_dir / "state.json")
             store.initialize(selected_run_id, pipeline_version=2)
             self._runtime.observability.begin_trace(run_dir, selected_run_id, created=True)
-            # This is the first durable boundary.  It intentionally carries
-            # no Git/plan identity yet: context and repository discovery are
-            # themselves resumable operations.
-            write_checkpoint(run_dir, ResumeCheckpoint(phase=ResumePhase.CONTEXT))
             # All downstream methods use this frozen per-run view.  The
             # caller's HarnessConfig object is never mutated.
             self._runtime.run_options = run_options
             self._runtime.repair_scope = effective_repair_scope_policy(run_options)
             self._runtime.config = effective_run_config(original_config, run_options)
-            store.update(
-                status=RunStatus.CREATED,
+            store.update_metadata(
                 spec_path="spec.md",
                 repo=str(self._runtime.config.repo),
                 base_ref=self._runtime.config.base_ref,
@@ -213,18 +211,26 @@ class Orchestrator:
             )
             if on_created is not None:
                 on_created(run_dir)
+            # The first durable boundary, declared once creation is announced:
+            # the run is CREATED until it exists, then CONTEXT owns the phase
+            # it will resume.  It intentionally carries no Git/plan identity
+            # yet, since context and repository discovery are themselves
+            # resumable operations.
+            write_checkpoint(run_dir, ResumeCheckpoint(phase=ResumePhase.CONTEXT))
             return self._runtime.observability.diagnose_result(
                 self._execute(store, run_dir, selected_run_id, spec_content)
             )
         except KeyboardInterrupt:
             if store is None:
                 raise
-            state = store.update(
-                status=RunStatus.INTERRUPTED,
-                failure={"reason": "INTERRUPTED"},
+            state = store.set_run_state(
+                RunMachineState(
+                    disposition=RunDisposition.FAILED, reason=INTERRUPTED_REASON,
+                ),
+                failure={"reason": INTERRUPTED_REASON},
                 **self._runtime.failure.closing_step_fields(store, "interrupted"),
             )
-            return self._runtime.observability.diagnose_result(RunResult(run_dir, RunStatus.INTERRUPTED, state))
+            return self._runtime.observability.diagnose_result(RunResult.of(run_dir, state))
         except Exception as exc:
             if store is None:
                 raise
@@ -246,8 +252,8 @@ class Orchestrator:
             assert_clean(repo)
         base_sha = resolve_commit(repo, self._runtime.config.base_ref)
         base_tree_sha = resolve_tree(repo, base_sha)
-        store.update(
-            status=RunStatus.CREATED, repo=str(repo), base_sha=base_sha,
+        store.update_metadata(
+            repo=str(repo), base_sha=base_sha,
             planning_protocol="v2",
         )
         try:
@@ -265,8 +271,7 @@ class Orchestrator:
         context_bundle = build_context(repo, base_sha, spec, self._runtime.config.context)
         context = render_context(context_bundle)
         atomic_write_text(run_dir / "context.txt", context)
-        store.update(
-            status=RunStatus.PLANNING,
+        store.update_metadata(
             context={
                 "base_sha": context_bundle.base_sha,
                 "locator_used": context_bundle.locator_used,
@@ -346,7 +351,7 @@ class Orchestrator:
                         "previous_failure": state.get("failure")},
                 current_step=None,
             )
-            return self._runtime.observability.diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
+            return self._runtime.observability.diagnose_result(RunResult.of(run_dir, failed))
         if not eligibility.resumable:
             raise ResumeNotAllowedError(eligibility.reason or "run is not resumable")
         try:
@@ -384,10 +389,10 @@ class Orchestrator:
                 exc.code, redact(str(exc), self._runtime.secrets),
                 resume={**record, "status": "refused"}, current_step=None,
             )
-            return self._runtime.observability.diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
-        claimed = store.transition_if(
-            state.get("status", RunStatus.FAILED), state.get("updated_at"),
-            status=PHASE_STATUS[checkpoint.phase], failure=None, current_step=None,
+            return self._runtime.observability.diagnose_result(RunResult.of(run_dir, failed))
+        claimed = store.transition_run(
+            RunEvent.resume(), expected=run_identity(state, run_dir, checkpoint),
+            failure=None, current_step=None,
             resume={**record, "status": "running",
                     "restored_paths": list(resumed.restore_paths)},
         )
@@ -414,14 +419,16 @@ class Orchestrator:
                 exc.code, redact(str(exc), self._runtime.secrets),
                 **self._runtime.failure.closing_step_fields(store, "failed"),
             )
-            return self._runtime.observability.diagnose_result(RunResult(run_dir, RunStatus.FAILED, failed))
+            return self._runtime.observability.diagnose_result(RunResult.of(run_dir, failed))
         except KeyboardInterrupt:
-            interrupted = store.update(
-                status=RunStatus.INTERRUPTED,
-                failure={"reason": "INTERRUPTED"},
+            interrupted = store.set_run_state(
+                RunMachineState(
+                    disposition=RunDisposition.FAILED, reason=INTERRUPTED_REASON,
+                ),
+                failure={"reason": INTERRUPTED_REASON},
                 **self._runtime.failure.closing_step_fields(store, "interrupted"),
             )
-            return self._runtime.observability.diagnose_result(RunResult(run_dir, RunStatus.INTERRUPTED, interrupted))
+            return self._runtime.observability.diagnose_result(RunResult.of(run_dir, interrupted))
         except Exception as exc:
             return self._runtime.observability.diagnose_result(self._runtime.failure.project_exception(store, run_dir, exc))
 

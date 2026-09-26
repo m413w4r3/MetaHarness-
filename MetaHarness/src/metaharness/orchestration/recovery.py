@@ -279,8 +279,7 @@ class RecoveryCoordinator:
         if not isinstance(attempts, list):
             raise PipelineFailure("DURABLE_ARTIFACT_CORRUPTED", "recovery attempts are malformed")
         record = _attempt_record(attempt, budget_consumed=value)
-        self._store.update(
-            status=state.get("status", RunStatus.VALIDATING),
+        self._store.update_metadata(
             recovery_counters={**counters, key: value},
             recovery_attempts=[*attempts, record][-MAX_RECOVERY_ATTEMPT_RECORDS:],
         )
@@ -312,8 +311,7 @@ class RecoveryCoordinator:
                 and tuple(item.get(key) for key in _ATTEMPT_IDENTITY) == identity
             )
         ]
-        self._store.update(
-            status=state.get("status", RunStatus.VALIDATING),
+        self._store.update_metadata(
             recovery_attempts=[*attempts, record][-MAX_RECOVERY_ATTEMPT_RECORDS:],
         )
 

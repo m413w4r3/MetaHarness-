@@ -46,7 +46,6 @@ from ..gitops import (
     status_porcelain,
     symbolic_head,
 )
-from ..models import RunStatus
 from ..redaction import redact
 from ..resume import ResumePhase, read_checkpoint
 from ..result import atomic_write_text
@@ -224,8 +223,8 @@ class StepAcceptanceService:
                     store, ctx, step_dir, candidate, authority, verification,
                     head=head, future_step_ids=future,
                 )
-                store.update(
-                    status=RunStatus.IMPLEMENTING, current_step=None,
+                store.update_metadata(
+                    current_step=None,
                     steps=self.runtime.composition.state_steps(ctx, cycle_plan),
                 )
                 return
@@ -249,7 +248,7 @@ class StepAcceptanceService:
             deferred_verify=str(record.get("deferred_verify") or ""),
             mismatch_retry_count=int(record.get("mismatch_retry_count") or 0),
         )
-        store.update(status=RunStatus.IMPLEMENTING, current_step=step.id)
+        store.update_metadata(current_step=step.id)
         try:
             self._accept_v2_step_tree(
                 store=store, run_dir=ctx.run_dir, info=ctx.info, authority=authority,
@@ -258,8 +257,8 @@ class StepAcceptanceService:
             )
         except (CommitSafetyError, GitError) as exc:
             raise self._step_acceptance_failure(step_dir, authority, exc) from exc
-        store.update(
-            status=RunStatus.IMPLEMENTING, current_step=None,
+        store.update_metadata(
+            current_step=None,
             steps=self.runtime.composition.state_steps(ctx, cycle_plan),
         )
         self.runtime.observability.update_v2_usage(store, ctx.run_dir)
@@ -439,8 +438,7 @@ class StepAcceptanceService:
                 )
             parent_list = commit_parents(info.worktree, parent_sha)
             expected_parent = parent_list[0] if parent_list else None
-            store.update(
-                status=RunStatus.IMPLEMENTING,
+            store.update_metadata(
                 expected_head_sha=parent_sha,
                 expected_parent_sha=expected_parent,
                 expected_tree_sha=outcome.tree_after,
@@ -494,8 +492,7 @@ class StepAcceptanceService:
             })
             parents = commit_parents(info.worktree, parent_sha)
             expected_parent = parents[0] if parents else None
-            store.update(
-                status=RunStatus.IMPLEMENTING,
+            store.update_metadata(
                 deferred_verifications=deferred_records,
                 expected_head_sha=parent_sha,
                 expected_parent_sha=expected_parent,
@@ -582,8 +579,7 @@ class StepAcceptanceService:
             "authority_source": authority.authority_source,
             "repair_slot": authority.repair_slot,
         }))
-        store.update(
-            status=RunStatus.IMPLEMENTING,
+        store.update_metadata(
             accepted_steps=merged(state.get("accepted_steps")),
             accepted_commits=merged(state.get("accepted_commits")),
             expected_head_sha=commit_sha,

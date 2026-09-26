@@ -367,10 +367,7 @@ class RunObservability:
         report), never from ``state.steps``.
         """
 
-        store.update(
-            status=store.load().get("status", RunStatus.PLANNING),
-            usage=phase_usage_summary(run_dir),
-        )
+        store.update_metadata(usage=phase_usage_summary(run_dir))
 
     @staticmethod
     def ensure_step_artifacts(step_dir: Path, result: Any) -> None:
@@ -417,8 +414,7 @@ class RunObservability:
                 once=True,
             )
         elif result.status in {
-            RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.BLOCKED,
-            RunStatus.PLAN_REJECTED,
+            RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.PLAN_REJECTED,
         }:
             failure = result.state.get("failure") if isinstance(result.state, Mapping) else None
             self.trace_emit(
@@ -444,8 +440,8 @@ class RunObservability:
             )
 
         if result.status in {
-            RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.BLOCKED,
-            RunStatus.PLAN_REJECTED, RunStatus.WAITING_HUMAN,
+            RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.PLAN_REJECTED,
+            RunStatus.WAITING_HUMAN,
             RunStatus.WAITING_EXTERNAL, RunStatus.WAITING_CHECK_INFRASTRUCTURE,
             RunStatus.WAITING_CHECK_REPAIR,
             RunStatus.WAITING_REMOTE, RunStatus.WAITING_SCOPE_APPROVAL,

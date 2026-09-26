@@ -39,7 +39,7 @@ from ..result import (
     ResultArtifactError,
     atomic_write_text,
 )
-from ..models import RunStatus, RunCycle
+from ..models import RunCycle
 from ..resume import ResumeIntegrityError
 from .pipeline_v2 import cycle_record_path
 from ..validation import check_result_json
@@ -100,11 +100,10 @@ class CycleArtifactService:
         else:
             atomic_write_text(path, record)
         state = store.load()
-        store.update(status=state.get("status", RunStatus.IMPLEMENTING), cycle=cycle.number)
+        store.update_metadata(cycle=cycle.number)
         self.cycle_update(store, cycle, status="running")
         if fresh and cycle.number > 1:
-            store.update(
-                status=RunStatus.PLANNING,
+            store.update_metadata(
                 git_ownership=_git_ownership_payload(
                     _git_ownership(ctx.repo, ctx.info.worktree)
                 ),

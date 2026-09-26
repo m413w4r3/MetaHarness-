@@ -16,7 +16,7 @@ from urllib.parse import unquote
 from ..agent.diagnostics import TOKEN_DIAGNOSTICS_NAME
 from ..agent.events import parse_event, summarize_event, summarize_step_event
 from ..diagnostics import DIAGNOSTICS_ERROR_NAME, DIAGNOSTICS_NAME, MAX_REPORT_BYTES, build_run_diagnostics
-from ..resume import resume_info
+from ..resume import resume_info, run_identity
 from ..approval import (
     ApprovalDecision,
     ApprovalError,
@@ -41,6 +41,8 @@ from ..models import (
     ExecutionSelection,
     HarnessConfig,
     PublishMode,
+    RunDisposition,
+    RunMachineState,
     RunStatus,
 )
 from ..progress import display_event, sync_progress
@@ -1062,9 +1064,10 @@ def approve_run(
     )
     _publish_decision(directory, selected, identity)
     # Compare-and-set: once the orchestrator has left the gate it owns the
-    # state, and this write must not resurrect the approval status.
-    RunStateStore(directory / "state.json").update_if_status(
-        RunStatus.AWAITING_PLAN_APPROVAL,
+    # state, and this metadata write must never move the machine state.  The
+    # claim observes the canonical identity of the gate it was validated on.
+    RunStateStore(directory / "state.json").update_metadata(
+        expected=run_identity(state, directory),
         plan_identity=asdict(identity),
         execution=_execution_state(durable),
     )
@@ -1837,8 +1840,9 @@ def approve_repair_scope(
     except (OSError, ValueError, ApprovalError) as exc:
         raise WebAPIError(409, "scope delta is invalid") from exc
     if selected is ApprovalDecision.REJECT:
-        RunStateStore(directory / "state.json").update(
-            status=RunStatus.FAILED, failure={"reason": "HUMAN_REQUIRED", "detail": "repair scope rejected"}
+        RunStateStore(directory / "state.json").set_run_state(
+            RunMachineState(disposition=RunDisposition.FAILED, reason="HUMAN_REQUIRED"),
+            failure={"reason": "HUMAN_REQUIRED", "detail": "repair scope rejected"},
         )
     return {"ok": True, "decision": selected.value, "scope_delta_sha256": delta_hash}
 

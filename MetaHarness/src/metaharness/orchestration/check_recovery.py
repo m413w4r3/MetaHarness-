@@ -15,7 +15,7 @@ from typing import Any, Callable, Mapping, Sequence
 from ..attempt_transaction import AttemptViolation, contain_trusted_process
 from ..evidence import EvidenceBundle
 from ..gitops import snapshot_candidate_state
-from ..models import HarnessConfig, RunStatus
+from ..models import HarnessConfig
 from ..recovery_policy import RecoveryBudgets
 from ..state import RunStateStore
 from ..validation import run_check_preflights
@@ -71,8 +71,7 @@ class CheckInfrastructureRecovery:
                     self._recovery.complete(pending, recovered=True, tree_after=tree_after)
                 return results
             if error.results:
-                self._store.update(
-                    status=RunStatus.PREPARING,
+                self._store.update_metadata(
                     workspace_setup=[asdict(result) for result in error.results],
                 )
             admission = self._recovery.admit(

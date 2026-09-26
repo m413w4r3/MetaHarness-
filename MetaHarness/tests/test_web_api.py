@@ -23,6 +23,9 @@ from metaharness.models import (
     ModelProfile,
     ExecutionRole,
     ProfileDriver,
+    RunDisposition,
+    RunMachineState,
+    RunPhase,
     RoutingConfig,
     SelectionMode,
     UIConfig,
@@ -31,6 +34,20 @@ from metaharness.run_options import RunOptions, write_run_options
 from metaharness.state import RunStateStore
 from metaharness.web import api
 from metaharness.web.server import create_server
+
+# One fixture state per operator-facing status the web tests render.  The
+# status itself is never written: each fixture names the machine state the
+# projection derives it from.
+FIXTURE_STATES = {
+    "created": RunMachineState(),
+    "planning": RunMachineState(RunPhase.PLANNER),
+    "awaiting_plan_approval": RunMachineState(RunPhase.PLAN_APPROVAL),
+    "implementing": RunMachineState(RunPhase.IMPLEMENT_STEP),
+    "validating": RunMachineState(RunPhase.DETERMINISTIC_GATE),
+    "reviewing": RunMachineState(RunPhase.FINAL_REVIEW),
+    "waiting_external": RunMachineState(disposition=RunDisposition.WAIT_EXTERNAL, reason="AGENT_TIMEOUT"),
+    "committed": RunMachineState(RunPhase.CANDIDATE_PUSH, RunDisposition.COMPLETED),
+}
 
 
 class WebServerTests(unittest.TestCase):
@@ -100,7 +117,7 @@ class WebServerTests(unittest.TestCase):
         run_dir = self.runs / run_id
         store = RunStateStore(run_dir / "state.json")
         store.initialize(run_id)
-        store.update(status=status, planning_protocol="v2")
+        store.set_run_state(FIXTURE_STATES[status], planning_protocol="v2")
         return run_dir
 
     def test_v1_get_routes_are_json_and_delegate_to_existing_api(self) -> None:
@@ -610,7 +627,7 @@ class WebServerTests(unittest.TestCase):
         run_dir = self.runs / "live"
         store = RunStateStore(run_dir / "state.json")
         store.initialize("live", base_sha="b" * 40, branch="metaharness/live", worktree="/tmp/wt live")
-        store.update(status="implementing")
+        store.set_run_state(RunMachineState(RunPhase.IMPLEMENT_STEP))
 
         page = self.get_html("/runs/live")
         self.assertIn("Run <span class=\"mono\">live</span>", page)
@@ -630,7 +647,7 @@ class WebServerTests(unittest.TestCase):
         gate = run_dir / "cycles/001/checks/post-implementation"
         gate.mkdir(parents=True)
         (gate / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
-        store.update(status="validating")
+        store.set_run_state(RunMachineState(RunPhase.DETERMINISTIC_GATE))
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assert_poll_shape(payload)
         self.assertEqual(payload["status"], "validating")
@@ -643,7 +660,7 @@ class WebServerTests(unittest.TestCase):
             json.dumps({"verdict": "PASS", "route": "NONE", "summary": "ok"}), encoding="utf-8"
         )
         (review / "reviewer.raw.md").write_text("VERDICT: PASS\n", encoding="utf-8")
-        store.update(status="reviewing")
+        store.set_run_state(RunMachineState(RunPhase.FINAL_REVIEW))
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assert_poll_shape(payload)
         self.assertEqual(payload["status"], "reviewing")
@@ -651,7 +668,10 @@ class WebServerTests(unittest.TestCase):
         self.assertTrue(payload["reviewer_raw_available"])
         self.assertEqual(payload["reviewer_raw"], "VERDICT: PASS\n")
 
-        store.update(status="committed", commit_sha="c" * 40)
+        store.set_run_state(
+            RunMachineState(RunPhase.CANDIDATE_PUSH, RunDisposition.COMPLETED),
+            commit_sha="c" * 40,
+        )
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assert_poll_shape(payload)
         self.assertEqual(payload["status"], "committed")

@@ -65,8 +65,7 @@ from ..models import (
     PlanDecision,
     ReviewRoute,
     ReviewVerdict,
-    RunCycle,
-    RunStatus,
+    RunCycle, RunDisposition, RunMachineState, SCOPE_APPROVAL_REASON,
 )
 from ..planning.artifacts import validate_implementation_bundle
 from ..planning.check_replan import (
@@ -467,7 +466,7 @@ class ReviewService:
             self.runtime.config, ctx.selection.planner.profile_id, ExecutionRole.PLANNER
         )
         approved_scope = self.runtime.composition.approved_scope_before(ctx, cycle.number)
-        store.update(status=RunStatus.PLANNING, current_step=None)
+        store.update_metadata(current_step=None)
         current_state = _json_text({
             "BASE_SHA": ctx.base_sha,
             "HEAD_SHA": head,
@@ -636,9 +635,9 @@ class ReviewService:
             approval = read_scope_approval(repair_dir, expected_sha256=delta_sha)
             if approval is None:
                 self.runtime.cycle_update(store, cycle, status="waiting_scope_approval", scope_delta=delta)
-                store.update(
-                    status=RunStatus.WAITING_SCOPE_APPROVAL, scope_delta=delta, current_step=None,
-                )
+                store.set_run_state(RunMachineState(
+                    disposition=RunDisposition.WAIT_HUMAN, reason=SCOPE_APPROVAL_REASON,
+                ), scope_delta=delta, current_step=None)
                 raise ScopeApprovalRequired()
             if approval.decision is not ApprovalDecision.APPROVE:
                 raise PipelineFailure("HUMAN_REQUIRED", "correction scope rejected")
@@ -689,7 +688,7 @@ class ReviewService:
         profile = profile_for_role(
             self.runtime.config, ctx.selection.planner.profile_id, ExecutionRole.PLANNER
         )
-        store.update(status=RunStatus.PLANNING, current_step=None)
+        store.update_metadata(current_step=None)
         started_at, started_mono = self.runtime.observability.trace_time(), time.perf_counter()
         selected = self.runtime.observability.trace_selected_profile(
             ctx.selection.planner.profile_id, ExecutionRole.PLANNER
@@ -851,7 +850,7 @@ class ReviewService:
                             "SEMANTIC REVISION: UNAVAILABLE\nreason=" + unavailable["reason"]
                         ),
                     )
-                    store.update(status=RunStatus.REVISING, semantic_revision=unavailable)
+                    store.update_metadata(semantic_revision=unavailable)
                     return
                 if error in {"REVISION_SCOPE_VIOLATION", AGENT_SCOPE_VIOLATION}:
                     raise PipelineFailure(
@@ -1022,11 +1021,9 @@ class ReviewService:
         if requires_approval and approval is None:
             _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
             delta["approval_artifact"] = delta_path.relative_to(ctx.run_dir).as_posix()
-            store.update(
-                status=RunStatus.WAITING_SCOPE_APPROVAL,
-                scope_delta=delta,
-                current_step=None,
-            )
+            store.set_run_state(RunMachineState(
+                disposition=RunDisposition.WAIT_HUMAN, reason=SCOPE_APPROVAL_REASON,
+            ), scope_delta=delta, current_step=None)
             self.runtime.cycle_update(
                 store, cycle_plan.cycle, status="waiting_scope_approval", scope_delta=delta,
             )
@@ -1175,12 +1172,11 @@ class ReviewService:
         directory = review_dir(ctx.run_dir, cycle_plan.cycle)
         accepted = _accepted_review(directory, evidence, candidate["commit_sha"])
         if accepted is not None and accepted.verdict is not ReviewVerdict.FAIL:
-            store.update(
-                status=store.load().get("status", RunStatus.REVIEWING),
+            store.update_metadata(
                 reviewed_candidate_sha=candidate["commit_sha"],
             )
             return accepted
-        store.update(status=RunStatus.REVIEWING, current_step=None)
+        store.update_metadata(current_step=None)
         if accepted is None:
             _archive_attempt(directory, names=_REVIEW_ATTEMPT_ARTIFACTS)
             review = self._review_with_transport_retries(
@@ -1198,8 +1194,7 @@ class ReviewService:
                 store=store, ctx=ctx, cycle_plan=cycle_plan, candidate=candidate,
                 supplied_evidence=evidence, first_review=review, artifacts_dir=directory,
             )
-        store.update(
-            status=store.load().get("status", RunStatus.REVIEWING),
+        store.update_metadata(
             reviewed_candidate_sha=candidate["commit_sha"],
         )
         return review
@@ -1430,8 +1425,8 @@ class ReviewService:
         self, store: RunStateStore, ctx: PipelineV2Context, number: int,
         review: ReviewResult, evidence: EvidenceBundle,
     ) -> None:
-        store.update(
-            status=RunStatus.REVIEWING, review=_review_payload(review),
+        store.update_metadata(
+            review=_review_payload(review),
             review_iterations=number,
         )
         self.runtime.cycle_update(

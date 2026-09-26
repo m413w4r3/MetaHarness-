@@ -715,5 +715,49 @@ class CompatibilityBreakTests(unittest.TestCase):
                     )
 
 
+class RunStateCommandTests(unittest.TestCase):
+    """Invariant 13: the machine state is the only thing a caller commands.
+
+    A status is a projection of ``(phase, disposition, reason)``: no service
+    picks one to pilot a run, and the store keeps no command that would let it.
+    """
+
+    # The command surface of the store: every one of them either refuses a
+    # control field or moves the machine state through ``transition``.
+    STATE_COMMANDS = (
+        "update", "update_metadata", "set_run_state", "transition_run", "record_failure",
+    )
+    REMOVED_STATUS_COMMANDS = ("update_if_status", "transition_if")
+
+    def test_the_status_command_api_stays_deleted(self) -> None:
+        for path in sorted(PACKAGE.rglob("*.py")):
+            where = path.relative_to(ROOT)
+            for lineno, name in _identifiers(_parse(path)):
+                self.assertNotIn(
+                    name, self.REMOVED_STATUS_COMMANDS,
+                    f"{where}:{lineno} revives {name}: a claim compares the canonical "
+                    f"RunIdentity, never a status spelling",
+                )
+
+    def test_no_service_commands_the_store_with_a_status(self) -> None:
+        for path in sorted(PACKAGE.rglob("*.py")):
+            where = path.relative_to(ROOT)
+            for node in ast.walk(_parse(path)):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not isinstance(func, ast.Attribute) or func.attr not in self.STATE_COMMANDS:
+                    continue
+                receiver = ast.unparse(func.value).casefold()
+                if "store" not in receiver and "state" not in receiver:
+                    continue
+                for keyword in node.keywords:
+                    self.assertNotIn(
+                        keyword.arg, {"status", "disposition", "phase", "reason"},
+                        f"{where}:{node.lineno} passes {keyword.arg}= to {func.attr}: the "
+                        f"machine state is written through RunMachineState, not named",
+                    )
+
+
 if __name__ == "__main__":  # pragma: no cover - unittest entry point
     unittest.main()

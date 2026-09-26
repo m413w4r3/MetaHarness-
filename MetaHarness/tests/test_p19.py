@@ -21,6 +21,8 @@ from metaharness.models import (
     LLMEndpointConfig,
     ModelProfile,
     ProfileDriver,
+    RunMachineState,
+    RunPhase,
     RoutingConfig,
     SelectionMode,
     UIConfig,
@@ -121,8 +123,8 @@ class P19WebTests(unittest.TestCase):
         raw, contract = "STATUS: READY\n", "# contract\n"
         (run / "planner.raw.md").write_text(raw)
         (run / "implementation_contract.md").write_text(contract)
-        store.update(
-            status="awaiting_plan_approval",
+        store.set_run_state(
+            RunMachineState(RunPhase.PLAN_APPROVAL),
             planning_protocol="v2",
             plan_identity=compute_plan_identity(raw, contract).__dict__,
         )
@@ -254,7 +256,7 @@ class P19WebTests(unittest.TestCase):
     def test_bounded_diagnostics_diff_and_progress(self) -> None:
         run = self.create_waiting("artifacts")
         store = RunStateStore(run / "state.json")
-        store.update(status="failed", failure={"reason": "AGENT_RUNTIME_FAILED"})
+        store.record_failure("AGENT_RUNTIME_FAILED")
         step = run / "cycles/001/implementation/steps/S01"
         step.mkdir(parents=True)
         (step / "agent.final.md").write_text("x" * (32 * 1024 + 100))
@@ -275,7 +277,7 @@ class P19WebTests(unittest.TestCase):
         self.assertEqual(payload["approval"], {"recorded": False, "decision": None})
 
     def test_refresh_rules(self) -> None:
-        for status in ("created", "planning", "preparing", "worktree_ready", "implementing", "validating", "reviewing"):
+        for status in ("created", "planning", "preparing", "implementing", "validating", "reviewing"):
             self.assertEqual(refresh_seconds_for_run({"status": status}), 2)
         self.assertEqual(refresh_seconds_for_run({"status": "approved"}), 1)
         self.assertIsNone(refresh_seconds_for_run({"status": "awaiting_plan_approval", "approval": {"recorded": False}}))

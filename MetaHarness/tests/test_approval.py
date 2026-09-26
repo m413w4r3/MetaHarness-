@@ -23,7 +23,9 @@ from metaharness.approval import (  # noqa: E402
     write_check_authority,
 )
 from metaharness.cli import main  # noqa: E402
-from metaharness.models import CheckConfig, RunStatus  # noqa: E402
+from metaharness.models import (  # noqa: E402
+    CheckConfig, RunMachineState, RunPhase,
+)
 from metaharness.state import RunStateStore  # noqa: E402
 
 
@@ -230,8 +232,8 @@ class ApprovalTests(unittest.TestCase):
         state = store.initialize("cli")
         (directory / "planner.raw.md").write_text(self.raw, encoding="utf-8")
         (directory / "implementation_contract.md").write_text(self.contract, encoding="utf-8")
-        state = store.update(
-            status=RunStatus.AWAITING_PLAN_APPROVAL,
+        state = store.set_run_state(
+            RunMachineState(RunPhase.PLAN_APPROVAL),
             plan_identity={
                 "raw_sha256": self.identity.raw_sha256,
                 "contract_sha256": self.identity.contract_sha256,

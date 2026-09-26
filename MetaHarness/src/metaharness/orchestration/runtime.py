@@ -18,7 +18,7 @@ import hashlib, os, re, uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Mapping, NoReturn
 from ..approval import (
     ApprovalError, PlanIdentity, compute_plan_identity_from_run,
     write_check_authority,
@@ -30,10 +30,13 @@ from ..gitops import (
     status_porcelain,
 )
 from ..integrations.github import GitHubWorkstreamClient, NullGitHubWorkstreamClient
-from ..models import GateStage, HarnessConfig, PlanDecision, RunCycle, RunStatus
+from ..models import (
+    GateStage, HarnessConfig, PlanDecision, RunCycle, RunDisposition,
+    RunMachineState, RunPhase,
+)
 from ..plan_recovery import (
     PLAN_SOURCE_OPERATOR, PlanRecoveryError, plan_recovery_info,
-    recoverable_plan_source_status,
+    recoverable_plan_failure,
     validate_replacement_text, write_plan_recovery_record,
 )
 from ..plan_repository_validation import (
@@ -49,6 +52,7 @@ from ..resume import (
     ResumeCheckpoint, ResumeCheckpointError, ResumePhase,
     ResumeRequiresOperatorError,
     read_checkpoint, read_checkpoint_record, write_checkpoint,
+    run_identity,
 )
 from ..run_options import (
     EffectiveRepairScopePolicy, RunOptions, RunOptionsError,
@@ -192,7 +196,7 @@ class RunRuntime:
             cycles.append(record)
         else:
             cycles[index] = record
-        store.update(status=state.get("status", RunStatus.PLANNING), cycles=cycles)
+        store.update_metadata(cycles=cycles)
 
     @staticmethod
     def approved_check_authority_sha256(run_dir: Path) -> str | None:
@@ -381,11 +385,12 @@ class RunRuntime:
             refuse(f"run Git identity cannot be verified: {exc}")
 
         replacement_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        source_status = recoverable_plan_source_status(state)
-        if source_status is None:
+        if not recoverable_plan_failure(state):
             refuse("run is not in an exact recoverable planner state")
-        claimed = store.transition_if(
-            source_status, state.get("updated_at"), status=source_status,
+        # The recovered plan replaces a durable failure at the same boundary:
+        # the claim observes the canonical identity and moves no machine state.
+        claimed = store.update_metadata(
+            expected=run_identity(state, run_dir, checkpoint),
             plan_recovery={"status": "persisting", "replacement_raw_sha256": replacement_sha},
         )
         if claimed is None:
@@ -428,15 +433,15 @@ class RunRuntime:
                 plan_identity=identity,
             )
         except Exception as exc:
-            store.update(
-                status=source_status,
+            store.update_metadata(
                 plan_recovery={"status": "failed", "replacement_raw_sha256": replacement_sha,
                                "detail": redact(str(exc), self._secrets_or_empty())},
             )
             raise
         planner_state = state.get("planner") if isinstance(state.get("planner"), dict) else {}
-        store.update(
-            status=RunStatus.FAILED,
+        failed = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
+        store.set_run_state(
+            RunMachineState(RunPhase.PLAN_APPROVAL, RunDisposition.FAILED, failed.get("reason")),
             plan_identity=asdict(identity),
             plan_recovery={**record, "status": "awaiting_approval"},
             planner={

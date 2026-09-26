@@ -347,7 +347,7 @@ class RecoveryCoordinatorTests(unittest.TestCase):
     def test_budget_is_durable_and_never_reset_by_a_resume(self) -> None:
         self.assertTrue(self.admit(self.coordinator()).admitted)
         state = self.store.load()
-        self.store.update(status=state["status"], resume={"attempts": 3})
+        self.store.update_metadata(resume={"attempts": 3})
         # A fresh coordinator after a resume sees the same consumed budget.
         second = self.admit(self.coordinator())
         self.assertTrue(second.admitted)
@@ -395,7 +395,7 @@ class RecoveryCoordinatorTests(unittest.TestCase):
 
     def test_malformed_counters_fail_closed(self) -> None:
         state = self.store.load()
-        self.store.update(status=state["status"], recovery_counters={"agent-step:001:S01": -1})
+        self.store.update_metadata(recovery_counters={"agent-step:001:S01": -1})
         with self.assertRaises(PipelineFailure) as caught:
             self.admit(self.coordinator())
         self.assertEqual(caught.exception.reason, "DURABLE_ARTIFACT_CORRUPTED")
