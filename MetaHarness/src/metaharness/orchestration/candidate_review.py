@@ -120,7 +120,7 @@ class CandidateReviewService:
     def _review_context_builder(self) -> ReviewContextBuilder:
         return ReviewContextBuilder(
             cycle_plan=self.runtime.composition.cycle_plan,
-            completed_steps=self.runtime.composition.completed_steps,
+            completed_steps=self.runtime.composition.reviewed_steps,
             load_revision=load_revision,
             read_candidate=_review_candidate_record,
             candidate_evidence=candidate_evidence,

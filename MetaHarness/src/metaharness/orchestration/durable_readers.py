@@ -188,15 +188,37 @@ def load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
     }
 
 
+# Durable outcomes of a step the run settled without completing it.
+FAILED_CONTINUED = "FAILED_CONTINUED"
+SKIPPED_DEPENDENCY = "SKIPPED_DEPENDENCY"
+
+
+def settled_step_status(directory: Path, step_id: str) -> str | None:
+    """``FAILED_CONTINUED`` or ``SKIPPED_DEPENDENCY`` once a step is settled."""
+
+    record = read_json_artifact(directory / "step.json", 128 * 1024)
+    if not isinstance(record, dict) or record.get("id") != step_id:
+        return None
+    status = record.get("status")
+    return status if status in {FAILED_CONTINUED, SKIPPED_DEPENDENCY} else None
+
+
 def completed_step_records(
     run_dir: Path, cycle: int, step_ids: list[str] | tuple[str, ...],
 ) -> list[dict[str, Any]]:
-    """The durable completed prefix of one cycle's approved steps."""
+    """The durable completed prefix of one cycle's approved steps.
+
+    A settled step (failed and continued, or skipped for its dependency) is
+    stepped over: the steps after it still belong to the prefix.
+    """
 
     records: list[dict[str, Any]] = []
     for step_id in step_ids:
-        record = load_completed_step(step_dir(run_dir, cycle, step_id), step_id)
+        directory = step_dir(run_dir, cycle, step_id)
+        record = load_completed_step(directory, step_id)
         if record is None:
+            if settled_step_status(directory, step_id) is not None:
+                continue
             break
         records.append(record)
     return records
@@ -266,8 +288,9 @@ def read_repository_reference(run_dir: Path) -> RepositoryReference | None:
 
 
 __all__ = [
+    "FAILED_CONTINUED", "SKIPPED_DEPENDENCY",
     "accepted_review", "candidate_evidence", "completed_step_records",
-    "load_completed_step", "load_evidence", "load_revision",
+    "load_completed_step", "load_evidence", "load_revision", "settled_step_status",
     "read_candidate_record", "read_planner_conversation",
     "read_repository_reference", "reusable_pre_checks",
 ]

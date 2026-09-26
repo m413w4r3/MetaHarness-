@@ -236,8 +236,10 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
             planner=[initial_plan(STEP), repaired_step_contract()], reviewer=["unused"],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
-        self.assertEqual(self.state()["failure"]["reason"], "AGENT_CONTRACT_MISMATCH")
+        # The spent step is settled; the run never waits for a human.
+        self.assertNotIn(result.status, {RunStatus.WAITING_HUMAN, RunStatus.FAILED})
+        record = json.loads((self.step_dir() / "step.json").read_text())
+        self.assertEqual((record["status"], record["reason"]), ("FAILED_CONTINUED", "AGENT_CONTRACT_MISMATCH"))
         self.assertEqual(len(self.workers.calls), 3)
         self.assertEqual(len(self.planner.requests), 3)
         self.assertEqual(self.repair_slots(), ["01", "02"])

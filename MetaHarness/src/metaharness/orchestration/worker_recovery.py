@@ -17,7 +17,6 @@ from ..agent.base import (
     AGENT_AUTH_FAILURE,
     AGENT_PROTOCOL_FAILED,
     AGENT_RUNTIME_FAILED,
-    AGENT_SCOPE_VIOLATION,
     AGENT_START_FAILED,
     AGENT_TIMEOUT,
     AgentError,
@@ -53,6 +52,8 @@ TRANSIENT_WORKER_FAILURES = frozenset({
 # The only ladder step this recovery loop may execute: a same-executor retry on
 # the exact pre-attempt tree it just restored.
 _RETRY_STRATEGIES = frozenset({RecoveryStrategy.RETRY_TARGETED})
+# Failures the semantic contract route of the step owns instead.
+_CONTRACT_ROUTE = frozenset({"AGENT_CONTRACT_MISMATCH", "AGENT_NO_CHANGE"})
 
 
 def safe_scope_request_path(path: str) -> bool:
@@ -106,29 +107,20 @@ class WorkerRecovery:
         before = failure.tree_before
         trace = {"phase": "implementation", "cycle": cycle, "step_id": failure.step_id}
         attempt = self._recovery.used(retry_key) + 1
-        if reason not in TRANSIENT_WORKER_FAILURES | {AGENT_AUTH_FAILURE}:
-            facts = {"tree_changed_out_of_scope": reason == AGENT_SCOPE_VIOLATION}
-            if classify_failure(reason, **facts).strategy is RecoveryStrategy.HARD_STOP:
-                self._recovery.stop(
-                    reason, attempt=attempt, tree_before=before,
-                    tree_after=failure.tree_after or _safe_candidate_tree(worktree),
-                    facts=facts, **trace,
-                )
+        if reason in _CONTRACT_ROUTE or classify_failure(reason).strategy.terminal:
+            # The contract route owns mismatches; a terminal leaves the loop.
             return None
 
         def refuse(code: str, detail: str, tree_after: str | None) -> None:
             if code == "RESUME_REQUIRES_OPERATOR":
                 failure.detail = (failure.detail or "worker failed") + "; " + detail
-                facts = {"rollback_succeeded": False}
             else:
                 failure.detail = detail
-                facts = {"tree_changed_out_of_scope": code == AGENT_SCOPE_VIOLATION}
             failure.reason = code
             failure.tree_after = tree_after
             failure.step_dir = artifact_dir
             self._recovery.stop(
-                code, attempt=attempt, tree_before=before, tree_after=tree_after,
-                facts=facts, **trace,
+                code, attempt=attempt, tree_before=before, tree_after=tree_after, **trace,
             )
 
         if before is None:
@@ -151,7 +143,7 @@ class WorkerRecovery:
             branch_ref=branch_ref, base_sha=base_sha, secrets=self._secrets,
         )
         try:
-            rollback = transaction.abort(
+            transaction.abort(
                 set((*step.write_set, *step.create_set, *step.delete_set)),
             )
         except AttemptViolation as violation:
@@ -160,17 +152,19 @@ class WorkerRecovery:
 
         failure.tree_after = before
         failure.index_tree_after = before
+        if reason == AGENT_AUTH_FAILURE:
+            # The same credentials can never succeed: an external change is due.
+            failure.step_dir = artifact_dir
+            return None
         admission = self._recovery.admit(
             retry_key, reason=reason, budget=self._budgets.max_transient_attempts,
             profile_id=failure.profile_id, tree_before=before, tree_after=before,
-            allowed=_RETRY_STRATEGIES,
-            facts={"tree_changed_in_scope": rollback.changed}, **trace,
+            allowed=_RETRY_STRATEGIES, **trace,
         )
         if not admission.admitted:
             if admission.exhausted:
                 failure.detail = (
-                    (failure.detail or "transient agent failure")
-                    + "; transient attempt budget exhausted"
+                    (failure.detail or "agent failure") + "; retry budget exhausted"
                 )
             failure.step_dir = artifact_dir
             return None
@@ -253,7 +247,7 @@ class WorkerRecovery:
                 return result, None
 
             failed_tree_after = _safe_candidate_tree(worktree)
-            changed = self._rollback_revision(
+            self._rollback_revision(
                 transaction, allowed=allowed, artifact_dir=artifact_dir,
                 allow_requested_paths=(error == SCOPE_REQUEST_ROUTE),
                 discard_scope_violations=is_check_repair,
@@ -282,7 +276,6 @@ class WorkerRecovery:
                 retry_key, reason=error, budget=self._budgets.max_transient_attempts,
                 phase=phase, cycle=cycle, profile_id=active.profile_id,
                 tree_before=tree_before, tree_after=candidate_tree_sha(worktree),
-                facts={"tree_changed_in_scope": changed},
             )
             if admission.admitted:
                 _archive_attempt(artifact_dir, names=_REVISION_ATTEMPT_ARTIFACTS)
@@ -308,7 +301,7 @@ class WorkerRecovery:
         artifact_dir: Path,
         allow_requested_paths: bool,
         discard_scope_violations: bool = False,
-    ) -> bool:
+    ) -> None:
         """Audit a failed revision and restore only a fully in-scope tree."""
 
         requested: set[str] = set()
@@ -322,10 +315,11 @@ class WorkerRecovery:
             raise PipelineFailure("AGENT_SCOPE_VIOLATION", "scope request contains an unsafe path")
         try:
             if discard_scope_violations:
-                rollback = transaction.discard()
-                transaction.enforce_scope(rollback.changed_paths, set(allowed) | requested)
+                transaction.enforce_scope(
+                    transaction.discard().changed_paths, set(allowed) | requested,
+                )
             else:
-                rollback = transaction.abort(allowed, requested=requested)
+                transaction.abort(allowed, requested=requested)
         except AttemptViolation as violation:
             if violation.code == "RESUME_REQUIRES_OPERATOR":
                 _record_failure_tree(artifact_dir, transaction.worktree)
@@ -333,7 +327,6 @@ class WorkerRecovery:
         atomic_write_text(
             artifact_dir / "tree_after_failure.txt", transaction.boundary.tree + "\n",
         )
-        return rollback.changed
 
 
 __all__ = ["TRANSIENT_WORKER_FAILURES", "WorkerRecovery", "safe_scope_request_path"]

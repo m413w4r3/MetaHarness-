@@ -162,19 +162,19 @@ class AutoResumeCommandTests(AutonomyHarness):
         self.assertEqual(sleeps, [])
         self.assertEqual(len(planner.requests), 1)
 
-    def test_nonretryable_planner_error_is_not_auto_resumed(self) -> None:
-        planner = ScriptedChat([PlanParseError("not a plan")], name="planner")
+    def test_planner_invalid_output_is_fixable_not_human(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        planner = ScriptedChat([PlanParseError("not a plan"), self.plan()], name="planner")
         self.config()
 
         code, sleeps = self.run_with_auto_resume(planner, ScriptedChat([review()]))
 
-        self.assertEqual(code, 1)
-        self.assertEqual(self.state()["status"], RunStatus.WAITING_HUMAN.value)
-        # An invalid planner answer is an operator decision, not a temporary
-        # outage: the transport failure would have been retried, this is not.
-        self.assertEqual(sleeps, [])
-        self.assertIsNone((self.state().get("resume") or {}).get("attempts"))
-
+        # An invalid planner answer is an ordinary model error: the run is
+        # never handed to an operator, it is resumed and planned again.
+        self.assertEqual(code, 0, self.state().get("failure"))
+        self.assertEqual(self.state()["status"], RunStatus.COMMITTED.value)
+        self.assertEqual(sleeps, [0.01])
+        self.assertEqual(len(planner.requests), 2)
 
 if __name__ == "__main__":
     unittest.main()

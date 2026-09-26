@@ -154,7 +154,8 @@ class StepAuthorityHarness(PipelineHarness):
             [self.one_step_plan()], config=config, options=self.options(config, max_added=1),
         )
 
-        self.assertEqual(result.status, RunStatus.FAILED)
+        # The refused scope request is an ordinary fixable failure, never fatal.
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
         self.assertEqual(self.workers.roles(), ["implementer", "repair"])
 
@@ -227,10 +228,13 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
             repair_contract("a.txt", "c.txt", "d.txt"),
         ])
 
-        self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
-        self.assertIn("e.txt", self.state()["failure"]["detail"])
-        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
+        # Never adopted: the step is rolled back and settled, the run goes on.
+        self.assertNotEqual(result.status, RunStatus.FAILED)
+        step = self.json(self.step_dir() / "step.json")
+        self.assertEqual((step["status"], step["reason"]), ("FAILED_CONTINUED", "AGENT_SCOPE_VIOLATION"))
+        self.assertIn("e.txt", step["detail"])
+        self.assertEqual(git(self.worktree(), "status", "--porcelain"), "")
+        self.assertNotIn("e.txt", git(self.worktree(), "diff", "--name-only", "main"))
         self.assertFalse((self.step_dir() / "step_candidate.json").exists())
 
     def test_the_commit_gate_itself_still_refuses_an_unauthorized_path(self) -> None:
@@ -247,16 +251,14 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
         with mock.patch("metaharness.orchestration.step_acceptance.commit_safety_gate", side_effect=narrowed):
             result = self.run_pipeline([self.one_step_plan()])
 
-        self.assertEqual(result.status, RunStatus.FAILED)
+        # The refusal is ordinary and fixable: the run waits, it is not fatal.
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         failure = self.state()["failure"]
         self.assertEqual(failure["reason"], "COMMIT_GATE_FAILED")
         self.assertIn("COMMIT_SCOPE_VIOLATION", failure["detail"])
         acceptance = self.json(self.step_dir() / "step_acceptance.json")
         self.assertEqual((acceptance["status"], acceptance["code"]), ("refused", "COMMIT_SCOPE_VIOLATION"))
         self.assertEqual(acceptance["paths"], ["feature.txt"])
-        info = resume_info(self.run_dir(), self.state())
-        self.assertFalse(info.resumable)
-        self.assertIsNone(info.operation)
 
     def test_a_secret_in_an_authorized_path_fails_closed(self) -> None:
         """CAS 13."""
@@ -272,7 +274,7 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
 
         self.assertEqual(result.status, RunStatus.FAILED)
         failure = self.state()["failure"]
-        self.assertEqual(failure["reason"], "COMMIT_GATE_FAILED")
+        self.assertEqual(failure["reason"], "COMMIT_SECURITY_FAILURE")
         self.assertIn("COMMIT_SECURITY_FAILURE", failure["detail"])
         self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
         self.assertEqual(git(self.worktree(), "rev-list", "--count", "HEAD"), git(self.repo, "rev-list", "--count", "main"))

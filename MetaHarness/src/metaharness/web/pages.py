@@ -894,6 +894,7 @@ _FAILURE_MESSAGES = {
     "CHECK_INFRASTRUCTURE_UNAVAILABLE": "Deterministic check infrastructure is unavailable",
     "CHECK_SIDE_EFFECT_REPEATED": "A deterministic check repeatedly changed the candidate",
     "HUMAN_REQUIRED": "Human action required",
+    "REVIEW_HUMAN_REQUIRED": "Reviewer requested a product decision",
     "REVIEWER_TRANSPORT_FAILURE": "Reviewer could not be reached",
     "REVIEWER_OUTPUT_INVALID": "Reviewer answer is invalid",
     "REVIEW_FAILED": "Review failed",

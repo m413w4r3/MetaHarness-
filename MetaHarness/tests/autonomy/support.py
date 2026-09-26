@@ -53,6 +53,7 @@ class Step:
     write: tuple[str, ...] = ()
     create: tuple[str, ...] = ()
     delete: tuple[str, ...] = ()
+    depends_on: str = "NONE"
 
     def render(self) -> str:
         def block(label: str, values: tuple[str, ...]) -> str:
@@ -63,7 +64,7 @@ class Step:
         return f"""BEGIN STEP {self.id}
 TITLE: {self.title}
 EXECUTION_CLASS: MECHANICAL
-DEPENDS_ON: NONE
+DEPENDS_ON: {self.depends_on}
 
 OBJECTIVE
 {self.title}

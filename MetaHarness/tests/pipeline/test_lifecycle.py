@@ -147,10 +147,11 @@ class LifecycleTests(PipelineHarness):
             self.config(), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "IMPLEMENTATION")],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "WAITING_REPAIR_EXHAUSTED")
         self.assertEqual(self.checkpoint()["phase"], "final_review")
-        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
+        # A fixable exit stays resumable: a resume retries it autonomously.
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
         self.assertFalse((self.run_dir() / "repair_task.json").exists())
 
     def test_human_route_stops_without_automatic_correction_or_publication(self) -> None:
@@ -164,7 +165,7 @@ class LifecycleTests(PipelineHarness):
         )
 
         self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
-        self.assertEqual(self.state()["failure"]["reason"], "HUMAN_REQUIRED")
+        self.assertEqual(self.state()["failure"]["reason"], "REVIEW_HUMAN_REQUIRED")
         self.assertEqual(self.workers.roles(), ["implementer"])
         self.assertEqual(len(self.reviewer.requests), 1)
         self.assertFalse((self.run_dir() / "publish.json").exists())

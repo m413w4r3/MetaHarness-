@@ -522,7 +522,8 @@ class PlannerNormalizationTests(PipelineHarness):
             reviewer=[review()],
         ).run_text("Make feature.txt good.\n", run_id="run")
 
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
+        # An impossible plan is a fixable planner error: resumable, not human.
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         state = self.state()
         self.assertEqual(state["failure"]["reason"], "PLAN_REPOSITORY_PRECONDITION_INVALID")
         self.assertIn("step=S01 no_mutation", state["failure"]["detail"])
@@ -615,7 +616,7 @@ class ReplanNormalizationTests(PipelineHarness):
             reviewer=[review("REVISE", "REPLAN")],
         ).run_text("Make feature.txt good.\n", run_id="run")
 
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "PLAN_REPOSITORY_PRECONDITION_INVALID")
         self.assertIn("step=S01 no_mutation", self.state()["failure"]["detail"])
         self.assertEqual(self.workers.roles(), ["implementer"])

@@ -51,7 +51,7 @@ from ..resume import (
 )
 from ..result import atomic_write_text
 from ..recovery_policy import (
-    RecoveryStrategy,
+    FailureClass,
     classify_failure,
 )
 from ..state import RunStateStore
@@ -413,7 +413,7 @@ class GateService:
             _archive_attempt_tree(attempt_dir)
 
         decision = classify_failure(soft[0] if soft else "CHECK_FAILED")
-        if decision.strategy is not RecoveryStrategy.REPAIR_TARGETED:
+        if decision.failure_class is not FailureClass.FIXABLE:
             raise PipelineFailure("CHECK_REPAIR_NOT_AUTHORIZED", "check failure is not repairable")
         atomic_write_text(
             attempt_dir / "failed_check_evidence_before.json",

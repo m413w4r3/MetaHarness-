@@ -50,6 +50,7 @@ from .cycle_loader import (
 )
 from .durable_readers import (
     completed_step_records, load_evidence, load_revision, read_candidate_record,
+    settled_step_status,
 )
 from .run_bootstrap import PreparedV2Run
 from .shared import CycleArtifactService, OrchestrationError, bounded_parse_detail
@@ -425,6 +426,16 @@ class RunComposition:
             ctx.run_dir, cycle_plan.cycle.number, [step.id for step in cycle_plan.plan.steps],
         )
 
+    def reviewed_steps(self, ctx: PipelineV2Context, cycle_plan: CyclePlan) -> list[dict[str, Any]]:
+        """The step reports a reviewer reads: an abandoned step is a visible deficit."""
+
+        records = {record["id"]: record for record in self.completed_steps(ctx, cycle_plan)}
+        for step in cycle_plan.plan.steps:
+            status = settled_step_status(cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id), step.id)
+            if status is not None:
+                records[step.id] = {"id": step.id, "status": status, "changed_paths": []}
+        return [records[step.id] for step in cycle_plan.plan.steps if step.id in records]
+
     def effective_cycle_scope(
         self, ctx: PipelineV2Context, cycle_plan: CyclePlan,
     ) -> tuple[str, ...]:
@@ -483,6 +494,12 @@ class RunComposition:
                 )
             elif step.id == running:
                 row["status"] = "running"
+            else:
+                settled = settled_step_status(
+                    cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id), step.id,
+                )
+                if settled is not None:
+                    row["status"] = settled.casefold()
             rows.append(row)
         return rows
 

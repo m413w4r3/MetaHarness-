@@ -238,7 +238,6 @@ class RunFailure:
             reason = normalize_exit_reason(reason)
             terminal_disposition = project_exit(
                 reason, phase=self.checkpoint_phase(run_dir),
-                remote_required=reason == "PUSH_FAILED",
             )[1].disposition
         if reason == "CHECK_REPAIR_EXHAUSTED":
             self.runtime.observability.trace_emit(
@@ -490,10 +489,7 @@ class RunFailure:
                 failure.reason = reason
                 failure.detail = "external executor authorization is required"
             checkpoint_phase = self.checkpoint_phase(pipeline.run_dir, default=start.phase)
-            decision, terminal = project_exit(
-                failure.reason, phase=checkpoint_phase,
-                remote_required=failure.reason == "PUSH_FAILED",
-            )
+            decision, terminal = project_exit(failure.reason, phase=checkpoint_phase)
             state = store.load()
             tree = state.get("staged_tree_sha")
             if not isinstance(tree, str):
@@ -501,14 +497,11 @@ class RunFailure:
             cycle = state.get("cycle") if isinstance(state.get("cycle"), int) else None
             phase = state.get("status") if isinstance(state.get("status"), str) else "run"
             recovery = self.runtime.recovery(store)
-            initial = recovery.stop(
+            recovery.stop(
                 failure.reason, phase=phase, cycle=cycle, step_id=failure.step_id,
                 tree_before=tree, tree_after=safe_candidate_tree(pipeline.info.worktree),
             )
-            if (
-                initial.strategy is not RecoveryStrategy.HARD_STOP
-                or terminal.disposition is not RunDisposition.FAILED
-            ):
+            if decision.strategy is not RecoveryStrategy.HARD_STOP:
                 recovery.trace(
                     "recovery.exhausted", reason=failure.reason, decision=decision,
                     attempt=1, tree_before=tree,

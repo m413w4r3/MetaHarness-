@@ -696,7 +696,7 @@ class OrchestratorE2ETests(unittest.TestCase):
         self.assertEqual(sum(item["event"] == "recovery.completed" for item in recovery), 2)
         self.assertEqual(sum(item["event"] == "recovery.exhausted" for item in recovery), 1)
         exhausted = next(item["data"] for item in recovery if item["event"] == "recovery.exhausted")
-        self.assertEqual(exhausted["terminal_strategy"], "wait_external")
+        self.assertEqual(exhausted["strategy"], "wait_external")
         self.assertEqual(exhausted["terminal_status"], RunStatus.WAITING_EXTERNAL.value)
         self.assertEqual(exhausted["checkpoint_phase"], "implement_step")
         self.assertTrue(all(
@@ -1093,7 +1093,9 @@ class OrchestratorE2ETests(unittest.TestCase):
         for behavior in ("switch", "branch"):
             run_id = f"git-{behavior}"
             _, llm, state = self.run_case(codex_behavior=behavior, run_id=run_id)
-            self.assertEqual(state["failure"]["reason"], "AGENT_GIT_VIOLATION")
+            # The harness cannot prove the run branch restored: a fatal stop.
+            self.assertEqual(state["status"], RunStatus.FAILED.value)
+            self.assertEqual(state["failure"]["reason"], "RESUME_REQUIRES_OPERATOR")
             self.assertEqual(llm.reviewer_calls, 0)
             self.assertEqual(self.harness_commits(run_id), 0)
             self.assertIn(f"agent-owned-{behavior}", state["failure"]["detail"])
@@ -1111,8 +1113,8 @@ class OrchestratorE2ETests(unittest.TestCase):
     def test_long_step_title_still_commits_with_a_bounded_subject(self) -> None:
         planner = v2_plan(step_title="Very long title " * 10)
         _, _, state = self.run_case(planner=planner, run_id="long-title")
-        # Exhausted planner correction waits for an operator plan recovery.
-        self.assertEqual(state["status"], RunStatus.WAITING_HUMAN.value)
+        # Exhausted planner correction is fixable: the run waits for a resume.
+        self.assertEqual(state["status"], RunStatus.WAITING_EXTERNAL.value)
         self.assertEqual(state["failure"]["reason"], "PLANNER_OUTPUT_INVALID")
         self.assertFalse((self.root / "worktrees" / "long-title").exists())
 
@@ -1160,7 +1162,7 @@ class OrchestratorE2ETests(unittest.TestCase):
             run_id="staged-secret",
             planning_decomposition="balanced",
         )
-        self.assertEqual(state["failure"]["reason"], "COMMIT_GATE_FAILED")
+        self.assertEqual(state["failure"]["reason"], "COMMIT_SECURITY_FAILURE")
         self.assertEqual(llm.reviewer_calls, 0)
         self.assertEqual(self.commits("staged-secret"), 1)
 

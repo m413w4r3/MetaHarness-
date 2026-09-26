@@ -34,12 +34,13 @@ class ReviewCorrectionTests(PipelineHarness):
             reviewer=[review("FAIL", "HUMAN")],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "REVIEW_EVIDENCE_UNRESOLVED")
         self.assertEqual(self.workers.roles(), ["implementer"])
         self.assertEqual(len(self.reviewer.requests), 2)
         self.assertEqual(self.checkpoint()["phase"], "final_review")
-        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
+        # A fixable exit stays resumable: a resume retries it autonomously.
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
         self.assertFalse((self.run_dir() / "publish.json").exists())
 
     def test_malformed_review_twice_keeps_final_review_checkpoint_and_candidate(self) -> None:
@@ -49,11 +50,12 @@ class ReviewCorrectionTests(PipelineHarness):
             reviewer=["VERDICT: PASS\nROUTE: NONE", "still malformed"],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(failed.status, RunStatus.WAITING_HUMAN)
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "REVIEW_FORMAT_INVALID")
         self.assertEqual(self.checkpoint()["phase"], "final_review")
         self.assertTrue((self.run_dir() / "cycles/001/candidate/commit.json").is_file())
-        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
+        # A fixable exit stays resumable: a resume retries it autonomously.
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
         self.assertEqual(self.workers.roles(), ["implementer"])
 
     def test_review_http_503_recovers_on_the_same_candidate(self) -> None:
@@ -227,13 +229,14 @@ class ReviewCorrectionTests(PipelineHarness):
             self.config(correction_cycles=2), planner=[initial_plan(STEP)],
             reviewer=[review("REVISE", "IMPLEMENTATION")],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         failure = self.state()["failure"]
         self.assertEqual(failure["reason"], "WAITING_REPAIR_EXHAUSTED")
         self.assertEqual(failure["detail"]["last_review_cycle"], 3)
         self.assertEqual(failure["detail"]["corrections_used"], 2)
         self.assertTrue(failure["detail"]["same_findings_as_previous_cycle"])
-        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
+        # A fixable exit stays resumable: a resume retries it autonomously.
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
         self.assertEqual(len(self.reviewer.requests), 3)
         self.assertEqual(self.workers.roles(), ["implementer", "reviser", "reviser"])
 
@@ -327,7 +330,7 @@ class SemanticRevisionTests(PipelineHarness):
             "UNAVAILABLE",
         )
 
-    def test_semantic_worker_scope_violation_is_a_hard_stop(self) -> None:
+    def test_semantic_worker_scope_violation_is_not_a_hard_stop(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.REVISER, write("other.txt", "unsafe\n"))
         result = self.orchestrator(
@@ -335,7 +338,8 @@ class SemanticRevisionTests(PipelineHarness):
             reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.FAILED)
+        # A neighbour write is rolled back and waits for a resume; never fatal.
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
         self.assertEqual(self.workers.roles(), ["implementer", "reviser"])
         self.assertEqual(self.reviewer.requests, [])

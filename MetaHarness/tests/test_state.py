@@ -569,9 +569,9 @@ PROJECTION_MATRIX = (
     (R.CANDIDATE_PUSH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_REMOTE, True, True),
     (R.PUBLISH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_REMOTE, True, True),
     (R.FINAL_REVIEW, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_EXTERNAL, True, True),
-    # Only the bounded repair slots a human may retry stay resumable.
-    (R.IMPLEMENT_STEP, D.WAIT_HUMAN, "STEP_CONTRACT_REPAIR_OUTPUT_INVALID", RunStatus.WAITING_CONTRACT_REPAIR, True, True),
-    (R.DETERMINISTIC_GATE, D.WAIT_HUMAN, "CHECK_REPAIR_EXHAUSTED", RunStatus.WAITING_CHECK_REPAIR, True, True),
+    # An exhausted bounded repair slot waits for a resume, never a decision.
+    (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, "STEP_CONTRACT_REPAIR_OUTPUT_INVALID", RunStatus.WAITING_CONTRACT_REPAIR, True, True),
+    (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_REPAIR_EXHAUSTED", RunStatus.WAITING_CHECK_REPAIR, True, True),
     (R.FINAL_REVIEW, D.WAIT_HUMAN, "CHECK_REPAIR_EXHAUSTED", RunStatus.WAITING_HUMAN, False, False),
     # An operator gate owns its durable pending operation; a human wait with
     # no gate and no repair slot owns nothing to resume.
@@ -699,8 +699,8 @@ class RunMachineTests(unittest.TestCase):
             ("waiting_check_infrastructure", D.WAIT_EXTERNAL),
             ("waiting_remote", D.WAIT_EXTERNAL),
             ("waiting_human", D.WAIT_HUMAN),
-            ("waiting_contract_repair", D.WAIT_HUMAN),
-            ("waiting_check_repair", D.WAIT_HUMAN),
+            ("waiting_contract_repair", D.WAIT_EXTERNAL),
+            ("waiting_check_repair", D.WAIT_EXTERNAL),
             ("failed", D.FAILED),
             ("interrupted", D.FAILED),
             ("committed", D.COMPLETED),
@@ -741,7 +741,7 @@ class RunMachineTests(unittest.TestCase):
 
     def test_a_run_state_written_before_the_vocabulary_is_read_through_the_bridge(self) -> None:
         for status, disposition in (
-            ("waiting_check_repair", D.WAIT_HUMAN),
+            ("waiting_check_repair", D.WAIT_EXTERNAL),
             ("waiting_remote", D.WAIT_EXTERNAL),
             ("failed", D.FAILED),
         ):
@@ -768,11 +768,11 @@ class RunStateProjectionTests(unittest.TestCase):
 
     def test_set_run_state_derives_the_status_from_the_posture(self) -> None:
         state = self.store.set_run_state(
-            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_HUMAN, "CHECK_REPAIR_EXHAUSTED"),
+            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_REPAIR_EXHAUSTED"),
             current_step=None,
         )
         self.assertEqual(state["status"], RunStatus.WAITING_CHECK_REPAIR.value)
-        self.assertEqual(state["disposition"], D.WAIT_HUMAN.value)
+        self.assertEqual(state["disposition"], D.WAIT_EXTERNAL.value)
         self.assertEqual(state["phase"], RunPhase.DETERMINISTIC_GATE.value)
         self.assertEqual(state["reason"], "CHECK_REPAIR_EXHAUSTED")
         self.assertEqual(self.store.load()["status"], RunStatus.WAITING_CHECK_REPAIR.value)
@@ -797,7 +797,7 @@ class RunStateProjectionTests(unittest.TestCase):
 
     def test_a_metadata_update_never_moves_the_machine_state(self) -> None:
         before = self.store.set_run_state(
-            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_HUMAN, "CHECK_REPAIR_EXHAUSTED"),
+            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_REPAIR_EXHAUSTED"),
         )
         machine_before = self.store.machine_state()
         after = self.store.update_metadata(checks=[{"name": "test", "ok": True}])

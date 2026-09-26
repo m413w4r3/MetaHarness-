@@ -21,7 +21,7 @@ from metaharness.planning.protocol import (
     parse_step_contract_repair,
 )
 from metaharness.orchestration import contract_repair
-from metaharness.resume import ResumeNotAllowedError, resume_info
+from metaharness.resume import resume_info
 from metaharness.run_options import RunOptions
 from tests.pipeline.support import SPEC, STEP, repaired_step_contract
 from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
@@ -525,12 +525,12 @@ class OutputCorrectionTests(ContractRepairFixtures):
             with_paths(repaired_step_contract(), *extra), options=options, config=config,
         )
 
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
+        # A denied scope is a fixable planner answer, never a human decision.
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "CONTRACT_REPAIR_SCOPE_DENIED")
         self.assert_no_false_mismatch()
         self.assertEqual(len(self.workers.calls), 1)
         self.assertEqual(len(self.planner.requests), 2)
-        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
 
 
 class PlanCountRepairTests(ContractRepairFixtures):
@@ -605,21 +605,17 @@ class PlanCountRepairTests(ContractRepairFixtures):
         })
         self.assertEqual(self.workers.calls[-2].mutable_paths, ("feature.txt",))
 
-class ContractRepairOperatorDecisionTests(ContractRepairFixtures):
-    """A genuine operator decision is never resumed automatically."""
+class ContractRepairExhaustionTests(ContractRepairFixtures):
+    """A spent contract repair settles its step instead of asking an operator."""
 
-    def test_a_genuine_waiting_human_stays_non_resumable(self) -> None:
+    def test_a_spent_contract_repair_never_waits_for_a_human(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, mismatch, mismatch)
         result = self.orchestrator(
             self.config(max_step_contract_repairs=2),
             planner=[initial_plan(STEP), repaired_step_contract()], reviewer=["unused"],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
 
-        info = resume_info(self.run_dir(), self.state())
-
-        self.assertFalse(info.resumable)
-        self.assertIsNone(info.operation)
-        with self.assertRaises(ResumeNotAllowedError):
-            self.resume(["planner must not be called"])
-        self.assertEqual(self.planner.requests, [])
+        self.assertNotIn(result.status, {RunStatus.WAITING_HUMAN, RunStatus.FAILED})
+        record = json.loads((self.step_dir() / "step.json").read_text(encoding="utf-8"))
+        self.assertEqual((record["status"], record["reason"]), ("FAILED_CONTINUED", "AGENT_CONTRACT_MISMATCH"))
+        self.assertIn("replan_step", record["strategies"])

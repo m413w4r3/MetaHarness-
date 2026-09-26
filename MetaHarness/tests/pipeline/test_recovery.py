@@ -160,7 +160,8 @@ class RecoveryPathTests(PipelineHarness):
         # the planner nothing.
         self.assertEqual(self.planner.requests, [])
         state = self.state()
-        self.assertEqual(resumed.status, RunStatus.WAITING_HUMAN)
+        # A fixed point is an ordinary FIXABLE end, never a human decision.
+        self.assertEqual(resumed.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(state["failure"]["reason"], "CHECK_REPAIR_FIXED_POINT")
         self.assertEqual(state["check_repair"]["status"], "fixed_point")
         self.assertEqual(state["failure"]["detail"]["fixed_point_fingerprint"], fingerprint)
@@ -515,7 +516,7 @@ class RecoveryPathTests(PipelineHarness):
         self.assertEqual(first.mutable_paths, second.mutable_paths)
         self.assertEqual(first.profile_id, second.profile_id)
 
-    def test_out_of_scope_timeout_is_a_hard_stop_without_retry(self) -> None:
+    def test_out_of_scope_timeout_is_rolled_back_and_the_step_failed_continued(self) -> None:
         from metaharness.agent import AgentRunResult
         from metaharness.gitops import candidate_tree_sha
 
@@ -532,8 +533,17 @@ class RecoveryPathTests(PipelineHarness):
         result = self.orchestrator(
             self.config(), planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
+        # A neighbour write is not fatal: the whole attempt is restored to the
+        # last green tree and the step is settled, never a hard stop.
+        self.assertNotIn(result.status, {RunStatus.FAILED, RunStatus.WAITING_HUMAN})
+        record = json.loads((self.run_dir() / "cycles/001/implementation/steps/S01/step.json").read_text())
+        self.assertEqual(record["status"], "FAILED_CONTINUED")
+        self.assertEqual(record["reason"], "AGENT_SCOPE_VIOLATION")
+        self.assertEqual(record["changed_paths"], ["other.txt"])
+        self.assertEqual(git(self.worktree(), "status", "--porcelain"), "")
+        self.assertNotEqual(
+            (self.worktree() / "other.txt").read_text(encoding="utf-8"), "unsafe\n",
+        )
         self.assertEqual(self.workers.roles(), ["implementer"])
 
     def test_in_scope_timeout_without_exact_rollback_requires_operator(self) -> None:

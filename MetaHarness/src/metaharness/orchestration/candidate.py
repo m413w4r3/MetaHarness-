@@ -283,7 +283,6 @@ class CandidateRemoteStaging:
                 admission = self._recovery.admit(
                     key, reason="PUSH_FAILED", budget=self._budgets.max_transient_attempts,
                     phase="candidate_push", cycle=cycle, tree_before=tree, tree_after=tree,
-                    facts={"remote_required": self._remote_required},
                 )
                 if not admission.admitted:
                     unavailable = self._unavailable(

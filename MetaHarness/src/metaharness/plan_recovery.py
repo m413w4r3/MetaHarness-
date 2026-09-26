@@ -37,13 +37,8 @@ MAX_REPLACEMENT_PLAN_BYTES = 2 * 1024 * 1024
 # executable plan crossed the approval boundary.  The pair is authoritative: a
 # planner failure recorded in any other posture is not recoverable here.
 RECOVERABLE_PLANNER_STATES = frozenset({
-    (RunDisposition.FAILED, "PLANNER_OUTPUT_INVALID"),
-    # Both planner answers violated the repository preconditions.
-    (RunDisposition.FAILED, "PLAN_REPOSITORY_PRECONDITION_INVALID"),
-    (RunDisposition.FAILED, "LLM_FAILURE"),
-    # The waiting postures project the same failures onto their retry boundary.
-    (RunDisposition.WAIT_HUMAN, "PLANNER_OUTPUT_INVALID"),
-    (RunDisposition.WAIT_HUMAN, "PLAN_REPOSITORY_PRECONDITION_INVALID"),
+    (RunDisposition.WAIT_EXTERNAL, "PLANNER_OUTPUT_INVALID"),
+    (RunDisposition.WAIT_EXTERNAL, "PLAN_REPOSITORY_PRECONDITION_INVALID"),
     (RunDisposition.WAIT_EXTERNAL, "LLM_FAILURE"),
 })
 PLAN_SOURCE_OPERATOR = "operator_recovery"

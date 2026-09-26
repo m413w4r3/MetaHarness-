@@ -62,7 +62,7 @@ from ..profiles import (
     profile_for_role,
 )
 from ..redaction import redact
-from ..recovery_policy import classify_failure
+from ..recovery_policy import FailureClass, RecoveryDecision, RecoveryStrategy
 from ..repository_topology import RepositoryTopology
 from ..result import atomic_write_text
 from ..state import RunStateStore
@@ -319,8 +319,8 @@ class ContractRecoveryService:
                     mismatch_retry_count=semantic_attempt, step_dir=artifact_dir,
                 ) from exc
         progress = progress_of(contract_repair.read_transaction(directory) or {})
-        decision = classify_failure(
-            "AGENT_CONTRACT_MISMATCH", clean_contract_mismatch=True, rollback_succeeded=True,
+        decision = RecoveryDecision(
+            FailureClass.FIXABLE, RecoveryStrategy.REPLAN_STEP, "the step contract was replanned",
         )
         # One semantic record per repair, whatever the number of resumes.
         recovery.record(RecoveryAttempt(

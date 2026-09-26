@@ -97,7 +97,8 @@ class CheckRepairTests(PipelineHarness):
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.FAILED)
+        # The out-of-scope repair is discarded; a scope mistake is never fatal.
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
         repair_request = self.workers.calls[-1]
         self.assertEqual(repair_request.mutable_paths, ("feature.txt",))
@@ -138,7 +139,8 @@ class CheckRepairTests(PipelineHarness):
             config, planner=[initial_plan(STEP)], reviewer=[review()],
         ).run_text(SPEC, run_id="run", run_options=options)
 
-        self.assertEqual(result.status, RunStatus.FAILED)
+        # The out-of-scope repair is discarded; a scope mistake is never fatal.
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual(self.state()["failure"]["reason"], "AGENT_SCOPE_VIOLATION")
         self.assertFalse(
             (self.run_dir() / "cycles/001/checks/post-implementation/accepted.json").exists()
@@ -338,7 +340,7 @@ class CheckRepairTests(PipelineHarness):
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.FAILED, self.state().get("failure"))
         failure = self.state()["failure"]
-        self.assertEqual(failure["reason"], "COMMIT_GATE_FAILED", failure)
+        self.assertEqual(failure["reason"], "COMMIT_SECURITY_FAILURE", failure)
         self.assertIn("UNREVIEWABLE_TEXT_DIFF:feature.txt", failure["detail"])
         self.assertEqual(self.workers.roles(), ["implementer"])
         self.assertEqual(self.reviewer.requests, [])
@@ -902,7 +904,7 @@ class CheckRepairTests(PipelineHarness):
 
         terminal = gate(facts())
         self.assertTrue(terminal.exhausted)
-        self.assertIs(terminal.strategy, RecoveryStrategy.WAIT_HUMAN)
+        self.assertIs(terminal.strategy, RecoveryStrategy.MARK_FAILED_CONTINUE)
         self.assertEqual(terminal.consumed, ())
         ladder_dir = self.run_dir() / "cycles/001/check-repair/post-implementation"
         self.assertFalse((ladder_dir / "ladder.json").exists())
@@ -971,7 +973,7 @@ class CheckRepairTests(PipelineHarness):
 
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
-        terminal = GateRecoveryStep(RecoveryStrategy.WAIT_HUMAN, exhausted=True)
+        terminal = GateRecoveryStep(RecoveryStrategy.MARK_FAILED_CONTINUE, exhausted=True)
         consulted: list[int] = []
 
         def gate_step(_ladder, **_kwargs):

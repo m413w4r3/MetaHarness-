@@ -37,6 +37,7 @@ from .models import (
     assemble_run_state,
     project_run_outcome,
 )
+from .recovery_policy import FailureClass, classify_failure
 from .result import atomic_write_text
 from .run_options import RUN_SCHEMA_UNSUPPORTED
 from .step_ids import STEP_ID_RE
@@ -280,20 +281,6 @@ CHECKPOINT_INTEGRITY_OPERATION = "checkpoint_integrity"
 # Exact exhausted check-repair state.
 CHECK_REPAIR_RETRY_OPERATION = "check_repair_retry"
 CHECK_REPAIR_INTEGRITY_OPERATION = "check_repair_integrity"
-# Failures that a checkpoint can never repair: the run needs an operator.
-_TERMINAL_FAILURES = frozenset({
-    "RESUME_INTEGRITY_FAILURE", "RESUME_REQUIRES_OPERATOR",
-    "AGENT_SCOPE_VIOLATION", "AGENT_GIT_VIOLATION",
-    "SECRET_IN_DIFF", "SECRET_IN_STAGED_BLOB", "UNSCANNABLE_STAGED_BLOB",
-    "STAGED_BLOB_SCAN_FAILED", "UNREVIEWABLE_TEXT_DIFF",
-    "HEAD_MISMATCH", "TREE_MISMATCH", "UNEXPECTED_HEAD", "UNEXPECTED_TREE",
-    "COMMIT_TREE_MISMATCH", "INTEGRITY_MISMATCH",
-    "COMMIT_GATE_FAILED",
-    "DURABLE_ARTIFACT_CORRUPTED", "CORRUPTED_DURABLE_ARTIFACT",
-    "ROLLBACK_FAILED", "ROLLBACK_TREE_MISMATCH",
-    "CHECK_MUTATED_FORBIDDEN_FILES",
-    "CHECK_REPAIR_FIXED_POINT",
-})
 
 
 def resume_label(checkpoint: ResumeCheckpoint) -> str:
@@ -412,8 +399,11 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     if state.get("planning_protocol") != "v2":
         return ResumeInfo(False, reason="only pipeline v2 runs can be resumed")
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-    if failure.get("reason") in _TERMINAL_FAILURES:
-        return ResumeInfo(False, reason="the run requires an operator")
+    reason = failure.get("reason")
+    if isinstance(reason, str) and reason.strip() and (
+        classify_failure(reason).failure_class is FailureClass.FATAL
+    ):
+        return ResumeInfo(False, reason="the run stopped at a fatal boundary")
     if state.get("recovery_resumable") is False:
         return ResumeInfo(False, reason="the run stopped at a non-resumable failure")
     if checkpoint is None:
@@ -453,7 +443,7 @@ def _check_repair_exhaustion_info(
         and failure.get("reason") == CHECK_REPAIR_WAIT_REASON
         and checkpoint is not None
         and machine_state_for_run(state, checkpoint).disposition
-        is RunDisposition.WAIT_HUMAN
+        is RunDisposition.WAIT_EXTERNAL
     ):
         return None
 

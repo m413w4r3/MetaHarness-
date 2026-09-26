@@ -48,6 +48,7 @@ from ..gitops import (
 )
 from ..redaction import redact
 from ..resume import ResumePhase, read_checkpoint
+from ..recovery_policy import FailureClass, classify_failure
 from ..result import atomic_write_text
 from ..state import RunStateStore
 from ..usage import normalize_usage
@@ -388,8 +389,11 @@ class StepAcceptanceService:
             }))
         except OSError:
             pass
+        # A security refusal keeps its own fatal code; every other refusal is
+        # the ordinary, fixable commit-gate failure.
+        fatal = classify_failure(code).failure_class is FailureClass.FATAL
         return PipelineFailure(
-            "COMMIT_GATE_FAILED",
+            code if fatal else COMMIT_GATE_FAILED,
             f"{code}: {message} (authority {authority.authority_sha256[:16]})",
             step_id=authority.step_id,
         )

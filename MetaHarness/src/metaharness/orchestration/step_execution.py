@@ -27,6 +27,9 @@ from ..agent.base import (
     AGENT_SCOPE_VIOLATION,
 )
 from ..attempt_transaction import (
+    AttemptBoundary,
+    AttemptViolation,
+    CandidateAttemptTransaction,
     git_ownership,
     ownership_violations,
     status_has_unstaged_or_untracked,
@@ -44,14 +47,18 @@ from ..gitops import (
 from ..models import ExecutionRole, ImplementationStep
 from ..profiles import profile_for_role
 from ..recovery_policy import (
+    FailureClass,
+    RecoveryDecision,
     RecoveryStrategy,
     classify_failure,
 )
 from ..result import atomic_write_text
+from ..usage import normalize_usage
 from ..resume import read_checkpoint
 from ..state import RunStateStore
 from . import contract_repair
 from .contract_repair import ContractRepairIntegrityError
+from .durable_readers import FAILED_CONTINUED, SKIPPED_DEPENDENCY, settled_step_status
 from .pipeline_v2 import (
     CyclePlan,
     PipelineFailure,
@@ -77,7 +84,6 @@ from .step_authority import (
     approved_step_contract,
     write_authority_diagnostic,
 )
-from .worker_recovery import TRANSIENT_WORKER_FAILURES
 
 
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
@@ -97,6 +103,18 @@ class StepExecutionService:
 
         step = cycle_plan.plan.steps[index]
         step_artifact_dir = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
+        if settled_step_status(step_artifact_dir, step.id) is not None:
+            return
+        # A dependent of a settled step is skipped; a skip settles it too, so
+        # the whole transitive chain of DEPENDS_ON is skipped in plan order.
+        dependency = step.depends_on
+        if dependency and settled_step_status(
+            cycle_step_dir(ctx.run_dir, cycle_plan.cycle, dependency), dependency,
+        ):
+            self._settle(store, ctx, cycle_plan, step, {
+                "status": SKIPPED_DEPENDENCY, "depends_on": dependency,
+            })
+            return
         # A previous failed attempt of this same step keeps its artifacts.
         archive_attempt(step_artifact_dir)
         contract = approved_step_contract(cycle_plan, step)
@@ -112,26 +130,36 @@ class StepExecutionService:
         reviewer_profile = profile_for_role(
             self.runtime.config, ctx.selection.final_reviewer.profile_id, ExecutionRole.REVIEWER
         )
-        execution = self._execute_step_attempts(
-            store=store, run_dir=ctx.run_dir, original_spec=ctx.spec,
-            original_plan_identity=json_text(
-                asdict(checkpoint.plan_identity) if checkpoint and checkpoint.plan_identity else {}
-            ),
-            repo=ctx.repo, worktree=ctx.info.worktree, base_sha=parent_sha,
-            branch_ref=ctx.branch_ref,
-            ownership_before=git_ownership(ctx.repo, ctx.info.worktree),
-            expected_tree=(
-                checkpoint.expected_tree_sha if checkpoint is not None
-                else candidate_tree_sha(ctx.info.worktree)
-            ),
-            step=step, contract=contract,
-            expected_plan_step_count=len(cycle_plan.plan.steps),
-            profile_id=cycle_plan.step_profile_ids[step.id],
-            fallback_profile_ids=(cycle_plan.step_fallback_profile_ids or {}).get(step.id, ()),
-            artifact_dir=step_artifact_dir,
-            forbidden_env_names=(planner_profile.api_key_env, reviewer_profile.api_key_env),
-            future_ownership=future_step_ownership(cycle_plan.plan.steps, index),
+        # The last green tree this step must leave behind if it is abandoned.
+        green = AttemptBoundary(
+            checkpoint.expected_tree_sha if checkpoint is not None
+            else candidate_tree_sha(ctx.info.worktree),
+            status_porcelain(ctx.info.worktree),
+            git_ownership(ctx.repo, ctx.info.worktree),
         )
+        try:
+            execution = self._execute_step_attempts(
+                store=store, run_dir=ctx.run_dir, original_spec=ctx.spec,
+                original_plan_identity=json_text(
+                    asdict(checkpoint.plan_identity) if checkpoint and checkpoint.plan_identity else {}
+                ),
+                repo=ctx.repo, worktree=ctx.info.worktree, base_sha=parent_sha,
+                branch_ref=ctx.branch_ref, ownership_before=green.ownership,
+                expected_tree=green.tree, step=step, contract=contract,
+                expected_plan_step_count=len(cycle_plan.plan.steps),
+                profile_id=cycle_plan.step_profile_ids[step.id],
+                fallback_profile_ids=(cycle_plan.step_fallback_profile_ids or {}).get(step.id, ()),
+                artifact_dir=step_artifact_dir,
+                forbidden_env_names=(planner_profile.api_key_env, reviewer_profile.api_key_env),
+                future_ownership=future_step_ownership(cycle_plan.plan.steps, index),
+            )
+        except StepExecutionFailure as failure:
+            if classify_failure(failure.reason).failure_class is not FailureClass.FIXABLE:
+                raise
+            self._mark_failed_continue(
+                store, ctx, cycle_plan, step, failure, green=green, parent_sha=parent_sha,
+            )
+            return
         self.runtime.step_acceptance.accept_execution(
             store, ctx, cycle_plan, index, execution, parent_sha=parent_sha,
         )
@@ -140,6 +168,80 @@ class StepExecutionService:
             steps=self.runtime.composition.state_steps(ctx, cycle_plan),
         )
         self.runtime.observability.update_v2_usage(store, ctx.run_dir)
+
+    def _mark_failed_continue(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
+        step: ImplementationStep, failure: StepExecutionFailure, *,
+        green: AttemptBoundary, parent_sha: str,
+    ) -> None:
+        """MARK_FAILED_CONTINUE: prove the last green tree, then settle the step.
+
+        Only an exact restoration of the pre-step tree, index and Git ownership
+        lets the run continue; anything else is ``ROLLBACK_FAILED``.
+        """
+
+        transaction = CandidateAttemptTransaction(
+            ctx.repo, ctx.info.worktree, green, branch_ref=ctx.branch_ref,
+            base_sha=parent_sha, secrets=self.runtime.secrets,
+        )
+        try:
+            transaction.audit_ownership()
+            tree, changed = transaction.freeze()
+            if tree != green.tree:
+                transaction.scan()
+            transaction.rollback(changed)
+        except AttemptViolation as violation:
+            code = (
+                violation.code if classify_failure(violation.code).failure_class is FailureClass.FATAL
+                and violation.code != "RESUME_REQUIRES_OPERATOR" else "ROLLBACK_FAILED"
+            )
+            raise PipelineFailure(
+                code, f"{failure.reason}: {violation.detail}", step_id=step.id,
+            ) from violation
+        directory = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
+        decision = classify_failure(failure.reason, exhausted=True)
+        strategies = [
+            item.get("strategy") for item in store.load().get("recovery_attempts") or ()
+            if isinstance(item, dict) and item.get("step_id") == step.id
+            and item.get("cycle") == self.runtime.trace_cycle
+        ]
+        if failure.profile_id not in {None, cycle_plan.step_profile_ids.get(step.id)}:
+            strategies.append(RecoveryStrategy.FALLBACK_EXECUTOR.value)
+        if (directory / "contract_repairs").is_dir():
+            strategies.append(RecoveryStrategy.REPLAN_STEP.value)
+        self._settle(store, ctx, cycle_plan, step, {
+            "status": FAILED_CONTINUED, "reason": failure.reason,
+            "detail": bounded_v2_report(str(failure.detail or "")),
+            "strategies": list(dict.fromkeys((*strategies, decision.strategy.value))),
+            "profile_id": failure.profile_id, "changed_paths": list(changed),
+            "tree_before": green.tree, "tree_after": green.tree, "tree_restored": green.tree,
+            "usage": normalize_usage(failure.usage),
+        })
+        self.runtime.recovery(store).trace(
+            "recovery.failed_continued", reason=failure.reason, decision=decision,
+            attempt=1, tree_before=tree, tree_after=green.tree, budget_remaining=0,
+            phase="implementation", cycle=self.runtime.trace_cycle, step_id=step.id,
+        )
+
+    def _settle(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
+        step: ImplementationStep, record: Mapping[str, object],
+    ) -> None:
+        """Persist a step the run abandons while its independent steps go on."""
+
+        directory = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
+        archive_attempt(directory)
+        atomic_write_text(directory / "step.json", json_text({"id": step.id, **record}))
+        self.runtime.observability.trace_emit(
+            "step." + str(record["status"]).casefold(), phase="implementation",
+            cycle=self.runtime.trace_cycle, step_id=step.id,
+            data={key: value for key, value in record.items() if key != "usage"},
+        )
+        store.update_metadata(
+            current_step=None,
+            steps=self.runtime.composition.state_steps(ctx, cycle_plan),
+        )
+
     def _execute_step_attempts(
         self,
         *,
@@ -295,8 +397,15 @@ class StepExecutionService:
                     return EffectiveStepExecution(self.runtime.worker_attempt.no_change_outcome(
                         failure, artifact_dir, worktree=worktree, expected_head=base_sha,
                     ), authority)
+                rolled_back = (
+                    failure.tree_before is not None and failure.tree_after == failure.tree_before
+                )
+                retryable = (
+                    rolled_back and failure.reason != "AGENT_CONTRACT_MISMATCH"
+                    and not classify_failure(failure.reason).strategy.terminal
+                )
                 if (
-                    failure.reason in TRANSIENT_WORKER_FAILURES
+                    retryable
                     and recovery.used(retry_key) >= self.runtime.run_options.recovery.max_transient_attempts
                     and fallback_index < len(fallback_ids)
                 ):
@@ -321,7 +430,13 @@ class StepExecutionService:
                     }))
                     store.update_metadata(current_step=step.id)
                     continue
-                if failure.reason != "AGENT_CONTRACT_MISMATCH":
+                if retryable and classify_failure(failure.reason).failure_class is FailureClass.FIXABLE:
+                    # REPLAN_STEP: the contract repair planner rewrites this
+                    # step from the failure itself, on the restored tree.
+                    failure.mismatch = failure.mismatch or bounded_v2_report(
+                        f"{failure.reason}: {failure.detail or 'the worker attempt failed'}"
+                    )
+                elif failure.reason != "AGENT_CONTRACT_MISMATCH":
                     failure.step_dir = artifact_dir
                     raise
                 if failure.tree_before is None or failure.mismatch is None:
@@ -359,24 +474,19 @@ class StepExecutionService:
                     failure.detail = (failure.detail or "worker reported a contract mismatch") + "; failed to restore attempt tree"
                     failure.step_dir = artifact_dir
                     raise
-                recovery_decision = classify_failure(
-                    "AGENT_CONTRACT_MISMATCH",
-                    tree_changed_in_scope=bool(changed),
-                    clean_contract_mismatch=True,
-                    rollback_succeeded=True,
+                recovery_decision = RecoveryDecision(
+                    classify_failure(failure.reason).failure_class,
+                    RecoveryStrategy.REPLAN_STEP, "the step contract is replanned",
                 )
                 recovery_attempt = repair_count + 1
                 recovery.trace(
-                    "recovery.classified", reason="AGENT_CONTRACT_MISMATCH",
+                    "recovery.classified", reason=failure.reason,
                     decision=recovery_decision, attempt=recovery_attempt,
                     tree_before=failure.tree_before, tree_after=failure.tree_before,
                     budget_remaining=max(0, max_repairs - repair_count),
                     phase="implementation", cycle=cycle_number,
                     step_id=step.id,
                 )
-                if recovery_decision.strategy is not RecoveryStrategy.REPAIR_TARGETED:
-                    failure.step_dir = artifact_dir
-                    raise
                 archive_attempt(artifact_dir)
                 if repair_count >= max_repairs:
                     if failure.mismatch in {
@@ -386,18 +496,14 @@ class StepExecutionService:
                         return EffectiveStepExecution(self.runtime.worker_attempt.no_change_outcome(
                             failure, artifact_dir, worktree=worktree, expected_head=base_sha,
                         ), authority)
-                    exhausted = classify_failure(
-                        "AGENT_CONTRACT_MISMATCH", clean_contract_mismatch=True,
-                        budget_exhausted=True,
-                    )
                     recovery.trace(
-                        "recovery.exhausted", reason="AGENT_CONTRACT_MISMATCH",
-                        decision=exhausted, attempt=recovery_attempt,
+                        "recovery.exhausted", reason=failure.reason,
+                        decision=classify_failure(failure.reason, exhausted=True), attempt=recovery_attempt,
                         tree_before=failure.tree_before, tree_after=failure.tree_before,
                         budget_remaining=0, phase="implementation",
                         cycle=cycle_number, step_id=step.id,
                     )
-                    failure.detail = (failure.detail or "worker reported a contract mismatch") + "; contract repair budget exhausted"
+                    failure.detail = (failure.detail or "worker reported a contract mismatch") + "; step replan budget exhausted"
                     failure.tree_after = failure.tree_before
                     failure.index_tree_after = failure.tree_before
                     failure.step_dir = artifact_dir
@@ -418,7 +524,7 @@ class StepExecutionService:
                     ) from exc
                 repair_count += 1
                 recovery.trace(
-                    "recovery.started", reason="AGENT_CONTRACT_MISMATCH",
+                    "recovery.started", reason=failure.reason,
                     decision=recovery_decision, attempt=recovery_attempt,
                     tree_before=failure.tree_before, tree_after=failure.tree_before,
                     budget_remaining=max(0, max_repairs - repair_count),

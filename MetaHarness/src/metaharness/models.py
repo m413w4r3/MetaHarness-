@@ -722,17 +722,18 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
             RunStatus.INTERRUPTED if reason == INTERRUPTED_REASON else RunStatus.FAILED
         )
         return RunOutcome(phase, disposition, status, False, True)
+    slot = _REPAIR_SLOT_WAITS.get((reason or "", phase))
     if disposition is RunDisposition.WAIT_EXTERNAL:
-        if reason in _CHECK_INFRASTRUCTURE_REASONS:
+        if slot is not None:
+            # An exhausted repair slot is retried by a resume, never decided.
+            status = slot
+        elif reason in _CHECK_INFRASTRUCTURE_REASONS:
             status = RunStatus.WAITING_CHECK_INFRASTRUCTURE
         elif reason in _REMOTE_REASONS and phase in _REMOTE_PHASES:
             status = RunStatus.WAITING_REMOTE
         else:
             status = RunStatus.WAITING_EXTERNAL
         return RunOutcome(phase, disposition, status, True, True)
-    slot = _REPAIR_SLOT_WAITS.get((reason or "", phase))
-    if slot is not None:
-        return RunOutcome(phase, disposition, slot, True, True)
     if reason == SCOPE_APPROVAL_REASON:
         return RunOutcome(phase, disposition, RunStatus.WAITING_SCOPE_APPROVAL, True, True)
     if reason == PLAN_REJECTED_REASON:
@@ -749,9 +750,9 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.WAITING_SCOPE_APPROVAL: RunDisposition.WAIT_HUMAN,
     RunStatus.WAITING_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_CHECK_INFRASTRUCTURE: RunDisposition.WAIT_EXTERNAL,
-    RunStatus.WAITING_CHECK_REPAIR: RunDisposition.WAIT_HUMAN,
+    RunStatus.WAITING_CHECK_REPAIR: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_REMOTE: RunDisposition.WAIT_EXTERNAL,
-    RunStatus.WAITING_CONTRACT_REPAIR: RunDisposition.WAIT_HUMAN,
+    RunStatus.WAITING_CONTRACT_REPAIR: RunDisposition.WAIT_EXTERNAL,
     RunStatus.PLAN_REJECTED: RunDisposition.WAIT_HUMAN,
     RunStatus.PREPARING: RunDisposition.RUNNING,
     RunStatus.IMPLEMENTING: RunDisposition.RUNNING,

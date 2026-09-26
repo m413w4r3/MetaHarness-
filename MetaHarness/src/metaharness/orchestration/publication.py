@@ -417,9 +417,7 @@ class PublicationService:
     ) -> RunResult:
         """A required publication remote is unavailable: wait, keep the candidate."""
 
-        decision, terminal = project_exit(
-            "PUSH_FAILED", phase=ResumePhase.PUBLISH, remote_required=True,
-        )
+        decision, terminal = project_exit("PUSH_FAILED", phase=ResumePhase.PUBLISH)
         self.runtime.recovery(store).trace(
             "recovery.exhausted", reason="PUSH_FAILED", decision=decision,
             attempt=1, tree_before=approved_tree, tree_after=approved_tree,

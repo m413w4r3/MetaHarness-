@@ -573,7 +573,7 @@ class PipelineV2Coordinator:
                 {"summary": review.summary, "findings": review.findings},
             )
         if review.route is ReviewRoute.HUMAN:
-            return ops.request_human(ctx, cycle.number, review, "HUMAN_REQUIRED")
+            return ops.request_human(ctx, cycle.number, review, "REVIEW_HUMAN_REQUIRED")
         if review.route not in {ReviewRoute.IMPLEMENTATION, ReviewRoute.REPLAN}:
             return ops.request_human(ctx, cycle.number, review, "HUMAN_REQUIRED")
         # One budget bounds every cycle after INITIAL, review or red-gate.

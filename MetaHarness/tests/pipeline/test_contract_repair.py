@@ -93,12 +93,11 @@ class ContractRepairTests(PipelineHarness):
         ).run_text(SPEC, run_id="residual-mismatch")
 
         worktree = self.worktree("residual-mismatch")
-        # Exhausted contract repair is a correctness decision for an operator.
-        self.assertEqual(result.status, RunStatus.WAITING_HUMAN)
-        self.assertEqual(
-            self.state("residual-mismatch")["failure"]["reason"],
-            "AGENT_CONTRACT_MISMATCH",
-        )
+        # An exhausted contract replan settles the step; no operator decision.
+        self.assertNotIn(result.status, {RunStatus.WAITING_HUMAN, RunStatus.FAILED})
+        step = self.run_dir("residual-mismatch") / "cycles/001/implementation/steps/S01/step.json"
+        record = json.loads(step.read_text())
+        self.assertEqual((record["status"], record["reason"]), ("FAILED_CONTINUED", "AGENT_CONTRACT_MISMATCH"))
         self.assertEqual(git(worktree, "rev-parse", "HEAD"), self.base_sha)
         self.assertEqual(git(worktree, "status", "--porcelain"), "")
         self.assertEqual((worktree / "feature.txt").read_text(), "base\n")

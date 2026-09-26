@@ -37,16 +37,7 @@ from ..planning.check_replan import (
     check_replan_dir,
     plan_identity,
 )
-from ..recovery_policy import (
-    FailureClass,
-    RecoveryFacts,
-    RecoveryFingerprint,
-    RecoveryProgression,
-    RecoveryStrategy,
-    admitted_strategies,
-    recovery_ladder,
-    terminal_strategy,
-)
+from ..recovery_policy import RecoveryStrategy, classify_failure
 from ..result import atomic_write_text
 from ..resume import ResumeIntegrityError
 from ..run_options import effective_repair_scope_policy
@@ -74,7 +65,13 @@ from .shared import (
 
 _LADDER_ARTIFACT = "ladder.json"
 _LADDER_SCHEMA_VERSION = 1
-_LADDER_CODE = "CHECK_FAILED"
+# The ladder of one red gate, in order; its end is the last step of the
+# ``CHECK_REPAIR_EXHAUSTED`` class ladder, never a human wait.
+_GATE_LADDER = (
+    RecoveryStrategy.REPAIR_TARGETED, RecoveryStrategy.EXPAND_SCOPE,
+    RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.REPLAN_CYCLE,
+    RecoveryStrategy.FALLBACK_EXECUTOR,
+)
 _MAX_LADDER_ENTRIES = 64
 _LADDER_STATES = frozenset({"running", "done"})
 # Strategies the ladder consumes at most once per gate episode.
@@ -247,11 +244,7 @@ class CheckRepairLadder:
                 repair_attempt=pending.repair_attempt, step_indices=pending.step_indices,
                 added_paths=pending.added_paths, consumed=self._trail(ledger),
             )
-        facts = self._facts(ledger, tree=tree, failed=failed, number=number, stage=stage_value)
-        progression = RecoveryProgression(self._consumed(ledger, number=number, stage=stage_value))
-        for strategy in recovery_ladder(FailureClass.CORRECTNESS):
-            if strategy.terminal or not self._policy_admits(strategy, facts):
-                continue
+        for strategy in _GATE_LADDER:
             if strategy is RecoveryStrategy.REPAIR_TARGETED and proof:
                 # The failure evidence proves an approved path the frozen
                 # repair scope cannot reach: the bounded expansion is the next
@@ -281,23 +274,17 @@ class CheckRepairLadder:
                 # Deterministically inapplicable for these exact facts:
                 # advance the ladder without executing anything.
                 continue
-            if not resuming and progression.is_consumed(progression.fingerprint(
-                candidate_tree=tree, failure_class=FailureClass.CORRECTNESS,
-                facts=facts, strategy=strategy,
-            )):
+            if not resuming and any(
+                entry.strategy is strategy and entry.tree == tree
+                and entry.failed_check_ids == failed for entry in ledger.entries
+            ):
                 # This exact strategy already ran for this tree and failure.
                 continue
             return step
         return GateRecoveryStep(
-            terminal_strategy(FailureClass.CORRECTNESS, _LADDER_CODE), tree=tree,
+            classify_failure("CHECK_REPAIR_EXHAUSTED", exhausted=True).strategy, tree=tree,
             failed_check_ids=failed, consumed=self._trail(ledger), exhausted=True,
         )
-
-    @staticmethod
-    def _policy_admits(strategy: RecoveryStrategy, facts: RecoveryFacts) -> bool:
-        """Whether the ladder policy itself admits this rung for these facts."""
-
-        return strategy in admitted_strategies(FailureClass.CORRECTNESS, facts)
 
     def begin_step(
         self, *, ctx: Any, cycle_plan: Any, stage: GateStage | str,
@@ -463,41 +450,6 @@ class CheckRepairLadder:
         _write_ladder(path, dataclasses.replace(ledger, entries=tuple(entries)))
 
     # -- deterministic facts -------------------------------------------------
-
-    @staticmethod
-    def _facts(
-        ledger: _LadderLedger, *, tree: str, failed: tuple[str, ...],
-        number: int, stage: GateStage,
-    ) -> RecoveryFacts:
-        return RecoveryFacts(
-            candidate_tree=tree,
-            observed_facts=(
-                ("cycle", f"{number:03d}"),
-                ("failed_checks", ",".join(failed)),
-                ("stage", stage.value),
-            ),
-            proof_required=ledger.proof_required,
-            fallback_executor_available=ledger.fallback_executor_available,
-            # The ladder's first step is a bounded repair pass; the frozen
-            # attempt budget is enforced by this ladder, never by the policy.
-            retry_allowed=True,
-        )
-
-    @classmethod
-    def _consumed(
-        cls, ledger: _LadderLedger, *, number: int, stage: GateStage,
-    ) -> tuple[RecoveryFingerprint, ...]:
-        return tuple(
-            RecoveryFingerprint(
-                entry.tree, FailureClass.CORRECTNESS,
-                cls._facts(
-                    ledger, tree=entry.tree, failed=entry.failed_check_ids,
-                    number=number, stage=stage,
-                ).stable_items(),
-                entry.strategy,
-            )
-            for entry in ledger.entries
-        )
 
     @staticmethod
     def _trail(ledger: _LadderLedger) -> tuple[RecoveryStrategy, ...]:
