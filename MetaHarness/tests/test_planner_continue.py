@@ -123,10 +123,28 @@ class ContinueProtocolTests(unittest.TestCase):
         self.assertIs(result.decision, ContinueDecision.SPEC_DECISION)
         self.assertEqual(result.spec_question, question)
         self.assertIsNone(result.next_plan)
-        for invalid in (answer("SPEC_DECISION"), answer("SPEC_DECISION", question="Retry budget")):
+        for invalid in (answer("SPEC_DECISION"), answer("SPEC_DECISION", question="N/A")):
             with self.subTest(question=invalid.splitlines()[-3]), self.assertRaisesRegex(
                     V2PlanParseError, "SPEC_QUESTION"):
                 parse(invalid)
+        with self.assertRaises(V2PlanParseError):
+            parse(answer("SPEC_DECISION", question=""))
+
+    def test_a_spec_question_is_content_never_a_question_mark(self) -> None:
+        for question in (
+            "Choose the canonical persistence format",
+            "Should deletion be soft or permanent",
+        ):
+            with self.subTest(question=question):
+                result = parse(answer("SPEC_DECISION", question=question))
+                self.assertIs(result.decision, ContinueDecision.SPEC_DECISION)
+                self.assertEqual(result.spec_question, question)
+        # A question is one bounded sentence, never a paragraph.
+        with self.assertRaisesRegex(V2PlanParseError, "SPEC_QUESTION"):
+            parse(answer("SPEC_DECISION", question="x" * 501))
+        payload = build_planner_continue_payload(
+            facts(), planning=PLANNING, check_catalog=CATALOG, default_check_ids=("test",))
+        self.assertIn('ending with "?" is recommended, never required', payload.rendered)
 
     def test_next_milestone_must_match_the_embedded_plan(self) -> None:
         with self.assertRaisesRegex(V2PlanParseError, "differ"):
@@ -267,7 +285,7 @@ class PlannerContinueServiceTests(unittest.TestCase):
             worker.write_text("WORKER PROMPT SENTINEL\n" + "x" * 40000, encoding="utf-8")
             raw_answer = answer("NEXT", milestone="M02", plan_text=SECOND_MILESTONE)
             service, client = self.service(raw_answer)
-            result = service.decide(facts(), artifacts_dir=iterations)
+            result = service.decide(facts(), iterations_dir=iterations)
 
             directory = planner_continue_dir(iterations, 1)
             self.assertEqual(directory, iterations / "01" / "planner-continue")
@@ -292,7 +310,7 @@ class PlannerContinueServiceTests(unittest.TestCase):
             rejected = answer("COMPLETE").replace("COMPLETE", "DONE")
             service, _ = self.service(rejected)
             with self.assertRaises(V2PlanParseError):
-                service.decide(facts(), artifacts_dir=iterations)
+                service.decide(facts(), iterations_dir=iterations)
             directory = planner_continue_dir(iterations, 1)
             self.assertEqual((directory / "raw.txt").read_text(encoding="utf-8"), rejected)
             self.assertTrue((directory / "request.json").is_file())

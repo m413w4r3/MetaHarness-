@@ -147,12 +147,16 @@ def repo_path(value: str, *, kind: str) -> str:
 def read_set(value: str, *, max_paths: int) -> tuple[str, ...]:
     if not value.strip():
         raise V2PlanParseError("READ_SET is missing")
+    # Exactly ``NONE`` is the explicit empty set: a CREATE-only step may need
+    # no read at all, and the normalizer adds every other mutation itself.
+    if value.strip() == "NONE":
+        return ()
     anchors_by_path: dict[str, list[str]] = {}
     for line in value.splitlines():
         if not line.strip():
             continue
         if not line.startswith("- ") or " :: " not in line:
-            raise V2PlanParseError("each READ_SET line must be '- path :: anchor'")
+            raise V2PlanParseError("each READ_SET line must be '- path :: anchor', or exactly NONE")
         path, anchor = line[2:].split(" :: ", 1)
         path = repo_path(path.strip(), kind="READ_SET")
         anchor = anchor.strip()

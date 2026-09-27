@@ -42,7 +42,7 @@ NEXT_MILESTONE
 NONE|Mxx
 
 SPEC_QUESTION
-NONE|<one concrete question ending with a question mark>
+NONE|<one concrete question; ending with "?" is recommended, never required>
 
 END META CONTINUE
 

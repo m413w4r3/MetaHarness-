@@ -126,7 +126,7 @@ mode = "run-branch"
 
 ```text
 PLAN → implementation step → accepted step commit → …
-→ deterministic checks ↔ AUDIT (one writable authority per red gate)
+→ deterministic checks ↔ AUDIT (one writable authority per gate with a diff)
 → accepted candidate → push run branch → publish exact candidate
 ```
 

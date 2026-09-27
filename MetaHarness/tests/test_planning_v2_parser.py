@@ -217,6 +217,25 @@ class PlanV2ControlTests(unittest.TestCase):
                 with self.assertRaisesRegex(V2PlanParseError, f"missing {section}"):
                     parse(missing)
 
+    def test_read_set_none_is_the_explicit_empty_set_of_a_create_only_step(self) -> None:
+        raw = (
+            initial_plan(("S01", "feature.txt", "Write the feature"))
+            .replace("READ_SET\n- feature.txt :: current content\n", "READ_SET\nNONE\n")
+            .replace("WRITE_SET\n- feature.txt\n", "WRITE_SET\nNONE\n")
+            .replace("CREATE_SET\nNONE\n", "CREATE_SET\n- created.txt\n")
+        )
+        step = parse(raw).steps[0]
+        self.assertEqual(step.read_set, ())
+        self.assertEqual(step.create_set, ("created.txt",))
+
+    def test_read_set_none_mixed_with_a_list_is_refused(self) -> None:
+        raw = initial_plan(("S01", "feature.txt", "Write the feature")).replace(
+            "READ_SET\n- feature.txt :: current content\n",
+            "READ_SET\nNONE\n- feature.txt :: current content\n",
+        )
+        with self.assertRaisesRegex(V2PlanParseError, "READ_SET"):
+            parse(raw)
+
     def test_auto_mode_accepts_a_coherent_single_step(self) -> None:
         plan = parse(initial_plan(("S01", "feature.txt", "Write the feature")))
         self.assertEqual(plan.execution_mode.value, "SINGLE")

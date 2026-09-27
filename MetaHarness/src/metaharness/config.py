@@ -921,7 +921,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         and publish.mode == PublishMode.RUN_BRANCH.value
         and publish.remote != repository.remote
     ):
-        # Run-branch publication is the reviewed candidate already pushed to
+        # Run-branch publication is the accepted candidate already pushed to
         # repository.remote; it never pushes anything to another remote.
         raise ConfigError(
             "publish.remote must equal repository.remote when publish.mode = 'run-branch'"

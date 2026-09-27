@@ -197,8 +197,9 @@ REMOVED_COMPATIBILITY_SYMBOLS = (
     "stranded_contract_repair",
     "supersede_legacy_prompt_bug",
 )
-# `render_profile_catalogue` is live in `recommendation.py` and was a dead alias
-# of the old `planning_v2.py`: only the planning package must stay free of it.
+# `render_profile_catalogue` lived in the removed `recommendation.py` and was a
+# dead alias of the old `planning_v2.py`: only the planning package must stay
+# free of it.
 REMOVED_SYMBOLS_PER_PACKAGE: Mapping[str, tuple[str, ...]] = {
     "planning": ("render_profile_catalogue",),
 }

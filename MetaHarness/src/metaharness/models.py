@@ -314,7 +314,7 @@ class RunPhase(StrEnum):
     """The durable operation a run is at: the one running, or the next one.
 
     A phase names an operation, never a posture.  ``DETERMINISTIC_GATE`` stays
-    the phase while a red gate waits for the audit authority that answers it.
+    the phase while the gate waits for the audit authority that answers it.
     The posture of the run is :class:`RunDisposition`; the business detail is
     the failure reason.
     """
@@ -613,7 +613,7 @@ def transition(current: RunMachineState, event: RunEvent) -> RunMachineState:
             )
         if current.phase not in _RUN_COMPLETABLE_PHASES:
             raise RunTransitionError(
-                "only a reviewed candidate push or its publication completes a run"
+                "only an accepted candidate push or its publication completes a run"
             )
         return RunMachineState(current.phase, RunDisposition.COMPLETED)
     if event.kind is RunEventKind.RESUME:
@@ -643,7 +643,7 @@ _RUNNING_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.PUBLISH: RunStatus.PUBLISHING,
 }
 # The operation a completed run stopped at names its completion: only the
-# publication of the reviewed candidate is a publication, every earlier
+# publication of the accepted candidate is a publication, every earlier
 # operation (the candidate push itself) stops at the committed candidate.
 _COMPLETED_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.PUBLISH: RunStatus.PUBLISHED,

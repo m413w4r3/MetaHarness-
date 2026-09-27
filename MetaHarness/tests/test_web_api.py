@@ -238,7 +238,7 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(payload["size"], len("review text"))
 
         status, missing, _ = self.request(
-            "GET", "/api/v1/runs/r1/artifact?name=steps/S01/step.json"
+            "GET", "/api/v1/runs/r1/artifact?name=cycles/001/implementation/steps/S01/step.json"
         )
         self.assertEqual(status, 200)
         self.assertFalse(missing["exists"])
@@ -590,14 +590,26 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         return content
 
-    def assert_poll_shape(self, payload: dict) -> None:
-        # Fields read by the run-page polling script.
+    def assert_run_shape(self, payload: dict) -> None:
+        # Fields of the run detail payload, with the state it carries.
         for key in (
             "run_id",
             "status",
             "updated_at",
-            "status",
             "state",
+            "cycle",
+            "failure",
+        ):
+            self.assertIn(key, payload)
+        for key in ("status", "base_sha", "branch", "worktree", "commit_sha", "failure"):
+            self.assertIn(key, payload["state"])
+
+    def assert_poll_shape(self, payload: dict) -> None:
+        # Fields the run-page polling script reads from /api/runs/<id>/live.
+        for key in (
+            "run_id",
+            "status",
+            "updated_at",
             "cycle",
             "failure",
             "resumable",
@@ -606,8 +618,6 @@ class WebServerTests(unittest.TestCase):
             "progress_events",
         ):
             self.assertIn(key, payload)
-        for key in ("status", "base_sha", "branch", "worktree", "commit_sha", "failure"):
-            self.assertIn(key, payload["state"])
 
     def test_run_page_observes_transitions_without_manual_reload(self) -> None:
         run_dir = self.runs / "live"
@@ -625,13 +635,17 @@ class WebServerTests(unittest.TestCase):
 
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assertEqual(status, 200)
-        self.assert_poll_shape(payload)
+        self.assert_run_shape(payload)
         self.assertEqual(payload["status"], "implementing")
         self.assertEqual(payload["state"]["worktree"], "/tmp/wt live")
+        status, polled, _ = self.request("GET", "/api/runs/live/live")
+        self.assertEqual(status, 200)
+        self.assert_poll_shape(polled)
+        self.assertEqual(polled["status"], "implementing")
 
         store.set_run_state(RunMachineState(RunPhase.DETERMINISTIC_GATE))
         status, payload, _ = self.request("GET", "/api/runs/live")
-        self.assert_poll_shape(payload)
+        self.assert_run_shape(payload)
         self.assertEqual(payload["status"], "validating")
 
         # The audit authority answers the gate; the attempted audit is visible
@@ -643,7 +657,7 @@ class WebServerTests(unittest.TestCase):
         )
         store.set_run_state(RunMachineState(RunPhase.AUDIT))
         status, payload, _ = self.request("GET", "/api/runs/live")
-        self.assert_poll_shape(payload)
+        self.assert_run_shape(payload)
         self.assertEqual(payload["status"], "revising")
 
         store.set_run_state(
@@ -651,7 +665,7 @@ class WebServerTests(unittest.TestCase):
             commit_sha="c" * 40,
         )
         status, payload, _ = self.request("GET", "/api/runs/live")
-        self.assert_poll_shape(payload)
+        self.assert_run_shape(payload)
         self.assertEqual(payload["status"], "committed")
         self.assertEqual(payload["state"]["commit_sha"], "c" * 40)
         self.assertIsNone(payload["failure"])
@@ -659,7 +673,7 @@ class WebServerTests(unittest.TestCase):
         failed = self.create_run("broken", "implementing")
         RunStateStore(failed / "state.json").record_failure("CHECK_FAILED", "unit")
         status, payload, _ = self.request("GET", "/api/runs/broken")
-        self.assert_poll_shape(payload)
+        self.assert_run_shape(payload)
         self.assertEqual(payload["status"], "failed")
         self.assertEqual(payload["state"]["failure"], {"reason": "CHECK_FAILED", "detail": "unit"})
 

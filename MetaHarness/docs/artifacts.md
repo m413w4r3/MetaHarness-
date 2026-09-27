@@ -70,8 +70,9 @@ base SHA -> accepted step commits -> green gate acceptance
 ```
 
 Only green, accepted trees become commits; a red tree stays an artifact. The
-audit is called only while the deterministic gate is red, and publication uses
-exactly the SHA named by the durable gate acceptance.
+audit is called whenever the deterministic gate leaves a diff - an initial
+green gate included - and publication uses exactly the SHA named by the
+durable gate acceptance.
 
 The state records references and bounded metadata, never API key values. The
 values of the variables named by `api_key_env` are redacted from check logs,

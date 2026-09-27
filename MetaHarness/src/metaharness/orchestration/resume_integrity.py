@@ -78,7 +78,12 @@ from ..models import (
     PlanDecision,
     TaskPlanV2,
 )
-from ..planning.artifacts import validate_implementation_bundle
+from ..plan_repository_validation import (
+    PlanRepositoryPreconditionError,
+    validate_plan_repository_topology,
+)
+from ..planning.artifacts import PLAN_NORMALIZATIONS_NAME, validate_implementation_bundle
+from ..planning.normalization import normalizations_payload
 from ..planning.protocol import V2PlanParseError, parse_task_plan_v2
 from ..profiles import ProfileError
 from ..resume import (
@@ -348,7 +353,11 @@ def validate_resume(
     if selection.planner.profile_id != planner_state.get("profile_id"):
         _refuse("execution selection planner is not the run planner")
 
-    # The approved plan and its exact bundle.
+    # The approved plan and its exact bundle.  The run approved the *effective*
+    # plan, so the very same deterministic normalization is replayed against
+    # the very same immutable start tree before any scope, authority or step
+    # identity is read from it.  What stays impossible after normalization is
+    # an irreducible contradiction, and no resume may invent around it.
     try:
         plan = parse_task_plan_v2(
             (run_dir / "planner.raw.md").read_text(encoding="utf-8"),
@@ -356,13 +365,21 @@ def validate_resume(
             check_catalog=config.check_catalog,
             default_check_ids=config.default_check_ids,
         )
+        plan = validate_plan_repository_topology(
+            repo, resolve_tree(repo, base_sha), plan,
+        )
         bundle, bundle_sha = validate_implementation_bundle(
             run_dir, expected_step_ids=[step.id for step in plan.steps]
         )
-    except (V2PlanParseError, OSError, UnicodeError) as exc:
-        _refuse(f"approved plan is unreadable: {exc}")
+        normalizations = normalizations_payload(plan)
+    except (
+        V2PlanParseError, PlanRepositoryPreconditionError, GitError, OSError, UnicodeError,
+    ) as exc:
+        _refuse(f"approved plan is invalid: {exc}")
     if plan.decision is not PlanDecision.READY or bundle_sha != identity.bundle_sha256:
         _refuse("approved bundle changed")
+    if read_json_artifact(run_dir / PLAN_NORMALIZATIONS_NAME) != normalizations:
+        _refuse("the plan normalization record does not match the approved plan")
     if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
         _refuse("execution selection steps do not match the plan")
 

@@ -13,7 +13,8 @@ import unittest
 
 from metaharness.config import load_config
 from metaharness.models import RunDisposition, RunMachineState, RunPhase, RunStatus
-from metaharness.resume import resume_info
+from metaharness.orchestration.resume_integrity import validate_resume
+from metaharness.resume import read_checkpoint, resume_info
 from metaharness.state import RunCheckpointError, RunStateStore
 
 from metaharness.models import ExecutionRole
@@ -26,6 +27,21 @@ from tests.pipeline.support import (
     initial_plan,
     write,
 )
+
+
+def raw_plan(
+    *, read_set: str = "NONE", write_set: str = "NONE",
+    create_set: str = "NONE", delete_set: str = "NONE",
+) -> str:
+    """The standard plan with exactly these declared change sets."""
+
+    return (
+        initial_plan(STEP)
+        .replace("READ_SET\n- feature.txt :: current content\n", f"READ_SET\n{read_set}\n")
+        .replace("WRITE_SET\n- feature.txt\n", f"WRITE_SET\n{write_set}\n")
+        .replace("CREATE_SET\nNONE\n", f"CREATE_SET\n{create_set}\n")
+        .replace("DELETE_SET\nNONE\n", f"DELETE_SET\n{delete_set}\n")
+    )
 
 
 class ResumeTests(PipelineHarness):
@@ -247,6 +263,73 @@ class ResumeAuthorityTests(PipelineHarness):
         failed = store.record_failure("RESUME_INTEGRITY_FAILURE", "the checkpoint is unreadable")
         self.assertEqual(failed["disposition"], RunDisposition.FAILED.value)
         self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
+
+
+class ResumePlanNormalizationTests(PipelineHarness):
+    """A resume rebuilds the effective plan the run really approved."""
+
+    def _crash_at_the_gate(self, raw: str) -> None:
+        original = self.orchestrator(self.config(), planner=[raw])
+        with crash_at_checkpoint(original, "deterministic_gate"):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
+
+    def _resumed_plan(self):
+        return validate_resume(
+            config=load_config(self.config_path),
+            run_dir=self.run_dir(), state=self.state(),
+            checkpoint=read_checkpoint(self.run_dir()),
+            staging_remote="origin",
+        ).plan
+
+    def test_a_raw_create_of_an_existing_path_resumes_as_the_write(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self._crash_at_the_gate(raw_plan(read_set="NONE", create_set="- feature.txt"))
+
+        step = self._resumed_plan().steps[0]
+        self.assertEqual(step.write_set, ("feature.txt",))
+        self.assertEqual(step.create_set, ())
+        self.assertEqual(step.read_set, ("feature.txt :: current content",))
+
+    def test_a_raw_delete_of_a_missing_path_is_not_resumed_scope(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self._crash_at_the_gate(raw_plan(
+            read_set="- feature.txt :: current content", write_set="- feature.txt",
+            delete_set="- missing.txt",
+        ))
+
+        step = self._resumed_plan().steps[0]
+        self.assertEqual(step.delete_set, ())
+        self.assertEqual(step.write_set, ("feature.txt",))
+        self.assertNotIn("missing.txt", (*step.read_set, *step.write_set, *step.create_set))
+
+    def test_a_raw_write_of_a_missing_path_resumes_as_the_create(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("missing.txt", "good\n"))
+        self._crash_at_the_gate(raw_plan(
+            read_set="- missing.txt :: current content", write_set="- missing.txt",
+        ))
+
+        step = self._resumed_plan().steps[0]
+        self.assertEqual(step.create_set, ("missing.txt",))
+        self.assertEqual(step.write_set, ())
+        self.assertEqual(step.read_set, ())
+
+    def test_an_incoherent_normalization_record_refuses_the_resume(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self._crash_at_the_gate(raw_plan(read_set="NONE", create_set="- feature.txt"))
+        record = self.run_dir() / "plan.normalizations.json"
+        self.assertIn("CREATE_EXISTING_TO_WRITE", record.read_text(encoding="utf-8"))
+        record.write_text('{"schema": 1, "steps": {}}\n', encoding="utf-8")
+        roles = self.workers.roles()
+
+        resumed = self.orchestrator(
+            self.config(), planner=["unused"], auditor=["unused"],
+        ).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.FAILED)
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.workers.roles(), roles)
+        self.assertEqual(self.planner.requests, [])
 
 
 if __name__ == "__main__":

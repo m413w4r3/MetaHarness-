@@ -39,6 +39,8 @@ CONTINUE_HEADER, CONTINUE_END = "META CONTINUE v1", "END META CONTINUE"
 CONTINUE_PLAN_BEGIN, CONTINUE_PLAN_END = "BEGIN NEXT PLAN", "END NEXT PLAN"
 _FIELDS = ("DECISION", "SUMMARY", "REMAINING", "NEXT_MILESTONE", "SPEC_QUESTION")
 _NONE_WORDS = frozenset({"none", "n/a", "na", "-", "—", "nil", "tbd"})
+# One concrete question, bounded: a real decision never needs a paragraph.
+MAX_SPEC_QUESTION_CHARS = 500
 
 
 class ContinueDecision(StrEnum):
@@ -144,7 +146,8 @@ def parse_planner_continue(
             raise V2PlanParseError(f"{decision.value} must set NEXT_MILESTONE to NONE")
         next_milestone = None
         if decision is ContinueDecision.SPEC_DECISION:
-            if question is None or "?" not in question:
+            # A question mark is recommended, never contractually required.
+            if question is None or len(question) > MAX_SPEC_QUESTION_CHARS:
                 raise V2PlanParseError("SPEC_DECISION requires one concrete SPEC_QUESTION")
         elif question is not None:
             raise V2PlanParseError("COMPLETE must set SPEC_QUESTION to NONE")
@@ -191,15 +194,15 @@ class PlannerContinue:
     last_usage: dict[str, Any] | None = None
 
     def decide(
-        self, facts: PlannerContinueFacts, *, artifacts_dir: str | Path | None = None,
+        self, facts: PlannerContinueFacts, *, iterations_dir: str | Path | None = None,
     ) -> PlannerContinueResult:
-        """Ask, persist when asked to, then parse; C4 owns failure shapes."""
+        """Ask, persist under ``iterations_dir/NN/`` when asked, then parse."""
 
         payload = build_planner_continue_payload(
             facts, planning=self.planning, check_catalog=self.check_catalog,
             default_check_ids=self.default_check_ids, budget_bytes=self.prompt_budget_bytes)
-        target = None if artifacts_dir is None else planner_continue_dir(
-            artifacts_dir, facts.iteration)
+        target = None if iterations_dir is None else planner_continue_dir(
+            iterations_dir, facts.iteration)
         if target is not None:
             write_planner_continue_request(target, planner_continue_request_record(facts, payload))
         raw = self.client.complete(payload.rendered)
@@ -220,6 +223,7 @@ class PlannerContinue:
 
 __all__ = [
     "CONTINUE_END", "CONTINUE_HEADER", "CONTINUE_PLAN_BEGIN", "CONTINUE_PLAN_END",
+    "MAX_SPEC_QUESTION_CHARS",
     "ContinueDecision", "PlannerContinue", "PlannerContinueFacts", "PlannerContinueResult",
     "build_planner_continue_payload", "parse_planner_continue", "stagnation_fingerprint",
 ]

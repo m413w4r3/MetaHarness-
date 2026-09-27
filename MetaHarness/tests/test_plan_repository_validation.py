@@ -405,6 +405,15 @@ class PlanContractNormalizationTests(_Repo):
         self.assertIn("step=S01 no_mutation", correction)
         self.assertIn("META PLAN v2", correction)
 
+    def test_the_correction_never_recommends_blocked_for_repository_facts(self) -> None:
+        correction = render_precondition_correction(
+            [PathPreconditionViolation("S01", "no_mutation", "")],
+            previous_raw="META PLAN v2\n",
+        )
+        self.assertNotIn("return BLOCKED", correction)
+        self.assertIn("Repository facts never justify BLOCKED", correction)
+        self.assertIn("BLOCKER_KIND: SPEC_DECISION", correction)
+
 
 class TopologyValidationTests(_Repo):
     def test_a_normally_classified_plan_is_returned_effective(self) -> None:

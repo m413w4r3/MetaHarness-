@@ -525,7 +525,7 @@ INVALID_TRANSITIONS = (
     (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.advance(None), "requires a target"),
     (RunMachineState(R.IMPLEMENT_STEP, D.WAIT_EXTERNAL), RunEvent.advance(R.STEP_ACCEPTANCE), "must be resumed"),
     (RunMachineState(R.IMPLEMENT_STEP, D.WAIT_HUMAN), RunEvent.complete(), "must be resumed"),
-    (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.complete(), "only a reviewed candidate push"),
+    (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.complete(), "only an accepted candidate push"),
     (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.wait(D.RUNNING), "requires the WAIT_EXTERNAL or WAIT_HUMAN"),
     (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.resume(), "is not waiting"),
     (RunMachineState(R.PUBLISH, D.COMPLETED), RunEvent.fail(), "accepts no further event"),

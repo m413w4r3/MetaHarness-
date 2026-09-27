@@ -7,8 +7,8 @@ a candidate commit, the publication) is injected explicitly through
 :class:`PipelineV2Operations`.
 
 A run executes one approved plan in one cycle: its steps, the deterministic
-gate the red audit authority answers, the accepted candidate HEAD, its push
-and the publication.
+gate the audit authority answers whenever it leaves a diff, the accepted
+candidate HEAD, its push and the publication.
 """
 
 from __future__ import annotations

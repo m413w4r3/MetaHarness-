@@ -31,6 +31,70 @@ from metaharness.planning.normalization import (
     normalize_step_contract,
     plan_contradictions,
 )
+from metaharness.planning.protocol import (
+    parse_step_contract_repair,
+    render_repaired_step_contract,
+)
+
+# One META STEP CONTRACT REPAIR v1 body: the second wire protocol sharing the
+# READ_SET grammar, so ``NONE`` must mean the same empty set on both.
+REPAIR_BODY = """META STEP CONTRACT REPAIR v1
+STEP_ID: S01
+TITLE: Touch the file
+EXECUTION_CLASS: MECHANICAL
+DEPENDS_ON: NONE
+
+CONTEXT
+kept.py already holds the content.
+
+READ_SET
+{read_set}
+
+WRITE_SET
+{write_set}
+
+CREATE_SET
+{create_set}
+
+DELETE_SET
+{delete_set}
+
+INSTRUCTIONS
+1. Change kept.py.
+
+INTERFACES
+NONE
+
+EXAMPLES
+NONE
+
+TESTS
+- The configured test covers the change.
+
+PITFALLS
+- Do not touch another path.
+
+DONE_WHEN
+- kept.py holds the required content.
+
+VERIFY
+- Run the configured test.
+
+END META STEP CONTRACT REPAIR
+"""
+
+
+def repair(
+    *, read_set: str = "NONE", write_set: str = "NONE",
+    create_set: str = "NONE", delete_set: str = "NONE",
+) -> ImplementationStep:
+    return parse_step_contract_repair(
+        REPAIR_BODY.format(
+            read_set=read_set, write_set=write_set,
+            create_set=create_set, delete_set=delete_set,
+        ),
+        max_read_paths_per_step=8,
+    )
 
 
 def step(
@@ -147,6 +211,29 @@ class StepContractNormalizationTests(unittest.TestCase):
             [ADD_MUTATION_TO_READ, DROP_READ_OF_CREATE],
         )
         self.assertIn(f"removed.py :: {NORMALIZED_READ_ANCHOR}", contract.step.read_set)
+
+    def test_a_parsed_read_set_of_none_gains_every_existing_mutation(self) -> None:
+        written = repair(write_set="- kept.py")
+        self.assertEqual(written.read_set, ())
+        contract = normalize_step_contract(written, tree("kept.py"))
+        self.assertEqual(reads(contract.step), ["kept.py"])
+        self.assertEqual(records(contract), [(ADD_MUTATION_TO_READ, "kept.py")])
+
+        deleted = repair(delete_set="- kept.py")
+        self.assertEqual(deleted.read_set, ())
+        contract = normalize_step_contract(deleted, tree("kept.py"))
+        self.assertEqual(reads(contract.step), ["kept.py"])
+        self.assertEqual(records(contract), [(ADD_MUTATION_TO_READ, "kept.py")])
+
+    def test_a_rendered_contract_with_an_empty_read_set_parses_back(self) -> None:
+        effective = normalize_step_contract(repair(create_set="- src/new.py"), tree()).step
+        self.assertEqual(effective.read_set, ())
+        rendered = render_repaired_step_contract(effective)
+        self.assertIn("READ_SET\nNONE\n", rendered)
+        reparsed = parse_step_contract_repair(rendered, max_read_paths_per_step=8)
+        self.assertEqual(reparsed.read_set, ())
+        self.assertEqual(reparsed.create_set, ("src/new.py",))
+        self.assertEqual(reparsed, effective)
 
     def test_normalization_is_idempotent(self) -> None:
         facts = tree("kept.py", "src/a.py", "removed.py")

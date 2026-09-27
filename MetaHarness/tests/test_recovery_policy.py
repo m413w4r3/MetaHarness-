@@ -171,6 +171,18 @@ class FailureClassificationTests(unittest.TestCase):
             names = {strategy.value for strategy in ladder}
             self.assertFalse(names & {"replan_cycle", "expand_scope", "repair_targeted"})
 
+    def test_codes_without_a_runtime_producer_stay_out_of_the_policy(self) -> None:
+        """A code no runtime code emits is never classified here."""
+
+        for code in (
+            "ATOMIC_SCOPE_POLICY_LIMIT",
+            "SECURITY_POLICY_DECISION_REQUIRED",
+            "HUMAN_REQUIRED",
+        ):
+            with self.subTest(code=code):
+                self.assertNotIn(code, FAILURE_CLASSES)
+                self.assertFalse(classify_failure(code).known)
+
     def test_budgets_have_bounded_durable_defaults(self) -> None:
         self.assertEqual(RecoveryBudgets(), RecoveryBudgets(
             max_transient_attempts=2,
