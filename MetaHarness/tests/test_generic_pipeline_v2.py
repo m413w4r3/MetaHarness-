@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from metaharness.approval import PlanIdentity
 from metaharness.execution_selection import (
     SCHEMA_VERSION,
     ensure_execution_selection,
@@ -18,26 +17,23 @@ from metaharness.resume import ResumeCheckpoint, ResumeCheckpointError, ResumePh
 
 
 class GenericCheckpointTests(unittest.TestCase):
-    def test_cycle_number_is_unbounded_but_positive(self) -> None:
+    def test_iteration_defaults_to_one_and_can_be_carried_forward(self) -> None:
         for cycle in (1, 2, 7):
             checkpoint = ResumeCheckpoint(
                 phase=ResumePhase.CONTEXT,
-                review_cycle=cycle,
+                iteration=cycle,
             )
-            self.assertEqual(checkpoint.review_cycle, cycle)
+            self.assertEqual(checkpoint.iteration, cycle)
         with self.assertRaises(ResumeCheckpointError):
-            ResumeCheckpoint(phase=ResumePhase.CONTEXT, review_cycle=0)
+            ResumeCheckpoint(phase=ResumePhase.CONTEXT, iteration=0)
 
-    def test_the_gate_stage_is_part_of_the_generic_gate_identity(self) -> None:
+    def test_implementation_checkpoint_names_the_next_step_and_git_authority(self) -> None:
         checkpoint = ResumeCheckpoint(
-            phase=ResumePhase.DETERMINISTIC_GATE,
-            stage="POST_IMPLEMENTATION",
-            expected_head_sha="a" * 40,
-            expected_tree_sha="b" * 40,
-            execution_selection_sha256="c" * 64,
-            plan_identity=PlanIdentity("d" * 64, "e" * 64),
+            phase=ResumePhase.IMPLEMENT_STEP, iteration=1, step_index=0,
+            last_green_commit="a" * 40, plan_sha256="d" * 64,
         )
-        self.assertEqual(checkpoint.stage.value, "POST_IMPLEMENTATION")
+        self.assertEqual(checkpoint.step_index, 0)
+        self.assertEqual(checkpoint.last_green_commit, "a" * 40)
 
 
 class GenericArtifactPathTests(unittest.TestCase):

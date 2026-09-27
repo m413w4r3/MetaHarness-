@@ -54,20 +54,11 @@ from ..usage import (
     normalize_usage,
     phase_usage_summary,
 )
-from ..plan_recovery import (
-    MAX_REPLACEMENT_PLAN_BYTES,
-    PLAN_RECOVERY_ARTIFACT,
-    PlanRecoveryError,
-    plan_recovery_info,
-    read_plan_recovery_record,
-    validate_replacement_text,
-)
 from .run_manager import (
     RunCapacityError,
     RunCollisionError,
     RunManager,
     RunManagerError,
-    RunPlanRecoveryError,
     RunResumeNotAllowedError,
 )
 
@@ -79,7 +70,6 @@ ARTIFACT_ALLOWLIST = frozenset(
         "planner.raw.md",
         "implementation_contract.md",
         "task_plan.json",
-        "task_plan_v2.json",
         "implementation_bundle.json",
         "agent.events.jsonl",
         "trace/events.v1.jsonl",
@@ -91,7 +81,6 @@ ARTIFACT_ALLOWLIST = frozenset(
         "changed-files.txt",
         "diff.patch",
         "plan_approval.json",
-        PLAN_RECOVERY_ARTIFACT,
         "publish.json",
         DIAGNOSTICS_NAME,
         DIAGNOSTICS_ERROR_NAME,
@@ -440,7 +429,6 @@ def get_run(
         "failure": state.get("failure"),
         "publish": _load_json(_artifact_path(directory, "publish.json")),
         "approval": {"recorded": approval_decision is not None, "decision": approval_decision},
-        "plan_recovery": _plan_recovery_payload(directory, state),
         "progress_tail": progress_tail(
             runs_root, safe_id, max_events=50,
             secrets=config_secret_values(config) if config is not None else (),
@@ -1171,26 +1159,11 @@ def _token_diagnostics(step_dir: Path) -> dict[str, Any] | None:
     return result
 
 
-def _plan_recovery_payload(directory: Path, state: Mapping[str, Any]) -> dict[str, Any]:
-    info = plan_recovery_info(directory, state)
-    return {
-        "eligible": info.eligible,
-        "reason": info.reason,
-        "recovered": read_plan_recovery_record(directory) is not None,
-        "max_bytes": MAX_REPLACEMENT_PLAN_BYTES,
-    }
-
-
 def _resume_payload(directory: Path, state: Mapping[str, Any]) -> dict[str, Any]:
     info = resume_info(directory, state)
-    label = info.label
-    if info.phase == "plan_approval" and read_plan_recovery_record(directory) is not None:
-        # Never "Retry planner": the plan authority is the operator's.
-        label = "Resume recovered plan approval"
     return {
-        "resumable": info.resumable, "phase": info.phase, "label": label,
-        "expected_tree": info.expected_tree, "review_cycle": info.review_cycle,
-        "step_id": info.step_id, "reason": info.reason,
+        "resumable": info.resumable, "phase": info.phase, "label": info.label,
+        "iteration": info.iteration, "step_index": info.step_index, "reason": info.reason,
         "operation": info.operation,
     }
 
@@ -1247,7 +1220,7 @@ def run_pipeline(
     planner = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
     resumable = isinstance(resume, Mapping) and bool(resume.get("resumable"))
     resume_phase = resume.get("phase") if resumable else None
-    resume_cycle = resume.get("review_cycle") if resumable else None
+    resume_cycle = resume.get("iteration") if resumable else None
     items: list[dict[str, str]] = []
 
     def add(key: str, label: str, value: str) -> None:
@@ -1268,11 +1241,10 @@ def run_pipeline(
         return "waiting"
 
     decision = planner.get("decision")
-    recovered = read_plan_recovery_record(directory) is not None
     if resume_phase in {"context", "planner"}:
         add("planner", "Planner", "resumable")
     elif decision == "READY":
-        add("planner", "Planner · operator recovery" if recovered else "Planner", "complete")
+        add("planner", "Planner", "complete")
     elif status == "waiting_human":
         add("planner", "Planner · operator decision required", "waiting")
     elif decision == "BLOCKED" or status == "blocked" or failed:
@@ -1526,39 +1498,6 @@ def resume_run_request(manager: RunManager, runs_root: Path, run_id: str) -> dic
     return {"ok": True, "run_id": safe_id, "location": f"/runs/{safe_id}"}
 
 
-def recover_plan_request(
-    manager: RunManager, runs_root: Path, run_id: str, replacement: object,
-) -> dict[str, Any]:
-    """REPLACE PLAN: publish an operator META PLAN v2, then await approval.
-
-    Only the raw replacement text is accepted: SPEC, context, BASE, run
-    options and catalogues stay those of the run.  No planner is called.
-    """
-
-    directory = _run_dir(runs_root, run_id)
-    safe_id = validate_run_id(run_id)
-    try:
-        text = validate_replacement_text(replacement)
-    except PlanRecoveryError as exc:
-        raise WebAPIError(400, str(exc)) from exc
-    info = plan_recovery_info(directory, _load_state(directory))
-    if not info.eligible:
-        raise WebAPIError(409, f"plan recovery refused: {info.reason}")
-    try:
-        manager.recover_plan(safe_id, text)
-    except RunPlanRecoveryError as exc:
-        raise WebAPIError(400, f"plan recovery refused: {exc}") from exc
-    except RunResumeNotAllowedError as exc:
-        raise WebAPIError(409, "recovered run could not be resumed") from exc
-    except RunCollisionError as exc:
-        raise WebAPIError(409, "run is already active") from exc
-    except RunCapacityError as exc:
-        raise WebAPIError(409, "maximum active runs reached") from exc
-    except RunManagerError as exc:
-        raise WebAPIError(503, "plan could not be recovered") from exc
-    return {"ok": True, "run_id": safe_id, "location": f"/runs/{safe_id}"}
-
-
 AWAITING_APPROVAL = RunStatus.AWAITING_PLAN_APPROVAL.value
 
 
@@ -1571,7 +1510,6 @@ __all__ = [
     "context_level",
     "live_status",
     "publish_target",
-    "recover_plan_request",
     "resume_run_request",
     "run_overview",
     "run_pipeline",

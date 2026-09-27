@@ -13,7 +13,6 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.models import (
-    GateStage,
     RunDisposition,
     RunEvent,
     RunEventKind,
@@ -22,6 +21,7 @@ from metaharness.models import (
     RunPhase,
     RunStatus,
     RunTransitionError,
+    RUN_CHECKPOINT_NAME,
     disposition_for_status,
     phase_successors,
     project_run_outcome,
@@ -29,13 +29,11 @@ from metaharness.models import (
 )
 from metaharness.resume import (
     CHECKPOINT_INTEGRITY_OPERATION,
-    CHECKPOINT_NAME,
     PHASE_STATUS,
     ResumeCheckpoint,
     ResumePhase,
     checkpoint_payload,
     machine_state_for_run,
-    plan_identity_from_mapping,
     resume_info,
 )
 from metaharness.run_options import (
@@ -406,7 +404,7 @@ class FrozenCheckpointSchemaTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.run_dir = Path(self.temp.name)
         self.state_path = self.run_dir / "state.json"
-        self.checkpoint_path = self.run_dir / CHECKPOINT_NAME
+        self.checkpoint_path = self.run_dir / RUN_CHECKPOINT_NAME
 
     def waiting_state(self) -> dict:
         store = RunStateStore(self.state_path)
@@ -420,15 +418,7 @@ class FrozenCheckpointSchemaTests(unittest.TestCase):
     def checkpoint_bytes(self) -> bytes:
         checkpoint = ResumeCheckpoint(
             phase=ResumePhase.IMPLEMENT_STEP,
-            step_id="S01",
-            expected_head_sha="6" * 40,
-            expected_tree_sha="7" * 40,
-            execution_selection_sha256="8" * 64,
-            plan_identity=plan_identity_from_mapping({
-                "raw_sha256": "1" * 64, "contract_sha256": "2" * 64,
-                "bundle_sha256": "3" * 64, "execution_sha256": "4" * 64,
-                "checks_sha256": "5" * 64,
-            }),
+            step_index=0, last_green_commit="6" * 40, plan_sha256="8" * 64,
         )
         return (json.dumps(checkpoint_payload(checkpoint), indent=2, sort_keys=True) + "\n").encode()
 
@@ -457,13 +447,13 @@ class FrozenCheckpointSchemaTests(unittest.TestCase):
 
         self.assertTrue(info.resumable, info.reason)
         self.assertEqual(info.phase, ResumePhase.IMPLEMENT_STEP.value)
-        self.assertEqual(info.step_id, "S01")
-        self.assertEqual(info.expected_tree, "7" * 40)
+        self.assertEqual(info.step_index, 0)
+        self.assertEqual(info.last_green_commit, "6" * 40)
 
     def test_a_corrupt_current_checkpoint_is_an_integrity_failure(self) -> None:
         state = self.waiting_state()
         payload = json.loads(self.checkpoint_bytes())
-        payload["step_id"] = "not-a-step"
+        payload["unexpected_artifact_hash"] = "0" * 64
         for name, data in (
             ("incoherent identity", json.dumps(payload, indent=2, sort_keys=True) + "\n"),
             ("unreadable bytes", "{not json"),
@@ -570,19 +560,13 @@ class RunMachineTests(unittest.TestCase):
         """A minimal coherent checkpoint for *phase*."""
 
         phase_fields: dict = {}
-        if phase is RunPhase.DETERMINISTIC_GATE:
-            phase_fields["stage"] = GateStage.POST_IMPLEMENTATION
-        elif phase in {RunPhase.IMPLEMENT_STEP, RunPhase.STEP_ACCEPTANCE}:
-            phase_fields["step_id"] = "S01"
+        if phase is RunPhase.IMPLEMENT_STEP:
+            phase_fields["step_index"] = 0
+        if phase not in {RunPhase.CONTEXT, RunPhase.PLANNER}:
+            phase_fields["last_green_commit"] = "6" * 40
+            phase_fields["plan_sha256"] = "8" * 64
         return ResumeCheckpoint(
             phase=phase, **phase_fields,
-            expected_head_sha="6" * 40, expected_tree_sha="7" * 40,
-            execution_selection_sha256="8" * 64,
-            plan_identity=plan_identity_from_mapping({
-                "raw_sha256": "1" * 64, "contract_sha256": "2" * 64,
-                "bundle_sha256": "3" * 64, "execution_sha256": "4" * 64,
-                "checks_sha256": "5" * 64,
-            }),
         )
 
     def test_the_transition_table_is_the_only_place_a_hand_over_is_decided(self) -> None:
@@ -815,19 +799,12 @@ class RunStateProjectionTests(unittest.TestCase):
         self.assertEqual(state["marker"], True)
 
     def test_the_checkpoint_phase_is_never_contradicted_by_a_machine_state(self) -> None:
-        self.store.path.parent.joinpath(CHECKPOINT_NAME).write_text(
+        self.store.path.parent.joinpath(RUN_CHECKPOINT_NAME).write_text(
             json.dumps(
                 checkpoint_payload(
                     ResumeCheckpoint(
                         phase=ResumePhase.DETERMINISTIC_GATE,
-                        stage=GateStage.POST_IMPLEMENTATION,
-                        execution_selection_sha256="8" * 64,
-                        expected_head_sha="6" * 40, expected_tree_sha="7" * 40,
-                        plan_identity=plan_identity_from_mapping({
-                            "raw_sha256": "1" * 64, "contract_sha256": "2" * 64,
-                            "bundle_sha256": "3" * 64, "execution_sha256": "4" * 64,
-                            "checks_sha256": "5" * 64,
-                        }),
+                        last_green_commit="6" * 40, plan_sha256="8" * 64,
                     )
                 ),
                 indent=2,
@@ -894,7 +871,7 @@ class CheckpointAuthorityTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.run_dir = Path(self.temp.name)
         self.state_path = self.run_dir / "state.json"
-        self.checkpoint_path = self.run_dir / CHECKPOINT_NAME
+        self.checkpoint_path = self.run_dir / RUN_CHECKPOINT_NAME
         self.store = RunStateStore(self.state_path)
         self.store.initialize("run")
 
@@ -978,9 +955,9 @@ class CheckpointAuthorityTests(unittest.TestCase):
         )
         corruptions = (
             ("unreadable bytes", "{not json"),
-            ("missing phase", json.dumps({"schema_version": 4, "status": "pending"})),
+            ("missing phase", json.dumps({"schema_version": 6})),
             ("unknown phase", json.dumps(
-                {"schema_version": 4, "status": "pending", "phase": "no_such_phase"},
+                {"schema_version": 6, "phase": "no_such_phase"},
             )),
             ("wrong object", json.dumps(["not", "an", "object"])),
         )

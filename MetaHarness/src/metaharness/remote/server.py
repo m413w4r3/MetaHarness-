@@ -7,7 +7,7 @@ read from ``remote_token_file``.  The request line is never logged, echoed or
 forwarded: each allowlisted ``/v1`` route maps to exactly one MetaHarness
 target, and an unknown route or method never reaches the local server.
 
-The observation routes are read-only.  The five mutation routes are validated
+The observation routes are read-only.  The four mutation routes are validated
 and translated here, then sent to MetaHarness by exactly one loopback request
 carrying ``X-MetaHarness-Token``: the remote bearer token is never forwarded,
 no mutation is ever retried, and the local status and JSON value are relayed
@@ -22,7 +22,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, parse_qs, urlsplit
 
-from ..plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
 from ..step_ids import is_step_id
 from .auth import bearer_token_from_header, load_token_file, token_matches
 from .client import (
@@ -40,14 +39,13 @@ _UPSTREAM_TIMEOUT_SECONDS = 10.0
 # Request bodies of the mutation routes: 64 KiB, and the room the local
 # server itself reserves for a replacement plan after JSON encoding.
 _MAX_BODY_BYTES = 64 * 1024
-_MAX_RECOVERY_BODY_BYTES = 4 * MAX_REPLACEMENT_PLAN_BYTES
 _FIXED_TARGETS = {
     "/v1/health": "/api/v1/health",
     "/v1/config": "/api/v1/config",
     "/v1/model-profiles": "/api/v1/model-profiles",
     "/v1/runs": "/api/v1/runs",
 }
-_MUTATION_SUFFIXES = ("approval", "resume", "recover-plan")
+_MUTATION_SUFFIXES = ("approval", "resume")
 # The statuses a mutation relays from MetaHarness; any other status, and any
 # non-object body, is reported as an upstream failure instead.
 _RELAYED_STATUSES = frozenset({200, 202, 400, 403, 404, 409, 413, 500, 503})
@@ -158,8 +156,7 @@ def _mutation_target(path: str) -> tuple[str, str, int]:
     parts = path.split("/")
     if len(parts) == 5 and parts[:3] == ["", "v1", "runs"] and parts[4] in _MUTATION_SUFFIXES:
         action = parts[4]
-        limit = _MAX_RECOVERY_BODY_BYTES if action == "recover-plan" else _MAX_BODY_BYTES
-        return action, _run_id(parts[3]), limit
+        return action, _run_id(parts[3]), _MAX_BODY_BYTES
     if _read_route(path):
         raise _RouteError(405, "method_not_allowed", _METHOD_MESSAGE)
     raise _RouteError(404, "not_found", "unknown route")
@@ -229,12 +226,6 @@ def _approval_payload(payload: dict[str, object]) -> dict[str, object]:
 def _require_empty_body(payload: dict[str, object]) -> None:
     if payload:
         raise _RouteError(400, "invalid_request", "resume body must be an empty JSON object")
-
-
-def _plan_text(payload: dict[str, object]) -> str:
-    if set(payload) != {"plan"} or not isinstance(payload.get("plan"), str):
-        raise _RouteError(400, "invalid_request", "body must contain exactly one plan string")
-    return payload["plan"]  # type: ignore[return-value]
 
 
 def _reject_duplicate_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -383,7 +374,7 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
         if action == "resume":
             _require_empty_body(payload)
             return client.resume_run(run_id)
-        return client.recover_plan(run_id, _plan_text(payload))
+        raise _RouteError(404, "not_found", "unknown mutation route")
 
     def _body(self, max_bytes: int) -> dict[str, object]:
         """Read the single bounded JSON object of a mutation request.

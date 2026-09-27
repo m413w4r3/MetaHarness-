@@ -186,12 +186,10 @@ class PipelineV2Operations:
 
     checkpoint: Callable[..., None]
     current_head: Callable[[PipelineV2Context], str]
-    candidate_tree: Callable[[PipelineV2Context], str]
     begin_cycle: Callable[[PipelineV2Context, RunCycle, bool], None]
     initial_plan: Callable[[PipelineV2Context], CyclePlan]
     completed_steps: Callable[[PipelineV2Context, CyclePlan], list[dict[str, Any]]]
     execute_step: Callable[[PipelineV2Context, CyclePlan, int], None]
-    accept_step: Callable[[PipelineV2Context, CyclePlan, int], None]
     run_gate: Callable[[PipelineV2Context, CyclePlan, GateStage], EvidenceBundle]
     load_gate_evidence: Callable[[PipelineV2Context, int, GateStage], EvidenceBundle | None]
     run_audit: Callable[[PipelineV2Context, CyclePlan, GateStage, EvidenceBundle, int], Any]
@@ -223,15 +221,13 @@ class PipelineV2Coordinator:
         self._cursor.append(target)
 
     def _boundary(
-        self, phase: RunPhase, plan: CyclePlan, *, stage: GateStage | None = None,
-        step_id: str | None = None,
+        self, phase: RunPhase, plan: CyclePlan, *, step_index: int | None = None,
     ) -> None:
         self._phase(phase)
         self.operations.checkpoint(
-            self.context, phase, cycle=plan.cycle.number,
+            self.context, phase, iteration=plan.cycle.number,
             head=self.operations.current_head(self.context),
-            tree=self.operations.candidate_tree(self.context),
-            stage=stage, step_id=step_id,
+            step_index=step_index,
         )
 
     def _candidate_boundary(
@@ -239,15 +235,14 @@ class PipelineV2Coordinator:
     ) -> None:
         self._phase(phase)
         self.operations.checkpoint(
-            self.context, phase, cycle=plan.cycle.number,
-            head=candidate["commit_sha"], tree=candidate["tree_sha"],
-            expected_parent_sha=candidate["parent_sha"],
+            self.context, phase, iteration=plan.cycle.number,
+            head=candidate["commit_sha"],
         )
 
     def run(self, start: ResumeCheckpoint, *, resumed: bool) -> RunResult:
         ops, ctx = self.operations, self.context
-        if start.review_cycle != 1:
-            raise PipelineFailure("RUN_SCHEMA_UNSUPPORTED", "an older run schema cannot resume")
+        if start.iteration != 1:
+            raise PipelineFailure("RUN_SCHEMA_UNSUPPORTED", "this runtime supports iteration 1 only")
         if start.phase in {
             RunPhase.CONTEXT, RunPhase.PLANNER, RunPhase.PLAN_APPROVAL,
             RunPhase.WORKTREE_SETUP,
@@ -259,26 +254,21 @@ class PipelineV2Coordinator:
         stage = GateStage.POST_IMPLEMENTATION
         if start.phase is RunPhase.PUBLISH:
             return ops.publish(ctx, 1, ops.load_candidate(ctx, 1))
-        if start.phase in {RunPhase.IMPLEMENT_STEP, RunPhase.STEP_ACCEPTANCE}:
-            if start.phase is RunPhase.STEP_ACCEPTANCE:
-                ids = [step.id for step in plan.plan.steps]
-                if start.step_id not in ids:
-                    raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted step is absent from the plan")
-                ops.accept_step(ctx, plan, ids.index(start.step_id))
-            done = {item["id"] for item in ops.completed_steps(ctx, plan)}
-            for index, step in enumerate(plan.plan.steps):
-                if step.id in done:
-                    continue
-                self._boundary(RunPhase.IMPLEMENT_STEP, plan, step_id=step.id)
+        if start.phase is RunPhase.IMPLEMENT_STEP:
+            index = start.step_index
+            if index is None or index > len(plan.plan.steps):
+                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "implementation step_index is outside the plan")
+            for index in range(index, len(plan.plan.steps)):
+                self._boundary(RunPhase.IMPLEMENT_STEP, plan, step_index=index)
                 ops.execute_step(ctx, plan, index)
-            self._boundary(RunPhase.DETERMINISTIC_GATE, plan, stage=stage)
+            self._boundary(RunPhase.DETERMINISTIC_GATE, plan)
             evidence = self._gate(plan, stage, None)
         elif start.phase in {RunPhase.DETERMINISTIC_GATE, RunPhase.AUDIT}:
             evidence = self._gate(plan, stage, start)
+        elif start.phase in {RunPhase.CANDIDATE_READY, RunPhase.CANDIDATE_PUSH}:
+            evidence = None
         else:
-            evidence = ops.load_gate_evidence(ctx, 1, stage)
-            if evidence is None or not evidence.deterministic_passed:
-                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted gate evidence is missing")
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "checkpoint phase is not executable")
         if start.phase in {RunPhase.CANDIDATE_READY, RunPhase.CANDIDATE_PUSH}:
             candidate = ops.load_candidate(ctx, 1)
         else:
@@ -297,7 +287,7 @@ class PipelineV2Coordinator:
         reports = sorted((cycle_dir(ctx.run_dir, plan.cycle) / "audit").glob("*/report.json"))
         if start is not None and start.phase is RunPhase.AUDIT and not reports:
             evidence = ops.load_gate_evidence(ctx, 1, stage)
-            if evidence is None or evidence.staged_tree_sha != start.expected_tree_sha:
+            if evidence is None:
                 raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "diagnostic gate evidence is missing")
         else:
             evidence = ops.run_gate(ctx, plan, stage)
@@ -331,7 +321,7 @@ class PipelineV2Coordinator:
                 raise PipelineFailure("SPEC_DECISION_REQUIRED", {
                     "remaining": remaining, "failure_ids": list(evidence.failures),
                 })
-            self._boundary(RunPhase.DETERMINISTIC_GATE, plan, stage=stage)
+            self._boundary(RunPhase.DETERMINISTIC_GATE, plan)
             evidence = ops.run_gate(ctx, plan, stage)
             hard = ops.hard_failures(evidence)
             if hard:

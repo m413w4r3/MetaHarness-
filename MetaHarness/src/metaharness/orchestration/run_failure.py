@@ -39,7 +39,7 @@ from .pipeline_v2 import (
     step_dir as cycle_step_dir,
 )
 from .recovery import normalize_exit_reason, project_exit
-from .resume_integrity import validate_resume
+from .run_resume import prepare_resume
 from .shared import (
     CandidatePushError, CommitBoundaryError, OrchestrationError,
     StepExecutionFailure, bounded_v2_report, json_text, safe_candidate_tree,
@@ -324,12 +324,15 @@ class RunFailure:
                 return False
             options, _digest = read_run_options_for_state(run_dir, state)
             config = effective_run_config(self.runtime.config, options)
-            validate_resume(
-                config=config,
-                run_dir=run_dir,
-                state=state,
-                checkpoint=checkpoint,
-                staging_remote=config.repository.remote,
+            if checkpoint.phase in {
+                ResumePhase.CONTEXT, ResumePhase.PLANNER,
+                ResumePhase.PLAN_APPROVAL, ResumePhase.WORKTREE_SETUP,
+            }:
+                return True
+            prepare_resume(
+                config=config, run_dir=run_dir,
+                run_id=str(state.get("run_id", "")), state=state,
+                checkpoint=checkpoint, restore_worktree=False,
             )
         except Exception:
             return False

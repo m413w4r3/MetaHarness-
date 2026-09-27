@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from .pipeline_v2 import PipelineFailure, candidate_dir, gate_acceptance_path
+from .pipeline_v2 import PipelineFailure, candidate_dir
 from .shared import CandidatePushError, _json_text, _read_json_artifact
 from ..gitops import (
     GitError,
@@ -14,9 +14,7 @@ from ..gitops import (
     current_head,
     normalize_github_web_url,
     resolve_tree,
-    validate_linear_commit_chain,
 )
-from ..evidence import required_checks_passed
 from ..result import atomic_write_text
 from ..models import GateStage
 from ..recovery_policy import RecoveryBudgets
@@ -67,30 +65,11 @@ def accepted_chain_records(run_dir: Path) -> tuple[dict[str, Any], ...]:
     chain = _read_json_artifact(chain_path)
     if isinstance(chain, dict):
         chain = chain.get("commits")
-    if not isinstance(chain, list) or not chain or not all(
+    if not isinstance(chain, list) or not all(
         isinstance(item, dict) for item in chain
     ):
-        raise GitError("accepted commit chain artifact is malformed")
+        return ()
     return tuple(chain)
-
-
-def validate_accepted_chain(
-    worktree: Path,
-    *,
-    run_dir: Path,
-    base_sha: str,
-    tip_sha: str,
-    approved_tree_sha: str,
-) -> tuple[str, ...]:
-    """Validate the exact durable chain used by candidate publication."""
-
-    return validate_linear_commit_chain(
-        worktree,
-        base_sha=base_sha,
-        tip_sha=tip_sha,
-        accepted_commits=accepted_chain_records(run_dir),
-        approved_tree_sha=approved_tree_sha,
-    )
 
 
 class CandidateLifecycle:
@@ -100,14 +79,10 @@ class CandidateLifecycle:
         self,
         *,
         staging_remote: str,
-        authorize_tree: Callable[..., None],
-        gate_mutable_authority: Callable[..., Any],
         push_tree: Callable[..., dict[str, Any]],
         cycle_update: Callable[..., None],
     ) -> None:
         self._staging_remote = staging_remote
-        self._authorize_tree = authorize_tree
-        self._gate_mutable_authority = gate_mutable_authority
         self._push_tree = push_tree
         self._cycle_update = cycle_update
 
@@ -115,73 +90,41 @@ class CandidateLifecycle:
         self, store: Any, ctx: Any, cycle_plan: Any, stage: GateStage,
         evidence: Any,
     ) -> dict[str, Any]:
-        if not evidence.deterministic_passed or not required_checks_passed(evidence):
-            raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
+        if evidence is None or not evidence.deterministic_passed:
+            raise PipelineFailure(
+                "DETERMINISTIC_GATE_FAILED", ", ".join(getattr(evidence, "failures", ())),
+            )
+        return self._from_git(store, ctx, cycle_plan.cycle.number, stage)
+
+    def load_from_git(self, store: Any, ctx: Any, number: int) -> dict[str, Any]:
+        """Rebuild candidate metadata from the branch commit, never its report."""
+
+        return self._from_git(store, ctx, number, GateStage.POST_IMPLEMENTATION)
+
+    def _from_git(self, store: Any, ctx: Any, number: int, stage: GateStage) -> dict[str, Any]:
         worktree = ctx.info.worktree
         head = current_head(worktree)
-        self._authorize_tree(evidence, worktree, head, ctx.branch_ref)
-        if resolve_tree(worktree, head) != evidence.staged_tree_sha:
-            raise PipelineFailure(
-                "RESUME_INTEGRITY_FAILURE",
-                "candidate HEAD tree differs from gate evidence",
-            )
-        acceptance = _read_json_artifact(
-            gate_acceptance_path(ctx.run_dir, cycle_plan.cycle, stage)
-        )
-        authority = self._gate_mutable_authority(ctx, cycle_plan, stage)
-        if (
-            not isinstance(acceptance, dict)
-            or acceptance.get("stage") != stage.value
-            or acceptance.get("tree_sha") != evidence.staged_tree_sha
-            or acceptance.get("commit_sha") != head
-            or acceptance.get("mutable_scope") != list(authority.effective_paths)
-            or acceptance.get("mutable_scope_sha256") != authority.sha256
-        ):
-            raise PipelineFailure(
-                "RESUME_INTEGRITY_FAILURE",
-                "final gate acceptance is missing or stale",
-            )
-        no_change = not evidence.changed_files
-        if no_change and evidence.diff != "":
-            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "no-change evidence has a diff")
+        tree = resolve_tree(worktree, head)
+        no_change = head == ctx.info.base_sha
         parents = () if no_change else commit_parents(worktree, head)
         if not no_change and len(parents) != 1:
             raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "candidate HEAD has no single parent")
-        path = _candidate_commit_path(ctx.run_dir, cycle_plan.cycle.number)
-        stored = _read_json_artifact(path)
-        if stored is not None and (
-            not isinstance(stored, dict)
-            or stored.get("commit_sha") != head
-            or stored.get("tree_sha") != evidence.staged_tree_sha
-            or stored.get("parent_sha") != (None if no_change else parents[0])
-            or stored.get("no_change", False) is not no_change
-        ):
-            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "candidate artifact does not match accepted HEAD")
         payload = _candidate_commit_payload(
             commit_sha=head,
-            tree_sha=evidence.staged_tree_sha,
+            tree_sha=tree,
             parent_sha=None if no_change else parents[0],
             branch=ctx.info.branch,
             remote=self._staging_remote,
             immutable_url=_commit_web_url(ctx.repository_reference, head),
             gate_stage=stage.value,
-            remote_sha=stored.get("remote_sha") if isinstance(stored, dict) else None,
-            pushed_at=stored.get("pushed_at") if isinstance(stored, dict) else None,
-            remote_status=(
-                stored.get("remote_status", "pending")
-                if isinstance(stored, dict) else "pending"
-            ),
             no_change=no_change,
         )
-        atomic_write_text(path, _json_text(payload))
+        atomic_write_text(_candidate_commit_path(ctx.run_dir, number), _json_text(payload))
         candidate_state = dict(store.load().get("candidate") or {})
-        candidate_state[f"{cycle_plan.cycle.number:03d}"] = payload
+        candidate_state[f"{number:03d}"] = payload
         store.update_metadata(
             candidate=candidate_state,
-            candidate_commit_sha=head, approved_tree_sha=evidence.staged_tree_sha,
-            expected_head_sha=head,
-            expected_parent_sha=None if no_change else parents[0],
-            expected_tree_sha=evidence.staged_tree_sha, next_step_id=None,
+            candidate_commit_sha=head, approved_tree_sha=tree,
         )
         return payload
 

@@ -285,13 +285,11 @@ class WebServerTests(unittest.TestCase):
             patch("metaharness.web.server.create_run", return_value={"run_id": "new", "location": "/runs/new"}) as create,
             patch("metaharness.web.server.approve_run", return_value={"decision": "REJECT"}) as approve,
             patch("metaharness.web.server.resume_run_request", return_value={"run_id": "r1", "location": "/runs/r1"}) as resume,
-            patch("metaharness.web.server.recover_plan_request", return_value={"run_id": "r1", "location": "/runs/r1"}) as recover,
         ):
             mutations = (
                 ("/api/v1/runs", {"spec": "spec", "run_id": "new", "planner_profile": "planner"}),
                 ("/api/v1/runs/r1/approval", {"decision": "REJECT"}),
                 ("/api/v1/runs/r1/resume", {}),
-                ("/api/v1/runs/r1/recover-plan", {"plan": "META PLAN v2\n"}),
             )
             for path, body in mutations:
                 with self.subTest(path=path):
@@ -306,14 +304,12 @@ class WebServerTests(unittest.TestCase):
             self.assertEqual(create.call_args.kwargs["run_id"], "new")
             approve.assert_called_once()
             resume.assert_called_once_with(self.server.run_manager, self.runs, "r1")
-            recover.assert_called_once_with(self.server.run_manager, self.runs, "r1", "META PLAN v2\n")
 
     def test_v1_mutations_reject_missing_token_unknown_fields_and_nonempty_resume(self) -> None:
         requests = (
             ("/api/v1/runs", {"spec": "spec"}),
             ("/api/v1/runs/r1/approval", {"decision": "REJECT"}),
             ("/api/v1/runs/r1/resume", {}),
-            ("/api/v1/runs/r1/recover-plan", {"plan": "x"}),
         )
         for path, body in requests:
             with self.subTest(path=path):
@@ -329,7 +325,6 @@ class WebServerTests(unittest.TestCase):
     def test_v1_invalid_mutation_payloads_and_unsupported_methods_stay_json(self) -> None:
         cases = (
             ("/api/v1/runs/r1/approval", {"decision": "REJECT", "unexpected": 1}),
-            ("/api/v1/runs/r1/recover-plan", {"plan": 1}),
         )
         for path, body in cases:
             with self.subTest(path=path):

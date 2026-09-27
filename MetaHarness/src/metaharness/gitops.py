@@ -1665,7 +1665,7 @@ def rewind_worktree(worktree: Path, commit_sha: str) -> str:
                 target.unlink()
             elif os.path.lexists(target):
                 raise GitError("the replay boundary encountered a non-file path")
-    _git(root, "clean", "-fdq", timeout=600)
+    _git(root, "clean", "-fdxq", timeout=600)
     if (
         current_head(root) != commit
         or candidate_tree_sha(root) != tree

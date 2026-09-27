@@ -25,7 +25,6 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from metaharness.plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
 from metaharness.remote import (
     MAX_RESPONSE_BYTES,
     LocalMetaHarnessClient,
@@ -68,18 +67,15 @@ UPSTREAM_MEMORY_PORT = 8765
 CREATE_PATH = "/v1/runs"
 APPROVAL_PATH = f"/v1/runs/{RUN_ID}/approval"
 RESUME_PATH = f"/v1/runs/{RUN_ID}/resume"
-RECOVERY_PATH = f"/v1/runs/{RUN_ID}/recover-plan"
-MUTATION_PATHS = (CREATE_PATH, APPROVAL_PATH, RESUME_PATH, RECOVERY_PATH)
+MUTATION_PATHS = (CREATE_PATH, APPROVAL_PATH, RESUME_PATH)
 
 LOCAL_CREATE = "/api/v1/runs"
 LOCAL_APPROVAL = f"/api/v1/runs/{RUN_ID}/approval"
 LOCAL_RESUME = f"/api/v1/runs/{RUN_ID}/resume"
-LOCAL_RECOVERY = f"/api/v1/runs/{RUN_ID}/recover-plan"
 LOCAL_TARGETS = {
     CREATE_PATH: LOCAL_CREATE,
     APPROVAL_PATH: LOCAL_APPROVAL,
     RESUME_PATH: LOCAL_RESUME,
-    RECOVERY_PATH: LOCAL_RECOVERY,
 }
 
 CREATE_RESULT = {
@@ -89,13 +85,11 @@ APPROVAL_RESULT = {"ok": True, "decision": "APPROVE"}
 RESUME_RESULT = {
     "ok": True, "run_id": RUN_ID, "location": f"/runs/{RUN_ID}", "accepted": True,
 }
-RECOVERY_RESULT = RESUME_RESULT
 
 DEFAULT_RESPONSES = {
     ("POST", LOCAL_CREATE): (202, CREATE_RESULT),
     ("POST", LOCAL_APPROVAL): (200, APPROVAL_RESULT),
     ("POST", LOCAL_RESUME): (202, RESUME_RESULT),
-    ("POST", LOCAL_RECOVERY): (202, RECOVERY_RESULT),
 }
 
 VALID_BODIES: dict[str, dict[str, object]] = {
@@ -106,7 +100,6 @@ VALID_BODIES: dict[str, dict[str, object]] = {
         "step_profiles": {"S01": "implementer"},
     },
     RESUME_PATH: {},
-    RECOVERY_PATH: {"plan": "# META PLAN v2\n"},
 }
 
 
@@ -737,56 +730,6 @@ class ResumeTests(MutationCase):
         self.assert_upstream_untouched()
 
 
-# ---------------------------------------------------------------------------
-# RECOVER PLAN
-# ---------------------------------------------------------------------------
-
-
-class RecoverPlanTests(MutationCase):
-    def test_recover_plan_forwards_the_plan(self) -> None:
-        plan = "# META PLAN v2\n\nS01 do the thing\n"
-        response = self.post(RECOVERY_PATH, {"plan": plan})
-        self.assertEqual(response.status, 202)
-        self.assertEqual(response.payload, RECOVERY_RESULT)
-        self.assertEqual(self.local_body(RECOVERY_PATH), {"plan": plan})
-
-    def test_recover_plan_accepts_a_body_above_the_standard_limit(self) -> None:
-        plan = "# META PLAN v2\n" + "S01 step line\n" * 6000
-        self.assertGreater(len(plan), 64 * 1024)
-        response = self.post(RECOVERY_PATH, {"plan": plan})
-        self.assertEqual(response.status, 202)
-        self.assertEqual(self.local_body(RECOVERY_PATH), {"plan": plan})
-
-    def test_recover_plan_limit_is_compatible_with_the_plan_limit(self) -> None:
-        # The local server reserves 4 * MAX_REPLACEMENT_PLAN_BYTES for the
-        # JSON encoding of one plan; the gateway must not accept less.
-        self.assertGreaterEqual(
-            gateway_module._MAX_RECOVERY_BODY_BYTES, 4 * MAX_REPLACEMENT_PLAN_BYTES
-        )
-        response = self.request(
-            "POST",
-            RECOVERY_PATH,
-            declared_length=gateway_module._MAX_RECOVERY_BODY_BYTES + 1,
-        )
-        self.assertEqual(response.status, 413)
-        self.assertEqual(response.payload, TOO_LARGE)
-        self.assert_upstream_untouched()
-
-    def test_recover_plan_refuses_other_bodies(self) -> None:
-        for payload in ({}, {"plan": 3}, {"plan": "x", "extra": 1}):
-            with self.subTest(payload=payload):
-                response = self.post(RECOVERY_PATH, payload)
-                self.assertEqual(response.status, 400)
-                self.assertEqual(
-                    response.payload,
-                    {
-                        "error": "invalid_request",
-                        "message": "body must contain exactly one plan string",
-                    },
-                )
-        self.assert_upstream_untouched()
-
-
 class RequestContractTests(MutationCase):
     """Media type and framing rules of a mutation body."""
 
@@ -853,15 +796,6 @@ class RequestContractTests(MutationCase):
                 self.assertIn(b"invalid_request", raw)
                 self.assertNotIn(target.encode(), raw)
         self.assert_upstream_untouched()
-
-    def test_a_pathologically_nested_body_is_refused(self) -> None:
-        nested = b'{"plan": ' + b"[" * 100_000 + b"]" * 100_000 + b"}"
-        self.assertLess(len(nested), gateway_module._MAX_RECOVERY_BODY_BYTES)
-        response = self.post(RECOVERY_PATH, raw=nested)
-        self.assertEqual(response.status, 400)
-        self.assertEqual(response.payload, BAD_JSON)
-        self.assert_upstream_untouched()
-
 
 class LocalBoundTests(MutationCase):
     """The loopback mutation leg is bounded in time and in size."""

@@ -1,4 +1,4 @@
-"""The structural identity of a run checkpoint: schema, status, phase, bytes.
+"""The structural identity of a run checkpoint: schema, phase, bytes.
 
 The checkpoint is the one durable owner of a run's phase, and two readers have
 to agree on what it says without sharing the resume gate: the state store,
@@ -22,10 +22,7 @@ from .models import RUN_CHECKPOINT_NAME, RunPhase
 # The schema this runtime writes and reads.  Another one is not corruption,
 # but it is not a phase authority either: the resume gate refuses it as
 # ``RUN_SCHEMA_UNSUPPORTED`` and a control read refuses to read a phase from it.
-CHECKPOINT_SCHEMA_VERSION = 5
-
-CHECKPOINT_STATUSES = frozenset({"pending", "completed"})
-
+CHECKPOINT_SCHEMA_VERSION = 6
 
 class CheckpointFormatError(ValueError):
     """A checkpoint is unreadable or structurally invalid.
@@ -40,13 +37,8 @@ class CheckpointStamp:
     """The exact bytes of one checkpoint and the fields that frame them."""
 
     schema_version: int
-    status: str
     phase: RunPhase
     sha256: str
-
-    @property
-    def pending(self) -> bool:
-        return self.status == "pending"
 
     @property
     def current_schema(self) -> bool:
@@ -69,16 +61,13 @@ def stamp_from_payload(payload: Any, *, sha256: str) -> CheckpointStamp:
     schema_version = payload.get("schema_version")
     if isinstance(schema_version, bool) or not isinstance(schema_version, int):
         raise CheckpointFormatError("checkpoint schema_version is not an integer")
-    status = payload.get("status")
-    if status not in CHECKPOINT_STATUSES:
-        raise CheckpointFormatError("checkpoint status is invalid")
     if "phase" not in payload:
         raise CheckpointFormatError("checkpoint phase is missing")
     try:
         phase = RunPhase(payload["phase"])
     except (TypeError, ValueError) as exc:
         raise CheckpointFormatError("checkpoint phase is unknown") from exc
-    return CheckpointStamp(schema_version, status, phase, sha256)
+    return CheckpointStamp(schema_version, phase, sha256)
 
 
 def read_checkpoint_file(run_dir: str | Path) -> CheckpointFile | None:
@@ -123,7 +112,7 @@ def checkpoint_sha256(run_dir: str | Path) -> str | None:
 
 
 __all__ = [
-    "CHECKPOINT_SCHEMA_VERSION", "CHECKPOINT_STATUSES", "CheckpointFile",
+    "CHECKPOINT_SCHEMA_VERSION", "CheckpointFile",
     "CheckpointFormatError", "CheckpointStamp", "checkpoint_sha256",
     "read_checkpoint_file", "read_checkpoint_stamp", "stamp_from_payload",
 ]

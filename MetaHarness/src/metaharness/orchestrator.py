@@ -1,7 +1,7 @@
 """The MetaHarness façade: prepare one run and drive its generic pipeline.
 
-The façade owns construction, the run entry points (``run_text``, ``resume``,
-``recover_plan``) and the delegation of the sequencing to
+The façade owns construction, the run entry points (``run_text`` and
+``resume``) and the delegation of the sequencing to
 :class:`~metaharness.orchestration.pipeline_v2.PipelineV2Coordinator`.
 Everything the coordinator sequences lives in
 :mod:`metaharness.orchestration.runtime` and the services it composes.
@@ -77,7 +77,7 @@ from .orchestration.shared import (
     CommitBoundaryError,
     OrchestrationError,
 )
-from .orchestration.resume_integrity import validate_resume
+from .orchestration.run_resume import prepare_resume
 from .orchestration.runtime import (
     RunRuntime,
     generate_run_id,
@@ -270,7 +270,7 @@ class Orchestrator:
             },
         )
         self._runtime.write_checkpoint(
-            run_dir, ResumePhase.PLANNER, head=base_sha, tree=base_tree_sha
+            run_dir, ResumePhase.PLANNER, head=base_sha
         )
         outcome = self._runtime.composition.execute_v2(
             store, run_dir, run_id, spec, repo, base_sha, context,
@@ -354,10 +354,9 @@ class Orchestrator:
                 on_claimed=on_claimed,
             ))
         try:
-            resumed = validate_resume(
-                config=self._runtime.config,
-                run_dir=run_dir, state=state, checkpoint=checkpoint,
-                staging_remote=self._runtime.config.repository.remote,
+            resumed = prepare_resume(
+                config=self._runtime.config, run_dir=run_dir, run_id=selected,
+                state=state, checkpoint=checkpoint,
             )
         except (ResumeIntegrityError, ResumeRequiresOperatorError) as exc:
             failed = store.record_failure(
@@ -365,19 +364,19 @@ class Orchestrator:
                 resume={**record, "status": "refused"}, current_step=None,
             )
             return self._runtime.observability.diagnose_result(RunResult.of(run_dir, failed))
+        checkpoint = resumed.checkpoint
+        record.update(phase=checkpoint.phase.value, label=resume_label(checkpoint))
         claimed = store.transition_run(
             RunEvent.resume(), expected=run_identity(state, run_dir, checkpoint),
             failure=None, current_step=None,
             resume={**record, "status": "running",
-                    "restored_paths": list(resumed.restore_paths)},
+                    "last_green_commit": checkpoint.last_green_commit},
         )
         if claimed is None:
             raise ResumeError("run state changed while the resume was validated")
         if on_claimed is not None:
             on_claimed(run_dir)
         try:
-            if resumed.restore_paths:
-                self._runtime.restore_checkpoint_tree(resumed)
             pipeline = self._runtime.composition.pipeline_context(
                 run_dir=run_dir, run_id=selected, spec=resumed.spec,
                 context=resumed.context, repo=resumed.info.source_repo,
@@ -407,23 +406,6 @@ class Orchestrator:
         except Exception as exc:
             return self._runtime.observability.diagnose_result(self._runtime.failure.project_exception(store, run_dir, exc))
 
-    def recover_plan(
-        self, run_id: str, replacement_raw: str, *,
-        on_claimed: Callable[[Path], None] | None = None,
-    ) -> RunResult:
-        """Replace a failed planner answer with an operator META PLAN v2.
-
-        No model is called.  The replacement is validated exactly like a
-        planner answer, published as the run's plan authority, and the
-        checkpoint moves to PLAN_APPROVAL.  The run then continues through the
-        normal resume workflow: plan approval, worktree setup, the first step...
-        A refusal raises :class:`PlanRecoveryError` and changes nothing.
-        """
-
-        self._runtime.persist_recovered_plan(run_id, replacement_raw)
-        return self.resume(run_id, on_claimed=on_claimed)
-
-
 def run_orchestrator(
     config: HarnessConfig | str | Path,
     spec: str | Path,
@@ -443,13 +425,6 @@ def resume_run(config: HarnessConfig | str | Path, run_id: str) -> RunResult:
     return Orchestrator(loaded).resume(run_id)
 
 
-def recover_plan_run(config: HarnessConfig | str | Path, run_id: str, replacement_raw: str) -> RunResult:
-    """Recover a failed planner run with an operator META PLAN v2 (no model call)."""
-
-    loaded = load_config(config) if not isinstance(config, HarnessConfig) else config
-    return Orchestrator(loaded).recover_plan(run_id, replacement_raw)
-
-
 __all__ = [
     "CommitBoundaryError",
     "OrchestrationError",
@@ -457,7 +432,6 @@ __all__ = [
     "ResumeError",
     "ResumeNotAllowedError",
     "generate_run_id",
-    "recover_plan_run",
     "resume_run",
     "run_orchestrator",
 ]

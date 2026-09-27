@@ -1,12 +1,4 @@
-"""Durable, provider-neutral checkpoints for the pipeline v2 state machine.
-
-Le checkpoint porte la phase qui fait autorité : l'opération courante ou
-prochaine.  ``state.json`` n'en stocke qu'une projection dérivée (la posture et
-son statut historique), calculée par
-:func:`~metaharness.models.project_run_outcome`.  Aucune matrice implicite
-status/phase ne subsiste : :func:`machine_state_for_run` assemble l'état
-durable, :func:`resume_info` le projette.
-"""
+"""Git-first resume checkpoint format and eligibility projection."""
 
 from __future__ import annotations
 
@@ -16,32 +8,55 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .approval import ApprovalError, PlanIdentity
-from .checkpoint_identity import (
-    CHECKPOINT_SCHEMA_VERSION,
-    CheckpointFormatError,
-    checkpoint_sha256,
-    read_checkpoint_file,
-    stamp_from_payload,
-)
-from .models import (
-    GateStage,
-    RunDisposition,
-    RunIdentity,
-    RunMachineState,
-    RunPhase,
-    RUN_CHECKPOINT_NAME,
-    assemble_run_state,
-    project_run_outcome,
-)
+from .checkpoint_identity import CHECKPOINT_SCHEMA_VERSION, CheckpointFormatError, checkpoint_sha256, read_checkpoint_file, stamp_from_payload
+from .models import RunDisposition, RunIdentity, RunMachineState, RunPhase, RUN_CHECKPOINT_NAME, assemble_run_state, project_run_outcome
 from .recovery_policy import FailureClass, classify_failure
 from .result import atomic_write_text
 from .run_options import RUN_SCHEMA_UNSUPPORTED
-from .step_ids import STEP_ID_RE
 
-CHECKPOINT_NAME = RUN_CHECKPOINT_NAME
-_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}\Z")
+ResumePhase = RunPhase
+_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_EARLY = frozenset({RunPhase.CONTEXT, RunPhase.PLANNER})
+_FIELDS = frozenset({"schema_version", "iteration", "phase", "step_index", "last_green_commit", "plan_sha256"})
+CHECKPOINT_INTEGRITY_OPERATION = "checkpoint_integrity"
+STEP_ACCEPTANCE_OPERATION = "step_acceptance"
+
+
+class ResumeCheckpointError(ValueError):
+    """A checkpoint is malformed or cannot name a resume boundary."""
+
+
+class ResumeSchemaUnsupportedError(ResumeCheckpointError):
+    """The run was written by a checkpoint schema this runtime cannot read."""
+
+
+@dataclass(frozen=True)
+class ResumeCheckpoint:
+    phase: ResumePhase
+    iteration: int = 1
+    step_index: int | None = None
+    last_green_commit: str | None = None
+    plan_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        try: phase = ResumePhase(self.phase)
+        except (TypeError, ValueError) as exc: raise ResumeCheckpointError("checkpoint phase is unknown") from exc
+        object.__setattr__(self, "phase", phase)
+        if isinstance(self.iteration, bool) or not isinstance(self.iteration, int) or self.iteration < 1:
+            raise ResumeCheckpointError("checkpoint iteration must be a positive integer")
+        if phase is RunPhase.IMPLEMENT_STEP and (isinstance(self.step_index, bool) or not isinstance(self.step_index, int) or self.step_index < 0):
+            raise ResumeCheckpointError("implementation checkpoint needs a 0-based step_index")
+        if phase is not RunPhase.IMPLEMENT_STEP and self.step_index is not None:
+            raise ResumeCheckpointError("step_index is only valid during implementation")
+        if self.last_green_commit is not None and not _OBJECT_ID.fullmatch(self.last_green_commit):
+            raise ResumeCheckpointError("last_green_commit is invalid")
+        if self.plan_sha256 is not None and not _SHA256.fullmatch(self.plan_sha256):
+            raise ResumeCheckpointError("plan_sha256 is invalid")
+        if phase not in _EARLY and self.plan_sha256 is None:
+            raise ResumeCheckpointError("this phase requires the durable effective plan hash")
+        if phase not in {*_EARLY, RunPhase.PLAN_APPROVAL, RunPhase.WORKTREE_SETUP} and self.last_green_commit is None:
+            raise ResumeCheckpointError("this phase requires last_green_commit")
 
 
 def pipeline_version_from_state(state: Mapping[str, Any]) -> int:
@@ -50,227 +65,54 @@ def pipeline_version_from_state(state: Mapping[str, Any]) -> int:
     return 2
 
 
-# The canonical phase vocabulary lives in the model (``RunPhase``); the
-# checkpoint exposes the same vocabulary as ``ResumePhase``.
-ResumePhase = RunPhase
-
-
-_GATE_STAGES = frozenset(stage.value for stage in GateStage)
-_STAGED_PHASES = frozenset({ResumePhase.DETERMINISTIC_GATE})
-_PRE_PLAN = frozenset({ResumePhase.CONTEXT, ResumePhase.PLANNER})
-_PRE_APPROVAL = _PRE_PLAN | frozenset({ResumePhase.PLAN_APPROVAL})
-_NO_WORKTREE = _PRE_APPROVAL | frozenset({ResumePhase.WORKTREE_SETUP})
-
-
-class ResumeCheckpointError(ValueError):
-    """A checkpoint is malformed or does not bind the next operation."""
-
-
-class ResumeSchemaUnsupportedError(ResumeCheckpointError):
-    """The checkpoint was written by an incompatible runtime.
-
-    It is never an integrity incident: the run is simply not resumable by
-    this runtime and every artifact stays readable for an operator.
-    """
-
-
-@dataclass(frozen=True)
-class ResumeCheckpoint:
-    phase: ResumePhase
-    review_cycle: int = 1
-    stage: GateStage | None = None
-    step_id: str | None = None
-    next_step_id: str | None = None
-    expected_head_sha: str | None = None
-    expected_parent_sha: str | None = None
-    expected_tree_sha: str | None = None
-    execution_selection_sha256: str | None = None
-    plan_identity: PlanIdentity | None = None
-
-    def __post_init__(self) -> None:
-        try:
-            phase = ResumePhase(self.phase)
-        except (TypeError, ValueError) as exc:
-            raise ResumeCheckpointError("checkpoint phase is unknown") from exc
-        object.__setattr__(self, "phase", phase)
-        if isinstance(self.review_cycle, bool) or not isinstance(self.review_cycle, int) or self.review_cycle < 1:
-            raise ResumeCheckpointError("checkpoint review_cycle must be a positive integer")
-        if self.stage is not None:
-            if not isinstance(self.stage, str) or self.stage not in _GATE_STAGES:
-                raise ResumeCheckpointError("checkpoint stage is invalid")
-            object.__setattr__(self, "stage", GateStage(self.stage))
-        if phase in _STAGED_PHASES and self.stage is None:
-            raise ResumeCheckpointError("gate checkpoints require a stage")
-        if phase not in _STAGED_PHASES and self.stage is not None:
-            raise ResumeCheckpointError("checkpoint stage is only valid for gate phases")
-        step_phases = {ResumePhase.IMPLEMENT_STEP, ResumePhase.STEP_ACCEPTANCE}
-        if phase in step_phases:
-            if not isinstance(self.step_id, str) or STEP_ID_RE.fullmatch(self.step_id) is None:
-                raise ResumeCheckpointError("checkpoint step_id is invalid")
-        elif self.step_id is not None:
-            raise ResumeCheckpointError("checkpoint step_id is only valid for step phases")
-        for name, value in (
-            ("next_step_id", self.next_step_id),
-        ):
-            if value is not None and (not isinstance(value, str) or STEP_ID_RE.fullmatch(value) is None):
-                raise ResumeCheckpointError(f"checkpoint {name} is invalid")
-        for name, value in (
-            ("expected_head_sha", self.expected_head_sha),
-            ("expected_parent_sha", self.expected_parent_sha),
-            ("expected_tree_sha", self.expected_tree_sha),
-        ):
-            if value is not None and (not isinstance(value, str) or _OBJECT_ID.fullmatch(value) is None):
-                raise ResumeCheckpointError(f"checkpoint {name} is invalid")
-        for name, value in (
-            ("execution_selection_sha256", self.execution_selection_sha256),
-        ):
-            if value is not None and (not isinstance(value, str) or _SHA256.fullmatch(value) is None):
-                raise ResumeCheckpointError(f"checkpoint {name} is invalid")
-        if self.plan_identity is not None and not isinstance(self.plan_identity, PlanIdentity):
-            raise ResumeCheckpointError("checkpoint plan_identity is invalid")
-        if phase not in _PRE_PLAN and self.plan_identity is None:
-            raise ResumeCheckpointError("checkpoint plan identity is required for this phase")
-        if phase not in _PRE_APPROVAL and self.execution_selection_sha256 is None:
-            raise ResumeCheckpointError("checkpoint execution selection hash is required for this phase")
-        if phase not in _NO_WORKTREE and (
-            self.expected_head_sha is None or self.expected_tree_sha is None
-        ):
-            raise ResumeCheckpointError("checkpoint Git identity is required for this phase")
-
-
-def _identity_payload(identity: PlanIdentity) -> dict[str, str | None]:
-    return {
-        "raw_sha256": identity.raw_sha256,
-        "contract_sha256": identity.contract_sha256,
-        "bundle_sha256": identity.bundle_sha256,
-        "execution_sha256": identity.execution_sha256,
-        "checks_sha256": identity.checks_sha256,
-    }
-
-
-def plan_identity_from_mapping(value: Any) -> PlanIdentity:
-    if not isinstance(value, Mapping):
-        raise ResumeCheckpointError("plan identity must be an object")
-    try:
-        return PlanIdentity(
-            raw_sha256=value["raw_sha256"], contract_sha256=value["contract_sha256"],
-            bundle_sha256=value.get("bundle_sha256"), execution_sha256=value.get("execution_sha256"),
-            checks_sha256=value.get("checks_sha256"),
-        )
-    except (KeyError, TypeError, ApprovalError) as exc:
-        raise ResumeCheckpointError("plan identity is invalid") from exc
-
-
-def checkpoint_payload(checkpoint: ResumeCheckpoint, *, status: str = "pending") -> dict[str, Any]:
-    return {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "status": status,
-        "phase": checkpoint.phase.value,
-        "review_cycle": checkpoint.review_cycle,
-        "stage": checkpoint.stage.value if checkpoint.stage else None,
-        "step_id": checkpoint.step_id,
-        "next_step_id": checkpoint.next_step_id,
-        "expected_head_sha": checkpoint.expected_head_sha,
-        "expected_parent_sha": checkpoint.expected_parent_sha,
-        "expected_tree_sha": checkpoint.expected_tree_sha,
-        "execution_selection_sha256": checkpoint.execution_selection_sha256,
-        "plan_identity": _identity_payload(checkpoint.plan_identity) if checkpoint.plan_identity else None,
-    }
+def checkpoint_payload(checkpoint: ResumeCheckpoint) -> dict[str, Any]:
+    return {"schema_version": CHECKPOINT_SCHEMA_VERSION, "iteration": checkpoint.iteration,
+            "phase": checkpoint.phase.value, "step_index": checkpoint.step_index,
+            "last_green_commit": checkpoint.last_green_commit, "plan_sha256": checkpoint.plan_sha256}
 
 
 def write_checkpoint(run_dir: str | Path, checkpoint: ResumeCheckpoint) -> None:
-    if not isinstance(checkpoint, ResumeCheckpoint):
-        raise TypeError("checkpoint must be a ResumeCheckpoint")
-    atomic_write_text(
-        Path(run_dir) / CHECKPOINT_NAME,
-        json.dumps(checkpoint_payload(checkpoint), indent=2, sort_keys=True) + "\n",
-    )
+    if not isinstance(checkpoint, ResumeCheckpoint): raise TypeError("checkpoint must be a ResumeCheckpoint")
+    atomic_write_text(Path(run_dir) / RUN_CHECKPOINT_NAME, json.dumps(checkpoint_payload(checkpoint), indent=2, sort_keys=True) + "\n")
 
 
-def _parse(payload: Any, *, sha256: str) -> tuple[ResumeCheckpoint, str]:
-    """The business identity of one decoded checkpoint.
-
-    The structural frame (schema, status, phase) and the digest come from the
-    shared reader this module and the state store both use; only the business
-    validation below is owned here.
-    """
-
-    try:
-        stamp = stamp_from_payload(payload, sha256=sha256)
-    except CheckpointFormatError as exc:
-        raise ResumeCheckpointError(str(exc)) from exc
+def _parse(payload: Any, *, sha256: str) -> ResumeCheckpoint:
+    if not isinstance(payload, Mapping): raise ResumeCheckpointError("checkpoint is not an object")
+    version = payload.get("schema_version")
+    if isinstance(version, int) and not isinstance(version, bool) and version != CHECKPOINT_SCHEMA_VERSION:
+        raise ResumeSchemaUnsupportedError(f"{RUN_SCHEMA_UNSUPPORTED}: checkpoint schema_version {version} is not {CHECKPOINT_SCHEMA_VERSION}")
+    try: stamp = stamp_from_payload(payload, sha256=sha256)
+    except CheckpointFormatError as exc: raise ResumeCheckpointError(str(exc)) from exc
     if stamp.schema_version != CHECKPOINT_SCHEMA_VERSION:
-        raise ResumeSchemaUnsupportedError(
-            f"{RUN_SCHEMA_UNSUPPORTED}: checkpoint schema_version "
-            f"{stamp.schema_version} is not {CHECKPOINT_SCHEMA_VERSION}"
-        )
-    checkpoint = ResumeCheckpoint(
-        phase=stamp.phase, review_cycle=payload.get("review_cycle", 1),
-        stage=payload.get("stage"), step_id=payload.get("step_id"),
-        next_step_id=payload.get("next_step_id"),
-        expected_head_sha=payload.get("expected_head_sha"), expected_parent_sha=payload.get("expected_parent_sha"),
-        expected_tree_sha=payload.get("expected_tree_sha"), execution_selection_sha256=payload.get("execution_selection_sha256"),
-        plan_identity=(plan_identity_from_mapping(payload["plan_identity"]) if payload.get("plan_identity") is not None else None),
-    )
-    return checkpoint, stamp.status
-
-
-def read_checkpoint_record(run_dir: str | Path) -> tuple[ResumeCheckpoint, str] | None:
-    """The full record of the run's checkpoint, or ``None`` when it has none.
-
-    A checkpoint that exists but cannot be read is refused here, never treated
-    as absent: the resume gate maps that refusal to ``RESUME_INTEGRITY_FAILURE``.
-    """
-
+        raise ResumeSchemaUnsupportedError(f"{RUN_SCHEMA_UNSUPPORTED}: checkpoint schema is unsupported")
+    if set(payload) != _FIELDS: raise ResumeCheckpointError("checkpoint fields do not match the current schema")
     try:
-        checkpoint = read_checkpoint_file(run_dir)
-    except CheckpointFormatError as exc:
-        raise ResumeCheckpointError(str(exc)) from exc
-    if checkpoint is None:
-        return None
-    return _parse(checkpoint.payload, sha256=checkpoint.sha256)
-
-
-def read_checkpoint(run_dir: str | Path) -> ResumeCheckpoint | None:
-    record = read_checkpoint_record(run_dir)
-    return record[0] if record is not None and record[1] == "pending" else None
-
-
-def mark_checkpoint_completed(run_dir: str | Path) -> None:
-    record = read_checkpoint_record(run_dir)
-    if record is not None:
-        atomic_write_text(
-            Path(run_dir) / CHECKPOINT_NAME,
-            json.dumps(checkpoint_payload(record[0], status="completed"), indent=2, sort_keys=True) + "\n",
+        return ResumeCheckpoint(
+            phase=stamp.phase, iteration=payload["iteration"], step_index=payload["step_index"],
+            last_green_commit=payload["last_green_commit"], plan_sha256=payload["plan_sha256"],
         )
+    except (KeyError, TypeError, ResumeCheckpointError) as exc:
+        raise ResumeCheckpointError(str(exc)) from exc
 
 
-# Derived, never authored: the status of a phase that is still running.
-PHASE_STATUS = {
-    phase: project_run_outcome(
-        RunMachineState(phase, RunDisposition.RUNNING),
-    ).status.value
-    for phase in ResumePhase
-}
-# The deterministic acceptance of a durable, successful worker candidate.
-STEP_ACCEPTANCE_OPERATION = "step_acceptance"
-# A current checkpoint whose durable identity no longer holds.
-CHECKPOINT_INTEGRITY_OPERATION = "checkpoint_integrity"
+def read_checkpoint_record(run_dir: str | Path) -> ResumeCheckpoint | None:
+    try: record = read_checkpoint_file(run_dir)
+    except CheckpointFormatError as exc: raise ResumeCheckpointError(str(exc)) from exc
+    return _parse(record.payload, sha256=record.sha256) if record is not None else None
+
+
+read_checkpoint = read_checkpoint_record
+PHASE_STATUS = {phase: project_run_outcome(RunMachineState(phase, RunDisposition.RUNNING)).status.value for phase in ResumePhase}
 
 
 def resume_label(checkpoint: ResumeCheckpoint) -> str:
-    cycle = f" (cycle {checkpoint.review_cycle:03d})" if checkpoint.review_cycle > 1 else ""
-    labels = {
-        ResumePhase.CONTEXT: "Retry context", ResumePhase.PLANNER: "Retry planner",
-        ResumePhase.PLAN_APPROVAL: "Resume plan approval", ResumePhase.WORKTREE_SETUP: "Retry workspace setup",
-        ResumePhase.IMPLEMENT_STEP: f"Retry {checkpoint.step_id}",
-        ResumePhase.STEP_ACCEPTANCE: f"Retry step acceptance ({checkpoint.step_id})",
-        ResumePhase.DETERMINISTIC_GATE: f"Retry deterministic gate ({checkpoint.stage})",
-        ResumePhase.AUDIT: "Retry audit",
-        ResumePhase.CANDIDATE_READY: "Prepare candidate",
-        ResumePhase.CANDIDATE_PUSH: "Push candidate", ResumePhase.PUBLISH: "Retry publish",
-    }
-    return labels[checkpoint.phase] + cycle
+    return {
+        RunPhase.CONTEXT: "Retry context", RunPhase.PLANNER: "Retry planner",
+        RunPhase.PLAN_APPROVAL: "Resume plan approval", RunPhase.WORKTREE_SETUP: "Retry workspace setup",
+        RunPhase.IMPLEMENT_STEP: f"Retry step {checkpoint.step_index}", RunPhase.STEP_ACCEPTANCE: "Retry step acceptance",
+        RunPhase.DETERMINISTIC_GATE: "Retry deterministic gate", RunPhase.AUDIT: "Retry audit",
+        RunPhase.CANDIDATE_READY: "Prepare candidate", RunPhase.CANDIDATE_PUSH: "Push candidate", RunPhase.PUBLISH: "Retry publish",
+    }[checkpoint.phase]
 
 
 @dataclass(frozen=True)
@@ -279,145 +121,77 @@ class ResumeInfo:
     phase: str | None = None
     label: str | None = None
     reason: str | None = None
-    expected_tree: str | None = None
-    review_cycle: int | None = None
-    step_id: str | None = None
+    iteration: int | None = None
+    step_index: int | None = None
+    last_green_commit: str | None = None
     operation: str | None = None
     disposition: str | None = None
 
 
-def machine_state_for_run(
-    state: Mapping[str, Any], checkpoint: ResumeCheckpoint | None = None,
-) -> RunMachineState:
-    """Assemble the durable run state: one phase, one disposition.
-
-    The checkpoint owns the phase; the run state owns the posture.  A stored
-    status is read through the single bridge
-    :func:`~metaharness.models.assemble_run_state`.
-    """
-
+def machine_state_for_run(state: Mapping[str, Any], checkpoint: ResumeCheckpoint | None = None) -> RunMachineState:
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     phase = checkpoint.phase if checkpoint is not None else None
-    if phase is None:
-        recorded = state.get("phase")
-        if recorded is not None:
-            try:
-                phase = RunPhase(recorded)
-            except (TypeError, ValueError) as exc:
-                raise ResumeCheckpointError("the recorded run phase is unknown") from exc
+    if phase is None and state.get("phase") is not None:
+        try: phase = RunPhase(state["phase"])
+        except (TypeError, ValueError) as exc: raise ResumeCheckpointError("the recorded run phase is unknown") from exc
     try:
         return assemble_run_state(
-            phase,
-            disposition=state.get("disposition"),
-            status=state.get("status"),
-            reason=state.get("reason"),
-            failure_reason=failure.get("reason"),
+            phase, disposition=state.get("disposition"), status=state.get("status"),
+            reason=state.get("reason"), failure_reason=failure.get("reason"),
         )
-    except ValueError as exc:
-        raise ResumeCheckpointError("the durable run state is unreadable") from exc
+    except ValueError as exc: raise ResumeCheckpointError("the durable run state is unreadable") from exc
 
 
-def run_identity(
-    state: Mapping[str, Any], run_dir: str | Path,
-    checkpoint: ResumeCheckpoint | None = None,
-) -> RunIdentity:
-    """The canonical identity of one observed run.
-
-    A claim compares the machine state, its generation (``updated_at``) and the
-    exact checkpoint bytes it was validated against; a status spelling is never
-    part of it.
-    """
-
-    machine = machine_state_for_run(state, checkpoint)
+def run_identity(state: Mapping[str, Any], run_dir: str | Path, checkpoint: ResumeCheckpoint | None = None) -> RunIdentity:
     updated_at = state.get("updated_at")
     return RunIdentity.of(
-        machine,
+        machine_state_for_run(state, checkpoint),
         updated_at=updated_at if isinstance(updated_at, str) else None,
         checkpoint_sha256=checkpoint_sha256(run_dir),
     )
 
 
 def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
-    """Whether this runtime may resume the run, and at which boundary.
-
-    The current checkpoint schema plus its durable identities decide: a
-    checkpoint written by an incompatible runtime is refused as
-    ``RUN_SCHEMA_UNSUPPORTED`` with every artifact left readable, while an
-    incoherent current checkpoint is an integrity incident.
-    """
-
     try:
         checkpoint = read_checkpoint(run_dir)
-    except ResumeSchemaUnsupportedError as exc:
-        return ResumeInfo(False, reason=str(exc), operation=RUN_SCHEMA_UNSUPPORTED)
-    except ResumeCheckpointError as exc:
-        return ResumeInfo(
-            False, reason=f"the current resume checkpoint is inconsistent: {exc}",
-            operation=CHECKPOINT_INTEGRITY_OPERATION,
-        )
+    except ResumeSchemaUnsupportedError as exc: return ResumeInfo(False, reason=str(exc), operation=RUN_SCHEMA_UNSUPPORTED)
+    except ResumeCheckpointError as exc: return ResumeInfo(False, reason=f"the current resume checkpoint is inconsistent: {exc}", operation=CHECKPOINT_INTEGRITY_OPERATION)
     try:
-        machine = machine_state_for_run(state, checkpoint)
-        outcome = project_run_outcome(machine)
-    except (ValueError, TypeError) as exc:
-        return ResumeInfo(
-            False, reason=f"the durable run state is unreadable: {exc}",
-            operation=CHECKPOINT_INTEGRITY_OPERATION,
-        )
+        outcome = project_run_outcome(machine_state_for_run(state, checkpoint))
+    except (ValueError, TypeError) as exc: return ResumeInfo(False, reason=f"the durable run state is unreadable: {exc}", operation=CHECKPOINT_INTEGRITY_OPERATION)
     if not outcome.resume_eligible:
         return ResumeInfo(False, reason="run has no resumable waiting state")
     if state.get("planning_protocol") != "v2":
         return ResumeInfo(False, reason="only pipeline v2 runs can be resumed")
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     reason = failure.get("reason")
-    if isinstance(reason, str) and reason.strip() and (
-        classify_failure(reason).failure_class is FailureClass.FATAL
-    ):
+    if isinstance(reason, str) and reason.strip() and classify_failure(reason).failure_class is FailureClass.FATAL:
         return ResumeInfo(False, reason="the run stopped at a fatal boundary")
     if state.get("recovery_resumable") is False:
         return ResumeInfo(False, reason="the run stopped at a non-resumable failure")
     if checkpoint is None:
         return ResumeInfo(False, reason="no resume checkpoint")
-    label = resume_label(checkpoint)
-    operation = None
-    # The projected outcome names the durable boundary; no caller compares the
-    # stored status to the checkpoint phase any more.
-    if checkpoint.phase is RunPhase.STEP_ACCEPTANCE:
-        operation = STEP_ACCEPTANCE_OPERATION
+    operation = STEP_ACCEPTANCE_OPERATION if checkpoint.phase is RunPhase.STEP_ACCEPTANCE else None
     return ResumeInfo(
-        True, checkpoint.phase.value, label,
-        expected_tree=checkpoint.expected_tree_sha,
-        review_cycle=checkpoint.review_cycle,
-        step_id=checkpoint.step_id,
-        operation=operation,
-        disposition=outcome.disposition.value,
+        True, checkpoint.phase.value, resume_label(checkpoint), iteration=checkpoint.iteration,
+        step_index=checkpoint.step_index, last_green_commit=checkpoint.last_green_commit,
+        operation=operation, disposition=outcome.disposition.value,
     )
 
 
-class ResumeError(RuntimeError):
-    pass
-
-
-class ResumeNotAllowedError(ResumeError):
-    pass
-
-
+class ResumeError(RuntimeError): pass
+class ResumeNotAllowedError(ResumeError): pass
 class ResumeIntegrityError(ResumeError):
     code = "RESUME_INTEGRITY_FAILURE"
-
-
 class ResumeRequiresOperatorError(ResumeError):
     code = "RESUME_REQUIRES_OPERATOR"
 
 
 __all__ = [
-    "CHECKPOINT_NAME",
-    "CHECKPOINT_INTEGRITY_OPERATION",
-    "PHASE_STATUS", "RUN_SCHEMA_UNSUPPORTED", "checkpoint_sha256", "machine_state_for_run",
-    "run_identity", "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint",
-    "ResumeCheckpointError", "ResumeError", "ResumeInfo", "ResumeIntegrityError",
-    "ResumeNotAllowedError", "ResumePhase", "ResumeRequiresOperatorError",
-    "ResumeSchemaUnsupportedError",
-    "checkpoint_payload", "mark_checkpoint_completed", "pipeline_version_from_state",
-    "plan_identity_from_mapping", "read_checkpoint", "read_checkpoint_record",
-    "resume_info", "resume_label", "write_checkpoint",
+    "CHECKPOINT_INTEGRITY_OPERATION", "PHASE_STATUS", "RUN_SCHEMA_UNSUPPORTED",
+    "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint", "ResumeCheckpointError",
+    "ResumeError", "ResumeInfo", "ResumeIntegrityError", "ResumeNotAllowedError",
+    "ResumePhase", "ResumeRequiresOperatorError", "ResumeSchemaUnsupportedError",
+    "checkpoint_payload", "pipeline_version_from_state", "read_checkpoint",
+    "read_checkpoint_record", "resume_info", "resume_label", "run_identity", "write_checkpoint",
 ]

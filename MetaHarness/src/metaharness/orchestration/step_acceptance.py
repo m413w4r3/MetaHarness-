@@ -1,12 +1,4 @@
-"""The durable acceptance boundary of one approved step.
-
-A successful worker tree becomes durable evidence first and a commit second:
-the candidate is frozen as ``step_candidate.json``, the checkpoint moves to
-``STEP_ACCEPTANCE``, and only then does the commit gate run, with the very
-:class:`~metaharness.orchestration.step_authority.EffectiveStepAuthority` the
-worker executed under.  ``resume_step_acceptance`` re-derives every proof of an
-interrupted acceptance instead of replaying a worker, a planner or an audit.
-"""
+"""The acceptance and commit boundary of one successful worker step."""
 
 from __future__ import annotations
 
@@ -17,7 +9,6 @@ from pathlib import Path
 from typing import (
     Any,
     Mapping,
-    NoReturn,
     Sequence,
     TYPE_CHECKING,
 )
@@ -35,19 +26,14 @@ from ..gitops import (
     GitError,
     WorktreeInfo,
     candidate_tree_sha,
-    changed_paths_between_trees,
-    commit_message,
     commit_parents,
     commit_step_tree,
     current_head,
     index_tree_sha,
-    resolve_tree,
     staged_diff,
     status_porcelain,
-    symbolic_head,
 )
 from ..redaction import redact
-from ..resume import ResumePhase, read_checkpoint
 from ..recovery_policy import FailureClass, classify_failure
 from ..result import atomic_write_text
 from ..state import RunStateStore
@@ -71,10 +57,7 @@ from .step_authority import (
     EffectiveStepAuthority,
     EffectiveStepExecution,
     StepAuthorityError,
-    approved_step_authority,
-    approved_step_contract,
     build_step_candidate,
-    read_step_candidate,
     write_authority_diagnostic,
     write_step_candidate,
 )
@@ -96,9 +79,9 @@ class StepAcceptanceService:
     ) -> None:
         """Cross the durable worker-success -> commit boundary of one step.
 
-        A changed tree is first frozen as ``step_candidate.json`` and the
-        checkpoint moves to ``STEP_ACCEPTANCE``; only then does the commit
-        gate run, with the very authority the worker executed under.
+        A changed tree is first frozen as ``step_candidate.json`` and then
+        passed through the commit gate. Until the next checkpoint is written,
+        a crash replays this step from its last accepted Git commit.
         """
 
         authority, outcome = execution.authority, execution.outcome
@@ -120,193 +103,10 @@ class StepAcceptanceService:
                 ctx, cycle_plan, step_dir, authority, outcome, verification,
                 parent_sha=parent_sha, source="worker_success",
             )
-            self.runtime.write_checkpoint(
-                ctx.run_dir, ResumePhase.STEP_ACCEPTANCE,
-                head=parent_sha, tree=outcome.tree_after, cycle=cycle_plan.cycle.number,
-                step_id=authority.step_id,
-            )
             accept(verification=verification)
         except (CommitSafetyError, GitError) as exc:
             raise self._step_acceptance_failure(step_dir, authority, exc) from exc
-    def resume_step_acceptance(
-        self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan, index: int,
-    ) -> None:
-        """Accept the durable worker candidate of a ``STEP_ACCEPTANCE`` checkpoint.
 
-        No worker, planner or audit is called.  Every proof is re-derived:
-        the checkpoint, the self-hashed candidate, the step record and report,
-        the effective authority (from its artifacts, never from state.json),
-        and the exact Git boundary.  Then the normal commit gate runs.
-        """
-
-        step = cycle_plan.plan.steps[index]
-        step_dir = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
-        worktree = ctx.info.worktree
-
-        def refuse(message: str) -> NoReturn:
-            raise PipelineFailure(
-                "RESUME_INTEGRITY_FAILURE", f"step acceptance: {message}", step_id=step.id,
-            )
-
-        checkpoint = read_checkpoint(ctx.run_dir)
-        if (
-            checkpoint is None or checkpoint.phase is not ResumePhase.STEP_ACCEPTANCE
-            or checkpoint.step_id != step.id
-            or checkpoint.review_cycle != cycle_plan.cycle.number
-        ):
-            refuse("the checkpoint does not name this step")
-        try:
-            candidate = read_step_candidate(step_dir)
-        except StepAuthorityError as exc:
-            refuse(str(exc))
-        if candidate is None:
-            refuse("the durable step candidate is missing")
-        parent_sha, tree_before, tree_after = (
-            candidate["parent_head_sha"], candidate["tree_before"], candidate["tree_after"],
-        )
-        changed = tuple(candidate["changed_paths"])
-        if (
-            candidate["step_id"] != step.id
-            or candidate.get("cycle") != cycle_plan.cycle.number
-            or candidate.get("run_id") != ctx.run_id
-            or parent_sha != checkpoint.expected_head_sha
-            or tree_after != checkpoint.expected_tree_sha
-        ):
-            refuse("the step candidate is not bound to its checkpoint")
-        authority = approved_step_authority(
-            step, approved_step_contract(cycle_plan, step),
-        )
-        if (
-            authority.authority_sha256 != candidate["effective_authority_sha256"]
-            or authority.effective_contract_sha256 != candidate["effective_contract_sha256"]
-        ):
-            refuse("the effective step authority changed since the worker succeeded")
-        try:
-            verification = StepVerification.from_payload(candidate.get("verification"))
-        except ValueError as exc:
-            refuse(str(exc))
-        outcome_refs = candidate["outcome"]
-        record_path, final_path = step_dir / "step.json", step_dir / "agent.final.md"
-        try:
-            record_bytes = record_path.read_bytes()
-            final_bytes = final_path.read_bytes() if final_path.is_file() else None
-        except OSError:
-            refuse("the step record is unreadable")
-        final_sha = hashlib.sha256(final_bytes).hexdigest() if final_bytes is not None else None
-        if final_sha != outcome_refs.get("final_report_sha256"):
-            refuse("the worker report changed")
-        record = read_json_artifact(record_path, 128 * 1024)
-        if (
-            not isinstance(record, dict) or record.get("id") != step.id
-            or record.get("tree_before") != tree_before or record.get("tree_after") != tree_after
-            or sorted(record.get("changed_paths") or []) != sorted(changed)
-        ):
-            refuse("the step record does not match the candidate")
-        extra = record.get("out_of_scope_paths") or []
-        if not isinstance(extra, list) or any(not isinstance(path, str) for path in extra):
-            refuse("the step record has an invalid out-of-scope audit field")
-        admitted = {*authority.mutable_scope, *extra}
-        if any(path not in admitted for path in changed):
-            refuse("the candidate changed paths outside its effective authority")
-        future = tuple(item.id for item in cycle_plan.plan.steps[index + 1:])
-        self.runtime.observability.trace_emit(
-            "recovery.resumed", phase="implementation", cycle=cycle_plan.cycle.number,
-            step_id=step.id,
-            data={
-                "operation": "step_acceptance", "tree_after": tree_after,
-                "effective_authority_sha256": authority.authority_sha256,
-                "source": candidate.get("source"),
-            },
-        )
-        try:
-            head = current_head(worktree)
-            if symbolic_head(worktree) != ctx.branch_ref:
-                refuse("the worktree HEAD is not the run branch")
-            if head != parent_sha:
-                self._recover_committed_step(
-                    store, ctx, step_dir, candidate, authority, verification,
-                    head=head, future_step_ids=future,
-                )
-                store.update_metadata(
-                    current_step=None,
-                    steps=self.runtime.composition.state_steps(ctx, cycle_plan),
-                )
-                return
-            if hashlib.sha256(record_bytes).hexdigest() != outcome_refs.get("step_record_sha256"):
-                refuse("the step record changed")
-            if (
-                resolve_tree(worktree, parent_sha) != tree_before
-                or index_tree_sha(worktree) != tree_after
-                or candidate_tree_sha(worktree) != tree_after
-                or status_has_unstaged_or_untracked(status_porcelain(worktree))
-                or tuple(sorted(changed_paths_between_trees(ctx.repo, tree_before, tree_after))) != tuple(sorted(changed))
-            ):
-                refuse("the worktree is not exactly the durable worker candidate")
-        except GitError as exc:
-            refuse(f"Git state is unreadable: {exc}")
-        outcome = StepExecutionOutcome(
-            step_id=step.id, profile_id=str(candidate.get("profile_id") or ""),
-            tree_before=tree_before, tree_after=tree_after, changed_paths=changed,
-            out_of_scope_paths=tuple(extra),
-            usage=normalize_usage(record.get("usage")),
-            final_report=(final_bytes or b"").decode("utf-8", errors="replace"),
-            deferred_verify=str(record.get("deferred_verify") or ""),
-        )
-        store.update_metadata(current_step=step.id)
-        try:
-            self._accept_v2_step_tree(
-                store=store, run_dir=ctx.run_dir, info=ctx.info, authority=authority,
-                outcome=outcome, parent_sha=parent_sha, future_step_ids=future,
-                run_id=ctx.run_id, step_dir=step_dir, verification=verification,
-            )
-        except (CommitSafetyError, GitError) as exc:
-            raise self._step_acceptance_failure(step_dir, authority, exc) from exc
-        store.update_metadata(
-            current_step=None,
-            steps=self.runtime.composition.state_steps(ctx, cycle_plan),
-        )
-        self.runtime.observability.update_v2_usage(store, ctx.run_dir)
-    def _recover_committed_step(
-        self, store: RunStateStore, ctx: PipelineV2Context, step_dir: Path,
-        candidate: Mapping[str, Any], authority: EffectiveStepAuthority,
-        verification: StepVerification, *, head: str, future_step_ids: Sequence[str],
-    ) -> None:
-        """A crash landed after the step commit: prove it, then only record it."""
-
-        worktree = ctx.info.worktree
-        parent_sha, tree_after = candidate["parent_head_sha"], candidate["tree_after"]
-        message = commit_message(worktree, head)
-        subject = message.splitlines()[0] if message else ""
-        if (
-            commit_parents(worktree, head) != (parent_sha,)
-            or resolve_tree(worktree, head) != tree_after
-            or not subject.startswith(f"metaharness({authority.step_id}):")
-            or f"MetaHarness-Run: {ctx.run_id}" not in message
-            or index_tree_sha(worktree) != tree_after
-            or candidate_tree_sha(worktree) != tree_after
-            or status_has_unstaged_or_untracked(status_porcelain(worktree))
-        ):
-            raise PipelineFailure(
-                "RESUME_INTEGRITY_FAILURE",
-                "step acceptance: HEAD moved to a commit that is not this step candidate",
-                step_id=authority.step_id,
-            )
-        record = accepted_step_record(
-            step_id=authority.step_id,
-            verification_status=verification.status,
-            parent_sha=parent_sha,
-            commit_sha=head,
-            tree_before=candidate["tree_before"],
-            tree_after=tree_after,
-            changed_paths=candidate["changed_paths"],
-            deferred=verification.deferred,
-            authority=authority.summary(),
-        )
-        diff_path = step_dir / "diff.patch"
-        self._finalize_accepted_step(
-            store, ctx.run_dir, step_dir, record, future_step_ids=future_step_ids,
-            authority=authority, diff_path=diff_path if diff_path.is_file() else None,
-        )
     def _step_verification(
         self, authority: EffectiveStepAuthority, outcome: StepExecutionOutcome,
         future_step_ids: Sequence[str],
@@ -328,6 +128,7 @@ class StepAcceptanceService:
                 },
             )
             raise
+
     def _persist_step_candidate(
         self, ctx: PipelineV2Context, cycle_plan: CyclePlan, step_dir: Path,
         authority: EffectiveStepAuthority, outcome: StepExecutionOutcome,

@@ -36,6 +36,7 @@ from ..gitops import (
     candidate_tree_sha,
     current_head,
     index_tree_sha,
+    resolve_tree,
     restore_paths_from_tree,
     stage_all,
     status_porcelain,
@@ -94,8 +95,6 @@ class StepExecutionService:
 
         step = cycle_plan.plan.steps[index]
         step_artifact_dir = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
-        if settled_step_status(step_artifact_dir, step.id) is not None:
-            return
         # A dependent of a settled step is skipped; a skip settles it too, so
         # the whole transitive chain of DEPENDS_ON is skipped in plan order.
         dependency = step.depends_on
@@ -122,8 +121,9 @@ class StepExecutionService:
             self.runtime.config, ctx.selection.audit.profile_id, ExecutionRole.AUDITOR
         )
         # The last green tree this step must leave behind if it is abandoned.
+        green_commit = checkpoint.last_green_commit if checkpoint is not None else None
         green = AttemptBoundary(
-            checkpoint.expected_tree_sha if checkpoint is not None
+            resolve_tree(ctx.info.worktree, green_commit) if green_commit
             else candidate_tree_sha(ctx.info.worktree),
             status_porcelain(ctx.info.worktree),
             git_ownership(ctx.repo, ctx.info.worktree),

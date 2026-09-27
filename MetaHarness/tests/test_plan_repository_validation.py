@@ -40,7 +40,6 @@ from metaharness.models import (
     TaskPlanV2,
     WRITE_MISSING_TO_CREATE,
 )
-from metaharness.plan_recovery import PlanRecoveryError, plan_recovery_info
 from metaharness.plan_repository_validation import (
     PathPreconditionViolation,
     PlanRepositoryPreconditionError,
@@ -540,37 +539,6 @@ class PlannerNormalizationTests(PipelineHarness):
         # A planning failure: the run is at its PLANNER checkpoint, never at a step.
         self.assertEqual(self.checkpoint()["phase"], "planner")
         self.assertFalse(self.worktree().exists())
-        self.assertTrue(plan_recovery_info(run_dir, state).eligible)
-
-    def test_operator_recovery_is_validated_before_approval(self) -> None:
-        orchestrator = self.orchestrator(
-            replace(self.config(), planning=replace(self.config().planning, max_preapproval_corrections=1)),
-            planner=[impossible_plan_message(), impossible_plan_message()],
-        )
-        orchestrator.run_text("Make feature.txt good.\n", run_id="run")
-        before = self.state()
-        with self.assertRaises(PlanRecoveryError) as caught:
-            orchestrator.recover_plan("run", impossible_plan_message())
-        self.assertIn("PLAN_REPOSITORY_PRECONDITION_INVALID", str(caught.exception))
-        self.assertIn("step=S01 no_mutation", str(caught.exception))
-        self.assertEqual(self.state()["updated_at"], before["updated_at"])
-        self.assertFalse((self.run_dir() / "implementation_bundle.json").exists())
-        self.assertEqual(self.checkpoint()["phase"], "planner")
-        self.assertEqual(self.workers.calls, [])
-
-    def test_operator_recovery_normalizes_a_classifiable_plan(self) -> None:
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        orchestrator = self.orchestrator(
-            self.config(), planner=[impossible_plan_message()],
-        )
-        orchestrator.run_text("Make feature.txt good.\n", run_id="run")
-        self.assertEqual(self.state()["failure"]["reason"], "PLAN_REPOSITORY_PRECONDITION_INVALID")
-
-        recovered = orchestrator.recover_plan("run", self.reference_corpus_plan())
-
-        self.assertEqual(recovered.status, RunStatus.PUBLISHED, self.state().get("failure"))
-        contract = (self.run_dir() / "steps/S01/contract.md").read_text(encoding="utf-8")
-        self.assertIn(AW010_PATH, contract.split("WRITE SET", 1)[1].split("CREATE SET", 1)[0])
 
     def test_both_planner_calls_stay_in_usage_accounting(self) -> None:
         chat = _Recording([impossible_plan_message(), self.reference_corpus_plan()])

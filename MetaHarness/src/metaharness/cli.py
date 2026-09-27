@@ -22,6 +22,7 @@ from .approval import (
     ApprovalDecision,
     ApprovalError,
     compute_plan_identity_from_run,
+    plan_identity_from_mapping,
     write_plan_approval,
 )
 from .config import ConfigError, load_config
@@ -48,8 +49,7 @@ from .gitops import (
 )
 from .llm.chat import validate_endpoint
 from .models import AgentConfig, HarnessConfig, ProfileDriver, PublishMode, RunStatus, profile_driver_name
-from .orchestrator import OrchestrationError, recover_plan_run, resume_run, run_orchestrator
-from .plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
+from .orchestrator import OrchestrationError, resume_run, run_orchestrator
 from .profiles import profiles_for_config
 from .redaction import config_secret_values, redact
 from .remote import (
@@ -60,7 +60,7 @@ from .remote import (
     token_matches,
 )
 from .result import RunResult
-from .resume import ResumeCheckpointError, ResumeError, plan_identity_from_mapping, resume_info
+from .resume import ResumeError, resume_info
 from .state import STATE_LOCK_NAME, RunStateStore
 
 _SANDBOX_PROBE_ARGV = ("sandbox", "--", "/bin/true")
@@ -197,20 +197,6 @@ def _resume(config_path: Path, run_id: str) -> int:
     return _report_result(result)
 
 
-def _recover_plan(config_path: Path, run_id: str, plan_path: Path) -> int:
-    """Replace a failed planner answer with an operator plan; no model call."""
-
-    try:
-        with plan_path.expanduser().open("rb") as stream:
-            # One byte over the bound lets the recovery report the exact limit.
-            data = stream.read(MAX_REPLACEMENT_PLAN_BYTES + 1)
-        result = recover_plan_run(config_path, run_id, data.decode("utf-8"))
-    except (ConfigError, ResumeError, OrchestrationError, OSError, UnicodeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    return _report_result(result)
-
-
 def _report_result(result: RunResult) -> int:
     print(f"run: {result.run_dir}")
     print(f"status: {result.status.value}")
@@ -330,7 +316,7 @@ def _write_plan_decision(run_dir: Path, decision: ApprovalDecision) -> int:
             raise ApprovalError("run state has no plan identity")
         try:
             expected_identity = plan_identity_from_mapping(state_identity)
-        except ResumeCheckpointError as exc:
+        except ApprovalError as exc:
             raise ApprovalError("run state has an invalid plan identity") from exc
         actual_identity = compute_plan_identity_from_run(directory)
         # REJECT executes nothing: the plan artifacts shown must be unchanged.
@@ -1022,13 +1008,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume.add_argument("--config", required=True, type=Path)
     resume.add_argument("--run-id", required=True, type=str)
-    recover = subparsers.add_parser(
-        "recover-plan",
-        help="replace a failed planner answer with a READY META PLAN v2 (no planner call)",
-    )
-    recover.add_argument("--config", required=True, type=Path)
-    recover.add_argument("--run-id", required=True, type=str)
-    recover.add_argument("--plan", required=True, type=Path)
     status = subparsers.add_parser("status", help="show a run status")
     status.add_argument("--run", required=True, type=Path)
     show = subparsers.add_parser("show", help="show run state and artifacts")
@@ -1074,8 +1053,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "resume":
         return _resume(args.config, args.run_id)
-    if args.command == "recover-plan":
-        return _recover_plan(args.config, args.run_id, args.plan)
     if args.command == "status":
         return _status(args.run)
     if args.command == "show":

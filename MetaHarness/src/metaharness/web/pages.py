@@ -828,7 +828,6 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     waiting_label = _WAITING_LABELS.get(status, status.upper())
     if status == "waiting_human":
         waiting_label = "Human decision genuinely required"
-    recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
     note = ""
     action = ""
     if resume.get("resumable"):
@@ -836,9 +835,9 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
         checkpoint = resume.get("phase") or "—"
         checkpoint_detail = (
             f'<p class="small mono">RESUME FROM {_e(checkpoint)}'
-            f' · tree={_e(resume.get("expected_tree") or "—")}'
-            f' · cycle={_e(resume.get("review_cycle") or "—")}'
-            f' · step={_e(resume.get("step_id") or "—")}</p>'
+            f' · commit={_e(resume.get("last_green_commit") or "—")}'
+            f' · iteration={_e(resume.get("iteration") or "—")}'
+            f' · step index={_e(resume.get("step_index") if resume.get("step_index") is not None else "—")}</p>'
         )
         button_label = label
         button = (
@@ -848,21 +847,8 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
             if token else f'<p><strong>{label}</strong></p>'
         )
         action = f'<p class="label">NEXT ACTION</p>{checkpoint_detail}{button}'
-    elif resume.get("reason") and not (status == "blocked" and recovery.get("eligible")):
+    elif resume.get("reason"):
         action = f'<p class="danger small">RESUME REFUSED: {_e(resume.get("reason"))}</p>'
-    if recovery.get("eligible") and token:
-        # The only operator input is the raw replacement plan; SPEC, context,
-        # BASE, run options and catalogues are the run's own.
-        action += (
-            f'<form class="recover-plan" action="/runs/{_e(run.get("run_id"))}/recover-plan" method="post">'
-            f'<input type="hidden" name="_token" value="{_e(token)}">'
-            '<p class="label">OR RECOVER WITH A CORRECTED PLAN</p>'
-            '<label for="replacement-plan">Replacement META PLAN v2 (STATUS: READY only). '
-            'Validated locally by the strict parser; the planner is not called. '
-            'The plan then waits for the normal approval.</label>'
-            f'<textarea id="replacement-plan" name="plan" rows="14" maxlength="{_e(recovery.get("max_bytes"))}" required></textarea>'
-            '<button class="resume" type="submit">REPLACE PLAN</button></form>'
-        )
     detail = failure.get("detail")
     if isinstance(detail, dict):
         detail = json.dumps(detail, ensure_ascii=False, sort_keys=True)
@@ -941,14 +927,8 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
     can_decide = status == AWAITING_APPROVAL_STATUS and bool(token) and not approval.get("recorded")
     approval_forms = ""
     is_v2 = state.get("planning_protocol") == "v2"
-    recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
     if can_decide and is_v2:
-        approval_forms = (
-            '<div class="card recovered-plan"><p class="label">Recovered plan — awaiting approval</p>'
-            '<p class="small">plan source: operator recovery · no planner call · this approval binds '
-            'the replacement plan, its contract and its bundle</p></div>'
-            if recovery.get("recovered") else ""
-        ) + _v2_approval_form(run_id, token or "", state, config, run.get("step_artifacts"))
+        approval_forms = _v2_approval_form(run_id, token or "", state, config, run.get("step_artifacts"))
     elif approval.get("recorded"):
         approval_forms = f'<section class="card"><h2>Plan approval</h2><p>Décision enregistrée : {_e(approval.get("decision"))}</p></section>'
     candidate = run.get("candidate") if isinstance(run.get("candidate"), dict) else {}; changed_files = candidate.get("changed_files") if isinstance(candidate.get("changed_files"), list) else []

@@ -122,16 +122,6 @@ class LocalMetaHarnessClient:
         target = _validated_run_id(run_id)
         return self._request_json("POST", f"{_API_PREFIX}/runs/{target}/resume", {})
 
-    def recover_plan(self, run_id: str, plan: str) -> tuple[int, object]:
-        """Replace the plan of *run_id* with one local POST."""
-
-        target = _validated_run_id(run_id)
-        if not isinstance(plan, str):
-            raise ValueError("plan must be a string")
-        return self._request_json(
-            "POST", f"{_API_PREFIX}/runs/{target}/recover-plan", {"plan": plan}
-        )
-
     def _request_json(
         self,
         method: str,

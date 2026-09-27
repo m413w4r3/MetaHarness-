@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
+from typing import Mapping
 
 from .models import CheckConfig
 
@@ -77,6 +78,21 @@ class PlanApproval:
             raise ApprovalError("approval created_at must be a non-empty string")
         if not isinstance(self.source, str) or self.source not in _SOURCES:
             raise ApprovalError("approval source is invalid")
+
+
+def plan_identity_from_mapping(value: object) -> PlanIdentity:
+    """Decode the separate human approval identity stored in run state."""
+
+    if not isinstance(value, Mapping):
+        raise ApprovalError("plan identity must be an object")
+    try:
+        return PlanIdentity(
+            raw_sha256=value["raw_sha256"], contract_sha256=value["contract_sha256"],
+            bundle_sha256=value.get("bundle_sha256"), execution_sha256=value.get("execution_sha256"),
+            checks_sha256=value.get("checks_sha256"),
+        )
+    except (KeyError, TypeError, ApprovalError) as exc:
+        raise ApprovalError("plan identity is invalid") from exc
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -636,6 +652,7 @@ __all__ = [
     "PlanIdentity",
     "compute_plan_identity",
     "compute_plan_identity_from_run",
+    "plan_identity_from_mapping",
     "read_check_authority",
     "read_plan_approval",
     "wait_for_plan_approval",

@@ -17,14 +17,15 @@ from typing import (
 )
 from ..evidence import (
     EvidenceBundle,
-    required_checks_passed,
 )
 from ..gitops import (
     BaseMovedError,
     BasePushError,
     GitError,
     WorktreeInfo,
+    commit_message,
     commit_parents,
+    validate_linear_commit_chain,
     publish_fast_forward_base,
     candidate_tree_sha,
     current_head,
@@ -49,10 +50,7 @@ from ..models import (
     RunDisposition,
     RunMachineState,
 )
-from ..resume import (
-    ResumePhase,
-    mark_checkpoint_completed,
-)
+from ..resume import ResumePhase
 from ..result import (
     RunResult,
     atomic_write_text,
@@ -63,14 +61,10 @@ from .shared import (
     CommitBoundaryError,
     _is_object_id,
     _json_text,
-    _read_json_artifact,
     _status_has_unstaged_or_untracked,
 )
 from .candidate import (
     CandidateRemoteStaging,
-    accepted_chain_records,
-    validate_accepted_chain,
-    _candidate_commit_path,
     _commit_web_url,
 )
 from .pipeline_v2 import (
@@ -78,9 +72,6 @@ from .pipeline_v2 import (
     PipelineV2Context,
 )
 from .recovery import project_exit
-from .durable_readers import (
-    candidate_evidence,
-)
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
 
@@ -320,15 +311,6 @@ class PublicationService:
     ) -> RunResult:
         """Publish the candidate accepted by the post-audit deterministic gate."""
 
-        evidence = candidate_evidence(ctx.run_dir, number)
-        if (
-            evidence is None
-            or not evidence.deterministic_passed
-            or evidence.staged_tree_sha != candidate["tree_sha"]
-        ):
-            raise PipelineFailure(
-                "DETERMINISTIC_GATE_FAILED", "candidate has no accepted green gate",
-            )
         if candidate.get("no_change") is True:
             self.runtime.cycle_update(store, number, status="completed_no_change")
             state = store.set_run_state(
@@ -341,7 +323,6 @@ class PublicationService:
                 approved_tree_sha=candidate["tree_sha"],
                 current_step=None,
             )
-            mark_checkpoint_completed(ctx.run_dir)
             self.runtime.observability.trace_emit(
                 "run.completed_no_change", phase="run", cycle=number,
                 data={"candidate_sha": candidate["commit_sha"], "tree_sha": candidate["tree_sha"]},
@@ -453,8 +434,8 @@ class PublicationService:
     ) -> dict[str, Any]:
         """Complete best-effort cleanup after publication is durable.
 
-        The publication state and completed checkpoint are deliberately
-        written by the caller before this method is entered.  If interruption
+        The publication state is deliberately written by the caller before
+        this method is entered. If interruption
         happens while cleaning up, the already-published state must not be
         downgraded to INTERRUPTED by the outer run boundary.
         """
@@ -492,72 +473,40 @@ class PublicationService:
                 *(state.get("accepted_steps") or []),
                 *(state.get("deferred_verifications") or []),
             ])
-            chain_records = accepted_chain_records(run_dir)
-            if not chain_records:
-                raise GitError("the accepted commit chain is missing")
-            validate_accepted_chain(
+            chain = validate_linear_commit_chain(
                 info.worktree,
-                run_dir=run_dir,
                 base_sha=info.base_sha,
                 tip_sha=commit_sha,
                 approved_tree_sha=approved_tree,
             )
+            run_id = state.get("run_id")
+            if not isinstance(run_id, str) or any(
+                f"MetaHarness-Run: {run_id}" not in commit_message(info.worktree, item)
+                for item in chain
+            ):
+                raise GitError("run history contains a commit from another authority")
         except (CommitSafetyError, GitError) as exc:
             state = store.record_failure("COMMIT_TREE_MISMATCH", str(exc), **fields)
             return RunResult.of(run_dir, state)
         try:
-            if state.get("approved_tree_sha") != approved_tree:
-                raise GitError("durable approved tree differs from candidate tree")
             if current_head(info.worktree) != commit_sha:
                 raise GitError("candidate commit is not the run branch tip")
             if resolve_tree(info.worktree, commit_sha) != approved_tree:
                 raise GitError("candidate commit tree differs from approved tree")
-            candidate_record = _read_json_artifact(_candidate_commit_path(run_dir, cycle))
-            if (
-                not isinstance(candidate_record, dict)
-                or candidate_record.get("commit_sha") != commit_sha
-                or candidate_record.get("tree_sha") != approved_tree
-            ):
-                raise GitError("candidate local identity is not exact")
-            final_evidence = candidate_evidence(run_dir, cycle)
-            if (
-                final_evidence is None
-                or final_evidence.staged_tree_sha != approved_tree
-                or not final_evidence.deterministic_passed
-                or not required_checks_passed(final_evidence)
-            ):
-                raise GitError("final deterministic gate evidence is missing or failed")
-            if final_evidence.changed_files:
-                audit_root = run_dir / "cycles" / f"{cycle:03d}" / "audit"
-                reports = sorted(audit_root.glob("*/report.json"))
-                if not reports:
-                    raise GitError("candidate has no audit report")
-                audit = _read_json_artifact(reports[-1])
-                if (
-                    not isinstance(audit, dict)
-                    or audit.get("status") not in {"DONE", "NEEDS_WORK"}
-                    or audit.get("tree_after") != approved_tree
-                ):
-                    raise GitError("audit does not name the exact candidate tree")
+            parents = commit_parents(info.worktree, commit_sha)
+            if commit_sha != info.base_sha and len(parents) != 1:
+                raise GitError("candidate commit has no single parent")
+            expected_parent = parents[0] if parents else info.base_sha
             remote_required = self.runtime.config.publish.enabled or (
                 self.runtime.config.github.enabled
                 and self.runtime.config.github.pull_request_mode == "create"
             )
-            if remote_required and (
-                candidate_record.get("remote") != self.runtime.config.repository.remote
-                or candidate_record.get("remote_branch") != info.branch
-                or candidate_record.get("remote_sha") != commit_sha
-                or candidate_record.get("remote_status") != "available"
-                or not isinstance(candidate_record.get("pushed_at"), str)
-                or not candidate_record.get("pushed_at")
-                or remote_run_branch_tip(
+            if remote_required and remote_run_branch_tip(
                     info.source_repo,
                     remote=self.runtime.config.repository.remote,
                     branch=info.branch,
-                ) != commit_sha
-            ):
+                ) != commit_sha:
                 raise GitError("candidate remote authority is not exact")
-            expected_parent = commit_parents(info.worktree, commit_sha)[0]
             validate_run_branch(info.branch, base_ref=self.runtime.config.base_ref)
             if self.runtime.config.publish.enabled:
                 repository_remote_url(info.worktree, self.runtime.config.publish.remote)
@@ -589,7 +538,6 @@ class PublicationService:
             state = store.set_run_state(
                 RunMachineState(disposition=RunDisposition.COMPLETED), **fields,
             )
-            mark_checkpoint_completed(run_dir)
             self.runtime.observability.trace_emit(
                 "publish.completed",
                 phase="publication",
@@ -607,17 +555,13 @@ class PublicationService:
         # Publication is this run's operation from here on: the checkpoint
         # owns that phase, and the store projects its status.
         self.runtime.write_checkpoint(
-            run_dir, ResumePhase.PUBLISH, cycle=cycle,
-            head=commit_sha, tree=approved_tree,
-            expected_parent_sha=expected_parent,
+            run_dir, ResumePhase.PUBLISH, iteration=cycle,
+            head=commit_sha,
         )
         store.update_metadata(**fields)
         base_branch = self.runtime.config.base_ref
         try:
             fast_forward = self.runtime.config.publish.mode == PublishMode.FAST_FORWARD_BASE.value
-            candidate = _read_json_artifact(_candidate_commit_path(run_dir, cycle))
-            if not isinstance(candidate, dict) or candidate.get("commit_sha") != commit_sha:
-                raise GitError("candidate commit artifact does not match publication")
             if remote_run_branch_tip(
                 info.source_repo, remote=self.runtime.config.repository.remote, branch=info.branch
             ) != commit_sha:
@@ -628,7 +572,6 @@ class PublicationService:
                     base_branch=base_branch, base_sha=info.base_sha,
                     commit_sha=commit_sha, approved_tree=approved_tree,
                     run_branch=info.branch, expected_parent=expected_parent,
-                    accepted_commits=chain_records or None,
                 )
                 publish_payload = {
                     "mode": PublishMode.FAST_FORWARD_BASE.value,
@@ -699,7 +642,6 @@ class PublicationService:
             **metadata_fields,
             **fields,
         )
-        mark_checkpoint_completed(run_dir)
         self.runtime.observability.trace_emit(
             "publish.completed",
             phase="publication",

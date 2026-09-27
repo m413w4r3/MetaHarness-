@@ -17,7 +17,11 @@ from typing import Any, Sequence
 
 from ..llm.chat import LLMConversationHandle, LLMProtocolError
 from ..models import (
+    BlockerKind,
+    ContractNormalization,
     ExecutionClass,
+    ExecutionMode,
+    ImplementationStep,
     PlanDecision,
     TaskPlanV2,
 )
@@ -62,10 +66,27 @@ def render_json(value: Any) -> str:
 def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict[str, Any]:
     """Write the human summary, bounded step contracts and secret-free index."""
 
+    bundle, contracts = _implementation_bundle(plan)
+    target = Path(directory)
+    atomic_write_text(target / "implementation_contract.md", render_plan_summary_v2(plan))
+    for step in plan.steps:
+        atomic_write_text(step_contract_path(target, step.id), contracts[step.id])
+    atomic_write_text(target / "implementation_bundle.json", json.dumps(bundle, ensure_ascii=False, indent=2) + "\n")
+    atomic_write_text(target / PLAN_NORMALIZATIONS_NAME, render_json(normalizations_payload(plan)))
+    atomic_write_text(target / "task_plan.json", render_json(effective_plan_payload(plan)))
+    return bundle
+
+
+def implementation_bundle_payload(plan: TaskPlanV2) -> dict[str, Any]:
+    """Derive the disposable worker bundle from the canonical effective plan."""
+
+    return _implementation_bundle(plan)[0]
+
+
+def _implementation_bundle(plan: TaskPlanV2) -> tuple[dict[str, Any], dict[str, str]]:
     if not isinstance(plan, TaskPlanV2) or plan.decision is not PlanDecision.READY:
         raise V2PlanParseError("implementation bundle requires a READY v2 plan")
     validate_step_contract_bounds(plan)
-    target = Path(directory)
     contracts = {step.id: render_step_contract(plan, step) for step in plan.steps}
     entries = []
     for step in plan.steps:
@@ -85,28 +106,68 @@ def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict
         "required_checks": list(plan.required_checks),
         "steps": entries,
     }
-    atomic_write_text(target / "implementation_contract.md", render_plan_summary_v2(plan))
-    for step in plan.steps:
-        # The only copy of each contract: approval hashes and runtime reads
-        # these exact bytes; nothing re-renders them after this point.
-        atomic_write_text(step_contract_path(target, step.id), contracts[step.id])
-    atomic_write_text(target / "implementation_bundle.json", json.dumps(bundle, ensure_ascii=False, indent=2) + "\n")
-    # Exactly one normalization record per plan, written with the plan whose
-    # steps it made effective; the audit reads it without re-deriving anything.
-    atomic_write_text(
-        target / PLAN_NORMALIZATIONS_NAME,
-        render_json(normalizations_payload(plan)),
-    )
-    # ``task_plan.json`` is the stable v2 artifact name approved by the human.
-    atomic_write_text(
-        target / "task_plan.json",
-        json.dumps(
-            {**asdict(plan), "decision": plan.decision.value,
-             "execution_mode": plan.execution_mode.value if plan.execution_mode else None},
-            ensure_ascii=False, indent=2,
-        ) + "\n",
-    )
-    return bundle
+    return bundle, contracts
+
+
+def effective_plan_payload(plan: TaskPlanV2) -> dict[str, Any]:
+    """One normalized plan representation; the raw response stays observational."""
+
+    payload = asdict(plan)
+    payload.pop("raw", None)
+    payload["decision"] = plan.decision.value
+    payload["execution_mode"] = plan.execution_mode.value if plan.execution_mode else None
+    payload["blocker_kind"] = plan.blocker_kind.value if plan.blocker_kind else None
+    return payload
+
+
+def persist_effective_plan(directory: str | Path, plan: TaskPlanV2) -> str:
+    """Persist the effective normalized plan and return its exact byte hash."""
+
+    target = Path(directory)
+    if plan.decision is PlanDecision.READY:
+        write_implementation_bundle(target, plan)
+    else:
+        atomic_write_text(target / "task_plan.json", render_json(effective_plan_payload(plan)))
+    return hashlib.sha256((target / "task_plan.json").read_bytes()).hexdigest()
+
+
+def read_effective_plan(directory: str | Path, expected_sha256: str) -> TaskPlanV2:
+    """Load the canonical plan only when its durable bytes match the checkpoint."""
+
+    path = Path(directory) / "task_plan.json"
+    try:
+        data = path.read_bytes()
+        payload = json.loads(data.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise V2PlanParseError("effective plan is missing or invalid") from exc
+    if hashlib.sha256(data).hexdigest() != expected_sha256 or not isinstance(payload, dict):
+        raise V2PlanParseError("effective plan hash does not match the checkpoint")
+    try:
+        steps = tuple(ImplementationStep(
+            **{
+                **item,
+                "execution_class": ExecutionClass(item["execution_class"]),
+                **{name: tuple(item[name]) for name in (
+                    "read_set", "write_set", "create_set", "delete_set",
+                )},
+            }
+        ) for item in payload["steps"])
+        normalizations = tuple(ContractNormalization(**item) for item in payload["normalizations"])
+        return TaskPlanV2(
+            decision=PlanDecision(payload["decision"]), title=payload["title"],
+            objective=payload["objective"], constraints=payload["constraints"],
+            execution_mode=ExecutionMode(payload["execution_mode"]) if payload["execution_mode"] else None,
+            steps=steps, acceptance=payload["acceptance"], tests=payload["tests"],
+            risks=payload["risks"], blockers=payload["blockers"], raw="",
+            required_checks=tuple(payload["required_checks"]),
+            max_step_contract_chars=payload["max_step_contract_chars"],
+            blocker_kind=BlockerKind(payload["blocker_kind"]) if payload["blocker_kind"] else None,
+            milestone_id=payload["milestone_id"], milestone_title=payload["milestone_title"],
+            milestone_goal=payload["milestone_goal"], project_remainder=payload["project_remainder"],
+            normalizations=normalizations,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise V2PlanParseError("effective plan fields are invalid") from exc
 
 
 def step_contract_path(directory: str | Path, step_id: str) -> Path:
@@ -229,51 +290,11 @@ def persist_planning_v2_artifacts(
     atomic_write_text(target / "context.txt", context)
     atomic_write_text(target / "planner.request.txt", request)
     atomic_write_text(target / "planner.raw.md", plan.raw)
-    write_task_plan_v2(target, plan)
-    # The unsuffixed artifact is the v2 approval surface.
+    # The effective unsuffixed plan is the only structured plan authority.
     if plan.decision is PlanDecision.BLOCKED:
-        atomic_write_text(
-            target / "task_plan.json",
-            json.dumps({**asdict(plan), "decision": plan.decision.value, "execution_mode": None}, ensure_ascii=False, indent=2) + "\n",
-        )
+        atomic_write_text(target / "task_plan.json", render_json(effective_plan_payload(plan)))
     if plan.decision is PlanDecision.READY:
         write_implementation_bundle(target, plan)
-
-
-
-
-def write_task_plan_v2(target: Path, plan: TaskPlanV2) -> None:
-    atomic_write_text(
-        target / "task_plan_v2.json",
-        json.dumps(
-            {
-                **asdict(plan),
-                "decision": plan.decision.value,
-                "execution_mode": plan.execution_mode.value
-                if plan.execution_mode is not None
-                else None,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-    )
-
-
-def persist_recovered_plan_artifacts(directory: str | Path, plan: TaskPlanV2) -> dict[str, Any]:
-    """Publish an operator-supplied READY plan as the run's plan authority.
-
-    Unlike :func:`persist_planning_v2_artifacts` this never touches
-    ``spec.md``, ``context.txt`` or ``planner.request.txt``: no planner
-    request exists for an operator recovery, and the run inputs are immutable.
-    """
-
-    if not isinstance(plan, TaskPlanV2) or plan.decision is not PlanDecision.READY:
-        raise V2PlanParseError("plan recovery requires a READY v2 plan")
-    target = Path(directory)
-    atomic_write_text(target / "planner.raw.md", plan.raw)
-    write_task_plan_v2(target, plan)
-    return write_implementation_bundle(target, plan)
 
 
 def read_planning_session(target: Path | None) -> dict[str, Any]:
@@ -352,8 +373,11 @@ def read_attempt_validation(attempt: Path) -> dict[str, Any]:
 
 __all__ = [
     "PLAN_NORMALIZATIONS_NAME",
+    "effective_plan_payload",
+    "implementation_bundle_payload",
+    "persist_effective_plan",
+    "read_effective_plan",
     "persist_planning_v2_artifacts",
-    "persist_recovered_plan_artifacts",
     "planning_session_handle",
     "read_approved_step_contract",
     "read_attempt_validation",
@@ -366,5 +390,4 @@ __all__ = [
     "validation_failure",
     "write_implementation_bundle",
     "write_planning_session",
-    "write_task_plan_v2",
 ]

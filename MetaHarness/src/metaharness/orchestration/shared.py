@@ -33,7 +33,6 @@ from ..gitops import (
     index_tree_sha,
     status_porcelain,
 )
-from ..plan_recovery import PLAN_RECOVERY_ARTIFACT
 from ..result import (
     ResultArtifactError,
     atomic_write_text,
@@ -165,6 +164,7 @@ def _git_ownership_payload(ownership: GitOwnership) -> dict[str, Any]:
         "head": ownership.head,
         "branches": sorted(ownership.branches),
         "worktrees": sorted(ownership.worktrees),
+        "refs": [list(item) for item in sorted(ownership.refs)],
     }
 
 
@@ -244,7 +244,7 @@ _ATTEMPT_ARTIFACTS = (
 
 
 _PLANNER_ATTEMPT_ARTIFACTS = (
-    "planner.request.txt", "planner.repair.request.txt", "prompt.diagnostics.json", "prompt.diagnostics.repair.json", "planner.raw.md", "task_plan_v2.json", "task_plan.json",
+    "planner.request.txt", "planner.repair.request.txt", "prompt.diagnostics.json", "prompt.diagnostics.repair.json", "planner.raw.md", "task_plan.json",
     "implementation_bundle.json", "planner.usage.json",
 )
 
@@ -255,14 +255,6 @@ _CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "e
 
 
 _PLANNER_CONVERSATION = "planner.conversation.json"
-
-
-# An operator recovery also retires the previous plan summary, the planner
-# conversation (the repair planner must never continue a conversation whose
-# answer was replaced) and any earlier recovery record.
-_RECOVERY_ATTEMPT_ARTIFACTS = _PLANNER_ATTEMPT_ARTIFACTS + (
-    "implementation_contract.md", _PLANNER_CONVERSATION, PLAN_RECOVERY_ARTIFACT,
-)
 
 
 class CandidatePushError(OrchestrationError):
@@ -442,7 +434,6 @@ _status_has_unstaged_or_untracked = status_has_unstaged_or_untracked
 # projection, the observability stream, the runtime kernel and the step
 # services reach the same objects through their public names.
 AGENT_ARTIFACTS = _AGENT_ARTIFACTS
-RECOVERY_ATTEMPT_ARTIFACTS = _RECOVERY_ATTEMPT_ARTIFACTS
 MAX_AGENT_REPORT_BYTES = _MAX_AGENT_REPORT_BYTES
 PLANNER_CONVERSATION = _PLANNER_CONVERSATION
 json_text = _json_text

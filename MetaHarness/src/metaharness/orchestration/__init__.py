@@ -5,7 +5,7 @@ the modules in this package are its internal sub-domains and must never
 import it back.  The dependency order is one-way::
 
     shared <- check_failure <- durable_readers
-    durable_readers <- resume_integrity
+    durable_readers <- run_resume
     shared <- candidate, audit
     pipeline_v2 <- recovery <- worker_recovery, check_recovery
     pipeline_v2 <- step_authority <- worker_attempt <- step_execution
@@ -23,7 +23,7 @@ metadata and the diagnostics of a run.
 The step services split the one step transaction by transaction:
 ``step_execution`` runs one approved step as a bounded ladder of attempts,
 ``worker_attempt`` runs the single worker request and normalizes its candidate
-result, and ``step_acceptance`` owns the durable commit boundary and its resume.
+result, and ``step_acceptance`` owns the durable commit boundary.
 
 ``recovery`` applies :func:`metaharness.recovery_policy.classify_failure`:
 it owns durable recovery budgets, attempt records, the ``recovery.*`` trace
@@ -34,8 +34,6 @@ every attempt shares lives in :mod:`metaharness.attempt_transaction`.
 
 Post-implementation authority is single: the deterministic gate alternates
 with the AUDIT service until the candidate is ready, then the candidate is
-pushed and published.  The resume domain is split the same way:
-``durable_readers`` owns every fail-closed reader of a durable artifact and
-``resume_integrity`` the single gate in front of every resumed checkpoint,
-which rebuilds a ``ResumedRun`` from those artifacts.
+pushed and published.  ``run_resume`` verifies the run branch and restores
+its last accepted commit before rebuilding the effective plan and selection.
 """

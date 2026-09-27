@@ -56,7 +56,15 @@ class LifecycleTests(PipelineHarness):
             json.loads((run_dir / "cycles/001/cycle.json").read_text()),
             {"kind": "initial", "number": 1, "schema_version": 1},
         )
-        self.assertEqual(self.checkpoint()["status"], "completed")
+        checkpoint = self.checkpoint()
+        self.assertEqual(set(checkpoint), {
+            "schema_version", "iteration", "phase", "step_index",
+            "last_green_commit", "plan_sha256",
+        })
+        self.assertEqual(checkpoint["iteration"], 1)
+        self.assertEqual(checkpoint["phase"], "publish")
+        self.assertIsNone(checkpoint["step_index"])
+        self.assertEqual(checkpoint["last_green_commit"], state["commit_sha"])
         # The gate accepted the tree and the audit confirmed it: exactly one
         # writable authority ran after the implementation worker.
         self.assertEqual(self.workers.roles(), ["implementer", "auditor"])

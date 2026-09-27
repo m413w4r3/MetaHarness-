@@ -157,7 +157,7 @@ class RemoteCandidateTests(PipelineHarness):
         ).resume("run")
 
         self.assertEqual(resumed.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "COMMIT_TREE_MISMATCH")
+        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
         self.assertFalse((self.run_dir() / "publish.json").exists())
         self.assertEqual(self.remote_tip(branch), moved)
 

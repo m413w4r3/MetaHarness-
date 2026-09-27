@@ -14,47 +14,20 @@ hands it to the coordinator; no module of this package imports the façade.
 
 from __future__ import annotations
 
-import dataclasses, hashlib, os, re, uuid
-from dataclasses import asdict
+import dataclasses, os, re, uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, NoReturn
-from ..approval import (
-    ApprovalError, PlanIdentity, compute_plan_identity_from_run,
-    write_check_authority,
-)
-from ..gitops import (
-    GitError, candidate_tree_sha, git_root, index_tree_sha, local_branches,
-    registered_worktrees,
-    resolve_commit, resolve_tree, restore_paths_from_tree, stage_all,
-    status_porcelain,
-)
+from typing import Any, Mapping
 from ..integrations.github import GitHubWorkstreamClient, NullGitHubWorkstreamClient
 from ..llm.chat import OpenAIChatTextClient
 from ..models import (
-    GateStage, HarnessConfig, LLMEndpointConfig, PlanDecision, RunCycle,
+    HarnessConfig, LLMEndpointConfig, RunCycle,
     RunDisposition, RunMachineState, RunPhase,
 )
-from ..plan_recovery import (
-    PLAN_SOURCE_OPERATOR, PlanRecoveryError, plan_recovery_info,
-    recoverable_plan_failure,
-    validate_replacement_text, write_plan_recovery_record,
-)
-from ..plan_repository_validation import (
-    PlanRepositoryPreconditionError,
-    validate_plan_repository_topology,
-)
-from ..planning.artifacts import persist_recovered_plan_artifacts, validate_implementation_bundle
-from ..planning.protocol import V2PlanParseError, parse_task_plan_v2
-from ..planning.validation import validate_execution_mode_policy
-from ..profiles import ProfileError, profiles_for_config
-from ..redaction import redact
 from ..result import RunResult
 from ..resume import (
     ResumeCheckpoint, ResumeCheckpointError, ResumePhase,
-    ResumeRequiresOperatorError,
-    read_checkpoint, read_checkpoint_record, write_checkpoint,
-    run_identity,
+    read_checkpoint_record, write_checkpoint,
 )
 from ..run_options import (
     RunOptions, RunOptionsError,
@@ -66,20 +39,17 @@ from ..trace import TraceSink, TraceStream
 from ..validation import ValidationError
 from .audit import AuditService
 from .check_recovery import CheckInfrastructureRecovery
-from .durable_readers import read_repository_reference
 from .gates import GateService
 from .pipeline_v2 import PipelineV2Coordinator, PipelineV2Context
 from .publication import PublicationService
 from .recovery import RecoveryCoordinator
-from .resume_integrity import ResumedRun
+from .run_resume import ResumedRun
 from .run_bootstrap import RunBootstrap
 from .run_composition import RunComposition
 from .run_failure import RunFailure
 from .run_observability import RunObservability
 from .shared import (
-    OrchestrationError, RECOVERY_ATTEMPT_ARTIFACTS, archive_attempt,
-    archive_attempt_target, chat_client,
-    is_object_id, status_has_unstaged_or_untracked,
+    OrchestrationError, chat_client,
 )
 from .step_acceptance import StepAcceptanceService
 from .step_execution import StepExecutionService
@@ -238,8 +208,9 @@ class RunRuntime:
             record = read_checkpoint_record(directory)
         except ResumeCheckpointError as exc:
             raise ValidationError(f"the run checkpoint is unreadable: {exc}") from exc
-        identity = record[0].plan_identity if record is not None else None
-        approved = identity.checks_sha256 if identity is not None else None
+        state = RunStateStore(directory / "state.json").load()
+        identity = state.get("plan_identity") if isinstance(state.get("plan_identity"), Mapping) else {}
+        approved = identity.get("checks_sha256")
         if approved is None:
             raise ValidationError(
                 "the run has a check authority but no durable approved hash"
@@ -252,229 +223,24 @@ class RunRuntime:
         phase: ResumePhase,
         *,
         head: str | None,
-        tree: str | None,
-        cycle: int | None = None,
-        stage: GateStage | None = None,
-        step_id: str | None = None,
-        expected_parent_sha: str | None = None,
-        next_step_id: str | None = None,
-        plan_identity: PlanIdentity | None = None,
-        execution_selection_sha256: str | None = None,
+        step_index: int | None = None,
+        iteration: int | None = None,
+        plan_sha256: str | None = None,
     ) -> None:
         """Persist the next operation that has not succeeded yet.
 
-        Only the run identity (plan identity and execution selection) is
-        carried over from the current checkpoint; every other field describes
-        exactly the new boundary.  A run without a pending checkpoint has
-        nothing to resume and is left untouched.
+        Git records the accepted commit; the checkpoint names only the next
+        operation and the canonical effective plan bytes.
         """
 
         record = read_checkpoint_record(run_dir)
-        if record is None or record[1] != "pending":
+        if record is None:
             return
-        previous = record[0]
+        previous = record
         write_checkpoint(run_dir, ResumeCheckpoint(
             phase=phase,
-            review_cycle=cycle or previous.review_cycle,
-            stage=stage,
-            step_id=step_id,
-            next_step_id=next_step_id,
-            expected_head_sha=head,
-            expected_parent_sha=expected_parent_sha,
-            expected_tree_sha=tree,
-            execution_selection_sha256=(
-                execution_selection_sha256 or previous.execution_selection_sha256
-            ),
-            plan_identity=plan_identity or previous.plan_identity,
+            iteration=iteration or previous.iteration,
+            step_index=step_index,
+            last_green_commit=head or previous.last_green_commit,
+            plan_sha256=plan_sha256 or previous.plan_sha256,
         ))
-
-    def restore_checkpoint_tree(self, resumed: ResumedRun) -> None:
-        """Undo a failed attempt's in-scope edits, exactly and boundedly."""
-
-        worktree = resumed.info.worktree
-        expected = resumed.checkpoint.expected_tree_sha
-        try:
-            restore_paths_from_tree(worktree, expected, resumed.restore_paths)
-            stage_all(worktree)
-            restored = (
-                index_tree_sha(worktree) == expected
-                and candidate_tree_sha(worktree) == expected
-                and not status_has_unstaged_or_untracked(status_porcelain(worktree))
-            )
-        except GitError:
-            restored = False
-        if not restored:
-            raise ResumeRequiresOperatorError(
-                "the checkpoint tree could not be restored exactly"
-            )
-
-    def persist_recovered_plan(self, run_id: str, replacement_raw: str) -> None:
-        def refuse(message: str) -> NoReturn:
-            raise PlanRecoveryError(message)
-
-        raw = validate_replacement_text(replacement_raw)
-        try:
-            selected = safe_run_id(run_id)
-        except OrchestrationError as exc:
-            refuse(str(exc))
-        run_dir = (self.config.runs_root / selected).expanduser().resolve()
-        if not (run_dir / "state.json").is_file():
-            refuse("run state does not exist")
-        store = RunStateStore(run_dir / "state.json")
-        try:
-            state = store.load()
-        except (OSError, ValueError) as exc:
-            refuse(f"run state is unreadable: {exc}")
-        eligibility = plan_recovery_info(run_dir, state)
-        if not eligibility.eligible:
-            refuse(eligibility.reason or "run is not eligible for plan recovery")
-        try:
-            options, _ = read_run_options_for_state(run_dir, state)
-            # The run's frozen options decide the policies and catalogues,
-            # never the current defaults.
-            config = effective_run_config(self.config, options)
-        except RunOptionsError:
-            refuse("run options are missing or invalid")
-        checkpoint = read_checkpoint(run_dir)
-        if checkpoint is None or checkpoint.phase is not ResumePhase.PLANNER:
-            refuse("run is not at its PLANNER checkpoint")
-        for name in ("spec.md", "context.txt"):
-            if not (run_dir / name).is_file():
-                refuse(f"{name} is missing")
-
-        # The run is bound to its immutable stored BASE, not to where
-        # base_ref points today.
-        base_sha = state.get("base_sha")
-        if not is_object_id(base_sha):
-            refuse("run base SHA is missing or invalid")
-        if checkpoint.expected_head_sha is None or checkpoint.expected_tree_sha is None:
-            refuse("PLANNER checkpoint has no BASE identity")
-        try:
-            repo = git_root(config.repo)
-            if state.get("repo") not in {None, str(repo), str(config.repo)}:
-                refuse("the configured repository is not the run repository")
-            if resolve_commit(repo, base_sha) != base_sha:
-                refuse("run base SHA does not resolve to itself")
-            base_tree = resolve_tree(repo, base_sha)
-            if checkpoint.expected_head_sha != base_sha:
-                refuse("PLANNER checkpoint base SHA does not match the run")
-            if checkpoint.expected_tree_sha != base_tree:
-                refuse("PLANNER checkpoint base tree does not match the run")
-            reference = read_repository_reference(run_dir)
-            if reference is None or reference.base_sha != base_sha:
-                refuse("repository reference does not match the run base SHA")
-            worktree_path = (config.worktrees_root / selected).expanduser().resolve()
-            if worktree_path.exists() or str(worktree_path) in registered_worktrees(repo):
-                refuse("a run worktree already exists")
-            if any(
-                ref.startswith("refs/heads/harness/") and ref.endswith(f"/{selected}")
-                for ref in local_branches(repo)
-            ):
-                refuse("a run branch already exists")
-        except GitError as exc:
-            refuse(f"run Git identity cannot be verified: {exc}")
-
-        try:
-            profiles = tuple(profiles_for_config(config).values())
-        except ProfileError as exc:
-            refuse(f"profile catalogue is unavailable: {exc}")
-        try:
-            plan = parse_task_plan_v2(
-                raw,
-                planning=config.planning,
-                check_catalog=config.check_catalog,
-                default_check_ids=config.default_check_ids,
-            )
-            if plan.decision is not PlanDecision.READY:
-                refuse("replacement plan must be STATUS: READY")
-            validate_execution_mode_policy(plan, config.planning)
-        except V2PlanParseError as exc:
-            refuse(f"replacement plan is invalid: {exc}")
-        try:
-            # An operator plan is bound by the same repository preconditions
-            # and normalized against the same tree as any other plan.
-            plan = validate_plan_repository_topology(repo, base_tree, plan)
-        except PlanRepositoryPreconditionError as exc:
-            refuse(f"{exc.code}: {exc}")
-        except GitError as exc:
-            refuse(f"run Git identity cannot be verified: {exc}")
-
-        replacement_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        if not recoverable_plan_failure(state):
-            refuse("run is not in an exact recoverable planner state")
-        # The recovered plan replaces a durable failure at the same boundary:
-        # the claim observes the canonical identity and moves no machine state.
-        claimed = store.update_metadata(
-            expected=run_identity(state, run_dir, checkpoint),
-            plan_recovery={"status": "persisting", "replacement_raw_sha256": replacement_sha},
-        )
-        if claimed is None:
-            refuse("run state changed while the plan recovery was validated")
-        try:
-            raw_path = run_dir / "planner.raw.md"
-            previous_sha = hashlib.sha256(raw_path.read_bytes()).hexdigest() if raw_path.is_file() else None
-            archived = archive_attempt(run_dir, names=RECOVERY_ATTEMPT_ARTIFACTS)
-            if (run_dir / "steps").is_dir():
-                # Only planning-time contracts can be there (eligibility):
-                # retire them with the plan they belong to.
-                if archived is None:
-                    archived = archive_attempt_target(run_dir)
-                os.replace(run_dir / "steps", archived / "steps")
-            persist_recovered_plan_artifacts(run_dir, plan)
-            # The recovered plan becomes approval authority here, so the check
-            # authority it selects must be frozen here too -- exactly as the
-            # planner path does before its own approval gate.  Without it the
-            # operator would be offered the gate while ``check_authority.json``
-            # does not exist yet, and the write-once decision published in that
-            # window could never bind the ``checks_sha256`` the run later
-            # expects.  The whole trusted catalogue is frozen, not just this
-            # selection, so a correction plan still runs approved argv.
-            selected_checks = config.select_checks(plan.required_checks)
-            write_check_authority(
-                run_dir, tuple(config.trusted_checks()),
-                required_check_ids=tuple(check.id for check in selected_checks),
-            )
-            validate_implementation_bundle(run_dir, expected_step_ids=[step.id for step in plan.steps])
-            identity = compute_plan_identity_from_run(run_dir)
-            if identity.raw_sha256 != replacement_sha or identity.execution_sha256 is not None:
-                raise ApprovalError("recovered plan identity does not match the replacement")
-            record = write_plan_recovery_record(
-                run_dir, previous_raw_sha256=previous_sha,
-                replacement_raw_sha256=replacement_sha,
-                archived_attempt=archived.relative_to(run_dir).as_posix() if archived else None,
-            )
-            self.write_checkpoint(
-                run_dir, ResumePhase.PLAN_APPROVAL, head=base_sha, tree=base_tree,
-                plan_identity=identity,
-            )
-        except Exception as exc:
-            store.update_metadata(
-                plan_recovery={"status": "failed", "replacement_raw_sha256": replacement_sha,
-                               "detail": redact(str(exc), self._secrets_or_empty())},
-            )
-            raise
-        planner_state = state.get("planner") if isinstance(state.get("planner"), dict) else {}
-        failed = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-        store.set_run_state(
-            RunMachineState(RunPhase.PLAN_APPROVAL, RunDisposition.FAILED, failed.get("reason")),
-            plan_identity=asdict(identity),
-            plan_recovery={**record, "status": "awaiting_approval"},
-            planner={
-                **planner_state,
-                "decision": plan.decision.value,
-                "title": plan.title,
-                "source": PLAN_SOURCE_OPERATOR,
-                "execution_mode": plan.execution_mode.value if plan.execution_mode else None,
-                "required_checks": list(plan.required_checks),
-                "steps": [
-                    {"id": step.id, "title": step.title,
-                     "execution_class": step.execution_class.value,
-                     "recommended_profile": self.config.routing.profile_for(step.execution_class),
-                     "status": "waiting"}
-                    for step in plan.steps
-                ],
-            },
-        )
-
-    def _secrets_or_empty(self) -> tuple[str, ...]:
-        return tuple(self.secrets or ())

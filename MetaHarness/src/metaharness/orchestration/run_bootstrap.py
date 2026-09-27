@@ -45,18 +45,19 @@ from ..models import (
     RunEvent,
     RunMachineState,
 )
-from ..plan_recovery import plan_source
 from ..plan_repository_validation import RepositoryPreconditions, validate_plan_repository_topology
-from ..planning.artifacts import validate_implementation_bundle
+from ..planning.artifacts import (
+    persist_effective_plan, read_effective_plan, validate_implementation_bundle,
+)
 from ..planning.planner import PlannerV2
-from ..planning.protocol import TaskPlanV2, V2PlanParseError, parse_task_plan_v2
+from ..planning.protocol import TaskPlanV2, V2PlanParseError
 from ..profiles import ProfileError, build_llm_endpoint, profile_for_role
 from ..redaction import redact
 from ..result import RunResult, atomic_write_text
 from ..resume import (
-    ResumeCheckpoint, ResumeCheckpointError, ResumeError,
+    ResumeCheckpoint, ResumeError,
     ResumeIntegrityError,
-    ResumePhase, ResumeRequiresOperatorError, plan_identity_from_mapping,
+    ResumePhase, ResumeRequiresOperatorError,
     run_identity,
     write_checkpoint,
 )
@@ -165,7 +166,6 @@ class RunBootstrap:
                 # will be archived by the next planner attempt.
                 self.runtime.write_checkpoint(
                     run_dir, ResumePhase.PLANNER, head=base_sha,
-                    tree=resolve_tree(repo, base_sha),
                 )
                 raise
             persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
@@ -211,9 +211,7 @@ class RunBootstrap:
                 "model": planner_profile.model,
                 "profile_id": planner_profile.id,
                 "selection_mode": planner_profile.selection_mode.value,
-                # operator_recovery: the plan was pasted by the operator and
-                # no planner completion produced it.
-                "source": plan_source(run_dir),
+                "source": "planner",
                 "execution_mode": plan.execution_mode.value if plan.execution_mode else None,
                 "required_checks": list(plan.required_checks),
                 "steps": [
@@ -257,9 +255,8 @@ class RunBootstrap:
             )
             return RunResult.of(run_dir, state)
 
-        # Every source of this plan (planner, resumed planner answer, operator
-        # recovery) must be possible against the base tree before it can be
-        # offered for approval.  Resume re-enters here, so it is checked again,
+        # Every planner answer must be possible against the base tree before it
+        # can be offered for approval. Resume re-enters here, so it is checked again,
         # and the effective plan it returns is the one approval binds.
         plan = validate_plan_repository_topology(repo, resolve_tree(repo, base_sha), plan)
         try:
@@ -274,14 +271,16 @@ class RunBootstrap:
                 run_dir, tuple(self.runtime.config.trusted_checks()),
                 required_check_ids=tuple(check.id for check in selected_checks),
             )
-            _bundle, _bundle_sha = validate_implementation_bundle(run_dir)
+            plan_sha = persist_effective_plan(run_dir, plan)
+            _bundle, _bundle_sha = validate_implementation_bundle(
+                run_dir, expected_step_ids=[step.id for step in plan.steps],
+            )
             plan_identity = compute_plan_identity_from_run(run_dir)
         except (ApprovalError, V2PlanParseError, OSError, UnicodeError) as exc:
             raise ApprovalError(f"invalid v2 plan artifacts: {exc}") from exc
         store.update_metadata(plan_identity=asdict(plan_identity))
         self.runtime.write_checkpoint(
-            run_dir, ResumePhase.PLAN_APPROVAL, head=base_sha,
-            tree=resolve_tree(repo, base_sha), plan_identity=plan_identity,
+            run_dir, ResumePhase.PLAN_APPROVAL, head=base_sha, plan_sha256=plan_sha,
         )
 
         if self.runtime.config.approval.require_plan_approval:
@@ -363,12 +362,10 @@ class RunBootstrap:
         )
         base_tree_sha = resolve_tree(repo, base_sha)
         self.runtime.write_checkpoint(
-            run_dir, ResumePhase.WORKTREE_SETUP, head=base_sha,
-            tree=base_tree_sha, plan_identity=durable_identity,
-            execution_selection_sha256=durable_identity.execution_sha256,
+            run_dir, ResumePhase.WORKTREE_SETUP, head=base_sha, plan_sha256=plan_sha,
         )
         # Plan approval complete: the next operation is the first step.
-        checkpoint = self._initial_checkpoint(plan, base_sha, base_tree_sha, durable_identity)
+        checkpoint = self._initial_checkpoint(plan, base_sha, plan_sha)
 
         branch = build_run_branch(plan.title, run_id)
         if existing_info is None:
@@ -449,16 +446,13 @@ class RunBootstrap:
 
     @staticmethod
     def _initial_checkpoint(
-        plan: TaskPlanV2, base_sha: str, base_tree_sha: str, identity: PlanIdentity,
+        plan: TaskPlanV2, base_sha: str, plan_sha256: str,
     ) -> ResumeCheckpoint | None:
-        if identity.execution_sha256 is None or not plan.steps:
+        if not plan.steps:
             return None
         return ResumeCheckpoint(
-            phase=ResumePhase.IMPLEMENT_STEP, review_cycle=1,
-            step_id=plan.steps[0].id, expected_head_sha=base_sha,
-            expected_tree_sha=base_tree_sha,
-            execution_selection_sha256=identity.execution_sha256,
-            plan_identity=identity,
+            phase=ResumePhase.IMPLEMENT_STEP, iteration=1, step_index=0,
+            last_green_commit=base_sha, plan_sha256=plan_sha256,
         )
 
     def resume_pre_execution(
@@ -500,10 +494,8 @@ class RunBootstrap:
                 if not is_object_id(base_sha):
                     refuse("run base SHA is invalid")
                 base_tree = resolve_tree(repo, base_sha)
-            if checkpoint.expected_head_sha is not None and checkpoint.expected_head_sha != base_sha:
-                refuse("the checkpoint base SHA changed")
-            if checkpoint.expected_tree_sha is not None and checkpoint.expected_tree_sha != base_tree:
-                refuse("the checkpoint base tree changed")
+            if checkpoint.last_green_commit is not None and checkpoint.last_green_commit != base_sha:
+                refuse("the pre-worktree checkpoint does not match the run base commit")
             reference = read_repository_reference(run_dir)
             if (run_dir / "repository_reference.json").exists() and reference is None:
                 refuse("repository reference artifact is corrupted")
@@ -533,10 +525,9 @@ class RunBootstrap:
                     "total_bytes": context_bundle.total_bytes,
                 })
                 self.runtime.write_checkpoint(run_dir, ResumePhase.PLANNER,
-                                             head=base_sha, tree=base_tree)
+                                             head=base_sha)
                 checkpoint = ResumeCheckpoint(
-                    phase=ResumePhase.PLANNER, review_cycle=1,
-                    expected_head_sha=base_sha, expected_tree_sha=base_tree,
+                    phase=ResumePhase.PLANNER, last_green_commit=base_sha,
                 )
             context = context_path.read_text(encoding="utf-8")
             planner_profile_id = (
@@ -562,19 +553,12 @@ class RunBootstrap:
                 plan = planner.plan(spec, context, artifacts_dir=run_dir)
                 persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
             else:
-                raw = (run_dir / "planner.raw.md").read_text(encoding="utf-8")
-                plan = parse_task_plan_v2(
-                    raw,
-                    planning=self.runtime.config.planning,
-                    check_catalog=self.runtime.config.check_catalog,
-                    default_check_ids=self.runtime.config.default_check_ids,
-                )
-                if checkpoint.plan_identity is not None:
-                    try:
-                        if compute_plan_identity_from_run(run_dir) != checkpoint.plan_identity:
-                            refuse("plan identity no longer matches")
-                    except (ApprovalError, OSError, UnicodeError) as exc:
-                        refuse(f"plan artifacts are invalid: {exc}")
+                if checkpoint.plan_sha256 is None:
+                    refuse("checkpoint has no effective plan hash")
+                try:
+                    plan = read_effective_plan(run_dir, checkpoint.plan_sha256)
+                except V2PlanParseError as exc:
+                    refuse(f"effective plan is invalid: {exc}")
             if checkpoint.phase in {ResumePhase.PLAN_APPROVAL, ResumePhase.WORKTREE_SETUP}:
                 try:
                     _bundle, bundle_sha = validate_implementation_bundle(
@@ -583,23 +567,26 @@ class RunBootstrap:
                     identity = compute_plan_identity_from_run(run_dir)
                 except (ApprovalError, V2PlanParseError, OSError, UnicodeError) as exc:
                     refuse(f"plan artifacts are invalid: {exc}")
-                if checkpoint.plan_identity is not None and identity != checkpoint.plan_identity:
-                    refuse("plan identity no longer matches")
                 recorded_identity = state.get("plan_identity")
                 if isinstance(recorded_identity, Mapping):
                     try:
-                        if identity != plan_identity_from_mapping(recorded_identity):
+                        stored_identity = PlanIdentity(
+                            raw_sha256=recorded_identity["raw_sha256"],
+                            contract_sha256=recorded_identity["contract_sha256"],
+                            bundle_sha256=recorded_identity.get("bundle_sha256"),
+                            execution_sha256=recorded_identity.get("execution_sha256"),
+                            checks_sha256=recorded_identity.get("checks_sha256"),
+                        )
+                        if identity != stored_identity:
                             refuse("plan identity no longer matches state")
-                    except ResumeCheckpointError as exc:
+                    except (KeyError, TypeError, ApprovalError) as exc:
                         refuse(str(exc))
                 if checkpoint.phase is ResumePhase.WORKTREE_SETUP:
                     try:
-                        _selection, selection_sha = read_execution_selection_with_sha256(run_dir)
+                        _selection, _selection_sha = read_execution_selection_with_sha256(run_dir)
                         validate_execution_selection(self.runtime.config, _selection)
                     except (ExecutionSelectionError, ProfileError, OSError, UnicodeError) as exc:
                         refuse(f"execution selection is invalid: {exc}")
-                    if selection_sha != checkpoint.execution_selection_sha256:
-                        refuse("execution selection hash changed")
                     if self.runtime.config.approval.require_plan_approval:
                         try:
                             approval = read_plan_approval(run_dir, expected_identity=identity)

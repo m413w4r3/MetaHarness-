@@ -17,11 +17,10 @@ from typing import Any, Iterable, Mapping
 
 from .agent.events import parse_event, summarize_step_event
 from .config import HarnessConfig
-from .plan_recovery import PLAN_RECOVERY_ARTIFACT, PLAN_SOURCE_OPERATOR, plan_source
 from .profiles import profiles_for_config, safe_profile_metadata
 from .redaction import config_secret_values, redact
 from .result import atomic_write_text
-from .resume import ResumeCheckpointError, resume_info, read_checkpoint_record
+from .resume import ResumeCheckpointError, resume_info
 from .orchestration.pipeline_v2 import (
     cycle_dir,
     implementation_steps_dir,
@@ -687,12 +686,9 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
     body += _section("RUN SUMMARY", summary_body)
     body += _section("RUN OPTIONS", _safe_json_artifact(directory, "run_options.json", secrets, ("schema_version", "planning", "profiles", "recovery")))
     try:
-        checkpoint_record = read_checkpoint_record(directory)
         checkpoint_text = _artifact_json(directory, "resume_checkpoint.json", secrets)
         info = resume_info(directory, state)
-        checkpoint_text += "Current resumable status:\n" + _json({"resumable": info.resumable, "phase": info.phase, "review_cycle": info.review_cycle, "step_id": info.step_id, "label": info.label, "reason": info.reason, "operation": info.operation})
-        if checkpoint_record:
-            checkpoint_text += f"Checkpoint status: {checkpoint_record[1]}\n"
+        checkpoint_text += "Current resumable status:\n" + _json({"resumable": info.resumable, "phase": info.phase, "iteration": info.iteration, "step_index": info.step_index, "last_green_commit": info.last_green_commit, "label": info.label, "reason": info.reason, "operation": info.operation})
     except (OSError, ValueError, ResumeCheckpointError) as exc:
         checkpoint_text = _artifact_json(directory, "resume_checkpoint.json", secrets) + "Resume information unavailable: " + redact(str(exc), secrets)[:500]
     body += _section("RESUME", checkpoint_text)
@@ -710,17 +706,10 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
     body += _section("REPOSITORY / CONTEXT SUMMARY", _artifact_header(ref) + _clean(_json(repository_meta), secrets) + "\n" + _artifact_header(_artifact(directory, "context.txt")))
     body += _section("PROMPT FOOTPRINT", _prompt_footprint(directory))
     body += _section("PLANNER REQUEST", _artifact_text(directory, "planner.request.txt", secrets, MAX_PLANNER_REQUEST_BYTES))
-    recovered = plan_source(directory) == PLAN_SOURCE_OPERATOR
     body += _section("PLANNER RESPONSE", "\n".join([
-        # An operator recovery replaces the planner answer without any model
-        # call; the planner usage below belongs to the archived attempt.
-        "plan source: operator recovery" if recovered else "plan source: planner model completion",
-        *([_safe_json_artifact(directory, PLAN_RECOVERY_ARTIFACT, secrets, (
-            "schema_version", "source", "previous_raw_sha256", "replacement_raw_sha256",
-            "recovered_at", "archived_attempt", "planner_called",
-        ))] if recovered else []),
+        "plan source: planner model completion",
         _artifact_text(directory, "planner.raw.md", secrets),
-        _plan_summary(directory, secrets, "task_plan_v2.json"),
+        _plan_summary(directory, secrets, "task_plan.json"),
         _artifact_json(directory, "planner.usage.json", secrets),
     ]))
     body += _section("PLAN / BUNDLE", "\n".join([

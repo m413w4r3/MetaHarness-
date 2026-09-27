@@ -20,7 +20,6 @@ from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 from ..config import load_config
 from ..models import HarnessConfig
-from ..plan_recovery import MAX_REPLACEMENT_PLAN_BYTES
 from ..step_ids import is_step_id
 from .api import (
     WebAPIError,
@@ -32,7 +31,6 @@ from .api import (
     live_status,
     model_profiles,
     progress,
-    recover_plan_request,
     resume_run_request,
     validate_run_id,
 )
@@ -44,7 +42,6 @@ _MAX_BODY_BYTES = 64 * 1024
 _MAX_CONTROL_TOKEN_BYTES = 4096
 # Only the REPLACE PLAN routes accept more: room for a 128 KiB plan after
 # form/JSON encoding.  The decoded text is bounded again, exactly.
-_MAX_RECOVERY_BODY_BYTES = 4 * MAX_REPLACEMENT_PLAN_BYTES
 _MAX_CONFIG_CHECKS = 80
 _LOCAL_HOST_NAMES = ("127.0.0.1", "localhost")
 _SECURITY_HEADERS = (
@@ -499,7 +496,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 or (
                     len(parts) == 4
                     and parts[1] == "runs"
-                    and parts[3] in {"approval", "resume", "recover-plan"}
+                    and parts[3] in {"approval", "resume"}
                 )
             )
             self._check_origin(allow_opaque=html_form_route)
@@ -539,16 +536,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                         raise WebAPIError(400, "resume body must be an empty JSON object")
                     result = resume_run_request(
                         self.server.run_manager, self.server.config.runs_root, run_id
-                    )
-                    self._json(202, {**result, "accepted": True})
-                    return
-                if action == "recover-plan":
-                    payload = self._body(max_bytes=_MAX_RECOVERY_BODY_BYTES)
-                    if set(payload) != {"plan"} or not isinstance(payload.get("plan"), str):
-                        raise WebAPIError(400, "body must contain exactly one plan string")
-                    result = recover_plan_request(
-                        self.server.run_manager, self.server.config.runs_root,
-                        run_id, payload["plan"],
                     )
                     self._json(202, {**result, "accepted": True})
                     return
@@ -638,31 +625,6 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     self._run_id(parts[2]),
                 )
                 self._redirect(result["location"])
-                return
-            if len(parts) == 4 and parts[1] == "runs" and parts[3] == "recover-plan":
-                # REPLACE PLAN: same Host/origin/token policy as resume.  The
-                # replacement META PLAN v2 is the only operator-supplied field.
-                payload = self._form({"_token", "plan"}, max_bytes=_MAX_RECOVERY_BODY_BYTES)
-                self._authorized_form(payload.get("_token"))
-                result = recover_plan_request(
-                    self.server.run_manager,
-                    self.server.config.runs_root,
-                    self._run_id(parts[2]),
-                    payload["plan"],
-                )
-                self._redirect(result["location"])
-                return
-            if len(parts) == 5 and parts[1:3] == ["api", "runs"] and parts[4] == "recover-plan":
-                self._authorized_api()
-                payload = self._body(max_bytes=_MAX_RECOVERY_BODY_BYTES)
-                if set(payload) != {"plan"} or not isinstance(payload.get("plan"), str):
-                    raise WebAPIError(400, "body must contain exactly one plan string")
-                self._json(202, recover_plan_request(
-                    self.server.run_manager,
-                    self.server.config.runs_root,
-                    self._run_id(parts[3]),
-                    payload["plan"],
-                ))
                 return
             if len(parts) == 4 and parts[1] == "runs" and parts[3] == "approval":
                 run_id = self._run_id(parts[2])
@@ -812,7 +774,6 @@ def configuration_description(
         "capabilities": {
             "plan_approval": bool(config.approval.require_plan_approval),
             "resume": callable(resume_run_request),
-            "recover_plan": callable(recover_plan_request),
             "cancel": False,
             "publish": bool(config.publish.enabled),
         },

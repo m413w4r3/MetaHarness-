@@ -15,7 +15,6 @@ from ..agent.execution import ExecutorRuntimeConfig, executor_for_profile
 from ..gitops import (
     RepositoryReference,
     WorktreeInfo,
-    candidate_tree_sha,
     current_head,
 )
 from ..models import (
@@ -33,8 +32,7 @@ from .pipeline_v2 import (
     step_dir as cycle_step_dir,
 )
 from .durable_readers import (
-    completed_step_records, load_evidence, read_candidate_record,
-    gate_mutable_authority, settled_step_status,
+    completed_step_records, load_evidence, gate_mutable_authority, settled_step_status,
 )
 from .run_bootstrap import PreparedV2Run
 from .shared import (
@@ -115,11 +113,6 @@ class RunComposition:
         bind = functools.partial
         candidate_lifecycle = CandidateLifecycle(
             staging_remote=self.runtime.config.repository.remote,
-            authorize_tree=self.runtime.publication.authorize_candidate_tree,
-            gate_mutable_authority=lambda ctx, plan, stage: gate_mutable_authority(
-                ctx.run_dir, plan.cycle.number, stage,
-                base_paths=self.effective_cycle_scope(ctx, plan),
-            ),
             push_tree=self.runtime.publication.push_candidate,
             cycle_update=self.runtime.cycle_update,
         )
@@ -137,12 +130,10 @@ class RunComposition:
                 ctx.run_dir, phase, **fields,
             ),
             current_head=lambda ctx: current_head(ctx.info.worktree),
-            candidate_tree=lambda ctx: candidate_tree_sha(ctx.info.worktree),
             begin_cycle=bind(cycle_artifacts.begin, store),
             initial_plan=self._initial_cycle_plan,
             completed_steps=self.completed_steps,
             execute_step=bind(self.runtime.step_execution.execute_cycle_step, store),
-            accept_step=bind(self.runtime.step_acceptance.resume_step_acceptance, store),
             run_gate=bind(self.runtime.gates.run_gate, store),
             load_gate_evidence=lambda ctx, number, stage: load_evidence(
                 gate_dir(ctx.run_dir, number, stage),
@@ -154,7 +145,7 @@ class RunComposition:
             ),
             hard_failures=hard_integrity_failures,
             create_candidate=bind(candidate_lifecycle.create, store),
-            load_candidate=lambda ctx, number: read_candidate_record(ctx.run_dir, number),
+            load_candidate=lambda ctx, number: candidate_lifecycle.load_from_git(store, ctx, number),
             push_candidate=bind(candidate_lifecycle.push, store),
             publish=bind(self.runtime.publication.publish_candidate, store),
         )
