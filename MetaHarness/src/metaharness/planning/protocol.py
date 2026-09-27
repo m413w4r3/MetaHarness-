@@ -104,7 +104,7 @@ _STEP_SECTIONS = frozenset({
     "INSTRUCTIONS", "INTERFACES", "EXAMPLES", "TESTS", "PITFALLS",
     "DONE_WHEN", "VERIFY",
 })
-_MILESTONE_ID = re.compile(r"^M\d{2,3}$")
+MILESTONE_ID_RE = re.compile(r"^M\d{2,3}$")
 
 
 def _parse_step(
@@ -525,7 +525,7 @@ def parse_task_plan_v2(
     if "BLOCKER_KIND" in inline:
         raise V2PlanParseError("BLOCKER_KIND is only valid for BLOCKED plans")
     milestone_id = nonempty(inline.get("MILESTONE_ID", ""), "MILESTONE_ID")
-    if _MILESTONE_ID.fullmatch(milestone_id) is None:
+    if MILESTONE_ID_RE.fullmatch(milestone_id) is None:
         raise V2PlanParseError("MILESTONE_ID must look like M01")
     milestone_title = nonempty(inline.get("MILESTONE_TITLE", ""), "MILESTONE_TITLE")
     milestone_goal = nonempty(sections.get("MILESTONE_GOAL", ""), "MILESTONE_GOAL")
@@ -719,6 +719,7 @@ def render_safe_check_catalogue(checks: Sequence[CheckConfig]) -> str:
 
 __all__ = [
     "MAX_STEP_CONTRACT_CHARS",
+    "MILESTONE_ID_RE",
     "STEP_CONTRACT_NAME",
     "STEP_ID_RANGE",
     "STEP_REPAIR_END",

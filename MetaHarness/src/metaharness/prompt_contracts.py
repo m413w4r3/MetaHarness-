@@ -298,6 +298,32 @@ def _section(name: str, text: str, authority: bool) -> PromptSection:
     return PromptSection.create(name, text, authority)
 
 
+def build_prompt_payload(
+    *,
+    role: str,
+    template: str,
+    sections: Sequence[PromptSection],
+    placeholders: Mapping[str, str],
+    budget_bytes: int = 0,
+    secondary_order: Sequence[str] = (),
+) -> PromptPayload:
+    """Build one role payload from named authority and secondary sections.
+
+    The mechanics (single-pass substitution, deterministic budgeting and the
+    truncation order) stay here; a role module owns its own section names,
+    texts and authority decisions.
+    """
+
+    return _payload_from_template(
+        role=role,
+        template=template,
+        sections=sections,
+        placeholders=placeholders,
+        budget_bytes=budget_bytes,
+        secondary_order=secondary_order,
+    )
+
+
 def build_planner_payload(
     *,
     spec: str,
