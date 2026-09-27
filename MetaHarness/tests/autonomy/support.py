@@ -17,7 +17,7 @@ import io
 import json
 import urllib.error
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from unittest import mock
 
 from metaharness.llm.chat import OpenAIChatTextClient
@@ -36,7 +36,7 @@ FALSE_HUMAN_STOP_STATUSES = frozenset({
 })
 
 # The postures of a run that delivered its accepted candidate.
-COMPLETED_STATUSES = frozenset({RunStatus.COMMITTED, RunStatus.PUBLISHED})
+COMPLETED_STATUSES = frozenset({RunStatus.COMMITTED, RunStatus.PUBLISHED, RunStatus.PARTIAL})
 
 
 @dataclass(frozen=True)
@@ -145,6 +145,12 @@ END META PLAN
 """
 
 
+def repaired_contract(step_id: str, title: str, path: str) -> str:
+    """A valid corrected-plan fixture retained for the baseline scenario."""
+
+    return meta_plan(Step(id=step_id, title=title, read=(path,), write=(path,)))
+
+
 class FakeClock:
     """A monotonic clock whose sleeps advance it: the suite never waits."""
 
@@ -199,7 +205,10 @@ class FlakyHTTPTransport:
     scripted completion.  No socket is ever opened.
     """
 
-    def __init__(self, clock: FakeClock, *, outage_seconds: float, answer: str) -> None:
+    def __init__(
+        self, clock: FakeClock, *, outage_seconds: float,
+        answer: str | Callable[[str], str],
+    ) -> None:
         self.clock = clock
         self.outage_seconds = outage_seconds
         self.answer = answer
@@ -211,7 +220,12 @@ class FlakyHTTPTransport:
             raise urllib.error.HTTPError(
                 request.full_url, 503, "Service Unavailable", {}, None,
             )
-        return _FakeResponse(completion_body(self.answer))
+        answer = self.answer
+        if callable(answer):
+            payload = json.loads(request.data.decode("utf-8"))
+            prompt = payload["messages"][-1]["content"]
+            answer = answer(prompt)
+        return _FakeResponse(completion_body(answer))
 
 
 def chat_endpoint() -> LLMEndpointConfig:

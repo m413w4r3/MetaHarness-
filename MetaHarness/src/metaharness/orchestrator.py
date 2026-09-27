@@ -348,7 +348,9 @@ class Orchestrator:
         if checkpoint.phase in {
             ResumePhase.CONTEXT, ResumePhase.PLANNER,
             ResumePhase.PLAN_APPROVAL, ResumePhase.WORKTREE_SETUP,
-        }:
+        } and not (
+            checkpoint.phase is ResumePhase.PLANNER and checkpoint.plan_sha256 is not None
+        ):
             return self._runtime.observability.diagnose_result(self._runtime.bootstrap.resume_pre_execution(
                 store, run_dir, selected, state, checkpoint, record,
                 on_claimed=on_claimed,

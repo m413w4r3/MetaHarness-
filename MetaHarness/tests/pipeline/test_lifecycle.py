@@ -24,6 +24,7 @@ from tests.pipeline.support import (
     initial_plan,
     write,
 )
+from tests.pipeline_support import ScriptedPlannerMux, continuation_answer
 
 
 class LifecycleTests(PipelineHarness):
@@ -253,10 +254,13 @@ class LifecycleTests(PipelineHarness):
         observer = BrokenObserver()
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.planner = ScriptedChat([initial_plan(STEP)], name="planner", events=self.events)
+        continuation = ScriptedChat(
+            [continuation_answer("COMPLETE")], name="planner_continue", events=self.events,
+        )
         self.workers.on(ExecutionRole.AUDITOR, audit())
         result = Orchestrator(
             self.config(publish=True),
-            planner_client=self.planner, trace_sink=observer,
+            planner_client=ScriptedPlannerMux(self.planner, continuation), trace_sink=observer,
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))

@@ -57,6 +57,11 @@ def _regression_feedback(
 
     by_id = {result.name: result for result in results}
     lines = ["The fast per-step gate refused this step tree."]
+    # Put durable path facts before the bounded log excerpt. The retry
+    # addendum has its own size limit and should not clip this actionable data.
+    if changed_paths:
+        lines.append("CHANGED PATHS:")
+        lines.extend(f"- {path}" for path in tuple(changed_paths)[:20])
     for judgement in regressions:
         lines.append(f"CHECK: {judgement.check_id}")
         if judgement.new_failure_ids:
@@ -68,9 +73,6 @@ def _regression_feedback(
             if excerpt:
                 lines.append("FAILURE EXCERPT:")
                 lines.append(excerpt)
-    if changed_paths:
-        lines.append("CHANGED PATHS:")
-        lines.extend(f"- {path}" for path in tuple(changed_paths)[:20])
     return "\n".join(lines)
 
 

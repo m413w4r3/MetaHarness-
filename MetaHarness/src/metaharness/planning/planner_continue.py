@@ -15,10 +15,11 @@ import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from ..llm.chat import LLMProtocolError
 from ..models import PlanDecision, PlanningConfig, TaskPlanV2
+from ..result import atomic_write_text
 from ..usage import completion_usage
 from . import TextCompletionClient
 from .continue_request import (
@@ -195,8 +196,9 @@ class PlannerContinue:
 
     def decide(
         self, facts: PlannerContinueFacts, *, iterations_dir: str | Path | None = None,
+        validate: Callable[[PlannerContinueResult], PlannerContinueResult] | None = None,
     ) -> PlannerContinueResult:
-        """Ask, persist under ``iterations_dir/NN/`` when asked, then parse."""
+        """Ask and persist a corrected response when validation rejects one."""
 
         payload = build_planner_continue_payload(
             facts, planning=self.planning, check_catalog=self.check_catalog,
@@ -205,20 +207,75 @@ class PlannerContinue:
             iterations_dir, facts.iteration)
         if target is not None:
             write_planner_continue_request(target, planner_continue_request_record(facts, payload))
-        raw = self.client.complete(payload.rendered)
-        self.last_usage = completion_usage(raw)
-        answer = raw if isinstance(raw, str) else getattr(raw, "text", None)
-        if not isinstance(answer, str):
-            raise LLMProtocolError("planner continue client did not return text")
-        if target is not None:
-            write_planner_continue_raw(target, answer)
-        # The paid answer is durable before interpretation, as in planning.
-        result = parse_planner_continue(
-            answer, planning=self.planning, check_catalog=self.check_catalog,
-            default_check_ids=self.default_check_ids)
-        if target is not None:
-            write_planner_continue_result(target, planner_continue_result_record(result))
-        return result
+        raw_path = target / "raw.txt" if target is not None else None
+        answer = None
+        if raw_path is not None and raw_path.is_file():
+            # A paid continuation is a durable parse boundary. A crash after
+            # raw.txt must never buy the same decision a second time.
+            answer = raw_path.read_text(encoding="utf-8")
+        last_error = ""
+        previous_answer = ""
+        for attempt in range(self.planning.max_preapproval_corrections + 1):
+            retry_dir = None if target is None or attempt == 0 else (
+                target / "corrections" / f"{attempt:02d}"
+            )
+            if retry_dir is not None:
+                retry_dir.mkdir(parents=True, exist_ok=True)
+            attempt_raw_path = (
+                retry_dir / "raw.txt" if retry_dir is not None else raw_path
+            )
+            if answer is None:
+                if attempt_raw_path is not None and attempt_raw_path.is_file():
+                    answer = attempt_raw_path.read_text(encoding="utf-8")
+                else:
+                    request = payload.rendered if attempt == 0 else _correction_prompt(
+                        payload.rendered, last_error, previous_answer,
+                    )
+                    if retry_dir is not None:
+                        atomic_write_text(retry_dir / "request.txt", request)
+                    raw = self.client.complete(request)
+                    self.last_usage = completion_usage(raw)
+                    answer = raw if isinstance(raw, str) else getattr(raw, "text", None)
+                    if not isinstance(answer, str):
+                        raise LLMProtocolError("planner continue client did not return text")
+                    if attempt == 0 and target is not None:
+                        write_planner_continue_raw(target, answer)
+                    elif attempt_raw_path is not None:
+                        atomic_write_text(attempt_raw_path, answer)
+            previous_answer = answer
+            try:
+                result = parse_planner_continue(
+                    answer, planning=self.planning, check_catalog=self.check_catalog,
+                    default_check_ids=self.default_check_ids)
+                if validate is not None:
+                    result = validate(result)
+                if target is not None:
+                    record = planner_continue_result_record(result)
+                    record["accepted_attempt"] = attempt
+                    write_planner_continue_result(target, record)
+                return result
+            except V2PlanParseError as exc:
+                last_error = str(exc)
+                rejection_dir = retry_dir if retry_dir is not None else target
+                if rejection_dir is not None:
+                    atomic_write_text(rejection_dir / "rejection.json", json.dumps(
+                        {"reason": last_error}, ensure_ascii=False, indent=2,
+                    ) + "\n")
+            answer = None
+        raise V2PlanParseError(f"planner continue remained invalid after correction: {last_error}")
+
+
+def _correction_prompt(initial: str, reason: str, rejected: str) -> str:
+    """Keep the full request authority while bounding rejected model output."""
+
+    bounded = rejected[:24_000]
+    if len(rejected) > len(bounded):
+        bounded += "\n[planner response truncated for correction]"
+    return (
+        initial + "\n\nCONTINUATION VALIDATION FAILURE\n" + reason
+        + "\n\nREJECTED CONTINUATION\n" + bounded
+        + "\n\nReturn a corrected complete META CONTINUE v1 response."
+    )
 
 
 __all__ = [

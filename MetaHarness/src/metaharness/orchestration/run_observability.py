@@ -392,7 +392,7 @@ class RunObservability:
     def diagnose_result(self, result: RunResult) -> RunResult:
         """Best-effort terminal projection; diagnostics never changes a run result."""
 
-        if result.status in {RunStatus.COMMITTED, RunStatus.PUBLISHED}:
+        if result.status in {RunStatus.COMMITTED, RunStatus.PUBLISHED, RunStatus.PARTIAL}:
             state = result.state
             self.trace_emit(
                 "run.completed",
@@ -402,6 +402,7 @@ class RunObservability:
                     "status": result.status.value,
                     "commit_sha": state.get("commit_sha"),
                     "published": result.status is RunStatus.PUBLISHED,
+                    "completion_kind": state.get("completion_kind"),
                 },
                 once=True,
             )
@@ -436,7 +437,7 @@ class RunObservability:
             RunStatus.WAITING_HUMAN,
             RunStatus.WAITING_EXTERNAL,
             RunStatus.WAITING_REMOTE,
-            RunStatus.COMMITTED, RunStatus.PUBLISHED,
+            RunStatus.COMMITTED, RunStatus.PUBLISHED, RunStatus.PARTIAL,
         }:
             try:
                 write_run_diagnostics(self.runtime.config, result.run_dir)

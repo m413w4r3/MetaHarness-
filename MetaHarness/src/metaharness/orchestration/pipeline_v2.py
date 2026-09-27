@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, TypeAlias
 
 from ..evidence import EvidenceBundle, required_checks_passed
-from ..gitops import RepositoryReference, WorktreeInfo
+from ..gitops import RepositoryReference, WorktreeInfo, resolve_tree
 from ..models import (
     CycleKind,
+    DROP_UNKNOWN_REQUIRED_CHECK,
     ExecutionSelection,
     GateStage,
     RunCycle,
@@ -35,6 +36,9 @@ from ..models import (
     TaskPlanV2,
     transition,
 )
+from ..planning.planner_continue import ContinueDecision, PlannerContinueResult, stagnation_fingerprint
+from ..planning.grammar import V2PlanParseError
+from ..plan_repository_validation import PlanRepositoryPreconditionError, validate_plan_repository_topology
 from ..result import RunResult
 from ..resume import ResumeCheckpoint
 from ..run_options import RunOptions
@@ -182,6 +186,22 @@ class CyclePlan:
 
 
 @dataclass(frozen=True)
+class IterationOutcome:
+    """The authoritative gate and writable audit result for one milestone."""
+
+    evidence: EvidenceBundle
+    audit_status: str = "NOT_RUN"
+    audit_remaining: tuple[str, ...] = ()
+    audit_fixed: tuple[str, ...] = ()
+    audit_refactored: tuple[str, ...] = ()
+    audit_risks: tuple[str, ...] = ()
+
+    @property
+    def gate_green(self) -> bool:
+        return self.evidence.deterministic_passed and required_checks_passed(self.evidence)
+
+
+@dataclass(frozen=True)
 class PipelineV2Operations:
     """Side effects of the single implementation, audit and acceptance path."""
 
@@ -200,11 +220,18 @@ class PipelineV2Operations:
     load_candidate: Callable[[PipelineV2Context, int], Mapping[str, Any]]
     push_candidate: Callable[[PipelineV2Context, int, Mapping[str, Any]], Mapping[str, Any]]
     publish: Callable[[PipelineV2Context, int, Mapping[str, Any]], RunResult]
+    load_iteration_outcome: Callable[[PipelineV2Context, CyclePlan], IterationOutcome]
+    planner_continue: Callable[..., PlannerContinueResult]
+    prepare_next_iteration: Callable[[PipelineV2Context, PlannerContinueResult], PipelineV2Context]
+    close_iteration: Callable[..., None]
+    partial: Callable[..., RunResult]
+    spec_decision: Callable[..., RunResult]
+    failed_continued: Callable[[PipelineV2Context, CyclePlan], tuple[str, ...]]
 
 
 @dataclass(frozen=True)
 class PipelineV2Coordinator:
-    """One batch: implement, diagnose, audit, rerun, accept and publish."""
+    """Run milestone batches until COMPLETE, SPEC_DECISION or PARTIAL."""
 
     context: PipelineV2Context
     operations: PipelineV2Operations
@@ -222,70 +249,197 @@ class PipelineV2Coordinator:
         self._cursor.append(target)
 
     def _boundary(
-        self, phase: RunPhase, plan: CyclePlan, *, step_index: int | None = None,
+        self, ctx: PipelineV2Context, phase: RunPhase, plan: CyclePlan, *, step_index: int | None = None,
     ) -> None:
         self._phase(phase)
         self.operations.checkpoint(
-            self.context, phase, iteration=plan.cycle.number,
-            head=self.operations.current_head(self.context),
+            ctx, phase, iteration=plan.cycle.number,
+            head=self.operations.current_head(ctx),
             step_index=step_index,
         )
 
     def _candidate_boundary(
-        self, phase: RunPhase, plan: CyclePlan, candidate: Mapping[str, Any],
+        self, ctx: PipelineV2Context, phase: RunPhase, plan: CyclePlan, candidate: Mapping[str, Any],
     ) -> None:
         self._phase(phase)
         self.operations.checkpoint(
-            self.context, phase, iteration=plan.cycle.number,
+            ctx, phase, iteration=plan.cycle.number,
             head=candidate["commit_sha"],
         )
 
     def run(self, start: ResumeCheckpoint, *, resumed: bool) -> RunResult:
-        ops, ctx = self.operations, self.context
+        ops = self.operations
+        ctx = self.context
         if ctx.iteration != start.iteration:
             raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "pipeline iteration does not match checkpoint")
         if start.phase in {
             RunPhase.CONTEXT, RunPhase.PLANNER, RunPhase.PLAN_APPROVAL,
             RunPhase.WORKTREE_SETUP,
-        }:
+        } and not (
+            start.phase is RunPhase.PLANNER and start.plan_sha256 is not None
+        ):
             raise ValueError(f"{start.phase.value} is not an execution checkpoint")
-        iteration = start.iteration
-        cycle = RunCycle(iteration, CycleKind.INITIAL)
-        ops.begin_cycle(ctx, cycle, not resumed)
-        plan = ops.initial_plan(ctx)
-        stage = GateStage.POST_IMPLEMENTATION
-        if start.phase is RunPhase.PUBLISH:
-            return ops.publish(ctx, iteration, ops.load_candidate(ctx, iteration))
-        if start.phase is RunPhase.IMPLEMENT_STEP:
-            index = start.step_index
-            if index is None or index > len(plan.plan.steps):
-                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "implementation step_index is outside the plan")
-            for index in range(index, len(plan.plan.steps)):
-                self._boundary(RunPhase.IMPLEMENT_STEP, plan, step_index=index)
-                ops.execute_step(ctx, plan, index)
-            self._boundary(RunPhase.DETERMINISTIC_GATE, plan)
-            evidence = self._gate(plan, stage, None)
-        elif start.phase in {RunPhase.DETERMINISTIC_GATE, RunPhase.AUDIT}:
-            evidence = self._gate(plan, stage, start)
-        elif start.phase in {RunPhase.CANDIDATE_READY, RunPhase.CANDIDATE_PUSH}:
-            evidence = None
-        else:
-            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "checkpoint phase is not executable")
-        if start.phase in {RunPhase.CANDIDATE_READY, RunPhase.CANDIDATE_PUSH}:
-            candidate = ops.load_candidate(ctx, iteration)
-        else:
-            self._boundary(RunPhase.CANDIDATE_READY, plan)
-            candidate = ops.create_candidate(ctx, plan, stage, evidence)
-        if start.phase is not RunPhase.CANDIDATE_PUSH:
-            self._candidate_boundary(RunPhase.CANDIDATE_PUSH, plan, candidate)
-        candidate = ops.push_candidate(ctx, iteration, candidate)
-        self._candidate_boundary(RunPhase.PUBLISH, plan, candidate)
-        return ops.publish(ctx, iteration, candidate)
+        if start.phase is RunPhase.PLANNER and start.plan_sha256 is not None:
+            plan = ops.initial_plan(ctx)
+            ops.begin_cycle(ctx, plan.cycle, False)
+            outcome = ops.load_iteration_outcome(ctx, plan)
+            return self._continue(
+                ctx, plan, outcome,
+                start_commit=iteration_start_commit(ctx, start.last_green_commit or ctx.base_sha),
+            )
+
+        while True:
+            iteration = ctx.iteration
+            cycle = RunCycle(iteration, CycleKind.INITIAL)
+            ops.begin_cycle(ctx, cycle, not resumed if iteration == start.iteration else True)
+            plan = ops.initial_plan(ctx)
+            stage = GateStage.POST_IMPLEMENTATION
+            if start.phase is RunPhase.PUBLISH:
+                return ops.publish(ctx, iteration, ops.load_candidate(ctx, iteration))
+            if start.phase is RunPhase.IMPLEMENT_STEP:
+                index = start.step_index
+                if index is None or index > len(plan.plan.steps):
+                    raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "implementation step_index is outside the plan")
+                for index in range(index, len(plan.plan.steps)):
+                    self._boundary(ctx, RunPhase.IMPLEMENT_STEP, plan, step_index=index)
+                    ops.execute_step(ctx, plan, index)
+                self._boundary(ctx, RunPhase.DETERMINISTIC_GATE, plan)
+                outcome = self._gate(ctx, plan, stage, None)
+            elif start.phase in {RunPhase.DETERMINISTIC_GATE, RunPhase.AUDIT}:
+                outcome = self._gate(ctx, plan, stage, start)
+            elif start.phase in {RunPhase.CANDIDATE_READY, RunPhase.CANDIDATE_PUSH}:
+                outcome = None
+            else:
+                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "checkpoint phase is not executable")
+
+            if start.phase in {RunPhase.CANDIDATE_READY, RunPhase.CANDIDATE_PUSH}:
+                candidate = ops.load_candidate(ctx, iteration)
+                if start.phase is RunPhase.CANDIDATE_READY:
+                    self._candidate_boundary(ctx, RunPhase.CANDIDATE_PUSH, plan, candidate)
+            else:
+                if outcome is None:
+                    raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "iteration outcome is missing")
+                return self._continue(
+                    ctx, plan, outcome,
+                    start_commit=iteration_start_commit(ctx, start.last_green_commit or ctx.base_sha),
+                )
+            if start.phase is not RunPhase.CANDIDATE_PUSH:
+                if start.phase not in {RunPhase.CANDIDATE_READY, RunPhase.CANDIDATE_PUSH}:
+                    self._boundary(ctx, RunPhase.CANDIDATE_READY, plan)
+                    candidate = ops.create_candidate(ctx, plan, stage, outcome.evidence if outcome else None)
+                    self._candidate_boundary(ctx, RunPhase.CANDIDATE_PUSH, plan, candidate)
+            candidate = ops.push_candidate(ctx, iteration, candidate)
+            self._candidate_boundary(ctx, RunPhase.PUBLISH, plan, candidate)
+            return ops.publish(ctx, iteration, candidate)
+
+    def _continue(
+        self, ctx: PipelineV2Context, plan: CyclePlan, outcome: IterationOutcome,
+        *, start_commit: str,
+    ) -> RunResult:
+        ops = self.operations
+        current_head = ops.current_head(ctx)
+        self._boundary(ctx, RunPhase.PLANNER, plan)
+        def validate_decision(decision: PlannerContinueResult) -> PlannerContinueResult:
+            if decision.decision is ContinueDecision.COMPLETE:
+                invalid: list[str] = []
+                if not outcome.gate_green:
+                    invalid.append("deterministic gate is red or required checks are unsatisfied")
+                if outcome.audit_remaining:
+                    invalid.append("audit REMAINING is not empty")
+                if decision.remaining:
+                    invalid.append("continuation REMAINING is not empty")
+                if str(plan.plan.project_remainder).strip().casefold() not in {
+                    "none", "n/a", "na", "-", "—", "nil",
+                }:
+                    invalid.append("current project_remainder is not NONE")
+                remaining = (*outcome.audit_remaining, *decision.remaining)
+                unresolved_failed = [
+                    item for item in failed
+                    if item.partition(":")[0].casefold() in " ".join(remaining).casefold()
+                ]
+                if unresolved_failed:
+                    invalid.append("FAILED_CONTINUED steps remain in continuation REMAINING")
+                if invalid:
+                    raise V2PlanParseError("COMPLETE refused: " + "; ".join(invalid))
+                return decision
+            if decision.decision is not ContinueDecision.NEXT or decision.next_plan is None:
+                if decision.decision is ContinueDecision.SPEC_DECISION:
+                    return decision
+                raise V2PlanParseError("continuation decision is incomplete")
+            expected_milestone = f"M{ctx.iteration + 1:02d}"
+            if decision.next_milestone != expected_milestone:
+                raise V2PlanParseError(f"NEXT must progress monotonically to {expected_milestone}")
+            if len(decision.next_plan.steps) > ctx.options.max_steps_per_plan:
+                raise V2PlanParseError("NEXT exceeds planning.max_steps_per_plan")
+            unknown_checks = [
+                item.detail for item in decision.next_plan.normalizations
+                if item.code == DROP_UNKNOWN_REQUIRED_CHECK
+            ]
+            if unknown_checks:
+                raise V2PlanParseError(f"NEXT contains untrusted checks: {unknown_checks}")
+            try:
+                normalized = validate_plan_repository_topology(
+                    ctx.info.worktree,
+                    resolve_tree(ctx.info.worktree, ops.current_head(ctx)),
+                    decision.next_plan,
+                )
+            except PlanRepositoryPreconditionError as exc:
+                raise V2PlanParseError(f"NEXT cannot run against the current HEAD: {exc}") from exc
+            return dataclasses.replace(decision, next_plan=normalized)
+
+        failed = ops.failed_continued(ctx, plan)
+        decision = ops.planner_continue(ctx, plan, outcome, validate_decision)
+        failed = ops.failed_continued(ctx, plan)
+
+        if decision.decision is ContinueDecision.SPEC_DECISION:
+            ops.close_iteration(ctx, plan, outcome, decision, start_commit, None, "SPEC_DECISION")
+            return ops.spec_decision(ctx, decision, outcome)
+
+        if decision.decision is ContinueDecision.COMPLETE:
+            fingerprint = stagnation_fingerprint((), resolve_candidate_tree(ctx), outcome.evidence.failures)
+            ops.close_iteration(ctx, plan, outcome, decision, start_commit, fingerprint, "COMPLETE")
+            self._boundary(ctx, RunPhase.CANDIDATE_READY, plan)
+            candidate = ops.create_candidate(ctx, plan, GateStage.POST_IMPLEMENTATION, outcome.evidence)
+            self._candidate_boundary(ctx, RunPhase.CANDIDATE_PUSH, plan, candidate)
+            candidate = ops.push_candidate(ctx, ctx.iteration, candidate)
+            self._candidate_boundary(ctx, RunPhase.PUBLISH, plan, candidate)
+            result = ops.publish(ctx, ctx.iteration, candidate)
+            return result
+
+        if decision.decision is not ContinueDecision.NEXT or decision.next_plan is None:
+            raise PipelineFailure("PLANNER_OUTPUT_INVALID", "continuation decision is incomplete")
+        remaining = (*outcome.audit_remaining, *decision.remaining)
+        fingerprint = stagnation_fingerprint(
+            remaining, resolve_candidate_tree(ctx), outcome.evidence.failures,
+        )
+        previous = load_stagnation_fingerprint(ctx.run_dir, ctx.iteration - 1)
+        stagnant = previous is not None and previous == fingerprint
+        partial_reason = "max_iterations" if ctx.iteration >= 8 else "stagnation" if stagnant else None
+        ops.close_iteration(
+            ctx, plan, outcome, decision, start_commit, fingerprint,
+            "PARTIAL" if partial_reason else "NEXT",
+        )
+        if partial_reason:
+            failures = tuple(dict.fromkeys((*outcome.evidence.failures, *failed)))
+            return ops.partial(ctx, partial_reason, remaining, failures)
+        next_ctx = ops.prepare_next_iteration(ctx, decision)
+        next_plan = ops.initial_plan(next_ctx)
+        self._boundary(next_ctx, RunPhase.IMPLEMENT_STEP, next_plan, step_index=0)
+        ctx = next_ctx
+        plan = next_plan
+        self.operations.begin_cycle(ctx, plan.cycle, True)
+        for index in range(len(plan.plan.steps)):
+            self._boundary(ctx, RunPhase.IMPLEMENT_STEP, plan, step_index=index)
+            ops.execute_step(ctx, plan, index)
+        self._boundary(ctx, RunPhase.DETERMINISTIC_GATE, plan)
+        outcome = self._gate(ctx, plan, GateStage.POST_IMPLEMENTATION, None)
+        return self._continue(ctx, plan, outcome, start_commit=current_head)
 
     def _gate(
-        self, plan: CyclePlan, stage: GateStage, start: ResumeCheckpoint | None,
-    ) -> EvidenceBundle:
-        ops, ctx = self.operations, self.context
+        self, ctx: PipelineV2Context, plan: CyclePlan, stage: GateStage,
+        start: ResumeCheckpoint | None,
+    ) -> IterationOutcome:
+        ops = self.operations
         reports = sorted((cycle_dir(ctx.run_dir, plan.cycle) / "audit").glob("*/report.json"))
         if start is not None and start.phase is RunPhase.AUDIT and not reports:
             evidence = ops.load_gate_evidence(ctx, plan.cycle.number, stage)
@@ -303,10 +457,10 @@ class PipelineV2Coordinator:
                     "remaining": report.get("remaining", []),
                     "failure_ids": report.get("failure_ids", []),
                 })
-        remaining = reports and report.get("remaining", []) or []
+        summary = audit_summary(reports)
         if reports and evidence.deterministic_passed and required_checks_passed(evidence):
             ops.accept_gate_state(ctx, plan, stage, evidence)
-            return evidence
+            return IterationOutcome(evidence, **summary)
         for attempt in range(len(reports) + 1, 3):
             hard = ops.hard_failures(evidence)
             if hard:
@@ -314,16 +468,22 @@ class PipelineV2Coordinator:
             if not evidence.changed_files:
                 if evidence.deterministic_passed and required_checks_passed(evidence):
                     ops.accept_gate_state(ctx, plan, stage, evidence)
-                    return evidence
+                    return IterationOutcome(evidence, **summary)
                 raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
-            self._boundary(RunPhase.AUDIT, plan)
+            self._boundary(ctx, RunPhase.AUDIT, plan)
             audit = ops.run_audit(ctx, plan, stage, evidence, attempt)
-            remaining = list(audit.remaining)
+            summary = {
+                "audit_status": audit.status,
+                "audit_remaining": tuple(audit.remaining),
+                "audit_fixed": tuple(audit.fixed),
+                "audit_refactored": tuple(audit.refactored),
+                "audit_risks": tuple(audit.risks),
+            }
             if audit.status == "SPEC_DECISION":
                 raise PipelineFailure("SPEC_DECISION_REQUIRED", {
-                    "remaining": remaining, "failure_ids": list(evidence.failures),
+                    "remaining": list(audit.remaining), "failure_ids": list(evidence.failures),
                 })
-            self._boundary(RunPhase.DETERMINISTIC_GATE, plan)
+            self._boundary(ctx, RunPhase.DETERMINISTIC_GATE, plan)
             evidence = ops.run_gate(ctx, plan, stage)
             hard = ops.hard_failures(evidence)
             if hard:
@@ -332,18 +492,63 @@ class PipelineV2Coordinator:
                 if evidence.failures or not required_checks_passed(evidence):
                     raise PipelineFailure("DURABLE_ARTIFACT_CORRUPTED", "PASS gate has incomplete evidence")
                 ops.accept_gate_state(ctx, plan, stage, evidence)
-                return evidence
-        raise PipelineFailure("AUDIT_REMAINING", {
-            "remaining": remaining,
-            "failure_ids": list(evidence.failures),
-            "candidate_tree": evidence.staged_tree_sha,
-        })
+                return IterationOutcome(evidence, **summary)
+        return IterationOutcome(evidence, **summary)
+
+
+def resolve_candidate_tree(ctx: PipelineV2Context) -> str:
+    """Return the exact tracked tree at the current worktree HEAD."""
+
+    from ..gitops import candidate_tree_sha
+    return candidate_tree_sha(ctx.info.worktree)
+
+
+def load_stagnation_fingerprint(run_dir: Path, iteration: int) -> str | None:
+    if iteration < 1:
+        return None
+    path = Path(run_dir) / "iterations" / f"{iteration:02d}" / "iteration.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = record.get("stagnation_fingerprint") if isinstance(record, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def iteration_start_commit(ctx: PipelineV2Context, fallback: str) -> str:
+    if ctx.iteration == 1:
+        return ctx.base_sha
+    path = ctx.run_dir / "iterations" / f"{ctx.iteration - 1:02d}" / "iteration.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return fallback
+    value = record.get("end_commit") if isinstance(record, dict) else None
+    return value if isinstance(value, str) else fallback
+
+
+def audit_summary(report_paths: list[Path]) -> dict[str, Any]:
+    """Read the latest compact audit outcome when resuming at PLANNER."""
+
+    if not report_paths:
+        return {"audit_status": "NOT_RUN"}
+    try:
+        report = json.loads(report_paths[-1].read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PipelineFailure("DURABLE_ARTIFACT_CORRUPTED", "audit report is unreadable") from exc
+    return {
+        "audit_status": report.get("status", "NOT_RUN"),
+        "audit_remaining": tuple(report.get("remaining", ())),
+        "audit_fixed": tuple(report.get("fixed", ())),
+        "audit_refactored": tuple(report.get("refactored", ())),
+        "audit_risks": tuple(report.get("risks", ())),
+    }
 
 
 __all__ = [
     "CyclePlan", "PipelineFailure", "PipelineV2Context", "PipelineV2Coordinator",
     "RecoveryStepUnavailable",
-    "PipelineV2Operations", "candidate_dir",
+    "IterationOutcome", "PipelineV2Operations", "candidate_dir",
     "cycle_dir", "cycle_record_path", "gate_acceptance_path", "gate_dir",
     "implementation_dir", "implementation_steps_dir", "step_dir",
 ]

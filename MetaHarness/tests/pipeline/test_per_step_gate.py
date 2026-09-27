@@ -21,6 +21,7 @@ from tests.pipeline.support import (
     STEP,
     PipelineHarness,
     audit_report,
+    continuation_answer,
     git,
     initial_plan,
     write,
@@ -97,23 +98,34 @@ timeout_seconds = 30
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(
             ExecutionRole.AUDITOR,
-            lambda _request: audit_report(
-                "DONE", fixed="the check passes now; the tree is already correct",
+            *(
+                lambda _request: audit_report(
+                    "DONE", fixed="the check passes now; the tree is already correct",
+                )
+                for _ in range(2)
             ),
         )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        m02 = initial_plan(STEP).replace("MILESTONE_ID: M01", "MILESTONE_ID: M02")
         result = self.orchestrator(
-            self.config(), planner=[initial_plan(STEP)],
+            self.config(), planner=[initial_plan(STEP)], continuation=[
+                continuation_answer("NEXT", milestone="M02", plan_text=m02),
+                continuation_answer("COMPLETE"),
+            ],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL, self.state())
-        self.assertEqual(self.state()["failure"]["reason"], "AUDIT_REMAINING")
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state())
+        self.assertEqual(len(self.continuation.requests), 2)
         # The claimed fix never became evidence: the harness reran the check.
-        self.assertFalse(self.state()["deterministic_gate"]["passed"])
+        m01_evidence = json.loads(
+            (self.run_dir() / "cycles/001/checks/post-implementation/evidence.json").read_text()
+        )
+        self.assertFalse(m01_evidence["deterministic_passed"])
         reports = sorted((self.run_dir() / "cycles/001/audit").glob("*/report.json"))
         self.assertEqual(len(reports), 2)
-        self.assertEqual(
-            self.state()["failure"]["detail"]["failure_ids"], ["CHECK_FAILED:test"],
-        )
+        self.assertTrue(json.loads(
+            (self.run_dir() / "iterations/01/planner-continue/request.json").read_text()
+        )["facts"]["evidence"].find("CHECK_FAILED:test") >= 0)
 
 
 class PreflightTests(PipelineHarness):

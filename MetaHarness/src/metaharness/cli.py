@@ -204,7 +204,7 @@ def _report_result(result: RunResult) -> int:
         print(f"commit: {result.commit_sha}")
     if result.failure_reason:
         print(f"failure: {result.failure_reason}")
-    if result.status in {RunStatus.COMMITTED, RunStatus.PUBLISHED}:
+    if result.status in {RunStatus.COMMITTED, RunStatus.PUBLISHED, RunStatus.PARTIAL}:
         return 0
     if result.status is RunStatus.INTERRUPTED:
         return 130

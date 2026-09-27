@@ -19,6 +19,7 @@ from tests.pipeline_support import (
     ScriptedWorkers,
     audit,
     audit_report,
+    continuation_answer,
     correction_plan,
     git,
     initial_plan,
@@ -31,7 +32,7 @@ STEP = ("S01", "feature.txt", "Write the feature")
 
 __all__ = [
     "PipelineHarness", "ScriptedChat", "ScriptedWorkers", "SPEC", "STEP",
-    "audit", "audit_report", "correction_plan", "git", "initial_plan", "plan",
+    "audit", "audit_report", "continuation_answer", "correction_plan", "git", "initial_plan", "plan",
     "write", "run_branch", "break_remote",
     "restore_remote", "divergent_run_branch", "move_run_branch",
     "reject_pushes", "crash_at_checkpoint",

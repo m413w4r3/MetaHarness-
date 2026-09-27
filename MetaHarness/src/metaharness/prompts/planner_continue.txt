@@ -24,6 +24,9 @@ SPEC_DECISION
   (repository evidence, scope size, a large transformation).
 REMAINING is what the audit still lists; keep it verbatim and compact. Never
 claim COMPLETE while REMAINING or the gate names real work.
+Treat PROJECT_REMAINDER and unresolved FAILED_CONTINUED steps as real work.
+Use CURRENT REPOSITORY CONTEXT for the tree at current HEAD; the original run
+context describes only the starting tree.
 
 Answer with exactly this protocol, with no prose and no code fences.
 
@@ -185,6 +188,9 @@ LAST META AUDIT
 
 LAST DETERMINISTIC GATE AND CUMULATIVE EVIDENCE
 {{EVIDENCE}}
+
+CURRENT REPOSITORY CONTEXT PINNED TO HEAD
+{{REPOSITORY}}
 
 TRUSTED CHECK CATALOGUE AND RUN RULES
 {{RULES}}

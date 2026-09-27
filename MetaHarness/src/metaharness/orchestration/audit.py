@@ -109,7 +109,8 @@ class AuditService:
         })
         payload = {
             "spec": ctx.spec,
-            "milestone": state.get("milestone"),
+            "milestone": state.get("current_milestone"),
+            "prior_iteration_remaining": state.get("iteration_remaining", []),
             "plan": dataclasses.asdict(cycle_plan.plan),
             "normalizations": getattr(cycle_plan.plan, "normalizations", ()),
             "steps": steps,

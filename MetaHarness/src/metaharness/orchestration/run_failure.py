@@ -325,9 +325,9 @@ class RunFailure:
             options, _digest = read_run_options_for_state(run_dir, state)
             config = effective_run_config(self.runtime.config, options)
             if checkpoint.phase in {
-                ResumePhase.CONTEXT, ResumePhase.PLANNER,
+                ResumePhase.CONTEXT,
                 ResumePhase.PLAN_APPROVAL, ResumePhase.WORKTREE_SETUP,
-            }:
+            } or (checkpoint.phase is ResumePhase.PLANNER and checkpoint.plan_sha256 is None):
                 return True
             prepare_resume(
                 config=config, run_dir=run_dir,

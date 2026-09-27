@@ -95,6 +95,7 @@ class CycleArtifactService:
         store.update_metadata(
             cycle=cycle.number,
             iteration=cycle.number,
+            current_iteration=cycle.number,
             current_milestone={"id": ctx.plan.milestone_id, "title": ctx.plan.milestone_title},
             planner=planner,
             steps=[

@@ -29,10 +29,10 @@ PLANNER_CONTINUE_DIR, PLANNER_CONTINUE_REQUEST = "planner-continue", "request.js
 PLANNER_CONTINUE_RAW, PLANNER_CONTINUE_RESULT = "raw.txt", "result.json"
 MAX_CONTINUE_ARTIFACT_BYTES = 4_000_000
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
-_SECTIONS = ("spec", "state", "plan", "audit", "evidence", "rules")
+_SECTIONS = ("spec", "state", "plan", "audit", "evidence", "repository", "rules")
 _TEXT_TUPLES = ("normalizations", "failed_steps", "audit_remaining", "audit_risks", "audit_fixed",
                 "audit_refactored", "gate_failures", "gate_warnings", "gate_baseline_warnings",
-                "modified_paths")
+                "modified_paths", "continuation_remaining", "prior_iteration_remaining")
 
 
 @dataclass(frozen=True)
@@ -58,10 +58,14 @@ class PlannerContinueFacts:
     gate_baseline_warnings: tuple[str, ...] = ()
     diffstat: str = ""
     modified_paths: tuple[str, ...] = ()
+    current_repository_context: str = ""
+    continuation_remaining: tuple[str, ...] = ()
+    prior_iteration_remaining: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if any(not isinstance(getattr(self, name), str) for name in (
-                "spec", "milestone_title", "milestone_goal", "audit_status", "diffstat")):
+                "spec", "milestone_title", "milestone_goal", "audit_status", "diffstat",
+                "current_repository_context")):
             raise ValueError("every text fact must be a string")
         if not self.spec.strip() or not isinstance(self.plan, TaskPlanV2):
             raise ValueError("spec and plan must be the run's own values")
@@ -128,6 +132,8 @@ def build_planner_continue_payload(
         "audit": _labeled(
             ("STATUS", facts.audit_status),
             ("REMAINING", _bullets(facts.audit_remaining)),
+            ("CONTINUATION REMAINING", _bullets(facts.continuation_remaining)),
+            ("PRIOR ITERATION REMAINING", _bullets(facts.prior_iteration_remaining)),
             ("RISKS", _bullets(facts.audit_risks)),
             ("FIXED", _bullets(facts.audit_fixed)),
             ("REFACTORED", _bullets(facts.audit_refactored))),
@@ -137,6 +143,7 @@ def build_planner_continue_payload(
             ("BASELINE WARNINGS", _bullets(facts.gate_baseline_warnings)),
             ("DIFFSTAT SINCE BASE", facts.diffstat.strip() or "NONE"),
             ("MODIFIED PATHS", _bullets(facts.modified_paths))),
+        "repository": facts.current_repository_context.strip() or "NONE",
         "rules": render_safe_check_catalogue(check_catalog),
     }
     return build_prompt_payload(
@@ -184,7 +191,14 @@ def read_planner_continue_artifacts(
         raise FileNotFoundError(f"planner continue artifacts are missing in {target}")
     if not isinstance(request, dict) or not isinstance(result, dict):
         raise TypeError("planner continue artifacts must be JSON objects")
-    return request, (target / PLANNER_CONTINUE_RAW).read_text(encoding="utf-8"), result
+    accepted_attempt = result.get("accepted_attempt", 0)
+    if isinstance(accepted_attempt, bool) or not isinstance(accepted_attempt, int) or accepted_attempt < 0:
+        raise TypeError("planner continue result has an invalid accepted_attempt")
+    raw_path = (
+        target / "raw.txt" if accepted_attempt == 0
+        else target / "corrections" / f"{accepted_attempt:02d}" / "raw.txt"
+    )
+    return request, raw_path.read_text(encoding="utf-8"), result
 
 
 def planner_continue_request_record(

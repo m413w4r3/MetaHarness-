@@ -21,7 +21,7 @@ from metaharness.planning.protocol import PlanParseError
 from metaharness.resume import resume_info
 
 from tests.autonomy.support import SPEC, AutonomyHarness, Step, meta_plan
-from tests.pipeline_support import ScriptedChat, write
+from tests.pipeline_support import ScriptedChat, continuation_answer, write
 
 AUDIT_DONE = (
     "META AUDIT v1\n\nSTATUS\nDONE\n\nFIXED\n- none\n\n"
@@ -41,7 +41,10 @@ class PlannerTransportExhaustionTests(AutonomyHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
         planner = ScriptedChat(
-            [LLMTransportExhaustedError("LLM transport horizon exhausted"), self.plan()],
+            [
+                LLMTransportExhaustedError("LLM transport horizon exhausted"), self.plan(),
+                continuation_answer("COMPLETE"),
+            ],
             name="planner",
         )
         config = self.config()
@@ -66,7 +69,7 @@ class PlannerTransportExhaustionTests(AutonomyHarness):
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # The exhausted call bought nothing durable: the resume pays for one
         # fresh planner answer and the pipeline continues past the planner.
-        self.assertEqual(len(planner.requests), 2)
+        self.assertEqual(len(planner.requests), 3)
 
 
 class _CliClock:
@@ -142,7 +145,10 @@ class AutoResumeCommandTests(AutonomyHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
         planner = ScriptedChat(
-            [LLMTransportExhaustedError("LLM transport horizon exhausted"), self.plan()],
+            [
+                LLMTransportExhaustedError("LLM transport horizon exhausted"), self.plan(),
+                continuation_answer("COMPLETE"),
+            ],
             name="planner",
         )
         self.config()
@@ -153,12 +159,12 @@ class AutoResumeCommandTests(AutonomyHarness):
         self.assertEqual(self.state()["status"], RunStatus.PUBLISHED.value)
         self.assertEqual(sleeps, [0.01])
         # One exhausted attempt, then the resumed attempt that planned the run.
-        self.assertEqual(len(planner.requests), 2)
+        self.assertEqual(len(planner.requests), 3)
 
     def test_auto_resume_stops_when_run_is_not_wait_external(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
-        planner = ScriptedChat([self.plan()], name="planner")
+        planner = ScriptedChat([self.plan(), continuation_answer("COMPLETE")], name="planner")
         self.config()
 
         code, sleeps = self.run_with_auto_resume(planner)
@@ -166,12 +172,14 @@ class AutoResumeCommandTests(AutonomyHarness):
         self.assertEqual(code, 0, self.state().get("failure"))
         # A run that never waits externally is never slept on, never resumed.
         self.assertEqual(sleeps, [])
-        self.assertEqual(len(planner.requests), 1)
+        self.assertEqual(len(planner.requests), 2)
 
     def test_planner_invalid_output_is_fixable_not_human(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
-        planner = ScriptedChat([PlanParseError("not a plan"), self.plan()], name="planner")
+        planner = ScriptedChat([
+            PlanParseError("not a plan"), self.plan(), continuation_answer("COMPLETE"),
+        ], name="planner")
         self.config()
 
         code, sleeps = self.run_with_auto_resume(planner)
@@ -181,7 +189,7 @@ class AutoResumeCommandTests(AutonomyHarness):
         self.assertEqual(code, 0, self.state().get("failure"))
         self.assertEqual(self.state()["status"], RunStatus.PUBLISHED.value)
         self.assertEqual(sleeps, [0.01])
-        self.assertEqual(len(planner.requests), 2)
+        self.assertEqual(len(planner.requests), 3)
 
 if __name__ == "__main__":
     unittest.main()

@@ -1093,6 +1093,20 @@ def changed_paths_between_trees(
     return tuple(sorted({path for path in output.split("\0") if path}))
 
 
+def diffstat_between_commits(repo: Path, base_sha: str, head_sha: str, *, max_chars: int = 16_000) -> str:
+    """Return a compact cumulative stat between two immutable commits."""
+
+    if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 256:
+        raise ValueError("max_chars must be at least 256")
+    output = _git(
+        repo, "diff", "--stat=80,200", base_sha, head_sha, "--", timeout=600,
+        errors="replace",
+    ).stdout.strip()
+    if len(output) <= max_chars:
+        return output
+    return output[: max_chars - 48] + "\n[diffstat truncated by MetaHarness]"
+
+
 def commit_tree(
     worktree: Path,
     *,

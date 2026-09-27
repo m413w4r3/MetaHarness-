@@ -6,7 +6,7 @@ import json
 import sys
 
 from metaharness.models import ExecutionRole
-from tests.pipeline_support import PipelineHarness, write
+from tests.pipeline_support import PipelineHarness, continuation_answer, write
 from tests.autonomy.support import SPEC, Step, meta_plan
 
 
@@ -19,11 +19,12 @@ def audit_message(status: str = "DONE", remaining: str = "none") -> str:
 
 
 class AuditPipelineTests(PipelineHarness):
-    def _run(self, *, extra_checks: str = ""):
+    def _run(self, *, extra_checks: str = "", continuation: list[str] | None = None):
         return self.orchestrator(
             self.config(extra_checks=extra_checks),
             planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)),
                                required_checks=("test", "integration", "frontend-e2e") if extra_checks else ("test",))],
+            continuation=continuation,
         ).run_text(SPEC, run_id="run")
 
     def test_green_gate_still_calls_auditor(self) -> None:
@@ -150,10 +151,16 @@ class AuditPipelineTests(PipelineHarness):
         self.workers.on(ExecutionRole.AUDITOR, *(
             (lambda _request: audit_message("NEEDS_WORK", "Fix test regression")) for _ in range(2)
         ))
-        result = self._run()
-        self.assertEqual(result.state["failure"]["reason"], "AUDIT_REMAINING")
-        self.assertNotEqual(result.state.get("disposition"), "wait_human")
-        self.assertNotEqual(result.state.get("disposition"), "wait_external")
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        m02 = meta_plan(Step(id="S01", title="Correct the regression", write=("feature.txt",)))
+        m02 = m02.replace("MILESTONE_ID: M01", "MILESTONE_ID: M02")
+        result = self._run(continuation=[
+            continuation_answer("NEXT", milestone="M02", plan_text=m02),
+            continuation_answer("COMPLETE"),
+        ])
+        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(len(self.continuation.requests), 2)
+        self.assertEqual(self.checkpoint()["iteration"], 2)
         report = json.loads((self.run_dir() / "cycles/001/audit/002/report.json").read_text())
         self.assertEqual(report["remaining"], ["Fix test regression"])
 

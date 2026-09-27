@@ -13,7 +13,7 @@ from metaharness.orchestration.step_acceptance import StepAcceptanceService
 from metaharness.orchestration.step_authority import read_step_candidate
 from metaharness.orchestrator import Orchestrator
 from metaharness.resume import resume_info
-from tests.pipeline.support import PipelineHarness, git, initial_plan, write
+from tests.pipeline.support import PipelineHarness, continuation_answer, git, initial_plan, write
 
 SPEC = "Make feature.txt good.\n"
 STEP = ("S01", "feature.txt", "Write the feature")
@@ -22,8 +22,12 @@ STEP = ("S01", "feature.txt", "Write the feature")
 class NoCall:
     def __init__(self) -> None:
         self.requests: list[str] = []
+        self.continuation_requests: list[str] = []
 
     def complete(self, request: str) -> str:
+        if "META CONTINUE v1" in request:
+            self.continuation_requests.append(request)
+            return continuation_answer("COMPLETE")
         self.requests.append(request)
         raise AssertionError("resume must not call the planner")
 
@@ -89,6 +93,7 @@ class StepAuthorityTests(PipelineHarness):
 
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(planner.requests, [])
+        self.assertEqual(len(planner.continuation_requests), 1)
         self.assertEqual(len([c for c in self.workers.calls if c.role is ExecutionRole.IMPLEMENTER]), 3)
 
     def test_uncheckpointed_candidate_is_rebuilt_by_step_replay(self) -> None:
@@ -111,6 +116,7 @@ class StepAuthorityTests(PipelineHarness):
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(read_step_candidate(self.step_dir())["changed_paths"], ["feature.txt"])
         self.assertEqual(planner.requests, [])
+        self.assertEqual(len(planner.continuation_requests), 1)
         self.assertEqual(
             len([call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER]), 2,
         )

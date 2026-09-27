@@ -305,6 +305,7 @@ class RunStatus(StrEnum):
     PUBLISHING = "publishing"
     PUBLISHED = "published"
     COMMITTED = "committed"
+    PARTIAL = "partial"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
 
@@ -529,7 +530,9 @@ class RunEvent:
 # episode runs several attempts.
 _RUN_PHASE_SUCCESSORS: Mapping[RunPhase, frozenset[RunPhase]] = {
     RunPhase.CONTEXT: frozenset({RunPhase.PLANNER}),
-    RunPhase.PLANNER: frozenset({RunPhase.PLAN_APPROVAL}),
+    RunPhase.PLANNER: frozenset({
+        RunPhase.PLAN_APPROVAL, RunPhase.IMPLEMENT_STEP, RunPhase.CANDIDATE_READY,
+    }),
     RunPhase.PLAN_APPROVAL: frozenset({RunPhase.WORKTREE_SETUP}),
     RunPhase.WORKTREE_SETUP: frozenset({RunPhase.IMPLEMENT_STEP}),
     RunPhase.IMPLEMENT_STEP: frozenset({
@@ -537,6 +540,7 @@ _RUN_PHASE_SUCCESSORS: Mapping[RunPhase, frozenset[RunPhase]] = {
     }),
     RunPhase.DETERMINISTIC_GATE: frozenset({
         RunPhase.DETERMINISTIC_GATE, RunPhase.CANDIDATE_READY, RunPhase.AUDIT,
+        RunPhase.PLANNER,
     }),
     RunPhase.AUDIT: frozenset({RunPhase.DETERMINISTIC_GATE}),
     RunPhase.CANDIDATE_READY: frozenset({RunPhase.CANDIDATE_PUSH}),
@@ -545,7 +549,7 @@ _RUN_PHASE_SUCCESSORS: Mapping[RunPhase, frozenset[RunPhase]] = {
 }
 # The operations that can end a run successfully: the audited candidate
 # commit itself, or its publication.
-_RUN_COMPLETABLE_PHASES = frozenset({RunPhase.CANDIDATE_PUSH, RunPhase.PUBLISH})
+_RUN_COMPLETABLE_PHASES = frozenset({RunPhase.CANDIDATE_PUSH, RunPhase.PUBLISH, RunPhase.PLANNER})
 
 
 def phase_successors(phase: RunPhase | str) -> frozenset[RunPhase]:
@@ -640,6 +644,7 @@ _RUNNING_STATUS: Mapping[RunPhase, RunStatus] = {
 # operation (the candidate push itself) stops at the committed candidate.
 _COMPLETED_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.PUBLISH: RunStatus.PUBLISHED,
+    RunPhase.PLANNER: RunStatus.PARTIAL,
 }
 # Failure reasons that name *what* an external wait waits for; the phase stays
 # the operation to retry, the reason carries the business meaning.  An
@@ -716,6 +721,7 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.PUBLISHING: RunDisposition.RUNNING,
     RunStatus.PUBLISHED: RunDisposition.COMPLETED,
     RunStatus.COMMITTED: RunDisposition.COMPLETED,
+    RunStatus.PARTIAL: RunDisposition.COMPLETED,
     RunStatus.FAILED: RunDisposition.FAILED,
     RunStatus.INTERRUPTED: RunDisposition.FAILED,
 }

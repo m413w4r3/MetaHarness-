@@ -24,7 +24,7 @@ from tests.autonomy.support import (
     chat_endpoint,
     meta_plan,
 )
-from tests.pipeline_support import write
+from tests.pipeline_support import continuation_answer, write
 
 AUDIT_DONE = (
     "META AUDIT v1\n\nSTATUS\nDONE\n\nFIXED\n- none\n\n"
@@ -42,11 +42,14 @@ class PlannerTransportOutageTests(AutonomyHarness):
             Step(id="S01", title="Write the feature", write=("feature.txt",)),
         )
 
+    def response(self, prompt: str) -> str:
+        return continuation_answer("COMPLETE") if "META CONTINUE v1" in prompt else self.plan()
+
     def test_control_a_healthy_transport_completes_the_run(self) -> None:
         """Control: the transport double itself is sound, with no outage at all."""
 
         clock = FakeClock()
-        transport = FlakyHTTPTransport(clock, outage_seconds=0.0, answer=self.plan())
+        transport = FlakyHTTPTransport(clock, outage_seconds=0.0, answer=self.response)
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
 
@@ -56,7 +59,7 @@ class PlannerTransportOutageTests(AutonomyHarness):
         ).run_text(SPEC, run_id="run")
 
         self.assert_run_completed(result)
-        self.assertEqual(transport.attempts, 1)
+        self.assertEqual(transport.attempts, 2)
 
     def test_the_transport_outlasts_a_ninety_second_outage(self) -> None:
         """The C4 horizon: retries continue while the injected clock runs."""
@@ -93,7 +96,7 @@ class PlannerTransportOutageTests(AutonomyHarness):
             config,
             planner_client=CompletionOverTransport(
                 endpoint,
-                FlakyHTTPTransport(clock, outage_seconds=horizon + 60.0, answer=self.plan()),
+                FlakyHTTPTransport(clock, outage_seconds=horizon + 60.0, answer=self.response),
                 clock,
             ),
         ).run_text(SPEC, run_id="run")
@@ -103,7 +106,7 @@ class PlannerTransportOutageTests(AutonomyHarness):
         self.assertEqual(self.checkpoint()["phase"], "planner")
         self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
 
-        recovered = FlakyHTTPTransport(clock, outage_seconds=0.0, answer=self.plan())
+        recovered = FlakyHTTPTransport(clock, outage_seconds=0.0, answer=self.response)
         resumed = Orchestrator(
             config,
             planner_client=CompletionOverTransport(endpoint, recovered, clock),
@@ -124,7 +127,7 @@ class PlannerTransportOutageTests(AutonomyHarness):
 
         clock = FakeClock()
         transport = FlakyHTTPTransport(
-            clock, outage_seconds=self.OUTAGE_SECONDS, answer=self.plan(),
+            clock, outage_seconds=self.OUTAGE_SECONDS, answer=self.response,
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)

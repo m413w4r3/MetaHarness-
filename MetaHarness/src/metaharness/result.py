@@ -31,7 +31,7 @@ class RunResult:
 
     @property
     def committed(self) -> bool:
-        return self.status in {RunStatus.COMMITTED, RunStatus.PUBLISHED}
+        return self.status in {RunStatus.COMMITTED, RunStatus.PUBLISHED, RunStatus.PARTIAL}
 
     @property
     def published(self) -> bool:

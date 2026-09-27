@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -148,7 +149,13 @@ def prepare_resume(
                 error.code = exc.code
                 raise error from exc
         plan = read_iteration_plan(run_dir, checkpoint.iteration, checkpoint.plan_sha256)
-        if branch != build_run_branch(plan.title, run_id):
+        initial_plan_path = iteration_plan_dir(run_dir, 1) / "task_plan.json"
+        try:
+            initial_plan_sha = hashlib.sha256(initial_plan_path.read_bytes()).hexdigest()
+            initial_plan = read_iteration_plan(run_dir, 1, initial_plan_sha)
+        except (OSError, ValueError) as exc:
+            _fail(f"initial effective plan is missing or invalid: {exc}")
+        if branch != build_run_branch(initial_plan.title, run_id):
             _fail("run branch identity does not match the effective plan")
         if head != green:
             checkpoint = _adopt_completed_commit(repo, checkpoint, head=head, plan=plan, run_id=run_id)

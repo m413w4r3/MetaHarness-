@@ -1,7 +1,7 @@
 """META CONTINUE v1: the authority that closes one audited milestone.
 
-The parser is pure (no model, no correction), the service runs on the planner
-profile through a text transport, and the artifacts of one decision round-trip.
+The parser is pure, the service runs on the planner profile through a text
+transport, and the artifacts of one decision round-trip.
 """
 
 from __future__ import annotations
@@ -262,7 +262,7 @@ class PlannerContinueServiceTests(unittest.TestCase):
             facts(), planning=PLANNING, check_catalog=CATALOG, default_check_ids=("test",))
         self.assertEqual(
             tuple(section.name for section in payload.sections),
-            ("spec", "state", "plan", "audit", "evidence", "rules"))
+            ("spec", "state", "plan", "audit", "evidence", "repository", "rules"))
         self.assertNotIn("{{", payload.rendered)
         self.assertFalse(payload.budget_overrun)
         fields = set(PlannerContinueFacts.__dataclass_fields__)
@@ -292,8 +292,8 @@ class PlannerContinueServiceTests(unittest.TestCase):
             request, raw, record = read_planner_continue_artifacts(directory)
             self.assertEqual(raw, raw_answer)
             self.assertNotIn("WORKER PROMPT SENTINEL", client.requests[0])
-            self.assertEqual(sorted(request["facts"]), ["audit", "evidence", "plan", "rules",
-                                                        "spec", "state"])
+            self.assertEqual(sorted(request["facts"]), ["audit", "evidence", "plan", "repository",
+                                                        "rules", "spec", "state"])
             self.assertEqual(request["facts"]["spec"], "SPEC: add the feature.")
             self.assertEqual(request["iteration"], 1)
             self.assertEqual(request["current_plan"]["steps"], ["S01"])

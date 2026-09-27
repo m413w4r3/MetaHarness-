@@ -146,6 +146,22 @@ def audit_report(
     )
 
 
+def continuation_answer(
+    decision: str, *, milestone: str = "NONE", remaining: str = "- none",
+    question: str = "NONE", plan_text: str | None = None,
+) -> str:
+    """One compact META CONTINUE v1 fixture."""
+
+    lines = [
+        "META CONTINUE v1", "", "DECISION", decision, "", "SUMMARY",
+        "The milestone decision is recorded.", "", "REMAINING", remaining,
+        "", "NEXT_MILESTONE", milestone, "", "SPEC_QUESTION", question,
+    ]
+    if plan_text is not None:
+        lines += ["", "BEGIN NEXT PLAN", plan_text.rstrip(), "END NEXT PLAN"]
+    return "\n".join(lines + ["", "END META CONTINUE", ""])
+
+
 def audit(
     status: str = "DONE", *, fixed: str = "none", refactored: str = "none",
     remaining: str = "none", risks: str = "none",
@@ -179,6 +195,19 @@ class ScriptedChat:
         if isinstance(answer, BaseException):
             raise answer
         return answer
+
+
+class ScriptedPlannerMux:
+    """Keep initial planner answers and continuation decisions independently scripted."""
+
+    def __init__(self, planner: ScriptedChat, continuation: ScriptedChat) -> None:
+        self.planner = planner
+        self.continuation = continuation
+
+    def complete(self, request: str) -> str:
+        if "META CONTINUE v1" in request:
+            return self.continuation.complete(request)
+        return self.planner.complete(request)
 
 
 Script = Callable[[AgentRunRequest], "str | AgentRunResult"]
@@ -415,6 +444,7 @@ timeout_seconds = 30
 
     def orchestrator(
         self, config: Any, *, planner: list[Any], auditor: list[Any] | None = None,
+        continuation: list[Any] | None = None,
     ) -> Orchestrator:
         """Wire one run: a scripted planner and the scripted auditor queue.
 
@@ -424,9 +454,13 @@ timeout_seconds = 30
         """
 
         self.planner = ScriptedChat(planner, name="planner", events=self.events)
+        self.continuation = ScriptedChat(
+            continuation or [continuation_answer("COMPLETE")],
+            name="planner_continue", events=self.events,
+        )
         self.auditor = auditor if auditor is not None else [audit()]
         self.workers.on(ExecutionRole.AUDITOR, *self.auditor)
-        return Orchestrator(config, planner_client=self.planner)
+        return Orchestrator(config, planner_client=ScriptedPlannerMux(self.planner, self.continuation))
 
     def run_dir(self, run_id: str = "run") -> Path:
         return self.root / "runs" / run_id
