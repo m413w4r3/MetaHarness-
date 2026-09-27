@@ -277,12 +277,14 @@ class RecoveryCoordinator:
         tree_before: str | None = None,
         tree_after: str | None = None,
         allowed: Collection[RecoveryStrategy] | None = None,
+        strategy: RecoveryStrategy | None = None,
     ) -> RecoveryAdmission:
         """Classify one failure and consume its budget when recovery is allowed.
 
         ``allowed`` restricts the ladder strategies the caller can execute; a
         terminal decision, or one naming any other strategy, is returned
-        unadmitted without consuming budget.
+        unadmitted without consuming budget.  ``strategy`` records which rung
+        the caller executes when it is not the first one of the ladder.
         """
 
         used = self.used(key)
@@ -312,7 +314,7 @@ class RecoveryCoordinator:
         consumed = self.consume(key, RecoveryAttempt(
             phase=phase, reason=reason, attempt=attempt, budget_key=key,
             budget=budget, budget_consumed=used + 1,
-            strategy=decision.strategy.value,
+            strategy=(strategy or decision.strategy).value,
             operation_id=f"recovery:{key}:{attempt:02d}",
             cycle=cycle, step_id=step_id,
             profile_id=profile_id, tree_before=tree_before, tree_after=tree_after,

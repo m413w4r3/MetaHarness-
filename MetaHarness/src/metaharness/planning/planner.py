@@ -153,8 +153,11 @@ def build_planner_prompt_v2(*args: Any, **kwargs: Any) -> str:
 class PlannerV2:
     """Standalone v2 planner entry point; it never invokes the profile recommender."""
 
-    def __init__(self, client: TextCompletionClient, *, repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None, check_catalog: Sequence[CheckConfig] = (), default_check_ids: Sequence[str] = (), prompt_budget_bytes: int = 0, repository_preconditions: RepositoryPreconditions | None = None, on_event: Callable[[str, dict[str, Any]], None] | None = None):
+    def __init__(self, client: TextCompletionClient, *, repository_reference: RepositoryReference | None = None, planning: PlanningConfig | None = None, template: str | None = None, check_catalog: Sequence[CheckConfig] = (), default_check_ids: Sequence[str] = (), prompt_budget_bytes: int = 0, repository_preconditions: RepositoryPreconditions | None = None, attempt_budget: int = 3, on_event: Callable[[str, dict[str, Any]], None] | None = None):
         self.client = client
+        # The total semantic answers one planner decision may spend: the
+        # initial answer plus its corrections, bounded by budget.step_attempts.
+        self.attempt_budget = attempt_budget
         self.repository_preconditions = repository_preconditions
         self.repository_reference = repository_reference
         self.planning = planning or PlanningConfig(protocol="v2")
@@ -196,7 +199,7 @@ class PlannerV2:
         attempts = target / PLANNER_ATTEMPTS_DIR if target is not None else None
         memory_previous: tuple[dict[str, Any], str] | None = None
         memory_usage: list[dict[str, Any]] = []
-        for attempt in range(1, self.planning.max_preapproval_corrections + 2):
+        for attempt in range(1, self.attempt_budget + 1):
             if attempts is not None and (attempts / f"{attempt:02d}").is_dir():
                 continue
             previous = attempts / f"{attempt - 1:02d}" if attempts is not None and attempt > 1 else None
@@ -316,7 +319,7 @@ class PlannerV2:
                     memory_previous = (validation, raw)
                     self.last_usage = add_usage(memory_usage)
                 security_violation = isinstance(exc, V2PlanParseError) and str(exc).startswith("unsafe ")
-                if security_violation or attempt > self.planning.max_preapproval_corrections:
+                if security_violation or attempt >= self.attempt_budget:
                     raise
                 continue
             if target is not None:

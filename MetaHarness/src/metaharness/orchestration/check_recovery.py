@@ -18,12 +18,11 @@ from ..baseline import PREFLIGHT_FILE, PREFLIGHT_SCHEMA_VERSION, preflight_finge
 from ..evidence import EvidenceBundle
 from ..gitops import snapshot_candidate_state
 from ..models import CheckConfig, HarnessConfig
-from ..recovery_policy import RecoveryBudgets
 from ..result import ResultArtifactError, atomic_write_text
 from ..state import RunStateStore
 from ..validation import run_check_preflights
 from ..workspace import WorkspaceSetupError
-from .pipeline_v2 import PipelineFailure
+from .pipeline_v2 import BudgetExhausted, PipelineFailure
 from .recovery import RecoveryAdmission, RecoveryCoordinator
 from .shared import OrchestrationError, _archive_attempt_tree, _safe_candidate_tree
 
@@ -43,11 +42,21 @@ class CheckInfrastructureRecovery:
     """Bounded same-tree retries of trusted check infrastructure."""
 
     def __init__(
-        self, recovery: RecoveryCoordinator, *, store: RunStateStore, budgets: RecoveryBudgets,
+        self, recovery: RecoveryCoordinator, *, store: RunStateStore, attempts: int,
+        budget_exhausted: Callable[[], str | None] = lambda: None,
     ) -> None:
         self._recovery = recovery
         self._store = store
-        self._budgets = budgets
+        # The one ``budget.step_attempts`` ceiling of the run: a retryable
+        # trusted operation is bounded by it, never by a second hidden budget.
+        self._attempts = attempts
+        # The run's global budget guard, consulted before a costly retry.
+        self._budget_exhausted = budget_exhausted
+
+    def _guard(self) -> None:
+        reason = self._budget_exhausted()
+        if reason is not None:
+            raise BudgetExhausted(reason)
 
     def prepare_workspace(
         self, *, worktree: Path, run_dir: Path, run_setup: Callable[[], Sequence[Any]],
@@ -55,9 +64,10 @@ class CheckInfrastructureRecovery:
         """Run trusted workspace setup; retry transient failures exactly."""
 
         key = self._recovery.budget_key("workspace-setup")
-        budget = self._budgets.max_workspace_setup_retries
+        budget = self._attempts
         pending: RecoveryAdmission | None = None
         while True:
+            self._guard()
             before = snapshot_candidate_state(worktree)
             try:
                 results = run_setup()
@@ -84,7 +94,7 @@ class CheckInfrastructureRecovery:
             if not admission.admitted:
                 raise OrchestrationError(
                     f"CHECK_INFRASTRUCTURE_UNAVAILABLE: {error.code}; "
-                    "workspace setup retry budget exhausted"
+                    "workspace setup attempts exhausted"
                 ) from error
             _archive_attempt_tree(run_dir / "setup")
             pending = admission
@@ -180,12 +190,13 @@ class GateInfraRetries:
         self._admissions: dict[str, RecoveryAdmission] = {}
 
     def __call__(self, check_id: str, failure_kind: str) -> bool:
+        self._owner._guard()
         recovery = self._owner._recovery
         reason = "CHECK_TIMEOUT" if failure_kind == "timeout" else "CHECK_INFRA_FAILURE"
         tree = _safe_candidate_tree(self._worktree)
         admission = recovery.admit(
             recovery.budget_key("check-infra", f"{self._cycle:03d}", self._stage, check_id),
-            reason=f"{reason}:{check_id}", budget=self._owner._budgets.max_check_infra_retries,
+            reason=f"{reason}:{check_id}", budget=self._owner._attempts,
             phase="validation", cycle=self._cycle, tree_before=tree, tree_after=tree,
         )
         self._admissions[check_id] = admission

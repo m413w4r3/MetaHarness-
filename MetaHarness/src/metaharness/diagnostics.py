@@ -283,7 +283,7 @@ def _safe_state(state: Mapping[str, Any]) -> dict[str, Any]:
     keys = (
         "run_id", "status", "started_at", "updated_at", "repo", "base_ref", "base_sha",
         "branch", "worktree", "cycle", "current_step", "approved_tree_sha", "commit_sha",
-        "planning_protocol",
+        "planning_protocol", "budget",
     )
     result = {key: state.get(key) for key in keys if key in state}
     failure = state.get("failure")

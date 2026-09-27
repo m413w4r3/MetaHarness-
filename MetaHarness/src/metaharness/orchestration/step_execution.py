@@ -54,6 +54,7 @@ from ..resume import read_checkpoint
 from ..state import RunStateStore
 from .durable_readers import FAILED_CONTINUED, SKIPPED_DEPENDENCY, settled_step_status
 from .pipeline_v2 import (
+    BudgetExhausted,
     CyclePlan,
     PipelineFailure,
     PipelineV2Context,
@@ -247,21 +248,31 @@ class StepExecutionService:
         forbidden_env_names: tuple[str | None, ...],
         future_ownership: Mapping[str, tuple[str, ...]] | None = None,
     ) -> EffectiveStepExecution:
-        """Run the normal worker retry and fallback ladder for one plan step."""
+        """Run the one bounded worker ladder of a plan step.
+
+        ``budget.step_attempts`` is the total ceiling of this autonomous
+        operation: the primary attempt, its same-executor retries and its
+        executor fallbacks all consume it, so a step never spends more than
+        that many semantic worker calls.  One attempt stays reserved per
+        remaining fallback, so a configured escalation is always reachable
+        inside the budget.
+        """
 
         authority = approved_step_authority(step, contract)
         recovery = self.runtime.recovery(store)
         cycle_number = self.runtime.trace_cycle
+        attempts = self.runtime.run_options.budget.step_attempts
         active_profile_id = profile_id
-        fallback_ids = tuple(fallback_profile_ids)[
-            :self.runtime.run_options.recovery.max_executor_fallbacks
-        ]
+        fallback_ids = tuple(fallback_profile_ids)[:max(0, attempts - 1)]
         fallback_index = 0
         retry_key = recovery.budget_key("agent-step", f"{cycle_number:03d}", step.id)
         pending_retry: RecoveryAdmission | None = None
         retry_addendum: str | None = None
         attempt_number = 0
         while True:
+            exhausted = self.runtime.budget_exhausted(store)
+            if exhausted is not None:
+                raise BudgetExhausted(exhausted)
             attempt_number += 1
             common = {
                 "repo": repo, "worktree": worktree, "base_sha": base_sha,
@@ -318,11 +329,13 @@ class StepExecutionService:
                         tree_after=failure.tree_after or safe_candidate_tree(worktree),
                     )
                     pending_retry = None
+                remaining_fallbacks = len(fallback_ids) - fallback_index
                 retry = self.runtime.worker_recovery(store).admit_step_retry(
                     failure=failure, retry_key=retry_key, repo=repo, worktree=worktree,
                     branch_ref=branch_ref, base_sha=base_sha,
                     ownership_before=ownership_before, step=step,
                     artifact_dir=artifact_dir, cycle=cycle_number,
+                    retry_budget=max(0, attempts - 1 - remaining_fallbacks),
                 )
                 if retry is not None:
                     pending_retry = retry
@@ -345,15 +358,23 @@ class StepExecutionService:
                 )
                 if (
                     retryable
-                    and recovery.used(retry_key) >= self.runtime.run_options.recovery.max_transient_attempts
                     and fallback_index < len(fallback_ids)
+                    and recovery.used(retry_key) < attempts - 1
                 ):
+                    # The next rung of the ladder, paid for by the same one
+                    # step budget as every other semantic worker attempt.
+                    admission = recovery.admit(
+                        retry_key, reason=failure.reason, budget=attempts - 1,
+                        phase="implementation", cycle=cycle_number, step_id=step.id,
+                        tree_before=failure.tree_before,
+                        tree_after=safe_candidate_tree(worktree),
+                        strategy=RecoveryStrategy.FALLBACK_EXECUTOR,
+                    )
+                    if not admission.admitted:
+                        failure.step_dir = artifact_dir
+                        raise
                     fallback_index += 1
                     active_profile_id = fallback_ids[fallback_index - 1]
-                    retry_key = recovery.budget_key(
-                        "agent-step", f"{cycle_number:03d}", step.id,
-                        "fallback", active_profile_id,
-                    )
                     recovery.fallback_selected(
                         reason=failure.reason, index=fallback_index,
                         available=len(fallback_ids), phase="implementation",

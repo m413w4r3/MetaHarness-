@@ -74,17 +74,19 @@ class PlannerTransactionTests(PipelineHarness):
         self.invalid = impossible_plan_message()
         self.valid = meta_plan({"read": ("feature.txt",), "write": ("feature.txt",)})
 
-    def planner(self, client, *, budget: int = 2, events=None) -> PlannerV2:
+    def planner(self, client, *, attempts: int = 3, events=None) -> PlannerV2:
+        """One planner whose total answer budget is ``budget.step_attempts``."""
+
         return PlannerV2(
-            client, planning=replace(self.config_value.planning, max_preapproval_corrections=budget),
+            client, planning=self.config_value.planning, attempt_budget=attempts,
             check_catalog=self.config_value.check_catalog,
             default_check_ids=self.config_value.default_check_ids,
             repository_preconditions=RepositoryPreconditions(self.repo, resolve_tree(self.repo, "HEAD")),
             on_event=events,
         )
 
-    def run_plan(self, client, *, budget: int = 2, events=None):
-        return self.planner(client, budget=budget, events=events).plan(
+    def run_plan(self, client, *, attempts: int = 3, events=None):
+        return self.planner(client, attempts=attempts, events=events).plan(
             "Make feature.txt good.", "feature.txt exists", artifacts_dir=self.target,
         )
 
@@ -196,11 +198,12 @@ class PlannerTransactionTests(PipelineHarness):
         contract = (self.target / "iterations/01/plan/steps/S01/contract.md").read_text(encoding="utf-8")
         self.assertIn(path, contract.split("WRITE SET", 1)[1].split("CREATE SET", 1)[0])
 
-    def test_budget_zero_stops_before_worker_or_bundle(self) -> None:
+    def test_a_single_attempt_budget_stops_before_worker_or_bundle(self) -> None:
         chat = _Chat([self.invalid])
         with self.assertRaises(PlanRepositoryPreconditionError):
-            self.run_plan(chat, budget=0)
+            self.run_plan(chat, attempts=1)
         self.assertEqual(chat.continue_calls, [])
+        self.assertEqual(len(chat.complete_calls), 1)
         self.assertFalse((self.target / "iterations/01/plan/implementation_bundle.json").exists())
 
     def test_two_corrections_and_exhaustion(self) -> None:

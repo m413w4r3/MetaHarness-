@@ -35,14 +35,13 @@ from .models import (
     ProfileDriver,
     RoutingConfig,
     RepositoryConfig,
-    RecoveryBudgets,
     SelectionMode,
     TransportConfig,
     UIConfig,
     WorkspaceSetupCommand,
     profile_driver_name,
 )
-from .recovery_policy import ExecutionFallbacks
+from .recovery_policy import AutonomyBudget, ExecutionFallbacks, unsupported_cost_cap
 from .scope import (
     DEFAULT_HARD_DENY_PATTERNS,
     SCOPE_MODES,
@@ -63,6 +62,17 @@ _KNOWN_SANDBOXES = frozenset({
     "danger-full-access",
 })
 _PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+# The non-budget planning bounds; a numeric autonomy limit is never one of them.
+_PLANNING_KEYS = frozenset({
+    "protocol", "decomposition", "execution_mode_policy",
+    "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
+    "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
+})
+# The exact five keys of the one autonomous budget section.
+_BUDGET_KEYS = frozenset({
+    "step_attempts", "audit_repairs", "max_iterations",
+    "max_wall_clock_hours", "max_cost",
+})
 _PROFILE_COMMON_KEYS = frozenset({
     "display_name",
     "roles",
@@ -244,6 +254,18 @@ def _bounded_int(
     if value > maximum:
         raise ConfigError(f"{where}.{key} must be at most {maximum}")
     return value
+
+
+def _bounded_cost(data: Mapping[str, Any], key: str, default: float) -> float:
+    """Read one non-negative USD cap; ``0`` disables the cap."""
+
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"budget.{key} must be a number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ConfigError(f"budget.{key} must be a non-negative number")
+    return result
 
 
 def _string_array(data: Mapping[str, Any], key: str, default: tuple[str, ...], where: str,
@@ -731,6 +753,11 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     max_diff_bytes = _positive_int(expanded, "max_diff_bytes", 400_000, "root")
 
     planning_data = _table(expanded, "planning")
+    unknown_planning = sorted(set(planning_data) - _PLANNING_KEYS)
+    if unknown_planning:
+        # Numeric retry or autonomy budgets are refused here: the one
+        # autonomous budget lives in [budget].
+        raise ConfigError(f"planning.{unknown_planning[0]} is not allowed")
     protocol = planning_data.get("protocol", "v2")
     if protocol != "v2":
         raise ConfigError("planning.protocol must be 'v2'")
@@ -770,9 +797,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         max_steps_per_plan=max_steps_per_plan,
         max_read_paths_per_step=max_read_paths_per_step,
         max_step_contract_chars=max_step_contract_chars,
-        max_preapproval_corrections=_bounded_int(
-            planning_data, "max_preapproval_corrections", 2, "planning", minimum=0, maximum=10
-        ),
     )
 
     transport_data = _table(expanded, "transport")
@@ -789,15 +813,40 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     except ValueError as exc:
         raise ConfigError(str(exc)) from None
 
+    budget_data = _table(expanded, "budget")
+    unknown_budget = sorted(set(budget_data) - _BUDGET_KEYS)
+    if unknown_budget:
+        raise ConfigError(f"budget.{unknown_budget[0]} is not allowed")
+    try:
+        budget = AutonomyBudget(
+            step_attempts=_bounded_int(
+                budget_data, "step_attempts", 3, "budget", minimum=1, maximum=10
+            ),
+            audit_repairs=_bounded_int(
+                budget_data, "audit_repairs", 2, "budget", minimum=0, maximum=10
+            ),
+            max_iterations=_bounded_int(
+                budget_data, "max_iterations", 8, "budget", minimum=1, maximum=99
+            ),
+            max_wall_clock_hours=_bounded_float(
+                budget_data, "max_wall_clock_hours", 12, "budget", maximum=720
+            ),
+            max_cost=_bounded_cost(budget_data, "max_cost", 0),
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from None
+    if (message := unsupported_cost_cap(budget.max_cost)) is not None:
+        raise ConfigError(message)
+
     recovery_data = _table(expanded, "recovery")
-    recovery_fields = {
-        "max_transient_attempts", "max_executor_fallbacks",
-        "max_check_infra_retries",
-        "max_workspace_setup_retries",
-    }
-    unknown_recovery = sorted(set(recovery_data) - recovery_fields - {"execution_fallbacks"})
+    unknown_recovery = sorted(set(recovery_data) - {"execution_fallbacks"})
     if unknown_recovery:
-        raise ConfigError(f"recovery.{unknown_recovery[0]} is not allowed")
+        # The numeric retry budgets of earlier schemas are refused, never
+        # reinterpreted: [budget] is the only numeric autonomy section.
+        raise ConfigError(
+            f"recovery.{unknown_recovery[0]} is not allowed; the run's numeric "
+            "autonomy limits live in [budget]"
+        )
     fallback_data = recovery_data.get("execution_fallbacks", {})
     if not isinstance(fallback_data, dict):
         raise ConfigError("recovery.execution_fallbacks must be a table")
@@ -814,13 +863,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             raise ConfigError(f"recovery.execution_fallbacks.{name} must be an array of profile IDs")
         parsed_fallbacks[name] = tuple(values)
     try:
-        recovery = RecoveryBudgets(**{
-            name: _bounded_int(
-                recovery_data, name, getattr(RecoveryBudgets(), name), "recovery",
-                minimum=0, maximum=10,
-            )
-            for name in sorted(recovery_fields)
-        }, execution_fallbacks=ExecutionFallbacks(**parsed_fallbacks))
+        execution_fallbacks = ExecutionFallbacks(**parsed_fallbacks)
     except ValueError as exc:
         raise ConfigError(str(exc)) from None
 
@@ -1104,7 +1147,8 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         workspace_setup=workspace_setup,
         gate=gate,
         planning=planning,
-        recovery=recovery,
+        budget=budget,
+        execution_fallbacks=execution_fallbacks,
         scope=scope,
         transport=transport,
         prompt_budget=prompt_budget,

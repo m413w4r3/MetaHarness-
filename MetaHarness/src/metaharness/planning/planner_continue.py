@@ -195,6 +195,9 @@ class PlannerContinue:
     # catalogue and the defaults above are its frozen values, never live ones.
     check_authority_sha256: str | None = None
     prompt_budget_bytes: int = 0
+    # The total semantic answers one continuation decision may spend, the
+    # same budget.step_attempts as every other autonomous operation.
+    attempt_budget: int = 3
     last_usage: dict[str, Any] | None = None
 
     def decide(
@@ -220,7 +223,7 @@ class PlannerContinue:
             answer = raw_path.read_text(encoding="utf-8")
         last_error = ""
         previous_answer = ""
-        for attempt in range(self.planning.max_preapproval_corrections + 1):
+        for attempt in range(self.attempt_budget):
             retry_dir = None if target is None or attempt == 0 else (
                 target / "corrections" / f"{attempt:02d}"
             )

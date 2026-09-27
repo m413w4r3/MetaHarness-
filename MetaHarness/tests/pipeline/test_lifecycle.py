@@ -100,17 +100,17 @@ class LifecycleTests(PipelineHarness):
         options = json.loads((self.run_dir() / "run_options.json").read_text())
         selection = json.loads((self.run_dir() / "iterations/01/execution_selection.json").read_text())
         self.assertFalse((self.run_dir() / "execution_selection.json").exists())
-        self.assertEqual(options["schema_version"], 7)
+        self.assertEqual(options["schema_version"], 8)
         self.assertEqual(options["pipeline_version"], 2)
         option_names = set(options) | {
-            name for section in ("planning", "profiles", "recovery")
+            name for section in ("planning", "profiles", "execution_fallbacks", "budget")
             for name in options[section]
         }
         for forbidden in (
             "semantic_revision_enabled", "max_check_repair_attempts",
             "max_correction_cycles", "check_repair_profile",
             "semantic_reviser_profile", "final_reviewer_profile",
-            "max_review_transport_retries",
+            "max_review_transport_retries", "recovery",
         ):
             self.assertNotIn(forbidden, option_names)
         self.assertEqual(
@@ -122,7 +122,12 @@ class LifecycleTests(PipelineHarness):
         )
         self.assertNotIn("pipeline", options)
         self.assertEqual(
-            set(options["recovery"]["execution_fallbacks"]),
+            set(options["budget"]),
+            {"step_attempts", "audit_repairs", "max_iterations",
+             "max_wall_clock_hours", "max_cost"},
+        )
+        self.assertEqual(
+            set(options["execution_fallbacks"]),
             {"mechanical", "reasoning", "agentic"},
         )
         self.assertEqual(self.state()["run_options"], options)

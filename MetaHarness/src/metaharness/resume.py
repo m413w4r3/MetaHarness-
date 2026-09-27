@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -92,6 +92,24 @@ def _parse(payload: Any, *, sha256: str) -> ResumeCheckpoint:
         )
     except (KeyError, TypeError, ResumeCheckpointError) as exc:
         raise ResumeCheckpointError(str(exc)) from exc
+
+
+def rephase_checkpoint(run_dir: str | Path, phase: RunPhase) -> None:
+    """Name the operation a run stopped at without replaying the one inside it.
+
+    The checkpoint stays the phase authority: a PARTIAL completion is a
+    planning decision (no further milestone is asked for), so a budget exit
+    that lands inside another operation first moves the durable boundary to
+    that decision.  A run without a checkpoint has no boundary to move.
+    """
+
+    record = read_checkpoint_record(run_dir)
+    if record is None or record.phase is phase:
+        return
+    write_checkpoint(run_dir, replace(
+        record, phase=phase,
+        step_index=record.step_index if phase is RunPhase.IMPLEMENT_STEP else None,
+    ))
 
 
 def read_checkpoint_record(run_dir: str | Path) -> ResumeCheckpoint | None:

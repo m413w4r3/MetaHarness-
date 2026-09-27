@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import metaharness
@@ -13,13 +14,15 @@ from metaharness.orchestration.recovery import RecoveryCoordinator, project_exit
 from metaharness.recovery_policy import (
     FAILURE_CLASSES,
     RECOVERY_LADDERS,
+    AutonomyBudget,
     FailureClass,
-    RecoveryBudgets,
     RecoveryDecision,
     RecoveryStrategy,
     classify_failure,
+    elapsed_hours,
     recovery_ladder,
     stable_code,
+    wall_clock_exhausted,
 )
 from metaharness.resume import ResumePhase
 from metaharness.state import RunStateStore
@@ -183,15 +186,42 @@ class FailureClassificationTests(unittest.TestCase):
                 self.assertNotIn(code, FAILURE_CLASSES)
                 self.assertFalse(classify_failure(code).known)
 
-    def test_budgets_have_bounded_durable_defaults(self) -> None:
-        self.assertEqual(RecoveryBudgets(), RecoveryBudgets(
-            max_transient_attempts=2,
-            max_executor_fallbacks=1,
-            max_check_infra_retries=2,
-            max_workspace_setup_retries=2,
+    def test_the_one_budget_has_exactly_five_bounded_fields(self) -> None:
+        self.assertEqual(tuple(AutonomyBudget.__dataclass_fields__), (
+            "step_attempts", "audit_repairs", "max_iterations",
+            "max_wall_clock_hours", "max_cost",
         ))
-        with self.assertRaises(ValueError):
-            RecoveryBudgets(max_transient_attempts=11)
+        self.assertEqual(AutonomyBudget(), AutonomyBudget(
+            step_attempts=3, audit_repairs=2, max_iterations=8,
+            max_wall_clock_hours=12, max_cost=0,
+        ))
+        for overrides in (
+            {"step_attempts": 0}, {"step_attempts": 11}, {"audit_repairs": -1},
+            {"max_iterations": 0}, {"max_wall_clock_hours": 0},
+            {"max_wall_clock_hours": 721}, {"max_cost": -1},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    AutonomyBudget(**overrides)
+
+    def test_wall_clock_is_measured_from_the_durable_start(self) -> None:
+        self.assertFalse(wall_clock_exhausted(None, max_wall_clock_hours=12))
+        self.assertFalse(wall_clock_exhausted("not-a-date", max_wall_clock_hours=12))
+        self.assertFalse(wall_clock_exhausted(
+            "2024-01-01T00:00:00Z", max_wall_clock_hours=12,
+            now=datetime(2024, 1, 1, 11, 59, tzinfo=timezone.utc),
+        ))
+        self.assertTrue(wall_clock_exhausted(
+            "2024-01-01T00:00:00Z", max_wall_clock_hours=12,
+            now=datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc),
+        ))
+        self.assertEqual(
+            elapsed_hours(
+                "2024-01-01T00:00:00+00:00",
+                now=datetime(2024, 1, 1, 6, 0, tzinfo=timezone.utc),
+            ),
+            6.0,
+        )
 
 
 class UnclassifiedObservabilityTests(unittest.TestCase):

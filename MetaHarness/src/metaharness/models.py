@@ -6,7 +6,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping
 
-from .recovery_policy import RecoveryBudgets
+from .recovery_policy import AutonomyBudget, ExecutionFallbacks
 from .scope import ScopePolicy
 
 
@@ -329,6 +329,11 @@ class RunPhase(StrEnum):
     CANDIDATE_READY = "candidate_ready"
     CANDIDATE_PUSH = "candidate_push"
     PUBLISH = "publish"
+
+
+# The complete set of PARTIAL reasons: an incomplete run is still a successful
+# completion, and it never waits for a human.
+PARTIAL_REASONS = ("stagnation", "max_iterations", "wall_clock", "cost_cap")
 
 
 class RunDisposition(StrEnum):
@@ -931,7 +936,6 @@ class PlanningConfig:
     max_steps_per_plan: int = 12
     max_read_paths_per_step: int = 8
     max_step_contract_chars: int = 9000
-    max_preapproval_corrections: int = 2
 
     def __post_init__(self) -> None:
         if self.protocol != "v2":
@@ -948,26 +952,8 @@ class PlanningConfig:
                 raise ValueError(f"{name} must be an integer greater than zero")
         if self.max_steps_per_plan > 99:
             raise ValueError("max_steps_per_plan must not exceed the protocol maximum of 99")
-        validate_revision_budget(self.max_preapproval_corrections, "max_preapproval_corrections")
         if self.execution_mode_policy not in {item.value for item in ExecutionModePolicy}:
             raise ValueError("planning execution_mode_policy must be 'auto' or 'require-staged'")
-
-
-MAX_REVISION_BUDGET = 10
-
-
-def validate_revision_budget(value: int, name: str) -> int:
-    """Validate one bounded correction budget in one central place."""
-
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 0 <= value <= MAX_REVISION_BUDGET
-    ):
-        raise ValueError(
-            f"{name} must be an integer between 0 and {MAX_REVISION_BUDGET}"
-        )
-    return value
 
 
 @dataclass(frozen=True)
@@ -1169,7 +1155,12 @@ class HarnessConfig:
     workspace_setup: tuple[WorkspaceSetupCommand, ...] = ()
     gate: GateConfig = field(default_factory=GateConfig)
     planning: PlanningConfig = field(default_factory=PlanningConfig)
-    recovery: RecoveryBudgets = field(default_factory=RecoveryBudgets)
+    # The one autonomous budget of every run (C10): five limits, no other
+    # numeric retry or autonomy knob exists in the runtime.
+    budget: AutonomyBudget = field(default_factory=AutonomyBudget)
+    # The frozen executor fallback authority: which profiles a step may
+    # escalate to, in order.  It is a policy list, never a numeric budget.
+    execution_fallbacks: ExecutionFallbacks = field(default_factory=ExecutionFallbacks)
     # How a path outside a step's declared mutable scope is treated: admitted
     # and recorded (``soft``) or restored (``strict``).  The forbidden-path
     # list is part of the same policy and is fatal in both modes.

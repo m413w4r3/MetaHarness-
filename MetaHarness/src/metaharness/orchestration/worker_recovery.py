@@ -25,7 +25,7 @@ from ..attempt_transaction import (
     GitOwnership,
 )
 from ..models import ImplementationStep
-from ..recovery_policy import RecoveryBudgets, RecoveryStrategy, classify_failure
+from ..recovery_policy import RecoveryStrategy, classify_failure
 from ..scope import ScopePolicy
 from ..state import RunStateStore
 from .recovery import RecoveryAdmission, RecoveryCoordinator
@@ -52,13 +52,11 @@ class WorkerRecovery:
         recovery: RecoveryCoordinator,
         *,
         store: RunStateStore,
-        budgets: RecoveryBudgets,
         secrets: Sequence[str],
         scope: ScopePolicy,
     ) -> None:
         self._recovery = recovery
         self._store = store
-        self._budgets = budgets
         self._secrets = tuple(secrets)
         self._scope = scope
 
@@ -77,10 +75,14 @@ class WorkerRecovery:
         step: ImplementationStep,
         artifact_dir: Path,
         cycle: int,
+        retry_budget: int,
     ) -> RecoveryAdmission | None:
         """Admit a same-executor retry only after an exact, in-scope rollback.
 
-        On refusal ``failure`` carries the stable reason the run must project.
+        ``retry_budget`` is how many attempts this step may still spend after
+        its primary one: the retry ladder rung is refused once the step's one
+        ``step_attempts`` budget is consumed.  On refusal ``failure`` carries
+        the stable reason the run must project.
         """
 
         reason = failure.reason
@@ -136,7 +138,7 @@ class WorkerRecovery:
             failure.step_dir = artifact_dir
             return None
         admission = self._recovery.admit(
-            retry_key, reason=reason, budget=self._budgets.max_transient_attempts,
+            retry_key, reason=reason, budget=retry_budget,
             profile_id=failure.profile_id, tree_before=before, tree_after=before,
             allowed=_RETRY_STRATEGIES, **trace,
         )

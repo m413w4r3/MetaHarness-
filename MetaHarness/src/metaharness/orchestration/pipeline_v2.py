@@ -23,6 +23,7 @@ from typing import Any, Callable, Mapping, TypeAlias
 from ..evidence import EvidenceBundle, required_checks_passed
 from ..gitops import RepositoryReference, WorktreeInfo, resolve_tree
 from ..models import (
+    PARTIAL_REASONS,
     CycleKind,
     DROP_UNKNOWN_REQUIRED_CHECK,
     ExecutionSelection,
@@ -111,6 +112,22 @@ class RecoveryStepUnavailable(RuntimeError):
         super().__init__(f"{getattr(strategy, 'value', strategy)}: {detail}")
         self.strategy = strategy
         self.detail = detail
+
+
+class BudgetExhausted(Exception):
+    """The run's one global budget is spent; the partial path owns the exit.
+
+    Raised at the boundary *before* an expensive operation: a new iteration, a
+    planner or worker semantic attempt, an audit, or a costly gate retry.  It
+    is never a failure: the coordinator projects it onto a ``PARTIAL``
+    completion with its reason.
+    """
+
+    def __init__(self, reason: str) -> None:
+        if reason not in PARTIAL_REASONS:
+            raise ValueError(f"{reason!r} is not a PARTIAL reason")
+        super().__init__(f"budget exhausted: {reason}")
+        self.reason = reason
 
 
 class PipelineFailure(Exception):
@@ -227,6 +244,10 @@ class PipelineV2Operations:
     partial: Callable[..., RunResult]
     spec_decision: Callable[..., RunResult]
     failed_continued: Callable[[PipelineV2Context, CyclePlan], tuple[str, ...]]
+    # The one global budget: the guard every expensive boundary consults, and
+    # the partial exit that consumes it without a human decision.
+    budget_exhausted: Callable[[PipelineV2Context], str | None]
+    budget_partial: Callable[[PipelineV2Context, str], RunResult]
 
 
 @dataclass(frozen=True)
@@ -236,6 +257,21 @@ class PipelineV2Coordinator:
     context: PipelineV2Context
     operations: PipelineV2Operations
     _cursor: list[RunPhase] = dataclasses.field(default_factory=list, repr=False, compare=False)
+    # The iteration in flight; a budget exit reports on this one, never on the
+    # context the coordinator was constructed with.
+    _current: list[PipelineV2Context] = dataclasses.field(default_factory=list, repr=False, compare=False)
+
+    @property
+    def current(self) -> PipelineV2Context:
+        return self._current[0] if self._current else self.context
+
+    def _guard(self, ctx: PipelineV2Context) -> None:
+        """Refuse to start an expensive operation once the budget is spent."""
+
+        self._current[:] = [ctx]
+        reason = self.operations.budget_exhausted(ctx)
+        if reason is not None:
+            raise BudgetExhausted(reason)
 
     def _phase(self, target: RunPhase) -> None:
         if self._cursor:
@@ -268,6 +304,12 @@ class PipelineV2Coordinator:
         )
 
     def run(self, start: ResumeCheckpoint, *, resumed: bool) -> RunResult:
+        try:
+            return self._run(start, resumed=resumed)
+        except BudgetExhausted as exhausted:
+            return self.operations.budget_partial(self.current, exhausted.reason)
+
+    def _run(self, start: ResumeCheckpoint, *, resumed: bool) -> RunResult:
         ops = self.operations
         ctx = self.context
         if ctx.iteration != start.iteration:
@@ -289,6 +331,7 @@ class PipelineV2Coordinator:
             )
 
         while True:
+            self._guard(ctx)
             iteration = ctx.iteration
             cycle = RunCycle(iteration, CycleKind.INITIAL)
             ops.begin_cycle(ctx, cycle, not resumed if iteration == start.iteration else True)
@@ -414,7 +457,10 @@ class PipelineV2Coordinator:
         )
         previous = load_stagnation_fingerprint(ctx.run_dir, ctx.iteration - 1)
         stagnant = previous is not None and previous == fingerprint
-        partial_reason = "max_iterations" if ctx.iteration >= 8 else "stagnation" if stagnant else None
+        partial_reason = (
+            "max_iterations" if ctx.iteration >= ctx.options.budget.max_iterations
+            else "stagnation" if stagnant else None
+        )
         ops.close_iteration(
             ctx, plan, outcome, decision, start_commit, fingerprint,
             "PARTIAL" if partial_reason else "NEXT",
@@ -423,6 +469,7 @@ class PipelineV2Coordinator:
             failures = tuple(dict.fromkeys((*outcome.evidence.failures, *failed)))
             return ops.partial(ctx, partial_reason, remaining, failures)
         next_ctx = ops.prepare_next_iteration(ctx, decision)
+        self._guard(next_ctx)
         next_plan = ops.initial_plan(next_ctx)
         self._boundary(next_ctx, RunPhase.IMPLEMENT_STEP, next_plan, step_index=0)
         ctx = next_ctx
@@ -461,7 +508,7 @@ class PipelineV2Coordinator:
         if reports and evidence.deterministic_passed and required_checks_passed(evidence):
             ops.accept_gate_state(ctx, plan, stage, evidence)
             return IterationOutcome(evidence, **summary)
-        for attempt in range(len(reports) + 1, 3):
+        for attempt in range(len(reports) + 1, ctx.options.budget.audit_repairs + 1):
             hard = ops.hard_failures(evidence)
             if hard:
                 raise PipelineFailure(hard[0].split(":", 1)[0], ", ".join(hard))
@@ -546,7 +593,7 @@ def audit_summary(report_paths: list[Path]) -> dict[str, Any]:
 
 
 __all__ = [
-    "CyclePlan", "PipelineFailure", "PipelineV2Context", "PipelineV2Coordinator",
+    "BudgetExhausted", "CyclePlan", "PipelineFailure", "PipelineV2Context", "PipelineV2Coordinator",
     "RecoveryStepUnavailable",
     "IterationOutcome", "PipelineV2Operations", "candidate_dir",
     "cycle_dir", "cycle_record_path", "gate_acceptance_path", "gate_dir",

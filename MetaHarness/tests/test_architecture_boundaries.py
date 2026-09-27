@@ -733,7 +733,7 @@ class RemovedAuthoritySurfaceTests(unittest.TestCase):
     def test_the_run_vocabulary_holds_only_the_current_authorities(self) -> None:
         from metaharness.models import ExecutionRole, GateStage, RunPhase
         from metaharness.run_options import SCHEMA_VERSION
-        from metaharness.recovery_policy import ExecutionFallbacks
+        from metaharness.recovery_policy import AutonomyBudget, ExecutionFallbacks
 
         self.assertEqual(
             tuple(role.name for role in ExecutionRole),
@@ -753,7 +753,12 @@ class RemovedAuthoritySurfaceTests(unittest.TestCase):
             tuple(field for field in ExecutionFallbacks.__dataclass_fields__),
             ("mechanical", "reasoning", "agentic"),
         )
-        self.assertEqual(SCHEMA_VERSION, 7)
+        self.assertEqual(SCHEMA_VERSION, 8)
+        self.assertEqual(
+            tuple(AutonomyBudget.__dataclass_fields__),
+            ("step_attempts", "audit_repairs", "max_iterations",
+             "max_wall_clock_hours", "max_cost"),
+        )
 
     def test_internal_step_acceptance_is_not_a_checkpoint_phase(self) -> None:
         for path in sorted(PACKAGE.rglob("*.py")):
@@ -792,6 +797,34 @@ class RemovedAuthoritySurfaceTests(unittest.TestCase):
 
         annotation = str(AgentRunRequest.__dataclass_fields__["mutable_paths"].type)
         self.assertEqual(annotation, "tuple[str, ...] | None")
+
+
+class OneAutonomyBudgetTests(unittest.TestCase):
+    """C10: exactly one autonomous budget object owns every numeric limit.
+
+    The retired knobs are the runtime spellings of the deleted per-operation
+    budgets.  Older configurations are refused by the *unknown key* check, so
+    no runtime module needs to name them: naming one again is a regression.
+    """
+
+    RETIRED_BUDGETS = (
+        "max_preapproval_corrections",
+        "max_transient_attempts",
+        "max_executor_fallbacks",
+        "max_check_infra_retries",
+        "max_workspace_setup_retries",
+        "RecoveryBudgets",
+    )
+
+    def test_no_runtime_module_names_a_retired_budget(self) -> None:
+        for path in sorted(PACKAGE.rglob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            for token in self.RETIRED_BUDGETS:
+                self.assertNotIn(
+                    token, text,
+                    f"{path.relative_to(PACKAGE)} names the retired budget {token!r}: "
+                    f"every autonomy limit lives in [budget] as AutonomyBudget",
+                )
 
 
 class RunStateCommandTests(unittest.TestCase):

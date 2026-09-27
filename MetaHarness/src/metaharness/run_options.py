@@ -8,8 +8,10 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from .models import HarnessConfig, PlanningConfig, RoutingConfig, validate_revision_budget
-from .recovery_policy import ExecutionFallbacks, RecoveryBudgets
+from .models import HarnessConfig, PlanningConfig, RoutingConfig
+from .recovery_policy import (
+    AutonomyBudget, ExecutionFallbacks, unsupported_cost_cap,
+)
 from .profiles import ProfileError, profile_for_role
 from .result import atomic_write_text
 from .models import ExecutionRole
@@ -23,27 +25,26 @@ class RunOptionsConflict(RunOptionsError):
     """An immutable run-options artifact already contains different bytes."""
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 # Deterministic refusal code for a snapshot that is not the current schema.
 RUN_SCHEMA_UNSUPPORTED = "RUN_SCHEMA_UNSUPPORTED"
 RUN_OPTIONS_NAME = "run_options.json"
 _TOP_LEVEL_FIELDS = frozenset({
-    "schema_version", "pipeline_version", "planning", "profiles", "recovery",
+    "schema_version", "pipeline_version", "planning", "profiles",
+    "execution_fallbacks", "budget",
 })
 _PLANNING_FIELDS = frozenset({
     "protocol", "decomposition", "execution_mode_policy",
     "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
     "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
-    "max_preapproval_corrections",
+})
+_BUDGET_FIELDS = frozenset({
+    "step_attempts", "audit_repairs", "max_iterations",
+    "max_wall_clock_hours", "max_cost",
 })
 _PROFILE_FIELDS = frozenset({
     "planner_profile", "mechanical_profile", "reasoning_profile", "agentic_profile",
     "audit_profile",
-})
-_RECOVERY_FIELDS = frozenset({
-    "max_transient_attempts", "max_executor_fallbacks",
-    "max_check_infra_retries",
-    "max_workspace_setup_retries",
 })
 _FALLBACK_FIELDS = frozenset({
     "mechanical", "reasoning", "agentic",
@@ -66,9 +67,9 @@ def _require_exact_keys(payload: Any, expected: frozenset[str], where: str) -> N
 
 def _fallback_ids(value: Any) -> tuple[str, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
-        raise RunOptionsError("run options recovery.execution_fallbacks must be arrays of profile IDs")
+        raise RunOptionsError("run options execution_fallbacks must be arrays of profile IDs")
     if any(not isinstance(profile_id, str) for profile_id in value):
-        raise RunOptionsError("run options recovery.execution_fallbacks must be arrays of profile IDs")
+        raise RunOptionsError("run options execution_fallbacks must be arrays of profile IDs")
     return tuple(value)
 
 
@@ -89,8 +90,10 @@ class RunOptions:
     max_steps_per_plan: int = 12
     max_read_paths_per_step: int = 8
     max_step_contract_chars: int = 9000
-    max_preapproval_corrections: int = 2
-    recovery: RecoveryBudgets = RecoveryBudgets()
+    # The one autonomous budget, and the executor fallback authority it
+    # bounds: neither is ever re-derived from the live configuration.
+    budget: AutonomyBudget = AutonomyBudget()
+    execution_fallbacks: ExecutionFallbacks = ExecutionFallbacks()
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -116,12 +119,12 @@ class RunOptions:
                 raise RunOptionsError(f"run options {name} must be greater than zero")
         if self.max_steps_per_plan > 99:
             raise RunOptionsError("run options max_steps_per_plan must not exceed 99")
-        try:
-            validate_revision_budget(self.max_preapproval_corrections, "run options max_preapproval_corrections")
-        except ValueError as exc:
-            raise RunOptionsError(str(exc)) from None
-        if not isinstance(self.recovery, RecoveryBudgets):
-            raise RunOptionsError("run options recovery budgets are invalid")
+        if not isinstance(self.budget, AutonomyBudget):
+            raise RunOptionsError("run options budget is invalid")
+        if (message := unsupported_cost_cap(self.budget.max_cost)) is not None:
+            raise RunOptionsError(message)
+        if not isinstance(self.execution_fallbacks, ExecutionFallbacks):
+            raise RunOptionsError("run options execution fallbacks are invalid")
         for name in (
             "planner_profile", "mechanical_profile", "reasoning_profile",
             "agentic_profile", "audit_profile",
@@ -138,8 +141,7 @@ class RunOptions:
             "planner_profile", "mechanical_profile",
             "reasoning_profile", "agentic_profile", "audit_profile",
             "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
-            "max_preapproval_corrections",
-            "recovery",
+            "budget", "execution_fallbacks",
         }
         unknown = set(overrides) - allowed
         if unknown:
@@ -160,11 +162,11 @@ class RunOptions:
             "max_steps_per_plan": config.planning.max_steps_per_plan,
             "max_read_paths_per_step": config.planning.max_read_paths_per_step,
             "max_step_contract_chars": config.planning.max_step_contract_chars,
-            "max_preapproval_corrections": config.planning.max_preapproval_corrections,
             "planner_profile": config.ui.default_planner_profile,
             **route_profiles,
             "audit_profile": config.ui.default_audit_profile,
-            "recovery": config.recovery,
+            "budget": config.budget,
+            "execution_fallbacks": config.execution_fallbacks,
         }
         values.update(overrides)
         result = cls(**values)
@@ -184,17 +186,17 @@ class RunOptions:
             except ProfileError as exc:
                 raise RunOptionsError(f"{name} is invalid or incompatible") from exc
         for execution_class in ("mechanical", "reasoning", "agentic"):
-            fallback_ids = self.recovery.execution_fallbacks.for_execution_class(execution_class)
+            fallback_ids = self.execution_fallbacks.for_execution_class(execution_class)
             if getattr(self, f"{execution_class}_profile") in fallback_ids:
                 raise RunOptionsError(
-                    f"recovery.execution_fallbacks.{execution_class} repeats the primary profile"
+                    f"execution_fallbacks.{execution_class} repeats the primary profile"
                 )
             for profile_id in fallback_ids:
                 try:
                     profile_for_role(config, profile_id, ExecutionRole.IMPLEMENTER)
                 except ProfileError as exc:
                     raise RunOptionsError(
-                        f"recovery.execution_fallbacks.{execution_class} contains an incompatible profile"
+                        f"execution_fallbacks.{execution_class} contains an incompatible profile"
                     ) from exc
 
     def to_dict(self) -> dict[str, Any]:
@@ -210,9 +212,9 @@ class RunOptions:
                 "max_steps_per_plan": self.max_steps_per_plan,
                 "max_read_paths_per_step": self.max_read_paths_per_step,
                 "max_step_contract_chars": self.max_step_contract_chars,
-                "max_preapproval_corrections": self.max_preapproval_corrections,
             },
-            "recovery": asdict(self.recovery),
+            "execution_fallbacks": asdict(self.execution_fallbacks),
+            "budget": asdict(self.budget),
             "profiles": {
                 "planner_profile": self.planner_profile,
                 "mechanical_profile": self.mechanical_profile,
@@ -238,27 +240,21 @@ class RunOptions:
                 f"{schema_version!r} is not {SCHEMA_VERSION}"
             )
         _require_exact_keys(value, _TOP_LEVEL_FIELDS, "run options")
-        planning, profiles, recovery = (
-            value["planning"], value["profiles"], value["recovery"],
+        planning, profiles, fallbacks, budget = (
+            value["planning"], value["profiles"], value["execution_fallbacks"], value["budget"],
         )
         _require_exact_keys(planning, _PLANNING_FIELDS, "run options planning")
         _require_exact_keys(profiles, _PROFILE_FIELDS, "run options profiles")
-        _require_exact_keys(
-            recovery, _RECOVERY_FIELDS | {"execution_fallbacks"}, "run options recovery",
-        )
-        fallbacks = recovery["execution_fallbacks"]
-        _require_exact_keys(
-            fallbacks, _FALLBACK_FIELDS, "run options recovery.execution_fallbacks",
-        )
-        normalized_recovery: dict[str, Any] = {key: recovery[key] for key in _RECOVERY_FIELDS}
-        normalized_recovery["execution_fallbacks"] = ExecutionFallbacks(
-            **{key: _fallback_ids(fallbacks[key]) for key in _FALLBACK_FIELDS}
-        )
+        _require_exact_keys(fallbacks, _FALLBACK_FIELDS, "run options execution_fallbacks")
+        _require_exact_keys(budget, _BUDGET_FIELDS, "run options budget")
         try:
             return cls(
                 schema_version=schema_version, pipeline_version=value["pipeline_version"],
                 **planning, **profiles,
-                recovery=RecoveryBudgets(**normalized_recovery),
+                execution_fallbacks=ExecutionFallbacks(
+                    **{key: _fallback_ids(fallbacks[key]) for key in _FALLBACK_FIELDS}
+                ),
+                budget=AutonomyBudget(**budget),
             )
         except RunOptionsError:
             raise
@@ -328,7 +324,6 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
         max_steps_per_plan=options.max_steps_per_plan,
         max_read_paths_per_step=options.max_read_paths_per_step,
         max_step_contract_chars=options.max_step_contract_chars,
-        max_preapproval_corrections=options.max_preapproval_corrections,
     )
     ui = replace(
         config.ui,
@@ -342,7 +337,7 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
     )
     return replace(
         config, planning=planning, ui=ui, routing=routing,
-        recovery=options.recovery,
+        budget=options.budget, execution_fallbacks=options.execution_fallbacks,
     )
 
 

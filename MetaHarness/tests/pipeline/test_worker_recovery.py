@@ -72,10 +72,12 @@ class WorkerRecoveryTests(PipelineHarness):
         self.assertEqual(git(self.worktree(), "status", "--porcelain"), "")
 
     def test_available_fallback_executor_runs_after_ordinary_retries(self) -> None:
-        config = self.config()
+        """One fallback fits in the three-attempt step budget, never beside it."""
+
+        self.config()
         self.config_path.write_text(
             self.config_path.read_text(encoding="utf-8")
-            + '''\n[recovery]\nmax_transient_attempts = 1\n\n[recovery.execution_fallbacks]\nmechanical = ["rescue"]\n\n[model_profiles.rescue]\ndisplay_name = "Rescue"\nroles = ["implementer"]\ndriver = "fake-worker"\nprovider = "test"\nmodel = "fake-rescue"\nselection_mode = "cli"\n''',
+            + '''\n[recovery.execution_fallbacks]\nmechanical = ["rescue"]\n\n[model_profiles.rescue]\ndisplay_name = "Rescue"\nroles = ["implementer"]\ndriver = "fake-worker"\nprovider = "test"\nmodel = "fake-rescue"\nselection_mode = "cli"\n''',
             encoding="utf-8",
         )
         config = load_config(self.config_path)

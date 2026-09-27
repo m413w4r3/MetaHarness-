@@ -19,7 +19,7 @@ from ..scope import ScopeViolation
 from ..state import RunStateStore
 from .audit_protocol import AuditReport, parse_audit_report
 from .candidate import accepted_chain_records
-from .pipeline_v2 import CyclePlan, PipelineFailure, PipelineV2Context, cycle_dir
+from .pipeline_v2 import BudgetExhausted, CyclePlan, PipelineFailure, PipelineV2Context, cycle_dir
 
 if TYPE_CHECKING:
     from .runtime import RunRuntime
@@ -143,6 +143,8 @@ class AuditService:
             "REFACTORED\n- ...\n\nREMAINING\n- ...\n\nRISKS\n- ...\nEND META AUDIT\n"
         )
         atomic_write_text(directory / "prompt.txt", prompt)
+        if (exhausted := self.runtime.budget_exhausted(store)) is not None:
+            raise BudgetExhausted(exhausted)
         profile_id = ctx.selection.audit.profile_id
         executor = self.runtime.composition.executor_for_profile(profile_id, ExecutionRole.AUDITOR)
         if not executor.capabilities.edits_workspace:

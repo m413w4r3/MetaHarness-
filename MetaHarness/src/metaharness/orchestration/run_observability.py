@@ -10,6 +10,7 @@ only projects a result the other authorities already produced.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib, time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Any, Mapping, TYPE_CHECKING
 from ..diagnostics import write_run_diagnostics
 from ..models import ExecutionRole, ModelProfile, RunStatus, profile_driver_name
 from ..profiles import profile_execution_fingerprint
+from ..recovery_policy import elapsed_hours
 from ..redaction import redact_file
 from ..result import RunResult, atomic_write_text
 from ..state import RunStateStore
@@ -352,14 +354,33 @@ class RunObservability:
         }
 
     def update_v2_usage(self, store: RunStateStore, run_dir: Path) -> None:
-        """Publish the per-cycle token totals.
+        """Publish the per-cycle token totals and the compact budget view.
 
         Always derived from persisted artifacts
         (``cycles/NNN/implementation/steps/Sxx/step.json`` and every worker
-        report), never from ``state.steps``.
+        report), never from ``state.steps``.  The budget block is descriptive:
+        the durable counters and the creation timestamp stay the authority.
         """
 
-        store.update_metadata(usage=phase_usage_summary(run_dir))
+        store.update_metadata(
+            usage=phase_usage_summary(run_dir), budget=self.budget_view(store),
+        )
+
+    def budget_view(self, store: RunStateStore) -> dict[str, Any]:
+        """What the one global budget is, what it consumed, and its known cost."""
+
+        budget = self.runtime.run_options.budget if self.runtime.run_options else None
+        state = store.load()
+        elapsed = elapsed_hours(state.get("started_at"))
+        iterations = state.get("current_iteration") or state.get("iteration")
+        return {
+            "configured": dataclasses.asdict(budget) if budget is not None else None,
+            "iterations": iterations if isinstance(iterations, int) else 1,
+            "elapsed_seconds": round(elapsed * 3600) if elapsed is not None else None,
+            # No configured provider publishes an explicit cost, and a price
+            # is never derived from token counts.
+            "cost_usd": None,
+        }
 
     @staticmethod
     def ensure_step_artifacts(step_dir: Path, result: Any) -> None:

@@ -359,7 +359,8 @@ class PublicationService:
         """Best-effort stage the candidate; remote proof never replaces local identity."""
 
         return CandidateRemoteStaging(
-            self.runtime.recovery(store), store=store, budgets=self.runtime.run_options.recovery,
+            self.runtime.recovery(store), store=store,
+            attempts=self.runtime.run_options.budget.step_attempts,
             emit=self.runtime.observability.trace_emit, remote=self.runtime.config.repository.remote,
             remote_required=self.runtime.config.publish.enabled or (
                 self.runtime.config.github.enabled

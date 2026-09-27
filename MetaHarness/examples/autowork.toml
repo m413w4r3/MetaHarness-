@@ -13,7 +13,6 @@ default_check_ids = ["lint", "typecheck", "test"]
 protocol = "v2"
 decomposition = "aggressive"
 execution_mode_policy = "auto"
-max_preapproval_corrections = 2
 
 single_step_max_mutable_paths = 6
 staged_step_max_mutable_paths = 12
@@ -34,11 +33,16 @@ per_step = ["lint", "typecheck"]
 # this long before the transport reports a temporary external exhaustion.
 max_wait_seconds = 1800
 
-[recovery]
-max_transient_attempts = 2
-max_executor_fallbacks = 1
-max_check_infra_retries = 2
-max_workspace_setup_retries = 2
+# C10: the one autonomous budget.  step_attempts is the total semantic
+# attempt ceiling of a single autonomous operation (primary + retries +
+# executor fallbacks); audit_repairs bounds the writable AUDIT calls of
+# one iteration.
+[budget]
+step_attempts = 3
+audit_repairs = 2
+max_iterations = 8
+max_wall_clock_hours = 12
+max_cost = 0
 
 [recovery.execution_fallbacks]
 mechanical = ["codex-luna-xhigh"]

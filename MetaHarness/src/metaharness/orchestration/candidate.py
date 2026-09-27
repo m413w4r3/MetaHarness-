@@ -17,7 +17,6 @@ from ..gitops import (
 )
 from ..result import atomic_write_text
 from ..models import GateStage
-from ..recovery_policy import RecoveryBudgets
 
 
 def _commit_web_url(reference: RepositoryReference, commit_sha: str) -> str | None:
@@ -171,7 +170,7 @@ class CandidateRemoteStaging:
         recovery: Any,
         *,
         store: Any,
-        budgets: RecoveryBudgets,
+        attempts: int,
         emit: Callable[..., None],
         remote: str,
         remote_required: bool,
@@ -180,7 +179,7 @@ class CandidateRemoteStaging:
     ) -> None:
         self._recovery = recovery
         self._store = store
-        self._budgets = budgets
+        self._attempts = attempts
         self._emit = emit
         self._remote = remote
         self._remote_required = remote_required
@@ -224,7 +223,7 @@ class CandidateRemoteStaging:
             except (GitError, OSError, ValueError) as exc:
                 last_failure = exc
                 admission = self._recovery.admit(
-                    key, reason="PUSH_FAILED", budget=self._budgets.max_transient_attempts,
+                    key, reason="PUSH_FAILED", budget=self._attempts,
                     phase="candidate_push", cycle=cycle, tree_before=tree, tree_after=tree,
                 )
                 if not admission.admitted:

@@ -120,7 +120,7 @@ def resolve_execution_selection(
         step_items[step.id] = (step.execution_class, profile_id)
     if set(override_ids) - set(step_items):
         raise ExecutionSelectionError("execution selection contains an unknown step")
-    fallbacks = fallback_authority or config.recovery.execution_fallbacks
+    fallbacks = fallback_authority or config.execution_fallbacks
     steps = tuple(
         StepExecutionSelection(
             step_id=step_id,
@@ -338,7 +338,7 @@ def validate_execution_selection(config: HarnessConfig, selection: ExecutionSele
     check("audit", selection.audit, ExecutionRole.AUDITOR)
     for item in selection.steps:
         check(f"step {item.step_id}", item.implementer, ExecutionRole.IMPLEMENTER)
-        expected_ids = config.recovery.execution_fallbacks.for_execution_class(
+        expected_ids = config.execution_fallbacks.for_execution_class(
             item.execution_class.value
         )
         if tuple(profile.profile_id for profile in item.fallbacks) != expected_ids:

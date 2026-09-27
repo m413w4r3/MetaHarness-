@@ -27,11 +27,13 @@ from ..gitops import (
     rewind_worktree,
 )
 from ..models import (
+    PARTIAL_REASONS,
     CycleKind, ExecutionRole, ExecutionSelection, RunCycle, RunDisposition, RunMachineState,
     RunPhase, TaskPlanV2, DROP_UNKNOWN_REQUIRED_CHECK,
 )
 from ..profiles import build_llm_endpoint, profile_for_role
 from ..result import RunResult, atomic_write_text
+from ..resume import rephase_checkpoint
 from ..state import RunStateStore
 from ..context import build_context, render_context
 from ..approval import compute_plan_identity_from_run
@@ -47,7 +49,8 @@ from .candidate import CandidateLifecycle
 from .check_failure import hard_integrity_failures
 from .gate_acceptance import GateAcceptanceService
 from .pipeline_v2 import (
-    CyclePlan, IterationOutcome, PipelineFailure, PipelineV2Context, PipelineV2Operations,
+    BudgetExhausted, CyclePlan, IterationOutcome, PipelineFailure, PipelineV2Context,
+    PipelineV2Operations,
     cycle_dir,
     gate_dir,
     step_dir as cycle_step_dir,
@@ -176,6 +179,8 @@ class RunComposition:
             partial=bind(self._partial, store),
             spec_decision=bind(self._spec_decision, store),
             failed_continued=self._failed_continued,
+            budget_exhausted=lambda ctx: self.runtime.budget_exhausted(store),
+            budget_partial=bind(self._budget_partial, store),
         )
 
     def _initial_cycle_plan(self, ctx: PipelineV2Context) -> CyclePlan:
@@ -231,6 +236,8 @@ class RunComposition:
         cycle_plan: CyclePlan, outcome: IterationOutcome,
         validate: Callable[[PlannerContinueResult], PlannerContinueResult],
     ) -> PlannerContinueResult:
+        if (exhausted := self.runtime.budget_exhausted(store)) is not None:
+            raise BudgetExhausted(exhausted)
         head = current_head(ctx.info.worktree)
         repository_context = render_context(build_context(
             ctx.info.worktree, head, ctx.spec, self.runtime.config.context,
@@ -302,6 +309,7 @@ class RunComposition:
             default_check_ids=policy.default_check_ids,
             check_authority_sha256=policy.sha256,
             prompt_budget_bytes=self.runtime.config.prompt_budget.planner_max_bytes,
+            attempt_budget=self.runtime.run_options.budget.step_attempts,
         )
         return service.decide(
             facts, iterations_dir=ctx.run_dir / "iterations", validate=validate,
@@ -331,7 +339,7 @@ class RunComposition:
             planner_profile_id=ctx.selection.planner.profile_id,
             plan_steps=plan.steps,
             audit_profile_id=ctx.selection.audit.profile_id,
-            fallback_authority=self.runtime.run_options.recovery.execution_fallbacks,
+            fallback_authority=self.runtime.run_options.execution_fallbacks,
         )
         selection = ensure_execution_selection(ctx.run_dir, selection, iteration=iteration)
         validate_execution_selection(self.runtime.config, selection)
@@ -430,10 +438,28 @@ class RunComposition:
             **({"completion_kind": "COMPLETE"} if status == "COMPLETE" else {}),
         )
 
+    def _budget_partial(
+        self, store: RunStateStore, ctx: PipelineV2Context, reason: str,
+    ) -> RunResult:
+        """Leave PARTIAL on the one global budget, with the work already accepted."""
+
+        state = store.load()
+        remaining = tuple(
+            item for item in state.get("iteration_remaining") or () if isinstance(item, str)
+        )
+        failures: tuple[str, ...] = ()
+        for item in state.get("completed_iterations") or ():
+            if isinstance(item, Mapping) and item.get("iteration") == ctx.iteration:
+                failures = tuple(str(code) for code in item.get("failures") or ())
+        rephase_checkpoint(ctx.run_dir, RunPhase.PLANNER)
+        return self._partial(store, ctx, reason, remaining, failures)
+
     def _partial(
         self, store: RunStateStore, ctx: PipelineV2Context, reason: str,
         remaining: tuple[str, ...], failures: tuple[str, ...],
     ) -> RunResult:
+        if reason not in PARTIAL_REASONS:
+            raise PipelineFailure("INTERNAL_HARNESS_ERROR", f"unknown PARTIAL reason {reason!r}")
         candidate_head = current_head(ctx.info.worktree)
         iteration_path = ctx.run_dir / "iterations" / f"{ctx.iteration:02d}" / "iteration.json"
         try:

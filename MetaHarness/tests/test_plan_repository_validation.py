@@ -18,6 +18,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+from metaharness.config import load_config
 from metaharness.context import build_context, render_context
 from metaharness.gitops import resolve_tree
 from metaharness.llm.chat import TextLLMResult
@@ -520,8 +521,14 @@ class PlannerNormalizationTests(PipelineHarness):
         self.assertIn(AW010_PATH, step_json["write_set"])
 
     def test_two_impossible_plans_fail_planning_before_any_worker(self) -> None:
+        # Two semantic planner answers, the run's one step budget.
+        config = self.config()
+        self.config_path.write_text(
+            self.config_path.read_text(encoding="utf-8") + "\n[budget]\nstep_attempts = 2\n",
+            encoding="utf-8",
+        )
         result = self.orchestrator(
-            replace(self.config(), planning=replace(self.config().planning, max_preapproval_corrections=1)),
+            load_config(self.config_path),
             planner=[impossible_plan_message(), impossible_plan_message()],
         ).run_text("Make feature.txt good.\n", run_id="run")
 

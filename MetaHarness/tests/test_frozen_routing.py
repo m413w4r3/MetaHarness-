@@ -27,7 +27,7 @@ from metaharness.run_options import (
     RunOptions,
     RunOptionsError,
 )
-from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
+from metaharness.recovery_policy import ExecutionFallbacks
 
 
 def frozen_routing_config() -> HarnessConfig:
@@ -116,12 +116,10 @@ def frozen_routing_config() -> HarnessConfig:
                 "DEEPSEEK_API_KEY",
             )
         },
-        recovery=RecoveryBudgets(
-            execution_fallbacks=ExecutionFallbacks(
-                mechanical=("codex-luna-xhigh",),
-                reasoning=("codex-luna-high",),
-                agentic=("codex-luna-high",),
-            )
+        execution_fallbacks=ExecutionFallbacks(
+            mechanical=("codex-luna-xhigh",),
+            reasoning=("codex-luna-high",),
+            agentic=("codex-luna-high",),
         ),
     )
 
@@ -172,19 +170,25 @@ class FrozenRoutingTests(unittest.TestCase):
         options = RunOptions.from_config(self.config)
         self.assertNotIn("default_implementer_profile", json.dumps(options.to_dict()))
         snapshot = options.to_dict()
-        self.assertEqual(snapshot["recovery"]["max_transient_attempts"], 2)
+        self.assertEqual(snapshot["budget"]["step_attempts"], 3)
         self.assertEqual(
-            RunOptions.from_mapping(snapshot).recovery,
-            options.recovery,
+            snapshot["execution_fallbacks"]["mechanical"], ("codex-luna-xhigh",),
+        )
+        self.assertEqual(
+            RunOptions.from_mapping(snapshot).budget, options.budget,
+        )
+        self.assertEqual(
+            RunOptions.from_mapping(snapshot).execution_fallbacks,
+            options.execution_fallbacks,
         )
         incomplete = json.loads(json.dumps(snapshot))
-        del incomplete["recovery"]["max_workspace_setup_retries"]
-        with self.assertRaisesRegex(RunOptionsError, "missing max_workspace_setup_retries"):
+        del incomplete["budget"]["audit_repairs"]
+        with self.assertRaisesRegex(RunOptionsError, "missing audit_repairs"):
             RunOptions.from_mapping(incomplete)
-        without_recovery = json.loads(json.dumps(snapshot))
-        del without_recovery["recovery"]
-        with self.assertRaisesRegex(RunOptionsError, "missing recovery"):
-            RunOptions.from_mapping(without_recovery)
+        without_budget = json.loads(json.dumps(snapshot))
+        del without_budget["budget"]
+        with self.assertRaisesRegex(RunOptionsError, "missing budget"):
+            RunOptions.from_mapping(without_budget)
         older = json.loads(json.dumps(snapshot))
         older["schema_version"] = SCHEMA_VERSION - 1
         with self.assertRaisesRegex(RunOptionsError, RUN_SCHEMA_UNSUPPORTED):

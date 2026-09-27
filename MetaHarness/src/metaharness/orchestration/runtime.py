@@ -29,6 +29,7 @@ from ..resume import (
     ResumeCheckpoint, ResumeCheckpointError, ResumePhase,
     read_checkpoint_record, write_checkpoint,
 )
+from ..recovery_policy import wall_clock_exhausted
 from ..run_options import (
     RunOptions, RunOptionsError,
     effective_run_config,
@@ -151,16 +152,35 @@ class RunRuntime:
 
         return RecoveryCoordinator(store, emit=self.observability.trace_emit)
 
+    def budget_exhausted(self, store: RunStateStore) -> str | None:
+        """The PARTIAL reason the one global budget already proves, or ``None``.
+
+        The wall-clock budget is measured from the run's durable creation
+        timestamp, never from an in-memory timer: a crash and a resume both
+        keep spending the same budget.
+        """
+
+        budget = self.run_options.budget if self.run_options is not None else None
+        if budget is None:
+            return None
+        if wall_clock_exhausted(
+            store.load().get("started_at"),
+            max_wall_clock_hours=budget.max_wall_clock_hours,
+        ):
+            return "wall_clock"
+        return None
+
     def check_recovery(self, store: RunStateStore) -> CheckInfrastructureRecovery:
         return CheckInfrastructureRecovery(
-            self.recovery(store), store=store, budgets=self.run_options.recovery,
+            self.recovery(store), store=store,
+            attempts=self.run_options.budget.step_attempts,
+            budget_exhausted=lambda: self.budget_exhausted(store),
         )
 
     def worker_recovery(self, store: RunStateStore) -> WorkerRecovery:
         return WorkerRecovery(
             self.recovery(store), store=store,
-            budgets=self.run_options.recovery, secrets=self.secrets,
-            scope=self.config.scope,
+            secrets=self.secrets, scope=self.config.scope,
         )
 
     @staticmethod

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import StrEnum
 
 
@@ -178,26 +179,89 @@ class ExecutionFallbacks:
         return getattr(self, key)
 
 
-@dataclass(frozen=True)
-class RecoveryBudgets:
-    """Retry limits frozen into each run's immutable options snapshot."""
+# The exact five limits of the one autonomous budget; no other numeric
+# retry or autonomy knob exists anywhere in the runtime.
+_BUDGET_BOUNDS: Mapping[str, tuple[int, int]] = {
+    "step_attempts": (1, 10),
+    "audit_repairs": (0, 10),
+    "max_iterations": (1, 99),
+}
 
-    max_transient_attempts: int = 2
-    max_executor_fallbacks: int = 1
-    max_check_infra_retries: int = 2
-    max_workspace_setup_retries: int = 2
-    execution_fallbacks: ExecutionFallbacks = ExecutionFallbacks()
+
+@dataclass(frozen=True)
+class AutonomyBudget:
+    """The single autonomous budget of a run: five limits, no hidden knob.
+
+    ``step_attempts`` is the total ceiling of one autonomous operation: the
+    primary attempt, its retries and its executor fallbacks all consume it.
+    ``audit_repairs`` is the number of writable AUDIT calls one iteration may
+    spend.  ``max_iterations`` counts ``M01`` as iteration one.
+    ``max_wall_clock_hours`` is measured from the run's durable creation
+    timestamp, so a resume never restarts it.  ``max_cost = 0`` disables the
+    cost cap; a positive value is refused until a provider publishes an
+    explicit cost, because MetaHarness never invents a price.
+    """
+
+    step_attempts: int = 3
+    audit_repairs: int = 2
+    max_iterations: int = 8
+    max_wall_clock_hours: float = 12
+    max_cost: float = 0
 
     def __post_init__(self) -> None:
-        for name in (
-            "max_transient_attempts", "max_executor_fallbacks",
-            "max_check_infra_retries", "max_workspace_setup_retries",
-        ):
+        for name, (minimum, maximum) in _BUDGET_BOUNDS.items():
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10:
-                raise ValueError(f"{name} must be an integer between 0 and 10")
-        if not isinstance(self.execution_fallbacks, ExecutionFallbacks):
-            raise ValueError("execution_fallbacks is invalid")
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+                raise ValueError(f"budget.{name} must be an integer between {minimum} and {maximum}")
+        hours = self.max_wall_clock_hours
+        if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0 < hours <= 720:
+            raise ValueError("budget.max_wall_clock_hours must be a number of hours in ]0, 720]")
+        cost = self.max_cost
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not 0 <= cost <= 1e9:
+            raise ValueError("budget.max_cost must be a number of USD in [0, 1e9]")
+
+
+def unsupported_cost_cap(max_cost: object) -> str | None:
+    """Why a positive cost cap cannot be applied, or ``None`` for ``0``.
+
+    No provider configured by this runtime publishes an explicit ``cost_usd``,
+    so a positive cap would be simulated.  It is refused instead.
+    """
+
+    if max_cost in (0, 0.0):
+        return None
+    return (
+        "budget.max_cost > 0 is not supported: no configured provider publishes "
+        "an explicit cost, and MetaHarness never derives a price from tokens"
+    )
+
+
+def elapsed_hours(started_at: object, *, now: datetime | None = None) -> float | None:
+    """Hours a run created at *started_at* has been alive, or ``None``.
+
+    The durable creation timestamp is the only source of elapsed time: an
+    in-memory timer would silently restart on a resume.  An unreadable
+    timestamp yields ``None`` rather than a fabricated duration.
+    """
+
+    if not isinstance(started_at, str) or not started_at.strip():
+        return None
+    try:
+        started = datetime.fromisoformat(started_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return ((now or datetime.now(timezone.utc)) - started).total_seconds() / 3600
+
+
+def wall_clock_exhausted(
+    started_at: object, *, max_wall_clock_hours: float, now: datetime | None = None,
+) -> bool:
+    """Whether a run created at *started_at* spent its wall-clock budget."""
+
+    hours = elapsed_hours(started_at, now=now)
+    return hours is not None and hours >= float(max_wall_clock_hours)
 
 
 def stable_code(failure: object) -> str:
@@ -245,7 +309,8 @@ def classify_failure(failure: str, *, exhausted: bool = False) -> RecoveryDecisi
 
 
 __all__ = [
-    "ExecutionFallbacks", "FAILURE_CLASSES", "FailureClass", "RECOVERY_LADDERS",
-    "RecoveryBudgets", "RecoveryDecision", "RecoveryStrategy", "classify_failure",
-    "recovery_ladder", "stable_code",
+    "AutonomyBudget", "ExecutionFallbacks", "FAILURE_CLASSES", "FailureClass",
+    "RECOVERY_LADDERS", "RecoveryDecision", "RecoveryStrategy", "classify_failure",
+    "elapsed_hours", "recovery_ladder", "stable_code", "unsupported_cost_cap",
+    "wall_clock_exhausted",
 ]

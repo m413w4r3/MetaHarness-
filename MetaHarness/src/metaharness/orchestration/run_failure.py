@@ -7,6 +7,7 @@ authorizes, and the projection of an exception that escaped the coordinator.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping, TYPE_CHECKING
 from ..agent.base import AgentError
@@ -24,7 +25,7 @@ from ..result import RunResult, atomic_write_text
 from ..resume import (
     ResumeCheckpoint, ResumeCheckpointError, ResumeIntegrityError, ResumePhase,
     ResumeRequiresOperatorError,
-    read_checkpoint,
+    read_checkpoint, rephase_checkpoint,
 )
 from ..run_options import (
     effective_run_config,
@@ -35,7 +36,8 @@ from ..usage import empty_usage, normalize_usage
 from ..validation import ValidationError
 from ..workspace import WorkspaceSetupError
 from .pipeline_v2 import (
-    FailureDetail, PipelineFailure, PipelineV2Context, PipelineV2Coordinator,
+    BudgetExhausted, FailureDetail, PipelineFailure, PipelineV2Context,
+    PipelineV2Coordinator,
     step_dir as cycle_step_dir,
 )
 from .recovery import normalize_exit_reason, project_exit
@@ -280,12 +282,37 @@ class RunFailure:
             failure=failure, **fields,
         )
 
+    def budget_partial(
+        self, store: RunStateStore, run_dir: Path, reason: str,
+    ) -> RunResult:
+        """Exit PARTIAL on the one budget, before any accepted work exists."""
+
+        rephase_checkpoint(run_dir, ResumePhase.PLANNER)
+        state = store.load()
+        report = {
+            "completion_kind": "PARTIAL", "reason": reason,
+            "last_accepted_commit": state.get("commit_sha") or state.get("base_sha"),
+            "remaining": list(state.get("iteration_remaining") or []),
+            "failures": [],
+        }
+        atomic_write_text(
+            Path(run_dir) / "partial.json",
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        )
+        state = store.set_run_state(
+            RunMachineState(ResumePhase.PLANNER, RunDisposition.COMPLETED),
+            completion_kind="PARTIAL", partial=report, current_step=None,
+        )
+        return RunResult.of(run_dir, state)
+
     def project_exception(
         self, store: RunStateStore, run_dir: Path, exc: Exception, *,
         operation: str = "orchestrator",
     ) -> RunResult:
         """Project an exception that escaped every recovery loop."""
 
+        if isinstance(exc, BudgetExhausted):
+            return self.budget_partial(store, run_dir, exc.reason)
         reason = normalize_exit_reason(_failure_reason(exc))
         phase = self.checkpoint_phase(run_dir)
         _decision, terminal = project_exit(reason, phase=phase)

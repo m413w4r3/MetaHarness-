@@ -937,7 +937,7 @@ def approve_run(
             ],
             step_profile_ids={key: value for key, value in step_profiles.items()},
             audit_profile_id=snapshot.audit_profile,
-            fallback_authority=snapshot.recovery.execution_fallbacks,
+            fallback_authority=snapshot.execution_fallbacks,
         )
     except (ProfileError, ExecutionSelectionError) as exc:
         raise WebAPIError(400, "selected profile is invalid") from exc

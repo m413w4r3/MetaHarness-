@@ -67,6 +67,7 @@ from ..usage import read_usage_artifact
 from ..validation import config_with_check_authority, frozen_check_policy
 from ..workspace import prepare_workspace
 from .durable_readers import read_repository_reference
+from .pipeline_v2 import BudgetExhausted
 from .shared import (
     GitOwnership, OrchestrationError, PLANNER_CONVERSATION, archive_attempt_tree,
     git_ownership, git_ownership_payload, is_object_id, json_text,
@@ -162,6 +163,7 @@ class RunBootstrap:
                 repository_preconditions=RepositoryPreconditions(
                     repo, resolve_tree(repo, base_sha),
                 ),
+                attempt_budget=self.runtime.run_options.budget.step_attempts,
                 on_event=lambda name, data: self.runtime.observability.trace_emit(name, phase="planning", cycle=iteration, data=data),
             )
             plan_started_at = self.runtime.observability.trace_time()
@@ -182,6 +184,8 @@ class RunBootstrap:
                     )
                 },
             )
+            if (exhausted := self.runtime.budget_exhausted(store)) is not None:
+                raise BudgetExhausted(exhausted)
             try:
                 plan = planner.plan(spec, context, artifacts_dir=run_dir, iteration=iteration)
             except Exception:
@@ -332,7 +336,7 @@ class RunBootstrap:
                 planner_profile_id=planner_profile_id,
                 plan_steps=plan.steps,
                 audit_profile_id=self.runtime.run_options.audit_profile,
-                fallback_authority=self.runtime.run_options.recovery.execution_fallbacks,
+                fallback_authority=self.runtime.run_options.execution_fallbacks,
             )
             selection = ensure_execution_selection(run_dir, requested, iteration=iteration)
             durable_identity = compute_plan_identity_from_run(run_dir, iteration=iteration)
@@ -573,9 +577,12 @@ class RunBootstrap:
                     check_catalog=check_catalog,
                     default_check_ids=default_check_ids,
                     prompt_budget_bytes=self.runtime.config.prompt_budget.planner_max_bytes,
+                    attempt_budget=self.runtime.run_options.budget.step_attempts,
                     repository_preconditions=RepositoryPreconditions(repo, base_tree),
                     on_event=lambda name, data: self.runtime.observability.trace_emit(name, phase="planning", cycle=checkpoint.iteration, data=data),
                 )
+                if (exhausted := self.runtime.budget_exhausted(store)) is not None:
+                    raise BudgetExhausted(exhausted)
                 plan = planner.plan(spec, context, artifacts_dir=run_dir, iteration=checkpoint.iteration)
                 persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
             else:

@@ -14,7 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from metaharness.agent import AgentExecutorCapabilities, AgentRunRequest, AgentRunResult, register_executor_driver
 from metaharness.config import load_config
@@ -335,6 +335,7 @@ class PipelineHarness(unittest.TestCase):
         self, *, scope_mode: str = "soft",
         publish: bool = False, github_pr: bool = False,
         extra_checks: str = "", per_step_gate: str | tuple[str, ...] = "",
+        budget: Mapping[str, Any] | None = None,
     ) -> Any:
         path = self.root / "config.toml"
         self.config_path = path
@@ -344,6 +345,10 @@ class PipelineHarness(unittest.TestCase):
         if gate_ids:
             rendered = ", ".join(f'"{item}"' for item in gate_ids)
             gate = f"\n[gate]\nper_step = [{rendered}]\n"
+        budget_section = ""
+        if budget:
+            entries = "".join(f"{key} = {value!r}\n" for key, value in budget.items())
+            budget_section = f"\n[budget]\n{entries}"
         path.write_text(f"""
 repo = {str(self.repo)!r}
 base_ref = "main"
@@ -353,6 +358,7 @@ require_clean_base = true
 {gate}
 [planning]
 protocol = "v2"
+{budget_section}
 
 [repository]
 remote = "origin"

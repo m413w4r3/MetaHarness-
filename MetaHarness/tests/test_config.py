@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from metaharness.config import ConfigError, load_config
 from metaharness.models import CheckConfig, RoutingConfig, TransportConfig
 from metaharness.planning.protocol import render_safe_check_catalogue
-from metaharness.recovery_policy import ExecutionFallbacks, RecoveryBudgets
+from metaharness.recovery_policy import AutonomyBudget, ExecutionFallbacks
 from metaharness.run_options import (
     RUN_SCHEMA_UNSUPPORTED,
     SCHEMA_VERSION,
@@ -234,23 +234,68 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(check_id=check_id):
                 self.assertIn(f"ID: {check_id}", rendered_catalogue)
 
-    def test_recovery_budgets_are_configurable_and_bounded(self) -> None:
+    def test_the_one_budget_section_is_configurable_and_bounded(self) -> None:
         contents = VALID_CONFIG + """
 
-[recovery]
-max_transient_attempts = 3
-max_executor_fallbacks = 1
-max_check_infra_retries = 2
-max_workspace_setup_retries = 2
+[budget]
+step_attempts = 4
+audit_repairs = 1
+max_iterations = 5
+max_wall_clock_hours = 3.5
+max_cost = 0
 """
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name), contents))
-        self.assertEqual(config.recovery, RecoveryBudgets(
-            max_transient_attempts=3,
-            max_executor_fallbacks=1,
-            max_check_infra_retries=2,
-            max_workspace_setup_retries=2,
+        self.assertEqual(config.budget, AutonomyBudget(
+            step_attempts=4, audit_repairs=1, max_iterations=5,
+            max_wall_clock_hours=3.5, max_cost=0,
         ))
+
+    def test_the_budget_defaults_are_the_spec_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), VALID_CONFIG))
+        self.assertEqual(config.budget, AutonomyBudget(
+            step_attempts=3, audit_repairs=2, max_iterations=8,
+            max_wall_clock_hours=12, max_cost=0,
+        ))
+        self.assertEqual(
+            [field for field in AutonomyBudget.__dataclass_fields__],
+            ["step_attempts", "audit_repairs", "max_iterations",
+             "max_wall_clock_hours", "max_cost"],
+        )
+
+    def test_removed_numeric_retry_budgets_are_refused(self) -> None:
+        for section in (
+            "max_transient_attempts = 3",
+            "max_executor_fallbacks = 1",
+            "max_check_infra_retries = 2",
+            "max_workspace_setup_retries = 2",
+        ):
+            contents = VALID_CONFIG + "\n[recovery]\n" + section + "\n"
+            with self.subTest(section=section):
+                with tempfile.TemporaryDirectory() as directory_name:
+                    with self.assertRaises(ConfigError) as caught:
+                        load_config(self.write_config(Path(directory_name), contents))
+                self.assertIn("is not allowed", str(caught.exception))
+                self.assertIn("[budget]", str(caught.exception))
+
+    def test_a_preapproval_correction_budget_is_refused(self) -> None:
+        contents = VALID_CONFIG + "\n[planning]\nmax_preapproval_corrections = 2\n"
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, "planning.max_preapproval_corrections is not allowed"):
+                load_config(self.write_config(Path(directory_name), contents))
+
+    def test_a_positive_cost_cap_is_refused_because_no_price_is_known(self) -> None:
+        contents = VALID_CONFIG + "\n[budget]\nmax_cost = 0.5\n"
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, "max_cost > 0 is not supported"):
+                load_config(self.write_config(Path(directory_name), contents))
+
+    def test_an_unknown_budget_key_is_refused(self) -> None:
+        contents = VALID_CONFIG + "\n[budget]\nmax_retries = 3\n"
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, "budget.max_retries is not allowed"):
+                load_config(self.write_config(Path(directory_name), contents))
 
     def test_execution_fallback_profiles_are_provider_neutral_config(self) -> None:
         contents = VALID_CONFIG + """
@@ -263,7 +308,7 @@ agentic = ["agentic-rescue"]
 """
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name), contents))
-        self.assertEqual(config.recovery.execution_fallbacks, ExecutionFallbacks(
+        self.assertEqual(config.execution_fallbacks, ExecutionFallbacks(
             mechanical=("mechanical-rescue",),
             reasoning=("reasoning-rescue",),
             agentic=("agentic-rescue",),
@@ -749,10 +794,10 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
     def snapshot(self) -> dict:
         return RunOptions.from_config(self.config()).to_dict()
 
-    def test_current_schema_seven_round_trips_identically(self) -> None:
+    def test_current_schema_eight_round_trips_identically(self) -> None:
         snapshot = self.snapshot()
         self.assertEqual(snapshot["schema_version"], SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 7)
+        self.assertEqual(SCHEMA_VERSION, 8)
         self.assertEqual(snapshot["profiles"]["audit_profile"], "implementer-codex")
         for removed in (
             "final_reviewer_profile", "semantic_reviser_profile",
@@ -761,8 +806,12 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
             self.assertNotIn(removed, snapshot["profiles"])
         self.assertNotIn("pipeline", snapshot)
         self.assertEqual(
-            set(snapshot["recovery"]["execution_fallbacks"]),
-            {"mechanical", "reasoning", "agentic"},
+            set(snapshot["execution_fallbacks"]), {"mechanical", "reasoning", "agentic"},
+        )
+        self.assertEqual(
+            set(snapshot["budget"]),
+            {"step_attempts", "audit_repairs", "max_iterations",
+             "max_wall_clock_hours", "max_cost"},
         )
         options = RunOptions.from_mapping(snapshot)
         self.assertEqual(options.to_dict(), snapshot)
@@ -797,7 +846,7 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
             "semantic_reviser_profile": "implementer-codex",
             "final_reviewer_profile": "implementer-codex",
         })
-        legacy["recovery"]["execution_fallbacks"].update({
+        legacy["execution_fallbacks"].update({
             "semantic_reviser": ["implementer-codex"],
             "check_repair": ["implementer-codex"],
         })
@@ -815,10 +864,10 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
              "profiles has unknown key semantic_reviser_profile"),
             (lambda s: s["profiles"].update(final_reviewer_profile="implementer-codex"),
              "profiles has unknown key final_reviewer_profile"),
-            (lambda s: s["recovery"]["execution_fallbacks"].update(
+            (lambda s: s["execution_fallbacks"].update(
                 semantic_reviser=["implementer-codex"]),
              "unknown key semantic_reviser"),
-            (lambda s: s["recovery"]["execution_fallbacks"].update(
+            (lambda s: s["execution_fallbacks"].update(
                 check_repair=["implementer-codex"]),
              "unknown key check_repair"),
         )
@@ -829,19 +878,26 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
                 with self.assertRaisesRegex(RunOptionsError, message):
                     RunOptions.from_mapping(snapshot)
 
-    def test_missing_recovery_fields_are_rejected(self) -> None:
-        for field in (
-            "max_transient_attempts",
-            "max_workspace_setup_retries",
-            "execution_fallbacks",
+    def test_missing_budget_and_fallback_fields_are_rejected(self) -> None:
+        for section, field in (
+            ("budget", "step_attempts"),
+            ("budget", "max_wall_clock_hours"),
+            ("execution_fallbacks", "mechanical"),
         ):
             snapshot = self.snapshot()
-            del snapshot["recovery"][field]
+            del snapshot[section][field]
             with self.assertRaisesRegex(RunOptionsError, f"missing {field}"):
                 RunOptions.from_mapping(snapshot)
+        for section in ("budget", "execution_fallbacks"):
+            snapshot = self.snapshot()
+            del snapshot[section]
+            with self.assertRaisesRegex(RunOptionsError, f"missing {section}"):
+                RunOptions.from_mapping(snapshot)
+
+    def test_a_positive_cost_cap_in_a_snapshot_is_refused(self) -> None:
         snapshot = self.snapshot()
-        del snapshot["recovery"]
-        with self.assertRaisesRegex(RunOptionsError, "missing recovery"):
+        snapshot["budget"]["max_cost"] = 3.0
+        with self.assertRaisesRegex(RunOptionsError, "max_cost > 0 is not supported"):
             RunOptions.from_mapping(snapshot)
 
     def test_historical_default_implementer_profile_is_rejected(self) -> None:
@@ -869,7 +925,8 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
             (lambda snapshot: snapshot["planning"].update(repair_rounds=1), "planning has unknown key repair_rounds"),
             (lambda snapshot: snapshot["profiles"].pop("audit_profile"), "profiles is missing audit_profile"),
             (lambda snapshot: snapshot.pop("profiles"), "missing profiles"),
-            (lambda snapshot: snapshot["recovery"].update(max_extra_attempts=1), "recovery has unknown key max_extra_attempts"),
+            (lambda snapshot: snapshot["budget"].update(max_extra_attempts=1), "budget has unknown key max_extra_attempts"),
+            (lambda snapshot: snapshot.pop("budget"), "missing budget"),
         ):
             snapshot = self.snapshot()
             mutate(snapshot)
