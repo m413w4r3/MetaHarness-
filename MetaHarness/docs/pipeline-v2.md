@@ -1,3 +1,5 @@
+> Current C7 flow: [diagnostic gate and active audit](audit-pipeline.md). Older review and check-repair sections below describe historical behavior.
+
 # Pipeline v2 : invariants opérationnels
 
 MetaHarness est l’autorité d’exécution. Un run v2 est une machine d’état

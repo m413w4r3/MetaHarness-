@@ -42,12 +42,8 @@ from ..scope import ScopeViolation
 from ..state import RunStateStore
 from ..validation import config_with_check_authority
 from .candidate import CandidateLifecycle
-from .check_failure import (
-    hard_integrity_failures,
-    soft_check_failures,
-)
+from .check_failure import hard_integrity_failures
 from .gate_acceptance import GateAcceptanceService
-from .gate_recovery import CheckRepairLadder
 from .pipeline_v2 import (
     CyclePlan, PipelineFailure, PipelineV2Context, PipelineV2Operations,
     correction_dir, gate_dir,
@@ -229,27 +225,22 @@ class RunComposition:
         return pipeline, prepared.checkpoint
 
     def pipeline_operations(self, store: RunStateStore) -> PipelineV2Operations:
-        """Bind every operation the coordinator sequences to this run."""
+        """Bind the one implementation, audit and acceptance path."""
 
         bind = functools.partial
         candidate_lifecycle = CandidateLifecycle(
             staging_remote=self.runtime.config.repository.remote,
             authorize_tree=self.runtime.publication.authorize_candidate_tree,
-            gate_mutable_authority=lambda ctx, cycle_plan, stage: gate_mutable_authority(
-                ctx.run_dir, cycle_plan.cycle.number, stage,
-                base_paths=self.effective_cycle_scope(ctx, cycle_plan),
-                require_attempt_records=True,
+            gate_mutable_authority=lambda ctx, plan, stage: gate_mutable_authority(
+                ctx.run_dir, plan.cycle.number, stage,
+                base_paths=self.effective_cycle_scope(ctx, plan),
             ),
             push_tree=self.runtime.publication.push_candidate,
             cycle_update=self.runtime.cycle_update,
         )
         gate_acceptance = GateAcceptanceService(
-            secrets=self.runtime.secrets,
             authorize_candidate_tree=self.runtime.publication.authorize_candidate_tree,
-            check_repair_attempts=self.runtime.gates.check_repair_attempt_records,
-            load_revision=load_revision,
             trace_emit=self.runtime.observability.trace_emit,
-            bounded_detail=bounded_parse_detail,
         )
         cycle_artifacts = CycleArtifactService(
             cycle_update=self.runtime.cycle_update,
@@ -258,48 +249,29 @@ class RunComposition:
         )
         return PipelineV2Operations(
             checkpoint=lambda ctx, phase, **fields: self.runtime.write_checkpoint(
-                ctx.run_dir, phase, **fields
+                ctx.run_dir, phase, **fields,
             ),
             current_head=lambda ctx: current_head(ctx.info.worktree),
             candidate_tree=lambda ctx: candidate_tree_sha(ctx.info.worktree),
             begin_cycle=bind(cycle_artifacts.begin, store),
-            load_cycle=lambda ctx, number: read_cycle_record(ctx.run_dir, number),
             initial_plan=self._initial_cycle_plan,
-            review_implementation_correction=self.runtime.review_correction.review_implementation_correction,
-            plan_correction=bind(self.runtime.review_correction.plan_correction, store),
-            load_correction=self._load_correction,
             completed_steps=self.completed_steps,
             execute_step=bind(self.runtime.step_execution.execute_cycle_step, store),
             accept_step=bind(self.runtime.step_acceptance.resume_step_acceptance, store),
-            semantic_revision=bind(self.runtime.semantic_revision.semantic_revision, store),
-            semantic_review_correction=bind(self.runtime.review_correction.semantic_review_correction, store),
             run_gate=bind(self.runtime.gates.run_gate, store),
             load_gate_evidence=lambda ctx, number, stage: load_evidence(
-                gate_dir(ctx.run_dir, number, stage)
+                gate_dir(ctx.run_dir, number, stage),
             ),
-            load_accepted_gate_evidence=self.runtime.gates.load_accepted_gate_evidence,
-            accept_gate_state=lambda ctx, cycle_plan, stage, evidence: gate_acceptance.accept(
-                store, ctx, cycle_plan, stage, evidence,
-                base_paths=self.effective_cycle_scope(ctx, cycle_plan),
+            run_audit=bind(self.runtime.audit.run, store),
+            accept_gate_state=lambda ctx, plan, stage, evidence: gate_acceptance.accept(
+                store, ctx, plan, stage, evidence,
+                base_paths=self.effective_cycle_scope(ctx, plan),
             ),
-            check_repair_attempts=lambda ctx, number, stage: self.runtime.gates.check_repair_attempt_records(
-                ctx.run_dir, number, stage
-            ),
-            check_repair_attempt=bind(self.runtime.gates.run_check_repair_attempt, store),
             hard_failures=hard_integrity_failures,
-            soft_failures=soft_check_failures,
             create_candidate=bind(candidate_lifecycle.create, store),
             load_candidate=lambda ctx, number: read_candidate_record(ctx.run_dir, number),
             push_candidate=bind(candidate_lifecycle.push, store),
-            review_candidate=bind(self.runtime.reviews.review_candidate, store),
-            record_review=bind(self.runtime.reviews.record_review, store),
-            request_human=bind(self.runtime.reviews.request_human, store),
-            review_repair_exhausted=bind(self.runtime.reviews.review_repair_exhausted, store),
             publish=bind(self.runtime.publication.publish_candidate, store),
-            recovery_operations=CheckRepairLadder(
-                replan_steps=functools.partial(self.runtime.gates.replan_responsible_step, store),
-                replan_cycles=functools.partial(self.runtime.check_replan.replan_cycle, store),
-            ),
         )
 
     def _initial_cycle_plan(self, ctx: PipelineV2Context) -> CyclePlan:

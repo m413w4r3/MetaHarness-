@@ -17,14 +17,12 @@
     plan_rejected: true, interrupted: true, awaiting_plan_approval: true,
     waiting_human: true, waiting_external: true,
     waiting_remote: true,
-    waiting_check_repair: true
   };
   var WAITING_LABELS = {
     waiting_external: "Waiting for external authorization",
     waiting_remote: "Waiting for remote",
     waiting_human: "Waiting for operator decision",
     waiting_contract_repair: "Output correction exhausted",
-    waiting_check_repair: "Check repair budget exhausted"
   };
   var SYMBOLS = {complete: "✓", running: "▶", failed: "✗", waiting: "·", resumable: "↻", skipped: "–"};
   var STATES = ["complete", "running", "failed", "waiting", "resumable", "skipped"];

@@ -1019,6 +1019,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     repair_default = ui_data.get("default_repair_profile")
     if repair_default is not None:
         repair_default = _check_default(model_profiles, repair_default, ExecutionRole.REPAIR)
+    audit_default = ui_data.get("default_audit_profile")
+    if audit_default is not None:
+        audit_default = _check_default(model_profiles, audit_default, ExecutionRole.AUDITOR)
     # The default planner and reviewer are text endpoints; every selected
     # profile is validated again against its role when a run is prepared.
     _profile_endpoint(model_profiles[planner_default])
@@ -1087,6 +1090,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         default_reviewer_profile=reviewer_default,
         default_reviser_profile=reviser_default,
         default_repair_profile=repair_default,
+        default_audit_profile=audit_default,
         enable_profile_recommendation=_bool(
             ui_data, "enable_profile_recommendation", True, "ui"
         ),

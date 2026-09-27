@@ -41,7 +41,6 @@ from .models import (
 )
 from .resume import (
     CHECKPOINT_INTEGRITY_OPERATION,
-    CHECK_REPAIR_INTEGRITY_OPERATION,
     ResumeCheckpoint,
     ResumeCheckpointError,
     ResumeError,
@@ -322,9 +321,7 @@ class Orchestrator:
         self._runtime.secrets = config_secret_values(self._runtime.config, self._runtime.environment)
         self._runtime.observability.begin_trace(run_dir, selected, created=False)
         eligibility = resume_info(run_dir, state)
-        if eligibility.operation in {
-            CHECKPOINT_INTEGRITY_OPERATION, CHECK_REPAIR_INTEGRITY_OPERATION,
-        }:
+        if eligibility.operation == CHECKPOINT_INTEGRITY_OPERATION:
             # A current checkpoint whose durable evidence no longer proves its
             # identity: fail closed, without any model call.
             failed = store.record_failure(

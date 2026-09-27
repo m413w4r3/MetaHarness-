@@ -382,6 +382,7 @@ always_files = []
 default_planner_profile = "planner"
 default_implementer_profile = "worker"
 default_reviewer_profile = "reviewer"{reviser}{repair}
+default_audit_profile = "auditor"
 
 [publish]
 enabled = {'true' if publish else 'false'}
@@ -431,6 +432,14 @@ roles = ["reviser"]
 driver = "{DRIVER}"
 provider = "test"
 model = "fake-reviser"
+selection_mode = "cli"
+
+[model_profiles.auditor]
+display_name = "Auditor"
+roles = ["auditor"]
+driver = "{DRIVER}"
+provider = "test"
+model = "fake-auditor"
 selection_mode = "cli"
 
 [model_profiles.live_planner]

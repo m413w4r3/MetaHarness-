@@ -508,10 +508,8 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 payload = self._body()
                 allowed = {
                     "spec", "run_id", "planner_profile", "mechanical_profile",
-                    "reasoning_profile", "agentic_profile", "final_reviewer_profile",
-                    "semantic_reviser_profile", "check_repair_profile",
-                    "semantic_revision_enabled", "max_check_repair_attempts",
-                    "max_correction_cycles", "decomposition", "execution_mode_policy",
+                    "reasoning_profile", "agentic_profile", "audit_profile",
+                    "decomposition", "execution_mode_policy",
                     "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
                 }
                 if set(payload) - allowed:
@@ -523,12 +521,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     mechanical_profile=payload.get("mechanical_profile"),
                     reasoning_profile=payload.get("reasoning_profile"),
                     agentic_profile=payload.get("agentic_profile"),
-                    final_reviewer_profile=payload.get("final_reviewer_profile"),
-                    semantic_reviser_profile=payload.get("semantic_reviser_profile"),
-                    check_repair_profile=payload.get("check_repair_profile"),
-                    semantic_revision_enabled=payload.get("semantic_revision_enabled"),
-                    max_check_repair_attempts=payload.get("max_check_repair_attempts"),
-                    max_correction_cycles=payload.get("max_correction_cycles"),
+                    audit_profile=payload.get("audit_profile"),
                     decomposition=payload.get("decomposition"),
                     execution_mode_policy=payload.get("execution_mode_policy"),
                     single_step_max_mutable_paths=payload.get("single_step_max_mutable_paths"),
@@ -582,11 +575,8 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 allowed = {
                     "spec", "run_id", "planner_profile", "mechanical_profile",
                     "reasoning_profile", "agentic_profile",
-                    "final_reviewer_profile", "semantic_reviser_profile", "check_repair_profile",
-                    "semantic_revision_enabled", "max_check_repair_attempts",
-                    "max_correction_cycles",
-                    "decomposition",
-                    "execution_mode_policy", "single_step_max_mutable_paths",
+                    "audit_profile",
+                    "decomposition", "execution_mode_policy", "single_step_max_mutable_paths",
                     "staged_step_max_mutable_paths",
                 }
                 unknown = set(payload) - allowed
@@ -600,12 +590,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     mechanical_profile=payload.get("mechanical_profile"),
                     reasoning_profile=payload.get("reasoning_profile"),
                     agentic_profile=payload.get("agentic_profile"),
-                    final_reviewer_profile=payload.get("final_reviewer_profile"),
-                    semantic_reviser_profile=payload.get("semantic_reviser_profile"),
-                    check_repair_profile=payload.get("check_repair_profile"),
-                    semantic_revision_enabled=payload.get("semantic_revision_enabled"),
-                    max_check_repair_attempts=payload.get("max_check_repair_attempts"),
-                    max_correction_cycles=payload.get("max_correction_cycles"),
+                    audit_profile=payload.get("audit_profile"),
                     decomposition=payload.get("decomposition"),
                     execution_mode_policy=payload.get("execution_mode_policy"),
                     single_step_max_mutable_paths=payload.get("single_step_max_mutable_paths"),
@@ -617,11 +602,9 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 payload = self._form({
                     "_token", "spec", "run_id", "planner_profile", "mechanical_profile",
                     "reasoning_profile", "agentic_profile",
-                    "final_reviewer_profile", "semantic_reviser_profile", "check_repair_profile",
-                    "semantic_revision_enabled", "max_check_repair_attempts",
-                    "max_correction_cycles",
+                    "audit_profile",
                     "decomposition",
-                    "execution_mode_policy", "single_step_max_mutable_paths",
+                    "decomposition", "execution_mode_policy", "single_step_max_mutable_paths",
                     "staged_step_max_mutable_paths",
                 }, exact=False)
                 if not {"_token", "spec", "run_id", "planner_profile"}.issubset(payload):
@@ -635,12 +618,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     mechanical_profile=payload.get("mechanical_profile"),
                     reasoning_profile=payload.get("reasoning_profile"),
                     agentic_profile=payload.get("agentic_profile"),
-                    final_reviewer_profile=payload.get("final_reviewer_profile"),
-                    semantic_reviser_profile=payload.get("semantic_reviser_profile"),
-                    check_repair_profile=payload.get("check_repair_profile"),
-                    semantic_revision_enabled=payload.get("semantic_revision_enabled"),
-                    max_check_repair_attempts=payload.get("max_check_repair_attempts"),
-                    max_correction_cycles=payload.get("max_correction_cycles"),
+                    audit_profile=payload.get("audit_profile"),
                     decomposition=payload.get("decomposition"),
                     execution_mode_policy=payload.get("execution_mode_policy"),
                     single_step_max_mutable_paths=payload.get("single_step_max_mutable_paths"),
@@ -697,7 +675,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 decision = payload.get("decision")
                 if decision == "APPROVE":
                     step_fields = {key for key in payload if key.startswith("step_profile__")}
-                    required = {"_token", "decision", "final_reviewer_profile"} | step_fields
+                    required = {"_token", "decision", "audit_profile"} | step_fields
                     if not step_fields or not required.issubset(payload):
                         raise WebAPIError(400, "missing approval field")
                 elif decision == "REJECT":
@@ -750,7 +728,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
 
 
 _APPROVAL_PROFILE_FIELDS = frozenset({
-    "final_reviewer_profile", "semantic_reviser_profile", "check_repair_profile",
+    "audit_profile",
 })
 
 
@@ -764,9 +742,7 @@ def _approval_profiles(payload: Mapping[str, Any]) -> dict[str, Any]:
         for key, value in payload.items() if key.startswith("step_profile__")
     }
     return {
-        "final_reviewer_profile": payload.get("final_reviewer_profile"),
-        "semantic_reviser_profile": payload.get("semantic_reviser_profile"),
-        "check_repair_profile": payload.get("check_repair_profile"),
+        "audit_profile": payload.get("audit_profile"),
         "step_profiles": step_profiles or None,
     }
 

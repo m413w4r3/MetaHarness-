@@ -430,10 +430,10 @@ class RunObservability:
                 },
                 once=True,
             )
-        elif result.status in {RunStatus.WAITING_HUMAN, RunStatus.WAITING_CHECK_REPAIR}:
+        elif result.status is RunStatus.WAITING_HUMAN:
             failure = result.state.get("failure") if isinstance(result.state, Mapping) else None
             self.trace_emit(
-                "run.waiting_check_repair" if result.status is RunStatus.WAITING_CHECK_REPAIR else "run.waiting_human",
+                "run.waiting_human",
                 phase="run",
                 cycle=result.state.get("cycle") if isinstance(result.state, Mapping) else None,
                 data={
@@ -445,7 +445,7 @@ class RunObservability:
         if result.status in {
             RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.PLAN_REJECTED,
             RunStatus.WAITING_HUMAN,
-            RunStatus.WAITING_EXTERNAL, RunStatus.WAITING_CHECK_REPAIR,
+            RunStatus.WAITING_EXTERNAL,
             RunStatus.WAITING_REMOTE,
             RunStatus.WAITING_CONTRACT_REPAIR, RunStatus.COMMITTED, RunStatus.PUBLISHED,
         }:

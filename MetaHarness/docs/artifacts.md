@@ -1,3 +1,5 @@
+> Current C7 flow: [diagnostic gate and active audit](audit-pipeline.md). Older review and check-repair sections below describe historical behavior.
+
 # Artifacts
 
 Each run directory is the durable handoff point for an operator. Failed and

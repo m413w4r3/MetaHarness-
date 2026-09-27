@@ -67,7 +67,7 @@ from .pipeline_v2 import (
     step_dir as cycle_step_dir,
 )
 from .recovery import RecoveryAdmission
-from .revision import future_step_ownership
+from .step_authority import future_step_ownership
 from .shared import (
     BOUNDED_NO_CHANGE_MISMATCH,
     SYNTHETIC_NO_CHANGE_MISMATCH,
@@ -127,8 +127,8 @@ class StepExecutionService:
         planner_profile = profile_for_role(
             self.runtime.config, ctx.selection.planner.profile_id, ExecutionRole.PLANNER
         )
-        reviewer_profile = profile_for_role(
-            self.runtime.config, ctx.selection.final_reviewer.profile_id, ExecutionRole.REVIEWER
+        audit_profile = profile_for_role(
+            self.runtime.config, ctx.selection.audit.profile_id, ExecutionRole.AUDITOR
         )
         # The last green tree this step must leave behind if it is abandoned.
         green = AttemptBoundary(
@@ -150,7 +150,7 @@ class StepExecutionService:
                 profile_id=cycle_plan.step_profile_ids[step.id],
                 fallback_profile_ids=(cycle_plan.step_fallback_profile_ids or {}).get(step.id, ()),
                 artifact_dir=step_artifact_dir,
-                forbidden_env_names=(planner_profile.api_key_env, reviewer_profile.api_key_env),
+                forbidden_env_names=(planner_profile.api_key_env, audit_profile.api_key_env),
                 future_ownership=future_step_ownership(cycle_plan.plan.steps, index),
             )
         except StepExecutionFailure as failure:
@@ -337,11 +337,7 @@ class StepExecutionService:
                 current_contract=effective_contract, mismatch=pending_repair.mismatch,
                 tree_before=pending_repair.tree_sha, profile_id=active_profile_id,
                 resumed=True,
-                failure_evidence=self.runtime.contract_recovery.repair_failure_evidence(pending_repair.directory),
-                # A slot a red gate opened owes a contract different from the
-                # one that gate failed under, on a resume as well: an
-                # unchanged answer stays an output defect, never a replay.
-                require_new_contract=self.runtime.contract_recovery.repair_slot_origin(pending_repair.directory) is not None,
+                failure_evidence="NONE", require_new_contract=False,
             )
             authority = self.runtime.contract_recovery.repaired_authority(resolve(), pending_repair.number)
             effective_step, effective_contract = authority.effective_step, authority.effective_contract

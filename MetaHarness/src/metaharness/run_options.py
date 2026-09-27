@@ -23,7 +23,7 @@ class RunOptionsConflict(RunOptionsError):
     """An immutable run-options artifact already contains different bytes."""
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 # Deterministic refusal code for a snapshot that is not the current schema.
 RUN_SCHEMA_UNSUPPORTED = "RUN_SCHEMA_UNSUPPORTED"
 RUN_OPTIONS_NAME = "run_options.json"
@@ -42,7 +42,7 @@ _PIPELINE_FIELDS = frozenset({
 })
 _PROFILE_FIELDS = frozenset({
     "planner_profile", "mechanical_profile", "reasoning_profile", "agentic_profile",
-    "check_repair_profile", "semantic_reviser_profile", "final_reviewer_profile",
+    "audit_profile",
 })
 _RECOVERY_FIELDS = frozenset({
     "max_transient_attempts", "max_executor_fallbacks",
@@ -99,6 +99,7 @@ class RunOptions:
     check_repair_profile: str | None = None
     semantic_reviser_profile: str | None = None
     final_reviewer_profile: str = ""
+    audit_profile: str = ""
     max_steps_per_plan: int = 8
     max_read_paths_per_step: int = 8
     max_step_contract_chars: int = 5000
@@ -150,7 +151,7 @@ class RunOptions:
             raise RunOptionsError(str(exc)) from None
         for name in (
             "planner_profile", "mechanical_profile", "reasoning_profile",
-            "agentic_profile", "final_reviewer_profile",
+            "agentic_profile", "audit_profile",
         ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
@@ -168,7 +169,7 @@ class RunOptions:
             "semantic_revision_enabled", "max_check_repair_attempts",
             "max_correction_cycles", "planner_profile", "mechanical_profile",
             "reasoning_profile", "agentic_profile",
-            "check_repair_profile", "semantic_reviser_profile", "final_reviewer_profile",
+            "check_repair_profile", "semantic_reviser_profile", "final_reviewer_profile", "audit_profile",
             "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
             "max_preapproval_corrections", "max_step_contract_repairs",
             "recovery",
@@ -202,17 +203,12 @@ class RunOptions:
             "check_repair_profile": config.ui.default_repair_profile,
             "semantic_reviser_profile": config.ui.default_reviser_profile,
             "final_reviewer_profile": config.ui.default_reviewer_profile,
+            "audit_profile": config.ui.default_audit_profile,
             "recovery": config.recovery,
         }
         values.update(overrides)
         result = cls(**values)
         result.validate_profiles(config)
-        if result.semantic_revision_enabled and result.semantic_reviser_profile is None:
-            raise RunOptionsError("semantic revision requires a semantic reviser profile")
-        if result.max_check_repair_attempts > 0 and result.check_repair_profile is None:
-            raise RunOptionsError("check-repair budget requires a check-repair profile")
-        if result.max_correction_cycles > 0 and result.semantic_reviser_profile is None:
-            raise RunOptionsError("correction budget requires a semantic reviser profile")
         return result
 
     def validate_profiles(self, config: HarnessConfig) -> None:
@@ -222,11 +218,12 @@ class RunOptions:
             ("reasoning_profile", ExecutionRole.IMPLEMENTER),
             ("agentic_profile", ExecutionRole.IMPLEMENTER),
             ("final_reviewer_profile", ExecutionRole.REVIEWER),
+            ("audit_profile", ExecutionRole.AUDITOR),
             ("semantic_reviser_profile", ExecutionRole.REVISER),
             ("check_repair_profile", ExecutionRole.REPAIR),
         ):
             value = getattr(self, name)
-            if value is None:
+            if value is None or value == "":
                 continue
             try:
                 profile_for_role(config, value, role)
@@ -287,9 +284,7 @@ class RunOptions:
                 "mechanical_profile": self.mechanical_profile,
                 "reasoning_profile": self.reasoning_profile,
                 "agentic_profile": self.agentic_profile,
-                "check_repair_profile": self.check_repair_profile,
-                "semantic_reviser_profile": self.semantic_reviser_profile,
-                "final_reviewer_profile": self.final_reviewer_profile,
+                "audit_profile": self.audit_profile,
             },
         }
 
@@ -407,9 +402,10 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
     ui = replace(
         config.ui,
         default_planner_profile=options.planner_profile,
-        default_reviewer_profile=options.final_reviewer_profile,
-        default_reviser_profile=options.semantic_reviser_profile,
-        default_repair_profile=options.check_repair_profile,
+        default_reviewer_profile=options.final_reviewer_profile or config.ui.default_reviewer_profile,
+        default_reviser_profile=options.semantic_reviser_profile or config.ui.default_reviser_profile,
+        default_repair_profile=options.check_repair_profile or config.ui.default_repair_profile,
+        default_audit_profile=options.audit_profile,
     )
     routing = RoutingConfig(
         mechanical_profile=options.mechanical_profile,

@@ -122,7 +122,7 @@ class GitHubWorkstreamTests(unittest.TestCase):
         self.assertNotIn("HOSTILE ISSUE CONTENT", state_text + trace_text)
         self.assertIn('"issue_number":123', trace_text)
 
-    def test_create_pull_request_uses_exact_reviewed_run_branch(self) -> None:
+    def test_create_pull_request_uses_exact_accepted_run_branch(self) -> None:
         client = _FakeGitHub()
         owner = _orchestrator(
             self.root,
@@ -131,10 +131,8 @@ class GitHubWorkstreamTests(unittest.TestCase):
         )
         self.store.update_metadata(planner={"title": "Approved plan"})
         self.store.set_run_state(
-            RunMachineState(RunPhase.FINAL_REVIEW),
-            review={"verdict": "PASS", "route": "NONE"},
+            RunMachineState(RunPhase.CANDIDATE_READY),
             candidate_commit_sha="b" * 40,
-            reviewed_candidate_sha="b" * 40,
         )
         with (
             mock.patch("metaharness.orchestration.publication.current_head", return_value="b" * 40),
@@ -163,7 +161,7 @@ class GitHubWorkstreamTests(unittest.TestCase):
         metadata = [event for event in events if event["event"] == "workstream.metadata"][-1]
         self.assertEqual(metadata["data"]["remote_branch"], "harness/plan/run-1")
         self.assertEqual(metadata["data"]["pull_request_number"], 456)
-        self.assertEqual(metadata["data"]["reviewed_candidate_sha"], "b" * 40)
+        self.assertEqual(metadata["data"]["candidate_commit_sha"], "b" * 40)
 
     def test_wrong_remote_sha_does_not_create_pull_request(self) -> None:
         client = _FakeGitHub()
@@ -173,10 +171,8 @@ class GitHubWorkstreamTests(unittest.TestCase):
             client,
         )
         self.store.set_run_state(
-            RunMachineState(RunPhase.FINAL_REVIEW),
-            review={"verdict": "PASS", "route": "NONE"},
+            RunMachineState(RunPhase.CANDIDATE_READY),
             candidate_commit_sha="b" * 40,
-            reviewed_candidate_sha="b" * 40,
         )
         with (
             mock.patch("metaharness.orchestration.publication.current_head", return_value="b" * 40),
@@ -192,9 +188,9 @@ class GitHubWorkstreamTests(unittest.TestCase):
             )
         self.assertEqual(client.pull_requests, [])
 
-    def test_non_pass_review_routes_do_not_create_pull_request(self) -> None:
-        for verdict, route in (("REVISE", "IMPLEMENTATION"), ("REVISE", "HUMAN"), ("FAIL", "HUMAN")):
-            with self.subTest(verdict=verdict, route=route):
+    def test_mismatched_candidate_does_not_create_pull_request(self) -> None:
+        for accepted_sha in ("a" * 40, "invalid"):
+            with self.subTest(accepted_sha=accepted_sha):
                 client = _FakeGitHub()
                 owner = _orchestrator(
                     self.root,
@@ -202,13 +198,11 @@ class GitHubWorkstreamTests(unittest.TestCase):
                     client,
                 )
                 self.store.set_run_state(
-                    RunMachineState(RunPhase.FINAL_REVIEW),
-                    review={"verdict": verdict, "route": route},
-                    candidate_commit_sha="b" * 40,
-                    reviewed_candidate_sha="b" * 40,
+                    RunMachineState(RunPhase.CANDIDATE_READY),
+                    candidate_commit_sha=accepted_sha,
                 )
                 with self.assertRaisesRegex(
-                    GitHubWorkstreamError, "exact PASS candidate"
+                    GitHubWorkstreamError, "accepted candidate"
                 ):
                     owner._ensure_github_pull_request_metadata(
                         store=self.store,

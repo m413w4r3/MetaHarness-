@@ -60,7 +60,6 @@ from ..repository_topology import RepositoryTopology
 from ..result import atomic_write_text
 from ..state import RunStateStore
 from . import contract_repair
-from .check_failure import replan_slot_origin
 from .contract_repair import ContractRepairIntegrityError
 from .pipeline_v2 import PipelineFailure
 from .recovery import (
@@ -83,11 +82,6 @@ from .step_authority import (
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
 
-# The bounded red-gate evidence a contract replan planner was given, kept with
-# its slot so an interrupted replan resumes with the same evidence instead of
-# a second, weaker request.
-GATE_REPLAN_EVIDENCE = "gate_evidence.txt"
-_MAX_GATE_REPLAN_EVIDENCE_BYTES = 64 * 1024
 
 
 class ContractRecoveryService:
@@ -550,20 +544,3 @@ class ContractRecoveryService:
             self.runtime.config.scope.check(added)
         except ScopeViolation as violation:
             raise PipelineFailure(violation.code, violation.detail) from None
-    @staticmethod
-    def repair_failure_evidence(directory: Path) -> str:
-        """The durable failure evidence of a slot a red gate opened, if any."""
-
-        try:
-            data = (directory / GATE_REPLAN_EVIDENCE).read_bytes()[:_MAX_GATE_REPLAN_EVIDENCE_BYTES]
-        except OSError:
-            return "NONE"
-        return data.decode("utf-8", errors="replace") or "NONE"
-    @staticmethod
-    def repair_slot_origin(directory: Path) -> Mapping[str, Any] | None:
-        """The red-gate replan identity of one contract repair slot, if it is one."""
-
-        archived = read_json_artifact(directory / contract_repair.MISMATCH_NAME, 64 * 1024)
-        if not isinstance(archived, dict) or not isinstance(archived.get("mismatch"), str):
-            return None
-        return replan_slot_origin(archived["mismatch"])

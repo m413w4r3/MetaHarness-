@@ -73,6 +73,11 @@ class P19WebTests(unittest.TestCase):
                 base_url=endpoint.base_url,
                 endpoint_path=endpoint.endpoint_path,
             ),
+            "auditor": ModelProfile(
+                id="auditor", display_name="Auditor", roles=(ExecutionRole.AUDITOR,),
+                driver=ProfileDriver.EXTERNAL, model="audit", selection_mode=SelectionMode.CLI,
+                provider="test", argv=("true",),
+            ),
         }
         config = HarnessConfig(
             repo=root,
@@ -87,6 +92,7 @@ class P19WebTests(unittest.TestCase):
             ui=UIConfig(
                 default_planner_profile="planner",
                 default_reviewer_profile="reviewer",
+                default_audit_profile="auditor",
             ),
             routing=RoutingConfig(
                 mechanical_profile="implementer",

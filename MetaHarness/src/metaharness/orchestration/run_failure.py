@@ -2,13 +2,11 @@
 
 ``RunFailure`` owns the single outcome a failure becomes: the durable step
 artifact, the state fields that close the run, the status the recovery policy
-authorizes, the fixed-point fingerprint of an exhausted check-repair episode
-and the projection of an exception that escaped the coordinator.
+authorizes, and the projection of an exception that escaped the coordinator.
 """
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import Any, Mapping, TYPE_CHECKING
 from ..agent.base import AgentError
@@ -39,8 +37,7 @@ from ..validation import ValidationError
 from ..workspace import WorkspaceSetupError
 from .pipeline_v2 import (
     FailureDetail, PipelineFailure, PipelineV2Context, PipelineV2Coordinator,
-    check_repair_dir,
-    check_repair_fingerprint, step_dir as cycle_step_dir,
+    step_dir as cycle_step_dir,
 )
 from .recovery import normalize_exit_reason, project_exit
 from .resume_integrity import validate_resume
@@ -195,69 +192,11 @@ class RunFailure:
         by the recovery policy: only a hard stop becomes ``FAILED``.
         """
 
-        repeated_fixed_point = False
-        retry_fingerprint: list[Any] | None = None
-        if reason == "CHECK_REPAIR_EXHAUSTED" and isinstance(detail, Mapping):
-            raw_failed_ids = detail.get("failed_check_ids")
-            candidate_tree = detail.get("candidate_tree")
-            try:
-                checkpoint = read_checkpoint(run_dir)
-            except ResumeCheckpointError:
-                checkpoint = None
-            if (
-                isinstance(raw_failed_ids, list)
-                and all(isinstance(item, str) for item in raw_failed_ids)
-                and isinstance(candidate_tree, str)
-                and checkpoint is not None
-                and checkpoint.stage is not None
-            ):
-                fingerprint = check_repair_fingerprint(
-                    candidate_tree, raw_failed_ids, checkpoint.stage,
-                    detail.get("strategy") if isinstance(detail.get("strategy"), str) else "",
-                )
-                # The durable fingerprint is compared against a JSON round
-                # trip: its failed-check set is normalized to a list so a
-                # reloaded state is the same identity as the written one.
-                retry_fingerprint = [fingerprint[0], list(fingerprint[1]), *fingerprint[2:]]
-                prior_check_repair = store.load().get("check_repair")
-                repeated_fixed_point = (
-                    isinstance(prior_check_repair, Mapping)
-                    and prior_check_repair.get("operator_retry_fingerprint") == retry_fingerprint
-                )
-                if repeated_fixed_point:
-                    reason = "CHECK_REPAIR_FIXED_POINT"
-                    detail = {
-                        **dict(detail),
-                        "fixed_point_fingerprint": retry_fingerprint,
-                        "operator_message": "Code change or additional repair authority required",
-                    }
-                    terminal_disposition = None
-                    auto_resumable = False
         if terminal_disposition is None:
             reason = normalize_exit_reason(reason)
             terminal_disposition = project_exit(
                 reason, phase=self.checkpoint_phase(run_dir),
             )[1].disposition
-        if reason == "CHECK_REPAIR_EXHAUSTED":
-            self.runtime.observability.trace_emit(
-                "check_repair.exhausted",
-                phase="repair",
-                cycle=self.runtime.trace_cycle,
-                data={"reason": reason, "step_id": step_id},
-                once=True,
-            )
-        elif reason == "CHECK_REPAIR_FIXED_POINT":
-            self.runtime.observability.trace_emit(
-                "check_repair.fixed_point",
-                phase="repair",
-                cycle=self.runtime.trace_cycle,
-                data={
-                    "step_id": step_id,
-                    "fingerprint": retry_fingerprint,
-                    "operator_message": "Code change or additional repair authority required",
-                },
-                once=True,
-            )
         try:
             self.runtime.observability.update_v2_usage(store, run_dir)
         except (OSError, ValueError):
@@ -267,67 +206,6 @@ class RunFailure:
             state, step_id,
             "waiting" if terminal_disposition is not RunDisposition.FAILED else "failed",
         )
-        if reason in {"CHECK_REPAIR_EXHAUSTED", "CHECK_REPAIR_FIXED_POINT"} and isinstance(detail, Mapping):
-            failure_detail = dict(detail)
-            evidence_sha = failure_detail.get("latest_evidence_sha256")
-            failed_ids = failure_detail.get("failed_check_ids")
-            candidate_tree = failure_detail.get("candidate_tree")
-            attempt_count = failure_detail.get("attempt_count")
-            budget = failure_detail.get("budget")
-            try:
-                checkpoint = read_checkpoint(run_dir)
-            except ResumeCheckpointError:
-                checkpoint = None
-            reports: list[dict[str, Any]] = []
-            if (
-                checkpoint is not None and checkpoint.stage is not None
-                and isinstance(attempt_count, int) and not isinstance(attempt_count, bool)
-            ):
-                root = check_repair_dir(run_dir, checkpoint.review_cycle, checkpoint.stage) / "attempts"
-                for number in range(1, attempt_count + 1):
-                    report_path = root / f"{number:03d}" / "report.json"
-                    if report_path.is_file():
-                        try:
-                            digest = hashlib.sha256(report_path.read_bytes()).hexdigest()
-                        except OSError:
-                            digest = None
-                        reports.append({
-                            "attempt": number,
-                            "artifact": report_path.relative_to(run_dir).as_posix(),
-                            "sha256": digest,
-                        })
-            failure_detail["repair_reports"] = reports
-            prior_check_repair = state.get("check_repair")
-            if retry_fingerprint is None:
-                fingerprint = check_repair_fingerprint(
-                    candidate_tree if isinstance(candidate_tree, str) else "",
-                    failed_ids if isinstance(failed_ids, list) else [],
-                    checkpoint.stage if checkpoint is not None and checkpoint.stage is not None else "",
-                    failure_detail.get("strategy")
-                    if isinstance(failure_detail.get("strategy"), str) else "",
-                )
-                retry_fingerprint = [fingerprint[0], list(fingerprint[1]), *fingerprint[2:]]
-            fixed_point = reason == "CHECK_REPAIR_FIXED_POINT"
-            if fixed_point:
-                failure_detail["fixed_point_fingerprint"] = retry_fingerprint
-                failure_detail["operator_message"] = "Code change or additional repair authority required"
-            fields["check_repair"] = {
-                **(dict(prior_check_repair) if isinstance(prior_check_repair, Mapping) else {}),
-                "status": "fixed_point" if fixed_point else "exhausted",
-                "attempt_count": attempt_count,
-                "budget": budget,
-                "failed_check_ids": list(failed_ids) if isinstance(failed_ids, list) else [],
-                "candidate_tree": candidate_tree,
-                "repair_reports": reports,
-                "latest_evidence_sha256": evidence_sha,
-                "failure_classification": "product_check",
-                "operator_retry_fingerprint": retry_fingerprint,
-                "next_action": (
-                    "Code change or additional repair authority required"
-                    if fixed_point else "Retry deterministic gate"
-                ),
-            }
-            detail = failure_detail
         if auto_resumable is not None:
             fields["recovery_resumable"] = auto_resumable
         cycles = list(state.get("cycles") or [])

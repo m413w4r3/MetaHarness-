@@ -1,3 +1,5 @@
+> Current C7 flow: [diagnostic gate and active audit](audit-pipeline.md). Older review and check-repair sections below describe historical behavior.
+
 # Architecture
 
 MetaHarness is a single-task state machine. It creates one planner

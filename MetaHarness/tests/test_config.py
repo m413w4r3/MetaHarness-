@@ -39,6 +39,7 @@ home = "codex-home"
 default_planner_profile = "planner-chat"
 default_implementer_profile = "implementer-codex"
 default_reviewer_profile = "reviewer-chat"
+default_audit_profile = "implementer-codex"
 
 [model_profiles.planner-chat]
 display_name = "Planner"
@@ -58,7 +59,7 @@ nested = { label = "${META_NESTED}" }
 
 [model_profiles.implementer-codex]
 display_name = "Implementer"
-roles = ["implementer"]
+roles = ["implementer", "auditor"]
 driver = "codex"
 provider = "bridge"
 model = "gpt-5.6-luna"
@@ -687,7 +688,7 @@ selection_mode = "cli"
 
 
 class RunOptionsStrictSchemaTests(unittest.TestCase):
-    """`run_options.json` has exactly one shape: schema 4 is read, nothing else."""
+    """`run_options.json` has exactly one current shape."""
 
     ENVIRONMENT = {
         "META_PLANNER_BASE_URL": "https://planner.example",
@@ -706,10 +707,13 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
     def snapshot(self) -> dict:
         return RunOptions.from_config(self.config()).to_dict()
 
-    def test_current_schema_four_round_trips_identically(self) -> None:
+    def test_current_schema_five_round_trips_identically(self) -> None:
         snapshot = self.snapshot()
         self.assertEqual(snapshot["schema_version"], SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 4)
+        self.assertEqual(SCHEMA_VERSION, 5)
+        self.assertEqual(snapshot["profiles"]["audit_profile"], "implementer-codex")
+        self.assertNotIn("final_reviewer_profile", snapshot["profiles"])
+        self.assertNotIn("semantic_reviser_profile", snapshot["profiles"])
         self.assertEqual(
             snapshot["pipeline"]["max_correction_cycles"],
             self.config().revision.max_correction_cycles,
@@ -783,7 +787,7 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
         for mutate, message in (
             (lambda snapshot: snapshot.update(topology="unused"), "unknown key topology"),
             (lambda snapshot: snapshot["planning"].update(repair_rounds=1), "planning has unknown key repair_rounds"),
-            (lambda snapshot: snapshot["profiles"].pop("final_reviewer_profile"), "profiles is missing final_reviewer_profile"),
+            (lambda snapshot: snapshot["profiles"].pop("audit_profile"), "profiles is missing audit_profile"),
             (lambda snapshot: snapshot.pop("profiles"), "missing profiles"),
             (lambda snapshot: snapshot["recovery"].update(max_extra_attempts=1), "recovery has unknown key max_extra_attempts"),
         ):

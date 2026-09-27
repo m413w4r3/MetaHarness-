@@ -2,9 +2,9 @@
 
 MetaHarness transforme un SPEC humain en un run Git contrôlé : un planner
 produit un plan texte d’implémentation, un backend sélectionné l’exécute dans un worktree isolé,
-les checks déterministes figent les preuves, puis un reviewer compare SPEC,
-plan et diff pour le candidat final avant publication. L’implémenteur reçoit le plan,
-pas le SPEC original ; le reviewer reçoit les deux. Une approbation humaine
+les checks déterministes figent les preuves, puis un auditeur actif compare SPEC,
+plan, diff et failures, et corrige le candidat avant un nouveau gate. L’implémenteur reçoit le plan,
+pas le SPEC original ; l’auditeur reçoit les deux. Une approbation humaine
 optionnelle peut être exigée après le planner et avant la création du worktree.
 
 Avec `[planning] protocol = "v2"`, le pipeline complet et backend-neutral est :
@@ -18,24 +18,19 @@ PLAN SINGLE or STAGED  (execution_mode_policy = "auto" by default)
   ↓
 implementation steps → accepted step commits
   ↓
-deterministic checks
-  ├ FAIL → recovery ladder (check-repair, replan, fallback) → gate rerun
-  └ PASS → semantic revision → deterministic checks
+POST_IMPLEMENTATION diagnostic gate (green or red)
   ↓
-accepted candidate D
+active high-tier AUDIT (writable; at most two passes)
+  ↓
+authoritative deterministic gate rerun after each pass
+  ↓
+accepted candidate D (only with green gate)
   ↓
 push exact D on the configured repository run branch
   ↓
 read the remote tip and require tip == D
   ↓
-final reviewer on immutable D
-  ↓
-PASS → publish exact reviewed SHA
-REVISE / IMPLEMENTATION → semantic correction
-REVISE / REPLAN → review repair planner
-REVISE / HUMAN → operator required
-
-approved candidate (fast-forward-base)
+publish exact accepted SHA (fast-forward-base)
   ↓
 CAS fast-forward local main A→B   (git update-ref refs/heads/main B A)
   ↓
@@ -44,21 +39,12 @@ push origin/main A→B              (git push --porcelain origin B:refs/heads/ma
 delete remote run branch           (fast-forward-base only; after publication)
 ```
 
-- `max_check_repair_attempts` et `max_correction_cycles` sont deux budgets
-  indépendants et configurables ; le second borne tout cycle après `INITIAL`,
-  qu'il vienne d'une review ou d'un gate déterministe ; le reviewer ne connaît
-  pas ces budgets ;
-- une réparation de check corrige uniquement un signal déterministe ; une
-  révision sémantique compare le candidat à la SPEC ; le reviewer final ne
-  corrige jamais directement ;
-- `REVISE / IMPLEMENTATION` réutilise le plan approuvé et appelle le reviser,
-  tandis que `REVISE / REPLAN` appelle un planner correctif puis un nouvel
-  implementer ; `REVISE / HUMAN` arrête toute correction automatique ;
-- `[revision]` fournit les valeurs par défaut ; chaque nouveau run capture ses
-  choix effectifs dans `run_options.json` ;
-- pour AutoWork, la portée de réparation recommandée est
-  `repair_scope_policy = "auto-bounded"` avec
-  `repair_scope_max_added_paths = 4` ;
+- Un gate rouge fournit les failure IDs et logs à AUDIT. L’auditeur peut modifier
+  le code, les tests et la configuration sous la hard-deny policy. Son sandbox
+  n’a pas à exécuter les checks : le harness relance le gate dans son environnement.
+- Après deux passes rouges, le run conserve `AUDIT_REMAINING` et les failures
+  pour C8. Seul `SPEC_DECISION` demande une décision humaine.
+- Le détail des preuves et du protocole figure dans [le pipeline d’audit](docs/audit-pipeline.md).
 - les agents ne travaillent jamais sur `main` : les rôles sélectionnés
   n’écrivent que dans le worktree isolé ; le checkout utilisateur n’est jamais
   modifié (ni checkout, ni index, ni fichiers) ;
@@ -71,14 +57,14 @@ delete remote run branch           (fast-forward-base only; after publication)
   `BASE_MOVED_SINCE_RUN`, sans merge, rebase ni force.
   `mode = "run-branch"` pousse seulement la branche de run ;
 - `trace/events.v1.jsonl` est la preuve chronologique d’observation : plan,
-  steps, checks, réparations, révisions, push, review et publication, avec les
+  steps, checks, audit, push et publication, avec les
   SHA/tree et les métadonnées de session disponibles ; il ne remplace jamais
   `RunStateStore` comme autorité ;
 - aucun force, lease, tag ou merge automatique ; un échec du cleanup après
   publication laisse le run `PUBLISHED` avec un warning diagnostiqué.
-- tous les candidats reviewables sont poussés sur la branche distante du run
-  avant le reviewer final, même quand `publish.enabled = false`. Ce staging
-  push est distinct de la publication post-PASS contrôlée par `[publish]` ;
+- tous les candidats acceptés sont poussés sur la branche distante du run,
+  même quand `publish.enabled = false`. Ce staging
+  push est distinct de la publication contrôlée par `[publish]` ;
   en `mode = "run-branch"`, `publish.remote` doit être `repository.remote`.
 
 ### Reprise : failure != lost work

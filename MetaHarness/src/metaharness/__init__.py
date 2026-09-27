@@ -107,7 +107,6 @@ from .trace import (
 from .prompt_contracts import (
     PromptPayload,
     PromptSection,
-    build_check_repair_payload,
     build_final_review_payload,
     build_implementer_payload,
     build_planner_payload,
@@ -122,7 +121,6 @@ from .integrations.github import (
     GitHubWorkstreamError,
     NullGitHubWorkstreamClient,
 )
-from .orchestration.check_failure import CheckRepairAttempt
 from .review import Reviewer, ReviewParseError, ReviewResult, parse_review
 from .result import RunResult
 from .run_options import (
@@ -153,7 +151,6 @@ __all__ = [
     "ClaudeRuntimeError",
     "CodexRuntimeConfig",
     "CheckResult",
-    "CheckRepairAttempt",
     "BlockerKind",
     "CodexAgent",
     "CodexAuthStatus",
@@ -252,7 +249,6 @@ __all__ = [
     "prepare_claude_home",
     "build_planner_payload",
     "build_implementer_payload",
-    "build_check_repair_payload",
     "build_semantic_revision_payload",
     "build_final_review_payload",
     "effective_run_config",

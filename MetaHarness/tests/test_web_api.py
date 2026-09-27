@@ -61,6 +61,7 @@ class WebServerTests(unittest.TestCase):
             "planner": ModelProfile("planner", "Planner", (ExecutionRole.PLANNER,), ProfileDriver.OPENAI_CHAT, "planner", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
             "implementer": ModelProfile("implementer", "Implementer", (ExecutionRole.IMPLEMENTER,), ProfileDriver.EXTERNAL, "worker", SelectionMode.CLI, argv=("true",)),
             "reviewer": ModelProfile("reviewer", "Reviewer", (ExecutionRole.REVIEWER,), ProfileDriver.OPENAI_CHAT, "reviewer", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
+            "auditor": ModelProfile("auditor", "Auditor", (ExecutionRole.AUDITOR,), ProfileDriver.EXTERNAL, "audit", SelectionMode.CLI, argv=("true",)),
         }
         self.config = HarnessConfig(
             repo=root,
@@ -75,6 +76,7 @@ class WebServerTests(unittest.TestCase):
             ui=UIConfig(
                 default_planner_profile="planner",
                 default_reviewer_profile="reviewer",
+                default_audit_profile="auditor",
             ),
             model_profiles=profiles,
             routing=RoutingConfig(
@@ -446,7 +448,7 @@ class WebServerTests(unittest.TestCase):
             f"/api/runs/{run_id}/approval",
             {
                 "decision": "APPROVE",
-                "final_reviewer_profile": "reviewer",
+                "audit_profile": "auditor",
                 "step_profile__S01": "implementer",
             },
             self.server.browser_token,
@@ -492,7 +494,7 @@ class WebServerTests(unittest.TestCase):
             json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),
             encoding="utf-8",
         )
-        fields = {"_token": self.server.browser_token, "decision": "APPROVE", "final_reviewer_profile": "r"}
+        fields = {"_token": self.server.browser_token, "decision": "APPROVE", "audit_profile": "auditor"}
         twelve = {f"step_profile__S{number:02d}": "luna" for number in range(1, 13)}
         # The fields for the actual bundle are accepted; the gate then refuses
         # this deliberately incomplete synthetic run.

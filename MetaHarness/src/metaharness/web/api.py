@@ -914,9 +914,7 @@ def approve_run(
     decision: str,
     *,
     config: HarnessConfig | None = None,
-    final_reviewer_profile: object = None,
-    semantic_reviser_profile: object = None,
-    check_repair_profile: object = None,
+    audit_profile: object = None,
     step_profiles: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Perform the only web mutation through the core approval API."""
@@ -932,43 +930,22 @@ def approve_run(
         raise WebAPIError(409, "run is not awaiting plan approval")
     if state.get("planning_protocol") != "v2":
         raise WebAPIError(409, "run is not a pipeline v2 run")
-    reviser_profile = semantic_reviser_profile
-    repair_profile = check_repair_profile
-    semantic_revision_enabled = check_repair_required = False
     if selected is ApprovalDecision.APPROVE:
         if not is_profile_aware_run(state):
             raise WebAPIError(409, "run has no planner profile")
-        if config is None or not isinstance(step_profiles, Mapping) or not isinstance(final_reviewer_profile, str):
-            raise WebAPIError(400, "step profiles and final_reviewer_profile are required")
+        if config is None or not isinstance(step_profiles, Mapping):
+            raise WebAPIError(400, "step profiles are required")
         try:
             snapshot, _ = read_run_options_for_state(directory, state)
             config = effective_run_config(config, snapshot)
         except RunOptionsError as exc:
             raise WebAPIError(409, "run options are invalid") from exc
-        # A semantic reviser or check-repair field never enables a pipeline
-        # implicitly: only the immutable creation snapshot decides this.
-        semantic_revision_enabled = snapshot.semantic_revision_enabled
-        check_repair_required = (
-            snapshot.max_check_repair_attempts > 0 or snapshot.max_correction_cycles > 0
-        )
         if any(not isinstance(value, str) for value in step_profiles.values()):
             raise WebAPIError(400, "invalid step profile field")
-        if reviser_profile is not None and not semantic_revision_enabled:
-            raise WebAPIError(400, "semantic_reviser_profile requires semantic revision")
-        if repair_profile is not None and not check_repair_required:
-            raise WebAPIError(400, "check_repair_profile requires a correction budget")
-        # Each default comes from its own frozen key: the check-repair
-        # profile is never derived from the reviser.
-        if semantic_revision_enabled and reviser_profile is None:
-            reviser_profile = snapshot.semantic_reviser_profile
-        if check_repair_required and repair_profile is None:
-            repair_profile = snapshot.check_repair_profile
-        for name, value in (
-            ("semantic_reviser_profile", reviser_profile),
-            ("check_repair_profile", repair_profile),
-        ):
-            if value is not None and (not isinstance(value, str) or not value):
-                raise WebAPIError(400, f"{name} is invalid")
+        if audit_profile is None:
+            audit_profile = snapshot.audit_profile
+        if not isinstance(audit_profile, str) or not audit_profile:
+            raise WebAPIError(400, "audit_profile is required")
     # 3. Verify the plan artifacts shown to the human.
     stored = state.get("plan_identity")
     if not isinstance(stored, dict):
@@ -1017,9 +994,7 @@ def approve_run(
                 for entry in bundle["steps"]
             ],
             step_profile_ids={key: value for key, value in step_profiles.items()},
-            semantic_reviser_profile_id=reviser_profile if semantic_revision_enabled else None,
-            check_repair_profile_id=repair_profile if check_repair_required else None,
-            final_reviewer_profile_id=final_reviewer_profile,
+            audit_profile_id=audit_profile,
         )
     except (ProfileError, ExecutionSelectionError) as exc:
         raise WebAPIError(400, "selected profile is invalid") from exc
@@ -1079,12 +1054,8 @@ def _execution_state(selection: ExecutionSelection) -> dict[str, Any]:
             {"step_id": item.step_id, "implementer": asdict(item.implementer)}
             for item in selection.steps
         ],
-        "final_reviewer": asdict(selection.final_reviewer),
+        "audit": asdict(selection.audit),
     }
-    if selection.check_repair is not None:
-        state["check_repair"] = asdict(selection.check_repair)
-    if selection.semantic_reviser is not None:
-        state["semantic_reviser"] = asdict(selection.semantic_reviser)
     return state
 
 
@@ -1098,9 +1069,7 @@ def model_profiles(config: HarnessConfig) -> dict[str, Any]:
         "reasoning": config.routing.reasoning_profile,
         "agentic": config.routing.agentic_profile,
         "planner_profile": config.ui.default_planner_profile,
-        "final_reviewer_profile": config.ui.default_reviewer_profile,
-        "semantic_reviser_profile": config.ui.default_reviser_profile,
-        "check_repair_profile": config.ui.default_repair_profile,
+        "audit_profile": config.ui.default_audit_profile,
     }
     return {
         "profiles": [safe_profile_metadata(profile) for profile in profiles.values()],
@@ -1117,12 +1086,7 @@ def create_run(
     mechanical_profile: object = None,
     reasoning_profile: object = None,
     agentic_profile: object = None,
-    final_reviewer_profile: object = None,
-    semantic_reviser_profile: object = None,
-    check_repair_profile: object = None,
-    semantic_revision_enabled: object = None,
-    max_check_repair_attempts: object = None,
-    max_correction_cycles: object = None,
+    audit_profile: object = None,
     decomposition: object = None,
     execution_mode_policy: object = None,
     single_step_max_mutable_paths: object = None,
@@ -1167,12 +1131,7 @@ def create_run(
             "mechanical_profile": profile(mechanical_profile, "mechanical_profile"),
             "reasoning_profile": profile(reasoning_profile, "reasoning_profile"),
             "agentic_profile": profile(agentic_profile, "agentic_profile"),
-            "final_reviewer_profile": profile(final_reviewer_profile, "final_reviewer_profile"),
-            "semantic_reviser_profile": optional_profile(semantic_reviser_profile, "semantic_reviser_profile"),
-            "check_repair_profile": optional_profile(check_repair_profile, "check_repair_profile"),
-            "semantic_revision_enabled": boolean(semantic_revision_enabled, "semantic_revision_enabled"),
-            "max_check_repair_attempts": integer(max_check_repair_attempts, "max_check_repair_attempts"),
-            "max_correction_cycles": integer(max_correction_cycles, "max_correction_cycles"),
+            "audit_profile": profile(audit_profile, "audit_profile"),
             "decomposition": decomposition,
             "execution_mode_policy": execution_mode_policy,
             "single_step_max_mutable_paths": integer(single_step_max_mutable_paths, "single_step_max_mutable_paths"),
@@ -1224,7 +1183,7 @@ LIVE_STOP_STATUSES = frozenset({
     "waiting_human",
     "awaiting_plan_approval",
     "waiting_remote", "waiting_external",
-    "waiting_contract_repair", "waiting_check_repair",
+    "waiting_contract_repair",
 })
 _CONTRACT_REPAIR_PHASES = {
     "running": "Contract repair",

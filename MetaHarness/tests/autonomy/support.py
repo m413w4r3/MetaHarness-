@@ -33,7 +33,6 @@ SPEC = "Make feature.txt hold the requested content.\n"
 # of these for an ordinary failure is the false stop the property forbids.
 FALSE_HUMAN_STOP_STATUSES = frozenset({
     RunStatus.WAITING_HUMAN,
-    RunStatus.WAITING_CHECK_REPAIR,
     RunStatus.WAITING_CONTRACT_REPAIR,
 })
 

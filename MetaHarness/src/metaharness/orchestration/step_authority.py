@@ -58,6 +58,18 @@ def mutable_paths(step: ImplementationStep) -> tuple[str, ...]:
     return tuple(sorted({*step.write_set, *step.create_set, *step.delete_set}))
 
 
+def future_step_ownership(
+    steps: Sequence[ImplementationStep], index: int,
+) -> dict[str, tuple[str, ...]]:
+    """Paths assigned to later approved steps, for verification dependencies."""
+
+    return {
+        step.id: paths
+        for step in steps[index + 1:]
+        if (paths := mutable_paths(step))
+    }
+
+
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 

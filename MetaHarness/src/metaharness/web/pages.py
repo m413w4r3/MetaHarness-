@@ -106,14 +106,12 @@ _TERMINAL_LABELS = {
     "waiting_external": "WAITING FOR EXTERNAL AUTHORIZATION",
     "waiting_remote": "WAITING FOR REMOTE",
     "waiting_contract_repair": "WAITING FOR CONTRACT REPAIR PLANNER",
-    "waiting_check_repair": "WAITING FOR DETERMINISTIC GATE RETRY",
 }
 _WAITING_LABELS = {
     "waiting_external": "Waiting for external authorization",
     "waiting_remote": "Waiting for remote",
     "waiting_human": "Waiting for operator decision",
     "waiting_contract_repair": "Output correction exhausted",
-    "waiting_check_repair": "Check repair budget exhausted",
 }
 TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
 AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
@@ -170,19 +168,8 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
         "mechanical": _new_profile_options(config, "implementer", defaults.mechanical_profile),
         "reasoning": _new_profile_options(config, "implementer", defaults.reasoning_profile),
         "agentic": _new_profile_options(config, "implementer", defaults.agentic_profile),
-        "reviewer": _new_profile_options(config, "reviewer", defaults.final_reviewer_profile),
-        "reviser": _new_profile_options(config, "reviser", defaults.semantic_reviser_profile, optional=True),
-        "repair": _new_profile_options(config, "repair", defaults.check_repair_profile, optional=True),
+        "audit": _new_profile_options(config, "auditor", defaults.audit_profile),
     }
-    semantic_revision = "enabled" if defaults.semantic_revision_enabled else "disabled"
-    check_attempt_options = "".join(
-        f'<option value="{value}"{" selected" if defaults.max_check_repair_attempts == value else ""}>{value}</option>'
-        for value in range(11)
-    )
-    review_cycle_options = "".join(
-        f'<option value="{value}"{" selected" if defaults.max_correction_cycles == value else ""}>{value}</option>'
-        for value in range(11)
-    )
     body = f'''<main><p><a href="/">← Tous les runs</a></p><h1>New Run</h1>
 <dl><dt>Repository</dt><dd class="mono">{_e(config.repo)}</dd><dt>Base ref</dt><dd class="mono">{_e(config.base_ref)}</dd>
 <dt>Execution policy</dt><dd>{_e(_execution_policy_label(config))}</dd>
@@ -196,12 +183,7 @@ def render_new_run(config: HarnessConfig, token: str, *, nonce: str | None = Non
 <label for="mechanical-profile">MECHANICAL</label><select id="mechanical-profile" name="mechanical_profile" required>{options["mechanical"]}</select>
 <label for="reasoning-profile">REASONING</label><select id="reasoning-profile" name="reasoning_profile" required>{options["reasoning"]}</select>
 <label for="agentic-profile">AGENTIC</label><select id="agentic-profile" name="agentic_profile" required>{options["agentic"]}</select>
-<label for="reviewer-profile">Final reviewer</label><select id="reviewer-profile" name="final_reviewer_profile" required>{options["reviewer"]}</select>
-<label for="semantic-revision">Semantic revision</label><select id="semantic-revision" name="semantic_revision_enabled" required><option value="enabled"{" selected" if semantic_revision == "enabled" else ""}>enabled</option><option value="disabled"{" selected" if semantic_revision == "disabled" else ""}>disabled</option></select>
-<label for="reviser-profile">Semantic reviser profile</label><select id="reviser-profile" name="semantic_reviser_profile" aria-describedby="reviser-help">{options["reviser"]}</select><p id="reviser-help" class="muted">The profile's declared role and executor determine whether the selection is valid.</p>
-<label for="check-repair-attempts">Maximum check-repair attempts</label><select id="check-repair-attempts" name="max_check_repair_attempts" required>{check_attempt_options}</select>
-<label for="repair-cycles">Maximum correction cycles</label><select id="repair-cycles" name="max_correction_cycles" required>{review_cycle_options}</select>
-<label for="repair-profile">Check-repair profile</label><select id="repair-profile" name="check_repair_profile">{options["repair"]}</select>
+<label for="audit-profile">High-tier audit</label><select id="audit-profile" name="audit_profile" required>{options["audit"]}</select>
 <label for="decomposition">Decomposition</label><select id="decomposition" name="decomposition" required><option value="balanced"{" selected" if defaults.decomposition == "balanced" else ""}>balanced</option><option value="aggressive"{" selected" if defaults.decomposition == "aggressive" else ""}>aggressive</option></select>
 <label for="execution-mode-policy">Execution mode</label><select id="execution-mode-policy" name="execution_mode_policy" required><option value="auto"{" selected" if defaults.execution_mode_policy == "auto" else ""}>auto</option><option value="require-staged"{" selected" if defaults.execution_mode_policy == "require-staged" else ""}>require-staged</option></select>
 <label for="single-limit">SINGLE mutable paths</label><input id="single-limit" name="single_step_max_mutable_paths" type="number" min="1" step="1" value="{_e(defaults.single_step_max_mutable_paths)}" required>
@@ -476,44 +458,15 @@ def _v2_approval_form(
             f'{_profile_options(config, "implementer", selected)}</select>'
             f'{_contract_block(artifact_map.get(step_id, {}))}</section>'
         )
-    reviewer = (
-        requested_profiles.get("final_reviewer_profile")
-        or planner.get("reviewer_recommendation")
+    frozen_profiles = options.get("profiles") if isinstance(options.get("profiles"), dict) else {}
+    audit = (
+        requested_profiles.get("audit_profile")
+        or frozen_profiles.get("audit_profile")
+        or (config.ui.default_audit_profile if config is not None else None)
     )
-    # Each optional role is shown according to the durable V2 budgets.  The
-    # profile catalogue, not a driver-name convention, determines options.
-    cycle_profiles = ""
-    pipeline = options.get("pipeline") if isinstance(options.get("pipeline"), dict) else {}
-    semantic_revision = bool(pipeline.get("semantic_revision_enabled"))
-    check_repair = (
-        pipeline.get("max_check_repair_attempts", 0) > 0
-        or pipeline.get("max_correction_cycles", 0) > 0
-    )
-    if config is not None and semantic_revision:
-        reviser = requested_profiles.get("semantic_reviser_profile")
-        reviser_meta = metadata.get(reviser, {})
-        cycle_profiles += (
-            '<section class="card revision-profile"><h3>Semantic reviser</h3>'
-            f'<p><span class="mono">{_e(reviser_meta.get("driver"))}</span> / '
-            f'<span class="mono">{_e(reviser_meta.get("model"))}</span> · '
-            f'recommended {_profile_triplet(reviser, reviser_meta.get("model"), reviser_meta.get("effort"))}</p>'
-            '<label for="reviser-profile">Semantic reviser (selected)</label>'
-            f'<select id="reviser-profile" name="semantic_reviser_profile" required>{_profile_options(config, "reviser", reviser)}</select></section>'
-        )
-    if config is not None and check_repair:
-        repair = requested_profiles.get("check_repair_profile")
-        repair_meta = metadata.get(repair, {})
-        cycle_profiles += (
-            '<section class="card repair-profile"><h3>Check repair and review corrections</h3>'
-            f'<p><span class="mono">{_e(repair_meta.get("driver"))}</span> / '
-            f'<span class="mono">{_e(repair_meta.get("model"))}</span> · '
-            f'recommended {_profile_triplet(repair, repair_meta.get("model"), repair_meta.get("effort"))}</p>'
-            '<label for="repair-profile">Check-repair profile (selected)</label>'
-            f'<select id="repair-profile" name="check_repair_profile" required>{_profile_options(config, "repair", repair)}</select></section>'
-        )
     execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
     planner_selected = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
-    reviewer_meta = metadata.get(reviewer, {})
+    audit_meta = metadata.get(audit, {})
     return f'''<section class="card"><h2>Execution plan</h2>
 <p>Execution mode: <strong>{_e(planner.get("execution_mode"))}</strong></p>
 <p>Steps: {_e(len(rows))}</p>
@@ -521,7 +474,7 @@ def _v2_approval_form(
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE">
 <h3>Planner</h3><p class="mono">{_e(planner_selected.get("profile_id") or "—")} / {_e(planner_selected.get("model") or "—")}</p>
 <h3>Initial implementation</h3><ul class="plan-steps">{"".join(overview)}</ul>
-{"".join(rows)}{cycle_profiles}<section class="card reviewer-profile"><h3>Reviewer</h3><p>recommended {_profile_triplet(reviewer, reviewer_meta.get("model"), reviewer_meta.get("selection_mode"))}</p><label for="reviewer-profile">Final reviewer (selected)</label><select id="reviewer-profile" name="final_reviewer_profile" required>{_profile_options(config, "reviewer", reviewer)}</select></section><br><button class="approve" type="submit">APPROVE PLAN</button></form>
+{"".join(rows)}<section class="card audit-profile"><h3>Audit</h3><p>{_profile_triplet(audit, audit_meta.get("model"), audit_meta.get("selection_mode"))}</p><label for="audit-profile">High-tier auditor</label><select id="audit-profile" name="audit_profile" required>{_profile_options(config, "auditor", audit)}</select></section><br><button class="approve" type="submit">APPROVE PLAN</button></form>
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT PLAN</button></form></section>'''
 
 
@@ -996,7 +949,6 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     if status not in {
         "failed", "blocked", "interrupted", "waiting_remote", "waiting_external",
         "waiting_human", "waiting_contract_repair",
-        "waiting_check_repair",
     } or not isinstance(failure, dict):
         return ""
     reason = str(failure.get("reason") or "")

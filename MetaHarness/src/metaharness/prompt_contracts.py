@@ -411,50 +411,6 @@ def build_implementer_payload(
     )
 
 
-def build_check_repair_payload(
-    *,
-    spec: str,
-    failed_check_ids: str,
-    failed_check_evidence: str,
-    read_set: str = "Only paths named in the failed-check evidence and direct local imports.",
-    compact_contract_invariants: str,
-    changed_files: str,
-    mutable_scope: str,
-    candidate_identity: str = "",
-    template: str | None = None,
-    budget_bytes: int = 40_000,
-) -> PromptPayload:
-    """Build the bounded corrective worker contract."""
-
-    if template is None:
-        template = _default_template("check_repair.txt")
-    sections = (
-        _section("spec", spec, True),
-        _section("failed_check_ids", failed_check_ids, True),
-        _section("read_set", read_set, True),
-        _section("failed_check_evidence", failed_check_evidence, False),
-        _section("compact_contract_invariants", compact_contract_invariants, False),
-        _section("changed_files", changed_files, False),
-        _section("mutable_scope", mutable_scope, True),
-        _section("candidate_identity", candidate_identity, True),
-    )
-    placeholders = {
-        "{{SPEC}}": "spec",
-        "{{FAILED_CHECK_IDS}}": "failed_check_ids",
-        "{{READ_SET}}": "read_set",
-        "{{CHECK_DETAILS}}": "failed_check_evidence",
-        "{{CONTRACT_INVARIANTS}}": "compact_contract_invariants",
-        "{{CHANGED_FILES}}": "changed_files",
-        "{{MUTABLE_SCOPE}}": "mutable_scope",
-        "{{CANDIDATE_IDENTITY}}": "candidate_identity",
-    }
-    return _payload_from_template(
-        role="check-repair", template=template, sections=sections,
-        placeholders=placeholders, budget_bytes=budget_bytes,
-        secondary_order=("failed_check_evidence", "changed_files", "compact_contract_invariants"),
-    )
-
-
 def build_semantic_revision_payload(
     *,
     spec: str,
@@ -572,7 +528,6 @@ __all__ = [
     "PromptPayload",
     "build_planner_payload",
     "build_implementer_payload",
-    "build_check_repair_payload",
     "build_semantic_revision_payload",
     "build_final_review_payload",
     "write_prompt_diagnostics",

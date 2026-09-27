@@ -19,15 +19,12 @@ from typing import Any, Sequence
 from .check_failure import hard_failure_items
 from .pipeline_v2 import (
     candidate_dir,
-    check_repair_attempt_dir,
-    check_repair_attempts_dir,
     gate_dir,
     step_dir,
 )
 from .shared import (
     MAX_AGENT_REPORT_BYTES,
     PLANNER_CONVERSATION,
-    CheckRepairScope,
     GateMutableAuthority,
     bounded_v2_report,
     is_object_id,
@@ -36,7 +33,6 @@ from .shared import (
     read_json_artifact,
 )
 from ..models import GateStage
-from ..scope import normalize_repo_paths
 from ..evidence import EvidenceBundle
 from ..gitops import RepositoryReference
 from ..resume import ResumeIntegrityError
@@ -308,198 +304,29 @@ def read_repository_reference(run_dir: Path) -> RepositoryReference | None:
 
 
 CYCLE_SCOPE_SOURCE = "cycle mutable scope"
-EVIDENCE_SCOPE_SOURCE = "failure evidence within approved mutable scope"
-SCOPE_REQUEST_SOURCE = "explicit META SCOPE REQUEST v1"
-GATE_SCOPE_EXPANSION_ARTIFACT = "scope-expansion.json"
 
 
 def mutable_scope_sha256(paths: Sequence[str]) -> str:
-    """Hash the canonical, sorted JSON representation of a mutable scope."""
-
     return hashlib.sha256(json_text(sorted(set(paths))).encode("utf-8")).hexdigest()
 
 
-def _read_scope_artifact(directory: Path, *, fallback_base: Sequence[str]) -> CheckRepairScope:
-    """Read one recorded check-repair scope; a malformed one fails closed."""
-
-    payload = read_json_artifact(directory / "scope.json", 64 * 1024)
-    approved = tuple(sorted(set(fallback_base)))
-    if not isinstance(payload, dict) or payload.get("schema_version") != 4:
-        raise ResumeIntegrityError("check-repair scope artifact is malformed or unsupported")
-    raw = [
-        payload.get("approved_mutable_scope"), payload.get("initial_repair_scope"),
-        payload.get("added_paths"), payload.get("effective_repair_scope"),
-    ]
-    if not all(isinstance(value, list) for value in raw):
-        raise ResumeIntegrityError("check-repair scope artifact is malformed")
-    try:
-        parsed = [tuple(sorted(set(normalize_repo_paths(paths)))) for paths in raw]
-    except ValueError as exc:
-        raise ResumeIntegrityError(
-            "check-repair scope artifact contains invalid paths"
-        ) from exc
-    if any(raw[index] != list(value) for index, value in enumerate(parsed)):
-        raise ResumeIntegrityError("check-repair scope artifact is not canonical")
-    parsed_approved, parsed_initial, parsed_added, parsed_effective = parsed
-    if (
-        not set(approved).issubset(parsed_approved)
-        or not set(parsed_initial).issubset(parsed_approved)
-        or not set(parsed_added).issubset(parsed_approved)
-        or set(parsed_initial) & set(parsed_added)
-        or parsed_effective != tuple(sorted(set(parsed_initial) | set(parsed_added)))
-    ):
-        raise ResumeIntegrityError("check-repair scope artifact does not match its envelope")
-    source = payload.get("source")
-    if source not in {CYCLE_SCOPE_SOURCE, EVIDENCE_SCOPE_SOURCE, SCOPE_REQUEST_SOURCE}:
-        raise ResumeIntegrityError("check-repair scope artifact has invalid provenance")
-    if parsed_added and source != SCOPE_REQUEST_SOURCE:
-        raise ResumeIntegrityError("check-repair added paths have an invalid provenance")
-    if not parsed_added and source not in {CYCLE_SCOPE_SOURCE, EVIDENCE_SCOPE_SOURCE}:
-        raise ResumeIntegrityError("check-repair initial scope has an invalid provenance")
-    return CheckRepairScope(
-        approved_mutable_scope=parsed_approved,
-        initial_repair_scope=parsed_initial,
-        added_paths=parsed_added,
-        effective_repair_scope=parsed_effective,
-        source=source,
-    )
-
-
-def _pending_scope_expansion(
-    run_dir: Path, cycle: int, stage: GateStage, attempt: int,
-) -> tuple[str, ...]:
-    """The ladder expansion authorized for one not-yet-recorded repair pass."""
-
-    directory = check_repair_attempt_dir(run_dir, cycle, stage, attempt)
-    if (directory / "scope.json").is_file():
-        # The pass is recorded: its own scope artifact is authoritative.
-        return ()
-    payload = read_json_artifact(directory / GATE_SCOPE_EXPANSION_ARTIFACT, 64 * 1024)
-    if payload is None:
-        return ()
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
-        raise ResumeIntegrityError("gate recovery scope expansion artifact is malformed")
-    if payload.get("attempt") != attempt:
-        raise ResumeIntegrityError("gate recovery scope expansion belongs to another attempt")
-    failed = payload.get("failed_check_ids")
-    if not isinstance(failed, list) or any(not isinstance(name, str) or not name for name in failed):
-        raise ResumeIntegrityError("gate recovery scope expansion has invalid failed checks")
-    added = payload.get("added_paths")
-    if not isinstance(added, list) or any(not isinstance(item, str) for item in added):
-        raise ResumeIntegrityError("gate recovery scope expansion contains invalid paths")
-    canonical = tuple(sorted(set(added)))
-    if list(canonical) != added:
-        raise ResumeIntegrityError("gate recovery scope expansion is not canonical")
-    try:
-        normalize_repo_paths(canonical)
-    except ValueError as exc:
-        raise ResumeIntegrityError(
-            "gate recovery scope expansion contains unsafe paths"
-        ) from exc
-    return canonical
-
-
-def _with_ladder_expansion(
-    authority: GateMutableAuthority, *,
-    run_dir: Path, cycle: int, stage: GateStage, through_attempt: int | None,
-) -> GateMutableAuthority:
-    """Fold the ladder expansion of the pending repair pass into its authority."""
-
-    if through_attempt is None:
-        return authority
-    added = _pending_scope_expansion(run_dir, cycle, stage, through_attempt + 1)
-    if not added:
-        return authority
-    effective = tuple(sorted(set(authority.effective_paths) | set(added)))
-    return GateMutableAuthority(
-        base_paths=authority.base_paths,
-        added_paths=tuple(sorted(set(authority.added_paths) | set(added))),
-        effective_paths=effective,
-        source=SCOPE_REQUEST_SOURCE,
-        sha256=mutable_scope_sha256(effective),
-        initial_paths=authority.initial_paths,
-    )
-
-
 def gate_mutable_authority(
-    run_dir: Path,
-    cycle: int,
-    stage: GateStage | str,
-    *,
+    run_dir: Path, cycle: int, stage: GateStage | str, *,
     base_paths: Sequence[str],
-    through_attempt: int | None = None,
-    require_attempt_records: bool = False,
 ) -> GateMutableAuthority:
-    """Rebuild and validate the exact mutation authority of one gate episode."""
+    """The plan's immutable gate scope; audit edits have their own proof."""
 
     base = tuple(sorted(set(base_paths)))
-    root = check_repair_attempts_dir(run_dir, cycle, stage)
-    if not root.is_dir():
-        return GateMutableAuthority(
-            base_paths=base, added_paths=(), effective_paths=base,
-            source=CYCLE_SCOPE_SOURCE, sha256=mutable_scope_sha256(base), initial_paths=(),
-        )
-    if through_attempt is not None and (
-        isinstance(through_attempt, bool)
-        or not isinstance(through_attempt, int)
-        or through_attempt < 0
-    ):
-        raise ResumeIntegrityError("check-repair scope attempt bound is invalid")
-    directories = sorted(
-        (
-            path for path in root.iterdir()
-            if path.is_dir() and path.name.isdigit()
-            and (through_attempt is None or int(path.name) <= through_attempt)
-        ),
-        key=lambda path: int(path.name),
+    return GateMutableAuthority(
+        base_paths=base, added_paths=(), effective_paths=base,
+        source=CYCLE_SCOPE_SOURCE, sha256=mutable_scope_sha256(base), initial_paths=(),
     )
-    if not directories:
-        if through_attempt:
-            raise ResumeIntegrityError("check-repair scope attempts are missing")
-        return _with_ladder_expansion(GateMutableAuthority(
-            base_paths=base, added_paths=(), effective_paths=base,
-            source=CYCLE_SCOPE_SOURCE, sha256=mutable_scope_sha256(base), initial_paths=(),
-        ), run_dir=run_dir, cycle=cycle, stage=stage, through_attempt=through_attempt)
-    scopes: list[CheckRepairScope] = []
-    for expected, directory in enumerate(directories, start=1):
-        if int(directory.name) != expected:
-            raise ResumeIntegrityError("check-repair scope attempts are not contiguous")
-        if not (directory / "scope.json").is_file():
-            raise ResumeIntegrityError("check-repair scope attempt artifacts are incomplete")
-        scope = _read_scope_artifact(directory, fallback_base=base)
-        if require_attempt_records:
-            attempt = read_json_artifact(directory / "attempt.json", 128 * 1024)
-            if (
-                not isinstance(attempt, dict)
-                or attempt.get("number") != expected
-                or attempt.get("mutable_scope") != list(scope.effective_repair_scope)
-            ):
-                raise ResumeIntegrityError("check-repair attempt is not bound to its scope")
-        if scopes and not set(scopes[-1].added_paths).issubset(scope.added_paths):
-            raise ResumeIntegrityError("check-repair scope additions are not cumulative")
-        if scopes and scopes[-1].initial_repair_scope != scope.initial_repair_scope:
-            raise ResumeIntegrityError("check-repair initial scope changed between attempts")
-        scopes.append(scope)
-    if through_attempt is not None and len(scopes) != through_attempt:
-        raise ResumeIntegrityError("check-repair scope attempts are not contiguous")
-    final = scopes[-1]
-    return _with_ladder_expansion(GateMutableAuthority(
-        base_paths=final.approved_mutable_scope,
-        added_paths=final.added_paths,
-        effective_paths=final.effective_repair_scope,
-        source=final.source,
-        sha256=mutable_scope_sha256(final.effective_repair_scope),
-        initial_paths=final.initial_repair_scope,
-    ), run_dir=run_dir, cycle=cycle, stage=stage, through_attempt=through_attempt)
 
 
 __all__ = [
-    "CYCLE_SCOPE_SOURCE", "EVIDENCE_SCOPE_SOURCE", "GATE_SCOPE_EXPANSION_ARTIFACT",
-    "SCOPE_REQUEST_SOURCE",
-    "FAILED_CONTINUED", "SKIPPED_DEPENDENCY",
+    "CYCLE_SCOPE_SOURCE", "FAILED_CONTINUED", "SKIPPED_DEPENDENCY",
     "accepted_review", "candidate_evidence", "completed_step_records",
     "gate_mutable_authority", "load_completed_step", "load_evidence", "load_revision",
-    "mutable_scope_sha256", "settled_step_status",
-    "read_candidate_record", "read_planner_conversation",
-    "read_repository_reference", "reusable_pre_checks",
+    "mutable_scope_sha256", "settled_step_status", "read_candidate_record",
+    "read_planner_conversation", "read_repository_reference", "reusable_pre_checks",
 ]

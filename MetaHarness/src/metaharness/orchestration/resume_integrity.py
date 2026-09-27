@@ -66,6 +66,7 @@ from ..execution_selection import (
     read_execution_selection_with_sha256,
     validate_execution_selection,
 )
+from ..scope import ScopeViolation
 from ..gitops import (
     GitError,
     RepositoryReference,
@@ -550,6 +551,15 @@ def validate_resume(
     validate_correction_bindings(run_dir, number)
     current_cycle = read_cycle_record(run_dir, number) if number > 1 else RunCycle(1, CycleKind.INITIAL)
     scope = _approved_scope(config, selection, run_dir, plan, checkpoint)
+    for report_path in sorted((run_dir / "cycles" / f"{number:03d}" / "audit").glob("*/report.json")):
+        audit = read_json_artifact(report_path)
+        paths = audit.get("changed_paths") if isinstance(audit, dict) else None
+        if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+            _refuse("audit path evidence is malformed")
+        try:
+            scope.update(config.scope.check(paths, worktree=worktree))
+        except ScopeViolation as exc:
+            _refuse(exc.detail)
     if current_cycle.kind is CycleKind.CHECK_REPLAN:
         # A cycle one red gate re-decomposed plans before it opens, so its
         # checkpoint never has to carry the plan: the durable answer does.
@@ -594,6 +604,18 @@ def validate_resume(
                 commit_parents(repo, head) == (checkpoint.expected_head_sha,)
                 and resolve_tree(repo, head) == expected_tree
             )
+            if checkpoint.phase is ResumePhase.AUDIT:
+                reports = sorted((run_dir / "cycles" / f"{number:03d}" / "audit").glob("*/report.json"))
+                audit = read_json_artifact(reports[-1]) if reports else None
+                if (
+                    isinstance(audit, dict)
+                    and audit.get("commit_sha") == head
+                    and audit.get("input_tree") == expected_tree
+                    and audit.get("tree_after") == resolve_tree(repo, head)
+                    and commit_parents(repo, head) == (checkpoint.expected_head_sha,)
+                ):
+                    advanced = True
+                    expected_tree = audit["tree_after"]
             if advanced and checkpoint.phase is ResumePhase.DETERMINISTIC_GATE and checkpoint.stage is not None:
                 acceptance = read_json_artifact(
                     gate_acceptance_path(run_dir, number, checkpoint.stage)
@@ -723,9 +745,15 @@ def validate_resume(
             evidence = candidate_evidence(run_dir, number)
             if evidence is None or evidence.staged_tree_sha != expected_tree:
                 _refuse("the candidate evidence is missing or not for the approved tree")
-            review = accepted_review(review_dir(run_dir, number), evidence, head)
-            if review is None or review.verdict is not ReviewVerdict.PASS or review.route is not ReviewRoute.NONE:
-                _refuse("the reviewer PASS is missing for the candidate")
+            if evidence.changed_files:
+                reports = sorted((run_dir / "cycles" / f"{number:03d}" / "audit").glob("*/report.json"))
+                audit = read_json_artifact(reports[-1]) if reports else None
+                if (
+                    not isinstance(audit, dict)
+                    or audit.get("status") not in {"DONE", "NEEDS_WORK"}
+                    or audit.get("tree_after") != expected_tree
+                ):
+                    _refuse("the audit is missing for the candidate")
         if current_cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION and (
             checkpoint.phase is ResumePhase.SEMANTIC_REVISION
             or (

@@ -375,7 +375,7 @@ class FrozenRunOptionsSchemaTests(unittest.TestCase):
             mechanical_profile="worker",
             reasoning_profile="worker",
             agentic_profile="worker",
-            final_reviewer_profile="reviewer",
+            audit_profile="auditor",
         )
         snapshot = options.to_dict()
         snapshot["schema_version"] = SCHEMA_VERSION - 1
@@ -496,14 +496,13 @@ TRANSITION_MATRIX = (
     (R.IMPLEMENT_STEP, RunEvent.advance(R.STEP_ACCEPTANCE), R.STEP_ACCEPTANCE, D.RUNNING),
     (R.STEP_ACCEPTANCE, RunEvent.advance(R.IMPLEMENT_STEP), R.IMPLEMENT_STEP, D.RUNNING),
     (R.IMPLEMENT_STEP, RunEvent.advance(R.DETERMINISTIC_GATE), R.DETERMINISTIC_GATE, D.RUNNING),
-    # A red gate repairs, then re-validates, as often as its budget admits.
-    (R.DETERMINISTIC_GATE, RunEvent.advance(R.CHECK_REPAIR), R.CHECK_REPAIR, D.RUNNING),
-    (R.CHECK_REPAIR, RunEvent.advance(R.DETERMINISTIC_GATE), R.DETERMINISTIC_GATE, D.RUNNING),
+    (R.DETERMINISTIC_GATE, RunEvent.advance(R.AUDIT), R.AUDIT, D.RUNNING),
+    (R.AUDIT, RunEvent.advance(R.DETERMINISTIC_GATE), R.DETERMINISTIC_GATE, D.RUNNING),
     (R.DETERMINISTIC_GATE, RunEvent.advance(R.SEMANTIC_REVISION), R.SEMANTIC_REVISION, D.RUNNING),
     (R.SEMANTIC_REVISION, RunEvent.advance(R.DETERMINISTIC_GATE), R.DETERMINISTIC_GATE, D.RUNNING),
     (R.DETERMINISTIC_GATE, RunEvent.advance(R.CANDIDATE_READY), R.CANDIDATE_READY, D.RUNNING),
     (R.CANDIDATE_READY, RunEvent.advance(R.CANDIDATE_PUSH), R.CANDIDATE_PUSH, D.RUNNING),
-    (R.CANDIDATE_PUSH, RunEvent.advance(R.FINAL_REVIEW), R.FINAL_REVIEW, D.RUNNING),
+    (R.CANDIDATE_PUSH, RunEvent.advance(R.PUBLISH), R.PUBLISH, D.RUNNING),
     # A reviewed candidate is published, or opens one bounded correction cycle.
     (R.FINAL_REVIEW, RunEvent.advance(R.PUBLISH), R.PUBLISH, D.RUNNING),
     (R.FINAL_REVIEW, RunEvent.advance(R.REVIEW_IMPLEMENTATION), R.REVIEW_IMPLEMENTATION, D.RUNNING),
@@ -520,7 +519,7 @@ TRANSITION_MATRIX = (
     (R.IMPLEMENT_STEP, RunEvent.wait(D.WAIT_EXTERNAL, reason="AGENT_TIMEOUT"), R.IMPLEMENT_STEP, D.WAIT_EXTERNAL),
     (R.DETERMINISTIC_GATE, RunEvent.wait(D.WAIT_EXTERNAL, reason="CHECK_TIMEOUT"), R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL),
     (R.FINAL_REVIEW, RunEvent.wait(D.WAIT_HUMAN, reason="SPEC_DECISION_REQUIRED"), R.FINAL_REVIEW, D.WAIT_HUMAN),
-    (R.DETERMINISTIC_GATE, RunEvent.wait(D.WAIT_HUMAN, reason="CHECK_REPAIR_EXHAUSTED"), R.DETERMINISTIC_GATE, D.WAIT_HUMAN),
+    (R.DETERMINISTIC_GATE, RunEvent.wait(D.WAIT_HUMAN, reason="CHECK_TIMEOUT"), R.DETERMINISTIC_GATE, D.WAIT_HUMAN),
     (R.IMPLEMENT_STEP, RunEvent.fail(reason="AGENT_SCOPE_VIOLATION"), R.IMPLEMENT_STEP, D.FAILED),
     (R.PUBLISH, RunEvent.fail(reason="PUSH_REJECTED"), R.PUBLISH, D.FAILED),
     (R.PUBLISH, RunEvent.complete(), R.PUBLISH, D.COMPLETED),
@@ -573,8 +572,8 @@ PROJECTION_MATRIX = (
     (R.FINAL_REVIEW, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_EXTERNAL, True, True),
     # An exhausted bounded repair slot waits for a resume, never a decision.
     (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, "STEP_CONTRACT_REPAIR_OUTPUT_INVALID", RunStatus.WAITING_CONTRACT_REPAIR, True, True),
-    (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_REPAIR_EXHAUSTED", RunStatus.WAITING_CHECK_REPAIR, True, True),
-    (R.FINAL_REVIEW, D.WAIT_HUMAN, "CHECK_REPAIR_EXHAUSTED", RunStatus.WAITING_HUMAN, False, False),
+    (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
+    (R.FINAL_REVIEW, D.WAIT_HUMAN, "CHECK_TIMEOUT", RunStatus.WAITING_HUMAN, False, False),
     # An operator gate owns its durable pending operation; a human wait with
     # no gate and no repair slot owns nothing to resume.
     (R.SEMANTIC_REVISION, D.WAIT_HUMAN, None, RunStatus.WAITING_HUMAN, False, False),
@@ -591,7 +590,7 @@ class RunMachineTests(unittest.TestCase):
         """A minimal coherent checkpoint for *phase*."""
 
         phase_fields: dict = {}
-        if phase in {RunPhase.DETERMINISTIC_GATE, RunPhase.CHECK_REPAIR}:
+        if phase is RunPhase.DETERMINISTIC_GATE:
             phase_fields["stage"] = GateStage.POST_IMPLEMENTATION
             if phase is RunPhase.CHECK_REPAIR:
                 phase_fields["check_repair_attempt"] = 1
@@ -699,7 +698,6 @@ class RunMachineTests(unittest.TestCase):
             ("waiting_remote", D.WAIT_EXTERNAL),
             ("waiting_human", D.WAIT_HUMAN),
             ("waiting_contract_repair", D.WAIT_EXTERNAL),
-            ("waiting_check_repair", D.WAIT_EXTERNAL),
             ("failed", D.FAILED),
             ("interrupted", D.FAILED),
             ("committed", D.COMPLETED),
@@ -740,7 +738,6 @@ class RunMachineTests(unittest.TestCase):
 
     def test_a_run_state_written_before_the_vocabulary_is_read_through_the_bridge(self) -> None:
         for status, disposition in (
-            ("waiting_check_repair", D.WAIT_EXTERNAL),
             ("waiting_remote", D.WAIT_EXTERNAL),
             ("failed", D.FAILED),
         ):
@@ -767,14 +764,14 @@ class RunStateProjectionTests(unittest.TestCase):
 
     def test_set_run_state_derives_the_status_from_the_posture(self) -> None:
         state = self.store.set_run_state(
-            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_REPAIR_EXHAUSTED"),
+            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT"),
             current_step=None,
         )
-        self.assertEqual(state["status"], RunStatus.WAITING_CHECK_REPAIR.value)
+        self.assertEqual(state["status"], RunStatus.WAITING_EXTERNAL.value)
         self.assertEqual(state["disposition"], D.WAIT_EXTERNAL.value)
         self.assertEqual(state["phase"], RunPhase.DETERMINISTIC_GATE.value)
-        self.assertEqual(state["reason"], "CHECK_REPAIR_EXHAUSTED")
-        self.assertEqual(self.store.load()["status"], RunStatus.WAITING_CHECK_REPAIR.value)
+        self.assertEqual(state["reason"], "CHECK_TIMEOUT")
+        self.assertEqual(self.store.load()["status"], RunStatus.WAITING_EXTERNAL.value)
 
     def test_set_run_state_owns_the_status(self) -> None:
         with self.assertRaises(ValueError):
@@ -796,7 +793,7 @@ class RunStateProjectionTests(unittest.TestCase):
 
     def test_a_metadata_update_never_moves_the_machine_state(self) -> None:
         before = self.store.set_run_state(
-            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_REPAIR_EXHAUSTED"),
+            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT"),
         )
         machine_before = self.store.machine_state()
         after = self.store.update_metadata(checks=[{"name": "test", "ok": True}])
@@ -805,7 +802,7 @@ class RunStateProjectionTests(unittest.TestCase):
             self.assertEqual(after[field], before[field], field)
         self.assertEqual(self.store.machine_state(), machine_before)
         self.assertEqual(
-            self.store.outcome().status, RunStatus.WAITING_CHECK_REPAIR,
+            self.store.outcome().status, RunStatus.WAITING_EXTERNAL,
         )
 
     def test_no_caller_can_author_the_status_or_the_machine_state(self) -> None:

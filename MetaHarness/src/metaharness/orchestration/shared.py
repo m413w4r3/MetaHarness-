@@ -556,22 +556,6 @@ def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
 
 
 @dataclasses.dataclass(frozen=True)
-class CheckRepairScope:
-    """The mutable scope of one check-repair pass.
-
-    ``added_paths`` are the paths the pass admitted beyond its initial,
-    evidence-derived scope.  They authorize this gate episode only: the durable
-    plan and the authority of a later step never inherit them.
-    """
-
-    approved_mutable_scope: tuple[str, ...]
-    initial_repair_scope: tuple[str, ...]
-    added_paths: tuple[str, ...]
-    effective_repair_scope: tuple[str, ...]
-    source: str
-
-
-@dataclasses.dataclass(frozen=True)
 class GateMutableAuthority:
     """The one durable mutation authority of a gate episode."""
 

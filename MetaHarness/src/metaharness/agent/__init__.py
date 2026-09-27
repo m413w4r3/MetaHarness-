@@ -37,16 +37,13 @@ from .codex import (
     classify_codex_failure,
 )
 from .protocol import (
-    CheckRepairResult,
     deferred_verify_dependency,
-    parse_check_repair_result,
 )
 from .events import extract_final, extract_usage, parse_event
 from .runtime import CodexRuntimeError, prepare_codex_home
 
 __all__ = [
     "AgentCommittedError",
-    "CheckRepairResult",
     "AgentError",
     "AgentExecutor",
     "AgentExecutorCapabilities",
@@ -82,6 +79,5 @@ __all__ = [
     "extract_final",
     "extract_usage",
     "parse_event",
-    "parse_check_repair_result",
     "prepare_codex_home",
 ]

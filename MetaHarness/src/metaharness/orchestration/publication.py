@@ -46,8 +46,6 @@ from ..commit_gate import (
 from ..integrations.github import GitHubWorkstreamError
 from ..models import (
     PublishMode,
-    ReviewRoute,
-    ReviewVerdict,
     RunDisposition,
     RunMachineState,
 )
@@ -78,11 +76,9 @@ from .candidate import (
 from .pipeline_v2 import (
     PipelineFailure,
     PipelineV2Context,
-    review_dir,
 )
 from .recovery import project_exit
 from .durable_readers import (
-    accepted_review,
     candidate_evidence,
 )
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
@@ -121,7 +117,7 @@ class PublicationService:
         payload: dict[str, int | str] = {}
         for key in (
             "remote_branch", "issue_number", "pull_request_number",
-            "reviewed_candidate_sha",
+            "candidate_commit_sha",
         ):
             value = state.get(key)
             if isinstance(value, (str, int)) and not isinstance(value, bool):
@@ -211,7 +207,7 @@ class PublicationService:
         commit_sha: str,
         cycle: int | None,
     ) -> None:
-        """Create the requested PR from the exact reviewed run branch."""
+        """Create the requested PR from the accepted, gated run branch."""
 
         github = self.runtime.config.github
         if not github.enabled or github.pull_request_mode == "off":
@@ -228,26 +224,19 @@ class PublicationService:
                 "GitHub pull-request creation requires a published run branch",
                 code="GITHUB_PR_REQUIRES_RUN_BRANCH",
             )
-        review = state.get("review")
-        reviewed_candidate_sha = state.get("reviewed_candidate_sha")
         accepted_candidate_sha = state.get("candidate_commit_sha")
         if (
-            not isinstance(review, Mapping)
-            or review.get("verdict") != ReviewVerdict.PASS.value
-            or review.get("route") not in {None, ReviewRoute.NONE.value}
-            or not _is_object_id(reviewed_candidate_sha)
-            or not _is_object_id(accepted_candidate_sha)
-            or reviewed_candidate_sha != accepted_candidate_sha
-            or reviewed_candidate_sha != commit_sha
+            not _is_object_id(accepted_candidate_sha)
+            or accepted_candidate_sha != commit_sha
         ):
             raise GitHubWorkstreamError(
-                "GitHub pull-request candidate authority is not an exact PASS candidate",
+                "GitHub pull-request candidate authority is not the accepted candidate",
                 code="GITHUB_PR_CANDIDATE_MISMATCH",
             )
         try:
             if current_head(info.worktree) != accepted_candidate_sha:
                 raise GitHubWorkstreamError(
-                    "local accepted candidate does not match the reviewed candidate",
+                    "local accepted candidate does not match the candidate commit",
                     code="GITHUB_PR_CANDIDATE_MISMATCH",
                 )
             remote_tip = remote_run_branch_tip(
@@ -266,18 +255,18 @@ class PublicationService:
                 "remote run branch tip could not be verified",
                 code="GITHUB_PR_CANDIDATE_MISMATCH",
             ) from None
-        if remote_tip != reviewed_candidate_sha:
+        if remote_tip != accepted_candidate_sha:
             raise GitHubWorkstreamError(
-                "remote run branch tip does not match the reviewed candidate",
+                "remote run branch tip does not match the accepted candidate",
                 code="GITHUB_PR_CANDIDATE_MISMATCH",
             )
         plan_state = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
         plan_title = plan_state.get("title") if isinstance(plan_state.get("title"), str) else "MetaHarness run"
         title = self._github_issue_title(plan_title, run_id)
         body = (
-            "MetaHarness reviewed workstream metadata.\n\n"
+            "MetaHarness accepted workstream metadata.\n\n"
             f"Run ID: {run_id}\n"
-            f"Reviewed commit: {commit_sha}\n"
+            f"Accepted commit: {commit_sha}\n"
             f"Head branch: {info.branch}\n"
             f"Base branch: {self.runtime.config.base_ref}\n"
         )
@@ -301,7 +290,7 @@ class PublicationService:
             data={
                 "remote_branch": info.branch,
                 "pull_request_number": number,
-                "reviewed_candidate_sha": reviewed_candidate_sha,
+                "candidate_commit_sha": accepted_candidate_sha,
             },
             once=True,
         )
@@ -329,30 +318,18 @@ class PublicationService:
         self, store: RunStateStore, ctx: PipelineV2Context, number: int,
         candidate: Mapping[str, Any],
     ) -> RunResult:
-        """Publish the reviewed candidate of cycle *number* after its PASS."""
+        """Publish the candidate accepted by the post-audit deterministic gate."""
 
-        # Only the exact SHA a durable reviewer PASS names is ever published.
         evidence = candidate_evidence(ctx.run_dir, number)
-        review = (
-            accepted_review(review_dir(ctx.run_dir, number), evidence, candidate["commit_sha"])
-            if evidence is not None and evidence.staged_tree_sha == candidate["tree_sha"]
-            else None
-        )
         if (
-            review is None
-            or review.verdict is not ReviewVerdict.PASS
-            or review.route is not ReviewRoute.NONE
+            evidence is None
+            or not evidence.deterministic_passed
+            or evidence.staged_tree_sha != candidate["tree_sha"]
         ):
             raise PipelineFailure(
-                "REVIEW_AUTHORITY_MISSING",
-                "no accepted reviewer PASS names the candidate commit",
+                "DETERMINISTIC_GATE_FAILED", "candidate has no accepted green gate",
             )
         if candidate.get("no_change") is True:
-            if not review.summary.startswith("SPEC_ALREADY_SATISFIED:"):
-                raise PipelineFailure(
-                    "REVIEW_AUTHORITY_MISSING",
-                    "no-change PASS must explicitly confirm SPEC_ALREADY_SATISFIED",
-                )
             self.runtime.cycle_update(store, number, status="completed_no_change")
             state = store.set_run_state(
                 RunMachineState(disposition=RunDisposition.COMPLETED),
@@ -505,7 +482,7 @@ class PublicationService:
         repository_reference: RepositoryReference,
         cycle: int,
     ) -> RunResult:
-        """Publish an already pushed candidate, only after reviewer PASS."""
+        """Publish an already pushed candidate after the authoritative gate."""
 
         self._validate_github_publication_mode()
         fields: dict[str, Any] = {"commit_sha": commit_sha, "current_step": None, "cycle": cycle}
@@ -550,16 +527,18 @@ class PublicationService:
                 or not required_checks_passed(final_evidence)
             ):
                 raise GitError("final deterministic gate evidence is missing or failed")
-            review = accepted_review(
-                review_dir(run_dir, cycle), final_evidence, commit_sha
-            )
-            if (
-                review is None
-                or review.verdict is not ReviewVerdict.PASS
-                or review.route is not ReviewRoute.NONE
-                or state.get("reviewed_candidate_sha") != commit_sha
-            ):
-                raise GitError("reviewer PASS does not name the exact candidate commit")
+            if final_evidence.changed_files:
+                audit_root = run_dir / "cycles" / f"{cycle:03d}" / "audit"
+                reports = sorted(audit_root.glob("*/report.json"))
+                if not reports:
+                    raise GitError("candidate has no audit report")
+                audit = _read_json_artifact(reports[-1])
+                if (
+                    not isinstance(audit, dict)
+                    or audit.get("status") not in {"DONE", "NEEDS_WORK"}
+                    or audit.get("tree_after") != approved_tree
+                ):
+                    raise GitError("audit does not name the exact candidate tree")
             remote_required = self.runtime.config.publish.enabled or (
                 self.runtime.config.github.enabled
                 and self.runtime.config.github.pull_request_mode == "create"

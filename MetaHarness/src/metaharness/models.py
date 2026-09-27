@@ -278,7 +278,6 @@ class RunStatus(StrEnum):
     WAITING_HUMAN = "waiting_human"
     AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
     WAITING_EXTERNAL = "waiting_external"
-    WAITING_CHECK_REPAIR = "waiting_check_repair"
     WAITING_REMOTE = "waiting_remote"
     WAITING_CONTRACT_REPAIR = "waiting_contract_repair"
     PLAN_REJECTED = "plan_rejected"
@@ -313,6 +312,7 @@ class RunPhase(StrEnum):
     # only its deterministic acceptance and commit remain.  Never a worker.
     STEP_ACCEPTANCE = "step_acceptance"
     DETERMINISTIC_GATE = "deterministic_gate"
+    AUDIT = "audit"
     CHECK_REPAIR = "check_repair"
     # The cycle a red gate's cycle replan opened: its approved decomposition is
     # loaded from the durable check-replan transaction and its steps run.
@@ -330,7 +330,7 @@ class RunDisposition(StrEnum):
     """The only postures a durable run can be in.
 
     Every finer business state is a ``(phase, disposition, reason)`` triple:
-    no ``WAITING_CHECK_REPAIR``, ``REVALIDATING`` or ``CONTRACT_REPAIRING``
+    no ``REVALIDATING`` or ``CONTRACT_REPAIRING``
     posture exists, because those name an operation or a failure detail.
     """
 
@@ -364,7 +364,6 @@ RUN_CHECKPOINT_NAME = "resume_checkpoint.json"
 # operation; the projection and the resume gate both read them as the machine
 # reason, never as a status.
 CONTRACT_REPAIR_WAIT_REASON = "STEP_CONTRACT_REPAIR_OUTPUT_INVALID"
-CHECK_REPAIR_WAIT_REASON = "CHECK_REPAIR_EXHAUSTED"
 PLAN_REJECTED_REASON = "PLAN_REJECTED"
 INTERRUPTED_REASON = "INTERRUPTED"
 
@@ -538,14 +537,16 @@ _RUN_PHASE_SUCCESSORS: Mapping[RunPhase, frozenset[RunPhase]] = {
     RunPhase.DETERMINISTIC_GATE: frozenset({
         RunPhase.DETERMINISTIC_GATE, RunPhase.CHECK_REPAIR,
         RunPhase.SEMANTIC_REVISION, RunPhase.CANDIDATE_READY, RunPhase.CHECK_REPLAN,
+        RunPhase.AUDIT,
     }),
+    RunPhase.AUDIT: frozenset({RunPhase.DETERMINISTIC_GATE}),
     RunPhase.CHECK_REPAIR: frozenset({RunPhase.CHECK_REPAIR, RunPhase.DETERMINISTIC_GATE}),
     # A new decomposition is implemented by its own cycle and returns to the
     # deterministic gate, exactly like every other cycle of the pipeline.
     RunPhase.CHECK_REPLAN: frozenset({RunPhase.IMPLEMENT_STEP, RunPhase.DETERMINISTIC_GATE}),
     RunPhase.SEMANTIC_REVISION: frozenset({RunPhase.DETERMINISTIC_GATE, RunPhase.CANDIDATE_READY}),
     RunPhase.CANDIDATE_READY: frozenset({RunPhase.CANDIDATE_PUSH}),
-    RunPhase.CANDIDATE_PUSH: frozenset({RunPhase.FINAL_REVIEW}),
+    RunPhase.CANDIDATE_PUSH: frozenset({RunPhase.PUBLISH}),
     RunPhase.FINAL_REVIEW: frozenset({
         RunPhase.PUBLISH, RunPhase.SEMANTIC_REVISION,
         RunPhase.REVIEW_IMPLEMENTATION, RunPhase.REVIEW_REPLAN,
@@ -649,6 +650,7 @@ _RUNNING_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.CHECK_REPAIR: RunStatus.REVISING,
     RunPhase.CHECK_REPLAN: RunStatus.IMPLEMENTING,
     RunPhase.SEMANTIC_REVISION: RunStatus.REVISING,
+    RunPhase.AUDIT: RunStatus.REVISING,
     RunPhase.CANDIDATE_READY: RunStatus.APPROVED,
     RunPhase.CANDIDATE_PUSH: RunStatus.APPROVED,
     RunPhase.FINAL_REVIEW: RunStatus.REVIEWING,
@@ -676,7 +678,6 @@ _REMOTE_PHASES = frozenset({RunPhase.CANDIDATE_PUSH, RunPhase.PUBLISH})
 # it refused is pending, so an operator retry resumes exactly that pass.
 _REPAIR_SLOT_WAITS: Mapping[tuple[str, RunPhase], RunStatus] = {
     (CONTRACT_REPAIR_WAIT_REASON, RunPhase.IMPLEMENT_STEP): RunStatus.WAITING_CONTRACT_REPAIR,
-    (CHECK_REPAIR_WAIT_REASON, RunPhase.DETERMINISTIC_GATE): RunStatus.WAITING_CHECK_REPAIR,
 }
 
 
@@ -739,7 +740,6 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.WAITING_HUMAN: RunDisposition.WAIT_HUMAN,
     RunStatus.AWAITING_PLAN_APPROVAL: RunDisposition.RUNNING,
     RunStatus.WAITING_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
-    RunStatus.WAITING_CHECK_REPAIR: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_REMOTE: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_CONTRACT_REPAIR: RunDisposition.WAIT_EXTERNAL,
     RunStatus.PLAN_REJECTED: RunDisposition.WAIT_HUMAN,
@@ -1121,6 +1121,7 @@ class UIConfig:
     default_reviewer_profile: str | None = None
     default_reviser_profile: str | None = None
     default_repair_profile: str | None = None
+    default_audit_profile: str | None = None
     enable_profile_recommendation: bool = True
 
 
@@ -1315,11 +1316,7 @@ class ExecutionSelection:
     schema_version: int
     planner: SelectedProfile
     steps: tuple[StepExecutionSelection, ...]
-    check_repair: SelectedProfile | None
-    semantic_reviser: SelectedProfile | None
-    final_reviewer: SelectedProfile
-    check_repair_fallbacks: tuple[SelectedProfile, ...] = ()
-    semantic_reviser_fallbacks: tuple[SelectedProfile, ...] = ()
+    audit: SelectedProfile
 
 
 @dataclass(frozen=True)

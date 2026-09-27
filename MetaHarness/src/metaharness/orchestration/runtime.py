@@ -64,23 +64,19 @@ from ..run_options import (
 from ..state import RunStateStore
 from ..trace import TraceSink, TraceStream
 from ..validation import ValidationError
-from .candidate_review import CandidateReviewService
+from .audit import AuditService
 from .check_recovery import CheckInfrastructureRecovery
-from .check_replan_service import CheckReplanService
 from .contract_recovery import ContractRecoveryService
 from .durable_readers import read_repository_reference
 from .gates import GateService
 from .pipeline_v2 import PipelineV2Coordinator, PipelineV2Context
 from .publication import PublicationService
 from .recovery import RecoveryCoordinator
-from .review_correction import ReviewCorrectionService
-from .review_recovery import ReviewRecovery
 from .resume_integrity import ResumedRun
 from .run_bootstrap import RunBootstrap
 from .run_composition import RunComposition
 from .run_failure import RunFailure
 from .run_observability import RunObservability
-from .semantic_revision import SemanticRevisionService
 from .shared import (
     OrchestrationError, RECOVERY_ATTEMPT_ARTIFACTS, archive_attempt,
     archive_attempt_target, chat_client,
@@ -88,7 +84,6 @@ from .shared import (
 )
 from .step_acceptance import StepAcceptanceService
 from .step_execution import StepExecutionService
-from .step_replan import StepReplanService
 from .worker_attempt import WorkerAttemptService
 from .worker_recovery import WorkerRecovery
 
@@ -149,15 +144,11 @@ class RunRuntime:
         self.worker_attempt = WorkerAttemptService(self)
         self.step_acceptance = StepAcceptanceService(self)
         self.contract_recovery = ContractRecoveryService(self)
-        self.step_replan = StepReplanService(self)
         self.gates = GateService(self)
+        self.audit = AuditService(self)
         # The review domain, split by authority: the reviewer decision, the
         # review-driven corrections, the one scope policy a correction applies,
         # the semantic revision pass and the red-gate cycle replan.
-        self.reviews = CandidateReviewService(self)
-        self.review_correction = ReviewCorrectionService(self)
-        self.semantic_revision = SemanticRevisionService(self)
-        self.check_replan = CheckReplanService(self)
         self.publication = PublicationService(self)
 
         # The four run authorities; each one owns its own module and reads the
@@ -202,9 +193,6 @@ class RunRuntime:
         return CheckInfrastructureRecovery(
             self.recovery(store), store=store, budgets=self.run_options.recovery,
         )
-
-    def review_recovery(self, store: RunStateStore) -> ReviewRecovery:
-        return ReviewRecovery(self.recovery(store), budgets=self.run_options.recovery)
 
     def worker_recovery(self, store: RunStateStore) -> WorkerRecovery:
         return WorkerRecovery(

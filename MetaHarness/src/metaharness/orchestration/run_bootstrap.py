@@ -341,15 +341,7 @@ class RunBootstrap:
                 self.runtime.config,
                 planner_profile_id=planner_profile_id,
                 plan_steps=plan.steps,
-                semantic_reviser_profile_id=(
-                    self.runtime.run_options.semantic_reviser_profile
-                    if revision_enabled or repair_enabled else None
-                ),
-                check_repair_profile_id=(
-                    self.runtime.run_options.check_repair_profile
-                    if check_repair_enabled else None
-                ),
-                final_reviewer_profile_id=self.runtime.run_options.final_reviewer_profile,
+                audit_profile_id=self.runtime.run_options.audit_profile,
                 fallback_authority=self.runtime.run_options.recovery.execution_fallbacks,
             )
             selection = ensure_execution_selection(run_dir, requested)
@@ -385,11 +377,7 @@ class RunBootstrap:
                 for item in selection.steps
             ],
         }
-        if selection.semantic_reviser is not None:
-            execution_state["semantic_reviser"] = asdict(selection.semantic_reviser)
-        if selection.check_repair is not None:
-            execution_state["check_repair"] = asdict(selection.check_repair)
-        execution_state["final_reviewer"] = asdict(selection.final_reviewer)
+        execution_state["audit"] = asdict(selection.audit)
         store.update_metadata(execution=execution_state,
                               plan_identity=asdict(durable_identity))
         self.runtime.observability.trace_emit(

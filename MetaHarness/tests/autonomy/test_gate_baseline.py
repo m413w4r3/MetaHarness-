@@ -72,6 +72,11 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(1, 2)
 '''
 
+AUDIT_DONE = (
+    "META AUDIT v1\n\nSTATUS\nDONE\n\nFIXED\n- none\n\n"
+    "REFACTORED\n- none\n\nREMAINING\n- none\n\nRISKS\n- none\nEND META AUDIT\n"
+)
+
 
 class GateBaselineTests(AutonomyHarness):
     def failing_tests(self) -> list[str]:
@@ -101,6 +106,7 @@ class GateBaselineTests(AutonomyHarness):
             write("component.py", "VALUE = 2\n"),
             write("component.py", "VALUE = 2\n"),
         )
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
 
         result = self.orchestrator(
             self.config(),
@@ -136,6 +142,7 @@ description = "integration check whose infrastructure is unavailable"
             required_checks=("test", "integration"),
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
 
         result = self.orchestrator(
             self.config(extra_checks=extra_checks), planner=[plan], reviewer=[review()],
