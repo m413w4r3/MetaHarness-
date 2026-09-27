@@ -160,6 +160,19 @@ class RequestShapeTests(unittest.TestCase):
 
 
 class RetryTests(unittest.TestCase):
+    def test_bridge_post_submission_502_is_not_replayed(self) -> None:
+        for details in (
+            {"code": "active_signal_stalled", "submission_state": "post_submission"},
+            {"code": "bridge_extension_disconnected", "retryable": False},
+        ):
+            with self.subTest(details=details):
+                with Server(lambda h, d=details: send_json(h, 502, {"error": d})) as server:
+                    with self.assertRaisesRegex(LLMHTTPError, "no replay"):
+                        OpenAIChatTextClient(
+                            endpoint(server.base_url, max_wait_seconds=1)
+                        ).complete("p")
+                self.assertEqual(len(server.requests), 1)
+
     def test_retryable_statuses_end_in_a_typed_transport_exhaustion(self) -> None:
         for status in (408, 429, 500, 502, 503, 504):
             with self.subTest(status=status):

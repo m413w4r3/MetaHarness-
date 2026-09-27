@@ -384,6 +384,10 @@ class OpenAIChatTextClient:
             except urllib.error.HTTPError as exc:
                 status = exc.code
                 elapsed_ms = round((time.monotonic() - attempt_started) * 1000)
+                # A bridge can return 502 *after* sending the prompt. Its
+                # structured error is authoritative about replay safety;
+                # the HTTP status alone cannot authorize another submission.
+                no_replay = _http_error_forbids_replay(exc)
                 try:
                     exc.close()
                 except OSError:
@@ -392,13 +396,14 @@ class OpenAIChatTextClient:
                     "http_response", attempt=attempts, http_status=status,
                     elapsed_ms=elapsed_ms,
                 )
-                if status not in _RETRYABLE_STATUS_CODES:
+                if status not in _RETRYABLE_STATUS_CODES or no_replay:
                     self._transport_event(
                         "waiting_external", attempt=attempts, http_status=status,
                         elapsed_ms=round((time.monotonic() - started) * 1000),
                     )
                     raise LLMHTTPError(
                         f"LLM endpoint returned HTTP {status}"
+                        + (" (submission already attempted; no replay)" if no_replay else "")
                     ) from None
                 retry_after = _retry_after_seconds(exc.headers)
                 failure = f"HTTP {status}"
@@ -451,6 +456,24 @@ class OpenAIChatTextClient:
             f"LLM transport horizon of {self.config.max_wait_seconds}s exhausted "
             f"after {attempts} attempt(s){detail}"
         )
+
+
+def _http_error_forbids_replay(error: urllib.error.HTTPError) -> bool:
+    """Honor a structured post-submission failure without exposing its body."""
+    try:
+        body = error.read(16_385)
+        if not body or len(body) > 16_384:
+            return False
+        payload = json.loads(body)
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    detail = payload.get("error")
+    return isinstance(detail, dict) and (
+        detail.get("submission_state") == "post_submission"
+        or detail.get("retryable") is False
+    )
 
 
 def _api_key(env_name: str, environment: Mapping[str, str] | None = None) -> str:
