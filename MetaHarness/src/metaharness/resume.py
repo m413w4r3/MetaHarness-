@@ -20,7 +20,6 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _EARLY = frozenset({RunPhase.CONTEXT, RunPhase.PLANNER})
 _FIELDS = frozenset({"schema_version", "iteration", "phase", "step_index", "last_green_commit", "plan_sha256"})
 CHECKPOINT_INTEGRITY_OPERATION = "checkpoint_integrity"
-STEP_ACCEPTANCE_OPERATION = "step_acceptance"
 
 
 class ResumeCheckpointError(ValueError):
@@ -109,7 +108,7 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
     return {
         RunPhase.CONTEXT: "Retry context", RunPhase.PLANNER: "Retry planner",
         RunPhase.PLAN_APPROVAL: "Resume plan approval", RunPhase.WORKTREE_SETUP: "Retry workspace setup",
-        RunPhase.IMPLEMENT_STEP: f"Retry step {checkpoint.step_index}", RunPhase.STEP_ACCEPTANCE: "Retry step acceptance",
+        RunPhase.IMPLEMENT_STEP: f"Retry step {checkpoint.step_index}",
         RunPhase.DETERMINISTIC_GATE: "Retry deterministic gate", RunPhase.AUDIT: "Retry audit",
         RunPhase.CANDIDATE_READY: "Prepare candidate", RunPhase.CANDIDATE_PUSH: "Push candidate", RunPhase.PUBLISH: "Retry publish",
     }[checkpoint.phase]
@@ -171,11 +170,10 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
         return ResumeInfo(False, reason="the run stopped at a non-resumable failure")
     if checkpoint is None:
         return ResumeInfo(False, reason="no resume checkpoint")
-    operation = STEP_ACCEPTANCE_OPERATION if checkpoint.phase is RunPhase.STEP_ACCEPTANCE else None
     return ResumeInfo(
         True, checkpoint.phase.value, resume_label(checkpoint), iteration=checkpoint.iteration,
         step_index=checkpoint.step_index, last_green_commit=checkpoint.last_green_commit,
-        operation=operation, disposition=outcome.disposition.value,
+        disposition=outcome.disposition.value,
     )
 
 
@@ -189,7 +187,7 @@ class ResumeRequiresOperatorError(ResumeError):
 
 __all__ = [
     "CHECKPOINT_INTEGRITY_OPERATION", "PHASE_STATUS", "RUN_SCHEMA_UNSUPPORTED",
-    "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint", "ResumeCheckpointError",
+    "ResumeCheckpoint", "ResumeCheckpointError",
     "ResumeError", "ResumeInfo", "ResumeIntegrityError", "ResumeNotAllowedError",
     "ResumePhase", "ResumeRequiresOperatorError", "ResumeSchemaUnsupportedError",
     "checkpoint_payload", "pipeline_version_from_state", "read_checkpoint",

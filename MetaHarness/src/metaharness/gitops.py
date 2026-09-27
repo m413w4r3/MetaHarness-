@@ -1631,8 +1631,9 @@ def rewind_worktree(worktree: Path, commit_sha: str) -> str:
     """Move the checked-out branch back to one accepted commit.
 
     The branch ref, the index and the worktree move together, so the worktree
-    is exactly the tree of *commit_sha* with no staged, unstaged or untracked
-    difference left behind.  Re-executing approved cycle work rewinds to the
+    is exactly the tree of *commit_sha* with no staged, unstaged or
+    non-ignored untracked difference left behind.  Existing ignored workspace
+    setup is preserved.  Re-executing approved cycle work rewinds to the
     boundary that work started from; every history-changing command stays in
     this module and the restored state is proven before returning.
     """
@@ -1665,7 +1666,7 @@ def rewind_worktree(worktree: Path, commit_sha: str) -> str:
                 target.unlink()
             elif os.path.lexists(target):
                 raise GitError("the replay boundary encountered a non-file path")
-    _git(root, "clean", "-fdxq", timeout=600)
+    _git(root, "clean", "-fdq", timeout=600)
     if (
         current_head(root) != commit
         or candidate_tree_sha(root) != tree

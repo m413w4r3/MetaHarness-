@@ -323,9 +323,6 @@ class RunPhase(StrEnum):
     PLAN_APPROVAL = "plan_approval"
     WORKTREE_SETUP = "worktree_setup"
     IMPLEMENT_STEP = "implement_step"
-    # A successful worker candidate is durable (``step_candidate.json``);
-    # only its deterministic acceptance and commit remain.  Never a worker.
-    STEP_ACCEPTANCE = "step_acceptance"
     DETERMINISTIC_GATE = "deterministic_gate"
     AUDIT = "audit"
     CANDIDATE_READY = "candidate_ready"
@@ -536,9 +533,8 @@ _RUN_PHASE_SUCCESSORS: Mapping[RunPhase, frozenset[RunPhase]] = {
     RunPhase.PLAN_APPROVAL: frozenset({RunPhase.WORKTREE_SETUP}),
     RunPhase.WORKTREE_SETUP: frozenset({RunPhase.IMPLEMENT_STEP}),
     RunPhase.IMPLEMENT_STEP: frozenset({
-        RunPhase.IMPLEMENT_STEP, RunPhase.STEP_ACCEPTANCE, RunPhase.DETERMINISTIC_GATE,
+        RunPhase.IMPLEMENT_STEP, RunPhase.DETERMINISTIC_GATE,
     }),
-    RunPhase.STEP_ACCEPTANCE: frozenset({RunPhase.IMPLEMENT_STEP, RunPhase.DETERMINISTIC_GATE}),
     RunPhase.DETERMINISTIC_GATE: frozenset({
         RunPhase.DETERMINISTIC_GATE, RunPhase.CANDIDATE_READY, RunPhase.AUDIT,
     }),
@@ -633,7 +629,6 @@ _RUNNING_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.PLAN_APPROVAL: RunStatus.AWAITING_PLAN_APPROVAL,
     RunPhase.WORKTREE_SETUP: RunStatus.PREPARING,
     RunPhase.IMPLEMENT_STEP: RunStatus.IMPLEMENTING,
-    RunPhase.STEP_ACCEPTANCE: RunStatus.IMPLEMENTING,
     RunPhase.DETERMINISTIC_GATE: RunStatus.VALIDATING,
     RunPhase.AUDIT: RunStatus.REVISING,
     RunPhase.CANDIDATE_READY: RunStatus.APPROVED,

@@ -25,10 +25,9 @@ write goes through `RunStateStore` and uses atomic replacement.
 | `check_authority.json` | Trusted check IDs and argv frozen at approval |
 | `plan_approval.json` | One exclusive APPROVE/REJECT decision bound to the plan, bundle and execution-selection hashes |
 | `planner.conversation.json` | Only when the driver officially returned a planner conversation handle (never simulated) |
-| `planner_recovery.json` | Operator plan recovery: `source: operator`, previous and replacement raw hashes, `planner_called: false` |
 | `setup/results.json` / `setup/*.log` | Workspace dependency setup results and redacted logs |
 | `accepted-chain.json` | Every commit MetaHarness accepted on the run branch (commit, tree, parent) |
-| `resume_checkpoint.json` | The next operation that has not yet succeeded, with its expected HEAD/tree and correction bundle hash |
+| `resume_checkpoint.json` | The next operation to resume, its last accepted commit, and the effective plan hash |
 | `publish.json` | Successful publication: mode, target, remote, run branch, commit SHA, optional safe GitHub URL |
 | `state.json` / `state.lock` | Atomic run state; the lock file serializes every state write and is never served |
 | `trace/events.v1.jsonl` | Observation-only META TRACE v1 stream (see `docs/architecture.md`) |
@@ -43,7 +42,7 @@ the initial implementation; every later cycle is one review-driven correction.
 | --- | --- |
 | `cycles/NNN/cycle.json` | Cycle identity. For NNN > 001: the source review cycle, route, candidate SHA and SHA-256 of the accepted `review.json`, and the resulting kind |
 | `cycles/NNN/implementation/steps/Sxx/` | Per-step prompt, events, report, `step.json` (trees, changed paths, usage, effective authority hashes once accepted), `diff.patch` and `token_diagnostics.json` |
-| `.../steps/Sxx/step_candidate.json` | Self-hashed successful worker candidate written before `step_acceptance`: parent, trees, changed paths, effective authority/contract SHA-256, verification |
+| `.../steps/Sxx/step_candidate.json` | Self-hashed successful worker candidate written before the internal acceptance transaction: parent, trees, changed paths, effective authority/contract SHA-256, verification |
 | `.../steps/Sxx/step_acceptance.json` | Commit-gate outcome (`accepted` or `refused` with a stable `COMMIT_*` code) and the authority SHA-256 the gate used |
 | `.../steps/Sxx/step_authority.json` | Advisory copy of the effective authority an attempt ran with (recomputed, never trusted) |
 | `cycles/NNN/checks/<stage>/` | One deterministic gate: `evidence.json`, `checks.json`, `checks/*.log`, `diff.patch`, `changed-files.txt` |

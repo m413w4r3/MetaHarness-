@@ -53,7 +53,6 @@ _AUTH_ALIASES = frozenset({
 # The trace phase of a recovery loop names its durable phase.
 _TRACE_CHECKPOINT = {
     "implementation": RunPhase.IMPLEMENT_STEP,
-    "step_acceptance": RunPhase.STEP_ACCEPTANCE,
     "workspace setup": RunPhase.WORKTREE_SETUP,
     "preparing": RunPhase.WORKTREE_SETUP,
     "checks": RunPhase.DETERMINISTIC_GATE,

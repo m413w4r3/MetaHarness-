@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from metaharness.config import load_config
+from metaharness.gitops import current_head, index_tree_sha, resolve_tree
 from metaharness.models import ExecutionRole, RunMachineState, RunPhase, RunStatus
 from metaharness.orchestration.gates import GateService
 from metaharness.resume import resume_info
@@ -47,16 +48,12 @@ class ResumeTests(PipelineHarness):
         (worktree / "feature.txt").write_text("partial feature\n")
         (worktree / "other.txt").write_text("partial other\n")
         (worktree / "attempt-new.txt").write_text("uncommitted\n")
-        (worktree / ".attempt-ignore").write_text("attempt-cache.*\n")
-        (worktree / "attempt-cache.tmp").write_text("ignored residue\n")
 
         resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(self.workers.roles().count("implementer"), 1)
         self.assertFalse((worktree / "attempt-new.txt").exists())
-        self.assertFalse((worktree / ".attempt-ignore").exists())
-        self.assertFalse((worktree / "attempt-cache.tmp").exists())
         checkpoint = json.loads((self.run_dir() / "resume_checkpoint.json").read_text())
         self.assertEqual(set(checkpoint), {
             "schema_version", "iteration", "phase", "step_index",
@@ -104,6 +101,51 @@ class ResumeTests(PipelineHarness):
 
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertGreaterEqual(calls, 2)
+        self.assertEqual(self.workers.roles().count("implementer"), 1)
+
+    def test_resume_preserves_ignored_workspace_setup_and_cleans_attempt_residue(self) -> None:
+        (self.repo / ".gitignore").write_text(".workspace-cache/\n", encoding="utf-8")
+        git(self.repo, "add", ".gitignore")
+        git(self.repo, "commit", "-qm", "ignore prepared workspace cache")
+        git(self.repo, "push", "-q", "origin", "main")
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+
+        real = GateService.run_gate
+        calls = 0
+        worktree = self.worktree()
+        cache = worktree / ".workspace-cache"
+        ready = cache / "dependency-ready"
+        residue = worktree / "attempt-residue.tmp"
+
+        def crash_once(service, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                cache.mkdir()
+                ready.write_text("installed before crash\n", encoding="utf-8")
+                residue.write_text("uncommitted attempt output\n", encoding="utf-8")
+                raise RuntimeError("crash during deterministic gate")
+
+            green = self.checkpoint()["last_green_commit"]
+            self.assertEqual(current_head(worktree), green)
+            self.assertEqual(index_tree_sha(worktree), resolve_tree(worktree, green))
+            self.assertTrue(ready.is_file())
+            self.assertFalse(residue.exists())
+            return real(service, *args, **kwargs)
+
+        original = self.orchestrator(self.config(), planner=[initial_plan(STEP)])
+        with mock.patch.object(GateService, "run_gate", crash_once):
+            failed = original.run_text(SPEC, run_id="run")
+            self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
+            self.assertEqual(self.checkpoint()["phase"], "deterministic_gate")
+            self.assertTrue(ready.is_file())
+            self.assertTrue(residue.is_file())
+
+            resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertTrue(ready.is_file())
+        self.assertFalse(residue.exists())
         self.assertEqual(self.workers.roles().count("implementer"), 1)
 
     def test_audit_mutation_before_commit_is_discarded_and_audit_replayed(self) -> None:

@@ -1196,7 +1196,7 @@ def _step_statuses(directory: Path, cycle: int, state: Mapping[str, Any]) -> lis
     return result
 
 
-_STEP_PHASES = frozenset({"implement_step", "step_acceptance"})
+_STEP_PHASES = frozenset({"implement_step"})
 _GATE_PHASES = frozenset({"deterministic_gate"})
 
 

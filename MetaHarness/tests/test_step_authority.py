@@ -62,13 +62,14 @@ class StepAuthorityTests(PipelineHarness):
         )
         self.assertNotIn("repair_slot", candidate)
 
-    def test_worker_retry_resume_needs_no_repair_artifact(self) -> None:
+    def test_interrupted_acceptance_replays_the_implementation_step(self) -> None:
         def mismatch(request):
             (request.worktree / "feature.txt").write_text("partial\n", encoding="utf-8")
             return CONTRACT_MISMATCH_HEADER + "\nThe step instructions were not met."
 
         self.workers.on(
             ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"),
+            write("feature.txt", "good\n"),
         )
         with mock.patch(
             "metaharness.orchestration.step_acceptance.commit_safety_gate",
@@ -81,16 +82,20 @@ class StepAuthorityTests(PipelineHarness):
         self.assertTrue((self.step_dir() / "attempts/01/step.json").exists())
         self.assertFalse((self.step_dir() / "contract_repairs").exists())
         info = resume_info(self.run_dir(), self.state())
-        self.assertEqual((info.operation, info.phase), ("step_acceptance", "step_acceptance"))
+        self.assertIsNone(info.operation)
+        self.assertEqual(info.phase, "implement_step")
 
         resumed, planner = self.resume_without_planner()
 
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(planner.requests, [])
-        self.assertEqual(len([c for c in self.workers.calls if c.role is ExecutionRole.IMPLEMENTER]), 2)
+        self.assertEqual(len([c for c in self.workers.calls if c.role is ExecutionRole.IMPLEMENTER]), 3)
 
-    def test_a_missing_or_corrupt_candidate_fails_closed(self) -> None:
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+    def test_uncheckpointed_candidate_is_rebuilt_by_step_replay(self) -> None:
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "good\n"), write("feature.txt", "good\n"),
+        )
         with mock.patch(
             "metaharness.orchestration.step_acceptance.commit_safety_gate",
             side_effect=KeyboardInterrupt(),
@@ -103,10 +108,12 @@ class StepAuthorityTests(PipelineHarness):
 
         resumed, planner = self.resume_without_planner()
 
-        self.assertEqual(resumed.status, RunStatus.FAILED)
-        self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-        self.assertIn("step candidate hash changed", self.state()["failure"]["detail"])
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(read_step_candidate(self.step_dir())["changed_paths"], ["feature.txt"])
         self.assertEqual(planner.requests, [])
+        self.assertEqual(
+            len([call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER]), 2,
+        )
 
     def test_git_ownership_drift_fails_closed(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))

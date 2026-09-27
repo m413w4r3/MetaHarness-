@@ -23,7 +23,7 @@ metadata and the diagnostics of a run.
 The step services split the one step transaction by transaction:
 ``step_execution`` runs one approved step as a bounded ladder of attempts,
 ``worker_attempt`` runs the single worker request and normalizes its candidate
-result, and ``step_acceptance`` owns the durable commit boundary.
+result, and ``step_acceptance`` owns the commit transaction inside that step.
 
 ``recovery`` applies :func:`metaharness.recovery_policy.classify_failure`:
 it owns durable recovery budgets, attempt records, the ``recovery.*`` trace

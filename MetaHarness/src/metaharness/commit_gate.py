@@ -132,8 +132,8 @@ class StepVerification:
     """The verification decision of one successful worker attempt.
 
     It is a pure function of the durable worker report and the approved
-    future step IDs, so a resumed step acceptance re-derives or re-reads it
-    without any worker or model call.
+    future step IDs, so the step acceptance transaction derives or re-reads it
+    without an additional worker or model call.
     """
 
     status: str

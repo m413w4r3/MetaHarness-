@@ -266,9 +266,9 @@ remote-tracking ref (`refs/remotes/<remote>/<base_ref>`).
 Every durable transition rewrites `resume_checkpoint.json` atomically. It
 always names the next operation that has not yet succeeded:
 
-At the conceptual level, supported phases are context, planner, plan approval,
-workspace setup, implementation steps, deterministic gates, candidate
-commit/push, final review, correction planning/steps, and publish. The planner
+Supported phases are context, planner, plan approval, workspace setup,
+implementation step, deterministic gate, audit, candidate ready, candidate
+push and publish. The planner
 checkpoint is durable before the planner call, so a temporary provider outage
 (`LLM_TRANSPORT_EXHAUSTED`, a `WAIT_EXTERNAL`) resumes there and pays for one
 fresh planner answer; a valid persisted planner answer is reused instead of
@@ -277,9 +277,7 @@ being paid for twice. Corruptions, identity violations and
 
 | After | Checkpoint |
 | --- | --- |
-| plan approval, worktree + setup | `initial_step` S01, base tree |
-| operator plan recovery (no planner call) | `plan_approval`, base tree |
-| successful worker of step Sxx | `step_acceptance` Sxx: `step_candidate.json` is durable, HEAD = parent, tree = candidate |
+| plan approval, worktree + setup | `implement_step` S01, base tree |
 | implementation step Sxx | next step, or `deterministic_gate`, with the step's tree |
 | deterministic gate | `audit` when red, otherwise `candidate_ready` |
 | audit pass | the next deterministic gate, with the audited tree |
@@ -294,22 +292,15 @@ sans nouveau worker ni commit avant la review. Le cycle n’est pas limité à 2
 
 A `PUBLISHED` (or `COMMITTED`) run marks it `completed`.
 
-### Effective step authority and step acceptance
+### Effective step authority and acceptance transaction
 
 The approved C6 step contract is the worker and commit authority. Its prompt,
 mutable paths, rollback, the commit gate, accepted record and resume all use
 the same normalized plan authority. A corrupted candidate is
 `RESUME_INTEGRITY_FAILURE`; the gate stays strict (`COMMIT_SCOPE_VIOLATION`
-etc. in `step_acceptance.json`).
-
-A `step_acceptance` resume calls no worker, planner or auditor: it re-proves
-the candidate hash, authority hash, step record, report, HEAD/tree/index and
-changed paths, then reruns the commit gate (or only records a commit that a
-crash left on the run branch). A legacy run stranded by
-`COMMIT_GATE_FAILED` "mutable scope violation" whose rejected paths were added
-by validated repairs, and whose worktree is still the successful candidate, is
-shown as `Retry step acceptance (Sxx)` and migrated to `step_acceptance`;
-every other `COMMIT_GATE_FAILED` stays terminal.
+etc. in `step_acceptance.json`). The `StepAcceptanceService` records its result
+inside the `implement_step` transaction; this evidence is not a resume phase.
+A resume restores the last accepted commit and retries the implementation step.
 
 ```bash
 metaharness resume --config examples/autowork.toml --run-id <RUN_ID>
@@ -375,58 +366,9 @@ recovered only when its current artifacts prove the next operation exactly.
 | Max step contract | 9000 characters (target 2500-7000) |
 | Max aggregate step contracts | None |
 | Execution selection steps (schema 3 and 4) | Up to 99, contiguous from `S01` |
-| Resume step IDs (`initial_step`, `repair_step`) | `S01` .. `S99` |
+| Resume step index (`implement_step`) | 0-based index into the approved plan |
 | Implementation bundle steps | 1..99, contiguous, each contract hash-bound |
 | Max diff bytes | 400000 (unchanged) |
-| Replacement plan for `REPLACE PLAN` | 2 MiB |
-
-## Plan recovery: replacing an unexecutable planner answer
-
-A META PLAN v2 run that failed at its PLANNER checkpoint
-(`PLANNER_OUTPUT_INVALID`, or `LLM_FAILURE` of the planner) can be continued
-with a corrected plan written by the operator, without calling the planner
-again:
-
-```bash
-metaharness recover-plan --config examples/autowork.toml \
-  --run-id <RUN_ID> --plan corrected-plan.md
-```
-
-The run page offers the same action as `REPLACE PLAN` (a textarea posting to
-`/runs/<run_id>/recover-plan`, with the same exact-Host, origin and
-mutation-token policy as the approval and resume forms; the replacement text
-is bounded to 128 KiB). The JSON route is
-`POST /api/runs/<run_id>/recover-plan` with `{"plan": "..."}`.
-
-Only the raw replacement plan is supplied. SPEC, `context.txt`, the
-repository reference, BASE SHA, run options, profile catalogue and check
-catalogue remain the run's own and cannot be edited.
-
-The action is refused, changing nothing, unless: the protocol is v2; the
-pending checkpoint is `planner`; the failure is a recoverable planner
-failure; no plan approval, execution selection, branch, worktree, or
-worker or audit execution artifact exists; and the stored BASE SHA and
-BASE tree are still exactly those of the run. Local `main` may have moved:
-the run stays bound to its immutable stored BASE.
-
-The replacement must be `STATUS: READY` and must pass, unchanged, the strict
-parser, the execution-mode and decomposition policies, the profile
-allowlists, the trusted check catalogue and the step/bundle bounds. BLOCKED
-is not accepted, and nothing is normalized or repaired: an invalid
-replacement leaves the current run authority byte-for-byte unchanged.
-
-On success the previous planner artifacts (including `planner.raw.md`, the
-planner usage of the failed attempt and any planner conversation handle) move
-to `attempts/NN/`, the replacement becomes `planner.raw.md`,
-`task_plan_v2.json` / `task_plan.json`, `implementation_contract.md`,
-`implementation_bundle.json` and the exact `steps/Sxx/contract.md` files,
-`planner_recovery.json` records the exchange, and the checkpoint becomes
-`plan_approval`. No worktree is created and no worker starts before the
-human approval; afterwards the run continues through the normal workflow
-(`plan_approval` -> `worktree_setup` -> implementation S01...) and the planner is never
-called again. Diagnostics then report `plan source: operator recovery`
-instead of `plan source: planner model completion`.
-
 ## Plan approval
 
 Set the following section to require the human gate:

@@ -743,16 +743,49 @@ class RemovedAuthoritySurfaceTests(unittest.TestCase):
             tuple(phase.name for phase in RunPhase),
             (
                 "CONTEXT", "PLANNER", "PLAN_APPROVAL", "WORKTREE_SETUP",
-                "IMPLEMENT_STEP", "STEP_ACCEPTANCE", "DETERMINISTIC_GATE",
-                "AUDIT", "CANDIDATE_READY", "CANDIDATE_PUSH", "PUBLISH",
+                "IMPLEMENT_STEP", "DETERMINISTIC_GATE", "AUDIT",
+                "CANDIDATE_READY", "CANDIDATE_PUSH", "PUBLISH",
             ),
         )
+        self.assertLessEqual(len(RunPhase), 10)
         self.assertEqual(tuple(stage.name for stage in GateStage), ("POST_IMPLEMENTATION",))
         self.assertEqual(
             tuple(field for field in ExecutionFallbacks.__dataclass_fields__),
             ("mechanical", "reasoning", "agentic"),
         )
         self.assertEqual(SCHEMA_VERSION, 7)
+
+    def test_internal_step_acceptance_is_not_a_checkpoint_phase(self) -> None:
+        for path in sorted(PACKAGE.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and node.value == "step_acceptance":
+                    self.fail(
+                        f"{path.relative_to(PACKAGE)} writes the removed checkpoint phase"
+                    )
+
+    def test_git_rewind_does_not_clean_ignored_paths(self) -> None:
+        path = PACKAGE / "gitops.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        rewind = next(
+            node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "rewind_worktree"
+        )
+        clean_calls = []
+        for node in ast.walk(rewind):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id != "_git":
+                continue
+            values = [arg.value for arg in node.args if isinstance(arg, ast.Constant)]
+            if "clean" not in values:
+                continue
+            clean_calls.append(values)
+            for value in values:
+                if isinstance(value, str) and value.startswith("-") and not value.startswith("--"):
+                    self.assertNotIn("x", value[1:], "git clean must preserve ignored paths")
+        self.assertTrue(clean_calls, "rewind must remove untracked non-ignored paths")
 
     def test_an_agent_request_scope_is_explicit(self) -> None:
         from metaharness.agent import AgentRunRequest

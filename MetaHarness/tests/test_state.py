@@ -478,10 +478,8 @@ TRANSITION_MATRIX = (
     (R.PLANNER, RunEvent.advance(R.PLAN_APPROVAL), R.PLAN_APPROVAL, D.RUNNING),
     (R.PLAN_APPROVAL, RunEvent.advance(R.WORKTREE_SETUP), R.WORKTREE_SETUP, D.RUNNING),
     (R.WORKTREE_SETUP, RunEvent.advance(R.IMPLEMENT_STEP), R.IMPLEMENT_STEP, D.RUNNING),
-    # A cycle implements several steps, then accepts and gates the candidate.
+    # A cycle implements several steps, then gates the candidate.
     (R.IMPLEMENT_STEP, RunEvent.advance(R.IMPLEMENT_STEP), R.IMPLEMENT_STEP, D.RUNNING),
-    (R.IMPLEMENT_STEP, RunEvent.advance(R.STEP_ACCEPTANCE), R.STEP_ACCEPTANCE, D.RUNNING),
-    (R.STEP_ACCEPTANCE, RunEvent.advance(R.IMPLEMENT_STEP), R.IMPLEMENT_STEP, D.RUNNING),
     (R.IMPLEMENT_STEP, RunEvent.advance(R.DETERMINISTIC_GATE), R.DETERMINISTIC_GATE, D.RUNNING),
     # The single post-implementation authority: the deterministic gate hands
     # the candidate to AUDIT, and AUDIT answers it with a new gate run.
@@ -513,14 +511,14 @@ INVALID_TRANSITIONS = (
     (RunMachineState(R.CONTEXT, D.RUNNING), RunEvent.advance(R.DETERMINISTIC_GATE), "never advances"),
     (RunMachineState(R.PUBLISH, D.RUNNING), RunEvent.advance(R.PUBLISH), "never advances"),
     (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.advance(None), "requires a target"),
-    (RunMachineState(R.IMPLEMENT_STEP, D.WAIT_EXTERNAL), RunEvent.advance(R.STEP_ACCEPTANCE), "must be resumed"),
+    (RunMachineState(R.IMPLEMENT_STEP, D.WAIT_EXTERNAL), RunEvent.advance(R.DETERMINISTIC_GATE), "must be resumed"),
     (RunMachineState(R.IMPLEMENT_STEP, D.WAIT_HUMAN), RunEvent.complete(), "must be resumed"),
     (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.complete(), "only an accepted candidate push"),
     (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.wait(D.RUNNING), "requires the WAIT_EXTERNAL or WAIT_HUMAN"),
     (RunMachineState(R.IMPLEMENT_STEP, D.RUNNING), RunEvent.resume(), "is not waiting"),
     (RunMachineState(R.PUBLISH, D.COMPLETED), RunEvent.fail(), "accepts no further event"),
     (RunMachineState(R.PUBLISH, D.COMPLETED), RunEvent.resume(), "accepts no further event"),
-    (RunMachineState(R.IMPLEMENT_STEP, D.FAILED), RunEvent.advance(R.STEP_ACCEPTANCE), "accepts no further event"),
+    (RunMachineState(R.IMPLEMENT_STEP, D.FAILED), RunEvent.advance(R.DETERMINISTIC_GATE), "accepts no further event"),
 )
 
 # (phase, disposition, reason, status, resumable, resume eligible)
@@ -624,7 +622,7 @@ class RunMachineTests(unittest.TestCase):
         self.assertEqual((resumed.phase, resumed.disposition), (R.IMPLEMENT_STEP, D.RUNNING))
         self.assertIsNone(resumed.reason)
         for event in (
-            RunEvent.advance(R.STEP_ACCEPTANCE), RunEvent.wait(D.WAIT_HUMAN),
+            RunEvent.advance(R.DETERMINISTIC_GATE), RunEvent.wait(D.WAIT_HUMAN),
             RunEvent.fail(), RunEvent.complete(),
         ):
             with (
