@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .approval import ApprovalError, read_check_authority
+from .approval import ApprovalError, CheckAuthority, read_check_authority
 from .attempt_transaction import (
     AttemptViolation,
     SideEffect,
@@ -48,31 +48,36 @@ class ValidationError(RuntimeError):
     """A configured check cannot be run safely."""
 
 
-def config_with_check_authority(
-    config: HarnessConfig, run_dir: str | Path, *,
-    requested_check_ids: tuple[str, ...] | list[str] | None = None,
-    expected_sha256: str | None = None,
-) -> tuple[HarnessConfig, tuple[str, ...] | None]:
-    """Return the run's frozen check configuration.
-
-    The current TOML is used only to confirm that the requested IDs remain in
-    the trusted catalogue.  The command-bearing values (argv, cwd, timeout,
-    preflight argv) always come from the durable authority artifact: once a
-    run owns a ``check_authority.json`` there is no fallback to today's
-    configuration, even for an ID the initial selection did not include.
-
-    *expected_sha256* is the already durable hash the approval bound.  It is
-    verified on every live use, not only on resume.
-    """
+def _check_authority_dir(run_dir: str | Path) -> Path | None:
+    """The nearest ancestor owning a ``check_authority.json``, if any."""
 
     directory = Path(run_dir).expanduser().resolve()
     while True:
         if (directory / "check_authority.json").is_file():
-            break
+            return directory
         parent = directory.parent
         if parent == directory:
-            raise ValidationError("the run has no check authority")
+            return None
         directory = parent
+
+
+def frozen_check_policy(
+    config: HarnessConfig, run_dir: str | Path, *,
+    expected_sha256: str | None = None,
+) -> CheckAuthority | None:
+    """The run's durable check policy, with today's installation veto applied.
+
+    ``None`` means the run does not own a check authority yet.  Once it does,
+    the command-bearing values (argv, cwd, timeout, preflight argv) and the
+    default check policy always come from that artifact: the current TOML can
+    only remove an ID from the allowed catalogue, never add one and never
+    replace a command.  A vetoed frozen default is a deterministic error,
+    never a silent substitution by another check.
+    """
+
+    directory = _check_authority_dir(run_dir)
+    if directory is None:
+        return None
     try:
         authority = read_check_authority(
             directory,
@@ -82,27 +87,43 @@ def config_with_check_authority(
     except ApprovalError as exc:
         raise ValidationError(str(exc)) from exc
     if authority is None:
+        return None
+    return authority
+
+
+def config_with_check_authority(
+    config: HarnessConfig, run_dir: str | Path, *,
+    requested_check_ids: tuple[str, ...] | list[str] | None = None,
+    expected_sha256: str | None = None,
+) -> tuple[HarnessConfig, tuple[str, ...] | None]:
+    """Return the run's frozen check configuration.
+
+    The current TOML is used only to confirm that the requested IDs remain in
+    the allowed catalogue.  The command-bearing values always come from the
+    durable authority artifact: once a run owns a ``check_authority.json``
+    there is no fallback to today's configuration, even for an ID the initial
+    selection did not include.
+
+    *expected_sha256* is the already durable hash the approval bound.  It is
+    verified on every live use, not only on resume.
+    """
+
+    policy = frozen_check_policy(config, run_dir, expected_sha256=expected_sha256)
+    if policy is None:
         raise ValidationError("the run has no check authority")
-    authority_ids, catalogue = authority
-    selected_ids = authority_ids
+    catalogue = policy.checks
+    selected_ids: tuple[str, ...] = ()
     if requested_check_ids is not None:
         selected_ids = tuple(requested_check_ids)
         if len(set(selected_ids)) != len(selected_ids):
             raise ValidationError("required check IDs must be unique")
-        frozen_by_id = {check.id: check for check in catalogue}
-        # The installation may still veto an ID, but it can never supply one.
-        trusted_ids = {check.id for check in config.trusted_checks()}
-        resolved: list[CheckConfig] = []
+        allowed = policy.by_id()
         for check_id in selected_ids:
-            frozen_check = frozen_by_id.get(check_id)
-            if frozen_check is None:
+            if check_id not in allowed:
                 raise ValidationError(
                     "requested check is absent from the run's approved check authority: "
                     + check_id
                 )
-            if check_id not in trusted_ids:
-                raise ValidationError("unknown trusted check ID(s): " + check_id)
-            resolved.append(frozen_check)
     frozen = dataclasses.replace(
         config,
         check_catalog=catalogue,

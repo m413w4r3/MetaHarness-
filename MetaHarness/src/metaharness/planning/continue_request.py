@@ -203,11 +203,13 @@ def read_planner_continue_artifacts(
 
 def planner_continue_request_record(
     facts: PlannerContinueFacts, payload: PromptPayload,
+    *, check_authority_sha256: str | None = None,
 ) -> dict[str, Any]:
     """The secret-free record of one request: section texts and pinned hashes."""
 
     return {
         "iteration": facts.iteration, "milestone_id": facts.milestone_id,
+        "check_authority_sha256": check_authority_sha256,
         "spec_sha256": sha256_bytes(facts.spec.encode("utf-8")),
         "current_plan": {"milestone_id": facts.plan.milestone_id,
                          "steps": [step.id for step in facts.plan.steps],

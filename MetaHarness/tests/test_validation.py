@@ -18,6 +18,7 @@ from metaharness.approval import write_check_authority  # noqa: E402
 from metaharness.validation import (  # noqa: E402
     ValidationError,
     config_with_check_authority,
+    frozen_check_policy,
     resolve_check_cwd,
     run_checks,
 )
@@ -176,7 +177,7 @@ class CheckAuthorityTests(ValidationTestBase):
         directory = Path(self.tempdir.name) / name
         directory.mkdir(parents=True, exist_ok=True)
         write_check_authority(
-            directory, self.CATALOGUE, required_check_ids=("lint", "test"),
+            directory, self.CATALOGUE, default_check_ids=("lint", "test"),
         )
         return directory
 
@@ -195,12 +196,47 @@ class CheckAuthorityTests(ValidationTestBase):
 
     def test_selection_and_catalogue_come_from_the_authority(self) -> None:
         run_dir = self.authority_run()
-        frozen, ids = config_with_check_authority(self.current_config(), run_dir)
+        policy = frozen_check_policy(self.current_config(), run_dir)
+        self.assertEqual(policy.default_check_ids, ("lint", "test"))
+        self.assertEqual([check.argv for check in policy.checks],
+                         [("frozen-lint",), ("frozen-test",), ("frozen-integration",)])
+        frozen, ids = config_with_check_authority(
+            self.current_config(), run_dir, requested_check_ids=("lint", "test"),
+        )
         self.assertEqual(ids, ("lint", "test"))
         self.assertEqual([check.argv for check in frozen.select_checks(ids)],
                          [("frozen-lint",), ("frozen-test",)])
         self.assertEqual([check.id for check in frozen.trusted_checks()],
                          ["lint", "test", "integration"])
+
+    def test_the_live_catalogue_can_only_veto_a_frozen_check(self) -> None:
+        run_dir = self.authority_run()
+        config = dataclasses.replace(
+            self.current_config(),
+            check_catalog=tuple(
+                check for check in self.current_config().check_catalog if check.id != "integration"
+            ),
+        )
+        policy = frozen_check_policy(config, run_dir)
+        # The frozen catalogue is intersected, never extended or replaced.
+        self.assertEqual([check.id for check in policy.checks], ["lint", "test"])
+        self.assertEqual([check.argv for check in policy.checks],
+                         [("frozen-lint",), ("frozen-test",)])
+
+    def test_a_vetoed_frozen_default_is_a_deterministic_error(self) -> None:
+        run_dir = self.authority_run()
+        config = dataclasses.replace(
+            self.current_config(),
+            check_catalog=tuple(
+                check for check in self.current_config().check_catalog if check.id != "lint"
+            ),
+        )
+        with self.assertRaises(ValidationError) as caught:
+            frozen_check_policy(config, run_dir)
+        self.assertIn("lint", str(caught.exception))
+        # No live command and no substitute check is ever selected instead.
+        with self.assertRaises(ValidationError):
+            config_with_check_authority(config, run_dir, requested_check_ids=("test",))
 
     def test_a_requested_check_outside_c01_uses_the_frozen_command(self) -> None:
         run_dir = self.authority_run()
@@ -254,7 +290,7 @@ class CheckAuthorityTests(ValidationTestBase):
             run_dir,
             tuple(dataclasses.replace(check, argv=("attacker", check.id))
                   for check in self.CATALOGUE),
-            required_check_ids=("lint", "test"),
+            default_check_ids=("lint", "test"),
         )
         with self.assertRaises(ValidationError):
             config_with_check_authority(config, run_dir, expected_sha256=approved)

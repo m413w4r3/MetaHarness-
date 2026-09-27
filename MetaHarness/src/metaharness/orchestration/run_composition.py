@@ -38,6 +38,7 @@ from ..approval import compute_plan_identity_from_run
 from ..execution_selection import (
     ensure_execution_selection, resolve_execution_selection, validate_execution_selection,
 )
+from ..validation import ValidationError, frozen_check_policy
 from ..plan_repository_validation import validate_plan_repository_topology
 from ..planning.artifacts import persist_iteration_plan, validate_implementation_bundle
 from ..planning.continue_request import PlannerContinueFacts
@@ -286,11 +287,20 @@ class RunComposition:
         planner_profile = profile_for_role(
             self.runtime.config, ctx.selection.planner.profile_id, ExecutionRole.PLANNER,
         )
+        # M02+ consumes the run's frozen check policy: a TOML edited after the
+        # freeze can only veto an ID, never change an argv or a default.
+        policy = frozen_check_policy(
+            self.runtime.config, ctx.run_dir,
+            expected_sha256=self.runtime.approved_check_authority_sha256(ctx.run_dir),
+        )
+        if policy is None:
+            raise ValidationError("the run has no check authority")
         service = PlannerContinue(
             client=self.runtime.planner_client or self.runtime.chat(build_llm_endpoint(planner_profile)),
             planning=self.runtime.config.planning,
-            check_catalog=self.runtime.config.trusted_checks(),
-            default_check_ids=self.runtime.config.required_check_ids(),
+            check_catalog=policy.checks,
+            default_check_ids=policy.default_check_ids,
+            check_authority_sha256=policy.sha256,
             prompt_budget_bytes=self.runtime.config.prompt_budget.planner_max_bytes,
         )
         return service.decide(

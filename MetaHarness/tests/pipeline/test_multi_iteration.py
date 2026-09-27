@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from metaharness.models import ExecutionRole, RunStatus
+from metaharness.approval import read_check_authority
+from metaharness.config import load_config
+from metaharness.models import ADD_DEFAULT_REQUIRED_CHECK, ExecutionRole, RunStatus
 from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
 from metaharness.planning.normalization import CREATE_EXISTING_TO_WRITE, WRITE_MISSING_TO_CREATE
 from metaharness.planning.planner_continue import ContinueDecision
@@ -15,7 +20,8 @@ from metaharness.planning.continue_request import planner_continue_dir, read_pla
 
 from tests.autonomy.support import Step, meta_plan
 from tests.pipeline.support import (
-    SPEC, STEP, PipelineHarness, audit, continuation_answer, initial_plan, write,
+    SPEC, STEP, PipelineHarness, audit, continuation_answer, crash_at_checkpoint,
+    initial_plan, write,
 )
 from tests.pipeline_support import git
 
@@ -405,6 +411,280 @@ class MultiIterationTests(PipelineHarness):
         resumed = orchestrator.resume("run")
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
         self.assertEqual(len(self.continuation.requests), 1)
+
+
+def m02_plan(*steps: tuple[str, str, str]) -> str:
+    """One NEXT answer for M02 over *steps*."""
+
+    return milestone(initial_plan(*steps), 2)
+
+
+class CheckPolicyDriftTests(PipelineHarness):
+    """The run freezes its check catalogue and defaults exactly once.
+
+    Every test here edits the real TOML after the freeze, at a real durable
+    boundary, and then asserts that the resumed run still consumes the frozen
+    policy: no live command, no live default and no check added mid-run.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.marker_log = self.root / "checks-ran.log"
+
+    # --- ports --------------------------------------------------------------
+
+    def _check_script(self, name: str, marker: str) -> str:
+        """One always-green check that records the argv that really executed."""
+
+        path = self.root / f"check-{name}.py"
+        path.write_text(
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(self.marker_log)!r}).open('a', encoding='utf-8')"
+            f".write({marker!r} + '\\n')\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def _catalogue_entry(self, check_id: str, script: str) -> str:
+        return (
+            f'\n[[check_catalog]]\nid = "{check_id}"\n'
+            f"argv = [{sys.executable!r}, {script!r}]\ntimeout_seconds = 30\n"
+        )
+
+    def _set_default_checks(self, *check_ids: str) -> None:
+        """Rewrite only the top-level ``default_check_ids`` policy of the TOML."""
+
+        rendered = ", ".join(f'"{item}"' for item in check_ids)
+        text = re.sub(
+            r"default_check_ids = \[[^\]]*\]\n+", "", self.config_path.read_text(encoding="utf-8"),
+        )
+        self.config_path.write_text(
+            text.replace("[planning]", f"default_check_ids = [{rendered}]\n\n[planning]", 1),
+            encoding="utf-8",
+        )
+
+    def _live_config(self):
+        return load_config(self.config_path)
+
+    def _ran(self) -> list[str]:
+        if not self.marker_log.is_file():
+            return []
+        return self.marker_log.read_text(encoding="utf-8").split()
+
+    def _crash_before_continue(self, continuation: list[str]):
+        """Run M01 and stop where the continuation decision is still unpaid."""
+
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "good\n"), write("other.txt", "second\n"),
+        )
+        self.workers.on(ExecutionRole.AUDITOR, audit(), audit())
+        orchestrator = self.orchestrator(
+            self._live_config(), planner=[initial_plan(STEP)], continuation=continuation,
+        )
+        with crash_at_checkpoint(orchestrator, "planner", occurrence=2, after=True):
+            interrupted = orchestrator.run_text(SPEC, run_id="run")
+        self.assertEqual(interrupted.status, RunStatus.WAITING_EXTERNAL, interrupted.state.get("failure"))
+        # M01 is closed, its checkpoint announces the continuation, and no
+        # continuation decision has been asked or paid for yet.
+        self.assertEqual(self.checkpoint()["phase"], "planner")
+        self.assertTrue((self.run_dir() / "iterations/01/plan/task_plan.json").is_file())
+        self.assertFalse((self.run_dir() / "iterations/01/planner-continue/request.json").exists())
+        return orchestrator
+
+    def _resume(self, continuation: list[str]):
+        self.workers.on(ExecutionRole.AUDITOR, audit(), audit())
+        return self.orchestrator(
+            self._live_config(), planner=["unused"], continuation=continuation,
+        ).resume("run")
+
+    def _next_then_complete(self) -> list[str]:
+        return [
+            continuation_answer("NEXT", milestone="M02", plan_text=m02_plan(("S01", "other.txt", "Write other"))),
+            continuation_answer("COMPLETE"),
+        ]
+
+    def _iteration_plan(self, iteration: int) -> dict:
+        path = self.run_dir() / f"iterations/{iteration:02d}/plan/task_plan.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    # --- tests --------------------------------------------------------------
+
+    def test_default_drift_after_the_freeze_keeps_the_frozen_defaults(self) -> None:
+        script_a = self._check_script("a", "A")
+        script_b = self._check_script("b", "B")
+        self.config(extra_checks=(
+            self._catalogue_entry("test-a", script_a) + self._catalogue_entry("test-b", script_b)
+        ))
+        self._set_default_checks("test-a")
+        self.assertEqual(self._live_config().default_check_ids, ("test-a",))
+        self._crash_before_continue(self._next_then_complete())
+
+        # The operator's new TOML would re-target every later milestone.
+        self._set_default_checks("test-b")
+        self.assertEqual(self._live_config().default_check_ids, ("test-b",))
+        resumed = self._resume(self._next_then_complete())
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        plan = self._iteration_plan(2)
+        self.assertIn("test-a", plan["required_checks"])
+        self.assertNotIn("test-b", plan["required_checks"])
+        self.assertIn(ADD_DEFAULT_REQUIRED_CHECK, {item["code"] for item in plan["normalizations"]})
+        # The frozen default was even named in the request the model received.
+        self.assertIn("test-a", self.continuation.requests[-1])
+        self.assertEqual(read_check_authority(self.run_dir()).default_check_ids, ("test-a",))
+
+    def test_command_drift_after_the_freeze_runs_the_frozen_argv(self) -> None:
+        script_a = self._check_script("a", "A")
+        script_b = self._check_script("b", "B")
+        self.config(extra_checks=self._catalogue_entry("test-a", script_a))
+        self._crash_before_continue(self._next_then_complete())
+        authority_bytes = (self.run_dir() / "check_authority.json").read_bytes()
+        frozen_argv = read_check_authority(self.run_dir()).by_id()["test-a"].argv
+        self.assertIn(script_a, frozen_argv)
+        self.assertIn("A", self._ran())
+
+        text = self.config_path.read_text(encoding="utf-8")
+        self.config_path.write_text(text.replace(script_a, script_b), encoding="utf-8")
+        drifted = {check.id: check for check in self._live_config().check_catalog}["test-a"]
+        self.assertEqual(list(drifted.argv), [sys.executable, script_b])
+        resumed = self._resume(self._next_then_complete())
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertIn("A", self._ran())
+        self.assertNotIn("B", self._ran())
+        self.assertEqual((self.run_dir() / "check_authority.json").read_bytes(), authority_bytes)
+        self.assertEqual(read_check_authority(self.run_dir()).by_id()["test-a"].argv, frozen_argv)
+
+    def test_a_check_added_after_the_freeze_is_refused_and_never_trusted(self) -> None:
+        script_a = self._check_script("a", "A")
+        new_script = self._check_script("new", "NEW")
+        self.config(extra_checks=self._catalogue_entry("test-a", script_a))
+        self._crash_before_continue(self._next_then_complete())
+
+        text = self.config_path.read_text(encoding="utf-8")
+        self.config_path.write_text(text + self._catalogue_entry("new-check", new_script), encoding="utf-8")
+        self.assertIn("new-check", {check.id for check in self._live_config().check_catalog})
+        late = m02_plan(("S01", "other.txt", "Write other")).replace(
+            "REQUIRED_CHECKS\n- test", "REQUIRED_CHECKS\n- new-check",
+        )
+        resumed = self._resume([
+            continuation_answer("NEXT", milestone="M02", plan_text=late),
+            continuation_answer("NEXT", milestone="M02", plan_text=m02_plan(("S01", "other.txt", "Write other"))),
+            continuation_answer("COMPLETE"),
+        ])
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        correction = self.continuation.requests[1]
+        self.assertIn("untrusted checks", correction)
+        # The catalogue the harness published to the model never grew.
+        catalogue = correction.split("TRUSTED CHECK CATALOGUE AND RUN RULES")[-1]
+        self.assertIn("ID: test-a", catalogue)
+        self.assertNotIn("ID: new-check", catalogue)
+        authority = read_check_authority(self.run_dir())
+        self.assertNotIn("new-check", authority.by_id())
+        for iteration in (1, 2):
+            self.assertNotIn("new-check", self._iteration_plan(iteration)["required_checks"])
+        self.assertNotIn("NEW", self._ran())
+
+    def test_a_vetoed_frozen_default_fails_closed_without_substitution(self) -> None:
+        script_a = self._check_script("a", "A")
+        self.config(extra_checks=self._catalogue_entry("test-a", script_a))
+        self._crash_before_continue(self._next_then_complete())
+        ran_before = self._ran()
+        authority_bytes = (self.run_dir() / "check_authority.json").read_bytes()
+
+        # The installation removes one frozen default from its own catalogue.
+        text = self.config_path.read_text(encoding="utf-8")
+        start = text.index('\n[[check_catalog]]\nid = "test-a"')
+        end = text.index("timeout_seconds = 30", start) + len("timeout_seconds = 30\n")
+        self.config_path.write_text(text[:start] + text[end:], encoding="utf-8")
+        self.assertNotIn("test-a", {check.id for check in self._live_config().check_catalog})
+        resumed = self._resume(self._next_then_complete())
+
+        self.assertNotEqual(resumed.status, RunStatus.PUBLISHED)
+        detail = json.dumps(resumed.state["failure"])
+        # A deterministic check-authority error names the vetoed default: the
+        # run stops instead of substituting another check or a live command.
+        self.assertIn("frozen default", detail)
+        self.assertIn("test-a", detail)
+        self.assertEqual(self._ran(), ran_before)
+        self.assertFalse((self.run_dir() / "iterations/02/plan/task_plan.json").exists())
+        self.assertEqual((self.run_dir() / "check_authority.json").read_bytes(), authority_bytes)
+
+    def test_resume_after_a_paid_continuation_reparses_with_the_frozen_policy(self) -> None:
+        import metaharness.planning.planner_continue as module
+
+        script_a = self._check_script("a", "A")
+        script_b = self._check_script("b", "B")
+        self.config(extra_checks=(
+            self._catalogue_entry("test-a", script_a) + self._catalogue_entry("test-b", script_b)
+        ))
+        self._set_default_checks("test-a")
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"), write("other.txt", "second\n"))
+        self.workers.on(ExecutionRole.AUDITOR, audit(), audit())
+        orchestrator = self.orchestrator(
+            self._live_config(), planner=[initial_plan(STEP)], continuation=self._next_then_complete(),
+        )
+        real_write = module.write_planner_continue_raw
+        interrupted = False
+
+        def write_then_crash(directory, raw):
+            nonlocal interrupted
+            path = real_write(directory, raw)
+            if not interrupted:
+                interrupted = True
+                raise RuntimeError("crash after paid continuation response")
+            return path
+
+        with mock.patch.object(module, "write_planner_continue_raw", write_then_crash):
+            failed = orchestrator.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
+        self.assertEqual(len(self.continuation.requests), 1)
+        authority_bytes = (self.run_dir() / "check_authority.json").read_bytes()
+
+        self._set_default_checks("test-b")
+        text = self.config_path.read_text(encoding="utf-8")
+        self.config_path.write_text(
+            text.replace(script_a, self._check_script("a2", "A2"))
+            + self._catalogue_entry("new-check", self._check_script("new", "NEW")),
+            encoding="utf-8",
+        )
+        resumed = self._resume([continuation_answer("COMPLETE")])
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        # The paid answer is reparsed, never bought again.
+        self.assertEqual(len(self.continuation.requests), 1)
+        plan = self._iteration_plan(2)
+        self.assertIn("test-a", plan["required_checks"])
+        self.assertNotIn("test-b", plan["required_checks"])
+        self.assertNotIn("new-check", plan["required_checks"])
+        self.assertEqual((self.run_dir() / "check_authority.json").read_bytes(), authority_bytes)
+        self.assertNotIn("A2", self._ran())
+        self.assertNotIn("NEW", self._ran())
+
+    def test_m01_and_m02_plans_share_one_check_authority_sha(self) -> None:
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "good\n"), write("other.txt", "second\n"),
+        )
+        result = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], continuation=self._next_then_complete(),
+            auditor=[audit(), audit()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        authority = read_check_authority(self.run_dir())
+        requests = [
+            json.loads((self.run_dir() / f"iterations/{iteration:02d}/planner-continue/request.json").read_text())
+            for iteration in (1, 2)
+        ]
+        self.assertEqual(
+            [item["check_authority_sha256"] for item in requests],
+            [authority.sha256, authority.sha256],
+        )
+        self.assertEqual(self.state()["plan_identity"]["checks_sha256"], authority.sha256)
 
 
 if __name__ == "__main__":  # pragma: no cover

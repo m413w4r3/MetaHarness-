@@ -97,12 +97,14 @@ def reject_pushes(harness: PipelineHarness) -> None:
 
 # --- crash-injection ports --------------------------------------------------
 
-def crash_at_checkpoint(orchestrator, phase: str, *, occurrence: int = 1):
+def crash_at_checkpoint(orchestrator, phase: str, *, occurrence: int = 1, after: bool = False):
     """Interrupt the run where it durably enters *phase*.
 
     The checkpoint writer is the run's durable boundary: raising inside it is
     exactly an abruptly killed process, and the next ``resume`` must observe
-    the state the boundary described.
+    the state the boundary described.  With *after*, the boundary is written
+    first and the crash lands on the operation it announced, so the resume
+    starts there instead of replaying the previous phase.
     """
 
     from metaharness.resume import ResumePhase
@@ -112,10 +114,15 @@ def crash_at_checkpoint(orchestrator, phase: str, *, occurrence: int = 1):
     seen: list[int] = []
 
     def write(run_dir, next_phase, **fields):
-        if next_phase is ResumePhase(phase):
+        if next_phase is ResumePhase(phase) and not after:
             seen.append(1)
             if len(seen) == occurrence:
                 raise RuntimeError(f"crash at {phase}")
-        return real(run_dir, next_phase, **fields)
+        result = real(run_dir, next_phase, **fields)
+        if next_phase is ResumePhase(phase) and after:
+            seen.append(1)
+            if len(seen) == occurrence:
+                raise RuntimeError(f"crash after {phase}")
+        return result
 
     return mock.patch.object(type(runtime), "write_checkpoint", staticmethod(write))

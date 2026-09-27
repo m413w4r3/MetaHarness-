@@ -72,7 +72,8 @@ class LifecycleTests(PipelineHarness):
         self.assertEqual(checkpoint["plan_sha256"], hashlib.sha256(plan_path.read_bytes()).hexdigest())
         self.assertTrue((self.run_dir() / "iterations/01/execution_selection.json").is_file())
         check_authority = json.loads((self.run_dir() / "check_authority.json").read_text())
-        self.assertEqual(check_authority["required_check_ids"], [])
+        self.assertEqual(check_authority["schema_version"], 3)
+        self.assertEqual(check_authority["default_check_ids"], ["test"])
         for name in (
             "task_plan.json", "implementation_bundle.json", "plan.normalizations.json",
             "implementation_contract.md", "steps/S01/contract.md",

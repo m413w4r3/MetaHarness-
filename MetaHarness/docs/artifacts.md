@@ -22,7 +22,7 @@ write goes through `RunStateStore` and uses atomic replacement.
 | `implementation_bundle.json` | Step IDs, recommended profiles and the SHA-256 of every step contract |
 | `steps/Sxx/contract.md` | The single authoritative step contract, approved and executed byte-for-byte |
 | `execution_selection.json` | Selected profile (role, driver, provider, model, effort, fingerprint) of every role and step |
-| `check_authority.json` | Trusted check IDs and argv frozen at approval |
+| `check_authority.json` | Run-level check authority (schema 3): the frozen trusted catalogue with its argv, cwd, timeout and preflight, plus the run's frozen default check IDs |
 | `plan_approval.json` | One exclusive APPROVE/REJECT decision bound to the plan, bundle and execution-selection hashes |
 | `planner.conversation.json` | Only when the driver officially returned a planner conversation handle (never simulated) |
 | `setup/results.json` / `setup/*.log` | Workspace dependency setup results and redacted logs |

@@ -38,7 +38,7 @@ from ..gitops import (
 )
 from ..llm.chat import LLMConversationHandle
 from ..models import (
-    BlockerKind, ExecutionRole, ExecutionSelection, ModelProfile, PlanDecision,
+    BlockerKind, CheckConfig, ExecutionRole, ExecutionSelection, ModelProfile, PlanDecision,
     INTERRUPTED_REASON,
     PLAN_REJECTED_REASON,
     RunDisposition,
@@ -64,7 +64,7 @@ from ..resume import (
 )
 from ..state import RunStateStore
 from ..usage import read_usage_artifact
-from ..validation import config_with_check_authority
+from ..validation import config_with_check_authority, frozen_check_policy
 from ..workspace import prepare_workspace
 from .durable_readers import read_repository_reference
 from .shared import (
@@ -107,6 +107,24 @@ class RunBootstrap:
     def __init__(self, runtime: "RunRuntime") -> None:
         self.runtime = runtime
 
+    def _check_policy(
+        self, run_dir: Path,
+    ) -> tuple[tuple[CheckConfig, ...], tuple[str, ...]]:
+        """The durable check policy of a run that already froze one.
+
+        Before the freeze the current TOML *is* the run's policy; afterwards it
+        can only remove an ID, so a modified TOML never changes the catalogue
+        or the default check IDs a resumed planner consumes.
+        """
+
+        policy = frozen_check_policy(self.runtime.config, run_dir)
+        if policy is not None:
+            return policy.checks, policy.default_check_ids
+        return (
+            tuple(self.runtime.config.trusted_checks()),
+            tuple(self.runtime.config.required_check_ids()),
+        )
+
     def prepare_v2_run(
         self,
         store: RunStateStore,
@@ -131,14 +149,15 @@ class RunBootstrap:
         planner_profile_id = planner_profile.id
         if planner_profile_id != self.runtime.run_options.planner_profile:
             raise ExecutionSelectionError("planner profile differs from the frozen run options")
+        check_catalog, default_check_ids = self._check_policy(run_dir)
         if existing_plan is None:
             planner = PlannerV2(
                 self.runtime.planner_client
                 or self.runtime.chat(build_llm_endpoint(planner_profile)),
                 repository_reference=repository_reference,
                 planning=self.runtime.config.planning,
-                check_catalog=self.runtime.config.check_catalog,
-                default_check_ids=self.runtime.config.default_check_ids,
+                check_catalog=check_catalog,
+                default_check_ids=default_check_ids,
                 prompt_budget_bytes=self.runtime.config.prompt_budget.planner_max_bytes,
                 repository_preconditions=RepositoryPreconditions(
                     repo, resolve_tree(repo, base_sha),
@@ -263,12 +282,13 @@ class RunBootstrap:
             # catalogue.  Materialize those exact trusted definitions before
             # the plan can become approval authority.
             selected_checks = self.runtime.config.select_checks(plan.required_checks)
-            # Freeze the whole trusted catalogue, not just this selection: a
-            # correction plan may legitimately require another approved check,
-            # and it must still run the argv approved at this boundary.
+            # Freeze the whole trusted catalogue *and* the run's default check
+            # policy, not just this selection: a later milestone may require
+            # another approved check, and every run must keep running the argv
+            # and the defaults approved at this boundary.
             write_check_authority(
                 run_dir, tuple(self.runtime.config.trusted_checks()),
-                required_check_ids=(),
+                default_check_ids=tuple(self.runtime.config.required_check_ids()),
             )
             plan_sha = persist_iteration_plan(run_dir, iteration, plan)
             _bundle, _bundle_sha = validate_implementation_bundle(
@@ -543,12 +563,15 @@ class RunBootstrap:
                 refuse("run planner profile is missing")
             planner_profile = profile_for_role(self.runtime.config, planner_profile_id, ExecutionRole.PLANNER)
             if checkpoint.phase is ResumePhase.PLANNER:
+                # A resumed initial planner replays its paid answer against the
+                # policy the run froze, not against a TOML edited meanwhile.
+                check_catalog, default_check_ids = self._check_policy(run_dir)
                 planner = PlannerV2(
                     self.runtime.planner_client
                     or self.runtime.chat(build_llm_endpoint(planner_profile)),
                     repository_reference=reference, planning=self.runtime.config.planning,
-                    check_catalog=self.runtime.config.check_catalog,
-                    default_check_ids=self.runtime.config.default_check_ids,
+                    check_catalog=check_catalog,
+                    default_check_ids=default_check_ids,
                     prompt_budget_bytes=self.runtime.config.prompt_budget.planner_max_bytes,
                     repository_preconditions=RepositoryPreconditions(repo, base_tree),
                     on_event=lambda name, data: self.runtime.observability.trace_emit(name, phase="planning", cycle=checkpoint.iteration, data=data),

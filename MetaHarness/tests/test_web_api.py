@@ -419,7 +419,7 @@ class WebServerTests(unittest.TestCase):
         )
         write_check_authority(
             run_dir, [CheckConfig("lint", ("python", "-c", "pass"))],
-            required_check_ids=("lint",),
+            default_check_ids=("lint",),
         )
         options_sha256 = write_run_options(run_dir, RunOptions.from_config(self.config))
         actual = compute_plan_identity_from_run(run_dir)

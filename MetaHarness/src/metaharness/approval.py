@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -138,9 +139,47 @@ def compute_plan_identity(
     )
 
 
+@dataclass(frozen=True)
+class CheckAuthority:
+    """One run's frozen check catalogue and default check policy.
+
+    ``checks`` is the full trusted catalogue frozen at bootstrap, with every
+    command-bearing field; ``default_check_ids`` is that run's default policy,
+    never an iteration's ``required_checks`` selection.
+    """
+
+    default_check_ids: tuple[str, ...]
+    checks: tuple[CheckConfig, ...]
+    sha256: str
+
+    def by_id(self) -> dict[str, CheckConfig]:
+        return {check.id: check for check in self.checks}
+
+    def allowed(self, trusted_check_ids: Iterable[str]) -> "CheckAuthority":
+        """Apply today's installation veto to the frozen catalogue.
+
+        The current configuration may only *remove* an ID: it never supplies a
+        command and never adds one.  A vetoed frozen default is a deterministic
+        error instead of a silent substitution by another check.
+        """
+
+        trusted = set(trusted_check_ids)
+        vetoed_defaults = [item for item in self.default_check_ids if item not in trusted]
+        if vetoed_defaults:
+            raise ApprovalError(
+                "check authority frozen default check is not trusted by the current "
+                "installation: " + vetoed_defaults[0]
+            )
+        return CheckAuthority(
+            default_check_ids=self.default_check_ids,
+            checks=tuple(check for check in self.checks if check.id in trusted),
+            sha256=self.sha256,
+        )
+
+
 def _check_authority_payload(
     checks: tuple[CheckConfig, ...],
-    required_check_ids: tuple[str, ...],
+    default_check_ids: tuple[str, ...],
 ) -> dict[str, object]:
     entries: list[dict[str, object]] = []
     for check in checks:
@@ -159,23 +198,23 @@ def _check_authority_payload(
         if check.junit_xml:
             entry["junit_xml"] = check.junit_xml
         entries.append(entry)
-    # This run-level artifact freezes command definitions. The stored ID list
-    # is empty for pipeline runs; each effective iteration plan owns its own
-    # required_checks selection.
+    # This run-level artifact freezes command definitions and the run's default
+    # policy.  Each effective iteration plan owns its own required_checks
+    # selection on top of that frozen universe.
     return {
-        "schema_version": 2,
-        "required_check_ids": list(required_check_ids),
+        "schema_version": 3,
+        "default_check_ids": list(default_check_ids),
         "checks": entries,
     }
 
 
 def _canonical_check_authority(
     checks: tuple[CheckConfig, ...],
-    required_check_ids: tuple[str, ...],
+    default_check_ids: tuple[str, ...],
 ) -> bytes:
     return (
         json.dumps(
-            _check_authority_payload(checks, required_check_ids),
+            _check_authority_payload(checks, default_check_ids),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -242,8 +281,15 @@ def read_check_authority(
     *,
     expected_sha256: str | None = None,
     trusted_check_ids: tuple[str, ...] | list[str] | None = None,
-) -> tuple[tuple[str, ...], tuple[CheckConfig, ...]] | None:
-    """Read the immutable, command-bearing check authority for a run."""
+) -> CheckAuthority | None:
+    """Read the immutable, command-bearing check authority for a run.
+
+    The returned value names the run's frozen default check policy and the
+    frozen catalogue without ambiguity.  An older schema is refused: there is
+    no migration, and no run keeps an authority the current code cannot read.
+    With *trusted_check_ids*, today's installation veto is applied: the frozen
+    catalogue is intersected with it, and a vetoed frozen default is refused.
+    """
 
     path = _run_path(run_dir) / _CHECK_AUTHORITY_FILENAME
     try:
@@ -260,49 +306,50 @@ def read_check_authority(
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ApprovalError("check authority JSON is invalid") from exc
     schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
-    if not isinstance(payload, dict) or schema_version != 2:
-        raise ApprovalError("check authority schema_version is unsupported")
-    required_ids = payload.get("required_check_ids")
+    if not isinstance(payload, dict) or schema_version != 3:
+        raise ApprovalError(f"check authority schema_version is unsupported: {schema_version!r}")
+    default_ids = payload.get("default_check_ids")
     raw_checks = payload.get("checks")
     if (
-        isinstance(required_ids, (str, bytes)) or not isinstance(required_ids, list)
+        isinstance(default_ids, (str, bytes)) or not isinstance(default_ids, list)
         or isinstance(raw_checks, (str, bytes)) or not isinstance(raw_checks, list)
     ):
         raise ApprovalError("check authority has an invalid shape")
-    if any(not isinstance(item, str) or _CHECK_ID.fullmatch(item) is None for item in required_ids):
-        raise ApprovalError("check authority required_check_ids are invalid")
-    if len(set(required_ids)) != len(required_ids):
+    if any(not isinstance(item, str) or _CHECK_ID.fullmatch(item) is None for item in default_ids):
+        raise ApprovalError("check authority default_check_ids are invalid")
+    if len(set(default_ids)) != len(default_ids):
         raise ApprovalError("check authority contains duplicate check IDs")
     checks = tuple(_validate_check_authority_check(item, index) for index, item in enumerate(raw_checks))
     catalogue_ids = tuple(check.id for check in checks)
     if len(set(catalogue_ids)) != len(catalogue_ids):
         raise ApprovalError("check authority contains duplicate check IDs")
-    unknown = [check_id for check_id in required_ids if check_id not in set(catalogue_ids)]
+    unknown = [check_id for check_id in default_ids if check_id not in set(catalogue_ids)]
     if unknown:
         raise ApprovalError(
-            "check authority required_check_ids are not in the frozen catalogue: " + unknown[0]
+            "check authority default_check_ids are not in the frozen catalogue: " + unknown[0]
         )
-    if trusted_check_ids is not None:
-        trusted = set(trusted_check_ids)
-        missing = [check_id for check_id in required_ids if check_id not in trusted]
-        if missing:
-            raise ApprovalError("check authority references an unknown trusted check ID: " + missing[0])
-    canonical = _canonical_check_authority(checks, tuple(required_ids))
+    canonical = _canonical_check_authority(checks, tuple(default_ids))
     if content != canonical:
         raise ApprovalError("check authority JSON is not canonical")
-    return tuple(required_ids), checks
+    authority = CheckAuthority(
+        default_check_ids=tuple(default_ids), checks=checks, sha256=actual_sha256,
+    )
+    if trusted_check_ids is not None:
+        return authority.allowed(trusted_check_ids)
+    return authority
 
 
 def write_check_authority(
     run_dir: str | Path,
     checks: tuple[CheckConfig, ...] | list[CheckConfig],
     *,
-    required_check_ids: tuple[str, ...] | list[str],
+    default_check_ids: tuple[str, ...] | list[str],
 ) -> str:
     """Publish check definitions once; identical publication is idempotent.
 
-    The schema 2 artifact freezes the whole trusted catalogue. Pipeline runs
-    leave its selection list empty because required IDs belong to each plan.
+    The schema 3 artifact freezes the whole trusted catalogue *and* the run's
+    default check policy.  Each effective iteration plan keeps its own
+    ``required_checks`` selection on top of that frozen universe.
     """
 
     normalized = tuple(checks)
@@ -311,13 +358,13 @@ def write_check_authority(
     catalogue_ids = tuple(check.id for check in normalized)
     if len(set(catalogue_ids)) != len(catalogue_ids):
         raise ApprovalError("check authority must not contain duplicate check IDs")
-    selection = tuple(required_check_ids)
+    selection = tuple(default_check_ids)
     if len(set(selection)) != len(selection):
-        raise ApprovalError("check authority required_check_ids must be unique")
+        raise ApprovalError("check authority default_check_ids must be unique")
     unknown = [check_id for check_id in selection if check_id not in set(catalogue_ids)]
     if unknown:
         raise ApprovalError(
-            "check authority required_check_ids are not in the frozen catalogue: " + unknown[0]
+            "check authority default_check_ids are not in the frozen catalogue: " + unknown[0]
         )
     content = _canonical_check_authority(normalized, selection)
     path = _run_path(run_dir) / _CHECK_AUTHORITY_FILENAME
@@ -661,6 +708,7 @@ def wait_for_plan_approval(
 __all__ = [
     "ApprovalDecision",
     "ApprovalError",
+    "CheckAuthority",
     "PlanApproval",
     "PlanIdentity",
     "compute_plan_identity",

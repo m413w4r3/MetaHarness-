@@ -191,6 +191,9 @@ class PlannerContinue:
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     check_catalog: tuple[Any, ...] = ()
     default_check_ids: tuple[str, ...] = ()
+    # The run-level check authority this decision was parsed against; the
+    # catalogue and the defaults above are its frozen values, never live ones.
+    check_authority_sha256: str | None = None
     prompt_budget_bytes: int = 0
     last_usage: dict[str, Any] | None = None
 
@@ -206,7 +209,9 @@ class PlannerContinue:
         target = None if iterations_dir is None else planner_continue_dir(
             iterations_dir, facts.iteration)
         if target is not None:
-            write_planner_continue_request(target, planner_continue_request_record(facts, payload))
+            write_planner_continue_request(target, planner_continue_request_record(
+                facts, payload, check_authority_sha256=self.check_authority_sha256,
+            ))
         raw_path = target / "raw.txt" if target is not None else None
         answer = None
         if raw_path is not None and raw_path.is_file():
