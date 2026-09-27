@@ -33,7 +33,6 @@ SPEC = "Make feature.txt hold the requested content.\n"
 # of these for an ordinary failure is the false stop the property forbids.
 FALSE_HUMAN_STOP_STATUSES = frozenset({
     RunStatus.WAITING_HUMAN,
-    RunStatus.WAITING_CONTRACT_REPAIR,
 })
 
 # The postures of a run that delivered its accepted candidate.
@@ -143,55 +142,6 @@ BLOCKERS
 NONE
 
 END META PLAN
-"""
-
-
-def repaired_contract(step_id: str, title: str, path: str) -> str:
-    """A valid planner repair of one step contract, keeping its identity."""
-
-    return f"""META STEP CONTRACT REPAIR v1
-STEP_ID: {step_id}
-TITLE: {title}
-EXECUTION_CLASS: MECHANICAL
-DEPENDS_ON: NONE
-
-CONTEXT
-{title} with the corrected bounded scope.
-
-READ_SET
-- {path} :: current content
-
-WRITE_SET
-- {path}
-
-CREATE_SET
-NONE
-
-DELETE_SET
-NONE
-
-INSTRUCTIONS
-1. Perform the step on {path} only.
-
-INTERFACES
-NONE
-
-EXAMPLES
-NONE
-
-TESTS
-- The configured checks cover the corrected scope.
-
-PITFALLS
-- Do not edit paths outside the approved set.
-
-DONE_WHEN
-- {path} holds the corrected change.
-
-VERIFY
-- Run the configured checks.
-
-END META STEP CONTRACT REPAIR
 """
 
 

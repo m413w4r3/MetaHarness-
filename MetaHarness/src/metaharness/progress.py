@@ -63,12 +63,7 @@ def _trace_message(payload: dict[str, Any], secrets: tuple[str, ...]) -> tuple[s
         "plan.corrected": "plan correction", "approval.granted": "approval granted",
         "step.started": "step started", "step.completed": "step completed",
         "step.no_change": "step no-change", "step.failed": "step failed",
-        "contract.mismatch": "contract mismatch", "contract_repair.started": "contract repair started",
-        "contract_repair.waiting_external": "contract repair waiting external",
-        "contract_repair.resumed": "contract repair resumed", "contract_repair.completed": "contract repair completed",
-        "contract_repair.output_invalid": "contract repair planner output invalid",
-        "contract_repair.output_correction.started": "contract repair output correction",
-        "contract_repair.output_correction.exhausted": "contract repair output correction exhausted",
+        "contract.mismatch": "contract mismatch",
         "check.started": "check started", "check.completed": "check completed",
         "candidate.created": "candidate created", "resume.started": "resume",
     }

@@ -774,7 +774,6 @@ def configuration_description(
     """Return the bounded, credential-free subset intended for UI forms."""
 
     planning = config.planning
-    revision = config.revision
     checks = config.check_catalog[:_MAX_CONFIG_CHECKS]
     return {
         "repository": {
@@ -789,9 +788,6 @@ def configuration_description(
             "single_step_max_mutable_paths": planning.single_step_max_mutable_paths,
             "staged_step_max_mutable_paths": planning.staged_step_max_mutable_paths,
             "max_steps_per_plan": planning.max_steps_per_plan,
-        },
-        "revision": {
-            "max_step_contract_repairs": revision.max_step_contract_repairs,
         },
         "approval": {
             "require_plan_approval": config.approval.require_plan_approval,

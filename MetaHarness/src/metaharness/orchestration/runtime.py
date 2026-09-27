@@ -66,7 +66,6 @@ from ..trace import TraceSink, TraceStream
 from ..validation import ValidationError
 from .audit import AuditService
 from .check_recovery import CheckInfrastructureRecovery
-from .contract_recovery import ContractRecoveryService
 from .durable_readers import read_repository_reference
 from .gates import GateService
 from .pipeline_v2 import PipelineV2Coordinator, PipelineV2Context
@@ -134,12 +133,10 @@ class RunRuntime:
         self.trace: TraceStream | None = None
         self.trace_cycle = 1
         # The step services of this run: the step execution ladder, the one
-        # worker attempt it drives, the durable acceptance boundary, the
-        # semantic contract repair transaction and the red-gate step replan.
+        # worker attempt it drives, and the durable acceptance boundary.
         self.step_execution = StepExecutionService(self)
         self.worker_attempt = WorkerAttemptService(self)
         self.step_acceptance = StepAcceptanceService(self)
-        self.contract_recovery = ContractRecoveryService(self)
         self.gates = GateService(self)
         self.audit = AuditService(self)
         # The candidate authority: the immutable candidate commit, its push
@@ -157,8 +154,8 @@ class RunRuntime:
         """The run's one text transport, on the run's one transport horizon.
 
         ``chat`` is the only place the ``[transport]`` budget is applied, so
-        every consumer of a text endpoint (the planner, the audit and the
-        contract repair planner) shares the same resilience.
+        every consumer of a text endpoint (the planner and the audit) shares
+        the same resilience.
         """
 
         return chat_client(

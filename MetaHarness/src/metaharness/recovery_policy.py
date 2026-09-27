@@ -27,7 +27,6 @@ class RecoveryStrategy(StrEnum):
     """One deterministic step of one recovery ladder."""
 
     RETRY_TARGETED = "retry_targeted"
-    REPLAN_STEP = "replan_step"
     FALLBACK_EXECUTOR = "fallback_executor"
     MARK_FAILED_CONTINUE = "mark_failed_continue"
     WAIT_EXTERNAL = "wait_external"
@@ -90,7 +89,7 @@ FAILURE_CLASSES: Mapping[str, FailureClass] = {
     "PLANNER_BLOCKED_REQUIRES_OPERATOR": _F, "PLAN_APPROVAL_INVALID": _F,
     "PLAN_REPOSITORY_PRECONDITION_INVALID": _F,
     "REPOSITORY_EVIDENCE_RECOVERY_EXHAUSTED": _F,
-    "STEP_CONTRACT_REPAIR_OUTPUT_INVALID": _F, "EXECUTION_SELECTION_INVALID": _F, "WORKSPACE_SETUP_MUTATED": _F,
+    "EXECUTION_SELECTION_INVALID": _F, "WORKSPACE_SETUP_MUTATED": _F,
     "COMMIT_GATE_FAILED": _F, "COMMIT_SCOPE_VIOLATION": _F, "COMMIT_PARENT_MISMATCH": _F,
     "COMMIT_WORKTREE_DRIFT": _F, "COMMIT_VERIFICATION_FAILURE": _F,
     "COMMIT_TREE_MISMATCH": _F, "HEAD_MISMATCH": _F, "TREE_MISMATCH": _F, "TOCTOU_FAILURE": _F, "INVALID_PHASE_TRANSITION": _F,
@@ -104,7 +103,7 @@ RECOVERY_LADDERS: Mapping[FailureClass, tuple[RecoveryStrategy, ...]] = {
     ),
     FailureClass.FIXABLE: (
         RecoveryStrategy.RETRY_TARGETED, RecoveryStrategy.FALLBACK_EXECUTOR,
-        RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.MARK_FAILED_CONTINUE,
+        RecoveryStrategy.MARK_FAILED_CONTINUE,
     ),
     FailureClass.SPEC_DECISION: (RecoveryStrategy.WAIT_HUMAN,),
     FailureClass.FATAL: (RecoveryStrategy.HARD_STOP,),
@@ -187,20 +186,12 @@ class RecoveryBudgets:
     max_executor_fallbacks: int = 1
     max_check_infra_retries: int = 2
     max_workspace_setup_retries: int = 2
-    # Protocol corrections of one StepContractRepairPlanner answer inside the
-    # same semantic repair slot; never a new ``max_step_contract_repairs``.
-    max_contract_repair_output_corrections: int = 2
-    # Self-contained planner restarts of one exhausted output-correction
-    # budget, still inside the same semantic repair slot.
-    max_contract_repair_planner_restarts: int = 1
     execution_fallbacks: ExecutionFallbacks = ExecutionFallbacks()
 
     def __post_init__(self) -> None:
         for name in (
             "max_transient_attempts", "max_executor_fallbacks",
             "max_check_infra_retries", "max_workspace_setup_retries",
-            "max_contract_repair_output_corrections",
-            "max_contract_repair_planner_restarts",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10:

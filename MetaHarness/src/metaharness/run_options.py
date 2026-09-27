@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from .models import HarnessConfig, RevisionConfig, PlanningConfig, RoutingConfig, validate_revision_budget
+from .models import HarnessConfig, PlanningConfig, RoutingConfig, validate_revision_budget
 from .recovery_policy import ExecutionFallbacks, RecoveryBudgets
 from .profiles import ProfileError, profile_for_role
 from .result import atomic_write_text
@@ -23,21 +23,18 @@ class RunOptionsConflict(RunOptionsError):
     """An immutable run-options artifact already contains different bytes."""
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 # Deterministic refusal code for a snapshot that is not the current schema.
 RUN_SCHEMA_UNSUPPORTED = "RUN_SCHEMA_UNSUPPORTED"
 RUN_OPTIONS_NAME = "run_options.json"
 _TOP_LEVEL_FIELDS = frozenset({
-    "schema_version", "pipeline_version", "planning", "pipeline", "profiles", "recovery",
+    "schema_version", "pipeline_version", "planning", "profiles", "recovery",
 })
 _PLANNING_FIELDS = frozenset({
     "protocol", "decomposition", "execution_mode_policy",
     "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
     "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
     "max_preapproval_corrections",
-})
-_PIPELINE_FIELDS = frozenset({
-    "max_step_contract_repairs",
 })
 _PROFILE_FIELDS = frozenset({
     "planner_profile", "mechanical_profile", "reasoning_profile", "agentic_profile",
@@ -46,8 +43,7 @@ _PROFILE_FIELDS = frozenset({
 _RECOVERY_FIELDS = frozenset({
     "max_transient_attempts", "max_executor_fallbacks",
     "max_check_infra_retries",
-    "max_workspace_setup_retries", "max_contract_repair_output_corrections",
-    "max_contract_repair_planner_restarts",
+    "max_workspace_setup_retries",
 })
 _FALLBACK_FIELDS = frozenset({
     "mechanical", "reasoning", "agentic",
@@ -86,7 +82,6 @@ class RunOptions:
     single_step_max_mutable_paths: int
     staged_step_max_mutable_paths: int
     planner_profile: str
-    max_step_contract_repairs: int = 2
     mechanical_profile: str = ""
     reasoning_profile: str = ""
     agentic_profile: str = ""
@@ -127,12 +122,6 @@ class RunOptions:
             raise RunOptionsError(str(exc)) from None
         if not isinstance(self.recovery, RecoveryBudgets):
             raise RunOptionsError("run options recovery budgets are invalid")
-        try:
-            validate_revision_budget(
-                self.max_step_contract_repairs, "run options max_step_contract_repairs"
-            )
-        except ValueError as exc:
-            raise RunOptionsError(str(exc)) from None
         for name in (
             "planner_profile", "mechanical_profile", "reasoning_profile",
             "agentic_profile", "audit_profile",
@@ -149,7 +138,7 @@ class RunOptions:
             "planner_profile", "mechanical_profile",
             "reasoning_profile", "agentic_profile", "audit_profile",
             "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
-            "max_preapproval_corrections", "max_step_contract_repairs",
+            "max_preapproval_corrections",
             "recovery",
         }
         unknown = set(overrides) - allowed
@@ -172,7 +161,6 @@ class RunOptions:
             "max_read_paths_per_step": config.planning.max_read_paths_per_step,
             "max_step_contract_chars": config.planning.max_step_contract_chars,
             "max_preapproval_corrections": config.planning.max_preapproval_corrections,
-            "max_step_contract_repairs": config.revision.max_step_contract_repairs,
             "planner_profile": config.ui.default_planner_profile,
             **route_profiles,
             "audit_profile": config.ui.default_audit_profile,
@@ -224,9 +212,6 @@ class RunOptions:
                 "max_step_contract_chars": self.max_step_contract_chars,
                 "max_preapproval_corrections": self.max_preapproval_corrections,
             },
-            "pipeline": {
-                "max_step_contract_repairs": self.max_step_contract_repairs,
-            },
             "recovery": asdict(self.recovery),
             "profiles": {
                 "planner_profile": self.planner_profile,
@@ -241,8 +226,7 @@ class RunOptions:
     def from_mapping(cls, value: Any) -> "RunOptions":
         """Read the one current snapshot shape; nothing is migrated.
 
-        The schema 5 -> 6 break removed the former revision and gate-repair
-        surfaces: every older snapshot is refused, never converted.
+        Every older snapshot is refused, never converted.
         """
 
         if not isinstance(value, Mapping):
@@ -254,11 +238,10 @@ class RunOptions:
                 f"{schema_version!r} is not {SCHEMA_VERSION}"
             )
         _require_exact_keys(value, _TOP_LEVEL_FIELDS, "run options")
-        planning, pipeline, profiles, recovery = (
-            value["planning"], value["pipeline"], value["profiles"], value["recovery"],
+        planning, profiles, recovery = (
+            value["planning"], value["profiles"], value["recovery"],
         )
         _require_exact_keys(planning, _PLANNING_FIELDS, "run options planning")
-        _require_exact_keys(pipeline, _PIPELINE_FIELDS, "run options pipeline")
         _require_exact_keys(profiles, _PROFILE_FIELDS, "run options profiles")
         _require_exact_keys(
             recovery, _RECOVERY_FIELDS | {"execution_fallbacks"}, "run options recovery",
@@ -274,7 +257,7 @@ class RunOptions:
         try:
             return cls(
                 schema_version=schema_version, pipeline_version=value["pipeline_version"],
-                **planning, **pipeline, **profiles,
+                **planning, **profiles,
                 recovery=RecoveryBudgets(**normalized_recovery),
             )
         except RunOptionsError:
@@ -357,11 +340,8 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
         reasoning_profile=options.reasoning_profile,
         agentic_profile=options.agentic_profile,
     )
-    revision = RevisionConfig(
-        max_step_contract_repairs=options.max_step_contract_repairs,
-    )
     return replace(
-        config, planning=planning, ui=ui, routing=routing, revision=revision,
+        config, planning=planning, ui=ui, routing=routing,
         recovery=options.recovery,
     )
 

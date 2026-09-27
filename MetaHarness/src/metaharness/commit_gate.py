@@ -329,7 +329,7 @@ def accepted_step_record(
     if authority is not None:
         for key in (
             "effective_authority_sha256", "effective_contract_sha256",
-            "approved_contract_sha256", "authority_source", "repair_slot",
+            "approved_contract_sha256",
         ):
             payload[key] = authority.get(key)
     return payload

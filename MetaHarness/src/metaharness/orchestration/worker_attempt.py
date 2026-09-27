@@ -7,9 +7,8 @@ worker process, the durable artifacts it leaves, and the
 consumes.  Gates run in a fixed order and every failure raises
 :class:`~metaharness.orchestration.shared.StepExecutionFailure`.
 
-The retry ladder, the semantic contract repair and the commit boundary stay
-with their own transactions; this module only runs one attempt and normalizes
-what it produced.
+The retry ladder and commit boundary stay with their own transactions; this
+module only runs one attempt and normalizes what it produced.
 """
 
 from __future__ import annotations
@@ -47,13 +46,11 @@ from ..attempt_transaction import (
     ownership_violations,
     paths_detail,
     recover_worker_git_state,
-    status_has_unstaged_or_untracked,
 )
 from ..gitops import (
     GitError,
     candidate_tree_sha,
     changed_paths_between_trees,
-    current_head,
     index_tree_sha,
     restore_paths_from_tree,
     stage_all,
@@ -79,17 +76,13 @@ from ..result import (
 )
 from ..usage import normalize_usage
 from .shared import (
-    BOUNDED_NO_CHANGE_MISMATCH,
-    SYNTHETIC_NO_CHANGE_MISMATCH,
     StepExecutionFailure,
     StepExecutionOutcome,
     bounded_v2_report,
     json_text,
-    new_status_lines,
     record_failure_tree,
     safe_candidate_tree,
     safe_index_tree,
-    safe_status,
 )
 
 
@@ -119,8 +112,7 @@ class WorkerAttemptService:
         forbidden_env_names: tuple[str | None, ...],
         future_ownership: Mapping[str, tuple[str, ...]] | None = None,
         original_spec: str = "",
-        initial_mismatch: str | None = None,
-        mismatch_retry_count: int = 0,
+        attempt_number: int = 1,
         retry_addendum: str | None = None,
     ) -> StepExecutionOutcome:
         """The single authoritative execution of one step, in any cycle.
@@ -131,15 +123,6 @@ class WorkerAttemptService:
         """
 
         step_id = step.id
-        # The retry mode of this invocation, recorded with every failure it
-        # can raise so the durable step record says which attempt failed.
-        retry_mode: dict[str, Any] = (
-            {
-                "mismatch_retry_count": mismatch_retry_count,
-                "initial_mismatch": bounded_v2_report(initial_mismatch or "") or None,
-            }
-            if mismatch_retry_count else {}
-        )
         # 1-2. The exact tree the worker will receive, and the effective
         # contract Git determines on it.  A mechanical path misclassification
         # -- a CREATE_SET entry for a path that tree already holds, a WRITE_SET
@@ -150,7 +133,7 @@ class WorkerAttemptService:
             raise StepExecutionFailure(
                 "REPOSITORY_TREE_DRIFT_UNEXPLAINED", step_id,
                 "worktree changed outside a step",
-                profile_id=profile_id, tree_before=tree_before, **retry_mode,
+                profile_id=profile_id, tree_before=tree_before,
             )
         contract_normalization = normalize_step_contract(
             step, repository_tree_facts(repo, tree_before),
@@ -159,7 +142,6 @@ class WorkerAttemptService:
         # The complete Git boundary a no-op mismatch must leave untouched.
         # Accumulated modifications from the earlier steps are legitimate, so
         # the gate is "unchanged", never "empty".
-        index_before = index_tree_sha(worktree)
         status_before = status_porcelain(worktree)
         # 3-4. Approved profile and isolated environment.
         profile, step_role = self._step_profile(profile_id)
@@ -234,7 +216,7 @@ class WorkerAttemptService:
                 cycle=self.runtime.trace_cycle,
                 step_id=step_id,
                 data={
-                    "attempt": mismatch_retry_count + 1,
+                    "attempt": attempt_number,
                     "tree_before": tree_before,
                     "session": self.runtime.observability.trace_session(
                         profile=profile,
@@ -269,7 +251,7 @@ class WorkerAttemptService:
                 cycle=self.runtime.trace_cycle,
                 step_id=step_id,
                 data={
-                    "attempt": mismatch_retry_count + 1,
+                    "attempt": attempt_number,
                     "status": "failed",
                     "session": self.runtime.observability.trace_session(
                         profile=profile,
@@ -286,7 +268,7 @@ class WorkerAttemptService:
             self.runtime.observability.redact_step_artifacts(artifact_dir)
             raise StepExecutionFailure(
                 AGENT_SCOPE_VIOLATION, step_id, redact(str(exc), self.runtime.secrets),
-                profile_id=profile.id, tree_before=tree_before, **retry_mode,
+                profile_id=profile.id, tree_before=tree_before,
             ) from None
         except AgentError as exc:
             reason = getattr(exc, "code", None) or AGENT_RUNTIME_FAILED
@@ -307,7 +289,6 @@ class WorkerAttemptService:
                 reason, step_id, redact(str(exc), self.runtime.secrets),
                 profile_id=profile.id, tree_before=tree_before,
                 tree_after=tree_after, status_before=status_before,
-                **retry_mode,
             ) from None
         # 6. Complete and redact the durable artifacts.
         self.runtime.observability.ensure_step_artifacts(artifact_dir, result)
@@ -323,7 +304,7 @@ class WorkerAttemptService:
             cycle=self.runtime.trace_cycle,
             step_id=step_id,
             data={
-                "attempt": mismatch_retry_count + 1,
+                "attempt": attempt_number,
                 "status": result.status,
                 "session": self.runtime.observability.trace_session(
                     profile=profile,
@@ -346,13 +327,10 @@ class WorkerAttemptService:
         failed = {
             "profile_id": profile.id, "tree_before": tree_before, "usage": usage,
             "status_before": status_before,
-            **retry_mode,
         }
         # 7. Authentication classification from fixed markers only.
         auth_failure = result.backend_reason == "AGENT_AUTH_FAILURE"
         # Capture ownership before interpreting the worker's structural report.
-        # A clean mismatch is allowed to defer only when the complete Git
-        # boundary is untouched.
         ownership_after = git_ownership(repo, worktree)
         mutation = audit_git_mutation(
             ownership_before, ownership_after, branch_ref=branch_ref, base_sha=base_sha,
@@ -363,7 +341,7 @@ class WorkerAttemptService:
             raise StepExecutionFailure(
                 mutation.fatal_code, step_id, mutation.fatal_detail,
                 profile_id=profile.id, tree_before=tree_before,
-                tree_after=safe_candidate_tree(worktree), usage=usage, **retry_mode,
+                tree_after=safe_candidate_tree(worktree), usage=usage,
             )
         if mutation.recoverable:
             # A local commit or a parasite branch is not a boundary: the
@@ -376,7 +354,7 @@ class WorkerAttemptService:
                 raise StepExecutionFailure(
                     violation.code, step_id, violation.detail,
                     profile_id=profile.id, tree_before=tree_before,
-                    tree_after=safe_candidate_tree(worktree), usage=usage, **retry_mode,
+                    tree_after=safe_candidate_tree(worktree), usage=usage,
                 ) from None
             ownership_after = git_ownership(repo, worktree)
         boundary_violations = ownership_violations(
@@ -388,30 +366,9 @@ class WorkerAttemptService:
         mismatch = None
         if not result.timed_out and result.exit_code == 0:
             mismatch = contract_mismatch_explanation(result.final_message)
-            if mismatch is None:
-                # A successful, completely clean no-op has the same semantic
-                # meaning as a worker-declared structural mismatch.  Feed it
-                # through the existing bounded retry path; any boundary drift
-                # remains fail-closed below.
-                no_change_tree = safe_candidate_tree(worktree)
-                no_change_index = safe_index_tree(worktree)
-                no_change_status = safe_status(worktree)
-                if (
-                    no_change_tree == tree_before
-                    and index_before == tree_before
-                    and no_change_index == tree_before
-                    and not status_has_unstaged_or_untracked(status_before)
-                    and no_change_status == status_before
-                    and not boundary_violations
-                ):
-                    mismatch = (
-                        BOUNDED_NO_CHANGE_MISMATCH
-                        if mismatch_retry_count else SYNTHETIC_NO_CHANGE_MISMATCH
-                    )
         if mismatch is not None:
-            # Freeze even unstaged worker edits into a durable candidate tree
-            # before the repair transaction.  This makes a crash at the
-            # mismatch boundary recoverable by the normal resume validator.
+            # Freeze the attempt tree so the ordinary retry can prove and
+            # restore its exact boundary.
             try:
                 stage_all(worktree)
             except GitError as exc:
@@ -421,30 +378,14 @@ class WorkerAttemptService:
                 ) from exc
             tree_after = safe_candidate_tree(worktree)
             index_after = safe_index_tree(worktree)
-            status_after = safe_status(worktree)
             if boundary_violations:
                 record_failure_tree(artifact_dir, worktree)
                 raise StepExecutionFailure(
                     "AGENT_GIT_VIOLATION", step_id,
                     "; ".join(boundary_violations),
-                    profile_id=profile.id, tree_before=tree_before,
-                    tree_after=tree_after, usage=usage,
+                    **failed, tree_after=tree_after,
                     mismatch=bounded_v2_report(mismatch),
-                    mismatch_retry_count=mismatch_retry_count,
                 )
-            # Clean means "the worker changed nothing": the candidate tree,
-            # the index, the porcelain status and Git ownership are all exactly
-            # what this step received.  It is deliberately not "git status is
-            # empty": the cumulative modifications of the earlier approved
-            # steps are legitimate and untracked-but-ignored files are never a
-            # gate here.
-            clean = (
-                bool(mismatch.strip())
-                and tree_after == tree_before
-                and index_after == index_before
-                and status_after == status_before
-                and not boundary_violations
-            )
             changed = []
             if tree_after is not None:
                 try:
@@ -458,11 +399,9 @@ class WorkerAttemptService:
                 raise StepExecutionFailure(
                     AGENT_SCOPE_VIOLATION, step_id,
                     "worker changed paths outside scope: " + paths_detail(unexpected),
-                    profile_id=profile.id, tree_before=tree_before,
-                    tree_after=tree_after, usage=usage,
+                    **failed, tree_after=tree_after,
                     mismatch=bounded_v2_report(mismatch),
                     index_tree_after=index_after,
-                    mismatch_retry_count=mismatch_retry_count,
                 )
             atomic_write_text(artifact_dir / "step.json", json_text({
                 "id": step_id, "status": "FAILED", "reason": "AGENT_CONTRACT_MISMATCH",
@@ -477,19 +416,12 @@ class WorkerAttemptService:
                 details.append(bounded_v2_report(mismatch))
             if tree_after is None:
                 details.append("failure tree could not be read")
-            residual = new_status_lines(status_before, status_after)
             raise StepExecutionFailure(
                 "AGENT_CONTRACT_MISMATCH", step_id,
                 "; ".join(details) or "worker reported a contract mismatch",
-                profile_id=profile.id, tree_before=tree_before,
-                tree_after=tree_after, usage=usage,
+                **failed, tree_after=tree_after,
                 mismatch=bounded_v2_report(mismatch),
-                clean_contract_mismatch=clean,
-                mismatch_retry_count=mismatch_retry_count,
-                initial_mismatch=(
-                    bounded_v2_report(initial_mismatch)
-                    if mismatch_retry_count and initial_mismatch else None
-                ),
+                retry_feedback=bounded_v2_report(mismatch),
                 index_tree_after=index_after,
             )
         # 8-9. Git ownership: HEAD, branch, branches and worktrees.
@@ -524,10 +456,15 @@ class WorkerAttemptService:
         stage_all(worktree)
         tree_after = index_tree_sha(worktree)
         if tree_after == tree_before:
+            feedback = (
+                "No in-scope candidate change was produced. Complete the approved "
+                "step if work remains."
+            )
             raise StepExecutionFailure(
                 "AGENT_NO_CHANGE", step_id,
-                bounded_v2_report(result.final_message) or "candidate delta is empty",
+                feedback,
                 tree_after=tree_after, index_tree_after=safe_index_tree(worktree), **failed,
+                retry_feedback=feedback,
             )
         # 15-16. Git, not the prompt, is the scope authority.  A forbidden
         # path is fatal in both modes; an ordinary path outside the declared
@@ -581,10 +518,7 @@ class WorkerAttemptService:
             "tree_before": tree_before, "tree_after": tree_after,
             "changed_paths": list(changed_paths),
             "out_of_scope_paths": list(out_of_scope_paths),
-            **({"mismatch_retry_count": mismatch_retry_count}
-               if mismatch_retry_count else {}),
-            **({"initial_mismatch": bounded_v2_report(initial_mismatch)}
-               if mismatch_retry_count and initial_mismatch else {}),
+            "attempt": attempt_number,
             **({"deferred_verify": deferred_verify} if deferred_verify else {}),
             "usage": usage,
         }))
@@ -597,7 +531,6 @@ class WorkerAttemptService:
             usage=usage,
             final_report=result.final_message,
             deferred_verify=deferred_verify,
-            mismatch_retry_count=mismatch_retry_count,
             out_of_scope_paths=out_of_scope_paths,
             status_before=tuple(status_before),
         )
@@ -605,53 +538,3 @@ class WorkerAttemptService:
         """The approved implementation profile of one plan step."""
 
         return profile_for_role(self.runtime.config, profile_id, ExecutionRole.IMPLEMENTER), ExecutionRole.IMPLEMENTER
-    def no_change_outcome(
-        self, failure: StepExecutionFailure, artifact_dir: Path, *,
-        worktree: Path, expected_head: str,
-    ) -> StepExecutionOutcome:
-        """Record a clean empty delta after the bounded worker/repair path."""
-
-        before = failure.tree_before
-        after = safe_candidate_tree(worktree)
-        index_after = safe_index_tree(worktree)
-        status_after = safe_status(worktree)
-        if (
-            before is None or after != before or index_after != before
-            or current_head(worktree) != expected_head
-            or status_has_unstaged_or_untracked(status_after or ())
-            or (failure.status_before is not None and status_after != failure.status_before)
-        ):
-            failure.step_dir = artifact_dir
-            raise failure
-        usage = normalize_usage(failure.usage)
-        report = bounded_v2_report(failure.detail or "candidate delta is empty")
-        atomic_write_text(artifact_dir / "step.json", json_text({
-            "id": failure.step_id,
-            "status": "COMPLETED",
-            "no_change": True,
-            "reason": "bounded execution left the exact candidate tree unchanged",
-            "profile_id": failure.profile_id,
-            "tree_before": before,
-            "tree_after": after,
-            "changed_paths": [],
-            "mismatch_retry_count": failure.mismatch_retry_count,
-            **({"initial_mismatch": failure.initial_mismatch}
-               if failure.initial_mismatch else {}),
-            "usage": usage,
-        }))
-        self.runtime.observability.trace_emit(
-            "step.completed_no_change", phase="implementation",
-            cycle=self.runtime.trace_cycle, step_id=failure.step_id,
-            data={"tree_sha": after, "mismatch_retry_count": failure.mismatch_retry_count},
-        )
-        return StepExecutionOutcome(
-            step_id=failure.step_id,
-            profile_id=failure.profile_id or "",
-            tree_before=before,
-            tree_after=after,
-            changed_paths=(),
-            usage=usage,
-            final_report=report,
-            mismatch_retry_count=failure.mismatch_retry_count,
-            no_change=True,
-        )

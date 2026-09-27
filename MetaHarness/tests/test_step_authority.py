@@ -1,10 +1,4 @@
-"""One effective step authority, end to end, across repair, acceptance and resume.
-
-Regression for run 20260923T182533Z-5dec8f9346: two validated contract
-repairs authorized two more S05 paths, the worker succeeded inside that
-authority, and the commit gate then refused exactly those paths because it
-was handed the approved step instead of the effective one.
-"""
+"""The approved plan step stays the only worker and commit authority."""
 
 from __future__ import annotations
 
@@ -16,408 +10,110 @@ from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
 from metaharness.commit_gate import commit_safety_gate
 from metaharness.models import ExecutionRole, RunStatus
 from metaharness.orchestration.step_acceptance import StepAcceptanceService
-from metaharness.orchestration.step_authority import mutable_paths, read_step_candidate
+from metaharness.orchestration.step_authority import read_step_candidate
 from metaharness.orchestrator import Orchestrator
-from metaharness.repository_topology import RepositoryTopology
 from metaharness.resume import resume_info
-from metaharness.run_options import RunOptions
-from tests.pipeline.support import repaired_step_contract
-from tests.pipeline_support import PipelineHarness, git, plan
+from tests.pipeline.support import PipelineHarness, git, initial_plan, write
 
 SPEC = "Make feature.txt good.\n"
-EDITION = "frontend/src/features/edition-dashboard/EditionDashboard.test.tsx"
-TRANSFER = "frontend/src/components/ProductionStateTransfer.test.tsx"
-
-
-def mismatch_for(text: str):
-    def action(_request) -> str:
-        return CONTRACT_MISMATCH_HEADER + "\n" + text
-    return action
-
-
-def writes(*paths: str, content: str = "changed\n", report: str = "done\n"):
-    def action(request) -> str:
-        for path in paths:
-            target = request.worktree / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("good\n" if path == "feature.txt" else content, encoding="utf-8")
-        return report
-    return action
-
-
-def repair_contract(*paths: str) -> str:
-    """The S01 repair: feature.txt plus *paths*, read and written."""
-
-    reads = "".join(f"- {path} :: current content\n" for path in paths)
-    written = "".join(f"- {path}\n" for path in paths)
-    return repaired_step_contract().replace(
-        "- feature.txt :: current content\n", "- feature.txt :: current content\n" + reads, 1,
-    ).replace("WRITE_SET\n- feature.txt\n", "WRITE_SET\n- feature.txt\n" + written, 1)
+STEP = ("S01", "feature.txt", "Write the feature")
 
 
 class NoCall:
-    """A model client that must not be called."""
-
     def __init__(self) -> None:
         self.requests: list[str] = []
 
     def complete(self, request: str) -> str:
         self.requests.append(request)
-        raise AssertionError("no model call is allowed here")
+        raise AssertionError("resume must not call the planner")
 
 
-class StepAuthorityHarness(PipelineHarness):
-    TRACKED = ("a.txt", "c.txt", "d.txt", "e.txt", TRANSFER, EDITION)
-
-    def setUp(self) -> None:
-        super().setUp()
-        for path in self.TRACKED:
-            target = self.repo / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "--all")
-        git(self.repo, "commit", "-qm", "tracked fixtures")
-        git(self.repo, "push", "-q", "origin", "main")
-
-    def options(self, config, *, max_added: int = 4) -> RunOptions:
-        del max_added
-        return RunOptions.from_config(config)
-
-    def one_step_plan(self, *extra: str) -> str:
-        """S01 approved on feature.txt (A) and *extra* (B...)."""
-
-        raw = plan(("S01", "feature.txt", "Write the feature"))
-        reads = "".join(f"- {path} :: current content\n" for path in extra)
-        written = "".join(f"- {path}\n" for path in extra)
-        return raw.replace(
-            "- feature.txt :: current content\n", "- feature.txt :: current content\n" + reads, 1,
-        ).replace("WRITE_SET\n- feature.txt\n", "WRITE_SET\n- feature.txt\n" + written, 1)
-
-    def step_dir(self, step_id: str = "S01") -> Path:
-        return self.run_dir() / f"cycles/001/implementation/steps/{step_id}"
+class StepAuthorityTests(PipelineHarness):
+    def step_dir(self) -> Path:
+        return self.run_dir() / "cycles/001/implementation/steps/S01"
 
     def json(self, path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def accepted_paths(self, step_id: str = "S01") -> list[str]:
-        chain = self.json(self.run_dir() / "accepted-chain.json")["commits"]
-        (record,) = [item for item in chain if item["step_id"] == step_id]
-        return sorted(record["changed_paths"])
-
-    def run_pipeline(self, planner: list, *, config=None, options=None):
-        config = config or self.config()
+    def run_pipeline(self):
         return self.orchestrator(
-            config, planner=planner,
-        ).run_text(SPEC, run_id="run", run_options=options or self.options(config))
+            self.config(), planner=[initial_plan(STEP)],
+        ).run_text(SPEC, run_id="run")
 
     def resume_without_planner(self):
         planner = NoCall()
-        orchestrator = Orchestrator(self.config(), planner_client=planner)
-        return orchestrator.resume("run"), planner
+        return Orchestrator(self.config(), planner_client=planner).resume("run"), planner
 
-    def two_repairs_then_success(self, *success_paths: str) -> None:
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            mismatch_for("The step also needs c.txt and d.txt."),
-            mismatch_for("The step still needs d.txt."),
-            writes(*success_paths),
-        )
+    def test_approved_authority_is_bound_through_candidate_and_commit(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
 
-class EffectiveAuthorityCommitTests(StepAuthorityHarness):
-    def test_two_validated_repairs_authorize_the_commit_gate(self) -> None:
-        """CAS 1: A,B approved; repairs add C then D; success on A,B,C,D."""
-
-        self.two_repairs_then_success("feature.txt", "a.txt", "c.txt", "d.txt")
-        captured: list[tuple[str, ...]] = []
-
-        def spy(*args, **kwargs):
-            captured.append(tuple(kwargs["mutable_scope"]))
-            return commit_safety_gate(*args, **kwargs)
-
-        with mock.patch("metaharness.orchestration.step_acceptance.commit_safety_gate", side_effect=spy):
-            result = self.run_pipeline([
-                self.one_step_plan("a.txt"),
-                repair_contract("a.txt", "c.txt"),
-                repair_contract("a.txt", "c.txt", "d.txt"),
-            ])
+        result = self.run_pipeline()
 
         self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
-        implementer_calls = [
-            call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER
-        ]
-        self.assertEqual(len(implementer_calls), 3)
-        self.assertEqual(
-            set(implementer_calls[-1].mutable_paths), {"feature.txt", "a.txt", "c.txt", "d.txt"},
-        )
-        # The commit gate received the effective authority, not the approved step.
-        self.assertEqual(captured, [("a.txt", "c.txt", "d.txt", "feature.txt")])
         step = self.json(self.step_dir() / "step.json")
         candidate = read_step_candidate(self.step_dir())
-        acceptance = self.json(self.step_dir() / "step_acceptance.json")
-        self.assertEqual(step["changed_paths"], ["a.txt", "c.txt", "d.txt", "feature.txt"])
-        self.assertEqual((step["authority_source"], step["repair_slot"]), ("contract_repair", 2))
-        # Worker authority == commit-gate authority == accepted record.
-        self.assertEqual(candidate["effective_authority_sha256"], step["effective_authority_sha256"])
-        self.assertEqual(acceptance["commit_gate_authority_sha256"], step["effective_authority_sha256"])
+        self.assertEqual(step["changed_paths"], ["feature.txt"])
         self.assertEqual(
-            self.json(self.step_dir() / "step_authority.json")["effective_authority_sha256"],
-            step["effective_authority_sha256"],
+            candidate["approved_contract_sha256"], candidate["effective_contract_sha256"],
         )
-        (chain,) = self.json(self.run_dir() / "accepted-chain.json")["commits"]
-        self.assertEqual(chain["effective_authority_sha256"], step["effective_authority_sha256"])
-        self.assertNotEqual(step["effective_contract_sha256"], step["approved_contract_sha256"])
-        names = self.trace_names()
-        self.assertLess(names.index("step.candidate.persisted"), names.index("step.committed"))
-
-    def test_one_repair_adding_the_two_frontend_fixtures_commits(self) -> None:
-        """CAS 2: the exact S05 shape, one repair +2 paths."""
-
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            mismatch_for("Fixtures ProductionStateTransfer.test.tsx and EditionDashboard.test.tsx must change."),
-            writes("feature.txt", "a.txt", TRANSFER, EDITION),
-        )
-        result = self.run_pipeline([self.one_step_plan("a.txt"), repair_contract("a.txt", TRANSFER, EDITION)])
-
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
-        validation = self.json(self.step_dir() / "contract_repairs/01/validation.json")
-        self.assertEqual(validation["added_mutable_paths"], sorted([TRANSFER, EDITION]))
-        self.assertEqual(self.accepted_paths(), sorted(["feature.txt", "a.txt", TRANSFER, EDITION]))
-
-    def test_a_safe_path_outside_the_effective_authority_is_a_recordable_signal(self) -> None:
-        """CAS 3: effective A..D, worker writes E: recorded, never a boundary."""
-
-        self.two_repairs_then_success("feature.txt", "c.txt", "d.txt", "e.txt")
-        result = self.run_pipeline([
-            self.one_step_plan("a.txt"),
-            repair_contract("a.txt", "c.txt"),
-            repair_contract("a.txt", "c.txt", "d.txt"),
-        ])
-
-        # E is an ordinary path: the change is admitted for this step, the
-        # commit gate is widened for exactly this attempt, and the audit is fed.
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
-        step = self.json(self.step_dir() / "step.json")
-        self.assertEqual(step["status"], "COMPLETED")
-        self.assertEqual(step["out_of_scope_paths"], ["e.txt"])
-        self.assertEqual(step["changed_paths"], ["c.txt", "d.txt", "e.txt", "feature.txt"])
-        self.assertEqual(self.accepted_paths(), ["c.txt", "d.txt", "e.txt", "feature.txt"])
-        self.assertEqual(git(self.worktree(), "status", "--porcelain"), "")
-        # The extra path widens nothing durable: the recorded authority stays
-        # the effective one and the approval envelope is untouched.
+        (record,) = self.json(self.run_dir() / "accepted-chain.json")["commits"]
         self.assertEqual(
-            self.json(self.step_dir() / "step_authority.json")["effective_mutable_paths"],
-            ["a.txt", "c.txt", "d.txt", "feature.txt"],
+            record["effective_authority_sha256"], candidate["effective_authority_sha256"],
         )
+        self.assertNotIn("repair_slot", candidate)
 
-    def test_the_commit_gate_itself_still_refuses_an_unauthorized_path(self) -> None:
-        """CAS 3 at the commit boundary: the gate is strict, not permissive."""
-
-        self.workers.on(ExecutionRole.IMPLEMENTER, writes("feature.txt"))
-        original = commit_safety_gate
-
-        def narrowed(*args, **kwargs):
-            # Simulate a candidate the effective authority does not cover.
-            kwargs["mutable_scope"] = ("a.txt",)
-            return original(*args, **kwargs)
-
-        with mock.patch("metaharness.orchestration.step_acceptance.commit_safety_gate", side_effect=narrowed):
-            result = self.run_pipeline([self.one_step_plan()])
-
-        # The refusal is ordinary and fixable: the run waits, it is not fatal.
-        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
-        failure = self.state()["failure"]
-        self.assertEqual(failure["reason"], "COMMIT_GATE_FAILED")
-        self.assertIn("COMMIT_SCOPE_VIOLATION", failure["detail"])
-        acceptance = self.json(self.step_dir() / "step_acceptance.json")
-        self.assertEqual((acceptance["status"], acceptance["code"]), ("refused", "COMMIT_SCOPE_VIOLATION"))
-        self.assertEqual(acceptance["paths"], ["feature.txt"])
-
-    def test_a_secret_in_an_authorized_path_fails_closed(self) -> None:
-        """CAS 13."""
-
-        secret = "sk-test-SUPERSECRETVALUE-0123456789"
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            mismatch_for("The step also needs c.txt."),
-            writes("feature.txt", "c.txt", content=f"token = {secret}\n"),
-        )
-        with mock.patch("metaharness.orchestrator.config_secret_values", return_value=(secret,)):
-            result = self.run_pipeline([self.one_step_plan(), repair_contract("c.txt")])
-
-        self.assertEqual(result.status, RunStatus.FAILED)
-        failure = self.state()["failure"]
-        self.assertEqual(failure["reason"], "COMMIT_SECURITY_FAILURE")
-        self.assertIn("COMMIT_SECURITY_FAILURE", failure["detail"])
-        self.assertFalse(resume_info(self.run_dir(), self.state()).resumable)
-        self.assertEqual(git(self.worktree(), "rev-list", "--count", "HEAD"), git(self.repo, "rev-list", "--count", "main"))
-
-
-class TopologyEvidenceTests(StepAuthorityHarness):
-    def test_the_repair_prompt_lists_the_tracked_candidate_of_a_basename(self) -> None:
-        """CAS 4: the mismatch names only a basename; the planner still chooses."""
+    def test_worker_retry_resume_needs_no_repair_artifact(self) -> None:
+        def mismatch(request):
+            (request.worktree / "feature.txt").write_text("partial\n", encoding="utf-8")
+            return CONTRACT_MISMATCH_HEADER + "\nThe step instructions were not met."
 
         self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            mismatch_for("EditionDashboard.test.tsx asserts the removed link."),
-            writes("feature.txt", EDITION),
-        )
-        result = self.run_pipeline([self.one_step_plan(), repair_contract(EDITION)])
-
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
-        request = self.planner.requests[1]
-        self.assertIn(
-            "<REPOSITORY PATH CANDIDATES>\nEditionDashboard.test.tsx:\n  - " + EDITION
-            + "\n</REPOSITORY PATH CANDIDATES>",
-            request,
-        )
-        evidence = self.json(self.step_dir() / "contract_repairs/01/topology_evidence.json")
-        self.assertEqual(evidence["tree_sha"], self.json(self.step_dir() / "contract_repairs/01/transaction.json")["tree_sha"])
-        self.assertEqual(evidence["references"][0]["candidates"], [EDITION])
-
-    def test_a_wrong_directory_is_normalized_inside_the_same_slot(self) -> None:
-        """CAS 5 under A4: Git classifies the path, so no answer is re-planned."""
-
-        wrong = "frontend/src/features/edition-workflow/EditionDashboard.test.tsx"
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            mismatch_for("EditionDashboard.test.tsx asserts the removed link."),
-            writes("feature.txt", wrong),
-        )
-        result = self.run_pipeline([self.one_step_plan(), repair_contract(wrong)])
-
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
-        # The original worker plus the post-repair worker only; one repair
-        # answer, never a paid output correction.
-        implementer_calls = [
-            call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER
-        ]
-        self.assertEqual(len(implementer_calls), 2)
-        self.assertEqual(len(self.planner.requests), 2)
-        slot = self.step_dir() / "contract_repairs/01"
-        self.assertEqual(sorted(path.name for path in slot.parent.iterdir()), ["01"])
-        contract = (slot / "contract.md").read_text(encoding="utf-8")
-        self.assertIn(f"CREATE_SET\n- {wrong}", contract)
-        self.assertEqual(self.json(slot / "validation.json")["added_mutable_paths"], [wrong])
-        self.assertEqual(self.json(slot / "transaction.json")["status"], "completed")
-        self.assertEqual(
-            [item["code"] for item in
-             self.json(slot / "contract_normalization.json")["normalizations"]],
-            ["WRITE_MISSING_TO_CREATE", "DROP_READ_OF_CREATE"],
-        )
-        self.assertEqual(self.accepted_paths(), sorted(["feature.txt", wrong]))
-
-    def test_an_ambiguous_basename_lists_every_candidate_and_chooses_none(self) -> None:
-        """CAS 6."""
-
-        topology = RepositoryTopology("a" * 40, frozenset({
-            "one/Widget.test.tsx", "two/Widget.test.tsx", "three/Other.tsx",
-        }))
-        (entry,) = topology.evidence("Widget.test.tsx fails")
-        self.assertEqual(entry["candidates"], ["one/Widget.test.tsx", "two/Widget.test.tsx"])
-        self.assertEqual(topology.candidates("three/Other.tsx"), ())
-        self.assertEqual(topology.candidates("zzz/Other.tsx"), ("three/Other.tsx",))
-
-
-class StepAcceptanceResumeTests(StepAuthorityHarness):
-    def interrupt_before_commit(self) -> None:
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            mismatch_for("The step also needs c.txt."),
-            writes("feature.txt", "c.txt"),
+            ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"),
         )
         with mock.patch(
-            "metaharness.orchestration.step_acceptance.commit_safety_gate", side_effect=KeyboardInterrupt(),
+            "metaharness.orchestration.step_acceptance.commit_safety_gate",
+            side_effect=KeyboardInterrupt(),
         ):
-            result = self.run_pipeline([self.one_step_plan(), repair_contract("c.txt")])
-        self.assertEqual(result.status, RunStatus.INTERRUPTED)
-        self.assertEqual(self.checkpoint()["phase"], "step_acceptance")
-        self.assertIsNotNone(read_step_candidate(self.step_dir()))
-
-    def test_a_crash_after_worker_success_resumes_without_any_model_call(self) -> None:
-        """CAS 7."""
-
-        self.interrupt_before_commit()
+            result = self.orchestrator(
+                self.config(), planner=[initial_plan(STEP)],
+            ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.INTERRUPTED, self.state().get("failure"))
+        self.assertTrue((self.step_dir() / "attempts/01/step.json").exists())
+        self.assertFalse((self.step_dir() / "contract_repairs").exists())
         info = resume_info(self.run_dir(), self.state())
-        self.assertTrue(info.resumable)
-        self.assertEqual((info.label, info.operation), ("Retry step acceptance (S01)", "step_acceptance"))
-        calls = len([c for c in self.workers.calls if c.role is ExecutionRole.IMPLEMENTER])
-
-        resumed, planner = self.resume_without_planner()
-
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
-        self.assertEqual(
-            len([c for c in self.workers.calls if c.role is ExecutionRole.IMPLEMENTER]), calls,
-        )
-        self.assertEqual(planner.requests, [])
-        self.assertEqual(self.accepted_paths(), ["c.txt", "feature.txt"])
-        self.assertIn("recovery.resumed", self.trace_names())
-
-    def test_a_crash_after_the_commit_is_only_recorded_again(self) -> None:
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            mismatch_for("The step also needs c.txt."),
-            writes("feature.txt", "c.txt"),
-        )
-        with mock.patch.object(
-            StepAcceptanceService, "_finalize_accepted_step", side_effect=KeyboardInterrupt(),
-        ):
-            result = self.run_pipeline([self.one_step_plan(), repair_contract("c.txt")])
-        self.assertEqual(result.status, RunStatus.INTERRUPTED)
-        committed = git(self.worktree(), "rev-parse", "HEAD")
+        self.assertEqual((info.operation, info.phase), ("step_acceptance", "step_acceptance"))
 
         resumed, planner = self.resume_without_planner()
 
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(planner.requests, [])
-        (chain,) = self.json(self.run_dir() / "accepted-chain.json")["commits"]
-        self.assertEqual(chain["commit_sha"], committed)
-        self.assertEqual(git(self.worktree(), "rev-list", "--count", f"{self.state()['base_sha']}..{committed}"), "1")
+        self.assertEqual(len([c for c in self.workers.calls if c.role is ExecutionRole.IMPLEMENTER]), 2)
 
     def test_a_missing_or_corrupt_candidate_fails_closed(self) -> None:
-        """CAS 8."""
-
-        self.interrupt_before_commit()
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        with mock.patch(
+            "metaharness.orchestration.step_acceptance.commit_safety_gate",
+            side_effect=KeyboardInterrupt(),
+        ):
+            self.run_pipeline()
         path = self.step_dir() / "step_candidate.json"
         payload = self.json(path)
-        payload["changed_paths"] = ["feature.txt"]
+        payload["changed_paths"] = ["other.txt"]
         path.write_text(json.dumps(payload), encoding="utf-8")
-        calls = len(self.workers.calls)
 
         resumed, planner = self.resume_without_planner()
 
         self.assertEqual(resumed.status, RunStatus.FAILED)
         self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
         self.assertIn("step candidate hash changed", self.state()["failure"]["detail"])
-        self.assertEqual((len(self.workers.calls), planner.requests), (calls, []))
-
-    def test_a_corrupted_effective_authority_fails_closed(self) -> None:
-        """CAS 12: contract.md, then validation.json, tampered."""
-
-        for artifact in ("contract.md", "validation.json"):
-            with self.subTest(artifact=artifact):
-                self.tearDown()
-                self.setUp()
-                self.interrupt_before_commit()
-                target = self.step_dir() / "contract_repairs/01" / artifact
-                if artifact == "contract.md":
-                    target.write_text(target.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
-                else:
-                    payload = self.json(target)
-                    payload["added_mutable_paths"] = ["c.txt", "e.txt"]
-                    target.write_text(json.dumps(payload), encoding="utf-8")
-
-                resumed, planner = self.resume_without_planner()
-
-                self.assertEqual(resumed.status, RunStatus.FAILED)
-                self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-                self.assertEqual(planner.requests, [])
-                self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(planner.requests, [])
 
     def test_git_ownership_drift_fails_closed(self) -> None:
-        """CAS 14."""
-
-        self.interrupt_before_commit()
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        with mock.patch.object(
+            StepAcceptanceService, "_finalize_accepted_step", side_effect=KeyboardInterrupt(),
+        ):
+            self.run_pipeline()
         git(self.worktree(), "checkout", "-q", "-b", "operator-branch")
 
         resumed, planner = self.resume_without_planner()
@@ -425,60 +121,3 @@ class StepAcceptanceResumeTests(StepAuthorityHarness):
         self.assertEqual(resumed.status, RunStatus.FAILED)
         self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
         self.assertEqual(planner.requests, [])
-
-
-class StagedReliabilityTests(StepAuthorityHarness):
-    """Part O: six steps, S05 repaired +2 paths, gates, revision, review."""
-
-    STEP_FILES = ("s01.txt", "s02.txt", "s03.txt", "s04.txt")
-
-    def setUp(self) -> None:
-        super().setUp()
-        for path in self.STEP_FILES:
-            (self.repo / path).write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "--all")
-        git(self.repo, "commit", "-qm", "step files")
-        git(self.repo, "push", "-q", "origin", "main")
-
-    def test_the_repaired_s05_is_accepted_and_the_run_commits(self) -> None:
-        steps = (
-            ("S01", "s01.txt", "First stage"), ("S02", "s02.txt", "Second stage"),
-            ("S03", "s03.txt", "Third stage"), ("S04", "s04.txt", "Fourth stage"),
-            ("S05", "a.txt", "Write the feature"), ("S06", "feature.txt", "Finish"),
-        )
-        repaired = repair_contract(TRANSFER, EDITION).replace("feature.txt", "a.txt").replace(
-            "STEP_ID: S01", "STEP_ID: S05", 1,
-        )
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            *(writes(path) for path in self.STEP_FILES),
-            mismatch_for("ProductionStateTransfer.test.tsx and EditionDashboard.test.tsx must change."),
-            writes("a.txt", TRANSFER, EDITION),
-            writes("feature.txt"),
-        )
-        config = self.config()
-
-        result = self.run_pipeline([plan(*steps), repaired], config=config)
-
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
-        roles = self.workers.roles()
-        self.assertEqual(roles.count("implementer"), 7)  # S01-S04, S05 x2, S06
-        self.assertEqual(
-            [call.artifact_dir.name for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER],
-            ["S01", "S02", "S03", "S04", "S05", "S05", "S06"],
-        )
-        chain = self.json(self.run_dir() / "accepted-chain.json")["commits"]
-        self.assertEqual([item["step_id"] for item in chain], ["S01", "S02", "S03", "S04", "S05", "S06"])
-        s05 = chain[4]
-        self.assertEqual(sorted(s05["changed_paths"]), sorted(["a.txt", TRANSFER, EDITION]))
-        self.assertEqual((s05["authority_source"], s05["repair_slot"]), ("contract_repair", 1))
-        self.assertTrue(all(item["effective_authority_sha256"] for item in chain))
-        self.assertEqual(
-            [item["authority_source"] for item in chain].count("approved"), 5,
-        )
-        repairs = [
-            item for item in self.state().get("recovery_attempts", [])
-            if item.get("budget_key") == "contract_repairs"
-        ]
-        self.assertEqual(len(repairs), 1)
-        self.assertEqual(len(self.planner.requests), 2)

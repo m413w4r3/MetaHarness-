@@ -22,7 +22,6 @@
     waiting_external: "Waiting for external authorization",
     waiting_remote: "Waiting for remote",
     waiting_human: "Waiting for operator decision",
-    waiting_contract_repair: "Output correction exhausted",
   };
   var SYMBOLS = {complete: "✓", running: "▶", failed: "✗", waiting: "·", resumable: "↻", skipped: "–"};
   var STATES = ["complete", "running", "failed", "waiting", "resumable", "skipped"];

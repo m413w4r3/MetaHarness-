@@ -93,7 +93,6 @@ _TIMELINE = (
     ("created", "CREATED"), ("planning", "PLANNING"),
     ("awaiting_plan_approval", "AWAITING PLAN APPROVAL"), ("worktree_ready", "WORKTREE"),
     ("preparing", "PREPARING"), ("implementing", "IMPLEMENTING"),
-    ("contract_repairing", "CORRECTING STEP CONTRACT"),
     ("revising", "REVISING"), ("revalidating", "REVALIDATING"),
     ("approved", "APPROVED"), ("waiting_remote", "WAITING FOR REMOTE"),
     ("publishing", "PUBLISHING"), ("published", "PUBLISHED"),
@@ -104,13 +103,11 @@ _TERMINAL_LABELS = {
     "interrupted": "INTERRUPTED", "waiting_human": "WAITING FOR OPERATOR",
     "waiting_external": "WAITING FOR EXTERNAL AUTHORIZATION",
     "waiting_remote": "WAITING FOR REMOTE",
-    "waiting_contract_repair": "WAITING FOR CONTRACT REPAIR PLANNER",
 }
 _WAITING_LABELS = {
     "waiting_external": "Waiting for external authorization",
     "waiting_remote": "Waiting for remote",
     "waiting_human": "Waiting for operator decision",
-    "waiting_contract_repair": "Output correction exhausted",
 }
 TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
 AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
@@ -497,14 +494,9 @@ def _step_card(item: dict[str, Any], artifact: dict[str, Any]) -> str:
     event_items = "".join(f"<li>{_e(event)}</li>" for event in events) or '<li class="muted">No event yet.</li>'
     reason = artifact.get("failure_reason")
     reason_line = f'<p class="danger">failure: {_e(reason)}</p>' if reason else ""
-    mismatch_line = ""
-    if artifact.get("mismatch_retry_count"):
-        mismatch_line += (
-            f'<p class="muted small">bounded mismatch retries: '
-            f'{_e(artifact.get("mismatch_retry_count"))}</p>'
-        )
+    annotation_line = ""
     if artifact.get("deferred_verify"):
-        mismatch_line += (
+        annotation_line += (
             '<p class="warning"><strong>DEFERRED VERIFY DEPENDENCY</strong>: '
             f'{_e(artifact.get("deferred_verify"))}</p>'
         )
@@ -513,7 +505,7 @@ def _step_card(item: dict[str, Any], artifact: dict[str, Any]) -> str:
         f'<summary>{_e(item.get("id"))} {icon} — {_e(item.get("title"))} · '
         f'{_e(usage.get("input_tokens", 0))} input / {_e(usage.get("output_tokens", 0))} output{warning}</summary>'
         f'<p>profile: <span class="mono">{_e(item.get("profile_id"))}</span></p>'
-        f'<p>status: {_e(status)}</p>{reason_line}{mismatch_line}'
+        f'<p>status: {_e(status)}</p>{reason_line}{annotation_line}'
         f'{_context_line(item.get("id"), cycle, usage, level)}'
         f'<h4>Recent events</h4><ul class="events">{event_items}</ul>'
         f'<details><summary>contract</summary><pre>{_e(artifact.get("contract"))}</pre></details>'
@@ -754,7 +746,6 @@ _FAILURE_MESSAGES = {
     "PUSH_FAILED": "Publication push failed",
     "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
-    "STEP_CONTRACT_REPAIR_OUTPUT_INVALID": "Contract repair planner answer remains invalid",
     "RESUME_REQUIRES_OPERATOR": "Resume requires an operator",
     "INTERRUPTED": "Run interrupted",
 }
@@ -791,7 +782,6 @@ def _run_configuration(state: dict[str, Any], config: HarnessConfig | None = Non
     if not snapshot and config is not None:
         snapshot = RunOptions.from_config(config).to_dict()
     planning = snapshot.get("planning") if isinstance(snapshot.get("planning"), dict) else {}
-    pipeline = snapshot.get("pipeline") if isinstance(snapshot.get("pipeline"), dict) else {}
     requested = snapshot.get("profiles") if isinstance(snapshot.get("profiles"), dict) else {}
     execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
     final: dict[str, Any] = {}
@@ -806,7 +796,6 @@ def _run_configuration(state: dict[str, Any], config: HarnessConfig | None = Non
         ("execution mode", planning.get("execution_mode_policy")),
         ("SINGLE mutable limit", planning.get("single_step_max_mutable_paths")),
         ("STAGED mutable limit", planning.get("staged_step_max_mutable_paths")),
-        ("step contract repairs", pipeline.get("max_step_contract_repairs", 0)),
     ]
     requested_roles = (
         ("planner_profile", "planner"),
@@ -831,17 +820,13 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     failure = run.get("failure", state.get("failure"))
     if status not in {
         "failed", "blocked", "interrupted", "waiting_remote", "waiting_external",
-        "waiting_human", "waiting_contract_repair",
+        "waiting_human",
     } or not isinstance(failure, dict):
         return ""
     reason = str(failure.get("reason") or "")
     resume = overview.get("resume") if isinstance(overview.get("resume"), dict) else {}
-    repair = overview.get("contract_repair") if isinstance(overview.get("contract_repair"), dict) else None
     waiting_label = _WAITING_LABELS.get(status, status.upper())
-    if repair is not None and resume.get("operation") == "contract_repair":
-        # A proven pending repair slot is not a generic operator decision.
-        waiting_label = f'{repair.get("phase")} · {repair.get("repair_id") or "—"}'
-    elif status == "waiting_human":
+    if status == "waiting_human":
         waiting_label = "Human decision genuinely required"
     recovery = run.get("plan_recovery") if isinstance(run.get("plan_recovery"), dict) else {}
     note = ""
@@ -906,10 +891,6 @@ def _run_card(run: dict[str, Any], token: str | None, overview: dict[str, Any], 
     live_reason = failure.get("reason") if isinstance(failure, dict) else ""
     polls = run_page_polls(run)
     status_label = _WAITING_LABELS.get(status, status.upper() or "—")
-    repair = overview.get("contract_repair") if isinstance(overview.get("contract_repair"), dict) else None
-    resume = overview.get("resume") if isinstance(overview.get("resume"), dict) else {}
-    if repair is not None and resume.get("operation") == "contract_repair":
-        status_label = "Contract repair"
     return (
         '<header class="sticky run-card">'
         f'<h1>Run <span class="mono">{_e(run_id)}</span></h1>'

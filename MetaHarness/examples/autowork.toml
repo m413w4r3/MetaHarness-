@@ -22,11 +22,6 @@ max_read_paths_per_step = 18
 max_step_contract_chars = 8500
 
 
-[revision]
-# Step contract repair slots; the post-implementation authority is the
-# deterministic gate alternating with AUDIT.
-max_step_contract_repairs = 2
-
 [gate]
 # The fast gate a step pays *before* its own commit.  Only the *new*
 # regressions of these checks refuse the step; the harness reruns and judges
@@ -44,8 +39,6 @@ max_transient_attempts = 2
 max_executor_fallbacks = 1
 max_check_infra_retries = 2
 max_workspace_setup_retries = 2
-max_contract_repair_output_corrections = 2
-max_contract_repair_planner_restarts = 1
 
 [recovery.execution_fallbacks]
 mechanical = ["codex-luna-xhigh"]

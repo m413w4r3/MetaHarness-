@@ -183,7 +183,6 @@ class StepExecutionOutcome:
     # path owned by a later approved step still fails.  Data only: the
     # deterministic gate and the audit remain the authority.
     deferred_verify: str = ""
-    mismatch_retry_count: int = 0
     no_change: bool = False
     # Paths this attempt changed outside its declared mutable scope and the
     # harness admitted.  They authorize this attempt's diff only: they never
@@ -192,19 +191,6 @@ class StepExecutionOutcome:
     # The exact porcelain status this attempt started from, so a fast-gate
     # refusal can be rolled back on the same boundary as any other failure.
     status_before: tuple[str, ...] = ()
-
-
-_SYNTHETIC_NO_CHANGE_MISMATCH = (
-    "Worker completed successfully without producing an in-scope candidate "
-    "change. Retry once to distinguish an already-satisfied step from a stale "
-    "contract."
-)
-
-
-_BOUNDED_NO_CHANGE_MISMATCH = (
-    "No in-scope change remained necessary after bounded retry; the step is "
-    "deferred until the contract is revisited."
-)
 
 
 class StepExecutionFailure(OrchestrationError):
@@ -221,9 +207,6 @@ class StepExecutionFailure(OrchestrationError):
         tree_after: str | None = None,
         usage: dict[str, int] | None = None,
         mismatch: str | None = None,
-        clean_contract_mismatch: bool = False,
-        mismatch_retry_count: int = 0,
-        initial_mismatch: str | None = None,
         index_tree_after: str | None = None,
         status_before: tuple[str, ...] | None = None,
         step_dir: Path | None = None,
@@ -238,9 +221,6 @@ class StepExecutionFailure(OrchestrationError):
         self.tree_after = tree_after
         self.usage = usage
         self.mismatch = mismatch
-        self.clean_contract_mismatch = clean_contract_mismatch
-        self.mismatch_retry_count = mismatch_retry_count
-        self.initial_mismatch = initial_mismatch
         self.index_tree_after = index_tree_after
         self.status_before = status_before
         self.step_dir = step_dir
@@ -345,20 +325,6 @@ def _safe_status(worktree: Path) -> tuple[str, ...] | None:
         return status_porcelain(worktree)
     except GitError:
         return None
-
-
-def _new_status_lines(
-    before: tuple[str, ...], after: tuple[str, ...] | None,
-) -> list[str]:
-    """The porcelain status lines an attempt added or removed."""
-
-    if after is None:
-        return ["the Git status could not be read"]
-    kept = set(before)
-    seen = set(after)
-    return [line for line in after if line not in kept] + [
-        line for line in before if line not in seen
-    ]
 
 
 def _record_failure_tree(artifact_dir: Path, worktree: Path) -> None:
@@ -489,9 +455,5 @@ safe_candidate_tree = _safe_candidate_tree
 archive_attempt = _archive_attempt
 archive_attempt_target = _archive_attempt_target
 archive_attempt_tree = _archive_attempt_tree
-BOUNDED_NO_CHANGE_MISMATCH = _BOUNDED_NO_CHANGE_MISMATCH
-SYNTHETIC_NO_CHANGE_MISMATCH = _SYNTHETIC_NO_CHANGE_MISMATCH
-new_status_lines = _new_status_lines
 record_failure_tree = _record_failure_tree
 safe_index_tree = _safe_index_tree
-safe_status = _safe_status

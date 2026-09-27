@@ -156,8 +156,8 @@ CORE_STATE_FORBIDDEN_MODULES = frozenset({
 PLANNING_PROTOCOL = PACKAGE / "planning" / "protocol.py"
 # `planning/grammar.py` is the shared stdlib-only lexical leaf (line splitting,
 # the `FIELD: value` form, labeled bodies, repository path sets) that the plan
-# protocol and the step-contract repair protocol both parse with: it imports no
-# harness module at all, so the parser still reads only vocabulary and policy.
+# protocol parses with: it imports no harness module at all, so the parser
+# still reads only vocabulary and policy.
 PROTOCOL_ALLOWED_INTERNAL_IMPORTS = frozenset({
     "metaharness.models", "metaharness.plan_repository_validation", "metaharness.step_ids",
     "metaharness.planning.grammar",
@@ -194,7 +194,6 @@ REMOVED_COMPATIBILITY_SYMBOLS = (
     "persist_implementation_bundle",
     "persist_planning_artifacts_v2",
     "run_planner_v2",
-    "stranded_contract_repair",
     "supersede_legacy_prompt_bug",
 )
 # `render_profile_catalogue` lived in the removed `recommendation.py` and was a
@@ -213,7 +212,6 @@ REMOVED_COMPATIBILITY_LITERALS = (
     "historical_check_repair_redaction_crash",
     "historical_commit_gate_stale_authority",
     "legacy_prompt_bug_candidate",
-    "stranded_contract_repair",
 )
 # Identifier fragments no runtime module may reintroduce.
 REMOVED_IDENTIFIER_TOKENS = ("compat", "legacy", "historical", "deprecated", "backward")
@@ -652,8 +650,7 @@ class RemovedAuthoritySurfaceTests(unittest.TestCase):
 
     One authority answers a red gate: ``DETERMINISTIC_GATE`` alternating with
     ``AUDIT``.  Nothing of the reviewer, semantic-revision or check-repair
-    pipeline may survive in a runtime file; the step contract repair is a
-    different surface and never matches one of these tokens.
+    pipeline may survive in a runtime file; this guard pins its names directly.
     """
 
     # Identifiers, durable labels and prose of the removed pipeline.  The
@@ -687,6 +684,32 @@ class RemovedAuthoritySurfaceTests(unittest.TestCase):
         os.path.join("orchestration", "cycle_loader.py"),
     )
     REMOVED_PROMPTS = ("check_replan_planner_v2.txt",)
+
+    STEP_REPAIR_TOKENS = (
+        "STEP_CONTRACT_REPAIR", "STEP CONTRACT REPAIR", "WAITING_CONTRACT_REPAIR",
+        "CONTRACT_REPAIR_WAIT_REASON", "CONTRACT_REPAIR_OPERATION",
+        "max_step_contract_repairs", "max_contract_repair_output_corrections",
+        "max_contract_repair_planner_restarts", "parse_step_contract_repair",
+        "contract_repair", "contract_recovery",
+    )
+
+    def test_step_repair_runtime_surface_is_absent(self) -> None:
+        for path in sorted(PACKAGE.rglob("*")):
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+            if b"\x00" in data:
+                continue
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            where = path.relative_to(PACKAGE)
+            for token in self.STEP_REPAIR_TOKENS:
+                self.assertNotIn(
+                    token.casefold(), text.casefold(),
+                    f"{where} still contains removed runtime token {token!r}",
+                )
 
     def test_no_runtime_file_names_a_removed_surface(self) -> None:
         for path in sorted(PACKAGE.rglob("*.py")):
@@ -729,7 +752,7 @@ class RemovedAuthoritySurfaceTests(unittest.TestCase):
             tuple(field for field in ExecutionFallbacks.__dataclass_fields__),
             ("mechanical", "reasoning", "agentic"),
         )
-        self.assertEqual(SCHEMA_VERSION, 6)
+        self.assertEqual(SCHEMA_VERSION, 7)
 
     def test_an_agent_request_scope_is_explicit(self) -> None:
         from metaharness.agent import AgentRunRequest

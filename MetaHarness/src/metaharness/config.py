@@ -35,14 +35,12 @@ from .models import (
     ProfileDriver,
     RoutingConfig,
     RepositoryConfig,
-    RevisionConfig,
     RecoveryBudgets,
     SelectionMode,
     TransportConfig,
     UIConfig,
     WorkspaceSetupCommand,
     profile_driver_name,
-    validate_revision_budget,
 )
 from .recovery_policy import ExecutionFallbacks
 from .scope import (
@@ -246,18 +244,6 @@ def _bounded_int(
     if value > maximum:
         raise ConfigError(f"{where}.{key} must be at most {maximum}")
     return value
-
-
-def _revision_budget(
-    data: Mapping[str, Any], key: str, default: int, where: str
-) -> int:
-    """Read one correction budget through the shared model validator."""
-
-    value = data.get(key, default)
-    try:
-        return validate_revision_budget(value, f"{where}.{key}")
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from None
 
 
 def _string_array(data: Mapping[str, Any], key: str, default: tuple[str, ...], where: str,
@@ -735,6 +721,8 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     expanded = _expand(raw, runtime_environment)
     if not isinstance(expanded, dict):  # pragma: no cover - tomllib guarantee
         raise ConfigError("configuration root must be a table")
+    if "revision" in expanded:
+        raise ConfigError("revision configuration is no longer supported")
     repo = _path(expanded.get("repo"), "repo", config_dir)
     base_ref = _required_string(expanded, "base_ref", "root")
     runs_root = _path(expanded.get("runs_root"), "runs_root", config_dir)
@@ -787,19 +775,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         ),
     )
 
-    revision_data = _table(expanded, "revision")
-    allowed_revision = {"max_step_contract_repairs"}
-    unknown_revision = sorted(set(revision_data) - allowed_revision)
-    if unknown_revision:
-        raise ConfigError(f"revision.{unknown_revision[0]} is not allowed")
-    contract_budget = _revision_budget(
-        revision_data, "max_step_contract_repairs", 2, "revision"
-    )
-    if not revision_data:
-        # A config with no [revision] section spends no step contract repair.
-        contract_budget = 0
-    revision = RevisionConfig(max_step_contract_repairs=contract_budget)
-
     transport_data = _table(expanded, "transport")
     unknown_transport = sorted(set(transport_data) - {"max_wait_seconds"})
     if unknown_transport:
@@ -818,8 +793,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     recovery_fields = {
         "max_transient_attempts", "max_executor_fallbacks",
         "max_check_infra_retries",
-        "max_workspace_setup_retries", "max_contract_repair_output_corrections",
-        "max_contract_repair_planner_restarts",
+        "max_workspace_setup_retries",
     }
     unknown_recovery = sorted(set(recovery_data) - recovery_fields - {"execution_fallbacks"})
     if unknown_recovery:
@@ -1130,7 +1104,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         workspace_setup=workspace_setup,
         gate=gate,
         planning=planning,
-        revision=revision,
         recovery=recovery,
         scope=scope,
         transport=transport,

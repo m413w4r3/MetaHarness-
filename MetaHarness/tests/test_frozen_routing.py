@@ -178,8 +178,8 @@ class FrozenRoutingTests(unittest.TestCase):
             options.recovery,
         )
         incomplete = json.loads(json.dumps(snapshot))
-        del incomplete["recovery"]["max_contract_repair_output_corrections"]
-        with self.assertRaisesRegex(RunOptionsError, "missing max_contract_repair_output_corrections"):
+        del incomplete["recovery"]["max_workspace_setup_retries"]
+        with self.assertRaisesRegex(RunOptionsError, "missing max_workspace_setup_retries"):
             RunOptions.from_mapping(incomplete)
         without_recovery = json.loads(json.dumps(snapshot))
         del without_recovery["recovery"]

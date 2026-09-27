@@ -41,7 +41,6 @@ from .shared import (
     CycleArtifactService,
     OrchestrationError,
 )
-from .step_authority import approved_step_contract
 
 if TYPE_CHECKING:
     from .runtime import RunRuntime
@@ -183,24 +182,9 @@ class RunComposition:
     def effective_cycle_scope(
         self, ctx: PipelineV2Context, cycle_plan: CyclePlan,
     ) -> tuple[str, ...]:
-        """The approved envelope plus the effective authority of every step.
-
-        A contract repair contributes only through its step's effective
-        authority (hash- and chain-verified).  Nothing widens the scope merely
-        because a repair exists.
-        """
+        """The approved envelope plus paths admitted by completed steps."""
 
         scope = set(cycle_plan.mutable_scope)
-        count = len(cycle_plan.plan.steps)
-        for step in cycle_plan.plan.steps:
-            artifact_dir = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
-            if not (artifact_dir / "contract_repairs").is_dir():
-                continue
-            authority = self.runtime.contract_recovery.resolve_step_authority(
-                artifact_dir, step, approved_step_contract(cycle_plan, step),
-                expected_tree=None, expected_plan_step_count=count,
-            )
-            scope.update(authority.mutable_scope)
         # A step whose worker reached one ordinary path beyond its declared
         # sets had that exact path durably recorded as an audit signal; the
         # boundary of this cycle admits it so the accepted diff can be

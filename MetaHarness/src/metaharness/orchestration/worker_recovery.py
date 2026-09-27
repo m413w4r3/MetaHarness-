@@ -42,12 +42,10 @@ TRANSIENT_WORKER_FAILURES = frozenset({
 # The only ladder step this recovery loop may execute: a same-executor retry on
 # the exact pre-attempt tree it just restored.
 _RETRY_STRATEGIES = frozenset({RecoveryStrategy.RETRY_TARGETED})
-# Failures the semantic contract route of the step owns instead.
-_CONTRACT_ROUTE = frozenset({"AGENT_CONTRACT_MISMATCH", "AGENT_NO_CHANGE"})
 
 
 class WorkerRecovery:
-    """Transient-failure recovery of one run's untrusted worker attempts."""
+    """Retry and fallback admission for one run's untrusted worker attempts."""
 
     def __init__(
         self,
@@ -89,8 +87,7 @@ class WorkerRecovery:
         before = failure.tree_before
         trace = {"phase": "implementation", "cycle": cycle, "step_id": failure.step_id}
         attempt = self._recovery.used(retry_key) + 1
-        if reason in _CONTRACT_ROUTE or classify_failure(reason).strategy.terminal:
-            # The contract route owns mismatches; a terminal leaves the loop.
+        if classify_failure(reason).strategy.terminal:
             return None
 
         def refuse(code: str, detail: str, tree_after: str | None) -> None:

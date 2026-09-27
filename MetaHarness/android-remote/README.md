@@ -48,7 +48,7 @@ Runs are grouped by `state.status`:
 | Section | Statuses |
 | --- | --- |
 | `ACTION REQUIRED` | `blocked`, `awaiting_plan_approval`, `waiting_scope_approval`, `plan_rejected` |
-| `ACTIVE` | `created`, `planning`, `worktree_ready`, `preparing`, `implementing`, `contract_repairing`, `validating`, `pre_revision_validating`, `revising`, `revalidating`, `reviewing`, `approved`, `publishing` |
+| `ACTIVE` | `created`, `planning`, `worktree_ready`, `preparing`, `implementing`, `validating`, `pre_revision_validating`, `revising`, `revalidating`, `reviewing`, `approved`, `publishing` |
 | `FAILED` | `failed`, `interrupted` |
 | `COMPLETED` | `published`, `committed` |
 | `OTHER` | every other status |

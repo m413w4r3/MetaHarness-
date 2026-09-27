@@ -112,11 +112,6 @@ def load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
         **({"out_of_scope_paths": sorted(set(extra))} if extra else {}),
         "usage": normalize_usage(record.get("usage")),
         "final": bounded_v2_report(read_bounded_text(step_dir / "agent.final.md")),
-        **({"initial_mismatch": bounded_v2_report(str(record["initial_mismatch"]))}
-           if isinstance(record.get("initial_mismatch"), str) and record["initial_mismatch"].strip()
-           else {}),
-        **({"mismatch_retry_count": record["mismatch_retry_count"]}
-           if isinstance(record.get("mismatch_retry_count"), int) else {}),
         **({"deferred_verify": bounded_v2_report(str(record["deferred_verify"]))}
            if isinstance(record.get("deferred_verify"), str) and record["deferred_verify"].strip()
            else {}),

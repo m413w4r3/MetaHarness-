@@ -25,7 +25,6 @@ from .checkpoint_identity import (
     stamp_from_payload,
 )
 from .models import (
-    CONTRACT_REPAIR_WAIT_REASON,
     GateStage,
     RunDisposition,
     RunIdentity,
@@ -253,8 +252,6 @@ PHASE_STATUS = {
     ).status.value
     for phase in ResumePhase
 }
-# An operator retry of the StepContractRepairPlanner of one pending slot.
-CONTRACT_REPAIR_OPERATION = "contract_repair"
 # The deterministic acceptance of a durable, successful worker candidate.
 STEP_ACCEPTANCE_OPERATION = "step_acceptance"
 # A current checkpoint whose durable identity no longer holds.
@@ -384,13 +381,7 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     operation = None
     # The projected outcome names the durable boundary; no caller compares the
     # stored status to the checkpoint phase any more.
-    if (
-        machine.reason == CONTRACT_REPAIR_WAIT_REASON
-        and checkpoint.phase is RunPhase.IMPLEMENT_STEP
-    ):
-        operation = CONTRACT_REPAIR_OPERATION
-        label = f"Retry contract repair planner ({checkpoint.step_id})"
-    elif checkpoint.phase is RunPhase.STEP_ACCEPTANCE:
+    if checkpoint.phase is RunPhase.STEP_ACCEPTANCE:
         operation = STEP_ACCEPTANCE_OPERATION
     return ResumeInfo(
         True, checkpoint.phase.value, label,
@@ -420,7 +411,7 @@ class ResumeRequiresOperatorError(ResumeError):
 
 __all__ = [
     "CHECKPOINT_NAME",
-    "CHECKPOINT_INTEGRITY_OPERATION", "CONTRACT_REPAIR_OPERATION",
+    "CHECKPOINT_INTEGRITY_OPERATION",
     "PHASE_STATUS", "RUN_SCHEMA_UNSUPPORTED", "checkpoint_sha256", "machine_state_for_run",
     "run_identity", "STEP_ACCEPTANCE_OPERATION", "ResumeCheckpoint",
     "ResumeCheckpointError", "ResumeError", "ResumeInfo", "ResumeIntegrityError",

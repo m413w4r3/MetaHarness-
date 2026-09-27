@@ -289,6 +289,7 @@ agentic = ["agentic-rescue"]
     def test_removed_semantic_revision_section_is_rejected(self) -> None:
         for body in (
             "[revision]\nenabled = true\n",
+            "[revision]\nmax_step_contract_repairs = 2\n",
             "[revision]\nmax_check_repair_attempts = 1\n",
             "[revision]\nmax_correction_cycles = 1\n",
             '[ui]\ndefault_reviewer_profile = "implementer-codex"\n',
@@ -748,24 +749,17 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
     def snapshot(self) -> dict:
         return RunOptions.from_config(self.config()).to_dict()
 
-    def test_current_schema_six_round_trips_identically(self) -> None:
+    def test_current_schema_seven_round_trips_identically(self) -> None:
         snapshot = self.snapshot()
         self.assertEqual(snapshot["schema_version"], SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 6)
+        self.assertEqual(SCHEMA_VERSION, 7)
         self.assertEqual(snapshot["profiles"]["audit_profile"], "implementer-codex")
         for removed in (
             "final_reviewer_profile", "semantic_reviser_profile",
             "check_repair_profile", "default_implementer_profile",
         ):
             self.assertNotIn(removed, snapshot["profiles"])
-        self.assertEqual(
-            set(snapshot["pipeline"]),
-            {"max_step_contract_repairs"},
-        )
-        self.assertEqual(
-            snapshot["pipeline"]["max_step_contract_repairs"],
-            self.config().revision.max_step_contract_repairs,
-        )
+        self.assertNotIn("pipeline", snapshot)
         self.assertEqual(
             set(snapshot["recovery"]["execution_fallbacks"]),
             {"mechanical", "reasoning", "agentic"},
@@ -780,7 +774,7 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
 
     def test_previous_schema_is_rejected_without_conversion(self) -> None:
         old_snapshot = self.snapshot()
-        old_snapshot["schema_version"] = 3
+        old_snapshot["schema_version"] = 6
         with self.assertRaises(RunOptionsError) as caught:
             RunOptions.from_mapping(old_snapshot)
         self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
@@ -797,7 +791,6 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
             "semantic_revision_enabled": True,
             "max_check_repair_attempts": 2,
             "max_correction_cycles": 1,
-            "max_step_contract_repairs": 2,
         }
         legacy["profiles"].update({
             "check_repair_profile": "implementer-codex",
@@ -814,12 +807,8 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
 
     def test_every_removed_option_name_is_rejected(self) -> None:
         cases = (
-            (lambda s: s["pipeline"].update(semantic_revision_enabled=True),
-             "pipeline has unknown key semantic_revision_enabled"),
-            (lambda s: s["pipeline"].update(max_check_repair_attempts=1),
-             "pipeline has unknown key max_check_repair_attempts"),
-            (lambda s: s["pipeline"].update(max_correction_cycles=1),
-             "pipeline has unknown key max_correction_cycles"),
+            (lambda s: s.update(pipeline={"obsolete": True}),
+             "unknown key pipeline"),
             (lambda s: s["profiles"].update(check_repair_profile="implementer-codex"),
              "profiles has unknown key check_repair_profile"),
             (lambda s: s["profiles"].update(semantic_reviser_profile="implementer-codex"),
@@ -843,7 +832,7 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
     def test_missing_recovery_fields_are_rejected(self) -> None:
         for field in (
             "max_transient_attempts",
-            "max_contract_repair_planner_restarts",
+            "max_workspace_setup_retries",
             "execution_fallbacks",
         ):
             snapshot = self.snapshot()
@@ -886,13 +875,6 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
             mutate(snapshot)
             with self.assertRaisesRegex(RunOptionsError, message):
                 RunOptions.from_mapping(snapshot)
-
-    def test_pipeline_without_max_step_contract_repairs_is_rejected(self) -> None:
-        snapshot = self.snapshot()
-        del snapshot["pipeline"]["max_step_contract_repairs"]
-        with self.assertRaisesRegex(RunOptionsError, "missing max_step_contract_repairs"):
-            RunOptions.from_mapping(snapshot)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,9 +55,8 @@ failure while that horizon still has room for another attempt, then reports
 `LLM_TRANSPORT_EXHAUSTED`. See `docs/providers.md` for the exact backoff and
 `Retry-After` rules.
 
-`[revision]` supplies the step contract repair budget. Every new durable run
-captures its effective choices in `run_options.json`: the planning bounds, the
-step contract repair budget, the recovery budgets and the five role profiles
+Every new durable run captures its effective choices in `run_options.json`:
+the planning bounds, the recovery budgets and the role profiles
 (`planner_profile`, `mechanical_profile`, `reasoning_profile`,
 `agentic_profile`, `audit_profile`). A snapshot of any older schema is refused,
 never converted.
@@ -115,9 +114,6 @@ independent network sandbox.
 `examples/autowork.toml` enables the full target workflow:
 
 ```toml
-[revision]
-max_step_contract_repairs = 2
-
 [publish]
 enabled = true
 remote = "origin"
@@ -131,10 +127,8 @@ PLAN → implementation step → accepted step commit → …
 ```
 
 The deterministic gate and the audit alternate until the gate accepts the
-candidate or the batch records `AUDIT_REMAINING`; there is no reviewer, no
-semantic-revision profile and no correction cycle. `max_step_contract_repairs`
-bounds the *pre-gate* step contract repairs only, and an exhausted repair
-settles its step instead of asking an operator. Each accepted candidate is
+candidate or the batch records `AUDIT_REMAINING`; there is no reviewer,
+semantic-revision profile or correction cycle. Each accepted candidate is
 pushed to the `repository.remote` run branch before publication, and MetaHarness
 persists and verifies the exact remote SHA. This staging push happens even when
 `publish.enabled = false`; publication happens only after the gate accepted the
@@ -302,14 +296,11 @@ A `PUBLISHED` (or `COMMITTED`) run marks it `completed`.
 
 ### Effective step authority and step acceptance
 
-Validated contract repairs of a step form one `EffectiveStepAuthority`,
-re-derived from `contract_repairs/NN/{transaction,validation}.json` and
-`contract.md` hashes on every use (never from `state.json`). The worker
-prompt and mutable paths, rollback, the commit gate, the accepted record
-(`effective_authority_sha256`, `effective_contract_sha256`,
-`authority_source`, `repair_slot`) and resume all use that same authority.
-A corrupted or unchained repair is `RESUME_INTEGRITY_FAILURE`; the gate stays
-strict (`COMMIT_SCOPE_VIOLATION` etc. in `step_acceptance.json`).
+The approved C6 step contract is the worker and commit authority. Its prompt,
+mutable paths, rollback, the commit gate, accepted record and resume all use
+the same normalized plan authority. A corrupted candidate is
+`RESUME_INTEGRITY_FAILURE`; the gate stays strict (`COMMIT_SCOPE_VIOLATION`
+etc. in `step_acceptance.json`).
 
 A `step_acceptance` resume calls no worker, planner or auditor: it re-proves
 the candidate hash, authority hash, step record, report, HEAD/tree/index and

@@ -9,7 +9,6 @@ import it back.  The dependency order is one-way::
     shared <- candidate, audit
     pipeline_v2 <- recovery <- worker_recovery, check_recovery
     pipeline_v2 <- step_authority <- worker_attempt <- step_execution
-    contract_recovery <- step_execution
     step_acceptance <- step_execution
     run_bootstrap <- run_composition <- runtime
     run_observability, run_failure <- runtime
@@ -24,9 +23,7 @@ metadata and the diagnostics of a run.
 The step services split the one step transaction by transaction:
 ``step_execution`` runs one approved step as a bounded ladder of attempts,
 ``worker_attempt`` runs the single worker request and normalizes its candidate
-result, ``step_acceptance`` owns the durable commit boundary and its resume and
-``contract_recovery`` owns the durable step contract repair slot and the
-effective repaired authority.
+result, and ``step_acceptance`` owns the durable commit boundary and its resume.
 
 ``recovery`` applies :func:`metaharness.recovery_policy.classify_failure`:
 it owns durable recovery budgets, attempt records, the ``recovery.*`` trace

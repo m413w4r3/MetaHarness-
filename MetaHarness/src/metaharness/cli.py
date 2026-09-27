@@ -780,10 +780,6 @@ def _doctor(config_path: Path) -> int:
                     "codex authentication could not be verified for managed CODEX_HOME\n"
                     f'hint: run CODEX_HOME="{codex_home}" codex login'
                 )
-    print(
-        "OK step contract repair: "
-        f"max_step_contract_repairs={config.revision.max_step_contract_repairs}"
-    )
     claude_profiles = tuple(
         profile for profile in profiles_for_config(config).values()
         if profile.driver is ProfileDriver.CLAUDE_CODE

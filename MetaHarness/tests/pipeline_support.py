@@ -191,61 +191,6 @@ def write(path: str, content: str, report: str = "done\n") -> Script:
     return action
 
 
-def repaired_step_contract(title: str = "Write the feature") -> str:
-    """A valid repair of the standard one-step plan's contract.
-
-    It keeps the approved step identity and mutable scope while changing the
-    objective and instructions, so a red-gate replan produces a genuinely
-    different, still bounded contract.  ``title`` must be the title of the
-    approved step the repair answers: a repair never renames that step.
-    """
-
-    return f"""META STEP CONTRACT REPAIR v1
-STEP_ID: S01
-TITLE: {title}
-EXECUTION_CLASS: MECHANICAL
-DEPENDS_ON: NONE
-
-CONTEXT
-feature.txt holds the required content once the step is done.
-
-READ_SET
-- feature.txt :: current content
-
-WRITE_SET
-- feature.txt
-
-CREATE_SET
-NONE
-
-DELETE_SET
-NONE
-
-INSTRUCTIONS
-1. Set the file to the required content.
-
-INTERFACES
-NONE
-
-EXAMPLES
-NONE
-
-TESTS
-- The configured test covers the required content.
-
-PITFALLS
-- Do not edit paths outside the approved set.
-
-DONE_WHEN
-- feature.txt holds the required content.
-
-VERIFY
-- Run the configured test.
-
-END META STEP CONTRACT REPAIR
-"""
-
-
 class ScriptedWorkers:
     """Every worker role answers from its own queue of scripted actions."""
 
@@ -358,7 +303,7 @@ class PipelineHarness(unittest.TestCase):
         self.temp.cleanup()
 
     def config(
-        self, *, max_step_contract_repairs: int = 2, scope_mode: str = "soft",
+        self, *, scope_mode: str = "soft",
         publish: bool = False, github_pr: bool = False,
         extra_checks: str = "", per_step_gate: str | tuple[str, ...] = "",
     ) -> Any:
@@ -379,9 +324,6 @@ require_clean_base = true
 {gate}
 [planning]
 protocol = "v2"
-
-[revision]
-max_step_contract_repairs = {max_step_contract_repairs}
 
 [repository]
 remote = "origin"

@@ -555,8 +555,6 @@ PROJECTION_MATRIX = (
     (R.CANDIDATE_PUSH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_REMOTE, True, True),
     (R.PUBLISH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_REMOTE, True, True),
     (R.AUDIT, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_EXTERNAL, True, True),
-    # An exhausted bounded repair slot waits for a resume, never a decision.
-    (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, "STEP_CONTRACT_REPAIR_OUTPUT_INVALID", RunStatus.WAITING_CONTRACT_REPAIR, True, True),
     (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
     (R.AUDIT, D.WAIT_HUMAN, "CHECK_TIMEOUT", RunStatus.WAITING_HUMAN, False, False),
     (R.IMPLEMENT_STEP, D.WAIT_HUMAN, "SPEC_DECISION_REQUIRED", RunStatus.WAITING_HUMAN, False, False),
@@ -677,7 +675,6 @@ class RunMachineTests(unittest.TestCase):
             ("waiting_external", D.WAIT_EXTERNAL),
             ("waiting_remote", D.WAIT_EXTERNAL),
             ("waiting_human", D.WAIT_HUMAN),
-            ("waiting_contract_repair", D.WAIT_EXTERNAL),
             ("failed", D.FAILED),
             ("interrupted", D.FAILED),
             ("committed", D.COMPLETED),
@@ -706,10 +703,10 @@ class RunMachineTests(unittest.TestCase):
         self.assertIsNone(machine_state_for_run(state, None).phase)
 
     def test_the_failure_reason_and_not_the_stored_status_names_the_wait(self) -> None:
-        # An incoherent pair (a repair-slot status with a decision reason) is
-        # projected from its reason, so no implicit status/phase matrix is left.
+        # An incoherent pair is projected from its reason, so no implicit
+        # status/phase matrix is left.
         state = {
-            "status": "waiting_contract_repair", "disposition": "WAIT_HUMAN",
+            "status": "waiting_external", "disposition": "WAIT_HUMAN",
             "failure": {"reason": "SPEC_DECISION_REQUIRED"},
         }
         machine = machine_state_for_run(state, self.checkpoint_at(RunPhase.IMPLEMENT_STEP))

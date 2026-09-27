@@ -224,7 +224,7 @@ class ResumeAuthorityTests(PipelineHarness):
         self._crash_before_candidate_ready()
         options = self.run_dir() / "run_options.json"
         payload = json.loads(options.read_text())
-        payload["max_step_contract_repairs"] = 9
+        payload["obsolete_budget"] = 9
         options.write_text(json.dumps(payload), encoding="utf-8")
         store = RunStateStore(self.run_dir() / "state.json")
         store.update_metadata(run_options_sha256=None)

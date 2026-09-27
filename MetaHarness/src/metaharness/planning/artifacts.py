@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -38,18 +38,8 @@ from .protocol import (
 )
 from .normalization import normalizations_payload
 
-STEP_CONTRACT_REPAIR_OUTPUT_INVALID = "STEP_CONTRACT_REPAIR_OUTPUT_INVALID"
 # The compact record of every deterministic normalization applied to the plan.
 PLAN_NORMALIZATIONS_NAME = "plan.normalizations.json"
-# Paid answers of one semantic repair slot beyond the first:
-# ``contract_repairs/NN/output_attempts/NNN``.
-STEP_REPAIR_OUTPUT_ATTEMPTS_DIR = "output_attempts"
-
-
-class StepContractRepairArtifactError(Exception):
-    """Durable repair answers, hashes or metadata are inconsistent."""
-
-    code = "RESUME_INTEGRITY_FAILURE"
 
 
 def read_bounded_json(path: Path, limit: int) -> Any:
@@ -67,107 +57,6 @@ def sha256_bytes(data: bytes) -> str:
 
 def render_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
-
-
-@dataclass(frozen=True)
-class StepRepairAttemptFiles:
-    """Durable files of one paid StepContractRepairPlanner answer.
-
-    Output attempt 001 keeps its historical slot-level request/raw/usage
-    files; every later attempt owns ``output_attempts/NNN``.  Each attempt's
-    ``parse_error.json`` and ``response.meta.json`` live in its own directory.
-    """
-
-    number: int
-    directory: Path
-    request: Path
-    meta: Path
-    raw: Path
-    usage: Path
-
-    @property
-    def parse_error(self) -> Path:
-        return self.directory / "parse_error.json"
-
-    @property
-    def response_meta(self) -> Path:
-        return self.directory / "response.meta.json"
-
-
-def step_repair_attempt_files(slot: str | Path, number: int) -> StepRepairAttemptFiles:
-    slot = Path(slot)
-    directory = slot / STEP_REPAIR_OUTPUT_ATTEMPTS_DIR / f"{number:03d}"
-    if number == 1:
-        return StepRepairAttemptFiles(
-            1, directory, slot / "planner.request.txt", slot / "request.meta.json",
-            slot / "planner.raw.md", slot / "usage.json",
-        )
-    return StepRepairAttemptFiles(
-        number, directory, directory / "planner.request.txt", directory / "request.meta.json",
-        directory / "planner.raw.md", directory / "usage.json",
-    )
-
-
-def step_repair_attempt_state(
-    files: StepRepairAttemptFiles, *, current_tree_sha: str | None = None,
-) -> tuple[str, str | None]:
-    """``(state, raw)`` of one output attempt; inconsistent evidence raises.
-
-    ``none``: no durable request; ``pending``: request durable, no answer;
-    ``raw``: a paid answer is durable and not yet classified; ``invalid``: the
-    answer was deterministically rejected (``parse_error.json``).
-    """
-
-    meta = read_bounded_json(files.meta, 64 * 1024)
-    if meta is None:
-        if files.meta.exists():
-            raise StepContractRepairArtifactError(
-                f"contract repair output attempt {files.number:03d} metadata is unreadable"
-            )
-        return "none", None
-    status = meta.get("status") if isinstance(meta, dict) else None
-    if status not in {"pending", "raw", "validated"}:
-        raise StepContractRepairArtifactError(
-            f"contract repair output attempt {files.number:03d} metadata is malformed"
-        )
-    try:
-        request_sha = sha256_bytes(files.request.read_bytes())
-    except OSError as exc:
-        raise StepContractRepairArtifactError(
-            f"contract repair output attempt {files.number:03d} request is missing"
-        ) from exc
-    if meta.get("request_sha256") != request_sha or (
-        current_tree_sha is not None and meta.get("current_tree_sha") != current_tree_sha
-    ):
-        raise StepContractRepairArtifactError(
-            f"contract repair output attempt {files.number:03d} request identity changed"
-        )
-    if status == "pending":
-        return "pending", None
-    try:
-        raw_bytes = files.raw.read_bytes()
-    except OSError as exc:
-        raise StepContractRepairArtifactError(
-            f"contract repair output attempt {files.number:03d} raw answer is missing"
-        ) from exc
-    raw_sha = sha256_bytes(raw_bytes)
-    if raw_sha != meta.get("raw_sha256"):
-        raise StepContractRepairArtifactError(
-            f"contract repair output attempt {files.number:03d} raw answer hash changed"
-        )
-    if files.parse_error.exists():
-        error = read_bounded_json(files.parse_error, 64 * 1024)
-        if (
-            not isinstance(error, dict)
-            or error.get("raw_sha256") != raw_sha
-            or error.get("request_sha256") != request_sha
-            or error.get("code") != STEP_CONTRACT_REPAIR_OUTPUT_INVALID
-        ):
-            raise StepContractRepairArtifactError(
-                f"contract repair output attempt {files.number:03d} parse error does not match its answer"
-            )
-        return "invalid", raw_bytes.decode("utf-8")
-    return "raw", raw_bytes.decode("utf-8")
 
 
 def write_implementation_bundle(directory: str | Path, plan: TaskPlanV2) -> dict[str, Any]:
@@ -463,10 +352,6 @@ def read_attempt_validation(attempt: Path) -> dict[str, Any]:
 
 __all__ = [
     "PLAN_NORMALIZATIONS_NAME",
-    "STEP_CONTRACT_REPAIR_OUTPUT_INVALID",
-    "STEP_REPAIR_OUTPUT_ATTEMPTS_DIR",
-    "StepContractRepairArtifactError",
-    "StepRepairAttemptFiles",
     "persist_planning_v2_artifacts",
     "persist_recovered_plan_artifacts",
     "planning_session_handle",
@@ -477,8 +362,6 @@ __all__ = [
     "render_json",
     "sha256_bytes",
     "step_contract_path",
-    "step_repair_attempt_files",
-    "step_repair_attempt_state",
     "validate_implementation_bundle",
     "validation_failure",
     "write_implementation_bundle",

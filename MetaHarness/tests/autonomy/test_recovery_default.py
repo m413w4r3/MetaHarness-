@@ -103,7 +103,7 @@ class FailedStepContinuationTests(AutonomyHarness):
         plan = meta_plan(feature_step(), other_step("S02"))
 
         result = self.orchestrator(
-            self.config(max_step_contract_repairs=0), planner=[plan],
+            self.config(), planner=[plan],
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_unrecoverable_hard_stop(result)
@@ -139,7 +139,7 @@ class FailedStepContinuationTests(AutonomyHarness):
         )
 
         result = self.orchestrator(
-            self.config(max_step_contract_repairs=0), planner=[plan],
+            self.config(), planner=[plan],
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_unrecoverable_hard_stop(result)
@@ -168,7 +168,7 @@ class FailedStepContinuationTests(AutonomyHarness):
             "metaharness.attempt_transaction.restore_paths_from_tree", lambda *_args: None,
         ):
             result = self.orchestrator(
-                self.config(max_step_contract_repairs=0), planner=[plan],
+                self.config(), planner=[plan],
             ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.FAILED)

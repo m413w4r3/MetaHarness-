@@ -1,18 +1,4 @@
-"""The single effective authority of one approved step.
-
-The approved plan and its step contract are immutable historical evidence.
-Validated contract repairs may change what a step is allowed to do; after
-them, every operational decision of that step (worker prompt and mutable
-paths, rollback, verification, commit gate, accepted record, resume) must use
-exactly one :class:`EffectiveStepAuthority`, resolved from durable artifacts
-by :func:`resolve_effective_step_authority`.
-
-The resolver never falls back to an older authority: a repair that claims to
-be validated but whose artifacts do not prove it is a
-``RESUME_INTEGRITY_FAILURE``.  It does not validate a planner answer either;
-that stays the contract repair transaction's job.  It only re-proves, from
-hashes and the immutable step identity, which validated repair is in force.
-"""
+"""The approved authority and durable candidate record of one plan step."""
 
 from __future__ import annotations
 
@@ -22,23 +8,19 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
+from typing import Any, Mapping, Sequence, TYPE_CHECKING
 
 from ..models import ImplementationStep
 from ..planning.artifacts import read_approved_step_contract
-from ..planning.contract_repair import StepRepairIdentity
-from ..planning.protocol import V2PlanParseError, parse_step_contract_repair
+from ..planning.protocol import V2PlanParseError
 from ..result import atomic_write_text
-from . import contract_repair
 from .pipeline_v2 import PipelineFailure
 from .shared import StepExecutionOutcome
 
 if TYPE_CHECKING:  # pragma: no cover - the plan authority is the coordinator
     from .pipeline_v2 import CyclePlan
 
-AUTHORITY_SCHEMA_VERSION = 1
-SOURCE_APPROVED = "approved"
-SOURCE_CONTRACT_REPAIR = "contract_repair"
+
 STEP_AUTHORITY_NAME = "step_authority.json"
 STEP_CANDIDATE_NAME = "step_candidate.json"
 STEP_ACCEPTANCE_NAME = "step_acceptance.json"
@@ -49,7 +31,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class StepAuthorityError(Exception):
-    """Durable authority evidence does not prove one effective authority."""
+    """Durable candidate evidence is incomplete or inconsistent."""
 
     code = "RESUME_INTEGRITY_FAILURE"
 
@@ -70,16 +52,9 @@ def future_step_ownership(
     }
 
 
-def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _sha256_text(text: str) -> str:
-    return _sha256_bytes(text.encode("utf-8"))
-
-
 def canonical_sha256(value: Any) -> str:
-    return _sha256_text(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _read_json(path: Path) -> Any:
@@ -93,7 +68,7 @@ def _read_json(path: Path) -> Any:
 
 @dataclass(frozen=True)
 class EffectiveStepAuthority:
-    """What one step may do after every validated repair, and why."""
+    """The plan step and its hash-bound, approved contract."""
 
     step_id: str
     title: str
@@ -101,15 +76,8 @@ class EffectiveStepAuthority:
     depends_on: str | None
     effective_step: ImplementationStep = field(repr=False)
     effective_contract: str = field(repr=False)
-    authority_source: str
     approved_contract_sha256: str
     effective_contract_sha256: str
-    approved_mutable_paths: tuple[str, ...]
-    repair_slot: int | None = None
-    # ``(slot, repaired_contract_sha256, validation_sha256)`` of every repair.
-    repair_chain: tuple[tuple[int, str, str], ...] = ()
-    # The tree every repair of the chain was validated on.
-    tree_sha: str | None = None
 
     @property
     def read_set(self) -> tuple[str, ...]:
@@ -131,15 +99,9 @@ class EffectiveStepAuthority:
     def mutable_scope(self) -> tuple[str, ...]:
         return mutable_paths(self.effective_step)
 
-    @property
-    def added_mutable_paths(self) -> tuple[str, ...]:
-        """Paths the validated repairs added to the approved scope."""
-
-        return tuple(sorted(set(self.mutable_scope) - set(self.approved_mutable_paths)))
-
     def identity_payload(self) -> dict[str, Any]:
         return {
-            "schema_version": AUTHORITY_SCHEMA_VERSION,
+            "schema_version": 1,
             "step_id": self.step_id,
             "title": self.title,
             "execution_class": self.execution_class,
@@ -148,12 +110,8 @@ class EffectiveStepAuthority:
             "write_set": list(self.write_set),
             "create_set": list(self.create_set),
             "delete_set": list(self.delete_set),
-            "authority_source": self.authority_source,
             "approved_contract_sha256": self.approved_contract_sha256,
             "effective_contract_sha256": self.effective_contract_sha256,
-            "repair_slot": self.repair_slot,
-            "repair_chain": [list(item) for item in self.repair_chain],
-            "tree_sha": self.tree_sha,
         }
 
     @property
@@ -161,28 +119,17 @@ class EffectiveStepAuthority:
         return canonical_sha256(self.identity_payload())
 
     def summary(self) -> dict[str, Any]:
-        """Bounded diagnostics and durable references; recomputed on resume."""
-
         return {
             "effective_authority_sha256": self.authority_sha256,
             "effective_contract_sha256": self.effective_contract_sha256,
             "approved_contract_sha256": self.approved_contract_sha256,
-            "authority_source": self.authority_source,
-            "repair_slot": self.repair_slot,
-            "repair_chain": [
-                {"slot": slot, "repaired_contract_sha256": contract, "validation_sha256": validation}
-                for slot, contract, validation in self.repair_chain
-            ],
-            "tree_sha": self.tree_sha,
-            "approved_mutable_paths": list(self.approved_mutable_paths),
-            "added_mutable_paths": list(self.added_mutable_paths),
             "effective_mutable_paths": list(self.mutable_scope),
         }
 
 
 @dataclass(frozen=True)
 class EffectiveStepExecution:
-    """A worker outcome together with the exact authority it executed under."""
+    """A worker outcome together with the authority it executed under."""
 
     outcome: StepExecutionOutcome
     authority: EffectiveStepAuthority
@@ -202,142 +149,13 @@ def approved_step_contract(cycle_plan: "CyclePlan", step: ImplementationStep) ->
 def approved_step_authority(
     step: ImplementationStep, approved_contract: str,
 ) -> EffectiveStepAuthority:
-    digest = _sha256_text(approved_contract)
+    digest = hashlib.sha256(approved_contract.encode("utf-8")).hexdigest()
     return EffectiveStepAuthority(
         step_id=step.id, title=step.title,
         execution_class=step.execution_class.value, depends_on=step.depends_on,
         effective_step=step, effective_contract=approved_contract,
-        authority_source=SOURCE_APPROVED,
         approved_contract_sha256=digest, effective_contract_sha256=digest,
-        approved_mutable_paths=mutable_paths(step),
     )
-
-
-def _refuse(slot: Path, message: str) -> StepAuthorityError:
-    return StepAuthorityError(f"contract repair {slot.name}: {message}")
-
-
-def resolve_effective_step_authority(
-    artifact_dir: Path,
-    original_step: ImplementationStep,
-    approved_contract: str,
-    *,
-    max_read_paths_per_step: int,
-    expected_plan_step_count: int | None = None,
-    expected_tree_sha: str | None = None,
-    authorize_added: Callable[[Path, list[str]], None] | None = None,
-) -> EffectiveStepAuthority:
-    """Replay the chain of validated repairs from the approved authority.
-
-    A slot is authority only when its transaction is ``validated`` or
-    ``completed`` (or a pre-transaction slot whose validation says so).
-    Each such slot must prove: its repaired contract hash, that it was
-    opened on the previous authority's contract, the tree it was validated on,
-    the immutable step identity, no removed mutable path, and exactly the
-    added paths it recorded.  ``authorize_added`` re-checks the scope policy
-    of each addition.  Any failure raises :class:`StepAuthorityError`.
-    """
-
-    current = approved_step_authority(original_step, approved_contract)
-    identity = StepRepairIdentity.of(original_step, expected_plan_step_count)
-    chain: list[tuple[int, str, str]] = []
-    tree = expected_tree_sha
-    pending_seen: Path | None = None
-    for directory in contract_repair.repair_dirs(artifact_dir):
-        try:
-            transaction = contract_repair.read_transaction(directory)
-        except contract_repair.ContractRepairIntegrityError as exc:
-            raise StepAuthorityError(str(exc)) from exc
-        validation_path = directory / "validation.json"
-        validation = _read_json(validation_path)
-        validated = isinstance(validation, dict) and validation.get("status") == "validated"
-        if transaction is not None:
-            if transaction["status"] == contract_repair.SUPERSEDED:
-                continue
-            if transaction["status"] not in {contract_repair.VALIDATED, contract_repair.COMPLETED}:
-                pending_seen = directory
-                continue
-            if not validated:
-                raise _refuse(directory, "transaction is finished without a validated repair")
-        elif not validated:
-            pending_seen = directory
-            continue
-        if pending_seen is not None:
-            raise _refuse(directory, f"follows the unfinished repair {pending_seen.name}")
-        assert isinstance(validation, dict)
-        contract_path = directory / "contract.md"
-        try:
-            contract_bytes = contract_path.read_bytes()
-            validation_bytes = validation_path.read_bytes()
-            contract_text = contract_bytes.decode("utf-8")
-        except (OSError, UnicodeError) as exc:
-            raise _refuse(directory, "repaired contract is unreadable") from exc
-        contract_sha = _sha256_bytes(contract_bytes)
-        if validation.get("repaired_contract_sha256") != contract_sha:
-            raise _refuse(directory, "repaired contract hash changed")
-        opened_on = [
-            value for value in (
-                validation.get("original_step_contract_sha256"),
-                (transaction or {}).get("original_contract_sha256"),
-            ) if value is not None
-        ]
-        if not opened_on or any(value != current.effective_contract_sha256 for value in opened_on):
-            raise _refuse(directory, "was not opened on the previous effective contract")
-        trees = [
-            value for value in (
-                validation.get("current_tree_sha"), (transaction or {}).get("tree_sha"),
-            ) if value is not None
-        ]
-        for value in trees:
-            if not isinstance(value, str) or _OBJECT_ID.fullmatch(value) is None:
-                raise _refuse(directory, "tree binding is malformed")
-            if tree is not None and value != tree:
-                raise _refuse(directory, "was validated on another tree")
-            tree = value
-        try:
-            repaired = parse_step_contract_repair(
-                contract_text,
-                max_read_paths_per_step=max_read_paths_per_step,
-                expected_step_id=identity.step_id,
-                expected_title=identity.title,
-                expected_execution_class=identity.execution_class,
-                expected_depends_on=identity.depends_on,
-                expected_plan_step_count=identity.expected_plan_step_count,
-            )
-        except V2PlanParseError as exc:
-            raise _refuse(directory, f"repaired contract no longer validates: {exc}") from exc
-        if repaired.id != original_step.id or identity.violation(repaired) is not None:
-            raise _refuse(directory, "repaired contract changed the step identity")
-        before = set(current.mutable_scope)
-        after = set(mutable_paths(repaired))
-        if before - after or set(current.approved_mutable_paths) - after:
-            raise _refuse(directory, "removed an authorized mutable path")
-        added = sorted(after - before)
-        recorded = validation.get("added_mutable_paths")
-        if not isinstance(recorded, list) or sorted(recorded) != added:
-            raise _refuse(directory, "recorded added paths differ from its contract")
-        if added and authorize_added is not None:
-            authorize_added(directory, added)
-        chain.append((int(directory.name), contract_sha, _sha256_bytes(validation_bytes)))
-        current = EffectiveStepAuthority(
-            step_id=original_step.id, title=original_step.title,
-            execution_class=original_step.execution_class.value,
-            depends_on=original_step.depends_on,
-            effective_step=repaired, effective_contract=contract_text,
-            authority_source=SOURCE_CONTRACT_REPAIR,
-            approved_contract_sha256=current.approved_contract_sha256,
-            effective_contract_sha256=contract_sha,
-            approved_mutable_paths=current.approved_mutable_paths,
-            repair_slot=int(directory.name), repair_chain=tuple(chain), tree_sha=tree,
-        )
-    return current
-
-
-# -- the durable step candidate ----------------------------------------------------
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def build_step_candidate(
@@ -360,8 +178,6 @@ def build_step_candidate(
         "effective_authority_sha256": authority.authority_sha256,
         "effective_contract_sha256": authority.effective_contract_sha256,
         "approved_contract_sha256": authority.approved_contract_sha256,
-        "authority_source": authority.authority_source,
-        "repair_slot": authority.repair_slot,
         "effective_mutable_paths": list(authority.mutable_scope),
         "verification": dict(verification),
         "outcome": {
@@ -371,7 +187,7 @@ def build_step_candidate(
             "final_report_sha256": final_report_sha256,
         },
         "source": source,
-        "created_at": _now(),
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     payload["candidate_sha256"] = canonical_sha256(payload)
     return payload
@@ -385,7 +201,7 @@ def write_step_candidate(step_dir: Path, payload: Mapping[str, Any]) -> str:
     atomic_write_text(path, text)
     if read_step_candidate(step_dir) != dict(payload):
         raise StepAuthorityError("step candidate could not be durably written")
-    return _sha256_bytes(path.read_bytes())
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def read_step_candidate(step_dir: Path) -> dict[str, Any] | None:
@@ -421,7 +237,7 @@ def read_step_candidate(step_dir: Path) -> dict[str, Any] | None:
 
 
 def write_authority_diagnostic(step_dir: Path, authority: EffectiveStepAuthority) -> None:
-    """Advisory copy of the authority an attempt ran with; never trusted."""
+    """Advisory copy of the approved authority an attempt ran with."""
 
     atomic_write_text(
         step_dir / STEP_AUTHORITY_NAME,
@@ -431,9 +247,9 @@ def write_authority_diagnostic(step_dir: Path, authority: EffectiveStepAuthority
 
 
 __all__ = [
-    "EffectiveStepAuthority", "EffectiveStepExecution", "SOURCE_APPROVED", "SOURCE_CONTRACT_REPAIR",
-    "STEP_ACCEPTANCE_NAME", "STEP_AUTHORITY_NAME", "STEP_CANDIDATE_NAME",
-    "StepAuthorityError", "approved_step_authority",
-    "build_step_candidate", "canonical_sha256", "mutable_paths", "read_step_candidate",
-    "resolve_effective_step_authority", "write_authority_diagnostic", "write_step_candidate",
+    "EffectiveStepAuthority", "EffectiveStepExecution", "STEP_ACCEPTANCE_NAME",
+    "STEP_AUTHORITY_NAME", "STEP_CANDIDATE_NAME", "StepAuthorityError",
+    "approved_step_authority", "approved_step_contract", "build_step_candidate",
+    "canonical_sha256", "mutable_paths", "read_step_candidate",
+    "write_authority_diagnostic", "write_step_candidate",
 ]

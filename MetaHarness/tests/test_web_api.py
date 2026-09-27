@@ -165,9 +165,7 @@ class WebServerTests(unittest.TestCase):
             "staged_step_max_mutable_paths": self.config.planning.staged_step_max_mutable_paths,
             "max_steps_per_plan": self.config.planning.max_steps_per_plan,
         })
-        self.assertEqual(payload["revision"], {
-            "max_step_contract_repairs": self.config.revision.max_step_contract_repairs,
-        })
+        self.assertNotIn("revision", payload)
         self.assertEqual(payload["ui"]["max_active_runs"], self.config.ui.max_active_runs)
         self.assertEqual(payload["checks"], [{"id": "lint", "description": "Repository lint gate."}])
         self.assertIsNone(payload["config_fingerprint"])
@@ -544,7 +542,7 @@ class WebServerTests(unittest.TestCase):
         trace.parent.mkdir(parents=True)
         trace.write_text(json.dumps({
             "schema_version": 1, "sequence": 1, "timestamp": "2026-09-23T15:45:17Z",
-            "event": "contract_repair.waiting_external", "phase": "repair", "cycle": 1,
+            "event": "recovery.waiting_external", "phase": "implementation", "cycle": 1,
             "step_id": "S04", "data": {"detail": "HTTP 503 after 3 attempts", "action": "waiting external",
                 "authorization": "Bearer SECRET"},
         }) + "\n", encoding="utf-8")

@@ -13,7 +13,7 @@ write goes through `RunStateStore` and uses atomic replacement.
 | `spec.md` | Exact human SPEC copied at run creation |
 | `context.txt` | Base-pinned planner context and locator warnings |
 | `repository_reference.json` | Staging remote name, optional GitHub web URL, base SHA and immutable base URL |
-| `run_options.json` | Frozen run options (schema 6): budgets, the step contract-repair budget, the five selected profiles and the three execution fallbacks |
+| `run_options.json` | Frozen run options (schema 7): planning bounds, recovery budgets, selected profiles and execution fallbacks |
 | `planner.request.txt` / `planner.raw.md` / `planner.usage.json` / `planner.validation.json` | Current planner attempt; the raw answer and usage are durable before parsing, while canonical plan artifacts appear only after validation passes |
 | `planner-attempts/NN/` | Rejected attempts, retaining request, raw answer, usage and deterministic validation errors |
 | `planner.session.json` | Private mode 0600 continuation handle and latest attempt; never exposed through state or trace |
@@ -46,7 +46,6 @@ the initial implementation; every later cycle is one review-driven correction.
 | `.../steps/Sxx/step_candidate.json` | Self-hashed successful worker candidate written before `step_acceptance`: parent, trees, changed paths, effective authority/contract SHA-256, verification |
 | `.../steps/Sxx/step_acceptance.json` | Commit-gate outcome (`accepted` or `refused` with a stable `COMMIT_*` code) and the authority SHA-256 the gate used |
 | `.../steps/Sxx/step_authority.json` | Advisory copy of the effective authority an attempt ran with (recomputed, never trusted) |
-| `.../steps/Sxx/contract_repairs/NN/topology_evidence.json` | Tracked-path candidates (exact basename/suffix) handed to the repair planner for one request |
 | `cycles/NNN/checks/<stage>/` | One deterministic gate: `evidence.json`, `checks.json`, `checks/*.log`, `diff.patch`, `changed-files.txt` |
 | `cycles/NNN/checks/<stage>/accepted.json` | The green tree accepted by that gate: commit, parent, tree, acceptance kind and exact mutable scope with its hash |
 | `cycles/NNN/check-repair/<stage>/attempts/NNN/` | One bounded check-repair attempt: prompt, report, `attempt.json`, trees before/after and the scope it was allowed |

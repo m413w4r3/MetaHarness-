@@ -71,6 +71,7 @@ from .step_authority import (
     EffectiveStepAuthority,
     EffectiveStepExecution,
     StepAuthorityError,
+    approved_step_authority,
     approved_step_contract,
     build_step_candidate,
     read_step_candidate,
@@ -172,9 +173,8 @@ class StepAcceptanceService:
             or tree_after != checkpoint.expected_tree_sha
         ):
             refuse("the step candidate is not bound to its checkpoint")
-        authority = self.runtime.contract_recovery.resolve_step_authority(
-            step_dir, step, approved_step_contract(cycle_plan, step),
-            expected_tree=tree_before, expected_plan_step_count=len(cycle_plan.plan.steps),
+        authority = approved_step_authority(
+            step, approved_step_contract(cycle_plan, step),
         )
         if (
             authority.authority_sha256 != candidate["effective_authority_sha256"]
@@ -251,7 +251,6 @@ class StepAcceptanceService:
             usage=normalize_usage(record.get("usage")),
             final_report=(final_bytes or b"").decode("utf-8", errors="replace"),
             deferred_verify=str(record.get("deferred_verify") or ""),
-            mismatch_retry_count=int(record.get("mismatch_retry_count") or 0),
         )
         store.update_metadata(current_step=step.id)
         try:
@@ -369,8 +368,6 @@ class StepAcceptanceService:
                 "tree_after": outcome.tree_after, "source": source,
                 "effective_authority_sha256": authority.authority_sha256,
                 "effective_contract_sha256": authority.effective_contract_sha256,
-                "authority_source": authority.authority_source,
-                "repair_slot": authority.repair_slot,
             },
         )
         return payload
@@ -583,8 +580,6 @@ class StepAcceptanceService:
             "tree_after": record["tree_after"],
             "commit_gate_authority_sha256": authority.authority_sha256,
             "effective_contract_sha256": authority.effective_contract_sha256,
-            "authority_source": authority.authority_source,
-            "repair_slot": authority.repair_slot,
         }))
         store.update_metadata(
             accepted_steps=merged(state.get("accepted_steps")),

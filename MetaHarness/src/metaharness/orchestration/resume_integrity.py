@@ -30,7 +30,6 @@ from .pipeline_v2 import (
     cycle_record_path,
     gate_acceptance_path,
     gate_dir,
-    implementation_steps_dir,
     step_dir,
 )
 from .shared import (
@@ -141,42 +140,6 @@ def _recorded_soft_scope(run_dir: Path, number: int, plan: TaskPlanV2) -> set[st
     return scope
 
 
-def _contract_repair_scope(run_dir: Path, number: int) -> set[str]:
-    """Read durable mutable paths approved by step-contract repairs."""
-
-    scope: set[str] = set()
-    root = implementation_steps_dir(run_dir, number)
-    if not root.is_dir():
-        return scope
-    for step_root in root.iterdir():
-        repairs = step_root / "contract_repairs"
-        if not repairs.is_dir():
-            continue
-        for repair in repairs.iterdir():
-            validation = read_json_artifact(repair / "validation.json", 64 * 1024)
-            contract = repair / "contract.md"
-            if not isinstance(validation, dict) or validation.get("status") != "validated":
-                continue
-            added = validation.get("added_mutable_paths")
-            digest = validation.get("repaired_contract_sha256")
-            if (
-                not isinstance(added, list) or any(
-                    not isinstance(path, str) or not path or path.startswith("/")
-                    or ".." in Path(path).parts for path in added
-                )
-                or not isinstance(digest, str) or not contract.is_file()
-            ):
-                raise ResumeIntegrityError("step contract repair scope artifact is malformed")
-            try:
-                actual = hashlib.sha256(contract.read_bytes()).hexdigest()
-            except OSError as exc:
-                raise ResumeIntegrityError("step contract repair contract is unreadable") from exc
-            if actual != digest:
-                raise ResumeIntegrityError("step contract repair contract hash changed")
-            scope.update(added)
-    return scope
-
-
 def _validate_gate_acceptance(
     run_dir: Path, number: int, stage: Any, *, tree: str | None, head: str | None,
     base_scope: tuple[str, ...],
@@ -268,8 +231,7 @@ def _cycle_base_scope(run_dir: Path, plan: TaskPlanV2) -> tuple[str, ...]:
     """The approved mutable scope of the run's single cycle."""
 
     return tuple(sorted(
-        set(_plan_scope(plan)) | _contract_repair_scope(run_dir, 1)
-        | _recorded_soft_scope(run_dir, 1, plan)
+        set(_plan_scope(plan)) | _recorded_soft_scope(run_dir, 1, plan)
     ))
 
 

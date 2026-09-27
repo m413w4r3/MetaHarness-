@@ -29,7 +29,6 @@ enum class RunCategory(val label: String) {
             "worktree_ready",
             "preparing",
             "implementing",
-            "contract_repairing",
             "validating",
             "pre_revision_validating",
             "revising",

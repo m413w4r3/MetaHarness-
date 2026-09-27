@@ -491,7 +491,7 @@ class PlannerNormalizationTests(PipelineHarness):
         return meta_plan({"read": ("feature.txt",), "write": ("feature.txt",), "create": (AW010_PATH,)})
 
     def test_aw010_create_on_an_existing_file_reaches_execution(self) -> None:
-        """Run 20260923T131351Z-e9a34fd827 must not stop on STEP_CONTRACT_DRIFT."""
+        """A CREATE_SET path already in the tree is normalized before execution."""
 
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(

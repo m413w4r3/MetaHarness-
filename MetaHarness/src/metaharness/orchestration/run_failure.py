@@ -158,9 +158,6 @@ class RunFailure:
             usage=failure.usage, profile_id=failure.profile_id,
             tree_before=failure.tree_before, tree_after=failure.tree_after,
             mismatch=failure.mismatch,
-            mismatch_clean=failure.clean_contract_mismatch,
-            mismatch_retry_count=failure.mismatch_retry_count,
-            initial_mismatch=failure.initial_mismatch,
             index_tree_after=failure.index_tree_after,
             step_dir=failure.step_dir,
             terminal_disposition=terminal.disposition,
@@ -175,9 +172,6 @@ class RunFailure:
         tree_before: str | None = None,
         tree_after: str | None = None,
         mismatch: str | None = None,
-        mismatch_clean: bool = False,
-        mismatch_retry_count: int = 0,
-        initial_mismatch: str | None = None,
         index_tree_after: str | None = None,
         step_dir: Path | None = None,
         terminal_disposition: RunDisposition | None = None,
@@ -247,12 +241,6 @@ class RunFailure:
                     "tree_before": tree_before, "tree_after": tree_after,
                     **({"changed_paths": []} if reason == "AGENT_CONTRACT_MISMATCH" and tree_before == tree_after else {}),
                     **({"mismatch": bounded_v2_report(mismatch)} if mismatch else {}),
-                    **({"mismatch_clean": mismatch_clean}
-                       if reason == "AGENT_CONTRACT_MISMATCH" else {}),
-                    **({"mismatch_retry_count": mismatch_retry_count}
-                       if mismatch_retry_count else {}),
-                    **({"initial_mismatch": bounded_v2_report(initial_mismatch)}
-                       if initial_mismatch else {}),
                     **({"index_tree_after": index_tree_after}
                        if index_tree_after else {}),
                     "usage": step_usage,

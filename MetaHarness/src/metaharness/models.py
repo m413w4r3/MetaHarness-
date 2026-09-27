@@ -296,7 +296,6 @@ class RunStatus(StrEnum):
     AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
     WAITING_EXTERNAL = "waiting_external"
     WAITING_REMOTE = "waiting_remote"
-    WAITING_CONTRACT_REPAIR = "waiting_contract_repair"
     PLAN_REJECTED = "plan_rejected"
     PREPARING = "preparing"
     IMPLEMENTING = "implementing"
@@ -338,7 +337,7 @@ class RunDisposition(StrEnum):
     """The only postures a durable run can be in.
 
     Every finer business state is a ``(phase, disposition, reason)`` triple:
-    no ``REVALIDATING`` or ``CONTRACT_REPAIRING``
+    no ``REVALIDATING``
     posture exists, because those name an operation or a failure detail.
     """
 
@@ -371,7 +370,6 @@ RUN_CHECKPOINT_NAME = "resume_checkpoint.json"
 # Failure reasons that name a durable operator boundary instead of an
 # operation; the projection and the resume gate both read them as the machine
 # reason, never as a status.
-CONTRACT_REPAIR_WAIT_REASON = "STEP_CONTRACT_REPAIR_OUTPUT_INVALID"
 PLAN_REJECTED_REASON = "PLAN_REJECTED"
 INTERRUPTED_REASON = "INTERRUPTED"
 
@@ -658,13 +656,6 @@ _REMOTE_REASONS = frozenset({
     "REMOTE_UNAVAILABLE", "REMOTE_TEMPORARILY_UNAVAILABLE",
 })
 _REMOTE_PHASES = frozenset({RunPhase.CANDIDATE_PUSH, RunPhase.PUBLISH})
-# A human wait that still owns a durable retry slot: the bounded repair pass
-# it refused is pending, so an operator retry resumes exactly that pass.
-_REPAIR_SLOT_WAITS: Mapping[tuple[str, RunPhase], RunStatus] = {
-    (CONTRACT_REPAIR_WAIT_REASON, RunPhase.IMPLEMENT_STEP): RunStatus.WAITING_CONTRACT_REPAIR,
-}
-
-
 @dataclass(frozen=True)
 class RunOutcome:
     """The derived status view of one durable run state."""
@@ -702,12 +693,8 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
             RunStatus.INTERRUPTED if reason == INTERRUPTED_REASON else RunStatus.FAILED
         )
         return RunOutcome(phase, disposition, status, False, True)
-    slot = _REPAIR_SLOT_WAITS.get((reason or "", phase))
     if disposition is RunDisposition.WAIT_EXTERNAL:
-        if slot is not None:
-            # An exhausted repair slot is retried by a resume, never decided.
-            status = slot
-        elif reason in _REMOTE_REASONS and phase in _REMOTE_PHASES:
+        if reason in _REMOTE_REASONS and phase in _REMOTE_PHASES:
             status = RunStatus.WAITING_REMOTE
         else:
             status = RunStatus.WAITING_EXTERNAL
@@ -725,7 +712,6 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.AWAITING_PLAN_APPROVAL: RunDisposition.RUNNING,
     RunStatus.WAITING_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_REMOTE: RunDisposition.WAIT_EXTERNAL,
-    RunStatus.WAITING_CONTRACT_REPAIR: RunDisposition.WAIT_EXTERNAL,
     RunStatus.PLAN_REJECTED: RunDisposition.WAIT_HUMAN,
     RunStatus.PREPARING: RunDisposition.RUNNING,
     RunStatus.IMPLEMENTING: RunDisposition.RUNNING,
@@ -984,17 +970,6 @@ def validate_revision_budget(value: int, name: str) -> int:
 
 
 @dataclass(frozen=True)
-class RevisionConfig:
-    """The bounded step-contract repair budget of one run."""
-
-    max_step_contract_repairs: int = 2
-
-    def __post_init__(self) -> None:
-        validate_revision_budget(
-            self.max_step_contract_repairs, "revision.max_step_contract_repairs"
-        )
-
-@dataclass(frozen=True)
 class PromptBudgetConfig:
     """Byte budgets for role-specific model payloads.
 
@@ -1193,7 +1168,6 @@ class HarnessConfig:
     workspace_setup: tuple[WorkspaceSetupCommand, ...] = ()
     gate: GateConfig = field(default_factory=GateConfig)
     planning: PlanningConfig = field(default_factory=PlanningConfig)
-    revision: RevisionConfig = field(default_factory=RevisionConfig)
     recovery: RecoveryBudgets = field(default_factory=RecoveryBudgets)
     # How a path outside a step's declared mutable scope is treated: admitted
     # and recorded (``soft``) or restored (``strict``).  The forbidden-path

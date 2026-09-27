@@ -436,7 +436,7 @@ class RunObservability:
             RunStatus.WAITING_HUMAN,
             RunStatus.WAITING_EXTERNAL,
             RunStatus.WAITING_REMOTE,
-            RunStatus.WAITING_CONTRACT_REPAIR, RunStatus.COMMITTED, RunStatus.PUBLISHED,
+            RunStatus.COMMITTED, RunStatus.PUBLISHED,
         }:
             try:
                 write_run_diagnostics(self.runtime.config, result.run_dir)

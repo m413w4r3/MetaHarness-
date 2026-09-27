@@ -66,10 +66,10 @@ class LifecycleTests(PipelineHarness):
         self.orchestrator(self.config(), planner=[initial_plan(STEP)]).run_text(SPEC, run_id="run")
         options = json.loads((self.run_dir() / "run_options.json").read_text())
         selection = json.loads((self.run_dir() / "execution_selection.json").read_text())
-        self.assertEqual(options["schema_version"], 6)
+        self.assertEqual(options["schema_version"], 7)
         self.assertEqual(options["pipeline_version"], 2)
         option_names = set(options) | {
-            name for section in ("planning", "pipeline", "profiles", "recovery")
+            name for section in ("planning", "profiles", "recovery")
             for name in options[section]
         }
         for forbidden in (
@@ -86,9 +86,7 @@ class LifecycleTests(PipelineHarness):
                 "agentic_profile", "audit_profile",
             },
         )
-        self.assertEqual(
-            set(options["pipeline"]), {"max_step_contract_repairs"},
-        )
+        self.assertNotIn("pipeline", options)
         self.assertEqual(
             set(options["recovery"]["execution_fallbacks"]),
             {"mechanical", "reasoning", "agentic"},

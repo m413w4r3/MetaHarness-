@@ -1,9 +1,8 @@
-"""The labeled-body grammar shared by the MetaHarness wire protocols.
+"""The labeled-body grammar of META PLAN v2.
 
 One lexical authority: line normalization, the strict ``FIELD: value`` inline
-form, the section forms, and the repository path sets both the plan protocol
-and the step-contract repair protocol parse.  It performs no I/O, calls no
-model and never touches Git.
+form, the section forms, and the repository path sets the plan parser uses.
+It performs no I/O, calls no model and never touches Git.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from typing import Sequence
 
 # One step contract is one bounded unit of work: numbered operations, a short
 # verification and a short pitfall list.  These are protocol limits, shared by
-# the plan parser and the step-contract repair parser.
+# the plan parser.
 MAX_STEP_INSTRUCTIONS = 12
 MAX_STEP_VERIFY_LINES = 6
 MAX_STEP_PITFALL_LINES = 6

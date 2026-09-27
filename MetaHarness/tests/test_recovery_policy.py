@@ -117,10 +117,10 @@ class FailureClassificationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RecoveryDecision(FailureClass.TRANSIENT, RecoveryStrategy.WAIT_HUMAN, "refused")
 
-    def test_no_fixable_ladder_ends_in_wait_human(self) -> None:
+    def test_fixable_ladder_ends_in_failed_continue(self) -> None:
         self.assertEqual(recovery_ladder(FailureClass.FIXABLE), (
             RecoveryStrategy.RETRY_TARGETED, RecoveryStrategy.FALLBACK_EXECUTOR,
-            RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.MARK_FAILED_CONTINUE,
+            RecoveryStrategy.MARK_FAILED_CONTINUE,
         ))
         for code in ("AUDIT_REMAINING", "WAITING_REPAIR_EXHAUSTED", "TOTALLY_NEW"):
             with self.subTest(code=code):
