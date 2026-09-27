@@ -109,8 +109,8 @@ def _step_repair_template(identity: StepRepairIdentity) -> str:
     return f"""{STEP_REPAIR_HEADER}
 {identity.fields()}
 
-OBJECTIVE
-<complete objective>
+CONTEXT
+<the repository facts the worker needs>
 
 READ_SET
 - relative/path :: exact symbol or anchor
@@ -127,20 +127,33 @@ NONE
 INSTRUCTIONS
 1. <concrete instruction>
 
-VERIFY
-<at most 3 lines>
+INTERFACES
+<signatures, types, schemas or invariants; NONE when the step has none>
 
-FORBIDDEN
-- <rule>
+EXAMPLES
+NONE
+
+TESTS
+<tests to create or modify, and the behavior they pin>
+
+PITFALLS
+<what a low-cost worker typically gets wrong here>
+
+DONE_WHEN
+<observable completion conditions>
+
+VERIFY
+<targeted commands or short observations; at most 6 lines>
 
 {STEP_REPAIR_END}"""
 
 
 _STEP_REPAIR_FORMAT_LIMITS = """FORMAT LIMITS (checked deterministically):
-- INSTRUCTIONS: at most 6 numbered operations;
-- VERIFY: at most 3 non-empty lines;
-- FORBIDDEN: at most 4 non-empty rules;
-- every section is present and non-empty; empty sets are written NONE."""
+- INSTRUCTIONS: 1 to 12 numbered concrete operations;
+- VERIFY: at most 6 non-empty lines;
+- PITFALLS: at most 6 non-empty entries;
+- every section except EXAMPLES is present and non-empty; EXAMPLES may be
+  NONE; empty sets are written NONE."""
 
 
 def _step_repair_identity_rules(identity: StepRepairIdentity) -> str:
@@ -243,8 +256,8 @@ that exact basename or suffix. MetaHarness never picks one for you: a
 contract path must be copied exactly from a tracked path you choose.
 
 Return exactly a complete repaired current-step contract. READ_SET may be
-clarified and instructions, objective, VERIFY, FORBIDDEN and anchors may be
-repaired. Do not change mutation sets unless the requested work truly requires
+clarified and CONTEXT, INSTRUCTIONS, INTERFACES, EXAMPLES, TESTS, PITFALLS,
+DONE_WHEN, VERIFY and anchors may be repaired. Do not change mutation sets unless the requested work truly requires
 it; any such change is subject to MetaHarness scope policy. An existing file
 that must change belongs to READ_SET and WRITE_SET, never CREATE_SET.
 

@@ -22,24 +22,25 @@ Use targeted repository reads.
 Do not print entire large files when a symbol/range is sufficient.
 Do not run verbose test modes unless diagnosing a failure.
 Run the narrow VERIFY commands from the contract first.
+You are never required to prove that you ran them.
 When a command fails, inspect the smallest useful failure excerpt.
 Do not repeatedly rerun a noisy full suite for diagnosis.
 MetaHarness owns the final authoritative gate.
 
 Do not create commits, move HEAD, publish, or make product decisions.
 
+CONTEXT states repository facts already established: trust it instead of
+rediscovering them. READ_SET is the only reading scope; WRITE_SET, CREATE_SET
+and DELETE_SET are absolute mutation limits. PITFALLS lists the mistakes this
+step must not make. DONE_WHEN states the observable completion conditions.
+
 The ORIGINAL SPEC is the original semantic authority for this run. The STEP
-CONTRACT defines the current work and the authority of paths. WRITE_SET,
-CREATE_SET and DELETE_SET remain absolute mutation limits. Receiving the full
-SPEC does not authorize implementing any other step.
+CONTRACT defines the current work and the authority of paths. Receiving the full
+SPEC does not authorize implementing any other step. When the contract refers to
+the SPEC, use the SPEC's exact definitions. Only a real contradiction between
+the SPEC and the STEP CONTRACT is a META CONTRACT MISMATCH v1.
 
-When the contract says "exactly as the SPEC" or otherwise refers to the SPEC,
-consult the SPEC and use its exact definitions; do not claim that you must
-guess because the detail is not repeated in READ_SET or the step instructions.
-Only a real contradiction between the SPEC and the STEP CONTRACT is a META
-CONTRACT MISMATCH v1.
-
-META IMPLEMENTATION CONTRACT v1
+META IMPLEMENTATION CONTRACT v2
 
 <ORIGINAL SPEC AUTHORITY>
 {{SPEC}}
@@ -50,9 +51,9 @@ META IMPLEMENTATION CONTRACT v1
 {{STEP_IDENTITY}}
 </STEP IDENTITY>
 
-<STEP OBJECTIVE>
-{{STEP_OBJECTIVE}}
-</STEP OBJECTIVE>
+<CONTEXT>
+{{CONTEXT}}
+</CONTEXT>
 
 <READ_SET>
 {{READ_SET}}
@@ -78,13 +79,29 @@ META IMPLEMENTATION CONTRACT v1
 {{INSTRUCTIONS}}
 </INSTRUCTIONS>
 
+<INTERFACES>
+{{INTERFACES}}
+</INTERFACES>
+
+<EXAMPLES>
+{{EXAMPLES}}
+</EXAMPLES>
+
+<TESTS>
+{{TESTS}}
+</TESTS>
+
+<PITFALLS>
+{{PITFALLS}}
+</PITFALLS>
+
+<DONE_WHEN>
+{{DONE_WHEN}}
+</DONE_WHEN>
+
 <VERIFY CONTRACT>
 {{VERIFY_CONTRACT}}
 </VERIFY CONTRACT>
-
-<FORBIDDEN CONTRACT>
-{{FORBIDDEN_CONTRACT}}
-</FORBIDDEN CONTRACT>
 </AUTHORITATIVE IMPLEMENTATION CONTRACT>
 
 {{RETRY_ADDENDUM}}

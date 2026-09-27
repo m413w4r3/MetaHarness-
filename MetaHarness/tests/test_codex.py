@@ -97,7 +97,7 @@ class CodexTests(unittest.TestCase):
         self.assertEqual(result.final_message, "final from codex\n")
         self.assertEqual(result.usage["total_tokens"], 7)
         prompt = (artifacts / "agent.prompt.txt").read_text()
-        self.assertIn("<STEP OBJECTIVE>\nSTATUS: READY\n</STEP OBJECTIVE>", prompt)
+        self.assertIn("<CONTEXT>\nSTATUS: READY\n</CONTEXT>", prompt)
         args = json.loads(args_capture.read_text())
         self.assertIn("--json", args)
         self.assertIn("--strict-config", args)
@@ -126,13 +126,18 @@ class CodexTests(unittest.TestCase):
         )
         payload = build_implementer_payload(
             step_identity="S01\\nTITLE\\nWrite the feature",
-            step_objective="write feature.txt",
+            step_title="Write the feature",
+            context="feature.txt is absent",
             read_set="README.md",
             write_set="feature.txt",
             mutable_scope='{"write": ["feature.txt"]}',
-            instructions="follow repository instructions",
+            instructions="1. write feature.txt",
+            interfaces="NONE",
+            examples="NONE",
+            tests="- test_feature",
+            pitfalls="- do not edit README.md",
+            done_when="- feature.txt exists",
             verify_contract="run the required check",
-            forbidden_contract="do not edit README.md",
         )
 
         self.agent(executable).run_step(

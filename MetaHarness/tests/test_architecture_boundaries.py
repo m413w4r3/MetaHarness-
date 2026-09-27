@@ -154,8 +154,13 @@ CORE_STATE_FORBIDDEN_MODULES = frozenset({
 })
 
 PLANNING_PROTOCOL = PACKAGE / "planning" / "protocol.py"
+# `planning/grammar.py` is the shared stdlib-only lexical leaf (line splitting,
+# the `FIELD: value` form, labeled bodies, repository path sets) that the plan
+# protocol and the step-contract repair protocol both parse with: it imports no
+# harness module at all, so the parser still reads only vocabulary and policy.
 PROTOCOL_ALLOWED_INTERNAL_IMPORTS = frozenset({
     "metaharness.models", "metaharness.plan_repository_validation", "metaharness.step_ids",
+    "metaharness.planning.grammar",
 })
 PROTOCOL_FORBIDDEN_MODULES = frozenset({
     "git", "gitops", "state", "llm", "agent", "web", "remote", "orchestration",

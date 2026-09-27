@@ -74,14 +74,6 @@ class PlannerTransactionTests(PipelineHarness):
         self.invalid = impossible_plan_message()
         self.valid = meta_plan({"read": ("feature.txt",), "write": ("feature.txt",)})
 
-    @staticmethod
-    def blocked_repository_evidence(path: str = "src/module.py", symbol: str = "evidence_symbol") -> str:
-        return (
-            "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: Need source evidence\n"
-            "BLOCKER_KIND: REPOSITORY_EVIDENCE\n\nOBJECTIVE\nMake feature.txt good.\n\n"
-            f"BLOCKERS\n- {path} :: {symbol}\n\nEND META PLAN\n"
-        )
-
     def planner(self, client, *, budget: int = 2, events=None) -> PlannerV2:
         return PlannerV2(
             client, planning=replace(self.config_value.planning, max_preapproval_corrections=budget),
@@ -103,30 +95,19 @@ class PlannerTransactionTests(PipelineHarness):
         self.assertEqual(chat.continue_calls, [])
         self.assertTrue((self.target / "implementation_bundle.json").is_file())
 
-    def test_repository_evidence_blocker_recovers_from_immutable_named_path(self) -> None:
-        chat = _Chat([self.blocked_repository_evidence(), self.valid])
-        (self.repo / "src/module.py").write_text("def changed_in_worktree(): pass\n", encoding="utf-8")
-        plan = self.run_plan(chat)
-        self.assertEqual(plan.raw, self.valid)
-        self.assertEqual(len(chat.complete_calls), 1)
-        self.assertEqual(len(chat.continue_calls), 1)
-        prompt = chat.continue_calls[0][1]
-        self.assertIn("REPOSITORY EVIDENCE", prompt)
-        self.assertIn("immutable source evidence", prompt)
-        self.assertNotIn("changed_in_worktree", prompt)
-        self.assertIn("IMMUTABLE TREE", prompt)
-        self.assertIn("COMPLETE META PLAN v2", prompt)
-        validation = json.loads(
-            (self.target / "planner-attempts/01/planner.validation.json").read_text()
+    def test_a_spec_decision_blocker_is_a_terminal_plan(self) -> None:
+        # SPEC_DECISION is the only blocker: it is a real product decision, so
+        # the planner answer is accepted instead of being corrected away.
+        answer = (
+            "META PLAN v2\n\nSTATUS: BLOCKED\nTITLE: Need a product choice\n"
+            "BLOCKER_KIND: SPEC_DECISION\n\nOBJECTIVE\nMake feature.txt good.\n\n"
+            "BLOCKERS\nThe SPEC does not choose the retry policy.\n\nEND META PLAN\n"
         )
-        self.assertEqual(validation["blocker_kind"], "REPOSITORY_EVIDENCE")
-
-    def test_repository_evidence_paths_are_validated_before_reading(self) -> None:
-        chat = _Chat([self.blocked_repository_evidence("../README.md", "heading"), self.valid])
-        self.run_plan(chat)
-        prompt = chat.continue_calls[0][1]
-        self.assertIn("rejected (not a valid repo-relative path)", prompt)
-        self.assertNotIn("pipeline fixture", prompt)
+        chat = _Chat([answer])
+        plan = self.run_plan(chat)
+        self.assertIs(plan.decision.value, "BLOCKED")
+        self.assertEqual(plan.blocker_kind.value, "SPEC_DECISION")
+        self.assertEqual(chat.continue_calls, [])
 
     def test_same_conversation_receives_small_correction_and_keeps_handle_private(self) -> None:
         chat = _Chat([self.invalid, self.valid])

@@ -32,7 +32,7 @@ def git(repo: Path, *args: str) -> str:
 
 
 def plan(*steps: tuple[str, str, str], title: str = "Add the feature") -> str:
-    """A READY META PLAN v2; each step is ``(id, write path, objective)``."""
+    """A READY META PLAN v2; each step is ``(id, write path, title)``."""
 
     blocks = []
     for step_id, path, objective in steps:
@@ -41,8 +41,8 @@ TITLE: {objective}
 EXECUTION_CLASS: MECHANICAL
 DEPENDS_ON: NONE
 
-OBJECTIVE
-{objective}
+CONTEXT
+{objective} lives in {path}; keep the surrounding conventions.
 
 READ_SET
 - {path} :: current content
@@ -57,13 +57,25 @@ DELETE_SET
 NONE
 
 INSTRUCTIONS
-1. {objective}
+1. {objective}.
+
+INTERFACES
+NONE
+
+EXAMPLES
+NONE
+
+TESTS
+- {objective} is covered by the configured test.
+
+PITFALLS
+- Do not change paths outside the declared sets.
+
+DONE_WHEN
+- {path} holds the requested content.
 
 VERIFY
 - Run the configured test.
-
-FORBIDDEN
-- Do not change paths outside the declared sets.
 
 END STEP {step_id}
 """)
@@ -72,12 +84,20 @@ END STEP {step_id}
 
 STATUS: READY
 TITLE: {title}
+MILESTONE_ID: M01
+MILESTONE_TITLE: {title}
 
 OBJECTIVE
 Implement the requested feature.
 
 CONSTRAINTS
 Keep the change local.
+
+MILESTONE_GOAL
+The requested feature exists and its checks pass.
+
+PROJECT_REMAINDER
+NONE
 
 EXECUTION_MODE: {mode}
 STEP_COUNT: {len(steps)}
@@ -186,8 +206,8 @@ TITLE: {title}
 EXECUTION_CLASS: MECHANICAL
 DEPENDS_ON: NONE
 
-OBJECTIVE
-Write feature.txt with the SPEC-required content.
+CONTEXT
+feature.txt holds the required content once the step is done.
 
 READ_SET
 - feature.txt :: current content
@@ -204,11 +224,23 @@ NONE
 INSTRUCTIONS
 1. Set the file to the required content.
 
+INTERFACES
+NONE
+
+EXAMPLES
+NONE
+
+TESTS
+- The configured test covers the required content.
+
+PITFALLS
+- Do not edit paths outside the approved set.
+
+DONE_WHEN
+- feature.txt holds the required content.
+
 VERIFY
 - Run the configured test.
-
-FORBIDDEN
-- Do not edit paths outside the approved set.
 
 END META STEP CONTRACT REPAIR
 """

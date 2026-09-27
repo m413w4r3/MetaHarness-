@@ -134,16 +134,22 @@ class FrozenRoutingTests(unittest.TestCase):
         options = RunOptions.from_config(self.config)
         steps = tuple(
             ImplementationStep(
-                step_id,
-                step_id,
-                execution_class,
-                None,
-                "",
-                (),
-                (),
-                "",
-                "",
-                "",
+                id=step_id,
+                title=step_id,
+                execution_class=execution_class,
+                depends_on=None,
+                context="context",
+                read_set=(),
+                write_set=(),
+                create_set=(),
+                delete_set=(),
+                instructions="1. do",
+                interfaces="NONE",
+                examples="NONE",
+                tests="- test",
+                pitfalls="- none",
+                done_when="- done",
+                verify="- check",
             )
             for step_id, execution_class in (
                 ("S01", ExecutionClass.MECHANICAL),

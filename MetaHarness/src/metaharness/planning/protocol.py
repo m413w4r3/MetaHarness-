@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import PurePosixPath
 from typing import Sequence
 
 from ..models import (
@@ -28,8 +27,19 @@ from ..models import (
 )
 from ..plan_repository_validation import MAX_BLOCKERS_CHARS
 from ..step_ids import LAST_STEP_ID, MAX_STEPS, STEP_ID_RE, step_ids
+from .grammar import (
+    PlanParseError,
+    V2PlanParseError,
+    change_sets,
+    lines,
+    nonempty,
+    parse_labeled_body,
+    read_set,
+    read_set_paths,
+    validate_step_text_limits,
+)
 
-MAX_STEP_CONTRACT_CHARS = 5_000
+MAX_STEP_CONTRACT_CHARS = 9_000
 # Canonical layout of the approved step contracts, written at planning time
 # and executed byte-for-byte: ``steps/<STEP>/contract.md``.
 STEP_CONTRACT_NAME = "contract.md"
@@ -40,122 +50,20 @@ _STEP_BEGIN = re.compile(r"^BEGIN STEP (.+)$")
 _STEP_END = re.compile(r"^END STEP (.+)$")
 _STEP_ID = STEP_ID_RE
 STEP_ID_RANGE = f"S01 through {LAST_STEP_ID}"
-_INLINE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*:\s*(.*)$")
-
-_ENVELOPE_INLINE = frozenset({"STATUS", "TITLE", "EXECUTION_MODE", "STEP_COUNT", "BLOCKER_KIND"})
-_ENVELOPE_SECTIONS = frozenset({"OBJECTIVE", "CONSTRAINTS", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS", "REQUIRED_CHECKS"})
-_STEP_INLINE = frozenset({"TITLE", "EXECUTION_CLASS", "DEPENDS_ON"})
-_STEP_SECTIONS = frozenset({"OBJECTIVE", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN"})
 
 
-class PlanParseError(ValueError):
-    """A planner answer was received but cannot be interpreted unambiguously."""
+def _extract_step_blocks(
+    lines: list[str], start: int, end: int
+) -> tuple[list[tuple[str, list[str]]], list[str]]:
+    """Split the envelope from the ``BEGIN STEP`` blocks, in order."""
 
-
-class V2PlanParseError(PlanParseError):
-    """A META PLAN v2 response is not safe to execute."""
-
-
-def _lines(raw: str) -> list[str]:
-    return raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-
-
-def _nonempty(value: str, name: str) -> str:
-    value = value.strip()
-    if not value or value.casefold() in {"none", "n/a", "na", "-", "—", "nil", "tbd"}:
-        raise V2PlanParseError(f"{name} is missing or a placeholder")
-    return value
-
-
-def _validate_step_text_limits(step_id: str, values: dict[str, str]) -> None:
-    title = values["TITLE"].strip()
-    if len(title) > 100:
-        raise V2PlanParseError(f"step {step_id} TITLE exceeds 100 characters")
-    instruction_lines = [line for line in values["INSTRUCTIONS"].splitlines() if line.strip()]
-    numbered = [line for line in instruction_lines if re.match(r"^\s*\d+[.)]\s+", line)]
-    if len(numbered) > 6:
-        raise V2PlanParseError(f"step {step_id} INSTRUCTIONS exceeds 6 operations")
-    verify_lines = [line for line in values["VERIFY"].splitlines() if line.strip()]
-    if len(verify_lines) > 3:
-        raise V2PlanParseError(f"step {step_id} VERIFY exceeds 3 lines")
-    forbidden_lines = [line for line in values["FORBIDDEN"].splitlines() if line.strip()]
-    if len(forbidden_lines) > 4:
-        raise V2PlanParseError(f"step {step_id} FORBIDDEN exceeds 4 rules")
-
-
-def _section_name(line: str, allowed: frozenset[str]) -> str | None:
-    candidate = line.strip()
-    candidate = re.sub(r"^#{1,6}\s+", "", candidate)
-    if candidate.endswith(":"):
-        candidate = candidate[:-1].rstrip()
-    for name in allowed:
-        if candidate.casefold() == name.casefold():
-            return name
-    return None
-
-
-def _parse_labeled_body(
-    body: Sequence[str],
-    *,
-    inline_names: frozenset[str],
-    section_names: frozenset[str],
-    where: str,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Parse one strict labeled body, tolerating Markdown headings for prose."""
-
-    inline: dict[str, str] = {}
-    sections: dict[str, list[str]] = {}
-    current: str | None = None
-    for raw_line in body:
-        stripped = raw_line.strip()
-        if not stripped:
-            if current is not None:
-                sections[current].append("")
-            continue
-
-        match = _INLINE.fullmatch(stripped)
-        if match and match.group(1) in inline_names:
-            name, value = match.groups()
-            if name in inline:
-                raise V2PlanParseError(f"duplicate {where} field {name}")
-            inline[name] = value.strip()
-            current = None
-            continue
-
-        if match and match.group(1) in section_names:
-            name, value = match.groups()
-            if name in sections:
-                raise V2PlanParseError(f"duplicate {where} section {name}")
-            sections[name] = [value] if value.strip() else []
-            current = name if not value.strip() else None
-            continue
-
-        section = _section_name(stripped, section_names)
-        if section is not None:
-            if section in sections:
-                raise V2PlanParseError(f"duplicate {where} section {section}")
-            sections[section] = []
-            current = section
-            continue
-
-        if current is None:
-            raise V2PlanParseError(f"unexpected content in {where}: {stripped[:80]}")
-        sections[current].append(raw_line)
-
-    values = {name: value.strip() for name, value in inline.items()}
-    values.update({name: "\n".join(lines).strip() for name, lines in sections.items()})
-    return values, {name: value for name, value in values.items() if name in section_names}
-
-
-def _extract_step_blocks(lines: list[str], start: int, end: int) -> tuple[list[tuple[str, list[str]]], list[str]]:
     blocks: list[tuple[str, list[str]]] = []
     envelope: list[str] = []
     index = start
     while index < end:
         stripped = lines[index].strip()
         begin = _STEP_BEGIN.fullmatch(stripped)
-        step_end = _STEP_END.fullmatch(stripped)
-        if step_end is not None:
+        if _STEP_END.fullmatch(stripped) is not None:
             raise V2PlanParseError("stray END STEP block")
         if begin is None:
             envelope.append(lines[index])
@@ -167,8 +75,7 @@ def _extract_step_blocks(lines: list[str], start: int, end: int) -> tuple[list[t
         close: int | None = None
         for candidate in range(index + 1, end):
             candidate_line = lines[candidate].strip()
-            nested = _STEP_BEGIN.fullmatch(candidate_line)
-            if nested is not None:
+            if _STEP_BEGIN.fullmatch(candidate_line) is not None:
                 raise V2PlanParseError("nested BEGIN STEP block")
             closing = _STEP_END.fullmatch(candidate_line)
             if closing is not None:
@@ -182,93 +89,22 @@ def _extract_step_blocks(lines: list[str], start: int, end: int) -> tuple[list[t
         index = close + 1
     return blocks, envelope
 
-
-def _repo_path(value: str, *, kind: str) -> str:
-    if not value or "\x00" in value or "\\" in value:
-        raise V2PlanParseError(f"unsafe {kind} path")
-    if value.startswith("/") or re.match(r"^[A-Za-z]:", value):
-        raise V2PlanParseError(f"unsafe {kind} path")
-    path = PurePosixPath(value)
-    if not value or path == PurePosixPath(".") or any(part in {"", ".", ".."} for part in path.parts):
-        raise V2PlanParseError(f"unsafe {kind} path")
-    if any(char in value for char in "*?["):
-        raise V2PlanParseError(f"wildcard {kind} path")
-    return value
-
-
-def _read_set(value: str, *, max_paths: int) -> tuple[str, ...]:
-    if not value.strip():
-        raise V2PlanParseError("READ_SET is missing")
-    anchors_by_path: dict[str, list[str]] = {}
-    for line in value.splitlines():
-        if not line.strip():
-            continue
-        if not line.startswith("- ") or " :: " not in line:
-            raise V2PlanParseError("each READ_SET line must be '- path :: anchor'")
-        path, anchor = line[2:].split(" :: ", 1)
-        path = _repo_path(path.strip(), kind="READ_SET")
-        anchor = anchor.strip()
-        if not anchor:
-            raise V2PlanParseError("READ_SET anchor must not be empty")
-        # Repeated paths merge their anchors instead of failing: the scope is
-        # unchanged, only the serialisation was split across lines.
-        anchors = anchors_by_path.setdefault(path, [])
-        if anchor not in anchors:
-            anchors.append(anchor)
-    if not anchors_by_path:
-        raise V2PlanParseError("READ_SET is missing")
-    if len(anchors_by_path) > max_paths:
-        raise V2PlanParseError(
-            f"READ_SET contains {len(anchors_by_path)} unique paths; "
-            f"maximum is {max_paths}"
-        )
-    return tuple(path + " :: " + "; ".join(anchors) for path, anchors in anchors_by_path.items())
-
-
-def read_set_paths(read_set: Sequence[str]) -> tuple[str, ...]:
-    """The repo-relative paths of ``'path :: anchor'`` READ_SET entries."""
-
-    return tuple(item.split(" :: ", 1)[0] for item in read_set)
-
-
-def _path_set(value: str, *, name: str) -> tuple[str, ...]:
-    """Parse a ``- path`` list; exactly ``NONE`` is the explicit empty set."""
-
-    if not value.strip():
-        raise V2PlanParseError(f"{name} is missing")
-    if value.strip() == "NONE":
-        return ()
-    result: list[str] = []
-    for line in value.splitlines():
-        if not line.strip():
-            continue
-        if not line.startswith("- ") or " :: " in line:
-            raise V2PlanParseError(f"each {name} line must be '- path'")
-        path = _repo_path(line[2:].strip(), kind=name)
-        if path in result:
-            raise V2PlanParseError(f"duplicate {name} path")
-        result.append(path)
-    if not result:
-        raise V2PlanParseError(f"{name} is missing")
-    return tuple(result)
-
-
-def _change_sets(
-    values: dict[str, str],
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Parse WRITE/CREATE/DELETE sets.
-
-    A path listed in several sets, or a mutation left out of READ_SET, is a
-    mechanical declaration defect the deterministic normalizer resolves against
-    the tree; the parser only refuses a step that declares no mutation at all.
-    """
-
-    write_set = _path_set(values["WRITE_SET"], name="WRITE_SET")
-    create_set = _path_set(values["CREATE_SET"], name="CREATE_SET")
-    delete_set = _path_set(values["DELETE_SET"], name="DELETE_SET")
-    if not (write_set or create_set or delete_set):
-        raise V2PlanParseError("a step must write, create or delete at least one path")
-    return write_set, create_set, delete_set
+_ENVELOPE_INLINE = frozenset({
+    "STATUS", "TITLE", "MILESTONE_ID", "MILESTONE_TITLE",
+    "EXECUTION_MODE", "STEP_COUNT", "BLOCKER_KIND",
+})
+_ENVELOPE_SECTIONS = frozenset({
+    "OBJECTIVE", "CONSTRAINTS", "MILESTONE_GOAL", "PROJECT_REMAINDER",
+    "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS", "REQUIRED_CHECKS",
+})
+_STEP_INLINE = frozenset({"TITLE", "EXECUTION_CLASS", "DEPENDS_ON"})
+# The rich contract of one step.  EXAMPLES is the single optional section.
+_STEP_SECTIONS = frozenset({
+    "CONTEXT", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET",
+    "INSTRUCTIONS", "INTERFACES", "EXAMPLES", "TESTS", "PITFALLS",
+    "DONE_WHEN", "VERIFY",
+})
+_MILESTONE_ID = re.compile(r"^M\d{2,3}$")
 
 
 def _parse_step(
@@ -278,19 +114,23 @@ def _parse_step(
     *,
     max_read_paths_per_step: int,
 ) -> ImplementationStep:
-    values, _ = _parse_labeled_body(
+    values, _ = parse_labeled_body(
         body, inline_names=_STEP_INLINE, section_names=_STEP_SECTIONS, where=f"step {step_id}"
     )
-    for name in ("TITLE", "EXECUTION_CLASS", "DEPENDS_ON", "OBJECTIVE", "READ_SET", "WRITE_SET", "INSTRUCTIONS", "VERIFY", "FORBIDDEN"):
+    for name in (
+        "TITLE", "EXECUTION_CLASS", "DEPENDS_ON", "CONTEXT", "READ_SET",
+        "WRITE_SET", "INSTRUCTIONS", "TESTS", "PITFALLS", "DONE_WHEN", "VERIFY",
+    ):
         if not values.get(name, "").strip():
             raise V2PlanParseError(f"step {step_id} is missing {name}")
-    for name in ("CREATE_SET", "DELETE_SET"):
-        if name not in values:
+    # ``NONE`` is a real answer for the sections that may not apply.
+    for name in ("CREATE_SET", "DELETE_SET", "INTERFACES"):
+        if not values.get(name, "").strip():
             raise V2PlanParseError(f"step {step_id} is missing {name}")
-        if not values[name].strip():
-            raise V2PlanParseError(f"step {step_id} has an empty {name}; use NONE")
-    _validate_step_text_limits(step_id, values)
-    title = _nonempty(values["TITLE"], f"step {step_id} TITLE")
+    if "EXAMPLES" in values and not values["EXAMPLES"].strip():
+        raise V2PlanParseError(f"step {step_id} has an empty EXAMPLES; use NONE")
+    validate_step_text_limits(step_id, values)
+    title = nonempty(values["TITLE"], f"step {step_id} TITLE")
     execution_class = values["EXECUTION_CLASS"]
     if execution_class not in {item.value for item in ExecutionClass}:
         raise V2PlanParseError(f"unknown execution class in {step_id}")
@@ -298,16 +138,26 @@ def _parse_step(
     if dependency != "NONE":
         if _STEP_ID.fullmatch(dependency) is None or dependency not in prior_ids:
             raise V2PlanParseError(f"invalid or future dependency in {step_id}")
-    objective = _nonempty(values["OBJECTIVE"], f"step {step_id} OBJECTIVE")
-    read_set = _read_set(values["READ_SET"], max_paths=max_read_paths_per_step)
-    write_set, create_set, delete_set = _change_sets(values)
-    instructions = _nonempty(values["INSTRUCTIONS"], f"step {step_id} INSTRUCTIONS")
-    verify = _nonempty(values["VERIFY"], f"step {step_id} VERIFY")
-    forbidden = _nonempty(values["FORBIDDEN"], f"step {step_id} FORBIDDEN")
+    context = nonempty(values["CONTEXT"], f"step {step_id} CONTEXT")
+    read_entries = read_set(values["READ_SET"], max_paths=max_read_paths_per_step)
+    write_set, create_set, delete_set = change_sets(values)
     return ImplementationStep(
-        step_id, title, ExecutionClass(execution_class), None if dependency == "NONE" else dependency,
-        objective, read_set, write_set, instructions, verify, forbidden,
-        create_set=create_set, delete_set=delete_set,
+        id=step_id,
+        title=title,
+        execution_class=ExecutionClass(execution_class),
+        depends_on=None if dependency == "NONE" else dependency,
+        context=context,
+        read_set=read_entries,
+        write_set=write_set,
+        create_set=create_set,
+        delete_set=delete_set,
+        instructions=nonempty(values["INSTRUCTIONS"], f"step {step_id} INSTRUCTIONS"),
+        interfaces=values["INTERFACES"].strip(),
+        examples=values.get("EXAMPLES", "").strip() or "NONE",
+        tests=nonempty(values["TESTS"], f"step {step_id} TESTS"),
+        pitfalls=nonempty(values["PITFALLS"], f"step {step_id} PITFALLS"),
+        done_when=nonempty(values["DONE_WHEN"], f"step {step_id} DONE_WHEN"),
+        verify=nonempty(values["VERIFY"], f"step {step_id} VERIFY"),
     )
 
 
@@ -317,19 +167,24 @@ def _render_step_contract_unchecked(plan: TaskPlanV2, step: ImplementationStep) 
 
     return "\n\n".join(
         (
-            "META IMPLEMENTATION STEP v1",
+            "META IMPLEMENTATION STEP v2",
             "RUN TITLE\n" + plan.title,
             f"STEP\n{step.id} / {len(plan.steps):02d}",
             "TITLE\n" + step.title,
             "EXECUTION CLASS\n" + step.execution_class.value,
-            "OBJECTIVE\n" + step.objective,
+            "DEPENDS_ON\n" + (step.depends_on or "NONE"),
+            "CONTEXT\n" + step.context,
             "READ SET\n" + lines(step.read_set),
             "WRITE SET\n" + lines(step.write_set),
             "CREATE SET\n" + lines(step.create_set),
             "DELETE SET\n" + lines(step.delete_set),
             "INSTRUCTIONS\n" + step.instructions,
+            "INTERFACES\n" + step.interfaces,
+            "EXAMPLES\n" + step.examples,
+            "TESTS\n" + step.tests,
+            "PITFALLS\n" + step.pitfalls,
+            "DONE_WHEN\n" + step.done_when,
             "VERIFY\n" + step.verify,
-            "FORBIDDEN\n" + step.forbidden,
             "END META IMPLEMENTATION STEP",
         )
     ) + "\n"
@@ -350,8 +205,9 @@ STEP_REPAIR_HEADER = "META STEP CONTRACT REPAIR v1"
 STEP_REPAIR_END = "END META STEP CONTRACT REPAIR"
 _STEP_REPAIR_INLINE = frozenset({"STEP_ID", "TITLE", "EXECUTION_CLASS", "DEPENDS_ON"})
 _STEP_REPAIR_SECTIONS = frozenset({
-    "OBJECTIVE", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET",
-    "INSTRUCTIONS", "VERIFY", "FORBIDDEN",
+    "CONTEXT", "READ_SET", "WRITE_SET", "CREATE_SET", "DELETE_SET",
+    "INSTRUCTIONS", "INTERFACES", "EXAMPLES", "TESTS", "PITFALLS",
+    "DONE_WHEN", "VERIFY",
 })
 _STEP_REPAIR_ID_WITH_COUNT = re.compile(r"^(S\d{2})\s*/\s*(\d{1,2})$")
 
@@ -429,18 +285,20 @@ def parse_step_contract_repair(
                 "field": "ENVELOPE", "rule": "single_utf8_bom_prefix",
                 "raw": "\ufeff", "canonical": "",
             })
-    lines = [line.rstrip() for line in _lines(raw)]
-    first = next((index for index, line in enumerate(lines) if line.strip()), None)
-    if first is None or lines[first].strip() != STEP_REPAIR_HEADER:
+    raw_lines = [line.rstrip() for line in lines(raw)]
+    first = next((index for index, line in enumerate(raw_lines) if line.strip()), None)
+    if first is None or raw_lines[first].strip() != STEP_REPAIR_HEADER:
         raise V2PlanParseError("missing META STEP CONTRACT REPAIR v1 header")
-    ends = [index for index, line in enumerate(lines) if line.strip() == STEP_REPAIR_END]
+    ends = [index for index, line in enumerate(raw_lines) if line.strip() == STEP_REPAIR_END]
     if len(ends) != 1 or ends[0] <= first:
         raise V2PlanParseError("missing or duplicate END META STEP CONTRACT REPAIR")
     end = ends[0]
-    if any(line.strip() for line in lines[:first]) or any(line.strip() for line in lines[end + 1:]):
+    if any(line.strip() for line in raw_lines[:first]) or any(
+        line.strip() for line in raw_lines[end + 1:]
+    ):
         raise V2PlanParseError("content outside step contract repair envelope")
-    inline, sections = _parse_labeled_body(
-        lines[first + 1:end],
+    inline, sections = parse_labeled_body(
+        raw_lines[first + 1:end],
         inline_names=_STEP_REPAIR_INLINE,
         section_names=_STEP_REPAIR_SECTIONS,
         where="step contract repair",
@@ -462,7 +320,7 @@ def parse_step_contract_repair(
             "raw": raw_step_id,
             "canonical": step_id,
         })
-    title = _nonempty(inline.get("TITLE", ""), "step contract repair TITLE")
+    title = nonempty(inline.get("TITLE", ""), "step contract repair TITLE")
     execution_class = inline.get("EXECUTION_CLASS")
     if execution_class not in {item.value for item in ExecutionClass}:
         raise V2PlanParseError("step contract repair EXECUTION_CLASS is invalid")
@@ -479,23 +337,31 @@ def parse_step_contract_repair(
             raise V2PlanParseError(
                 f"step contract repair {name} changed: expected {expected!r}, got {actual!r}"
             )
-    for name in _STEP_REPAIR_SECTIONS:
+    for name in _STEP_REPAIR_SECTIONS - {"EXAMPLES", "INTERFACES"}:
         if not sections.get(name, "").strip():
             raise V2PlanParseError(f"step contract repair is missing {name}")
-    _validate_step_text_limits(step_id, sections | {"TITLE": title})
-    read_set = _read_set(sections["READ_SET"], max_paths=max_read_paths_per_step)
-    write_set, create_set, delete_set = _change_sets(sections)
+    if not sections.get("INTERFACES", "").strip():
+        raise V2PlanParseError("step contract repair is missing INTERFACES")
+    validate_step_text_limits(step_id, sections | {"TITLE": title})
+    read_entries = read_set(sections["READ_SET"], max_paths=max_read_paths_per_step)
+    write_set, create_set, delete_set = change_sets(sections)
     return ImplementationStep(
-        step_id, title, ExecutionClass(execution_class),
-        None if dependency == "NONE" else dependency,
-        _nonempty(sections["OBJECTIVE"], "step contract repair OBJECTIVE"),
-        read_set,
-        write_set,
-        _nonempty(sections["INSTRUCTIONS"], "step contract repair INSTRUCTIONS"),
-        _nonempty(sections["VERIFY"], "step contract repair VERIFY"),
-        _nonempty(sections["FORBIDDEN"], "step contract repair FORBIDDEN"),
+        id=step_id,
+        title=title,
+        execution_class=ExecutionClass(execution_class),
+        depends_on=None if dependency == "NONE" else dependency,
+        context=nonempty(sections["CONTEXT"], "step contract repair CONTEXT"),
+        read_set=read_entries,
+        write_set=write_set,
         create_set=create_set,
         delete_set=delete_set,
+        instructions=nonempty(sections["INSTRUCTIONS"], "step contract repair INSTRUCTIONS"),
+        interfaces=sections["INTERFACES"].strip(),
+        examples=sections.get("EXAMPLES", "").strip() or "NONE",
+        tests=nonempty(sections["TESTS"], "step contract repair TESTS"),
+        pitfalls=nonempty(sections["PITFALLS"], "step contract repair PITFALLS"),
+        done_when=nonempty(sections["DONE_WHEN"], "step contract repair DONE_WHEN"),
+        verify=nonempty(sections["VERIFY"], "step contract repair VERIFY"),
     )
 
 
@@ -511,14 +377,18 @@ def render_repaired_step_contract(step: ImplementationStep) -> str:
         f"TITLE: {step.title}",
         f"EXECUTION_CLASS: {step.execution_class.value}",
         f"DEPENDS_ON: {step.depends_on or 'NONE'}",
-        "OBJECTIVE\n" + step.objective,
+        "CONTEXT\n" + step.context,
         "READ_SET\n" + lines(step.read_set),
         "WRITE_SET\n" + lines(step.write_set),
         "CREATE_SET\n" + lines(step.create_set),
         "DELETE_SET\n" + lines(step.delete_set),
         "INSTRUCTIONS\n" + step.instructions,
+        "INTERFACES\n" + step.interfaces,
+        "EXAMPLES\n" + step.examples,
+        "TESTS\n" + step.tests,
+        "PITFALLS\n" + step.pitfalls,
+        "DONE_WHEN\n" + step.done_when,
         "VERIFY\n" + step.verify,
-        "FORBIDDEN\n" + step.forbidden,
         STEP_REPAIR_END,
     )) + "\n"
 
@@ -599,19 +469,21 @@ def parse_task_plan_v2(
     planning = planning or PlanningConfig()
     if not isinstance(planning, PlanningConfig):
         raise TypeError("planning must be a PlanningConfig")
-    lines = _lines(raw)
-    first = next((index for index, line in enumerate(lines) if line.strip()), None)
-    if first is None or lines[first].strip() != _HEADER:
+    raw_lines = lines(raw)
+    first = next((index for index, line in enumerate(raw_lines) if line.strip()), None)
+    if first is None or raw_lines[first].strip() != _HEADER:
         raise V2PlanParseError("missing META PLAN v2 header")
-    ends = [index for index, line in enumerate(lines) if line.strip() == _END]
+    ends = [index for index, line in enumerate(raw_lines) if line.strip() == _END]
     if len(ends) != 1 or ends[0] <= first:
         raise V2PlanParseError("missing or duplicate END META PLAN")
     end = ends[0]
-    if any(line.strip() for line in lines[:first]) or any(line.strip() for line in lines[end + 1:]):
+    if any(line.strip() for line in raw_lines[:first]) or any(
+        line.strip() for line in raw_lines[end + 1:]
+    ):
         raise V2PlanParseError("content outside META PLAN v2 envelope")
 
-    blocks, envelope_lines = _extract_step_blocks(lines, first + 1, end)
-    inline, sections = _parse_labeled_body(
+    blocks, envelope_lines = _extract_step_blocks(raw_lines, first + 1, end)
+    inline, sections = parse_labeled_body(
         envelope_lines,
         inline_names=_ENVELOPE_INLINE,
         section_names=_ENVELOPE_SECTIONS,
@@ -621,11 +493,14 @@ def parse_task_plan_v2(
     if status not in {PlanDecision.READY.value, PlanDecision.BLOCKED.value}:
         raise V2PlanParseError("STATUS must be exactly READY or BLOCKED")
     decision = PlanDecision(status)
-    title = _nonempty(inline.get("TITLE", ""), "TITLE")
-    objective = _nonempty(sections.get("OBJECTIVE", ""), "OBJECTIVE")
+    title = nonempty(inline.get("TITLE", ""), "TITLE")
+    objective = nonempty(sections.get("OBJECTIVE", ""), "OBJECTIVE")
     blockers = sections.get("BLOCKERS", "").strip()
     if decision is PlanDecision.BLOCKED:
-        if blocks or any(name in inline for name in ("EXECUTION_MODE", "STEP_COUNT")):
+        if blocks or any(
+            name in inline
+            for name in ("EXECUTION_MODE", "STEP_COUNT", "MILESTONE_ID", "MILESTONE_TITLE")
+        ):
             raise V2PlanParseError("BLOCKED plan must not contain execution metadata or steps")
         if not blockers or blockers.casefold() in {"none", "n/a", "na", "-", "—", "nil"}:
             raise V2PlanParseError("BLOCKED plan requires real BLOCKERS")
@@ -649,6 +524,15 @@ def parse_task_plan_v2(
         )
     if "BLOCKER_KIND" in inline:
         raise V2PlanParseError("BLOCKER_KIND is only valid for BLOCKED plans")
+    milestone_id = nonempty(inline.get("MILESTONE_ID", ""), "MILESTONE_ID")
+    if _MILESTONE_ID.fullmatch(milestone_id) is None:
+        raise V2PlanParseError("MILESTONE_ID must look like M01")
+    milestone_title = nonempty(inline.get("MILESTONE_TITLE", ""), "MILESTONE_TITLE")
+    milestone_goal = nonempty(sections.get("MILESTONE_GOAL", ""), "MILESTONE_GOAL")
+    # ``NONE`` is the explicit, valid statement that nothing is left over.
+    project_remainder = sections.get("PROJECT_REMAINDER", "").strip()
+    if not project_remainder:
+        raise V2PlanParseError("MILESTONE_GOAL and PROJECT_REMAINDER are required")
 
     mode = inline.get("EXECUTION_MODE")
     if mode not in {item.value for item in ExecutionMode}:
@@ -686,7 +570,8 @@ def parse_task_plan_v2(
                 max_read_paths_per_step=planning.max_read_paths_per_step,
             )
         )
-    for name in ("CONSTRAINTS", "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS"):
+    for name in ("CONSTRAINTS", "MILESTONE_GOAL", "PROJECT_REMAINDER",
+                 "ACCEPTANCE", "TESTS", "RISKS", "BLOCKERS"):
         if name not in sections or not sections[name].strip():
             raise V2PlanParseError(f"READY plan is missing {name}")
     if blockers and blockers.casefold() not in {"none", "n/a", "na", "-", "—", "nil"}:
@@ -713,6 +598,10 @@ def parse_task_plan_v2(
         required_checks=required_checks,
         normalizations=tuple(normalizations),
         max_step_contract_chars=planning.max_step_contract_chars,
+        milestone_id=milestone_id,
+        milestone_title=milestone_title,
+        milestone_goal=milestone_goal,
+        project_remainder=project_remainder,
     )
     validate_step_contract_bounds(plan)
     return plan
@@ -724,11 +613,15 @@ def render_plan_summary_v2(plan: TaskPlanV2) -> str:
     mode = plan.execution_mode.value if plan.execution_mode is not None else "NONE"
     summaries = []
     for step in plan.steps:
-        summaries.append(f"{step.id} — {step.title} [{step.execution_class.value}]\n{step.objective}")
+        summaries.append(f"{step.id} — {step.title} [{step.execution_class.value}]\n{step.context}")
+    milestone = plan.milestone_id or "NONE"
     return "\n\n".join(
         (
             "# Implementation contract",
             f"## Title\n{plan.title}",
+            f"## Milestone\n{milestone} — {plan.milestone_title or 'NONE'}",
+            f"## Milestone goal\n{plan.milestone_goal or 'NONE'}",
+            f"## Project remainder\n{plan.project_remainder or 'NONE'}",
             f"## Objective\n{plan.objective}",
             f"## Constraints\n{plan.constraints or 'NONE'}",
             f"## Execution mode\n{mode}",
@@ -767,8 +660,8 @@ def render_repair_step_index(plan: TaskPlanV2) -> str:
     """Render the compact original-plan index the repair planner needs.
 
     The immutable candidate commit is the authority on the implementation, so
-    the index carries only what the plan itself decided: objective, approved
-    mutation scope, verification and prohibitions.  Instructions, READ_SET,
+    the index carries only what the plan itself decided: context, approved
+    mutation scope, verification and pitfalls.  Instructions, READ_SET,
     profiles and worker reports are deliberately absent.
     """
 
@@ -784,14 +677,14 @@ def render_repair_step_index(plan: TaskPlanV2) -> str:
                 "title": step.title,
                 "depends_on": step.depends_on,
                 "execution_class": step.execution_class.value,
-                "objective": step.objective,
+                "context": step.context,
                 "mutation_scope": {
                     "write": list(step.write_set),
                     "create": list(step.create_set),
                     "delete": list(step.delete_set),
                 },
                 "verify": step.verify,
-                "forbidden": step.forbidden,
+                "pitfalls": step.pitfalls,
             }
         )
 

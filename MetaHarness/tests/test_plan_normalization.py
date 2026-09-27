@@ -42,9 +42,22 @@ def step(
     delete: tuple[str, ...] = (),
 ) -> ImplementationStep:
     return ImplementationStep(
-        step_id, "title", ExecutionClass.MECHANICAL, None, "objective",
-        tuple(f"{path} :: anchor" for path in read), write,
-        "1. do", "- check", "- none", create_set=create, delete_set=delete,
+        id=step_id,
+        title="title",
+        execution_class=ExecutionClass.MECHANICAL,
+        depends_on=None,
+        context="context",
+        read_set=tuple(f"{path} :: anchor" for path in read),
+        write_set=write,
+        create_set=create,
+        delete_set=delete,
+        instructions="1. do",
+        interfaces="NONE",
+        examples="NONE",
+        tests="- test",
+        pitfalls="- none",
+        done_when="- done",
+        verify="- check",
     )
 
 

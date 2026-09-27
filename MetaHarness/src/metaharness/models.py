@@ -75,10 +75,13 @@ class PlanDecision(StrEnum):
 
 
 class BlockerKind(StrEnum):
-    REPOSITORY_EVIDENCE = "REPOSITORY_EVIDENCE"
+    """The only reason a planner may stop a run.
+
+    Every other obstacle is something MetaHarness resolves itself
+    (repository evidence, scope size) or a decision the SPEC must make.
+    """
+
     SPEC_DECISION = "SPEC_DECISION"
-    SECURITY_POLICY = "SECURITY_POLICY"
-    ATOMIC_SCOPE = "ATOMIC_SCOPE"
 
 
 class ExecutionMode(StrEnum):
@@ -226,20 +229,30 @@ class ContractNormalization:
 
 @dataclass(frozen=True)
 class ImplementationStep:
+    """One testable, coherent unit of the current milestone.
+
+    The contract is deliberately richer than a summary: a low-cost worker must
+    be able to execute it on its first pass without rediscovering repository
+    facts.  ``context`` carries those facts, ``interfaces`` the exact contracts
+    to produce, ``pitfalls`` what such a worker typically gets wrong.
+    """
+
     id: str
     title: str
     execution_class: ExecutionClass
     depends_on: str | None
-    objective: str
+    context: str
     read_set: tuple[str, ...]
     write_set: tuple[str, ...]
+    create_set: tuple[str, ...]
+    delete_set: tuple[str, ...]
     instructions: str
+    interfaces: str
+    examples: str
+    tests: str
+    pitfalls: str
+    done_when: str
     verify: str
-    forbidden: str
-    # New paths the step may create, existing paths it may delete.  Older
-    # META PLAN v2 answers without these sections parse to empty tuples.
-    create_set: tuple[str, ...] = ()
-    delete_set: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -256,8 +269,15 @@ class TaskPlanV2:
     blockers: str
     raw: str
     required_checks: tuple[str, ...] = ()
-    max_step_contract_chars: int = 5000
+    max_step_contract_chars: int = 9000
     blocker_kind: BlockerKind | None = None
+    # The minimal durable identity of the milestone this plan covers.  A plan
+    # never carries more than the next milestone; ``project_remainder`` names
+    # what is deliberately left out ("NONE" for a single-milestone project).
+    milestone_id: str | None = None
+    milestone_title: str = ""
+    milestone_goal: str = ""
+    project_remainder: str = ""
     # Every deterministic normalization applied to this plan, in order.  It is
     # durable evidence for audit; downstream code reads the effective steps.
     normalizations: tuple[ContractNormalization, ...] = ()
@@ -916,12 +936,14 @@ class PublishConfig:
 class PlanningConfig:
     protocol: str = "v2"
     decomposition: str = "aggressive"
-    single_step_max_mutable_paths: int = 2
-    staged_step_max_mutable_paths: int = 5
+    # Default mutable-path target of one step.  A step may exceed it only for a
+    # genuinely atomic transformation, which its CONTEXT must then explain.
+    single_step_max_mutable_paths: int = 3
+    staged_step_max_mutable_paths: int = 3
     execution_mode_policy: str = "auto"
-    max_steps_per_plan: int = 8
+    max_steps_per_plan: int = 12
     max_read_paths_per_step: int = 8
-    max_step_contract_chars: int = 5000
+    max_step_contract_chars: int = 9000
     max_preapproval_corrections: int = 2
 
     def __post_init__(self) -> None:

@@ -237,43 +237,18 @@ class RunBootstrap:
             steps_summary=[{"id": step.id, "title": step.title} for step in plan.steps],
         )
         if plan.decision is PlanDecision.BLOCKED:
+            # ``SPEC_DECISION`` is the only blocker a plan can carry: every
+            # other obstacle is MetaHarness' own to resolve.
             kind = plan.blocker_kind
-            if kind is BlockerKind.REPOSITORY_EVIDENCE:
-                reason = "REPOSITORY_EVIDENCE_RECOVERY_EXHAUSTED"
-                detail: dict[str, Any] = {
-                    "blocker_kind": kind.value,
-                    "blockers": plan.blockers,
-                    "action": "operator must clarify the named repository path or symbol",
-                }
-            elif kind is BlockerKind.SPEC_DECISION:
-                reason = "SPEC_DECISION_REQUIRED"
-                detail = {
-                    "blocker_kind": kind.value,
-                    "blockers": plan.blockers,
-                    "action": "operator must resolve the product choice left open by the SPEC",
-                }
-            elif kind is BlockerKind.SECURITY_POLICY:
-                reason = "SECURITY_POLICY_DECISION_REQUIRED"
-                detail = {
-                    "blocker_kind": kind.value,
-                    "blockers": plan.blockers,
-                    "action": "operator must decide the security or policy question",
-                }
-            elif kind is BlockerKind.ATOMIC_SCOPE:
-                reason = "ATOMIC_SCOPE_POLICY_LIMIT"
-                detail = {
-                    "blocker_kind": kind.value,
-                    "blockers": plan.blockers,
-                    "planning_limits": {
-                        "max_steps_per_plan": self.runtime.config.planning.max_steps_per_plan,
-                        "single_step_max_mutable_paths": self.runtime.config.planning.single_step_max_mutable_paths,
-                        "staged_step_max_mutable_paths": self.runtime.config.planning.staged_step_max_mutable_paths,
-                    },
-                    "action": "operator must authorize a higher planning limit or split the requested work",
-                }
-            else:
-                reason = "PLANNER_BLOCKED_REQUIRES_OPERATOR"
-                detail = {"blocker_kind": None, "blockers": plan.blockers}
+            reason = (
+                "SPEC_DECISION_REQUIRED" if kind is BlockerKind.SPEC_DECISION
+                else "PLANNER_BLOCKED_REQUIRES_OPERATOR"
+            )
+            detail: dict[str, Any] = {
+                "blocker_kind": kind.value if kind else None,
+                "blockers": plan.blockers,
+                "action": "operator must resolve the product choice left open by the SPEC",
+            }
             state = store.set_run_state(
                 RunMachineState(
                     disposition=RunDisposition.WAIT_HUMAN, reason=reason,

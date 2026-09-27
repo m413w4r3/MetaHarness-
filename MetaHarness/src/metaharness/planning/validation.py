@@ -1,7 +1,13 @@
-"""Plan constraints: execution mode, decomposition and repository preconditions.
+"""Plan constraints: execution mode, granularity policy, repository facts.
 
 This module owns the deterministic policy the harness applies to a parsed plan
 and the policy text the planner is asked to honour.  It never calls a model.
+
+Granularity is no longer a hard limit: one step is one testable, coherent unit
+with a default mutable scope of a few paths, and a genuinely atomic
+transformation is allowed to exceed that default as long as its CONTEXT
+explains the atomicity.  A transformation the limit cannot express becomes a
+milestone, never a BLOCKED plan.
 """
 
 from __future__ import annotations
@@ -11,7 +17,6 @@ from typing import Sequence
 from ..models import (
     ExecutionMode,
     ExecutionModePolicy,
-    ImplementationStep,
     PlanDecision,
     PlanningConfig,
     TaskPlanV2,
@@ -52,10 +57,12 @@ architectural discovery.
 def render_decomposition_policy_text(
     single_step_max_mutable_paths: int, staged_step_max_mutable_paths: int
 ) -> str:
-    """Render the AGGRESSIVE mutable-scope policy from the configured limits.
+    """Render the AGGRESSIVE granularity policy from the configured targets.
 
-    The numbers come from :class:`PlanningConfig`, the same values that
-    :func:`validate_decomposition_policy` enforces after parsing.
+    The numbers come from :class:`PlanningConfig`.  They are the default
+    mutable scope of one step, deliberately a target and not a limit: the
+    harness never rejects a step for scope size, because a genuinely atomic
+    transformation is allowed to exceed it when CONTEXT explains why.
     """
 
     for name, value in (
@@ -68,29 +75,17 @@ def render_decomposition_policy_text(
     staged = staged_step_max_mutable_paths
     return f"""This run uses AGGRESSIVE decomposition.
 
-A READY SINGLE plan may modify at most {single} distinct mutable paths across
-the union of WRITE_SET, CREATE_SET and DELETE_SET.
+One step is one testable, coherent unit: one main reasoning responsibility, one
+observable result and one targeted verification.
 
-Every STAGED step may modify at most {staged} distinct mutable paths across the
-union of WRITE_SET, CREATE_SET and DELETE_SET.
+Default mutable scope: 1 to {single} distinct paths for a SINGLE plan, and 1 to
+{staged} distinct paths per step for STAGED. The default applies to the union
+of WRITE_SET, CREATE_SET and DELETE_SET, not to each section independently.
 
-This limit applies to the UNION of the three sets, not to each section
-independently. A path counts once in the union. A READY plan must never exceed
-the active limit; the harness rejects it deterministically.
-
-The mutable-path limit bounds the scope of one worker; it is not an order to
-fragment an atomic operation unsafely. When a transformation exceeds the
-limit, decompose it only where a mechanically coherent decomposition exists:
-by transformation, layer, or dependency boundary. Do not create an artificial
-"implementation" step followed by a "tests" step to satisfy the limit; tests
-directly associated with a local transformation stay in the same step. Every
-step must leave the repository in a coherent state for the next step.
-
-A large task is not in itself a reason to return BLOCKED. BLOCKED remains
-reserved for when the architecture, paths or operations cannot be determined
-precisely, or when one atomic operation needs more mutable paths than the
-limit and no safe decomposition exists. In that case return BLOCKED instead
-of an invalid plan or a plan that asks the worker to discover a solution.
+A step may exceed that default only when a genuinely atomic transformation
+requires it, and CONTEXT must then explain that atomicity. Never return BLOCKED
+for scope size: split by transformation, layer or dependency boundary, or plan
+only the next milestone.
 """
 
 
@@ -114,34 +109,6 @@ def validate_execution_mode_policy(plan: TaskPlanV2, planning: PlanningConfig) -
         return
     if plan.decision is PlanDecision.READY and plan.execution_mode is not ExecutionMode.STAGED:
         raise V2PlanParseError("execution policy requires STAGED")
-
-
-def validate_decomposition_policy(
-    plan: TaskPlanV2,
-    planning: PlanningConfig,
-) -> None:
-    """Apply the configured mutable-scope policy after strict v2 parsing."""
-
-    if not isinstance(plan, TaskPlanV2) or not isinstance(planning, PlanningConfig):
-        raise TypeError("plan and planning must be v2 model values")
-    if plan.decision is not PlanDecision.READY or planning.decomposition != "aggressive":
-        return
-
-    def mutable_count(step: ImplementationStep) -> int:
-        return len(set(step.write_set) | set(step.create_set) | set(step.delete_set))
-
-    if plan.execution_mode is ExecutionMode.SINGLE:
-        limit = planning.single_step_max_mutable_paths
-    else:
-        limit = planning.staged_step_max_mutable_paths
-    mode = plan.execution_mode.value if plan.execution_mode else "UNKNOWN"
-    for step in plan.steps:
-        count = mutable_count(step)
-        if count > limit:
-            raise V2PlanParseError(
-                f"aggressive {mode} step {step.id} may modify at most {limit} "
-                f"distinct mutable paths; got {count}"
-            )
 
 
 def normalize_plan_repository(
@@ -172,6 +139,5 @@ __all__ = [
     "render_decomposition_policy_text",
     "render_plan_precondition_correction",
     "render_require_staged_policy_text",
-    "validate_decomposition_policy",
     "validate_execution_mode_policy",
 ]

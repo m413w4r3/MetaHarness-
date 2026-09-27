@@ -194,11 +194,11 @@ passes its exact tool list, managed settings and empty MCP configuration.
 protocol = "v2"
 decomposition = "aggressive"
 execution_mode_policy = "require-staged"
-single_step_max_mutable_paths = 2
-staged_step_max_mutable_paths = 5
-max_steps_per_plan = 8
+single_step_max_mutable_paths = 3
+staged_step_max_mutable_paths = 3
+max_steps_per_plan = 12
 max_read_paths_per_step = 8
-max_step_contract_chars = 5000
+max_step_contract_chars = 9000
 
 [publish]
 enabled = true
@@ -206,12 +206,22 @@ remote = "origin"
 mode = "fast-forward-base"
 ```
 
-With `decomposition = "aggressive"`, `single_step_max_mutable_paths` bounds a
-READY SINGLE plan and `staged_step_max_mutable_paths` (default 5) bounds every
-STAGED step. Mutable paths are the distinct union of WRITE_SET, CREATE_SET and
-DELETE_SET. Both limits are written into `planner.request.txt` and enforced
+With `decomposition = "aggressive"`, `single_step_max_mutable_paths` (default 3)
+bounds a READY SINGLE plan and `staged_step_max_mutable_paths` (default 3) bounds
+every STAGED step. Mutable paths are the distinct union of WRITE_SET, CREATE_SET
+and DELETE_SET. Both limits are written into `planner.request.txt` and enforced
 after parsing with the same values (`PLANNER_OUTPUT_INVALID` otherwise).
-`balanced` applies neither limit.
+`balanced` applies neither limit. A step may exceed its limit only for a
+genuinely atomic transformation, which its `CONTEXT` then has to explain.
+
+`max_steps_per_plan` (default 12) is the step budget of the **current
+milestone**. A project that needs more than that is never `BLOCKED`: the plan
+carries the durable milestone identity (`MILESTONE_ID`, `MILESTONE_TITLE`,
+`MILESTONE_GOAL`, `PROJECT_REMAINDER`) and only the next milestone's steps.
+`PROJECT_REMAINDER` is the explicit `NONE` for a single-milestone project.
+`max_step_contract_chars` (default 9000) is the hard limit of one step contract;
+the planner targets 2500 to 7000 characters so a low-cost model gets the
+context, interfaces, tests and pitfalls it needs.
 
 ```text
 BASE → isolated run worktree → PLAN STAGED
@@ -369,8 +379,9 @@ recovered only when its current artifacts prove the next operation exactly.
 | Protocol step syntax bound (`PROTOCOL_MAX_STEPS`) | 99 (`SINGLE` = exactly 1; `STAGED` = 2..99) |
 | Allowed step IDs | `S01` .. `S99`, contiguous from `S01` |
 | Max READ_SET paths per step | 8 (`max_read_paths_per_step`) |
-| Max mutable union per aggressive STAGED step | 5 (`staged_step_max_mutable_paths`) |
-| Max step contract | 5000 characters (target ~1000-2200) |
+| Max mutable union per aggressive STAGED step | 3 (`staged_step_max_mutable_paths`) |
+| Max steps per plan (current milestone) | 12 (`max_steps_per_plan`) |
+| Max step contract | 9000 characters (target 2500-7000) |
 | Max aggregate step contracts | None |
 | Execution selection steps (schema 3 and 4) | Up to 99, contiguous from `S01` |
 | Resume step IDs (`initial_step`, `repair_step`) | `S01` .. `S99` |

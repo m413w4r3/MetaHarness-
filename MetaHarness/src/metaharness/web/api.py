@@ -99,7 +99,7 @@ ARTIFACT_ALLOWLIST = frozenset(
         PLANNER_USAGE_ARTIFACT,
     }
 )
-# The parser caps a step contract at 5000 characters; the UI read bound is
+# The parser caps a step contract at 9000 characters; the UI read bound is
 # deliberately higher so a malformed artifact is reported rather than read
 # without a bound.
 MAX_STEP_CONTRACT_BYTES = 64 * 1024
@@ -915,8 +915,22 @@ def approve_run(
             planner_profile_id=state["execution"]["planner"]["profile_id"],
             plan_steps=[
                 ImplementationStep(
-                    entry["id"], entry["title"], ExecutionClass(entry["execution_class"]),
-                    None, "", (), (), "", "", "",
+                    id=entry["id"],
+                    title=entry["title"],
+                    execution_class=ExecutionClass(entry["execution_class"]),
+                    depends_on=None,
+                    context="",
+                    read_set=(),
+                    write_set=(),
+                    create_set=(),
+                    delete_set=(),
+                    instructions="",
+                    interfaces="",
+                    examples="NONE",
+                    tests="",
+                    pitfalls="",
+                    done_when="",
+                    verify="",
                 )
                 for entry in bundle["steps"]
             ],

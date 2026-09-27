@@ -46,7 +46,7 @@ from ..plan_repository_validation import (
 )
 from ..planning.artifacts import persist_recovered_plan_artifacts, validate_implementation_bundle
 from ..planning.protocol import V2PlanParseError, parse_task_plan_v2
-from ..planning.validation import validate_decomposition_policy, validate_execution_mode_policy
+from ..planning.validation import validate_execution_mode_policy
 from ..profiles import ProfileError, profiles_for_config
 from ..redaction import redact
 from ..result import RunResult
@@ -391,7 +391,6 @@ class RunRuntime:
             if plan.decision is not PlanDecision.READY:
                 refuse("replacement plan must be STATUS: READY")
             validate_execution_mode_policy(plan, config.planning)
-            validate_decomposition_policy(plan, config.planning)
         except V2PlanParseError as exc:
             refuse(f"replacement plan is invalid: {exc}")
         try:

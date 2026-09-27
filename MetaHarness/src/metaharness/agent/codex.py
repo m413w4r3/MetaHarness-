@@ -224,18 +224,15 @@ class CodexAgent:
         if not isinstance(plan, str):
             raise TypeError("plan must be a string")
         payload = build_implementer_payload(
-        step_identity="implementation request",
-            step_objective=plan,
+            step_identity="implementation request",
+            context=plan,
             read_set="NONE",
-            mutable_scope="NONE",
-            repository_instructions="NONE",
-            verify_instructions="NONE",
             write_set="NONE",
             create_set="NONE",
             delete_set="NONE",
+            mutable_scope="NONE",
             instructions="NONE",
             verify_contract="NONE",
-            forbidden_contract="NONE",
         )
         return self._run_with_prompt(
             payload.rendered, worktree, artifacts_dir,

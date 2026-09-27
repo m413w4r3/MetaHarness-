@@ -1,0 +1,219 @@
+"""The labeled-body grammar shared by the MetaHarness wire protocols.
+
+One lexical authority: line normalization, the strict ``FIELD: value`` inline
+form, the section forms, and the repository path sets both the plan protocol
+and the step-contract repair protocol parse.  It performs no I/O, calls no
+model and never touches Git.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import PurePosixPath
+from typing import Sequence
+
+# One step contract is one bounded unit of work: numbered operations, a short
+# verification and a short pitfall list.  These are protocol limits, shared by
+# the plan parser and the step-contract repair parser.
+MAX_STEP_INSTRUCTIONS = 12
+MAX_STEP_VERIFY_LINES = 6
+MAX_STEP_PITFALL_LINES = 6
+
+# The strict ``FIELD: value`` form the labeled bodies are built from.
+INLINE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*:\s*(.*)$")
+
+
+class PlanParseError(ValueError):
+    """A planner answer was received but cannot be interpreted unambiguously."""
+
+
+class V2PlanParseError(PlanParseError):
+    """A META PLAN v2 response is not safe to execute."""
+
+
+def lines(raw: str) -> list[str]:
+    return raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def nonempty(value: str, name: str) -> str:
+    value = value.strip()
+    if not value or value.casefold() in {"none", "n/a", "na", "-", "—", "nil", "tbd"}:
+        raise V2PlanParseError(f"{name} is missing or a placeholder")
+    return value
+
+
+def validate_step_text_limits(step_id: str, values: dict[str, str]) -> None:
+    title = values["TITLE"].strip()
+    if len(title) > 100:
+        raise V2PlanParseError(f"step {step_id} TITLE exceeds 100 characters")
+    instruction_lines = [line for line in values["INSTRUCTIONS"].splitlines() if line.strip()]
+    numbered = [line for line in instruction_lines if re.match(r"^\s*\d+[.)]\s+", line)]
+    if not numbered:
+        raise V2PlanParseError(
+            f"step {step_id} INSTRUCTIONS must contain 1 to {MAX_STEP_INSTRUCTIONS} "
+            "numbered concrete operations"
+        )
+    if len(numbered) > MAX_STEP_INSTRUCTIONS:
+        raise V2PlanParseError(
+            f"step {step_id} INSTRUCTIONS exceeds {MAX_STEP_INSTRUCTIONS} operations"
+        )
+    verify_lines = [line for line in values["VERIFY"].splitlines() if line.strip()]
+    if len(verify_lines) > MAX_STEP_VERIFY_LINES:
+        raise V2PlanParseError(f"step {step_id} VERIFY exceeds {MAX_STEP_VERIFY_LINES} lines")
+    pitfall_lines = [line for line in values["PITFALLS"].splitlines() if line.strip()]
+    if len(pitfall_lines) > MAX_STEP_PITFALL_LINES:
+        raise V2PlanParseError(
+            f"step {step_id} PITFALLS exceeds {MAX_STEP_PITFALL_LINES} entries"
+        )
+
+
+def section_name(line: str, allowed: frozenset[str]) -> str | None:
+    candidate = line.strip()
+    candidate = re.sub(r"^#{1,6}\s+", "", candidate)
+    if candidate.endswith(":"):
+        candidate = candidate[:-1].rstrip()
+    for name in allowed:
+        if candidate.casefold() == name.casefold():
+            return name
+    return None
+
+
+def parse_labeled_body(
+    body: Sequence[str],
+    *,
+    inline_names: frozenset[str],
+    section_names: frozenset[str],
+    where: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Parse one strict labeled body, tolerating Markdown headings for prose."""
+
+    inline: dict[str, str] = {}
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for raw_line in body:
+        stripped = raw_line.strip()
+        if not stripped:
+            if current is not None:
+                sections[current].append("")
+            continue
+
+        match = INLINE.fullmatch(stripped)
+        if match and match.group(1) in inline_names:
+            name, value = match.groups()
+            if name in inline:
+                raise V2PlanParseError(f"duplicate {where} field {name}")
+            inline[name] = value.strip()
+            current = None
+            continue
+
+        if match and match.group(1) in section_names:
+            name, value = match.groups()
+            if name in sections:
+                raise V2PlanParseError(f"duplicate {where} section {name}")
+            sections[name] = [value] if value.strip() else []
+            current = name if not value.strip() else None
+            continue
+
+        section = section_name(stripped, section_names)
+        if section is not None:
+            if section in sections:
+                raise V2PlanParseError(f"duplicate {where} section {section}")
+            sections[section] = []
+            current = section
+            continue
+
+        if current is None:
+            raise V2PlanParseError(f"unexpected content in {where}: {stripped[:80]}")
+        sections[current].append(raw_line)
+
+    values = {name: value.strip() for name, value in inline.items()}
+    values.update({name: "\n".join(lines).strip() for name, lines in sections.items()})
+    return values, {name: value for name, value in values.items() if name in section_names}
+
+
+def repo_path(value: str, *, kind: str) -> str:
+    if not value or "\x00" in value or "\\" in value:
+        raise V2PlanParseError(f"unsafe {kind} path")
+    if value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+        raise V2PlanParseError(f"unsafe {kind} path")
+    path = PurePosixPath(value)
+    if not value or path == PurePosixPath(".") or any(part in {"", ".", ".."} for part in path.parts):
+        raise V2PlanParseError(f"unsafe {kind} path")
+    if any(char in value for char in "*?["):
+        raise V2PlanParseError(f"wildcard {kind} path")
+    return value
+
+
+def read_set(value: str, *, max_paths: int) -> tuple[str, ...]:
+    if not value.strip():
+        raise V2PlanParseError("READ_SET is missing")
+    anchors_by_path: dict[str, list[str]] = {}
+    for line in value.splitlines():
+        if not line.strip():
+            continue
+        if not line.startswith("- ") or " :: " not in line:
+            raise V2PlanParseError("each READ_SET line must be '- path :: anchor'")
+        path, anchor = line[2:].split(" :: ", 1)
+        path = repo_path(path.strip(), kind="READ_SET")
+        anchor = anchor.strip()
+        if not anchor:
+            raise V2PlanParseError("READ_SET anchor must not be empty")
+        # Repeated paths merge their anchors instead of failing: the scope is
+        # unchanged, only the serialisation was split across lines.
+        anchors = anchors_by_path.setdefault(path, [])
+        if anchor not in anchors:
+            anchors.append(anchor)
+    if not anchors_by_path:
+        raise V2PlanParseError("READ_SET is missing")
+    if len(anchors_by_path) > max_paths:
+        raise V2PlanParseError(
+            f"READ_SET contains {len(anchors_by_path)} unique paths; "
+            f"maximum is {max_paths}"
+        )
+    return tuple(path + " :: " + "; ".join(anchors) for path, anchors in anchors_by_path.items())
+
+
+def read_set_paths(read_set: Sequence[str]) -> tuple[str, ...]:
+    """The repo-relative paths of ``'path :: anchor'`` READ_SET entries."""
+
+    return tuple(item.split(" :: ", 1)[0] for item in read_set)
+
+
+def path_set(value: str, *, name: str) -> tuple[str, ...]:
+    """Parse a ``- path`` list; exactly ``NONE`` is the explicit empty set."""
+
+    if not value.strip():
+        raise V2PlanParseError(f"{name} is missing")
+    if value.strip() == "NONE":
+        return ()
+    result: list[str] = []
+    for line in value.splitlines():
+        if not line.strip():
+            continue
+        if not line.startswith("- ") or " :: " in line:
+            raise V2PlanParseError(f"each {name} line must be '- path'")
+        path = repo_path(line[2:].strip(), kind=name)
+        if path in result:
+            raise V2PlanParseError(f"duplicate {name} path")
+        result.append(path)
+    if not result:
+        raise V2PlanParseError(f"{name} is missing")
+    return tuple(result)
+
+
+def change_sets(
+    values: dict[str, str],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Parse WRITE/CREATE/DELETE sets.
+
+    A path listed in several sets, or a mutation left out of READ_SET, is a
+    mechanical declaration defect the deterministic normalizer resolves against
+    the tree; the parser only refuses a step that declares no mutation at all.
+    """
+
+    write_set = path_set(values["WRITE_SET"], name="WRITE_SET")
+    create_set = path_set(values["CREATE_SET"], name="CREATE_SET")
+    delete_set = path_set(values["DELETE_SET"], name="DELETE_SET")
+    if not (write_set or create_set or delete_set):
+        raise V2PlanParseError("a step must write, create or delete at least one path")
+    return write_set, create_set, delete_set

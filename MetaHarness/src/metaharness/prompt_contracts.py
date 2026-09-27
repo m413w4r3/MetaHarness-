@@ -318,9 +318,9 @@ def build_planner_payload(
     # know the v2 parser limits.
     template = (
         template.replace("{{DEFAULT_CHECK_IDS}}", "NONE")
-        .replace("{{MAX_STEPS}}", "8")
-        .replace("{{LAST_STEP_ID}}", "S08")
-        .replace("{{MAX_STEP_CONTRACT_CHARS}}", "5000")
+        .replace("{{MAX_STEPS}}", "12")
+        .replace("{{LAST_STEP_ID}}", "S12")
+        .replace("{{MAX_STEP_CONTRACT_CHARS}}", "9000")
         .replace("{{MAX_READ_PATHS_PER_STEP}}", "8")
     )
     if using_default_template:
@@ -349,19 +349,21 @@ def build_planner_payload(
 def build_implementer_payload(
     *,
     original_spec: str = "",
-    step_objective: str,
-    read_set: str,
-    mutable_scope: str,
-    repository_instructions: str = "",
-    verify_instructions: str = "",
-    step_title: str = "",
     step_identity: str | None = None,
+    step_title: str = "",
+    context: str = "",
+    read_set: str = "NONE",
     write_set: str = "NONE",
     create_set: str = "NONE",
     delete_set: str = "NONE",
-    instructions: str | None = None,
-    verify_contract: str | None = None,
-    forbidden_contract: str | None = None,
+    mutable_scope: str = "NONE",
+    instructions: str = "",
+    interfaces: str = "NONE",
+    examples: str = "NONE",
+    tests: str = "NONE",
+    pitfalls: str = "NONE",
+    done_when: str = "NONE",
+    verify_contract: str = "NONE",
     template: str | None = None,
     budget_bytes: int = 0,
     retry_addendum: str = "",
@@ -371,37 +373,40 @@ def build_implementer_payload(
     if template is None:
         template = _default_template("implementer.txt")
     effective_identity = step_identity if step_identity is not None else step_title
-    effective_instructions = (
-        instructions if instructions is not None else repository_instructions
-    )
-    effective_verify = verify_contract if verify_contract is not None else verify_instructions
-    effective_forbidden = forbidden_contract if forbidden_contract is not None else ""
     sections = (
         _section("original_spec", original_spec, True),
         _section("step_identity", effective_identity, True),
-        _section("step_objective", step_objective, True),
+        _section("context", context, True),
         _section("read_set", read_set, True),
         _section("write_set", write_set, True),
         _section("create_set", create_set, True),
         _section("delete_set", delete_set, True),
         _section("mutable_scope", mutable_scope, True),
-        _section("instructions", effective_instructions, True),
-        _section("verify_contract", effective_verify, True),
-        _section("forbidden_contract", effective_forbidden, True),
+        _section("instructions", instructions, True),
+        _section("interfaces", interfaces, True),
+        _section("examples", examples, True),
+        _section("tests", tests, True),
+        _section("pitfalls", pitfalls, True),
+        _section("done_when", done_when, True),
+        _section("verify_contract", verify_contract, True),
         _section("retry_addendum", retry_addendum, False),
     )
     placeholders = {
         "{{SPEC}}": "original_spec",
         "{{STEP_IDENTITY}}": "step_identity",
-        "{{STEP_OBJECTIVE}}": "step_objective",
+        "{{CONTEXT}}": "context",
         "{{READ_SET}}": "read_set",
         "{{WRITE_SET}}": "write_set",
         "{{CREATE_SET}}": "create_set",
         "{{DELETE_SET}}": "delete_set",
         "{{MUTABLE_SCOPE}}": "mutable_scope",
         "{{INSTRUCTIONS}}": "instructions",
+        "{{INTERFACES}}": "interfaces",
+        "{{EXAMPLES}}": "examples",
+        "{{TESTS}}": "tests",
+        "{{PITFALLS}}": "pitfalls",
+        "{{DONE_WHEN}}": "done_when",
         "{{VERIFY_CONTRACT}}": "verify_contract",
-        "{{FORBIDDEN_CONTRACT}}": "forbidden_contract",
         "{{RETRY_ADDENDUM}}": "retry_addendum",
     }
     return _payload_from_template(

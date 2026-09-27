@@ -275,9 +275,11 @@ touche pas donne un run vert, avec l'avertissement « baseline failure ».
    - `DONE_WHEN` ;
    - `VERIFY` : commandes exactes.
 4. **Jalons** : si la SPEC dépasse un lot (`max_steps_per_plan`, 12 par
-   défaut), le planner produit une section `MILESTONES` (M1…Mn, chacun avec
-   ses critères d'acceptation) et planifie **seulement le prochain jalon**.
-   C'est ce qui alimente C8.
+   défaut), le planner ne bloque plus : le plan porte l'identité durable du
+   jalon courant (`MILESTONE_ID` M01, `MILESTONE_TITLE`, `MILESTONE_GOAL`,
+   `PROJECT_REMAINDER`) et **seulement le prochain jalon**. Un petit projet a
+   `M01` pour unique jalon et `PROJECT_REMAINDER = NONE`. C'est ce qui
+   alimente C8.
 5. `EXECUTION_CLASS` est conservé (routage vers un profil), avec une règle
    simple : MECHANICAL et REASONING vont au low-tier, AGENTIC au low-tier
    `max`, et l'escalade (A3) va vers le profil `escalation` de la classe.
@@ -289,8 +291,8 @@ touche pas donne un run vert, avec l'avertissement « baseline failure ».
 **Acceptation**
 - Sur `examples/spec-example.md`, le plan contient au moins 2 steps, chacun
   avec `INTERFACES`, `TESTS`, `PITFALLS` et `DONE_WHEN` non vides.
-- Une SPEC de 30 étapes produit des `MILESTONES` plus un lot de 12 steps au
-  maximum.
+- Une SPEC de 30 étapes produit un jalon (`MILESTONE_ID`, `MILESTONE_GOAL`,
+  `PROJECT_REMAINDER` non vides) et un lot de 12 steps au maximum.
 
 ### C7 — Audit high-tier actif : revue, refacto et correction en une passe
 

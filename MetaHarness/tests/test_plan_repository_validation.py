@@ -47,7 +47,6 @@ from metaharness.plan_repository_validation import (
     RepositoryPreconditions,
     normalize_plan_contracts,
     plan_repository_violations,
-    render_blocker_repository_evidence,
     render_precondition_correction,
     render_violations,
     validate_plan_repository_topology,
@@ -68,9 +67,22 @@ def step(
     create: tuple[str, ...] = (), delete: tuple[str, ...] = (),
 ) -> ImplementationStep:
     return ImplementationStep(
-        step_id, "title", ExecutionClass.MECHANICAL, None, "objective",
-        tuple(f"{path} :: anchor" for path in read), write_set,
-        "1. do", "- check", "- none", create_set=create, delete_set=delete,
+        id=step_id,
+        title="title",
+        execution_class=ExecutionClass.MECHANICAL,
+        depends_on=None,
+        context="context",
+        read_set=tuple(f"{path} :: anchor" for path in read),
+        write_set=write_set,
+        create_set=create,
+        delete_set=delete,
+        instructions="1. do",
+        interfaces="NONE",
+        examples="NONE",
+        tests="- test",
+        pitfalls="- none",
+        done_when="- done",
+        verify="- check",
     )
 
 
@@ -97,7 +109,7 @@ TITLE: Change the feature
 EXECUTION_CLASS: MECHANICAL
 DEPENDS_ON: NONE
 
-OBJECTIVE
+CONTEXT
 Change the feature.
 
 READ_SET
@@ -115,11 +127,23 @@ DELETE_SET
 INSTRUCTIONS
 1. Change the feature.
 
+INTERFACES
+NONE
+
+EXAMPLES
+NONE
+
+TESTS
+- The configured test covers the change.
+
+PITFALLS
+- Do not change paths outside the declared sets.
+
+DONE_WHEN
+- The declared change is present.
+
 VERIFY
 - Run the configured test.
-
-FORBIDDEN
-- Do not change paths outside the declared sets.
 
 END STEP {step_id}
 """)
@@ -128,12 +152,20 @@ END STEP {step_id}
 
 STATUS: READY
 TITLE: {title}
+MILESTONE_ID: M01
+MILESTONE_TITLE: {title}
 
 OBJECTIVE
 Implement the requested feature.
 
 CONSTRAINTS
 Keep the change local.
+
+MILESTONE_GOAL
+The requested feature exists and its checks pass.
+
+PROJECT_REMAINDER
+NONE
 
 EXECUTION_MODE: {mode}
 STEP_COUNT: {len(steps)}
@@ -398,43 +430,6 @@ class TopologyValidationTests(_Repo):
                 step("S02", read=(X,), write_set=(X,)),
             ),
         )
-
-
-class BlockerEvidenceTests(_Repo):
-    """The bounded, tree-pinned evidence a planner is allowed to see."""
-
-    def test_sensitive_and_binary_paths_are_never_put_in_a_prompt(self) -> None:
-        (self.repo / ".env").write_text("TOKEN=hidden\n", encoding="utf-8")
-        (self.repo / "pkg/blob.bin").write_bytes(b"\x00\x01binary")
-        git(self.repo, "add", "--all")
-        git(self.repo, "commit", "-qm", "sensitive")
-        tree = resolve_tree(self.repo, "HEAD")
-
-        _, evidence = render_blocker_repository_evidence(
-            self.repo, tree, "- path: .env\n- pkg/blob.bin\n- pkg/big.py :: symbol\n- pkg/x.py :: VALUE",
-        )
-
-        self.assertIn(".env", evidence)
-        self.assertIn("withheld (sensitive path)", evidence)
-        self.assertIn("binary file", evidence)
-        self.assertIn("absent from the immutable tree", evidence)
-        self.assertIn("VALUE = 1", evidence)
-        self.assertNotIn("hidden", evidence)
-
-    def test_evidence_is_bounded_and_tree_pinned(self) -> None:
-        (self.repo / X).write_text("WORKING TREE ONLY\n", encoding="utf-8")
-        big = "pkg/big.py"
-        (self.repo / big).write_text("x" * 20000, encoding="utf-8")
-        git(self.repo, "add", big)
-        git(self.repo, "commit", "-qm", "big")
-        tree = resolve_tree(self.repo, "HEAD")
-
-        _, evidence = render_blocker_repository_evidence(self.repo, tree, f"- {X}\n- {big}")
-
-        self.assertIn("VALUE = 1", evidence)
-        self.assertNotIn("WORKING TREE ONLY", evidence)
-        self.assertIn("SIZE:", evidence.replace("CONTENT (first 8192 bytes of 20000):", "SIZE:"))
-        self.assertNotIn("x" * 8193, evidence)
 
 
 class SpecPathContextTests(_Repo):

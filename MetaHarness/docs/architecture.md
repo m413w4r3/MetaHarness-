@@ -197,9 +197,11 @@ PLAN → implementation step → accepted step commit → …
   execution selection (schema 3 and 4), resume checkpoints, usage accounting
   and the UI all import it; no module spells its own step bound. SINGLE is
   exactly one step, STAGED two to `PlanningConfig.max_steps_per_plan`. A step
-  contract is at most `max_step_contract_chars` (default 5000), and each step
+  contract is at most `max_step_contract_chars` (default 9000), and each step
   has at most `max_read_paths_per_step` unique READ_SET paths (default 8).
-  The planner target is approximately 1000-2200 characters per step.
+  The planner target is 2500 to 7000 characters per step: one step is one
+  testable unit with one main reasoning responsibility, one to three mutable
+  paths by default, and its own small verification.
 - Initial and correction-cycle steps run through the same generic step executor, with
   the same ordered gates and failure reasons (`REPOSITORY_TREE_DRIFT_UNEXPLAINED`,
   `AGENT_AUTH_FAILURE`, `AGENT_GIT_VIOLATION`,
@@ -292,8 +294,8 @@ reviewer reporting the planner's handle is rejected as
 
 The pushed candidate commit is the code authority for correction planning.
 The repair planner receives a compact index of the original plan — per step,
-its ID, title, dependency, objective, approved mutation scope, VERIFY and
-FORBIDDEN — never the full approved step contracts, and never worker
+its ID, title, dependency, execution class, CONTEXT, approved mutation scope,
+VERIFY and PITFALLS — never the full approved step contracts, and never worker
 reports, token counters or tree SHAs. The full candidate diff is not inlined
 when Git remote exploration is available: the planner gets the BASE SHA, the
 CANDIDATE SHA, the immutable candidate URL, the `BASE...CANDIDATE`

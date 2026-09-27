@@ -91,9 +91,9 @@ class RunOptions:
     reasoning_profile: str = ""
     agentic_profile: str = ""
     audit_profile: str = ""
-    max_steps_per_plan: int = 8
+    max_steps_per_plan: int = 12
     max_read_paths_per_step: int = 8
-    max_step_contract_chars: int = 5000
+    max_step_contract_chars: int = 9000
     max_preapproval_corrections: int = 2
     recovery: RecoveryBudgets = RecoveryBudgets()
 

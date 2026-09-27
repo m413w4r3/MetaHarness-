@@ -63,8 +63,8 @@ TITLE: {self.title}
 EXECUTION_CLASS: MECHANICAL
 DEPENDS_ON: {self.depends_on}
 
-OBJECTIVE
-{self.title}
+CONTEXT
+{self.title} is the only work of this step.
 
 {block("READ_SET", reads)}
 {block("WRITE_SET", self.write)}
@@ -73,11 +73,23 @@ OBJECTIVE
 INSTRUCTIONS
 1. {self.title}
 
+INTERFACES
+NONE
+
+EXAMPLES
+NONE
+
+TESTS
+- The configured checks cover {self.title}.
+
+PITFALLS
+- Do not change paths outside the declared sets.
+
+DONE_WHEN
+- The declared change is present.
+
 VERIFY
 - Run the configured checks.
-
-FORBIDDEN
-- Do not change paths outside the declared sets.
 
 END STEP {self.id}
 """
@@ -96,12 +108,20 @@ def meta_plan(
 
 STATUS: READY
 TITLE: {title}
+MILESTONE_ID: M01
+MILESTONE_TITLE: {title}
 
 OBJECTIVE
 Implement the requested change.
 
 CONSTRAINTS
 Keep the change local.
+
+MILESTONE_GOAL
+The requested change is delivered.
+
+PROJECT_REMAINDER
+NONE
 
 EXECUTION_MODE: {mode}
 STEP_COUNT: {len(steps)}
@@ -135,7 +155,7 @@ TITLE: {title}
 EXECUTION_CLASS: MECHANICAL
 DEPENDS_ON: NONE
 
-OBJECTIVE
+CONTEXT
 {title} with the corrected bounded scope.
 
 READ_SET
@@ -153,11 +173,23 @@ NONE
 INSTRUCTIONS
 1. Perform the step on {path} only.
 
+INTERFACES
+NONE
+
+EXAMPLES
+NONE
+
+TESTS
+- The configured checks cover the corrected scope.
+
+PITFALLS
+- Do not edit paths outside the approved set.
+
+DONE_WHEN
+- {path} holds the corrected change.
+
 VERIFY
 - Run the configured checks.
-
-FORBIDDEN
-- Do not edit paths outside the approved set.
 
 END META STEP CONTRACT REPAIR
 """

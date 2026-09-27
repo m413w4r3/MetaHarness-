@@ -19,28 +19,31 @@ class PromptContractTests(unittest.TestCase):
 
     def test_implementer_is_executor_only(self) -> None:
         payload = build_implementer_payload(
-            step_title="S01", step_objective="implement one step",
-            forbidden_contract="preserve API", read_set="src/a.py :: symbol",
-            mutable_scope="src/a.py", repository_instructions="follow AGENTS.md",
-            verify_instructions="python -m unittest",
+            step_title="S01",
+            context="src/a.py exposes the client contract",
+            read_set="src/a.py :: symbol",
+            mutable_scope="src/a.py",
+            instructions="follow AGENTS.md",
+            verify_contract="python -m unittest",
+            pitfalls="Do not broaden the retry policy.",
         )
         self.assertIn("You are the implementation executor", payload.rendered)
         self.assertIn("Do not redesign the plan or broaden the task.", payload.rendered)
         self.assertIn("Implement the supplied contract exactly.", payload.rendered)
 
-    def test_forbidden_is_single_nontruncatable_authority(self) -> None:
-        forbidden = "DO NOT CREATE migration 0002"
+    def test_pitfalls_are_single_nontruncatable_authority(self) -> None:
+        pitfalls = "DO NOT CREATE migration 0002"
         payload = build_implementer_payload(
-            step_identity="S04", step_objective="remove legacy state",
-            read_set="NONE", mutable_scope="NONE", forbidden_contract=forbidden,
+            step_identity="S04", context="remove legacy state",
+            read_set="NONE", mutable_scope="NONE", pitfalls=pitfalls,
             budget_bytes=1,
         )
-        self.assertIn(f"<FORBIDDEN CONTRACT>\n{forbidden}\n</FORBIDDEN CONTRACT>", payload.rendered)
-        self.assertEqual(payload.rendered.count(forbidden), 1)
-        section = next(item for item in payload.sections if item.name == "forbidden_contract")
+        self.assertIn(f"<PITFALLS>\n{pitfalls}\n</PITFALLS>", payload.rendered)
+        self.assertEqual(payload.rendered.count(pitfalls), 1)
+        section = next(item for item in payload.sections if item.name == "pitfalls")
         self.assertTrue(section.authority)
         self.assertFalse(section.truncated)
-        self.assertEqual(section.sha256, hashlib.sha256(forbidden.encode()).hexdigest())
+        self.assertEqual(section.sha256, hashlib.sha256(pitfalls.encode()).hexdigest())
 
     def test_planner_authority_and_diagnostics_are_bounded(self) -> None:
         payload = build_planner_payload(
