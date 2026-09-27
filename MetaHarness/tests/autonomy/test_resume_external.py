@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import time
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from metaharness.cli import main as cli_main
+from metaharness.cli import _auto_resume, main as cli_main
 from metaharness.llm.chat import LLMTransportExhaustedError
 from metaharness.models import ExecutionRole, RunStatus
 from metaharness.orchestrator import Orchestrator
 from metaharness.planning.protocol import PlanParseError
+from metaharness.result import RunResult
 from metaharness.resume import resume_info
 
 from tests.autonomy.support import SPEC, AutonomyHarness, Step, meta_plan
@@ -73,23 +75,13 @@ class PlannerTransportExhaustionTests(AutonomyHarness):
 
 
 class _CliClock:
-    """A fake sleeper for the ``--auto-resume`` loop, and a real clock elsewhere.
-
-    The loop's two time calls are faked so an interval costs no wall time and
-    the ceiling is deterministic; every other attribute stays the real module,
-    so the rest of the process keeps its own timing.
-    """
+    """A fake sleeper for the ``--auto-resume`` loop."""
 
     def __init__(self) -> None:
         self.sleeps: list[float] = []
-        self._now = time.monotonic()
-
-    def monotonic(self) -> float:
-        return self._now
 
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
-        self._now += max(0.0, seconds)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(time, name)
@@ -173,6 +165,63 @@ class AutoResumeCommandTests(AutonomyHarness):
         # A run that never waits externally is never slept on, never resumed.
         self.assertEqual(sleeps, [])
         self.assertEqual(len(planner.requests), 2)
+
+    def test_auto_resume_ignores_transport_horizon(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
+        planner = ScriptedChat(
+            [
+                LLMTransportExhaustedError("first transport horizon"),
+                LLMTransportExhaustedError("second transport horizon"),
+                self.plan(),
+                continuation_answer("COMPLETE"),
+            ],
+            name="planner",
+        )
+        self.config()
+
+        code, sleeps = self.run_with_auto_resume(planner, interval="1801")
+
+        self.assertEqual(code, 0, self.state().get("failure"))
+        self.assertEqual(self.state()["status"], RunStatus.PUBLISHED.value)
+        self.assertEqual(sleeps, [1801.0, 1801.0])
+
+    def test_auto_resume_stops_on_runtime_wall_clock_partial(self) -> None:
+        config = self.config()
+        waiting = RunResult(Path("/runs/run"), RunStatus.WAITING_EXTERNAL, {})
+        partial = RunResult(
+            Path("/runs/run"), RunStatus.PARTIAL, {"failure": {"reason": "wall_clock"}},
+        )
+        with (
+            mock.patch("metaharness.cli.time.sleep") as sleep,
+            mock.patch("metaharness.cli.resume_run", return_value=partial) as resume,
+        ):
+            code = _auto_resume(config, waiting, 600.0)
+
+        self.assertEqual(code, 0)
+        sleep.assert_called_once_with(600.0)
+        resume.assert_called_once_with(config, "run")
+
+    def test_auto_resume_never_retries_human_failure_or_terminal_statuses(self) -> None:
+        config = self.config()
+        statuses = (
+            RunStatus.WAITING_HUMAN,
+            RunStatus.FAILED,
+            RunStatus.PUBLISHED,
+            RunStatus.COMMITTED,
+            RunStatus.PARTIAL,
+        )
+        with (
+            mock.patch("metaharness.cli.time.sleep") as sleep,
+            mock.patch("metaharness.cli.resume_run") as resume,
+        ):
+            for status in statuses:
+                with self.subTest(status=status):
+                    result = RunResult(Path("/runs/run"), status, {})
+                    _auto_resume(config, result, 600.0)
+
+        sleep.assert_not_called()
+        resume.assert_not_called()
 
     def test_planner_invalid_output_is_fixable_not_human(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))

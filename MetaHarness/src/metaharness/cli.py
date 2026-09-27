@@ -167,16 +167,11 @@ def _auto_resume(config: HarnessConfig, result: RunResult, interval: float) -> i
     """Re-run a run that waits on a temporary external condition, in-process.
 
     The loop stops as soon as the run leaves ``WAIT_EXTERNAL`` -- a completed
-    run, a human decision or a definitive failure is never retried -- and it
-    reuses ``transport.max_wait_seconds`` as its global ceiling, so one budget
-    bounds both the transport horizon and this loop.
+    run, a human decision or a definitive failure is never retried.  The
+    runtime owns the run's global wall-clock budget from its durable start.
     """
 
-    budget = config.transport.max_wait_seconds
-    waiting_since = time.monotonic()
     while result.status is RunStatus.WAITING_EXTERNAL:
-        if time.monotonic() - waiting_since >= budget:
-            break
         time.sleep(interval)
         try:
             result = resume_run(config, result.run_dir.name)
