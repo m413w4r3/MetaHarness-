@@ -59,6 +59,20 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def iteration_dir(run_dir: str | Path, iteration: int) -> Path:
+    """Return the durable directory for one positive iteration number."""
+
+    if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 1:
+        raise ValueError("iteration must be a positive integer")
+    return Path(run_dir) / "iterations" / f"{iteration:02d}"
+
+
+def iteration_plan_dir(run_dir: str | Path, iteration: int) -> Path:
+    """Return ``iterations/NN/plan`` for one effective plan authority."""
+
+    return iteration_dir(run_dir, iteration) / "plan"
+
+
 def render_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
 
@@ -131,6 +145,12 @@ def persist_effective_plan(directory: str | Path, plan: TaskPlanV2) -> str:
     return hashlib.sha256((target / "task_plan.json").read_bytes()).hexdigest()
 
 
+def persist_iteration_plan(run_dir: str | Path, iteration: int, plan: TaskPlanV2) -> str:
+    """Persist an iteration's effective plan and return its exact byte hash."""
+
+    return persist_effective_plan(iteration_plan_dir(run_dir, iteration), plan)
+
+
 def read_effective_plan(directory: str | Path, expected_sha256: str) -> TaskPlanV2:
     """Load the canonical plan only when its durable bytes match the checkpoint."""
 
@@ -168,6 +188,12 @@ def read_effective_plan(directory: str | Path, expected_sha256: str) -> TaskPlan
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise V2PlanParseError("effective plan fields are invalid") from exc
+
+
+def read_iteration_plan(run_dir: str | Path, iteration: int, expected_sha256: str) -> TaskPlanV2:
+    """Read the effective plan named by an iteration checkpoint."""
+
+    return read_effective_plan(iteration_plan_dir(run_dir, iteration), expected_sha256)
 
 
 def step_contract_path(directory: str | Path, step_id: str) -> Path:
@@ -282,6 +308,7 @@ def persist_planning_v2_artifacts(
     context: str,
     request: str,
     plan: TaskPlanV2,
+    iteration: int = 1,
 ) -> None:
     """Persist the v2 exchange and publish its implementation bundle."""
 
@@ -290,11 +317,13 @@ def persist_planning_v2_artifacts(
     atomic_write_text(target / "context.txt", context)
     atomic_write_text(target / "planner.request.txt", request)
     atomic_write_text(target / "planner.raw.md", plan.raw)
-    # The effective unsuffixed plan is the only structured plan authority.
+    # Planner exchange artifacts remain at the run root; the executable
+    # authority belongs to the first iteration from its first publication.
+    plan_dir = iteration_plan_dir(target, iteration)
     if plan.decision is PlanDecision.BLOCKED:
-        atomic_write_text(target / "task_plan.json", render_json(effective_plan_payload(plan)))
+        atomic_write_text(plan_dir / "task_plan.json", render_json(effective_plan_payload(plan)))
     if plan.decision is PlanDecision.READY:
-        write_implementation_bundle(target, plan)
+        write_implementation_bundle(plan_dir, plan)
 
 
 def read_planning_session(target: Path | None) -> dict[str, Any]:
@@ -375,7 +404,11 @@ __all__ = [
     "PLAN_NORMALIZATIONS_NAME",
     "effective_plan_payload",
     "implementation_bundle_payload",
+    "iteration_dir",
+    "iteration_plan_dir",
     "persist_effective_plan",
+    "persist_iteration_plan",
+    "read_iteration_plan",
     "read_effective_plan",
     "persist_planning_v2_artifacts",
     "planning_session_handle",

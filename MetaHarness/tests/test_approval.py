@@ -104,7 +104,7 @@ class ApprovalTests(unittest.TestCase):
     def test_check_authority_hash_is_bound_to_approval(self) -> None:
         directory = self._run_dir("check-authority")
         (directory / "planner.raw.md").write_text(self.raw, encoding="utf-8")
-        (directory / "implementation_contract.md").write_text(self.contract, encoding="utf-8")
+        (directory / "iterations/01/plan/implementation_contract.md").write_text(self.contract, encoding="utf-8")
         check = CheckConfig("lint", ("make", "lint"), timeout_seconds=18000)
         write_check_authority(directory, [check], required_check_ids=("lint",))
         identity = compute_plan_identity_from_run(directory)
@@ -231,7 +231,7 @@ class ApprovalTests(unittest.TestCase):
         store = RunStateStore(directory / "state.json")
         state = store.initialize("cli")
         (directory / "planner.raw.md").write_text(self.raw, encoding="utf-8")
-        (directory / "implementation_contract.md").write_text(self.contract, encoding="utf-8")
+        (directory / "iterations/01/plan/implementation_contract.md").write_text(self.contract, encoding="utf-8")
         state = store.set_run_state(
             RunMachineState(RunPhase.PLAN_APPROVAL),
             plan_identity={
@@ -254,9 +254,11 @@ class ApprovalTests(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(root))
         directory = root / name
         directory.mkdir()
+        plan_dir = directory / "iterations/01/plan"
+        plan_dir.mkdir(parents=True)
         if name.startswith("identity"):
             (directory / "planner.raw.md").write_bytes(self.raw.encode("utf-8"))
-            (directory / "implementation_contract.md").write_bytes(self.contract.encode("utf-8"))
+            (plan_dir / "implementation_contract.md").write_bytes(self.contract.encode("utf-8"))
         return directory
 
 

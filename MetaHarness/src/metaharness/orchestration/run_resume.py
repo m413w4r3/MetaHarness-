@@ -15,8 +15,12 @@ from ..gitops import (
     status_porcelain, symbolic_head, validate_run_branch,
 )
 from ..models import HarnessConfig, RunPhase
-from ..planning.artifacts import implementation_bundle_payload, read_effective_plan, write_implementation_bundle
+from ..planning.artifacts import (
+    implementation_bundle_payload, iteration_plan_dir, read_iteration_plan,
+    write_implementation_bundle,
+)
 from ..profiles import ProfileError
+from ..run_options import read_run_options_for_state
 from ..scope import ScopeViolation
 from ..resume import ResumeCheckpoint, ResumeIntegrityError, write_checkpoint
 from ..validation import ValidationError, config_with_check_authority, resolve_check_cwd
@@ -83,7 +87,9 @@ def _adopt_completed_commit(
             step_index=next_index if phase is RunPhase.IMPLEMENT_STEP else None,
             last_green_commit=head, plan_sha256=checkpoint.plan_sha256,
         )
-    elif checkpoint.phase is RunPhase.AUDIT and message.splitlines()[0] == "metaharness(audit): cycle 1":
+    elif checkpoint.phase is RunPhase.AUDIT and message.splitlines()[0] == (
+        f"metaharness(audit): cycle {checkpoint.iteration}"
+    ):
         adopted = ResumeCheckpoint(
             phase=RunPhase.DETERMINISTIC_GATE, iteration=checkpoint.iteration,
             last_green_commit=head, plan_sha256=checkpoint.plan_sha256,
@@ -100,8 +106,6 @@ def prepare_resume(
 ) -> ResumedRun:
     """Validate Git ownership, restore last green, and load the canonical plan."""
 
-    if checkpoint.iteration != 1:
-        _fail("this runtime supports iteration 1 only")
     if checkpoint.last_green_commit is None or checkpoint.plan_sha256 is None:
         _fail("execution checkpoint is missing its Git or plan authority")
     try:
@@ -143,7 +147,7 @@ def prepare_resume(
                 error = ResumeIntegrityError(str(exc))
                 error.code = exc.code
                 raise error from exc
-        plan = read_effective_plan(run_dir, checkpoint.plan_sha256)
+        plan = read_iteration_plan(run_dir, checkpoint.iteration, checkpoint.plan_sha256)
         if branch != build_run_branch(plan.title, run_id):
             _fail("run branch identity does not match the effective plan")
         if head != green:
@@ -157,22 +161,31 @@ def prepare_resume(
             if current_head(worktree) != green or symbolic_head(worktree) != f"refs/heads/{branch}":
                 _fail("worktree could not be restored to last_green_commit")
         bundle = (
-            write_implementation_bundle(run_dir, plan)
+            write_implementation_bundle(iteration_plan_dir(run_dir, checkpoint.iteration), plan)
             if restore_worktree else implementation_bundle_payload(plan)
         )
-        selection, _ = read_execution_selection_with_sha256(run_dir)
+        try:
+            selection, _ = read_execution_selection_with_sha256(
+                run_dir, iteration=checkpoint.iteration,
+            )
+        except ValueError as exc:
+            if "RUN_SCHEMA_UNSUPPORTED" in str(exc):
+                error = ResumeIntegrityError(str(exc))
+                error.code = "RUN_SCHEMA_UNSUPPORTED"
+                raise error from exc
+            raise
         validate_execution_selection(config, selection)
         if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
             _fail("execution selection steps do not match the effective plan")
         execution = state.get("execution") if isinstance(state.get("execution"), Mapping) else {}
         planner = execution.get("planner") if isinstance(execution.get("planner"), Mapping) else {}
         audit = execution.get("audit") if isinstance(execution.get("audit"), Mapping) else {}
-        step_rows = execution.get("steps") if isinstance(execution.get("steps"), list) else []
+        options, _ = read_run_options_for_state(run_dir, state)
         if (
-            selection.planner.profile_id != planner.get("profile_id")
+            selection.planner.profile_id != options.planner_profile
+            or selection.audit.profile_id != options.audit_profile
+            or selection.planner.profile_id != planner.get("profile_id")
             or selection.audit.profile_id != audit.get("profile_id")
-            or [item.implementer.profile_id for item in selection.steps]
-            != [row.get("implementer", {}).get("profile_id") for row in step_rows if isinstance(row, Mapping)]
         ):
             _fail("execution selection does not match the run's frozen profiles")
         spec = (run_dir / "spec.md").read_text(encoding="utf-8")
@@ -180,11 +193,12 @@ def prepare_resume(
         durable_identity = state.get("plan_identity")
         checks_sha = durable_identity.get("checks_sha256") if isinstance(durable_identity, Mapping) else None
         frozen_config, frozen_ids = config_with_check_authority(
-            config, run_dir, expected_sha256=checks_sha,
+            config, run_dir, requested_check_ids=plan.required_checks,
+            expected_sha256=checks_sha,
         )
-        if frozen_ids is not None:
-            for check in frozen_config.select_checks(frozen_ids):
-                resolve_check_cwd(worktree, check)
+        selected_checks = frozen_config.select_checks(plan.required_checks)
+        for check in selected_checks:
+            resolve_check_cwd(worktree, check)
         if config.approval.require_plan_approval:
             if not isinstance(durable_identity, Mapping):
                 _fail("run plan approval identity is missing")
@@ -195,7 +209,9 @@ def prepare_resume(
                 execution_sha256=durable_identity.get("execution_sha256"),
                 checks_sha256=durable_identity.get("checks_sha256"),
             )
-            approval = read_plan_approval(run_dir, expected_identity=identity)
+            approval = read_plan_approval(
+                run_dir, expected_identity=identity, iteration=checkpoint.iteration,
+            )
             if approval is None or approval.decision is not ApprovalDecision.APPROVE:
                 _fail("plan approval is missing or is not APPROVE")
     except ResumeIntegrityError:

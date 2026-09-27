@@ -384,6 +384,7 @@ class Orchestrator:
                 base_tree_sha=resumed.base_tree_sha,
                 repository_reference=resumed.repository_reference,
                 plan=resumed.plan, bundle=resumed.bundle, selection=resumed.selection,
+                iteration=checkpoint.iteration,
             )
             return self._runtime.observability.diagnose_result(
                 self._runtime.run_pipeline(store, pipeline, checkpoint, resumed=True)

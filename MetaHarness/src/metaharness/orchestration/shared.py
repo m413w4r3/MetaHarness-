@@ -63,8 +63,8 @@ class CycleArtifactService:
 
     def begin(self, store: Any, ctx: Any, cycle: RunCycle, fresh: bool) -> None:
         self.set_trace_cycle(cycle.number)
-        if cycle.number != 1 or cycle.kind is not CycleKind.INITIAL:
-            raise ResumeIntegrityError("the pipeline executes one initial cycle")
+        if cycle.number != ctx.iteration or cycle.kind is not CycleKind.INITIAL:
+            raise ResumeIntegrityError("cycle number does not match the current iteration")
         path = cycle_record_path(ctx.run_dir, cycle)
         record = _json_text({
             "schema_version": 1,
@@ -77,7 +77,34 @@ class CycleArtifactService:
         else:
             atomic_write_text(path, record)
         store.load()
-        store.update_metadata(cycle=cycle.number)
+        execution = store.load().get("execution")
+        execution = dict(execution) if isinstance(execution, Mapping) else {}
+        execution["steps"] = [
+            {
+                "step_id": step.id,
+                "implementer": dataclasses.asdict(selected.implementer),
+            }
+            for step, selected in zip(ctx.plan.steps, ctx.selection.steps, strict=True)
+        ]
+        planner = store.load().get("planner")
+        planner = dict(planner) if isinstance(planner, Mapping) else {}
+        planner["required_checks"] = list(ctx.plan.required_checks)
+        planner["execution_mode"] = (
+            ctx.plan.execution_mode.value if ctx.plan.execution_mode else None
+        )
+        store.update_metadata(
+            cycle=cycle.number,
+            iteration=cycle.number,
+            current_milestone={"id": ctx.plan.milestone_id, "title": ctx.plan.milestone_title},
+            planner=planner,
+            steps=[
+                {"id": step.id, "title": step.title, "status": "waiting",
+                 "execution_class": step.execution_class.value,
+                 "profile_id": selected.implementer.profile_id}
+                for step, selected in zip(ctx.plan.steps, ctx.selection.steps, strict=True)
+            ],
+            execution=execution,
+        )
         self.cycle_update(store, cycle, status="running")
 
 

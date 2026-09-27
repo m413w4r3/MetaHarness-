@@ -147,6 +147,8 @@ class RunStateStore:
             "checks": [],
             "cycle": 1,
             "cycles": [],
+            "iteration": 1,
+            "current_milestone": None,
             "remote_branch": None,
             "remote_sha": None,
             "reviewed_candidate_sha": None,

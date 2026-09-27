@@ -20,12 +20,16 @@ from .models import (
     ImplementationStep,
     profile_driver_name,
 )
+from .planning.artifacts import iteration_dir
 from .profiles import ProfileError, profile_execution_fingerprint, profile_for_role
+from .run_options import RUN_SCHEMA_UNSUPPORTED
 from .step_ids import MAX_STEPS, STEP_ID_RE, step_ids
 
 
 class ExecutionSelectionError(ValueError):
     """The execution selection is absent, invalid, or no longer matches config."""
+
+    code = "EXECUTION_SELECTION_INVALID"
 
 
 class ExecutionSelectionConflict(ExecutionSelectionError):
@@ -194,8 +198,21 @@ def _publish_exclusive(path: Path, content: str) -> bool:
             pass
 
 
-def ensure_execution_selection(run_dir: Path, selection: ExecutionSelection) -> ExecutionSelection:
-    path = Path(run_dir).expanduser().resolve() / _FILENAME
+def _unsupported_global_selection_error() -> ExecutionSelectionError:
+    error = ExecutionSelectionError(
+        f"{RUN_SCHEMA_UNSUPPORTED}: global execution selection is unsupported"
+    )
+    error.code = RUN_SCHEMA_UNSUPPORTED
+    return error
+
+
+def ensure_execution_selection(
+    run_dir: Path, selection: ExecutionSelection, *, iteration: int = 1,
+) -> ExecutionSelection:
+    directory = Path(run_dir).expanduser().resolve()
+    if (directory / _FILENAME).is_file():
+        raise _unsupported_global_selection_error()
+    path = iteration_dir(directory, iteration) / _FILENAME
     content = json.dumps(_payload(selection), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if path.exists():
         try:
@@ -283,17 +300,24 @@ def parse_execution_selection(data: bytes) -> ExecutionSelection:
 
 
 
-def read_execution_selection_with_sha256(run_dir: Path) -> tuple[ExecutionSelection, str]:
-    path = Path(run_dir).expanduser().resolve() / _FILENAME
+def read_execution_selection_with_sha256(
+    run_dir: Path, *, iteration: int = 1,
+) -> tuple[ExecutionSelection, str]:
+    directory = Path(run_dir).expanduser().resolve()
+    if (directory / _FILENAME).is_file():
+        raise _unsupported_global_selection_error()
+    path = iteration_dir(directory, iteration) / _FILENAME
     try:
         data = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise ExecutionSelectionError("execution selection is missing or invalid") from exc
     except OSError as exc:
         raise ExecutionSelectionError("execution selection is missing or invalid") from exc
     return parse_execution_selection(data), hashlib.sha256(data).hexdigest()
 
 
-def read_execution_selection(run_dir: Path) -> ExecutionSelection:
-    return read_execution_selection_with_sha256(run_dir)[0]
+def read_execution_selection(run_dir: Path, *, iteration: int = 1) -> ExecutionSelection:
+    return read_execution_selection_with_sha256(run_dir, iteration=iteration)[0]
 
 
 def validate_execution_selection(config: HarnessConfig, selection: ExecutionSelection) -> None:

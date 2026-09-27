@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 from ..config import load_config
 from ..models import HarnessConfig
+from ..planning.artifacts import iteration_plan_dir
 from ..step_ids import is_step_id
 from .api import (
     WebAPIError,
@@ -77,7 +78,13 @@ def _actual_plan_step_ids(run_dir: Path) -> frozenset[str]:
     """Return only step IDs declared by this run's implementation bundle."""
 
     try:
-        payload = json.loads((run_dir / "implementation_bundle.json").read_text(encoding="utf-8"))
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        iteration = state.get("iteration", 1) if isinstance(state, dict) else 1
+        if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 1:
+            return frozenset()
+        payload = json.loads(
+            (iteration_plan_dir(run_dir, iteration) / "implementation_bundle.json").read_text(encoding="utf-8")
+        )
     except (OSError, UnicodeError, json.JSONDecodeError):
         return frozenset()
     steps = payload.get("steps") if isinstance(payload, dict) else None

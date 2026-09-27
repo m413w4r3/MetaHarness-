@@ -93,7 +93,9 @@ class PlannerTransactionTests(PipelineHarness):
         self.run_plan(chat)
         self.assertEqual(len(chat.complete_calls), 1)
         self.assertEqual(chat.continue_calls, [])
-        self.assertTrue((self.target / "implementation_bundle.json").is_file())
+        plan_dir = self.target / "iterations/01/plan"
+        self.assertTrue((plan_dir / "implementation_bundle.json").is_file())
+        self.assertFalse((self.target / "task_plan.json").exists())
 
     def test_a_spec_decision_blocker_is_a_terminal_plan(self) -> None:
         # SPEC_DECISION is the only blocker: it is a real product decision, so
@@ -185,13 +187,13 @@ class PlannerTransactionTests(PipelineHarness):
         self.assertEqual(step.create_set, ())
         self.assertEqual(step.write_set, ("feature.txt", path))
         self.assertEqual(
-            json.loads((self.target / "plan.normalizations.json").read_text())["steps"]["S01"],
+            json.loads((self.target / "iterations/01/plan/plan.normalizations.json").read_text())["steps"]["S01"],
             [
                 {"code": "CREATE_EXISTING_TO_WRITE", "path": path},
                 {"code": "ADD_MUTATION_TO_READ", "path": path},
             ],
         )
-        contract = (self.target / "steps/S01/contract.md").read_text(encoding="utf-8")
+        contract = (self.target / "iterations/01/plan/steps/S01/contract.md").read_text(encoding="utf-8")
         self.assertIn(path, contract.split("WRITE SET", 1)[1].split("CREATE SET", 1)[0])
 
     def test_budget_zero_stops_before_worker_or_bundle(self) -> None:
@@ -199,7 +201,7 @@ class PlannerTransactionTests(PipelineHarness):
         with self.assertRaises(PlanRepositoryPreconditionError):
             self.run_plan(chat, budget=0)
         self.assertEqual(chat.continue_calls, [])
-        self.assertFalse((self.target / "implementation_bundle.json").exists())
+        self.assertFalse((self.target / "iterations/01/plan/implementation_bundle.json").exists())
 
     def test_two_corrections_and_exhaustion(self) -> None:
         chat = _Chat([self.invalid, self.invalid, self.valid])
@@ -211,7 +213,7 @@ class PlannerTransactionTests(PipelineHarness):
         with self.assertRaises(PlanRepositoryPreconditionError):
             self.planner(chat2).plan("Make feature.txt good.", "feature.txt exists", artifacts_dir=target)
         self.assertEqual(len(chat2.continue_calls), 2)
-        self.assertFalse((target / "implementation_bundle.json").exists())
+        self.assertFalse((target / "iterations/01/plan/implementation_bundle.json").exists())
 
     def test_resume_reuses_paid_raw_before_validation(self) -> None:
         chat = _Chat([self.valid])

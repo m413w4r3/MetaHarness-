@@ -503,17 +503,18 @@ class PlannerNormalizationTests(PipelineHarness):
         self.assertEqual(len(self.planner.requests), 1)
         self.assertEqual(self.trace_names().count("plan.completed"), 1)
         self.assertEqual(self.workers.roles(), ["implementer", "auditor"])
-        contract = (run_dir / "steps/S01/contract.md").read_text(encoding="utf-8")
+        plan_dir = run_dir / "iterations/01/plan"
+        contract = (plan_dir / "steps/S01/contract.md").read_text(encoding="utf-8")
         self.assertIn(f"- {AW010_PATH}", contract.split("WRITE SET", 1)[1].split("CREATE SET", 1)[0])
         created = contract.split("CREATE SET", 1)[1].split("DELETE SET", 1)[0]
         self.assertNotIn(AW010_PATH, created)
-        normalized = json.loads((run_dir / "plan.normalizations.json").read_text(encoding="utf-8"))
+        normalized = json.loads((plan_dir / "plan.normalizations.json").read_text(encoding="utf-8"))
         self.assertIn(
             {"code": CREATE_EXISTING_TO_WRITE, "path": AW010_PATH},
             normalized["steps"]["S01"],
         )
         (step_json,) = json.loads(
-            (run_dir / "task_plan.json").read_text(encoding="utf-8"),
+            (plan_dir / "task_plan.json").read_text(encoding="utf-8"),
         )["steps"]
         self.assertEqual(step_json["create_set"], [])
         self.assertIn(AW010_PATH, step_json["write_set"])
@@ -532,8 +533,10 @@ class PlannerNormalizationTests(PipelineHarness):
         self.assertEqual(len(self.planner.requests), 2)
         self.assertEqual(self.workers.calls, [])
         run_dir = self.run_dir()
-        for name in ("implementation_bundle.json", "task_plan.json", "planner.raw.md", "steps"):
-            self.assertFalse((run_dir / name).exists(), name)
+        for name in ("implementation_bundle.json", "task_plan.json", "steps"):
+            self.assertFalse((run_dir / "iterations/01/plan" / name).exists(), name)
+        self.assertFalse((run_dir / "planner.raw.md").exists())
+        self.assertFalse((run_dir / "task_plan.json").exists())
         record = json.loads((run_dir / "planner-attempts/02/repository_preconditions.json").read_text())
         self.assertEqual(record["violations"], [{"step_id": "S01", "kind": "no_mutation", "path": ""}])
         # A planning failure: the run is at its PLANNER checkpoint, never at a step.

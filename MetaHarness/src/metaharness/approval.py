@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .models import CheckConfig
+from .planning.artifacts import iteration_dir, iteration_plan_dir
 
 
 class ApprovalError(ValueError):
@@ -158,9 +159,9 @@ def _check_authority_payload(
         if check.junit_xml:
             entry["junit_xml"] = check.junit_xml
         entries.append(entry)
-    # The schema 2 artifact freezes the whole trusted catalogue and names the
-    # initial selection separately, so a correction plan can request another
-    # approved check without reaching today's configuration for its argv.
+    # This run-level artifact freezes command definitions. The stored ID list
+    # is empty for pipeline runs; each effective iteration plan owns its own
+    # required_checks selection.
     return {
         "schema_version": 2,
         "required_check_ids": list(required_check_ids),
@@ -300,8 +301,8 @@ def write_check_authority(
 ) -> str:
     """Publish check definitions once; identical publication is idempotent.
 
-    The schema 2 artifact freezes the whole trusted catalogue and records the
-    initial selection separately.
+    The schema 2 artifact freezes the whole trusted catalogue. Pipeline runs
+    leave its selection list empty because required IDs belong to each plan.
     """
 
     normalized = tuple(checks)
@@ -333,23 +334,24 @@ def write_check_authority(
     return hashlib.sha256(content).hexdigest()
 
 
-def compute_plan_identity_from_run(run_dir: str | Path) -> PlanIdentity:
-    """Hash the bytes currently persisted in a run's two plan artifacts."""
+def compute_plan_identity_from_run(run_dir: str | Path, *, iteration: int = 1) -> PlanIdentity:
+    """Hash the root planner response and one iteration's effective artifacts."""
 
     directory = _run_path(run_dir)
+    plan_directory = iteration_plan_dir(directory, iteration)
     try:
         raw = (directory / "planner.raw.md").read_bytes()
-        contract = (directory / "implementation_contract.md").read_bytes()
+        contract = (plan_directory / "implementation_contract.md").read_bytes()
     except (OSError, UnicodeError) as exc:
         raise ApprovalError(f"could not read plan artifacts: {exc}") from exc
-    execution_path = directory / "execution_selection.json"
+    execution_path = iteration_dir(directory, iteration) / "execution_selection.json"
     execution_sha256: str | None = None
     if execution_path.exists():
         try:
             execution_sha256 = hashlib.sha256(execution_path.read_bytes()).hexdigest()
         except (OSError, UnicodeError) as exc:
             raise ApprovalError(f"could not read execution selection: {exc}") from exc
-    bundle_path = directory / "implementation_bundle.json"
+    bundle_path = plan_directory / "implementation_bundle.json"
     bundle_sha256: str | None = None
     if bundle_path.exists():
         try:
@@ -451,6 +453,7 @@ def write_plan_approval(
     decision: ApprovalDecision,
     identity: PlanIdentity,
     source: str,
+    iteration: int = 1,
 ) -> None:
     """Write one approval decision without ever replacing an existing one."""
 
@@ -500,7 +503,9 @@ def write_plan_approval(
         schema_version = 5
     elif normalized_decision is ApprovalDecision.APPROVE and identity.execution_sha256 is not None and identity.bundle_sha256 is not None:
         try:
-            selection_payload = json.loads((directory / "execution_selection.json").read_text(encoding="utf-8"))
+            selection_payload = json.loads(
+                (iteration_dir(directory, iteration) / "execution_selection.json").read_text(encoding="utf-8")
+            )
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ApprovalError("execution selection is missing or invalid") from exc
         if isinstance(selection_payload, dict) and selection_payload.get("schema_version") == 4:
@@ -513,6 +518,7 @@ def read_plan_approval(
     run_dir: Path,
     *,
     expected_identity: PlanIdentity,
+    iteration: int = 1,
 ) -> PlanApproval | None:
     """Read and validate the decision for exactly ``expected_identity``."""
 
@@ -556,7 +562,9 @@ def read_plan_approval(
         raise ApprovalError("historic approval contains a check authority hash")
     if schema_version == 4:
         try:
-            selection_payload = json.loads((_run_path(run_dir) / "execution_selection.json").read_text(encoding="utf-8"))
+            selection_payload = json.loads(
+                (iteration_dir(_run_path(run_dir), iteration) / "execution_selection.json").read_text(encoding="utf-8")
+            )
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ApprovalError("execution selection is missing or invalid") from exc
         if not isinstance(selection_payload, dict) or selection_payload.get("schema_version") != 4:
@@ -578,7 +586,9 @@ def read_plan_approval(
         raise ApprovalError("approval artifact is invalid") from exc
     if approval.execution_sha256 is not None:
         try:
-            execution_bytes = (_run_path(run_dir) / "execution_selection.json").read_bytes()
+            execution_bytes = (
+                iteration_dir(_run_path(run_dir), iteration) / "execution_selection.json"
+            ).read_bytes()
         except OSError as exc:
             raise ApprovalError("execution selection is missing") from exc
         actual_execution = hashlib.sha256(execution_bytes).hexdigest()
@@ -586,7 +596,9 @@ def read_plan_approval(
             raise ApprovalError("execution selection does not match approval")
     if approval.bundle_sha256 is not None:
         try:
-            bundle_bytes = (_run_path(run_dir) / "implementation_bundle.json").read_bytes()
+            bundle_bytes = (
+                iteration_plan_dir(_run_path(run_dir), iteration) / "implementation_bundle.json"
+            ).read_bytes()
         except OSError as exc:
             raise ApprovalError("implementation bundle is missing") from exc
         if hashlib.sha256(bundle_bytes).hexdigest() != approval.bundle_sha256:
@@ -627,6 +639,7 @@ def wait_for_plan_approval(
     *,
     identity: PlanIdentity,
     poll_interval_seconds: float,
+    iteration: int = 1,
 ) -> PlanApproval:
     """Poll until one valid human decision is durably present."""
 
@@ -639,7 +652,7 @@ def wait_for_plan_approval(
     ):
         raise ValueError("poll_interval_seconds must be > 0 and <= 10")
     while True:
-        approval = read_plan_approval(run_dir, expected_identity=identity)
+        approval = read_plan_approval(run_dir, expected_identity=identity, iteration=iteration)
         if approval is not None:
             return approval
         time.sleep(poll_interval_seconds)

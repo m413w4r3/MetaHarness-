@@ -427,10 +427,8 @@ def _v2_approval_form(
             f'{_contract_block(artifact_map.get(step_id, {}))}</section>'
         )
     frozen_profiles = options.get("profiles") if isinstance(options.get("profiles"), dict) else {}
-    audit = (
-        requested_profiles.get("audit_profile")
-        or frozen_profiles.get("audit_profile")
-        or (config.ui.default_audit_profile if config is not None else None)
+    audit = frozen_profiles.get("audit_profile") or (
+        config.ui.default_audit_profile if config is not None else None
     )
     execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
     planner_selected = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
@@ -439,10 +437,10 @@ def _v2_approval_form(
 <p>Execution mode: <strong>{_e(planner.get("execution_mode"))}</strong></p>
 <p>Steps: {_e(len(rows))}</p>
 {_approval_targets(config)}
-<form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE">
+<form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="APPROVE"><input type="hidden" name="audit_profile" value="{_e(audit or '')}">
 <h3>Planner</h3><p class="mono">{_e(planner_selected.get("profile_id") or "—")} / {_e(planner_selected.get("model") or "—")}</p>
 <h3>Initial implementation</h3><ul class="plan-steps">{"".join(overview)}</ul>
-{"".join(rows)}<section class="card audit-profile"><h3>Audit</h3><p>{_profile_triplet(audit, audit_meta.get("model"), audit_meta.get("selection_mode"))}</p><label for="audit-profile">High-tier auditor</label><select id="audit-profile" name="audit_profile" required>{_profile_options(config, "auditor", audit)}</select></section><br><button class="approve" type="submit">APPROVE PLAN</button></form>
+{"".join(rows)}<section class="card audit-profile"><h3>Audit</h3><p>{_profile_triplet(audit, audit_meta.get("model"), audit_meta.get("selection_mode"))}</p><p>Auditor fixed by run options.</p></section><br><button class="approve" type="submit">APPROVE PLAN</button></form>
 <form action="/runs/{_e(run_id)}/approval" method="post"><input type="hidden" name="_token" value="{_e(token)}"><input type="hidden" name="decision" value="REJECT"><button class="reject" type="submit">REJECT PLAN</button></form></section>'''
 
 
@@ -698,13 +696,13 @@ def _execution_card_v2(
         for item in (approved.get("steps") if isinstance(approved.get("steps"), list) else [])
         if isinstance(item, dict) and isinstance(item.get("implementer"), dict)
     }
-    recommended_steps = planner_state.get("steps") if isinstance(planner_state.get("steps"), list) else []
+    recommended_steps = state.get("steps") if isinstance(state.get("steps"), list) else []
     rows = []
     for item in recommended_steps:
         if not isinstance(item, dict):
             continue
         step_id = item.get("id")
-        recommended = item.get("recommended_profile")
+        recommended = item.get("recommended_profile") or item.get("profile_id")
         meta = metadata.get(recommended, {})
         chosen = approved_steps.get(step_id)
         rows.append(

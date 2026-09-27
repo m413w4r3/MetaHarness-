@@ -6,15 +6,22 @@ import hashlib
 import json
 import subprocess
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from metaharness.config import load_config
 from metaharness.gitops import current_head, index_tree_sha, resolve_tree
+from metaharness.execution_selection import ensure_execution_selection, read_execution_selection
 from metaharness.models import ExecutionRole, RunMachineState, RunPhase, RunStatus
 from metaharness.orchestration.gates import GateService
 from metaharness.resume import resume_info
 from metaharness.state import RunCheckpointError, RunStateStore
-from metaharness.planning.artifacts import read_effective_plan
+from metaharness.orchestration.run_resume import prepare_resume
+from metaharness.planning.artifacts import (
+    iteration_plan_dir, persist_iteration_plan, read_effective_plan,
+    read_iteration_plan, validate_implementation_bundle,
+)
+from metaharness.resume import ResumeCheckpoint, ResumePhase, write_checkpoint
 from tests.pipeline.support import (
     SPEC, STEP, PipelineHarness, audit_report, crash_at_checkpoint, git, initial_plan, write,
 )
@@ -314,7 +321,7 @@ class ResumeTests(PipelineHarness):
         with crash_at_checkpoint(original, "candidate_push"):
             failed = original.run_text(SPEC, run_id="run")
         self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
-        effective_path = self.run_dir() / "task_plan.json"
+        effective_path = self.run_dir() / "iterations/01/plan/task_plan.json"
         canonical_bytes = effective_path.read_bytes()
         expected_hash = hashlib.sha256(canonical_bytes).hexdigest()
         self.assertEqual(self.checkpoint()["plan_sha256"], expected_hash)
@@ -327,12 +334,64 @@ class ResumeTests(PipelineHarness):
         self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(effective_path.read_bytes(), canonical_bytes)
         self.assertEqual(hashlib.sha256(effective_path.read_bytes()).hexdigest(), expected_hash)
-        plan = read_effective_plan(self.run_dir(), expected_hash)
+        plan = read_effective_plan(effective_path.parent, expected_hash)
         step = plan.steps[0]
         self.assertEqual(step.read_set, ("feature.txt :: current content",))
         self.assertEqual(step.write_set, ("feature.txt",))
         self.assertEqual(step.create_set, ("missing.txt",))
         self.assertEqual(step.delete_set, ())
+
+    def test_resume_uses_durable_iteration_two_plan_and_selection(self) -> None:
+        original = self.orchestrator(self.config(), planner=[raw_normalization_plan()])
+        with crash_at_checkpoint(original, "implement_step"):
+            failed = original.run_text(SPEC, run_id="run")
+        self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
+        run_dir = self.run_dir()
+        checkpoint1 = self.checkpoint()
+        first_plan = read_iteration_plan(run_dir, 1, checkpoint1["plan_sha256"])
+        second_step = replace(first_plan.steps[0], title="Second milestone step")
+        second_plan = replace(
+            first_plan, milestone_id="M02", milestone_title="Second milestone",
+            milestone_goal="Finish the next milestone.", steps=(second_step,),
+        )
+        second_hash = persist_iteration_plan(run_dir, 2, second_plan)
+        second_dir = iteration_plan_dir(run_dir, 2)
+        _bundle, _bundle_hash = validate_implementation_bundle(
+            second_dir, expected_step_ids=["S01"],
+        )
+        effective_bytes = (second_dir / "task_plan.json").read_bytes()
+        self.assertTrue(first_plan.normalizations)
+        self.assertEqual(
+            second_hash,
+            hashlib.sha256(effective_bytes).hexdigest(),
+        )
+        normalized = read_iteration_plan(run_dir, 2, second_hash)
+        self.assertEqual(persist_iteration_plan(run_dir, 2, normalized), second_hash)
+        self.assertEqual((second_dir / "task_plan.json").read_bytes(), effective_bytes)
+        self.assertNotEqual(
+            (iteration_plan_dir(run_dir, 1) / "steps/S01/contract.md").read_bytes(),
+            (second_dir / "steps/S01/contract.md").read_bytes(),
+        )
+
+        selection1 = read_execution_selection(run_dir, iteration=1)
+        ensure_execution_selection(run_dir, selection1, iteration=2)
+        checkpoint2 = ResumeCheckpoint(
+            phase=ResumePhase.IMPLEMENT_STEP, iteration=2,
+            step_index=checkpoint1["step_index"],
+            last_green_commit=checkpoint1["last_green_commit"],
+            plan_sha256=second_hash,
+        )
+        write_checkpoint(run_dir, checkpoint2)
+        resumed = prepare_resume(
+            config=self.config(), run_dir=run_dir, run_id="run",
+            state=self.state(), checkpoint=checkpoint2, restore_worktree=False,
+        )
+        self.assertEqual(resumed.checkpoint, checkpoint2)
+        self.assertEqual(resumed.plan.milestone_id, "M02")
+        self.assertEqual([step.id for step in resumed.plan.steps], ["S01"])
+        self.assertEqual([item.step_id for item in resumed.selection.steps], ["S01"])
+        self.assertEqual(resumed.selection.planner.profile_id, self.state()["run_options"]["profiles"]["planner_profile"])
+        self.assertEqual(resumed.selection.audit.profile_id, self.state()["run_options"]["profiles"]["audit_profile"])
 
     def test_unreadable_checkpoint_blocks_control_writes(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))

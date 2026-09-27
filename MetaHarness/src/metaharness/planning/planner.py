@@ -170,7 +170,10 @@ class PlannerV2:
         if self.on_event is not None:
             self.on_event(name, data)
 
-    def plan(self, spec: str, context: str, *, repository_reference: RepositoryReference | None = None, artifacts_dir: str | Path | None = None) -> TaskPlanV2:
+    def plan(
+        self, spec: str, context: str, *, repository_reference: RepositoryReference | None = None,
+        artifacts_dir: str | Path | None = None, iteration: int = 1,
+    ) -> TaskPlanV2:
         reference = repository_reference if repository_reference is not None else self.repository_reference
         payload = build_planner_payload_v2(
             spec, context, repository_reference=reference,
@@ -318,7 +321,10 @@ class PlannerV2:
                 continue
             if target is not None:
                 atomic_write_text(target / "planner.validation.json", '{"valid": true, "errors": []}\n')
-                persist_planning_v2_artifacts(target, spec=spec, context=context, request=request, plan=plan)
+                persist_planning_v2_artifacts(
+                    target, spec=spec, context=context, request=request, plan=plan,
+                    iteration=iteration,
+                )
                 self.last_usage = planner_usage(target)
             else:
                 self.last_usage = add_usage(memory_usage)

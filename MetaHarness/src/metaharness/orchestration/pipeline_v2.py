@@ -154,6 +154,7 @@ class PipelineV2Context:
     bundle: Mapping[str, Any]
     selection: ExecutionSelection
     options: RunOptions
+    iteration: int = 1
 
     @property
     def branch_ref(self) -> str:
@@ -241,19 +242,20 @@ class PipelineV2Coordinator:
 
     def run(self, start: ResumeCheckpoint, *, resumed: bool) -> RunResult:
         ops, ctx = self.operations, self.context
-        if start.iteration != 1:
-            raise PipelineFailure("RUN_SCHEMA_UNSUPPORTED", "this runtime supports iteration 1 only")
+        if ctx.iteration != start.iteration:
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "pipeline iteration does not match checkpoint")
         if start.phase in {
             RunPhase.CONTEXT, RunPhase.PLANNER, RunPhase.PLAN_APPROVAL,
             RunPhase.WORKTREE_SETUP,
         }:
             raise ValueError(f"{start.phase.value} is not an execution checkpoint")
-        cycle = RunCycle(1, CycleKind.INITIAL)
+        iteration = start.iteration
+        cycle = RunCycle(iteration, CycleKind.INITIAL)
         ops.begin_cycle(ctx, cycle, not resumed)
         plan = ops.initial_plan(ctx)
         stage = GateStage.POST_IMPLEMENTATION
         if start.phase is RunPhase.PUBLISH:
-            return ops.publish(ctx, 1, ops.load_candidate(ctx, 1))
+            return ops.publish(ctx, iteration, ops.load_candidate(ctx, iteration))
         if start.phase is RunPhase.IMPLEMENT_STEP:
             index = start.step_index
             if index is None or index > len(plan.plan.steps):
@@ -270,15 +272,15 @@ class PipelineV2Coordinator:
         else:
             raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "checkpoint phase is not executable")
         if start.phase in {RunPhase.CANDIDATE_READY, RunPhase.CANDIDATE_PUSH}:
-            candidate = ops.load_candidate(ctx, 1)
+            candidate = ops.load_candidate(ctx, iteration)
         else:
             self._boundary(RunPhase.CANDIDATE_READY, plan)
             candidate = ops.create_candidate(ctx, plan, stage, evidence)
         if start.phase is not RunPhase.CANDIDATE_PUSH:
             self._candidate_boundary(RunPhase.CANDIDATE_PUSH, plan, candidate)
-        candidate = ops.push_candidate(ctx, 1, candidate)
+        candidate = ops.push_candidate(ctx, iteration, candidate)
         self._candidate_boundary(RunPhase.PUBLISH, plan, candidate)
-        return ops.publish(ctx, 1, candidate)
+        return ops.publish(ctx, iteration, candidate)
 
     def _gate(
         self, plan: CyclePlan, stage: GateStage, start: ResumeCheckpoint | None,
@@ -286,7 +288,7 @@ class PipelineV2Coordinator:
         ops, ctx = self.operations, self.context
         reports = sorted((cycle_dir(ctx.run_dir, plan.cycle) / "audit").glob("*/report.json"))
         if start is not None and start.phase is RunPhase.AUDIT and not reports:
-            evidence = ops.load_gate_evidence(ctx, 1, stage)
+            evidence = ops.load_gate_evidence(ctx, plan.cycle.number, stage)
             if evidence is None:
                 raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "diagnostic gate evidence is missing")
         else:

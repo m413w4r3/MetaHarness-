@@ -16,7 +16,7 @@ class WorkerNormalizationTests(PipelineHarness):
         ).run_text(SPEC, run_id="run")
 
     def assert_plan_normalization(self, code: str) -> None:
-        path = self.run_dir() / "plan.normalizations.json"
+        path = self.run_dir() / "iterations/01/plan/plan.normalizations.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         self.assertIn(code, {item["code"] for item in payload["steps"]["S01"]})
 

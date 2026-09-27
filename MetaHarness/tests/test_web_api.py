@@ -392,13 +392,14 @@ class WebServerTests(unittest.TestCase):
         raw = "META PLAN v2\nSTATUS: READY\n"
         contract = "# v2 contract\n"
         (run_dir / "planner.raw.md").write_text(raw, encoding="utf-8")
-        (run_dir / "implementation_contract.md").write_text(contract, encoding="utf-8")
-        step_contract = run_dir / "steps" / "S01" / "contract.md"
+        plan_dir = run_dir / "iterations/01/plan"
+        step_contract = plan_dir / "steps" / "S01" / "contract.md"
         step_contract.parent.mkdir(parents=True)
         step_contract.write_text("step contract\n", encoding="utf-8")
+        (plan_dir / "implementation_contract.md").write_text(contract, encoding="utf-8")
         import hashlib
 
-        (run_dir / "implementation_bundle.json").write_text(
+        (plan_dir / "implementation_bundle.json").write_text(
             json.dumps(
                 {
                     "schema_version": 1,
@@ -479,7 +480,8 @@ class WebServerTests(unittest.TestCase):
         RunStateStore(run_dir / "state.json").update_metadata(
             execution={"planner": {"profile_id": "planner"}},
         )
-        (run_dir / "implementation_bundle.json").write_text(
+        (run_dir / "iterations/01/plan/implementation_bundle.json").parent.mkdir(parents=True, exist_ok=True)
+        (run_dir / "iterations/01/plan/implementation_bundle.json").write_text(
             json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),
             encoding="utf-8",
         )
@@ -493,7 +495,8 @@ class WebServerTests(unittest.TestCase):
         )
 
         page_dir = self.create_run("form-page", "awaiting_plan_approval")
-        (page_dir / "implementation_bundle.json").write_text(
+        (page_dir / "iterations/01/plan/implementation_bundle.json").parent.mkdir(parents=True, exist_ok=True)
+        (page_dir / "iterations/01/plan/implementation_bundle.json").write_text(
             json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),
             encoding="utf-8",
         )

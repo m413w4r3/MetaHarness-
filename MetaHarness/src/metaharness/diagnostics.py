@@ -20,7 +20,7 @@ from .config import HarnessConfig
 from .profiles import profiles_for_config, safe_profile_metadata
 from .redaction import config_secret_values, redact
 from .result import atomic_write_text
-from .resume import ResumeCheckpointError, resume_info
+from .resume import ResumeCheckpointError, read_checkpoint, resume_info
 from .orchestration.pipeline_v2 import (
     cycle_dir,
     implementation_steps_dir,
@@ -378,10 +378,10 @@ def _bundle_summary(run_dir: Path, secrets: tuple[str, ...], relative: str) -> s
     return _artifact_header(item) + "Bundle summary:\n" + redact(_json(safe), secrets)
 
 
-def _selection_summary(run_dir: Path, secrets: tuple[str, ...]) -> str:
+def _selection_summary(run_dir: Path, secrets: tuple[str, ...], iteration: int) -> str:
     """Render execution selection metadata without endpoint/credential fields."""
 
-    relative = "execution_selection.json"
+    relative = f"iterations/{iteration:02d}/execution_selection.json"
     item = _artifact(run_dir, relative)
     if not item.exists:
         return _artifact_header(item)
@@ -671,6 +671,13 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
         state = {}
     if not isinstance(state, Mapping):
         state = {}
+    try:
+        checkpoint = read_checkpoint(directory)
+    except ResumeCheckpointError:
+        checkpoint = None
+    iteration = checkpoint.iteration if checkpoint is not None else state.get("iteration", 1)
+    if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 1:
+        iteration = 1
     header = "# MetaHarness Run Diagnostics\n\n"
     header += _section("REPORT", _json({
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -709,16 +716,16 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
     body += _section("PLANNER RESPONSE", "\n".join([
         "plan source: planner model completion",
         _artifact_text(directory, "planner.raw.md", secrets),
-        _plan_summary(directory, secrets, "task_plan.json"),
+        _plan_summary(directory, secrets, f"iterations/{iteration:02d}/plan/task_plan.json"),
         _artifact_json(directory, "planner.usage.json", secrets),
     ]))
     body += _section("PLAN / BUNDLE", "\n".join([
-        _artifact_text(directory, "implementation_contract.md", secrets),
-        _bundle_summary(directory, secrets, "implementation_bundle.json"),
+        _artifact_text(directory, f"iterations/{iteration:02d}/plan/implementation_contract.md", secrets),
+        _bundle_summary(directory, secrets, f"iterations/{iteration:02d}/plan/implementation_bundle.json"),
     ]))
     body += _section("APPROVAL", "\n".join([
         _safe_json_artifact(directory, "plan_approval.json", secrets, ("decision", "raw_sha256", "contract_sha256", "bundle_sha256", "execution_sha256", "source")),
-        _selection_summary(directory, secrets),
+        _selection_summary(directory, secrets, iteration),
     ]))
     cycles = _cycle_dirs(directory)
     for cycle_path in cycles:

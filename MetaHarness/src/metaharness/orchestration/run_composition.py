@@ -34,6 +34,7 @@ from .pipeline_v2 import (
 from .durable_readers import (
     completed_step_records, load_evidence, gate_mutable_authority, settled_step_status,
 )
+from ..planning.artifacts import iteration_plan_dir
 from .run_bootstrap import PreparedV2Run
 from .shared import (
     CycleArtifactService,
@@ -104,6 +105,7 @@ class RunComposition:
             repository_reference=repository_reference, info=prepared.info,
             plan=prepared.plan, bundle=prepared.bundle, selection=prepared.selection,
             options=self.runtime.run_options,
+            iteration=prepared.checkpoint.iteration,
         )
         return pipeline, prepared.checkpoint
 
@@ -152,10 +154,10 @@ class RunComposition:
 
     def _initial_cycle_plan(self, ctx: PipelineV2Context) -> CyclePlan:
         return CyclePlan(
-            cycle=RunCycle(1, CycleKind.INITIAL),
+            cycle=RunCycle(ctx.iteration, CycleKind.INITIAL),
             plan=ctx.plan,
             bundle=ctx.bundle,
-            contracts_dir=ctx.run_dir,
+            contracts_dir=iteration_plan_dir(ctx.run_dir, ctx.iteration),
             step_profile_ids={
                 item.step_id: item.implementer.profile_id for item in ctx.selection.steps
             },
@@ -225,6 +227,7 @@ class RunComposition:
         info: WorktreeInfo, base_sha: str, base_tree_sha: str,
         repository_reference: RepositoryReference, plan: TaskPlanV2,
         bundle: Mapping[str, Any], selection: ExecutionSelection,
+        iteration: int = 1,
     ) -> PipelineV2Context:
         """The immutable facts of this run, as the coordinator reads them."""
 
@@ -233,4 +236,5 @@ class RunComposition:
             base_sha=base_sha, base_tree_sha=base_tree_sha,
             repository_reference=repository_reference, info=info, plan=plan,
             bundle=bundle, selection=selection, options=self.runtime.run_options,
+            iteration=iteration,
         )

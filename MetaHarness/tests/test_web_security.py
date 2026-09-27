@@ -98,7 +98,8 @@ class LocalServerHardeningTests(unittest.TestCase):
         store.initialize(run_id)
         raw, contract = "STATUS: READY\n", "# contract\n"
         (run_dir / "planner.raw.md").write_text(raw, encoding="utf-8")
-        (run_dir / "implementation_contract.md").write_text(contract, encoding="utf-8")
+        (run_dir / "iterations/01/plan/implementation_contract.md").parent.mkdir(parents=True, exist_ok=True)
+        (run_dir / "iterations/01/plan/implementation_contract.md").write_text(contract, encoding="utf-8")
         store.set_run_state(
             RunMachineState(RunPhase.PLAN_APPROVAL),
             planning_protocol="v2",

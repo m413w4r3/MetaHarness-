@@ -119,7 +119,8 @@ class P19WebTests(unittest.TestCase):
         store.initialize(run_id)
         raw, contract = "STATUS: READY\n", "# contract\n"
         (run / "planner.raw.md").write_text(raw)
-        (run / "implementation_contract.md").write_text(contract)
+        (run / "iterations/01/plan/implementation_contract.md").parent.mkdir(parents=True, exist_ok=True)
+        (run / "iterations/01/plan/implementation_contract.md").write_text(contract)
         store.set_run_state(
             RunMachineState(RunPhase.PLAN_APPROVAL),
             planning_protocol="v2",
@@ -258,7 +259,7 @@ class P19WebTests(unittest.TestCase):
         step.mkdir(parents=True)
         (step / "agent.final.md").write_text("x" * (32 * 1024 + 100))
         (step / "agent.stderr.log").write_text("e" * (32 * 1024 + 100))
-        (run / "implementation_bundle.json").write_text(json.dumps({
+        (run / "iterations/01/plan/implementation_bundle.json").write_text(json.dumps({
             "schema_version": 1, "steps": [{"id": "S01", "title": "one"}],
         }))
         gate = run / "cycles/001/checks/post-implementation"

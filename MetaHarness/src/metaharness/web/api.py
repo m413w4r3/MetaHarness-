@@ -43,7 +43,9 @@ from ..models import (
 )
 from ..progress import display_event, sync_progress
 from ..redaction import config_secret_values
-from ..planning.artifacts import step_contract_path, validate_implementation_bundle
+from ..planning.artifacts import (
+    iteration_dir, iteration_plan_dir, step_contract_path, validate_implementation_bundle,
+)
 from ..planning.protocol import V2PlanParseError
 from ..profiles import ProfileError, profiles_for_config, safe_profile_metadata
 from ..run_options import RunOptions, RunOptionsError, effective_run_config, read_run_options_for_state
@@ -68,13 +70,9 @@ ARTIFACT_ALLOWLIST = frozenset(
         "run_options.json",
         "spec.md",
         "planner.raw.md",
-        "implementation_contract.md",
-        "task_plan.json",
-        "implementation_bundle.json",
         "agent.events.jsonl",
         "trace/events.v1.jsonl",
         "checks.json",
-        "execution_selection.json",
         "agent.result.json",
         "agent.final.md",
         "agent.stderr.log",
@@ -245,10 +243,19 @@ _CYCLE_ARTIFACT = re.compile(
     r"|candidate"
     r")/[A-Za-z0-9_][A-Za-z0-9_.-]*"
 )
+_ITERATION_ARTIFACT = re.compile(
+    rf"iterations/[0-9]{{2,}}/(?:execution_selection\.json|"
+    rf"plan/(?:task_plan\.json|implementation_bundle\.json|plan\.normalizations\.json|"
+    rf"implementation_contract\.md|steps/{STEP_ID_PATTERN}/contract\.md))"
+)
 
 
 def _artifact_path(run_dir: Path, name: str) -> Path:
-    if name not in ARTIFACT_ALLOWLIST and _CYCLE_ARTIFACT.fullmatch(name) is None:
+    if (
+        name not in ARTIFACT_ALLOWLIST
+        and _CYCLE_ARTIFACT.fullmatch(name) is None
+        and _ITERATION_ARTIFACT.fullmatch(name) is None
+    ):
         raise ValueError("artifact is not allowlisted")
     return run_dir / name
 
@@ -345,9 +352,12 @@ def get_run(
     directory = _run_dir(runs_root, run_id)
     safe_id = validate_run_id(run_id)
     state = _load_state(directory)
+    iteration = state.get("iteration", 1)
+    if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 1:
+        iteration = 1
     raw_plan = _load_text(_artifact_path(directory, "planner.raw.md"))
     spec = _load_text(_artifact_path(directory, "spec.md"))
-    contract = _load_text(_artifact_path(directory, "implementation_contract.md"))
+    contract = _load_text(_artifact_path(directory, f"iterations/{iteration:02d}/plan/implementation_contract.md"))
     approval_payload = _load_json(_artifact_path(directory, "plan_approval.json"))
     approval_decision = (
         approval_payload.get("decision")
@@ -417,11 +427,11 @@ def get_run(
         # both values still come exclusively from the allowlisted artifacts.
         "planner_raw": raw_plan,
         "implementation_contract": contract,
-        "task_plan": _load_json(_artifact_path(directory, "task_plan.json")),
-        "implementation_bundle": _load_json(_artifact_path(directory, "implementation_bundle.json")),
+        "task_plan": _load_json(_artifact_path(directory, f"iterations/{iteration:02d}/plan/task_plan.json")),
+        "implementation_bundle": _load_json(_artifact_path(directory, f"iterations/{iteration:02d}/plan/implementation_bundle.json")),
         "checks": _load_json(_artifact_path(directory, checks_path)),
         "execution_selection": _load_json(
-            _artifact_path(directory, "execution_selection.json")
+            _artifact_path(directory, f"iterations/{iteration:02d}/execution_selection.json")
         ),
         "run_options": _load_json(
             _artifact_path(directory, "run_options.json")
@@ -471,9 +481,9 @@ def _cycle_numbers(directory: Path) -> list[int]:
 
 
 def _cycle_contracts_dir(directory: Path, cycle: int) -> Path:
-    """Where the approved plan of the initial cycle keeps its bundle and contracts."""
+    """The plan bundle and contracts frozen for this iteration."""
 
-    return directory
+    return iteration_plan_dir(directory, cycle)
 
 
 def _cycle_gate_dir(directory: Path, cycle: int) -> Path | None:
@@ -839,6 +849,9 @@ def approve_run(
     # 1-2. Load state and require the approval gate of a pipeline-v2 run.
     directory = _run_dir(runs_root, run_id)
     state = _load_state(directory)
+    iteration = state.get("iteration", 1)
+    if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 1:
+        raise WebAPIError(409, "run iteration is invalid")
     if state.get("status") != RunStatus.AWAITING_PLAN_APPROVAL.value:
         raise WebAPIError(409, "run is not awaiting plan approval")
     if state.get("planning_protocol") != "v2":
@@ -859,6 +872,8 @@ def approve_run(
             audit_profile = snapshot.audit_profile
         if not isinstance(audit_profile, str) or not audit_profile:
             raise WebAPIError(400, "audit_profile is required")
+        if audit_profile != snapshot.audit_profile:
+            raise WebAPIError(400, "audit profile must match the frozen run options")
     # 3. Verify the plan artifacts shown to the human.
     stored = state.get("plan_identity")
     if not isinstance(stored, dict):
@@ -871,7 +886,7 @@ def approve_run(
             bundle_sha256=stored.get("bundle_sha256"),
             checks_sha256=stored.get("checks_sha256"),
         )
-        actual = compute_plan_identity_from_run(directory)
+        actual = compute_plan_identity_from_run(directory, iteration=iteration)
     except (KeyError, TypeError, ValueError, ApprovalError, OSError, UnicodeError) as exc:
         raise WebAPIError(409, "plan artifacts do not match run state") from exc
     if (actual.raw_sha256, actual.contract_sha256, actual.bundle_sha256) != (
@@ -884,12 +899,12 @@ def approve_run(
         raise WebAPIError(409, "check authority does not match the durable plan identity")
 
     if selected is ApprovalDecision.REJECT:
-        _publish_decision(directory, selected, expected)
+        _publish_decision(directory, selected, expected, iteration=iteration)
         return {"ok": True, "decision": selected.value}
 
     # 4. Freeze the requested profiles from trusted configuration only.
     try:
-        bundle, _ = validate_implementation_bundle(directory)
+        bundle, _ = validate_implementation_bundle(iteration_plan_dir(directory, iteration))
     except (V2PlanParseError, OSError, UnicodeError) as exc:
         raise WebAPIError(409, "plan artifacts do not match run state") from exc
     expected_ids = [entry["id"] for entry in bundle["steps"]]
@@ -898,7 +913,7 @@ def approve_run(
     try:
         requested = resolve_execution_selection(
             config,
-            planner_profile_id=state["execution"]["planner"]["profile_id"],
+            planner_profile_id=snapshot.planner_profile,
             plan_steps=[
                 ImplementationStep(
                     id=entry["id"],
@@ -921,14 +936,17 @@ def approve_run(
                 for entry in bundle["steps"]
             ],
             step_profile_ids={key: value for key, value in step_profiles.items()},
-            audit_profile_id=audit_profile,
+            audit_profile_id=snapshot.audit_profile,
+            fallback_authority=snapshot.recovery.execution_fallbacks,
         )
     except (ProfileError, ExecutionSelectionError) as exc:
         raise WebAPIError(400, "selected profile is invalid") from exc
     # 5. Claim the selection immutably, then read back the exact durable bytes.
     try:
-        ensure_execution_selection(directory, requested)
-        durable, execution_sha256 = read_execution_selection_with_sha256(directory)
+        ensure_execution_selection(directory, requested, iteration=iteration)
+        durable, execution_sha256 = read_execution_selection_with_sha256(
+            directory, iteration=iteration,
+        )
         validate_execution_selection(config, durable)
     except ExecutionSelectionConflict as exc:
         raise WebAPIError(409, "a different execution selection is already recorded") from exc
@@ -944,7 +962,7 @@ def approve_run(
         bundle_sha256=expected.bundle_sha256,
         checks_sha256=actual.checks_sha256,
     )
-    _publish_decision(directory, selected, identity)
+    _publish_decision(directory, selected, identity, iteration=iteration)
     # Compare-and-set: once the orchestrator has left the gate it owns the
     # state, and this metadata write must never move the machine state.  The
     # claim observes the canonical identity of the gate it was validated on.
@@ -957,7 +975,7 @@ def approve_run(
 
 
 def _publish_decision(
-    directory: Path, decision: ApprovalDecision, identity: PlanIdentity
+    directory: Path, decision: ApprovalDecision, identity: PlanIdentity, *, iteration: int = 1,
 ) -> None:
     try:
         write_plan_approval(
@@ -965,6 +983,7 @@ def _publish_decision(
             decision=decision,
             identity=identity,
             source="web-ui",
+            iteration=iteration,
         )
     except ApprovalError as exc:
         raise WebAPIError(409, "plan approval already exists or is invalid") from exc
@@ -1258,7 +1277,7 @@ def run_pipeline(
     approval_decision = approval.get("decision") if isinstance(approval, dict) else None
     if approval_decision == "APPROVE" or (
         approval_decision is None and decision == "READY"
-        and (directory / "execution_selection.json").exists()
+        and (iteration_dir(directory, _state_cycle(state)) / "execution_selection.json").exists()
         and status != AWAITING_APPROVAL
     ):
         add("approval", "Approval", "complete")
@@ -1381,7 +1400,7 @@ def run_overview(
     pipeline = run_pipeline(directory, state, config, resume)
     current, following = _current_and_next(pipeline, state)
     planner = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
-    steps = planner.get("steps") if isinstance(planner.get("steps"), list) else []
+    steps = state.get("steps") if isinstance(state.get("steps"), list) else []
     mode = planner.get("execution_mode") or "—"
     target, target_detail = publish_target(config, state)
     return {

@@ -8,6 +8,7 @@ candidate and the publication carry.
 from __future__ import annotations
 
 import json
+import hashlib
 import unittest
 
 from metaharness.models import ExecutionRole, RunStatus
@@ -65,6 +66,28 @@ class LifecycleTests(PipelineHarness):
         self.assertEqual(checkpoint["phase"], "publish")
         self.assertIsNone(checkpoint["step_index"])
         self.assertEqual(checkpoint["last_green_commit"], state["commit_sha"])
+        plan_path = self.run_dir() / "iterations/01/plan/task_plan.json"
+        plan_dir = plan_path.parent
+        self.assertEqual(checkpoint["plan_sha256"], hashlib.sha256(plan_path.read_bytes()).hexdigest())
+        self.assertTrue((self.run_dir() / "iterations/01/execution_selection.json").is_file())
+        check_authority = json.loads((self.run_dir() / "check_authority.json").read_text())
+        self.assertEqual(check_authority["required_check_ids"], [])
+        for name in (
+            "task_plan.json", "implementation_bundle.json", "plan.normalizations.json",
+            "implementation_contract.md", "steps/S01/contract.md",
+        ):
+            self.assertTrue((plan_dir / name).is_file(), name)
+        for name in (
+            "task_plan.json", "implementation_bundle.json", "plan.normalizations.json",
+            "implementation_contract.md", "execution_selection.json",
+        ):
+            self.assertFalse((self.run_dir() / name).exists(), name)
+        self.assertFalse((self.run_dir() / "steps").exists())
+        self.assertEqual(state["iteration"], 1)
+        self.assertEqual(state["current_milestone"]["id"], "M01")
+        self.assertTrue(state["current_milestone"]["title"])
+        self.assertEqual([item["id"] for item in state["steps"]], ["S01"])
+        self.assertNotIn("steps", state["planner"])
         # The gate accepted the tree and the audit confirmed it: exactly one
         # writable authority ran after the implementation worker.
         self.assertEqual(self.workers.roles(), ["implementer", "auditor"])
@@ -73,7 +96,8 @@ class LifecycleTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         self.orchestrator(self.config(), planner=[initial_plan(STEP)]).run_text(SPEC, run_id="run")
         options = json.loads((self.run_dir() / "run_options.json").read_text())
-        selection = json.loads((self.run_dir() / "execution_selection.json").read_text())
+        selection = json.loads((self.run_dir() / "iterations/01/execution_selection.json").read_text())
+        self.assertFalse((self.run_dir() / "execution_selection.json").exists())
         self.assertEqual(options["schema_version"], 7)
         self.assertEqual(options["pipeline_version"], 2)
         option_names = set(options) | {

@@ -6,13 +6,16 @@ from pathlib import Path
 
 from metaharness.execution_selection import (
     SCHEMA_VERSION,
+    ExecutionSelectionError,
     ensure_execution_selection,
     read_execution_selection,
 )
+from metaharness.planning.artifacts import iteration_dir, iteration_plan_dir
 from metaharness.models import ExecutionSelection, RunCycle, SelectedProfile, StepExecutionSelection
 from metaharness.orchestration.pipeline_v2 import cycle_dir, gate_dir
 from metaharness.run_options import RunOptions
 from metaharness.run_options import SCHEMA_VERSION as RUN_OPTIONS_SCHEMA_VERSION
+from metaharness.run_options import RUN_SCHEMA_UNSUPPORTED
 from metaharness.resume import ResumeCheckpoint, ResumeCheckpointError, ResumePhase
 
 
@@ -46,6 +49,9 @@ class GenericArtifactPathTests(unittest.TestCase):
             gate_dir(root, 10, "POST_IMPLEMENTATION"),
             root / "cycles/010/checks/post-implementation",
         )
+        self.assertEqual(iteration_dir(root, 1), root / "iterations/01")
+        self.assertEqual(iteration_dir(root, 2), root / "iterations/02")
+        self.assertEqual(iteration_plan_dir(root, 2), root / "iterations/02/plan")
 
 
 class GenericSnapshotTests(unittest.TestCase):
@@ -76,10 +82,19 @@ class GenericSnapshotTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            ensure_execution_selection(path, selection)
-            durable = read_execution_selection(path)
-            payload = (path / "execution_selection.json").read_text(encoding="utf-8")
+            ensure_execution_selection(path, selection, iteration=1)
+            ensure_execution_selection(path, selection, iteration=2)
+            durable = read_execution_selection(path, iteration=1)
+            durable2 = read_execution_selection(path, iteration=2)
+            payload = (iteration_dir(path, 1) / "execution_selection.json").read_text(encoding="utf-8")
+            legacy = path / "legacy"
+            legacy.mkdir()
+            (legacy / "execution_selection.json").write_text(payload, encoding="utf-8")
+            with self.assertRaises(ExecutionSelectionError) as raised:
+                read_execution_selection(legacy, iteration=1)
         self.assertEqual(durable, selection)
+        self.assertEqual(durable2, selection)
+        self.assertEqual(raised.exception.code, RUN_SCHEMA_UNSUPPORTED)
         self.assertNotIn('"reviser"', payload)
         self.assertNotIn('"repair_implementer"', payload)
         self.assertNotIn('"reviewer"', payload)

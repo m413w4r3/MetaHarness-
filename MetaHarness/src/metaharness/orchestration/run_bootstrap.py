@@ -47,7 +47,8 @@ from ..models import (
 )
 from ..plan_repository_validation import RepositoryPreconditions, validate_plan_repository_topology
 from ..planning.artifacts import (
-    persist_effective_plan, read_effective_plan, validate_implementation_bundle,
+    iteration_plan_dir, persist_iteration_plan, read_iteration_plan,
+    validate_implementation_bundle,
 )
 from ..planning.planner import PlannerV2
 from ..planning.protocol import TaskPlanV2, V2PlanParseError
@@ -119,6 +120,7 @@ class RunBootstrap:
         planner_profile: ModelProfile,
         existing_plan: TaskPlanV2 | None = None,
         existing_info: WorktreeInfo | None = None,
+        iteration: int = 1,
     ) -> "PreparedV2Run | RunResult":
         """Plan, obtain the approved selection, create the worktree and set up.
 
@@ -127,6 +129,8 @@ class RunBootstrap:
         """
 
         planner_profile_id = planner_profile.id
+        if planner_profile_id != self.runtime.run_options.planner_profile:
+            raise ExecutionSelectionError("planner profile differs from the frozen run options")
         if existing_plan is None:
             planner = PlannerV2(
                 self.runtime.planner_client
@@ -139,14 +143,14 @@ class RunBootstrap:
                 repository_preconditions=RepositoryPreconditions(
                     repo, resolve_tree(repo, base_sha),
                 ),
-                on_event=lambda name, data: self.runtime.observability.trace_emit(name, phase="planning", cycle=1, data=data),
+                on_event=lambda name, data: self.runtime.observability.trace_emit(name, phase="planning", cycle=iteration, data=data),
             )
             plan_started_at = self.runtime.observability.trace_time()
             plan_started_mono = time.perf_counter()
             self.runtime.observability.trace_emit(
                 "plan.started",
                 phase="planning",
-                cycle=1,
+                cycle=iteration,
                 data={
                     "session": self.runtime.observability.trace_session(
                         profile=planner_profile,
@@ -160,7 +164,7 @@ class RunBootstrap:
                 },
             )
             try:
-                plan = planner.plan(spec, context, artifacts_dir=run_dir)
+                plan = planner.plan(spec, context, artifacts_dir=run_dir, iteration=iteration)
             except Exception:
                 # The failed planner answer is deliberately left in place and
                 # will be archived by the next planner attempt.
@@ -172,7 +176,7 @@ class RunBootstrap:
             self.runtime.observability.trace_emit(
                 "plan.completed",
                 phase="planning",
-                cycle=1,
+                cycle=iteration,
                 data={
                     "decision": plan.decision.value,
                     "title": plan.title,
@@ -214,14 +218,9 @@ class RunBootstrap:
                 "source": "planner",
                 "execution_mode": plan.execution_mode.value if plan.execution_mode else None,
                 "required_checks": list(plan.required_checks),
-                "steps": [
-                    {"id": step.id, "title": step.title,
-                     "execution_class": step.execution_class.value,
-                     "recommended_profile": self.runtime.config.routing.profile_for(step.execution_class),
-                     "status": "waiting"}
-                    for step in plan.steps
-                ],
             },
+            iteration=iteration,
+            current_milestone={"id": plan.milestone_id, "title": plan.milestone_title},
             steps=[
                 {"id": step.id, "title": step.title, "status": "waiting",
                  "execution_class": step.execution_class.value,
@@ -231,7 +230,7 @@ class RunBootstrap:
             current_step=None,
         )
         self.runtime.cycle_update(
-            store, 1, status="running", plan_summary=plan.title,
+            store, iteration, status="running", plan_summary=plan.title,
             steps_summary=[{"id": step.id, "title": step.title} for step in plan.steps],
         )
         if plan.decision is PlanDecision.BLOCKED:
@@ -269,13 +268,13 @@ class RunBootstrap:
             # and it must still run the argv approved at this boundary.
             write_check_authority(
                 run_dir, tuple(self.runtime.config.trusted_checks()),
-                required_check_ids=tuple(check.id for check in selected_checks),
+                required_check_ids=(),
             )
-            plan_sha = persist_effective_plan(run_dir, plan)
+            plan_sha = persist_iteration_plan(run_dir, iteration, plan)
             _bundle, _bundle_sha = validate_implementation_bundle(
-                run_dir, expected_step_ids=[step.id for step in plan.steps],
+                iteration_plan_dir(run_dir, iteration), expected_step_ids=[step.id for step in plan.steps],
             )
-            plan_identity = compute_plan_identity_from_run(run_dir)
+            plan_identity = compute_plan_identity_from_run(run_dir, iteration=iteration)
         except (ApprovalError, V2PlanParseError, OSError, UnicodeError) as exc:
             raise ApprovalError(f"invalid v2 plan artifacts: {exc}") from exc
         store.update_metadata(plan_identity=asdict(plan_identity))
@@ -288,6 +287,7 @@ class RunBootstrap:
             approval = wait_for_plan_approval(
                 run_dir, identity=plan_identity,
                 poll_interval_seconds=self.runtime.config.approval.poll_interval_seconds,
+                iteration=iteration,
             )
             if approval.decision is ApprovalDecision.REJECT:
                 state = store.set_run_state(RunMachineState(
@@ -295,13 +295,13 @@ class RunBootstrap:
                 ))
                 return RunResult.of(run_dir, state)
             try:
-                selection, execution_sha = read_execution_selection_with_sha256(run_dir)
+                selection, execution_sha = read_execution_selection_with_sha256(run_dir, iteration=iteration)
                 validate_execution_selection(self.runtime.config, selection)
-                durable_identity = compute_plan_identity_from_run(run_dir)
+                durable_identity = compute_plan_identity_from_run(run_dir, iteration=iteration)
                 if durable_identity.execution_sha256 != execution_sha:
                     raise ApprovalError("execution selection hash mismatch")
-                read = compute_plan_identity_from_run(run_dir)
-                bound = read_plan_approval(run_dir, expected_identity=read)
+                read = compute_plan_identity_from_run(run_dir, iteration=iteration)
+                bound = read_plan_approval(run_dir, expected_identity=read, iteration=iteration)
                 if bound is None or bound.bundle_sha256 != durable_identity.bundle_sha256:
                     raise ApprovalError("v2 approval is not bound to the exact bundle")
             except (ExecutionSelectionError, ApprovalError, OSError, UnicodeError) as exc:
@@ -314,8 +314,8 @@ class RunBootstrap:
                 audit_profile_id=self.runtime.run_options.audit_profile,
                 fallback_authority=self.runtime.run_options.recovery.execution_fallbacks,
             )
-            selection = ensure_execution_selection(run_dir, requested)
-            durable_identity = compute_plan_identity_from_run(run_dir)
+            selection = ensure_execution_selection(run_dir, requested, iteration=iteration)
+            durable_identity = compute_plan_identity_from_run(run_dir, iteration=iteration)
 
         # Re-read the complete manifest after the approval transaction.  The
         # first validation protects the approval surface; this one closes the
@@ -323,7 +323,7 @@ class RunBootstrap:
         # still be the ones hashed at planning time and bound by the approval.
         try:
             bundle, bundle_sha = validate_implementation_bundle(
-                run_dir, expected_step_ids=[step.id for step in plan.steps]
+                iteration_plan_dir(run_dir, iteration), expected_step_ids=[step.id for step in plan.steps]
             )
         except (V2PlanParseError, OSError, UnicodeError) as exc:
             raise ApprovalError(f"PLAN_APPROVAL_INVALID: {exc}") from exc
@@ -332,6 +332,8 @@ class RunBootstrap:
 
         if selection.planner.profile_id != planner_profile_id:
             raise ExecutionSelectionError("execution selection planner is not the run planner")
+        if selection.audit.profile_id != self.runtime.run_options.audit_profile:
+            raise ExecutionSelectionError("execution selection auditor differs from the frozen run options")
         if [item.step_id for item in selection.steps] != [step.id for step in plan.steps]:
             raise ExecutionSelectionError("execution selection steps do not match the plan")
         if [item.execution_class for item in selection.steps] != [step.execution_class for step in plan.steps]:
@@ -353,7 +355,7 @@ class RunBootstrap:
         self.runtime.observability.trace_emit(
             "plan.approved",
             phase="planning",
-            cycle=1,
+            cycle=iteration,
             data={
                 "plan_identity": asdict(durable_identity),
                 "execution_selection_sha256": durable_identity.execution_sha256,
@@ -365,7 +367,7 @@ class RunBootstrap:
             run_dir, ResumePhase.WORKTREE_SETUP, head=base_sha, plan_sha256=plan_sha,
         )
         # Plan approval complete: the next operation is the first step.
-        checkpoint = self._initial_checkpoint(plan, base_sha, plan_sha)
+        checkpoint = self._initial_checkpoint(plan, base_sha, plan_sha, iteration=iteration)
 
         branch = build_run_branch(plan.title, run_id)
         if existing_info is None:
@@ -384,7 +386,7 @@ class RunBootstrap:
         self.runtime.observability.trace_emit(
             "worktree.created",
             phase="setup",
-            cycle=1,
+            cycle=iteration,
             data={
                 "branch": info.branch,
                 "worktree": str(info.worktree),
@@ -418,9 +420,10 @@ class RunBootstrap:
         # The workspace preflight is the first live use of the authority; the
         # expected hash is the one this run's identity already durably bound.
         check_config, check_ids = config_with_check_authority(
-            self.runtime.config, run_dir, expected_sha256=durable_identity.checks_sha256,
+            self.runtime.config, run_dir, requested_check_ids=plan.required_checks,
+            expected_sha256=durable_identity.checks_sha256,
         )
-        selected_check_ids = tuple(check_ids or plan.required_checks)
+        selected_check_ids = tuple(check_ids or ())
         skipped_checks = self.runtime.gates.run_check_preflights_recoverably(
             store=store, run_dir=run_dir, worktree=info.worktree,
             check_config=check_config, check_ids=selected_check_ids, phase="preparing",
@@ -446,12 +449,12 @@ class RunBootstrap:
 
     @staticmethod
     def _initial_checkpoint(
-        plan: TaskPlanV2, base_sha: str, plan_sha256: str,
+        plan: TaskPlanV2, base_sha: str, plan_sha256: str, *, iteration: int = 1,
     ) -> ResumeCheckpoint | None:
         if not plan.steps:
             return None
         return ResumeCheckpoint(
-            phase=ResumePhase.IMPLEMENT_STEP, iteration=1, step_index=0,
+            phase=ResumePhase.IMPLEMENT_STEP, iteration=iteration, step_index=0,
             last_green_commit=base_sha, plan_sha256=plan_sha256,
         )
 
@@ -548,23 +551,24 @@ class RunBootstrap:
                     default_check_ids=self.runtime.config.default_check_ids,
                     prompt_budget_bytes=self.runtime.config.prompt_budget.planner_max_bytes,
                     repository_preconditions=RepositoryPreconditions(repo, base_tree),
-                    on_event=lambda name, data: self.runtime.observability.trace_emit(name, phase="planning", cycle=1, data=data),
+                    on_event=lambda name, data: self.runtime.observability.trace_emit(name, phase="planning", cycle=checkpoint.iteration, data=data),
                 )
-                plan = planner.plan(spec, context, artifacts_dir=run_dir)
+                plan = planner.plan(spec, context, artifacts_dir=run_dir, iteration=checkpoint.iteration)
                 persist_planner_conversation(run_dir, getattr(planner, "last_conversation", None))
             else:
                 if checkpoint.plan_sha256 is None:
                     refuse("checkpoint has no effective plan hash")
                 try:
-                    plan = read_effective_plan(run_dir, checkpoint.plan_sha256)
+                    plan = read_iteration_plan(run_dir, checkpoint.iteration, checkpoint.plan_sha256)
                 except V2PlanParseError as exc:
                     refuse(f"effective plan is invalid: {exc}")
             if checkpoint.phase in {ResumePhase.PLAN_APPROVAL, ResumePhase.WORKTREE_SETUP}:
                 try:
                     _bundle, bundle_sha = validate_implementation_bundle(
-                        run_dir, expected_step_ids=[step.id for step in plan.steps]
+                        iteration_plan_dir(run_dir, checkpoint.iteration),
+                        expected_step_ids=[step.id for step in plan.steps]
                     )
-                    identity = compute_plan_identity_from_run(run_dir)
+                    identity = compute_plan_identity_from_run(run_dir, iteration=checkpoint.iteration)
                 except (ApprovalError, V2PlanParseError, OSError, UnicodeError) as exc:
                     refuse(f"plan artifacts are invalid: {exc}")
                 recorded_identity = state.get("plan_identity")
@@ -583,13 +587,17 @@ class RunBootstrap:
                         refuse(str(exc))
                 if checkpoint.phase is ResumePhase.WORKTREE_SETUP:
                     try:
-                        _selection, _selection_sha = read_execution_selection_with_sha256(run_dir)
+                        _selection, _selection_sha = read_execution_selection_with_sha256(
+                            run_dir, iteration=checkpoint.iteration,
+                        )
                         validate_execution_selection(self.runtime.config, _selection)
                     except (ExecutionSelectionError, ProfileError, OSError, UnicodeError) as exc:
                         refuse(f"execution selection is invalid: {exc}")
                     if self.runtime.config.approval.require_plan_approval:
                         try:
-                            approval = read_plan_approval(run_dir, expected_identity=identity)
+                            approval = read_plan_approval(
+                                run_dir, expected_identity=identity, iteration=checkpoint.iteration,
+                            )
                         except ApprovalError as exc:
                             refuse(f"approval artifact is invalid: {exc}")
                         if approval is None or approval.decision is not ApprovalDecision.APPROVE:
@@ -604,6 +612,7 @@ class RunBootstrap:
                 store, run_dir, run_id, spec, repo, base_sha, context,
                 reference, planner_profile, existing_plan=plan,
                 existing_info=existing_info,
+                iteration=checkpoint.iteration,
             )
             if isinstance(prepared, RunResult):
                 return prepared
