@@ -1,7 +1,7 @@
 # Providers
 
 MetaHarness uses one deliberately small, OpenAI-compatible text contract
-for planner and reviewer endpoints.
+for text endpoints (the planner and the contract-repair planner).
 
 ## Minimal HTTP contract
 
@@ -22,8 +22,8 @@ choices[0].message.content
 ```
 
 The text protocol deliberately does not require JSON output, a `system` role, or a
-`response_format` field. Structured Outputs are intentionally unused so the
-planner and reviewer have the same wire contract on every backend.
+`response_format` field. Structured Outputs are intentionally unused so every
+text role has the same wire contract on every backend.
 
 Transport rules:
 
@@ -66,12 +66,12 @@ must return a durable handle for the completed turn and implement continuation
 against the native endpoint, distinguishing explicit `conversation_unavailable`
 from ambiguous transport failure. The provider ID must remain stable.
 
-For a ChatGPT-compatible bridge, configure an explicit planner/reviewer profile:
+For a ChatGPT-compatible bridge, configure an explicit planner profile:
 
 ```toml
 [model_profiles.chat]
 display_name = "Chat bridge"
-roles = ["planner", "reviewer"]
+roles = ["planner"]
 driver = "openai-chat"
 provider = "openai-compatible"
 model = "${META_PLANNER_MODEL}"
@@ -82,14 +82,19 @@ api_key_env = "BRIDGE_API_KEY"
 
 [ui]
 default_planner_profile = "chat"
-default_reviewer_profile = "chat"
-default_implementer_profile = "worker"
+
+[routing]
+mechanical_profile = "worker"
+reasoning_profile = "worker"
+agentic_profile = "worker"
 ```
 
-La réparation transverse des checks (`[ui] default_repair_profile`, ou tout
-profil portant le rôle `repair`) lit l'historique de panne d'un run entier :
-recommandez-y un profil *high-tier*. Les retries bornés du gate rapide par
-step, eux, peuvent rester sur un profil mécanique bon marché.
+AUDIT is the one post-implementation critic. It runs as an execution-class
+worker, so it is selected through `[routing]` and `[ui] default_audit_profile`
+(recommend a *high-tier* profile); the historical per-role defaults
+(`default_reviewer_profile`, `default_reviser_profile`,
+`default_repair_profile`, `default_implementer_profile`) and the historical
+`reviewer` / `reviser` / `repair` roles are refused by the loader.
 
 The `model` value may be only a label interpreted by the bridge. MetaHarness
 does not verify or guarantee that it names a native model, and no model name

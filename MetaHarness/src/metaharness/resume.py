@@ -57,7 +57,7 @@ ResumePhase = RunPhase
 
 
 _GATE_STAGES = frozenset(stage.value for stage in GateStage)
-_STAGED_PHASES = frozenset({ResumePhase.DETERMINISTIC_GATE, ResumePhase.CHECK_REPAIR})
+_STAGED_PHASES = frozenset({ResumePhase.DETERMINISTIC_GATE})
 _PRE_PLAN = frozenset({ResumePhase.CONTEXT, ResumePhase.PLANNER})
 _PRE_APPROVAL = _PRE_PLAN | frozenset({ResumePhase.PLAN_APPROVAL})
 _NO_WORKTREE = _PRE_APPROVAL | frozenset({ResumePhase.WORKTREE_SETUP})
@@ -82,13 +82,11 @@ class ResumeCheckpoint:
     stage: GateStage | None = None
     step_id: str | None = None
     next_step_id: str | None = None
-    check_repair_attempt: int | None = None
     expected_head_sha: str | None = None
     expected_parent_sha: str | None = None
     expected_tree_sha: str | None = None
     execution_selection_sha256: str | None = None
     plan_identity: PlanIdentity | None = None
-    correction_bundle_sha256: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -103,13 +101,10 @@ class ResumeCheckpoint:
                 raise ResumeCheckpointError("checkpoint stage is invalid")
             object.__setattr__(self, "stage", GateStage(self.stage))
         if phase in _STAGED_PHASES and self.stage is None:
-            raise ResumeCheckpointError("gate and check-repair checkpoints require a stage")
+            raise ResumeCheckpointError("gate checkpoints require a stage")
         if phase not in _STAGED_PHASES and self.stage is not None:
             raise ResumeCheckpointError("checkpoint stage is only valid for gate phases")
-        step_phases = {
-            ResumePhase.IMPLEMENT_STEP, ResumePhase.STEP_ACCEPTANCE,
-            ResumePhase.REVIEW_IMPLEMENTATION,
-        }
+        step_phases = {ResumePhase.IMPLEMENT_STEP, ResumePhase.STEP_ACCEPTANCE}
         if phase in step_phases:
             if not isinstance(self.step_id, str) or STEP_ID_RE.fullmatch(self.step_id) is None:
                 raise ResumeCheckpointError("checkpoint step_id is invalid")
@@ -129,18 +124,9 @@ class ResumeCheckpoint:
                 raise ResumeCheckpointError(f"checkpoint {name} is invalid")
         for name, value in (
             ("execution_selection_sha256", self.execution_selection_sha256),
-            ("correction_bundle_sha256", self.correction_bundle_sha256),
         ):
             if value is not None and (not isinstance(value, str) or _SHA256.fullmatch(value) is None):
                 raise ResumeCheckpointError(f"checkpoint {name} is invalid")
-        if self.check_repair_attempt is not None and (
-            isinstance(self.check_repair_attempt, bool)
-            or not isinstance(self.check_repair_attempt, int)
-            or self.check_repair_attempt < 1
-        ):
-            raise ResumeCheckpointError("checkpoint check_repair_attempt is invalid")
-        if phase is ResumePhase.CHECK_REPAIR and self.check_repair_attempt is None:
-            raise ResumeCheckpointError("check-repair checkpoint requires an attempt")
         if self.plan_identity is not None and not isinstance(self.plan_identity, PlanIdentity):
             raise ResumeCheckpointError("checkpoint plan_identity is invalid")
         if phase not in _PRE_PLAN and self.plan_identity is None:
@@ -185,13 +171,11 @@ def checkpoint_payload(checkpoint: ResumeCheckpoint, *, status: str = "pending")
         "stage": checkpoint.stage.value if checkpoint.stage else None,
         "step_id": checkpoint.step_id,
         "next_step_id": checkpoint.next_step_id,
-        "check_repair_attempt": checkpoint.check_repair_attempt,
         "expected_head_sha": checkpoint.expected_head_sha,
         "expected_parent_sha": checkpoint.expected_parent_sha,
         "expected_tree_sha": checkpoint.expected_tree_sha,
         "execution_selection_sha256": checkpoint.execution_selection_sha256,
         "plan_identity": _identity_payload(checkpoint.plan_identity) if checkpoint.plan_identity else None,
-        "correction_bundle_sha256": checkpoint.correction_bundle_sha256,
     }
 
 
@@ -224,11 +208,10 @@ def _parse(payload: Any, *, sha256: str) -> tuple[ResumeCheckpoint, str]:
     checkpoint = ResumeCheckpoint(
         phase=stamp.phase, review_cycle=payload.get("review_cycle", 1),
         stage=payload.get("stage"), step_id=payload.get("step_id"),
-        next_step_id=payload.get("next_step_id"), check_repair_attempt=payload.get("check_repair_attempt"),
+        next_step_id=payload.get("next_step_id"),
         expected_head_sha=payload.get("expected_head_sha"), expected_parent_sha=payload.get("expected_parent_sha"),
         expected_tree_sha=payload.get("expected_tree_sha"), execution_selection_sha256=payload.get("execution_selection_sha256"),
         plan_identity=(plan_identity_from_mapping(payload["plan_identity"]) if payload.get("plan_identity") is not None else None),
-        correction_bundle_sha256=payload.get("correction_bundle_sha256"),
     )
     return checkpoint, stamp.status
 
@@ -276,7 +259,6 @@ CONTRACT_REPAIR_OPERATION = "contract_repair"
 STEP_ACCEPTANCE_OPERATION = "step_acceptance"
 # A current checkpoint whose durable identity no longer holds.
 CHECKPOINT_INTEGRITY_OPERATION = "checkpoint_integrity"
-# Exact exhausted check-repair state.
 
 
 def resume_label(checkpoint: ResumeCheckpoint) -> str:
@@ -288,11 +270,8 @@ def resume_label(checkpoint: ResumeCheckpoint) -> str:
         ResumePhase.STEP_ACCEPTANCE: f"Retry step acceptance ({checkpoint.step_id})",
         ResumePhase.DETERMINISTIC_GATE: f"Retry deterministic gate ({checkpoint.stage})",
         ResumePhase.AUDIT: "Retry audit",
-        ResumePhase.CHECK_REPLAN: "Retry re-decomposition planner",
-        ResumePhase.SEMANTIC_REVISION: "Retry semantic revision", ResumePhase.CANDIDATE_READY: "Prepare candidate",
-        ResumePhase.CANDIDATE_PUSH: "Push candidate", ResumePhase.FINAL_REVIEW: "Retry final review",
-        ResumePhase.REVIEW_IMPLEMENTATION: f"Retry correction {checkpoint.step_id}",
-        ResumePhase.REVIEW_REPLAN: "Retry correction planner", ResumePhase.PUBLISH: "Retry publish",
+        ResumePhase.CANDIDATE_READY: "Prepare candidate",
+        ResumePhase.CANDIDATE_PUSH: "Push candidate", ResumePhase.PUBLISH: "Retry publish",
     }
     return labels[checkpoint.phase] + cycle
 

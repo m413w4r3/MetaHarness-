@@ -1,9 +1,9 @@
 """In-process harness for the generic pipeline-v2 state machine.
 
 Git, the deterministic checks, the commit gates and every durable artifact
-are real.  The planner and reviewer are scripted chat clients and every
-worker role (implementer, check-repair, semantic reviser) is a scripted
-executor registered under a test driver.  Nothing calls a network.
+are real.  The planner is a scripted chat client and every worker role
+(implementer, auditor) is a scripted executor registered under a test driver.
+Nothing calls a network.
 """
 
 from __future__ import annotations
@@ -110,22 +110,36 @@ def correction_plan(*steps: tuple[str, str, str], title: str = "Correct the feat
     return plan(*steps, title=title).replace("{implementer}", "worker")
 
 
-def review(verdict: str = "PASS", route: str = "NONE") -> str:
-    if verdict == "PASS":
-        findings = "NONE"
-    elif verdict == "FAIL":
-        route = "NONE"
-        findings = "EVIDENCE_INVALID | required evidence is contradictory"
-    elif route == "HUMAN":
-        findings = "PRODUCT_SPEC_AMBIGUITY | the spec permits incompatible outcomes"
-    else:
-        findings = "MINOR | the content needs a correction"
-    fixes = "NONE" if verdict == "PASS" else "Fix feature.txt."
+def audit_report(
+    status: str = "DONE", *, fixed: str = "none", refactored: str = "none",
+    remaining: str = "none", risks: str = "none",
+) -> str:
+    """One complete META AUDIT v1 answer; the only audit completion contract."""
+
+    if status != "DONE" and remaining == "none":
+        remaining = "the remaining work named by the audit"
     return (
-        f"VERDICT: {verdict}\nROUTE: {route}\nSUMMARY: scripted review\n"
-        f"FINDINGS: {findings}\nREQUIRED FIXES: {fixes}\nMISSING TESTS: NONE\n"
-        "RESIDUAL RISKS: NONE\n"
+        "META AUDIT v1\n\nSTATUS\n" + status +
+        "\n\nFIXED\n- " + fixed + "\n\nREFACTORED\n- " + refactored +
+        "\n\nREMAINING\n- " + remaining + "\n\nRISKS\n- " + risks +
+        "\nEND META AUDIT\n"
     )
+
+
+def audit(
+    status: str = "DONE", *, fixed: str = "none", refactored: str = "none",
+    remaining: str = "none", risks: str = "none",
+) -> Script:
+    """A scripted auditor worker answering one META AUDIT v1 report."""
+
+    report = audit_report(
+        status, fixed=fixed, refactored=refactored, remaining=remaining, risks=risks,
+    )
+
+    def answer(_request: AgentRunRequest) -> str:
+        return report
+
+    return answer
 
 
 class ScriptedChat:
@@ -150,27 +164,9 @@ class ScriptedChat:
 Script = Callable[[AgentRunRequest], "str | AgentRunResult"]
 
 
-def check_repair_result(
-    result: str = "DONE", targeted_check: str = "PASS", blocked_kind: str = "NONE",
-    note: str = "targeted check completed",
-) -> str:
-    """Render the strict machine result used by scripted repair workers."""
-
-    return (
-        "META CHECK REPAIR RESULT v1\n\n"
-        f"RESULT\n{result}\n\n"
-        f"TARGETED_CHECK\n{targeted_check}\n\n"
-        f"BLOCKED_KIND\n{blocked_kind}\n\n"
-        f"NOTE\n{note}\n"
-        "END META CHECK REPAIR RESULT\n"
-    )
-
-
 def write(path: str, content: str, report: str = "done\n") -> Script:
     def action(request: AgentRunRequest) -> str:
         (request.worktree / path).write_text(content, encoding="utf-8")
-        if request.role is ExecutionRole.REPAIR and report == "done\n":
-            return check_repair_result()
         return report
     return action
 
@@ -330,9 +326,7 @@ class PipelineHarness(unittest.TestCase):
         self.temp.cleanup()
 
     def config(
-        self, *, check_repair: int = 0, correction_cycles: int = 0,
-        max_step_contract_repairs: int = 2,
-        semantic_revision: bool = False, scope_mode: str = "soft",
+        self, *, max_step_contract_repairs: int = 2, scope_mode: str = "soft",
         publish: bool = False, github_pr: bool = False,
         extra_checks: str = "", per_step_gate: str | tuple[str, ...] = "",
     ) -> Any:
@@ -344,11 +338,6 @@ class PipelineHarness(unittest.TestCase):
         if gate_ids:
             rendered = ", ".join(f'"{item}"' for item in gate_ids)
             gate = f"\n[gate]\nper_step = [{rendered}]\n"
-        reviser = (
-            '\ndefault_reviser_profile = "reviser"'
-            if semantic_revision or correction_cycles else ""
-        )
-        repair = '\ndefault_repair_profile = "repairer"' if check_repair else ""
         path.write_text(f"""
 repo = {str(self.repo)!r}
 base_ref = "main"
@@ -360,9 +349,6 @@ require_clean_base = true
 protocol = "v2"
 
 [revision]
-enabled = {'true' if semantic_revision else 'false'}
-max_check_repair_attempts = {check_repair}
-max_correction_cycles = {correction_cycles}
 max_step_contract_repairs = {max_step_contract_repairs}
 
 [repository]
@@ -380,9 +366,12 @@ always_files = []
 
 [ui]
 default_planner_profile = "planner"
-default_implementer_profile = "worker"
-default_reviewer_profile = "reviewer"{reviser}{repair}
 default_audit_profile = "auditor"
+
+[routing]
+mechanical_profile = "worker"
+reasoning_profile = "worker"
+agentic_profile = "worker"
 
 [publish]
 enabled = {'true' if publish else 'false'}
@@ -400,38 +389,12 @@ selection_mode = "request"
 base_url = "http://127.0.0.1:9"
 endpoint_path = "/v1/chat/completions"
 
-[model_profiles.reviewer]
-display_name = "Reviewer"
-roles = ["reviewer"]
-driver = "openai-chat"
-provider = "test"
-model = "fake-reviewer"
-selection_mode = "request"
-base_url = "http://127.0.0.1:9"
-endpoint_path = "/v1/chat/completions"
-
 [model_profiles.worker]
 display_name = "Worker"
 roles = ["implementer"]
 driver = "{DRIVER}"
 provider = "test"
 model = "fake-worker"
-selection_mode = "cli"
-
-[model_profiles.repairer]
-display_name = "Repairer"
-roles = ["repair"]
-driver = "{DRIVER}"
-provider = "test"
-model = "fake-repairer"
-selection_mode = "cli"
-
-[model_profiles.reviser]
-display_name = "Reviser"
-roles = ["reviser"]
-driver = "{DRIVER}"
-provider = "test"
-model = "fake-reviser"
 selection_mode = "cli"
 
 [model_profiles.auditor]
@@ -452,15 +415,13 @@ selection_mode = "request"
 base_url = "http://127.0.0.1:9"
 endpoint_path = "/v1/chat/completions"
 
-[model_profiles.live_reviewer]
-display_name = "Live Reviewer"
-roles = ["reviewer"]
-driver = "openai-chat"
+[model_profiles.live_auditor]
+display_name = "Live Auditor"
+roles = ["auditor"]
+driver = "{DRIVER}"
 provider = "live"
-model = "live-reviewer"
-selection_mode = "request"
-base_url = "http://127.0.0.1:9"
-endpoint_path = "/v1/chat/completions"
+model = "live-auditor"
+selection_mode = "cli"
 
 [model_profiles.live_worker]
 display_name = "Live Worker"
@@ -468,22 +429,6 @@ roles = ["implementer"]
 driver = "{DRIVER}"
 provider = "live"
 model = "live-worker"
-selection_mode = "cli"
-
-[model_profiles.live_repairer]
-display_name = "Live Repairer"
-roles = ["repair"]
-driver = "{DRIVER}"
-provider = "live"
-model = "live-repairer"
-selection_mode = "cli"
-
-[model_profiles.live_reviser]
-display_name = "Live Reviser"
-roles = ["reviser"]
-driver = "{DRIVER}"
-provider = "live"
-model = "live-reviser"
 selection_mode = "cli"
 
 [[check_catalog]]
@@ -495,11 +440,19 @@ timeout_seconds = 30
         return load_config(path)
 
     def orchestrator(
-        self, config: Any, *, planner: list[Any], reviewer: list[Any],
+        self, config: Any, *, planner: list[Any], auditor: list[Any] | None = None,
     ) -> Orchestrator:
+        """Wire one run: a scripted planner and the scripted auditor queue.
+
+        The deterministic gate answers with an audit whenever the candidate is
+        not clean, so a run that reaches its gate needs an auditor script; the
+        default script lets the audit accept the candidate unchanged.
+        """
+
         self.planner = ScriptedChat(planner, name="planner", events=self.events)
-        self.reviewer = ScriptedChat(reviewer, name="reviewer", events=self.events)
-        return Orchestrator(config, planner_client=self.planner, reviewer_client=self.reviewer)
+        self.auditor = auditor if auditor is not None else [audit()]
+        self.workers.on(ExecutionRole.AUDITOR, *self.auditor)
+        return Orchestrator(config, planner_client=self.planner)
 
     def run_dir(self, run_id: str = "run") -> Path:
         return self.root / "runs" / run_id

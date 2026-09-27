@@ -22,7 +22,7 @@ from .models import RUN_CHECKPOINT_NAME, RunPhase
 # The schema this runtime writes and reads.  Another one is not corruption,
 # but it is not a phase authority either: the resume gate refuses it as
 # ``RUN_SCHEMA_UNSUPPORTED`` and a control read refuses to read a phase from it.
-CHECKPOINT_SCHEMA_VERSION = 4
+CHECKPOINT_SCHEMA_VERSION = 5
 
 CHECKPOINT_STATUSES = frozenset({"pending", "completed"})
 

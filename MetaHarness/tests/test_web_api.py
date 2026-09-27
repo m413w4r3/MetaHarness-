@@ -44,7 +44,7 @@ FIXTURE_STATES = {
     "awaiting_plan_approval": RunMachineState(RunPhase.PLAN_APPROVAL),
     "implementing": RunMachineState(RunPhase.IMPLEMENT_STEP),
     "validating": RunMachineState(RunPhase.DETERMINISTIC_GATE),
-    "reviewing": RunMachineState(RunPhase.FINAL_REVIEW),
+    "revising": RunMachineState(RunPhase.AUDIT),
     "waiting_external": RunMachineState(disposition=RunDisposition.WAIT_EXTERNAL, reason="AGENT_TIMEOUT"),
     "committed": RunMachineState(RunPhase.CANDIDATE_PUSH, RunDisposition.COMPLETED),
 }
@@ -60,7 +60,6 @@ class WebServerTests(unittest.TestCase):
         profiles = {
             "planner": ModelProfile("planner", "Planner", (ExecutionRole.PLANNER,), ProfileDriver.OPENAI_CHAT, "planner", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
             "implementer": ModelProfile("implementer", "Implementer", (ExecutionRole.IMPLEMENTER,), ProfileDriver.EXTERNAL, "worker", SelectionMode.CLI, argv=("true",)),
-            "reviewer": ModelProfile("reviewer", "Reviewer", (ExecutionRole.REVIEWER,), ProfileDriver.OPENAI_CHAT, "reviewer", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
             "auditor": ModelProfile("auditor", "Auditor", (ExecutionRole.AUDITOR,), ProfileDriver.EXTERNAL, "audit", SelectionMode.CLI, argv=("true",)),
         }
         self.config = HarnessConfig(
@@ -75,7 +74,6 @@ class WebServerTests(unittest.TestCase):
             runtime_environment={"API_KEY": "secret-test-value"},
             ui=UIConfig(
                 default_planner_profile="planner",
-                default_reviewer_profile="reviewer",
                 default_audit_profile="auditor",
             ),
             model_profiles=profiles,
@@ -168,9 +166,7 @@ class WebServerTests(unittest.TestCase):
             "max_steps_per_plan": self.config.planning.max_steps_per_plan,
         })
         self.assertEqual(payload["revision"], {
-            "enabled": self.config.revision.enabled,
-            "max_check_repair_attempts": self.config.revision.max_check_repair_attempts,
-            "max_correction_cycles": self.config.revision.max_correction_cycles,
+            "max_step_contract_repairs": self.config.revision.max_step_contract_repairs,
         })
         self.assertEqual(payload["ui"]["max_active_runs"], self.config.ui.max_active_runs)
         self.assertEqual(payload["checks"], [{"id": "lint", "description": "Repository lint gate."}])
@@ -225,24 +221,24 @@ class WebServerTests(unittest.TestCase):
 
     def test_artifact_endpoint_reads_allowlisted_files_with_a_bound(self) -> None:
         run_dir = self.create_run("r1")
-        (run_dir / "reviewer.raw.md").write_text("review text", encoding="utf-8")
+        (run_dir / "agent.final.md").write_text("review text", encoding="utf-8")
         (run_dir / "trace").mkdir()
         (run_dir / "trace" / "events.v1.jsonl").write_text(
             "event one\nevent two\n", encoding="utf-8"
         )
 
         status, payload, _ = self.request(
-            "GET", "/api/v1/runs/r1/artifact?name=reviewer.raw.md"
+            "GET", "/api/v1/runs/r1/artifact?name=agent.final.md"
         )
         self.assertEqual(status, 200)
-        self.assertEqual(payload["name"], "reviewer.raw.md")
+        self.assertEqual(payload["name"], "agent.final.md")
         self.assertTrue(payload["exists"])
         self.assertEqual(payload["content"], "review text")
         self.assertFalse(payload["truncated"])
         self.assertEqual(payload["size"], len("review text"))
 
         status, missing, _ = self.request(
-            "GET", "/api/v1/runs/r1/artifact?name=review.json"
+            "GET", "/api/v1/runs/r1/artifact?name=steps/S01/step.json"
         )
         self.assertEqual(status, 200)
         self.assertFalse(missing["exists"])
@@ -600,21 +596,18 @@ class WebServerTests(unittest.TestCase):
             "run_id",
             "status",
             "updated_at",
+            "status",
             "state",
-            "plan",
-            "checks",
-            "review",
-            "reviewer_raw",
-            "reviewer_raw_available",
+            "cycle",
             "failure",
-            "commit_sha",
+            "resumable",
+            "pipeline",
+            "token_totals",
+            "progress_events",
         ):
             self.assertIn(key, payload)
         for key in ("status", "base_sha", "branch", "worktree", "commit_sha", "failure"):
             self.assertIn(key, payload["state"])
-        self.assertIn("raw", payload["plan"])
-        self.assertIn("contract", payload["plan"])
-        self.assertEqual(payload["status"], payload["state"]["status"])
 
     def test_run_page_observes_transitions_without_manual_reload(self) -> None:
         run_dir = self.runs / "live"
@@ -636,30 +629,22 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(payload["status"], "implementing")
         self.assertEqual(payload["state"]["worktree"], "/tmp/wt live")
 
-        checks = [{"name": "unit", "exit_code": 0, "timed_out": False, "stdout_tail": "<b>ok</b>"}]
-        gate = run_dir / "cycles/001/checks/post-implementation"
-        gate.mkdir(parents=True)
-        (gate / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
         store.set_run_state(RunMachineState(RunPhase.DETERMINISTIC_GATE))
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assert_poll_shape(payload)
         self.assertEqual(payload["status"], "validating")
-        self.assertEqual(payload["checks"], checks)
-        self.assertFalse(payload["reviewer_raw_available"])
 
-        review = run_dir / "cycles/001/review"
-        review.mkdir(parents=True)
-        (review / "review.json").write_text(
-            json.dumps({"verdict": "PASS", "route": "NONE", "summary": "ok"}), encoding="utf-8"
+        # The audit authority answers the gate; the attempted audit is visible
+        # as the reviewing status of the same gate phase.
+        audit_attempt = run_dir / "cycles/001/audit/001"
+        audit_attempt.mkdir(parents=True)
+        (audit_attempt / "report.json").write_text(
+            json.dumps({"status": "DONE", "summary": "ok"}), encoding="utf-8"
         )
-        (review / "reviewer.raw.md").write_text("VERDICT: PASS\n", encoding="utf-8")
-        store.set_run_state(RunMachineState(RunPhase.FINAL_REVIEW))
+        store.set_run_state(RunMachineState(RunPhase.AUDIT))
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assert_poll_shape(payload)
-        self.assertEqual(payload["status"], "reviewing")
-        self.assertEqual(payload["review"]["verdict"], "PASS")
-        self.assertTrue(payload["reviewer_raw_available"])
-        self.assertEqual(payload["reviewer_raw"], "VERDICT: PASS\n")
+        self.assertEqual(payload["status"], "revising")
 
         store.set_run_state(
             RunMachineState(RunPhase.CANDIDATE_PUSH, RunDisposition.COMPLETED),

@@ -524,20 +524,27 @@ def _model_profiles(
     return result
 
 
+# The historical per-role defaults of the removed post-implementation
+# pipeline.  They are refused by name: C7 keeps one planner default, one audit
+# default and the three execution-class routes.
+_REMOVED_UI_DEFAULTS = (
+    "default_implementer_profile", "default_reviewer_profile",
+    "default_reviser_profile", "default_repair_profile",
+)
+
+
 def _routing(data: Mapping[str, Any], profiles: Mapping[str, ModelProfile]) -> RoutingConfig:
+    ui_data = _table(data, "ui")
+    for removed in _REMOVED_UI_DEFAULTS:
+        if removed in ui_data:
+            raise ConfigError(
+                f"ui.{removed} was removed; configure [routing] and the current ui defaults"
+            )
     raw = data.get("routing")
     if raw is None:
-        # Without a [routing] table, every execution class routes to the ui
-        # implementer default.
-        ui_default = _table(data, "ui").get("default_implementer_profile")
-        if isinstance(ui_default, str) and ui_default.strip():
-            raw = {
-                "mechanical_profile": ui_default,
-                "reasoning_profile": ui_default,
-                "agentic_profile": ui_default,
-            }
-        else:
-            raise ConfigError("ui.default_implementer_profile is required")
+        # The three execution classes are routed by one explicit table; the
+        # historical ui default is never converted into a routing policy.
+        raise ConfigError("routing is required")
     if not isinstance(raw, dict):
         raise ConfigError("routing must be a table")
     values = {
@@ -589,33 +596,6 @@ def _check_default(
             f"default profile {value!r} is incompatible with {role.value}"
         )
     return value
-
-
-def _validate_revision(
-    revision: RevisionConfig,
-    planning: PlanningConfig,
-    ui: UIConfig,
-    profiles: Mapping[str, ModelProfile],
-) -> None:
-    """Validate role/profile presence without coupling roles to drivers."""
-    if (revision.enabled or revision.max_correction_cycles > 0) and planning.protocol != "v2":
-        raise ConfigError("revision corrections require planning.protocol = 'v2'")
-
-    if revision.max_check_repair_attempts > 0:
-        value = ui.default_repair_profile
-        if not isinstance(value, str) or not value.strip():
-            raise ConfigError("revision check-repair budget requires ui.default_repair_profile")
-        repair = profiles.get(value)
-        if repair is None or ExecutionRole.REPAIR not in repair.roles:
-            raise ConfigError("revision check-repair profile must resolve for repair")
-
-    if revision.enabled or revision.max_correction_cycles > 0:
-        value = ui.default_reviser_profile
-        if not isinstance(value, str) or not value.strip():
-            raise ConfigError("revision correction budget requires ui.default_reviser_profile")
-        reviser = profiles.get(value)
-        if reviser is None or ExecutionRole.REVISER not in reviser.roles:
-            raise ConfigError("revision semantic reviser profile must resolve for reviser")
 
 
 def _checks(value: Any, *, catalogue: bool = False) -> tuple[CheckConfig, ...]:
@@ -808,32 +788,17 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     )
 
     revision_data = _table(expanded, "revision")
-    allowed_revision = {
-        "enabled", "max_correction_cycles", "max_check_repair_attempts",
-        "max_step_contract_repairs",
-    }
+    allowed_revision = {"max_step_contract_repairs"}
     unknown_revision = sorted(set(revision_data) - allowed_revision)
     if unknown_revision:
         raise ConfigError(f"revision.{unknown_revision[0]} is not allowed")
-    revision_enabled = _bool(revision_data, "enabled", False, "revision")
-    correction_budget = _revision_budget(
-        revision_data, "max_correction_cycles", 1, "revision"
-    )
-    check_budget = _revision_budget(
-        revision_data, "max_check_repair_attempts", 2, "revision"
-    )
     contract_budget = _revision_budget(
         revision_data, "max_step_contract_repairs", 2, "revision"
     )
     if not revision_data:
-        # A config with no [revision] section has no correction pipeline.
-        correction_budget = check_budget = contract_budget = 0
-    revision = RevisionConfig(
-        enabled=revision_enabled,
-        max_correction_cycles=correction_budget,
-        max_check_repair_attempts=check_budget,
-        max_step_contract_repairs=contract_budget,
-    )
+        # A config with no [revision] section spends no step contract repair.
+        contract_budget = 0
+    revision = RevisionConfig(max_step_contract_repairs=contract_budget)
 
     transport_data = _table(expanded, "transport")
     unknown_transport = sorted(set(transport_data) - {"max_wait_seconds"})
@@ -852,7 +817,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     recovery_data = _table(expanded, "recovery")
     recovery_fields = {
         "max_transient_attempts", "max_executor_fallbacks",
-        "max_check_infra_retries", "max_review_transport_retries",
+        "max_check_infra_retries",
         "max_workspace_setup_retries", "max_contract_repair_output_corrections",
         "max_contract_repair_planner_restarts",
     }
@@ -862,7 +827,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     fallback_data = recovery_data.get("execution_fallbacks", {})
     if not isinstance(fallback_data, dict):
         raise ConfigError("recovery.execution_fallbacks must be a table")
-    fallback_fields = {"mechanical", "reasoning", "agentic", "semantic_reviser", "check_repair"}
+    fallback_fields = {"mechanical", "reasoning", "agentic"}
     unknown_fallbacks = sorted(set(fallback_data) - fallback_fields)
     if unknown_fallbacks:
         raise ConfigError(f"recovery.execution_fallbacks.{unknown_fallbacks[0]} is not allowed")
@@ -892,15 +857,6 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         ),
         implementer_max_bytes=_positive_int(
             prompt_budget_data, "implementer_max_bytes", 120_000, "prompt_budget"
-        ),
-        check_repair_max_bytes=_positive_int(
-            prompt_budget_data, "check_repair_max_bytes", 40_000, "prompt_budget"
-        ),
-        semantic_revision_max_bytes=_positive_int(
-            prompt_budget_data, "semantic_revision_max_bytes", 120_000, "prompt_budget"
-        ),
-        final_review_max_bytes=_positive_int(
-            prompt_budget_data, "final_review_max_bytes", 120_000, "prompt_budget"
         ),
     )
 
@@ -1010,22 +966,12 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     planner_default = _check_default(
         model_profiles, ui_data.get("default_planner_profile"), ExecutionRole.PLANNER
     )
-    reviewer_default = _check_default(
-        model_profiles, ui_data.get("default_reviewer_profile"), ExecutionRole.REVIEWER
-    )
-    reviser_default = ui_data.get("default_reviser_profile")
-    if reviser_default is not None:
-        reviser_default = _check_default(model_profiles, reviser_default, ExecutionRole.REVISER)
-    repair_default = ui_data.get("default_repair_profile")
-    if repair_default is not None:
-        repair_default = _check_default(model_profiles, repair_default, ExecutionRole.REPAIR)
     audit_default = ui_data.get("default_audit_profile")
     if audit_default is not None:
         audit_default = _check_default(model_profiles, audit_default, ExecutionRole.AUDITOR)
-    # The default planner and reviewer are text endpoints; every selected
-    # profile is validated again against its role when a run is prepared.
+    # The default planner is a text endpoint; every selected profile is
+    # validated again against its role when a run is prepared.
     _profile_endpoint(model_profiles[planner_default])
-    _profile_endpoint(model_profiles[reviewer_default])
 
     context_data = _table(expanded, "context")
     context = ContextConfig(
@@ -1087,16 +1033,8 @@ def load_config(config_path: str | Path) -> HarnessConfig:
             maximum=4,
         ),
         default_planner_profile=planner_default,
-        default_reviewer_profile=reviewer_default,
-        default_reviser_profile=reviser_default,
-        default_repair_profile=repair_default,
         default_audit_profile=audit_default,
-        enable_profile_recommendation=_bool(
-            ui_data, "enable_profile_recommendation", True, "ui"
-        ),
     )
-
-    _validate_revision(revision, planning, ui, model_profiles)
 
     if "checks" in expanded:
         raise ConfigError("unsupported configuration key 'checks'; use [[check_catalog]]")

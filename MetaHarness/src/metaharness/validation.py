@@ -550,7 +550,7 @@ def run_check_preflights(
 
 
 def check_result_json(result: CheckResult, *, log_stem: str | None = None) -> dict[str, Any]:
-    """Serialize reviewer-safe check metadata; full logs remain in log files."""
+    """Serialize audit-safe check metadata; full logs remain in log files."""
 
     data = asdict(result)
     data.pop("stdout_log")

@@ -22,7 +22,7 @@ from ..result import RunResult, atomic_write_text
 from ..state import RunStateStore
 from ..trace import TraceStream
 from ..usage import normalize_usage, phase_usage_summary
-from .shared import AGENT_ARTIFACTS, REVISION_ARTIFACTS, json_text
+from .shared import AGENT_ARTIFACTS, json_text
 
 if TYPE_CHECKING:
     from .runtime import RunRuntime
@@ -30,9 +30,7 @@ if TYPE_CHECKING:
 _OUTPUT_DISCIPLINE_TARGETS = {
     ExecutionRole.PLANNER: "META PLAN v2 only",
     ExecutionRole.IMPLEMENTER: "<=8 lines; <=1200 characters",
-    ExecutionRole.REPAIR: "<=6 lines; <=800 characters",
-    ExecutionRole.REVISER: "<=10 lines; <=1500 characters",
-    ExecutionRole.REVIEWER: "META REVIEW v1; terse material findings only",
+    ExecutionRole.AUDITOR: "<=8 lines; <=1200 characters",
 }
 
 
@@ -144,20 +142,11 @@ class RunObservability:
                             return fallback
         name = {
             ExecutionRole.PLANNER: "planner",
-            ExecutionRole.REPAIR: "check_repair",
-            ExecutionRole.REVIEWER: "final_reviewer",
-            ExecutionRole.REVISER: "semantic_reviser",
+            ExecutionRole.AUDITOR: "audit",
         }.get(role)
         selected = getattr(selection, name, None) if name is not None else None
         if getattr(selected, "profile_id", None) == profile_id:
             return selected
-        fallback_name = {
-            ExecutionRole.REPAIR: "check_repair_fallbacks",
-            ExecutionRole.REVISER: "semantic_reviser_fallbacks",
-        }.get(role)
-        for fallback in getattr(selection, fallback_name, ()) if fallback_name else ():
-            if getattr(fallback, "profile_id", None) == profile_id:
-                return fallback
         return None
 
     def trace_session(
@@ -456,10 +445,6 @@ class RunObservability:
                 # possible.  A reporting failure must not alter the pipeline.
                 pass
         return result
-
-    def redact_revision_artifacts(self, artifact_dir: Path) -> None:
-        for name in REVISION_ARTIFACTS:
-            redact_file(artifact_dir / name, self.runtime.secrets)
 
     def redact_step_artifacts(self, step_dir: Path) -> None:
         for name in AGENT_ARTIFACTS:

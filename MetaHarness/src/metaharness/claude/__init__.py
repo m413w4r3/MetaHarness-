@@ -1,4 +1,4 @@
-"""Claude Code runtime integration for the MetaHarness reviser."""
+"""Claude Code runtime integration for the MetaHarness agent roles."""
 
 from .agent import (
     ClaudeAgentError,

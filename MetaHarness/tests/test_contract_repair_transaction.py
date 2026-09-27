@@ -14,7 +14,7 @@ from metaharness.orchestration.pipeline_v2 import PipelineFailure
 from metaharness.orchestration import contract_repair
 from metaharness.resume import resume_info
 from tests.pipeline.support import SPEC, STEP, repaired_step_contract
-from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
+from tests.pipeline_support import PipelineHarness, git, initial_plan, write
 
 OUTAGE = "LLM endpoint returned HTTP 503"
 REPAIR_ID = "contract-repair:cycle-001:S01:01"
@@ -45,16 +45,17 @@ class ContractRepairFixtures(PipelineHarness):
             if item.get("budget_key") == "contract_repairs"
         ]
 
-    def resume(self, planner: list, reviewer: list | None = None):
-        return self.orchestrator(
-            self.config(), planner=planner, reviewer=reviewer or ["unused"],
-        ).resume("run")
+    def resume(self, planner: list):
+        return self.orchestrator(self.config(), planner=planner).resume("run")
 
     def wait_on_outage(self) -> None:
         result = self.orchestrator(
-            self.config(), planner=[initial_plan(STEP), LLMError(OUTAGE)], reviewer=[review()],
+            self.config(), planner=[initial_plan(STEP), LLMError(OUTAGE)],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL, self.state().get("failure"))
+
+    def worker_calls(self) -> list:
+        return [call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER]
 
     def git_tree(self) -> str:
         return git(self.worktree(), "rev-parse", "HEAD^{tree}")
@@ -65,7 +66,7 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         self.wait_on_outage()
 
-        self.assertEqual(len(self.workers.calls), 1)
+        self.assertEqual(len(self.worker_calls()), 1)
         first_repair_requests = self.planner.requests[1:]
         self.assertEqual(len(first_repair_requests), 1)
         state = self.state()
@@ -82,11 +83,11 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
         self.assertEqual(self.semantic_records(), [])
         self.assertTrue(resume_info(self.run_dir(), state).resumable)
 
-        resumed = self.resume([repaired_step_contract()], [review()])
+        resumed = self.resume([repaired_step_contract()])
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # The original worker plus the post-repair worker only.
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(len(self.worker_calls()), 2)
         self.assertEqual(self.planner.requests, first_repair_requests)
         self.assertEqual(self.repair_slots(), ["01"])
         self.assertEqual(self.transaction()["status"], "completed")
@@ -104,17 +105,16 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
             # The process is interrupted after the paid answer became durable.
             interrupted = self.orchestrator(
                 self.config(), planner=[initial_plan(STEP), repaired_step_contract()],
-                reviewer=[review()],
-            ).run_text(SPEC, run_id="run")
+                ).run_text(SPEC, run_id="run")
         self.assertEqual(interrupted.status, RunStatus.INTERRUPTED)
         self.assertEqual(len(self.planner.requests), 2)
         self.assertEqual(self.transaction()["status"], "planner_response_durable")
 
-        resumed = self.resume(["provider must not be called"], [review()])
+        resumed = self.resume(["provider must not be called"])
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(self.planner.requests, [])
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(len(self.worker_calls()), 2)
         self.assertEqual(self.transaction()["status"], "completed")
         self.assertEqual(len(self.semantic_records()), 1)
 
@@ -124,17 +124,17 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
         for transport_attempt in (2, 3):
             waiting = self.resume([LLMError(OUTAGE)])
             self.assertEqual(waiting.status, RunStatus.WAITING_EXTERNAL)
-            self.assertEqual(len(self.workers.calls), 1)
+            self.assertEqual(len(self.worker_calls()), 1)
             self.assertEqual(self.repair_slots(), ["01"])
             transaction = self.transaction()
             self.assertEqual(transaction["repair_number"], 1)
             self.assertEqual(transaction["planner_transport_attempt"], transport_attempt)
             self.assertEqual(self.semantic_records(), [])
 
-        resumed = self.resume([repaired_step_contract()], [review()])
+        resumed = self.resume([repaired_step_contract()])
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(len(self.worker_calls()), 2)
         self.assertEqual(self.transaction()["planner_transport_attempt"], 4)
         self.assertEqual([item["operation_id"] for item in self.semantic_records()], [REPAIR_ID])
 
@@ -163,7 +163,7 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
             write("s03.txt", "three\n"), mismatch, write("feature.txt", "good\n"),
         )
         waiting = self.orchestrator(
-            self.config(), planner=[plan, LLMError(OUTAGE)], reviewer=[review()],
+            self.config(), planner=[plan, LLMError(OUTAGE)],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(waiting.status, RunStatus.WAITING_EXTERNAL)
         self.assertEqual((self.checkpoint()["phase"], self.checkpoint()["step_id"]), ("implement_step", "S04"))
@@ -192,8 +192,7 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
                     "STEP_ID: S04\nTITLE: Repair the final stage\nEXECUTION_CLASS: MECHANICAL\nDEPENDS_ON: S03",
                     1,
                 )],
-                reviewer=[review()],
-            ).resume("run")
+                ).resume("run")
         self.assertEqual(interrupted.status, RunStatus.INTERRUPTED)
         self.assertTrue(replayed)
         self.assertEqual([item["operation_id"] for item in self.semantic_records()], [S04_REPAIR_ID])
@@ -203,10 +202,10 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
         transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
         self.assertEqual(transaction["tree_sha"], self.git_tree())
 
-        resumed = self.resume(["planner must not be called"], [review()])
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        resumed = self.resume(["planner must not be called"])
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual([item["operation_id"] for item in self.semantic_records()], [S04_REPAIR_ID])
-        self.assertEqual(len(self.workers.calls), 5)
+        self.assertEqual(len(self.worker_calls()), 5)
 
     def test_two_genuine_repairs_fit_the_budget_and_transport_is_not_counted(self) -> None:
         self.workers.on(
@@ -215,13 +214,13 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
         self.wait_on_outage()
         waiting = self.resume([repaired_step_contract(), LLMError(OUTAGE)])
         self.assertEqual(waiting.status, RunStatus.WAITING_EXTERNAL)
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(len(self.worker_calls()), 2)
         self.assertEqual(self.repair_slots(), ["01", "02"])
 
-        resumed = self.resume([repaired_step_contract()], [review()])
+        resumed = self.resume([repaired_step_contract()])
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(len(self.workers.calls), 3)
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(len(self.worker_calls()), 3)
         self.assertEqual(self.repair_slots(), ["01", "02"])
         self.assertEqual(
             [item["operation_id"] for item in self.semantic_records()],
@@ -232,14 +231,14 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, mismatch, mismatch)
         result = self.orchestrator(
             self.config(max_step_contract_repairs=2),
-            planner=[initial_plan(STEP), repaired_step_contract()], reviewer=["unused"],
+            planner=[initial_plan(STEP), repaired_step_contract()],
         ).run_text(SPEC, run_id="run")
 
         # The spent step is settled; the run never waits for a human.
         self.assertNotIn(result.status, {RunStatus.WAITING_HUMAN, RunStatus.FAILED})
         record = json.loads((self.step_dir() / "step.json").read_text())
         self.assertEqual((record["status"], record["reason"]), ("FAILED_CONTINUED", "AGENT_CONTRACT_MISMATCH"))
-        self.assertEqual(len(self.workers.calls), 3)
+        self.assertEqual(len(self.worker_calls()), 3)
         self.assertEqual(len(self.planner.requests), 3)
         self.assertEqual(self.repair_slots(), ["01", "02"])
         self.assertEqual(len(self.semantic_records()), 2)
@@ -252,9 +251,9 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
 
         result = self.resume([repaired_step_contract()])
 
-        self.assertNotIn(result.status, {RunStatus.COMMITTED, RunStatus.WAITING_EXTERNAL})
+        self.assertNotIn(result.status, {RunStatus.PUBLISHED, RunStatus.WAITING_EXTERNAL})
         self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-        self.assertEqual(len(self.workers.calls), 1)
+        self.assertEqual(len(self.worker_calls()), 1)
         self.assertEqual(self.planner.requests, [])
         self.assertTrue((slot / "request.meta.json").is_file())
 
@@ -272,8 +271,8 @@ class ContractRepairTransactionTests(ContractRepairFixtures):
         result = self.resume([repaired_step_contract()])
 
         self.assertEqual(self.state()["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
-        self.assertNotEqual(result.status, RunStatus.COMMITTED)
-        self.assertEqual(len(self.workers.calls), 1)
+        self.assertNotEqual(result.status, RunStatus.PUBLISHED)
+        self.assertEqual(len(self.worker_calls()), 1)
         self.assertEqual(self.planner.requests, [])
 
 
@@ -291,7 +290,7 @@ class WaitingDiagnosticsTests(PipelineHarness):
     def test_waiting_external_writes_fresh_diagnostics(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch)
         result = self.orchestrator(
-            self.config(), planner=[initial_plan(STEP), LLMError(OUTAGE)], reviewer=["unused"],
+            self.config(), planner=[initial_plan(STEP), LLMError(OUTAGE)],
         ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assert_fresh(RunStatus.WAITING_EXTERNAL, "LLM_FAILURE")
@@ -305,7 +304,7 @@ class WaitingDiagnosticsTests(PipelineHarness):
             side_effect=PipelineFailure("CHECK_INFRASTRUCTURE_UNAVAILABLE", "diagnostic"),
         ):
             result = self.orchestrator(
-                self.config(), planner=[initial_plan(STEP)], reviewer=["unused"],
+                self.config(), planner=[initial_plan(STEP)],
             ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         self.assert_fresh(RunStatus.WAITING_EXTERNAL, "CHECK_INFRASTRUCTURE_UNAVAILABLE")
@@ -317,7 +316,7 @@ class WaitingDiagnosticsTests(PipelineHarness):
             side_effect=GitError("simulated network outage"),
         ):
             result = self.orchestrator(
-                self.config(publish=True), planner=[initial_plan(STEP)], reviewer=[review()],
+                self.config(publish=True), planner=[initial_plan(STEP)],
             ).run_text(SPEC, run_id="run")
         self.assertEqual(result.status, RunStatus.WAITING_REMOTE)
         self.assert_fresh(RunStatus.WAITING_REMOTE, None)
@@ -331,11 +330,11 @@ class WaitingDiagnosticsTests(PipelineHarness):
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(), planner=[initial_plan(STEP), expanded], reviewer=[review()],
+            self.config(), planner=[initial_plan(STEP), expanded],
         ).run_text(SPEC, run_id="run")
 
         # A repaired WRITE_SET is a signal for the audit, never an operator gate.
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         transaction = json.loads((
             self.run_dir() / "cycles/001/implementation/steps/S01/contract_repairs/01/transaction.json"
         ).read_text(encoding="utf-8"))
@@ -348,7 +347,7 @@ class WaitingDiagnosticsTests(PipelineHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch)
         config = self.config()
         self.orchestrator(
-            config, planner=[initial_plan(STEP), LLMError(OUTAGE)], reviewer=["unused"],
+            config, planner=[initial_plan(STEP), LLMError(OUTAGE)],
         ).run_text(SPEC, run_id="run")
         stale = "# stale report\n"
         (self.run_dir() / "diagnostics.md").write_text(stale, encoding="utf-8")

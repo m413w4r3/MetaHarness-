@@ -5,7 +5,7 @@ the candidate is frozen as ``step_candidate.json``, the checkpoint moves to
 ``STEP_ACCEPTANCE``, and only then does the commit gate run, with the very
 :class:`~metaharness.orchestration.step_authority.EffectiveStepAuthority` the
 worker executed under.  ``resume_step_acceptance`` re-derives every proof of an
-interrupted acceptance instead of replaying a worker, a planner or a reviewer.
+interrupted acceptance instead of replaying a worker, a planner or an audit.
 """
 
 from __future__ import annotations
@@ -123,7 +123,6 @@ class StepAcceptanceService:
                 ctx.run_dir, ResumePhase.STEP_ACCEPTANCE,
                 head=parent_sha, tree=outcome.tree_after, cycle=cycle_plan.cycle.number,
                 step_id=authority.step_id,
-                correction_bundle_sha256=cycle_plan.correction_bundle_sha256,
             )
             accept(verification=verification)
         except (CommitSafetyError, GitError) as exc:
@@ -133,7 +132,7 @@ class StepAcceptanceService:
     ) -> None:
         """Accept the durable worker candidate of a ``STEP_ACCEPTANCE`` checkpoint.
 
-        No worker, planner or reviewer is called.  Every proof is re-derived:
+        No worker, planner or audit is called.  Every proof is re-derived:
         the checkpoint, the self-hashed candidate, the step record and report,
         the effective authority (from its artifacts, never from state.json),
         and the exact Git boundary.  Then the normal commit gate runs.

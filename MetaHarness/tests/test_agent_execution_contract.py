@@ -105,8 +105,8 @@ class AgentExecutionContractTests(unittest.TestCase):
             claude_home=self.root / "claude-home",
         )
         codex = CodexExecutor(profile(ProfileDriver.CODEX, ExecutionRole.IMPLEMENTER), runtime, agent=_CodexDouble())
-        claude_profile = profile(ProfileDriver.CLAUDE_CODE, ExecutionRole.REVISER)
-        claude_request = replace(self.request, role=ExecutionRole.REVISER, profile_id=claude_profile.id)
+        claude_profile = profile(ProfileDriver.CLAUDE_CODE, ExecutionRole.AUDITOR)
+        claude_request = replace(self.request, role=ExecutionRole.AUDITOR, profile_id=claude_profile.id)
         claude = ClaudeCodeExecutor(claude_profile, runtime, agent=_ClaudeDouble())
         self.assertIsInstance(codex, AgentExecutor)
         self.assertIsInstance(claude, AgentExecutor)
@@ -116,7 +116,7 @@ class AgentExecutionContractTests(unittest.TestCase):
     def test_resolver_selects_driver_adapter_without_orchestrator_branching(self) -> None:
         runtime = ExecutorRuntimeConfig(environment={}, claude_home=self.root / "claude-home")
         codex = executor_for_profile(profile(ProfileDriver.CODEX, ExecutionRole.IMPLEMENTER), runtime, agent=_CodexDouble())
-        claude = executor_for_profile(profile(ProfileDriver.CLAUDE_CODE, ExecutionRole.REVISER), runtime, reviser=_ClaudeDouble())
+        claude = executor_for_profile(profile(ProfileDriver.CLAUDE_CODE, ExecutionRole.AUDITOR), runtime, agent=_ClaudeDouble())
         self.assertIsInstance(codex, CodexExecutor)
         self.assertIsInstance(claude, ClaudeCodeExecutor)
 

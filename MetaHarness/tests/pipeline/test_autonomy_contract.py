@@ -1,8 +1,9 @@
 """The autonomy contract of a red deterministic gate, proven on the real pipeline.
 
-The pure v4 policy is proven in ``tests/test_recovery_policy.py`` and
-``tests/test_recovery_matrix.py``; this module proves the durable route: a red
-gate consumes its ladder without any human wait.
+The pure v4 policy is proven in ``tests/test_recovery_policy.py``; this module
+proves the durable route: a red gate hands the evidence to the writable audit,
+which repairs the tree, and the run reaches its publication without any human
+wait.
 """
 
 from __future__ import annotations
@@ -15,15 +16,14 @@ from tests.pipeline.support import (
     SPEC,
     STEP,
     PipelineHarness,
+    audit_report,
     initial_plan,
-    ladder_strategies,
-    review,
     write,
 )
 
 
 class CorrectnessRouteIsAutonomousTests(PipelineHarness):
-    """The durable route: a red gate consumes its ladder before any human wait."""
+    """The durable route: a red gate is repaired by the audit authority."""
 
     def test_a_red_gate_is_repaired_autonomously_without_a_human_wait(self) -> None:
         counter = self.root / "gate-count"
@@ -37,17 +37,20 @@ class CorrectnessRouteIsAutonomousTests(PipelineHarness):
             encoding="utf-8",
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
-        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
+
+        def repair(request):
+            (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
+            return audit_report("DONE")
 
         result = self.orchestrator(
-            self.config(check_repair=1), planner=[initial_plan(STEP)], reviewer=[review()],
+            self.config(), planner=[initial_plan(STEP)], auditor=[repair],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertGreaterEqual(int(counter.read_text()), 2, "the gate was never red")
         self.assertEqual(
-            ladder_strategies(self), ["repair_targeted"],
-            "the red gate consumed its autonomous rung before anything else",
+            self.workers.roles(), ["implementer", "auditor"],
+            "the red gate consumed its autonomous repair before anything else",
         )
         self.assertEqual(
             human_terminals(self), [],

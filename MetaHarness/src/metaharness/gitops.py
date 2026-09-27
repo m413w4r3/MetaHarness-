@@ -756,8 +756,8 @@ def staged_diff(worktree: Path) -> str:
     """Return the complete staged diff, independent of user diff settings.
 
     External diff drivers, textconv filters and colors are disabled so the
-    reviewer sees the raw content change.  Undecodable bytes are replaced in
-    this review text only; the staged tree SHA stays the commit identity.
+    audit sees the raw content change.  Undecodable bytes are replaced in this
+    diff text only; the staged tree SHA stays the commit identity.
     """
 
     return _git(
@@ -838,7 +838,7 @@ def candidate_tree_sha(worktree: Path) -> str:
 
     A copy of the worktree index is updated through ``GIT_INDEX_FILE``.  The
     result covers tracked changes, deletions, mode changes and untracked
-    non-ignored files, i.e. exactly the candidate submitted for review.
+    non-ignored files, i.e. exactly the candidate submitted to the gate and audit.
     """
 
     index_path = Path(
@@ -1189,45 +1189,6 @@ def commit_step_tree(
         subject=f"metaharness({step_id}): {step_title}"[:72],
         body=body,
         reflog_message=f"metaharness: accept step {step_id}",
-    )
-
-
-def commit_repair_tree(
-    worktree: Path,
-    *,
-    tree_sha: str,
-    parent_sha: str,
-    cycle: int,
-    body: str = "",
-) -> str:
-    """Commit a green check-repair tree; red attempts never call this."""
-
-    return commit_tree(
-        worktree,
-        tree_sha=tree_sha,
-        parent_sha=parent_sha,
-        subject=f"metaharness(check-repair): cycle {cycle}"[:72],
-        body=body,
-        reflog_message=f"metaharness: accept check-repair cycle {cycle}",
-    )
-
-
-def commit_revision_tree(
-    worktree: Path,
-    *,
-    tree_sha: str,
-    parent_sha: str,
-    body: str = "",
-) -> str:
-    """Commit a semantic revision only after deterministic checks pass."""
-
-    return commit_tree(
-        worktree,
-        tree_sha=tree_sha,
-        parent_sha=parent_sha,
-        subject="metaharness(semantic-revision): accepted",
-        body=body,
-        reflog_message="metaharness: accept semantic revision",
     )
 
 

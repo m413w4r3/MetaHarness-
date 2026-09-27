@@ -10,20 +10,16 @@ refuses a tampered artifact instead of returning a partial value.
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
-import json
 
 from pathlib import Path
 from typing import Any, Sequence
-from .check_failure import hard_failure_items
 from .pipeline_v2 import (
     candidate_dir,
     gate_dir,
     step_dir,
 )
 from .shared import (
-    MAX_AGENT_REPORT_BYTES,
     PLANNER_CONVERSATION,
     GateMutableAuthority,
     bounded_v2_report,
@@ -36,52 +32,8 @@ from ..models import GateStage
 from ..evidence import EvidenceBundle
 from ..gitops import RepositoryReference
 from ..resume import ResumeIntegrityError
-from ..review import (
-    ReviewParseError,
-    ReviewResult,
-    parse_review,
-)
-from ..usage import (
-    normalize_usage,
-    read_usage_artifact,
-)
+from ..usage import normalize_usage
 from ..llm.chat import LLMConversationHandle
-
-
-@dataclasses.dataclass(frozen=True)
-class _PersistedRevision:
-    """A completed revision or check-repair pass read back from its artifacts."""
-
-    final_message: str
-    usage: dict[str, int]
-    tree_before: str
-    tree_after: str
-    exit_code: int = 0
-    timed_out: bool = False
-    stderr_tail: str = ""
-
-
-def reusable_pre_checks(artifact_dir: Path, tree: str) -> dict[str, Any] | None:
-    """Durable pre-revision evidence frozen for exactly *tree*, if any."""
-
-    payload = read_json_artifact(artifact_dir / "pre_checks.json")
-    if not isinstance(payload, dict) or payload.get("staged_tree_sha") != tree:
-        return None
-    failures = payload.get("failures")
-    if not isinstance(failures, list) or any(not isinstance(item, str) for item in failures):
-        return None
-    if hard_failure_items(failures):
-        return None
-    evidence = read_json_artifact(artifact_dir / "evidence.json")
-    if not isinstance(evidence, dict) or evidence.get("staged_tree_sha") != tree:
-        return None
-    try:
-        # Keep the durable evidence existence check, but never return its
-        # contents to a worker prompt.
-        (artifact_dir / "diff.patch").read_bytes()
-    except OSError:
-        return None
-    return payload
 
 
 def load_evidence(directory: Path) -> EvidenceBundle | None:
@@ -122,39 +74,6 @@ def load_evidence(directory: Path) -> EvidenceBundle | None:
             item for item in payload.get("baseline_cleared", []) if isinstance(item, str)
         ),
     )
-
-
-def accepted_review(
-    directory: Path, evidence: EvidenceBundle, candidate_sha: str | None = None,
-) -> ReviewResult | None:
-    """A reviewer answer already accepted for exactly this candidate tree."""
-
-    if not (directory / "review.json").is_file():
-        return None
-    try:
-        request = (directory / "reviewer.request.txt").read_text(encoding="utf-8")
-        raw = (directory / "reviewer.raw.md").read_text(encoding="utf-8")
-        persisted = json.loads((directory / "review.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError):
-        return None
-    except json.JSONDecodeError:
-        return None
-    # The request is the exact evidence the answer was given: it must name
-    # both the reviewed tree and the immutable candidate commit.
-    if evidence.staged_tree_sha not in request:
-        return None
-    if candidate_sha is not None and candidate_sha not in request:
-        return None
-    try:
-        review = parse_review(raw, deterministic_passed=evidence.deterministic_passed)
-    except ReviewParseError:
-        return None
-    normalized = dataclasses.asdict(review)
-    normalized["verdict"] = review.verdict.value
-    normalized["route"] = review.route.value
-    if persisted != normalized:
-        return None
-    return review
 
 
 def load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
@@ -240,19 +159,6 @@ def completed_step_records(
     return records
 
 
-def load_revision(directory: Path) -> _PersistedRevision | None:
-    report = read_json_artifact(directory / "report.json", 1024 * 1024)
-    if not isinstance(report, dict) or report.get("status") not in {"COMPLETED", "NO_CHANGE"}:
-        return None
-    if not is_object_id(report.get("tree_before")) or not is_object_id(report.get("tree_after")):
-        return None
-    final = read_bounded_text(directory / "agent.final.md", MAX_AGENT_REPORT_BYTES * 2)
-    if not final and isinstance(report.get("final"), str):
-        final = report["final"]
-    usage = read_usage_artifact(directory / "usage.json") or normalize_usage(report.get("usage"))
-    return _PersistedRevision(final, usage, report["tree_before"], report["tree_after"])
-
-
 def read_candidate_record(run_dir: Path, number: int) -> dict[str, Any]:
     """One cycle's immutable candidate commit record."""
 
@@ -325,8 +231,8 @@ def gate_mutable_authority(
 
 __all__ = [
     "CYCLE_SCOPE_SOURCE", "FAILED_CONTINUED", "SKIPPED_DEPENDENCY",
-    "accepted_review", "candidate_evidence", "completed_step_records",
-    "gate_mutable_authority", "load_completed_step", "load_evidence", "load_revision",
+    "candidate_evidence", "completed_step_records",
+    "gate_mutable_authority", "load_completed_step", "load_evidence",
     "mutable_scope_sha256", "settled_step_status", "read_candidate_record",
-    "read_planner_conversation", "read_repository_reference", "reusable_pre_checks",
+    "read_planner_conversation", "read_repository_reference",
 ]

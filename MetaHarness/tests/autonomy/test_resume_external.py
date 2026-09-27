@@ -21,7 +21,12 @@ from metaharness.planning.protocol import PlanParseError
 from metaharness.resume import resume_info
 
 from tests.autonomy.support import SPEC, AutonomyHarness, Step, meta_plan
-from tests.pipeline_support import ScriptedChat, review, write
+from tests.pipeline_support import ScriptedChat, write
+
+AUDIT_DONE = (
+    "META AUDIT v1\n\nSTATUS\nDONE\n\nFIXED\n- none\n\n"
+    "REFACTORED\n- none\n\nREMAINING\n- none\n\nRISKS\n- none\nEND META AUDIT\n"
+)
 
 
 class PlannerTransportExhaustionTests(AutonomyHarness):
@@ -34,15 +39,15 @@ class PlannerTransportExhaustionTests(AutonomyHarness):
 
     def test_planner_transport_exhaustion_is_resumable(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
         planner = ScriptedChat(
             [LLMTransportExhaustedError("LLM transport horizon exhausted"), self.plan()],
             name="planner",
         )
-        reviewer = ScriptedChat([review()], name="reviewer")
         config = self.config()
 
         failed = Orchestrator(
-            config, planner_client=planner, reviewer_client=reviewer,
+            config, planner_client=planner,
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
@@ -55,10 +60,10 @@ class PlannerTransportExhaustionTests(AutonomyHarness):
         self.assertEqual(len(planner.requests), 1)
 
         resumed = Orchestrator(
-            config, planner_client=planner, reviewer_client=reviewer,
+            config, planner_client=planner,
         ).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # The exhausted call bought nothing durable: the resume pays for one
         # fresh planner answer and the pipeline continues past the planner.
         self.assertEqual(len(planner.requests), 2)
@@ -100,18 +105,17 @@ class AutoResumeCommandTests(AutonomyHarness):
         self.spec_path = self.root / "spec.txt"
         self.spec_path.write_text(SPEC, encoding="utf-8")
 
-    def scripted_clients(self, planner: ScriptedChat, reviewer: ScriptedChat) -> Any:
+    def scripted_clients(self, planner: ScriptedChat) -> Any:
         """Replace the production chat client with the scripted double.
 
         The replacement keeps the constructor surface ``chat_client`` probes,
-        so every profile builds the scripted client instead of a real socket.
+        so the planner profile builds the scripted client instead of a real
+        socket.
         """
 
         def factory(endpoint, environment=None, on_transport=None):
             if endpoint.model == "fake-planner":
                 return planner
-            if endpoint.model == "fake-reviewer":
-                return reviewer
             raise AssertionError(f"unexpected chat profile: {endpoint.model}")
 
         return mock.patch(
@@ -119,7 +123,7 @@ class AutoResumeCommandTests(AutonomyHarness):
         )
 
     def run_with_auto_resume(
-        self, planner: ScriptedChat, reviewer: ScriptedChat, *,
+        self, planner: ScriptedChat, *,
         interval: str = "0.01", run_id: str = "run",
     ) -> tuple[int, list[float]]:
         clock = _CliClock()
@@ -129,33 +133,35 @@ class AutoResumeCommandTests(AutonomyHarness):
         ]
         with (
             mock.patch("metaharness.cli.time", clock),
-            self.scripted_clients(planner, reviewer),
+            self.scripted_clients(planner),
         ):
             code = cli_main(argv)
         return code, clock.sleeps
 
     def test_auto_resume_retries_wait_external_run(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
         planner = ScriptedChat(
             [LLMTransportExhaustedError("LLM transport horizon exhausted"), self.plan()],
             name="planner",
         )
         self.config()
 
-        code, sleeps = self.run_with_auto_resume(planner, ScriptedChat([review()]))
+        code, sleeps = self.run_with_auto_resume(planner)
 
         self.assertEqual(code, 0, self.state().get("failure"))
-        self.assertEqual(self.state()["status"], RunStatus.COMMITTED.value)
+        self.assertEqual(self.state()["status"], RunStatus.PUBLISHED.value)
         self.assertEqual(sleeps, [0.01])
         # One exhausted attempt, then the resumed attempt that planned the run.
         self.assertEqual(len(planner.requests), 2)
 
     def test_auto_resume_stops_when_run_is_not_wait_external(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
         planner = ScriptedChat([self.plan()], name="planner")
         self.config()
 
-        code, sleeps = self.run_with_auto_resume(planner, ScriptedChat([review()]))
+        code, sleeps = self.run_with_auto_resume(planner)
 
         self.assertEqual(code, 0, self.state().get("failure"))
         # A run that never waits externally is never slept on, never resumed.
@@ -164,15 +170,16 @@ class AutoResumeCommandTests(AutonomyHarness):
 
     def test_planner_invalid_output_is_fixable_not_human(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
         planner = ScriptedChat([PlanParseError("not a plan"), self.plan()], name="planner")
         self.config()
 
-        code, sleeps = self.run_with_auto_resume(planner, ScriptedChat([review()]))
+        code, sleeps = self.run_with_auto_resume(planner)
 
         # An invalid planner answer is an ordinary model error: the run is
         # never handed to an operator, it is resumed and planned again.
         self.assertEqual(code, 0, self.state().get("failure"))
-        self.assertEqual(self.state()["status"], RunStatus.COMMITTED.value)
+        self.assertEqual(self.state()["status"], RunStatus.PUBLISHED.value)
         self.assertEqual(sleeps, [0.01])
         self.assertEqual(len(planner.requests), 2)
 

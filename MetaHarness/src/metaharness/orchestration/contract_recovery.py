@@ -58,6 +58,7 @@ from ..redaction import redact
 from ..recovery_policy import FailureClass, RecoveryDecision, RecoveryStrategy
 from ..repository_topology import RepositoryTopology
 from ..result import atomic_write_text
+from ..scope import ScopeViolation
 from ..state import RunStateStore
 from . import contract_repair
 from .contract_repair import ContractRepairIntegrityError

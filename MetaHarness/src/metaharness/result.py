@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 from dataclasses import dataclass
@@ -86,38 +85,4 @@ def atomic_write_text(path: str | Path, content: str) -> None:
                 pass
 
 
-def write_repair_task(run_dir: str | Path, *, fields: dict[str, Any]) -> None:
-    """Persist the single explicit repair task requested by a REVISE review."""
-
-    directory = Path(run_dir).expanduser().resolve()
-    markdown = "\n".join(
-        [
-            "# MetaHarness repair task",
-            "",
-            f"Route: {fields['route']}",
-            f"Run ID: {fields['run_id']}",
-            f"Existing branch: {fields['existing_branch']}",
-            f"Existing worktree: {fields['existing_worktree']}",
-            "",
-            "## Review summary",
-            str(fields["review_summary"]),
-            "",
-            "## Findings",
-            str(fields["findings"]),
-            "",
-            "## Required fixes",
-            str(fields["required_fixes"]),
-            "",
-            "## Missing tests",
-            str(fields["missing_tests"]),
-            "",
-        ]
-    )
-    atomic_write_text(directory / "repair_task.md", markdown)
-    atomic_write_text(
-        directory / "repair_task.json",
-        json.dumps(fields, ensure_ascii=False, indent=2) + "\n",
-    )
-
-
-__all__ = ["ResultArtifactError", "RunResult", "atomic_write_text", "write_repair_task"]
+__all__ = ["ResultArtifactError", "RunResult", "atomic_write_text"]

@@ -56,7 +56,7 @@ from metaharness.plan_repository_validation import (
 from metaharness.planning.normalization import normalizations_payload, plan_contradictions
 from metaharness.planning.planner import PlannerV2
 from metaharness.usage import phase_usage_summary
-from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
+from tests.pipeline_support import PipelineHarness, git, initial_plan, write
 
 X = "pkg/x.py"
 AW010_PATH = "backend/src/cti_app/domain/reference_corpus.py"
@@ -491,15 +491,15 @@ class PlannerNormalizationTests(PipelineHarness):
 
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(), planner=[self.reference_corpus_plan()], reviewer=[review()],
+            self.config(), planner=[self.reference_corpus_plan()],
         ).run_text("Make feature.txt good.\n", run_id="run")
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         run_dir = self.run_dir()
         # One answer, no correction: the harness owns the deterministic fix.
         self.assertEqual(len(self.planner.requests), 1)
         self.assertEqual(self.trace_names().count("plan.completed"), 1)
-        self.assertEqual(self.workers.roles(), ["implementer"])
+        self.assertEqual(self.workers.roles(), ["implementer", "auditor"])
         contract = (run_dir / "steps/S01/contract.md").read_text(encoding="utf-8")
         self.assertIn(f"- {AW010_PATH}", contract.split("WRITE SET", 1)[1].split("CREATE SET", 1)[0])
         created = contract.split("CREATE SET", 1)[1].split("DELETE SET", 1)[0]
@@ -519,7 +519,6 @@ class PlannerNormalizationTests(PipelineHarness):
         result = self.orchestrator(
             replace(self.config(), planning=replace(self.config().planning, max_preapproval_corrections=1)),
             planner=[impossible_plan_message(), impossible_plan_message()],
-            reviewer=[review()],
         ).run_text("Make feature.txt good.\n", run_id="run")
 
         # An impossible plan is a fixable planner error: resumable, not human.
@@ -543,7 +542,6 @@ class PlannerNormalizationTests(PipelineHarness):
         orchestrator = self.orchestrator(
             replace(self.config(), planning=replace(self.config().planning, max_preapproval_corrections=1)),
             planner=[impossible_plan_message(), impossible_plan_message()],
-            reviewer=[review()],
         )
         orchestrator.run_text("Make feature.txt good.\n", run_id="run")
         before = self.state()
@@ -559,14 +557,14 @@ class PlannerNormalizationTests(PipelineHarness):
     def test_operator_recovery_normalizes_a_classifiable_plan(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         orchestrator = self.orchestrator(
-            self.config(), planner=[impossible_plan_message()], reviewer=[review()],
+            self.config(), planner=[impossible_plan_message()],
         )
         orchestrator.run_text("Make feature.txt good.\n", run_id="run")
         self.assertEqual(self.state()["failure"]["reason"], "PLAN_REPOSITORY_PRECONDITION_INVALID")
 
         recovered = orchestrator.recover_plan("run", self.reference_corpus_plan())
 
-        self.assertEqual(recovered.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(recovered.status, RunStatus.PUBLISHED, self.state().get("failure"))
         contract = (self.run_dir() / "steps/S01/contract.md").read_text(encoding="utf-8")
         self.assertIn(AW010_PATH, contract.split("WRITE SET", 1)[1].split("CREATE SET", 1)[0])
 
@@ -586,49 +584,6 @@ class PlannerNormalizationTests(PipelineHarness):
         self.assertEqual(planner.last_usage["total_tokens"], 30)
 
 
-class ReplanNormalizationTests(PipelineHarness):
-    def test_replan_is_normalized_against_the_reviewed_candidate_tree(self) -> None:
-        # new.txt is absent from the base but present in the reviewed candidate.
-        self.workers.on(ExecutionRole.IMPLEMENTER, _write_both, write("new.txt", "second\n"))
-        initial = meta_plan({"read": ("feature.txt",), "write": ("feature.txt",), "create": ("new.txt",)})
-        replan = meta_plan({"read": ("feature.txt",), "create": ("new.txt",)}, title="Correct")
-        result = self.orchestrator(
-            self.config(correction_cycles=1),
-            planner=[initial, replan],
-            reviewer=[review("REVISE", "REPLAN"), review()],
-        ).run_text("Make feature.txt good.\n", run_id="run")
-
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(len(self.planner.requests), 2)
-        correction = self.run_dir() / "cycles/002/correction"
-        contract = (correction / "steps/S01/contract.md").read_text(encoding="utf-8")
-        written = contract.split("WRITE SET", 1)[1].split("CREATE SET", 1)[0]
-        self.assertIn("- new.txt", written)
-        self.assertEqual((correction / "planner.raw.md").read_text(), replan)
-        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
-
-    def test_an_impossible_replan_still_stops_before_the_correction_worker(self) -> None:
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
-        initial = meta_plan({"read": ("feature.txt",), "write": ("feature.txt",)})
-        result = self.orchestrator(
-            self.config(correction_cycles=1),
-            planner=[initial, impossible_plan_message(title="Correct"), impossible_plan_message(title="Correct")],
-            reviewer=[review("REVISE", "REPLAN")],
-        ).run_text("Make feature.txt good.\n", run_id="run")
-
-        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
-        self.assertEqual(self.state()["failure"]["reason"], "PLAN_REPOSITORY_PRECONDITION_INVALID")
-        self.assertIn("step=S01 no_mutation", self.state()["failure"]["detail"])
-        self.assertEqual(self.workers.roles(), ["implementer"])
-        self.assertFalse((self.run_dir() / "cycles/002/correction/implementation_bundle.json").exists())
-
-
-def _write_both(request):  # type: ignore[no-untyped-def]
-    (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
-    (request.worktree / "new.txt").write_text("first\n", encoding="utf-8")
-    return "done\n"
-
-
 class RuntimeDriftGateTests(PipelineHarness):
     def test_a_worktree_changed_outside_a_step_is_an_integrity_failure(self) -> None:
         """Only a real tree change is a drift; a misclassified path never is."""
@@ -641,7 +596,6 @@ class RuntimeDriftGateTests(PipelineHarness):
             result = self.orchestrator(
                 self.config(),
                 planner=[initial_plan(("S01", "feature.txt", "Write the feature"))],
-                reviewer=[review()],
             ).run_text("Make feature.txt good.\n", run_id="run")
 
         self.assertEqual(result.status, RunStatus.FAILED)

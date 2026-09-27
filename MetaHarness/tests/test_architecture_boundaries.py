@@ -14,6 +14,7 @@ same change.
 from __future__ import annotations
 
 import ast
+import os
 import sys
 import unittest
 
@@ -58,28 +59,11 @@ PARSER_PREFIXES = ("parse_", "_parse_", "read_meta", "_read_meta")
 SPLIT_PACKAGES = (PACKAGE / "orchestration", PACKAGE / "planning")
 MODULE_MAX_LINES = 900
 # Landed sizes of the modules that predate the refoundation: frozen ceilings,
-# never raised by accident.  The resume split deleted the resume_validation
-# entry this table landed with: its durable readers, its cycle loaders and its
-# integrity gate are three bounded modules now.
-# The two replan entries were raised in the change that made the red-gate rung
-# rewrite a step's contract: the evidence belongs to the ladder that produced
-# the failure, the rewind/re-execution belongs to the step service that owns
-# their artifacts, and a fresh module would have had to reach the shared toolbox
-# through the private imports the table below forbids.
-# Raised in the check-replan change: the red-gate recovery ladder gained its
-# last, autonomous rung (a cycle re-decomposition) inside the modules that
-# already own the gate episode, the plan authority and the resume proof, and
-# the durable answer itself landed in ``planning/check_replan.py``.
-# Raised in the single-correction-budget change: the ladder's cycle rung is
-# refused against that budget inside the module that owns the rungs, the plan
-# authority learned to read a check-replan's own directory, and the check-replan
-# service keeps its defence-in-depth refusal of an unaffordable rung.
-FROZEN_MODULE_SIZES: Mapping[str, int] = {
-    # Raised in the check-repair decomposition: the bounded check-repair
-    # prompt moved next to the revision transaction that consumes it, the
-    # module that actually builds and injects it.
-    "orchestration/revision.py": 1104,
-}
+# never raised by accident.  C7 deleted the last oversized module with the
+# check-repair and semantic-revision pipeline it served, so the ratchet is
+# empty: a new oversized module fails `test_new_modules_fit_the_budget`
+# instead.  The table stays as the record of that decision.
+FROZEN_MODULE_SIZES: Mapping[str, int] = {}
 
 PIPELINE_TEST_MAX_LINES = 1000
 
@@ -95,22 +79,8 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
     "metaharness.orchestration.candidate": {
         "metaharness.orchestration.shared": ('_json_text', '_read_json_artifact'),
     },
-    "metaharness.orchestration.candidate_review": {
-        "metaharness.orchestration.shared": (
-            "_REVIEW_ATTEMPT_ARTIFACTS",
-            "_archive_attempt",
-            "_check_payload",
-            "_is_object_id",
-            "_json_text",
-            "_read_json_artifact",
-        ),
-        "metaharness.orchestration.revision": ('_review_payload',),
-    },
     "metaharness.orchestration.check_recovery": {
         "metaharness.orchestration.shared": ('_archive_attempt_tree', '_safe_candidate_tree'),
-    },
-    "metaharness.orchestration.check_replan_service": {
-        "metaharness.orchestration.shared": ('_json_text',),
     },
     "metaharness.orchestration.gates": {
         "metaharness.orchestration.shared": (
@@ -135,44 +105,6 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_status_has_unstaged_or_untracked",
         ),
         "metaharness.orchestration.candidate": ('_candidate_commit_path', '_commit_web_url'),
-    },
-    "metaharness.orchestration.review_correction": {
-        "metaharness.orchestration.shared": (
-            "_REVISION_ATTEMPT_ARTIFACTS",
-            "_archive_attempt",
-            "_bounded_report",
-            "_git_ownership",
-            "_json_text",
-            "_repair_checks_payload",
-        ),
-        "metaharness.orchestration.revision": (
-            "_bounded_previous_revision_report",
-            "_review_payload",
-        ),
-    },
-    "metaharness.orchestration.revision": {
-        "metaharness.orchestration.shared": (
-            "_PROMPTS_DIR",
-            "_bounded_report",
-            "_check_payload",
-            "_git_ownership",
-            "_json_text",
-            "_ownership_violations",
-            "_read_bounded_text",
-            "_record_failure_tree",
-        ),
-    },
-    "metaharness.orchestration.semantic_revision": {
-        "metaharness.orchestration.shared": (
-            "_REVISION_ATTEMPT_ARTIFACTS",
-            "_archive_attempt",
-            "_bounded_report",
-            "_git_ownership",
-            "_json_text",
-            "_read_json_artifact",
-            "_record_failure_tree",
-            "_safe_candidate_tree",
-        ),
     },
     "metaharness.orchestration.worker_recovery": {
         "metaharness.orchestration.shared": (
@@ -707,6 +639,97 @@ class CompatibilityBreakTests(unittest.TestCase):
                         label, text,
                         f"{where}:{lineno} revives the deleted migration label {label!r}",
                     )
+
+
+class RemovedAuthoritySurfaceTests(unittest.TestCase):
+    """C7.1: the removed post-implementation authorities stay absent.
+
+    One authority answers a red gate: ``DETERMINISTIC_GATE`` alternating with
+    ``AUDIT``.  Nothing of the reviewer, semantic-revision or check-repair
+    pipeline may survive in a runtime file; the step contract repair is a
+    different surface and never matches one of these tokens.
+    """
+
+    # Identifiers, durable labels and prose of the removed pipeline.  The
+    # scan is textual on purpose: a leftover comment or prompt string is
+    # exactly the kind of surface this guard exists to catch.
+    REMOVED_TOKENS = (
+        "semantic_revision", "semantic revision", "semantic_reviser",
+        "check_repair", "check-repair", "check replan", "check_replan",
+        "correction_cycles", "correction cycle", "correction_dir", "correction_kind",
+        "final_reviewer_profile", "default_reviewer_profile", "default_reviser_profile",
+        "default_repair_profile", "check_repair_profile", "semantic_reviser_profile",
+        "max_check_repair_attempts", "max_correction_cycles",
+        "pre_semantic_gate_stage", "final_gate_stage", "review_dir",
+        "review_implementation", "review_replan", "final_review",
+        "metaharness.review", "cycle_loader", "metaharness.recommendation",
+        "check_replan_planner_v2", "recommender.txt",
+        "reviewer", "reviser",
+    )
+    # A removed spelling a runtime file must still name to refuse it: the
+    # historical ``[ui]`` defaults and the historical configuration sections.
+    ALLOWED = frozenset({
+        ("config.py", "reviewer"),
+        ("config.py", "default_reviewer_profile"),
+        ("config.py", "default_reviser_profile"),
+        ("config.py", "default_repair_profile"),
+        ("config.py", "reviser"),
+    })
+    REMOVED_MODULES = (
+        "review.py", "recommendation.py",
+        os.path.join("planning", "check_replan.py"),
+        os.path.join("orchestration", "cycle_loader.py"),
+    )
+    REMOVED_PROMPTS = ("check_replan_planner_v2.txt",)
+
+    def test_no_runtime_file_names_a_removed_surface(self) -> None:
+        for path in sorted(PACKAGE.rglob("*.py")):
+            relative = str(path.relative_to(PACKAGE))
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for token in self.REMOVED_TOKENS:
+                if (relative, token) in self.ALLOWED:
+                    continue
+                for number, line in enumerate(lines, start=1):
+                    self.assertNotIn(
+                        token, line.casefold(),
+                        f"{relative}:{number} still names the removed surface {token!r}",
+                    )
+
+    def test_the_removed_modules_and_prompts_stay_deleted(self) -> None:
+        for name in self.REMOVED_MODULES:
+            self.assertFalse((PACKAGE / name).exists(), f"{name} is back")
+        for name in self.REMOVED_PROMPTS:
+            self.assertFalse((PACKAGE / "prompts" / name).exists(), f"prompt {name} is back")
+
+    def test_the_run_vocabulary_holds_only_the_current_authorities(self) -> None:
+        from metaharness.models import ExecutionRole, GateStage, RunPhase
+        from metaharness.run_options import SCHEMA_VERSION
+        from metaharness.recovery_policy import ExecutionFallbacks
+
+        self.assertEqual(
+            tuple(role.name for role in ExecutionRole),
+            ("PLANNER", "IMPLEMENTER", "AUDITOR"),
+        )
+        self.assertEqual(
+            tuple(phase.name for phase in RunPhase),
+            (
+                "CONTEXT", "PLANNER", "PLAN_APPROVAL", "WORKTREE_SETUP",
+                "IMPLEMENT_STEP", "STEP_ACCEPTANCE", "DETERMINISTIC_GATE",
+                "AUDIT", "CANDIDATE_READY", "CANDIDATE_PUSH", "PUBLISH",
+            ),
+        )
+        self.assertEqual(tuple(stage.name for stage in GateStage), ("POST_IMPLEMENTATION",))
+        self.assertEqual(
+            tuple(field for field in ExecutionFallbacks.__dataclass_fields__),
+            ("mechanical", "reasoning", "agentic"),
+        )
+        self.assertEqual(SCHEMA_VERSION, 6)
+
+    def test_an_agent_request_scope_is_explicit(self) -> None:
+        from metaharness.agent import AgentRunRequest
+
+        annotation = str(AgentRunRequest.__dataclass_fields__["mutable_paths"].type)
+        self.assertEqual(annotation, "tuple[str, ...] | None")
 
 
 class RunStateCommandTests(unittest.TestCase):

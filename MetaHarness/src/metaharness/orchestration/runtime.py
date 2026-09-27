@@ -114,8 +114,6 @@ class RunRuntime:
         config: HarnessConfig,
         *,
         planner_client: Any | None = None,
-        reviewer_client: Any | None = None,
-        recommender_client: Any | None = None,
         github_client: GitHubWorkstreamClient | None = None,
         trace_sink: TraceSink | None = None,
     ) -> None:
@@ -123,8 +121,6 @@ class RunRuntime:
             raise TypeError("config must be a HarnessConfig")
         self.config = config
         self.planner_client = planner_client
-        self.reviewer_client = reviewer_client
-        self.recommender_client = recommender_client
         self.github_client = (
             github_client if github_client is not None else NullGitHubWorkstreamClient()
         )
@@ -146,9 +142,8 @@ class RunRuntime:
         self.contract_recovery = ContractRecoveryService(self)
         self.gates = GateService(self)
         self.audit = AuditService(self)
-        # The review domain, split by authority: the reviewer decision, the
-        # review-driven corrections, the one scope policy a correction applies,
-        # the semantic revision pass and the red-gate cycle replan.
+        # The candidate authority: the immutable candidate commit, its push
+        # and the publication of the accepted HEAD.
         self.publication = PublicationService(self)
 
         # The four run authorities; each one owns its own module and reads the
@@ -162,8 +157,8 @@ class RunRuntime:
         """The run's one text transport, on the run's one transport horizon.
 
         ``chat`` is the only place the ``[transport]`` budget is applied, so
-        every consumer of a text endpoint (planner, reviewer, correction and
-        repair planners, recommender) shares the same resilience.
+        every consumer of a text endpoint (the planner, the audit and the
+        contract repair planner) shares the same resilience.
         """
 
         return chat_client(
@@ -264,8 +259,6 @@ class RunRuntime:
         cycle: int | None = None,
         stage: GateStage | None = None,
         step_id: str | None = None,
-        check_repair_attempt: int | None = None,
-        correction_bundle_sha256: str | None = None,
         expected_parent_sha: str | None = None,
         next_step_id: str | None = None,
         plan_identity: PlanIdentity | None = None,
@@ -289,7 +282,6 @@ class RunRuntime:
             stage=stage,
             step_id=step_id,
             next_step_id=next_step_id,
-            check_repair_attempt=check_repair_attempt,
             expected_head_sha=head,
             expected_parent_sha=expected_parent_sha,
             expected_tree_sha=tree,
@@ -297,7 +289,6 @@ class RunRuntime:
                 execution_selection_sha256 or previous.execution_selection_sha256
             ),
             plan_identity=plan_identity or previous.plan_identity,
-            correction_bundle_sha256=correction_bundle_sha256,
         ))
 
     def restore_checkpoint_tree(self, resumed: ResumedRun) -> None:
@@ -486,7 +477,6 @@ class RunRuntime:
                      "status": "waiting"}
                     for step in plan.steps
                 ],
-                "reviewer_recommendation": self.run_options.final_reviewer_profile,
             },
         )
 

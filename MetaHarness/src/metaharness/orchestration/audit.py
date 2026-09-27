@@ -148,7 +148,7 @@ class AuditService:
             raise PipelineFailure("AUDIT_PROFILE_NOT_WRITABLE")
         result = executor.run(AgentRunRequest(
             role=ExecutionRole.AUDITOR, profile_id=profile_id, prompt=prompt,
-            worktree=worktree, artifact_dir=directory, mutable_paths=(),
+            worktree=worktree, artifact_dir=directory, mutable_paths=None,
             prompt_mode="revision",
         ))
         if current_head(worktree) != parent:

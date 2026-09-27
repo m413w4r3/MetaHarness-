@@ -101,7 +101,7 @@ class ProviderNeutralBackendTests(unittest.TestCase):
             agent=_CodexDouble(),
         )
         claude = ClaudeCodeExecutor(
-            profile(ProfileDriver.CLAUDE_CODE, roles=(ExecutionRole.REVISER,)),
+            profile(ProfileDriver.CLAUDE_CODE, roles=(ExecutionRole.AUDITOR,)),
             ExecutorRuntimeConfig(environment={}),
             agent=_ClaudeDouble(),
         )
@@ -144,24 +144,24 @@ class ProviderNeutralBackendTests(unittest.TestCase):
             [[ExecutionRole.IMPLEMENTER]] * 3,
         )
 
-    def test_registry_uses_one_backend_neutral_role_path_for_semantic_revisers(self) -> None:
-        for driver in ("test-reviser-a", "test-reviser-b"):
+    def test_registry_uses_one_backend_neutral_role_path_for_auditors(self) -> None:
+        for driver in ("test-auditor-a", "test-auditor-b"):
             register_executor_driver(
                 driver,
                 lambda _profile, _runtime, **_: _FakeExecutor(driver),
                 replace=True,
             )
         request = AgentRunRequest(
-            role=ExecutionRole.REVISER,
-            profile_id="reviser",
-            prompt="review and repair",
+            role=ExecutionRole.AUDITOR,
+            profile_id="auditor",
+            prompt="audit and repair",
             worktree=Path("."),
             artifact_dir=Path("."),
             mutable_paths=(),
         )
-        for driver in ("test-reviser-a", "test-reviser-b"):
+        for driver in ("test-auditor-a", "test-auditor-b"):
             result = executor_for_profile(
-                profile(driver, roles=(ExecutionRole.REVISER,)),
+                profile(driver, roles=(ExecutionRole.AUDITOR,)),
                 ExecutorRuntimeConfig(environment={}),
             ).run(request)
             self.assertEqual(result.status, "completed")
@@ -203,12 +203,16 @@ allow_no_required_checks = true
 
 [ui]
 default_planner_profile = "chat"
-default_implementer_profile = "worker"
-default_reviewer_profile = "chat"
+default_audit_profile = "worker"
+
+[routing]
+mechanical_profile = "worker"
+reasoning_profile = "worker"
+agentic_profile = "worker"
 
 [model_profiles.chat]
 display_name = "Chat"
-roles = ["planner", "reviewer"]
+roles = ["planner", "auditor"]
 driver = "openai-chat"
 model = "planner-model"
 selection_mode = "request"
@@ -217,7 +221,7 @@ endpoint_path = "/chat"
 
 [model_profiles.worker]
 display_name = "Trusted worker"
-roles = ["implementer", "repair", "reviser"]
+roles = ["implementer", "auditor"]
 driver = "external"
 provider = "provider-x"
 model = "exact-worker-model"

@@ -20,7 +20,6 @@ from ..plan_repository_validation import (
     PathPreconditionViolation,
     RepositoryPreconditions,
     normalize_plan_contracts,
-    plan_repository_violations,
     render_precondition_correction,
 )
 from ..step_ids import MAX_STEPS
@@ -95,44 +94,6 @@ of an invalid plan or a plan that asks the worker to discover a solution.
 """
 
 
-def render_repair_decomposition_policy_text(
-    staged_step_max_mutable_paths: int,
-) -> str:
-    """Render the correction mutable-scope policy from its one real limit.
-
-    A bounded correction step is bounded by what a single worker is already
-    allowed to touch, so the STAGED per-step maximum is the authority here --
-    for a SINGLE ``S01`` exactly as for a STAGED step.
-    """
-
-    if (
-        isinstance(staged_step_max_mutable_paths, bool)
-        or not isinstance(staged_step_max_mutable_paths, int)
-        or staged_step_max_mutable_paths <= 0
-    ):
-        raise ValueError(
-            "staged_step_max_mutable_paths "
-            "must be an integer greater than zero"
-        )
-
-    return f"""REPAIR DECOMPOSITION POLICY
-
-This is a bounded correction plan.
-
-Every repair implementation step, including a SINGLE S01,
-may modify at most {staged_step_max_mutable_paths} distinct mutable
-paths across the UNION of WRITE_SET, CREATE_SET and DELETE_SET.
-
-A path counts once in that union.
-
-If one corrective step requires more than
-{staged_step_max_mutable_paths} mutable paths, decompose it into
-multiple ordered STAGED steps.
-
-Do not return a READY repair plan containing any step above this limit.
-"""
-
-
 def insert_before_protocol(prompt: str, text: str) -> str:
     index = prompt.find(_PROTOCOL_ANCHOR)
     if index < 0:
@@ -183,52 +144,6 @@ def validate_decomposition_policy(
             )
 
 
-def validate_repair_decomposition_policy(
-    plan: TaskPlanV2,
-    planning: PlanningConfig,
-) -> None:
-    """Bound every correction step by the normal staged worker limit.
-
-    The SINGLE limit of :func:`validate_decomposition_policy` decides when an
-    *initial* task must be decomposed.  A correction is already bounded to one
-    corrective cycle, to the approved repair scope, to a reviewed immutable
-    candidate and to the deterministic gates plus reviewer #2 that follow it,
-    so the only remaining question is whether one worker may touch that many
-    paths -- and ``staged_step_max_mutable_paths`` already answers it.  The
-    execution mode therefore does not change this limit.
-    """
-
-    if not isinstance(plan, TaskPlanV2) or not isinstance(
-        planning,
-        PlanningConfig,
-    ):
-        raise TypeError(
-            "plan and planning must be v2 model values"
-        )
-
-    if (
-        plan.decision is not PlanDecision.READY
-        or planning.decomposition != "aggressive"
-    ):
-        return
-
-    limit = planning.staged_step_max_mutable_paths
-
-    for step in plan.steps:
-        count = len(
-            set(step.write_set)
-            | set(step.create_set)
-            | set(step.delete_set)
-        )
-
-        if count > limit:
-            raise V2PlanParseError(
-                f"aggressive repair step {step.id} "
-                f"may modify at most {limit} "
-                f"distinct mutable paths; got {count}"
-            )
-
-
 def normalize_plan_repository(
     preconditions: RepositoryPreconditions | None, plan: TaskPlanV2,
 ) -> TaskPlanV2:
@@ -256,9 +171,7 @@ __all__ = [
     "normalize_plan_repository",
     "render_decomposition_policy_text",
     "render_plan_precondition_correction",
-    "render_repair_decomposition_policy_text",
     "render_require_staged_policy_text",
     "validate_decomposition_policy",
     "validate_execution_mode_policy",
-    "validate_repair_decomposition_policy",
 ]

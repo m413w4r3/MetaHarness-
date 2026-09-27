@@ -19,13 +19,12 @@ from ..evidence import (
 from ..baseline import (
     BaselineCache,
     BaselineRecord,
-    CheckVerdict,
     baseline_of_result,
     compare_check,
     junit_report_path,
     preflight_skips,
 )
-from ..validation import config_with_check_authority, run_checks
+from ..validation import config_with_check_authority
 from ..gitops import (
     GitError,
     commit_parents,

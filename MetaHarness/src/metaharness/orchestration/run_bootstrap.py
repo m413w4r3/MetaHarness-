@@ -125,9 +125,6 @@ class RunBootstrap:
         of this is ever replayed by a resume.
         """
 
-        revision_enabled = self.runtime.run_options.semantic_revision_enabled
-        repair_enabled = self.runtime.run_options.max_correction_cycles > 0
-        check_repair_enabled = self.runtime.run_options.max_check_repair_attempts > 0
         planner_profile_id = planner_profile.id
         if existing_plan is None:
             planner = PlannerV2(
@@ -226,7 +223,6 @@ class RunBootstrap:
                      "status": "waiting"}
                     for step in plan.steps
                 ],
-                "reviewer_recommendation": self.runtime.run_options.final_reviewer_profile,
             },
             steps=[
                 {"id": step.id, "title": step.title, "status": "waiting",

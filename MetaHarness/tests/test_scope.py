@@ -9,7 +9,6 @@ ref or an unrecoverable Git state stay fatal.
 
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 import unittest
@@ -40,21 +39,11 @@ from metaharness.scope import (
 )
 
 from tests.autonomy.support import SPEC, AutonomyHarness, Step, meta_plan
-from tests.pipeline_support import PipelineHarness, check_repair_result, git, review
+from tests.pipeline_support import PipelineHarness, git
 
 RUN_BRANCH = "refs/heads/metaharness/run"
 NEIGHBOUR = "def test_a():\n    assert True\n"
 NEIGHBOUR_TOUCHED = "def test_a():\n    assert True\n# touched by the worker\n"
-
-
-def scope_request(path: str) -> str:
-    return (
-        "META SCOPE REQUEST v1\n\n"
-        "REASON\nThe correction needs this path.\n\n"
-        f"PATHS\n- {path}\n\n"
-        "EVIDENCE\n- The failing check names it.\n\n"
-        "END META SCOPE REQUEST"
-    )
 
 
 class ScopePolicyTests(unittest.TestCase):
@@ -236,7 +225,7 @@ class SoftScopeTests(AutonomyHarness):
 
     def run_plan(self, plan: str, *, scope_mode: str = "soft"):
         return self.orchestrator(
-            self.config(scope_mode=scope_mode), planner=[plan], reviewer=[review()],
+            self.config(scope_mode=scope_mode), planner=[plan],
         ).run_text(SPEC, run_id="run")
 
     def test_soft_scope_accepts_safe_neighbour(self) -> None:
@@ -308,7 +297,10 @@ class SoftScopeTests(AutonomyHarness):
         self.assertEqual(first_record["out_of_scope_paths"], ["notes.md"])
         self.assertEqual(second_record["out_of_scope_paths"], ["notes.md"])
         # The recorded extra path of S01 never widened S02's declared scope.
-        self.assertEqual(self.workers.calls[-1].mutable_paths, ("src/b.py",))
+        implementer_calls = [
+            call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER
+        ]
+        self.assertEqual(implementer_calls[-1].mutable_paths, ("src/b.py",))
         self.assertEqual(second_record["changed_paths"], ["notes.md", "src/b.py"])
 
 
@@ -320,7 +312,7 @@ class StrictScopeTests(AutonomyHarness):
 
     def run_plan(self, plan: str):
         return self.orchestrator(
-            self.config(scope_mode="strict"), planner=[plan], reviewer=[review()],
+            self.config(scope_mode="strict"), planner=[plan],
         ).run_text(SPEC, run_id="run")
 
     def test_strict_scope_discards_only_extra_paths(self) -> None:
@@ -364,10 +356,11 @@ class StrictScopeTests(AutonomyHarness):
         result = self.run_plan(self.one_step())
 
         self.assert_run_completed(result)
-        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
-        self.assertIn(
-            "changes outside mutable scope were discarded", self.workers.calls[-1].prompt,
-        )
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer", "auditor"])
+        retry_prompt = [
+            call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER
+        ][-1].prompt
+        self.assertIn("changes outside mutable scope were discarded", retry_prompt)
         step = self.step_record()
         self.assertEqual(step["status"], "COMPLETED")
         self.assertEqual(step["changed_paths"], ["src/a.py"])
@@ -392,66 +385,11 @@ class FatalScopeTests(AutonomyHarness):
         result = self.orchestrator(
             self.config(), planner=[
                 meta_plan(Step(id="S01", title="Change a", read=("src/a.py",), write=("src/a.py",))),
-            ], reviewer=[review()],
+            ],
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.FAILED, self.failure_reason())
         self.assertEqual(self.failure_reason(), HARD_DENY_PATH_MUTATION)
-
-    def test_scope_request_to_denied_path_is_fatal(self) -> None:
-        def failing(request):
-            (request.worktree / "feature.txt").write_text("bad\n", encoding="utf-8")
-            return "done\n"
-
-        self.workers.on(ExecutionRole.IMPLEMENTER, failing)
-        self.workers.on(
-            ExecutionRole.REPAIR,
-            lambda _request: scope_request(".git/config") + "\n\n" + check_repair_result(
-                "BLOCKED", "NOT_RUN", "SCOPE", "the git directory is not writable",
-            ),
-        )
-        result = self.orchestrator(
-            self.config(check_repair=1), planner=[
-                meta_plan(Step(id="S01", title="Make the feature", write=("feature.txt",))),
-            ], reviewer=[review()],
-        ).run_text(SPEC, run_id="run")
-
-        self.assertEqual(result.status, RunStatus.FAILED, self.failure_reason())
-        self.assertEqual(self.failure_reason(), HARD_DENY_PATH_MUTATION)
-
-    def test_scope_request_is_auto_admitted(self) -> None:
-        def failing(request):
-            (request.worktree / "feature.txt").write_text("bad\n", encoding="utf-8")
-            return "done\n"
-
-        def repair(request):
-            if "other.txt" not in request.mutable_paths:
-                return scope_request("other.txt") + "\n\n" + check_repair_result(
-                    "BLOCKED", "NOT_RUN", "SCOPE", "other.txt is outside the cycle scope",
-                )
-            (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
-            (request.worktree / "other.txt").write_text("changed\n", encoding="utf-8")
-            return check_repair_result()
-
-        self.workers.on(ExecutionRole.IMPLEMENTER, failing)
-        self.workers.on(ExecutionRole.REPAIR, repair, repair)
-        result = self.orchestrator(
-            self.config(check_repair=1), planner=[
-                meta_plan(Step(id="S01", title="Make the feature", write=("feature.txt",))),
-            ], reviewer=[review()],
-        ).run_text(SPEC, run_id="run")
-
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.failure_reason())
-        self.assertIn("other.txt", self.workers.calls[-1].mutable_paths)
-        decisions = sorted(
-            (self.run_dir() / "cycles/001/check-repair").rglob("scope_requests/*/decision.json")
-        )
-        self.assertEqual(len(decisions), 1)
-        self.assertEqual(
-            json.loads(decisions[0].read_text(encoding="utf-8"))["decision"], "auto-admitted",
-        )
-        self.assertEqual(list(self.run_dir().rglob("scope_approval.json")), [])
-
 
 if __name__ == "__main__":  # pragma: no cover - unittest entry point
     unittest.main()

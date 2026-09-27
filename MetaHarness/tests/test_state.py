@@ -368,9 +368,6 @@ class FrozenRunOptionsSchemaTests(unittest.TestCase):
             execution_mode_policy="auto",
             single_step_max_mutable_paths=2,
             staged_step_max_mutable_paths=6,
-            semantic_revision_enabled=False,
-            max_check_repair_attempts=0,
-            max_correction_cycles=0,
             planner_profile="planner",
             mechanical_profile="worker",
             reasoning_profile="worker",
@@ -496,29 +493,18 @@ TRANSITION_MATRIX = (
     (R.IMPLEMENT_STEP, RunEvent.advance(R.STEP_ACCEPTANCE), R.STEP_ACCEPTANCE, D.RUNNING),
     (R.STEP_ACCEPTANCE, RunEvent.advance(R.IMPLEMENT_STEP), R.IMPLEMENT_STEP, D.RUNNING),
     (R.IMPLEMENT_STEP, RunEvent.advance(R.DETERMINISTIC_GATE), R.DETERMINISTIC_GATE, D.RUNNING),
+    # The single post-implementation authority: the deterministic gate hands
+    # the candidate to AUDIT, and AUDIT answers it with a new gate run.
     (R.DETERMINISTIC_GATE, RunEvent.advance(R.AUDIT), R.AUDIT, D.RUNNING),
     (R.AUDIT, RunEvent.advance(R.DETERMINISTIC_GATE), R.DETERMINISTIC_GATE, D.RUNNING),
-    (R.DETERMINISTIC_GATE, RunEvent.advance(R.SEMANTIC_REVISION), R.SEMANTIC_REVISION, D.RUNNING),
-    (R.SEMANTIC_REVISION, RunEvent.advance(R.DETERMINISTIC_GATE), R.DETERMINISTIC_GATE, D.RUNNING),
     (R.DETERMINISTIC_GATE, RunEvent.advance(R.CANDIDATE_READY), R.CANDIDATE_READY, D.RUNNING),
     (R.CANDIDATE_READY, RunEvent.advance(R.CANDIDATE_PUSH), R.CANDIDATE_PUSH, D.RUNNING),
     (R.CANDIDATE_PUSH, RunEvent.advance(R.PUBLISH), R.PUBLISH, D.RUNNING),
-    # A reviewed candidate is published, or opens one bounded correction cycle.
-    (R.FINAL_REVIEW, RunEvent.advance(R.PUBLISH), R.PUBLISH, D.RUNNING),
-    (R.FINAL_REVIEW, RunEvent.advance(R.REVIEW_IMPLEMENTATION), R.REVIEW_IMPLEMENTATION, D.RUNNING),
-    # A review that sends the candidate back to direct implementation opens a
-    # correction cycle whose first operation is the revision itself.
-    (R.FINAL_REVIEW, RunEvent.advance(R.SEMANTIC_REVISION), R.SEMANTIC_REVISION, D.RUNNING),
-    (R.FINAL_REVIEW, RunEvent.advance(R.REVIEW_REPLAN), R.REVIEW_REPLAN, D.RUNNING),
-    (R.REVIEW_IMPLEMENTATION, RunEvent.advance(R.REVIEW_IMPLEMENTATION), R.REVIEW_IMPLEMENTATION, D.RUNNING),
-    (R.REVIEW_IMPLEMENTATION, RunEvent.advance(R.DETERMINISTIC_GATE), R.DETERMINISTIC_GATE, D.RUNNING),
-    (R.REVIEW_REPLAN, RunEvent.advance(R.REVIEW_IMPLEMENTATION), R.REVIEW_IMPLEMENTATION, D.RUNNING),
-    (R.WORKTREE_SETUP, RunEvent.advance(R.REVIEW_IMPLEMENTATION), R.REVIEW_IMPLEMENTATION, D.RUNNING),
     # A run stops without failing: the phase it stopped at is the operation to
     # retry, and the failure reason carries the business detail.
     (R.IMPLEMENT_STEP, RunEvent.wait(D.WAIT_EXTERNAL, reason="AGENT_TIMEOUT"), R.IMPLEMENT_STEP, D.WAIT_EXTERNAL),
     (R.DETERMINISTIC_GATE, RunEvent.wait(D.WAIT_EXTERNAL, reason="CHECK_TIMEOUT"), R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL),
-    (R.FINAL_REVIEW, RunEvent.wait(D.WAIT_HUMAN, reason="SPEC_DECISION_REQUIRED"), R.FINAL_REVIEW, D.WAIT_HUMAN),
+    (R.AUDIT, RunEvent.wait(D.WAIT_HUMAN, reason="SPEC_DECISION_REQUIRED"), R.AUDIT, D.WAIT_HUMAN),
     (R.DETERMINISTIC_GATE, RunEvent.wait(D.WAIT_HUMAN, reason="CHECK_TIMEOUT"), R.DETERMINISTIC_GATE, D.WAIT_HUMAN),
     (R.IMPLEMENT_STEP, RunEvent.fail(reason="AGENT_SCOPE_VIOLATION"), R.IMPLEMENT_STEP, D.FAILED),
     (R.PUBLISH, RunEvent.fail(reason="PUSH_REJECTED"), R.PUBLISH, D.FAILED),
@@ -554,8 +540,7 @@ PROJECTION_MATRIX = (
     (R.PLAN_APPROVAL, D.RUNNING, None, RunStatus.AWAITING_PLAN_APPROVAL, False, False),
     (R.IMPLEMENT_STEP, D.RUNNING, None, RunStatus.IMPLEMENTING, False, False),
     (R.DETERMINISTIC_GATE, D.RUNNING, None, RunStatus.VALIDATING, False, False),
-    (R.SEMANTIC_REVISION, D.RUNNING, None, RunStatus.REVISING, False, False),
-    (R.FINAL_REVIEW, D.RUNNING, None, RunStatus.REVIEWING, False, False),
+    (R.AUDIT, D.RUNNING, None, RunStatus.REVISING, False, False),
     (R.PUBLISH, D.RUNNING, None, RunStatus.PUBLISHING, False, False),
     (R.CANDIDATE_PUSH, D.COMPLETED, None, RunStatus.COMMITTED, False, False),
     (R.PUBLISH, D.COMPLETED, None, RunStatus.PUBLISHED, False, False),
@@ -566,19 +551,16 @@ PROJECTION_MATRIX = (
     # A check infrastructure reason is an ordinary external wait: a skipped
     # check is a durable warning, never a gate infrastructure status.
     (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
-    (R.FINAL_REVIEW, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
+    (R.AUDIT, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
     (R.CANDIDATE_PUSH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_REMOTE, True, True),
     (R.PUBLISH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_REMOTE, True, True),
-    (R.FINAL_REVIEW, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_EXTERNAL, True, True),
+    (R.AUDIT, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_EXTERNAL, True, True),
     # An exhausted bounded repair slot waits for a resume, never a decision.
     (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, "STEP_CONTRACT_REPAIR_OUTPUT_INVALID", RunStatus.WAITING_CONTRACT_REPAIR, True, True),
     (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
-    (R.FINAL_REVIEW, D.WAIT_HUMAN, "CHECK_TIMEOUT", RunStatus.WAITING_HUMAN, False, False),
-    # An operator gate owns its durable pending operation; a human wait with
-    # no gate and no repair slot owns nothing to resume.
-    (R.SEMANTIC_REVISION, D.WAIT_HUMAN, None, RunStatus.WAITING_HUMAN, False, False),
+    (R.AUDIT, D.WAIT_HUMAN, "CHECK_TIMEOUT", RunStatus.WAITING_HUMAN, False, False),
     (R.IMPLEMENT_STEP, D.WAIT_HUMAN, "SPEC_DECISION_REQUIRED", RunStatus.WAITING_HUMAN, False, False),
-    (R.FINAL_REVIEW, D.WAIT_HUMAN, "SECURITY_POLICY_DECISION_REQUIRED", RunStatus.WAITING_HUMAN, False, False),
+    (R.AUDIT, D.WAIT_HUMAN, "SECURITY_POLICY_DECISION_REQUIRED", RunStatus.WAITING_HUMAN, False, False),
 )
 
 
@@ -592,9 +574,7 @@ class RunMachineTests(unittest.TestCase):
         phase_fields: dict = {}
         if phase is RunPhase.DETERMINISTIC_GATE:
             phase_fields["stage"] = GateStage.POST_IMPLEMENTATION
-            if phase is RunPhase.CHECK_REPAIR:
-                phase_fields["check_repair_attempt"] = 1
-        elif phase in {RunPhase.IMPLEMENT_STEP, RunPhase.STEP_ACCEPTANCE, RunPhase.REVIEW_IMPLEMENTATION}:
+        elif phase in {RunPhase.IMPLEMENT_STEP, RunPhase.STEP_ACCEPTANCE}:
             phase_fields["step_id"] = "S01"
         return ResumeCheckpoint(
             phase=phase, **phase_fields,

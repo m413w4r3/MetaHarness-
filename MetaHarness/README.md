@@ -49,8 +49,8 @@ delete remote run branch           (fast-forward-base only; after publication)
   n’écrivent que dans le worktree isolé ; le checkout utilisateur n’est jamais
   modifié (ni checkout, ni index, ni fichiers) ;
 - `[publish] mode = "fast-forward-base"` (AutoWork) : chaque candidat exact est
-  commité puis poussé sur la branche de run avant sa review ; après le PASS
-  final, `main` local avance par compare-and-swap de A vers B, puis B est poussé
+  commité puis poussé sur la branche de run avant son audit ; après l’audit PASS,
+  `main` local avance par compare-and-swap de A vers B, puis B est poussé
   sur `origin/main`. Une fois cette publication réussie, la branche distante
   temporaire du run est supprimée idempotemment. Si `main` ou `origin/main`
   (ref de suivi locale, sans fetch implicite) a bougé :
@@ -72,9 +72,9 @@ delete remote run branch           (fast-forward-base only; after publication)
 Chaque transition durable met à jour `resume_checkpoint.json`, qui décrit
 toujours la prochaine opération non encore réussie. Les phases supportées sont
 conceptuellement : context, planner, plan approval, workspace setup, worker
-steps, deterministic gates, reviewer, correction planner/steps, commit et publish.
+steps, deterministic gate, audit, candidate ready, candidate push et publish.
 Un run `failed` dont l’échec est reprenable
-(avant mutation, transport reviewer, push) se reprend au même
+(avant mutation, transport de l’audit, push) se reprend au même
 `run_id`, sans rejouer planner, approbation, setup ni step déjà réussi :
 
 ```bash
@@ -82,16 +82,15 @@ metaharness resume --config examples/autowork.toml --run-id <RUN_ID>
 ```
 
 ou via le bouton unique de la page du run (`REPRENDRE LE RUN`,
-`RETRY S02`, `RETRY REVIEWER #1`, `RETRY PUBLISH`…). Avant toute reprise,
+`RETRY S02`, `RETRY AUDIT`, `RETRY PUBLISH`…). Avant toute reprise,
 MetaHarness revérifie l’approbation, l’identité du plan, le hash de
 l’execution selection, le worktree, la branche, HEAD, l’arbre candidat exact et
 le scope approuvé ; au moindre écart : `RESUME_INTEGRITY_FAILURE`, sans aucun
 appel LLM. Les corruptions, violations d’identité et
 `AGENT_CONTRACT_MISMATCH` restent volontairement non-resumables.
 
-Sans `revision.enabled`, la correction sémantique est désactivée : le planner,
-les étapes d’implémentation, les checks, le reviewer et le commit restent
-disponibles. Les
+Un gate rouge est répondu par l’audit seul : il n’existe ni reviewer, ni
+révision sémantique, ni cycle de correction. Les
 secrets ne sont jamais mis dans la configuration persistée : `api_key_env`
 contient seulement le nom d’une variable d’environnement. Les écritures d’état
 passent par `RunStateStore` et sont atomiques.

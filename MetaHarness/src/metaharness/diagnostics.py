@@ -21,18 +21,10 @@ from .plan_recovery import PLAN_RECOVERY_ARTIFACT, PLAN_SOURCE_OPERATOR, plan_so
 from .profiles import profiles_for_config, safe_profile_metadata
 from .redaction import config_secret_values, redact
 from .result import atomic_write_text
-from .resume import ResumeCheckpointError, read_checkpoint, resume_info, read_checkpoint_record
+from .resume import ResumeCheckpointError, resume_info, read_checkpoint_record
 from .orchestration.pipeline_v2 import (
-    check_repair_root,
-    correction_dir,
     cycle_dir,
     implementation_steps_dir,
-    review_dir,
-    semantic_revision_dir,
-)
-from .run_options import (
-    RunOptionsError,
-    read_run_options_with_sha256,
 )
 from .step_ids import is_step_id
 from .usage import normalize_usage, phase_usage_summary, read_usage_artifact
@@ -292,7 +284,7 @@ def _safe_state(state: Mapping[str, Any]) -> dict[str, Any]:
     keys = (
         "run_id", "status", "started_at", "updated_at", "repo", "base_ref", "base_sha",
         "branch", "worktree", "cycle", "current_step", "approved_tree_sha", "commit_sha",
-        "review_iterations", "planning_protocol",
+        "planning_protocol",
     )
     result = {key: state.get(key) for key in keys if key in state}
     failure = state.get("failure")
@@ -320,7 +312,7 @@ def _safe_state(state: Mapping[str, Any]) -> dict[str, Any]:
     }
     result["planner"] = {
         key: state.get("planner", {}).get(key)
-        for key in ("decision", "title", "profile_id", "model", "source", "execution_mode", "steps", "reviewer_recommendation")
+        for key in ("decision", "title", "profile_id", "model", "source", "execution_mode", "steps")
         if isinstance(state.get("planner"), Mapping) and key in state["planner"]
     }
     cycles = state.get("cycles")
@@ -413,7 +405,7 @@ def _selection_summary(run_dir: Path, secrets: tuple[str, ...]) -> str:
     safe: dict[str, Any] = {}
     if isinstance(payload, Mapping):
         safe["schema_version"] = payload.get("schema_version")
-        for role in ("planner", "check_repair", "semantic_reviser", "final_reviewer"):
+        for role in ("planner", "audit"):
             value = payload.get(role)
             if isinstance(value, Mapping):
                 safe[role] = {key: value.get(key) for key in ("profile_id", "model", "effort", "selection_mode") if key in value}
@@ -490,9 +482,7 @@ def _prompt_footprint(run_dir: Path) -> str:
     add("planner.request.txt", "planner.usage.json")
     for cycle_path in _cycle_dirs(run_dir):
         relative = cycle_path.relative_to(run_dir).as_posix()
-        add(f"{relative}/correction/planner.request.txt", f"{relative}/correction/planner.usage.json")
-        cycle_number = int(cycle_path.name)
-        steps_root = implementation_steps_dir(run_dir, cycle_number)
+        steps_root = implementation_steps_dir(run_dir, int(cycle_path.name))
         try:
             step_dirs = sorted(
                 path for path in steps_root.iterdir()
@@ -503,11 +493,6 @@ def _prompt_footprint(run_dir: Path) -> str:
         for step_dir in step_dirs:
             step = f"{relative}/implementation/steps/{step_dir.name}"
             add(f"{step}/agent.prompt.txt", f"{step}/step.json", nested_usage=True)
-        add(f"{relative}/semantic-revision/agent.prompt.txt", f"{relative}/semantic-revision/usage.json")
-        for attempt in sorted(check_repair_root(run_dir, cycle_number).glob("*/attempts/[0-9][0-9][0-9]")):
-            attempt_relative = attempt.relative_to(run_dir).as_posix()
-            add(f"{attempt_relative}/agent.prompt.txt", f"{attempt_relative}/usage.json")
-        add(f"{relative}/review/reviewer.request.txt", f"{relative}/review/reviewer.usage.json")
 
     lines = ["Prompt artifacts:", "| Relative path | Bytes | SHA256 | Input tokens |", "|---|---:|---|---:|"]
     for relative, artifact, usage_path, nested_usage in rows:
@@ -542,88 +527,6 @@ def _prompt_footprint(run_dir: Path) -> str:
     if diagnostics:
         lines.extend(("", "Prompt contract diagnostics:", *diagnostics))
     return "\n".join(lines) + "\n"
-
-
-def _semantic_revision_status(run_dir: Path, revision_exists: bool) -> str:
-    try:
-        options, _digest = read_run_options_with_sha256(run_dir)
-    except RunOptionsError:
-        return "Semantic revision status unavailable: durable run options are missing or malformed."
-    if not options.semantic_revision_enabled:
-        return "Semantic revision disabled by run options."
-    if not revision_exists:
-        return "Semantic revision enabled by run options, but no revision artifact was produced/reached."
-    return "Semantic revision artifacts present."
-
-
-def _check_recovery_summary(run_dir: Path, state: Mapping[str, Any]) -> str:
-    """Render the bounded deterministic-gate recovery authority and next step."""
-
-    checkpoint = None
-    try:
-        checkpoint = read_checkpoint(run_dir)
-    except ResumeCheckpointError:
-        pass
-    repair = state.get("check_repair") if isinstance(state.get("check_repair"), Mapping) else {}
-    gate = state.get("deterministic_gate") if isinstance(state.get("deterministic_gate"), Mapping) else {}
-    options = state.get("run_options") if isinstance(state.get("run_options"), Mapping) else {}
-    pipeline = options.get("pipeline") if isinstance(options.get("pipeline"), Mapping) else {}
-    budget = pipeline.get("max_check_repair_attempts")
-    used = repair.get("attempt_count")
-    attempt = gate.get("attempt", state.get("deterministic_gate_attempt"))
-    failures = gate.get("failures") if isinstance(gate.get("failures"), list) else []
-    failed_ids = repair.get("failed_check_ids")
-    if not isinstance(failed_ids, list):
-        failed_ids = [
-            item.split(":", 1)[1] for item in failures
-            if isinstance(item, str) and item.startswith("CHECK_FAILED:")
-        ]
-    failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
-    reason = failure.get("reason")
-    if any(isinstance(item, str) and item.startswith("CHECK_FAILED:") for item in failures):
-        classification = "product_check"
-    elif (
-        reason == "CHECK_INFRASTRUCTURE_UNAVAILABLE"
-        or any(isinstance(item, str) and item.startswith(("CHECK_INFRA", "CHECK_TIMEOUT")) for item in failures)
-    ):
-        classification = "infrastructure"
-    elif isinstance(reason, str) and (
-        "INTEGRITY" in reason or "SECURITY" in reason or reason.startswith("SECRET_")
-    ):
-        classification = "security/integrity"
-    elif reason == "INTERNAL_HARNESS_ERROR":
-        classification = "internal_harness_error"
-    else:
-        classification = "unclassified"
-    candidate_tree = repair.get("candidate_tree") or state.get("staged_tree_sha")
-    evidence_sha = repair.get("latest_evidence_sha256")
-    if not isinstance(evidence_sha, str) and checkpoint is not None and checkpoint.stage is not None:
-        gate_dir_path = run_dir / "cycles" / f"{checkpoint.review_cycle:03d}" / "checks" / checkpoint.stage.value.casefold().replace("_", "-")
-        try:
-            evidence_sha = hashlib.sha256((gate_dir_path / "evidence.json").read_bytes()).hexdigest()
-        except OSError:
-            evidence_sha = None
-    if reason == "CHECK_REPAIR_EXHAUSTED" or reason == "ATTRIBUTEERROR" and checkpoint is not None and checkpoint.stage is not None:
-        next_action = "Retry deterministic gate"
-    elif reason == "CHECK_INFRASTRUCTURE_UNAVAILABLE":
-        next_action = "Retry check infrastructure"
-    else:
-        next_action = repair.get("next_action") or "No automatic recovery action"
-    reports = repair.get("repair_reports") if isinstance(repair.get("repair_reports"), list) else []
-    report_paths = [
-        item.get("artifact") for item in reports
-        if isinstance(item, Mapping) and isinstance(item.get("artifact"), str)
-    ]
-    return "\n".join((
-        f"deterministic gate attempt: {attempt if isinstance(attempt, int) else 'unavailable'}",
-        f"check-repair attempts used / budget: {used if isinstance(used, int) else 0} / {budget if isinstance(budget, int) else 'unavailable'}",
-        f"latest failed check IDs: {', '.join(str(item) for item in failed_ids) if failed_ids else 'none recorded'}",
-        f"latest candidate tree: {candidate_tree if isinstance(candidate_tree, str) else 'unavailable'}",
-        f"latest evidence SHA256: {evidence_sha if isinstance(evidence_sha, str) else 'unavailable'}",
-        f"failure classification: {classification}",
-        f"next recovery action: {next_action}",
-        f"repair reports: {', '.join(report_paths) if report_paths else 'none recorded'}",
-    ))
 
 
 def _event_artifact(run_dir: Path, relative: str, secrets: tuple[str, ...]) -> str:
@@ -676,26 +579,14 @@ _EVIDENCE_KEYS = ("base_sha", "staged_tree_sha", "deterministic_passed", "failur
 
 
 def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
-    """One generic cycle: plan, steps, revision, gates, repairs, candidate, review."""
+    """One generic cycle: plan, steps, gates, candidate."""
 
     root = cycle_dir(run_dir, cycle).relative_to(run_dir).as_posix()
     record = _safe_json_payload(cycle_dir(run_dir, cycle) / "cycle.json")
     kind = record.get("kind") if isinstance(record, Mapping) else None
     parts = [_section(f"CYCLE {cycle:03d}", f"kind: {kind or ('initial' if cycle == 1 else 'unknown')}")]
-    if cycle == 1:
-        contracts = ""
-        plan_body = "Approved plan: see PLANNER RESPONSE and PLAN / BUNDLE."
-    else:
-        correction = correction_dir(run_dir, cycle).relative_to(run_dir).as_posix()
-        contracts = correction + "/"
-        plan_body = "\n".join([
-            _artifact_text(run_dir, f"{correction}/planner.request.txt", secrets, MAX_PLANNER_REQUEST_BYTES),
-            _artifact_text(run_dir, f"{correction}/planner.raw.md", secrets),
-            _plan_summary(run_dir, secrets, f"{correction}/task_plan_v2.json"),
-            _bundle_summary(run_dir, secrets, f"{correction}/implementation_bundle.json"),
-            _artifact_json(run_dir, f"{correction}/scope_delta.json", secrets),
-        ])
-    parts.append(_section("Plan", plan_body))
+    contracts = ""
+    parts.append(_section("Plan", "Approved plan: see PLANNER RESPONSE and PLAN / BUNDLE."))
     steps_root = implementation_steps_dir(run_dir, cycle)
     try:
         step_ids = sorted(path.name for path in steps_root.iterdir() if path.is_dir() and is_step_id(path.name))
@@ -718,24 +609,6 @@ def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
             _event_artifact(run_dir, step + "agent.events.jsonl", secrets),
         ])
         parts.append(_section(step_id, body))
-    revision = semantic_revision_dir(run_dir, cycle).relative_to(run_dir).as_posix() + "/"
-    revision_exists = any(
-        (run_dir / revision / name).exists()
-        for name in ("agent.prompt.txt", "agent.result.json", "agent.final.md", "agent.stderr.log", "report.json", "tree_before.txt")
-    )
-    revision_body = _semantic_revision_status(run_dir, revision_exists)
-    if revision_exists:
-        revision_body += "\n" + _agent_terminal_summary(run_dir, revision + "agent.result.json", secrets)
-        revision_body += "\n" + "\n".join([
-            _artifact_text(run_dir, revision + "agent.prompt.txt", secrets),
-            _agent_result_artifact(run_dir, revision + "agent.result.json", secrets),
-            _artifact_text(run_dir, revision + "agent.final.md", secrets),
-            _artifact_text(run_dir, revision + "agent.stderr.log", secrets, MAX_STDERR_BYTES, tail=True),
-            _artifact_json(run_dir, revision + "report.json", secrets),
-            _artifact_json(run_dir, revision + "usage.json", secrets),
-            _event_artifact(run_dir, revision + "agent.events.jsonl", secrets),
-        ])
-    parts.append(_section(f"SEMANTIC REVISION {cycle:03d}", revision_body))
     for gate in sorted((cycle_dir(run_dir, cycle) / "checks").glob("*")):
         if not gate.is_dir():
             continue
@@ -747,28 +620,9 @@ def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
             "Diff artifact metadata (diff omitted from consolidated diagnostics):",
             _artifact_header(_artifact(run_dir, f"{gate_relative}/diff.patch")),
         ])))
-        stage_repairs = check_repair_root(run_dir, cycle) / gate.name
-        for attempt in sorted((stage_repairs / "attempts").glob("[0-9][0-9][0-9]")):
-            attempt_relative = attempt.relative_to(run_dir).as_posix()
-            parts.append(_section(f"CHECK REPAIR {cycle:03d} {gate.name} ATTEMPT {attempt.name}", "\n".join([
-                _artifact_json(run_dir, f"{attempt_relative}/attempt.json", secrets),
-                _artifact_json(run_dir, f"{attempt_relative}/failure.json", secrets),
-                _artifact_json(run_dir, f"{attempt_relative}/scope.json", secrets),
-                _artifact_text(run_dir, f"{attempt_relative}/agent.prompt.txt", secrets),
-                _agent_result_artifact(run_dir, f"{attempt_relative}/agent.result.json", secrets),
-                _artifact_text(run_dir, f"{attempt_relative}/agent.final.md", secrets),
-                _artifact_json(run_dir, f"{attempt_relative}/report.json", secrets),
-            ])))
     parts.append(_section(f"CANDIDATE {cycle:03d}", _artifact_json(
         run_dir, f"{root}/candidate/commit.json", secrets,
     )))
-    review = review_dir(run_dir, cycle).relative_to(run_dir).as_posix() + "/"
-    parts.append(_section(f"REVIEWER {cycle:03d}", "\n".join([
-        _artifact_text(run_dir, review + "reviewer.request.txt", secrets),
-        _artifact_text(run_dir, review + "reviewer.raw.md", secrets),
-        _artifact_json(run_dir, review + "review.json", secrets),
-        _artifact_json(run_dir, review + "reviewer.usage.json", secrets),
-    ])))
     return "".join(parts)
 
 
@@ -789,7 +643,7 @@ def _attempts(run_dir: Path, secrets: tuple[str, ...]) -> str:
         for attempt in attempts:
             status = "FAILED" if (attempt / "agent.stderr.log").exists() or (attempt / "planner.raw.md").exists() else "RECORDED"
             rows.append(f"### {phase} — ATTEMPT {attempt.name} — {status}\n")
-            for name in ("planner.request.txt", "planner.raw.md", "agent.final.md", "agent.stderr.log", "step.json", "usage.json", "planner.usage.json", "reviewer.raw.md", "review.json"):
+            for name in ("planner.request.txt", "planner.raw.md", "agent.final.md", "agent.stderr.log", "step.json", "usage.json", "planner.usage.json"):
                 if (attempt / name).exists():
                     relative = str((attempt / name).relative_to(run_dir))
                     rows.append(_artifact_text(run_dir, relative, secrets, MAX_STDERR_BYTES if name.endswith("stderr.log") else MAX_ARTIFACT_BYTES, tail=name.endswith("stderr.log")))
@@ -820,12 +674,6 @@ def _current_attempt_status(directory: Path, secrets: tuple[str, ...]) -> str | 
             if isinstance(payload, Mapping) and payload.get("exit_code") == 0 and not payload.get("timed_out"):
                 return "SUCCESS"
             return "FAILED"
-        for name in ("review.json",):
-            path = directory / name
-            if path.is_file():
-                text, _size, truncated = _read_bounded(path, MAX_ARTIFACT_BYTES, secrets)
-                payload = json.loads(text) if not truncated else None
-                return "SUCCESS" if isinstance(payload, Mapping) and payload.get("verdict") == "PASS" else "FAILED"
         planner = directory / "planner.raw.md"
         if planner.is_file():
             text, _size, _truncated = _read_bounded(planner, MAX_ARTIFACT_BYTES, secrets)
@@ -888,7 +736,6 @@ def build_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> str:
     except (OSError, ValueError, ResumeCheckpointError) as exc:
         checkpoint_text = _artifact_json(directory, "resume_checkpoint.json", secrets) + "Resume information unavailable: " + redact(str(exc), secrets)[:500]
     body += _section("RESUME", checkpoint_text)
-    body += _section("DETERMINISTIC GATE RECOVERY", _check_recovery_summary(directory, state))
     try:
         body += _section("CONTRACT REPAIR", _contract_repairs(directory, state, secrets))
     except (OSError, ValueError) as exc:

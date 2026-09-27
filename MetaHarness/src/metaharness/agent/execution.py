@@ -401,7 +401,6 @@ class ExecutorDriverRegistry:
         runtime_config: Any = None,
         *,
         agent: Any | None = None,
-        reviser: Any | None = None,
     ) -> AgentExecutor:
         name = profile_driver_name(profile.driver)
         factory = self._factories.get(name)
@@ -421,8 +420,6 @@ class ExecutorDriverRegistry:
         kwargs: dict[str, Any] = {}
         if accepts_kwargs or "agent" in parameters:
             kwargs["agent"] = agent
-        if accepts_kwargs or "reviser" in parameters:
-            kwargs["reviser"] = reviser
         return factory(profile, runtime_config, **kwargs)
 
 
@@ -441,22 +438,21 @@ def register_executor_driver(
 
 
 def _codex_factory(
-    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None,
+    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None,
 ) -> AgentExecutor:
-    del reviser
     return CodexExecutor(profile, runtime_config, agent=agent)
 
 
 def _claude_factory(
-    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None,
+    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None,
 ) -> AgentExecutor:
-    return ClaudeCodeExecutor(profile, runtime_config, agent=reviser or agent)
+    return ClaudeCodeExecutor(profile, runtime_config, agent=agent)
 
 
 def _external_factory(
-    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None, reviser: Any | None = None,
+    profile: ModelProfile, runtime_config: Any = None, *, agent: Any | None = None,
 ) -> AgentExecutor:
-    del agent, reviser
+    del agent
     return ExternalAgentExecutor(profile, runtime_config)
 
 
@@ -470,15 +466,12 @@ def executor_for_profile(
     runtime_config: Any = None,
     *,
     agent: Any | None = None,
-    reviser: Any | None = None,
 ) -> AgentExecutor:
     """Resolve exactly one infrastructure adapter for a selected profile."""
 
     if not isinstance(profile, ModelProfile):
         raise TypeError("profile must be a ModelProfile")
-    return EXECUTOR_REGISTRY.resolve(
-        profile, runtime_config, agent=agent, reviser=reviser
-    )
+    return EXECUTOR_REGISTRY.resolve(profile, runtime_config, agent=agent)
 
 
 __all__ = [

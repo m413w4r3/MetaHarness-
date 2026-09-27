@@ -569,8 +569,8 @@ class WorkerAttemptService:
             changed_paths = changed_paths_between_trees(repo, tree_before, tree_after)
         out_of_scope_paths = () if policy.strict else tuple(unexpected)
         # 17-18. Durable step record, then the outcome.  A deferred verify
-        # dependency is recorded as data for the reviser and the reviewer; it never
-        # relaxes a deterministic gate.
+        # dependency is recorded as data for the audit; it never relaxes a
+        # deterministic gate.
         deferred_verify = bounded_v2_report(
             deferred_verify_dependency(result.final_message) or ""
         )

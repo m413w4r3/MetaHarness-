@@ -27,10 +27,7 @@ class RecoveryStrategy(StrEnum):
     """One deterministic step of one recovery ladder."""
 
     RETRY_TARGETED = "retry_targeted"
-    REPAIR_TARGETED = "repair_targeted"
-    EXPAND_SCOPE = "expand_scope"
     REPLAN_STEP = "replan_step"
-    REPLAN_CYCLE = "replan_cycle"
     FALLBACK_EXECUTOR = "fallback_executor"
     MARK_FAILED_CONTINUE = "mark_failed_continue"
     WAIT_EXTERNAL = "wait_external"
@@ -56,72 +53,47 @@ _T, _F, _S, _X = (
 # a prefix or suffix pattern; an exact key always wins over a pattern.
 FAILURE_CLASSES: Mapping[str, FailureClass] = {
     # -- FATAL: secrets and content the harness cannot inspect.
-    "SECRET_*": _X, "*_BLOB_NOT_REVIEWABLE": _X, "SECURITY_VIOLATION": _X,
-    "UNSCANNABLE_STAGED_BLOB": _X, "STAGED_BLOB_SCAN_FAILED": _X,
-    "BLOB_SCAN_FAILED": _X, "UNREVIEWABLE_TEXT_DIFF": _X, "COMMIT_SECURITY_FAILURE": _X,
+    "SECRET_*": _X, "*_BLOB_NOT_REVIEWABLE": _X,
+    "UNSCANNABLE_STAGED_BLOB": _X, "STAGED_BLOB_SCAN_FAILED": _X, "UNREVIEWABLE_TEXT_DIFF": _X, "COMMIT_SECURITY_FAILURE": _X,
     # -- FATAL: writes outside physical authority, foreign Git state.
     "TREE_MODIFIED_OUTSIDE_AUTHORITY": _X, "HEAD_MODIFIED_OUTSIDE_AUTHORITY": _X,
     "BRANCH_MODIFIED_OUTSIDE_AUTHORITY": _X, "REMOTE_AUTHORITY_MISMATCH": _X,
-    "BASE_MOVED_SINCE_RUN": _X, "REPOSITORY_TREE_DRIFT_UNEXPLAINED": _X,
-    "UNEXPLAINED_REPOSITORY_TREE_DRIFT": _X, "HARD_DENY_PATH_MUTATION": _X,
+    "BASE_MOVED_SINCE_RUN": _X, "REPOSITORY_TREE_DRIFT_UNEXPLAINED": _X, "HARD_DENY_PATH_MUTATION": _X,
     # -- FATAL: the last green tree or the durable authority cannot be restored.
     "ROLLBACK_FAILED": _X, "ROLLBACK_TREE_MISMATCH": _X, "RESUME_REQUIRES_OPERATOR": _X,
     "RESUME_INTEGRITY_FAILURE": _X, "DURABLE_ARTIFACT_CORRUPTED": _X,
     "RUN_SCHEMA_UNSUPPORTED": _X,
     "AUDIT_PROFILE_NOT_WRITABLE": _X,
-    "CORRUPTED_DURABLE_ARTIFACT": _X, "CHECK_AUTHORITY_TAMPERING": _X,
-    "CHECK_AUTHORITY_CORRUPTED": _X, "CHECK_AUTHORITY_MISMATCH": _X,
-    "CHECK_AUTHORITY_INVALID": _X, "APPROVED_PLAN_HASH_MISMATCH": _X,
-    "APPROVED_PLAN_SHA_MISMATCH": _X, "PLAN_HASH_MISMATCH": _X,
-    "PLAN_APPROVAL_IDENTITY_MISMATCH": _X, "APPROVAL_IDENTITY_MISMATCH": _X,
-    "RESUME_IDENTITY_MISMATCH": _X, "RESUME_IDENTITY_INVALID": _X,
     # -- SPEC_DECISION: a product or policy choice the SPEC leaves open.
-    "SPEC_DECISION_REQUIRED": _S, "SECURITY_POLICY_DECISION_REQUIRED": _S,
-    "REVIEW_HUMAN_REQUIRED": _S, "ATOMIC_SCOPE_POLICY_LIMIT": _S,
+    "SPEC_DECISION_REQUIRED": _S, "SECURITY_POLICY_DECISION_REQUIRED": _S, "ATOMIC_SCOPE_POLICY_LIMIT": _S,
     # -- TRANSIENT: providers, transport, executors and infrastructure.
     "LLM_*": _T, "AGENT_START_FAILED": _T, "AGENT_RUNTIME_FAILED": _T,
     "AGENT_TIMEOUT": _T, "AGENT_PROTOCOL_FAILED": _T, "AGENT_FAILURE": _T,
     "AGENT_AUTH_FAILURE": _T, "MISSING_PROVIDER_CREDENTIALS": _T,
     "PROVIDER_CREDENTIALS_MISSING": _T, "EXTERNAL_AUTH_REQUIRED": _T,
-    "DNS_UNAVAILABLE": _T, "NETWORK_UNAVAILABLE": _T, "DOCKER_DAEMON_UNAVAILABLE": _T,
     "REMOTE_TEMPORARILY_UNAVAILABLE": _T, "REMOTE_UNAVAILABLE": _T,
     "CANDIDATE_REMOTE_UNAVAILABLE": _T, "PUSH_FAILED": _T, "CANDIDATE_PUSH_FAILED": _T,
     "GITHUB_WORKSTREAM_FAILURE": _T, "GIT_FAILURE": _T,
     "CHECK_TIMEOUT": _T, "CHECK_PREFLIGHT_FAILED": _T, "CHECK_INFRA_FAILURE": _T,
     "CHECK_INFRASTRUCTURE_UNAVAILABLE": _T,
     "CHECK_SIDE_EFFECT_REPEATED": _T, "CHECK_SIDE_EFFECT_UNSTABLE": _T,
-    "SEMANTIC_REVISER_UNAVAILABLE": _T, "SEMANTIC_REVISER_PROFILE_MISSING": _T,
     "WORKSPACE_SETUP_FAILED": _T, "WORKSPACE_SETUP_TIMEOUT": _T,
-    "TRANSIENT_ATTEMPTS_EXHAUSTED": _T, "REVIEW_TRANSPORT_FAILURE": _T,
-    "REVIEWER_TRANSPORT_FAILURE": _T,
     # -- FIXABLE: model, contract, scope and correctness failures.
     "AGENT_CONTRACT_MISMATCH": _F, "AGENT_NO_CHANGE": _F, "AGENT_SCOPE_VIOLATION": _F,
-    "AGENT_GIT_VIOLATION": _F, "CONTRACT_INSUFFICIENT": _F, "CONTRACT_INSUFFICIENCY": _F,
+    "AGENT_GIT_VIOLATION": _F,
     "CHECK_FAILED": _F, "DETERMINISTIC_GATE_FAILED": _F,
-    "AUDIT_REMAINING": _F,
-    "PER_STEP_GATE_REGRESSION": _F,
-    "CHECK_MUTATED_FORBIDDEN_FILES": _F, "CHECK_SETUP_INVALID": _F,
-    "WAITING_REPAIR_EXHAUSTED": _F, "HUMAN_REQUIRED": _F,
-    "REVIEW_IMPLEMENTATION": _F, "REVIEW_REPLAN": _F, "REVIEW_EVIDENCE_RETRY": _F,
-    "REVIEW_EVIDENCE_UNRESOLVED": _F, "REVIEW_FORMAT_INVALID": _F,
-    "REVIEW_PARSE_INVALID": _F, "REVIEWER_OUTPUT_INVALID": _F, "REVIEW_ROUTE_NOT_NONE": _F,
-    "REVIEW_AUTHORITY_MISSING": _F, "BOUNDED_SCOPE_REQUEST": _F,
-    "PLANNER_OUTPUT_INVALID": _F, "PLANNER_FORMAT_INVALID": _F,
-    "PLANNER_PROTOCOL_FAILED": _F, "PLANNER_REPOSITORY_EVIDENCE": _F,
+    "AUDIT_REMAINING": _F, "CODEX_RUNTIME_FAILURE": _F,
+    "GITHUB_CONFIG_INVALID": _F, "GITHUB_ISSUE_NOT_FOUND": _F,
+    "GITHUB_PR_CANDIDATE_MISMATCH": _F, "GITHUB_PR_REQUIRES_RUN_BRANCH": _F,
+    "PER_STEP_GATE_REGRESSION": _F, "CHECK_SETUP_INVALID": _F, "HUMAN_REQUIRED": _F,
+    "PLANNER_OUTPUT_INVALID": _F,
     "PLANNER_BLOCKED_REQUIRES_OPERATOR": _F, "PLAN_APPROVAL_INVALID": _F,
-    "PLAN_REPOSITORY_PRECONDITION_INVALID": _F, "PLAN_REPOSITORY_PRECONDITION_ERROR": _F,
-    "PLANNER_REPOSITORY_PRECONDITION_ERROR": _F,
+    "PLAN_REPOSITORY_PRECONDITION_INVALID": _F,
     "REPOSITORY_EVIDENCE_RECOVERY_EXHAUSTED": _F,
-    "STEP_CONTRACT_REPAIR_OUTPUT_INVALID": _F,
-    "REPAIR_PLANNER_BLOCKED": _F,
-    "REPLAN_CYCLE_REQUIRED": _F, "REPLAN_EXECUTION_SELECTION_INVALID": _F,
-    "REPLAN_EXECUTION_SELECTION_MISMATCH": _F, "EXECUTION_SELECTION_INVALID": _F,
-    "IMPLEMENTATION_CORRECTION_CYCLE_REQUIRED": _F, "WORKSPACE_SETUP_MUTATED": _F,
+    "STEP_CONTRACT_REPAIR_OUTPUT_INVALID": _F, "EXECUTION_SELECTION_INVALID": _F, "WORKSPACE_SETUP_MUTATED": _F,
     "COMMIT_GATE_FAILED": _F, "COMMIT_SCOPE_VIOLATION": _F, "COMMIT_PARENT_MISMATCH": _F,
     "COMMIT_WORKTREE_DRIFT": _F, "COMMIT_VERIFICATION_FAILURE": _F,
-    "COMMIT_TREE_MISMATCH": _F, "HEAD_MISMATCH": _F, "TREE_MISMATCH": _F,
-    "BRANCH_MISMATCH": _F, "UNEXPECTED_HEAD": _F, "UNEXPECTED_TREE": _F,
-    "INTEGRITY_MISMATCH": _F, "TOCTOU_FAILURE": _F, "INVALID_PHASE_TRANSITION": _F,
+    "COMMIT_TREE_MISMATCH": _F, "HEAD_MISMATCH": _F, "TREE_MISMATCH": _F, "TOCTOU_FAILURE": _F, "INVALID_PHASE_TRANSITION": _F,
     "INTERNAL_HARNESS_ERROR": _F,
 }
 
@@ -184,11 +156,9 @@ class ExecutionFallbacks:
     mechanical: tuple[str, ...] = ()
     reasoning: tuple[str, ...] = ()
     agentic: tuple[str, ...] = ()
-    semantic_reviser: tuple[str, ...] = ()
-    check_repair: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("mechanical", "reasoning", "agentic", "semantic_reviser", "check_repair"):
+        for name in ("mechanical", "reasoning", "agentic"):
             values = getattr(self, name)
             if isinstance(values, str) or not isinstance(values, tuple):
                 raise ValueError(f"execution_fallbacks.{name} must be a tuple of profile IDs")
@@ -216,7 +186,6 @@ class RecoveryBudgets:
     max_transient_attempts: int = 2
     max_executor_fallbacks: int = 1
     max_check_infra_retries: int = 2
-    max_review_transport_retries: int = 2
     max_workspace_setup_retries: int = 2
     # Protocol corrections of one StepContractRepairPlanner answer inside the
     # same semantic repair slot; never a new ``max_step_contract_repairs``.
@@ -229,8 +198,8 @@ class RecoveryBudgets:
     def __post_init__(self) -> None:
         for name in (
             "max_transient_attempts", "max_executor_fallbacks",
-            "max_check_infra_retries", "max_review_transport_retries",
-            "max_workspace_setup_retries", "max_contract_repair_output_corrections",
+            "max_check_infra_retries", "max_workspace_setup_retries",
+            "max_contract_repair_output_corrections",
             "max_contract_repair_planner_restarts",
         ):
             value = getattr(self, name)

@@ -47,10 +47,11 @@ class EnvironmentFileTests(unittest.TestCase):
             config_file.write_text(
                 'repo = "."\nbase_ref = "HEAD"\nruns_root = "runs"\nworktrees_root = "worktrees"\nallow_no_required_checks = true\n'
                 '[environment]\nfiles = [".env"]\n'
-                '[ui]\ndefault_planner_profile = "planner"\ndefault_implementer_profile = "worker"\ndefault_reviewer_profile = "reviewer"\n'
+                '[ui]\ndefault_planner_profile = "planner"\ndefault_audit_profile = "auditor"\n'
+                '[routing]\nmechanical_profile = "worker"\nreasoning_profile = "worker"\nagentic_profile = "worker"\n'
                 '[model_profiles.planner]\ndisplay_name = "Planner"\nroles = ["planner"]\ndriver = "openai-chat"\nprovider = "bridge"\nmodel = "m"\nselection_mode = "request"\nbase_url = "http://127.0.0.1:1"\nendpoint_path = "/${VALUE}"\napi_key_env = "BRIDGE_API_KEY"\n'
                 '[model_profiles.worker]\ndisplay_name = "Worker"\nroles = ["implementer"]\ndriver = "external"\nprovider = "bridge"\nmodel = "m"\nselection_mode = "cli"\nargv = ["worker"]\n'
-                '[model_profiles.reviewer]\ndisplay_name = "Reviewer"\nroles = ["reviewer"]\ndriver = "openai-chat"\nprovider = "bridge"\nmodel = "m"\nselection_mode = "request"\nbase_url = "http://127.0.0.1:1"\nendpoint_path = "/review"\n'
+                '[model_profiles.auditor]\ndisplay_name = "Auditor"\nroles = ["auditor"]\ndriver = "openai-chat"\nprovider = "bridge"\nmodel = "m"\nselection_mode = "request"\nbase_url = "http://127.0.0.1:1"\nendpoint_path = "/audit"\n'
                 '',
                 encoding="utf-8",
             )

@@ -17,17 +17,13 @@ from typing import Any, Sequence
 
 from ..llm.chat import LLMConversationHandle, LLMProtocolError
 from ..models import (
-    CheckConfig,
     ExecutionClass,
     PlanDecision,
-    PlanningConfig,
     TaskPlanV2,
 )
 from ..plan_repository_validation import (
     PathPreconditionViolation,
     PlanRepositoryPreconditionError,
-    RepositoryPreconditions,
-    plan_repository_violations,
 )
 from ..result import atomic_write_text
 from ..step_ids import MAX_STEPS, STEP_ID_RE, step_ids
@@ -36,16 +32,11 @@ from .protocol import (
     STEP_CONTRACT_NAME,
     STEP_ID_RANGE,
     V2PlanParseError,
-    parse_task_plan_v2,
     render_plan_summary_v2,
     render_step_contract,
     validate_step_contract_bounds,
 )
 from .normalization import normalizations_payload
-from .validation import (
-    normalize_plan_repository,
-    validate_repair_decomposition_policy,
-)
 
 STEP_CONTRACT_REPAIR_OUTPUT_INVALID = "STEP_CONTRACT_REPAIR_OUTPUT_INVALID"
 # The compact record of every deterministic normalization applied to the plan.
@@ -293,8 +284,6 @@ def validate_implementation_bundle(
         raise V2PlanParseError("implementation bundle is missing or invalid") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise V2PlanParseError("implementation bundle schema_version is invalid")
-    if "reviewer_profile" in payload or "implementer_profiles" in payload:
-        raise V2PlanParseError("implementation bundle contains planner-selected profiles")
     steps = payload.get("steps")
     if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_STEPS:
         raise V2PlanParseError("implementation bundle steps are invalid")
@@ -472,113 +461,6 @@ def read_attempt_validation(attempt: Path) -> dict[str, Any]:
     return value
 
 
-def _repair_plan_recovery_sources(target: Path) -> list[Path]:
-    """The correction directories that may hold an already paid planner answer.
-
-    ``target`` first, then its archived retry attempts newest-first, so a raw
-    response that was already paid for and rejected only by local validation
-    is found wherever it was kept.
-    """
-
-    sources = [target]
-    attempts = target / "attempts"
-    if attempts.is_dir():
-        sources.extend(
-            sorted((path for path in attempts.iterdir() if path.is_dir()), reverse=True)
-        )
-    return sources
-
-
-def recover_existing_repair_plan(
-    *,
-    target: Path,
-    current_evidence_text: str,
-    original_spec: str,
-    current_repository_state: str,
-    check_catalog: Sequence[CheckConfig],
-    inherited_check_ids: Sequence[str],
-    planning: PlanningConfig,
-    repository_preconditions: RepositoryPreconditions | None = None,
-) -> TaskPlanV2 | None:
-    """Revalidate an already produced correction answer locally, or return ``None``.
-
-    A durable ``planner.raw.md`` is reusable only next to a
-    ``planner.evidence.md`` byte-identical to *current_evidence_text*: the
-    answer then belongs to exactly this candidate commit, reviewer result
-    and approved mutable scope.  The strict parser and the repair policy are
-    applied unchanged, no existing artifact is deleted, and the model is never
-    called.  A structurally invalid or still out-of-policy answer is refused.
-    """
-
-    # Accepted for symmetry with the persistence step; a recovery decision
-    # depends only on the evidence packet and on the raw answer itself.
-    del original_spec, current_repository_state
-
-    for source in _repair_plan_recovery_sources(target):
-        try:
-            raw = (source / "planner.raw.md").read_text(encoding="utf-8")
-            evidence = (source / "planner.evidence.md").read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            continue
-        if evidence != current_evidence_text:
-            continue
-        try:
-            plan = parse_task_plan_v2(
-                raw,
-                planning=planning,
-                check_catalog=check_catalog,
-                inherited_check_ids=inherited_check_ids,
-            )
-            validate_repair_decomposition_policy(plan, planning)
-        except V2PlanParseError:
-            continue
-        plan = normalize_plan_repository(repository_preconditions, plan)
-        if plan_repository_violations(plan):
-            continue
-        if source is not target:
-            # The retry archived the provenance of the answer being reused, so
-            # restore it where the run expects it -- never over a present copy.
-            for name, text in (
-                ("planner.raw.md", raw),
-                ("planner.evidence.md", evidence),
-            ):
-                if not (target / name).exists():
-                    atomic_write_text(target / name, text)
-        return plan
-    return None
-
-
-def persist_recovered_repair_artifacts(
-    target: Path,
-    *,
-    original_spec: str,
-    current_repository_state: str,
-    plan: TaskPlanV2,
-) -> None:
-    """Publish a locally revalidated repair plan without rewriting its call.
-
-    ``planner.request.txt``, ``planner.request.fallback.txt``,
-    ``planner.evidence.md``, ``planner.request.meta.json``, ``planner.raw.md``
-    and ``planner.usage.json`` describe the one exchange that really produced
-    this answer, so they stay exactly as they are; the already durable raw
-    response remains the authority of provenance.
-    """
-
-    atomic_write_text(target / "spec.md", original_spec)
-    atomic_write_text(target / "context.txt", current_repository_state)
-    write_task_plan_v2(target, plan)
-    if plan.decision is PlanDecision.READY:
-        write_implementation_bundle(target, plan)
-    else:
-        atomic_write_text(
-            target / "task_plan.json",
-            json.dumps(
-                {**asdict(plan), "decision": plan.decision.value, "execution_mode": None},
-                ensure_ascii=False, indent=2,
-            ) + "\n",
-        )
-
-
 __all__ = [
     "PLAN_NORMALIZATIONS_NAME",
     "STEP_CONTRACT_REPAIR_OUTPUT_INVALID",
@@ -587,13 +469,11 @@ __all__ = [
     "StepRepairAttemptFiles",
     "persist_planning_v2_artifacts",
     "persist_recovered_plan_artifacts",
-    "persist_recovered_repair_artifacts",
     "planning_session_handle",
     "read_approved_step_contract",
     "read_attempt_validation",
     "read_bounded_json",
     "read_planning_session",
-    "recover_existing_repair_plan",
     "render_json",
     "sha256_bytes",
     "step_contract_path",

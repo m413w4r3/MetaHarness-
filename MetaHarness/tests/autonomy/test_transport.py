@@ -24,7 +24,12 @@ from tests.autonomy.support import (
     chat_endpoint,
     meta_plan,
 )
-from tests.pipeline_support import ScriptedChat, review, write
+from tests.pipeline_support import write
+
+AUDIT_DONE = (
+    "META AUDIT v1\n\nSTATUS\nDONE\n\nFIXED\n- none\n\n"
+    "REFACTORED\n- none\n\nREMAINING\n- none\n\nRISKS\n- none\nEND META AUDIT\n"
+)
 
 
 class PlannerTransportOutageTests(AutonomyHarness):
@@ -43,11 +48,11 @@ class PlannerTransportOutageTests(AutonomyHarness):
         clock = FakeClock()
         transport = FlakyHTTPTransport(clock, outage_seconds=0.0, answer=self.plan())
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
 
         result = Orchestrator(
             self.config(),
             planner_client=CompletionOverTransport(chat_endpoint(), transport, clock),
-            reviewer_client=ScriptedChat([review()]),
         ).run_text(SPEC, run_id="run")
 
         self.assert_run_completed(result)
@@ -78,6 +83,7 @@ class PlannerTransportOutageTests(AutonomyHarness):
         """
 
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
         horizon = 30
         endpoint = dataclasses.replace(chat_endpoint(), max_wait_seconds=horizon)
         clock = FakeClock()
@@ -90,7 +96,6 @@ class PlannerTransportOutageTests(AutonomyHarness):
                 FlakyHTTPTransport(clock, outage_seconds=horizon + 60.0, answer=self.plan()),
                 clock,
             ),
-            reviewer_client=ScriptedChat([review()]),
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(failed.status, RunStatus.WAITING_EXTERNAL)
@@ -102,10 +107,9 @@ class PlannerTransportOutageTests(AutonomyHarness):
         resumed = Orchestrator(
             config,
             planner_client=CompletionOverTransport(endpoint, recovered, clock),
-            reviewer_client=ScriptedChat([review()]),
         ).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # The plan came from the provider once it was reachable again: the
         # exhausted phase never persisted an answer to replay.
         self.assertGreaterEqual(recovered.attempts, 1)
@@ -123,11 +127,11 @@ class PlannerTransportOutageTests(AutonomyHarness):
             clock, outage_seconds=self.OUTAGE_SECONDS, answer=self.plan(),
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
 
         result = Orchestrator(
             self.config(),
             planner_client=CompletionOverTransport(chat_endpoint(), transport, clock),
-            reviewer_client=ScriptedChat([review()]),
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_false_human_stop(result)

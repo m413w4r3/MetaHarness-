@@ -23,9 +23,8 @@ max_step_contract_chars = 8500
 
 
 [revision]
-enabled = true
-max_check_repair_attempts = 2
-max_correction_cycles = 2
+# Step contract repair slots; the post-implementation authority is the
+# deterministic gate alternating with AUDIT.
 max_step_contract_repairs = 2
 
 [gate]
@@ -44,7 +43,6 @@ max_wait_seconds = 1800
 max_transient_attempts = 2
 max_executor_fallbacks = 1
 max_check_infra_retries = 2
-max_review_transport_retries = 2
 max_workspace_setup_retries = 2
 max_contract_repair_output_corrections = 2
 max_contract_repair_planner_restarts = 1
@@ -53,7 +51,6 @@ max_contract_repair_planner_restarts = 1
 mechanical = ["codex-luna-xhigh"]
 reasoning = ["codex-sol-high"]
 agentic = ["codex-sol-high"]
-semantic_reviser = ["codex-astra-medium"]
 
 [repository]
 remote = "origin"
@@ -93,15 +90,10 @@ poll_interval_seconds = 0.5
 
 [ui]
 max_active_runs = 1
-enable_profile_recommendation = true
 default_planner_profile = "planner-chatgpt"
-default_reviewer_profile = "planner-chatgpt"
-default_reviser_profile = "claude-opus-5-medium"
+# AUDIT is the one post-implementation critic: recommend a high-tier profile
+# ("codex-sol-high" or "claude-opus-5-medium").
 default_audit_profile = "claude-opus-5-medium"
-# The transverse final check repair reads the whole failure history of a run:
-# recommend a high-tier profile there ("codex-sol-high" or
-# "claude-opus-5-medium"), while the fast per-step gate stays cheap.
-default_repair_profile = "codex-luna-high"
 
 [context]
 always_files = ["AGENTS.md"]
@@ -125,9 +117,6 @@ require_locator_head_at_base = true
 [prompt_budget]
 planner_max_bytes = 192000
 implementer_max_bytes = 96000
-check_repair_max_bytes = 64000
-semantic_revision_max_bytes = 128000
-final_review_max_bytes = 128000
 
 
 # Provider configuration for Codex-backed DeepSeek workers.
@@ -141,7 +130,7 @@ api_key_env = "DEEPSEEK_API_KEY"
 
 [model_profiles."planner-chatgpt"]
 display_name = "ChatGPT UI Planner"
-roles = ["planner", "reviewer"]
+roles = ["planner"]
 driver = "openai-chat"
 provider = "openai"
 model = "chatgpt-web"
@@ -149,9 +138,9 @@ selection_mode = "external-ui"
 base_url = "http://127.0.0.1:8001"
 endpoint_path = "/v1/chat/completions"
 api_key_env = "BRIDGE_API_KEY"
-timeout_seconds = 420000
-description = "Strong semantic planning and review through the ChatGPT bridge."
-strengths = ["planning", "semantic review", "risk analysis"]
+timeout_seconds = 42000
+description = "Strong planning and repository analysis through the ChatGPT bridge."
+strengths = ["planning", "repository analysis", "risk analysis"]
 cost_tier = "standard"
 latency_tier = "standard"
 
@@ -162,7 +151,7 @@ latency_tier = "standard"
 
 [model_profiles."codex-luna-high"]
 display_name = "Luna High"
-roles = ["implementer", "repair"]
+roles = ["implementer"]
 driver = "codex"
 provider = "openai"
 model = "gpt-6-luna"
@@ -170,8 +159,8 @@ effort = "high"
 sandbox = "workspace-write"
 selection_mode = "cli"
 timeout_seconds = 54000
-description = "Small mechanical steps and deterministic check repair."
-strengths = ["mechanical implementation", "unit tests", "check repair"]
+description = "Small mechanical implementation steps."
+strengths = ["mechanical implementation", "unit tests", "small diffs"]
 cost_tier = "low"
 latency_tier = "fast"
 
@@ -194,7 +183,7 @@ latency_tier = "standard"
 
 [model_profiles."codex-sol-high"]
 display_name = "Sol High"
-roles = ["implementer", "reviser"]
+roles = ["implementer"]
 driver = "codex"
 provider = "openai"
 model = "gpt-6-sol"
@@ -202,15 +191,15 @@ effort = "high"
 sandbox = "workspace-write"
 selection_mode = "cli"
 timeout_seconds = 54000
-description = "Complex bounded reasoning and alternative semantic revision."
-strengths = ["complex reasoning", "integration", "semantic revision"]
+description = "Complex bounded reasoning and integration."
+strengths = ["complex reasoning", "integration", "multi-file refactor"]
 cost_tier = "high"
 latency_tier = "standard"
 
 
 [model_profiles."codex-astra-medium"]
 display_name = "Astra Medium"
-roles = ["implementer", "reviser"]
+roles = ["implementer"]
 driver = "codex"
 provider = "openai"
 model = "gpt-6-astra"
@@ -218,8 +207,8 @@ effort = "medium"
 sandbox = "workspace-write"
 selection_mode = "cli"
 timeout_seconds = 54000
-description = "Exceptional reserve for difficult implementation or semantic revision."
-strengths = ["agentic implementation", "complex reasoning", "semantic revision"]
+description = "Exceptional reserve for difficult implementation."
+strengths = ["agentic implementation", "complex reasoning", "long-horizon work"]
 cost_tier = "high"
 latency_tier = "slow"
 
@@ -266,7 +255,7 @@ latency_tier = "standard"
 
 [model_profiles."claude-opus-5-medium"]
 display_name = "Claude Opus 5 Medium"
-roles = ["reviser", "auditor"]
+roles = ["auditor"]
 driver = "claude-code"
 provider = "anthropic"
 model = "claude-opus-5.5"
@@ -274,8 +263,8 @@ effort = "medium"
 permission_mode = "acceptEdits"
 selection_mode = "cli"
 timeout_seconds = 54000
-description = "Primary independent semantic revision profile."
-strengths = ["semantic revision", "integration review", "corrective editing"]
+description = "Primary independent AUDIT profile."
+strengths = ["independent audit", "integration analysis", "corrective editing"]
 cost_tier = "high"
 latency_tier = "slow"
 

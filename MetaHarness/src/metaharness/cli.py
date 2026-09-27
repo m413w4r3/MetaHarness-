@@ -108,9 +108,6 @@ def _config_check(config_path: Path) -> int:
         ("mechanical", config.routing.mechanical_profile),
         ("reasoning", config.routing.reasoning_profile),
         ("agentic", config.routing.agentic_profile),
-        ("reviewer", config.ui.default_reviewer_profile),
-        ("reviser", config.ui.default_reviser_profile),
-        ("repair", config.ui.default_repair_profile),
     ):
         profile = config.model_profiles.get(profile_id) if profile_id else None
         if profile is None:
@@ -325,8 +322,8 @@ def _write_plan_decision(run_dir: Path, decision: ApprovalDecision) -> int:
             # would silently downgrade this run to unapproved defaults.
             raise ApprovalError(
                 "this run is profile-aware: approve it through the profile-aware "
-                "web UI (metaharness web) so the implementer and reviewer "
-                "profiles are recorded; no approval was written"
+                "web UI (metaharness web) so the executed profiles are "
+                "recorded; no approval was written"
             )
         state_identity = state.get("plan_identity")
         if not isinstance(state_identity, dict):
@@ -545,7 +542,7 @@ def _doctor_claude(config: HarnessConfig, path_value: str) -> list[str]:
         claude, claude_environment, claude_home
     )
     if not supported:
-        return ["unsupported Claude Code CLI for MetaHarness reviser"]
+        return ["unsupported Claude Code CLI for MetaHarness"]
     print("OK claude CLI capabilities: supported")
     auth_status = check_claude_authentication(
         claude_home, environment=claude_environment
@@ -783,21 +780,10 @@ def _doctor(config_path: Path) -> int:
                     "codex authentication could not be verified for managed CODEX_HOME\n"
                     f'hint: run CODEX_HOME="{codex_home}" codex login'
                 )
-    if (
-        config.revision.enabled
-        or config.revision.max_check_repair_attempts > 0
-        or config.revision.max_correction_cycles > 0
-    ):
-        print(
-            "OK correction pipeline: "
-            f"semantic_revision={'enabled' if config.revision.enabled else 'disabled'}, "
-            f"max_check_repair_attempts={config.revision.max_check_repair_attempts}, "
-            f"max_correction_cycles={config.revision.max_correction_cycles}, "
-            f"reviser={config.ui.default_reviser_profile}, "
-            f"repair={config.ui.default_repair_profile})"
-        )
-    else:
-        print("OK correction pipeline: disabled")
+    print(
+        "OK step contract repair: "
+        f"max_step_contract_repairs={config.revision.max_step_contract_repairs}"
+    )
     claude_profiles = tuple(
         profile for profile in profiles_for_config(config).values()
         if profile.driver is ProfileDriver.CLAUDE_CODE

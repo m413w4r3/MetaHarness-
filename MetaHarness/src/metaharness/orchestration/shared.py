@@ -38,7 +38,7 @@ from ..result import (
     ResultArtifactError,
     atomic_write_text,
 )
-from ..models import RunCycle
+from ..models import CycleKind, RunCycle
 from ..resume import ResumeIntegrityError
 from .pipeline_v2 import cycle_record_path
 from ..validation import check_result_json
@@ -64,47 +64,22 @@ class CycleArtifactService:
 
     def begin(self, store: Any, ctx: Any, cycle: RunCycle, fresh: bool) -> None:
         self.set_trace_cycle(cycle.number)
+        if cycle.number != 1 or cycle.kind is not CycleKind.INITIAL:
+            raise ResumeIntegrityError("the pipeline executes one initial cycle")
         path = cycle_record_path(ctx.run_dir, cycle)
-        if cycle.number == 1:
-            record = _json_text({
-                "schema_version": 1,
-                "number": cycle.number,
-                "kind": cycle.kind.value,
-            })
-        else:
-            # The source review is the authority for the correction kind. The
-            # planner is never allowed to choose or repair this binding.
-            from .cycle_loader import correction_binding, validate_correction_bindings
-
-            validate_correction_bindings(ctx.run_dir, cycle.number - 1)
-            binding = correction_binding(ctx.run_dir, cycle.number)
-            if binding["kind"] != cycle.kind.value:
-                raise ResumeIntegrityError(
-                    f"cycle {cycle.number:03d} kind does not match its review route"
-                )
-            record = _json_text({
-                "schema_version": 2,
-                "number": cycle.number,
-                **binding,
-            })
+        record = _json_text({
+            "schema_version": 1,
+            "number": cycle.number,
+            "kind": cycle.kind.value,
+        })
         if path.exists():
             if path.read_text(encoding="utf-8") != record:
                 raise ResumeIntegrityError(f"cycle {cycle.number:03d} record diverges")
         else:
             atomic_write_text(path, record)
-        state = store.load()
+        store.load()
         store.update_metadata(cycle=cycle.number)
         self.cycle_update(store, cycle, status="running")
-        if fresh and cycle.number > 1:
-            store.update_metadata(
-                git_ownership=_git_ownership_payload(
-                    _git_ownership(ctx.repo, ctx.info.worktree)
-                ),
-            )
-            self.trace_emit(
-                "cycle.started", phase="cycle", cycle=cycle.number,
-                data={"kind": cycle.kind.value}, once=True,
-            )
 
 
 _MAX_AGENT_REPORT_BYTES = 32_000
@@ -121,27 +96,6 @@ _AGENT_ARTIFACTS = (
     "agent.result.json",
     "executor.json",
 )
-
-
-_REVISION_ARTIFACTS = (
-    "agent.prompt.txt",
-    "prompt.diagnostics.json",
-    "agent.events.jsonl",
-    "agent.stderr.log",
-    "agent.final.md",
-    "agent.result.json",
-)
-
-
-def _bounded_report(text: str) -> str:
-    """Bound the non-authoritative agent report sent to the reviewer."""
-
-    encoded = text.encode("utf-8", errors="replace")
-    if len(encoded) <= _MAX_AGENT_REPORT_BYTES:
-        return text
-    head = encoded[:_MAX_AGENT_REPORT_BYTES].decode("utf-8", errors="ignore")
-    omitted = len(encoded) - _MAX_AGENT_REPORT_BYTES
-    return f"{head}\n[... {omitted} bytes truncated; full report in agent.final.md ...]"
 
 
 def bounded_v2_report(text: str) -> str:
@@ -227,7 +181,7 @@ class StepExecutionOutcome:
     final_report: str
     # A verification the worker could not complete because an out-of-scope
     # path owned by a later approved step still fails.  Data only: the
-    # deterministic gate and the reviewer remain the authority.
+    # deterministic gate and the audit remain the authority.
     deferred_verify: str = ""
     mismatch_retry_count: int = 0
     no_change: bool = False
@@ -315,22 +269,9 @@ _PLANNER_ATTEMPT_ARTIFACTS = (
 )
 
 
-_REVIEW_ATTEMPT_ARTIFACTS = (
-    "reviewer.request.txt", "reviewer.request.meta.json", "reviewer.repair.request.txt",
-    "prompt.diagnostics.json", "prompt.diagnostics.repair.json", "reviewer.raw.md",
-    "reviewer.repair.raw.md", "reviewer.usage.json", "review.json",
-)
-
-
 _CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "evidence.json", "checks")
 
 
-
-
-_REVISION_ATTEMPT_ARTIFACTS = _AGENT_ARTIFACTS + (
-    "tree_after_failure.txt", "failure.json", "report.json", "usage.json",
-    "tree_before.txt", "tree_after.txt",
-)
 
 
 _PLANNER_CONVERSATION = "planner.conversation.json"
@@ -501,51 +442,9 @@ def _create_file_once(path: Path, data: bytes) -> None:
         os.close(directory_fd)
 
 
-# The prompt templates ship in the ``metaharness`` package directory, one
-# level above this sub-package.  Resolved exactly as
-# ``orchestrator.py`` used to resolve it, so the template files read are
-# byte-for-byte the same ones.
-_PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
-
-
-def _repair_checks_payload(bundle: EvidenceBundle) -> dict[str, Any]:
-    """Summarize a cycle's accepted deterministic gate for the correction planner.
-
-    The reviewed candidate only exists because its gate was accepted, so argv,
-    cwd, durations and log tails add no decision value here; they stay in the
-    durable check artifacts.
-    """
-
-    checks: list[dict[str, Any]] = []
-
-    for check in bundle.checks:
-        payload = (
-            dict(check)
-            if isinstance(check, Mapping)
-            else check_result_json(check)
-        )
-
-        checks.append(
-            {
-                "name": payload.get("name"),
-                "exit_code": payload.get("exit_code"),
-                "timed_out": bool(payload.get("timed_out", False)),
-                "workspace_mutated": bool(
-                    payload.get("workspace_mutated", False)
-                ),
-            }
-        )
-
-    return {
-        "deterministic_passed": bundle.deterministic_passed,
-        "failures": list(bundle.failures),
-        "checks": checks,
-    }
-
-
 def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
     # A bundle rebuilt from ``evidence.json`` on resume carries the persisted
-    # reviewer-safe payloads instead of CheckResult objects.
+    # bounded payloads instead of CheckResult objects.
     payload: list[dict[str, Any]] = []
     for check in bundle.checks:
         item = dict(check) if isinstance(check, Mapping) else check_result_json(check)
@@ -573,11 +472,10 @@ _status_has_unstaged_or_untracked = status_has_unstaged_or_untracked
 
 # The public spelling of the toolbox the run authorities import: the sibling
 # services keep reading the private names above, while `run_bootstrap`, the
-# composition root, the durable readers, the cycle loader, the resume gate,
-# the failure projection, the observability stream, the runtime kernel and the
-# step services reach the same objects through their public names.
+# composition root, the durable readers, the resume gate, the failure
+# projection, the observability stream, the runtime kernel and the step
+# services reach the same objects through their public names.
 AGENT_ARTIFACTS = _AGENT_ARTIFACTS
-REVISION_ARTIFACTS = _REVISION_ARTIFACTS
 RECOVERY_ATTEMPT_ARTIFACTS = _RECOVERY_ATTEMPT_ARTIFACTS
 MAX_AGENT_REPORT_BYTES = _MAX_AGENT_REPORT_BYTES
 PLANNER_CONVERSATION = _PLANNER_CONVERSATION

@@ -36,7 +36,7 @@ def _config(root: Path, runs: Path) -> HarnessConfig:
     profiles = {
         "planner": ModelProfile("planner", "Planner", (ExecutionRole.PLANNER,), ProfileDriver.OPENAI_CHAT, "planner", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
         "implementer": ModelProfile("implementer", "Implementer", (ExecutionRole.IMPLEMENTER,), ProfileDriver.EXTERNAL, "worker", SelectionMode.CLI, argv=("true",)),
-        "reviewer": ModelProfile("reviewer", "Reviewer", (ExecutionRole.REVIEWER,), ProfileDriver.OPENAI_CHAT, "reviewer", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
+        "auditor": ModelProfile("auditor", "Auditor", (ExecutionRole.AUDITOR,), ProfileDriver.OPENAI_CHAT, "auditor", SelectionMode.REQUEST, base_url=endpoint.base_url, endpoint_path=endpoint.endpoint_path),
     }
     return HarnessConfig(
         repo=root,
@@ -47,7 +47,7 @@ def _config(root: Path, runs: Path) -> HarnessConfig:
         context=ContextConfig(),
         check_catalog=(),
         allow_no_required_checks=True,
-        ui=UIConfig(default_planner_profile="planner", default_reviewer_profile="reviewer"),
+        ui=UIConfig(default_planner_profile="planner", default_audit_profile="auditor"),
         model_profiles=profiles,
         routing=RoutingConfig(
             mechanical_profile="implementer",

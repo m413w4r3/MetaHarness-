@@ -102,7 +102,7 @@ VALID_BODIES: dict[str, dict[str, object]] = {
     CREATE_PATH: {"spec": "Implement the widget."},
     APPROVAL_PATH: {
         "decision": "APPROVE",
-        "final_reviewer_profile": "final-reviewer",
+        "audit_profile": "final-auditor",
         "step_profiles": {"S01": "implementer"},
     },
     RESUME_PATH: {},
@@ -513,12 +513,7 @@ class CreateRunTests(MutationCase):
             "mechanical_profile": "mechanical",
             "reasoning_profile": "reasoning",
             "agentic_profile": "agentic",
-            "final_reviewer_profile": "final-reviewer",
-            "semantic_reviser_profile": "reviser",
-            "check_repair_profile": "repairer",
-            "semantic_revision_enabled": True,
-            "max_check_repair_attempts": 2,
-            "max_correction_cycles": 1,
+            "audit_profile": "final-auditor",
             "decomposition": "auto",
             "execution_mode_policy": "auto",
             "single_step_max_mutable_paths": 4,
@@ -599,9 +594,7 @@ class ApprovalTests(MutationCase):
             APPROVAL_PATH,
             {
                 "decision": "APPROVE",
-                "final_reviewer_profile": "reviewer",
-                "semantic_reviser_profile": "reviser",
-                "check_repair_profile": "repairer",
+                "audit_profile": "final-auditor",
                 "step_profiles": {"S01": "implementer-a", "S42": "implementer-b"},
             },
         )
@@ -611,9 +604,7 @@ class ApprovalTests(MutationCase):
             self.local_body(APPROVAL_PATH),
             {
                 "decision": "APPROVE",
-                "final_reviewer_profile": "reviewer",
-                "semantic_reviser_profile": "reviser",
-                "check_repair_profile": "repairer",
+                "audit_profile": "final-auditor",
                 "step_profile__S01": "implementer-a",
                 "step_profile__S42": "implementer-b",
             },
@@ -624,7 +615,7 @@ class ApprovalTests(MutationCase):
             APPROVAL_PATH,
             {
                 "decision": "REJECT",
-                "final_reviewer_profile": "reviewer",
+                "audit_profile": "final-auditor",
                 "step_profiles": {"S01": "implementer"},
             },
         )
@@ -636,9 +627,7 @@ class ApprovalTests(MutationCase):
             APPROVAL_PATH,
             {
                 "decision": "APPROVE",
-                "final_reviewer_profile": "reviewer",
-                "semantic_reviser_profile": None,
-                "check_repair_profile": None,
+                "audit_profile": "final-auditor",
                 "step_profiles": {"S01": "implementer"},
             },
         )
@@ -647,7 +636,7 @@ class ApprovalTests(MutationCase):
             self.local_body(APPROVAL_PATH),
             {
                 "decision": "APPROVE",
-                "final_reviewer_profile": "reviewer",
+                "audit_profile": "final-auditor",
                 "step_profile__S01": "implementer",
             },
         )
@@ -663,7 +652,7 @@ class ApprovalTests(MutationCase):
                     APPROVAL_PATH,
                     {
                         "decision": "APPROVE",
-                        "final_reviewer_profile": "reviewer",
+                        "audit_profile": "final-auditor",
                         "step_profiles": {step_id: "implementer"},
                     },
                 )
@@ -681,14 +670,14 @@ class ApprovalTests(MutationCase):
             {"step_profiles": {"S01": 42}},
             {"step_profiles": {"S01": ""}},
             {"step_profiles": {"S01": None}},
-            {"final_reviewer_profile": 3},
-            {"final_reviewer_profile": ""},
+            {"audit_profile": 3},
+            {"audit_profile": ""},
         )
         for extra in cases:
             with self.subTest(extra=extra):
                 response = self.post(
                     APPROVAL_PATH,
-                    {"decision": "APPROVE", "final_reviewer_profile": "reviewer", **extra},
+                    {"decision": "APPROVE", "audit_profile": "final-auditor", **extra},
                 )
                 self.assertEqual(response.status, 400)
         self.assert_upstream_untouched()

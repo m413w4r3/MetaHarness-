@@ -13,7 +13,7 @@ write goes through `RunStateStore` and uses atomic replacement.
 | `spec.md` | Exact human SPEC copied at run creation |
 | `context.txt` | Base-pinned planner context and locator warnings |
 | `repository_reference.json` | Staging remote name, optional GitHub web URL, base SHA and immutable base URL |
-| `run_options.json` | Frozen run options: budgets, semantic revision switch, repair-scope policy, selected profiles |
+| `run_options.json` | Frozen run options (schema 6): budgets, the step contract-repair budget, the five selected profiles and the three execution fallbacks |
 | `planner.request.txt` / `planner.raw.md` / `planner.usage.json` / `planner.validation.json` | Current planner attempt; the raw answer and usage are durable before parsing, while canonical plan artifacts appear only after validation passes |
 | `planner-attempts/NN/` | Rejected attempts, retaining request, raw answer, usage and deterministic validation errors |
 | `planner.session.json` | Private mode 0600 continuation handle and latest attempt; never exposed through state or trace |
@@ -29,7 +29,6 @@ write goes through `RunStateStore` and uses atomic replacement.
 | `setup/results.json` / `setup/*.log` | Workspace dependency setup results and redacted logs |
 | `accepted-chain.json` | Every commit MetaHarness accepted on the run branch (commit, tree, parent) |
 | `resume_checkpoint.json` | The next operation that has not yet succeeded, with its expected HEAD/tree and correction bundle hash |
-| `repair_task.md` / `repair_task.json` | `REVISE / HUMAN` only: route, summary, findings, required fixes, missing tests, branch, worktree, run id |
 | `publish.json` | Successful publication: mode, target, remote, run branch, commit SHA, optional safe GitHub URL |
 | `state.json` / `state.lock` | Atomic run state; the lock file serializes every state write and is never served |
 | `trace/events.v1.jsonl` | Observation-only META TRACE v1 stream (see `docs/architecture.md`) |
@@ -58,21 +57,21 @@ the initial implementation; every later cycle is one review-driven correction.
 | `.../tree_after_failure.txt` | Tree left by a failed worker attempt; a resume restores the checkpoint tree (in-scope paths only) |
 | `.../attempts/NN/` | Artifacts of a failed attempt, moved aside before a resumed retry of the same operation |
 
-Gate stages are `post-implementation`, `post-semantic-revision`,
-`post-review-implementation` and `post-review-replan`.
+The only gate stage is `post-implementation`: one deterministic gate episode per
+cycle. The historical `post-semantic-revision`, `post-review-implementation` and
+`post-review-replan` stages no longer exist.
 
 ## Identity chain
 
 ```text
 base SHA -> accepted step commits -> green gate acceptance
-         -> candidate commit (pushed, remote tip verified) -> reviewer PASS
+         -> candidate commit (pushed, remote tip verified)
          -> publication of that exact SHA
 ```
 
-Only green, accepted trees become commits; a red tree stays an artifact. A
-reviewer is called only when the local candidate SHA, the remote run-branch
-tip and the reviewed SHA are identical, and publication uses exactly the SHA
-named by the durable reviewer PASS.
+Only green, accepted trees become commits; a red tree stays an artifact. The
+audit is called only while the deterministic gate is red, and publication uses
+exactly the SHA named by the durable gate acceptance.
 
 The state records references and bounded metadata, never API key values. The
 values of the variables named by `api_key_env` are redacted from check logs,

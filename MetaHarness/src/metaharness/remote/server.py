@@ -53,19 +53,14 @@ _MUTATION_SUFFIXES = ("approval", "resume", "recover-plan")
 _RELAYED_STATUSES = frozenset({200, 202, 400, 403, 404, 409, 413, 500, 503})
 _CREATE_FIELDS = frozenset({
     "spec", "run_id", "planner_profile", "mechanical_profile",
-    "reasoning_profile", "agentic_profile", "final_reviewer_profile",
-    "semantic_reviser_profile", "check_repair_profile",
-    "semantic_revision_enabled", "max_check_repair_attempts",
-    "max_correction_cycles", "decomposition", "execution_mode_policy",
+    "reasoning_profile", "agentic_profile", "audit_profile",
+    "decomposition", "execution_mode_policy",
     "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
 })
 _APPROVAL_FIELDS = frozenset({
-    "decision", "final_reviewer_profile", "semantic_reviser_profile",
-    "check_repair_profile", "step_profiles",
+    "decision", "audit_profile", "step_profiles",
 })
-_APPROVAL_PROFILE_FIELDS = (
-    "final_reviewer_profile", "semantic_reviser_profile", "check_repair_profile",
-)
+_APPROVAL_PROFILE_FIELDS = ("audit_profile",)
 _DECISIONS = ("APPROVE", "REJECT")
 # Sending any of these could escape the single path component the local
 # server expects; run-id policy beyond that stays owned by MetaHarness.

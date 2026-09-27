@@ -11,7 +11,7 @@ from __future__ import annotations
 from metaharness.models import ExecutionRole
 
 from tests.autonomy.support import SPEC, AutonomyHarness, Step, meta_plan
-from tests.pipeline_support import review, write
+from tests.pipeline_support import write
 
 
 class PlannerCreateNormalizationTests(AutonomyHarness):
@@ -24,7 +24,7 @@ class PlannerCreateNormalizationTests(AutonomyHarness):
         )
 
         result = self.orchestrator(
-            self.config(), planner=[plan], reviewer=[review()],
+            self.config(), planner=[plan],
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_false_human_stop(result)

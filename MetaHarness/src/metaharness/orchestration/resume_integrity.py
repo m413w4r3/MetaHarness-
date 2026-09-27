@@ -18,17 +18,8 @@ from typing import (
     Mapping,
     NoReturn,
 )
-from .cycle_loader import (
-    check_replan_binding,
-    load_correction_plan,
-    read_cycle_record,
-    semantic_revision_scope,
-    validate_correction_bindings,
-    verify_correction_scope,
-)
 from .durable_readers import (
     gate_mutable_authority,
-    accepted_review,
     candidate_evidence,
     completed_step_records,
     load_evidence,
@@ -36,21 +27,15 @@ from .durable_readers import (
     read_repository_reference,
 )
 from .pipeline_v2 import (
-    check_repair_attempt_dir,
     cycle_record_path,
-    final_gate_stage,
     gate_acceptance_path,
     gate_dir,
     implementation_steps_dir,
-    pre_semantic_gate_stage,
-    review_dir,
-    semantic_revision_dir,
     step_dir,
 )
 from .shared import (
     is_object_id,
     read_json_artifact,
-    read_tree_file,
 )
 from ..approval import (
     ApprovalDecision,
@@ -78,7 +63,6 @@ from ..gitops import (
     current_head,
     git_root,
     index_tree_sha,
-    is_ancestor,
     registered_worktrees,
     remote_run_branch_tip,
     resolve_commit,
@@ -92,17 +76,9 @@ from ..models import (
     GateStage,
     HarnessConfig,
     PlanDecision,
-    ReviewRoute,
-    ReviewVerdict,
-    RunCycle,
     TaskPlanV2,
 )
 from ..planning.artifacts import validate_implementation_bundle
-from ..planning.check_replan import (
-    PLAN_ARTIFACT as CHECK_REPLAN_PLAN_ARTIFACT,
-    check_replan_dir,
-    plan_identity,
-)
 from ..planning.protocol import V2PlanParseError, parse_task_plan_v2
 from ..profiles import ProfileError
 from ..resume import (
@@ -134,10 +110,8 @@ class ResumedRun:
 
 # -- the resume integrity gate --------------------------------------------------
 
-_STEP_PHASES = frozenset({ResumePhase.IMPLEMENT_STEP, ResumePhase.REVIEW_IMPLEMENTATION})
-_CANDIDATE_PHASES = frozenset({
-    ResumePhase.CANDIDATE_PUSH, ResumePhase.FINAL_REVIEW, ResumePhase.PUBLISH,
-})
+_STEP_PHASES = frozenset({ResumePhase.IMPLEMENT_STEP, ResumePhase.STEP_ACCEPTANCE})
+_CANDIDATE_PHASES = frozenset({ResumePhase.CANDIDATE_PUSH, ResumePhase.PUBLISH})
 
 
 def _refuse(message: str) -> NoReturn:
@@ -210,11 +184,7 @@ def _validate_gate_acceptance(
         evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
     except OSError:
         evidence_sha256 = None
-    authority = gate_mutable_authority(
-        run_dir, number, stage,
-        base_paths=base_scope,
-        require_attempt_records=True,
-    )
+    authority = gate_mutable_authority(run_dir, number, stage, base_paths=base_scope)
     no_change = payload.get("no_change", False) if isinstance(payload, dict) else False
     parent_sha = payload.get("parent_sha") if isinstance(payload, dict) else None
     evidence = load_evidence(gate_dir(run_dir, number, stage))
@@ -239,7 +209,7 @@ def _validate_gate_acceptance(
         )
         or payload.get("tree_sha") != tree
         or payload.get("commit_sha") != head
-        or payload.get("acceptance_kind") not in {"existing-head", "repair", "semantic-revision"}
+        or payload.get("acceptance_kind") != "existing-head"
         or not isinstance(payload.get("commit_created"), bool)
         or (
             no_change
@@ -264,173 +234,49 @@ def _validate_gate_acceptance(
         _refuse("the gate acceptance artifact is missing or invalid")
 
 
-def _cycle_scopes(
-    config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
-    plan: TaskPlanV2, checkpoint: ResumeCheckpoint,
-) -> tuple[dict[int, tuple[str, ...]], dict[int, tuple[str, ...]], dict[int, CycleKind]]:
-    """The approved mutable scope of every durable cycle ``1..n``.
-
-    ``base`` is the plan, step-contract-repair and recorded soft-scope
-    authority of one cycle; ``full`` adds the semantic-revision authority of
-    that same cycle.  A direct semantic correction reuses the preceding
-    approved plan, while its own final gate may still own a check-repair
-    authority.  A cycle whose correction plan is still being written has no
-    authority yet and is absent from both.
-    """
-
-    pending = (
-        checkpoint.review_cycle if checkpoint.phase is ResumePhase.REVIEW_REPLAN else None
-    )
-    base = tuple(sorted(
-        set(_plan_scope(plan)) | _contract_repair_scope(run_dir, 1)
-        | _recorded_soft_scope(run_dir, 1, plan)
-    ))
-    bases: dict[int, tuple[str, ...]] = {1: base}
-    full: dict[int, tuple[str, ...]] = {
-        1: tuple(sorted(set(base) | semantic_revision_scope(run_dir, 1))),
-    }
-    kinds: dict[int, CycleKind] = {1: CycleKind.INITIAL}
-    for number in range(2, checkpoint.review_cycle + 1):
-        cycle = read_cycle_record(run_dir, number)
-        kinds[number] = cycle.kind
-        if cycle.kind is CycleKind.REVIEW_IMPLEMENTATION:
-            base = full[number - 1]
-        elif number == pending:
-            # The correction plan of this cycle is not an authority yet: it
-            # may still record its scope additions.
-            del kinds[number]
-            continue
-        else:
-            correction, _bundle, bundle_sha = load_correction_plan(
-                config, selection, run_dir, number,
-                inherited_check_ids=plan.required_checks,
-            )
-            verify_correction_scope(run_dir, number, bundle_sha)
-            base = tuple(sorted(
-                set(_plan_scope(correction)) | _contract_repair_scope(run_dir, number)
-                | _recorded_soft_scope(run_dir, number, correction)
-            ))
-        bases[number] = base
-        full[number] = tuple(sorted(set(base) | semantic_revision_scope(run_dir, number)))
-    return bases, full, kinds
-
-
-def _approved_scope(
-    config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
-    plan: TaskPlanV2, checkpoint: ResumeCheckpoint,
-) -> set[str]:
-    """Every path any durable authority of cycles ``1..n`` approved."""
-
-    bases, full, kinds = _cycle_scopes(config, selection, run_dir, plan, checkpoint)
-    scope = {path for paths in full.values() for path in paths}
-    for number, base in bases.items():
-        kind = kinds[number]
-        last = final_gate_stage(kind)
-        stages = (
-            (last,) if kind is CycleKind.REVIEW_IMPLEMENTATION
-            else (pre_semantic_gate_stage(kind), last)
-        )
-        for stage in dict.fromkeys(stages):
-            authority = gate_mutable_authority(
-                run_dir, number, stage,
-                base_paths=(full[number] if stage == last else base),
-            )
-            scope |= set(authority.effective_paths)
-    return scope
-
-
-def _cycle_base_scope(
-    config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
-    plan: TaskPlanV2, checkpoint: ResumeCheckpoint, number: int,
-    *, include_current_semantic: bool = True,
-) -> tuple[str, ...]:
-    """Return the approved plan scope which is the base for one cycle."""
-
-    bases, full, _kinds = _cycle_scopes(config, selection, run_dir, plan, checkpoint)
-    return full[number] if include_current_semantic else bases[number]
-
-
 def _failure_tree_for(
     run_dir: Path, checkpoint: ResumeCheckpoint,
 ) -> str | None:
     """The tree a failed attempt at *checkpoint* durably recorded, if any."""
 
-    number = checkpoint.review_cycle
-    if checkpoint.phase in _STEP_PHASES:
-        if checkpoint.phase is ResumePhase.REVIEW_IMPLEMENTATION:
-            try:
-                if read_cycle_record(run_dir, number).kind is CycleKind.REVIEW_IMPLEMENTATION:
-                    return read_tree_file(
-                        semantic_revision_dir(run_dir, number) / "tree_after_failure.txt"
-                    )
-            except ResumeIntegrityError:
-                return None
-        record = read_json_artifact(
-            step_dir(run_dir, number, str(checkpoint.step_id)) / "step.json",
-            128 * 1024,
-        )
-        if isinstance(record, dict) and record.get("status") == "FAILED" and is_object_id(record.get("tree_after")):
-            return record["tree_after"]
-        if (
-            isinstance(record, dict) and record.get("status") == "COMPLETED"
-            and is_object_id(record.get("tree_after"))
-            and record.get("tree_before") == checkpoint.expected_tree_sha
-            and record.get("tree_after") != record.get("tree_before")
-            and record.get("commit_sha") is None
-        ):
-            # A worker success interrupted before its candidate became
-            # durable: only an exact in-scope rollback is offered.
-            return record["tree_after"]
+    if checkpoint.phase not in _STEP_PHASES:
         return None
-    if checkpoint.phase is ResumePhase.SEMANTIC_REVISION:
-        return read_tree_file(semantic_revision_dir(run_dir, number) / "tree_after_failure.txt")
-    if checkpoint.phase is ResumePhase.CHECK_REPAIR and checkpoint.stage is not None:
-        return read_tree_file(
-            check_repair_attempt_dir(
-                run_dir, number, checkpoint.stage, int(checkpoint.check_repair_attempt or 1),
-            ) / "tree_after_failure.txt"
-        )
+    record = read_json_artifact(
+        step_dir(run_dir, 1, str(checkpoint.step_id)) / "step.json", 128 * 1024,
+    )
+    if isinstance(record, dict) and record.get("status") == "FAILED" and is_object_id(record.get("tree_after")):
+        return record["tree_after"]
+    if (
+        isinstance(record, dict) and record.get("status") == "COMPLETED"
+        and is_object_id(record.get("tree_after"))
+        and record.get("tree_before") == checkpoint.expected_tree_sha
+        and record.get("tree_after") != record.get("tree_before")
+        and record.get("commit_sha") is None
+    ):
+        # A worker success interrupted before its candidate became durable:
+        # only an exact in-scope rollback is offered.
+        return record["tree_after"]
     return None
 
 
-def _replaced_by_replan(run_dir: Path, number: int) -> bool:
-    """True when cycle *number* ended on a red gate that re-decomposed it."""
+def _cycle_base_scope(run_dir: Path, plan: TaskPlanV2) -> tuple[str, ...]:
+    """The approved mutable scope of the run's single cycle."""
 
-    try:
-        following = read_cycle_record(run_dir, number + 1)
-    except (ResumeIntegrityError, OSError):
-        return False
-    return following.kind is CycleKind.CHECK_REPLAN
+    return tuple(sorted(
+        set(_plan_scope(plan)) | _contract_repair_scope(run_dir, 1)
+        | _recorded_soft_scope(run_dir, 1, plan)
+    ))
 
 
-def _validate_check_replan_authority(
-    config: HarnessConfig, selection: ExecutionSelection, run_dir: Path,
-    number: int, plan: TaskPlanV2,
-) -> None:
-    """Prove the durable re-decomposition of cycle *number* is intact.
+def _approved_scope(run_dir: Path, plan: TaskPlanV2) -> set[str]:
+    """Every path a durable authority of the cycle approved."""
 
-    The record is the one durable answer a red gate paid for; it must still
-    name the cycle record's own digest, must differ from the plan it replaced
-    and must bind exactly the bundle its steps read.
-    """
-
-    # The record is the durability proof: the cycle record names its digest and
-    # the re-parsed answer must still render it.
-    check_replan_binding(run_dir, number)
-    record = read_json_artifact(
-        check_replan_dir(run_dir, number) / CHECK_REPLAN_PLAN_ARTIFACT, 64 * 1024,
+    scope = set(_cycle_base_scope(run_dir, plan))
+    authority = gate_mutable_authority(
+        run_dir, 1, GateStage.POST_IMPLEMENTATION, base_paths=tuple(scope),
     )
-    plan_value, _bundle, bundle_sha = load_correction_plan(
-        config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
-    )
-    if (
-        not isinstance(record, dict)
-        or record.get("implementation_bundle_sha256") != bundle_sha
-        or record.get("plan_identity_after") is None
-        or record.get("plan_identity_after") == record.get("plan_identity_before")
-        or record.get("plan_identity_after") != plan_identity(plan_value)
-    ):
-        _refuse("the check-replan plan changed")
+    scope |= set(authority.effective_paths)
+    return scope
 
 
 def validate_resume(
@@ -537,20 +383,20 @@ def validate_resume(
     except (ValidationError, ValueError) as exc:
         _refuse(f"check authority is invalid: {exc}")
 
-    # Cycle identity and every authority of cycles 1..n.
+    # The run has one cycle; its durable record must still say exactly that.
     number = checkpoint.review_cycle
-    if number > 1 or cycle_record_path(run_dir, 1).exists():
-        if read_cycle_record(run_dir, 1).kind is not CycleKind.INITIAL:
+    if number != 1:
+        _refuse("only the initial cycle can resume")
+    if cycle_record_path(run_dir, 1).exists():
+        record = read_json_artifact(cycle_record_path(run_dir, 1))
+        if (
+            not isinstance(record, dict)
+            or record.get("schema_version") != 1
+            or record.get("number") != 1
+            or record.get("kind") != CycleKind.INITIAL.value
+        ):
             _refuse("cycle 001 is not the initial cycle")
-    for earlier in range(2, number + 1):
-        read_cycle_record(run_dir, earlier)
-    for earlier in range(1, number):
-        if _replaced_by_replan(run_dir, earlier):
-            continue
-        read_candidate_record(run_dir, earlier)
-    validate_correction_bindings(run_dir, number)
-    current_cycle = read_cycle_record(run_dir, number) if number > 1 else RunCycle(1, CycleKind.INITIAL)
-    scope = _approved_scope(config, selection, run_dir, plan, checkpoint)
+    scope = _approved_scope(run_dir, plan)
     for report_path in sorted((run_dir / "cycles" / f"{number:03d}" / "audit").glob("*/report.json")):
         audit = read_json_artifact(report_path)
         paths = audit.get("changed_paths") if isinstance(audit, dict) else None
@@ -560,29 +406,6 @@ def validate_resume(
             scope.update(config.scope.check(paths, worktree=worktree))
         except ScopeViolation as exc:
             _refuse(exc.detail)
-    if current_cycle.kind is CycleKind.CHECK_REPLAN:
-        # A cycle one red gate re-decomposed plans before it opens, so its
-        # checkpoint never has to carry the plan: the durable answer does.
-        _validate_check_replan_authority(config, selection, run_dir, number, plan)
-    elif (
-        checkpoint.phase not in {ResumePhase.REVIEW_REPLAN, *_STEP_PHASES}
-        and number > 1
-        and current_cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION
-    ):
-        if checkpoint.correction_bundle_sha256 is None:
-            _refuse("the correction checkpoint is not bound to its plan")
-        _correction, _bundle, correction_sha = load_correction_plan(
-            config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
-        )
-        if correction_sha != checkpoint.correction_bundle_sha256:
-            _refuse("the correction plan changed")
-    if checkpoint.phase is ResumePhase.REVIEW_IMPLEMENTATION and current_cycle.kind is CycleKind.REVIEW_REPLAN:
-        _correction, _bundle, correction_sha = load_correction_plan(
-            config, selection, run_dir, number, inherited_check_ids=plan.required_checks,
-        )
-        if correction_sha != checkpoint.correction_bundle_sha256:
-            _refuse("the correction plan changed")
-
     restore: tuple[str, ...] = ()
     try:
         if str(worktree) not in registered_worktrees(repo):
@@ -629,13 +452,7 @@ def validate_resume(
                 if advanced:
                     _validate_gate_acceptance(
                         run_dir, number, checkpoint.stage, tree=expected_tree, head=head,
-                        base_scope=_cycle_base_scope(
-                            config, selection, run_dir, plan, checkpoint, number,
-                            include_current_semantic=(
-                                current_cycle.kind is CycleKind.REVIEW_IMPLEMENTATION
-                                or checkpoint.stage != pre_semantic_gate_stage(current_cycle.kind)
-                            ),
-                        ),
+                        base_scope=_cycle_base_scope(run_dir, plan),
                     )
             elif checkpoint.phase is ResumePhase.STEP_ACCEPTANCE:
                 # Committed before the next boundary: the step acceptance
@@ -650,27 +467,6 @@ def validate_resume(
             and commit_parents(repo, head) != (checkpoint.expected_parent_sha,)
         ):
             _refuse("HEAD parent differs from the checkpoint parent")
-        # Every earlier reviewed candidate is a real commit with its recorded
-        # tree and parent, and the run branch still descends from it.  A cycle
-        # a red gate re-decomposed never reached one: its successor owns that
-        # authority instead.
-        for earlier in range(1, number):
-            if _replaced_by_replan(run_dir, earlier):
-                continue
-            record = read_candidate_record(run_dir, earlier)
-            earlier_parents = (
-                (record["parent_sha"],) if record.get("parent_sha") is not None else ()
-            )
-            if (
-                resolve_tree(repo, record["commit_sha"]) != record["tree_sha"]
-                or (
-                    record.get("no_change") is not True
-                    and commit_parents(repo, record["commit_sha"]) != earlier_parents
-                )
-                or not is_ancestor(repo, record["commit_sha"], head)
-            ):
-                _refuse(f"cycle {earlier:03d} candidate record is not in the run history")
-
         if checkpoint.phase in _CANDIDATE_PHASES:
             candidate = read_candidate_record(run_dir, number)
             if candidate["commit_sha"] != head or candidate["tree_sha"] != expected_tree:
@@ -710,15 +506,9 @@ def validate_resume(
                 candidate_stage = GateStage(candidate["gate_stage"])
             except (KeyError, TypeError, ValueError):
                 _refuse("the candidate gate stage is invalid")
-            cycle_base_scope = _cycle_base_scope(
-                config, selection, run_dir, plan, checkpoint, number,
-                include_current_semantic=(
-                    candidate_stage is final_gate_stage(current_cycle.kind)
-                ),
-            )
             _validate_gate_acceptance(
                 run_dir, number, candidate_stage, tree=expected_tree, head=head,
-                base_scope=cycle_base_scope,
+                base_scope=_cycle_base_scope(run_dir, plan),
             )
             remote_required = config.publish.enabled or (
                 config.github.enabled and config.github.pull_request_mode == "create"
@@ -754,37 +544,6 @@ def validate_resume(
                     or audit.get("tree_after") != expected_tree
                 ):
                     _refuse("the audit is missing for the candidate")
-        if current_cycle.kind is not CycleKind.REVIEW_IMPLEMENTATION and (
-            checkpoint.phase is ResumePhase.SEMANTIC_REVISION
-            or (
-                checkpoint.phase in {ResumePhase.DETERMINISTIC_GATE, ResumePhase.CHECK_REPAIR}
-                and checkpoint.stage is final_gate_stage(current_cycle.kind)
-            )
-        ):
-            # Semantic revision never precedes a green gate: its pre-semantic
-            # acceptance must durably name the HEAD the revision started from.
-            pre_head = checkpoint.expected_head_sha
-            _validate_gate_acceptance(
-                run_dir, number, pre_semantic_gate_stage(current_cycle.kind),
-                tree=resolve_tree(repo, pre_head), head=pre_head,
-                base_scope=_cycle_base_scope(
-                    config, selection, run_dir, plan, checkpoint, number,
-                    include_current_semantic=False,
-                ),
-            )
-        if checkpoint.phase is ResumePhase.CHECK_REPAIR:
-            evidence = load_evidence(gate_dir(run_dir, number, checkpoint.stage))
-            if evidence is None or evidence.staged_tree_sha != expected_tree:
-                _refuse("the red gate evidence is missing or not for the checkpoint tree")
-        if checkpoint.phase is ResumePhase.DETERMINISTIC_GATE and checkpoint.check_repair_attempt is not None:
-            record = read_json_artifact(
-                check_repair_attempt_dir(
-                    run_dir, number, checkpoint.stage, checkpoint.check_repair_attempt,
-                ) / "attempt.json"
-            )
-            if not isinstance(record, dict) or record.get("tree_after") != expected_tree:
-                _refuse("the check-repair attempt record is not for the checkpoint tree")
-
         candidate_tree = candidate_tree_sha(worktree)
         index_tree = index_tree_sha(worktree)
         dirty = status_has_unstaged_or_untracked(status_porcelain(worktree))

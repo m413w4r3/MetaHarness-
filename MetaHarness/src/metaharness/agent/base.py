@@ -36,7 +36,10 @@ class AgentRunRequest:
     prompt: str
     worktree: Path
     artifact_dir: Path
-    mutable_paths: tuple[str, ...]
+    # ``None`` means the request carries no contractual agent scope: the
+    # harness ScopePolicy stays the only authority over observed paths.  A
+    # tuple, including the empty one, is a bounded scope the agent must honour.
+    mutable_paths: tuple[str, ...] | None
     # This is an infrastructure hint, not a business/backend selection.  It
     # lets the adapter preserve the v1 plan prompt and v2 step prompt bytes.
     prompt_mode: str = "raw"

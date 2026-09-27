@@ -66,7 +66,7 @@ class LLMConversationHandle:
     handle exists only when the driver/bridge returns it.  A handle may be
     exposed by a driver for explicitly conversation-aware workflows.
     A planning transaction may continue this conversation while validation
-    rejects planner answers. A later review repair starts a new transaction.
+    rejects planner answers. A new planning transaction starts from scratch.
     """
 
     provider_id: str
@@ -622,7 +622,7 @@ def _parse_completion_response(response: dict[str, Any]) -> TextLLMResult:
         raise LLMProtocolError("LLM response first choice must be an object")
     finish_reason = first_choice.get("finish_reason")
     if isinstance(finish_reason, str) and finish_reason in _TRUNCATED_FINISH_REASONS:
-        # A truncated plan or review may still look well formed; never use it.
+        # A truncated plan or audit report may look well formed; never use it.
         raise LLMProtocolError(
             f"LLM response is incomplete (finish_reason={finish_reason})"
         )

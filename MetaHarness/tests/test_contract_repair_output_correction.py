@@ -24,7 +24,7 @@ from metaharness.orchestration import contract_repair
 from metaharness.resume import resume_info
 from metaharness.run_options import RunOptions
 from tests.pipeline.support import SPEC, STEP, repaired_step_contract
-from tests.pipeline_support import PipelineHarness, git, initial_plan, review, write
+from tests.pipeline_support import PipelineHarness, git, initial_plan, write
 from tests.test_contract_repair_transaction import OUTAGE, REPAIR_ID, ContractRepairFixtures, mismatch
 
 FIXTURES = (
@@ -179,10 +179,10 @@ class IdentityPinningPromptTests(PipelineHarness):
     def test_the_prompt_sent_by_the_pipeline_carries_the_exact_identity(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(), planner=[initial_plan(STEP), repaired_step_contract()], reviewer=[review()],
+            self.config(), planner=[initial_plan(STEP), repaired_step_contract()],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # A repair valid on the first answer needs no extra planner call.
         (request,) = self.planner.requests[1:]
         self.assertIn(
@@ -205,7 +205,7 @@ class OutputCorrectionTests(ContractRepairFixtures):
 
     def run_repair(self, *answers, options: RunOptions | None = None, config=None):
         return self.orchestrator(
-            config or self.config(), planner=[initial_plan(STEP), *answers], reviewer=[review()],
+            config or self.config(), planner=[initial_plan(STEP), *answers],
         ).run_text(SPEC, run_id="run", run_options=options)
 
     @staticmethod
@@ -229,9 +229,9 @@ class OutputCorrectionTests(ContractRepairFixtures):
 
         result = self.run_repair(malformed(), repaired_step_contract())
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # The worker ran once before the repair and once after validation.
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(len(self.worker_calls()), 2)
         self.assertEqual(self.repair_slots(), ["01"])
         transaction = self.transaction()
         self.assertEqual(transaction["repair_id"], REPAIR_ID)
@@ -265,7 +265,7 @@ class OutputCorrectionTests(ContractRepairFixtures):
 
         result = self.run_repair(with_paths(repaired_step_contract(), *missing_paths))
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # An absent path cannot be written or read yet: the harness creates it
         # and drops the impossible read, instead of paying a second answer.
         self.assertEqual(len(self.planner.requests), 2)
@@ -285,7 +285,7 @@ class OutputCorrectionTests(ContractRepairFixtures):
 
         result = self.run_repair(wrong, repaired_step_contract())
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertIn("STEP_ID changed", self.parse_error(1)["detail"])
         self.assertEqual((self.slot() / "planner.raw.md").read_text(encoding="utf-8"), wrong)
         self.assertEqual(len(self.planner.requests), 3)
@@ -296,7 +296,7 @@ class OutputCorrectionTests(ContractRepairFixtures):
 
         result = self.run_repair(malformed("S01 / 02"), repaired_step_contract())
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(self.parse_error(1)["code"], "STEP_CONTRACT_REPAIR_OUTPUT_INVALID")
         self.assertEqual(len(self.planner.requests), 3)  # plan, rejected answer, correction
         self.assertEqual(len(self.semantic_records()), 1)
@@ -315,7 +315,7 @@ class OutputCorrectionTests(ContractRepairFixtures):
 
         result = self.run_repair(removed, repaired_step_contract())
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertIn("removed approved mutable paths", self.parse_error(1)["detail"])
         self.assertEqual(len(self.planner.requests), 3)
         self.assertEqual(len(self.semantic_records()), 1)
@@ -328,10 +328,10 @@ class OutputCorrectionTests(ContractRepairFixtures):
 
         result = self.run_repair(create_existing)
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # Git decides the classification, so the answer is never re-planned.
         self.assertEqual(len(self.planner.requests), 2)
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(len(self.worker_calls()), 2)
         slot = self.slot()
         contract = (slot / "contract.md").read_text(encoding="utf-8")
         self.assertIn("WRITE_SET\n- feature.txt", contract)
@@ -346,7 +346,7 @@ class OutputCorrectionTests(ContractRepairFixtures):
     def test_corrupt_repaired_contract_hash_fails_closed_before_another_call(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
         result = self.run_repair(repaired_step_contract())
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         slot = self.slot()
         contract_path = slot / "contract.md"
         contract_path.write_text(contract_path.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
@@ -374,8 +374,8 @@ class OutputCorrectionTests(ContractRepairFixtures):
 
         result = self.run_repair(malformed(), malformed("S01 / 02"), repaired_step_contract())
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(len(self.worker_calls()), 2)
         self.assertEqual(self.repair_slots(), ["01"])
         self.assertEqual(self.transaction()["output_correction_attempt"], 2)
         self.assertEqual(len(self.semantic_records()), 1)
@@ -389,7 +389,7 @@ class OutputCorrectionTests(ContractRepairFixtures):
         self.assertEqual(result.status, RunStatus.WAITING_CONTRACT_REPAIR)
         self.assertEqual(self.state()["failure"]["reason"], "STEP_CONTRACT_REPAIR_OUTPUT_INVALID")
         self.assert_no_false_mismatch()
-        self.assertEqual(len(self.workers.calls), 1)
+        self.assertEqual(len(self.worker_calls()), 1)
         # Plan, the answer, two corrections, then one bounded planner restart
         # of two more corrections -- all inside the same semantic slot.
         self.assertEqual(len(self.planner.requests), 6)
@@ -412,11 +412,11 @@ class OutputCorrectionTests(ContractRepairFixtures):
         live = live_status(self.root / "runs", "run", config=self.config())
         self.assertEqual(live["current_label"], "Output correction exhausted · S01 · attempt 4 / 4")
 
-        resumed = self.resume([repaired_step_contract()], [review()])
+        resumed = self.resume([repaired_step_contract()])
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(len(self.planner.requests), 1)
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(len(self.worker_calls()), 2)
         transaction = self.transaction()
         self.assertEqual((transaction["output_attempt"], transaction["operator_output_retries"]), (6, 1))
         self.assertEqual(self.repair_slots(), ["01"])
@@ -431,14 +431,14 @@ class OutputCorrectionTests(ContractRepairFixtures):
         self.assertEqual(interrupted.status, RunStatus.INTERRUPTED)
         self.assertFalse((self.output_attempt(1) / "parse_error.json").exists())
 
-        resumed = self.resume([repaired_step_contract()], [review()])
+        resumed = self.resume([repaired_step_contract()])
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # The durable answer was classified first; the only call is its correction.
         (correction,) = self.planner.requests
         self.assertIn("<REJECTED RESPONSE>", correction)
         self.assertEqual(self.parse_error(1)["detail"], PARSE_ERROR)
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(len(self.worker_calls()), 2)
 
     def test_a_durable_rejection_resumes_at_the_next_correction(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, write("feature.txt", "good\n"))
@@ -454,13 +454,13 @@ class OutputCorrectionTests(ContractRepairFixtures):
             "metaharness.planning.contract_repair.parse_step_contract_repair",
             wraps=step_contract_repair.parse_step_contract_repair,
         ) as parse:
-            resumed = self.resume([repaired_step_contract()], [review()])
+            resumed = self.resume([repaired_step_contract()])
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # Only the corrected answer is parsed; the rejection is never re-parsed.
         self.assertEqual(parse.call_count, 1)
         self.assertEqual(len(self.planner.requests), 1)
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(len(self.worker_calls()), 2)
         self.assertEqual(self.repair_slots(), ["01"])
 
     def test_a_transport_failure_during_correction_waits_external_in_the_same_slot(self) -> None:
@@ -474,12 +474,12 @@ class OutputCorrectionTests(ContractRepairFixtures):
         self.assertEqual((transaction["output_attempt"], transaction["repair_id"]), (2, REPAIR_ID))
         pending = (self.output_attempt(2) / "planner.request.txt").read_text(encoding="utf-8")
 
-        resumed = self.resume([repaired_step_contract()], [review()])
+        resumed = self.resume([repaired_step_contract()])
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # The pending correction is re-sent byte-for-byte; no worker replay.
         self.assertEqual(self.planner.requests, [pending])
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(len(self.worker_calls()), 2)
         self.assertEqual(self.repair_slots(), ["01"])
         transaction = self.transaction()
         self.assertEqual((transaction["output_correction_attempt"], transaction["planner_transport_attempt"]), (1, 2))
@@ -506,11 +506,11 @@ class OutputCorrectionTests(ContractRepairFixtures):
             options=options, config=config,
         )
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         validation = json.loads((self.slot() / "validation.json").read_text(encoding="utf-8"))
         self.assertEqual(validation["added_mutable_paths"], sorted(FIXTURES))
         self.assertEqual(validation["create_set"], [])
-        self.assertTrue(set(FIXTURES) <= set(self.workers.calls[-1].mutable_paths))
+        self.assertTrue(set(FIXTURES) <= set(self.worker_calls()[-1].mutable_paths))
 
     def test_many_scope_additions_are_auto_admitted(self) -> None:
         extra = tuple(f"fixtures/f{index}.txt" for index in range(5))
@@ -524,10 +524,10 @@ class OutputCorrectionTests(ContractRepairFixtures):
         )
 
         # A repaired scope is a signal for the audit, whatever its size.
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         validation = json.loads((self.slot() / "validation.json").read_text(encoding="utf-8"))
         self.assertEqual(validation["added_mutable_paths"], sorted(extra))
-        self.assertTrue(set(extra) <= set(self.workers.calls[-1].mutable_paths))
+        self.assertTrue(set(extra) <= set(self.worker_calls()[-1].mutable_paths))
         self.assert_no_false_mismatch()
 
 
@@ -578,14 +578,13 @@ class PlanCountRepairTests(ContractRepairFixtures):
         result = self.orchestrator(
             self.config(),
             planner=[self.plan_with_s05_identity(), s05_repair_response()],
-            reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(len(self.planner.requests), 2)  # initial plan + one repair answer
-        self.assertEqual(len(self.workers.calls), 7)  # S05 was run once after its repair
-        self.assertIn("STEP_ID: S05\n", self.workers.calls[-2].contract or "")
-        self.assertIn(REPAIR_TITLE_S05, self.workers.calls[-2].contract or "")
+        self.assertEqual(len(self.worker_calls()), 7)  # S05 was run once after its repair
+        self.assertIn("STEP_ID: S05\n", self.worker_calls()[-2].contract or "")
+        self.assertIn(REPAIR_TITLE_S05, self.worker_calls()[-2].contract or "")
         self.assertEqual(self.repair_slots(), ["01"])
         transaction = self.transaction()
         self.assertEqual(transaction["status"], "completed")
@@ -601,7 +600,7 @@ class PlanCountRepairTests(ContractRepairFixtures):
                 "raw": "S05 / 06", "canonical": "S05",
             }],
         })
-        self.assertEqual(self.workers.calls[-2].mutable_paths, ("feature.txt",))
+        self.assertEqual(self.worker_calls()[-2].mutable_paths, ("feature.txt",))
 
 class ContractRepairExhaustionTests(ContractRepairFixtures):
     """A spent contract repair settles its step instead of asking an operator."""
@@ -610,7 +609,7 @@ class ContractRepairExhaustionTests(ContractRepairFixtures):
         self.workers.on(ExecutionRole.IMPLEMENTER, mismatch, mismatch, mismatch)
         result = self.orchestrator(
             self.config(max_step_contract_repairs=2),
-            planner=[initial_plan(STEP), repaired_step_contract()], reviewer=["unused"],
+            planner=[initial_plan(STEP), repaired_step_contract()],
         ).run_text(SPEC, run_id="run")
 
         self.assertNotIn(result.status, {RunStatus.WAITING_HUMAN, RunStatus.FAILED})

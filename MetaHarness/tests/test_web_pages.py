@@ -63,16 +63,6 @@ class P19WebTests(unittest.TestCase):
                 provider="test",
                 argv=("worker",),
             ),
-            "reviewer": ModelProfile(
-                id="reviewer",
-                display_name="Reviewer",
-                roles=(ExecutionRole.REVIEWER,),
-                driver=ProfileDriver.OPENAI_CHAT,
-                model="reviewer-model",
-                selection_mode=SelectionMode.REQUEST,
-                base_url=endpoint.base_url,
-                endpoint_path=endpoint.endpoint_path,
-            ),
             "auditor": ModelProfile(
                 id="auditor", display_name="Auditor", roles=(ExecutionRole.AUDITOR,),
                 driver=ProfileDriver.EXTERNAL, model="audit", selection_mode=SelectionMode.CLI,
@@ -91,7 +81,6 @@ class P19WebTests(unittest.TestCase):
             model_profiles=profiles,
             ui=UIConfig(
                 default_planner_profile="planner",
-                default_reviewer_profile="reviewer",
                 default_audit_profile="auditor",
             ),
             routing=RoutingConfig(

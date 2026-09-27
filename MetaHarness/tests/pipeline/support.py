@@ -17,15 +17,13 @@ from tests.pipeline_support import (
     PipelineHarness,
     ScriptedChat,
     ScriptedWorkers,
-    check_repair_result,
+    audit,
+    audit_report,
     correction_plan,
     git,
     initial_plan,
-    ladder_ledger,
-    ladder_strategies,
     plan,
     repaired_step_contract,
-    review,
     write,
 )
 
@@ -34,11 +32,10 @@ STEP = ("S01", "feature.txt", "Write the feature")
 
 __all__ = [
     "PipelineHarness", "ScriptedChat", "ScriptedWorkers", "SPEC", "STEP",
-    "check_repair_result", "correction_plan", "git", "initial_plan",
-    "ladder_ledger", "ladder_strategies", "plan", "review", "write",
-    "repaired_step_contract", "run_branch", "break_remote", "restore_remote",
-    "divergent_run_branch", "move_run_branch", "reject_pushes",
-    "crash_at_checkpoint", "crash_on_review", "crash_on_revision",
+    "audit", "audit_report", "correction_plan", "git", "initial_plan", "plan",
+    "write", "repaired_step_contract", "run_branch", "break_remote",
+    "restore_remote", "divergent_run_branch", "move_run_branch",
+    "reject_pushes", "crash_at_checkpoint",
 ]
 
 
@@ -100,9 +97,7 @@ def reject_pushes(harness: PipelineHarness) -> None:
 
 # --- crash-injection ports --------------------------------------------------
 
-def crash_at_checkpoint(
-    orchestrator, phase: str, *, occurrence: int = 1, attempt: int | None = None,
-):
+def crash_at_checkpoint(orchestrator, phase: str, *, occurrence: int = 1):
     """Interrupt the run where it durably enters *phase*.
 
     The checkpoint writer is the run's durable boundary: raising inside it is
@@ -117,38 +112,10 @@ def crash_at_checkpoint(
     seen: list[int] = []
 
     def write(run_dir, next_phase, **fields):
-        if next_phase is ResumePhase(phase) and (
-            attempt is None or fields.get("check_repair_attempt") == attempt
-        ):
+        if next_phase is ResumePhase(phase):
             seen.append(1)
             if len(seen) == occurrence:
                 raise RuntimeError(f"crash at {phase}")
         return real(run_dir, next_phase, **fields)
 
     return mock.patch.object(type(runtime), "write_checkpoint", staticmethod(write))
-
-
-def crash_on_review(orchestrator, number: int = 1):
-    """Interrupt the run at the *number*-th candidate review."""
-
-    reviews = orchestrator._runtime.reviews
-    real = type(reviews).review_candidate
-    calls: list[int] = []
-
-    def review_or_crash(owner, *args, **kwargs):
-        calls.append(1)
-        if len(calls) == number:
-            raise RuntimeError("crash at final review")
-        return real(owner, *args, **kwargs)
-
-    return mock.patch.object(type(reviews), "review_candidate", review_or_crash)
-
-
-def crash_on_revision(orchestrator):
-    """Interrupt the run before the semantic reviser runs."""
-
-    revisions = orchestrator._runtime.semantic_revision
-    return mock.patch.object(
-        type(revisions), "run_revision_with_recovery",
-        side_effect=RuntimeError("crash before semantic worker"),
-    )

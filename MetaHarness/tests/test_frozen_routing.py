@@ -45,16 +45,16 @@ def frozen_routing_config() -> HarnessConfig:
             endpoint_path="/v1/chat",
             api_key_env="PLANNER_API_KEY",
         ),
-        "reviewer-chat": ModelProfile(
-            "reviewer-chat",
-            "Reviewer",
-            (ExecutionRole.REVIEWER,),
+        "auditor-chat": ModelProfile(
+            "auditor-chat",
+            "Auditor",
+            (ExecutionRole.AUDITOR,),
             ProfileDriver.OPENAI_CHAT,
-            "reviewer-model",
+            "auditor-model",
             SelectionMode.REQUEST,
-            base_url="https://reviewer.example",
+            base_url="https://auditor.example",
             endpoint_path="/v1/chat",
-            api_key_env="REVIEWER_API_KEY",
+            api_key_env="AUDITOR_API_KEY",
         ),
         "codex-luna-high": ModelProfile(
             "codex-luna-high",
@@ -100,7 +100,7 @@ def frozen_routing_config() -> HarnessConfig:
         allow_no_required_checks=True,
         ui=UIConfig(
             default_planner_profile="planner-chat",
-            default_reviewer_profile="reviewer-chat",
+            default_audit_profile="auditor-chat",
         ),
         model_profiles=profiles,
         routing=RoutingConfig(
@@ -155,9 +155,7 @@ class FrozenRoutingTests(unittest.TestCase):
             self.config,
             planner_profile_id=options.planner_profile,
             plan_steps=steps,
-            check_repair_profile_id=options.check_repair_profile,
-            semantic_reviser_profile_id=options.semantic_reviser_profile,
-            final_reviewer_profile_id=options.final_reviewer_profile,
+            audit_profile_id=options.audit_profile,
         )
         self.assertEqual(
             [item.implementer.profile_id for item in selection.steps],

@@ -161,12 +161,16 @@ class DoctorTests(unittest.TestCase):
 
                 [ui]
                 default_planner_profile = "bridge"
-                default_implementer_profile = "impl"
-                default_reviewer_profile = "bridge"
+                default_audit_profile = "impl"
+
+                [routing]
+                mechanical_profile = "impl"
+                reasoning_profile = "impl"
+                agentic_profile = "impl"
 
                 [model_profiles.bridge]
                 display_name = "Bridge"
-                roles = ["planner", "reviewer"]
+                roles = ["planner"]
                 driver = "openai-chat"
                 model = "chatgpt-web"
                 selection_mode = "external-ui"
@@ -176,7 +180,7 @@ class DoctorTests(unittest.TestCase):
 
                 [model_profiles.impl]
                 display_name = "Impl"
-                roles = ["implementer"]
+                roles = ["implementer", "auditor"]
                 driver = "codex"
                 model = "luna"
                 effort = "high"

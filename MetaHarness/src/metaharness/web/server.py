@@ -791,9 +791,7 @@ def configuration_description(
             "max_steps_per_plan": planning.max_steps_per_plan,
         },
         "revision": {
-            "enabled": revision.enabled,
-            "max_check_repair_attempts": revision.max_check_repair_attempts,
-            "max_correction_cycles": revision.max_correction_cycles,
+            "max_step_contract_repairs": revision.max_step_contract_repairs,
         },
         "approval": {
             "require_plan_approval": config.approval.require_plan_approval,
@@ -817,7 +815,6 @@ def configuration_description(
         "checks_truncated": len(config.check_catalog) > len(checks),
         "capabilities": {
             "plan_approval": bool(config.approval.require_plan_approval),
-            "semantic_revision": bool(revision.enabled),
             "resume": callable(resume_run_request),
             "recover_plan": callable(recover_plan_request),
             "cancel": False,

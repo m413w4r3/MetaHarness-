@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .models import (
-    CycleExecutionSelection,
     ExecutionClass,
     ExecutionRole,
     ExecutionSelection,
@@ -35,7 +34,6 @@ class ExecutionSelectionConflict(ExecutionSelectionError):
 
 _FILENAME = "execution_selection.json"
 SCHEMA_VERSION = 7
-_CYCLE_SCHEMA_VERSION = 2
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _PROFILE_FIELDS = frozenset({
     "profile_id", "driver", "provider", "model", "effort", "selection_mode",
@@ -66,7 +64,7 @@ def _selected(config: HarnessConfig, profile_id: str, role: ExecutionRole) -> Se
             profile,
             agent_env_allowlist=(
                 tuple(config.codex_runtime.env_allowlist)
-                if role in {ExecutionRole.IMPLEMENTER, ExecutionRole.REPAIR}
+                if role is ExecutionRole.IMPLEMENTER
                 else ()
             ),
             codex_home=(config.codex_runtime.home if profile.driver == "codex" else None),
@@ -140,44 +138,6 @@ def resolve_execution_selection(
         audit=_selected(config, audit_profile_id, ExecutionRole.AUDITOR),
     )
 
-
-def resolve_cycle_execution_selection(
-    config: HarnessConfig,
-    *,
-    cycle: int,
-    plan_steps: tuple[ImplementationStep, ...] | list[ImplementationStep] | None = None,
-    step_profile_ids: Mapping[str, str] | None = None,
-    fallback_authority: Any | None = None,
-) -> CycleExecutionSelection:
-    """Freeze implementer profiles for a single review-replan cycle."""
-
-    if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 2:
-        raise ExecutionSelectionError("cycle execution selection cycle is invalid")
-    if not plan_steps:
-        raise ExecutionSelectionError("execution plan steps are required")
-    if len(plan_steps) > MAX_STEPS:
-        raise ExecutionSelectionError(f"cycle execution selection may contain at most {MAX_STEPS} steps")
-    overrides = step_profile_ids or {}
-    if set(overrides) - {step.id for step in plan_steps}:
-        raise ExecutionSelectionError("cycle execution selection contains an unknown step")
-    fallbacks = fallback_authority or config.recovery.execution_fallbacks
-    steps = tuple(
-        StepExecutionSelection(
-            step_id=step.id,
-            implementer=_selected(
-                config,
-                overrides.get(step.id) or config.routing.profile_for(step.execution_class),
-                ExecutionRole.IMPLEMENTER,
-            ),
-            execution_class=step.execution_class,
-            fallbacks=tuple(
-                _selected(config, fallback_id, ExecutionRole.IMPLEMENTER)
-                for fallback_id in fallbacks.for_execution_class(step.execution_class.value)
-            ),
-        )
-        for step in sorted(plan_steps, key=lambda item: int(item.id[1:]))
-    )
-    return CycleExecutionSelection(_CYCLE_SCHEMA_VERSION, cycle, steps)
 
 
 def _selected_payload(value: SelectedProfile) -> dict[str, Any]:
@@ -253,46 +213,6 @@ def ensure_execution_selection(run_dir: Path, selection: ExecutionSelection) -> 
     return selection
 
 
-def _cycle_payload(selection: CycleExecutionSelection) -> dict[str, Any]:
-    if not isinstance(selection, CycleExecutionSelection) or selection.schema_version != _CYCLE_SCHEMA_VERSION:
-        raise ExecutionSelectionError("cycle execution selection schema_version is unsupported")
-    if selection.cycle < 2 or not selection.steps:
-        raise ExecutionSelectionError("cycle execution selection is invalid")
-    return {
-        "schema_version": _CYCLE_SCHEMA_VERSION,
-        "cycle": selection.cycle,
-        "steps": [
-            {"step_id": item.step_id, "execution_class": item.execution_class.value,
-             "implementer": _selected_payload(item.implementer),
-             "fallbacks": [_selected_payload(profile) for profile in item.fallbacks]}
-            for item in selection.steps
-        ],
-    }
-
-
-def _cycle_path(run_dir: Path, cycle: int) -> Path:
-    if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 2:
-        raise ExecutionSelectionError("cycle execution selection cycle is invalid")
-    return Path(run_dir).expanduser().resolve() / "cycles" / f"{cycle:03d}" / "correction" / _FILENAME
-
-
-def ensure_cycle_execution_selection(
-    run_dir: Path, selection: CycleExecutionSelection,
-) -> CycleExecutionSelection:
-    path = _cycle_path(run_dir, selection.cycle)
-    content = json.dumps(_cycle_payload(selection), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    if path.exists():
-        durable = parse_cycle_execution_selection(path.read_bytes())
-        if durable != selection:
-            raise ExecutionSelectionConflict("cycle execution selection is immutable")
-        return durable
-    if not _publish_exclusive(path, content):
-        durable = parse_cycle_execution_selection(path.read_bytes())
-        if durable != selection:
-            raise ExecutionSelectionConflict("cycle execution selection is immutable")
-        return durable
-    return selection
-
 
 def _parse_selected(value: Any, name: str) -> SelectedProfile:
     if not isinstance(value, dict) or set(value) != _PROFILE_FIELDS:
@@ -362,98 +282,6 @@ def parse_execution_selection(data: bytes) -> ExecutionSelection:
     )
 
 
-def parse_cycle_execution_selection(data: bytes) -> CycleExecutionSelection:
-    try:
-        payload = json.loads(data.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise ExecutionSelectionError("cycle execution selection is missing or invalid") from exc
-    schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
-    if not isinstance(payload, dict) or (
-        schema_version == 1 and set(payload) != {"schema_version", "cycle", "steps"}
-    ) or (
-        schema_version == 2 and set(payload) != {"schema_version", "cycle", "steps"}
-    ) or schema_version not in {1, 2}:
-        raise ExecutionSelectionError("cycle execution selection schema is invalid")
-    cycle = payload.get("cycle")
-    if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 2:
-        raise ExecutionSelectionError("cycle execution selection cycle is invalid")
-    raw_steps = payload.get("steps")
-    if not isinstance(raw_steps, list) or not raw_steps:
-        raise ExecutionSelectionError("cycle execution selection steps are invalid")
-    steps = []
-    for item in raw_steps:
-        allowed_keys = {"step_id", "execution_class", "implementer"}
-        if schema_version == 2:
-            allowed_keys.add("fallbacks")
-        if not isinstance(item, dict) or set(item) != allowed_keys:
-            raise ExecutionSelectionError("cycle execution selection step is invalid")
-        step_id = item.get("step_id")
-        if not isinstance(step_id, str) or STEP_ID_RE.fullmatch(step_id) is None:
-            raise ExecutionSelectionError("cycle execution selection step ID is invalid")
-        try:
-            execution_class = ExecutionClass(item["execution_class"])
-        except (TypeError, ValueError) as exc:
-            raise ExecutionSelectionError("cycle execution selection execution class is invalid") from exc
-        steps.append(StepExecutionSelection(
-            step_id, _parse_selected(item["implementer"], f"cycle step {step_id}"), execution_class,
-            _parse_selected_list(item.get("fallbacks", []), f"cycle step {step_id} fallbacks"),
-        ))
-    if [item.step_id for item in steps] != list(step_ids(len(steps))):
-        raise ExecutionSelectionError("cycle execution selection step IDs are not contiguous")
-    return CycleExecutionSelection(schema_version, cycle, tuple(steps))
-
-
-def read_cycle_execution_selection_with_sha256(
-    run_dir: Path, cycle: int,
-) -> tuple[CycleExecutionSelection, str]:
-    path = _cycle_path(run_dir, cycle)
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        raise ExecutionSelectionError("cycle execution selection is missing or invalid") from exc
-    return parse_cycle_execution_selection(data), hashlib.sha256(data).hexdigest()
-
-
-def read_cycle_execution_selection(run_dir: Path, cycle: int) -> CycleExecutionSelection:
-    return read_cycle_execution_selection_with_sha256(run_dir, cycle)[0]
-
-
-def validate_cycle_execution_selection(
-    config: HarnessConfig, selection: CycleExecutionSelection,
-) -> None:
-    if not isinstance(selection, CycleExecutionSelection) or selection.schema_version not in {1, _CYCLE_SCHEMA_VERSION}:
-        raise ExecutionSelectionError("cycle execution selection is invalid")
-    for item in selection.steps:
-        try:
-            expected = _selected(config, item.implementer.profile_id, ExecutionRole.IMPLEMENTER)
-        except ProfileError as exc:
-            raise ExecutionSelectionError(
-                f"cycle step {item.step_id} implementer profile is unavailable"
-            ) from exc
-        if item.implementer != expected:
-            raise ExecutionSelectionError(
-                f"cycle step {item.step_id} implementer profile no longer matches config"
-            )
-        if selection.schema_version == _CYCLE_SCHEMA_VERSION:
-            expected_ids = config.recovery.execution_fallbacks.for_execution_class(
-                item.execution_class.value
-            )
-            if tuple(profile.profile_id for profile in item.fallbacks) != expected_ids:
-                raise ExecutionSelectionError(
-                    f"cycle step {item.step_id} fallback authority changed"
-                )
-            for profile in item.fallbacks:
-                try:
-                    selected = _selected(config, profile.profile_id, ExecutionRole.IMPLEMENTER)
-                except ProfileError as exc:
-                    raise ExecutionSelectionError(
-                        f"cycle step {item.step_id} fallback profile is unavailable"
-                    ) from exc
-                if profile != selected:
-                    raise ExecutionSelectionError(
-                        f"cycle step {item.step_id} fallback profile no longer matches config"
-                    )
-
 
 def read_execution_selection_with_sha256(run_dir: Path) -> tuple[ExecutionSelection, str]:
     path = Path(run_dir).expanduser().resolve() / _FILENAME
@@ -496,22 +324,15 @@ def validate_execution_selection(config: HarnessConfig, selection: ExecutionSele
 
 
 __all__ = [
-    "CycleExecutionSelection",
     "ExecutionSelection",
     "ExecutionSelectionConflict",
     "ExecutionSelectionError",
     "SCHEMA_VERSION",
     "ensure_execution_selection",
-    "ensure_cycle_execution_selection",
     "is_profile_aware_run",
     "parse_execution_selection",
-    "parse_cycle_execution_selection",
     "read_execution_selection",
     "read_execution_selection_with_sha256",
-    "read_cycle_execution_selection",
-    "read_cycle_execution_selection_with_sha256",
-    "resolve_cycle_execution_selection",
     "resolve_execution_selection",
     "validate_execution_selection",
-    "validate_cycle_execution_selection",
 ]

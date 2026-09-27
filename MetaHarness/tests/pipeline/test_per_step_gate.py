@@ -20,12 +20,9 @@ from tests.pipeline.support import (
     SPEC,
     STEP,
     PipelineHarness,
-    check_repair_result,
+    audit_report,
     git,
     initial_plan,
-    ladder_strategies,
-    repaired_step_contract,
-    review,
     write,
 )
 
@@ -56,11 +53,11 @@ timeout_seconds = 30
         )
         result = self.orchestrator(
             self.config(per_step_gate="lint", extra_checks=self.lint_check()),
-            planner=[initial_plan(STEP)], reviewer=[review()],
+            planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles().count("implementer"), 2)
         record = json.loads((
             self.run_dir()
             / "cycles/001/implementation/steps/S01/per-step-gate/attempt-01.json"
@@ -78,11 +75,11 @@ timeout_seconds = 30
         )
         result = self.orchestrator(
             self.config(per_step_gate="lint", extra_checks=self.lint_check()),
-            planner=[initial_plan(STEP)], reviewer=[review()],
+            planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        first, second = self.workers.calls
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        first, second = self.workers.calls[0], self.workers.calls[1]
         # The retry keeps the profile and receives only the bounded evidence.
         self.assertEqual(second.profile_id, first.profile_id)
         self.assertIn("The fast per-step gate refused this step tree.", second.prompt)
@@ -94,58 +91,29 @@ timeout_seconds = 30
         self.assertNotIn("x" * 5000, second.prompt, "the whole log reached the worker")
         self.assertIsNone(self.state().get("failure"))
 
-    def test_a_worker_claiming_pass_does_not_close_the_gate(self) -> None:
+    def test_a_worker_claim_never_closes_the_gate(self) -> None:
         """A report is informative: only the rerun decides, and it stays red."""
-
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            write("feature.txt", "bad\n"), write("feature.txt", "still bad\n"),
-        )
-        self.workers.on(
-            ExecutionRole.REPAIR,
-            write("feature.txt", "still bad\n", report=check_repair_result(
-                "DONE", "PASS", "NONE", "the check passes now",
-            )),
-        )
-        result = self.orchestrator(
-            self.config(check_repair=1, correction_cycles=1),
-            planner=[initial_plan(STEP), repaired_step_contract(), initial_plan(STEP)],
-            reviewer=[review()],
-        ).run_text(SPEC, run_id="run")
-
-        self.assertEqual(result.status, RunStatus.WAITING_CHECK_REPAIR, self.state())
-        self.assertEqual(self.state()["failure"]["reason"], "CHECK_REPAIR_EXHAUSTED")
-        self.assertEqual(self.workers.roles(), ["implementer", "repair", "implementer"])
-        # The claimed PASS survives as an informative record; the durable gate
-        # verdict stayed red, so no ladder rung was skipped by the report.
-        attempt = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts/001"
-        record = json.loads((attempt / "attempt.json").read_text(encoding="utf-8"))
-        self.assertEqual(record["targeted_check"], "PASS")
-        self.assertFalse(self.state()["deterministic_gate"]["passed"])
-        self.assertEqual(
-            ladder_strategies(self), ["repair_targeted", "replan_step", "replan_cycle"],
-        )
-
-    def test_worker_not_running_check_does_not_decide_gate(self) -> None:
-        """``NOT_RUN`` is accepted: the harness reruns the check itself."""
 
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
         self.workers.on(
-            ExecutionRole.REPAIR,
-            lambda request: (
-                (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8"),
-                check_repair_result("DONE", "NOT_RUN", "NONE", "no target could be run"),
-            )[-1],
+            ExecutionRole.AUDITOR,
+            lambda _request: audit_report(
+                "DONE", fixed="the check passes now; the tree is already correct",
+            ),
         )
         result = self.orchestrator(
-            self.config(check_repair=1), planner=[initial_plan(STEP)], reviewer=[review()],
+            self.config(), planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(self.workers.roles(), ["implementer", "repair"])
-        attempt = self.run_dir() / "cycles/001/check-repair/post-implementation/attempts/001"
-        record = json.loads((attempt / "attempt.json").read_text(encoding="utf-8"))
-        self.assertEqual(record["targeted_check"], "NOT_RUN")
+        self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL, self.state())
+        self.assertEqual(self.state()["failure"]["reason"], "AUDIT_REMAINING")
+        # The claimed fix never became evidence: the harness reran the check.
+        self.assertFalse(self.state()["deterministic_gate"]["passed"])
+        reports = sorted((self.run_dir() / "cycles/001/audit").glob("*/report.json"))
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(
+            self.state()["failure"]["detail"]["failure_ids"], ["CHECK_FAILED:test"],
+        )
 
 
 class PreflightTests(PipelineHarness):
@@ -172,16 +140,15 @@ preflight_argv = [{sys.executable!r}, {str(probe)!r}]
 """
 
     def test_preflight_runs_once_per_run(self) -> None:
-        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
-        self.workers.on(ExecutionRole.REPAIR, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(check_repair=1, extra_checks=self.preflight_check(status=0)),
-            planner=[initial_plan(STEP)], reviewer=[review()],
+            self.config(extra_checks=self.preflight_check(status=0)),
+            planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        # Two gates answered this run and one repair pass ran between them: the
-        # trusted probe was still paid exactly once.
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        # Two gate runs answered this run (the gate and its post-audit rerun):
+        # the trusted probe was still paid exactly once.
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(self.preflight_marker.read_text(), "1")
         verdicts = json.loads(
             (self.run_dir() / "preflights.json").read_text(encoding="utf-8")
@@ -193,10 +160,10 @@ preflight_argv = [{sys.executable!r}, {str(probe)!r}]
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(
             self.config(extra_checks=self.preflight_check(status=3)),
-            planner=[initial_plan(STEP)], reviewer=[review()],
+            planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(self.preflight_marker.read_text(), "1")
         state = self.state()
         self.assertEqual(state["skipped_checks"], ["integration"])
@@ -210,7 +177,7 @@ preflight_argv = [{sys.executable!r}, {str(probe)!r}]
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(
             self.config(extra_checks=self.preflight_check(status=3, blocking=True)),
-            planner=[initial_plan(STEP)], reviewer=[review()],
+            planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL, self.state())
@@ -219,10 +186,10 @@ preflight_argv = [{sys.executable!r}, {str(probe)!r}]
         )
         self.assertEqual(self.preflight_marker.read_text(), "1")
         self.assertNotEqual(result.status, RunStatus.WAITING_HUMAN)
-        # The blocking condition is an external wait, never a new human door.
-        self.assertFalse(
-            (self.run_dir() / "cycles/001/check-repair/post-implementation/ladder.json").exists()
-        )
+        # The blocking condition is an external wait, never a new human door,
+        # and it is decided before any agent is bought.
+        self.assertEqual(self.workers.roles(), [])
+        self.assertFalse((self.run_dir() / "cycles/001/audit").exists())
 
 
 if __name__ == "__main__":  # pragma: no cover - unittest entry point

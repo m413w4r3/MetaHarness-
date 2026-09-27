@@ -66,10 +66,7 @@ class SelectionMode(StrEnum):
 class ExecutionRole(StrEnum):
     PLANNER = "planner"
     IMPLEMENTER = "implementer"
-    REVIEWER = "reviewer"
-    REPAIR = "repair"
     AUDITOR = "auditor"
-    REVISER = "reviser"
 
 
 class PlanDecision(StrEnum):
@@ -285,7 +282,6 @@ class RunStatus(StrEnum):
     IMPLEMENTING = "implementing"
     VALIDATING = "validating"
     REVISING = "revising"
-    REVIEWING = "reviewing"
     APPROVED = "approved"
     PUBLISHING = "publishing"
     PUBLISHED = "published"
@@ -298,9 +294,9 @@ class RunPhase(StrEnum):
     """The durable operation a run is at: the one running, or the next one.
 
     A phase names an operation, never a posture.  ``DETERMINISTIC_GATE`` stays
-    the phase while a red gate waits for a repaired tree, and ``CHECK_REPAIR``
-    names the bounded repair pass itself.  The posture of the run is
-    :class:`RunDisposition`; the business detail is the failure reason.
+    the phase while a red gate waits for the audit authority that answers it.
+    The posture of the run is :class:`RunDisposition`; the business detail is
+    the failure reason.
     """
 
     CONTEXT = "context"
@@ -313,16 +309,8 @@ class RunPhase(StrEnum):
     STEP_ACCEPTANCE = "step_acceptance"
     DETERMINISTIC_GATE = "deterministic_gate"
     AUDIT = "audit"
-    CHECK_REPAIR = "check_repair"
-    # The cycle a red gate's cycle replan opened: its approved decomposition is
-    # loaded from the durable check-replan transaction and its steps run.
-    CHECK_REPLAN = "check_replan"
-    SEMANTIC_REVISION = "semantic_revision"
     CANDIDATE_READY = "candidate_ready"
     CANDIDATE_PUSH = "candidate_push"
-    FINAL_REVIEW = "final_review"
-    REVIEW_IMPLEMENTATION = "review_implementation"
-    REVIEW_REPLAN = "review_replan"
     PUBLISH = "publish"
 
 
@@ -528,38 +516,20 @@ _RUN_PHASE_SUCCESSORS: Mapping[RunPhase, frozenset[RunPhase]] = {
     RunPhase.CONTEXT: frozenset({RunPhase.PLANNER}),
     RunPhase.PLANNER: frozenset({RunPhase.PLAN_APPROVAL}),
     RunPhase.PLAN_APPROVAL: frozenset({RunPhase.WORKTREE_SETUP}),
-    RunPhase.WORKTREE_SETUP: frozenset({RunPhase.IMPLEMENT_STEP, RunPhase.REVIEW_IMPLEMENTATION}),
+    RunPhase.WORKTREE_SETUP: frozenset({RunPhase.IMPLEMENT_STEP}),
     RunPhase.IMPLEMENT_STEP: frozenset({
-        RunPhase.IMPLEMENT_STEP, RunPhase.STEP_ACCEPTANCE,
-        RunPhase.DETERMINISTIC_GATE, RunPhase.REVIEW_IMPLEMENTATION,
+        RunPhase.IMPLEMENT_STEP, RunPhase.STEP_ACCEPTANCE, RunPhase.DETERMINISTIC_GATE,
     }),
     RunPhase.STEP_ACCEPTANCE: frozenset({RunPhase.IMPLEMENT_STEP, RunPhase.DETERMINISTIC_GATE}),
     RunPhase.DETERMINISTIC_GATE: frozenset({
-        RunPhase.DETERMINISTIC_GATE, RunPhase.CHECK_REPAIR,
-        RunPhase.SEMANTIC_REVISION, RunPhase.CANDIDATE_READY, RunPhase.CHECK_REPLAN,
-        RunPhase.AUDIT,
+        RunPhase.DETERMINISTIC_GATE, RunPhase.CANDIDATE_READY, RunPhase.AUDIT,
     }),
     RunPhase.AUDIT: frozenset({RunPhase.DETERMINISTIC_GATE}),
-    RunPhase.CHECK_REPAIR: frozenset({RunPhase.CHECK_REPAIR, RunPhase.DETERMINISTIC_GATE}),
-    # A new decomposition is implemented by its own cycle and returns to the
-    # deterministic gate, exactly like every other cycle of the pipeline.
-    RunPhase.CHECK_REPLAN: frozenset({RunPhase.IMPLEMENT_STEP, RunPhase.DETERMINISTIC_GATE}),
-    RunPhase.SEMANTIC_REVISION: frozenset({RunPhase.DETERMINISTIC_GATE, RunPhase.CANDIDATE_READY}),
     RunPhase.CANDIDATE_READY: frozenset({RunPhase.CANDIDATE_PUSH}),
     RunPhase.CANDIDATE_PUSH: frozenset({RunPhase.PUBLISH}),
-    RunPhase.FINAL_REVIEW: frozenset({
-        RunPhase.PUBLISH, RunPhase.SEMANTIC_REVISION,
-        RunPhase.REVIEW_IMPLEMENTATION, RunPhase.REVIEW_REPLAN,
-    }),
-    RunPhase.REVIEW_IMPLEMENTATION: frozenset({
-        RunPhase.REVIEW_IMPLEMENTATION, RunPhase.DETERMINISTIC_GATE, RunPhase.SEMANTIC_REVISION,
-    }),
-    RunPhase.REVIEW_REPLAN: frozenset({
-        RunPhase.IMPLEMENT_STEP, RunPhase.REVIEW_IMPLEMENTATION, RunPhase.DETERMINISTIC_GATE,
-    }),
     RunPhase.PUBLISH: frozenset(),
 }
-# The operations that can end a run successfully: the reviewed candidate
+# The operations that can end a run successfully: the audited candidate
 # commit itself, or its publication.
 _RUN_COMPLETABLE_PHASES = frozenset({RunPhase.CANDIDATE_PUSH, RunPhase.PUBLISH})
 
@@ -647,15 +617,9 @@ _RUNNING_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.IMPLEMENT_STEP: RunStatus.IMPLEMENTING,
     RunPhase.STEP_ACCEPTANCE: RunStatus.IMPLEMENTING,
     RunPhase.DETERMINISTIC_GATE: RunStatus.VALIDATING,
-    RunPhase.CHECK_REPAIR: RunStatus.REVISING,
-    RunPhase.CHECK_REPLAN: RunStatus.IMPLEMENTING,
-    RunPhase.SEMANTIC_REVISION: RunStatus.REVISING,
     RunPhase.AUDIT: RunStatus.REVISING,
     RunPhase.CANDIDATE_READY: RunStatus.APPROVED,
     RunPhase.CANDIDATE_PUSH: RunStatus.APPROVED,
-    RunPhase.FINAL_REVIEW: RunStatus.REVIEWING,
-    RunPhase.REVIEW_IMPLEMENTATION: RunStatus.IMPLEMENTING,
-    RunPhase.REVIEW_REPLAN: RunStatus.PLANNING,
     RunPhase.PUBLISH: RunStatus.PUBLISHING,
 }
 # The operation a completed run stopped at names its completion: only the
@@ -747,7 +711,6 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.IMPLEMENTING: RunDisposition.RUNNING,
     RunStatus.VALIDATING: RunDisposition.RUNNING,
     RunStatus.REVISING: RunDisposition.RUNNING,
-    RunStatus.REVIEWING: RunDisposition.RUNNING,
     RunStatus.APPROVED: RunDisposition.RUNNING,
     RunStatus.PUBLISHING: RunDisposition.RUNNING,
     RunStatus.PUBLISHED: RunDisposition.COMPLETED,
@@ -815,19 +778,6 @@ def status_of_run_state(state: Mapping[str, Any]) -> RunStatus:
             failure_reason=failure.get("reason") if isinstance(failure, Mapping) else None,
         )
     ).status
-
-
-class ReviewVerdict(StrEnum):
-    PASS = "PASS"
-    REVISE = "REVISE"
-    FAIL = "FAIL"
-
-
-class ReviewRoute(StrEnum):
-    NONE = "NONE"
-    IMPLEMENTATION = "IMPLEMENTATION"
-    REPLAN = "REPLAN"
-    HUMAN = "HUMAN"
 
 
 @dataclass(frozen=True)
@@ -932,7 +882,7 @@ class ExecutionModePolicy(StrEnum):
 
 
 class PublishMode(StrEnum):
-    """Where a final reviewed commit is published."""
+    """Where the accepted candidate commit is published."""
 
     # Push only the run branch ``harness/<plan>/<run-id>``.
     RUN_BRANCH = "run-branch"
@@ -1013,25 +963,11 @@ def validate_revision_budget(value: int, name: str) -> int:
 
 @dataclass(frozen=True)
 class RevisionConfig:
-    """Bounded semantic revision, one correction budget and check repairs.
+    """The bounded step-contract repair budget of one run."""
 
-    The default is no correction pipeline: every budget needs its profile.
-    """
-
-    enabled: bool = False
-    max_correction_cycles: int = 0
-    max_check_repair_attempts: int = 0
     max_step_contract_repairs: int = 2
 
     def __post_init__(self) -> None:
-        if not isinstance(self.enabled, bool):
-            raise ValueError("revision.enabled must be a boolean")
-        validate_revision_budget(
-            self.max_correction_cycles, "revision.max_correction_cycles"
-        )
-        validate_revision_budget(
-            self.max_check_repair_attempts, "revision.max_check_repair_attempts"
-        )
         validate_revision_budget(
             self.max_step_contract_repairs, "revision.max_step_contract_repairs"
         )
@@ -1047,17 +983,11 @@ class PromptBudgetConfig:
 
     planner_max_bytes: int = 160_000
     implementer_max_bytes: int = 120_000
-    check_repair_max_bytes: int = 40_000
-    semantic_revision_max_bytes: int = 120_000
-    final_review_max_bytes: int = 120_000
 
     def __post_init__(self) -> None:
         for name in (
             "planner_max_bytes",
             "implementer_max_bytes",
-            "check_repair_max_bytes",
-            "semantic_revision_max_bytes",
-            "final_review_max_bytes",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -1118,11 +1048,7 @@ class TransportConfig:
 class UIConfig:
     max_active_runs: int = 1
     default_planner_profile: str | None = None
-    default_reviewer_profile: str | None = None
-    default_reviser_profile: str | None = None
-    default_repair_profile: str | None = None
     default_audit_profile: str | None = None
-    enable_profile_recommendation: bool = True
 
 
 @dataclass(frozen=True)
@@ -1319,66 +1245,20 @@ class ExecutionSelection:
     audit: SelectedProfile
 
 
-@dataclass(frozen=True)
-class CycleExecutionSelection:
-    """Immutable implementer selections for one review-replan cycle."""
-
-    schema_version: int
-    cycle: int
-    steps: tuple[StepExecutionSelection, ...]
-
-
 class CycleKind(StrEnum):
     """Why one pipeline cycle exists; every cycle names its kind explicitly."""
 
     INITIAL = "initial"
-    REVIEW_IMPLEMENTATION = "review-implementation"
-    REVIEW_REPLAN = "review-replan"
-    # A red deterministic gate whose bounded repair pass and single-step
-    # replan were both durably spent, so the decomposition itself is replanned.
-    CHECK_REPLAN = "check-replan"
-
-
-_CORRECTION_CYCLE_KINDS = frozenset({
-    CycleKind.REVIEW_IMPLEMENTATION, CycleKind.REVIEW_REPLAN, CycleKind.CHECK_REPLAN,
-})
-_REPLAN_CYCLE_KINDS = frozenset({CycleKind.REVIEW_REPLAN, CycleKind.CHECK_REPLAN})
-
-
-def is_correction_cycle(kind: CycleKind) -> bool:
-    """Whether one cycle corrects earlier approved work: every kind but ``INITIAL``."""
-
-    return CycleKind(kind) in _CORRECTION_CYCLE_KINDS
-
-
-def is_replan_cycle(kind: CycleKind) -> bool:
-    """Whether one cycle exists because approved work was re-decomposed."""
-
-    return CycleKind(kind) in _REPLAN_CYCLE_KINDS
-
-
-def correction_cycles_used(cycle_number: int) -> int:
-    """The correction units a run reaching ``cycle_number`` has spent.
-
-    Cycle ``001`` is the initial implementation; every later cycle -- one a
-    review opened or one a red deterministic gate re-decomposed -- spends
-    exactly one unit of the run's single correction budget.
-    """
-
-    return cycle_number - 1
 
 
 class GateStage(StrEnum):
     """Why one deterministic gate episode runs.
 
-    ``(review_cycle, stage)`` identifies exactly one gate episode.
+    ``(cycle, stage)`` identifies exactly one gate episode; the pipeline has a
+    single episode per cycle, after the implementation work.
     """
 
     POST_IMPLEMENTATION = "POST_IMPLEMENTATION"
-    POST_SEMANTIC_REVISION = "POST_SEMANTIC_REVISION"
-    POST_CHECK_REPLAN = "POST_CHECK_REPLAN"
-    POST_REVIEW_IMPLEMENTATION = "POST_REVIEW_IMPLEMENTATION"
-    POST_REVIEW_REPLAN = "POST_REVIEW_REPLAN"
 
 
 @dataclass(frozen=True)

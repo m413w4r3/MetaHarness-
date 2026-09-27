@@ -16,7 +16,7 @@ from metaharness.agent import AgentRunRequest
 from metaharness.models import ExecutionRole
 
 from tests.autonomy.support import SPEC, AutonomyHarness, Step, meta_plan
-from tests.pipeline_support import Script, git, review
+from tests.pipeline_support import Script, git
 
 NEIGHBOUR = "def test_a():\n    assert True\n"
 NEIGHBOUR_TOUCHED = "def test_a():\n    assert True\n# touched by the worker\n"
@@ -56,7 +56,7 @@ class WorkerToleranceTests(AutonomyHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, edit_two_files())
 
         result = self.orchestrator(
-            self.config(), planner=[self.change_a_plan()], reviewer=[review()],
+            self.config(), planner=[self.change_a_plan()],
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_false_human_stop(result)
@@ -78,7 +78,7 @@ class WorkerToleranceTests(AutonomyHarness):
         self.workers.on(ExecutionRole.IMPLEMENTER, edit_and_commit())
 
         result = self.orchestrator(
-            self.config(), planner=[self.change_a_plan()], reviewer=[review()],
+            self.config(), planner=[self.change_a_plan()],
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_false_human_stop(result)

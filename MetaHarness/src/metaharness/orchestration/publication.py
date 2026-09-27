@@ -4,7 +4,7 @@ This module owns the candidate boundary and the publication of the accepted
 candidate: it authorizes the candidate tree against its evidence before
 anything else observes it, stages the run branch best-effort, creates the
 optional GitHub workstream metadata and publishes the base branch.  It never
-plans, reviews or runs a check.
+plans, audits or runs a check.
 """
 
 from __future__ import annotations
@@ -359,7 +359,7 @@ class PublicationService:
     def authorize_candidate_tree(
         self, evidence: EvidenceBundle, worktree: Path, parent_sha: str, branch_ref: str,
     ) -> str:
-        """Authorize the immutable candidate tree before semantic review."""
+        """Authorize the immutable candidate tree before the audit."""
 
         if not evidence.deterministic_passed or evidence.failures or not evidence.staged_tree_sha:
             raise CommitBoundaryError("deterministic gate did not pass for candidate commit")

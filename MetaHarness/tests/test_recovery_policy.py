@@ -12,6 +12,7 @@ from metaharness.models import RunDisposition, RunStatus
 from metaharness.orchestration.recovery import RecoveryCoordinator, project_exit
 from metaharness.recovery_policy import (
     FAILURE_CLASSES,
+    RECOVERY_LADDERS,
     FailureClass,
     RecoveryBudgets,
     RecoveryDecision,
@@ -92,7 +93,7 @@ class FailureClassificationTests(unittest.TestCase):
         # An ordinary model mistake is never fatal.
         for code in (
             "AGENT_SCOPE_VIOLATION", "AGENT_GIT_VIOLATION", "CONTRACT_INSUFFICIENT",
-            "PLANNER_OUTPUT_INVALID", "CHECK_FAILED", "REVIEW_EVIDENCE_UNRESOLVED",
+            "PLANNER_OUTPUT_INVALID", "CHECK_FAILED", "AUDIT_REMAINING",
         ):
             with self.subTest(code=code):
                 self.assertIsNot(
@@ -121,7 +122,7 @@ class FailureClassificationTests(unittest.TestCase):
             RecoveryStrategy.RETRY_TARGETED, RecoveryStrategy.FALLBACK_EXECUTOR,
             RecoveryStrategy.REPLAN_STEP, RecoveryStrategy.MARK_FAILED_CONTINUE,
         ))
-        for code in ("CHECK_REPAIR_EXHAUSTED", "WAITING_REPAIR_EXHAUSTED", "TOTALLY_NEW"):
+        for code in ("AUDIT_REMAINING", "WAITING_REPAIR_EXHAUSTED", "TOTALLY_NEW"):
             with self.subTest(code=code):
                 decision, terminal = project_exit(code, phase=ResumePhase.IMPLEMENT_STEP)
                 self.assertIs(decision.strategy, RecoveryStrategy.MARK_FAILED_CONTINUE)
@@ -135,7 +136,7 @@ class FailureClassificationTests(unittest.TestCase):
         ))
         for code in ("LLM_TRANSPORT_EXHAUSTED", "AGENT_TIMEOUT", "CHECK_INFRASTRUCTURE_UNAVAILABLE"):
             with self.subTest(code=code):
-                decision, terminal = project_exit(code, phase=ResumePhase.FINAL_REVIEW)
+                decision, terminal = project_exit(code, phase=ResumePhase.AUDIT)
                 self.assertIs(decision.strategy, RecoveryStrategy.WAIT_EXTERNAL)
                 self.assertTrue(terminal.resumable)
         _decision, terminal = project_exit("SPEC_DECISION_REQUIRED", phase=ResumePhase.PLANNER)
@@ -151,12 +152,30 @@ class FailureClassificationTests(unittest.TestCase):
         # The guard disciplines the source; the runtime stays fail-open.
         self.assertIs(classify_failure("DYNAMIC_UNKNOWN").failure_class, FailureClass.FIXABLE)
 
+    def test_the_removed_pipeline_families_stay_out_of_the_policy(self) -> None:
+        """C7.1: a family no runtime code emits is never classified here."""
+
+        removed_families = (
+            "SEMANTIC_REVISER_", "REVIEW_", "REVIEWER_", "CHECK_REPAIR_",
+            "REPLAN_CYCLE", "EXPAND_SCOPE", "REPAIR_TARGETED",
+        )
+        for key in FAILURE_CLASSES:
+            for family in removed_families:
+                self.assertFalse(
+                    key.startswith(family) or key == family,
+                    f"FAILURE_CLASSES still classifies the removed family {family!r}",
+                )
+        for family in removed_families:
+            self.assertNotIn(family, RecoveryStrategy.__members__)
+        for ladder in RECOVERY_LADDERS.values():
+            names = {strategy.value for strategy in ladder}
+            self.assertFalse(names & {"replan_cycle", "expand_scope", "repair_targeted"})
+
     def test_budgets_have_bounded_durable_defaults(self) -> None:
         self.assertEqual(RecoveryBudgets(), RecoveryBudgets(
             max_transient_attempts=2,
             max_executor_fallbacks=1,
             max_check_infra_retries=2,
-            max_review_transport_retries=2,
             max_workspace_setup_retries=2,
         ))
         with self.assertRaises(ValueError):

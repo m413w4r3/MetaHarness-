@@ -25,7 +25,7 @@ from tests.autonomy.support import (
     meta_plan,
     repaired_contract,
 )
-from tests.pipeline_support import review, write
+from tests.pipeline_support import write
 
 OLD_FAILURE = "FAILED tests/test_component.py::test_old_failure"
 
@@ -111,7 +111,6 @@ class GateBaselineTests(AutonomyHarness):
         result = self.orchestrator(
             self.config(),
             planner=[plan, repaired_contract("S01", "Raise the component value", "component.py")],
-            reviewer=[review()],
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_false_human_stop(result)
@@ -145,7 +144,7 @@ description = "integration check whose infrastructure is unavailable"
         self.workers.on(ExecutionRole.AUDITOR, lambda _request: AUDIT_DONE)
 
         result = self.orchestrator(
-            self.config(extra_checks=extra_checks), planner=[plan], reviewer=[review()],
+            self.config(extra_checks=extra_checks), planner=[plan],
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_false_human_stop(result)

@@ -1,4 +1,4 @@
-"""Step-contract repair: planner repair, rollback and review of a no-change tree."""
+"""Step-contract repair: planner repair, rollback and the no-change tree."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from tests.pipeline.support import (
     git,
     initial_plan,
     repaired_step_contract,
-    review,
     write,
 )
 
@@ -41,15 +40,14 @@ class ContractRepairTests(PipelineHarness):
         result = self.orchestrator(
             self.config(max_step_contract_repairs=1),
             planner=[initial_plan(STEP), repaired_step_contract()],
-            reviewer=[review()],
         ).run_text(SPEC, run_id="contract-repair")
 
         self.assertEqual(
-            result.status, RunStatus.COMMITTED,
+            result.status, RunStatus.PUBLISHED,
             self.state("contract-repair").get("failure"),
         )
         self.assertEqual(observed_before_retry, ["base\n"])
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer", "auditor"])
         self.assertEqual(len(self.planner.requests), 2)
         repair_request = self.planner.requests[1]
         self.assertIn(SPEC.strip(), repair_request)
@@ -89,7 +87,6 @@ class ContractRepairTests(PipelineHarness):
         result = self.orchestrator(
             self.config(max_step_contract_repairs=1),
             planner=[initial_plan(STEP), repaired_step_contract()],
-            reviewer=[review()],
         ).run_text(SPEC, run_id="residual-mismatch")
 
         worktree = self.worktree("residual-mismatch")
@@ -101,7 +98,9 @@ class ContractRepairTests(PipelineHarness):
         self.assertEqual(git(worktree, "rev-parse", "HEAD"), self.base_sha)
         self.assertEqual(git(worktree, "status", "--porcelain"), "")
         self.assertEqual((worktree / "feature.txt").read_text(), "base\n")
-        self.assertEqual(len(self.workers.calls), 2)
+        self.assertEqual(
+            [request.role for request in self.workers.calls].count(ExecutionRole.IMPLEMENTER), 2,
+        )
 
     def test_environment_verify_failure_is_not_contract_mismatch(self) -> None:
         self.workers.on(
@@ -113,14 +112,16 @@ class ContractRepairTests(PipelineHarness):
         )
         result = self.orchestrator(
             self.config(max_step_contract_repairs=1),
-            planner=[initial_plan(STEP)], reviewer=[review()],
+            planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="environment-verify")
 
         self.assertEqual(
-            result.status, RunStatus.COMMITTED,
+            result.status, RunStatus.PUBLISHED,
             self.state("environment-verify").get("failure"),
         )
-        self.assertEqual(len(self.workers.calls), 1)
+        self.assertEqual(
+            [request.role for request in self.workers.calls].count(ExecutionRole.IMPLEMENTER), 1,
+        )
         self.assertEqual(len(self.planner.requests), 1)
         steps_dir = (
             self.run_dir("environment-verify")
@@ -129,36 +130,31 @@ class ContractRepairTests(PipelineHarness):
         self.assertFalse((steps_dir / "contract_repairs").exists())
         self.assertNotIn("AGENT_CONTRACT_MISMATCH", self.trace_names("environment-verify"))
 
-    def test_no_change_after_contract_repair_is_reviewed_before_implementation_correction(self) -> None:
-        # The required check passes on the unchanged tree and on the corrected
-        # tree; the independent reviewer decides that the SPEC still needs work.
-        self.check.write_text(
-            "import pathlib, sys\n"
-            "sys.exit(0 if pathlib.Path('feature.txt').read_text().strip() in {'base', 'good'} else 1)\n",
-            encoding="utf-8",
+    def test_a_no_change_tree_is_settled_by_the_deterministic_gate_alone(self) -> None:
+        # The worker changes nothing and the required check passes on the
+        # unchanged tree. One authority settles that tree: the deterministic
+        # gate. No audit, no replan and no human wait is spent on a candidate
+        # that carries no delta.
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            lambda _request: "done\n", lambda _request: "done\n",
         )
-        self.workers.on(ExecutionRole.IMPLEMENTER, lambda _request: "done\n", lambda _request: "done\n")
-        self.workers.on(ExecutionRole.REVISER, write("feature.txt", "good\n"))
         result = self.orchestrator(
-            self.config(max_step_contract_repairs=1, correction_cycles=1),
+            self.config(max_step_contract_repairs=1),
             planner=[initial_plan(STEP), repaired_step_contract()],
-            reviewer=[review("REVISE", "IMPLEMENTATION"), review()],
-        ).run_text(SPEC, run_id="reviewed-no-change")
+        ).run_text(SPEC, run_id="no-change")
 
-        self.assertEqual(
-            result.status, RunStatus.COMMITTED,
-            self.state("reviewed-no-change").get("failure"),
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state("no-change").get("failure"))
+        self.assertEqual(len(self.planner.requests), 2)
+        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+        candidate = json.loads(
+            (self.run_dir("no-change") / "cycles/001/candidate/commit.json").read_text()
         )
-        first_candidate = json.loads(
-            (self.run_dir("reviewed-no-change") / "cycles/001/candidate/commit.json").read_text()
-        )
-        self.assertTrue(first_candidate["no_change"])
-        self.assertEqual(first_candidate["commit_sha"], self.base_sha)
-        self.assertEqual(self.state("reviewed-no-change").get("no_change"), None)
-        self.assertEqual(git(self.worktree("reviewed-no-change"), "rev-list", "--count", "HEAD"), "2")
-        self.assertEqual(self.workers.roles(), ["implementer", "implementer", "reviser"])
-        self.assertEqual(len(self.reviewer.requests), 2)
-        self.assertIn("candidate delta is empty", self.reviewer.requests[0])
+        self.assertTrue(candidate["no_change"])
+        self.assertEqual(candidate["commit_sha"], self.base_sha)
+        self.assertEqual(self.state("no-change").get("no_change"), True)
+        self.assertIn("run.completed_no_change", self.trace_names("no-change"))
+
 
 if __name__ == "__main__":
     unittest.main()

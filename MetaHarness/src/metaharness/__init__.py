@@ -53,8 +53,6 @@ from .commit_gate import (
 from .gitops import (
     build_run_branch,
     commit_candidate_tree,
-    commit_repair_tree,
-    commit_revision_tree,
     commit_step_tree,
     commit_tree,
     validate_linear_commit_chain,
@@ -86,8 +84,6 @@ from .models import (
     RoutingConfig,
     RepositoryConfig,
     TransportConfig,
-    ReviewRoute,
-    ReviewVerdict,
     RunStatus,
     RunCycle,
     TaskPlanV2,
@@ -107,10 +103,8 @@ from .trace import (
 from .prompt_contracts import (
     PromptPayload,
     PromptSection,
-    build_final_review_payload,
     build_implementer_payload,
     build_planner_payload,
-    build_semantic_revision_payload,
 )
 from .orchestrator import Orchestrator, run_orchestrator
 from .integrations.github import (
@@ -121,7 +115,6 @@ from .integrations.github import (
     GitHubWorkstreamError,
     NullGitHubWorkstreamClient,
 )
-from .review import Reviewer, ReviewParseError, ReviewResult, parse_review
 from .result import RunResult
 from .run_options import (
     RunOptions,
@@ -185,11 +178,6 @@ __all__ = [
     "RepositoryConfig",
     "PlanApproval",
     "PlanIdentity",
-    "ReviewParseError",
-    "ReviewResult",
-    "ReviewRoute",
-    "ReviewVerdict",
-    "Reviewer",
     "RunStateStore",
     "RunResult",
     "RunOptions",
@@ -228,15 +216,12 @@ __all__ = [
     "build_run_branch",
     "commit_candidate_tree",
     "commit_step_tree",
-    "commit_repair_tree",
-    "commit_revision_tree",
     "validate_linear_commit_chain",
     "check_codex_authentication",
     "check_claude_authentication",
     "compute_plan_identity",
     "compute_plan_identity_from_run",
     "load_config",
-    "parse_review",
     "parse_env_file",
     "render_context",
     "read_plan_approval",
@@ -249,8 +234,6 @@ __all__ = [
     "prepare_claude_home",
     "build_planner_payload",
     "build_implementer_payload",
-    "build_semantic_revision_payload",
-    "build_final_review_payload",
     "effective_run_config",
     "read_run_options_with_sha256",
 ]

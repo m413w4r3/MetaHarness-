@@ -416,7 +416,7 @@ def persist_evidence(
     write_logs: bool = True,
     secrets: tuple[str, ...] = (),
 ) -> None:
-    """Persist full diff/log artifacts and reviewer-safe JSON metadata.
+    """Persist full diff/log artifacts and audit-safe JSON metadata.
 
     ``write_logs=False`` keeps the complete log files already written by
     :func:`run_checks` instead of replacing them with in-memory copies.
@@ -592,10 +592,10 @@ def collect_evidence(
 
     head_matches = current_head(root) == (expected_head_sha or base_sha)
     # This is intentionally after every check, including failed checks, so the
-    # tree written below is the exact tree offered to the reviewer.
+    # tree written below is the exact tree offered to the audit.
     stage_all(root)
     # Pipeline v2 freezes accepted implementation steps as commits. The
-    # reviewer therefore needs the cumulative delta from the immutable run
+    # audit therefore needs the cumulative delta from the immutable run
     # base, while security checks still inspect staged post-commit changes.
     changed_files = staged_changed_files_from(root, base_sha)
     diff = staged_diff_from(root, base_sha)

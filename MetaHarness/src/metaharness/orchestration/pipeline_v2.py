@@ -2,27 +2,23 @@
 
 ``PipelineV2Coordinator`` owns the order of the durable phases and the
 checkpoint written before each of them.  It never owns an ``Orchestrator``:
-every operation it sequences (a worker step, a deterministic gate, a
-candidate commit, a review, the publication) is injected explicitly through
+every operation it sequences (a worker step, a deterministic gate, an audit,
+a candidate commit, the publication) is injected explicitly through
 :class:`PipelineV2Operations`.
 
-A run is a sequence of cycles ``001, 002, ...``.  Each cycle executes one
-approved plan (the operator-approved plan for the initial cycle, a
-review-driven or red-gate correction plan afterwards), optionally a semantic
-revision, one or two deterministic gate episodes with their recovery ladder,
-the accepted candidate HEAD, its push and one final review.  The number of
-cycles is bounded only by the frozen run options, never by this module.
+A run executes one approved plan in one cycle: its steps, the deterministic
+gate the red audit authority answers, the accepted candidate HEAD, its push
+and the publication.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence, TypeAlias
+from typing import Any, Callable, Mapping, TypeAlias
 
 from ..evidence import EvidenceBundle, required_checks_passed
 from ..gitops import RepositoryReference, WorktreeInfo
@@ -30,8 +26,6 @@ from ..models import (
     CycleKind,
     ExecutionSelection,
     GateStage,
-    ReviewRoute,
-    ReviewVerdict,
     RunCycle,
     RunDisposition,
     RunEvent,
@@ -39,36 +33,14 @@ from ..models import (
     RunPhase,
     RunTransitionError,
     TaskPlanV2,
-    correction_cycles_used,
     transition,
 )
-from ..recovery_policy import RecoveryStrategy
 from ..result import RunResult
 from ..resume import ResumeCheckpoint
-from ..review import ReviewResult
 from ..run_options import RunOptions
 
 FailureDetail: TypeAlias = str | Mapping[str, Any]
 
-if TYPE_CHECKING:  # pragma: no cover - the ladder protocol lives in recovery.py
-    from .recovery import GateRecoveryStep, RecoveryOperations
-
-
-def check_repair_fingerprint(
-    candidate_tree_sha: str, failed_check_ids: Sequence[str], stage: GateStage | str,
-    strategy: str = "",
-) -> tuple[str, tuple[str, ...], str, str]:
-    """Stable identity of one exhausted deterministic-gate failure.
-
-    The ladder position is part of the identity: two exhausted episodes that
-    stopped after different strategies are different facts, so an operator
-    retry that opened a new rung is never mistaken for a fixed point.
-    """
-
-    stage_name = stage.value if isinstance(stage, GateStage) else str(stage)
-    return (
-        candidate_tree_sha, tuple(sorted(set(failed_check_ids))), stage_name, str(strategy),
-    )
 
 
 # -- durable artifact layout -------------------------------------------------
@@ -104,14 +76,6 @@ def step_dir(run_dir: Path, cycle: RunCycle | int, step_id: str) -> Path:
     return implementation_steps_dir(run_dir, cycle) / step_id
 
 
-def correction_dir(run_dir: Path, cycle: RunCycle | int) -> Path:
-    return cycle_dir(run_dir, cycle) / "correction"
-
-
-def semantic_revision_dir(run_dir: Path, cycle: RunCycle | int) -> Path:
-    return cycle_dir(run_dir, cycle) / "semantic-revision"
-
-
 def gate_dir(run_dir: Path, cycle: RunCycle | int, stage: GateStage | str) -> Path:
     return cycle_dir(run_dir, cycle) / "checks" / _stage_name(stage)
 
@@ -120,65 +84,12 @@ def gate_acceptance_path(run_dir: Path, cycle: RunCycle | int, stage: GateStage 
     return gate_dir(run_dir, cycle, stage) / "accepted.json"
 
 
-def check_repair_dir(run_dir: Path, cycle: RunCycle | int, stage: GateStage | str) -> Path:
-    return cycle_dir(run_dir, cycle) / "check-repair" / _stage_name(stage)
-
-
-def check_repair_root(run_dir: Path, cycle: RunCycle | int) -> Path:
-    return cycle_dir(run_dir, cycle) / "check-repair"
-
-
-def check_repair_attempts_dir(
-    run_dir: Path, cycle: RunCycle | int, stage: GateStage | str,
-) -> Path:
-    return check_repair_dir(run_dir, cycle, stage) / "attempts"
-
-
-def check_repair_attempt_dir(
-    run_dir: Path, cycle: RunCycle | int, stage: GateStage | str, attempt: int,
-) -> Path:
-    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
-        raise ValueError("check-repair attempt must be a positive integer")
-    return check_repair_attempts_dir(run_dir, cycle, stage) / f"{attempt:03d}"
-
-
 def candidate_dir(run_dir: Path, cycle: RunCycle | int) -> Path:
     return cycle_dir(run_dir, cycle) / "candidate"
 
 
-def review_dir(run_dir: Path, cycle: RunCycle | int) -> Path:
-    return cycle_dir(run_dir, cycle) / "review"
-
-
 def cycle_record_path(run_dir: Path, cycle: RunCycle | int) -> Path:
     return cycle_dir(run_dir, cycle) / "cycle.json"
-
-
-def pre_semantic_gate_stage(kind: CycleKind) -> GateStage:
-    """Return the gate immediately following implementation work."""
-
-    return {
-        CycleKind.INITIAL: GateStage.POST_IMPLEMENTATION,
-        CycleKind.REVIEW_REPLAN: GateStage.POST_REVIEW_REPLAN,
-        CycleKind.CHECK_REPLAN: GateStage.POST_CHECK_REPLAN,
-    }[CycleKind(kind)]
-
-
-def final_gate_stage(kind: CycleKind) -> GateStage:
-    """Return the gate which authorizes the candidate HEAD."""
-
-    kind = CycleKind(kind)
-    if kind is CycleKind.REVIEW_IMPLEMENTATION:
-        return GateStage.POST_REVIEW_IMPLEMENTATION
-    return GateStage.POST_SEMANTIC_REVISION
-
-
-def correction_kind(route: ReviewRoute) -> CycleKind:
-    if route is ReviewRoute.IMPLEMENTATION:
-        return CycleKind.REVIEW_IMPLEMENTATION
-    if route is ReviewRoute.REPLAN:
-        return CycleKind.REVIEW_REPLAN
-    raise ValueError("only IMPLEMENTATION and REPLAN reviews open a correction cycle")
 
 
 # -- data exchanged with the operations ---------------------------------------
@@ -196,11 +107,6 @@ class RecoveryStepUnavailable(RuntimeError):
         super().__init__(f"{getattr(strategy, 'value', strategy)}: {detail}")
         self.strategy = strategy
         self.detail = detail
-
-
-# The phases that restate a cycle boundary, and the ordinary step cycles.
-_CYCLE_ENTRY_PHASES = frozenset({RunPhase.REVIEW_REPLAN, RunPhase.CHECK_REPLAN})
-_IMPLEMENT_PHASES = frozenset({CycleKind.INITIAL, CycleKind.CHECK_REPLAN})
 
 
 class PipelineFailure(Exception):
@@ -264,7 +170,6 @@ class CyclePlan:
     # Where the approved ``steps/Sxx/contract.md`` files of this plan live.
     contracts_dir: Path
     step_profile_ids: Mapping[str, str]
-    correction_bundle_sha256: str | None = None
     step_fallback_profile_ids: Mapping[str, tuple[str, ...]] | None = None
 
     @property
@@ -342,7 +247,7 @@ class PipelineV2Coordinator:
     def run(self, start: ResumeCheckpoint, *, resumed: bool) -> RunResult:
         ops, ctx = self.operations, self.context
         if start.review_cycle != 1:
-            raise PipelineFailure("RUN_SCHEMA_UNSUPPORTED", "old correction cycles cannot resume")
+            raise PipelineFailure("RUN_SCHEMA_UNSUPPORTED", "an older run schema cannot resume")
         if start.phase in {
             RunPhase.CONTEXT, RunPhase.PLANNER, RunPhase.PLAN_APPROVAL,
             RunPhase.WORKTREE_SETUP,
@@ -446,9 +351,7 @@ class PipelineV2Coordinator:
 __all__ = [
     "CyclePlan", "PipelineFailure", "PipelineV2Context", "PipelineV2Coordinator",
     "RecoveryStepUnavailable",
-    "PipelineV2Operations", "candidate_dir", "check_repair_attempt_dir",
-    "check_repair_attempts_dir", "check_repair_dir", "check_repair_root", "correction_dir", "correction_kind", "cycle_dir",
-    "cycle_record_path", "final_gate_stage", "gate_acceptance_path", "gate_dir", "implementation_dir", "implementation_steps_dir",
-    "pre_semantic_gate_stage", "step_dir",
-    "review_dir", "semantic_revision_dir",
+    "PipelineV2Operations", "candidate_dir",
+    "cycle_dir", "cycle_record_path", "gate_acceptance_path", "gate_dir",
+    "implementation_dir", "implementation_steps_dir", "step_dir",
 ]

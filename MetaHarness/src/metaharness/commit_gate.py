@@ -303,7 +303,7 @@ def accepted_step_record(
     deferred: DeferredVerification | None = None,
     authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the durable, reviewer-safe metadata for one accepted step.
+    """Build the durable, audit-safe metadata for one accepted step.
 
     ``authority`` names the effective step authority the commit gate used;
     its hashes are re-derived from their artifacts on every resume.

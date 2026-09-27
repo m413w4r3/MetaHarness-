@@ -98,16 +98,12 @@ class Orchestrator:
         config: HarnessConfig,
         *,
         planner_client: Any | None = None,
-        reviewer_client: Any | None = None,
-        recommender_client: Any | None = None,
         github_client: GitHubWorkstreamClient | None = None,
         trace_sink: TraceSink | None = None,
     ) -> None:
         self._runtime = RunRuntime(
             config,
             planner_client=planner_client,
-            reviewer_client=reviewer_client,
-            recommender_client=recommender_client,
             github_client=github_client,
             trace_sink=trace_sink,
         )

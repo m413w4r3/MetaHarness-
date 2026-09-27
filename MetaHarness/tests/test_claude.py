@@ -1,4 +1,4 @@
-"""P24 Claude Code runtime and reviser tests; no real Claude process is used."""
+"""P24 Claude Code runtime and executor-adapter tests; no real Claude process runs."""
 
 from __future__ import annotations
 
@@ -159,7 +159,7 @@ class ClaudeTests(unittest.TestCase):
         profile = ModelProfile(
             id="claude",
             display_name="Claude",
-            roles=(ExecutionRole.REVISER,),
+            roles=(ExecutionRole.AUDITOR,),
             driver=ProfileDriver.CLAUDE_CODE,
             model="opus",
             selection_mode=SelectionMode.CLI,
@@ -213,7 +213,7 @@ class ClaudeTests(unittest.TestCase):
         profile = ModelProfile(
             id="claude",
             display_name="Claude",
-            roles=(ExecutionRole.REVISER,),
+            roles=(ExecutionRole.AUDITOR,),
             driver=ProfileDriver.CLAUDE_CODE,
             model="opus",
             selection_mode=SelectionMode.CLI,
@@ -247,7 +247,7 @@ class ClaudeTests(unittest.TestCase):
         profile = ModelProfile(
             id="claude",
             display_name="Claude",
-            roles=(ExecutionRole.REVISER,),
+            roles=(ExecutionRole.AUDITOR,),
             driver=ProfileDriver.CLAUDE_CODE,
             model="opus",
             selection_mode=SelectionMode.CLI,
@@ -304,7 +304,7 @@ class ClaudeTests(unittest.TestCase):
         profile = ModelProfile(
             id="claude",
             display_name="Claude",
-            roles=(ExecutionRole.REVISER,),
+            roles=(ExecutionRole.AUDITOR,),
             driver=ProfileDriver.CLAUDE_CODE,
             model="opus",
             selection_mode=SelectionMode.CLI,
@@ -345,11 +345,9 @@ class ClaudeTests(unittest.TestCase):
             allow_no_required_checks = true
             [ui]
             default_planner_profile = "p"
-            default_implementer_profile = "i"
-            default_reviewer_profile = "p"
             [model_profiles.p]
             display_name = "p"
-            roles = ["planner", "reviewer"]
+            roles = ["planner"]
             driver = "openai-chat"
             model = "p"
             selection_mode = "request"
@@ -365,7 +363,7 @@ class ClaudeTests(unittest.TestCase):
             selection_mode = "cli"
             [model_profiles.c]
             display_name = "c"
-            roles = ["reviser"]
+            roles = ["auditor"]
             driver = "claude-code"
             model = "opus"
             effort = "medium"

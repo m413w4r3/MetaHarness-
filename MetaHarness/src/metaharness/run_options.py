@@ -23,7 +23,7 @@ class RunOptionsConflict(RunOptionsError):
     """An immutable run-options artifact already contains different bytes."""
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 # Deterministic refusal code for a snapshot that is not the current schema.
 RUN_SCHEMA_UNSUPPORTED = "RUN_SCHEMA_UNSUPPORTED"
 RUN_OPTIONS_NAME = "run_options.json"
@@ -37,7 +37,6 @@ _PLANNING_FIELDS = frozenset({
     "max_preapproval_corrections",
 })
 _PIPELINE_FIELDS = frozenset({
-    "semantic_revision_enabled", "max_check_repair_attempts", "max_correction_cycles",
     "max_step_contract_repairs",
 })
 _PROFILE_FIELDS = frozenset({
@@ -46,12 +45,12 @@ _PROFILE_FIELDS = frozenset({
 })
 _RECOVERY_FIELDS = frozenset({
     "max_transient_attempts", "max_executor_fallbacks",
-    "max_check_infra_retries", "max_review_transport_retries",
+    "max_check_infra_retries",
     "max_workspace_setup_retries", "max_contract_repair_output_corrections",
     "max_contract_repair_planner_restarts",
 })
 _FALLBACK_FIELDS = frozenset({
-    "mechanical", "reasoning", "agentic", "semantic_reviser", "check_repair",
+    "mechanical", "reasoning", "agentic",
 })
 
 
@@ -86,19 +85,11 @@ class RunOptions:
     execution_mode_policy: str
     single_step_max_mutable_paths: int
     staged_step_max_mutable_paths: int
-    semantic_revision_enabled: bool
-    max_check_repair_attempts: int
-    # One budget for every cycle after ``INITIAL``: a review correction and a
-    # red-gate re-decomposition alike.  There is no second cycle budget.
-    max_correction_cycles: int
     planner_profile: str
     max_step_contract_repairs: int = 2
     mechanical_profile: str = ""
     reasoning_profile: str = ""
     agentic_profile: str = ""
-    check_repair_profile: str | None = None
-    semantic_reviser_profile: str | None = None
-    final_reviewer_profile: str = ""
     audit_profile: str = ""
     max_steps_per_plan: int = 8
     max_read_paths_per_step: int = 8
@@ -134,15 +125,8 @@ class RunOptions:
             validate_revision_budget(self.max_preapproval_corrections, "run options max_preapproval_corrections")
         except ValueError as exc:
             raise RunOptionsError(str(exc)) from None
-        if not isinstance(self.semantic_revision_enabled, bool):
-            raise RunOptionsError("run options semantic_revision_enabled must be boolean")
         if not isinstance(self.recovery, RecoveryBudgets):
             raise RunOptionsError("run options recovery budgets are invalid")
-        for name in ("max_check_repair_attempts", "max_correction_cycles"):
-            try:
-                validate_revision_budget(getattr(self, name), f"run options {name}")
-            except ValueError as exc:
-                raise RunOptionsError(str(exc)) from None
         try:
             validate_revision_budget(
                 self.max_step_contract_repairs, "run options max_step_contract_repairs"
@@ -156,20 +140,14 @@ class RunOptions:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise RunOptionsError(f"run options {name} is invalid")
-        for name in ("check_repair_profile", "semantic_reviser_profile"):
-            value = getattr(self, name)
-            if value is not None and (not isinstance(value, str) or not value.strip()):
-                raise RunOptionsError(f"run options {name} is invalid")
 
     @classmethod
     def from_config(cls, config: HarnessConfig, **overrides: Any) -> "RunOptions":
         allowed = {
             "protocol", "decomposition", "execution_mode_policy",
             "single_step_max_mutable_paths", "staged_step_max_mutable_paths",
-            "semantic_revision_enabled", "max_check_repair_attempts",
-            "max_correction_cycles", "planner_profile", "mechanical_profile",
-            "reasoning_profile", "agentic_profile",
-            "check_repair_profile", "semantic_reviser_profile", "final_reviewer_profile", "audit_profile",
+            "planner_profile", "mechanical_profile",
+            "reasoning_profile", "agentic_profile", "audit_profile",
             "max_steps_per_plan", "max_read_paths_per_step", "max_step_contract_chars",
             "max_preapproval_corrections", "max_step_contract_repairs",
             "recovery",
@@ -194,15 +172,9 @@ class RunOptions:
             "max_read_paths_per_step": config.planning.max_read_paths_per_step,
             "max_step_contract_chars": config.planning.max_step_contract_chars,
             "max_preapproval_corrections": config.planning.max_preapproval_corrections,
-            "semantic_revision_enabled": config.revision.enabled,
-            "max_check_repair_attempts": config.revision.max_check_repair_attempts,
-            "max_correction_cycles": config.revision.max_correction_cycles,
             "max_step_contract_repairs": config.revision.max_step_contract_repairs,
             "planner_profile": config.ui.default_planner_profile,
             **route_profiles,
-            "check_repair_profile": config.ui.default_repair_profile,
-            "semantic_reviser_profile": config.ui.default_reviser_profile,
-            "final_reviewer_profile": config.ui.default_reviewer_profile,
             "audit_profile": config.ui.default_audit_profile,
             "recovery": config.recovery,
         }
@@ -217,16 +189,10 @@ class RunOptions:
             ("mechanical_profile", ExecutionRole.IMPLEMENTER),
             ("reasoning_profile", ExecutionRole.IMPLEMENTER),
             ("agentic_profile", ExecutionRole.IMPLEMENTER),
-            ("final_reviewer_profile", ExecutionRole.REVIEWER),
             ("audit_profile", ExecutionRole.AUDITOR),
-            ("semantic_reviser_profile", ExecutionRole.REVISER),
-            ("check_repair_profile", ExecutionRole.REPAIR),
         ):
-            value = getattr(self, name)
-            if value is None or value == "":
-                continue
             try:
-                profile_for_role(config, value, role)
+                profile_for_role(config, getattr(self, name), role)
             except ProfileError as exc:
                 raise RunOptionsError(f"{name} is invalid or incompatible") from exc
         for execution_class in ("mechanical", "reasoning", "agentic"):
@@ -241,20 +207,6 @@ class RunOptions:
                 except ProfileError as exc:
                     raise RunOptionsError(
                         f"recovery.execution_fallbacks.{execution_class} contains an incompatible profile"
-                    ) from exc
-        for key, role in (
-            ("semantic_reviser", ExecutionRole.REVISER),
-            ("check_repair", ExecutionRole.REPAIR),
-        ):
-            for profile_id in getattr(self.recovery.execution_fallbacks, key):
-                primary = getattr(self, "semantic_reviser_profile" if key == "semantic_reviser" else "check_repair_profile")
-                if profile_id == primary:
-                    raise RunOptionsError(f"recovery.execution_fallbacks.{key} repeats the primary profile")
-                try:
-                    profile_for_role(config, profile_id, role)
-                except ProfileError as exc:
-                    raise RunOptionsError(
-                        f"recovery.execution_fallbacks.{key} contains an incompatible profile"
                     ) from exc
 
     def to_dict(self) -> dict[str, Any]:
@@ -273,9 +225,6 @@ class RunOptions:
                 "max_preapproval_corrections": self.max_preapproval_corrections,
             },
             "pipeline": {
-                "semantic_revision_enabled": self.semantic_revision_enabled,
-                "max_check_repair_attempts": self.max_check_repair_attempts,
-                "max_correction_cycles": self.max_correction_cycles,
                 "max_step_contract_repairs": self.max_step_contract_repairs,
             },
             "recovery": asdict(self.recovery),
@@ -292,9 +241,8 @@ class RunOptions:
     def from_mapping(cls, value: Any) -> "RunOptions":
         """Read the one current snapshot shape; nothing is migrated.
 
-        The schema 3 -> 4 break renamed the single cycle budget to
-        ``max_correction_cycles``: every older snapshot is refused, never
-        converted.
+        The schema 5 -> 6 break removed the former revision and gate-repair
+        surfaces: every older snapshot is refused, never converted.
         """
 
         if not isinstance(value, Mapping):
@@ -402,9 +350,6 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
     ui = replace(
         config.ui,
         default_planner_profile=options.planner_profile,
-        default_reviewer_profile=options.final_reviewer_profile or config.ui.default_reviewer_profile,
-        default_reviser_profile=options.semantic_reviser_profile or config.ui.default_reviser_profile,
-        default_repair_profile=options.check_repair_profile or config.ui.default_repair_profile,
         default_audit_profile=options.audit_profile,
     )
     routing = RoutingConfig(
@@ -413,10 +358,7 @@ def effective_run_config(config: HarnessConfig, options: RunOptions) -> HarnessC
         agentic_profile=options.agentic_profile,
     )
     revision = RevisionConfig(
-        enabled=options.semantic_revision_enabled,
-        max_check_repair_attempts=options.max_check_repair_attempts,
         max_step_contract_repairs=options.max_step_contract_repairs,
-        max_correction_cycles=options.max_correction_cycles,
     )
     return replace(
         config, planning=planning, ui=ui, routing=routing, revision=revision,

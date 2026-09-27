@@ -37,9 +37,12 @@ home = "codex-home"
 
 [ui]
 default_planner_profile = "planner-chat"
-default_implementer_profile = "implementer-codex"
-default_reviewer_profile = "reviewer-chat"
 default_audit_profile = "implementer-codex"
+
+[routing]
+mechanical_profile = "implementer-codex"
+reasoning_profile = "implementer-codex"
+agentic_profile = "implementer-codex"
 
 [model_profiles.planner-chat]
 display_name = "Planner"
@@ -67,17 +70,6 @@ effort = "high"
 sandbox = "workspace-write"
 selection_mode = "cli"
 timeout_seconds = 5400
-
-[model_profiles.reviewer-chat]
-display_name = "Reviewer"
-roles = ["reviewer"]
-driver = "openai-chat"
-provider = "bridge"
-model = "review-model"
-selection_mode = "request"
-base_url = "https://review.example"
-endpoint_path = "/v1/chat"
-timeout_seconds = 420
 
 [context]
 always_files = ["AGENTS.md", "README.md"]
@@ -136,6 +128,37 @@ class ConfigTests(unittest.TestCase):
             "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
         ))
 
+    def test_the_removed_ui_defaults_are_refused_by_name(self) -> None:
+        """No alias, no migration: a removed [ui] default is a configuration error."""
+
+        for removed in (
+            "default_implementer_profile", "default_reviewer_profile",
+            "default_reviser_profile", "default_repair_profile",
+        ):
+            with self.subTest(removed=removed):
+                contents = VALID_CONFIG.replace(
+                    'default_planner_profile = "planner-chat"',
+                    f'default_planner_profile = "planner-chat"\n{removed} = "implementer-codex"',
+                )
+                with tempfile.TemporaryDirectory() as directory_name:
+                    path = self.write_config(Path(directory_name), contents)
+                    with self.assertRaisesRegex(ConfigError, removed):
+                        load_config(path)
+
+    def test_routing_is_required_and_never_defaulted(self) -> None:
+        without_routing = VALID_CONFIG.replace(
+            "[routing]\n"
+            'mechanical_profile = "implementer-codex"\n'
+            'reasoning_profile = "implementer-codex"\n'
+            'agentic_profile = "implementer-codex"\n',
+            "",
+        )
+        self.assertNotIn("[routing]", without_routing)
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_config(Path(directory_name), without_routing)
+            with self.assertRaisesRegex(ConfigError, "routing is required"):
+                load_config(path)
+
     def test_autowork_example_uses_its_two_megabyte_diff_bound(self) -> None:
         example = Path(__file__).resolve().parents[1] / "examples" / "autowork.toml"
         # This assertion is about the literal example declaration.  Loading
@@ -165,7 +188,6 @@ class ConfigTests(unittest.TestCase):
                 "mechanical": ["codex-luna-xhigh"],
                 "reasoning": ["codex-sol-high"],
                 "agentic": ["codex-sol-high"],
-                "semantic_reviser": ["codex-astra-medium"],
             },
         )
         self.assertEqual(raw["default_check_ids"], ["lint", "typecheck", "test"])
@@ -219,7 +241,6 @@ class ConfigTests(unittest.TestCase):
 max_transient_attempts = 3
 max_executor_fallbacks = 1
 max_check_infra_retries = 2
-max_review_transport_retries = 0
 max_workspace_setup_retries = 2
 """
         with tempfile.TemporaryDirectory() as directory_name:
@@ -228,7 +249,6 @@ max_workspace_setup_retries = 2
             max_transient_attempts=3,
             max_executor_fallbacks=1,
             max_check_infra_retries=2,
-            max_review_transport_retries=0,
             max_workspace_setup_retries=2,
         ))
 
@@ -240,8 +260,6 @@ max_workspace_setup_retries = 2
 mechanical = ["mechanical-rescue"]
 reasoning = ["reasoning-rescue"]
 agentic = ["agentic-rescue"]
-semantic_reviser = ["reviser-rescue"]
-check_repair = ["repair-rescue"]
 """
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name), contents))
@@ -249,9 +267,39 @@ check_repair = ["repair-rescue"]
             mechanical=("mechanical-rescue",),
             reasoning=("reasoning-rescue",),
             agentic=("agentic-rescue",),
-            semantic_reviser=("reviser-rescue",),
-            check_repair=("repair-rescue",),
         ))
+
+    def test_removed_execution_fallbacks_are_rejected(self) -> None:
+        # The old check-repair and semantic-revision rungs are gone: a config
+        # that still names them is refused instead of silently ignored.
+        for removed in ("semantic_reviser", "check_repair", "final_reviewer"):
+            with self.subTest(removed=removed):
+                contents = VALID_CONFIG + f"""
+
+[recovery.execution_fallbacks]
+{removed} = ["rescue"]
+"""
+                with tempfile.TemporaryDirectory() as directory_name:
+                    path = self.write_config(Path(directory_name), contents)
+                    with self.assertRaisesRegex(
+                        ConfigError, f"execution_fallbacks.{removed} is not allowed"
+                    ):
+                        load_config(path)
+
+    def test_removed_semantic_revision_section_is_rejected(self) -> None:
+        for body in (
+            "[revision]\nenabled = true\n",
+            "[revision]\nmax_check_repair_attempts = 1\n",
+            "[revision]\nmax_correction_cycles = 1\n",
+            '[ui]\ndefault_reviewer_profile = "implementer-codex"\n',
+            '[ui]\ndefault_reviser_profile = "implementer-codex"\n',
+            '[ui]\ndefault_repair_profile = "implementer-codex"\n',
+        ):
+            with self.subTest(body=body):
+                with tempfile.TemporaryDirectory() as directory_name:
+                    path = self.write_config(Path(directory_name), VALID_CONFIG + body)
+                    with self.assertRaises(ConfigError):
+                        load_config(path)
 
     def test_execution_fallback_profiles_must_be_arrays(self) -> None:
         contents = VALID_CONFIG + """
@@ -607,15 +655,25 @@ mechanical = "rescue"
         with tempfile.TemporaryDirectory() as directory_name:
             with self.assertRaisesRegex(ConfigError, "model_profiles"):
                 load_config(self.write_config(Path(directory_name), missing_profiles))
-        for key in (
-            "default_planner_profile",
-            "default_implementer_profile",
-            "default_reviewer_profile",
-        ):
-            contents = VALID_CONFIG.replace(f'{key} = "', f'# {key} = "', 1)
-            with tempfile.TemporaryDirectory() as directory_name:
-                with self.assertRaisesRegex(ConfigError, f"ui.{key} is required"):
-                    load_config(self.write_config(Path(directory_name), contents))
+        contents = VALID_CONFIG.replace(
+            'default_planner_profile = "', '# default_planner_profile = "', 1,
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, "ui.default_planner_profile is required"):
+                load_config(self.write_config(Path(directory_name), contents))
+        contents = VALID_CONFIG.replace(
+            'mechanical_profile = "implementer-codex"', 'mechanical_profile = "planner-chat"', 1,
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ConfigError, "must have the implementer role"):
+                load_config(self.write_config(Path(directory_name), contents))
+        # The audit default is optional as long as the audit role is routable.
+        contents = VALID_CONFIG.replace(
+            'default_audit_profile = "implementer-codex"\n', "", 1,
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            config = load_config(self.write_config(Path(directory_name), contents))
+        self.assertIsNone(config.ui.default_audit_profile)
 
     def test_ui_active_run_capacity_is_bounded_and_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
@@ -643,36 +701,20 @@ mechanical = "rescue"
             config = load_config(self.write_config(Path(directory_name), contents))
         self.assertEqual(config.model_profiles["planner-chat"].provider, "arbitrary-provider")
 
-    def test_modern_role_matrix_accepts_external_repair_and_claude_reviser(self) -> None:
+    def test_modern_role_matrix_accepts_external_implementer_and_auditor(self) -> None:
         contents = VALID_CONFIG.replace(
-            'default_reviewer_profile = "reviewer-chat"',
-            'default_reviewer_profile = "reviewer-chat"\n'
-            'default_reviser_profile = "reviser-claude"\n'
-            'default_repair_profile = "repair-external"',
-        ).replace(
             'driver = "codex"\nprovider = "bridge"\nmodel = "gpt-5.6-luna"\neffort = "high"\nsandbox = "workspace-write"\nselection_mode = "cli"',
             'driver = "external"\nprovider = "deepseek"\nmodel = "deepseek-worker"\nselection_mode = "cli"\nargv = ["trusted-worker"]',
+        ).replace(
+            'default_audit_profile = "implementer-codex"',
+            'default_audit_profile = "auditor-claude"',
         ) + '''
-[revision]
-enabled = true
-max_check_repair_attempts = 1
-max_correction_cycles = 1
-
 [claude_runtime]
 home = "claude-home"
 
-[model_profiles.repair-external]
-display_name = "External repair"
-roles = ["repair"]
-driver = "external"
-provider = "deepseek"
-model = "deepseek-repair"
-selection_mode = "cli"
-argv = ["trusted-repair"]
-
-[model_profiles.reviser-claude]
-display_name = "Claude reviser"
-roles = ["reviser"]
+[model_profiles.auditor-claude]
+display_name = "Claude auditor"
+roles = ["auditor"]
 driver = "claude-code"
 provider = "anthropic"
 model = "opus"
@@ -683,8 +725,7 @@ selection_mode = "cli"
         with tempfile.TemporaryDirectory() as directory_name:
             config = load_config(self.write_config(Path(directory_name), contents))
         self.assertEqual(config.model_profiles["implementer-codex"].driver, "external")
-        self.assertEqual(config.ui.default_repair_profile, "repair-external")
-        self.assertEqual(config.ui.default_reviser_profile, "reviser-claude")
+        self.assertEqual(config.ui.default_audit_profile, "auditor-claude")
 
 
 class RunOptionsStrictSchemaTests(unittest.TestCase):
@@ -707,18 +748,28 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
     def snapshot(self) -> dict:
         return RunOptions.from_config(self.config()).to_dict()
 
-    def test_current_schema_five_round_trips_identically(self) -> None:
+    def test_current_schema_six_round_trips_identically(self) -> None:
         snapshot = self.snapshot()
         self.assertEqual(snapshot["schema_version"], SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 5)
+        self.assertEqual(SCHEMA_VERSION, 6)
         self.assertEqual(snapshot["profiles"]["audit_profile"], "implementer-codex")
-        self.assertNotIn("final_reviewer_profile", snapshot["profiles"])
-        self.assertNotIn("semantic_reviser_profile", snapshot["profiles"])
+        for removed in (
+            "final_reviewer_profile", "semantic_reviser_profile",
+            "check_repair_profile", "default_implementer_profile",
+        ):
+            self.assertNotIn(removed, snapshot["profiles"])
         self.assertEqual(
-            snapshot["pipeline"]["max_correction_cycles"],
-            self.config().revision.max_correction_cycles,
+            set(snapshot["pipeline"]),
+            {"max_step_contract_repairs"},
         )
-        self.assertNotIn("max_review_repair_cycles", snapshot["pipeline"])
+        self.assertEqual(
+            snapshot["pipeline"]["max_step_contract_repairs"],
+            self.config().revision.max_step_contract_repairs,
+        )
+        self.assertEqual(
+            set(snapshot["recovery"]["execution_fallbacks"]),
+            {"mechanical", "reasoning", "agentic"},
+        )
         options = RunOptions.from_mapping(snapshot)
         self.assertEqual(options.to_dict(), snapshot)
         encoded = canonical_run_options_bytes(options)
@@ -737,17 +788,57 @@ class RunOptionsStrictSchemaTests(unittest.TestCase):
             replace(RunOptions.from_mapping(self.snapshot()), schema_version=3)
         self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
 
-    def test_schema_three_snapshot_is_never_migrated(self) -> None:
-        """The renamed single budget is a clean break: no key is ever converted."""
+    def test_a_schema_five_snapshot_is_rejected_without_conversion(self) -> None:
+        """C7 drops the check-repair and semantic-revision surfaces: clean break."""
 
         legacy = self.snapshot()
-        legacy["schema_version"] = 3
-        legacy["pipeline"]["max_review_repair_cycles"] = legacy["pipeline"].pop(
-            "max_correction_cycles"
-        )
+        legacy["schema_version"] = 5
+        legacy["pipeline"] = {
+            "semantic_revision_enabled": True,
+            "max_check_repair_attempts": 2,
+            "max_correction_cycles": 1,
+            "max_step_contract_repairs": 2,
+        }
+        legacy["profiles"].update({
+            "check_repair_profile": "implementer-codex",
+            "semantic_reviser_profile": "implementer-codex",
+            "final_reviewer_profile": "implementer-codex",
+        })
+        legacy["recovery"]["execution_fallbacks"].update({
+            "semantic_reviser": ["implementer-codex"],
+            "check_repair": ["implementer-codex"],
+        })
         with self.assertRaises(RunOptionsError) as caught:
             RunOptions.from_mapping(legacy)
         self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
+
+    def test_every_removed_option_name_is_rejected(self) -> None:
+        cases = (
+            (lambda s: s["pipeline"].update(semantic_revision_enabled=True),
+             "pipeline has unknown key semantic_revision_enabled"),
+            (lambda s: s["pipeline"].update(max_check_repair_attempts=1),
+             "pipeline has unknown key max_check_repair_attempts"),
+            (lambda s: s["pipeline"].update(max_correction_cycles=1),
+             "pipeline has unknown key max_correction_cycles"),
+            (lambda s: s["profiles"].update(check_repair_profile="implementer-codex"),
+             "profiles has unknown key check_repair_profile"),
+            (lambda s: s["profiles"].update(semantic_reviser_profile="implementer-codex"),
+             "profiles has unknown key semantic_reviser_profile"),
+            (lambda s: s["profiles"].update(final_reviewer_profile="implementer-codex"),
+             "profiles has unknown key final_reviewer_profile"),
+            (lambda s: s["recovery"]["execution_fallbacks"].update(
+                semantic_reviser=["implementer-codex"]),
+             "unknown key semantic_reviser"),
+            (lambda s: s["recovery"]["execution_fallbacks"].update(
+                check_repair=["implementer-codex"]),
+             "unknown key check_repair"),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                snapshot = self.snapshot()
+                mutate(snapshot)
+                with self.assertRaisesRegex(RunOptionsError, message):
+                    RunOptions.from_mapping(snapshot)
 
     def test_missing_recovery_fields_are_rejected(self) -> None:
         for field in (

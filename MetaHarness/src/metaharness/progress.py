@@ -70,7 +70,6 @@ def _trace_message(payload: dict[str, Any], secrets: tuple[str, ...]) -> tuple[s
         "contract_repair.output_correction.started": "contract repair output correction",
         "contract_repair.output_correction.exhausted": "contract repair output correction exhausted",
         "check.started": "check started", "check.completed": "check completed",
-        "review.started": "review started", "review.completed": "review completed",
         "candidate.created": "candidate created", "resume.started": "resume",
     }
     message = labels.get(event, event.replace(".", " ").replace("_", " "))
@@ -104,10 +103,7 @@ def _sources(run_dir: Path) -> list[Path]:
     paths = [run_dir / "trace/events.v1.jsonl"]
     for pattern in (
         "cycles/*/implementation/steps/*/agent.events.jsonl",
-        "cycles/*/semantic-revision/agent.events.jsonl",
-        "cycles/*/check-repair/**/agent.events.jsonl",
-        "semantic-revision/agent.events.jsonl",
-        "check-repair/**/agent.events.jsonl",
+        "cycles/*/audit/**/agent.events.jsonl",
     ):
         paths.extend(run_dir.glob(pattern))
     paths.extend(p for p in (run_dir / "agent.events.jsonl",) if p.exists())

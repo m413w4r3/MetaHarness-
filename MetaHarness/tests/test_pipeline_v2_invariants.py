@@ -1,8 +1,8 @@
 """End-to-end invariant checks for the provider-neutral v2 boundaries.
 
 The fixtures in this module are deliberately small: Git, the deterministic
-commit gate and the executor registry are real; model, reviewer and provider
-objects are in-process fakes.  No test here needs a network or an API key.
+commit gate and the executor registry are real; model and provider objects are
+in-process fakes.  No test here needs a network or an API key.
 """
 
 from __future__ import annotations
@@ -30,9 +30,8 @@ from metaharness.commit_gate import (
 )
 from metaharness.gitops import (
     commit_parents,
-    commit_repair_tree,
-    commit_revision_tree,
     commit_step_tree,
+    commit_tree,
     current_head,
     index_tree_sha,
     publish_fast_forward_base,
@@ -44,19 +43,8 @@ from metaharness.models import ExecutionRole, ModelProfile, SelectionMode
 from metaharness.orchestrator import Orchestrator
 from metaharness.orchestration.durable_readers import load_completed_step
 from metaharness.resume import pipeline_version_from_state
-from metaharness.review import parse_review
 from metaharness.run_options import SCHEMA_VERSION, RunOptions
 from metaharness.state import RunStateStore
-
-
-PASS = """VERDICT: PASS
-ROUTE: NONE
-SUMMARY: accepted
-FINDINGS: NONE
-REQUIRED FIXES: NONE
-MISSING TESTS: NONE
-RESIDUAL RISKS: NONE
-"""
 
 
 def git(repo: Path, *args: str) -> str:
@@ -89,7 +77,7 @@ class PipelineFixture(unittest.TestCase):
         self,
         value: str,
         *,
-        kind: str,
+        kind: str = "step",
         step_id: str | None = None,
         parent: str | None = None,
     ) -> tuple[str, dict[str, object]]:
@@ -108,13 +96,11 @@ class PipelineFixture(unittest.TestCase):
                 self.repo, tree_sha=tree, parent_sha=parent,
                 step_id=step_id or "S01", step_title="accepted step",
             )
-        elif kind == "repair":
-            commit = commit_repair_tree(
-                self.repo, tree_sha=tree, parent_sha=parent, cycle=7,
-            )
         else:
-            commit = commit_revision_tree(
+            commit = commit_tree(
                 self.repo, tree_sha=tree, parent_sha=parent,
+                subject="metaharness: accept candidate",
+                reflog_message="metaharness: accept candidate",
             )
         return commit, {
             "step_id": step_id or kind,
@@ -163,8 +149,8 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
         (step_dir / "step.json").write_text(json.dumps(payload), encoding="utf-8")
         self.assertIsNone(load_completed_step(step_dir, "S01"))
 
-    def test_a_repair_and_semantic_revision_preserve_the_exact_accepted_chain(self) -> None:
-        """A red attempt is evidence only; A, B, C and D are linear."""
+    def test_an_empty_attempt_and_a_candidate_preserve_the_exact_chain(self) -> None:
+        """A red attempt is evidence only; A, B, C and D stay linear."""
 
         accepted: list[dict[str, object]] = []
         a, record = self.accept("S01\n", kind="step", step_id="S01")
@@ -192,9 +178,9 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
         self.assertEqual(current_head(self.repo), b)
         git(self.repo, "reset", "-q", "--hard", b)
 
-        c, record = self.accept("T2\n", kind="repair", parent=b)
+        c, record = self.accept("T2\n", kind="candidate", parent=b)
         accepted.append(record)
-        d, record = self.accept("T3\n", kind="revision", parent=c)
+        d, record = self.accept("T3\n", kind="candidate", parent=c)
         accepted.append(record)
         self.assertEqual(commit_parents(self.repo, c), (b,))
         self.assertEqual(commit_parents(self.repo, d), (c,))
@@ -208,7 +194,7 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
             (a, b, c, d),
         )
 
-        # The candidate is immutable and pushed before the reviewer sees it;
+        # The candidate is immutable and pushed before AUDIT sees it;
         # publication uses that exact approved SHA.
         branch = "harness/invariant/run"
         git(self.repo, "switch", "-q", "-c", branch, d)
@@ -219,9 +205,8 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
         events: list[tuple[str, str]] = []
         push_run_branch(self.repo, remote="origin", branch=branch, commit_sha=d)
         events.append(("push", d))
-        reviewer_sha = d
-        events.append(("review", reviewer_sha))
-        self.assertLess(events.index(("push", d)), events.index(("review", d)))
+        events.append(("audit", d))
+        self.assertLess(events.index(("push", d)), events.index(("audit", d)))
         publication = publish_fast_forward_base(
             self.repo, remote="origin", base_branch="main", base_sha=self.base,
             commit_sha=d, approved_tree=accepted[-1]["tree_after"],
@@ -231,37 +216,6 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
         self.assertEqual(
             git(self.repo, "--git-dir", str(bare), "rev-parse", "refs/heads/main"), d,
         )
-
-    def test_b_check_repair_budget_is_separate_from_the_correction_budget(self) -> None:
-        options = RunOptions(
-            schema_version=SCHEMA_VERSION, pipeline_version=2, protocol="v2",
-            decomposition="balanced", execution_mode_policy="auto",
-            single_step_max_mutable_paths=2, staged_step_max_mutable_paths=6,
-            semantic_revision_enabled=True, max_check_repair_attempts=2,
-            max_correction_cycles=4, planner_profile="planner",
-            mechanical_profile="worker", reasoning_profile="worker",
-            agentic_profile="worker", check_repair_profile="repair",
-            semantic_reviser_profile="reviser", final_reviewer_profile="reviewer",
-        )
-        self.assertEqual(options.max_check_repair_attempts, 2)
-        self.assertEqual(options.max_correction_cycles, 4)
-        self.assertNotEqual(options.max_check_repair_attempts, options.max_correction_cycles)
-
-    def test_c_d_e_review_routes_are_data_and_only_the_selected_route_is_actionable(self) -> None:
-        for route in ("IMPLEMENTATION", "REPLAN", "HUMAN"):
-            raw = PASS.replace("VERDICT: PASS", "VERDICT: REVISE").replace(
-                "ROUTE: NONE", f"ROUTE: {route}"
-            ).replace("FINDINGS: NONE", (
-                "FINDINGS: PRODUCT_SPEC_AMBIGUITY | SPEC leaves incompatible outcomes"
-                if route == "HUMAN" else "FINDINGS: MAJOR | issue | fix | required"
-            )).replace(
-                "REQUIRED FIXES: NONE", "REQUIRED FIXES: apply the selected route"
-            )
-            result = parse_review(raw, deterministic_passed=True)
-            self.assertEqual(result.route.value, route)
-            self.assertEqual(result.verdict.value, "REVISE")
-        # A reviewer never receives the correction budget as a control input.
-        self.assertNotIn("max_correction_cycles", PASS)
 
     def test_f_integrity_failures_fail_closed_without_an_agent_call(self) -> None:
         calls: list[str] = []
@@ -328,7 +282,8 @@ class PipelineV2EndToEndInvariantTests(PipelineFixture):
             )
         request = AgentRunRequest(
             role=ExecutionRole.IMPLEMENTER, profile_id="worker", prompt="same",
-            worktree=self.repo, artifact_dir=self.root / "artifacts", mutable_paths=(),
+            worktree=self.repo, artifact_dir=self.root / "artifacts",
+            mutable_paths=("feature.txt",),
         )
         results = []
         for driver in ("fake-codex", "fake-claude", "fake-deepseek"):

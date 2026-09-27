@@ -50,9 +50,8 @@ _EXECUTION_ARTIFACTS = (
     "plan_approval.json", "execution_selection.json",
     "agent.prompt.txt", "agent.events.jsonl", "agent.result.json", "agent.final.md",
     "agent.stderr.log", "evidence.json", "checks.json", "changed-files.txt", "diff.patch",
-    "reviewer.request.txt", "reviewer.raw.md", "reviewer.usage.json", "review.json",
-    "repair_task.md", "publish.json",
-    "revision", "review", "checks", "repair", "setup", "candidate",
+    "audit.json", "publish.json",
+    "checks", "setup", "candidate",
 )
 
 

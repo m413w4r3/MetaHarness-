@@ -28,7 +28,6 @@ PLANNER_USAGE_ARTIFACT = "planner.usage.json"
 # Planner answers rejected by repository-precondition validation, kept for
 # audit under ``<planning dir>/planner-attempts/NN/``.
 PLANNER_ATTEMPTS_DIR = "planner-attempts"
-REVIEWER_USAGE_ARTIFACT = "reviewer.usage.json"
 _MAX_USAGE_ARTIFACT_BYTES = 16 * 1024
 
 # Provider spellings accepted for each canonical counter, in priority order.
@@ -232,10 +231,6 @@ def phase_usage_summary(run_dir: str | Path) -> dict[str, Any]:
     planner = planner_usage(directory)
     cycles: list[dict[str, Any]] = []
     implementer_rows: list[dict[str, Any]] = []
-    correction_planner = empty_usage()
-    semantic_reviser = empty_usage()
-    check_repair = empty_usage()
-    final_reviewer = empty_usage()
     for cycle_path in sorted((directory / "cycles").glob("[0-9][0-9][0-9]")):
         if not cycle_path.is_dir():
             continue
@@ -245,38 +240,18 @@ def phase_usage_summary(run_dir: str | Path) -> dict[str, Any]:
             for row in persisted_step_usage(cycle_path / "implementation" / "steps")
         ]
         cycle_implementer = add_usage(row["usage"] for row in step_rows)
-        cycle_planner = planner_usage(cycle_path / "correction")
-        cycle_reviser = _first_usage(cycle_path / "semantic-revision" / "usage.json")
-        cycle_repair = add_usage(
-            _first_usage(path)
-            for path in sorted(cycle_path.glob("check-repair/*/attempts/[0-9][0-9][0-9]/usage.json"))
-        )
-        cycle_reviewer = _first_usage(cycle_path / "review" / REVIEWER_USAGE_ARTIFACT)
-        correction_planner = add_usage((correction_planner, cycle_planner))
-        semantic_reviser = add_usage((semantic_reviser, cycle_reviser))
-        check_repair = add_usage((check_repair, cycle_repair))
-        final_reviewer = add_usage((final_reviewer, cycle_reviewer))
         implementer_rows.extend(step_rows)
         cycles.append({
             "number": number,
-            "correction_planner": cycle_planner,
             "implementer": cycle_implementer,
-            "semantic_reviser": cycle_reviser,
-            "check_repair": cycle_repair,
-            "final_reviewer": cycle_reviewer,
         })
     summary: dict[str, Any] = {
         "planner": planner,
-        "correction_planner": correction_planner,
         "implementer": {"total": add_usage(row["usage"] for row in implementer_rows), "steps": implementer_rows},
-        "check_repair": check_repair,
-        "semantic_reviser": semantic_reviser,
-        "final_reviewer": final_reviewer,
         "cycles": cycles,
     }
     summary["grand_total"] = add_usage((
-        planner, correction_planner, summary["implementer"]["total"],
-        check_repair, semantic_reviser, final_reviewer,
+        planner, summary["implementer"]["total"],
     ))
     return summary
 
@@ -284,7 +259,6 @@ def phase_usage_summary(run_dir: str | Path) -> dict[str, Any]:
 __all__ = [
     "PLANNER_ATTEMPTS_DIR",
     "PLANNER_USAGE_ARTIFACT",
-    "REVIEWER_USAGE_ARTIFACT",
     "USAGE_FIELDS",
     "add_usage",
     "completion_usage",

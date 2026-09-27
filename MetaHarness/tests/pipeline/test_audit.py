@@ -24,7 +24,6 @@ class AuditPipelineTests(PipelineHarness):
             self.config(extra_checks=extra_checks),
             planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)),
                                required_checks=("test", "integration", "frontend-e2e") if extra_checks else ("test",))],
-            reviewer=[],
         ).run_text(SPEC, run_id="run")
 
     def test_green_gate_still_calls_auditor(self) -> None:
@@ -33,11 +32,28 @@ class AuditPipelineTests(PipelineHarness):
         result = self.orchestrator(
             self.config(),
             planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)))],
-            reviewer=[],
         ).run_text(SPEC, run_id="run")
         self.assertIn("auditor", self.workers.roles())
         self.assertNotIn("reviewer", self.workers.roles())
         self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+
+    def test_audit_has_no_contractual_scope_and_the_worker_has_a_bounded_one(self) -> None:
+        """``mutable_paths`` is explicit: a tuple bounds an agent, ``None`` is no scope."""
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(),
+            planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)))],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        (implementer,) = [
+            call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER
+        ]
+        (auditor,) = [call for call in self.workers.calls if call.role is ExecutionRole.AUDITOR]
+        # The worker honours the declared step authority; the audit is bounded
+        # by the harness ScopePolicy alone, never by a contract of its own.
+        self.assertEqual(implementer.mutable_paths, ("feature.txt",))
+        self.assertIsNone(auditor.mutable_paths)
 
     def test_red_gate_calls_auditor_with_failures_and_reruns(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
@@ -52,7 +68,6 @@ class AuditPipelineTests(PipelineHarness):
         result = self.orchestrator(
             self.config(),
             planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)))],
-            reviewer=[],
         ).run_text(SPEC, run_id="run")
         self.assertIn("auditor", self.workers.roles())
         report = json.loads((self.run_dir() / "cycles/001/audit/001/report.json").read_text())
@@ -152,7 +167,6 @@ class AuditPipelineTests(PipelineHarness):
         orchestrator = self.orchestrator(
             self.config(),
             planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)))],
-            reviewer=[],
         )
         first = orchestrator.run_text(SPEC, run_id="run")
         self.assertEqual(first.state["disposition"], "WAIT_EXTERNAL")

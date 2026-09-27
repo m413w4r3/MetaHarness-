@@ -22,9 +22,7 @@ from metaharness.repository_topology import RepositoryTopology
 from metaharness.resume import resume_info
 from metaharness.run_options import RunOptions
 from tests.pipeline.support import repaired_step_contract
-from tests.pipeline_support import (
-    PipelineHarness, ScriptedChat, check_repair_result, git, plan, review,
-)
+from tests.pipeline_support import PipelineHarness, git, plan
 
 SPEC = "Make feature.txt good.\n"
 EDITION = "frontend/src/features/edition-dashboard/EditionDashboard.test.tsx"
@@ -106,18 +104,15 @@ class StepAuthorityHarness(PipelineHarness):
         (record,) = [item for item in chain if item["step_id"] == step_id]
         return sorted(record["changed_paths"])
 
-    def run_pipeline(self, planner: list, *, config=None, options=None, reviewer=None):
+    def run_pipeline(self, planner: list, *, config=None, options=None):
         config = config or self.config()
         return self.orchestrator(
-            config, planner=planner, reviewer=reviewer or [review()],
+            config, planner=planner,
         ).run_text(SPEC, run_id="run", run_options=options or self.options(config))
 
-    def resume_without_planner(self, reviewer=None):
+    def resume_without_planner(self):
         planner = NoCall()
-        orchestrator = Orchestrator(
-            self.config(), planner_client=planner,
-            reviewer_client=ScriptedChat(reviewer or [review()], name="reviewer"),
-        )
+        orchestrator = Orchestrator(self.config(), planner_client=planner)
         return orchestrator.resume("run"), planner
 
     def two_repairs_then_success(self, *success_paths: str) -> None:
@@ -127,50 +122,6 @@ class StepAuthorityHarness(PipelineHarness):
             mismatch_for("The step still needs d.txt."),
             writes(*success_paths),
         )
-
-    def test_check_repair_scope_request_is_auto_admitted_beyond_the_cycle_envelope(self) -> None:
-        scope_request = (
-            "META SCOPE REQUEST v1\n\n"
-            "REASON\nThe source path is needed to resolve the gate failure.\n\n"
-            "PATHS\n- c.txt\n\n"
-            "EVIDENCE\n- The failing check depends on c.txt.\n\n"
-            "END META SCOPE REQUEST"
-        )
-        def fail_feature(request):
-            (request.worktree / "feature.txt").write_text("bad\n", encoding="utf-8")
-            return "implemented with a failing gate\n"
-
-        def repair(request):
-            if "c.txt" not in request.mutable_paths:
-                return scope_request + "\n\n" + check_repair_result(
-                    "BLOCKED", "NOT_RUN", "SCOPE", "c.txt is outside approved cycle scope",
-                )
-            (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
-            (request.worktree / "c.txt").write_text("changed\n", encoding="utf-8")
-            return check_repair_result()
-
-        self.workers.on(ExecutionRole.IMPLEMENTER, fail_feature)
-        self.workers.on(ExecutionRole.REPAIR, repair, repair)
-        config = self.config(check_repair=1)
-
-        result = self.run_pipeline(
-            [self.one_step_plan()], config=config, options=self.options(config, max_added=1),
-        )
-
-        # A scope request above the cycle envelope is a signal: no operator
-        # decision, no wait, and the requested path is admitted for the repair.
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(self.workers.roles(), ["implementer", "repair", "repair"])
-        self.assertIn("c.txt", self.workers.calls[-1].mutable_paths)
-        decisions = sorted(
-            (self.run_dir() / "cycles/001/check-repair").rglob("scope_requests/*/decision.json")
-        )
-        self.assertEqual(len(decisions), 1)
-        decision = json.loads(decisions[0].read_text(encoding="utf-8"))
-        self.assertEqual(decision["decision"], "auto-admitted")
-        self.assertEqual(decision["added_paths"], ["c.txt"])
-        self.assertEqual(list(self.run_dir().rglob("scope_approval.json")), [])
-
 
 class EffectiveAuthorityCommitTests(StepAuthorityHarness):
     def test_two_validated_repairs_authorize_the_commit_gate(self) -> None:
@@ -190,10 +141,13 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
                 repair_contract("a.txt", "c.txt", "d.txt"),
             ])
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(len(self.workers.calls), 3)
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        implementer_calls = [
+            call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER
+        ]
+        self.assertEqual(len(implementer_calls), 3)
         self.assertEqual(
-            set(self.workers.calls[-1].mutable_paths), {"feature.txt", "a.txt", "c.txt", "d.txt"},
+            set(implementer_calls[-1].mutable_paths), {"feature.txt", "a.txt", "c.txt", "d.txt"},
         )
         # The commit gate received the effective authority, not the approved step.
         self.assertEqual(captured, [("a.txt", "c.txt", "d.txt", "feature.txt")])
@@ -225,7 +179,7 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
         )
         result = self.run_pipeline([self.one_step_plan("a.txt"), repair_contract("a.txt", TRANSFER, EDITION)])
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         validation = self.json(self.step_dir() / "contract_repairs/01/validation.json")
         self.assertEqual(validation["added_mutable_paths"], sorted([TRANSFER, EDITION]))
         self.assertEqual(self.accepted_paths(), sorted(["feature.txt", "a.txt", TRANSFER, EDITION]))
@@ -242,7 +196,7 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
 
         # E is an ordinary path: the change is admitted for this step, the
         # commit gate is widened for exactly this attempt, and the audit is fed.
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         step = self.json(self.step_dir() / "step.json")
         self.assertEqual(step["status"], "COMPLETED")
         self.assertEqual(step["out_of_scope_paths"], ["e.txt"])
@@ -299,25 +253,6 @@ class EffectiveAuthorityCommitTests(StepAuthorityHarness):
         self.assertEqual(git(self.worktree(), "rev-list", "--count", "HEAD"), git(self.repo, "rev-list", "--count", "main"))
 
 
-class CycleScopeTests(StepAuthorityHarness):
-    def test_semantic_revision_receives_the_repaired_step_scope(self) -> None:
-        """CAS 11: the cycle authority is the union of effective step authorities."""
-
-        self.workers.on(
-            ExecutionRole.IMPLEMENTER,
-            mismatch_for("The step also needs c.txt."),
-            writes("feature.txt", "c.txt"),
-        )
-        self.workers.on(ExecutionRole.REVISER, lambda _request: "no semantic change\n")
-        config = self.config(semantic_revision=True)
-        result = self.run_pipeline([self.one_step_plan(), repair_contract("c.txt")], config=config)
-
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        reviser = next(call for call in self.workers.calls if call.role is ExecutionRole.REVISER)
-        # Exactly the union of accepted effective scopes, nothing more.
-        self.assertEqual(set(reviser.mutable_paths), {"feature.txt", "c.txt"})
-
-
 class TopologyEvidenceTests(StepAuthorityHarness):
     def test_the_repair_prompt_lists_the_tracked_candidate_of_a_basename(self) -> None:
         """CAS 4: the mismatch names only a basename; the planner still chooses."""
@@ -329,7 +264,7 @@ class TopologyEvidenceTests(StepAuthorityHarness):
         )
         result = self.run_pipeline([self.one_step_plan(), repair_contract(EDITION)])
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         request = self.planner.requests[1]
         self.assertIn(
             "<REPOSITORY PATH CANDIDATES>\nEditionDashboard.test.tsx:\n  - " + EDITION
@@ -351,10 +286,13 @@ class TopologyEvidenceTests(StepAuthorityHarness):
         )
         result = self.run_pipeline([self.one_step_plan(), repair_contract(wrong)])
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         # The original worker plus the post-repair worker only; one repair
         # answer, never a paid output correction.
-        self.assertEqual(len(self.workers.calls), 2)
+        implementer_calls = [
+            call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER
+        ]
+        self.assertEqual(len(implementer_calls), 2)
         self.assertEqual(len(self.planner.requests), 2)
         slot = self.step_dir() / "contract_repairs/01"
         self.assertEqual(sorted(path.name for path in slot.parent.iterdir()), ["01"])
@@ -403,12 +341,14 @@ class StepAcceptanceResumeTests(StepAuthorityHarness):
         info = resume_info(self.run_dir(), self.state())
         self.assertTrue(info.resumable)
         self.assertEqual((info.label, info.operation), ("Retry step acceptance (S01)", "step_acceptance"))
-        calls = len(self.workers.calls)
+        calls = len([c for c in self.workers.calls if c.role is ExecutionRole.IMPLEMENTER])
 
         resumed, planner = self.resume_without_planner()
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(len(self.workers.calls), calls)
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(
+            len([c for c in self.workers.calls if c.role is ExecutionRole.IMPLEMENTER]), calls,
+        )
         self.assertEqual(planner.requests, [])
         self.assertEqual(self.accepted_paths(), ["c.txt", "feature.txt"])
         self.assertIn("recovery.resumed", self.trace_names())
@@ -428,7 +368,7 @@ class StepAcceptanceResumeTests(StepAuthorityHarness):
 
         resumed, planner = self.resume_without_planner()
 
-        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
         self.assertEqual(planner.requests, [])
         (chain,) = self.json(self.run_dir() / "accepted-chain.json")["commits"]
         self.assertEqual(chain["commit_sha"], committed)
@@ -516,12 +456,11 @@ class StagedReliabilityTests(StepAuthorityHarness):
             writes("a.txt", TRANSFER, EDITION),
             writes("feature.txt"),
         )
-        self.workers.on(ExecutionRole.REVISER, lambda _request: "no semantic change\n")
-        config = self.config(semantic_revision=True)
+        config = self.config()
 
         result = self.run_pipeline([plan(*steps), repaired], config=config)
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
         roles = self.workers.roles()
         self.assertEqual(roles.count("implementer"), 7)  # S01-S04, S05 x2, S06
         self.assertEqual(
@@ -543,4 +482,3 @@ class StagedReliabilityTests(StepAuthorityHarness):
         ]
         self.assertEqual(len(repairs), 1)
         self.assertEqual(len(self.planner.requests), 2)
-        self.assertEqual(len(self.reviewer.requests), 1)

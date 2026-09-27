@@ -51,11 +51,8 @@ from ..state import RunStateStore
 from ..step_ids import STEP_ID_PATTERN, STEP_ID_RE
 from ..usage import (
     PLANNER_USAGE_ARTIFACT,
-    REVIEWER_USAGE_ARTIFACT,
-    add_usage,
     normalize_usage,
     phase_usage_summary,
-    read_usage_artifact,
 )
 from ..plan_recovery import (
     MAX_REPLACEMENT_PLAN_BYTES,
@@ -84,17 +81,10 @@ ARTIFACT_ALLOWLIST = frozenset(
         "task_plan.json",
         "task_plan_v2.json",
         "implementation_bundle.json",
-        "execution_recommendation.request.txt",
-        "execution_recommendation.raw.md",
-        "execution_recommendation.json",
-        "execution_recommendation.error.txt",
         "agent.events.jsonl",
         "trace/events.v1.jsonl",
         "checks.json",
-        "review.json",
-        "reviewer.raw.md",
         "execution_selection.json",
-        "repair_task.md",
         "agent.result.json",
         "agent.final.md",
         "agent.stderr.log",
@@ -107,7 +97,6 @@ ARTIFACT_ALLOWLIST = frozenset(
         DIAGNOSTICS_ERROR_NAME,
         "setup/results.json",
         PLANNER_USAGE_ARTIFACT,
-        REVIEWER_USAGE_ARTIFACT,
     }
 )
 # The parser caps a step contract at 5000 characters; the UI read bound is
@@ -263,11 +252,8 @@ def _run_dir(runs_root: Path, run_id: str) -> Path:
 _CYCLE_ARTIFACT = re.compile(
     r"cycles/[0-9]{3}/(?:"
     rf"implementation/steps/{STEP_ID_PATTERN}"
-    rf"|correction(?:/steps/{STEP_ID_PATTERN})?"
-    r"|semantic-revision"
     r"|checks/[a-z-]+"
-    r"|check-repair/[a-z-]+/attempts/[0-9]{3}"
-    r"|candidate|review"
+    r"|candidate"
     r")/[A-Za-z0-9_][A-Za-z0-9_.-]*"
 )
 
@@ -394,11 +380,7 @@ def get_run(
         gate.relative_to(directory).as_posix() if gate is not None
         else f"{root}/checks/post-implementation"
     )
-    checks_path, review_path = f"{gate_root}/checks.json", f"{root}/review/review.json"
-    scope_delta_path = _artifact_path(directory, f"{root}/correction/scope_delta.json")
-    scope_delta = _load_json(scope_delta_path, max_bytes=256 * 1024)
-    reviewer_raw = _load_text(_artifact_path(directory, f"{root}/review/reviewer.raw.md"))
-    revision_path = f"{root}/semantic-revision/report.json"
+    checks_path = f"{gate_root}/checks.json"
     changed_path, diff_path = f"{gate_root}/changed-files.txt", f"{gate_root}/diff.patch"
     changed_files = _bounded_changed_files(_artifact_path(directory, changed_path))
     diff_tail = _tail_text(_artifact_path(directory, diff_path), MAX_DIFF_BYTES)
@@ -449,21 +431,12 @@ def get_run(
         "task_plan": _load_json(_artifact_path(directory, "task_plan.json")),
         "implementation_bundle": _load_json(_artifact_path(directory, "implementation_bundle.json")),
         "checks": _load_json(_artifact_path(directory, checks_path)),
-        "review": _load_json(_artifact_path(directory, review_path)),
-        "reviewer_raw": reviewer_raw,
-        "reviewer_raw_available": reviewer_raw is not None,
-        "revision": _load_json(_artifact_path(directory, revision_path)),
         "execution_selection": _load_json(
             _artifact_path(directory, "execution_selection.json")
         ),
         "run_options": _load_json(
             _artifact_path(directory, "run_options.json")
         ),
-        "execution_recommendation": _load_json(
-            _artifact_path(directory, "execution_recommendation.json")
-        ),
-        "repair_task": _load_text(_artifact_path(directory, "repair_task.md")),
-        "scope_delta": scope_delta,
         "failure": state.get("failure"),
         "publish": _load_json(_artifact_path(directory, "publish.json")),
         "approval": {"recorded": approval_decision is not None, "decision": approval_decision},
@@ -493,7 +466,7 @@ def _state_cycle(state: Mapping[str, Any]) -> int:
 
 def _cycle_root(directory: Path, cycle: int) -> Path:
     if not isinstance(cycle, int) or isinstance(cycle, bool) or cycle < 1:
-        raise WebAPIError(400, "invalid review cycle")
+        raise WebAPIError(400, "invalid cycle")
     return directory / "cycles" / f"{cycle:03d}"
 
 
@@ -510,9 +483,9 @@ def _cycle_numbers(directory: Path) -> list[int]:
 
 
 def _cycle_contracts_dir(directory: Path, cycle: int) -> Path:
-    """Where the approved plan of one cycle keeps its bundle and contracts."""
+    """Where the approved plan of the initial cycle keeps its bundle and contracts."""
 
-    return directory if cycle == 1 else _cycle_root(directory, cycle) / "correction"
+    return directory
 
 
 def _cycle_gate_dir(directory: Path, cycle: int) -> Path | None:
@@ -616,21 +589,6 @@ def _cycle_steps(directory: Path, cycle: int, state: Mapping[str, Any]) -> list[
     return result
 
 
-def _cycle_revision(directory: Path, cycle: int) -> dict[str, Any] | None:
-    source = _cycle_root(directory, cycle) / "semantic-revision"
-    if not (source / "tree_before.txt").exists() and not (source / "report.json").exists():
-        return None
-    return {
-        "report": _load_json(source / "report.json", max_bytes=MAX_RESULT_BYTES),
-        "pre_checks": _load_json(source / "pre_checks.json", max_bytes=MAX_RESULT_BYTES),
-        "scope": _load_json(source / "scope.json", max_bytes=MAX_RESULT_BYTES),
-        "final": _tail_text(source / "agent.final.md", 8 * 1024),
-        "stderr": _tail_text(source / "agent.stderr.log", 8 * 1024),
-        "events": _tail_events(source / "agent.events.jsonl", STEP_EVENTS_MAX, summarize_step_event),
-        "usage": read_usage_artifact(source / "usage.json"),
-    }
-
-
 def _cycle_checks(directory: Path, cycle: int) -> dict[str, Any] | None:
     source = _cycle_gate_dir(directory, cycle)
     if source is None:
@@ -643,34 +601,12 @@ def _cycle_checks(directory: Path, cycle: int) -> dict[str, Any] | None:
         {"passed": evidence.get("deterministic_passed"), "failures": evidence.get("failures")}
         if isinstance(evidence, dict) else None
     )
-    repairs = sorted((_cycle_root(directory, cycle) / "check-repair").glob("*/attempts/[0-9][0-9][0-9]"))
     return {
         "stage": source.name,
         "checks": checks,
         "gate": gate,
-        "check_repair_attempts": [
-            {
-                "attempt": item.name,
-                "record": _load_json(item / "attempt.json", max_bytes=MAX_RESULT_BYTES),
-                "failure": _load_json(item / "failure.json", max_bytes=MAX_RESULT_BYTES),
-            }
-            for item in repairs
-        ],
         "changed_files": _bounded_changed_files(source / "changed-files.txt"),
         "diff_tail": _tail_text(source / "diff.patch", MAX_DIFF_BYTES),
-    }
-
-
-def _cycle_review(directory: Path, cycle: int) -> dict[str, Any] | None:
-    source = _cycle_root(directory, cycle) / "review"
-    review = _load_json(source / "review.json", max_bytes=MAX_RESULT_BYTES)
-    raw = _load_text_bounded(source / "reviewer.raw.md", MAX_RESULT_BYTES)
-    if review is None and raw is None:
-        return None
-    return {
-        "review": review,
-        "raw": raw,
-        "usage": read_usage_artifact(source / REVIEWER_USAGE_ARTIFACT),
     }
 
 
@@ -690,21 +626,12 @@ def _cycle_artifacts(directory: Path, state: Mapping[str, Any]) -> list[dict[str
             "kind": _cycle_kind(directory, number),
             "status": record.get("status"),
             "failure": record.get("failure"),
-            "plan_raw": (
-                _load_text_bounded(
-                    _cycle_root(directory, number) / "correction" / "planner.raw.md",
-                    MAX_RESULT_BYTES,
-                )
-                if number > 1 else None
-            ),
             "steps": _cycle_steps(directory, number, state),
-            "revision": _cycle_revision(directory, number),
             "checks": _cycle_checks(directory, number),
             "candidate": _load_json(
                 _cycle_root(directory, number) / "candidate" / "commit.json",
                 max_bytes=MAX_RESULT_BYTES,
             ),
-            "review": _cycle_review(directory, number),
         })
     return cycles
 
@@ -899,7 +826,7 @@ def cycle_step_progress_tail(
     if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events < 0:
         raise WebAPIError(400, "max_events must be a non-negative integer")
     if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 1:
-        raise WebAPIError(400, "invalid review cycle")
+        raise WebAPIError(400, "invalid cycle")
     if not isinstance(step_id, str) or _STEP_ID.fullmatch(step_id) is None:
         raise WebAPIError(400, "invalid step id")
     if max_events == 0:
@@ -1336,8 +1263,8 @@ def _step_statuses(directory: Path, cycle: int, state: Mapping[str, Any]) -> lis
     return result
 
 
-_STEP_PHASES = frozenset({"implement_step", "review_implementation"})
-_GATE_PHASES = frozenset({"deterministic_gate", "check_repair"})
+_STEP_PHASES = frozenset({"implement_step", "step_acceptance"})
+_GATE_PHASES = frozenset({"deterministic_gate"})
 
 
 def run_pipeline(
@@ -1361,9 +1288,6 @@ def run_pipeline(
     resumable = isinstance(resume, Mapping) and bool(resume.get("resumable"))
     resume_phase = resume.get("phase") if resumable else None
     resume_cycle = resume.get("review_cycle") if resumable else None
-    snapshot = state.get("run_options") if isinstance(state.get("run_options"), Mapping) else {}
-    pipeline_snapshot = snapshot.get("pipeline") if isinstance(snapshot.get("pipeline"), Mapping) else {}
-    revision_enabled = bool(pipeline_snapshot.get("semantic_revision_enabled"))
     items: list[dict[str, str]] = []
 
     def add(key: str, label: str, value: str) -> None:
@@ -1418,15 +1342,7 @@ def run_pipeline(
         add("approval", "Approval", "waiting")
 
     for cycle in _cycle_numbers(directory) or [1]:
-        root = _cycle_root(directory, cycle)
         label = f"{cycle:03d}"
-        if cycle > 1:
-            planned = (root / "correction" / "implementation_bundle.json").is_file()
-            value = phase_state(
-                planned, frozenset({"review_replan"}), frozenset({"planning"}),
-                ("REPAIR", "PLANNER", "LLM_FAILURE", "HUMAN_REQUIRED"), cycle,
-            )
-            add(f"c{cycle}-planner", f"{label} · correction planner ({_cycle_kind(directory, cycle)})", value)
         steps = _step_statuses(directory, cycle, state)
         for step_id, step_status in steps:
             value = _PIPELINE_STEP_STATE.get(step_status, "waiting")
@@ -1435,27 +1351,12 @@ def run_pipeline(
             add(f"c{cycle}-{step_id}", f"{label} · {step_id}", value)
         if not steps:
             add(f"c{cycle}-steps", f"{label} · steps", "waiting")
-        if revision_enabled:
-            report = _load_json(root / "semantic-revision" / "report.json", max_bytes=MAX_RESULT_BYTES)
-            add(f"c{cycle}-revision", f"{label} · semantic revision", phase_state(
-                isinstance(report, dict) and report.get("status") in {"COMPLETED", "NO_CHANGE"},
-                frozenset({"semantic_revision"}),
-                frozenset({"pre_revision_validating", "revising"}),
-                ("AGENT_", "REVISION_SCOPE", "SEMANTIC_REVISER"), cycle,
-            ))
         gate = _cycle_gate_dir(directory, cycle)
         evidence = _load_json(gate / "evidence.json", max_bytes=MAX_RESULT_BYTES + MAX_DIFF_BYTES * 8) if gate else None
         add(f"c{cycle}-checks", f"{label} · checks", phase_state(
             isinstance(evidence, dict) and evidence.get("deterministic_passed") is True,
             _GATE_PHASES, frozenset({"validating", "revalidating", "revising"}),
-            (*_CHECK_FAILURE_PREFIXES, "REVISION_SCOPE"), cycle,
-        ))
-        review = _load_json(root / "review" / "review.json", max_bytes=MAX_RESULT_BYTES)
-        add(f"c{cycle}-reviewer", f"{label} · reviewer", phase_state(
-            isinstance(review, dict),
-            frozenset({"candidate_ready", "candidate_push", "final_review"}),
-            frozenset({"approved", "reviewing"}),
-            ("REVIEW", "PUSH_FAILED"), cycle,
+            _CHECK_FAILURE_PREFIXES, cycle,
         ))
 
     publish_enabled = config.publish.enabled if config is not None else True
@@ -1516,15 +1417,9 @@ def _usage_pair(value: Any) -> dict[str, int]:
 def _token_totals(directory: Path) -> dict[str, dict[str, int]]:
     usage = phase_usage_summary(directory)
     implementer = usage.get("implementer") if isinstance(usage.get("implementer"), dict) else {}
-    planner = add_usage((
-        normalize_usage(usage.get("planner")), normalize_usage(usage.get("correction_planner")),
-    ))
     return {
-        "planner": _usage_pair(planner),
+        "planner": _usage_pair(usage.get("planner")),
         "implementer": _usage_pair(implementer.get("total")),
-        "check_repair": _usage_pair(usage.get("check_repair")),
-        "semantic_reviser": _usage_pair(usage.get("semantic_reviser")),
-        "final_reviewer": _usage_pair(usage.get("final_reviewer")),
         "total": _usage_pair(usage.get("grand_total")),
     }
 
@@ -1609,9 +1504,6 @@ def _live_events(
     if isinstance(step, str) and _STEP_ID.fullmatch(step):
         path = _cycle_root(directory, cycle) / "implementation" / "steps" / step / "agent.events.jsonl"
         return _recent_events(path, LIVE_EVENTS_MAX)
-    if state.get("status") == "revising":
-        source = _cycle_root(directory, cycle) / "semantic-revision"
-        return _recent_events(source / "agent.events.jsonl", LIVE_EVENTS_MAX)
     return []
 
 

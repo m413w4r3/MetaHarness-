@@ -1,4 +1,4 @@
-"""Bounded Claude Code execution for semantic revision."""
+"""Bounded Claude Code execution for one agentic role."""
 
 from __future__ import annotations
 

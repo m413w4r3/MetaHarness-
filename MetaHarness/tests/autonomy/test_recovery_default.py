@@ -18,7 +18,7 @@ from metaharness.models import ExecutionRole, RunStatus
 from metaharness.recovery_policy import classify_failure
 
 from tests.autonomy.support import SPEC, AutonomyHarness, Step, meta_plan
-from tests.pipeline_support import DRIVER, Script, git, review, write
+from tests.pipeline_support import DRIVER, Script, git, write
 
 UNKNOWN_CODE = "SOME_FUTURE_FIXABLE_FAILURE"
 
@@ -64,14 +64,17 @@ class UnknownFailureCodeTests(AutonomyHarness):
         plan = meta_plan(Step(id="S01", title="Write the feature", write=("feature.txt",)))
 
         result = self.orchestrator(
-            self.config(), planner=[plan], reviewer=[review()],
+            self.config(), planner=[plan],
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_unrecoverable_hard_stop(result)
         self.assert_not_false_human_stop(result)
         self.assert_run_completed(result)
-        # The run retried the step on its own instead of asking an operator.
-        self.assertEqual(self.workers.roles(), ["implementer", "implementer"])
+        # The run retried the step on its own instead of asking an operator;
+        # the gate then handed the delivered candidate to one audit authority.
+        self.assertEqual(
+            self.workers.roles(), ["implementer", "implementer", "auditor"],
+        )
 
     def test_an_unknown_failure_code_maps_to_a_non_terminal_recovery(self) -> None:
         decision = classify_failure(UNKNOWN_CODE)
@@ -100,7 +103,7 @@ class FailedStepContinuationTests(AutonomyHarness):
         plan = meta_plan(feature_step(), other_step("S02"))
 
         result = self.orchestrator(
-            self.config(max_step_contract_repairs=0), planner=[plan], reviewer=[review()],
+            self.config(max_step_contract_repairs=0), planner=[plan],
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_unrecoverable_hard_stop(result)
@@ -118,9 +121,10 @@ class FailedStepContinuationTests(AutonomyHarness):
             (worktree / "feature.txt").read_text(encoding="utf-8"), self.base_content("feature.txt"),
         )
         self.assertEqual((worktree / "other.txt").read_text(encoding="utf-8"), "done\n")
-        self.assertEqual(self.workers.roles(), ["implementer"] * 4)
-        # The incomplete result goes through the existing review, deficit shown.
-        self.assertIn('"status": "FAILED_CONTINUED"', self.reviewer.requests[-1])
+        self.assertEqual(self.workers.roles(), ["implementer"] * 4 + ["auditor"])
+        # The settled step is not a blocker: the delivered tree is handed to
+        # the gate and its one audit authority exactly once.
+        self.assertEqual(self.workers.roles().count("auditor"), 1)
 
     def test_failed_step_skips_transitive_dependents(self) -> None:
         self.green_check()
@@ -135,7 +139,7 @@ class FailedStepContinuationTests(AutonomyHarness):
         )
 
         result = self.orchestrator(
-            self.config(max_step_contract_repairs=0), planner=[plan], reviewer=[review()],
+            self.config(max_step_contract_repairs=0), planner=[plan],
         ).run_text(SPEC, run_id="run")
 
         self.assert_not_unrecoverable_hard_stop(result)
@@ -150,7 +154,7 @@ class FailedStepContinuationTests(AutonomyHarness):
         )
         self.assertEqual(self.step_record("S04")["status"], "COMPLETED")
         # No dependent was ever handed to a worker.
-        self.assertEqual(self.workers.roles(), ["implementer"] * 4)
+        self.assertEqual(self.workers.roles(), ["implementer"] * 4 + ["auditor"])
 
     def test_rollback_failure_is_fatal(self) -> None:
         self.green_check()
@@ -164,7 +168,7 @@ class FailedStepContinuationTests(AutonomyHarness):
             "metaharness.attempt_transaction.restore_paths_from_tree", lambda *_args: None,
         ):
             result = self.orchestrator(
-                self.config(max_step_contract_repairs=0), planner=[plan], reviewer=[review()],
+                self.config(max_step_contract_repairs=0), planner=[plan],
             ).run_text(SPEC, run_id="run")
 
         self.assertEqual(result.status, RunStatus.FAILED)

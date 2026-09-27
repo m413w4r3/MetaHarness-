@@ -11,7 +11,7 @@ failure is retried, falls back or waits: the recovery coordinator does.  An
 
 Trusted processes (workspace setup, check preflights, deterministic checks)
 use :func:`observe_side_effects` and :func:`restore_exact`; untrusted workers
-(implementer, semantic reviser, check repair) use
+(implementer) uses
 :class:`CandidateAttemptTransaction`.
 """
 

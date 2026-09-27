@@ -212,7 +212,7 @@ def build_agent_config(
 
 
 def build_claude_profile(profile: ModelProfile) -> ModelProfile:
-    """Validate and return a Claude Code reviser profile."""
+    """Validate and return a Claude Code agent profile."""
 
     if not isinstance(profile, ModelProfile):
         raise TypeError("profile must be a ModelProfile")

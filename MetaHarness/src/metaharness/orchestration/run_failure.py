@@ -26,7 +26,6 @@ from ..resume import (
     ResumeRequiresOperatorError,
     read_checkpoint,
 )
-from ..review import ReviewParseError
 from ..run_options import (
     effective_run_config,
     read_run_options_for_state,
@@ -106,8 +105,6 @@ def _failure_reason(exc: Exception) -> str:
         return "EXECUTION_SELECTION_INVALID"
     if isinstance(exc, PlanParseError):
         return "PLANNER_OUTPUT_INVALID"
-    if isinstance(exc, ReviewParseError):
-        return "REVIEWER_OUTPUT_INVALID"
     if isinstance(exc, LLMError):
         # A transport that names its own stable condition (the exhausted
         # horizon) keeps that code; every other transport error stays the

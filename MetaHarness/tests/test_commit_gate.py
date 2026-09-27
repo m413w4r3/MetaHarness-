@@ -77,7 +77,6 @@ class CommitPathStructureTests(unittest.TestCase):
     def test_every_commit_primitive_runs_after_the_commit_safety_gate(self) -> None:
         primitives = {
             "commit_step_tree", "commit_candidate_tree",
-            "commit_repair_tree", "commit_revision_tree",
         }
         found: dict[str, list[str]] = {}
         for path, tree in parsed_sources():
@@ -102,8 +101,6 @@ class CommitPathStructureTests(unittest.TestCase):
                     self.assertLess(gate, first, function.name)
         self.assertEqual(found, {
             "commit_step_tree": ["step_acceptance.py:_accept_v2_step_tree"],
-            "commit_repair_tree": ["gate_acceptance.py:accept"],
-            "commit_revision_tree": ["gate_acceptance.py:accept"],
         })
 
 

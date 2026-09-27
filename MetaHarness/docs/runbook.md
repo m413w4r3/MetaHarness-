@@ -6,8 +6,8 @@
 
 - Python 3.12 or newer.
 - A clean Git base when `require_clean_base = true`.
-- A configured planner and reviewer endpoint implementing the contract in
-  [providers.md](providers.md).
+- A configured planner endpoint and a writable auditor profile implementing
+  the contract in [providers.md](providers.md).
 - Any API key supplied through the environment variable named by
   `api_key_env`; never put the key itself in TOML.
 
@@ -24,8 +24,8 @@ python -m unittest discover -s tests -v
 python -m compileall -q src tests
 ```
 
-The test suite includes a local fake HTTP planner/reviewer and fake Codex
-executable for a complete no-network orchestration path.
+The test suite drives the pipeline in-process with scripted models and a
+fake Codex executable; no provider endpoint is required.
 
 ## Configure and run
 
@@ -55,15 +55,12 @@ failure while that horizon still has room for another attempt, then reports
 `LLM_TRANSPORT_EXHAUSTED`. See `docs/providers.md` for the exact backoff and
 `Retry-After` rules.
 
-`[revision]` supplies defaults. Every new durable UI
-run captures its effective choices in `run_options.json`: the semantic
-revision switch, check-repair attempt budget, review-repair cycle budget, and
-role-specific profiles. The two correction budgets are validated independently
-in the inclusive range `0..10`.
-For AutoWork, use `repair_scope_policy = "auto-bounded"` and
-`repair_scope_max_added_paths = 4`. Use `require-approval` when an operator
-must explicitly accept an exact planner-derived scope delta; use
-`deny-expansion` for the default behavior.
+`[revision]` supplies the step contract repair budget. Every new durable run
+captures its effective choices in `run_options.json`: the planning bounds, the
+step contract repair budget, the recovery budgets and the five role profiles
+(`planner_profile`, `mechanical_profile`, `reasoning_profile`,
+`agentic_profile`, `audit_profile`). A snapshot of any older schema is refused,
+never converted.
 
 `doctor` never contacts a model. Besides local files, Git and executables it
 runs the managed Codex runtime's `codex sandbox -- /bin/true` probe (which
@@ -87,7 +84,7 @@ verified. It never makes a model request and never starts a login flow.
 MetaHarness never copies the personal `CODEX_HOME`, MCP configuration, or
 credentials into that managed runtime.
 
-When a `claude-code` reviser profile is configured, authenticate Claude Code
+When a `claude-code` auditor profile is configured, authenticate Claude Code
 in its managed home through the CLI itself. MetaHarness does not assume an
 authentication subcommand that is absent from the installed version:
 
@@ -113,15 +110,13 @@ HOME/TMPDIR, `CODEX_HOME` or API key is passed, and no user file is copied.
 Claude Code is configuration-isolated and Git-scope-enforced; it is not an
 independent network sandbox.
 
-## Configurable v2 correction pipeline and publication
+## Configurable v2 pipeline and publication
 
 `examples/autowork.toml` enables the full target workflow:
 
 ```toml
 [revision]
-enabled = true
-max_check_repair_attempts = 2
-max_correction_cycles = 1
+max_step_contract_repairs = 2
 
 [publish]
 enabled = true
@@ -131,50 +126,33 @@ mode = "run-branch"
 
 ```text
 PLAN → implementation step → accepted step commit → …
-→ deterministic checks
-   ├ FAIL → recovery ladder → deterministic checks
-   └ PASS → semantic revision → deterministic checks
-→ accepted candidate → push run branch → final reviewer
-   ├ PASS → publish exact reviewed SHA
-   ├ REVISE / IMPLEMENTATION → semantic correction
-   ├ REVISE / REPLAN → review repair planner
-   └ REVISE / HUMAN → operator
+→ deterministic checks ↔ AUDIT (one writable authority per red gate)
+→ accepted candidate → push run branch → publish exact candidate
 ```
 
-`max_check_repair_attempts` and `max_correction_cycles` are independent
-budgets; the latter bounds every cycle after `INITIAL`, whether a review opened
-it or a red deterministic gate re-decomposed it. Each reviewable candidate is
-pushed to the `repository.remote` run branch before its reviewer, and
-MetaHarness persists and verifies the exact
-remote SHA. This staging push happens even when `publish.enabled = false`;
-publication happens only after the final reviewer PASS and the exact-tree
-candidate gate, and only for the SHA named by the durable reviewer PASS
-(`REVIEW_AUTHORITY_MISSING` otherwise). With `mode = "run-branch"`, the
-published branch is that staging push, so `publish.remote` must equal
-`repository.remote`; the configuration is refused otherwise.
-It never pushes `base_ref`, never uses force, tags or deletion, and never
-automatically merges the run branch. A published run exposes the branch URL
-(`…/tree/harness/<plan>/<run-id>`).
-Failures specific to this mode include `CHECK_REPAIR_EXHAUSTED`,
-`REVIEW_REPAIR_EXHAUSTED`, `REVIEW_FAILED`, `HUMAN_REQUIRED`,
-`REPAIR_PLANNER_BLOCKED`, `REPAIR_SCOPE_EXPANSION`,
-`REVISION_SCOPE_VIOLATION` and `PUSH_FAILED`.
+The deterministic gate and the audit alternate until the gate accepts the
+candidate or the batch records `AUDIT_REMAINING`; there is no reviewer, no
+semantic-revision profile and no correction cycle. `max_step_contract_repairs`
+bounds the *pre-gate* step contract repairs only, and an exhausted repair
+settles its step instead of asking an operator. Each accepted candidate is
+pushed to the `repository.remote` run branch before publication, and MetaHarness
+persists and verifies the exact remote SHA. This staging push happens even when
+`publish.enabled = false`; publication happens only after the gate accepted the
+exact candidate tree. With `mode = "run-branch"`, the published branch is that
+staging push, so `publish.remote` must equal `repository.remote`; the
+configuration is refused otherwise. It never pushes `base_ref`, never uses
+force, tags or deletion, and never automatically merges the run branch. A
+published run exposes the branch URL (`…/tree/harness/<plan>/<run-id>`).
 
 Agent failures are classified through the backend-neutral execution contract;
-the role and profile, not a vendor name, determine the route. Check repair is
-never a planner: a failed deterministic signal walks the configured recovery
-ladder, whose check-repair passes stay inside the frozen attempt budget and
-whose replan rungs rewrite the responsible step contract through the durable
-contract-repair transaction, inside the approved scope, before re-executing
-that step. Integrity failures are fail-closed and never start an
-LLM/AgentExecutor repair call.
+the role and profile, not a vendor name, determine the route. A red
+deterministic gate is a signal for the audit, never a planner: the audit
+answers with `DONE`, `NEEDS_WORK` or `SPEC_DECISION`, and only a product choice
+absent from the SPEC reaches an operator. Integrity failures are fail-closed
+and never start an LLM/AgentExecutor repair call.
 
-Ne pas confondre réparation de check, révision sémantique et reviewer final.
-`REVISE / IMPLEMENTATION` réutilise le plan et appelle le semantic reviser ;
-`REVISE / REPLAN` appelle un planner correctif puis un implementer ;
-`REVISE / HUMAN` arrête la correction automatique. Les profils et budgets
-proviennent des snapshots durables du run, pas de defaults live modifiés après
-sa création.
+The profiles and budgets come from the run's durable snapshots, never from live
+defaults edited after its creation.
 
 Claude Code is invoked with an authoritative, non-configurable argv; the
 prompt is stdin and no shell is used:
@@ -209,7 +187,7 @@ passes its exact tool list, managed settings and empty MCP configuration.
 
 ## Publication to main (`fast-forward-base`)
 
-`examples/autowork.toml` publishes the final reviewed commit to `main`:
+`examples/autowork.toml` publishes the final audited commit to `main`:
 
 ```toml
 [planning]
@@ -238,22 +216,18 @@ after parsing with the same values (`PLANNER_OUTPUT_INVALID` otherwise).
 ```text
 BASE → isolated run worktree → PLAN STAGED
 → implementation steps → accepted step commits
-→ deterministic checks
-   ├ FAIL → recovery ladder → deterministic checks
-   └ PASS → semantic revision → deterministic checks
-→ accepted candidate → push exact SHA → final reviewer
-   ├ PASS → publish exact reviewed SHA
-   ├ REVISE / IMPLEMENTATION → semantic correction
-   ├ REVISE / REPLAN → review repair planner
-   └ REVISE / HUMAN → operator
+→ deterministic gate
+   ├ RED → AUDIT (writable, at most two passes) → deterministic gate
+   ├ AUDIT_REMAINING → the run waits with its evidence
+   └ PASS → accepted candidate → push exact SHA
 
-approved candidate (fast-forward-base)
+accepted candidate (fast-forward-base)
 → CAS fast-forward local main A→B → push origin/main A→B
 ```
 
-Agents never work on `main`: the selected role profiles and reviewer only see
+Agents never work on `main`: the selected role profiles and the audit only see
 the isolated worktree `harness/<plan>/<run-id>`; the user checkout is never
-checked out, reset or written. After the final PASS, publication uses the
+checked out, reset or written. After an audit PASS, publication uses the
 already-created exact candidate commit and re-resolves `refs/heads/main` and
 `refs/remotes/origin/main`
 (no implicit fetch) and requires: local main == remote-tracking main ==
@@ -263,7 +237,7 @@ fast-forwards `base_sha` to the exact approved candidate chain tip. Local main t
 with `git update-ref refs/heads/main <commit> <base>` (compare-and-swap), and
 `git push --porcelain origin <commit>:refs/heads/main` publishes exactly that
 commit — no force, lease, merge, tag or delete. Each exact candidate was
-already pushed to the run branch before its reviewer; that run branch remains
+already pushed to the run branch before publication; that run branch remains
 the immutable candidate reference.
 
 - `BASE_MOVED_SINCE_RUN`: main or origin/main moved (or the swap failed).
@@ -303,12 +277,11 @@ being paid for twice. Corruptions, identity violations and
 | operator plan recovery (no planner call) | `plan_approval`, base tree |
 | successful worker of step Sxx | `step_acceptance` Sxx: `step_candidate.json` is durable, HEAD = parent, tree = candidate |
 | implementation step Sxx | next step, or `deterministic_gate`, with the step's tree |
-| deterministic gate | `check_repair` when red, otherwise the next semantic revision or candidate boundary |
-| semantic revision or correction | the next deterministic gate, with the worker tree |
+| deterministic gate | `audit` when red, otherwise `candidate_ready` |
+| audit pass | the next deterministic gate, with the audited tree |
 | accepted gate | `candidate_ready`, then `candidate_push` |
-| exact candidate push | `final_review` |
-| reviewer REVISE/IMPLEMENTATION or REPLAN | the corresponding correction cycle boundary |
-| approved candidate | `publish` (HEAD = candidate commit) |
+| exact candidate push | `publish` |
+| published candidate | the run is terminal (HEAD = candidate commit) |
 
 Ces checkpoints sont idempotents : après le worker les checks reprennent sans
 rejouer le worker ; après une evidence PASS le commit n’est créé qu’une fois ;
@@ -328,7 +301,7 @@ prompt and mutable paths, rollback, the commit gate, the accepted record
 A corrupted or unchained repair is `RESUME_INTEGRITY_FAILURE`; the gate stays
 strict (`COMMIT_SCOPE_VIOLATION` etc. in `step_acceptance.json`).
 
-A `step_acceptance` resume calls no worker, planner or reviewer: it re-proves
+A `step_acceptance` resume calls no worker, planner or auditor: it re-proves
 the candidate hash, authority hash, step record, report, HEAD/tree/index and
 changed paths, then reruns the commit gate (or only records a commit that a
 crash left on the run branch). A legacy run stranded by
@@ -344,11 +317,10 @@ metaharness resume --config examples/autowork.toml --run-id <RUN_ID>
 Resumable failures use provider-neutral reasons such as `AGENT_RUNTIME_FAILED`,
 `AGENT_AUTH_FAILURE`, `AGENT_TIMEOUT`, and `AGENT_PROTOCOL_FAILED`.
 (same step, only if the tree is still the step's `tree_before`),
-`REVIEWER_TRANSPORT_FAILURE` (same exact candidate; semantic revision and checks are not
-rerun), `LLM_FAILURE` of the repair planner, `PUSH_FAILED` (candidate or
+`LLM_FAILURE` of the contract-repair planner, `PUSH_FAILED` (candidate or
 publication push),
 and `INTERRUPTED`. `STEP_WRITE_SET_VIOLATION`, `AGENT_GIT_VIOLATION`,
-invalid reviewer verdicts and `BASE_MOVED_SINCE_RUN`
+invalid audit reports and `BASE_MOVED_SINCE_RUN`
 are never retried automatically.
 
 Before any resume, with no model call, MetaHarness verifies: run directory
@@ -359,8 +331,8 @@ base SHA is unchanged; there is no untracked or unapproved path and no
 agent-created commit. Any mismatch records `RESUME_INTEGRITY_FAILURE`.
 
 Evidence invariants are phase-specific. A red deterministic gate keeps its
-failed evidence beside the bounded repair attempt; after repair, the gate is
-re-run against the repaired tree. Resume reuses only evidence whose exact
+failed evidence beside the audit episode that answers it; once the audit
+returns its candidate, the gate is re-run against that tree. Resume reuses only evidence whose exact
 HEAD and tree identities still match the checkpoint, and never treats a red
 bundle as proof that a new gate is green.
 
@@ -431,7 +403,7 @@ catalogue remain the run's own and cannot be edited.
 The action is refused, changing nothing, unless: the protocol is v2; the
 pending checkpoint is `planner`; the failure is a recoverable planner
 failure; no plan approval, execution selection, branch, worktree, or
-worker, reviser or reviewer execution artifact exists; and the stored BASE SHA and
+worker or audit execution artifact exists; and the stored BASE SHA and
 BASE tree are still exactly those of the run. Local `main` may have moved:
 the run stays bound to its immutable stored BASE.
 
@@ -512,13 +484,12 @@ With `[planning] protocol = "v2"`, the approval card shows the execution mode,
 the step count and, for every step, the recommended implementer, a profile
 dropdown and the exact `steps/Sxx/contract.md` bytes hashed in
 `implementation_bundle.json` — the same bytes each fresh executor receives.
-With correction enabled, the card also shows the planner, initial
-implementers, optional semantic-reviser and check-repair profiles, and final
-reviewer. After approval the run page renders each durable `CYCLE n` with its
-own steps, corrections, checks and review, read from that cycle's artifacts
-only. Each step card shows its status (✓ ✗ ▶ …), recent events (messages and
-tool names, never tool arguments) and token usage; the header summary and the
-CHECKS/REVIEW sections describe the final cycle.
+The card also shows the planner profile, the routed execution profiles and the
+AUDIT profile. After approval the run page renders each durable `CYCLE n` with
+its own steps, checks and audit episode, read from that cycle's artifacts only.
+Each step card shows its status (✓ ✗ ▶ …), recent events (messages and tool
+names, never tool arguments) and token usage; the header summary and the
+CHECKS/AUDIT sections describe the final cycle.
 
 Open the created run, read the canonical plan, then approve or reject it and
 observe Codex progress, checks and review. The UI never runs Codex or checks,
@@ -546,7 +517,7 @@ server-rendered page on demand. Only a running run page has
 `script-src 'self'`; every other page keeps `script-src 'none'`.
 
 A resumable failed run shows exactly one primary action (`REPRENDRE À PARTIR
-DE CLAUDE`, `RETRY S02`, `RETRY REVIEWER #1`, `RETRY PUBLISH`, …) that posts
+DE CLAUDE`, `RETRY S02`, `RETRY AUDIT`, `RETRY PUBLISH`, …) that posts
 to `/runs/<run_id>/resume` with the same exact-Host, origin and mutation-token
 protections as the approval form; the RunManager resumes the same run id.
 `failed` remains the terminal status until the operator clicks it. Worker
@@ -566,17 +537,17 @@ server-side and written with `textContent` client-side, never as HTML.
 
 ## Failure handling
 
-`BLOCKED`, `PLAN_REJECTED`, `REVISE`, `FAIL`, check failures, timeouts, mutations, stale HEAD,
-empty diffs, and review-boundary changes do not commit. The current pipeline also treats
+`BLOCKED`, `PLAN_REJECTED`, `REVISE`, `FAIL`, check failures, timeouts, mutations, stale HEAD
+and empty diffs do not commit. The current pipeline also treats
 an oversized diff as a gate; v2 uses `max_diff_bytes` only as the inline
-semantic-model diff budget. Common
+audit diff budget. Common
 failure reasons in `state.json`: `PLANNER_OUTPUT_INVALID`,
-`REVIEWER_OUTPUT_INVALID`, `LLM_FAILURE`, `LLM_TRANSPORT_EXHAUSTED` (a
+`LLM_FAILURE`, `LLM_TRANSPORT_EXHAUSTED` (a
 `WAIT_EXTERNAL`: the provider stayed unreachable for the whole
 `[transport] max_wait_seconds` horizon), `AGENT_TIMEOUT`, `AGENT_RUNTIME_FAILED`,
 `AGENT_GIT_VIOLATION`, `CHECK_SETUP_INVALID`,
 `CHECK_MUTATED`, `EMPTY_DIFF`, `DIFF_TOO_LARGE`, `SECRET_IN_DIFF`,
-`DETERMINISTIC_GATE_FAILED`, `REVIEW_REVISE`, `REVIEW_FAIL`,
+`DETERMINISTIC_GATE_FAILED`, `AUDIT_REMAINING`,
 `PLAN_APPROVAL_INVALID`, `WORKSPACE_SETUP_FAILED`, `WORKSPACE_SETUP_TIMEOUT`,
 `WORKSPACE_SETUP_MUTATED`, `AGENT_NO_CHANGE`, `TOCTOU_FAILURE`, `GIT_FAILURE`,
 `REPOSITORY_TREE_DRIFT_UNEXPLAINED` (the worktree changed outside a step),
@@ -595,8 +566,8 @@ remote) and run `metaharness resume` or click the run page's single resume
 action: the same run id continues at its checkpoint. Otherwise
 (`RESUME_INTEGRITY_FAILURE`, `RESUME_REQUIRES_OPERATOR`, scope or Git
 violations, `BASE_MOVED_SINCE_RUN`) resolve the issue as an operator, then
-start a new run ID. Resume-related reasons: `REVIEWER_TRANSPORT_FAILURE` (no reviewer
-answer was obtained), `BASE_MOVED_SINCE_RUN`, `RESUME_INTEGRITY_FAILURE`,
+start a new run ID. Resume-related reasons: `BASE_MOVED_SINCE_RUN`,
+`RESUME_INTEGRITY_FAILURE`,
 `RESUME_REQUIRES_OPERATOR`; with `execution_mode_policy = "require-staged"` a
 READY SINGLE plan fails as `PLANNER_OUTPUT_INVALID` ("execution policy
 requires STAGED"). Remove an obsolete worktree only through
@@ -604,8 +575,8 @@ the normal Git worktree workflow after confirming it is no longer needed.
 
 The locator is advisory and never supplies source truth: context is read from
 the resolved base commit. Nested repository instruction files are loaded when
-the locator identifies code in their scope. A fenced code block in a planner
-or reviewer response is treated as data, not as metadata.
+the locator identifies code in their scope. A fenced code block in a planner,
+contract-repair or audit response is treated as data, not as metadata.
 
 ## Versioned JSON API
 
