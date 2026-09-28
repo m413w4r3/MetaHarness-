@@ -88,6 +88,7 @@ timeout_seconds = 30
         self.assertIn("NEW FAILING TEST IDS:", second.prompt)
         self.assertIn("tests/test_feature.py::test_behavior", second.prompt)
         self.assertIn("FAILURE EXCERPT:", second.prompt)
+        self.assertIn("including in files outside WRITE_SET", second.prompt)
         self.assertIn("CHANGED PATHS:", second.prompt)
         self.assertNotIn("x" * 5000, second.prompt, "the whole log reached the worker")
         self.assertIsNone(self.state().get("failure"))

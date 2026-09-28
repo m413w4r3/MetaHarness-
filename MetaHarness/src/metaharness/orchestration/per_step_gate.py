@@ -62,6 +62,7 @@ def _regression_feedback(
     if changed_paths:
         lines.append("CHANGED PATHS:")
         lines.extend(f"- {path}" for path in tuple(changed_paths)[:20])
+    lines.append("Fix every regression listed above, including in files outside WRITE_SET that this step's change broke; MetaHarness admits and reports those paths.")
     for judgement in regressions:
         lines.append(f"CHECK: {judgement.check_id}")
         if judgement.new_failure_ids:

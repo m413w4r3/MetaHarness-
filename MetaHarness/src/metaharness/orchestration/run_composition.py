@@ -265,7 +265,6 @@ class RunComposition:
             for item in completed or ()
             if isinstance(item, Mapping) and isinstance(item.get("milestone_id"), str)
         )
-        failed = self._failed_continued(ctx, cycle_plan)
         tree = resolve_tree(ctx.info.worktree, head)
         facts = PlannerContinueFacts(
             spec=ctx.spec,
@@ -277,7 +276,7 @@ class RunComposition:
             audit_status=outcome.audit_status,
             milestones=milestones,
             normalizations=normalizations,
-            failed_steps=failed,
+            failed_steps=self._failed_step_facts(ctx, cycle_plan),
             audit_remaining=outcome.audit_remaining,
             audit_risks=outcome.audit_risks,
             audit_fixed=outcome.audit_fixed,
@@ -386,6 +385,26 @@ class RunComposition:
                 continue
             if isinstance(record, dict) and record.get("status") == "FAILED_CONTINUED":
                 rows.append(f"{step.id}: {record.get('reason', 'worker failure')}")
+        return tuple(rows)
+
+    def _failed_step_facts(
+        self, ctx: PipelineV2Context, cycle_plan: CyclePlan,
+    ) -> tuple[str, ...]:
+        rows = []
+        for step in cycle_plan.plan.steps:
+            path = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id) / "step.json"
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            if record.get("status") == "FAILED_CONTINUED":
+                detail = str(record.get("detail") or "").strip()[:600]
+                suffix = f" — {detail}" if detail else ""
+                rows.append(f"{step.id}: {record.get('reason', 'worker failure')}{suffix}")
+            elif record.get("status") == "SKIPPED_DEPENDENCY":
+                rows.append(f"{step.id}: SKIPPED_DEPENDENCY on {record.get('depends_on')}")
         return tuple(rows)
 
     def _close_iteration(

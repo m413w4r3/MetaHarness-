@@ -58,6 +58,35 @@ class MultiIterationTests(PipelineHarness):
         self.assertEqual(record["plan_sha256"], hashlib.sha256(plan_bytes).hexdigest())
         self.assertEqual((self.run_dir() / "iterations/02/execution_selection.json").is_file(), True)
 
+    def test_m01_next_m01_retries_the_current_milestone(self) -> None:
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "good\n"), write("other.txt", "second\n"),
+        )
+        result = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], continuation=[
+                continuation_answer("NEXT", milestone="M01", plan_text=initial_plan(
+                    ("S01", "other.txt", "Write the companion"),
+                )),
+                continuation_answer("COMPLETE"),
+            ], auditor=[audit(), audit()],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.state["current_iteration"], 2)
+        self.assertEqual(result.state["current_milestone"]["id"], "M01")
+
+    def test_m01_next_m03_is_rejected(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP)], continuation=[
+                continuation_answer("NEXT", milestone="M03", plan_text=milestone(initial_plan(STEP), 3)),
+            ],
+        ).run_text(SPEC, run_id="run")
+
+        self.assertEqual(result.state["failure"]["reason"], "PLANNER_OUTPUT_INVALID")
+        self.assertIn("must stay on M01", result.state["failure"]["detail"])
+
     def test_m02_create_of_m01_path_normalizes_to_write(self) -> None:
         self.workers.on(
             ExecutionRole.IMPLEMENTER,
@@ -351,6 +380,10 @@ class MultiIterationTests(PipelineHarness):
         self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
         request = json.loads((self.run_dir() / "iterations/01/planner-continue/request.json").read_text())
         self.assertIn("S01:", request["facts"]["plan"])
+        self.assertIn(
+            "S01: AGENT_CONTRACT_MISMATCH — The approved step instructions were not met.",
+            request["facts"]["plan"],
+        )
         audit_prompt = next(call.prompt for call in self.workers.calls if call.role is ExecutionRole.AUDITOR)
         self.assertIn("failed_continue_steps", audit_prompt)
 

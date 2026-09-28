@@ -27,6 +27,28 @@ local transformation stay in that step.
 A step may exceed the default mutable scope only when a truly atomic
 transformation requires it; CONTEXT must then explain that atomicity. Never
 return BLOCKED for scope size, and never ask a worker to discover a solution.
+Every step must leave lint and type-check no worse than before it: the
+harness checks the whole repository after each step. A change that breaks
+existing code (new required field or parameter, renamed symbol, changed
+signature or return type) is one atomic transformation with every affected
+call site and fixture: put them in the same step, list them in WRITE_SET, and
+explain the atomicity in CONTEXT. Never plan a later step to repair callers
+an earlier step broke.
+VERIFY must pass as soon as its own step ends: never list a check, test or
+command that only passes after a later step.
+DEPENDS_ON names an earlier step only when this step really needs code that
+step creates or changes (a symbol, file, fixture or test it reads, imports or
+extends); otherwise it is NONE. Point at the step that produces what is used,
+never merely at the previous step. A failed step skips every step that
+depends on it, so an unnecessary dependency turns one failure into an empty
+iteration.
+A REASONING or AGENTIC step carries exactly one responsibility: when its
+INSTRUCTIONS cover several independent concerns (for example a hash, a
+reference scheme and a timeline), split them into separate steps. Target
+about 4000 characters for REASONING and AGENTIC contracts; the upper part of
+the range is for MECHANICAL steps and atomic call-site lists.
+A milestone delivers one subject. Two independent subjects are two
+milestones: plan the first and name the second in PROJECT_REMAINDER.
 
 STEPS AND MILESTONES
 A plan covers the NEXT MILESTONE ONLY, never the whole project.

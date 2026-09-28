@@ -409,9 +409,18 @@ class PipelineV2Coordinator:
                 if decision.decision is ContinueDecision.SPEC_DECISION:
                     return decision
                 raise V2PlanParseError("continuation decision is incomplete")
-            expected_milestone = f"M{ctx.iteration + 1:02d}"
-            if decision.next_milestone != expected_milestone:
-                raise V2PlanParseError(f"NEXT must progress monotonically to {expected_milestone}")
+            current = plan.plan.milestone_id
+            if current.startswith("M") and current[1:].isdigit():
+                n = int(current[1:])
+                allowed = {current, f"M{n + 1:02d}"}
+                if decision.next_milestone not in allowed:
+                    raise V2PlanParseError(
+                        f"NEXT must stay on {current} or progress to M{n + 1:02d}"
+                    )
+            else:
+                expected_milestone = f"M{ctx.iteration + 1:02d}"
+                if decision.next_milestone != expected_milestone:
+                    raise V2PlanParseError(f"NEXT must progress monotonically to {expected_milestone}")
             if len(decision.next_plan.steps) > ctx.options.max_steps_per_plan:
                 raise V2PlanParseError("NEXT exceeds planning.max_steps_per_plan")
             unknown_checks = [
@@ -512,7 +521,7 @@ class PipelineV2Coordinator:
             hard = ops.hard_failures(evidence)
             if hard:
                 raise PipelineFailure(hard[0].split(":", 1)[0], ", ".join(hard))
-            if not evidence.changed_files:
+            if not evidence.changed_files and not ops.failed_continued(ctx, plan):
                 if evidence.deterministic_passed and required_checks_passed(evidence):
                     ops.accept_gate_state(ctx, plan, stage, evidence)
                     return IterationOutcome(evidence, **summary)

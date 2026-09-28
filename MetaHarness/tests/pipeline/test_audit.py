@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 
+from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
 from metaharness.models import ExecutionRole
 from tests.pipeline_support import PipelineHarness, continuation_answer, write
 from tests.autonomy.support import SPEC, Step, meta_plan
@@ -133,6 +134,20 @@ class AuditPipelineTests(PipelineHarness):
         self.assertEqual(result.state["status"], "published", result.state.get("failure"))
         report = json.loads((self.run_dir() / "cycles/001/audit/001/report.json").read_text())
         self.assertIn("tests/test_feature.py", report["changed_paths"])
+
+    def test_failed_step_with_empty_diff_still_calls_auditor(self) -> None:
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            *(
+                lambda _request: CONTRACT_MISMATCH_HEADER
+                + "\nThe approved step instructions were not met."
+                for _ in range(3)
+            ),
+        )
+        self.workers.on(ExecutionRole.AUDITOR, write("feature.txt", "good\n", audit_message()))
+        result = self._run()
+        self.assertIn("auditor", self.workers.roles())
+        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
 
     def test_hard_deny_audit_path_is_refused(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
