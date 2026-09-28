@@ -21,6 +21,11 @@ MAX_STEP_PITFALL_LINES = 6
 # The strict ``FIELD: value`` form the labeled bodies are built from.
 INLINE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*:\s*(.*)$")
 
+_INSTRUCTION_MARKER = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<marker>\d+[.)]|[-*+])"
+    r"(?:[ \t]+(?P<content>\S(?:.*?\S)?))?[ \t]*$"
+)
+
 
 class PlanParseError(ValueError):
     """A planner answer was received but cannot be interpreted unambiguously."""
@@ -41,21 +46,112 @@ def nonempty(value: str, name: str) -> str:
     return value
 
 
+def _split_instruction_items(
+    value: str,
+) -> list[tuple[re.Match[str], list[str]]] | None:
+    """Split an unambiguous top-level instruction list into its items.
+
+    The first list marker establishes the harmless indentation of the list.
+    Markers at that same indentation start items; everything else after the
+    first item is continuation text.  This deliberately does not interpret
+    prose before the first marker or indented nested lists.
+    """
+
+    raw_lines = value.splitlines()
+    first_index = next((index for index, line in enumerate(raw_lines) if line.strip()), None)
+    if first_index is None:
+        return None
+    first_match = _INSTRUCTION_MARKER.fullmatch(raw_lines[first_index])
+    if first_match is None:
+        return None
+    base_indent = first_match.group("indent")
+    items: list[tuple[re.Match[str], list[str]]] = []
+    continuation: list[str] | None = None
+    for raw_line in raw_lines[first_index:]:
+        match = _INSTRUCTION_MARKER.fullmatch(raw_line)
+        if match is not None and match.group("indent") == base_indent:
+            continuation = []
+            items.append((match, continuation))
+            continue
+        if match is not None:
+            # A nested-looking marker could be either continuation content or
+            # a misindented operation.  Refuse to guess at that boundary.
+            return None
+        if continuation is None:
+            return None
+        continuation.append(raw_line)
+    return items
+
+
+def _canonical_instruction_continuation(raw_line: str, base_indent: str) -> str:
+    if not raw_line.strip():
+        return ""
+    remainder = raw_line
+    if base_indent and remainder.startswith(base_indent):
+        remainder = remainder[len(base_indent):]
+    remainder = remainder.rstrip()
+    if remainder[:1] not in {" ", "\t"}:
+        return "  " + remainder.lstrip()
+    return remainder
+
+
+def _instruction_marker_kind(items: Sequence[tuple[re.Match[str], list[str]]]) -> str:
+    markers = [match.group("marker") for match, _ in items]
+    if all(marker in {"-", "*", "+"} for marker in markers):
+        return "unordered"
+    if all(marker.endswith(")") for marker in markers):
+        return "numbered_parenthesized"
+    if all(marker.endswith(".") for marker in markers):
+        return "numbered"
+    return "mixed"
+
+
+def normalize_instruction_list(value: str) -> tuple[str, str | None]:
+    """Return canonical numbered instructions and the source marker kind.
+
+    ``None`` means the value was not a mechanically recognizable list and is
+    left for the strict validator to reject.  Continuation text remains in its
+    item and is never split into additional operations.
+    """
+
+    items = _split_instruction_items(value)
+    if not items:
+        return value, None
+    base_indent = items[0][0].group("indent")
+    canonical_lines: list[str] = []
+    for number, (match, continuation) in enumerate(items, start=1):
+        content = (match.group("content") or "").strip()
+        canonical_lines.append(f"{number}. {content}" if content else f"{number}.")
+        canonical_lines.extend(
+            _canonical_instruction_continuation(line, base_indent)
+            for line in continuation
+        )
+    canonical = "\n".join(canonical_lines).strip()
+    return canonical, _instruction_marker_kind(items) if canonical != value else None
+
+
 def validate_step_text_limits(step_id: str, values: dict[str, str]) -> None:
     title = values["TITLE"].strip()
     if len(title) > 100:
         raise V2PlanParseError(f"step {step_id} TITLE exceeds 100 characters")
-    instruction_lines = [line for line in values["INSTRUCTIONS"].splitlines() if line.strip()]
-    numbered = [line for line in instruction_lines if re.match(r"^\s*\d+[.)]\s+", line)]
-    if not numbered:
+    instruction_items = _split_instruction_items(values["INSTRUCTIONS"])
+    if not instruction_items:
         raise V2PlanParseError(
             f"step {step_id} INSTRUCTIONS must contain 1 to {MAX_STEP_INSTRUCTIONS} "
             "numbered concrete operations"
         )
-    if len(numbered) > MAX_STEP_INSTRUCTIONS:
+    if len(instruction_items) > MAX_STEP_INSTRUCTIONS:
         raise V2PlanParseError(
             f"step {step_id} INSTRUCTIONS exceeds {MAX_STEP_INSTRUCTIONS} operations"
         )
+    for match, continuation in instruction_items:
+        if not (match.group("content") or "").strip() and not any(
+            line.strip() for line in continuation
+        ):
+            raise V2PlanParseError(
+                f"step {step_id} INSTRUCTIONS must contain 1 to {MAX_STEP_INSTRUCTIONS} "
+                "numbered concrete operations"
+            )
     verify_lines = [line for line in values["VERIFY"].splitlines() if line.strip()]
     if len(verify_lines) > MAX_STEP_VERIFY_LINES:
         raise V2PlanParseError(f"step {step_id} VERIFY exceeds {MAX_STEP_VERIFY_LINES} lines")

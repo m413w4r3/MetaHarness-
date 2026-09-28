@@ -7,8 +7,9 @@ from typing import Callable
 
 from ..config import HarnessConfig
 from ..orchestrator import Orchestrator, OrchestrationError, generate_run_id, safe_run_id
-from ..resume import ResumeNotAllowedError
+from ..resume import ResumeNotAllowedError, resume_info
 from ..run_options import RunOptions
+from ..state import RunStateStore
 
 
 class RunManagerError(RuntimeError):
@@ -117,6 +118,53 @@ class RunManager:
             lambda orchestrator, run, on_claimed: orchestrator.resume(run, on_claimed=on_claimed),
             failure="run could not be resumed",
         )
+
+    def resume_approved_run(self, run_id: str) -> bool:
+        """Schedule an approved plan whose original worker is no longer present."""
+
+        try:
+            selected_run_id = safe_run_id(run_id)
+        except (OrchestrationError, TypeError):
+            return False
+        with self._lock:
+            if (
+                selected_run_id in self._active_run_ids
+                or len(self._active_run_ids) >= self._max_active_runs
+            ):
+                return False
+        thread = threading.Thread(
+            target=self._resume_approved_worker, args=(selected_run_id,), daemon=True,
+        )
+        thread.start()
+        return True
+
+    def recover_approved_runs(self) -> None:
+        """Reattach approved plan gates after a web process restart."""
+
+        try:
+            candidates = sorted(self._config.runs_root.expanduser().resolve().iterdir())
+        except OSError:
+            return
+        for directory in candidates:
+            if not directory.is_dir():
+                continue
+            try:
+                run_id = safe_run_id(directory.name)
+                state = RunStateStore(directory / "state.json").load()
+            except (OSError, OrchestrationError, TypeError, UnicodeError, ValueError):
+                continue
+            if state.get("status") != "awaiting_plan_approval":
+                continue
+            if resume_info(directory, state).resumable:
+                self.resume_approved_run(run_id)
+
+    def _resume_approved_worker(self, run_id: str) -> None:
+        try:
+            self.resume_run(run_id)
+        except Exception:
+            # The durable run records any post-claim failure; a stale approval
+            # must never make the web server thread fail or remain occupied.
+            pass
 
     def _run_until_claimed(
         self,

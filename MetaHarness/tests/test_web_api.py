@@ -702,6 +702,31 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(planner["state"], "waiting")
         self.assertIn("waiting_human", api.LIVE_STOP_STATUSES)
 
+    def test_approval_pipeline_handles_waiting_and_resumable_states(self) -> None:
+        for suffix, state, resume, expected_state in (
+            (
+                "waiting",
+                {"status": api.AWAITING_APPROVAL, "cycle": 1, "planner": {"decision": "READY"}},
+                None,
+                "running",
+            ),
+            (
+                "resumable",
+                {"status": "created", "cycle": 1, "planner": {"decision": "READY"}},
+                {"resumable": True, "phase": "plan_approval", "iteration": 1},
+                "resumable",
+            ),
+        ):
+            with self.subTest(suffix=suffix):
+                run_dir = self.runs / f"approval-{suffix}"
+                run_dir.mkdir()
+                approval = next(
+                    item for item in api.run_pipeline(run_dir, state, self.config, resume)
+                    if item["key"] == "approval"
+                )
+                self.assertEqual(approval["label"], "Approval")
+                self.assertEqual(approval["state"], expected_state)
+
 
 class ProgressOffsetTests(unittest.TestCase):
     def setUp(self) -> None:

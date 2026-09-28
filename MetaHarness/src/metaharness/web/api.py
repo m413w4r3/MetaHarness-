@@ -1284,9 +1284,9 @@ def run_pipeline(
     elif approval_decision == "REJECT" or status == "plan_rejected":
         add("approval", "Approval", "failed")
     elif resume_phase == "plan_approval":
-        add("approval", "Recovered plan — awaiting approval" if recovered else "Approval", "resumable")
+        add("approval", "Approval", "resumable")
     elif status == AWAITING_APPROVAL:
-        add("approval", "Recovered plan — awaiting approval" if recovered else "Approval", "running")
+        add("approval", "Approval", "running")
     elif failed and reason.startswith(("PLAN_APPROVAL", "EXECUTION_SELECTION")):
         add("approval", "Approval", "failed")
     else:

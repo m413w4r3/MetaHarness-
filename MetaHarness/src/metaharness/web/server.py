@@ -165,6 +165,7 @@ class MetaHarnessHTTPServer(ThreadingHTTPServer):
             max_active_runs=config.ui.max_active_runs,
         )
         super().__init__(address, MetaHarnessRequestHandler)
+        self.run_manager.recover_approved_runs()
 
 
 def load_or_create_control_token(token_file: str | Path) -> str:
@@ -560,6 +561,8 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                         self.server.config.runs_root, run_id, decision,
                         config=self.server.config, **_approval_profiles(payload),
                     )
+                    if decision == "APPROVE":
+                        self.server.run_manager.resume_approved_run(run_id)
                     self._json(200, result)
                     return
                 raise WebAPIError(404, "not found")
@@ -659,6 +662,8 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     config=self.server.config,
                     **_approval_profiles(payload),
                 )
+                if decision == "APPROVE":
+                    self.server.run_manager.resume_approved_run(run_id)
                 self._redirect(f"/runs/{run_id}")
                 return
             if len(parts) != 5 or parts[1:3] != ["api", "runs"] or parts[4] != "approval":
@@ -681,6 +686,8 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 config=self.server.config,
                 **_approval_profiles(payload),
             )
+            if decision == "APPROVE":
+                self.server.run_manager.resume_approved_run(run_id)
             self._json(200, result)
         except WebAPIError as exc:
             self._error(exc)

@@ -347,6 +347,55 @@ class MilestoneIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(V2PlanParseError, "numbered concrete operations"):
             parse(raw)
 
+    def test_instruction_list_markers_are_normalized_before_validation(self) -> None:
+        for marker_form in (
+            "1) first operation\n2) second operation",
+            "- first operation\n- second operation",
+            "* first operation\n* second operation",
+            "+ first operation\n+ second operation",
+        ):
+            with self.subTest(marker_form=marker_form):
+                raw = initial_plan(STEP).replace("1. Write the feature.", marker_form, 1)
+                plan = parse(raw)
+                self.assertEqual(
+                    plan.steps[0].instructions,
+                    "1. first operation\n2. second operation",
+                )
+                self.assertEqual(
+                    [(item.code, item.step_id, item.detail) for item in plan.normalizations],
+                    [(
+                        "NORMALIZE_INSTRUCTIONS_LIST_MARKER",
+                        "S01",
+                        "from=numbered_parenthesized to=canonical_ordered",
+                    )] if marker_form.startswith("1)") else [(
+                        "NORMALIZE_INSTRUCTIONS_LIST_MARKER",
+                        "S01",
+                        "from=unordered to=canonical_ordered",
+                    )],
+                )
+
+    def test_instruction_continuations_are_not_counted_as_operations(self) -> None:
+        raw = initial_plan(STEP).replace(
+            "1. Write the feature.",
+            "- Update the snapshot so publication_language\n"
+            "  participates in both functional hashes.\n"
+            "- Add validation tests.",
+            1,
+        )
+        plan = parse(raw)
+        self.assertEqual(
+            plan.steps[0].instructions,
+            "1. Update the snapshot so publication_language\n"
+            "  participates in both functional hashes.\n"
+            "2. Add validation tests.",
+        )
+
+    def test_thirteen_bullet_operations_still_exceed_the_limit(self) -> None:
+        operations = "\n".join(f"- operation {number}" for number in range(1, 14))
+        raw = initial_plan(STEP).replace("1. Write the feature.", operations, 1)
+        with self.assertRaisesRegex(V2PlanParseError, "INSTRUCTIONS exceeds 12"):
+            parse(raw)
+
     def test_the_rich_contract_sections_are_required(self) -> None:
         raw = initial_plan(STEP)
         for section, pattern in (

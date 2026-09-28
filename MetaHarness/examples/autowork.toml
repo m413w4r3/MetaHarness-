@@ -82,7 +82,7 @@ reasoning_profile = "codex-luna-xhigh"
 agentic_profile = "codex-deepseek-flash-max"
 
 [approval]
-require_plan_approval = false
+require_plan_approval = true
 poll_interval_seconds = 0.5
 
 [ui]

@@ -211,6 +211,7 @@ DROP_READ_OF_CREATE = "DROP_READ_OF_CREATE"
 DROP_UNKNOWN_REQUIRED_CHECK = "DROP_UNKNOWN_REQUIRED_CHECK"
 ADD_DEFAULT_REQUIRED_CHECK = "ADD_DEFAULT_REQUIRED_CHECK"
 NORMALIZE_STEP_COUNT = "NORMALIZE_STEP_COUNT"
+NORMALIZE_INSTRUCTIONS_LIST_MARKER = "NORMALIZE_INSTRUCTIONS_LIST_MARKER"
 # The one code that is not a normalization: it names what stays impossible.
 NO_MUTATION_REMAINS = "NO_MUTATION_REMAINS"
 CONTRADICTION_CODES = frozenset({NO_MUTATION_REMAINS})
@@ -583,6 +584,14 @@ def transition(current: RunMachineState, event: RunEvent) -> RunMachineState:
     resumable_failure = (
         event.kind is RunEventKind.RESUME and current.disposition is RunDisposition.FAILED
     )
+    # A plan-approval worker may disappear with the web process while the
+    # machine state remains RUNNING.  The resume gate separately requires a
+    # durable APPROVE artifact before this boundary can be reclaimed.
+    approved_plan_gate = (
+        event.kind is RunEventKind.RESUME
+        and current.disposition is RunDisposition.RUNNING
+        and current.phase is RunPhase.PLAN_APPROVAL
+    )
     if current.disposition.terminal and not resumable_failure:
         raise RunTransitionError(
             f"a {current.disposition.value} run accepts no further event"
@@ -620,7 +629,7 @@ def transition(current: RunMachineState, event: RunEvent) -> RunMachineState:
             )
         return RunMachineState(current.phase, RunDisposition.COMPLETED)
     if event.kind is RunEventKind.RESUME:
-        if not current.disposition.waiting and not resumable_failure:
+        if not current.disposition.waiting and not resumable_failure and not approved_plan_gate:
             raise RunTransitionError(
                 f"a {current.disposition.value} run is not waiting and cannot be resumed"
             )

@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
+from .approval import ApprovalDecision, ApprovalError, PlanIdentity, read_plan_approval
 from .checkpoint_identity import CHECKPOINT_SCHEMA_VERSION, CheckpointFormatError, checkpoint_sha256, read_checkpoint_file, stamp_from_payload
 from .models import RunDisposition, RunIdentity, RunMachineState, RunPhase, RUN_CHECKPOINT_NAME, assemble_run_state, project_run_outcome
 from .recovery_policy import FailureClass, classify_failure
@@ -168,6 +169,35 @@ def run_identity(state: Mapping[str, Any], run_dir: str | Path, checkpoint: Resu
     )
 
 
+def _approved_plan_waiting(run_dir: str | Path, state: Mapping[str, Any], checkpoint: ResumeCheckpoint | None) -> bool:
+    """Treat a durable approval as resumable after a web-process restart."""
+
+    if (
+        checkpoint is None
+        or checkpoint.phase is not RunPhase.PLAN_APPROVAL
+        or state.get("status") != "awaiting_plan_approval"
+        or state.get("planning_protocol") != "v2"
+    ):
+        return False
+    identity = state.get("plan_identity")
+    if not isinstance(identity, Mapping):
+        return False
+    try:
+        expected = PlanIdentity(
+            raw_sha256=identity["raw_sha256"],
+            contract_sha256=identity["contract_sha256"],
+            bundle_sha256=identity.get("bundle_sha256"),
+            execution_sha256=identity.get("execution_sha256"),
+            checks_sha256=identity.get("checks_sha256"),
+        )
+        approval = read_plan_approval(
+            Path(run_dir), expected_identity=expected, iteration=checkpoint.iteration,
+        )
+    except (ApprovalError, KeyError, OSError, TypeError, UnicodeError, ValueError):
+        return False
+    return approval is not None and approval.decision is ApprovalDecision.APPROVE
+
+
 def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     try:
         checkpoint = read_checkpoint(run_dir)
@@ -176,10 +206,11 @@ def resume_info(run_dir: str | Path, state: Mapping[str, Any]) -> ResumeInfo:
     try:
         outcome = project_run_outcome(machine_state_for_run(state, checkpoint))
     except (ValueError, TypeError) as exc: return ResumeInfo(False, reason=f"the durable run state is unreadable: {exc}", operation=CHECKPOINT_INTEGRITY_OPERATION)
-    if not outcome.resume_eligible:
-        return ResumeInfo(False, reason="run has no resumable waiting state")
     if state.get("planning_protocol") != "v2":
         return ResumeInfo(False, reason="only pipeline v2 runs can be resumed")
+    approved_plan_waiting = _approved_plan_waiting(run_dir, state, checkpoint)
+    if not outcome.resume_eligible and not approved_plan_waiting:
+        return ResumeInfo(False, reason="run has no resumable waiting state")
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     reason = failure.get("reason")
     if isinstance(reason, str) and reason.strip() and classify_failure(reason).failure_class is FailureClass.FATAL:

@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from unittest import mock
 
@@ -27,6 +28,7 @@ from metaharness.models import (
     project_run_outcome,
     transition,
 )
+from metaharness.approval import ApprovalDecision, PlanIdentity, write_plan_approval
 from metaharness.resume import (
     CHECKPOINT_INTEGRITY_OPERATION,
     PHASE_STATUS,
@@ -450,6 +452,30 @@ class FrozenCheckpointSchemaTests(unittest.TestCase):
         self.assertEqual(info.step_index, 0)
         self.assertEqual(info.last_green_commit, "6" * 40)
 
+    def test_approved_plan_approval_is_resumable_after_worker_restart(self) -> None:
+        store = RunStateStore(self.state_path)
+        store.initialize("run")
+        identity = PlanIdentity(raw_sha256="1" * 64, contract_sha256="2" * 64)
+        state = store.set_run_state(
+            RunMachineState(ResumePhase.PLAN_APPROVAL),
+            planning_protocol="v2", plan_identity=asdict(identity),
+        )
+        checkpoint = ResumeCheckpoint(
+            phase=ResumePhase.PLAN_APPROVAL, plan_sha256="8" * 64,
+        )
+        self.checkpoint_path.write_bytes(
+            (json.dumps(checkpoint_payload(checkpoint), indent=2, sort_keys=True) + "\n").encode()
+        )
+        write_plan_approval(
+            self.run_dir, decision=ApprovalDecision.APPROVE,
+            identity=identity, source="test",
+        )
+
+        info = resume_info(self.run_dir, state)
+
+        self.assertTrue(info.resumable, info.reason)
+        self.assertEqual(info.phase, ResumePhase.PLAN_APPROVAL.value)
+
     def test_a_corrupt_current_checkpoint_is_an_integrity_failure(self) -> None:
         state = self.waiting_state()
         payload = json.loads(self.checkpoint_bytes())
@@ -601,6 +627,13 @@ class RunMachineTests(unittest.TestCase):
                 self.assertIn(message, str(caught.exception))
                 # A refusal never leaks the other ValueError spelling.
                 self.assertIsInstance(caught.exception, ValueError)
+
+    def test_plan_approval_gate_can_be_reclaimed_after_worker_restart(self) -> None:
+        resumed = transition(
+            RunMachineState(R.PLAN_APPROVAL, D.RUNNING), RunEvent.resume()
+        )
+        self.assertEqual((resumed.phase, resumed.disposition), (R.PLAN_APPROVAL, D.RUNNING))
+        self.assertIsNone(resumed.reason)
 
     def test_a_terminal_run_never_accepts_another_event(self) -> None:
         for event in (

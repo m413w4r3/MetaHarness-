@@ -20,6 +20,7 @@ from ..models import (
     ExecutionClass,
     ExecutionMode,
     ImplementationStep,
+    NORMALIZE_INSTRUCTIONS_LIST_MARKER,
     NORMALIZE_STEP_COUNT,
     PlanDecision,
     PlanningConfig,
@@ -33,6 +34,7 @@ from .grammar import (
     change_sets,
     lines,
     nonempty,
+    normalize_instruction_list,
     parse_labeled_body,
     read_set,
     read_set_paths,
@@ -113,6 +115,7 @@ def _parse_step(
     prior_ids: frozenset[str],
     *,
     max_read_paths_per_step: int,
+    normalizations: list[ContractNormalization],
 ) -> ImplementationStep:
     values, _ = parse_labeled_body(
         body, inline_names=_STEP_INLINE, section_names=_STEP_SECTIONS, where=f"step {step_id}"
@@ -129,6 +132,14 @@ def _parse_step(
             raise V2PlanParseError(f"step {step_id} is missing {name}")
     if "EXAMPLES" in values and not values["EXAMPLES"].strip():
         raise V2PlanParseError(f"step {step_id} has an empty EXAMPLES; use NONE")
+    normalized_instructions, marker_kind = normalize_instruction_list(values["INSTRUCTIONS"])
+    if marker_kind is not None:
+        values["INSTRUCTIONS"] = normalized_instructions
+        normalizations.append(ContractNormalization(
+            code=NORMALIZE_INSTRUCTIONS_LIST_MARKER,
+            step_id=step_id,
+            detail=f"from={marker_kind} to=canonical_ordered",
+        ))
     validate_step_text_limits(step_id, values)
     title = nonempty(values["TITLE"], f"step {step_id} TITLE")
     execution_class = values["EXECUTION_CLASS"]
@@ -376,6 +387,7 @@ def parse_task_plan_v2(
                 body,
                 frozenset(step.id for step in steps),
                 max_read_paths_per_step=planning.max_read_paths_per_step,
+                normalizations=normalizations,
             )
         )
     for name in ("CONSTRAINTS", "MILESTONE_GOAL", "PROJECT_REMAINDER",
