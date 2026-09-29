@@ -497,7 +497,7 @@ class PlannerNormalizationTests(PipelineHarness):
             self.config(), planner=[self.reference_corpus_plan()],
         ).run_text("Make feature.txt good.\n", run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         run_dir = self.run_dir()
         # One answer, no correction: the harness owns the deterministic fix.
         self.assertEqual(len(self.planner.requests), 1)

@@ -70,7 +70,7 @@ class ResumeTests(PipelineHarness):
         resumed = self.orchestrator(config, planner=["unused"], continuation=[
             continuation_answer("COMPLETE"),
         ]).resume("run")
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual((self.run_dir() / "plan_approval.json").read_bytes(), approval_bytes)
 
     def test_resume_preserves_gate_snapshot_when_live_check_is_added(self) -> None:
@@ -87,7 +87,7 @@ argv = ["must-not-execute-new-check"]
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         resumed = self.orchestrator(config, planner=["unused"]).resume("run")
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual((self.run_dir() / "check_authority.json").read_bytes(), authority)
 
     def test_legacy_resume_excludes_check_added_after_approval(self) -> None:
@@ -108,7 +108,7 @@ argv = ["must-not-execute-new-check"]
         )
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         resumed = self.orchestrator(config, planner=["unused"]).resume("run")
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertTrue(any("test-collection" in item for item in self.state()["check_warnings"]))
 
     def test_own_remote_tracking_ref_may_lag_behind_local_steps(self) -> None:
@@ -125,7 +125,7 @@ argv = ["must-not-execute-new-check"]
         branch = self.state()["branch"]
         git(self.repo, "update-ref", f"refs/remotes/origin/{branch}", first_step)
         resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
 
     def test_unowned_ancestor_remote_tracking_ref_is_refused(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
@@ -168,7 +168,7 @@ argv = ["must-not-execute-new-check"]
 
         resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles().count("implementer"), 2)
 
     def test_dirty_interrupted_worker_is_reset_and_step_is_replayed(self) -> None:
@@ -191,7 +191,7 @@ argv = ["must-not-execute-new-check"]
 
         resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles().count("implementer"), 1)
         self.assertFalse((worktree / "attempt-new.txt").exists())
         checkpoint = json.loads((self.run_dir() / "resume_checkpoint.json").read_text())
@@ -212,7 +212,7 @@ argv = ["must-not-execute-new-check"]
 
         resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles().count("implementer"), 1)
         self.assertEqual(subprocess.run(
             ["git", "-C", str(step_commit), "rev-list", "--count", "HEAD"],
@@ -239,7 +239,7 @@ argv = ["must-not-execute-new-check"]
             self.assertEqual(self.checkpoint()["phase"], "deterministic_gate")
             resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertGreaterEqual(calls, 2)
         self.assertEqual(self.workers.roles().count("implementer"), 1)
 
@@ -283,7 +283,7 @@ argv = ["must-not-execute-new-check"]
 
             resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertTrue(ready.is_file())
         self.assertFalse(residue.exists())
         self.assertEqual(self.workers.roles().count("implementer"), 1)
@@ -315,7 +315,7 @@ argv = ["must-not-execute-new-check"]
             self.assertEqual((self.worktree() / "feature.txt").read_text(), "good\n")
             resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles().count("auditor"), 2)
         self.assertEqual(self.worktree().joinpath("feature.txt").read_text(), "good\n")
         subjects = git(self.worktree(), "log", "--format=%s")
@@ -332,7 +332,7 @@ argv = ["must-not-execute-new-check"]
 
         resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles().count("auditor"), 1)
         self.assertEqual(git(self.worktree(), "log", "--format=%s").count(
             "metaharness(audit): cycle 1"), 1)
@@ -350,7 +350,7 @@ argv = ["must-not-execute-new-check"]
 
         resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles(), roles)
 
     def test_missing_accepted_chain_report_does_not_block_resume(self) -> None:
@@ -362,7 +362,7 @@ argv = ["must-not-execute-new-check"]
 
         resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
 
     def test_foreign_branch_is_fatal(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
@@ -440,7 +440,7 @@ argv = ["must-not-execute-new-check"]
 
         resumed = self.orchestrator(load_config(self.config_path), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual([call.profile_id for call in self.workers.calls], ["worker", "auditor"])
 
     def test_effective_plan_hash_survives_resume_after_all_normalizations(self) -> None:
@@ -464,7 +464,7 @@ argv = ["must-not-execute-new-check"]
 
         resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(effective_path.read_bytes(), canonical_bytes)
         self.assertEqual(hashlib.sha256(effective_path.read_bytes()).hexdigest(), expected_hash)
         plan = read_effective_plan(effective_path.parent, expected_hash)

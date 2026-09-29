@@ -35,7 +35,7 @@ class WorkerRecoveryTests(PipelineHarness):
 
         result = self.run_scripts([self.mismatch(edit="partial\n"), successful_retry])
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(observed, ["base\n"])
         self.assertEqual([call.role for call in self.workers.calls].count(ExecutionRole.IMPLEMENTER), 2)
         self.assertEqual(len(self.planner.requests), 1)
@@ -51,7 +51,7 @@ class WorkerRecoveryTests(PipelineHarness):
 
         result = self.run_scripts([lambda _request: "done\n", successful_retry])
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(len(observed), 1)
         self.assertIn("No in-scope candidate change", observed[0])
         self.assertEqual(len(self.planner.requests), 1)
@@ -90,6 +90,6 @@ class WorkerRecoveryTests(PipelineHarness):
             config, planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual([call.profile_id for call in self.workers.calls[:3]], ["worker", "worker", "rescue"])
         self.assertEqual(len(self.planner.requests), 1)

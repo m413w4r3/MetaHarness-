@@ -68,7 +68,7 @@ class PlannerTransportExhaustionTests(AutonomyHarness):
             config, planner_client=planner,
         ).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         # The exhausted call bought nothing durable: the resume pays for one
         # fresh planner answer and the pipeline continues past the planner.
         self.assertEqual(len(planner.requests), 3)
@@ -148,7 +148,7 @@ class AutoResumeCommandTests(AutonomyHarness):
         code, sleeps = self.run_with_auto_resume(planner)
 
         self.assertEqual(code, 0, self.state().get("failure"))
-        self.assertEqual(self.state()["status"], RunStatus.PUBLISHED.value)
+        self.assertEqual(self.state()["status"], RunStatus.COMMITTED.value)
         self.assertEqual(sleeps, [0.01])
         # One exhausted attempt, then the resumed attempt that planned the run.
         self.assertEqual(len(planner.requests), 3)
@@ -183,7 +183,7 @@ class AutoResumeCommandTests(AutonomyHarness):
         code, sleeps = self.run_with_auto_resume(planner, interval="1801")
 
         self.assertEqual(code, 0, self.state().get("failure"))
-        self.assertEqual(self.state()["status"], RunStatus.PUBLISHED.value)
+        self.assertEqual(self.state()["status"], RunStatus.COMMITTED.value)
         self.assertEqual(sleeps, [1801.0, 1801.0])
 
     def test_auto_resume_stops_on_runtime_wall_clock_partial(self) -> None:
@@ -207,7 +207,7 @@ class AutoResumeCommandTests(AutonomyHarness):
         statuses = (
             RunStatus.WAITING_HUMAN,
             RunStatus.FAILED,
-            RunStatus.PUBLISHED,
+            RunStatus.COMMITTED,
             RunStatus.COMMITTED,
             RunStatus.PARTIAL,
         )
@@ -236,7 +236,7 @@ class AutoResumeCommandTests(AutonomyHarness):
         # An invalid planner answer is an ordinary model error: the run is
         # never handed to an operator, it is resumed and planned again.
         self.assertEqual(code, 0, self.state().get("failure"))
-        self.assertEqual(self.state()["status"], RunStatus.PUBLISHED.value)
+        self.assertEqual(self.state()["status"], RunStatus.COMMITTED.value)
         self.assertEqual(sleeps, [0.01])
         self.assertEqual(len(planner.requests), 3)
 

@@ -121,7 +121,7 @@ class BudgetTests(PipelineHarness):
             self.config(budget={"step_attempts": 3}),
             planner=[invalid, invalid, initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(accepted.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(accepted.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(len(self.planner.requests), 3)
 
         exhausted = self.orchestrator(
@@ -129,7 +129,7 @@ class BudgetTests(PipelineHarness):
             planner=[invalid, invalid, initial_plan(STEP)],
         ).run_text(SPEC, run_id="run-two")
         self.assertEqual(len(self.planner.requests), 2)
-        self.assertNotEqual(exhausted.status, RunStatus.PUBLISHED)
+        self.assertNotEqual(exhausted.status, RunStatus.COMMITTED)
         self.assertNotEqual(exhausted.status, RunStatus.WAITING_HUMAN)
 
     def test_planner_continue_corrections_stay_inside_the_attempt_budget(self) -> None:
@@ -179,7 +179,7 @@ class BudgetTests(PipelineHarness):
         first = self.run_dir() / "cycles/001/audit"
         self.assertEqual(sorted(item.name for item in first.iterdir()), ["001", "002"])
         self.assertEqual(len(self.auditor_calls()), 3)
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
 
     def test_zero_audit_repairs_reaches_the_continuation_without_an_audit(self) -> None:
         self.workers.on(
@@ -202,7 +202,7 @@ class BudgetTests(PipelineHarness):
             (planner_continue_dir(self.run_dir() / "iterations", 1) / "request.json").read_text()
         )
         self.assertIn("CHECK_FAILED:test", request["facts"]["evidence"])
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
 
     def test_max_iterations_counts_the_first_milestone_as_one(self) -> None:
         self.workers.on(
@@ -281,7 +281,7 @@ class BudgetTests(PipelineHarness):
             self.config(budget={"max_cost": 0}), planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         budget = self.state()["budget"]
         self.assertEqual(
             set(budget), {"configured", "iterations", "elapsed_seconds", "cost_usd"},

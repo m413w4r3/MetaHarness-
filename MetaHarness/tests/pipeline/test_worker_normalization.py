@@ -35,7 +35,7 @@ class WorkerNormalizationTests(PipelineHarness):
 
         result = self.run_plan(raw, worker)
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assert_plan_normalization("CREATE_EXISTING_TO_WRITE")
         self.assertEqual(len(self.planner.requests), 1)
 
@@ -52,7 +52,7 @@ class WorkerNormalizationTests(PipelineHarness):
 
         result = self.run_plan(raw, worker)
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assert_plan_normalization("WRITE_MISSING_TO_CREATE")
         self.assertEqual(len(self.planner.requests), 1)
 
@@ -70,6 +70,6 @@ class WorkerNormalizationTests(PipelineHarness):
 
         result = self.run_plan(raw, worker)
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assert_plan_normalization("DROP_MISSING_DELETE")
         self.assertEqual(len(self.planner.requests), 1)

@@ -34,7 +34,7 @@ class LifecycleTests(PipelineHarness):
             SPEC, run_id="run",
         )
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         state = self.state()
         run_dir = self.run_dir()
         self.assertEqual(state["pipeline_version"], 2)
@@ -64,7 +64,7 @@ class LifecycleTests(PipelineHarness):
             "last_green_commit", "plan_sha256",
         })
         self.assertEqual(checkpoint["iteration"], 1)
-        self.assertEqual(checkpoint["phase"], "publish")
+        self.assertEqual(checkpoint["phase"], "candidate_push")
         self.assertIsNone(checkpoint["step_index"])
         self.assertEqual(checkpoint["last_green_commit"], state["commit_sha"])
         plan_path = self.run_dir() / "iterations/01/plan/task_plan.json"
@@ -158,7 +158,7 @@ class LifecycleTests(PipelineHarness):
         completed = self.orchestrator(
             config, planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(completed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(completed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.state()["recovery_counters"]["agent-step:001:S01"], 1)
         self.assertTrue(
             (self.run_dir() / "cycles/001/implementation/steps/S01/attempts/01").is_dir()

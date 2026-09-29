@@ -112,7 +112,7 @@ class PlannerTransportOutageTests(AutonomyHarness):
             planner_client=CompletionOverTransport(endpoint, recovered, clock),
         ).resume("run")
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         # The plan came from the provider once it was reachable again: the
         # exhausted phase never persisted an answer to replay.
         self.assertGreaterEqual(recovered.attempts, 1)

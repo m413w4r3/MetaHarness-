@@ -19,7 +19,7 @@ from ..llm.chat import LLMError
 from ..models import RunDisposition, RunMachineState
 from ..plan_repository_validation import PlanRepositoryPreconditionError
 from ..planning.protocol import PlanParseError
-from ..recovery_policy import RecoveryStrategy
+from ..recovery_policy import RecoveryStrategy, classify_failure
 from ..redaction import redact, redact_mapping
 from ..result import RunResult, atomic_write_text
 from ..resume import (
@@ -135,6 +135,11 @@ class RunFailure:
     def step_failed(
         self, store: RunStateStore, run_dir: Path, failure: StepExecutionFailure,
     ) -> RunResult:
+        decision = classify_failure(failure.reason, exhausted=True)
+        if decision.strategy is RecoveryStrategy.MARK_FAILED_CONTINUE:
+            return self.project_exception(
+                store, run_dir, failure, operation="escaped_step_failure",
+            )
         _decision, terminal = project_exit(
             failure.reason, phase=self.checkpoint_phase(run_dir),
         )
@@ -313,22 +318,26 @@ class RunFailure:
             return self.budget_partial(store, run_dir, exc.reason)
         reason = normalize_exit_reason(_failure_reason(exc))
         phase = self.checkpoint_phase(run_dir)
-        _decision, terminal = project_exit(reason, phase=phase)
         detail: FailureDetail
         auto_resumable: bool | None = None
-        if reason == "INTERNAL_HARNESS_ERROR":
+        decision = classify_failure(reason, exhausted=True)
+        if decision.strategy is RecoveryStrategy.MARK_FAILED_CONTINUE:
             message = " ".join(str(exc).split())[:500]
-            detail = {
-                "exception_type": type(exc).__name__,
-                "message": message,
-                "phase": phase.value,
-                "operation": operation,
-            }
+            detail = (
+                {
+                    "exception_type": type(exc).__name__,
+                    "message": message,
+                    "phase": phase.value,
+                    "operation": operation,
+                }
+                if reason == "INTERNAL_HARNESS_ERROR" else message
+            )
             auto_resumable = self._checkpoint_is_retryable(store, run_dir)
             disposition = (
                 RunDisposition.WAIT_EXTERNAL if auto_resumable else RunDisposition.FAILED
             )
         else:
+            _decision, terminal = project_exit(reason, phase=phase)
             detail = " ".join(str(exc).split())[:500]
             disposition = terminal.disposition
         fields = self.closing_step_fields(
@@ -378,7 +387,13 @@ class RunFailure:
                 failure.reason = reason
                 failure.detail = "external executor authorization is required"
             checkpoint_phase = self.checkpoint_phase(pipeline.run_dir, default=start.phase)
-            decision, terminal = project_exit(failure.reason, phase=checkpoint_phase)
+            decision = classify_failure(failure.reason, exhausted=True)
+            if decision.strategy is RecoveryStrategy.MARK_FAILED_CONTINUE:
+                return self.project_exception(
+                    store, pipeline.run_dir, failure,
+                    operation="escaped_pipeline_failure",
+                )
+            _decision, terminal = project_exit(failure.reason, phase=checkpoint_phase)
             state = store.load()
             tree = state.get("staged_tree_sha")
             if not isinstance(tree, str):

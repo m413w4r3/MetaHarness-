@@ -32,7 +32,7 @@ class RemoteCandidateTests(PipelineHarness):
             self.config(publish=False), planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         candidate = json.loads(
             (self.run_dir() / "cycles/001/candidate/commit.json").read_text(encoding="utf-8")
         )
@@ -52,7 +52,7 @@ class RemoteCandidateTests(PipelineHarness):
             self.config(publish=False), planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         candidate = json.loads(
             (self.run_dir() / "cycles/001/candidate/commit.json").read_text()
         )
@@ -72,7 +72,7 @@ class RemoteCandidateTests(PipelineHarness):
         )
 
         self.assertEqual(self.state()["branch"], branch)
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         candidate = json.loads(
             (self.run_dir() / "cycles/001/candidate/commit.json").read_text()
         )

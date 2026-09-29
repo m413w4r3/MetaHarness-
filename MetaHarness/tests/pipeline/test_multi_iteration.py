@@ -44,7 +44,7 @@ class MultiIterationTests(PipelineHarness):
             ], auditor=[audit(), audit()],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         state = self.state()
         self.assertEqual(state["completion_kind"], "COMPLETE")
         self.assertEqual(state["current_iteration"], 2)
@@ -72,7 +72,7 @@ class MultiIterationTests(PipelineHarness):
             ], auditor=[audit(), audit()],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         self.assertEqual(result.state["current_iteration"], 2)
         self.assertEqual(result.state["current_milestone"]["id"], "M01")
 
@@ -100,7 +100,7 @@ class MultiIterationTests(PipelineHarness):
                 continuation_answer("COMPLETE"),
             ], auditor=[audit(), audit()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         plan = json.loads((self.run_dir() / "iterations/02/plan/task_plan.json").read_text())
         self.assertEqual(plan["steps"][0]["write_set"], ["new.txt"])
         self.assertIn(CREATE_EXISTING_TO_WRITE, {item["code"] for item in plan["normalizations"]})
@@ -119,7 +119,7 @@ class MultiIterationTests(PipelineHarness):
                 continuation_answer("COMPLETE"),
             ], auditor=[audit(), audit()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         plan = json.loads((self.run_dir() / "iterations/02/plan/task_plan.json").read_text())
         self.assertEqual(plan["steps"][0]["create_set"], ["future.txt"])
         self.assertIn(WRITE_MISSING_TO_CREATE, {item["code"] for item in plan["normalizations"]})
@@ -136,7 +136,7 @@ class MultiIterationTests(PipelineHarness):
                 continuation_answer("COMPLETE"),
             ], auditor=[audit(), audit()],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         self.assertTrue((self.run_dir() / "cycles/001/implementation/steps/S01/step.json").is_file())
         self.assertTrue((self.run_dir() / "cycles/002/implementation/steps/S01/step.json").is_file())
 
@@ -151,7 +151,7 @@ class MultiIterationTests(PipelineHarness):
                 continuation_answer("COMPLETE"),
             ],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         request = json.loads((planner_continue_dir(self.run_dir() / "iterations", 1) / "request.json").read_text())
         self.assertIn("Fix the check", request["facts"]["audit"])
         self.assertIn("CHECK_FAILED:test", request["facts"]["evidence"])
@@ -171,7 +171,7 @@ class MultiIterationTests(PipelineHarness):
                 continuation_answer("COMPLETE"),
             ],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         self.assertEqual(len(self.continuation.requests), 3)
         self.assertIn("deterministic gate is red", self.continuation.requests[1])
         _request, accepted_raw, accepted_result = read_planner_continue_artifacts(
@@ -186,7 +186,7 @@ class MultiIterationTests(PipelineHarness):
         result = self.orchestrator(
             self.config(), planner=[plan], continuation=[continuation_answer("COMPLETE")],
         ).run_text(SPEC, run_id="run")
-        self.assertNotEqual(result.status, RunStatus.PUBLISHED)
+        self.assertNotEqual(result.status, RunStatus.COMMITTED)
         self.assertEqual(result.state["failure"]["reason"], "PLANNER_OUTPUT_INVALID")
         self.assertFalse((self.run_dir() / "cycles/001/candidate/commit.json").exists())
 
@@ -307,7 +307,7 @@ class MultiIterationTests(PipelineHarness):
             "report_commit": report.get("commit_sha"), "head": git(self.worktree(), "rev-parse", "HEAD"),
         })
         resumed = orchestrator.resume("run")
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, resumed.state.get("failure"))
         self.assertEqual(self.workers.roles().count("auditor"), 2)
         self.assertEqual(
             git(self.worktree(), "rev-list", "--count", "--grep=metaharness(audit): cycle 2", "HEAD"),
@@ -343,7 +343,7 @@ class MultiIterationTests(PipelineHarness):
                 continuation_answer("COMPLETE"),
             ],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         m02_evidence = json.loads((self.run_dir() / "iterations/02/planner-continue/request.json").read_text())
         self.assertIn("CHECK_FAILED:test", m02_evidence["facts"]["evidence"])
         self.assertIn("BASELINE WARNINGS", m02_evidence["facts"]["evidence"])
@@ -377,7 +377,7 @@ class MultiIterationTests(PipelineHarness):
                 continuation_answer("COMPLETE"),
             ],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         request = json.loads((self.run_dir() / "iterations/01/planner-continue/request.json").read_text())
         self.assertIn("S01:", request["facts"]["plan"])
         self.assertIn(
@@ -416,7 +416,7 @@ class MultiIterationTests(PipelineHarness):
         self.assertEqual(self.checkpoint()["iteration"], 2)
         self.assertEqual(self.workers.roles().count("implementer"), 1)
         resumed = orchestrator.resume("run")
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, resumed.state.get("failure"))
         self.assertEqual(self.workers.roles().count("implementer"), 2)
 
     def test_paid_continuation_raw_is_reparsed_without_another_call(self) -> None:
@@ -442,7 +442,7 @@ class MultiIterationTests(PipelineHarness):
         self.assertEqual(self.checkpoint()["phase"], "planner")
         self.assertEqual(len(self.continuation.requests), 1)
         resumed = orchestrator.resume("run")
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, resumed.state.get("failure"))
         self.assertEqual(len(self.continuation.requests), 1)
 
 
@@ -559,7 +559,7 @@ class CheckPolicyDriftTests(PipelineHarness):
         self.assertEqual(self._live_config().default_check_ids, ("test-b",))
         resumed = self._resume(self._next_then_complete())
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, resumed.state.get("failure"))
         plan = self._iteration_plan(2)
         self.assertIn("test-a", plan["required_checks"])
         self.assertNotIn("test-b", plan["required_checks"])
@@ -584,7 +584,7 @@ class CheckPolicyDriftTests(PipelineHarness):
         self.assertEqual(list(drifted.argv), [sys.executable, script_b])
         resumed = self._resume(self._next_then_complete())
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, resumed.state.get("failure"))
         self.assertIn("A", self._ran())
         self.assertNotIn("B", self._ran())
         self.assertEqual((self.run_dir() / "check_authority.json").read_bytes(), authority_bytes)
@@ -608,7 +608,7 @@ class CheckPolicyDriftTests(PipelineHarness):
             continuation_answer("COMPLETE"),
         ])
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, resumed.state.get("failure"))
         correction = self.continuation.requests[1]
         self.assertIn("untrusted checks", correction)
         # The catalogue the harness published to the model never grew.
@@ -636,7 +636,7 @@ class CheckPolicyDriftTests(PipelineHarness):
         self.assertNotIn("test-a", {check.id for check in self._live_config().check_catalog})
         resumed = self._resume(self._next_then_complete())
 
-        self.assertNotEqual(resumed.status, RunStatus.PUBLISHED)
+        self.assertNotEqual(resumed.status, RunStatus.COMMITTED)
         detail = json.dumps(resumed.state["failure"])
         # A deterministic check-authority error names the vetoed default: the
         # run stops instead of substituting another check or a live command.
@@ -686,7 +686,7 @@ class CheckPolicyDriftTests(PipelineHarness):
         )
         resumed = self._resume([continuation_answer("COMPLETE")])
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, resumed.state.get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, resumed.state.get("failure"))
         # The paid answer is reparsed, never bought again.
         self.assertEqual(len(self.continuation.requests), 1)
         plan = self._iteration_plan(2)
@@ -707,7 +707,7 @@ class CheckPolicyDriftTests(PipelineHarness):
             auditor=[audit(), audit()],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, result.state.get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         authority = read_check_authority(self.run_dir())
         requests = [
             json.loads((self.run_dir() / f"iterations/{iteration:02d}/planner-continue/request.json").read_text())

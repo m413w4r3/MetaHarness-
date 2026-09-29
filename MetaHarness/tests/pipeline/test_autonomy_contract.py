@@ -46,7 +46,7 @@ class CorrectnessRouteIsAutonomousTests(PipelineHarness):
             self.config(), planner=[initial_plan(STEP)], auditor=[repair],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertGreaterEqual(int(counter.read_text()), 2, "the gate was never red")
         self.assertEqual(
             self.workers.roles(), ["implementer", "auditor"],

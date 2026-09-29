@@ -30,7 +30,7 @@ class AuditPipelineTests(PipelineHarness):
             result = self.orchestrator(
                 self.config(), planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)))],
             ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
         for request in self.workers.calls:
             self.assertIn(SPEC, request.prompt)
             self.assertEqual(request.read_only_paths, ())
@@ -45,7 +45,7 @@ class AuditPipelineTests(PipelineHarness):
         config = replace(config, prompt_budget=replace(config.prompt_budget, implementer_max_bytes=1, audit_max_bytes=1))
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
         result = self.orchestrator(config, planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)))]).run_text(SPEC, run_id="run")
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
         self.assertIn("auditor", self.workers.roles())
 
     def _audit_fallback_config(self):
@@ -81,7 +81,7 @@ class AuditPipelineTests(PipelineHarness):
         result = self.orchestrator(self._audit_fallback_config(), planner=[
             meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
         ]).run_text(SPEC, run_id="run")
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
         report = json.loads((self.run_dir() / "cycles/001/audit/001/report.json").read_text())
         self.assertEqual(report["profile_id"], "audit-fallback")
         self.assertEqual([item["profile_id"] for item in report["executions"]], ["auditor", "audit-fallback"])
@@ -195,7 +195,7 @@ class AuditPipelineTests(PipelineHarness):
         ).run_text(SPEC, run_id="run")
         self.assertIn("auditor", self.workers.roles())
         self.assertNotIn("reviewer", self.workers.roles())
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
         prompt = next(call.prompt for call in self.workers.calls if call.role is ExecutionRole.AUDITOR)
         self.assertNotIn("diff --git", prompt)
         self.assertNotIn('"raw":', prompt)
@@ -222,7 +222,7 @@ class AuditPipelineTests(PipelineHarness):
             self.config(),
             planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)))],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
         (implementer,) = [
             call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER
         ]
@@ -249,7 +249,7 @@ class AuditPipelineTests(PipelineHarness):
         self.assertIn("auditor", self.workers.roles())
         report = json.loads((self.run_dir() / "cycles/001/audit/001/report.json").read_text())
         self.assertEqual(report["status"], "DONE")
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
 
     def test_two_real_regressions_reach_audit_despite_model_sandbox(self) -> None:
         self.check.write_text("import sys; sys.exit(0)\n", encoding="utf-8")
@@ -280,7 +280,7 @@ class AuditPipelineTests(PipelineHarness):
 
         self.workers.on(ExecutionRole.AUDITOR, audit)
         result = self._run(extra_checks=checks)
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
         self.assertEqual(self.workers.roles().count("auditor"), 1)
         self.assertNotIn("check_repair", self.workers.roles())
         self.assertNotIn("CHECK_REPAIR_UNAVAILABLE", json.dumps(result.state))
@@ -306,7 +306,7 @@ class AuditPipelineTests(PipelineHarness):
         )
         self.workers.on(ExecutionRole.AUDITOR, write("tests/test_feature.py", "assert True\n", audit_message()))
         result = self._run()
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
         report = json.loads((self.run_dir() / "cycles/001/audit/001/report.json").read_text())
         self.assertIn("tests/test_feature.py", report["changed_paths"])
 
@@ -322,7 +322,7 @@ class AuditPipelineTests(PipelineHarness):
         self.workers.on(ExecutionRole.AUDITOR, write("feature.txt", "good\n", audit_message()))
         result = self._run()
         self.assertIn("auditor", self.workers.roles())
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
 
     def test_hard_deny_audit_path_is_refused(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
@@ -348,7 +348,7 @@ class AuditPipelineTests(PipelineHarness):
             continuation_answer("NEXT", milestone="M02", plan_text=m02),
             continuation_answer("COMPLETE"),
         ])
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
         self.assertEqual(len(self.continuation.requests), 2)
         self.assertEqual(self.checkpoint()["iteration"], 2)
         report = json.loads((self.run_dir() / "cycles/001/audit/002/report.json").read_text())
@@ -379,7 +379,7 @@ class AuditPipelineTests(PipelineHarness):
             continuation_answer("NEXT", milestone="M02", plan_text=next_plan),
             continuation_answer("COMPLETE"),
         ])
-        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertEqual(result.state["status"], "committed", result.state.get("failure"))
 
     def test_resume_retries_an_interrupted_audit_checkpoint(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
@@ -395,7 +395,7 @@ class AuditPipelineTests(PipelineHarness):
         first = orchestrator.run_text(SPEC, run_id="run")
         self.assertEqual(first.state["disposition"], "WAIT_EXTERNAL")
         resumed = orchestrator.resume("run")
-        self.assertEqual(resumed.state["status"], "published", resumed.state.get("failure"))
+        self.assertEqual(resumed.state["status"], "committed", resumed.state.get("failure"))
         self.assertEqual(self.workers.roles().count("auditor"), 2)
 
     def test_blocking_harness_preflight_waits_external_before_audit(self) -> None:

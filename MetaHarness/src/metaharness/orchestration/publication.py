@@ -365,7 +365,7 @@ class PublicationService:
             terminal_status=terminal.status, checkpoint_phase=ResumePhase.PUBLISH,
         )
         state = self.runtime.failure.persist_exit(
-            store, "PUSH_FAILED", detail, terminal.status,
+            store, "PUSH_FAILED", detail, terminal.disposition,
             recovery_resumable=terminal.resumable, **fields,
         )
         return RunResult.of(run_dir, state)
@@ -517,8 +517,15 @@ class PublicationService:
                 commit_sha=commit_sha,
                 cycle=cycle,
             )
+            self.runtime.write_checkpoint(
+                run_dir, ResumePhase.CANDIDATE_PUSH, iteration=cycle,
+                head=commit_sha,
+            )
             state = store.set_run_state(
-                RunMachineState(disposition=RunDisposition.COMPLETED), **fields,
+                RunMachineState(
+                    ResumePhase.CANDIDATE_PUSH, RunDisposition.COMPLETED,
+                ),
+                **fields,
             )
             self.runtime.observability.trace_emit(
                 "publish.completed",

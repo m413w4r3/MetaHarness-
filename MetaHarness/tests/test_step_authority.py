@@ -51,7 +51,7 @@ class StepAuthorityTests(PipelineHarness):
 
         result = self.run_pipeline()
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         step = self.json(self.step_dir() / "step.json")
         candidate = read_step_candidate(self.step_dir())
         self.assertEqual(step["changed_paths"], ["feature.txt"])
@@ -90,7 +90,7 @@ class StepAuthorityTests(PipelineHarness):
 
         resumed, planner = self.resume_without_planner()
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(planner.requests, [])
         self.assertEqual(len(planner.continuation_requests), 1)
         self.assertEqual(len([c for c in self.workers.calls if c.role is ExecutionRole.IMPLEMENTER]), 3)
@@ -112,7 +112,7 @@ class StepAuthorityTests(PipelineHarness):
 
         resumed, planner = self.resume_without_planner()
 
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(read_step_candidate(self.step_dir())["changed_paths"], ["feature.txt"])
         self.assertEqual(planner.requests, [])
         self.assertEqual(len(planner.continuation_requests), 1)

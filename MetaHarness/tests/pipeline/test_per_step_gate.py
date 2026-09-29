@@ -51,7 +51,7 @@ class PerStepGateTests(PipelineHarness):
         resumed = self.orchestrator(
             self.config(extra_checks=self.lint_check()), planner=["unused"],
         ).resume("run")
-        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(resumed.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles().count("implementer"), 2)
         self.assertIn("CHECK: lint", self.workers.calls[1].prompt)
 
@@ -80,7 +80,7 @@ argv = [{sys.executable!r}, "-B", "-c", "import runpy; runpy.run_path('test_fixt
             self.config(per_step_gate="test-collection", extra_checks=check),
             planner=[meta_plan(Step(id="S01", title="Rename API", write=("api.py",)))],
         ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles().count("implementer"), 2)
         self.assertEqual(self.workers.roles().count("auditor"), 1)
         artifact = json.loads((self.run_dir() / "cycles/001/implementation/steps/S01/per-step-gate/attempt-01.json").read_text())
@@ -107,7 +107,7 @@ timeout_seconds = 30
             planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.workers.roles().count("implementer"), 2)
         record = json.loads((
             self.run_dir()
@@ -129,7 +129,7 @@ timeout_seconds = 30
             planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         first, second = self.workers.calls[0], self.workers.calls[1]
         # The retry keeps the profile and receives only the bounded evidence.
         self.assertEqual(second.profile_id, first.profile_id)
@@ -165,7 +165,7 @@ timeout_seconds = 30
             ],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state())
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state())
         self.assertEqual(len(self.continuation.requests), 2)
         # The claimed fix never became evidence: the harness reran the check.
         m01_evidence = json.loads(
@@ -211,7 +211,7 @@ preflight_argv = [{sys.executable!r}, {str(probe)!r}]
 
         # Two gate runs answered this run (the gate and its post-audit rerun):
         # the trusted probe was still paid exactly once.
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.preflight_marker.read_text(), "1")
         verdicts = json.loads(
             (self.run_dir() / "preflights.json").read_text(encoding="utf-8")
@@ -226,7 +226,7 @@ preflight_argv = [{sys.executable!r}, {str(probe)!r}]
             planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
         self.assertEqual(self.preflight_marker.read_text(), "1")
         state = self.state()
         self.assertEqual(state["skipped_checks"], ["integration"])
