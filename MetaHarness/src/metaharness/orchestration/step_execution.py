@@ -347,6 +347,7 @@ class StepExecutionService:
                 )
                 retryable = (
                     rolled_back
+                    and failure.reason != "AGENT_CONTRACT_MISMATCH"
                     and not classify_failure(failure.reason).strategy.terminal
                 )
                 if (

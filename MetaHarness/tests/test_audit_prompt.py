@@ -6,7 +6,7 @@ from pathlib import Path
 
 from metaharness.evidence import EvidenceBundle
 from metaharness.orchestration.audit import _evidence_payload
-from metaharness.orchestration.audit import build_audit_payload
+from metaharness.orchestration.audit import build_audit_payload, parse_audit_report
 from metaharness.planning.protocol import parse_task_plan_v2
 from tests.autonomy.support import Step, meta_plan
 
@@ -38,6 +38,9 @@ class AuditPromptTests(unittest.TestCase):
         )
         plan = replace(
             plan,
+            objective="reuse publication artifacts safely",
+            milestone_goal="reuse a prior publication artifact",
+            acceptance=("the publication result keeps provenance",),
             risks="preserve published format",
             project_remainder="frontend belongs to M02",
             raw="RAW CONTRACT SHOULD NOT BE PASTED" * 10000,
@@ -50,8 +53,11 @@ class AuditPromptTests(unittest.TestCase):
                     "id": "S01",
                     "status": "FAILED_CONTINUED",
                     "reason": "CHECK_FAILED",
+                    "detail": "required change is outside the WRITE_SET",
+                    "mismatch": "find_reusable refuses PUBLICATION",
                     "out_of_scope_paths": ["fixture.py"],
-                    "final": "OLD WORKER MESSAGE" * 10000,
+                    "changed_paths": ["feature.txt"],
+                    "final": "Worker conclusion: publication reuse lacks provenance.",
                 },
             ],
             baseline={
@@ -81,7 +87,6 @@ class AuditPromptTests(unittest.TestCase):
             changed_paths=["feature.txt"],
             diff_base_tree="a" * 40,
             candidate_parent="b" * 40,
-            prior_remaining=["complete publication behavior"],
             hard_deny=[".env*"],
             file_refs={"plan": "/run/iterations/01/plan/task_plan.json"},
             budget_bytes=budget,
@@ -100,21 +105,25 @@ class AuditPromptTests(unittest.TestCase):
             self.assertNotIn(redundant, payload.rendered)
         self.assertIn("/run/iterations/01/plan/task_plan.json", payload.rendered)
         self.assertIn("git diff --stat", payload.rendered)
-        self.assertIn("preserve published format", payload.rendered)
-        self.assertIn("frontend belongs to M02", payload.rendered)
-        self.assertIn("Do not implement PROJECT_REMAINDER", payload.rendered)
+        self.assertIn("reuse publication artifacts safely", payload.rendered)
+        self.assertIn("Worker conclusion: publication reuse lacks provenance.", payload.rendered)
+        self.assertIn("find_reusable refuses PUBLICATION", payload.rendered)
+        self.assertNotIn("frontend belongs to M02", payload.rendered)
+        self.assertNotIn('"approved_step_contracts"', payload.rendered)
+        self.assertIn("Keep repairs within the current milestone", payload.rendered)
         self.assertIn("FAILED_CONTINUED", payload.rendered)
-        self.assertIn("fixture.py", payload.rendered)
+        self.assertIn('"changed_paths"', payload.rendered)
 
-    def test_external_audit_keeps_authority_and_excerpts_even_over_budget(self):
+    def test_external_audit_bounds_context_and_drops_contract_dump(self):
         spec = "SPEC exact external invariant\n" * 1000
         details = "failure with exact reproduction details\n" * 1000
         payload = self.payload(spec=spec, excerpt=details, budget=1000, artifacts_readable=False)
         self.assertIn(spec, payload.rendered)
-        self.assertIn(details, payload.rendered)
-        self.assertIn('"approved_step_contracts"', payload.rendered)
+        self.assertNotIn(details, payload.rendered)
+        self.assertNotIn('"approved_step_contracts"', payload.rendered)
         self.assertIn("repository access only", payload.rendered)
         self.assertTrue(payload.budget_overrun)
+        self.assertLess(payload.total_bytes, 150_000)
         batch = json.loads(next(section.text for section in payload.sections if section.name == "batch"))
         self.assertEqual(batch["file_refs"], {})
         for section in payload.sections:
@@ -132,12 +141,12 @@ class AuditPromptTests(unittest.TestCase):
         self.assertIn("/run/checks/test.stdout.log", payload.rendered)
         self.assertIn("REGRESSION", payload.rendered)
         self.assertIn(".env*", payload.rendered)
-        self.assertIn("complete publication behavior", payload.rendered)
+        self.assertNotIn("complete publication behavior", payload.rendered)
         for section in payload.sections:
             if section.authority:
                 self.assertFalse(section.truncated)
 
-    def test_large_spec_is_never_silently_truncated(self):
+    def test_large_spec_is_never_silently_truncated_and_dispatch_guard_can_reject_it(self):
         spec = "SPEC semantic authority\n" * 10000
         payload = self.payload(spec=spec, budget=6_000)
         self.assertIn(spec, payload.rendered)
@@ -157,7 +166,7 @@ class AuditPromptTests(unittest.TestCase):
                 {"id": "test", "exit_code": 1, "stdout_log": "/run/test.log",
                  "unneeded_raw_log": "RAW" * 100_000},
             ]}, changed_paths=["feature.txt"], diff_base_tree="a" * 40,
-            candidate_parent="b" * 40, prior_remaining=[],
+            candidate_parent="b" * 40,
             file_refs={"spec": "/run/spec.md", "evidence": "/run/evidence.json", "baseline": "/run/state.json"},
             budget_bytes=20_000,
             artifacts_readable=True,
@@ -166,9 +175,35 @@ class AuditPromptTests(unittest.TestCase):
         self.assertNotIn("RAWRAW", payload.rendered)
         gate = json.loads(next(section.text for section in payload.sections if section.name == "gate"))
         self.assertEqual(gate["failures_count"], 5000)
-        self.assertEqual(gate["failures_omitted"], 4992)
+        self.assertEqual(gate["failures_omitted"], 4980)
         self.assertEqual(gate["baseline"][0]["new_failure_ids_count"], 5000)
         self.assertIn("/run/evidence.json", payload.rendered)
+
+    def test_audit_report_parser_recovers_bounded_indented_bullet_continuations(self):
+        message = (
+            "META AUDIT v1\n\nSTATUS\nDONE\n\nFIXED\n"
+            "- Reused the publication artifact while preserving\n"
+            "  its provenance fields.\n\nREFACTORED\n- none\n\n"
+            "REMAINING\n- none\n\nRISKS\n- none\nEND META AUDIT\n"
+        )
+        report = parse_audit_report(message)
+        self.assertIsNotNone(report)
+        self.assertEqual(report.fixed, ("Reused the publication artifact while preserving its provenance fields.",))
+
+    def test_large_secondary_evidence_is_pruned_below_the_absolute_ceiling(self):
+        plan = parse_task_plan_v2(meta_plan(Step(id="S01", title="Feature", write=("feature.txt",))))
+        payload = build_audit_payload(
+            spec="Exact bounded spec.", plan=plan,
+            steps=[{"id": f"S{index:02d}", "final": "agent conclusion " * 1_000} for index in range(1, 31)],
+            baseline={"checks": []}, gate={"passed": False, "failures": ["failure"] * 1_000,
+                "checks": [{"id": "test", "failure_excerpt": "log " * 100_000}]},
+            changed_paths=[f"src/file_{index}.py" for index in range(1_000)],
+            diff_base_tree="a" * 40, candidate_parent="b" * 40,
+            file_refs={}, budget_bytes=150_000,
+            candidate_diff="diff --git\n" + "+change\n" * 1_000_000,
+        )
+        self.assertLessEqual(payload.total_bytes, 150_000)
+        self.assertFalse(payload.budget_overrun)
 
 
 if __name__ == "__main__":

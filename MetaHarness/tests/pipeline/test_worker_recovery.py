@@ -24,39 +24,30 @@ class WorkerRecoveryTests(PipelineHarness):
             self.config(), planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-    def test_contract_mismatch_retries_with_feedback_after_exact_rollback(self) -> None:
-        observed: list[str] = []
+    def test_contract_mismatch_is_rolled_back_and_sent_to_replanning(self) -> None:
+        result = self.run_scripts([self.mismatch(edit="partial\n")])
 
-        def successful_retry(request):
-            observed.append((request.worktree / "feature.txt").read_text(encoding="utf-8"))
-            self.assertIn("approved step instructions were not met", request.retry_addendum)
-            (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
-            return "done\n"
-
-        result = self.run_scripts([self.mismatch(edit="partial\n"), successful_retry])
-
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(observed, ["base\n"])
-        self.assertEqual([call.role for call in self.workers.calls].count(ExecutionRole.IMPLEMENTER), 2)
+        self.assertIn(result.status, {RunStatus.COMMITTED, RunStatus.PUBLISHED})
+        self.assertEqual([call.role for call in self.workers.calls].count(ExecutionRole.IMPLEMENTER), 1)
         self.assertEqual(len(self.planner.requests), 1)
         self.assertTrue((self.run_dir() / "cycles/001/implementation/steps/S01/attempts/01/step.json").exists())
+        import json
+        request = json.loads((self.run_dir() / "iterations/01/planner-continue/request.json").read_text())
+        self.assertIn("approved step instructions were not met", request["facts"]["plan"])
 
-    def test_no_change_retries_with_the_worker_addendum(self) -> None:
-        observed: list[str] = []
+    def test_no_change_is_sent_to_replanning_without_reexecution(self) -> None:
+        result = self.run_scripts([lambda _request: "done\n"])
 
-        def successful_retry(request):
-            observed.append(request.retry_addendum or "")
-            (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
-            return "done\n"
-
-        result = self.run_scripts([lambda _request: "done\n", successful_retry])
-
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual(len(observed), 1)
-        self.assertIn("No in-scope candidate change", observed[0])
+        self.assertIn(result.status, {RunStatus.COMMITTED, RunStatus.PUBLISHED})
+        self.assertEqual(
+            [call.role for call in self.workers.calls].count(ExecutionRole.IMPLEMENTER), 1,
+        )
         self.assertEqual(len(self.planner.requests), 1)
+        import json
+        request = json.loads((self.run_dir() / "iterations/01/planner-continue/request.json").read_text())
+        self.assertIn("No in-scope candidate change", request["facts"]["plan"])
 
-    def test_repeated_mismatch_settles_without_an_operator_or_external_wait(self) -> None:
+    def test_mismatch_settles_without_same_executor_retry(self) -> None:
         result = self.run_scripts([self.mismatch(), self.mismatch(), self.mismatch()])
 
         self.assertNotIn(
@@ -67,12 +58,15 @@ class WorkerRecoveryTests(PipelineHarness):
         import json
         record = json.loads(step.read_text(encoding="utf-8"))
         self.assertEqual((record["status"], record["reason"]), ("FAILED_CONTINUED", "AGENT_CONTRACT_MISMATCH"))
+        self.assertEqual(
+            [call.role for call in self.workers.calls].count(ExecutionRole.IMPLEMENTER), 1,
+        )
         self.assertEqual(len(self.planner.requests), 1)
         self.assertFalse(step.parent.joinpath("contract_repairs").exists())
         self.assertEqual(git(self.worktree(), "status", "--porcelain"), "")
 
-    def test_available_fallback_executor_runs_after_ordinary_retries(self) -> None:
-        """One fallback fits in the three-attempt step budget, never beside it."""
+    def test_contract_mismatch_does_not_use_fallback_executor(self) -> None:
+        """A missing prerequisite is sent to replanning, not another worker."""
 
         self.config()
         self.config_path.write_text(
@@ -83,13 +77,14 @@ class WorkerRecoveryTests(PipelineHarness):
         config = load_config(self.config_path)
         self.workers.on(
             ExecutionRole.IMPLEMENTER,
-            self.mismatch(), self.mismatch(), write("feature.txt", "good\n"),
+            self.mismatch(), write("feature.txt", "good\n"),
         )
 
         result = self.orchestrator(
             config, planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(result.status, RunStatus.COMMITTED, self.state().get("failure"))
-        self.assertEqual([call.profile_id for call in self.workers.calls[:3]], ["worker", "worker", "rescue"])
+        self.assertIn(result.status, {RunStatus.COMMITTED, RunStatus.PUBLISHED})
+        implementers = [call.profile_id for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER]
+        self.assertEqual(implementers, ["worker"])
         self.assertEqual(len(self.planner.requests), 1)

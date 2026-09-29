@@ -58,6 +58,22 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("Do not redesign the plan or broaden the task.", payload.rendered)
         self.assertIn("Implement the supplied contract exactly.", payload.rendered)
 
+    def test_implementer_limits_repository_exploration(self) -> None:
+        payload = build_implementer_payload(step_title="S01")
+        rendered = " ".join(payload.rendered.split())
+        self.assertIn("Do not chase transitive imports", rendered)
+        self.assertIn("return BLOCKED with the exact contract gap", rendered)
+
+    def test_planner_resolves_dependencies_before_worker_contract(self) -> None:
+        prompts = Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts"
+        planner = " ".join((prompts / "planner_v2.txt").read_text(encoding="utf-8").split())
+        self.assertIn("confirm the named contract supports", planner)
+        self.assertIn("Never ask the worker to", planner)
+        self.assertIn("the planner must declare it", planner)
+        self.assertIn("Sharing one source file or test file", planner)
+        self.assertIn("reject noncanonical input forms", planner)
+        self.assertIn("Do not repeat full lint, typecheck", planner)
+
     def test_pitfalls_are_single_nontruncatable_authority(self) -> None:
         pitfalls = "DO NOT CREATE migration 0002"
         payload = build_implementer_payload(

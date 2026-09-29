@@ -345,6 +345,37 @@ class MilestoneIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(V2PlanParseError, "INSTRUCTIONS exceeds 12"):
             parse(thirteen)
 
+    def test_plan_rejects_worker_discovery_of_repository_contracts(self) -> None:
+        raw = initial_plan(STEP).replace(
+            "1. Write the feature.",
+            "1. Follow the repository imports and inspect existing call sites "
+            "to identify the reuse contract.",
+            1,
+        )
+        with self.assertRaisesRegex(V2PlanParseError, "repository discovery to the worker"):
+            parse(raw)
+
+    def test_aggressive_plan_splits_large_reasoning_steps(self) -> None:
+        raw = initial_plan(STEP).replace(
+            "EXECUTION_CLASS: MECHANICAL", "EXECUTION_CLASS: REASONING", 1,
+        ).replace(
+            "1. Write the feature.",
+            "\n".join(f"{number}. operation {number}" for number in range(1, 8)),
+            1,
+        )
+        with self.assertRaisesRegex(V2PlanParseError, "more than 6 reasoning operations"):
+            parse(raw)
+        self.assertEqual(
+            len(parse(raw, planning=PlanningConfig(decomposition="balanced")).steps), 1,
+        )
+        atomic = raw.replace(
+            "Write the feature lives in feature.txt; keep the surrounding conventions.",
+            "ATOMIC_SCOPE: This signature change and its existing callers must "
+            "change together to keep the intermediate tree valid.",
+            1,
+        )
+        self.assertEqual(len(parse(atomic).steps), 1)
+
     def test_instructions_must_be_a_numbered_operation_list(self) -> None:
         raw = initial_plan(STEP).replace("1. Write the feature.", "Write the feature", 1)
         with self.assertRaisesRegex(V2PlanParseError, "numbered concrete operations"):

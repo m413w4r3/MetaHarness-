@@ -59,13 +59,17 @@ class PlannerContinueFacts:
     diffstat: str = ""
     modified_paths: tuple[str, ...] = ()
     current_repository_context: str = ""
+    repository_web_url: str = ""
+    worktree_path: str = ""
+    current_head_sha: str = ""
     continuation_remaining: tuple[str, ...] = ()
     prior_iteration_remaining: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if any(not isinstance(getattr(self, name), str) for name in (
                 "spec", "milestone_title", "milestone_goal", "audit_status", "diffstat",
-                "current_repository_context")):
+                "current_repository_context", "repository_web_url", "worktree_path",
+                "current_head_sha")):
             raise ValueError("every text fact must be a string")
         if not self.spec.strip() or not isinstance(self.plan, TaskPlanV2):
             raise ValueError("spec and plan must be the run's own values")
@@ -143,7 +147,11 @@ def build_planner_continue_payload(
             ("BASELINE WARNINGS", _bullets(facts.gate_baseline_warnings)),
             ("DIFFSTAT SINCE BASE", facts.diffstat.strip() or "NONE"),
             ("MODIFIED PATHS", _bullets(facts.modified_paths))),
-        "repository": facts.current_repository_context.strip() or "NONE",
+        "repository": _labeled(
+            ("WEB URL", facts.repository_web_url or "UNAVAILABLE"),
+            ("LOCAL WORKTREE", facts.worktree_path or "UNAVAILABLE"),
+            ("CURRENT LOCAL HEAD SHA", facts.current_head_sha or "UNAVAILABLE"),
+            ("CURRENT TREE CONTEXT", facts.current_repository_context.strip() or "NONE")),
         "rules": render_safe_check_catalogue(check_catalog),
     }
     return build_prompt_payload(

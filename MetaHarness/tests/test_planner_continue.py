@@ -276,6 +276,19 @@ class PlannerContinueServiceTests(unittest.TestCase):
         for absent in ("logs", "worker_prompt", "worker_prompts", "transcript", "artifacts"):
             self.assertNotIn(absent, fields)
 
+    def test_replanning_identifies_the_current_local_candidate(self) -> None:
+        payload = build_planner_continue_payload(facts(
+            repository_web_url="https://github.com/example/project",
+            worktree_path="/tmp/run/worktree",
+            current_head_sha="a" * 40,
+            current_repository_context="### SOURCE: feature.py:1-5\ncurrent source",
+        ))
+        self.assertIn("WEB URL\nhttps://github.com/example/project", payload.rendered)
+        self.assertIn("LOCAL WORKTREE\n/tmp/run/worktree", payload.rendered)
+        self.assertIn("CURRENT LOCAL HEAD SHA\n" + "a" * 40, payload.rendered)
+        self.assertIn("CURRENT TREE CONTEXT\n### SOURCE: feature.py:1-5", payload.rendered)
+        self.assertIn("current commit may not have been", payload.rendered)
+
     def test_the_prompt_carries_the_run_policy_and_the_protocol_numbers(self) -> None:
         planning = PlanningConfig(max_steps_per_plan=4, execution_mode_policy="require-staged")
         payload = build_planner_continue_payload(

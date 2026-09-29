@@ -38,6 +38,14 @@ smallest edit and list them in CHANGED. A broken caller outside the scope is
 never a META CONTRACT MISMATCH. PITFALLS lists the mistakes this
 step must not make. DONE_WHEN states the observable completion conditions.
 
+Keep exploration bounded: read the listed anchors first, then only direct local
+imports needed to understand those named symbols. Do not chase transitive
+imports, search unrelated call sites, or map the surrounding subsystem. The
+contract must state the behavior to use; do not discover reuse rules, policy
+exceptions, provenance choices, or architectural ownership. If a required
+behavior or mutable path is missing, return BLOCKED with the exact contract gap
+instead of guessing or broadening the implementation.
+
 The ORIGINAL SPEC is the semantic authority, supplied inline or as a read-only
 file reference. The STEP CONTRACT defines the current work and path authority.
 Read only the SPEC definitions and invariants relevant to this step; do not

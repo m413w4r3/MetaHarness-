@@ -255,8 +255,15 @@ class RunComposition:
         if (exhausted := self.runtime.budget_exhausted(store)) is not None:
             raise BudgetExhausted(exhausted)
         head = current_head(ctx.info.worktree)
+        # Replanning needs the current tree, but not another full initial
+        # planning dossier. Keep the locator and its source excerpts bounded.
+        context_config = replace(
+            self.runtime.config.context,
+            max_hits=min(self.runtime.config.context.max_hits, 6),
+            max_bytes=min(self.runtime.config.context.max_bytes, 48_000),
+        )
         repository_context = render_context(build_context(
-            ctx.info.worktree, head, ctx.spec, self.runtime.config.context,
+            ctx.info.worktree, head, ctx.spec, context_config,
         ))
         context_path = ctx.run_dir / "iterations" / f"{ctx.iteration:02d}" / "repository-context.txt"
         atomic_write_text(context_path, repository_context)
@@ -303,6 +310,9 @@ class RunComposition:
             diffstat=diffstat_between_commits(ctx.info.worktree, ctx.base_sha, head),
             modified_paths=changed_paths_between_trees(ctx.info.worktree, ctx.base_tree_sha, tree),
             current_repository_context=repository_context,
+            repository_web_url=ctx.repository_reference.web_url or "",
+            worktree_path=str(ctx.info.worktree),
+            current_head_sha=head,
             continuation_remaining=tuple(state.get("iteration_remaining") or ()),
             prior_iteration_remaining=prior_remaining,
         )

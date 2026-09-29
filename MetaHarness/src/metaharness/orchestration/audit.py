@@ -43,6 +43,10 @@ from .pipeline_v2 import (
 from .publication import accepted_chain_records
 from .shared import read_json_artifact
 
+
+MAX_AUDIT_PROMPT_BYTES = 150_000
+MAX_AUDIT_FAILURE_DETAIL_BYTES = 8_000
+
 if TYPE_CHECKING:
     from .runtime import RunRuntime
 
@@ -140,13 +144,42 @@ class AuditService:
         records = {step["id"]: step for step in state.get("steps", []) if isinstance(step, dict) and "id" in step}
         for step in steps:
             records[step["id"]] = {**records.get(step["id"], {}), **step}
+        implementation_steps = cycle_dir(ctx.run_dir, cycle_plan.cycle) / "implementation/steps"
+        for step in cycle_plan.plan.steps:
+            step_directory = implementation_steps / step.id
+            record = read_json_artifact(step_directory / "step.json")
+            if isinstance(record, dict):
+                retained = {
+                    key: redact(str(record[key]), self.runtime.secrets)
+                    for key in ("status", "reason", "detail", "mismatch", "out_of_scope_paths")
+                    if key in record
+                }
+                final_path = step_directory / "agent.final.md"
+                if not final_path.is_file():
+                    attempt_finals = sorted((step_directory / "attempts").glob("*/agent.final.md"))
+                    if attempt_finals:
+                        final_path = attempt_finals[-1]
+                if final_path.is_file():
+                    retained["final"] = redact(
+                        _read_excerpt(str(final_path), limit=6_000), self.runtime.secrets,
+                    )
+                records[step.id] = {**records.get(step.id, {}), **retained}
         spec_path = directory / "spec.md"
         atomic_write_text(spec_path, ctx.spec)
         prompt_inputs = {
             "spec": ctx.spec, "plan": cycle_plan.plan, "steps": list(records.values()),
             "baseline": baseline if isinstance(baseline, dict) else {}, "gate": gate,
             "changed_paths": batch_changed_paths, "diff_base_tree": batch_base_tree,
-            "candidate_parent": parent, "prior_remaining": state.get("iteration_remaining", []),
+            "candidate_parent": parent,
+            "repository": {
+                "web_url": ctx.repository_reference.web_url,
+                "local_worktree": str(worktree),
+                "local_head": parent,
+                "candidate_tree": tree_before,
+                "candidate_has_uncommitted_changes": bool(status_porcelain(worktree)),
+                "candidate_remote_sha": None,
+                "candidate_remote_note": "The audited tree is local; no remote candidate SHA is asserted.",
+            },
             "hard_deny": self.runtime.config.scope.hard_deny,
             "file_refs": {
                 "spec": str(spec_path),
@@ -189,6 +222,12 @@ class AuditService:
                             "are preserved in this worktree. Inspect and complete them, then produce "
                             "the full audit report for the batch, including the preceding edits.") if index else "",
             )
+            if call_payload.total_bytes > MAX_AUDIT_PROMPT_BYTES:
+                raise PipelineFailure("AUDIT_CONTEXT_TOO_LARGE", {
+                    "prompt_bytes": call_payload.total_bytes,
+                    "maximum_bytes": MAX_AUDIT_PROMPT_BYTES,
+                    "reason": "SPEC and fixed audit instructions exceed the prompt ceiling",
+                })
             write_prompt_diagnostics(artifact_dir, call_payload)
             atomic_write_text(artifact_dir / "prompt.txt", call_payload.rendered)
             result = executor.run(AgentRunRequest(
@@ -314,7 +353,7 @@ def build_audit_payload(
     changed_paths: Sequence[str],
     diff_base_tree: str,
     candidate_parent: str,
-    prior_remaining: Sequence[str],
+    repository: Mapping[str, Any] | None = None,
     file_refs: Mapping[str, str],
     hard_deny: Sequence[str] = (),
     budget_bytes: int = 64_000,
@@ -322,7 +361,7 @@ def build_audit_payload(
     artifacts_readable: bool = False,
     candidate_diff: str = "",
 ) -> PromptPayload:
-    """Keep SPEC, milestone boundaries and check verdicts unabridged."""
+    """Build a focused audit request; dispatch enforces the absolute ceiling."""
 
     step_summaries = [
         {
@@ -332,49 +371,59 @@ def build_audit_payload(
                 "id",
                 "title",
                 "status",
-                "out_of_scope_paths",
                 "reason",
+                "detail",
+                "mismatch",
+                "changed_paths",
             )
             if key in step
         }
-        for step in steps
+        for step in steps[:30]
     ]
+    conclusion_budget = 16_000
+    for summary, step in zip(step_summaries, steps[:30], strict=True):
+        conclusion = step.get("final")
+        if isinstance(conclusion, str) and conclusion.strip() and conclusion_budget:
+            bounded = conclusion[:min(2_000, conclusion_budget)]
+            summary["implementation_conclusion"] = bounded
+            conclusion_budget -= len(bounded.encode("utf-8"))
+        for key in ("detail", "mismatch"):
+            value = summary.get(key)
+            if isinstance(value, str):
+                summary[key] = value[:1_000]
     batch = {
         "milestone_id": plan.milestone_id,
         "title": plan.milestone_title,
         "objective": plan.objective,
         "milestone_goal": plan.milestone_goal,
         "acceptance": plan.acceptance,
-        "constraints": plan.constraints,
-        "risks": plan.risks,
-        "project_remainder": plan.project_remainder,
-        "prior_iteration_remaining": list(prior_remaining),
         "diff_base_tree": diff_base_tree,
         "candidate_parent": candidate_parent,
-        "changed_paths": list(changed_paths),
+        "repository": dict(repository or {}),
+        "changed_paths": list(changed_paths[:200]),
+        "changed_paths_omitted": max(0, len(changed_paths) - 200),
         "file_refs": dict(file_refs) if artifacts_readable else {},
-        "hard_deny": list(hard_deny),
+        "hard_deny": list(hard_deny[:100]),
+        "hard_deny_omitted": max(0, len(hard_deny) - 100),
         "steps": step_summaries,
-        "failed_continue_steps": [
-            step for step in step_summaries
-            if str(step.get("status", "")).casefold() in {
-                "failed_continued", "skipped_dependency",
-            }
-        ],
+        "steps_omitted": max(0, len(steps) - 30),
     }
-    if not artifacts_readable:
-        batch["approved_step_contracts"] = [
-            {key: getattr(step, key) for key in (
-                "id", "title", "context", "read_set", "write_set", "create_set", "delete_set",
-                "instructions", "interfaces", "examples", "tests", "pitfalls", "done_when", "verify",
-            )}
-            for step in plan.steps
-        ]
-    summary = _summary(gate, ("passed", "failures", "warnings"), compact=artifacts_readable)
+    # Keep the exact gate verdict and bounded IDs inline. Full evidence stays
+    # in referenced artifacts for a local auditor to inspect on demand.
+    summary = {
+        "passed": bool(gate.get("passed")),
+        "failures_count": len(gate.get("failures", ())),
+        "failures": [str(item)[:300] for item in gate.get("failures", ())[:20]],
+        "failures_omitted": max(0, len(gate.get("failures", ())) - 20),
+        "warnings_count": len(gate.get("warnings", ())),
+        "warnings": [str(item)[:300] for item in gate.get("warnings", ())[:8]],
+        "warnings_omitted": max(0, len(gate.get("warnings", ())) - 8),
+    }
     summary["checks"] = [
-        _summary(check, ("id", "exit_code", "failure_kind", "skipped_reason", "stdout_log", "stderr_log"), compact=artifacts_readable)
-        for check in gate.get("checks", [])
+        _summary(check, ("id", "exit_code", "failure_kind", "skipped_reason", "stdout_log", "stderr_log"), compact=True)
+        for check in gate.get("checks", [])[:20]
     ]
+    summary["checks_omitted"] = max(0, len(gate.get("checks", ())) - 20)
     summary["baseline"] = [
         _summary(check, (
                 "id",
@@ -383,18 +432,19 @@ def build_audit_payload(
                 "candidate_status",
                 "new_failure_ids",
                 "warning",
-            ), compact=artifacts_readable)
+        ), compact=True)
         for check in baseline.get("checks", [])
         if isinstance(check, Mapping)
-    ]
+    ][:20]
+    summary["baseline_checks_omitted"] = max(0, len(baseline.get("checks", ())) - 20)
     details = "\n\n".join(
         str(check.get("id", "")) + "\n" + check["failure_excerpt"]
         for check in gate.get("checks", [])
         if check.get("failure_excerpt")
     )
     detail_bytes = details.encode("utf-8")
-    if artifacts_readable and len(detail_bytes) > 4_000:
-        details = detail_bytes[:4_000].decode("utf-8", "ignore") + "\n[read referenced logs for remaining failure details]"
+    if len(detail_bytes) > MAX_AUDIT_FAILURE_DETAIL_BYTES:
+        details = detail_bytes[:MAX_AUDIT_FAILURE_DETAIL_BYTES].decode("utf-8", "ignore") + "\n[remaining failure details in referenced gate artifacts]"
 
     def encode(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, indent=2, default=str)
@@ -402,17 +452,18 @@ def build_audit_payload(
     sections = (
         PromptSection.create("spec", file_authority(spec, file_refs["spec"]) if artifacts_readable and file_refs.get("spec") else spec, True),
         PromptSection.create("batch", encode(batch), True),
-        PromptSection.create("handoff", handoff, True),
-        PromptSection.create("gate", encode(summary), True),
+        PromptSection.create("handoff", handoff[:2_000], False),
+        PromptSection.create("gate", encode(summary), False),
         PromptSection.create("failure_details", details, not artifacts_readable),
-        PromptSection.create("candidate_diff", candidate_diff if not artifacts_readable else "", True),
+        PromptSection.create("candidate_diff", candidate_diff if not artifacts_readable else "", False),
         PromptSection.create("artifact_access", (
             "Local artifacts are readable. Use the referenced diff.patch if Git is unavailable; "
             "select relevant hunks. Gate diagnostics show counts and bounded samples: read "
             "referenced evidence and baseline fields for omitted failures. Never treat omissions as passes."
             if artifacts_readable else
-            "This is an external audit with repository access only. SPEC, approved contracts, "
-            "gate and baseline facts and failure excerpts are inline. Local harness artifacts "
+            "This is an external audit with repository access only. SPEC, milestone objectives, "
+            "implementation conclusions, changed paths, and compact gate facts are inline. "
+            "Local harness artifacts "
             "and log paths are unavailable; do not attempt to read them. Inspect repository source "
             "and the supplied Git object identities directly."
         ), True),
@@ -433,8 +484,8 @@ def build_audit_payload(
             "{{ARTIFACT_ACCESS}}": "artifact_access",
             "{{CANDIDATE_DIFF}}": "candidate_diff",
         },
-        budget_bytes=budget_bytes,
-        secondary_order=("failure_details",),
+        budget_bytes=min(MAX_AUDIT_PROMPT_BYTES, budget_bytes) if budget_bytes else MAX_AUDIT_PROMPT_BYTES,
+        secondary_order=("candidate_diff", "failure_details", "gate", "handoff"),
     )
 
 
@@ -469,12 +520,26 @@ def parse_audit_report(message: str) -> AuditReport | None:
             return None
         index += 2
         items: list[str] = []
-        while index < len(block) and block[index].startswith("- "):
-            item = block[index][2:].strip()
-            if not item:
+        continuation_lines = 0
+        while index < len(block) and block[index] != "" and block[index] not in {
+            "FIXED", "REFACTORED", "REMAINING", "RISKS",
+        }:
+            line = block[index]
+            if line.startswith("- "):
+                item = line[2:].strip()
+                if not item:
+                    return None
+                if item != "none":
+                    items.append(item)
+            elif line[:1].isspace() and items and len(line) <= 1_000:
+                # Recover ordinary wrapped bullets without making arbitrary
+                # prose or malformed section boundaries part of the report.
+                continuation_lines += 1
+                if continuation_lines > 50:
+                    return None
+                items[-1] = (items[-1] + " " + line.strip())[:2_000]
+            else:
                 return None
-            if item != "none":
-                items.append(item)
             index += 1
         if not items and (index == 0 or block[index - 1] != "- none"):
             return None

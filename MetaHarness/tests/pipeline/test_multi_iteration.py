@@ -363,7 +363,7 @@ class MultiIterationTests(PipelineHarness):
         )
         self.workers.on(
             ExecutionRole.IMPLEMENTER,
-            mismatch, mismatch, mismatch, write("feature.txt", "good\n"),
+            mismatch, write("feature.txt", "good\n"),
             write("aux.txt", "repaired\n"),
         )
         self.workers.on(
@@ -380,12 +380,17 @@ class MultiIterationTests(PipelineHarness):
         self.assertEqual(result.status, RunStatus.COMMITTED, result.state.get("failure"))
         request = json.loads((self.run_dir() / "iterations/01/planner-continue/request.json").read_text())
         self.assertIn("S01:", request["facts"]["plan"])
+        self.assertIn("LOCAL WORKTREE\n", request["facts"]["repository"])
+        self.assertIn("CURRENT LOCAL HEAD SHA\n", request["facts"]["repository"])
+        self.assertIn("CURRENT TREE CONTEXT\n", request["facts"]["repository"])
         self.assertIn(
             "S01: AGENT_CONTRACT_MISMATCH — The approved step instructions were not met.",
             request["facts"]["plan"],
         )
         audit_prompt = next(call.prompt for call in self.workers.calls if call.role is ExecutionRole.AUDITOR)
-        self.assertIn("failed_continue_steps", audit_prompt)
+        self.assertIn('"status": "FAILED_CONTINUED"', audit_prompt)
+        self.assertIn('"reason": "AGENT_CONTRACT_MISMATCH"', audit_prompt)
+        self.assertIn('"implementation_conclusion"', audit_prompt)
 
     def test_resume_at_m02_implementation_replays_only_that_step(self) -> None:
         self.workers.on(

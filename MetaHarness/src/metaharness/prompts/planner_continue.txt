@@ -19,6 +19,11 @@ NEXT
 When a step failed or was skipped, read its detail: replan the same work so
 that the failure cannot recur (widen the step to the broken call sites,
 merge dependent steps) instead of repeating the failed contract.
+For AGENT_CONTRACT_MISMATCH caused by a required path outside WRITE_SET,
+resolve that path and its contract first. If the dependency can be made ready
+independently, give it a preceding step and make the original step depend on
+that result. Include the exact existing symbol and behavior in each worker
+contract; do not send workers to discover the architecture again.
 SPEC_DECISION
 - one product choice the SPEC does not authorize is genuinely blocking, and no
   milestone can be planned around it;
@@ -30,6 +35,11 @@ claim COMPLETE while REMAINING or the gate names real work.
 Treat PROJECT_REMAINDER and unresolved FAILED_CONTINUED steps as real work.
 Use CURRENT REPOSITORY CONTEXT for the tree at current HEAD; the original run
 context describes only the starting tree.
+The WEB URL identifies the repository, but CURRENT LOCAL HEAD SHA and LOCAL
+WORKTREE identify the updated candidate. The current commit may not have been
+pushed, so do not treat the remote URL as proof of its contents. Use the
+current tree evidence and the failed step detail when replanning; resolve any
+missing repository contract before assigning a new WRITE_SET.
 
 Answer with exactly this protocol, with no prose and no code fences.
 
@@ -89,8 +99,14 @@ iteration.
 A REASONING or AGENTIC step carries exactly one responsibility: when its
 INSTRUCTIONS cover several independent concerns (for example a hash, a
 reference scheme and a timeline), split them into separate steps. Target
-about 4000 characters for REASONING and AGENTIC contracts; the upper part of
-the range is for MECHANICAL steps and atomic call-site lists.
+at most 6 numbered operations for REASONING and AGENTIC steps. A genuinely
+atomic change with 7 to 12 operations needs an `ATOMIC_SCOPE:` line in CONTEXT
+explaining why splitting it would break an intermediate repository state.
+Target about 4000 characters for these contracts; the upper part of the range
+is for MECHANICAL steps and atomic call-site lists.
+Shared source or test files do not justify merging independent responsibilities.
+Separate independently validated domain objects, and separate structural
+validation from serialization when each can pass a targeted check alone.
 A milestone delivers one subject. Two independent subjects are two
 milestones: plan the first and name the second in PROJECT_REMAINDER.
 Keep premium audit work bounded: persistence, reuse/revision, workflow cutover,
@@ -114,6 +130,9 @@ TESTS names the behaviors to pin. PITFALLS lists what a low-cost executor gets
 wrong. DONE_WHEN and VERIFY are observable. Each step uses at most
 {{MAX_READ_PATHS_PER_STEP}} unique READ_SET paths written as
 `- relative/path :: exact symbol`, with no wildcards and no absolute paths.
+For deterministic serialization, specify canonical UUID/date/enum wire forms
+and tests that reject noncanonical forms. VERIFY should name only focused
+checks for that step; the harness owns the repository-wide gates.
 EXECUTION_CLASS is MECHANICAL, REASONING or AGENTIC, chosen from the difficulty
 of the step.
 

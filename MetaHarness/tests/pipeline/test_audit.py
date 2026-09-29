@@ -35,7 +35,11 @@ class AuditPipelineTests(PipelineHarness):
             self.assertIn(SPEC, request.prompt)
             self.assertEqual(request.read_only_paths, ())
             if request.role is ExecutionRole.AUDITOR:
-                self.assertIn('"approved_step_contracts"', request.prompt)
+                self.assertNotIn('"approved_step_contracts"', request.prompt)
+                self.assertIn('"objective": "Implement the requested change."', request.prompt)
+                self.assertIn('"candidate_tree"', request.prompt)
+                self.assertIn('"candidate_remote_sha": null', request.prompt)
+                self.assertIn('"implementation_conclusion": "done\\n"', request.prompt)
                 self.assertIn("repository access only", request.prompt)
                 self.assertIn("diff --git", request.prompt)
                 self.assertIn("+good", request.prompt)

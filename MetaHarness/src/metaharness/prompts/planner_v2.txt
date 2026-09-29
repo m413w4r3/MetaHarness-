@@ -13,6 +13,18 @@ complete answer. READ_SET is not a repository survey: include a file only if
 the worker must inspect it for this step, using the narrowest useful symbol or
 anchor. Direct local imports needed by a named symbol may be included.
 
+Resolve implementation dependencies before writing the contract. When a step
+must use an existing service, repository, policy, allowlist or schema, use the
+available repository context/reference to confirm the named contract supports
+the requested case. Name its exact symbol and behavior in CONTEXT or INTERFACES.
+If that contract must change, put its owner path in a prerequisite step's
+WRITE_SET and make the consumer depend on that step. Never ask the worker to
+"follow imports", find call sites, discover reuse rules, choose provenance
+fields, or determine which layers need changes. If targeted repository evidence
+does not establish the contract, do not invent it: make the smallest bounded
+step that resolves that boundary, or BLOCKED only when the SPEC leaves a product
+decision open. Do not compensate with a broad READ_SET or repository survey.
+
 DECOMPOSITION
 ONE STEP = ONE TESTABLE, COHERENT UNIT.
 - 1 to 3 mutable paths by default (the union of WRITE_SET, CREATE_SET and
@@ -24,6 +36,11 @@ Split as soon as two modifications require two independent reasonings. Never
 merge two concerns just to reduce STEP_COUNT, and never split a genuinely
 atomic transformation to make steps look smaller. Tests directly coupled to a
 local transformation stay in that step.
+Sharing one source file or test file is not a reason to merge concerns. For
+example, independently validated indicators, source metadata and uncertainty
+records belong in separate steps even if all live in one domain module. Keep
+structural validation separate from a JSON codec when each can be verified on
+its own. DEPENDS_ON may connect steps that extend the same types in sequence.
 A step may exceed the default mutable scope only when a truly atomic
 transformation requires it; CONTEXT must then explain that atomicity. Never
 return BLOCKED for scope size, and never ask a worker to discover a solution.
@@ -45,8 +62,11 @@ iteration.
 A REASONING or AGENTIC step carries exactly one responsibility: when its
 INSTRUCTIONS cover several independent concerns (for example a hash, a
 reference scheme and a timeline), split them into separate steps. Target
-about 4000 characters for REASONING and AGENTIC contracts; the upper part of
-the range is for MECHANICAL steps and atomic call-site lists.
+at most 6 numbered operations for REASONING and AGENTIC steps. If one
+genuinely atomic change requires 7 to 12 operations, add an `ATOMIC_SCOPE:`
+line in CONTEXT explaining why it cannot leave the repository valid if split.
+Target about 4000 characters for these contracts; the upper part of the range
+is for MECHANICAL steps and atomic call-site lists.
 A milestone delivers one subject. Two independent subjects are two
 milestones: plan the first and name the second in PROJECT_REMAINDER.
 Keep premium audit work bounded: persistence, reuse/revision, workflow cutover,
@@ -84,15 +104,24 @@ same requirement in multiple fields. The worker reads its READ_SET locally.
 - EXAMPLES: one reduced excerpt only if it removes ambiguity; otherwise NONE.
 - TESTS: the tests to create or modify, and the behaviors and edge cases they
   must pin.
+- For deterministic serialization, name canonical wire forms for UUIDs, dates
+  and enums in INTERFACES; TESTS must reject noncanonical input forms that
+  would change when read and written again.
 - PITFALLS: the mistakes a low-cost executor typically makes on this step.
 - DONE_WHEN: the observable conditions that end the step.
 - VERIFY: targeted commands or short observations. The worker is never obliged
   to prove it ran them; MetaHarness owns the authoritative gate.
+  Include only checks focused on this step. Do not repeat full lint, typecheck,
+  integration or frontend suites in every step's VERIFY; the harness runs the
+  configured repository-wide checks at its own boundaries.
 
 Each step uses at most {{MAX_READ_PATHS_PER_STEP}} unique READ_SET paths;
 repeated anchors on one path count once. Use exact repo-relative non-wildcard
 paths. A worker may read only applicable instructions, its READ_SET and direct
-local imports needed by named symbols.
+local imports needed to understand named symbols. This import allowance is for
+contract confirmation only: do not chase transitive imports or search unrelated
+call sites. If implementation requires another behavior or mutable path, the
+planner must declare it in this step or a prerequisite before execution.
 
 EXECUTION_CLASS is a harness routing category chosen from the difficulty of
 the step, never from a provider or model name. Never name a provider, a model

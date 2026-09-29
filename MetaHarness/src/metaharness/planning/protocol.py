@@ -45,6 +45,14 @@ MAX_STEP_CONTRACT_CHARS = 9_000
 # Canonical layout of the approved step contracts, written at planning time
 # and executed byte-for-byte: ``steps/<STEP>/contract.md``.
 STEP_CONTRACT_NAME = "contract.md"
+_WORKER_DISCOVERY = re.compile(
+    r"^\d+[.)]\s*(?:"
+    r"follow\b[^\n.]{0,180}\bimports\b"
+    r"|inspect\b[^\n.]{0,180}\b(?:repository|call sites)\b"
+    r"[^\n.]{0,180}\b(?:identify|determine|discover)\b"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 _HEADER = "META PLAN v2"
 _END = "END META PLAN"
@@ -212,10 +220,29 @@ def render_step_contract(plan: TaskPlanV2, step: ImplementationStep) -> str:
     return rendered
 
 
-def validate_step_contract_bounds(plan: TaskPlanV2) -> None:
+def validate_step_contract_bounds(
+    plan: TaskPlanV2, *, planning: PlanningConfig | None = None,
+) -> None:
     contracts = [_render_step_contract_unchecked(plan, step) for step in plan.steps]
     if any(len(contract) > plan.max_step_contract_chars for contract in contracts):
         raise V2PlanParseError("step contract exceeds MAX_STEP_CONTRACT_CHARS")
+    for step in plan.steps:
+        if _WORKER_DISCOVERY.search(step.instructions):
+            raise V2PlanParseError(
+                f"step {step.id} assigns repository discovery to the worker; "
+                "resolve the dependency in the plan and name its contract"
+            )
+        if (
+            planning is not None
+            and planning.decomposition == "aggressive"
+            and step.execution_class in {ExecutionClass.REASONING, ExecutionClass.AGENTIC}
+            and len(re.findall(r"^\d+\.\s", step.instructions, re.MULTILINE)) > 6
+            and not re.search(r"(?m)^ATOMIC_SCOPE:\s*\S.{49,}$", step.context)
+        ):
+            raise V2PlanParseError(
+                f"step {step.id} has more than 6 reasoning operations; "
+                "split independent work or explain the atomic scope in CONTEXT"
+            )
 
 
 def _parse_required_checks(
@@ -423,7 +450,7 @@ def parse_task_plan_v2(
         milestone_goal=milestone_goal,
         project_remainder=project_remainder,
     )
-    validate_step_contract_bounds(plan)
+    validate_step_contract_bounds(plan, planning=planning)
     return plan
 
 

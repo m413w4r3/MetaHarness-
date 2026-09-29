@@ -565,6 +565,15 @@ class WorkerRecovery:
 
         failure.tree_after = before
         failure.index_tree_after = before
+        if reason == "AGENT_CONTRACT_MISMATCH":
+            # A mismatch describes a contradiction in the approved contract,
+            # not a transient execution failure.  The exact rollback above
+            # makes it safe to move on to the independent steps and let the
+            # iteration's audit/planner continuation revise the contract.
+            # Replanning is the recovery path; swapping executors cannot make
+            # an impossible approved scope or missing prerequisite executable.
+            failure.step_dir = artifact_dir
+            return None
         if reason == "EXTERNAL_AUTH_REQUIRED":
             # The same credentials can never succeed: an external change is due.
             failure.step_dir = artifact_dir
