@@ -100,7 +100,7 @@ class CommitPathStructureTests(unittest.TestCase):
                     self.assertIsNotNone(gate, f"{function.name} commits without the safety gate")
                     self.assertLess(gate, first, function.name)
         self.assertEqual(found, {
-            "commit_step_tree": ["step_acceptance.py:_accept_v2_step_tree"],
+            "commit_step_tree": ["step_execution.py:_accept_v2_step_tree"],
         })
 
 

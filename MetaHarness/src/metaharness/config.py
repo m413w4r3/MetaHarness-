@@ -200,17 +200,6 @@ def _positive_int(data: Mapping[str, Any], key: str, default: int, where: str) -
     return value
 
 
-def _nonnegative_int(
-    data: Mapping[str, Any], key: str, default: int, where: str
-) -> int:
-    value = data.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigError(f"{where}.{key} must be an integer")
-    if value < 0:
-        raise ConfigError(f"{where}.{key} must not be negative")
-    return value
-
-
 def _bool(data: Mapping[str, Any], key: str, default: bool, where: str) -> bool:
     value = data.get(key, default)
     if not isinstance(value, bool):

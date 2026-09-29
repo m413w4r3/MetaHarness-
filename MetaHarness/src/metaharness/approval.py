@@ -421,35 +421,25 @@ def compute_plan_identity_from_run(run_dir: str | Path, *, iteration: int = 1) -
     )
 
 
-def _approval_payload(approval: PlanApproval, *, schema_version: int | None = None) -> dict[str, object]:
-    schema_version = schema_version or (
-        5 if approval.checks_sha256 is not None else
-        3 if approval.bundle_sha256 is not None else
-        2 if approval.execution_sha256 is not None else 1
-    )
-    return {
-        "schema_version": schema_version,
+def _approval_payload(approval: PlanApproval) -> dict[str, object]:
+    # Schema 1 remains the standalone approval API; schema 5 binds v4 authority.
+    payload = {
+        "schema_version": 5 if approval.checks_sha256 is not None else 1,
         "decision": approval.decision.value,
         "raw_sha256": approval.raw_sha256,
         "contract_sha256": approval.contract_sha256,
-        **(
-            {"execution_sha256": approval.execution_sha256}
-            if approval.execution_sha256 is not None or approval.bundle_sha256 is not None
-            else {}
-        ),
-        **(
-            {"bundle_sha256": approval.bundle_sha256}
-            if approval.bundle_sha256 is not None
-            else {}
-        ),
-        **(
-            {"checks_sha256": approval.checks_sha256}
-            if approval.checks_sha256 is not None
-            else {}
-        ),
         "created_at": approval.created_at,
         "source": approval.source,
     }
+    for field in ("execution_sha256", "bundle_sha256", "checks_sha256"):
+        value = getattr(approval, field)
+        if value is not None:
+            payload[field] = value
+    # A detached identity with execution artifacts still uses the current schema.
+    if approval.execution_sha256 is not None or approval.bundle_sha256 is not None:
+        payload["schema_version"] = 5
+        payload["checks_sha256"] = approval.checks_sha256
+    return payload
 
 
 def _publish_exclusive(path: Path, content: str) -> None:
@@ -545,19 +535,7 @@ def write_plan_approval(
         source=source,
     )
     directory = _run_path(run_dir)
-    schema_version = None
-    if normalized_decision is ApprovalDecision.APPROVE and identity.checks_sha256 is not None:
-        schema_version = 5
-    elif normalized_decision is ApprovalDecision.APPROVE and identity.execution_sha256 is not None and identity.bundle_sha256 is not None:
-        try:
-            selection_payload = json.loads(
-                (iteration_dir(directory, iteration) / "execution_selection.json").read_text(encoding="utf-8")
-            )
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ApprovalError("execution selection is missing or invalid") from exc
-        if isinstance(selection_payload, dict) and selection_payload.get("schema_version") == 4:
-            schema_version = 4
-    content = json.dumps(_approval_payload(approval, schema_version=schema_version), ensure_ascii=False, indent=2) + "\n"
+    content = json.dumps(_approval_payload(approval), ensure_ascii=False, indent=2) + "\n"
     _publish_exclusive(directory / _APPROVAL_FILENAME, content)
 
 
@@ -583,39 +561,17 @@ def read_plan_approval(
     if not isinstance(payload, dict):
         raise ApprovalError("approval JSON must contain an object")
     schema_version = payload.get("schema_version")
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in (1, 2, 3, 4, 5):
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in (1, 5):
         raise ApprovalError("approval schema_version is unsupported")
     required = ("decision", "raw_sha256", "contract_sha256", "created_at", "source")
     if any(field not in payload for field in required):
         raise ApprovalError("approval artifact is missing an essential field")
-    if schema_version == 2:
-        if "execution_sha256" not in payload:
-            raise ApprovalError("approval artifact is missing an essential field")
-        if "bundle_sha256" in payload:
-            raise ApprovalError("schema 2 approval contains a bundle hash")
-    elif schema_version in (3, 4):
-        if "execution_sha256" not in payload or "bundle_sha256" not in payload:
-            raise ApprovalError("approval artifact is missing an essential field")
-        if payload.get("execution_sha256") is None and payload.get("decision") != ApprovalDecision.REJECT.value:
-            raise ApprovalError("approved schema 3 decision must bind execution")
-    elif schema_version == 5:
-        if "checks_sha256" not in payload:
-            raise ApprovalError("schema 5 approval is missing the check authority hash")
-    elif "execution_sha256" in payload:
-        raise ApprovalError("historic approval contains an execution hash")
-    if schema_version not in (3, 4, 5) and "bundle_sha256" in payload:
-        raise ApprovalError("historic approval contains a bundle hash")
-    if schema_version != 5 and "checks_sha256" in payload:
-        raise ApprovalError("historic approval contains a check authority hash")
-    if schema_version == 4:
-        try:
-            selection_payload = json.loads(
-                (iteration_dir(_run_path(run_dir), iteration) / "execution_selection.json").read_text(encoding="utf-8")
-            )
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ApprovalError("execution selection is missing or invalid") from exc
-        if not isinstance(selection_payload, dict) or selection_payload.get("schema_version") != 4:
-            raise ApprovalError("schema 4 approval requires execution selection schema 4")
+    if schema_version == 5 and "checks_sha256" not in payload:
+        raise ApprovalError("schema 5 approval is missing the check authority hash")
+    if schema_version == 1 and any(
+        field in payload for field in ("execution_sha256", "bundle_sha256", "checks_sha256")
+    ):
+        raise ApprovalError("standalone approval contains an authority hash")
     try:
         approval = PlanApproval(
             decision=ApprovalDecision(payload["decision"]),
@@ -631,32 +587,22 @@ def read_plan_approval(
         if isinstance(exc, ApprovalError):
             raise
         raise ApprovalError("approval artifact is invalid") from exc
-    if approval.execution_sha256 is not None:
+    directory = _run_path(run_dir)
+    artifacts = (
+        ("execution_sha256", iteration_dir(directory, iteration) / "execution_selection.json", "execution selection"),
+        ("bundle_sha256", iteration_plan_dir(directory, iteration) / "implementation_bundle.json", "implementation bundle"),
+        ("checks_sha256", directory / _CHECK_AUTHORITY_FILENAME, "check authority"),
+    )
+    for field, artifact, label in artifacts:
+        digest = getattr(approval, field)
+        if digest is None:
+            continue
         try:
-            execution_bytes = (
-                iteration_dir(_run_path(run_dir), iteration) / "execution_selection.json"
-            ).read_bytes()
+            content = artifact.read_bytes()
         except OSError as exc:
-            raise ApprovalError("execution selection is missing") from exc
-        actual_execution = hashlib.sha256(execution_bytes).hexdigest()
-        if actual_execution != approval.execution_sha256:
-            raise ApprovalError("execution selection does not match approval")
-    if approval.bundle_sha256 is not None:
-        try:
-            bundle_bytes = (
-                iteration_plan_dir(_run_path(run_dir), iteration) / "implementation_bundle.json"
-            ).read_bytes()
-        except OSError as exc:
-            raise ApprovalError("implementation bundle is missing") from exc
-        if hashlib.sha256(bundle_bytes).hexdigest() != approval.bundle_sha256:
-            raise ApprovalError("implementation bundle does not match approval")
-    if approval.checks_sha256 is not None:
-        try:
-            checks_bytes = (_run_path(run_dir) / _CHECK_AUTHORITY_FILENAME).read_bytes()
-        except OSError as exc:
-            raise ApprovalError("check authority is missing") from exc
-        if hashlib.sha256(checks_bytes).hexdigest() != approval.checks_sha256:
-            raise ApprovalError("check authority does not match approval")
+            raise ApprovalError(f"{label} is missing") from exc
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise ApprovalError(f"{label} does not match approval")
     if (
         approval.raw_sha256 != expected_identity.raw_sha256
         or approval.contract_sha256 != expected_identity.contract_sha256
@@ -672,8 +618,6 @@ def read_plan_approval(
             expected_identity.checks_sha256 is not None
             and approval.checks_sha256 != expected_identity.checks_sha256
         )
-        or (expected_identity.execution_sha256 is None and approval.execution_sha256 is not None
-            and schema_version not in (2, 3, 4, 5))
         or (expected_identity.bundle_sha256 is None and approval.bundle_sha256 is not None)
         or (expected_identity.checks_sha256 is None and approval.checks_sha256 is not None)
     ):

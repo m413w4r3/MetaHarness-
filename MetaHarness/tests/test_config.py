@@ -174,7 +174,7 @@ class ConfigTests(unittest.TestCase):
             raw = tomllib.load(stream)
 
         checks = {check["id"]: check for check in raw["check_catalog"]}
-        self.assertEqual(raw["planning"]["max_steps_per_plan"], 6)
+        self.assertEqual(raw["planning"]["max_steps_per_plan"], 21)
         self.assertIn("test-collection", raw["gate"]["per_step"])
         self.assertEqual(raw["prompt_budget"]["audit_max_bytes"], 64_000)
         self.assertIn("--collect-only", checks["test-collection"]["argv"])

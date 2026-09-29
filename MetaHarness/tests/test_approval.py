@@ -13,7 +13,6 @@ from metaharness import approval as approval_module  # noqa: E402
 from metaharness.approval import (  # noqa: E402
     ApprovalDecision,
     ApprovalError,
-    PlanIdentity,
     compute_plan_identity,
     compute_plan_identity_from_run,
     read_check_authority,
@@ -71,6 +70,7 @@ class ApprovalTests(unittest.TestCase):
     def test_invalid_or_wrong_approval_fails_closed(self) -> None:
         cases = (
             {"schema_version": 2},
+            {"schema_version": 5.0},
             {"schema_version": 1, "decision": "MAYBE"},
             {"schema_version": 1, "decision": "APPROVE", "raw_sha256": "bad"},
             {

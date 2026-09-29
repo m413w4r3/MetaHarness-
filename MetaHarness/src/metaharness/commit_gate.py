@@ -29,12 +29,7 @@ from .gitops import (
 # Stable reasons of one refused commit.  The human message stays detailed;
 # recovery and diagnostics reason on the code, never on the message text.
 COMMIT_GATE_FAILED = "COMMIT_GATE_FAILED"
-COMMIT_SCOPE_VIOLATION = "COMMIT_SCOPE_VIOLATION"
-COMMIT_PARENT_MISMATCH = "COMMIT_PARENT_MISMATCH"
-COMMIT_TREE_MISMATCH = "COMMIT_TREE_MISMATCH"
-COMMIT_WORKTREE_DRIFT = "COMMIT_WORKTREE_DRIFT"
 COMMIT_SECURITY_FAILURE = "COMMIT_SECURITY_FAILURE"
-COMMIT_VERIFICATION_FAILURE = "COMMIT_VERIFICATION_FAILURE"
 
 
 class CommitSafetyError(GitError):
@@ -185,9 +180,9 @@ def step_verification(
     """
 
     if isinstance(reported_status, str) and reported_status.casefold() in {"failed", "fail", "red"}:
-        raise CommitSafetyError("step VERIFY did not pass", code=COMMIT_VERIFICATION_FAILURE)
+        raise CommitSafetyError("step VERIFY did not pass", code=COMMIT_GATE_FAILED)
     if _VERIFY_FAILED.search(final_report) and not _ENVIRONMENT_VERIFY_FAILED.search(final_report):
-        raise CommitSafetyError("step VERIFY did not pass", code=COMMIT_VERIFICATION_FAILURE)
+        raise CommitSafetyError("step VERIFY did not pass", code=COMMIT_GATE_FAILED)
     if not deferred_requested:
         return StepVerification("passed")
     try:
@@ -195,11 +190,11 @@ def step_verification(
             final_report, current_step_id=step_id, future_step_ids=future_step_ids,
         )
     except CommitSafetyError as exc:
-        raise CommitSafetyError(str(exc), code=COMMIT_VERIFICATION_FAILURE) from exc
+        raise CommitSafetyError(str(exc), code=COMMIT_GATE_FAILED) from exc
     if deferred is None:
         raise CommitSafetyError(
             "a deferred step must provide the explicit DEFERRED VERIFY DEPENDENCY contract",
-            code=COMMIT_VERIFICATION_FAILURE,
+            code=COMMIT_GATE_FAILED,
         )
     return StepVerification("deferred", deferred)
 
@@ -227,14 +222,14 @@ def commit_safety_gate(
 
     root = Path(worktree).expanduser().resolve()
     if verification_status not in {"passed", "deferred"}:
-        raise CommitSafetyError("verification did not pass", code=COMMIT_VERIFICATION_FAILURE)
+        raise CommitSafetyError("verification did not pass", code=COMMIT_GATE_FAILED)
     if not security_passed:
         raise CommitSafetyError("security gate did not pass", code=COMMIT_SECURITY_FAILURE)
     if current_head(root) != parent_sha:
-        raise CommitSafetyError("parent HEAD changed before commit", code=COMMIT_PARENT_MISMATCH)
+        raise CommitSafetyError("parent HEAD changed before commit", code=COMMIT_GATE_FAILED)
     if index_tree_sha(root) != tree_sha or candidate_tree_sha(root) != tree_sha:
         raise CommitSafetyError(
-            "working tree or index differs from the accepted tree", code=COMMIT_TREE_MISMATCH,
+            "working tree or index differs from the accepted tree", code=COMMIT_GATE_FAILED,
         )
     # A candidate is normally staged before this gate.  Staged changes are
     # intentional; only an unstaged worktree or an untracked path means that
@@ -245,7 +240,7 @@ def commit_safety_gate(
     )
     if dirty:
         raise CommitSafetyError(
-            "worktree has unstaged or untracked changes", code=COMMIT_WORKTREE_DRIFT,
+            "worktree has unstaged or untracked changes", code=COMMIT_GATE_FAILED,
         )
     parent_tree = resolve_tree(root, parent_sha)
     changed = tuple(changed_paths_between_trees(root, parent_tree, tree_sha))
@@ -254,7 +249,7 @@ def commit_safety_gate(
         unexpected = [path for path in changed if path not in allowed]
         raise CommitSafetyError(
             "mutable scope violation: " + ", ".join(unexpected[:20]),
-            code=COMMIT_SCOPE_VIOLATION, paths=unexpected[:20],
+            code=COMMIT_GATE_FAILED, paths=unexpected[:20],
         )
     failures = scan_staged_security(
         root, secrets=secrets, max_diff_bytes=max_diff_bytes,
@@ -273,13 +268,13 @@ def commit_safety_gate(
         if not reason or not dependents or not contract:
             raise CommitSafetyError(
                 "deferred verification requires reason, dependent_step_ids and command/contract",
-                code=COMMIT_VERIFICATION_FAILURE,
+                code=COMMIT_GATE_FAILED,
             )
         deferred = DeferredVerification(reason[:2048], dependents, contract[:4096])
     elif any((deferred_reason, tuple(dependent_step_ids), deferred_command_or_contract)):
         raise CommitSafetyError(
             "deferred metadata is present for a passed verification",
-            code=COMMIT_VERIFICATION_FAILURE,
+            code=COMMIT_GATE_FAILED,
         )
     return CommitSafetyResult(
         parent_sha=parent_sha,

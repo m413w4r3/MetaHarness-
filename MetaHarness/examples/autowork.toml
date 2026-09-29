@@ -16,7 +16,7 @@ execution_mode_policy = "auto"
 
 single_step_max_mutable_paths = 6
 staged_step_max_mutable_paths = 12
-max_steps_per_plan = 6
+max_steps_per_plan = 21
 max_read_paths_per_step = 18
 max_step_contract_chars = 8500
 
@@ -83,7 +83,7 @@ reasoning_profile = "codex-luna-xhigh"
 agentic_profile = "codex-deepseek-flash-max"
 
 [approval]
-require_plan_approval = true
+require_plan_approval = false
 poll_interval_seconds = 0.5
 
 [ui]

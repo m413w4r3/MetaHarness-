@@ -2,14 +2,11 @@
 
 from .auth import CodexAuthStatus, check_codex_authentication
 from .base import (
-    AGENT_PROTOCOL_FAILED,
-    AGENT_RATE_LIMITED,
+    AGENT_RUNTIME_FAILED,
     AGENT_AUTH_FAILURE,
     AGENT_GIT_VIOLATION,
     AGENT_SCOPE_REQUEST,
-    AGENT_RUNTIME_FAILED,
     AGENT_SCOPE_VIOLATION,
-    AGENT_START_FAILED,
     AGENT_TIMEOUT,
     AgentError,
     AgentExecutor,
@@ -44,7 +41,7 @@ from .events import extract_final, extract_usage, parse_event
 from .runtime import CodexRuntimeError, prepare_codex_home
 
 __all__ = [
-    "AGENT_RATE_LIMITED",
+    "AGENT_RUNTIME_FAILED",
     "AgentCommittedError",
     "AgentError",
     "AgentExecutor",
@@ -54,13 +51,10 @@ __all__ = [
     "AgentRunRequest",
     "AgentRunResult",
     "AgentScopeError",
-    "AGENT_PROTOCOL_FAILED",
     "AGENT_AUTH_FAILURE",
     "AGENT_GIT_VIOLATION",
     "AGENT_SCOPE_REQUEST",
-    "AGENT_RUNTIME_FAILED",
     "AGENT_SCOPE_VIOLATION",
-    "AGENT_START_FAILED",
     "AGENT_TIMEOUT",
     "ClaudeCodeExecutor",
     "CodexAuthStatus",

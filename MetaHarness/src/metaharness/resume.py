@@ -175,7 +175,8 @@ def _approved_plan_waiting(run_dir: str | Path, state: Mapping[str, Any], checkp
     if (
         checkpoint is None
         or checkpoint.phase is not RunPhase.PLAN_APPROVAL
-        or state.get("status") != "awaiting_plan_approval"
+        or (state.get("disposition") != RunDisposition.RUNNING.value
+            and state.get("status") != "running")
         or state.get("planning_protocol") != "v2"
     ):
         return False

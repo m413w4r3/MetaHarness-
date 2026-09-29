@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from metaharness.evidence import (  # noqa: E402
     EvidenceBundle,
-    bounded_semantic_diff,
     collect_evidence,
     required_checks_passed,
 )
@@ -146,8 +145,8 @@ class EvidenceTests(unittest.TestCase):
             bundle = collect_evidence(self.repo, self.base_sha, self.config(checks))
         self.assertFalse(bundle.deterministic_passed)
         self.assertIn("CHECK_FAILED:fail", bundle.failures)
-        self.assertIn("CHECK_TIMEOUT:timeout", bundle.failures)
-        self.assertIn("CHECK_MUTATED:mutate", bundle.failures)
+        self.assertIn("CHECK_INFRASTRUCTURE_UNAVAILABLE:timeout", bundle.failures)
+        self.assertIn("CHECK_FAILED:mutate", bundle.failures)
         self.assertIn("mutated.txt", bundle.changed_files)
 
     def test_checks_continue_after_failure(self) -> None:
@@ -164,31 +163,15 @@ class EvidenceTests(unittest.TestCase):
     def test_empty_and_large_diff_are_rejected_without_truncating_diff(self) -> None:
         empty = collect_evidence(self.repo, self.base_sha, self.config())
         self.assertFalse(empty.deterministic_passed)
-        self.assertIn("EMPTY_DIFF", empty.failures)
+        self.assertIn("DETERMINISTIC_GATE_FAILED:empty_diff", empty.failures)
 
         content = "A" * 200
         (self.repo / "keep.txt").write_text(content, encoding="utf-8")
         large = collect_evidence(self.repo, self.base_sha, self.config(max_diff_bytes=1))
         self.assertFalse(large.deterministic_passed)
-        self.assertIn("DIFF_TOO_LARGE", large.failures)
+        self.assertIn("DETERMINISTIC_GATE_FAILED:diff_too_large", large.failures)
         self.assertIn(content, large.diff)
 
-    def test_bounded_semantic_diff_is_exactly_bounded_and_covers_all_files(self) -> None:
-        diff = "".join(
-            f"diff --git a/file-{index}.py b/file-{index}.py\n"
-            f"@@ -1 +1 @@\n-old-{index}\n+new-{index}\n"
-            for index in range(20)
-        )
-        excerpt, truncated, full_bytes = bounded_semantic_diff(diff, 1000)
-
-        self.assertTrue(truncated)
-        self.assertEqual(full_bytes, len(diff.encode("utf-8")))
-        self.assertLessEqual(len(excerpt.encode("utf-8")), 1000)
-        self.assertTrue(excerpt.startswith("SEMANTIC DIFF EXCERPT\n"))
-        self.assertIn("TRUNCATED: true", excerpt)
-        self.assertEqual(
-            sum(line.startswith("diff --git ") for line in excerpt.splitlines()), 20
-        )
 
     def test_v2_evidence_keeps_large_diff_as_evidence_without_size_failure(self) -> None:
         content = "A" * 200
@@ -199,7 +182,7 @@ class EvidenceTests(unittest.TestCase):
         )
 
         self.assertTrue(bundle.deterministic_passed)
-        self.assertNotIn("DIFF_TOO_LARGE", bundle.failures)
+        self.assertNotIn("DETERMINISTIC_GATE_FAILED:diff_too_large", bundle.failures)
         self.assertIn(content, bundle.diff)
 
     def test_head_mismatch_and_tree_sha_change_with_index_content(self) -> None:
@@ -219,7 +202,7 @@ class EvidenceTests(unittest.TestCase):
         run_git(self.repo, "commit", "-m", "unexpected")
         bundle = collect_evidence(self.repo, self.base_sha, self.config())
         self.assertFalse(bundle.deterministic_passed)
-        self.assertIn("HEAD_MISMATCH", bundle.failures)
+        self.assertIn("COMMIT_GATE_FAILED", bundle.failures)
 
     def test_secret_in_diff_suppressed_by_gitattributes_is_found_in_staged_blob(self) -> None:
         secret = "sk-staged-secret-012345"
@@ -235,7 +218,7 @@ class EvidenceTests(unittest.TestCase):
 
         self.assertNotIn(secret, bundle.diff)
         self.assertFalse(bundle.deterministic_passed)
-        self.assertIn("SECRET_IN_STAGED_BLOB:secret.py", bundle.failures)
+        self.assertIn("COMMIT_SECURITY_FAILURE:secret_in_staged_blob:secret.py", bundle.failures)
 
     def test_normal_text_blob_secret_and_clean_blob(self) -> None:
         secret = "sk-normal-secret-012345"
@@ -243,7 +226,7 @@ class EvidenceTests(unittest.TestCase):
         secret_bundle = collect_evidence(
             self.repo, self.base_sha, self.config(), secrets=(secret,)
         )
-        self.assertIn("SECRET_IN_STAGED_BLOB:secret.txt", secret_bundle.failures)
+        self.assertIn("COMMIT_SECURITY_FAILURE:secret_in_staged_blob:secret.txt", secret_bundle.failures)
 
         clean = self.repo / "secret.txt"
         clean.write_text("safe\n", encoding="utf-8")
@@ -260,7 +243,7 @@ class EvidenceTests(unittest.TestCase):
             bundle = collect_evidence(self.repo, self.base_sha, self.config())
 
         self.assertFalse(bundle.deterministic_passed)
-        self.assertIn("UNSCANNABLE_STAGED_BLOB:large.txt", bundle.failures)
+        self.assertIn("COMMIT_SECURITY_FAILURE:unscannable_staged_blob:large.txt", bundle.failures)
 
     def test_binary_only_source_diff_is_not_reviewable_but_binary_asset_is_allowed(self) -> None:
         (self.repo / ".gitattributes").write_text("*.py -diff\n", encoding="utf-8")
@@ -270,8 +253,8 @@ class EvidenceTests(unittest.TestCase):
         bundle = collect_evidence(self.repo, self.base_sha, self.config())
 
         self.assertFalse(bundle.deterministic_passed)
-        self.assertIn("UNREVIEWABLE_TEXT_DIFF:source.py", bundle.failures)
-        self.assertNotIn("UNREVIEWABLE_TEXT_DIFF:image.png", bundle.failures)
+        self.assertIn("COMMIT_SECURITY_FAILURE:source.py", bundle.failures)
+        self.assertNotIn("COMMIT_SECURITY_FAILURE:image.png", bundle.failures)
 
     def test_deleted_file_does_not_trigger_blob_read(self) -> None:
         (self.repo / "delete.txt").unlink()

@@ -206,7 +206,7 @@ class CheckProcessTests(TempRepoCase):
         bundle = collect_evidence(self.repo, self.base, config)
         self.assertEqual(bundle.checks[0].exit_code, -1)
         self.assertIn("could not start", bundle.checks[0].stderr_log)
-        self.assertIn("CHECK_INFRA_FAILURE:absent", bundle.failures)
+        self.assertIn("CHECK_INFRASTRUCTURE_UNAVAILABLE:absent", bundle.failures)
         self.assertIn("CHECK_FAILED:fails", bundle.failures)
         self.assertFalse(bundle.deterministic_passed)
 

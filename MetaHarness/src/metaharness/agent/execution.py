@@ -19,29 +19,15 @@ from ..models import (
 )
 from ..profiles import build_agent_config, build_claude_profile
 from ..usage import normalize_usage
-from .base import (
-    AGENT_PROTOCOL_FAILED,
-    AGENT_RATE_LIMITED,
-    AGENT_RUNTIME_FAILED,
-    AGENT_SCOPE_VIOLATION,
-    AGENT_START_FAILED,
-    AGENT_TIMEOUT,
-    AgentError,
-    AgentExecutor,
-    AgentExecutorCapabilities,
-    AgentProtocolError,
-    AgentRunRequest,
-    AgentRunResult,
-    AgentScopeError,
-)
+from .base import AGENT_RUNTIME_FAILED, AGENT_SCOPE_VIOLATION, AGENT_TIMEOUT, AgentError, AgentExecutor, AgentExecutorCapabilities, AgentRunRequest, AgentRunResult, AgentScopeError
 from .codex import AgentCommittedError, CodexAgent, classify_codex_failure
 from ..claude.agent import (
     ClaudeCodeAgent,
     ClaudeCommittedError,
     classify_claude_failure,
 )
-from ..claude.runtime import ClaudeRuntimeError, prepare_claude_home
-from .runtime import CodexRuntimeError, prepare_codex_home
+from ..claude.runtime import prepare_claude_home
+from .runtime import prepare_codex_home
 from ..agent.codex import build_agent_environment
 from ..claude.agent import build_claude_environment
 from .external import ExternalAgentExecutor
@@ -113,16 +99,12 @@ def _result(
     timed_out = bool(getattr(raw, "timed_out", False))
     exit_code = getattr(raw, "exit_code", None)
     terminal_is_error = getattr(raw, "terminal_is_error", None) is True
-    if backend_reason == AGENT_RATE_LIMITED and not timed_out and (
-        terminal_is_error or exit_code not in (None, 0)
-    ):
-        exit_reason = exit_reason or AGENT_RATE_LIMITED
     if timed_out:
         status = "timed_out"
         exit_reason = exit_reason or AGENT_TIMEOUT
     elif terminal_is_error:
         status = "failed"
-        exit_reason = exit_reason or AGENT_PROTOCOL_FAILED
+        exit_reason = exit_reason or AGENT_RUNTIME_FAILED
     elif exit_code not in (None, 0):
         status = "failed"
         exit_reason = exit_reason or AGENT_RUNTIME_FAILED
@@ -167,12 +149,6 @@ def _failed_result(
     backend_reason = code if isinstance(code, str) else type(exc).__name__
     if isinstance(exc, (AgentCommittedError, ClaudeCommittedError, AgentScopeError)):
         reason = AGENT_SCOPE_VIOLATION
-    elif isinstance(exc, AgentProtocolError):
-        reason = AGENT_PROTOCOL_FAILED
-    elif isinstance(exc, (CodexRuntimeError, ClaudeRuntimeError)):
-        reason = AGENT_START_FAILED
-    elif isinstance(exc, AgentError):
-        reason = AGENT_START_FAILED
     else:
         reason = AGENT_RUNTIME_FAILED
     return AgentRunResult(

@@ -39,7 +39,9 @@ from ..models import (
     ExecutionSelection,
     HarnessConfig,
     PublishMode,
+    RunPhase,
     RunStatus,
+    status_of_run_state,
 )
 from ..progress import display_event, sync_progress
 from ..redaction import config_secret_values
@@ -212,6 +214,8 @@ def _load_state(run_dir: Path) -> dict[str, Any]:
             state = RunStateStore(run_dir / "state.json").load()
             if not isinstance(state, dict):
                 raise TypeError("run state must contain an object")
+            if "disposition" in state:
+                state = {**state, "status": status_of_run_state(state).value}
             return state
         except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
             last_error = exc
@@ -853,7 +857,10 @@ def approve_run(
     iteration = state.get("iteration", 1)
     if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 1:
         raise WebAPIError(409, "run iteration is invalid")
-    if state.get("status") != RunStatus.AWAITING_PLAN_APPROVAL.value:
+    if (
+        state.get("status") != RunStatus.RUNNING.value
+        or state.get("phase") != RunPhase.PLAN_APPROVAL.value
+    ):
         raise WebAPIError(409, "run is not awaiting plan approval")
     if state.get("planning_protocol") != "v2":
         raise WebAPIError(409, "run is not a pipeline v2 run")
@@ -1126,10 +1133,8 @@ _LIVE_EVENT_WINDOW_BYTES = 256 * 1024
 # Statuses for which the run page stops polling: terminal, or waiting for a
 # human decision that needs the complete server-rendered page.
 LIVE_STOP_STATUSES = frozenset({
-    "committed", "published", "failed", "blocked", "plan_rejected", "interrupted",
-    "waiting_human",
-    "awaiting_plan_approval",
-    "waiting_remote", "waiting_external",
+    "committed", "published", "partial", "failed", "interrupted",
+    "waiting_human", "waiting_external",
 })
 _DIAGNOSTIC_COUNTERS = (
     "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
@@ -1137,11 +1142,11 @@ _DIAGNOSTIC_COUNTERS = (
 )
 _DIAGNOSTIC_LISTS = ("files_read_observed", "commands_observed")
 _CHECK_FAILURE_PREFIXES = (
-    "CHECK_", "DETERMINISTIC_GATE", "EMPTY_DIFF", "DIFF_TOO_LARGE", "SECRET_IN",
-    "UNSCANNABLE", "UNREVIEWABLE", "HEAD_MISMATCH",
+    "CHECK_", "DETERMINISTIC_GATE", "DETERMINISTIC_GATE_FAILED:empty_diff", "DETERMINISTIC_GATE_FAILED:diff_too_large", "SECRET_IN",
+    "UNSCANNABLE", "UNREVIEWABLE", "COMMIT_GATE_FAILED",
 )
 _PUBLISH_FAILURES = frozenset({
-    "PUSH_FAILED", "BASE_MOVED_SINCE_RUN", "COMMIT_TREE_MISMATCH", "TOCTOU_FAILURE",
+    "PUSH_FAILED", "BASE_MOVED_SINCE_RUN", "COMMIT_GATE_FAILED",
 })
 _PIPELINE_STEP_STATE = {
     "completed": "complete", "running": "running", "failed": "failed",
@@ -1240,6 +1245,7 @@ def run_pipeline(
     planner = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
     resumable = isinstance(resume, Mapping) and bool(resume.get("resumable"))
     resume_phase = resume.get("phase") if resumable else None
+    state_phase = state.get("phase")
     resume_cycle = resume.get("iteration") if resumable else None
     items: list[dict[str, str]] = []
 
@@ -1256,7 +1262,7 @@ def run_pipeline(
             return "resumable"
         if cycle == current and failed and reason.startswith(failure_prefixes):
             return "failed"
-        if cycle == current and not failed and status in running_statuses:
+        if cycle == current and status in running_statuses and state_phase in phases:
             return "running"
         return "waiting"
 
@@ -1267,9 +1273,9 @@ def run_pipeline(
         add("planner", "Planner", "complete")
     elif status == "waiting_human":
         add("planner", "Planner · operator decision required", "waiting")
-    elif decision == "BLOCKED" or status == "blocked" or failed:
+    elif decision == "BLOCKED" or failed:
         add("planner", "Planner", "failed")
-    elif status in {"created", "planning"}:
+    elif status == "created" or (status == "running" and state_phase in {"context", "planner"}):
         add("planner", "Planner", "running")
     else:
         add("planner", "Planner", "waiting")
@@ -1279,14 +1285,14 @@ def run_pipeline(
     if approval_decision == "APPROVE" or (
         approval_decision is None and decision == "READY"
         and (iteration_dir(directory, _state_cycle(state)) / "execution_selection.json").exists()
-        and status != AWAITING_APPROVAL
+        and state_phase != AWAITING_APPROVAL and resume_phase != AWAITING_APPROVAL
     ):
         add("approval", "Approval", "complete")
-    elif approval_decision == "REJECT" or status == "plan_rejected":
+    elif approval_decision == "REJECT" or (failed and reason.startswith("PLAN_APPROVAL")):
         add("approval", "Approval", "failed")
     elif resume_phase == "plan_approval":
         add("approval", "Approval", "resumable")
-    elif status == AWAITING_APPROVAL:
+    elif status == "running" and state_phase == AWAITING_APPROVAL:
         add("approval", "Approval", "running")
     elif failed and reason.startswith(("PLAN_APPROVAL", "EXECUTION_SELECTION")):
         add("approval", "Approval", "failed")
@@ -1307,7 +1313,7 @@ def run_pipeline(
         evidence = _load_json(gate / "evidence.json", max_bytes=MAX_RESULT_BYTES + MAX_DIFF_BYTES * 8) if gate else None
         add(f"c{cycle}-checks", f"{label} · checks", phase_state(
             isinstance(evidence, dict) and evidence.get("deterministic_passed") is True,
-            _GATE_PHASES, frozenset({"validating", "revalidating", "revising"}),
+            _GATE_PHASES, frozenset({"running"}),
             _CHECK_FAILURE_PREFIXES, cycle,
         ))
 
@@ -1323,7 +1329,7 @@ def run_pipeline(
         value = "resumable"
     elif failed and reason in _PUBLISH_FAILURES:
         value = "failed"
-    elif status == "publishing":
+    elif status == "running" and state_phase in {"candidate_ready", "candidate_push", "publish"}:
         value = "running"
     else:
         value = "waiting"
@@ -1481,13 +1487,13 @@ def live_status(
         "status": status,
         "updated_at": state.get("updated_at"),
         "cycle": cycle,
-        "phase": f"{status}:{current_step}" if current_step else status,
+        "phase": state.get("phase"),
         "current_step": current_step,
         "failure": failure_payload,
         "resumable": overview["resume"]["resumable"],
         "resume_phase": overview["resume"]["phase"],
         "resume_label": overview["resume"]["label"],
-        "running": status not in LIVE_STOP_STATUSES,
+        "running": status not in LIVE_STOP_STATUSES and state.get("phase") != AWAITING_APPROVAL,
         "token_totals": overview["token_totals"],
         "progress_events": _live_events(
             directory, state, config_secret_values(config) if config is not None else (),
@@ -1532,7 +1538,7 @@ def pause_run_request(manager: RunManager, runs_root: Path, run_id: str) -> dict
     return {"ok": True, "run_id": safe_id, "location": f"/runs/{safe_id}"}
 
 
-AWAITING_APPROVAL = RunStatus.AWAITING_PLAN_APPROVAL.value
+AWAITING_APPROVAL = RunPhase.PLAN_APPROVAL.value
 
 
 __all__ = [

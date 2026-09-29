@@ -66,9 +66,9 @@ from ..state import RunStateStore
 from ..usage import read_usage_artifact
 from ..validation import config_with_check_authority, frozen_check_policy
 from ..workspace import prepare_workspace
-from .durable_readers import read_repository_reference
+from .shared import read_repository_reference
 from .pipeline_v2 import BudgetExhausted
-from .per_step_gate import per_step_check_ids
+from .gates import per_step_check_ids
 from .shared import (
     GitOwnership, OrchestrationError, PLANNER_CONVERSATION, archive_attempt_tree,
     git_ownership, git_ownership_payload, is_object_id, json_text,
@@ -263,7 +263,7 @@ class RunBootstrap:
             kind = plan.blocker_kind
             reason = (
                 "SPEC_DECISION_REQUIRED" if kind is BlockerKind.SPEC_DECISION
-                else "PLANNER_BLOCKED_REQUIRES_OPERATOR"
+                else "PLANNER_OUTPUT_INVALID"
             )
             detail: dict[str, Any] = {
                 "blocker_kind": kind.value if kind else None,
@@ -286,7 +286,7 @@ class RunBootstrap:
             # REQUIRED_CHECKS has already been parsed against the trusted
             # catalogue.  Materialize those exact trusted definitions before
             # the plan can become approval authority.
-            selected_checks = self.runtime.config.select_checks(plan.required_checks)
+            self.runtime.config.select_checks(plan.required_checks)
             # Freeze the whole trusted catalogue *and* the run's default check
             # policy, not just this selection: a later milestone may require
             # another approved check, and every run must keep running the argv
@@ -319,8 +319,8 @@ class RunBootstrap:
             )
             if approval.decision is ApprovalDecision.REJECT:
                 state = store.set_run_state(RunMachineState(
-                    disposition=RunDisposition.WAIT_HUMAN, reason=PLAN_REJECTED_REASON,
-                ))
+                    disposition=RunDisposition.FAILED, reason=PLAN_REJECTED_REASON,
+                ), failure={"reason": PLAN_REJECTED_REASON})
                 return RunResult.of(run_dir, state)
             try:
                 selection, execution_sha = read_execution_selection_with_sha256(run_dir, iteration=iteration)

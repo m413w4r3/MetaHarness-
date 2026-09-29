@@ -739,6 +739,8 @@ def create_run_worktree(
     )
 
 
+
+
 def assert_agent_did_not_commit(info: WorktreeInfo) -> None:
     """Fail if the agent moved the run worktree away from its base commit."""
 

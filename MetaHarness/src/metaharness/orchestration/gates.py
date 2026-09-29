@@ -2,70 +2,243 @@
 
 from __future__ import annotations
 
-import hashlib, time
+import hashlib
+import json
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import (
-    Any,
-    Callable,
-    Mapping,
-    Sequence,
-    TYPE_CHECKING,
-)
-from ..evidence import (
-    EvidenceBundle,
-    collect_evidence,
-    required_checks_passed,
-)
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+
+from ..approval import ApprovalError, read_check_authority
 from ..baseline import (
     BaselineCache,
     BaselineRecord,
     baseline_of_result,
     compare_check,
+    judge_results,
     junit_report_path,
     preflight_skips,
 )
-from ..validation import config_with_check_authority
+from ..evidence import EvidenceBundle, collect_evidence, required_checks_passed
 from ..gitops import (
-    GitError,
-    commit_parents,
     candidate_tree_sha,
+    commit_parents,
     current_head,
     index_tree_sha,
     resolve_tree,
 )
-from ..models import (
-    GateStage,
-    HarnessConfig,
-)
+from ..models import GateStage, HarnessConfig
+from ..recovery_policy import FailureClass, classify_failure
 from ..result import atomic_write_text
 from ..state import RunStateStore
-from .shared import (
-    _CHECK_ATTEMPT_ARTIFACTS,
-    _archive_attempt,
-    _check_payload,
-    _json_text,
-    _read_json_artifact,
-    _safe_candidate_tree,
-)
-from .per_step_gate import (
-    PerStepGateOutcome,
-    record_step_warnings,
-    run_per_step_gate,
+from ..validation import (
+    ValidationError,
+    bounded_tail,
+    config_with_check_authority,
+    run_checks,
 )
 from .pipeline_v2 import (
     CyclePlan,
     PipelineFailure,
     PipelineV2Context,
-    gate_dir,
     gate_acceptance_path,
+    gate_dir,
 )
-from .durable_readers import (
+from .shared import (
+    _CHECK_ATTEMPT_ARTIFACTS,
+    _archive_attempt,
+    _check_payload,
+    _json_text,
+    _safe_candidate_tree,
+    gate_mutable_authority,
+    is_object_id,
+    json_text,
     load_evidence,
+    read_json_artifact,
 )
+
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
 
 
+if TYPE_CHECKING:  # pragma: no cover - the service is the composition root
+    from .gates import GateService
+
+
+_FEEDBACK_EXCERPT_BYTES = 2000
+
+
+@dataclass(frozen=True)
+class PerStepGateOutcome:
+    """What the optional fast gate answered for one mutated step tree."""
+
+    enabled: bool
+    passed: bool
+    feedback: str = ""
+    warnings: tuple[str, ...] = ()
+    regressions: tuple[str, ...] = ()
+
+
+def _excerpt_text(result: Any) -> str:
+    """The bounded log text of one check result, whatever shape it has."""
+
+    stdout = str(getattr(result, "stdout_tail", "") or "")
+    stderr = str(getattr(result, "stderr_tail", "") or "")
+    return f"{stdout}\n{stderr}".strip()
+
+
+def _regression_feedback(
+    *,
+    regressions: Any,
+    results: Any,
+    changed_paths: Any,
+) -> str:
+    """The bounded evidence one refused step hands back to its worker."""
+
+    by_id = {result.name: result for result in results}
+    lines = ["The fast per-step gate refused this step tree."]
+    # Put durable path facts before the bounded log excerpt. The retry
+    # addendum has its own size limit and should not clip this actionable data.
+    if changed_paths:
+        lines.append("CHANGED PATHS:")
+        lines.extend(f"- {path}" for path in tuple(changed_paths)[:20])
+    lines.append("Fix every regression listed above, including in files outside WRITE_SET that this step's change broke; MetaHarness admits and reports those paths.")
+    for judgement in regressions:
+        lines.append(f"CHECK: {judgement.check_id}")
+        if judgement.new_failure_ids:
+            lines.append("NEW FAILING TEST IDS:")
+            lines.extend(f"- {item}" for item in judgement.new_failure_ids[:10])
+        result = by_id.get(judgement.check_id)
+        if result is not None:
+            excerpt = bounded_tail(_excerpt_text(result), _FEEDBACK_EXCERPT_BYTES).strip()
+            if excerpt:
+                lines.append("FAILURE EXCERPT:")
+                lines.append(excerpt)
+    return "\n".join(lines)
+
+
+def record_step_warnings(store: RunStateStore, warnings: Any) -> None:
+    """Keep the non-blocking verdicts of the fast gate durable."""
+
+    state = store.load()
+    existing = [
+        item for item in (state.get("check_warnings") or []) if isinstance(item, str)
+    ]
+    merged = list(dict.fromkeys((*existing, *warnings)))
+    if merged != existing:
+        store.update_metadata(check_warnings=merged)
+
+
+def per_step_check_ids(runtime: Any, run_dir: Path) -> tuple[str, ...]:
+    """Keep live gate additions outside an older run's approved catalogue."""
+
+    store = RunStateStore(run_dir / "state.json")
+    state = store.load()
+    if "per_step_check_ids" in state:
+        ids = state["per_step_check_ids"]
+        if (
+            not isinstance(ids, list)
+            or any(not isinstance(item, str) or not item for item in ids)
+            or len(set(ids)) != len(ids)
+        ):
+            raise ValidationError("the run's per-step check policy is invalid")
+        return tuple(ids)
+    # Legacy runs have no gate snapshot. Retain only live selections that
+    # were already in their original catalogue; never import today's argv.
+    try:
+        policy = read_check_authority(
+            run_dir, expected_sha256=runtime.approved_check_authority_sha256(run_dir),
+        )
+    except ApprovalError as exc:
+        raise ValidationError(str(exc)) from exc
+    if policy is None:
+        raise ValidationError("the run has no check authority")
+    approved = policy.by_id()
+    requested = runtime.config.gate.per_step
+    omitted = tuple(item for item in requested if item not in approved)
+    if omitted:
+        record_step_warnings(store, (
+            "Per-step check excluded because it was added after this run's "
+            "check authority was frozen: " + item for item in omitted
+        ))
+    return tuple(item for item in requested if item in approved)
+
+
+def run_per_step_gate(
+    service: "GateService",
+    *,
+    run_dir: Path,
+    worktree: Path,
+    base_sha: str,
+    step_dir: Path,
+    check_ids: Any,
+    changed_paths: Any,
+) -> PerStepGateOutcome:
+    """Run the configured fast checks and judge only their *new* failures."""
+
+    if not check_ids:
+        return PerStepGateOutcome(enabled=False, passed=True)
+    runtime = service.runtime
+    check_config, _ids = config_with_check_authority(
+        runtime.config, run_dir, requested_check_ids=list(check_ids),
+        expected_sha256=runtime.approved_check_authority_sha256(run_dir),
+    )
+    selected = check_config.select_checks(list(check_ids))
+    skipped = preflight_skips(run_dir, selected)
+    baseline = service.gate_baseline(
+        run_dir=run_dir, worktree=worktree, base_sha=base_sha,
+        check_config=check_config, checks=selected, skipped=skipped,
+    )
+    directory = step_dir / "per-step-gate"
+    directory.mkdir(parents=True, exist_ok=True)
+    evaluated = tuple(check for check in selected if check.id not in skipped)
+    results = run_checks(
+        worktree, check_config, required_check_ids=[check.id for check in evaluated],
+        logs_dir=directory / "checks", secrets=runtime.secrets,
+    )
+    judgements = judge_results(baseline, results, evaluated, skipped=skipped)
+    regressions = tuple(item for item in judgements if item.blocking)
+    warnings = tuple(item.warning for item in judgements if item.warning)
+    payload = {
+        "schema_version": 1,
+        "step_dir": step_dir.name,
+        "check_ids": list(check_ids),
+        "baseline_check_config_sha": baseline.check_config_sha,
+        "regressions": [item.check_id for item in regressions],
+        "checks": [
+            {
+                "id": item.check_id,
+                "verdict": item.verdict.value,
+                "new_failure_ids": list(item.new_failure_ids),
+                "warning": item.warning,
+            }
+            for item in judgements
+        ],
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    atomic_write_text(directory / f"attempt-{_attempt_index(step_dir):02d}.json", text)
+    atomic_write_text(directory / "per-step-gate.json", text)
+    if not regressions:
+        return PerStepGateOutcome(
+            enabled=True, passed=True, warnings=warnings, regressions=(),
+        )
+    feedback = _regression_feedback(
+        regressions=regressions, results=results, changed_paths=changed_paths,
+    )
+    return PerStepGateOutcome(
+        enabled=True, passed=False, feedback=feedback, warnings=warnings,
+        regressions=tuple(item.check_id for item in regressions),
+    )
+
+
+def _attempt_index(step_dir: Path) -> int:
+    """The 1-based index of the worker attempt this gate just judged."""
+
+    root = step_dir / "attempts"
+    index = 1
+    while (root / f"{index:02d}").exists():
+        index += 1
+    return index
 
 
 class GateService:
@@ -144,72 +317,6 @@ class GateService:
         )
         self.runtime.cycle_update(store, cycle_plan.cycle, deterministic_gate=gate)
         retry_check.settle(evidence)
-        return evidence
-    @staticmethod
-    def load_accepted_gate_evidence(
-        ctx: PipelineV2Context, number: int, stage: GateStage,
-    ) -> EvidenceBundle | None:
-        """Return a green evidence bundle only when its gate acceptance binds it."""
-
-        directory = gate_dir(ctx.run_dir, number, stage)
-        acceptance_path = gate_acceptance_path(ctx.run_dir, number, stage)
-        if not acceptance_path.is_file():
-            return None
-        try:
-            payload = _read_json_artifact(acceptance_path)
-            evidence_path = directory / "evidence.json"
-            evidence_bytes = evidence_path.read_bytes()
-            evidence = load_evidence(directory)
-            current = current_head(ctx.info.worktree)
-            current_tree = resolve_tree(ctx.info.worktree, current)
-            parents = commit_parents(ctx.info.worktree, current)
-        except (OSError, GitError, ValueError) as exc:
-            raise PipelineFailure(
-                "RESUME_INTEGRITY_FAILURE", "accepted gate evidence is unreadable",
-            ) from exc
-        digest = hashlib.sha256(evidence_bytes).hexdigest()
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema_version") not in {1, 2}
-            or payload.get("review_cycle") != number
-            or payload.get("stage") != stage.value
-            or evidence is None
-            or evidence.base_sha != ctx.base_sha
-            or not evidence.deterministic_passed
-            or not required_checks_passed(evidence)
-            or bool(evidence.failures)
-            or payload.get("tree_sha") != evidence.staged_tree_sha
-            or payload.get("commit_sha") != current
-            or current_tree != evidence.staged_tree_sha
-            or (
-                payload.get("no_change") is not True
-                and parents != (payload.get("parent_sha"),)
-            )
-            or not isinstance(payload.get("no_change", False), bool)
-            or (
-                payload.get("no_change") is True
-                and (
-                    payload.get("parent_sha") is not None
-                    or evidence.diff != ""
-                    or bool(evidence.changed_files)
-                    or payload.get("commit_created") is not False
-                )
-            )
-            or (
-                payload.get("parent_sha") is None
-                and (
-                    payload.get("no_change") is not True
-                    or bool(evidence.changed_files)
-                )
-            )
-            or (
-                payload.get("schema_version") == 2
-                and payload.get("evidence_sha256") != digest
-            )
-        ):
-            raise PipelineFailure(
-                "RESUME_INTEGRITY_FAILURE", "gate acceptance does not bind its evidence",
-            )
         return evidence
     def run_check_preflights_recoverably(
         self,
@@ -412,3 +519,174 @@ class GateService:
         }
         atomic_write_text(evidence_dir / "baseline.json", _json_text(payload))
         return evidence, payload
+
+
+def hard_failure_items(failures: Any) -> list[str]:
+    return [
+        item for item in failures
+        if isinstance(item, str)
+        and classify_failure(item.split(":", 1)[0]).failure_class is FailureClass.FATAL
+    ]
+
+
+def hard_integrity_failures(bundle: EvidenceBundle) -> list[str]:
+    return hard_failure_items(bundle.failures)
+
+
+class GateAcceptanceService:
+    """Persist and validate the green tree accepted by one gate episode."""
+
+    def __init__(
+        self, *, authorize_candidate_tree: Callable[..., None],
+        trace_emit: Callable[..., None],
+    ) -> None:
+        self._authorize_candidate_tree = authorize_candidate_tree
+        self._trace_emit = trace_emit
+
+    def accept(
+        self, store: Any, ctx: Any, cycle_plan: Any, stage: GateStage,
+        evidence: EvidenceBundle, *, base_paths: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        if (
+            not evidence.deterministic_passed
+            or not required_checks_passed(evidence)
+            or evidence.staged_tree_sha is None
+        ):
+            raise PipelineFailure("DETERMINISTIC_GATE_FAILED", ", ".join(evidence.failures))
+        no_change = not evidence.changed_files
+        if no_change and (evidence.diff != "" or evidence.base_sha != ctx.base_sha):
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", "no-change evidence is not bound to the run base",
+            )
+        worktree = ctx.info.worktree
+        directory = gate_dir(ctx.run_dir, cycle_plan.cycle, stage)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = gate_acceptance_path(ctx.run_dir, cycle_plan.cycle, stage)
+        authority = gate_mutable_authority(
+            ctx.run_dir, cycle_plan.cycle.number, stage,
+            base_paths=(
+                cycle_plan.mutable_scope if base_paths is None else base_paths
+            ),
+        )
+        stored = read_json_artifact(path) if path.is_file() else None
+        if path.is_file() and stored is None:
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "gate acceptance is corrupted")
+        if stored is not None:
+            stored_no_change = stored.get("no_change", False) if isinstance(stored, dict) else False
+            stored_parent = stored.get("parent_sha") if isinstance(stored, dict) else None
+            parent_valid = is_object_id(stored_parent) or (
+                stored_no_change is True
+                and stored_parent is None
+                and not evidence.changed_files
+            )
+            evidence_sha256 = self._durable_evidence_sha256(directory)
+            if (
+                not isinstance(stored, dict)
+                or stored.get("schema_version") != 2
+                or stored.get("review_cycle") != cycle_plan.cycle.number
+                or not all(is_object_id(stored.get(key)) for key in ("tree_sha", "commit_sha"))
+                or not isinstance(stored_no_change, bool)
+                or not parent_valid
+                or stored_no_change is not (not evidence.changed_files)
+                or (
+                    stored_no_change
+                    and (
+                        stored_parent is not None
+                        or stored.get("commit_created") is not False
+                        or stored.get("acceptance_kind") != "existing-head"
+                    )
+                )
+                or stored.get("stage") != stage.value
+                or stored.get("acceptance_kind") != "existing-head"
+                or not isinstance(stored.get("commit_created"), bool)
+                or stored.get("tree_sha") != evidence.staged_tree_sha
+                or stored.get("mutable_scope") != list(authority.effective_paths)
+                or stored.get("mutable_scope_sha256") != authority.sha256
+                or stored.get("evidence_sha256") != evidence_sha256
+            ):
+                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "gate acceptance does not match evidence")
+            if current_head(worktree) != stored["commit_sha"]:
+                raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted gate HEAD moved")
+            if (
+                resolve_tree(worktree, stored["commit_sha"]) != stored["tree_sha"]
+                or (
+                    not stored_no_change
+                    and commit_parents(worktree, stored["commit_sha"]) != (stored["parent_sha"],)
+                )
+            ):
+                raise PipelineFailure(
+                    "RESUME_INTEGRITY_FAILURE", "gate acceptance does not match its commit",
+                )
+            self._emit_acceptance(ctx, cycle_plan, stage, stored)
+            return stored
+
+        self._authorize_candidate_tree(
+            evidence, worktree, current_head(worktree), ctx.branch_ref,
+        )
+        head = current_head(worktree)
+        current_tree = resolve_tree(worktree, head)
+        if no_change and current_tree != evidence.staged_tree_sha:
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", "no-change HEAD tree differs from gate evidence",
+            )
+        if current_tree != evidence.staged_tree_sha:
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", "gate evidence differs from the committed audit tree",
+            )
+        parents = () if no_change else commit_parents(worktree, head)
+        if not no_change and len(parents) != 1:
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "accepted HEAD has no single parent")
+        commit_sha, parent_sha = head, None if no_change else parents[0]
+        acceptance_kind = "existing-head"
+        commit_created = False
+
+        acceptance = {
+            "schema_version": 2,
+            "review_cycle": cycle_plan.cycle.number,
+            "stage": stage.value,
+            "tree_sha": evidence.staged_tree_sha,
+            "commit_sha": commit_sha,
+            "parent_sha": parent_sha,
+            "no_change": not evidence.changed_files,
+            "commit_created": commit_created,
+            "acceptance_kind": acceptance_kind,
+            "mutable_scope": list(authority.effective_paths),
+            "mutable_scope_sha256": authority.sha256,
+            "evidence_sha256": self._durable_evidence_sha256(directory),
+        }
+        atomic_write_text(path, json_text(acceptance))
+        store.update_metadata(
+            approved_tree_sha=evidence.staged_tree_sha,
+            expected_head_sha=commit_sha,
+            expected_parent_sha=parent_sha,
+            expected_tree_sha=evidence.staged_tree_sha,
+        )
+        self._emit_acceptance(ctx, cycle_plan, stage, acceptance)
+        return acceptance
+
+    @staticmethod
+    def _durable_evidence_sha256(directory: Path) -> str:
+        try:
+            return hashlib.sha256((directory / "evidence.json").read_bytes()).hexdigest()
+        except OSError as exc:
+            raise PipelineFailure(
+                "RESUME_INTEGRITY_FAILURE", "accepted gate evidence is unreadable",
+            ) from exc
+
+    def _emit_acceptance(self, ctx: Any, cycle_plan: Any, stage: GateStage, payload: Mapping[str, Any]) -> None:
+        self._trace_emit(
+            "gate.accepted",
+            phase="validation",
+            cycle=cycle_plan.cycle.number,
+            data={
+                "stage": stage.value,
+                "parent_sha": payload["parent_sha"],
+                "commit_sha": payload["commit_sha"],
+                "tree_sha": payload["tree_sha"],
+                "commit_created": payload.get("commit_created"),
+                "acceptance_kind": payload.get("acceptance_kind"),
+            },
+        )
+
+
+__all__ = ['PerStepGateOutcome', 'record_step_warnings', 'run_per_step_gate']

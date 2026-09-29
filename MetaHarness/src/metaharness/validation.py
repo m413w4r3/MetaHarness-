@@ -170,14 +170,14 @@ def _snapshot(worktree: Path) -> CandidateState:
     try:
         return snapshot_candidate_state(worktree)
     except GitError as exc:
-        raise ValidationError(f"TREE_MISMATCH: could not snapshot candidate state: {exc}") from exc
+        raise ValidationError(f"COMMIT_GATE_FAILED: could not snapshot candidate state: {exc}") from exc
 
 
 def _observe(worktree: Path, before: CandidateState) -> SideEffect | None:
     try:
         return observe_side_effects(worktree, before)
     except GitError as exc:
-        raise ValidationError(f"TREE_MISMATCH: could not snapshot candidate state: {exc}") from exc
+        raise ValidationError(f"COMMIT_GATE_FAILED: could not snapshot candidate state: {exc}") from exc
 
 
 def _archive_mutation(
@@ -371,7 +371,6 @@ def run_checks(
                 exit_code = -1
                 timed_out = False
                 process_error: OSError | ValueError | None = None
-                attempt_started = time.monotonic()
                 with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                     try:
                         exit_code, timed_out = run_bounded(
@@ -392,7 +391,6 @@ def run_checks(
                         stderr.write(
                             f"\ncheck timed out after {check.timeout_seconds}s\n".encode("utf-8")
                         )
-                duration = time.monotonic() - attempt_started
                 effect = _observe(root, before)
                 redact_file(stdout_path, secrets)
                 redact_file(stderr_path, secrets)
@@ -431,7 +429,7 @@ def run_checks(
                             ) from None
                         archive(rollback="mismatch")
                         raise ValidationError(
-                            "ROLLBACK_TREE_MISMATCH: check rollback did not restore exact state; "
+                            "ROLLBACK_FAILED: check rollback did not restore exact state; "
                             f"mutated_tree={after.candidate_tree}"
                         ) from None
                     archive(rollback="verified")
@@ -551,7 +549,7 @@ def run_check_preflights(
             except AttemptViolation as violation:
                 raise ValidationError(f"{violation.code}: {violation.detail}") from None
             except GitError as exc:
-                raise ValidationError(f"TREE_MISMATCH: could not snapshot candidate state: {exc}") from exc
+                raise ValidationError(f"COMMIT_GATE_FAILED: could not snapshot candidate state: {exc}") from exc
             if effect is not None:
                 signature = effect.signature
                 if not mutation_retry_used:
@@ -560,12 +558,12 @@ def run_check_preflights(
                     continue
                 code = (
                     "CHECK_SIDE_EFFECT_REPEATED"
-                    if signature == first_mutation else "CHECK_SIDE_EFFECT_UNSTABLE"
+                    if signature == first_mutation else "CHECK_SIDE_EFFECT_REPEATED"
                 )
                 failures.append(f"{code}:{check.id}")
                 break
             if timed_out or exit_code != 0:
-                failures.append(f"CHECK_PREFLIGHT_FAILED:{check.id}")
+                failures.append(f"CHECK_INFRASTRUCTURE_UNAVAILABLE:{check.id}")
             break
     return tuple(failures)
 

@@ -18,21 +18,10 @@ import time
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
-    Any,
     Mapping,
 )
 
-from ..agent.base import (
-    AGENT_AUTH_FAILURE,
-    AGENT_PROTOCOL_FAILED,
-    AGENT_RUNTIME_FAILED,
-    AGENT_SCOPE_VIOLATION,
-    AGENT_START_FAILED,
-    AGENT_TIMEOUT,
-    AgentError,
-    AgentRunRequest,
-    AgentScopeError,
-)
+from ..agent.base import AGENT_AUTH_FAILURE, AGENT_RUNTIME_FAILED, AGENT_SCOPE_VIOLATION, AGENT_TIMEOUT, AgentError, AgentRunRequest, AgentScopeError
 from ..agent.diagnostics import write_token_diagnostics
 from ..agent.protocol import (
     contract_mismatch_explanation,
@@ -445,7 +434,7 @@ class WorkerAttemptService:
                 step_id, **failed, tree_after=safe_candidate_tree(worktree)
             )
         if result.exit_code not in (0, None) or result.exit_reason in {
-            AGENT_START_FAILED, AGENT_RUNTIME_FAILED, AGENT_PROTOCOL_FAILED,
+            AGENT_RUNTIME_FAILED,
             AGENT_SCOPE_VIOLATION,
         }:
             reason = result.exit_reason or AGENT_RUNTIME_FAILED
@@ -462,7 +451,7 @@ class WorkerAttemptService:
                 "step if work remains."
             )
             raise StepExecutionFailure(
-                "AGENT_NO_CHANGE", step_id,
+                "AGENT_CONTRACT_MISMATCH", step_id,
                 feedback,
                 tree_after=tree_after, index_tree_after=safe_index_tree(worktree), **failed,
                 retry_feedback=feedback,

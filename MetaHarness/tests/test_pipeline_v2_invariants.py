@@ -12,7 +12,6 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from metaharness.agent import (
     AgentRunRequest,
@@ -40,11 +39,7 @@ from metaharness.gitops import (
     validate_linear_commit_chain,
 )
 from metaharness.models import ExecutionRole, ModelProfile, SelectionMode
-from metaharness.orchestrator import Orchestrator
-from metaharness.orchestration.durable_readers import load_completed_step
-from metaharness.resume import pipeline_version_from_state
-from metaharness.run_options import SCHEMA_VERSION, RunOptions
-from metaharness.state import RunStateStore
+from metaharness.orchestration.shared import load_completed_step
 
 
 def git(repo: Path, *args: str) -> str:

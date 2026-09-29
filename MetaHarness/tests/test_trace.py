@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from metaharness.agent.base import AgentRunResult
 from metaharness.models import ExecutionRole, ModelProfile, ProfileDriver, SelectionMode
-from metaharness.orchestration.run_observability import RunObservability
+from metaharness.orchestration.runtime import RunObservability
 from metaharness.orchestration.runtime import RunRuntime
 from metaharness.trace import TraceEvent, TraceStream
 

@@ -4,32 +4,30 @@
 the modules in this package are its internal sub-domains and must never
 import it back.  The dependency order is one-way::
 
-    shared <- check_failure <- durable_readers
-    durable_readers <- run_resume
-    shared <- candidate, audit
-    pipeline_v2 <- recovery <- worker_recovery, check_recovery
-    pipeline_v2 <- step_authority <- worker_attempt <- step_execution
-    step_acceptance <- step_execution
+    shared <- gates, publication, audit
+    shared <- run_resume
+    pipeline_v2 <- recovery
+    pipeline_v2 <- worker_attempt <- step_execution
     run_bootstrap <- run_composition <- runtime
-    run_observability, run_failure <- runtime
+    run_failure <- runtime
 
 The run authorities sit next to the kernel that composes them: ``run_bootstrap``
 owns the planning, approval, worktree and setup of a new run,
 ``run_composition`` the immutable context, the ``PipelineV2Operations`` wiring
 and the cycle authority, ``run_failure`` the durable projection of a failure
-that left its recovery loop and ``run_observability`` the trace, the session
-metadata and the diagnostics of a run.
+that left its recovery loop.  Runtime observability is kept beside those
+authorities in ``runtime``.
 
 The step services split the one step transaction by transaction:
-``step_execution`` runs one approved step as a bounded ladder of attempts,
-``worker_attempt`` runs the single worker request and normalizes its candidate
-result, and ``step_acceptance`` owns the commit transaction inside that step.
+``step_execution`` runs one approved step as a bounded ladder of attempts and
+owns its acceptance boundary, while ``worker_attempt`` runs the single worker
+request and normalizes its candidate result.
 
 ``recovery`` applies :func:`metaharness.recovery_policy.classify_failure`:
 it owns durable recovery budgets, attempt records, the ``recovery.*`` trace
 and the projection of a failure onto ``FAILED`` or a ``WAITING_*`` state.
-The ``*_recovery`` services run the phase-specific actions (worker rollback
-and executor fallback, check infrastructure retries); the Git transaction
+The recovery services run the phase-specific actions (worker rollback and
+executor fallback, check infrastructure retries); the Git transaction
 every attempt shares lives in :mod:`metaharness.attempt_transaction`.
 
 Post-implementation authority is single: the deterministic gate alternates

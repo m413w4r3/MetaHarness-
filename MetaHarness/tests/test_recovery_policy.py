@@ -34,14 +34,14 @@ _CODE_CONSTRUCTORS = frozenset({
 _SOURCE = Path(metaharness.__file__).parent
 
 
-def _literal_failure_codes() -> dict[str, str]:
+def literal_failure_codes(source: Path = _SOURCE) -> dict[str, str]:
     """Every literal code the source raises, mapped to one place it is raised.
 
     A module-level string constant passed to a code constructor counts as the
     literal it names; a dynamic expression is the runtime's business.
     """
 
-    trees = {path: ast.parse(path.read_text(encoding="utf-8")) for path in _SOURCE.rglob("*.py")}
+    trees = {path: ast.parse(path.read_text(encoding="utf-8")) for path in source.rglob("*.py")}
     constants: dict[str, set[str]] = {}
     for tree in trees.values():
         for node in tree.body:
@@ -68,11 +68,33 @@ def _literal_failure_codes() -> dict[str, str]:
             else:
                 continue
             for value in values:
-                codes.setdefault(stable_code(value), f"{path.relative_to(_SOURCE)}:{node.lineno}")
+                codes.setdefault(stable_code(value), f"{path.relative_to(source)}:{node.lineno}")
     return codes
 
 
 class FailureClassificationTests(unittest.TestCase):
+    def test_unknown_codes_do_not_inherit_a_namespace_policy(self) -> None:
+        for code in (
+            "RESUME_TEMPORARY_FAILURE", "ROLLBACK_RETRY_PENDING",
+            "STAGED_BLOB_RETRY_PENDING", "WORKER_SECURITY_FAILURE",
+            "CUSTOM_OUTSIDE_AUTHORITY", "CUSTOM_AUTHORITY_MISMATCH",
+            "AGENT_FUTURE_ERROR", "CHECK_FUTURE_ERROR",
+        ):
+            with self.subTest(code=code):
+                decision = classify_failure(code, exhausted=True)
+                self.assertFalse(decision.known)
+                self.assertIs(decision.failure_class, FailureClass.FIXABLE)
+                self.assertIs(decision.strategy, RecoveryStrategy.MARK_FAILED_CONTINUE)
+
+    def test_recorded_v4_fatal_boundaries_remain_fatal(self) -> None:
+        for code in (
+            "UNSCANNABLE_STAGED_BLOB", "STAGED_BLOB_SCAN_FAILED", "UNREVIEWABLE_TEXT_DIFF",
+            "HEAD_MODIFIED_OUTSIDE_AUTHORITY", "BRANCH_MODIFIED_OUTSIDE_AUTHORITY",
+            "REMOTE_AUTHORITY_MISMATCH", "ROLLBACK_TREE_MISMATCH",
+        ):
+            with self.subTest(code=code):
+                self.assertIs(classify_failure(code).strategy, RecoveryStrategy.HARD_STOP)
+
     def test_unknown_failure_defaults_to_fixable(self) -> None:
         decision = classify_failure("SOME_FUTURE_FAILURE")
 
@@ -90,7 +112,7 @@ class FailureClassificationTests(unittest.TestCase):
                     RecoveryStrategy.HARD_STOP in recovery_ladder(failure_class),
                     failure_class is FailureClass.FATAL,
                 )
-        for code in ("SECRET_IN_DIFF", "SOURCE_STAGED_BLOB_NOT_REVIEWABLE", "ROLLBACK_FAILED"):
+        for code in ("COMMIT_SECURITY_FAILURE:secret_in_diff", "SOURCE_STAGED_BLOB_NOT_REVIEWABLE", "ROLLBACK_FAILED"):
             with self.subTest(code=code):
                 self.assertIs(classify_failure(code).strategy, RecoveryStrategy.HARD_STOP)
         # An ordinary model mistake is never fatal.
@@ -144,11 +166,11 @@ class FailureClassificationTests(unittest.TestCase):
                 self.assertTrue(terminal.resumable)
         _decision, terminal = project_exit("SPEC_DECISION_REQUIRED", phase=ResumePhase.PLANNER)
         self.assertIs(terminal.status, RunStatus.WAITING_HUMAN)
-        _decision, terminal = project_exit("SECRET_IN_DIFF", phase=ResumePhase.DETERMINISTIC_GATE)
+        _decision, terminal = project_exit("COMMIT_SECURITY_FAILURE:secret_in_diff", phase=ResumePhase.DETERMINISTIC_GATE)
         self.assertIs(terminal.status, RunStatus.FAILED)
 
     def test_all_literal_pipeline_failure_codes_are_explicitly_classified(self) -> None:
-        codes = _literal_failure_codes()
+        codes = literal_failure_codes()
         self.assertIn("RESUME_INTEGRITY_FAILURE", codes)
         unclassified = {code: where for code, where in codes.items() if not classify_failure(code).known}
         self.assertEqual(unclassified, {}, "classify these codes in FAILURE_CLASSES")

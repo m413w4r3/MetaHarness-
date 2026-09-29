@@ -25,7 +25,7 @@ from ..run_options import read_run_options_for_state
 from ..scope import ScopeViolation
 from ..resume import ResumeCheckpoint, ResumeIntegrityError, write_checkpoint
 from ..validation import ValidationError, config_with_check_authority, resolve_check_cwd
-from .durable_readers import read_repository_reference
+from .shared import read_repository_reference
 
 
 @dataclass(frozen=True)

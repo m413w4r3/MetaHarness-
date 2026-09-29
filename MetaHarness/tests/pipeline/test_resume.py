@@ -158,7 +158,7 @@ argv = ["must-not-execute-new-check"]
 
         paused = original.run_text(SPEC, run_id="run")
 
-        self.assertEqual(paused.status, RunStatus.PAUSED, paused.state)
+        self.assertEqual(paused.status, RunStatus.WAITING_EXTERNAL, paused.state)
         self.assertEqual(paused.state["failure"]["reason"], "PAUSED")
         self.assertFalse(paused.state["pause_requested"])
         self.assertEqual(self.checkpoint()["phase"], "implement_step")

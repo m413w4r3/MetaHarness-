@@ -6,7 +6,7 @@ from pathlib import Path
 
 from metaharness.evidence import EvidenceBundle
 from metaharness.orchestration.audit import _evidence_payload
-from metaharness.orchestration.audit_prompt import build_audit_payload
+from metaharness.orchestration.audit import build_audit_payload
 from metaharness.planning.protocol import parse_task_plan_v2
 from tests.autonomy.support import Step, meta_plan
 

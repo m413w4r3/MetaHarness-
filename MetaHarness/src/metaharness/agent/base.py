@@ -17,13 +17,10 @@ AgentUsage = dict[str, int]
 
 # Durable, backend-neutral failure reasons.  Backend-specific diagnostics stay
 # in ``backend_reason`` and never become pipeline state.
-AGENT_START_FAILED = "AGENT_START_FAILED"
 AGENT_RUNTIME_FAILED = "AGENT_RUNTIME_FAILED"
 AGENT_TIMEOUT = "AGENT_TIMEOUT"
-AGENT_PROTOCOL_FAILED = "AGENT_PROTOCOL_FAILED"
 AGENT_SCOPE_VIOLATION = "AGENT_SCOPE_VIOLATION"
 AGENT_AUTH_FAILURE = "AGENT_AUTH_FAILURE"
-AGENT_RATE_LIMITED = "AGENT_RATE_LIMITED"
 AGENT_GIT_VIOLATION = "AGENT_GIT_VIOLATION"
 AGENT_SCOPE_REQUEST = "AGENT_SCOPE_REQUEST"
 
@@ -121,4 +118,4 @@ class AgentScopeError(AgentError):
 class AgentProtocolError(AgentError):
     """The worker produced an invalid execution protocol result."""
 
-    code = AGENT_PROTOCOL_FAILED
+    code = AGENT_RUNTIME_FAILED

@@ -20,7 +20,7 @@ from metaharness.models import (  # noqa: E402
     GitHubConfig, PublishConfig, RunMachineState, RunPhase,
 )
 from metaharness.orchestration.publication import PublicationService  # noqa: E402
-from metaharness.orchestration.run_observability import RunObservability  # noqa: E402
+from metaharness.orchestration.runtime import RunObservability  # noqa: E402
 from metaharness.orchestration.runtime import RunRuntime  # noqa: E402
 from metaharness.state import RunStateStore  # noqa: E402
 

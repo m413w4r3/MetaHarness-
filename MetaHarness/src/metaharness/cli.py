@@ -48,7 +48,7 @@ from .gitops import (
     validate_run_branch,
 )
 from .llm.chat import validate_endpoint
-from .models import AgentConfig, HarnessConfig, ProfileDriver, PublishMode, RunStatus, profile_driver_name
+from .models import AgentConfig, HarnessConfig, ProfileDriver, PublishMode, RunPhase, RunStatus, profile_driver_name
 from .orchestrator import OrchestrationError, resume_run, run_orchestrator
 from .profiles import profiles_for_config
 from .redaction import config_secret_values, redact
@@ -295,8 +295,11 @@ def _diagnostics(config_path: Path, target: str, *, stdout: bool = False) -> int
 def _write_plan_decision(run_dir: Path, decision: ApprovalDecision) -> int:
     try:
         directory, state = _load_run_state(run_dir)
-        if state.get("status") != RunStatus.AWAITING_PLAN_APPROVAL.value:
-            raise ApprovalError("run must be awaiting_plan_approval")
+        if (
+            state.get("status") != RunStatus.RUNNING.value
+            or state.get("phase") != RunPhase.PLAN_APPROVAL.value
+        ):
+            raise ApprovalError("run must be in plan_approval phase")
         profile_aware = is_profile_aware_run(state)
         if decision is ApprovalDecision.APPROVE and profile_aware:
             # The CLI cannot choose execution profiles; a schema-v1 approval

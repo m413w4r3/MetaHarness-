@@ -7,10 +7,8 @@ from pathlib import Path
 from unittest import mock
 
 from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
-from metaharness.commit_gate import commit_safety_gate
 from metaharness.models import ExecutionRole, RunStatus
-from metaharness.orchestration.step_acceptance import StepAcceptanceService
-from metaharness.orchestration.step_authority import read_step_candidate
+from metaharness.orchestration.step_execution import StepAcceptanceService, read_step_candidate
 from metaharness.orchestrator import Orchestrator
 from metaharness.resume import resume_info
 from tests.pipeline.support import PipelineHarness, continuation_answer, git, initial_plan, write
@@ -76,7 +74,7 @@ class StepAuthorityTests(PipelineHarness):
             write("feature.txt", "good\n"),
         )
         with mock.patch(
-            "metaharness.orchestration.step_acceptance.commit_safety_gate",
+            "metaharness.orchestration.step_execution.commit_safety_gate",
             side_effect=KeyboardInterrupt(),
         ):
             result = self.orchestrator(
@@ -102,7 +100,7 @@ class StepAuthorityTests(PipelineHarness):
             write("feature.txt", "good\n"), write("feature.txt", "good\n"),
         )
         with mock.patch(
-            "metaharness.orchestration.step_acceptance.commit_safety_gate",
+            "metaharness.orchestration.step_execution.commit_safety_gate",
             side_effect=KeyboardInterrupt(),
         ):
             self.run_pipeline()

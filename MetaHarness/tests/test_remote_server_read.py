@@ -312,8 +312,6 @@ class GatewayCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
         else:
             self.upstream_server.state = self.upstream
-            self.addCleanup(self.upstream_server.shutdown)
-            self.addCleanup(self.upstream_server.server_close)
             self.start_thread(self.upstream_server)
             self.upstream_port = self.upstream_server.server_port
             self.gateway = create_remote_gateway(
@@ -322,8 +320,6 @@ class GatewayCase(unittest.TestCase):
                 control_token_file=self.control_token_file,
                 metaharness_port=self.upstream_port,
             )
-            self.addCleanup(self.gateway.shutdown)
-            self.addCleanup(self.gateway.server_close)
             self.start_thread(self.gateway)
         self.gateway_port: int = self.gateway.server_port  # type: ignore[attr-defined]
 
@@ -332,7 +328,9 @@ class GatewayCase(unittest.TestCase):
             target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
         )
         thread.start()
+        self.addCleanup(server.server_close)
         self.addCleanup(thread.join, TEST_TIMEOUT)
+        self.addCleanup(server.shutdown)
 
     def _memory_connection(
         self, host, port=None, timeout=None, source_address=None, blocksize=8192

@@ -9,13 +9,11 @@ artefact.
 
 from __future__ import annotations
 
-import base64
 import email.utils
 import http.client
 import json
 import os
 import random
-import re
 import socket
 import time
 import urllib.error
@@ -99,60 +97,6 @@ class ConversationContinuationClient(Protocol):
 
 
 @dataclass(frozen=True)
-class TextFileAttachment:
-    """One bounded UTF-8 text file offered to the endpoint as an attachment.
-
-    An attachment is a transport mode for evidence that is already durable in
-    the run artifacts; it never carries protocol authority.
-    """
-
-    filename: str
-    text: str
-    media_type: str = "text/markdown"
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.filename, str)
-            or not self.filename
-            or len(self.filename) > 128
-            or "/" in self.filename
-            or "\\" in self.filename
-            or "\x00" in self.filename
-        ):
-            raise ValueError("attachment filename is invalid")
-
-        if not isinstance(self.text, str):
-            raise TypeError("attachment text must be a string")
-
-        if (
-            not isinstance(self.media_type, str)
-            or not re.fullmatch(
-                r"[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+",
-                self.media_type,
-            )
-        ):
-            raise ValueError("attachment media type is invalid")
-
-
-def _attachment_part(
-    attachment: TextFileAttachment,
-) -> dict[str, Any]:
-    encoded = base64.b64encode(
-        attachment.text.encode("utf-8")
-    ).decode("ascii")
-
-    return {
-        "type": "input_file",
-        "file": {
-            "filename": attachment.filename,
-            "file_data": (
-                f"data:{attachment.media_type};base64,{encoded}"
-            ),
-        },
-    }
-
-
-@dataclass(frozen=True)
 class TextLLMResult:
     text: str
     model: str | None
@@ -191,7 +135,6 @@ _JITTER_FRACTION = 0.2
 _MIN_USEFUL_WAIT_SECONDS = 1.0
 # An inline request that has been retried for this long hands its evidence
 # over to an attached file instead of paying for the large inline payload.
-DEFAULT_FILE_FALLBACK_AFTER_SECONDS = 30.0
 _MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _TRUNCATED_FINISH_REASONS = frozenset({"length", "content_filter"})
@@ -252,59 +195,10 @@ class OpenAIChatTextClient:
         response_data = self._request_json(request)
         return _parse_completion_response(response_data)
 
-    def complete_with_file_fallback(
-        self,
-        prompt: str,
-        *,
-        fallback_prompt: str,
-        attachments: tuple[TextFileAttachment, ...],
-        fallback_after_seconds: float = DEFAULT_FILE_FALLBACK_AFTER_SECONDS,
-    ) -> TextLLMResult:
-        """Send *prompt* inline, moving evidence to files only late.
-
-        The attachments are used from the first attempt that starts more than
-        *fallback_after_seconds* after the completion began: the inline payload
-        is always tried first, and a non-retryable status still fails on its
-        own attempt without ever attaching a file.
-        """
-
-        if not isinstance(prompt, str):
-            raise TypeError("prompt must be a string")
-        if not isinstance(fallback_prompt, str):
-            raise TypeError("fallback_prompt must be a string")
-        if not isinstance(attachments, tuple) or not attachments:
-            raise TypeError("attachments must be a non-empty tuple")
-        if any(not isinstance(item, TextFileAttachment) for item in attachments):
-            raise TypeError("attachments must contain TextFileAttachment values")
-        if (
-            isinstance(fallback_after_seconds, bool)
-            or not isinstance(fallback_after_seconds, (int, float))
-            or fallback_after_seconds < 0
-        ):
-            raise ValueError("fallback_after_seconds must be a non-negative number")
-
-        response_data = self._request_json_with_factory(
-            lambda attached: self._build_request(
-                prompt
-                if not attached
-                else [
-                    {
-                        "type": "text",
-                        "text": fallback_prompt,
-                    },
-                    *[
-                        _attachment_part(item)
-                        for item in attachments
-                    ],
-                ]
-            ),
-            fallback_after_seconds=float(fallback_after_seconds),
-        )
-        return _parse_completion_response(response_data)
 
     def _build_request(
         self,
-        content: str | list[dict[str, Any]],
+        content: str,
     ) -> urllib.request.Request:
         payload: dict[str, Any] = dict(self.config.extra_body)
         # Protected keys are written last: even a mutated extra_body cannot
@@ -337,14 +231,6 @@ class OpenAIChatTextClient:
         )
 
     def _request_json(self, request: urllib.request.Request) -> dict[str, Any]:
-        return self._request_json_with_factory(lambda _attached: request)
-
-    def _request_json_with_factory(
-        self,
-        request_factory: Callable[[bool], urllib.request.Request],
-        *,
-        fallback_after_seconds: float | None = None,
-    ) -> dict[str, Any]:
         """One completion over a monotonic horizon, not an attempt count.
 
         Every retryable failure (429, 5xx, a timeout, an interrupted
@@ -364,11 +250,6 @@ class OpenAIChatTextClient:
         )
         while True:
             attempts += 1
-            attached = (
-                fallback_after_seconds is not None
-                and time.monotonic() - started >= fallback_after_seconds
-            )
-            request = request_factory(attached)
             attempt_started = time.monotonic()
             self._transport_event("attempt_started", attempt=attempts)
             retry_after: float | None = None

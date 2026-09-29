@@ -7,7 +7,7 @@ import sys
 from dataclasses import replace
 from unittest.mock import patch
 
-from metaharness.agent.base import AGENT_RATE_LIMITED, AgentRunResult
+from metaharness.agent.base import AGENT_RUNTIME_FAILED, AgentRunResult
 from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
 from metaharness.models import AgentExecutorCapabilities, ExecutionRole
 from metaharness.recovery_policy import ExecutionFallbacks
@@ -58,7 +58,7 @@ class AuditPipelineTests(PipelineHarness):
     def _limited_audit(self, request):
         (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
         return AgentRunResult(
-            status="failed", exit_reason=AGENT_RATE_LIMITED, backend_reason=AGENT_RATE_LIMITED,
+            status="failed", exit_reason=AGENT_RUNTIME_FAILED, backend_reason="rate_limited",
             tree_before="", tree_after="", usage=None, external_session_id=None,
             report_path=None, exit_code=1, terminal_is_error=True,
             final_message="You've hit your session limit · resets 4:20am (Europe/Paris)",
@@ -102,7 +102,7 @@ class AuditPipelineTests(PipelineHarness):
         result = self.orchestrator(config, planner=[
             meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
         ]).run_text(SPEC, run_id="run")
-        self.assertEqual(result.state["failure"]["reason"], AGENT_RATE_LIMITED)
+        self.assertEqual(result.state["failure"]["reason"], AGENT_RUNTIME_FAILED)
         self.assertEqual(self.workers.roles().count("auditor"), 1)
 
     def test_rate_limit_without_fallback_retains_real_failure(self) -> None:
@@ -110,7 +110,7 @@ class AuditPipelineTests(PipelineHarness):
         self.workers.on(ExecutionRole.AUDITOR, self._limited_audit)
         result = self._run()
         self.assertEqual(result.state["disposition"], "WAIT_EXTERNAL")
-        self.assertEqual(result.state["failure"]["reason"], AGENT_RATE_LIMITED)
+        self.assertEqual(result.state["failure"]["reason"], AGENT_RUNTIME_FAILED)
         self.assertFalse((self.run_dir() / "cycles/001/audit/001/report.json").exists())
 
     def test_all_auditors_rate_limited_wait_without_repeating(self) -> None:
@@ -119,7 +119,7 @@ class AuditPipelineTests(PipelineHarness):
         result = self.orchestrator(self._audit_fallback_config(), planner=[
             meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
         ]).run_text(SPEC, run_id="run")
-        self.assertEqual(result.state["failure"]["reason"], AGENT_RATE_LIMITED)
+        self.assertEqual(result.state["failure"]["reason"], AGENT_RUNTIME_FAILED)
         self.assertEqual(self.workers.roles().count("auditor"), 2)
 
     def test_invalid_audit_report_does_not_trigger_rate_limit_fallback(self) -> None:
@@ -128,7 +128,7 @@ class AuditPipelineTests(PipelineHarness):
         result = self.orchestrator(self._audit_fallback_config(), planner=[
             meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
         ]).run_text(SPEC, run_id="run")
-        self.assertEqual(result.state["failure"]["reason"], "AGENT_PROTOCOL_FAILED")
+        self.assertEqual(result.state["failure"]["reason"], "AGENT_RUNTIME_FAILED")
         self.assertEqual(self.workers.roles().count("auditor"), 1)
 
     def test_hard_deny_before_rate_limit_prevents_fallback(self) -> None:

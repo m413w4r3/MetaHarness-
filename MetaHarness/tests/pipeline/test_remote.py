@@ -95,7 +95,7 @@ class RemoteCandidateTests(PipelineHarness):
         self.assertIn('"gate"', prompt)
         self.assertIn('"baseline"', prompt)
         self.assertIn('"changed_paths"', prompt)
-        self.assertIn("+good", prompt)
+        self.assertIn("diff.patch", prompt)
         self.assertNotIn("remote_exploration", prompt)
 
     def test_required_candidate_push_waits_and_resumes_at_candidate_push(self) -> None:
@@ -105,7 +105,7 @@ class RemoteCandidateTests(PipelineHarness):
             self.config(publish=True), planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(waiting.status.value, "waiting_remote")
+        self.assertEqual(waiting.status.value, "waiting_external")
         self.assertEqual(self.checkpoint()["phase"], "candidate_push")
         self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
         candidate = json.loads(
@@ -132,7 +132,7 @@ class RemoteCandidateTests(PipelineHarness):
             planner=[initial_plan(STEP)],
         ).run_text(SPEC, run_id="run")
 
-        self.assertEqual(waiting.status.value, "waiting_remote")
+        self.assertEqual(waiting.status.value, "waiting_external")
         self.assertEqual(self.checkpoint()["phase"], "candidate_push")
         self.assertFalse((self.run_dir() / "publish.json").exists())
         self.assertFalse((self.run_dir() / "github").exists())

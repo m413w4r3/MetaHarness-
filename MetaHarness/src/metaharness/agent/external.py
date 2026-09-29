@@ -17,15 +17,7 @@ from typing import Any, Mapping
 from ..gitops import GitError, candidate_tree_sha
 from ..procutil import read_capped, run_bounded
 from ..redaction import config_secret_values, redact_file
-from .base import (
-    AGENT_RUNTIME_FAILED,
-    AGENT_START_FAILED,
-    AGENT_TIMEOUT,
-    AgentError,
-    AgentExecutorCapabilities,
-    AgentRunRequest,
-    AgentRunResult,
-)
+from .base import AGENT_RUNTIME_FAILED, AGENT_TIMEOUT, AgentError, AgentExecutorCapabilities, AgentRunRequest, AgentRunResult
 
 
 @dataclass(frozen=True)
@@ -159,7 +151,7 @@ class ExternalAgentExecutor:
         except (OSError, ValueError, TypeError, AgentError) as exc:
             return AgentRunResult(
                 status="failed",
-                exit_reason=AGENT_START_FAILED,
+                exit_reason=AGENT_RUNTIME_FAILED,
                 tree_before=before,
                 tree_after=_tree(worktree),
                 usage=None,

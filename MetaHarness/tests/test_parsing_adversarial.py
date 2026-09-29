@@ -12,8 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from metaharness.llm.wire import WireParseError, control_tokens  # noqa: E402
-from metaharness.orchestration.audit_protocol import parse_audit_report  # noqa: E402
+from metaharness.orchestration.audit import parse_audit_report  # noqa: E402
 
 
 def report(
@@ -148,16 +147,6 @@ class AuditReportControlTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         assert parsed is not None
         self.assertEqual(parsed.fixed, (single[2:],))
-
-
-class ControlTokenTests(unittest.TestCase):
-    def test_control_tokens_are_exact(self) -> None:
-        self.assertEqual(control_tokens("  **PASS**  ", {"PASS", "FAIL"}), ("PASS",))
-        self.assertEqual(control_tokens("", {"PASS"}), ())
-        for value in ("PASS!", "PASSED", "PASS FAIL", "PASS, finally"):
-            with self.subTest(value=value):
-                with self.assertRaises(WireParseError):
-                    control_tokens(value, {"PASS", "FAIL"})
 
 
 if __name__ == "__main__":

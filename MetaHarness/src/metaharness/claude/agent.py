@@ -13,7 +13,7 @@ from ..gitops import GitError, current_head
 from ..models import ModelProfile, ProfileDriver
 from ..procutil import run_bounded
 from ..usage import normalize_usage
-from ..agent.base import AGENT_AUTH_FAILURE, AGENT_GIT_VIOLATION, AGENT_RATE_LIMITED, AGENT_RUNTIME_FAILED, AgentError
+from ..agent.base import AGENT_AUTH_FAILURE, AGENT_GIT_VIOLATION, AGENT_RUNTIME_FAILED, AgentError
 from ..agent.events import extract_final, extract_terminal_result, extract_usage, parse_event
 
 
@@ -104,7 +104,7 @@ def classify_claude_failure(stderr: str, events: str = "") -> str | None:
         "you've hit your session limit", "you’ve hit your session limit",
         "you've hit your weekly limit", "you’ve hit your weekly limit",
     )):
-        return AGENT_RATE_LIMITED
+        return "rate_limited"
     return None
 
 

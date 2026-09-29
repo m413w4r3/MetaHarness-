@@ -102,9 +102,7 @@ class GitMutationAudit:
 
 
 # The run branch moved forward; the harness rewinds it with ``reset --soft``.
-REMOTE_AUTHORITY_MISMATCH = "REMOTE_AUTHORITY_MISMATCH"
-BRANCH_MODIFIED_OUTSIDE_AUTHORITY = "BRANCH_MODIFIED_OUTSIDE_AUTHORITY"
-HEAD_MODIFIED_OUTSIDE_AUTHORITY = "HEAD_MODIFIED_OUTSIDE_AUTHORITY"
+TREE_MODIFIED_OUTSIDE_AUTHORITY = "TREE_MODIFIED_OUTSIDE_AUTHORITY"
 
 
 def audit_git_mutation(
@@ -123,18 +121,18 @@ def audit_git_mutation(
     deleted = tuple(sorted(before.branches - after.branches))
     if deleted:
         return GitMutationAudit(
-            BRANCH_MODIFIED_OUTSIDE_AUTHORITY,
+            TREE_MODIFIED_OUTSIDE_AUTHORITY,
             "branch(es) deleted: " + ", ".join(deleted),
         )
     if _remote_refs(after) != _remote_refs(before):
         return GitMutationAudit(
-            REMOTE_AUTHORITY_MISMATCH,
+            TREE_MODIFIED_OUTSIDE_AUTHORITY,
             "remote-tracking refs changed: the worker pushed or fetched",
         )
     foreign = _foreign_ref_changes(before, after, branch_ref=branch_ref, created=created)
     if foreign:
         return GitMutationAudit(
-            BRANCH_MODIFIED_OUTSIDE_AUTHORITY,
+            TREE_MODIFIED_OUTSIDE_AUTHORITY,
             "ref(s) modified outside the run branch: " + ", ".join(foreign),
         )
     roots = {
@@ -150,18 +148,18 @@ def audit_git_mutation(
     )
     if after.head_ref not in {branch_ref, adopted}:
         return GitMutationAudit(
-            HEAD_MODIFIED_OUTSIDE_AUTHORITY,
+            TREE_MODIFIED_OUTSIDE_AUTHORITY,
             f"worktree HEAD switched to {after.head_ref or 'a detached HEAD'}",
         )
     if after.head != base_sha:
         moved = _moves_forward(before.head, after.head, base_sha, repo=repo)
         if adopted is None and after.head_ref != branch_ref:
             return GitMutationAudit(
-                HEAD_MODIFIED_OUTSIDE_AUTHORITY, "worktree HEAD commit changed",
+                TREE_MODIFIED_OUTSIDE_AUTHORITY, "worktree HEAD commit changed",
             )
         if not moved:
             return GitMutationAudit(
-                HEAD_MODIFIED_OUTSIDE_AUTHORITY,
+                TREE_MODIFIED_OUTSIDE_AUTHORITY,
                 "the run branch no longer descends from the expected commit",
             )
         return GitMutationAudit(
@@ -346,7 +344,7 @@ def restore_exact(worktree: Path, before: CandidateState, *, label: str) -> None
             "ROLLBACK_FAILED", f"{label} rollback failed: {type(exc).__name__}",
         ) from None
     if restored != before:
-        raise AttemptViolation("ROLLBACK_TREE_MISMATCH", f"{label} rollback was not exact")
+        raise AttemptViolation("ROLLBACK_FAILED", f"{label} rollback was not exact")
 
 
 def contain_trusted_process(
@@ -482,7 +480,7 @@ class CandidateAttemptTransaction:
             failures = scan_staged_security(self.worktree, secrets=self._secrets)
         except (GitError, OSError, ValueError) as exc:
             raise AttemptViolation(
-                "STAGED_BLOB_SCAN_FAILED",
+                "COMMIT_SECURITY_FAILURE",
                 f"staged changes could not be scanned: {type(exc).__name__}",
             ) from exc
         if failures:
@@ -538,14 +536,4 @@ class CandidateAttemptTransaction:
         return AttemptRollback(changed, tree_after)
 
 
-__all__ = [
-    "AttemptBoundary", "AttemptRollback", "AttemptViolation",
-    "BRANCH_MODIFIED_OUTSIDE_AUTHORITY", "GitMutationAudit",
-    "HEAD_MODIFIED_OUTSIDE_AUTHORITY", "REMOTE_AUTHORITY_MISMATCH",
-    "audit_git_mutation", "recover_worker_git_state",
-    "CandidateAttemptTransaction", "GitOwnership", "SideEffect",
-    "MAX_REPORTED_PATHS", "contain_trusted_process", "git_ownership",
-    "observe_side_effects", "ownership_violations", "paths_detail", "restore_exact",
-    "safe_path_label",
-    "status_has_unstaged_or_untracked",
-]
+__all__ = ['AttemptBoundary', 'AttemptRollback', 'AttemptViolation', 'TREE_MODIFIED_OUTSIDE_AUTHORITY', 'GitMutationAudit', 'audit_git_mutation', 'recover_worker_git_state', 'CandidateAttemptTransaction', 'GitOwnership', 'SideEffect', 'MAX_REPORTED_PATHS', 'contain_trusted_process', 'git_ownership', 'observe_side_effects', 'ownership_violations', 'paths_detail', 'restore_exact', 'safe_path_label', 'status_has_unstaged_or_untracked']
