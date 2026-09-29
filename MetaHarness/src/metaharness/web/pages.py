@@ -73,6 +73,7 @@ def _page(
     dl.tokens {{ display: grid; grid-template-columns: auto 1fr; gap: 0 .5rem; margin: 0; font-size: .82rem; }} dl.tokens dd {{ margin: 0; }}
     .failure-card {{ margin-top: .6rem; }} .failure-title {{ font-size: 1.1rem; margin: .2rem 0; }}
     button.resume {{ border-color: #4cae4c; text-transform: uppercase; }}
+    button.pause {{ border-color: #e0a030; text-transform: uppercase; }}
     ol.pipeline-list {{ list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: .35rem; }}
     ol.pipeline-list li {{ border: 1px solid #7776; border-radius: .35rem; padding: .35rem .55rem; }}
     .symbol {{ display: inline-block; width: 1.2rem; font-weight: 700; }}
@@ -101,6 +102,7 @@ _ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
 _TERMINAL_LABELS = {
     "blocked": "BLOCKED", "plan_rejected": "REJECTED", "failed": "FAILED",
     "interrupted": "INTERRUPTED", "waiting_human": "WAITING FOR OPERATOR",
+    "paused": "PAUSED",
     "waiting_external": "WAITING FOR EXTERNAL AUTHORIZATION",
     "waiting_remote": "WAITING FOR REMOTE",
 }
@@ -108,6 +110,7 @@ _WAITING_LABELS = {
     "waiting_external": "Waiting for external authorization",
     "waiting_remote": "Waiting for remote",
     "waiting_human": "Waiting for operator decision",
+    "paused": "Paused after step",
 }
 TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
 AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
@@ -746,6 +749,7 @@ _FAILURE_MESSAGES = {
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
     "RESUME_REQUIRES_OPERATOR": "Resume requires an operator",
     "INTERRUPTED": "Run interrupted",
+    "PAUSED": "Run paused after the current step",
 }
 
 
@@ -817,7 +821,7 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     status = str(state.get("status", run.get("status", "")) or "")
     failure = run.get("failure", state.get("failure"))
     if status not in {
-        "failed", "blocked", "interrupted", "waiting_remote", "waiting_external",
+        "failed", "blocked", "interrupted", "paused", "waiting_remote", "waiting_external",
         "waiting_human",
     } or not isinstance(failure, dict):
         return ""
@@ -837,7 +841,7 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
             f' · iteration={_e(resume.get("iteration") or "—")}'
             f' · step index={_e(resume.get("step_index") if resume.get("step_index") is not None else "—")}</p>'
         )
-        button_label = label
+        button_label = "RESUME RUN" if status == "paused" else label
         button = (
             f'<form action="/runs/{_e(run.get("run_id"))}/resume" method="post">'
             f'<input type="hidden" name="_token" value="{_e(token)}">'
@@ -871,6 +875,17 @@ def _run_card(run: dict[str, Any], token: str | None, overview: dict[str, Any], 
         )
     )
     style = "failed" if status in {"failed", "blocked", "plan_rejected", "interrupted"} else "success" if status in {"committed", "approved", "published"} else ""
+    current_step = state.get("current_step")
+    pause_requested = state.get("pause_requested") is True
+    pause_action = ""
+    if status == "implementing" and isinstance(current_step, str) and current_step and token:
+        pause_action = (
+            f'<form action="/runs/{_e(run_id)}/pause" method="post">'
+            f'<input type="hidden" name="_token" value="{_e(token)}">'
+            f'<button class="pause" type="submit"'
+            f'{" disabled" if pause_requested else ""}>'
+            f'{"PAUSE REQUESTED" if pause_requested else "PAUSE AFTER CURRENT STEP"}</button></form>'
+        )
     failure = run.get("failure", state.get("failure"))
     live_reason = failure.get("reason") if isinstance(failure, dict) else ""
     polls = run_page_polls(run)
@@ -890,6 +905,7 @@ def _run_card(run: dict[str, Any], token: str | None, overview: dict[str, Any], 
         f'<div><p class="label">TOKENS</p><dl class="tokens">{tokens}</dl></div>'
         '</div>'
         f'{_final_summary(run) if is_v2 else ""}'
+        f'{pause_action}'
         f'<p id="live-failure" class="danger"{"" if polls and live_reason else " hidden"}>{_e(live_reason)}</p>'
         f'{_failure_card(run, token, overview)}'
         + ('<button type="button" id="refresh-details" hidden>Actualiser les détails</button>' if polls else "")

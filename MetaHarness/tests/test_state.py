@@ -21,6 +21,7 @@ from metaharness.models import (
     RunMachineState,
     RunPhase,
     RunStatus,
+    PAUSED_REASON,
     RunTransitionError,
     RUN_CHECKPOINT_NAME,
     disposition_for_status,
@@ -562,6 +563,7 @@ PROJECTION_MATRIX = (
     # The failure reason names the flavour of an external wait; a reason that
     # belongs to another phase stays a plain external wait.
     (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, "AGENT_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
+    (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, PAUSED_REASON, RunStatus.PAUSED, True, True),
     # A check infrastructure reason is an ordinary external wait: a skipped
     # check is a durable warning, never a gate infrastructure status.
     (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),

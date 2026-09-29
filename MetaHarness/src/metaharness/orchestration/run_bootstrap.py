@@ -68,6 +68,7 @@ from ..validation import config_with_check_authority, frozen_check_policy
 from ..workspace import prepare_workspace
 from .durable_readers import read_repository_reference
 from .pipeline_v2 import BudgetExhausted
+from .per_step_gate import per_step_check_ids
 from .shared import (
     GitOwnership, OrchestrationError, PLANNER_CONVERSATION, archive_attempt_tree,
     git_ownership, git_ownership_payload, is_object_id, json_text,
@@ -290,10 +291,13 @@ class RunBootstrap:
             # policy, not just this selection: a later milestone may require
             # another approved check, and every run must keep running the argv
             # and the defaults approved at this boundary.
+            new_check_authority = not (run_dir / "check_authority.json").exists()
             write_check_authority(
                 run_dir, tuple(self.runtime.config.trusted_checks()),
                 default_check_ids=tuple(self.runtime.config.required_check_ids()),
             )
+            if new_check_authority:
+                store.update_metadata(per_step_check_ids=list(self.runtime.config.gate.per_step))
             plan_sha = persist_iteration_plan(run_dir, iteration, plan)
             _bundle, _bundle_sha = validate_implementation_bundle(
                 iteration_plan_dir(run_dir, iteration), expected_step_ids=[step.id for step in plan.steps],
@@ -456,7 +460,7 @@ class RunBootstrap:
         # The baseline of the base commit comes before the first implementation
         # step: no later gate ever has to guess whether a failure is new.
         baseline_ids = tuple(dict.fromkeys(
-            (*selected_check_ids, *self.runtime.config.gate.per_step)
+            (*selected_check_ids, *per_step_check_ids(self.runtime, run_dir))
         ))
         baseline = BaselineCache(self.runtime.config.runs_root).ensure(
             repo=info.worktree, base_sha=info.base_sha, config=check_config,

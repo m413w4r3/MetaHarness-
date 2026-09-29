@@ -40,6 +40,9 @@ class AgentExecutorCapabilities:
     exposes_reasoning_usage: bool = False
     exposes_tool_count: bool = False
     isolation_mode: str | None = None
+    # False for repository-only/remote executors. Never replace authority with
+    # a local artifact pointer unless the executor can actually read it.
+    reads_external_artifacts: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -48,6 +51,7 @@ class AgentExecutorCapabilities:
             "exposes_usage",
             "exposes_reasoning_usage",
             "exposes_tool_count",
+            "reads_external_artifacts",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
@@ -296,6 +300,7 @@ class RunStatus(StrEnum):
     WAITING_HUMAN = "waiting_human"
     AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
     WAITING_EXTERNAL = "waiting_external"
+    PAUSED = "paused"
     WAITING_REMOTE = "waiting_remote"
     PLAN_REJECTED = "plan_rejected"
     PREPARING = "preparing"
@@ -376,6 +381,7 @@ RUN_CHECKPOINT_NAME = "resume_checkpoint.json"
 # reason, never as a status.
 PLAN_REJECTED_REASON = "PLAN_REJECTED"
 INTERRUPTED_REASON = "INTERRUPTED"
+PAUSED_REASON = "PAUSED"
 
 
 def _run_reason(value: Any) -> str | None:
@@ -708,6 +714,8 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
         )
         return RunOutcome(phase, disposition, status, False, True)
     if disposition is RunDisposition.WAIT_EXTERNAL:
+        if reason == PAUSED_REASON:
+            return RunOutcome(phase, disposition, RunStatus.PAUSED, True, True)
         if reason in _REMOTE_REASONS and phase in _REMOTE_PHASES:
             status = RunStatus.WAITING_REMOTE
         else:
@@ -725,6 +733,7 @@ _STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
     RunStatus.WAITING_HUMAN: RunDisposition.WAIT_HUMAN,
     RunStatus.AWAITING_PLAN_APPROVAL: RunDisposition.RUNNING,
     RunStatus.WAITING_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
+    RunStatus.PAUSED: RunDisposition.WAIT_EXTERNAL,
     RunStatus.WAITING_REMOTE: RunDisposition.WAIT_EXTERNAL,
     RunStatus.PLAN_REJECTED: RunDisposition.WAIT_HUMAN,
     RunStatus.PREPARING: RunDisposition.RUNNING,
@@ -976,11 +985,13 @@ class PromptBudgetConfig:
 
     planner_max_bytes: int = 160_000
     implementer_max_bytes: int = 120_000
+    audit_max_bytes: int = 64_000
 
     def __post_init__(self) -> None:
         for name in (
             "planner_max_bytes",
             "implementer_max_bytes",
+            "audit_max_bytes",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -1240,6 +1251,7 @@ class ExecutionSelection:
     planner: SelectedProfile
     steps: tuple[StepExecutionSelection, ...]
     audit: SelectedProfile
+    audit_fallbacks: tuple[SelectedProfile, ...] = ()
 
 
 class CycleKind(StrEnum):

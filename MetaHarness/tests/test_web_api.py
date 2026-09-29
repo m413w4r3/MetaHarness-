@@ -527,7 +527,7 @@ class WebServerTests(unittest.TestCase):
         (run_dir / "agent.events.jsonl").write_text("".join(events), encoding="utf-8")
         status, payload, _ = self.request("GET", "/api/runs/events/progress?offset=0")
         self.assertEqual(status, 200)
-        self.assertTrue(any("turn.started" in item for item in payload["events"]))
+        self.assertEqual(payload["events"], [])
         status, second, _ = self.request(
             "GET", f"/api/runs/events/progress?offset={payload['next_offset']}"
         )
@@ -538,20 +538,43 @@ class WebServerTests(unittest.TestCase):
         run_dir = self.create_run("unified")
         trace = run_dir / "trace" / "events.v1.jsonl"
         trace.parent.mkdir(parents=True)
-        trace.write_text(json.dumps({
-            "schema_version": 1, "sequence": 1, "timestamp": "2026-09-23T15:45:17Z",
-            "event": "recovery.waiting_external", "phase": "implementation", "cycle": 1,
-            "step_id": "S04", "data": {"detail": "HTTP 503 after 3 attempts", "action": "waiting external",
-                "authorization": "Bearer SECRET"},
-        }) + "\n", encoding="utf-8")
+        trace.write_text("\n".join(json.dumps(item) for item in [
+            {
+                "schema_version": 1, "sequence": 1, "timestamp": "2026-09-23T15:45:17Z",
+                "event": "step.started", "phase": "implementation", "cycle": 1,
+                "step_id": "S01", "data": {},
+            },
+            {
+                "schema_version": 1, "sequence": 2, "timestamp": "2026-09-23T15:45:18Z",
+                "event": "step.committed", "phase": "implementation", "cycle": 1,
+                "step_id": "S01", "data": {"changed_paths": ["src/app.py"]},
+            },
+            {
+                "schema_version": 1, "sequence": 3, "timestamp": "2026-09-23T15:45:19Z",
+                "event": "recovery.waiting_external", "phase": "implementation", "cycle": 1,
+                "step_id": "S04", "data": {"detail": "HTTP 503 after 3 attempts", "action": "waiting external",
+                    "authorization": "Bearer SECRET"},
+            },
+        ]) + "\n", encoding="utf-8")
         agent = run_dir / "cycles/001/implementation/steps/S01/agent.events.jsonl"
         agent.parent.mkdir(parents=True)
-        agent.write_text(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "rg Authorization SECRET"}}) + "\n" + json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "DEEPSEEK_API_KEY=SECRET found issue"}}) + "\n", encoding="utf-8")
+        agent.write_text("\n".join(json.dumps(item) for item in [
+            {"type": "item.started", "item": {"type": "command_execution", "command": "zsh -lc rg Authorization SECRET"}},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "zsh -lc rg Authorization SECRET", "exit_code": 0}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "DEEPSEEK_API_KEY=SECRET found issue"}},
+        ]) + "\n", encoding="utf-8")
+        progress = run_dir / "progress/events.v1.jsonl"
+        progress.parent.mkdir(parents=True)
+        progress.write_text(json.dumps({
+            "schema_version": 1, "sequence": 1, "message": "old noisy projection",
+            "source_id": "old", "timestamp": "2026-09-23T15:45:16Z",
+        }) + "\n", encoding="utf-8")
         status, first, _ = self.request("GET", "/api/runs/unified/progress?offset=0")
         self.assertEqual(status, 200)
+        self.assertTrue(any("[S01] step completed: committed" in item for item in first["events"]))
+        self.assertFalse(any("step started" in item for item in first["events"]))
+        self.assertFalse(any("old noisy projection" in item for item in first["events"]))
         self.assertTrue(any("[recovery] [S04]" in item and "HTTP 503" in item for item in first["events"]))
-        self.assertTrue(any("[S01] tool: command rg" in item for item in first["events"]))
-        self.assertTrue(any("[REDACTED]" in item for item in first["events"]))
         self.assertNotIn("SECRET", "\n".join(first["events"]))
         status, second, _ = self.request("GET", f"/api/runs/unified/progress?offset={first['next_offset']}")
         self.assertEqual(status, 200)

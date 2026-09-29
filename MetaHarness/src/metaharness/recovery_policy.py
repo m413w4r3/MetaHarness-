@@ -69,7 +69,7 @@ FAILURE_CLASSES: Mapping[str, FailureClass] = {
     # -- TRANSIENT: providers, transport, executors and infrastructure.
     "LLM_*": _T, "AGENT_START_FAILED": _T, "AGENT_RUNTIME_FAILED": _T,
     "AGENT_TIMEOUT": _T, "AGENT_PROTOCOL_FAILED": _T, "AGENT_FAILURE": _T,
-    "AGENT_AUTH_FAILURE": _T, "MISSING_PROVIDER_CREDENTIALS": _T,
+    "AGENT_AUTH_FAILURE": _T, "AGENT_RATE_LIMITED": _T, "MISSING_PROVIDER_CREDENTIALS": _T,
     "PROVIDER_CREDENTIALS_MISSING": _T, "EXTERNAL_AUTH_REQUIRED": _T,
     "REMOTE_TEMPORARILY_UNAVAILABLE": _T, "REMOTE_UNAVAILABLE": _T,
     "CANDIDATE_REMOTE_UNAVAILABLE": _T, "PUSH_FAILED": _T, "CANDIDATE_PUSH_FAILED": _T,
@@ -156,9 +156,10 @@ class ExecutionFallbacks:
     mechanical: tuple[str, ...] = ()
     reasoning: tuple[str, ...] = ()
     agentic: tuple[str, ...] = ()
+    audit: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("mechanical", "reasoning", "agentic"):
+        for name in ("mechanical", "reasoning", "agentic", "audit"):
             values = getattr(self, name)
             if isinstance(values, str) or not isinstance(values, tuple):
                 raise ValueError(f"execution_fallbacks.{name} must be a tuple of profile IDs")

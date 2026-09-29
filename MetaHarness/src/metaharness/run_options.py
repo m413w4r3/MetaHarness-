@@ -198,6 +198,13 @@ class RunOptions:
                     raise RunOptionsError(
                         f"execution_fallbacks.{execution_class} contains an incompatible profile"
                     ) from exc
+        if self.audit_profile in self.execution_fallbacks.audit:
+            raise RunOptionsError("execution_fallbacks.audit repeats the primary profile")
+        for profile_id in self.execution_fallbacks.audit:
+            try:
+                profile_for_role(config, profile_id, ExecutionRole.AUDITOR)
+            except ProfileError as exc:
+                raise RunOptionsError("execution_fallbacks.audit contains an incompatible profile") from exc
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -213,7 +220,10 @@ class RunOptions:
                 "max_read_paths_per_step": self.max_read_paths_per_step,
                 "max_step_contract_chars": self.max_step_contract_chars,
             },
-            "execution_fallbacks": asdict(self.execution_fallbacks),
+            "execution_fallbacks": {
+                key: value for key, value in asdict(self.execution_fallbacks).items()
+                if key != "audit" or value
+            },
             "budget": asdict(self.budget),
             "profiles": {
                 "planner_profile": self.planner_profile,
@@ -245,14 +255,15 @@ class RunOptions:
         )
         _require_exact_keys(planning, _PLANNING_FIELDS, "run options planning")
         _require_exact_keys(profiles, _PROFILE_FIELDS, "run options profiles")
-        _require_exact_keys(fallbacks, _FALLBACK_FIELDS, "run options execution_fallbacks")
+        expected_fallbacks = _FALLBACK_FIELDS | ({"audit"} if isinstance(fallbacks, dict) and "audit" in fallbacks else set())
+        _require_exact_keys(fallbacks, expected_fallbacks, "run options execution_fallbacks")
         _require_exact_keys(budget, _BUDGET_FIELDS, "run options budget")
         try:
             return cls(
                 schema_version=schema_version, pipeline_version=value["pipeline_version"],
                 **planning, **profiles,
                 execution_fallbacks=ExecutionFallbacks(
-                    **{key: _fallback_ids(fallbacks[key]) for key in _FALLBACK_FIELDS}
+                    **{key: _fallback_ids(fallbacks[key]) for key in expected_fallbacks}
                 ),
                 budget=AutonomyBudget(**budget),
             )

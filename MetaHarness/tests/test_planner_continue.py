@@ -226,6 +226,13 @@ class StagnationFingerprintTests(unittest.TestCase):
 
 
 class PlannerContinueServiceTests(unittest.TestCase):
+    def test_soft_prompt_budget_does_not_block_continuation(self) -> None:
+        service, client = self.service(answer("COMPLETE"))
+        service.prompt_budget_bytes = 1000
+        result = service.decide(facts())
+        self.assertIs(result.decision, ContinueDecision.COMPLETE)
+        self.assertEqual(len(client.requests), 1)
+
     def service(self, *answers: str) -> tuple[PlannerContinue, ScriptedChat]:
         client = ScriptedChat(list(answers))
         return PlannerContinue(

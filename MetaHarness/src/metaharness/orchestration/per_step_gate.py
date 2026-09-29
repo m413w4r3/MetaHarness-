@@ -16,10 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from ..approval import ApprovalError, read_check_authority
 from ..baseline import judge_results, preflight_skips
 from ..result import atomic_write_text
 from ..state import RunStateStore
-from ..validation import bounded_tail, config_with_check_authority, run_checks
+from ..validation import ValidationError, bounded_tail, config_with_check_authority, run_checks
 
 if TYPE_CHECKING:  # pragma: no cover - the service is the composition root
     from .gates import GateService
@@ -87,6 +88,41 @@ def record_step_warnings(store: RunStateStore, warnings: Any) -> None:
     merged = list(dict.fromkeys((*existing, *warnings)))
     if merged != existing:
         store.update_metadata(check_warnings=merged)
+
+
+def per_step_check_ids(runtime: Any, run_dir: Path) -> tuple[str, ...]:
+    """Keep live gate additions outside an older run's approved catalogue."""
+
+    store = RunStateStore(run_dir / "state.json")
+    state = store.load()
+    if "per_step_check_ids" in state:
+        ids = state["per_step_check_ids"]
+        if (
+            not isinstance(ids, list)
+            or any(not isinstance(item, str) or not item for item in ids)
+            or len(set(ids)) != len(ids)
+        ):
+            raise ValidationError("the run's per-step check policy is invalid")
+        return tuple(ids)
+    # Legacy runs have no gate snapshot. Retain only live selections that
+    # were already in their original catalogue; never import today's argv.
+    try:
+        policy = read_check_authority(
+            run_dir, expected_sha256=runtime.approved_check_authority_sha256(run_dir),
+        )
+    except ApprovalError as exc:
+        raise ValidationError(str(exc)) from exc
+    if policy is None:
+        raise ValidationError("the run has no check authority")
+    approved = policy.by_id()
+    requested = runtime.config.gate.per_step
+    omitted = tuple(item for item in requested if item not in approved)
+    if omitted:
+        record_step_warnings(store, (
+            "Per-step check excluded because it was added after this run's "
+            "check authority was frozen: " + item for item in omitted
+        ))
+    return tuple(item for item in requested if item in approved)
 
 
 def run_per_step_gate(

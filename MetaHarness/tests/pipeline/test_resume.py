@@ -10,6 +10,7 @@ from dataclasses import replace
 from unittest import mock
 
 from metaharness.config import load_config
+from metaharness.approval import ApprovalDecision, compute_plan_identity_from_run, write_plan_approval
 from metaharness.gitops import current_head, index_tree_sha, resolve_tree
 from metaharness.execution_selection import ensure_execution_selection, read_execution_selection
 from metaharness.models import ExecutionRole, RunMachineState, RunPhase, RunStatus
@@ -21,9 +22,9 @@ from metaharness.planning.artifacts import (
     iteration_plan_dir, persist_iteration_plan, read_effective_plan,
     read_iteration_plan, validate_implementation_bundle,
 )
-from metaharness.resume import ResumeCheckpoint, ResumePhase, write_checkpoint
+from metaharness.resume import ResumeCheckpoint, ResumeIntegrityError, ResumePhase, read_checkpoint, write_checkpoint
 from tests.pipeline.support import (
-    SPEC, STEP, PipelineHarness, audit_report, crash_at_checkpoint, git, initial_plan, write,
+    SPEC, STEP, PipelineHarness, audit_report, continuation_answer, crash_at_checkpoint, git, initial_plan, write,
 )
 
 
@@ -38,6 +39,138 @@ def raw_normalization_plan() -> str:
 
 
 class ResumeTests(PipelineHarness):
+    def test_later_milestone_resume_validates_initial_human_approval(self) -> None:
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "good\n"), write("other.txt", "second\n"),
+        )
+        second = initial_plan(("S01", "other.txt", "Second")).replace(
+            "MILESTONE_ID: M01", "MILESTONE_ID: M02",
+        )
+        config = self.config()
+        original = self.orchestrator(config, planner=[initial_plan(STEP)], continuation=[
+            continuation_answer("NEXT", milestone="M02", plan_text=second),
+        ])
+        with crash_at_checkpoint(original, "deterministic_gate", occurrence=3):
+            original.run_text(SPEC, run_id="run")
+        self.assertEqual(self.checkpoint()["iteration"], 2)
+        write_plan_approval(
+            self.run_dir(), decision=ApprovalDecision.APPROVE,
+            identity=compute_plan_identity_from_run(self.run_dir(), iteration=1), source="test",
+        )
+        config = replace(config, approval=replace(config.approval, require_plan_approval=True))
+        approval_bytes = (self.run_dir() / "plan_approval.json").read_bytes()
+        tampered = self.state()
+        tampered["plan_identity"]["execution_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ResumeIntegrityError, "durable plan identity"):
+            prepare_resume(
+                config=config, run_dir=self.run_dir(), run_id="run", state=tampered,
+                checkpoint=read_checkpoint(self.run_dir()), restore_worktree=False,
+            )
+        resumed = self.orchestrator(config, planner=["unused"], continuation=[
+            continuation_answer("COMPLETE"),
+        ]).resume("run")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual((self.run_dir() / "plan_approval.json").read_bytes(), approval_bytes)
+
+    def test_resume_preserves_gate_snapshot_when_live_check_is_added(self) -> None:
+        original = self.orchestrator(self.config(), planner=[initial_plan(STEP)])
+        with crash_at_checkpoint(original, "implement_step"):
+            original.run_text(SPEC, run_id="run")
+        authority = (self.run_dir() / "check_authority.json").read_bytes()
+        config = self.config(
+            per_step_gate="test-collection",
+            extra_checks='''[[check_catalog]]
+id = "test-collection"
+argv = ["must-not-execute-new-check"]
+''',
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        resumed = self.orchestrator(config, planner=["unused"]).resume("run")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual((self.run_dir() / "check_authority.json").read_bytes(), authority)
+
+    def test_legacy_resume_excludes_check_added_after_approval(self) -> None:
+        original = self.orchestrator(self.config(), planner=[initial_plan(STEP)])
+        with crash_at_checkpoint(original, "implement_step"):
+            original.run_text(SPEC, run_id="run")
+        # Reproduce a run created before the per-step policy was captured.
+        store = RunStateStore(self.run_dir() / "state.json")
+        state = store.load()
+        state.pop("per_step_check_ids")
+        store._write(state)
+        config = self.config(
+            per_step_gate="test-collection",
+            extra_checks='''[[check_catalog]]
+id = "test-collection"
+argv = ["must-not-execute-new-check"]
+''',
+        )
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        resumed = self.orchestrator(config, planner=["unused"]).resume("run")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertTrue(any("test-collection" in item for item in self.state()["check_warnings"]))
+
+    def test_own_remote_tracking_ref_may_lag_behind_local_steps(self) -> None:
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "good\n"), write("other.txt", "second\n"),
+        )
+        original = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP, ("S02", "other.txt", "Second"))],
+        )
+        with crash_at_checkpoint(original, "deterministic_gate"):
+            original.run_text(SPEC, run_id="run")
+        first_step = git(self.worktree(), "rev-parse", "HEAD^")
+        branch = self.state()["branch"]
+        git(self.repo, "update-ref", f"refs/remotes/origin/{branch}", first_step)
+        resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+
+    def test_unowned_ancestor_remote_tracking_ref_is_refused(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        original = self.orchestrator(self.config(), planner=[initial_plan(STEP)])
+        with crash_at_checkpoint(original, "deterministic_gate"):
+            original.run_text(SPEC, run_id="run")
+        branch = self.state()["branch"]
+        git(self.repo, "update-ref", f"refs/remotes/origin/{branch}", self.base_sha)
+        roles = self.workers.roles()
+        resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
+        self.assertEqual(resumed.state["failure"]["reason"], "RESUME_INTEGRITY_FAILURE")
+        self.assertEqual(self.workers.roles(), roles)
+
+    def test_pause_after_step_is_durable_and_resumes_at_the_next_step(self) -> None:
+        def write_and_request_pause(request):
+            (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
+            RunStateStore(self.run_dir() / "state.json").update_metadata(
+                pause_requested=True,
+            )
+            return "done\n"
+
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write_and_request_pause,
+            write("other.txt", "second\n"),
+        )
+        original = self.orchestrator(
+            self.config(), planner=[initial_plan(STEP, ("S02", "other.txt", "Write other"))],
+        )
+
+        paused = original.run_text(SPEC, run_id="run")
+
+        self.assertEqual(paused.status, RunStatus.PAUSED, paused.state)
+        self.assertEqual(paused.state["failure"]["reason"], "PAUSED")
+        self.assertFalse(paused.state["pause_requested"])
+        self.assertEqual(self.checkpoint()["phase"], "implement_step")
+        self.assertEqual(self.checkpoint()["step_index"], 1)
+        self.assertTrue(resume_info(self.run_dir(), self.state()).resumable)
+        self.assertEqual(self.workers.roles().count("implementer"), 1)
+
+        resumed = self.orchestrator(self.config(), planner=["unused"]).resume("run")
+
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles().count("implementer"), 2)
+
     def test_dirty_interrupted_worker_is_reset_and_step_is_replayed(self) -> None:
         def verify_clean_then_write(request):
             self.assertEqual((request.worktree / "feature.txt").read_text(), "base\n")

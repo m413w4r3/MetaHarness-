@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..approval import ApprovalDecision, PlanIdentity, read_plan_approval
+from ..approval import ApprovalDecision, PlanIdentity, compute_plan_identity_from_run, read_plan_approval
 from ..execution_selection import read_execution_selection_with_sha256, validate_execution_selection
 from ..gitops import (
     GitError, WorktreeInfo, all_refs, branch_exists, build_run_branch, commit_message,
@@ -56,8 +56,16 @@ def _check_foreign_refs(repo: Path, state: Mapping[str, Any], branch: str, head:
     expected = {name: value for name, value in original.items() if name != run_ref}
     observed = {name: value for name, value in current.items() if name != run_ref}
     remote_run_ref = f"refs/remotes/{remote}/{branch}"
-    if remote_run_ref not in original and observed.get(remote_run_ref) == head:
-        observed.pop(remote_run_ref)
+    remote_head = observed.get(remote_run_ref)
+    if remote_run_ref not in original and remote_head is not None:
+        # A previous milestone may already have pushed this run branch. Its
+        # tracking ref legitimately lags behind subsequent local step commits.
+        if remote_head == head or (
+            is_ancestor(repo, remote_head, head)
+            and "MetaHarness-Run: " + str(state.get("run_id"))
+            in commit_message(repo, remote_head).splitlines()
+        ):
+            observed.pop(remote_run_ref)
     if expected != observed:
         _fail("a foreign Git ref changed during this run")
     old_branches = set(baseline.get("branches") or ())
@@ -216,8 +224,14 @@ def prepare_resume(
                 execution_sha256=durable_identity.get("execution_sha256"),
                 checks_sha256=durable_identity.get("checks_sha256"),
             )
+            if compute_plan_identity_from_run(run_dir, iteration=checkpoint.iteration) != identity:
+                _fail("effective plan artifacts do not match the durable plan identity")
+            # Human approval belongs to the initial plan. Later milestones
+            # are admitted by planner continuation and carry their own durable
+            # identity, not a second copy of the initial approval's hashes.
+            initial_identity = compute_plan_identity_from_run(run_dir, iteration=1)
             approval = read_plan_approval(
-                run_dir, expected_identity=identity, iteration=checkpoint.iteration,
+                run_dir, expected_identity=initial_identity, iteration=1,
             )
             if approval is None or approval.decision is not ApprovalDecision.APPROVE:
                 _fail("plan approval is missing or is not APPROVE")

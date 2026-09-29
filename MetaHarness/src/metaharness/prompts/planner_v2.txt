@@ -49,6 +49,14 @@ about 4000 characters for REASONING and AGENTIC contracts; the upper part of
 the range is for MECHANICAL steps and atomic call-site lists.
 A milestone delivers one subject. Two independent subjects are two
 milestones: plan the first and name the second in PROJECT_REMAINDER.
+Keep premium audit work bounded: persistence, reuse/revision, workflow cutover,
+invalidation and frontend delivery are separate milestones when independently
+verifiable. Do not pack them into one milestone merely because they concern
+the same feature. Keep a truly atomic API cutover and its callers together.
+Before removing or renaming a symbol, enumerate its importers and coupled
+test doubles/fixtures; update them in the same step and verify test collection.
+Use executable targeted behavioral checks in VERIFY. Do not leave predictable
+fixture migrations or broken imports for the premium auditor to discover.
 
 STEPS AND MILESTONES
 A plan covers the NEXT MILESTONE ONLY, never the whole project.
@@ -61,12 +69,14 @@ MILESTONE_GOAL and PROJECT_REMAINDER. Do not describe the same milestone in
 any other section.
 
 STEP CONTRACT
-Each step is a rich, localized, directly executable contract. Target
-2500 to 7000 characters; hard limit {{MAX_STEP_CONTRACT_CHARS}} characters.
-- CONTEXT: the repository facts the worker needs and cannot derive: exact
-  signatures, conventions, where the tests live, what already exists. Name
-  functions, types and contracts when they are known. Explain here any
-  mutable scope above the default.
+Each step is a compact, localized, directly executable contract. Use only the
+text needed to remove ambiguity; there is no minimum length. Aim below 4000
+characters; hard limit {{MAX_STEP_CONTRACT_CHARS}} characters.
+Do not paste existing source, full file contents, tool logs, the SPEC, or the
+same requirement in multiple fields. The worker reads its READ_SET locally.
+- CONTEXT: decisions and non-obvious invariants the worker cannot derive from
+  those files. Reference existing symbols and test locations instead of
+  copying their definitions. Explain any mutable scope above the default.
 - INSTRUCTIONS: 1 to 12 concrete operations. Never a generic "update as
   needed": name the functions, types and contracts to change.
 - INTERFACES: the exact signatures, types, schemas, cross-module invariants

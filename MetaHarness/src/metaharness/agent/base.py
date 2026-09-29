@@ -23,6 +23,7 @@ AGENT_TIMEOUT = "AGENT_TIMEOUT"
 AGENT_PROTOCOL_FAILED = "AGENT_PROTOCOL_FAILED"
 AGENT_SCOPE_VIOLATION = "AGENT_SCOPE_VIOLATION"
 AGENT_AUTH_FAILURE = "AGENT_AUTH_FAILURE"
+AGENT_RATE_LIMITED = "AGENT_RATE_LIMITED"
 AGENT_GIT_VIOLATION = "AGENT_GIT_VIOLATION"
 AGENT_SCOPE_REQUEST = "AGENT_SCOPE_REQUEST"
 
@@ -46,6 +47,8 @@ class AgentRunRequest:
     # Adapter inputs for retry and prompt-contract handling.
     contract: str | None = None
     retry_addendum: str | None = None
+    # Harness evidence can be inspected without granting artifact write access.
+    read_only_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -773,6 +773,15 @@ def staged_diff(worktree: Path) -> str:
     ).stdout
 
 
+def diff_between_trees(worktree: Path, before: str, after: str) -> str:
+    """Inspect the exact candidate delta, including frozen uncommitted edits."""
+
+    return _git(
+        worktree, "diff", "--no-ext-diff", "--no-textconv", "--no-color",
+        before, after, "--", timeout=600, errors="replace",
+    ).stdout
+
+
 def staged_diff_from(worktree: Path, base_sha: str) -> str:
     """Return the frozen index delta from an immutable run base commit."""
 

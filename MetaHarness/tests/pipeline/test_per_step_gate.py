@@ -22,6 +22,7 @@ from tests.pipeline.support import (
     PipelineHarness,
     audit_report,
     continuation_answer,
+    crash_at_checkpoint,
     git,
     initial_plan,
     write,
@@ -36,6 +37,55 @@ if pathlib.Path('feature.txt').read_text().strip() == 'bad':
 
 
 class PerStepGateTests(PipelineHarness):
+    def test_resume_keeps_frozen_gate_when_live_gate_selection_is_removed(self) -> None:
+        original = self.orchestrator(
+            self.config(per_step_gate="lint", extra_checks=self.lint_check()),
+            planner=[initial_plan(STEP)],
+        )
+        with crash_at_checkpoint(original, "implement_step"):
+            original.run_text(SPEC, run_id="run")
+        self.workers.on(
+            ExecutionRole.IMPLEMENTER,
+            write("feature.txt", "bad\n"), write("feature.txt", "good\n"),
+        )
+        resumed = self.orchestrator(
+            self.config(extra_checks=self.lint_check()), planner=["unused"],
+        ).resume("run")
+        self.assertEqual(resumed.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles().count("implementer"), 2)
+        self.assertIn("CHECK: lint", self.workers.calls[1].prompt)
+
+    def test_collection_catches_a_removed_import_before_premium_audit(self) -> None:
+        from tests.autonomy.support import Step, meta_plan
+
+        (self.repo / "api.py").write_text("old_api = 1\n", encoding="utf-8")
+        (self.repo / "test_fixture.py").write_text("from api import old_api\n", encoding="utf-8")
+        git(self.repo, "add", "--all")
+        git(self.repo, "commit", "-qm", "baseline import fixture")
+        self.base_sha = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "push", "-q", "origin", "main")
+        check = f'''[[check_catalog]]
+id = "test-collection"
+argv = [{sys.executable!r}, "-B", "-c", "import runpy; runpy.run_path('test_fixture.py')"]
+'''
+
+        def repair(request):
+            self.assertIn("old_api", request.prompt)
+            (request.worktree / "api.py").write_text("new_api = 1\n", encoding="utf-8")
+            (request.worktree / "test_fixture.py").write_text("from api import new_api\n", encoding="utf-8")
+            return "done\n"
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("api.py", "new_api = 1\n"), repair)
+        result = self.orchestrator(
+            self.config(per_step_gate="test-collection", extra_checks=check),
+            planner=[meta_plan(Step(id="S01", title="Rename API", write=("api.py",)))],
+        ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.status, RunStatus.PUBLISHED, self.state().get("failure"))
+        self.assertEqual(self.workers.roles().count("implementer"), 2)
+        self.assertEqual(self.workers.roles().count("auditor"), 1)
+        artifact = json.loads((self.run_dir() / "cycles/001/implementation/steps/S01/per-step-gate/attempt-01.json").read_text())
+        self.assertEqual(artifact["regressions"], ["test-collection"])
+
     def lint_check(self) -> str:
         """A second check whose only regression is the ``bad`` content."""
 

@@ -850,7 +850,7 @@ def load_config(config_path: str | Path) -> HarnessConfig:
     fallback_data = recovery_data.get("execution_fallbacks", {})
     if not isinstance(fallback_data, dict):
         raise ConfigError("recovery.execution_fallbacks must be a table")
-    fallback_fields = {"mechanical", "reasoning", "agentic"}
+    fallback_fields = {"mechanical", "reasoning", "agentic", "audit"}
     unknown_fallbacks = sorted(set(fallback_data) - fallback_fields)
     if unknown_fallbacks:
         raise ConfigError(f"recovery.execution_fallbacks.{unknown_fallbacks[0]} is not allowed")
@@ -874,6 +874,9 @@ def load_config(config_path: str | Path) -> HarnessConfig:
         ),
         implementer_max_bytes=_positive_int(
             prompt_budget_data, "implementer_max_bytes", 120_000, "prompt_budget"
+        ),
+        audit_max_bytes=_positive_int(
+            prompt_budget_data, "audit_max_bytes", 64_000, "prompt_budget"
         ),
     )
 

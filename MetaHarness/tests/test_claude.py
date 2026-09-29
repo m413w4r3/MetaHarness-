@@ -18,6 +18,7 @@ from metaharness.claude.agent import (  # noqa: E402
     ClaudeCodeAgent,
     build_claude_environment,
     build_revision_prompt,
+    classify_claude_failure,
 )
 from metaharness.agent.protocol import parse_scope_request  # noqa: E402
 from metaharness.claude.auth import check_claude_authentication  # noqa: E402
@@ -39,6 +40,57 @@ from metaharness.models import (  # noqa: E402
 
 
 class ClaudeTests(unittest.TestCase):
+    def test_audit_evidence_is_readable_without_granting_artifact_writes(self) -> None:
+        profile = ModelProfile(
+            id="claude", display_name="Claude", roles=(ExecutionRole.AUDITOR,),
+            driver=ProfileDriver.CLAUDE_CODE, model="opus", selection_mode=SelectionMode.CLI,
+            effort="medium", permission_mode="acceptEdits",
+        )
+        directory = self.root / "audit-artifacts"
+        argv = ClaudeCodeAgent().build_argv(
+            self.repo, profile=profile, claude_home=self.root / "claude-home",
+            read_only_paths=(directory,),
+        )
+        pattern = "/" + str(directory.resolve()) + "/**"
+        self.assertEqual(argv[argv.index("--add-dir") + 1], str(directory.resolve()))
+        self.assertIn(f"Read({pattern})", argv)
+        self.assertIn(f"Edit({pattern})", argv[argv.index("--disallowedTools") + 1:])
+        self.assertIn(f"Write({pattern})", argv[argv.index("--disallowedTools") + 1:])
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Edit,Write,Grep,Glob")
+        self.assertIn("--restricted", argv)
+
+    def test_session_limit_is_classified_only_from_error_diagnostics(self) -> None:
+        text = "You've hit your session limit · resets 4:20am (Europe/Paris)"
+        event = {"type": "result", "is_error": True, "subtype": "success", "result": text}
+        self.assertEqual(classify_claude_failure("", json.dumps(event)), "AGENT_RATE_LIMITED")
+        event["is_error"] = False
+        self.assertIsNone(classify_claude_failure("", json.dumps(event)))
+        self.assertIsNone(classify_claude_failure("", json.dumps({"type": "user", "content": text})))
+
+    def test_retry_rewrites_stale_final_message(self) -> None:
+        executable = self._executable("claude-limit", '''
+            import json, sys
+            sys.stdin.read()
+            print(json.dumps({"type": "result", "subtype": "success", "is_error": True,
+                              "result": "You've hit your session limit"}))
+            sys.exit(1)
+        ''')
+        profile = ModelProfile(
+            id="claude", display_name="Claude", roles=(ExecutionRole.AUDITOR,),
+            driver=ProfileDriver.CLAUDE_CODE, model="opus", selection_mode=SelectionMode.CLI,
+            effort="medium", permission_mode="acceptEdits", timeout_seconds=5,
+        )
+        home = prepare_claude_home(self._config())
+        directory = self.root / "retry/revision"
+        directory.mkdir(parents=True)
+        (directory / "agent.final.md").write_text("old model error", encoding="utf-8")
+        result = ClaudeCodeAgent(executable=str(executable)).run_revision(
+            "inspect", self.repo, artifacts_dir=self.root / "retry", profile=profile,
+            environment=build_claude_environment({"PATH": "/usr/bin"}, claude_home=home),
+        )
+        self.assertEqual(result.final_message, "You've hit your session limit")
+        self.assertEqual((directory / "agent.final.md").read_text(), result.final_message)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

@@ -21,6 +21,7 @@ from ..profiles import build_agent_config, build_claude_profile
 from ..usage import normalize_usage
 from .base import (
     AGENT_PROTOCOL_FAILED,
+    AGENT_RATE_LIMITED,
     AGENT_RUNTIME_FAILED,
     AGENT_SCOPE_VIOLATION,
     AGENT_START_FAILED,
@@ -112,6 +113,10 @@ def _result(
     timed_out = bool(getattr(raw, "timed_out", False))
     exit_code = getattr(raw, "exit_code", None)
     terminal_is_error = getattr(raw, "terminal_is_error", None) is True
+    if backend_reason == AGENT_RATE_LIMITED and not timed_out and (
+        terminal_is_error or exit_code not in (None, 0)
+    ):
+        exit_reason = exit_reason or AGENT_RATE_LIMITED
     if timed_out:
         status = "timed_out"
         exit_reason = exit_reason or AGENT_TIMEOUT
@@ -229,6 +234,7 @@ class CodexExecutor:
             exposes_reasoning_usage=True,
             exposes_tool_count=False,
             isolation_mode=profile.sandbox,
+            reads_external_artifacts=True,
         )
 
     @property
@@ -323,6 +329,7 @@ class ClaudeCodeExecutor:
             exposes_reasoning_usage=False,
             exposes_tool_count=False,
             isolation_mode="restricted",
+            reads_external_artifacts=True,
         )
 
     @property
@@ -348,6 +355,7 @@ class ClaudeCodeExecutor:
                 profile=self.profile,
                 environment=environment,
                 revision_dir=request.artifact_dir,
+                **({"read_only_paths": request.read_only_paths} if request.read_only_paths else {}),
             )
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):

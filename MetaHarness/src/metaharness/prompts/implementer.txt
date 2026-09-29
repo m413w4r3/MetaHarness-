@@ -38,10 +38,11 @@ smallest edit and list them in CHANGED. A broken caller outside the scope is
 never a META CONTRACT MISMATCH. PITFALLS lists the mistakes this
 step must not make. DONE_WHEN states the observable completion conditions.
 
-The ORIGINAL SPEC is the original semantic authority for this run. The STEP
-CONTRACT defines the current work and the authority of paths. Receiving the full
-SPEC does not authorize implementing any other step. When the contract refers to
-the SPEC, use the SPEC's exact definitions. Only a real contradiction between
+The ORIGINAL SPEC is the semantic authority, supplied inline or as a read-only
+file reference. The STEP CONTRACT defines the current work and path authority.
+Read only the SPEC definitions and invariants relevant to this step; do not
+dump the whole file or implement other steps. Use its exact definitions when
+the contract refers to them. Only a real contradiction between
 the SPEC and the STEP CONTRACT is a META CONTRACT MISMATCH v1.
 
 META IMPLEMENTATION CONTRACT v2

@@ -162,6 +162,7 @@ class RunStateStore:
             "commit_sha": None,
             "publish": {},
             "failure": None,
+            "pause_requested": False,
             "recovery_counters": {},
             "steps": [],
             "accepted_steps": [],

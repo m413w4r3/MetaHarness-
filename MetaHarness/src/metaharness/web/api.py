@@ -61,6 +61,7 @@ from .run_manager import (
     RunCollisionError,
     RunManager,
     RunManagerError,
+    RunPauseNotAllowedError,
     RunResumeNotAllowedError,
 )
 
@@ -1517,6 +1518,20 @@ def resume_run_request(manager: RunManager, runs_root: Path, run_id: str) -> dic
     return {"ok": True, "run_id": safe_id, "location": f"/runs/{safe_id}"}
 
 
+def pause_run_request(manager: RunManager, runs_root: Path, run_id: str) -> dict[str, Any]:
+    """Request a durable pause at the next implementation-step boundary."""
+
+    _run_dir(runs_root, run_id)
+    safe_id = validate_run_id(run_id)
+    try:
+        manager.pause_run(safe_id)
+    except RunPauseNotAllowedError as exc:
+        raise WebAPIError(409, str(exc)) from exc
+    except RunManagerError as exc:
+        raise WebAPIError(503, "run could not be paused") from exc
+    return {"ok": True, "run_id": safe_id, "location": f"/runs/{safe_id}"}
+
+
 AWAITING_APPROVAL = RunStatus.AWAITING_PLAN_APPROVAL.value
 
 
@@ -1529,6 +1544,7 @@ __all__ = [
     "context_level",
     "live_status",
     "publish_target",
+    "pause_run_request",
     "resume_run_request",
     "run_overview",
     "run_pipeline",

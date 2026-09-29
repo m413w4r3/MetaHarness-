@@ -140,6 +140,7 @@ def resolve_execution_selection(
         planner=_selected(config, planner_profile_id, ExecutionRole.PLANNER),
         steps=steps,
         audit=_selected(config, audit_profile_id, ExecutionRole.AUDITOR),
+        audit_fallbacks=tuple(_selected(config, profile_id, ExecutionRole.AUDITOR) for profile_id in fallbacks.audit),
     )
 
 
@@ -175,6 +176,7 @@ def _payload(selection: ExecutionSelection) -> dict[str, Any]:
             for item in selection.steps
         ],
         "audit": _selected_payload(selection.audit),
+        **({"audit_fallbacks": [_selected_payload(item) for item in selection.audit_fallbacks]} if selection.audit_fallbacks else {}),
     }
 
 
@@ -268,6 +270,8 @@ def parse_execution_selection(data: bytes) -> ExecutionSelection:
         raise ExecutionSelectionError("execution selection is missing or invalid") from exc
     schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
     expected = {"schema_version", "planner", "steps", "audit"}
+    if isinstance(payload, dict) and "audit_fallbacks" in payload:
+        expected.add("audit_fallbacks")
     if not isinstance(payload, dict) or schema_version != SCHEMA_VERSION or set(payload) != expected:
         raise ExecutionSelectionError("execution selection schema_version is unsupported")
     raw_steps = payload["steps"]
@@ -296,6 +300,7 @@ def parse_execution_selection(data: bytes) -> ExecutionSelection:
         planner=_parse_selected(payload["planner"], "planner"),
         steps=tuple(steps),
         audit=_parse_selected(payload["audit"], "audit"),
+        audit_fallbacks=_parse_selected_list(payload.get("audit_fallbacks", []), "audit fallbacks"),
     )
 
 
@@ -336,6 +341,12 @@ def validate_execution_selection(config: HarnessConfig, selection: ExecutionSele
 
     check("planner", selection.planner, ExecutionRole.PLANNER)
     check("audit", selection.audit, ExecutionRole.AUDITOR)
+    if tuple(item.profile_id for item in selection.audit_fallbacks) != config.execution_fallbacks.audit:
+        raise ExecutionSelectionError("audit fallback authority changed")
+    if selection.audit.profile_id in config.execution_fallbacks.audit:
+        raise ExecutionSelectionError("audit fallback repeats the primary profile")
+    for profile in selection.audit_fallbacks:
+        check("audit fallback", profile, ExecutionRole.AUDITOR)
     for item in selection.steps:
         check(f"step {item.step_id}", item.implementer, ExecutionRole.IMPLEMENTER)
         expected_ids = config.execution_fallbacks.for_execution_class(

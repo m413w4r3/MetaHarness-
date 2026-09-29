@@ -13,7 +13,7 @@ from ..gitops import GitError, current_head
 from ..models import ModelProfile, ProfileDriver
 from ..procutil import run_bounded
 from ..usage import normalize_usage
-from ..agent.base import AGENT_AUTH_FAILURE, AGENT_GIT_VIOLATION, AGENT_RUNTIME_FAILED, AgentError
+from ..agent.base import AGENT_AUTH_FAILURE, AGENT_GIT_VIOLATION, AGENT_RATE_LIMITED, AGENT_RUNTIME_FAILED, AgentError
 from ..agent.events import extract_final, extract_terminal_result, extract_usage, parse_event
 
 
@@ -95,6 +95,16 @@ def classify_claude_failure(stderr: str, events: str = "") -> str | None:
     haystack = f"{stderr}\n{events}".casefold()
     if any(signal in haystack for signal in _AUTH_FAILURE_SIGNALS):
         return AGENT_AUTH_FAILURE
+    limit_diagnostics = stderr.casefold()
+    for line in events.splitlines():
+        event = parse_event(line)
+        if event is not None and event.get("type") == "result" and event.get("is_error") is True:
+            limit_diagnostics += "\n" + str(event.get("result", "")).casefold()
+    if any(signal in limit_diagnostics for signal in (
+        "you've hit your session limit", "you’ve hit your session limit",
+        "you've hit your weekly limit", "you’ve hit your weekly limit",
+    )):
+        return AGENT_RATE_LIMITED
     return None
 
 
@@ -168,7 +178,8 @@ class ClaudeCodeAgent:
         self.stderr_tail_bytes = stderr_tail_bytes
 
     def build_argv(
-        self, worktree: str | Path, *, profile: ModelProfile, claude_home: str | Path
+        self, worktree: str | Path, *, profile: ModelProfile, claude_home: str | Path,
+        read_only_paths: tuple[Path, ...] = (),
     ) -> list[str]:
         if profile.driver is not ProfileDriver.CLAUDE_CODE:
             raise ClaudeAgentError("profile driver is not claude-code")
@@ -178,7 +189,7 @@ class ClaudeCodeAgent:
         # ``--print`` with ``--output-format stream-json`` is rejected by the
         # Claude Code CLI unless ``--verbose`` is present.  It is part of the
         # authoritative argv and deliberately not configurable.
-        return [
+        argv = [
             self.executable,
             "--print",
             "--verbose",
@@ -207,6 +218,14 @@ class ClaudeCodeAgent:
             "--mcp-config",
             str(home / "empty-mcp.json"),
         ]
+        for path in dict.fromkeys(Path(value).expanduser().resolve() for value in read_only_paths):
+            pattern = "/" + str(path) + "/**"
+            argv.extend([
+                "--add-dir", str(path),
+                "--allowedTools", f"Read({pattern})", f"Grep({pattern})", f"Glob({pattern})",
+                "--disallowedTools", f"Edit({pattern})", f"Write({pattern})",
+            ])
+        return argv
 
     def run_revision(
         self,
@@ -217,6 +236,7 @@ class ClaudeCodeAgent:
         profile: ModelProfile,
         environment: Mapping[str, str],
         revision_dir: Path | None = None,
+        read_only_paths: tuple[Path, ...] = (),
     ) -> ClaudeResult:
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
@@ -242,7 +262,8 @@ class ClaudeCodeAgent:
         home_value = environment.get("CLAUDE_CONFIG_DIR")
         if not isinstance(home_value, str) or not home_value:
             raise ClaudeAgentError("CLAUDE_CONFIG_DIR is not forced")
-        argv = self.build_argv(worktree_path, profile=profile, claude_home=Path(home_value))
+        argv = self.build_argv(worktree_path, profile=profile, claude_home=Path(home_value),
+                               read_only_paths=read_only_paths)
         try:
             with prompt_path.open("rb") as stdin, events_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                 exit_code, timed_out = run_bounded(
@@ -265,11 +286,8 @@ class ClaudeCodeAgent:
         if actual_head != expected_head:
             raise ClaudeCommittedError(expected_head, actual_head)
         usage, event_final, terminal = _scan_events(events_path)
-        if final_path.exists():
-            final_message = final_path.read_text(encoding="utf-8", errors="replace")
-        else:
-            final_message = event_final or ""
-            final_path.write_text(final_message, encoding="utf-8")
+        final_message = event_final or ""
+        final_path.write_text(final_message, encoding="utf-8")
         result = ClaudeResult(
             exit_code=124 if timed_out else exit_code,
             timed_out=timed_out,

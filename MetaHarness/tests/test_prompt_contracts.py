@@ -6,6 +6,7 @@ from pathlib import Path
 
 from metaharness.prompt_contracts import (
     PromptPayload,
+    build_correction_payload,
     build_implementer_payload,
     build_planner_payload,
     write_prompt_diagnostics,
@@ -13,6 +14,32 @@ from metaharness.prompt_contracts import (
 
 
 class PromptContractTests(unittest.TestCase):
+    def test_worker_references_complete_spec_without_repeating_it(self) -> None:
+        spec = "semantic authority " * 20_000
+        payload = build_implementer_payload(
+            original_spec=spec, spec_path="/run/authority/spec.md",
+            instructions="preserve the exact invariant", budget_bytes=8_000,
+        )
+        self.assertNotIn(spec, payload.rendered)
+        self.assertIn("/run/authority/spec.md", payload.rendered)
+        self.assertIn(hashlib.sha256(spec.encode()).hexdigest(), payload.rendered)
+        self.assertLess(payload.total_bytes, 8_000)
+
+    def test_corrections_bound_utf8_output_without_losing_authority(self) -> None:
+        payload = build_correction_payload(
+            "original SPEC and contract", "fix missing path", "é" * 50_000,
+            role="planner-correction", budget_bytes=2_000,
+        )
+        self.assertLessEqual(payload.total_bytes, 2_000)
+        self.assertIn("original SPEC and contract", payload.rendered)
+        self.assertIn("fix missing path", payload.rendered)
+        self.assertFalse(payload.budget_overrun)
+
+    def test_oversized_authority_is_preserved_with_soft_overrun(self) -> None:
+        payload = build_implementer_payload(instructions="x" * 10_000, budget_bytes=1_000)
+        self.assertTrue(payload.budget_overrun)
+        self.assertIn("x" * 10_000, payload.rendered)
+
     def test_role_prompt_static_size_limits(self) -> None:
         prompts = Path(__file__).resolve().parents[1] / "src" / "metaharness" / "prompts"
         self.assertLess((prompts / "implementer.txt").stat().st_size, 4 * 1024)

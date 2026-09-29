@@ -308,12 +308,57 @@ metaharness resume --config examples/autowork.toml --run-id <RUN_ID>
 
 Resumable failures use provider-neutral reasons such as `AGENT_RUNTIME_FAILED`,
 `AGENT_AUTH_FAILURE`, `AGENT_TIMEOUT`, and `AGENT_PROTOCOL_FAILED`.
-(same step, only if the tree is still the step's `tree_before`),
-`LLM_FAILURE` of the contract-repair planner, `PUSH_FAILED` (candidate or
-publication push),
-and `INTERRUPTED`. `STEP_WRITE_SET_VIOLATION`, `AGENT_GIT_VIOLATION`,
-invalid audit reports and `BASE_MOVED_SINCE_RUN`
+Other resumable failures include `LLM_FAILURE`, `PUSH_FAILED` (candidate or
+publication push), and `INTERRUPTED`. `STEP_WRITE_SET_VIOLATION`,
+`AGENT_GIT_VIOLATION`, invalid audit reports and `BASE_MOVED_SINCE_RUN`
 are never retried automatically.
+
+Audit session limits are reported as `AGENT_RATE_LIMITED`. Configure an
+ordered audit fallback list with `[recovery.execution_fallbacks]`
+`audit = ["codex-sol-medium"]`; each profile must support the `auditor` role.
+The example uses `gpt-6-sol`, effort `medium`, with workspace write access.
+This list and the profile fingerprints are frozen in the run's options and
+execution selection when its plan is approved.
+
+On a session limit, the next auditor receives the same worktree, including
+the preceding auditor's uncommitted edits. HEAD and hard-deny checks remain
+mandatory before switching. Executor attempts are bounded by `step_attempts`
+and the run budget. A successful report is followed by the deterministic
+gate. If all authorized auditors are limited, the run waits with
+`AGENT_RATE_LIMITED`. Execution history is in `audit/NNN/executions.json`;
+fallback artifacts are in `audit/NNN/executors/NNN/`.
+An ordinary later resume restores the last accepted commit; preservation of
+partial edits applies to the immediate fallback within an audit pass.
+
+Local workers and auditors that advertise `reads_external_artifacts` receive
+a read-only SPEC file reference with its exact
+byte count and SHA256, rather than another copy of the complete SPEC. They
+read relevant definitions and invariants on demand. Repository-only/external
+auditors retain inline SPEC, approved step contracts, all gate and baseline
+failure IDs, useful failure excerpts and the candidate diff (including edits
+not yet available in the remote repository). They never depend on local harness
+files. The planner also uses inline authority because its text transport has
+no local file access.
+Premium audit prompts contain the current milestone's objective, acceptance,
+risks and compact gate verdicts. Large diagnostic lists carry counts and up to
+eight samples; complete failures and baseline records remain referenced artifacts.
+Local audit failure excerpts total at most 4,000 bytes. Full diffs, step
+contracts and logs are referenced artifacts rather than pasted into every
+request. `prompt_budget.audit_max_bytes` defaults to 64,000 bytes; log excerpts
+can shrink, but semantic authority is never truncated. Budgets stay soft:
+an authority overrun is recorded in `prompt.diagnostics.json` and execution
+continues. This also applies to corrections and executor fallbacks.
+Rejected output contributes at most 8,000
+bytes and shrinks first. Claude receives read access to the run
+artifacts with Edit/Write explicitly denied there. Each fallback gets its own
+refreshed `diff.patch` and prompt diagnostics.
+
+The example keeps future plans to six steps and collects backend tests before
+each commit, alongside lint and type checking. Collection catches broken
+imports before a premium audit; it does not replace behavioral or integration
+checks. Keep atomic API cutovers with their callers and fixtures in one step,
+and separate independently verifiable milestones. Larger follow-up work stays
+in the audit's `REMAINING` for the planner and implementation workers.
 
 Before any resume, with no model call, MetaHarness verifies: run directory
 and state exist; the plan approval is `APPROVE`; the plan identity and the

@@ -29,7 +29,7 @@ from ..gitops import (
 from ..models import (
     PARTIAL_REASONS,
     CycleKind, ExecutionRole, ExecutionSelection, RunCycle, RunDisposition, RunMachineState,
-    RunPhase, TaskPlanV2, DROP_UNKNOWN_REQUIRED_CHECK,
+    RunPhase, TaskPlanV2, DROP_UNKNOWN_REQUIRED_CHECK, PAUSED_REASON,
 )
 from ..profiles import build_llm_endpoint, profile_for_role
 from ..result import RunResult, atomic_write_text
@@ -158,6 +158,8 @@ class RunComposition:
             initial_plan=self._initial_cycle_plan,
             completed_steps=self.completed_steps,
             execute_step=bind(self.runtime.step_execution.execute_cycle_step, store),
+            pause_requested=lambda _ctx: bool(store.load().get("pause_requested")),
+            pause=bind(self._pause_after_step, store),
             run_gate=bind(self.runtime.gates.run_gate, store),
             load_gate_evidence=lambda ctx, number, stage: load_evidence(
                 gate_dir(ctx.run_dir, number, stage),
@@ -182,6 +184,24 @@ class RunComposition:
             budget_exhausted=lambda ctx: self.runtime.budget_exhausted(store),
             budget_partial=bind(self._budget_partial, store),
         )
+
+    def _pause_after_step(
+        self, store: RunStateStore, ctx: PipelineV2Context, plan: CyclePlan, index: int,
+    ) -> RunResult:
+        step = plan.plan.steps[index]
+        state = store.set_run_state(
+            RunMachineState(disposition=RunDisposition.WAIT_EXTERNAL, reason=PAUSED_REASON),
+            failure={"reason": PAUSED_REASON}, current_step=None,
+            pause_requested=False,
+            pause={
+                "cycle": plan.cycle.number,
+                "completed_step": step.id,
+            },
+        )
+        self.runtime.observability.trace_emit(
+            "run.paused", phase="implementation", cycle=plan.cycle.number, step_id=step.id,
+        )
+        return RunResult.of(ctx.run_dir, state)
 
     def _initial_cycle_plan(self, ctx: PipelineV2Context) -> CyclePlan:
         return CyclePlan(

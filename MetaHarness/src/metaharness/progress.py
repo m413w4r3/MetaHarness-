@@ -17,12 +17,21 @@ from .redaction import REDACTED, redact
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_EVENTS = 20_000
 MAX_MESSAGE = 300
+PROJECTION_VERSION = 2
 _SOURCE_CACHE: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)\b((?:DEEPSEEK|BRIDGE|OPENAI|ANTHROPIC|API)_API_KEY\s*=\s*)[^\s,;]+"),
     re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|secret)\s*[:=]\s*[^\s,;]+"),
 )
+_TRACE_NOISE = frozenset({
+    "step.agent.completed",
+    "step.candidate.persisted",
+    "step.verification.completed",
+    "workstream.metadata",
+    "recovery.classified",
+    "recovery.executor_selected",
+})
 
 
 def _safe(text: Any, secrets: tuple[str, ...] = ()) -> str:
@@ -52,31 +61,108 @@ def _category(event: str, phase: str | None) -> str:
     return "system"
 
 
+def _is_public_trace_event(event: str) -> bool:
+    """Keep milestones and outcomes; omit lifecycle chatter from the UI feed."""
+
+    return (
+        event not in _TRACE_NOISE
+        and not event.endswith(".started")
+        and not event.startswith("transport.")
+    )
+
+
+def _path_summary(value: Any) -> str | None:
+    if not isinstance(value, list):
+        return None
+    paths = [str(item) for item in value if isinstance(item, str) and item]
+    if not paths:
+        return None
+    shown = ", ".join(paths[:3])
+    if len(paths) > 3:
+        shown += f", +{len(paths) - 3} more"
+    return f"{len(paths)} file(s): {shown}"
+
+
+def _duration(value: Any) -> str | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        seconds = value / 1000
+        return f"{seconds:.1f}s" if seconds < 60 else f"{seconds / 60:.1f}m"
+    return None
+
+
 def _trace_message(payload: dict[str, Any], secrets: tuple[str, ...]) -> tuple[str, str, str] | None:
     event = str(payload.get("event") or "event")
+    if not _is_public_trace_event(event):
+        return None
     phase = str(payload.get("phase") or "")
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     category = _category(event, phase)
     labels = {
-        "run.created": "run started", "run.completed": "run completed", "run.failed": "hard failure",
+        "run.created": "run started", "run.completed": "run completed", "run.failed": "run failed",
         "planning.started": "planning started", "planning.completed": "planning completed",
+        "plan.completed": "plan completed",
         "plan.corrected": "plan correction", "approval.granted": "approval granted",
-        "step.started": "step started", "step.completed": "step completed",
-        "step.no_change": "step no-change", "step.failed": "step failed",
+        "step.committed": "step completed: committed",
+        "step.no_change.accepted": "step completed: no changes",
+        "step.failed": "step failed",
         "contract.mismatch": "contract mismatch",
-        "check.started": "check started", "check.completed": "check completed",
+        "checks.completed": "checks completed",
+        "recovery.completed": "recovery completed", "recovery.exhausted": "recovery exhausted",
+        "publish.completed": "publication completed",
         "candidate.created": "candidate created", "resume.started": "resume",
     }
-    message = labels.get(event, event.replace(".", " ").replace("_", " "))
+    if event == "step.committed":
+        message = labels[event]
+        path_summary = _path_summary(data.get("changed_paths"))
+        if path_summary:
+            message += f" ({path_summary})"
+    elif event == "step.no_change.accepted":
+        message = labels[event]
+    elif event == "checks.completed":
+        passed = data.get("passed") is True
+        message = "checks passed" if passed else "checks failed"
+        stage = data.get("stage")
+        if isinstance(stage, str) and stage:
+            message += f" ({stage})"
+        failures = data.get("failures")
+        if isinstance(failures, list) and failures:
+            message += ": " + ", ".join(str(item) for item in failures[:3])
+    elif event == "plan.completed":
+        message = labels[event]
+        decision = data.get("decision")
+        title = data.get("title")
+        if isinstance(decision, str) and decision:
+            message += f": {decision}"
+        if isinstance(title, str) and title:
+            message += f" — {title}"
+    elif event == "step.failed":
+        message = "step failed"
+        reason = data.get("reason")
+        detail = data.get("detail")
+        if isinstance(reason, str) and reason:
+            message += f": {reason}"
+        if isinstance(detail, str) and detail and detail != reason:
+            message += f" — {detail}"
+    else:
+        message = labels.get(event, event.replace(".", " ").replace("_", " "))
+        detail = data.get("detail")
+        if isinstance(detail, str) and detail and event.startswith(("recovery.", "repair.", "run.")):
+            message += f": {detail}"
     if event == "transport.http_response" and isinstance(data.get("http_status"), int):
         message = f"HTTP {data['http_status']}"
     elif event.startswith("transport."):
         message = event.removeprefix("transport.").replace("_", " ")
     details = []
-    for key in ("check_id", "name", "status", "result", "reason", "detail", "action", "attempt", "http_status", "exit_code"):
+    detail_in_message = event in {"step.failed", "plan.completed"} or event.startswith(("recovery.", "repair.", "run."))
+    for key in ("status", "reason", "action", "attempt", "http_status", "exit_code", "terminal_status", "remote_status", "acceptance_kind", "completion_kind"):
         value = data.get(key)
+        if key in {"reason", "action"} and detail_in_message:
+            continue
         if isinstance(value, (str, int, float)) and value != "":
             details.append(f"{key}={value}")
+    elapsed = _duration(data.get("wall_time_ms"))
+    if elapsed:
+        details.append(f"duration={elapsed}")
     if details:
         message += ": " + ", ".join(details)
     lowered = message.casefold()
@@ -132,7 +218,8 @@ def _state_failure(run_dir: Path, secrets: tuple[str, ...]) -> list[dict[str, An
                 context.append(_safe(val, secrets))
     stable = hashlib.sha256(json.dumps(failure, sort_keys=True, default=str).encode()).hexdigest()
     return [{
-        "schema_version": 1, "timestamp": _timestamp(state.get("updated_at")),
+        "schema_version": 1, "projection_version": PROJECTION_VERSION,
+        "timestamp": _timestamp(state.get("updated_at")),
         "level": "error", "category": "recovery", "phase": "failure",
         "cycle": state.get("cycle") if isinstance(state.get("cycle"), int) else None,
         "step_id": step if isinstance(step, str) and re.fullmatch(r"S\d{2,3}", step) else None,
@@ -185,7 +272,8 @@ def _project_source(run_dir: Path, path: Path, secrets: tuple[str, ...]) -> list
             cycle = int(cycle_match.group(1)) if cycle_match else None
             timestamp = _timestamp(payload.get("timestamp") or payload.get("created_at"))
         rows.append({
-            "schema_version": 1, "timestamp": timestamp, "level": level,
+            "schema_version": 1, "projection_version": PROJECTION_VERSION,
+            "timestamp": timestamp, "level": level,
             "category": category, "phase": phase, "cycle": cycle, "step_id": step,
             "message": message, "source_id": identity,
         })
@@ -204,6 +292,7 @@ def sync_progress(run_dir: Path, *, secrets: tuple[str, ...] = ()) -> Path:
         fcntl.flock(fd, fcntl.LOCK_EX)
         known: set[str] = set()
         last = 0
+        rebuild = False
         if path.is_file():
             valid = bytearray()
             with path.open("rb") as stream:
@@ -215,7 +304,14 @@ def sync_progress(run_dir: Path, *, secrets: tuple[str, ...] = ()) -> Path:
                 try:
                     record = json.loads(line)
                     sequence = record.get("sequence") if isinstance(record, dict) else None
-                    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= last:
+                    if (
+                        not isinstance(record, dict)
+                        or record.get("projection_version") != PROJECTION_VERSION
+                        or isinstance(sequence, bool)
+                        or not isinstance(sequence, int)
+                        or sequence <= last
+                    ):
+                        rebuild = True
                         break
                 except (UnicodeError, ValueError):
                     break
@@ -223,7 +319,11 @@ def sync_progress(run_dir: Path, *, secrets: tuple[str, ...] = ()) -> Path:
                 if isinstance(record.get("source_id"), str):
                     known.add(record["source_id"])
                 valid.extend(line)
-            if len(valid) != len(raw_existing):
+            if rebuild:
+                valid = bytearray()
+                known.clear()
+                last = 0
+            if len(valid) != len(raw_existing) or rebuild:
                 with path.open("wb") as stream:
                     stream.write(valid)
                     stream.flush()

@@ -34,6 +34,7 @@ from ..plan_repository_validation import (
 )
 from ..prompt_contracts import (
     PromptPayload,
+    build_correction_payload,
     build_planner_payload,
     payload_for_rendered_request,
     write_prompt_diagnostics,
@@ -233,7 +234,9 @@ class PlannerV2:
                     handle = planning_session_handle(session)
                     continuation_used = handle is not None and isinstance(self.client, ConversationContinuationClient)
                     fallback_fresh = not continuation_used
-                    request = short if continuation_used else _fresh_correction(initial_request, previous_raw, short)
+                    request = short if continuation_used else _fresh_correction(
+                        initial_request, previous_raw, short, budget_bytes=self.prompt_budget_bytes,
+                    )
                 self._event("plan.attempt.started", attempt=attempt,
                     continuation_used=continuation_used, fallback_fresh_request=fallback_fresh)
                 if attempt > 1:
@@ -249,11 +252,16 @@ class PlannerV2:
                     try:
                         result = self.client.continue_conversation(handle, request)
                     except ConversationUnavailableError:
-                        request = _fresh_correction(initial_request, previous_raw, short)
+                        request = _fresh_correction(
+                            initial_request, previous_raw, short, budget_bytes=self.prompt_budget_bytes,
+                        )
                         fallback_fresh = True
                         continuation_used = False
                         if target is not None:
                             atomic_write_text(target / "planner.request.txt", request)
+                            write_prompt_diagnostics(target, payload_for_rendered_request(
+                                "planner-correction", request, budget_bytes=self.prompt_budget_bytes,
+                            ))
                         result = self.client.complete(request)
                 else:
                     result = self.client.complete(request)
@@ -358,13 +366,11 @@ def _correction_request(validation: dict[str, Any]) -> str:
     return template.replace("{{ERRORS}}", "\n".join(lines)).rstrip() + "\n"
 
 
-def _fresh_correction(initial_request: str, previous_raw: str, correction: str) -> str:
-    from ..plan_repository_validation import MAX_PREVIOUS_PLAN_CHARS
-    prior = previous_raw[:MAX_PREVIOUS_PLAN_CHARS]
-    if len(prior) < len(previous_raw):
-        prior += "\n[previous answer truncated]"
-    return (initial_request.rstrip() + "\n\nPREVIOUS PLANNER ANSWER\n" + prior +
-            "\nEND PREVIOUS PLANNER ANSWER\n\n" + correction)
+def _fresh_correction(initial_request: str, previous_raw: str, correction: str, *, budget_bytes: int = 0) -> str:
+    payload = build_correction_payload(
+        initial_request, correction, previous_raw, role="planner-correction", budget_bytes=budget_bytes,
+    )
+    return payload.rendered
 
 
 __all__ = [

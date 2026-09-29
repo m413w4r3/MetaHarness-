@@ -6,6 +6,7 @@ import threading
 from typing import Callable
 
 from ..config import HarnessConfig
+from ..models import RunDisposition, RunPhase
 from ..orchestrator import Orchestrator, OrchestrationError, generate_run_id, safe_run_id
 from ..resume import ResumeNotAllowedError, resume_info
 from ..run_options import RunOptions
@@ -119,6 +120,40 @@ class RunManager:
             failure="run could not be resumed",
         )
 
+    def pause_run(self, run_id: str) -> str:
+        """Request a durable pause after the currently executing step."""
+
+        try:
+            selected_run_id = safe_run_id(run_id)
+        except (OrchestrationError, TypeError) as exc:
+            raise RunPauseNotAllowedError(str(exc)) from exc
+        directory = (self._config.runs_root / selected_run_id).expanduser().resolve()
+        store = RunStateStore(directory / "state.json")
+        try:
+            expected = store.identity()
+            state = store.load()
+            machine = store.machine_state()
+            if (
+                machine.disposition is not RunDisposition.RUNNING
+                or machine.phase is not RunPhase.IMPLEMENT_STEP
+                or not isinstance(state.get("current_step"), str)
+                or not state.get("current_step")
+            ):
+                raise RunPauseNotAllowedError(
+                    "pause is available only while an implementation step is running"
+                )
+            if state.get("pause_requested") is True:
+                return selected_run_id
+            if store.update_metadata(
+                expected=expected, pause_requested=True,
+            ) is None:
+                raise RunPauseNotAllowedError("run state changed before pause was requested")
+        except RunPauseNotAllowedError:
+            raise
+        except (OSError, ValueError, TypeError) as exc:
+            raise RunPauseNotAllowedError("run could not be paused") from exc
+        return selected_run_id
+
     def resume_approved_run(self, run_id: str) -> bool:
         """Schedule an approved plan whose original worker is no longer present."""
 
@@ -222,6 +257,10 @@ class RunResumeNotAllowedError(RunManagerError):
     pass
 
 
+class RunPauseNotAllowedError(RunManagerError):
+    pass
+
+
 # Resume validation reads Git trees (no model call); allow it more time than
 # a creation before answering the browser, which then shows durable state.
 _RESUME_VALIDATION_TIMEOUT_SECONDS = 60.0
@@ -232,5 +271,6 @@ __all__ = [
     "RunCollisionError",
     "RunManager",
     "RunManagerError",
+    "RunPauseNotAllowedError",
     "RunResumeNotAllowedError",
 ]

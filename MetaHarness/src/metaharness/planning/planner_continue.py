@@ -19,6 +19,11 @@ from typing import Any, Callable, Sequence
 
 from ..llm.chat import LLMProtocolError
 from ..models import PlanDecision, PlanningConfig, TaskPlanV2
+from ..prompt_contracts import (
+    build_correction_payload,
+    payload_for_rendered_request,
+    write_prompt_diagnostics,
+)
 from ..result import atomic_write_text
 from ..usage import completion_usage
 from . import TextCompletionClient
@@ -238,9 +243,16 @@ class PlannerContinue:
                 else:
                     request = payload.rendered if attempt == 0 else _correction_prompt(
                         payload.rendered, last_error, previous_answer,
+                        budget_bytes=self.prompt_budget_bytes,
                     )
                     if retry_dir is not None:
                         atomic_write_text(retry_dir / "request.txt", request)
+                    call_payload = payload_for_rendered_request(
+                        "planner-continue" if attempt == 0 else "planner-continue-correction",
+                        request, budget_bytes=self.prompt_budget_bytes,
+                    )
+                    if target is not None:
+                        write_prompt_diagnostics(retry_dir or target, call_payload)
                     raw = self.client.complete(request)
                     self.last_usage = completion_usage(raw)
                     answer = raw if isinstance(raw, str) else getattr(raw, "text", None)
@@ -273,17 +285,15 @@ class PlannerContinue:
         raise V2PlanParseError(f"planner continue remained invalid after correction: {last_error}")
 
 
-def _correction_prompt(initial: str, reason: str, rejected: str) -> str:
+def _correction_prompt(initial: str, reason: str, rejected: str, *, budget_bytes: int = 0) -> str:
     """Keep the full request authority while bounding rejected model output."""
 
-    bounded = rejected[:24_000]
-    if len(rejected) > len(bounded):
-        bounded += "\n[planner response truncated for correction]"
-    return (
-        initial + "\n\nCONTINUATION VALIDATION FAILURE\n" + reason
-        + "\n\nREJECTED CONTINUATION\n" + bounded
-        + "\n\nReturn a corrected complete META CONTINUE v1 response."
+    payload = build_correction_payload(
+        initial, "CONTINUATION VALIDATION FAILURE\n" + reason
+        + "\n\nReturn a corrected complete META CONTINUE v1 response.", rejected,
+        role="planner-continue-correction", budget_bytes=budget_bytes,
     )
+    return payload.rendered
 
 
 __all__ = [

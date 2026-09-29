@@ -262,7 +262,7 @@ class ScriptedWorkers:
 
 
 class _Executor:
-    capabilities = AgentExecutorCapabilities(edits_workspace=True)
+    capabilities = AgentExecutorCapabilities(edits_workspace=True, reads_external_artifacts=True)
     driver = DRIVER
     driver_version = "test"
 

@@ -228,6 +228,8 @@ class PipelineV2Operations:
     initial_plan: Callable[[PipelineV2Context], CyclePlan]
     completed_steps: Callable[[PipelineV2Context, CyclePlan], list[dict[str, Any]]]
     execute_step: Callable[[PipelineV2Context, CyclePlan, int], None]
+    pause_requested: Callable[[PipelineV2Context], bool]
+    pause: Callable[[PipelineV2Context, CyclePlan, int], RunResult]
     run_gate: Callable[[PipelineV2Context, CyclePlan, GateStage], EvidenceBundle]
     load_gate_evidence: Callable[[PipelineV2Context, int, GateStage], EvidenceBundle | None]
     run_audit: Callable[[PipelineV2Context, CyclePlan, GateStage, EvidenceBundle, int], Any]
@@ -303,6 +305,20 @@ class PipelineV2Coordinator:
             head=candidate["commit_sha"],
         )
 
+    def _pause_after_step(
+        self, ctx: PipelineV2Context, plan: CyclePlan, index: int,
+    ) -> RunResult | None:
+        """Stop only after the accepted result of one complete step."""
+
+        if not self.operations.pause_requested(ctx):
+            return None
+        next_index = index + 1
+        if next_index < len(plan.plan.steps):
+            self._boundary(ctx, RunPhase.IMPLEMENT_STEP, plan, step_index=next_index)
+        else:
+            self._boundary(ctx, RunPhase.DETERMINISTIC_GATE, plan)
+        return self.operations.pause(ctx, plan, index)
+
     def run(self, start: ResumeCheckpoint, *, resumed: bool) -> RunResult:
         try:
             return self._run(start, resumed=resumed)
@@ -346,6 +362,8 @@ class PipelineV2Coordinator:
                 for index in range(index, len(plan.plan.steps)):
                     self._boundary(ctx, RunPhase.IMPLEMENT_STEP, plan, step_index=index)
                     ops.execute_step(ctx, plan, index)
+                    if paused := self._pause_after_step(ctx, plan, index):
+                        return paused
                 self._boundary(ctx, RunPhase.DETERMINISTIC_GATE, plan)
                 outcome = self._gate(ctx, plan, stage, None)
             elif start.phase in {RunPhase.DETERMINISTIC_GATE, RunPhase.AUDIT}:
@@ -487,6 +505,8 @@ class PipelineV2Coordinator:
         for index in range(len(plan.plan.steps)):
             self._boundary(ctx, RunPhase.IMPLEMENT_STEP, plan, step_index=index)
             ops.execute_step(ctx, plan, index)
+            if paused := self._pause_after_step(ctx, plan, index):
+                return paused
         self._boundary(ctx, RunPhase.DETERMINISTIC_GATE, plan)
         outcome = self._gate(ctx, plan, GateStage.POST_IMPLEMENTATION, None)
         return self._continue(ctx, plan, outcome, start_commit=current_head)

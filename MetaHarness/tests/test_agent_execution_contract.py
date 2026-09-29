@@ -120,6 +120,17 @@ class AgentExecutionContractTests(unittest.TestCase):
         self.assertIsInstance(codex, CodexExecutor)
         self.assertIsInstance(claude, ClaudeCodeExecutor)
 
+    def test_claude_adapter_forwards_read_only_evidence_authority(self) -> None:
+        runtime = ExecutorRuntimeConfig(environment={}, claude_home=self.root / "claude-home")
+        selected = profile(ProfileDriver.CLAUDE_CODE, ExecutionRole.AUDITOR)
+        agent = _ClaudeDouble()
+        request = replace(self.request, role=ExecutionRole.AUDITOR, profile_id=selected.id,
+                          read_only_paths=(self.root / "audit-artifacts",))
+        with mock.patch.object(agent, "run_revision", wraps=agent.run_revision) as run:
+            result = ClaudeCodeExecutor(selected, runtime, agent=agent).run(request)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(run.call_args.kwargs["read_only_paths"], request.read_only_paths)
+
     def test_adapter_maps_start_protocol_scope_and_runtime_failures_generically(self) -> None:
         runtime = ExecutorRuntimeConfig(environment={}, codex_home=self.root / "codex-home")
         selected = profile(ProfileDriver.CODEX, ExecutionRole.IMPLEMENTER)

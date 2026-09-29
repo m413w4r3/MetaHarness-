@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import dataclasses
 import time
-
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Mapping,
-    TYPE_CHECKING,
 )
+
 from ..agent.base import (
     AGENT_AUTH_FAILURE,
     AGENT_PROTOCOL_FAILED,
@@ -62,7 +62,6 @@ from ..models import (
     ModelProfile,
 )
 from ..plan_repository_validation import repository_tree_facts
-from ..scope import ScopeViolation
 from ..planning.normalization import normalization_entries, normalize_step_contract
 from ..profiles import profile_for_role
 from ..prompt_contracts import (
@@ -74,6 +73,7 @@ from ..result import (
     ResultArtifactError,
     atomic_write_text,
 )
+from ..scope import ScopeViolation
 from ..usage import normalize_usage
 from .shared import (
     StepExecutionFailure,
@@ -84,7 +84,6 @@ from .shared import (
     safe_candidate_tree,
     safe_index_tree,
 )
-
 
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
@@ -181,8 +180,13 @@ class WorkerAttemptService:
                 "contradictions": list(contract_normalization.contradictions),
             }))
         try:
+            spec_path = None
+            if getattr(executor.capabilities, "reads_external_artifacts", False):
+                spec_path = artifact_dir / "authority" / "spec.md"
+                atomic_write_text(spec_path, original_spec)
             prompt_payload = build_implementer_payload(
                 original_spec=original_spec,
+                spec_path=spec_path,
                 step_identity=f"{step.id}\nTITLE\n{step.title}",
                 step_title=step.title,
                 context=step.context,
@@ -190,11 +194,7 @@ class WorkerAttemptService:
                 write_set="\n".join(step.write_set) or "NONE",
                 create_set="\n".join(step.create_set) or "NONE",
                 delete_set="\n".join(step.delete_set) or "NONE",
-                mutable_scope=json_text({
-                    "write": list(step.write_set),
-                    "create": list(step.create_set),
-                    "delete": list(step.delete_set),
-                }),
+                mutable_scope="WRITE_SET, CREATE_SET and DELETE_SET above.",
                 instructions=step.instructions,
                 interfaces=step.interfaces,
                 examples=step.examples,
@@ -242,6 +242,7 @@ class WorkerAttemptService:
                     prompt_mode="raw",
                     contract=contract,
                     retry_addendum=retry_addendum,
+                    read_only_paths=(spec_path.parent,) if spec_path else (),
                 )
             )
         except AgentScopeError as exc:

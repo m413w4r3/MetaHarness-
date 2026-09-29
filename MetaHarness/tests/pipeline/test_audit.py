@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
+from unittest.mock import patch
 
+from metaharness.agent.base import AGENT_RATE_LIMITED, AgentRunResult
 from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
-from metaharness.models import ExecutionRole
-from tests.pipeline_support import PipelineHarness, continuation_answer, write
+from metaharness.models import AgentExecutorCapabilities, ExecutionRole
+from metaharness.recovery_policy import ExecutionFallbacks
 from tests.autonomy.support import SPEC, Step, meta_plan
+from tests.pipeline_support import PipelineHarness, continuation_answer, write
 
 
 def audit_message(status: str = "DONE", remaining: str = "none") -> str:
@@ -20,6 +24,160 @@ def audit_message(status: str = "DONE", remaining: str = "none") -> str:
 
 
 class AuditPipelineTests(PipelineHarness):
+    def test_repository_only_executor_receives_complete_inline_authority(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        with patch("tests.pipeline_support._Executor.capabilities", AgentExecutorCapabilities(edits_workspace=True)):
+            result = self.orchestrator(
+                self.config(), planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)))],
+            ).run_text(SPEC, run_id="run")
+        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        for request in self.workers.calls:
+            self.assertIn(SPEC, request.prompt)
+            self.assertEqual(request.read_only_paths, ())
+            if request.role is ExecutionRole.AUDITOR:
+                self.assertIn('"approved_step_contracts"', request.prompt)
+                self.assertIn("repository access only", request.prompt)
+                self.assertIn("diff --git", request.prompt)
+                self.assertIn("+good", request.prompt)
+
+    def test_soft_prompt_budgets_allow_workers_and_audit_to_finish(self) -> None:
+        config = self.config()
+        config = replace(config, prompt_budget=replace(config.prompt_budget, implementer_max_bytes=1, audit_max_bytes=1))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        result = self.orchestrator(config, planner=[meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",)))]).run_text(SPEC, run_id="run")
+        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        self.assertIn("auditor", self.workers.roles())
+
+    def _audit_fallback_config(self):
+        config = self.config()
+        profiles = dict(config.model_profiles)
+        profiles["audit-fallback"] = replace(profiles["auditor"], id="audit-fallback")
+        return replace(config, model_profiles=profiles,
+                       execution_fallbacks=ExecutionFallbacks(audit=("audit-fallback",)))
+
+    def _limited_audit(self, request):
+        (request.worktree / "feature.txt").write_text("good\n", encoding="utf-8")
+        return AgentRunResult(
+            status="failed", exit_reason=AGENT_RATE_LIMITED, backend_reason=AGENT_RATE_LIMITED,
+            tree_before="", tree_after="", usage=None, external_session_id=None,
+            report_path=None, exit_code=1, terminal_is_error=True,
+            final_message="You've hit your session limit · resets 4:20am (Europe/Paris)",
+        )
+
+    def test_rate_limit_switches_auditor_and_preserves_partial_edits(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "bad\n"))
+
+        def fallback(request):
+            self.assertEqual(request.profile_id, "audit-fallback")
+            self.assertEqual((request.worktree / "feature.txt").read_text(), "good\n")
+            self.assertIn("uncommitted edits", request.prompt)
+            self.assertIsNone(request.mutable_paths)
+            diff = (request.artifact_dir / "diff.patch").read_text()
+            self.assertIn("+good", diff)
+            self.assertNotIn("+bad", diff)
+            return audit_message()
+
+        self.workers.on(ExecutionRole.AUDITOR, self._limited_audit, fallback)
+        result = self.orchestrator(self._audit_fallback_config(), planner=[
+            meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
+        ]).run_text(SPEC, run_id="run")
+        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        report = json.loads((self.run_dir() / "cycles/001/audit/001/report.json").read_text())
+        self.assertEqual(report["profile_id"], "audit-fallback")
+        self.assertEqual([item["profile_id"] for item in report["executions"]], ["auditor", "audit-fallback"])
+        self.assertIn("feature.txt", report["changed_paths"])
+        fallback_prompt = next(call.prompt for call in self.workers.calls if call.profile_id == "audit-fallback")
+        diagnostics = json.loads((self.run_dir() / "cycles/001/audit/001/executors/002/prompt.diagnostics.json").read_text())
+        self.assertEqual(diagnostics["prompt_bytes"], len(fallback_prompt.encode()))
+        selection = json.loads((self.run_dir() / "iterations/01/execution_selection.json").read_text())
+        self.assertEqual(selection["audit_fallbacks"][0]["profile_id"], "audit-fallback")
+        options = json.loads((self.run_dir() / "run_options.json").read_text())
+        self.assertEqual(options["execution_fallbacks"]["audit"], ["audit-fallback"])
+
+    def test_audit_fallback_respects_semantic_attempt_budget(self) -> None:
+        config = self._audit_fallback_config()
+        config = replace(config, budget=replace(config.budget, step_attempts=1))
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, self._limited_audit)
+        result = self.orchestrator(config, planner=[
+            meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
+        ]).run_text(SPEC, run_id="run")
+        self.assertEqual(result.state["failure"]["reason"], AGENT_RATE_LIMITED)
+        self.assertEqual(self.workers.roles().count("auditor"), 1)
+
+    def test_rate_limit_without_fallback_retains_real_failure(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, self._limited_audit)
+        result = self._run()
+        self.assertEqual(result.state["disposition"], "WAIT_EXTERNAL")
+        self.assertEqual(result.state["failure"]["reason"], AGENT_RATE_LIMITED)
+        self.assertFalse((self.run_dir() / "cycles/001/audit/001/report.json").exists())
+
+    def test_all_auditors_rate_limited_wait_without_repeating(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, self._limited_audit, self._limited_audit)
+        result = self.orchestrator(self._audit_fallback_config(), planner=[
+            meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
+        ]).run_text(SPEC, run_id="run")
+        self.assertEqual(result.state["failure"]["reason"], AGENT_RATE_LIMITED)
+        self.assertEqual(self.workers.roles().count("auditor"), 2)
+
+    def test_invalid_audit_report_does_not_trigger_rate_limit_fallback(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: "invalid report")
+        result = self.orchestrator(self._audit_fallback_config(), planner=[
+            meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
+        ]).run_text(SPEC, run_id="run")
+        self.assertEqual(result.state["failure"]["reason"], "AGENT_PROTOCOL_FAILED")
+        self.assertEqual(self.workers.roles().count("auditor"), 1)
+
+    def test_hard_deny_before_rate_limit_prevents_fallback(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+
+        def limited(request):
+            (request.worktree / ".env").write_text("opaque\n", encoding="utf-8")
+            return self._limited_audit(request)
+
+        self.workers.on(ExecutionRole.AUDITOR, limited)
+        result = self.orchestrator(self._audit_fallback_config(), planner=[
+            meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
+        ]).run_text(SPEC, run_id="run")
+        self.assertEqual(result.state["failure"]["reason"], "HARD_DENY_PATH_MUTATION")
+        self.assertEqual(self.workers.roles().count("auditor"), 1)
+
+    def test_failed_execution_cannot_supply_an_accepted_report(self) -> None:
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+
+        def failed(request):
+            return replace(self._limited_audit(request), exit_reason="AGENT_RUNTIME_FAILED",
+                           backend_reason=None, final_message=audit_message())
+
+        self.workers.on(ExecutionRole.AUDITOR, failed)
+        result = self.orchestrator(self._audit_fallback_config(), planner=[
+            meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
+        ]).run_text(SPEC, run_id="run")
+        self.assertEqual(result.state["failure"]["reason"], "AGENT_RUNTIME_FAILED")
+        self.assertEqual(self.workers.roles().count("auditor"), 1)
+        self.assertFalse((self.run_dir() / "cycles/001/audit/001/report.json").exists())
+
+    def test_audit_fallback_snapshot_rejects_profile_drift(self) -> None:
+        from metaharness.execution_selection import (
+            ExecutionSelectionError,
+            read_execution_selection,
+            validate_execution_selection,
+        )
+        config = self._audit_fallback_config()
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))
+        self.workers.on(ExecutionRole.AUDITOR, lambda _request: audit_message())
+        self.orchestrator(config, planner=[
+            meta_plan(Step(id="S01", title="Write feature", write=("feature.txt",))),
+        ]).run_text(SPEC, run_id="run")
+        selection = read_execution_selection(self.run_dir())
+        profiles = dict(config.model_profiles)
+        profiles["audit-fallback"] = replace(profiles["audit-fallback"], model="changed-model")
+        with self.assertRaises(ExecutionSelectionError):
+            validate_execution_selection(replace(config, model_profiles=profiles), selection)
+
     def _run(self, *, extra_checks: str = "", continuation: list[str] | None = None):
         return self.orchestrator(
             self.config(extra_checks=extra_checks),
@@ -38,6 +196,23 @@ class AuditPipelineTests(PipelineHarness):
         self.assertIn("auditor", self.workers.roles())
         self.assertNotIn("reviewer", self.workers.roles())
         self.assertEqual(result.state["status"], "published", result.state.get("failure"))
+        prompt = next(call.prompt for call in self.workers.calls if call.role is ExecutionRole.AUDITOR)
+        self.assertNotIn("diff --git", prompt)
+        self.assertNotIn('"raw":', prompt)
+        diagnostics = json.loads((self.run_dir() / "cycles/001/audit/001/prompt.diagnostics.json").read_text())
+        self.assertEqual(diagnostics["role"], "auditor")
+        self.assertLess(diagnostics["prompt_bytes"], 64_000)
+        request = next(call for call in self.workers.calls if call.role is ExecutionRole.AUDITOR)
+        self.assertEqual(request.read_only_paths, (self.run_dir(),))
+        self.assertIn("+good", (request.artifact_dir / "diff.patch").read_text())
+        batch = json.loads(prompt.split("CURRENT MILESTONE AND BATCH\n", 1)[1].split("PRECEDING AUDITOR HANDOFF", 1)[0])
+        from pathlib import Path
+        self.assertTrue(Path(batch["file_refs"]["evidence"]).is_file())
+        self.assertEqual(Path(batch["file_refs"]["spec"]).read_text(), SPEC)
+        self.assertNotIn(SPEC, prompt)
+        worker = next(call for call in self.workers.calls if call.role is ExecutionRole.IMPLEMENTER)
+        self.assertNotIn(SPEC, worker.prompt)
+        self.assertEqual((worker.read_only_paths[0] / "spec.md").read_text(), SPEC)
 
     def test_audit_has_no_contractual_scope_and_the_worker_has_a_bounded_one(self) -> None:
         """``mutable_paths`` is explicit: a tuple bounds an agent, ``None`` is no scope."""
@@ -178,6 +353,33 @@ class AuditPipelineTests(PipelineHarness):
         self.assertEqual(self.checkpoint()["iteration"], 2)
         report = json.loads((self.run_dir() / "cycles/001/audit/002/report.json").read_text())
         self.assertEqual(report["remaining"], ["Fix test regression"])
+
+    def test_later_milestone_does_not_reaudit_preceding_batch_diff(self) -> None:
+        from tests.pipeline_support import git
+
+        first_tree = []
+
+        def first_audit(request):
+            first_tree.append(git(request.worktree, "rev-parse", "HEAD^{tree}"))
+            return audit_message()
+
+        def next_audit(request):
+            text = request.prompt.split("CURRENT MILESTONE AND BATCH\n", 1)[1]
+            batch = json.loads(text.split("PRECEDING AUDITOR HANDOFF", 1)[0].strip())
+            self.assertEqual(batch["diff_base_tree"], first_tree[0])
+            self.assertEqual(batch["changed_paths"], ["other.txt"])
+            return audit_message()
+
+        self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"),
+                        write("other.txt", "other milestone\n"))
+        self.workers.on(ExecutionRole.AUDITOR, first_audit, next_audit)
+        next_plan = meta_plan(Step(id="S01", title="Other milestone", write=("other.txt",)))
+        next_plan = next_plan.replace("MILESTONE_ID: M01", "MILESTONE_ID: M02")
+        result = self._run(continuation=[
+            continuation_answer("NEXT", milestone="M02", plan_text=next_plan),
+            continuation_answer("COMPLETE"),
+        ])
+        self.assertEqual(result.state["status"], "published", result.state.get("failure"))
 
     def test_resume_retries_an_interrupted_audit_checkpoint(self) -> None:
         self.workers.on(ExecutionRole.IMPLEMENTER, write("feature.txt", "good\n"))

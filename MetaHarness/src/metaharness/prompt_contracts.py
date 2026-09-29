@@ -17,8 +17,19 @@ from typing import Mapping, Sequence
 
 from .result import atomic_write_text
 
-
 _TRUNCATION_MARKER = "\n[TRUNCATED: secondary prompt evidence]\n"
+
+
+def file_authority(text: str, path: str | Path) -> str:
+    """Identify complete authority available to a local agent, without pasting it."""
+
+    return (
+        f"Read-only authority file: {path}\n"
+        f"UTF-8 bytes: {len(_encoded(text))}\n"
+        f"SHA256: {hashlib.sha256(_encoded(text)).hexdigest()}\n"
+        "Read the relevant definitions and invariants when needed. "
+        "The complete file remains authoritative; do not infer omitted requirements."
+    )
 
 
 def _default_template(name: str) -> str:
@@ -122,6 +133,7 @@ class PromptPayload:
             ],
             "omitted_sections": list(self.omitted_sections),
         }
+
 
 
 def write_prompt_diagnostics(
@@ -324,6 +336,30 @@ def build_prompt_payload(
     )
 
 
+def build_correction_payload(
+    initial: str, correction: str, rejected: str, *, role: str,
+    budget_bytes: int = 0,
+) -> PromptPayload:
+    """Keep the request and errors, with at most 8 KiB of rejected output."""
+
+    prior = _utf8_prefix(rejected, 8_000)
+    if len(_encoded(prior)) < len(_encoded(rejected)):
+        prior += "\n[previous answer truncated]"
+    return build_prompt_payload(
+        role=role,
+        template="{{INITIAL}}\n\nPREVIOUS PLANNER ANSWER\n{{REJECTED}}"
+                 "\nEND PREVIOUS PLANNER ANSWER\n\n{{CORRECTION}}",
+        sections=(
+            _section("initial_request", initial.rstrip(), True),
+            _section("correction", correction, True),
+            _section("rejected_answer", prior, False),
+        ),
+        placeholders={"{{INITIAL}}": "initial_request", "{{CORRECTION}}": "correction",
+                      "{{REJECTED}}": "rejected_answer"},
+        budget_bytes=budget_bytes, secondary_order=("rejected_answer",),
+    )
+
+
 def build_planner_payload(
     *,
     spec: str,
@@ -356,7 +392,7 @@ def build_planner_payload(
         _section("repository_identity", repository_identity, True),
         _section("discovery_context", discovery_context, False),
         _section("trusted_check_catalogue", trusted_check_catalogue, True),
-        _section("planning_constraints", planning_constraints, False),
+        _section("planning_constraints", planning_constraints, True),
     )
     placeholders = {
         "{{SPEC}}": "spec",
@@ -393,6 +429,7 @@ def build_implementer_payload(
     template: str | None = None,
     budget_bytes: int = 0,
     retry_addendum: str = "",
+    spec_path: str | Path | None = None,
 ) -> PromptPayload:
     """Build one worker contract; no full plan or run history is accepted."""
 
@@ -400,7 +437,7 @@ def build_implementer_payload(
         template = _default_template("implementer.txt")
     effective_identity = step_identity if step_identity is not None else step_title
     sections = (
-        _section("original_spec", original_spec, True),
+        _section("original_spec", file_authority(original_spec, spec_path) if spec_path else original_spec, True),
         _section("step_identity", effective_identity, True),
         _section("context", context, True),
         _section("read_set", read_set, True),

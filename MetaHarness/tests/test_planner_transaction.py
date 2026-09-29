@@ -9,9 +9,14 @@ from unittest import mock
 
 from metaharness.gitops import resolve_tree
 from metaharness.llm.chat import (
-    ConversationUnavailableError, LLMConversationHandle, TextLLMResult,
+    ConversationUnavailableError,
+    LLMConversationHandle,
+    TextLLMResult,
 )
-from metaharness.plan_repository_validation import PlanRepositoryPreconditionError, RepositoryPreconditions
+from metaharness.plan_repository_validation import (
+    PlanRepositoryPreconditionError,
+    RepositoryPreconditions,
+)
 from metaharness.planning.planner import PlannerV2
 from tests.pipeline_support import PipelineHarness, git
 from tests.test_plan_repository_validation import impossible_plan_message, meta_plan
@@ -54,6 +59,16 @@ class _Stateless:
 
 
 class PlannerTransactionTests(PipelineHarness):
+    def test_soft_prompt_budget_does_not_block_planning(self) -> None:
+        client = _Stateless([self.valid])
+        planner = self.planner(client)
+        planner.prompt_budget_bytes = 1000
+        planner.plan("Original SPEC", "context", artifacts_dir=self.target)
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("Original SPEC", client.calls[0])
+        diagnostics = json.loads((self.target / "prompt.diagnostics.json").read_text())
+        self.assertTrue(diagnostics["budget_overrun"])
+
     def setUp(self) -> None:
         super().setUp()
         self.target = self.root / "planner-run"

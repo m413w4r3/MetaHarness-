@@ -15,6 +15,7 @@
   var STOP_STATUSES = {
     committed: true, published: true, failed: true, blocked: true,
     plan_rejected: true, interrupted: true, awaiting_plan_approval: true,
+    paused: true,
     waiting_human: true, waiting_external: true,
     waiting_remote: true,
   };
@@ -22,6 +23,7 @@
     waiting_external: "Waiting for external authorization",
     waiting_remote: "Waiting for remote",
     waiting_human: "Waiting for operator decision",
+    paused: "Paused after step",
   };
   var SYMBOLS = {complete: "✓", running: "▶", failed: "✗", waiting: "·", resumable: "↻", skipped: "–"};
   var STATES = ["complete", "running", "failed", "waiting", "resumable", "skipped"];

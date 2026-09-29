@@ -221,11 +221,31 @@ def _program_name(command: Any) -> str:
     return first.rsplit("/", 1)[-1][:40] or "?"
 
 
-def summarize_step_event(event: dict[str, Any]) -> str | None:
-    """Compact per-step progress line: messages and tool names only.
+def _failed_item(item: dict[str, Any]) -> tuple[bool, str | None]:
+    """Return whether a completed tool item failed, without exposing output."""
 
-    Tool arguments (command lines, MCP arguments, patch bodies) are never
-    rendered; a command is reduced to its program name.
+    exit_code = item.get("exit_code")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        return exit_code != 0, f"exit {exit_code}"
+    if item.get("is_error") is True or item.get("error"):
+        return True, "error"
+    for key in ("status", "result", "outcome"):
+        value = item.get(key)
+        if isinstance(value, str):
+            status = value.casefold()
+            if any(word in status for word in ("fail", "error", "timeout", "abort")):
+                return True, status
+    return False, None
+
+
+def summarize_step_event(event: dict[str, Any]) -> str | None:
+    """Return only actionable tool failures from an agent event.
+
+    The raw agent stream remains available as a diagnostic artifact.  The
+    progress projection deliberately omits intermediate messages, turn
+    markers, tool starts and successful commands: the durable trace reports
+    the useful step result.  Failed tools are retained because they explain a
+    stalled or recovered step.
     """
 
     msg = event.get("msg") if isinstance(event.get("msg"), dict) else {}
@@ -233,36 +253,24 @@ def summarize_step_event(event: dict[str, Any]) -> str | None:
     item = event.get("item") or msg.get("item")
     if isinstance(item, dict):
         item_type = str(item.get("type") or "")
-        if event_type == "item.updated":
+        if event_type != "item.completed":
             return None
-        if item_type in {"agent_message", "assistant_message"}:
-            if event_type == "item.started":
-                return None
-            text = item.get("text") or item.get("content")
-            return f"message: {_one_line(text)}" if isinstance(text, str) and text.strip() else None
         if item_type == "command_execution" or "command" in item:
-            if event_type == "item.completed":
+            failed, detail = _failed_item(item)
+            if not failed:
                 return None
-            return f"tool: command {_program_name(item.get('command'))}"
-        if item_type in {"file_change", "patch_apply", "apply_patch"}:
-            if event_type == "item.started":
-                return None
-            changes = item.get("changes") or item.get("paths") or item.get("files") or []
-            paths = [
-                str(change.get("path")) if isinstance(change, dict) else str(change)
-                for change in changes if isinstance(changes, list)
-            ][:3]
-            return "tool: file_change" + (f" {_one_line(', '.join(paths), 90)}" if paths else "")
+            suffix = f" ({detail})" if detail else ""
+            return f"command failed: {_program_name(item.get('command'))}{suffix}"
         tool = item.get("tool_name") or item.get("tool") or item.get("name")
         if item_type == "mcp_tool_call" or isinstance(tool, str):
-            if event_type == "item.completed":
+            failed, detail = _failed_item(item)
+            if not failed:
                 return None
-            return f"tool: {_one_line(tool or item_type, 60)}"
-        if item_type:
-            return None if event_type in {"item.started", "item.completed"} else item_type
-    if msg.get("type") in {"agent_message", "assistant_message"} and isinstance(msg.get("message"), str):
-        return f"message: {_one_line(msg['message'])}"
-    return event_type or None
+            suffix = f" ({detail})" if detail else ""
+            return f"tool failed: {_one_line(tool or item_type, 60)}{suffix}"
+    if event_type in {"turn.completed", "response.completed", "result"}:
+        return "agent turn completed"
+    return None
 
 
 __all__ = [

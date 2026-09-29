@@ -12,6 +12,7 @@ from metaharness.agent.events import (
     extract_usage,
     iter_events,
     parse_event,
+    summarize_step_event,
 )
 from metaharness.claude.agent import _scan_events
 
@@ -111,6 +112,33 @@ class AgentEventsTests(unittest.TestCase):
 
     def test_unknown_event_is_not_terminal(self) -> None:
         self.assertIsNone(extract_terminal_result({"type": "message", "subtype": "success"}))
+
+    def test_progress_omits_agent_chatter_and_successful_commands(self) -> None:
+        self.assertIsNone(summarize_step_event({
+            "type": "item.started",
+            "item": {"type": "command_execution", "command": "zsh -lc test"},
+        }))
+        self.assertIsNone(summarize_step_event({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "zsh -lc test", "exit_code": 0},
+        }))
+        self.assertIsNone(summarize_step_event({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "intermediate thought"},
+        }))
+
+    def test_progress_keeps_failed_command_without_arguments_or_output(self) -> None:
+        summary = summarize_step_event({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "zsh -lc 'pytest --secret API_KEY=VALUE'",
+                "exit_code": 2,
+                "aggregated_output": "API_KEY=VALUE",
+            },
+        })
+
+        self.assertEqual(summary, "command failed: zsh (exit 2)")
 
     def test_scan_events_keeps_last_terminal_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -53,6 +53,7 @@ from ..usage import normalize_usage
 from ..resume import read_checkpoint
 from ..state import RunStateStore
 from .durable_readers import FAILED_CONTINUED, SKIPPED_DEPENDENCY, settled_step_status
+from .per_step_gate import per_step_check_ids
 from .pipeline_v2 import (
     BudgetExhausted,
     CyclePlan,
@@ -268,6 +269,7 @@ class StepExecutionService:
         retry_key = recovery.budget_key("agent-step", f"{cycle_number:03d}", step.id)
         pending_retry: RecoveryAdmission | None = None
         retry_addendum: str | None = None
+        gate_check_ids = per_step_check_ids(self.runtime, run_dir)
         attempt_number = 0
         while True:
             exhausted = self.runtime.budget_exhausted(store)
@@ -294,7 +296,7 @@ class StepExecutionService:
                 per_step = self.runtime.gates.run_per_step_gate(
                     run_dir=run_dir, worktree=worktree, base_sha=base_sha,
                     step_dir=artifact_dir,
-                    check_ids=self.runtime.config.gate.per_step,
+                    check_ids=gate_check_ids,
                     changed_paths=outcome.changed_paths,
                 )
                 if not per_step.passed:

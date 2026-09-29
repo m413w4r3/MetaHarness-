@@ -33,6 +33,7 @@ from .api import (
     model_profiles,
     progress,
     resume_run_request,
+    pause_run_request,
     validate_run_id,
 )
 from .pages import render_index, render_new_run, render_run, run_page_polls
@@ -504,7 +505,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 or (
                     len(parts) == 4
                     and parts[1] == "runs"
-                    and parts[3] in {"approval", "resume"}
+                    and parts[3] in {"approval", "pause", "resume"}
                 )
             )
             self._check_origin(allow_opaque=html_form_route)
@@ -543,6 +544,15 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     if payload:
                         raise WebAPIError(400, "resume body must be an empty JSON object")
                     result = resume_run_request(
+                        self.server.run_manager, self.server.config.runs_root, run_id
+                    )
+                    self._json(202, {**result, "accepted": True})
+                    return
+                if action == "pause":
+                    payload = self._body()
+                    if payload:
+                        raise WebAPIError(400, "pause body must be an empty JSON object")
+                    result = pause_run_request(
                         self.server.run_manager, self.server.config.runs_root, run_id
                     )
                     self._json(202, {**result, "accepted": True})
@@ -630,6 +640,16 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                 payload = self._form({"_token"})
                 self._authorized_form(payload.get("_token"))
                 result = resume_run_request(
+                    self.server.run_manager,
+                    self.server.config.runs_root,
+                    self._run_id(parts[2]),
+                )
+                self._redirect(result["location"])
+                return
+            if len(parts) == 4 and parts[1] == "runs" and parts[3] == "pause":
+                payload = self._form({"_token"})
+                self._authorized_form(payload.get("_token"))
+                result = pause_run_request(
                     self.server.run_manager,
                     self.server.config.runs_root,
                     self._run_id(parts[2]),
@@ -788,6 +808,7 @@ def configuration_description(
         "capabilities": {
             "plan_approval": bool(config.approval.require_plan_approval),
             "resume": callable(resume_run_request),
+            "pause": callable(pause_run_request),
             "cancel": False,
             "publish": bool(config.publish.enabled),
         },

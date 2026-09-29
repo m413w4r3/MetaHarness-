@@ -22,11 +22,15 @@ from metaharness.models import (
     RoutingConfig,
     SelectionMode,
     UIConfig,
+    RunDisposition,
+    RunMachineState,
+    RunPhase,
 )
+from metaharness.resume import ResumeCheckpoint, write_checkpoint
 from metaharness.run_options import RunOptions
 from metaharness.state import RunStateStore
 from metaharness.web.api import WebAPIError, create_run, validate_spec
-from metaharness.web.run_manager import RunCapacityError, RunManager
+from metaharness.web.run_manager import RunCapacityError, RunManager, RunPauseNotAllowedError
 
 
 def config_for(root: Path, *, max_active_runs: int = 1) -> HarnessConfig:
@@ -129,6 +133,44 @@ class RunManagerTests(unittest.TestCase):
             set(vars(manager)),
             {"_config", "_max_active_runs", "_orchestrator_factory", "_lock", "_active_run_ids"},
         )
+
+    def test_pause_run_sets_a_durable_request_only_for_an_active_step(self) -> None:
+        run_dir = self.config.runs_root / "pause-me"
+        run_dir.mkdir()
+        store = RunStateStore(run_dir / "state.json")
+        store.initialize("pause-me")
+        write_checkpoint(
+            run_dir,
+            ResumeCheckpoint(
+                RunPhase.IMPLEMENT_STEP,
+                last_green_commit="a" * 40,
+                plan_sha256="b" * 64,
+                step_index=0,
+            ),
+        )
+        store.set_run_state(
+            RunMachineState(RunPhase.IMPLEMENT_STEP, RunDisposition.RUNNING),
+            current_step="S01",
+        )
+
+        manager = RunManager(self.config, orchestrator_factory=self.factory)
+        self.assertEqual(manager.pause_run("pause-me"), "pause-me")
+        self.assertTrue(store.load()["pause_requested"])
+
+        write_checkpoint(
+            run_dir,
+            ResumeCheckpoint(
+                RunPhase.DETERMINISTIC_GATE,
+                last_green_commit="a" * 40,
+                plan_sha256="b" * 64,
+            ),
+        )
+        store.set_run_state(
+            RunMachineState(RunPhase.DETERMINISTIC_GATE, RunDisposition.RUNNING),
+            current_step=None,
+        )
+        with self.assertRaises(RunPauseNotAllowedError):
+            manager.pause_run("pause-me")
 
 
 class CreateRunAPITests(unittest.TestCase):

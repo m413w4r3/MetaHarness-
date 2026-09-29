@@ -174,6 +174,10 @@ class ConfigTests(unittest.TestCase):
             raw = tomllib.load(stream)
 
         checks = {check["id"]: check for check in raw["check_catalog"]}
+        self.assertEqual(raw["planning"]["max_steps_per_plan"], 6)
+        self.assertIn("test-collection", raw["gate"]["per_step"])
+        self.assertEqual(raw["prompt_budget"]["audit_max_bytes"], 64_000)
+        self.assertIn("--collect-only", checks["test-collection"]["argv"])
         self.assertEqual(
             raw["routing"],
             {
@@ -185,6 +189,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             raw["recovery"]["execution_fallbacks"],
             {
+                "audit": ["codex-sol-medium"],
                 "mechanical": ["codex-luna-xhigh"],
                 "reasoning": ["codex-sol-high"],
                 "agentic": ["codex-sol-high"],
@@ -197,6 +202,7 @@ class ConfigTests(unittest.TestCase):
                 "lint",
                 "typecheck",
                 "test",
+                "test-collection",
                 "test-integration",
                 "frontend-e2e",
                 "alembic-heads",
