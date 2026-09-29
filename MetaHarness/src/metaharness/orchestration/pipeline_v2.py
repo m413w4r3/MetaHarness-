@@ -100,18 +100,6 @@ def cycle_record_path(run_dir: Path, cycle: RunCycle | int) -> Path:
 # -- data exchanged with the operations ---------------------------------------
 
 
-class RecoveryStepUnavailable(RuntimeError):
-    """A recovery ladder rung cannot be executed for these exact facts.
-
-    The deterministic gate never guesses and never widens an authority: it
-    consumes the refused rung durably and asks the ladder for the next
-    distinct strategy.
-    """
-
-    def __init__(self, strategy: Any, detail: str) -> None:
-        super().__init__(f"{getattr(strategy, 'value', strategy)}: {detail}")
-        self.strategy = strategy
-        self.detail = detail
 
 
 class BudgetExhausted(Exception):
@@ -283,7 +271,7 @@ class PipelineV2Coordinator:
                     RunEvent.advance(target),
                 )
             except RunTransitionError as exc:
-                raise PipelineFailure("INVALID_PHASE_TRANSITION", str(exc)) from exc
+                raise PipelineFailure("INTERNAL_HARNESS_ERROR", str(exc)) from exc
         self._cursor.append(target)
 
     def _boundary(
@@ -621,10 +609,4 @@ def audit_summary(report_paths: list[Path]) -> dict[str, Any]:
     }
 
 
-__all__ = [
-    "BudgetExhausted", "CyclePlan", "PipelineFailure", "PipelineV2Context", "PipelineV2Coordinator",
-    "RecoveryStepUnavailable",
-    "IterationOutcome", "PipelineV2Operations", "candidate_dir",
-    "cycle_dir", "cycle_record_path", "gate_acceptance_path", "gate_dir",
-    "implementation_dir", "implementation_steps_dir", "step_dir",
-]
+__all__ = ['BudgetExhausted', 'CyclePlan', 'PipelineFailure', 'PipelineV2Context', 'PipelineV2Coordinator', 'IterationOutcome', 'PipelineV2Operations', 'candidate_dir', 'cycle_dir', 'cycle_record_path', 'gate_acceptance_path', 'gate_dir', 'implementation_dir', 'implementation_steps_dir', 'step_dir']

@@ -13,17 +13,12 @@
 
   var POLL_MS = 2000;
   var STOP_STATUSES = {
-    committed: true, published: true, failed: true, blocked: true,
-    plan_rejected: true, interrupted: true, awaiting_plan_approval: true,
-    paused: true,
+    committed: true, published: true, partial: true, failed: true,
     waiting_human: true, waiting_external: true,
-    waiting_remote: true,
   };
   var WAITING_LABELS = {
     waiting_external: "Waiting for external authorization",
-    waiting_remote: "Waiting for remote",
     waiting_human: "Waiting for operator decision",
-    paused: "Paused after step",
   };
   var SYMBOLS = {complete: "✓", running: "▶", failed: "✗", waiting: "·", resumable: "↻", skipped: "–"};
   var STATES = ["complete", "running", "failed", "waiting", "resumable", "skipped"];
@@ -34,6 +29,7 @@
   }
   var runId = root.getAttribute("data-run-id") || "";
   var initialStatus = root.getAttribute("data-status") || "";
+  var initialPhase = root.getAttribute("data-phase") || "";
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(runId) || STOP_STATUSES[initialStatus]) {
     return;
   }
@@ -114,7 +110,7 @@
     });
     var badge = byId("live-status");
     if (badge) {
-      badge.classList.toggle("failed", status === "failed" || status === "interrupted");
+      badge.classList.toggle("failed", status === "failed");
       badge.classList.toggle("success", status === "published" || status === "committed");
     }
     var failure = byId("live-failure");
@@ -125,7 +121,7 @@
     }
     updatePipeline(payload.pipeline);
     updateEvents(payload.progress_events);
-    if (status !== initialStatus) {
+    if (status !== initialStatus || payload.phase !== initialPhase) {
       var refresh = byId("refresh-details");
       if (refresh) {
         refresh.hidden = false;

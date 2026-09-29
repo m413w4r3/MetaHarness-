@@ -62,7 +62,7 @@ class WorkspaceSetupTests(unittest.TestCase):
         script.chmod(script.stat().st_mode | stat.S_IXUSR)
         git(self.root, "add", "mutate")
         git(self.root, "commit", "-qm", "add setup command")
-        with self.assertRaisesRegex(WorkspaceSetupError, "WORKSPACE_SETUP_MUTATED"):
+        with self.assertRaisesRegex(WorkspaceSetupError, "CONFIGURATION_INVALID"):
             prepare_workspace(
                 self.root,
                 (WorkspaceSetupCommand("mutate", (str(script),)),),

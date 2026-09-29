@@ -32,7 +32,6 @@ from metaharness.models import (
 from metaharness.approval import ApprovalDecision, PlanIdentity, write_plan_approval
 from metaharness.resume import (
     CHECKPOINT_INTEGRITY_OPERATION,
-    PHASE_STATUS,
     ResumeCheckpoint,
     ResumePhase,
     checkpoint_payload,
@@ -59,9 +58,9 @@ class StateTests(unittest.TestCase):
 
             self.assertEqual(initial["schema_version"], 1)
             self.assertEqual(initial["run_id"], "run-123")
-            self.assertEqual(initial["status"], "created")
+            self.assertEqual(initial["status"], "running")
             self.assertIsNone(initial["failure"])
-            self.assertEqual(json.loads(state_path.read_text())["status"], "created")
+            self.assertEqual(json.loads(state_path.read_text())["status"], "running")
 
             store.update_metadata(planner={"request_id": "p1"})
             store.set_run_state(
@@ -70,7 +69,7 @@ class StateTests(unittest.TestCase):
             )
             loaded = store.load()
 
-            self.assertEqual(loaded["status"], "validating")
+            self.assertEqual(loaded["status"], "running")
             self.assertEqual(loaded["planner"]["request_id"], "p1")
             self.assertTrue(loaded["checks"][0]["ok"])
             self.assertGreaterEqual(loaded["updated_at"], loaded["started_at"])
@@ -184,7 +183,7 @@ class StateLockingTests(unittest.TestCase):
             # The writer really reached flock and the kernel refused it.
             self.assertTrue(probe.blocked("writer").wait(5))
             self.assertFalse(finished.is_set())
-            self.assertEqual(store.load()["status"], "created")
+            self.assertEqual(store.load()["status"], "running")
         thread.join(timeout=5)
         self.assertTrue(finished.is_set())
         self.assertTrue(store.load()["marker"])
@@ -195,13 +194,13 @@ class StateLockingTests(unittest.TestCase):
         gate = store.identity()
         written = store.update_metadata(expected=gate, execution={"owner": "web"})
         self.assertIsNotNone(written)
-        self.assertEqual(written["status"], "awaiting_plan_approval")
+        self.assertEqual(written["status"], "running")
         store.set_run_state(
             RunMachineState(RunPhase.PLANNER), execution={"owner": "orchestrator"},
         )
         self.assertIsNone(store.update_metadata(expected=gate, execution={"owner": "late web"}))
         final = store.load()
-        self.assertEqual(final["status"], "planning")
+        self.assertEqual(final["status"], "running")
         self.assertEqual(final["execution"], {"owner": "orchestrator"})
         with self.assertRaises(ValueError):
             store.update_metadata(expected=store.identity(), status="failed")
@@ -258,7 +257,7 @@ class StateLockingTests(unittest.TestCase):
         results = self.run_interleaved(store, ("web", web), ("orchestrator", orchestrator))
         self.assertIsNotNone(results["web"])
         final = store.load()
-        self.assertEqual(final["status"], "preparing")
+        self.assertEqual(final["status"], "running")
         self.assertEqual(final["branch"], "harness/x")
         self.assertEqual(final["execution"], {"owner": "orchestrator"})
         self.assertEqual(final["plan_identity"], {"web": True})
@@ -271,13 +270,13 @@ class StateLockingTests(unittest.TestCase):
         results = self.run_interleaved(store, ("orchestrator", orchestrator), ("web", web))
         self.assertIsNone(results["web"])
         final = store.load()
-        self.assertEqual(final["status"], "preparing")
+        self.assertEqual(final["status"], "running")
         self.assertEqual(final["branch"], "harness/x")
         self.assertEqual(final["execution"], {"owner": "orchestrator"})
         self.assertIsNone(final["plan_identity"])
         # Once the orchestrator left the gate, the gate never reappears.
         self.assertIsNone(web())
-        self.assertEqual(store.load()["status"], "preparing")
+        self.assertEqual(store.load()["status"], "running")
 
     def test_concurrent_updates_never_lose_fields(self) -> None:
         store = self.store()
@@ -355,7 +354,7 @@ class StateLockingTests(unittest.TestCase):
         for thread in readers:
             thread.join(timeout=10)
         self.assertEqual(errors, [])
-        self.assertEqual(store.load()["status"], "validating")
+        self.assertEqual(store.load()["status"], "running")
 
 class FrozenRunOptionsSchemaTests(unittest.TestCase):
     """An older snapshot fails closed; the run directory is never rewritten."""
@@ -396,7 +395,7 @@ class FrozenRunOptionsSchemaTests(unittest.TestCase):
             self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
             self.assertEqual(path.read_bytes(), data)
             self.assertEqual(store.load()["run_options_sha256"], digest)
-            self.assertEqual(store.load()["status"], RunStatus.CREATED.value)
+            self.assertEqual(store.load()["status"], RunStatus.RUNNING.value)
 
 
 class FrozenCheckpointSchemaTests(unittest.TestCase):
@@ -518,9 +517,9 @@ TRANSITION_MATRIX = (
     # A run stops without failing: the phase it stopped at is the operation to
     # retry, and the failure reason carries the business detail.
     (R.IMPLEMENT_STEP, RunEvent.wait(D.WAIT_EXTERNAL, reason="AGENT_TIMEOUT"), R.IMPLEMENT_STEP, D.WAIT_EXTERNAL),
-    (R.DETERMINISTIC_GATE, RunEvent.wait(D.WAIT_EXTERNAL, reason="CHECK_TIMEOUT"), R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL),
+    (R.DETERMINISTIC_GATE, RunEvent.wait(D.WAIT_EXTERNAL, reason="CHECK_INFRASTRUCTURE_UNAVAILABLE"), R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL),
     (R.AUDIT, RunEvent.wait(D.WAIT_HUMAN, reason="SPEC_DECISION_REQUIRED"), R.AUDIT, D.WAIT_HUMAN),
-    (R.DETERMINISTIC_GATE, RunEvent.wait(D.WAIT_HUMAN, reason="CHECK_TIMEOUT"), R.DETERMINISTIC_GATE, D.WAIT_HUMAN),
+    (R.DETERMINISTIC_GATE, RunEvent.wait(D.WAIT_EXTERNAL, reason="CHECK_INFRASTRUCTURE_UNAVAILABLE"), R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL),
     (R.IMPLEMENT_STEP, RunEvent.fail(reason="AGENT_SCOPE_VIOLATION"), R.IMPLEMENT_STEP, D.FAILED),
     (R.PUBLISH, RunEvent.fail(reason="PUSH_REJECTED"), R.PUBLISH, D.FAILED),
     (R.PUBLISH, RunEvent.complete(), R.PUBLISH, D.COMPLETED),
@@ -530,7 +529,7 @@ TRANSITION_MATRIX = (
 # A waiting run claims its exact phase again; only its posture changes.
 RESUME_MATRIX = (
     (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, RunEvent.resume(), R.IMPLEMENT_STEP, D.RUNNING),
-    (R.DETERMINISTIC_GATE, D.WAIT_HUMAN, RunEvent.resume(), R.DETERMINISTIC_GATE, D.RUNNING),
+    (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, RunEvent.resume(), R.DETERMINISTIC_GATE, D.RUNNING),
 )
 
 # Every illegal pair fails in ``transition`` and nowhere else.
@@ -550,31 +549,29 @@ INVALID_TRANSITIONS = (
 
 # (phase, disposition, reason, status, resumable, resume eligible)
 PROJECTION_MATRIX = (
-    (None, D.RUNNING, None, RunStatus.CREATED, False, False),
-    (R.CONTEXT, D.RUNNING, None, RunStatus.PLANNING, False, False),
-    (R.PLAN_APPROVAL, D.RUNNING, None, RunStatus.AWAITING_PLAN_APPROVAL, False, False),
-    (R.IMPLEMENT_STEP, D.RUNNING, None, RunStatus.IMPLEMENTING, False, False),
-    (R.DETERMINISTIC_GATE, D.RUNNING, None, RunStatus.VALIDATING, False, False),
-    (R.AUDIT, D.RUNNING, None, RunStatus.REVISING, False, False),
-    (R.PUBLISH, D.RUNNING, None, RunStatus.PUBLISHING, False, False),
+    (None, D.RUNNING, None, RunStatus.RUNNING, False, False),
+    (R.CONTEXT, D.RUNNING, None, RunStatus.RUNNING, False, False),
+    (R.PLAN_APPROVAL, D.RUNNING, None, RunStatus.RUNNING, False, False),
+    (R.IMPLEMENT_STEP, D.RUNNING, None, RunStatus.RUNNING, False, False),
+    (R.DETERMINISTIC_GATE, D.RUNNING, None, RunStatus.RUNNING, False, False),
+    (R.AUDIT, D.RUNNING, None, RunStatus.RUNNING, False, False),
+    (R.PUBLISH, D.RUNNING, None, RunStatus.RUNNING, False, False),
     (R.CANDIDATE_PUSH, D.COMPLETED, None, RunStatus.COMMITTED, False, False),
     (R.PUBLISH, D.COMPLETED, None, RunStatus.PUBLISHED, False, False),
     (R.IMPLEMENT_STEP, D.FAILED, "AGENT_SCOPE_VIOLATION", RunStatus.FAILED, False, True),
     # The failure reason names the flavour of an external wait; a reason that
     # belongs to another phase stays a plain external wait.
     (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, "AGENT_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
-    (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, PAUSED_REASON, RunStatus.PAUSED, True, True),
+    (R.IMPLEMENT_STEP, D.WAIT_EXTERNAL, PAUSED_REASON, RunStatus.WAITING_EXTERNAL, True, True),
     # A check infrastructure reason is an ordinary external wait: a skipped
     # check is a durable warning, never a gate infrastructure status.
-    (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
-    (R.AUDIT, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
-    (R.CANDIDATE_PUSH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_REMOTE, True, True),
-    (R.PUBLISH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_REMOTE, True, True),
+    (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_INFRASTRUCTURE_UNAVAILABLE", RunStatus.WAITING_EXTERNAL, True, True),
+    (R.AUDIT, D.WAIT_EXTERNAL, "CHECK_INFRASTRUCTURE_UNAVAILABLE", RunStatus.WAITING_EXTERNAL, True, True),
+    (R.CANDIDATE_PUSH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_EXTERNAL, True, True),
+    (R.PUBLISH, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_EXTERNAL, True, True),
     (R.AUDIT, D.WAIT_EXTERNAL, "PUSH_FAILED", RunStatus.WAITING_EXTERNAL, True, True),
-    (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL, True, True),
-    (R.AUDIT, D.WAIT_HUMAN, "CHECK_TIMEOUT", RunStatus.WAITING_HUMAN, False, False),
+    (R.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_INFRASTRUCTURE_UNAVAILABLE", RunStatus.WAITING_EXTERNAL, True, True),
     (R.IMPLEMENT_STEP, D.WAIT_HUMAN, "SPEC_DECISION_REQUIRED", RunStatus.WAITING_HUMAN, False, False),
-    (R.AUDIT, D.WAIT_HUMAN, "SECURITY_POLICY_DECISION_REQUIRED", RunStatus.WAITING_HUMAN, False, False),
 )
 
 
@@ -652,7 +649,7 @@ class RunMachineTests(unittest.TestCase):
         # The resume gate has validated the durable retry boundary: RESUME is
         # the one event that re-claims a failure, and every other event stops.
         resumed = transition(
-            RunMachineState(R.IMPLEMENT_STEP, D.FAILED, "LLM_FAILURE"), RunEvent.resume(),
+            RunMachineState(R.IMPLEMENT_STEP, D.FAILED, "LLM_TRANSPORT_EXHAUSTED"), RunEvent.resume(),
         )
         self.assertEqual((resumed.phase, resumed.disposition), (R.IMPLEMENT_STEP, D.RUNNING))
         self.assertIsNone(resumed.reason)
@@ -678,7 +675,7 @@ class RunMachineTests(unittest.TestCase):
         for phase in RunPhase:
             with self.subTest(phase=phase.value):
                 outcome = project_run_outcome(RunMachineState(phase, D.RUNNING))
-                self.assertEqual(outcome.status.value, PHASE_STATUS[phase])
+                self.assertIs(outcome.status, RunStatus.RUNNING)
                 self.assertFalse(outcome.resume_eligible)
                 # The status a resume claims is never a waiting or terminal one.
                 self.assertNotIn(outcome.status.value, {"failed", "published", "committed"})
@@ -690,18 +687,49 @@ class RunMachineTests(unittest.TestCase):
                 self.assertIsInstance(disposition_for_status(status), RunDisposition)
         for status, disposition in (
             ("waiting_external", D.WAIT_EXTERNAL),
-            ("waiting_remote", D.WAIT_EXTERNAL),
             ("waiting_human", D.WAIT_HUMAN),
             ("failed", D.FAILED),
             ("interrupted", D.FAILED),
+            ("planning", D.RUNNING),
+            ("awaiting_plan_approval", D.RUNNING),
+            ("publishing", D.RUNNING),
+            ("paused", D.WAIT_EXTERNAL),
+            ("waiting_remote", D.WAIT_EXTERNAL),
+            ("plan_rejected", D.FAILED),
             ("committed", D.COMPLETED),
             ("published", D.COMPLETED),
-            ("validating", D.RUNNING),
+            ("running", D.RUNNING),
         ):
             with self.subTest(status=status):
                 self.assertIs(disposition_for_status(status), disposition)
         with self.assertRaises(ValueError):
             disposition_for_status("not-a-status")
+
+    def test_legacy_statuses_are_read_only_projections(self) -> None:
+        old_running = (
+            "created", "planning", "awaiting_plan_approval", "preparing",
+            "implementing", "validating", "revising", "approved", "publishing",
+        )
+        for spelling in old_running:
+            with self.subTest(spelling=spelling):
+                self.assertIs(
+                    project_run_outcome(machine_state_for_run({"status": spelling})).status,
+                    RunStatus.RUNNING,
+                )
+        for spelling in ("paused", "waiting_remote"):
+            with self.subTest(spelling=spelling):
+                self.assertIs(
+                    project_run_outcome(machine_state_for_run({"status": spelling})).status,
+                    RunStatus.WAITING_EXTERNAL,
+                )
+        for spelling in ("plan_rejected", "interrupted"):
+            with self.subTest(spelling=spelling):
+                self.assertIs(
+                    project_run_outcome(machine_state_for_run({"status": spelling})).status,
+                    RunStatus.FAILED,
+                )
+        for spelling in (*old_running, "paused", "waiting_remote", "plan_rejected", "interrupted"):
+            self.assertNotIn(spelling.upper(), RunStatus.__members__)
 
     def test_the_checkpoint_phase_is_the_authority(self) -> None:
         # The run state only ever carries the posture: whatever a status
@@ -709,7 +737,7 @@ class RunMachineTests(unittest.TestCase):
         state = {
             "status": "waiting_external",
             "disposition": "WAIT_EXTERNAL",
-            "failure": {"reason": "CHECK_TIMEOUT"},
+            "failure": {"reason": "CHECK_INFRASTRUCTURE_UNAVAILABLE"},
         }
         checkpoint = self.checkpoint_at(RunPhase.DETERMINISTIC_GATE)
         machine = machine_state_for_run(state, checkpoint)
@@ -732,7 +760,7 @@ class RunMachineTests(unittest.TestCase):
 
     def test_a_run_state_written_before_the_vocabulary_is_read_through_the_bridge(self) -> None:
         for status, disposition in (
-            ("waiting_remote", D.WAIT_EXTERNAL),
+            ("waiting_external", D.WAIT_EXTERNAL),
             ("failed", D.FAILED),
         ):
             with self.subTest(status=status):
@@ -753,18 +781,18 @@ class RunStateProjectionTests(unittest.TestCase):
 
     def test_initialize_seeds_the_canonical_posture(self) -> None:
         state = self.store.load()
-        self.assertEqual(state["status"], RunStatus.CREATED.value)
+        self.assertEqual(state["status"], RunStatus.RUNNING.value)
         self.assertEqual(state["disposition"], RunDisposition.RUNNING.value)
 
     def test_set_run_state_derives_the_status_from_the_posture(self) -> None:
         state = self.store.set_run_state(
-            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT"),
+            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_INFRASTRUCTURE_UNAVAILABLE"),
             current_step=None,
         )
         self.assertEqual(state["status"], RunStatus.WAITING_EXTERNAL.value)
         self.assertEqual(state["disposition"], D.WAIT_EXTERNAL.value)
         self.assertEqual(state["phase"], RunPhase.DETERMINISTIC_GATE.value)
-        self.assertEqual(state["reason"], "CHECK_TIMEOUT")
+        self.assertEqual(state["reason"], "CHECK_INFRASTRUCTURE_UNAVAILABLE")
         self.assertEqual(self.store.load()["status"], RunStatus.WAITING_EXTERNAL.value)
 
     def test_set_run_state_owns_the_status(self) -> None:
@@ -787,7 +815,7 @@ class RunStateProjectionTests(unittest.TestCase):
 
     def test_a_metadata_update_never_moves_the_machine_state(self) -> None:
         before = self.store.set_run_state(
-            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_TIMEOUT"),
+            RunMachineState(RunPhase.DETERMINISTIC_GATE, D.WAIT_EXTERNAL, "CHECK_INFRASTRUCTURE_UNAVAILABLE"),
         )
         machine_before = self.store.machine_state()
         after = self.store.update_metadata(checks=[{"name": "test", "ok": True}])
@@ -814,7 +842,7 @@ class RunStateProjectionTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 mutate()
-        self.assertEqual(self.store.load()["status"], RunStatus.CREATED.value)
+        self.assertEqual(self.store.load()["status"], RunStatus.RUNNING.value)
 
     def test_a_recorded_status_is_re_derived_and_never_trusted(self) -> None:
         # A recorded status that contradicts the posture is not authority: the
@@ -827,7 +855,7 @@ class RunStateProjectionTests(unittest.TestCase):
         )
         self.store.path.write_text(json.dumps(payload), encoding="utf-8")
         state = self.store.update_metadata(marker=True)
-        self.assertEqual(state["status"], RunStatus.IMPLEMENTING.value)
+        self.assertEqual(state["status"], RunStatus.RUNNING.value)
         self.assertEqual(state["disposition"], RunDisposition.RUNNING.value)
         self.assertEqual(state["marker"], True)
 
@@ -861,8 +889,8 @@ class RunStateProjectionTests(unittest.TestCase):
         # The UI keeps reading a status: it is a projection of the machine, so a
         # gate reason keeps naming its operator-facing flavour.
         for reason, status in (
-            ("CHECK_TIMEOUT", RunStatus.WAITING_EXTERNAL),
-            ("PUSH_FAILED", RunStatus.WAITING_REMOTE),
+            ("CHECK_INFRASTRUCTURE_UNAVAILABLE", RunStatus.WAITING_EXTERNAL),
+            ("PUSH_FAILED", RunStatus.WAITING_EXTERNAL),
             ("AGENT_TIMEOUT", RunStatus.WAITING_EXTERNAL),
         ):
             with self.subTest(reason=reason):
@@ -885,7 +913,7 @@ class RunStateProjectionTests(unittest.TestCase):
             RunEvent.resume(), expected=self.store.identity(), failure=None,
         )
         self.assertIsNotNone(claimed)
-        self.assertEqual(claimed["status"], RunStatus.IMPLEMENTING.value)
+        self.assertEqual(claimed["status"], RunStatus.RUNNING.value)
         self.assertEqual(claimed["disposition"], RunDisposition.RUNNING.value)
         self.assertEqual(claimed["phase"], waiting["phase"])
         self.assertIsNone(claimed["reason"])
@@ -951,7 +979,7 @@ class CheckpointAuthorityTests(unittest.TestCase):
 
     def test_a_corrupt_checkpoint_refuses_every_control_read_and_write(self) -> None:
         self.store.set_run_state(
-            RunMachineState(RunPhase.IMPLEMENT_STEP, D.FAILED, "LLM_FAILURE"),
+            RunMachineState(RunPhase.IMPLEMENT_STEP, D.FAILED, "LLM_TRANSPORT_EXHAUSTED"),
         )
         expected = self.store.identity()
         self.checkpoint_path.write_text("{not json", encoding="utf-8")

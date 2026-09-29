@@ -9,73 +9,54 @@ plans, audits or runs a check.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import (
-    Any,
-    Mapping,
-    TYPE_CHECKING,
-)
-from ..evidence import (
-    EvidenceBundle,
-)
+from typing import TYPE_CHECKING, Any, Callable, Mapping
+
+from ..commit_gate import CommitSafetyError, assert_deferred_verifications_resolved
+from ..evidence import EvidenceBundle
+from ..attempt_transaction import status_has_unstaged_or_untracked
 from ..gitops import (
     BaseMovedError,
     BasePushError,
     GitError,
+    RepositoryReference,
     WorktreeInfo,
+    candidate_tree_sha,
     commit_message,
     commit_parents,
-    validate_linear_commit_chain,
-    publish_fast_forward_base,
-    candidate_tree_sha,
     current_head,
     delete_run_branch,
     index_tree_sha,
+    normalize_github_web_url,
+    publish_fast_forward_base,
     push_run_branch,
     remote_run_branch_tip,
+    repository_remote_url,
     resolve_tree,
-    RepositoryReference,
     status_porcelain,
     symbolic_head,
-    repository_remote_url,
+    validate_linear_commit_chain,
     validate_run_branch,
 )
-from ..commit_gate import (
-    CommitSafetyError,
-    assert_deferred_verifications_resolved,
-)
 from ..integrations.github import GitHubWorkstreamError
-from ..models import (
-    PublishMode,
-    RunDisposition,
-    RunMachineState,
-)
-from ..resume import ResumePhase
-from ..result import (
-    RunResult,
-    atomic_write_text,
-)
+from ..models import GateStage, PublishMode, RunDisposition, RunMachineState
 from ..recovery_policy import classify_failure
+from ..result import RunResult, atomic_write_text
+from ..resume import ResumePhase
 from ..state import RunStateStore
-from .shared import (
-    CommitBoundaryError,
-    _is_object_id,
-    _json_text,
-    _status_has_unstaged_or_untracked,
-)
-from .candidate import (
-    CandidateRemoteStaging,
-    _commit_web_url,
-)
-from .pipeline_v2 import (
-    PipelineFailure,
-    PipelineV2Context,
-)
+from .pipeline_v2 import PipelineFailure, PipelineV2Context, candidate_dir
 from .recovery import project_exit
+from .shared import (
+    CandidatePushError,
+    CommitBoundaryError,
+    is_object_id,
+    json_text,
+    read_json_artifact,
+)
+
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
-
-
 
 
 class PublicationService:
@@ -133,7 +114,7 @@ class PublicationService:
             if github.issue_mode == "link-existing" and github.issue_number not in {None, current}:
                 raise GitHubWorkstreamError(
                     "configured GitHub issue does not match the persisted workstream issue",
-                    code="GITHUB_CONFIG_INVALID",
+                    code="CONFIGURATION_INVALID",
                 )
             return
         if github.issue_mode == "link-existing":
@@ -141,7 +122,7 @@ class PublicationService:
             if requested is None:
                 raise GitHubWorkstreamError(
                     "github.issue_number is required for link-existing",
-                    code="GITHUB_CONFIG_INVALID",
+                    code="CONFIGURATION_INVALID",
                 )
             try:
                 issue = self.runtime.github_client.read_issue(requested)
@@ -150,13 +131,13 @@ class PublicationService:
             if issue is None:
                 raise GitHubWorkstreamError(
                     "requested GitHub issue was not found",
-                    code="GITHUB_ISSUE_NOT_FOUND",
+                    code="CONFIGURATION_INVALID",
                 )
             number = self._github_result_number(issue, "issue")
             if number != requested:
                 raise GitHubWorkstreamError(
                     "GitHub issue response did not match the requested issue",
-                    code="GITHUB_ISSUE_NOT_FOUND",
+                    code="CONFIGURATION_INVALID",
                 )
             event = "workstream.issue.linked"
         else:
@@ -213,22 +194,22 @@ class PublicationService:
         ):
             raise GitHubWorkstreamError(
                 "GitHub pull-request creation requires a published run branch",
-                code="GITHUB_PR_REQUIRES_RUN_BRANCH",
+                code="CONFIGURATION_INVALID",
             )
         accepted_candidate_sha = state.get("candidate_commit_sha")
         if (
-            not _is_object_id(accepted_candidate_sha)
+            not is_object_id(accepted_candidate_sha)
             or accepted_candidate_sha != commit_sha
         ):
             raise GitHubWorkstreamError(
                 "GitHub pull-request candidate authority is not the accepted candidate",
-                code="GITHUB_PR_CANDIDATE_MISMATCH",
+                code="CONFIGURATION_INVALID",
             )
         try:
             if current_head(info.worktree) != accepted_candidate_sha:
                 raise GitHubWorkstreamError(
                     "local accepted candidate does not match the candidate commit",
-                    code="GITHUB_PR_CANDIDATE_MISMATCH",
+                    code="CONFIGURATION_INVALID",
                 )
             remote_tip = remote_run_branch_tip(
                 info.source_repo,
@@ -244,12 +225,12 @@ class PublicationService:
         except (GitError, OSError, ValueError):
             raise GitHubWorkstreamError(
                 "remote run branch tip could not be verified",
-                code="GITHUB_PR_CANDIDATE_MISMATCH",
+                code="CONFIGURATION_INVALID",
             ) from None
         if remote_tip != accepted_candidate_sha:
             raise GitHubWorkstreamError(
                 "remote run branch tip does not match the accepted candidate",
-                code="GITHUB_PR_CANDIDATE_MISMATCH",
+                code="CONFIGURATION_INVALID",
             )
         plan_state = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
         plan_title = plan_state.get("title") if isinstance(plan_state.get("title"), str) else "MetaHarness run"
@@ -303,7 +284,7 @@ class PublicationService:
         ):
             raise GitHubWorkstreamError(
                 "GitHub pull-request creation requires a published run branch",
-                code="GITHUB_PR_REQUIRES_RUN_BRANCH",
+                code="CONFIGURATION_INVALID",
             )
     def publish_candidate(
         self, store: RunStateStore, ctx: PipelineV2Context, number: int,
@@ -349,7 +330,7 @@ class PublicationService:
         candidate = evidence.staged_tree_sha
         if index_tree_sha(worktree) != candidate or candidate_tree_sha(worktree) != candidate:
             raise CommitBoundaryError("candidate tree changed before candidate commit")
-        if _status_has_unstaged_or_untracked(status_porcelain(worktree)):
+        if status_has_unstaged_or_untracked(status_porcelain(worktree)):
             raise CommitBoundaryError("worktree has changes before candidate commit")
         return candidate
     def push_candidate(
@@ -437,8 +418,8 @@ class PublicationService:
 
         The publication state is deliberately written by the caller before
         this method is entered. If interruption
-        happens while cleaning up, the already-published state must not be
-        downgraded to INTERRUPTED by the outer run boundary.
+        happens while cleaning up, the outer run boundary must not rewrite the
+        already-published state as a failed interruption.
         """
 
         try:
@@ -451,7 +432,7 @@ class PublicationService:
             **publish_payload,
             "run_branch_cleanup": cleanup,
         }
-        atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
+        atomic_write_text(run_dir / "publish.json", json_text(publish_payload))
         return store.update_metadata(publish=publish_payload)
     def _complete_candidate_publication(
         self,
@@ -487,7 +468,7 @@ class PublicationService:
             ):
                 raise GitError("run history contains a commit from another authority")
         except (CommitSafetyError, GitError) as exc:
-            state = store.record_failure("COMMIT_TREE_MISMATCH", str(exc), **fields)
+            state = store.record_failure("COMMIT_GATE_FAILED", str(exc), **fields)
             return RunResult.of(run_dir, state)
         try:
             if current_head(info.worktree) != commit_sha:
@@ -512,7 +493,7 @@ class PublicationService:
             if self.runtime.config.publish.enabled:
                 repository_remote_url(info.worktree, self.runtime.config.publish.remote)
         except (GitError, OSError, ValueError):
-            state = store.record_failure("COMMIT_TREE_MISMATCH", "candidate identity is not exact", **fields)
+            state = store.record_failure("COMMIT_GATE_FAILED", "candidate identity is not exact", **fields)
             return RunResult.of(run_dir, state)
 
         self.runtime.observability.trace_emit(
@@ -635,7 +616,7 @@ class PublicationService:
             commit_sha=commit_sha,
             cycle=cycle,
         )
-        atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
+        atomic_write_text(run_dir / "publish.json", json_text(publish_payload))
         metadata_fields = {"remote_branch": info.branch} if self.runtime.config.github.enabled else {}
         state = store.set_run_state(
             RunMachineState(disposition=RunDisposition.COMPLETED),
@@ -665,3 +646,290 @@ class PublicationService:
         return RunResult.of(run_dir, state)
 
     # -- resume ------------------------------------------------------------
+
+
+def _commit_web_url(reference: RepositoryReference, commit_sha: str) -> str | None:
+    if reference.web_url is None:
+        return None
+    try:
+        normalized = normalize_github_web_url(reference.web_url)
+    except ValueError:
+        return None
+    return f"{normalized}/commit/{commit_sha}" if normalized is not None else None
+
+
+def _candidate_commit_path(run_dir: Path, cycle: int) -> Path:
+    return candidate_dir(run_dir, cycle) / "commit.json"
+
+
+def _candidate_commit_payload(
+    *, commit_sha: str, tree_sha: str, parent_sha: str | None, branch: str,
+    remote: str, immutable_url: str | None, gate_stage: str,
+    remote_sha: str | None = None, pushed_at: str | None = None,
+    remote_status: str = "pending", no_change: bool = False,
+) -> dict[str, Any]:
+    return {
+        "commit_sha": commit_sha,
+        "tree_sha": tree_sha,
+        "parent_sha": parent_sha,
+        "gate_stage": gate_stage,
+        "branch": branch,
+        "remote_branch": branch,
+        "remote": remote,
+        "remote_sha": remote_sha,
+        "immutable_commit_url": immutable_url,
+        "pushed_at": pushed_at,
+        "remote_status": remote_status,
+        "no_change": no_change,
+    }
+
+
+def accepted_chain_records(run_dir: Path) -> tuple[dict[str, Any], ...]:
+    """Read the durable accepted commit chain of a run (empty before any)."""
+
+    chain_path = run_dir / "accepted-chain.json"
+    if not chain_path.is_file():
+        return ()
+    chain = read_json_artifact(chain_path)
+    if isinstance(chain, dict):
+        chain = chain.get("commits")
+    if not isinstance(chain, list) or not all(
+        isinstance(item, dict) for item in chain
+    ):
+        return ()
+    return tuple(chain)
+
+
+class CandidateLifecycle:
+    """Own candidate identity, durable candidate state and candidate push."""
+
+    def __init__(
+        self,
+        *,
+        staging_remote: str,
+        push_tree: Callable[..., dict[str, Any]],
+        cycle_update: Callable[..., None],
+    ) -> None:
+        self._staging_remote = staging_remote
+        self._push_tree = push_tree
+        self._cycle_update = cycle_update
+
+    def create(
+        self, store: Any, ctx: Any, cycle_plan: Any, stage: GateStage,
+        evidence: Any,
+    ) -> dict[str, Any]:
+        if evidence is None or not evidence.deterministic_passed:
+            raise PipelineFailure(
+                "DETERMINISTIC_GATE_FAILED", ", ".join(getattr(evidence, "failures", ())),
+            )
+        return self._from_git(store, ctx, cycle_plan.cycle.number, stage)
+
+    def load_from_git(self, store: Any, ctx: Any, number: int) -> dict[str, Any]:
+        """Rebuild candidate metadata from the branch commit, never its report."""
+
+        return self._from_git(store, ctx, number, GateStage.POST_IMPLEMENTATION)
+
+    def _from_git(self, store: Any, ctx: Any, number: int, stage: GateStage) -> dict[str, Any]:
+        worktree = ctx.info.worktree
+        head = current_head(worktree)
+        tree = resolve_tree(worktree, head)
+        no_change = head == ctx.info.base_sha
+        parents = () if no_change else commit_parents(worktree, head)
+        if not no_change and len(parents) != 1:
+            raise PipelineFailure("RESUME_INTEGRITY_FAILURE", "candidate HEAD has no single parent")
+        payload = _candidate_commit_payload(
+            commit_sha=head,
+            tree_sha=tree,
+            parent_sha=None if no_change else parents[0],
+            branch=ctx.info.branch,
+            remote=self._staging_remote,
+            immutable_url=_commit_web_url(ctx.repository_reference, head),
+            gate_stage=stage.value,
+            no_change=no_change,
+        )
+        atomic_write_text(_candidate_commit_path(ctx.run_dir, number), json_text(payload))
+        candidate_state = dict(store.load().get("candidate") or {})
+        candidate_state[f"{number:03d}"] = payload
+        store.update_metadata(
+            candidate=candidate_state,
+            candidate_commit_sha=head, approved_tree_sha=tree,
+        )
+        return payload
+
+    def push(
+        self, store: Any, ctx: Any, number: int, candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        if candidate.get("no_change") is True:
+            skipped = {**candidate, "remote_sha": None, "pushed_at": None, "remote_status": "not_required"}
+            atomic_write_text(_candidate_commit_path(ctx.run_dir, number), json_text(skipped))
+            candidates = dict(store.load().get("candidate") or {})
+            candidates[f"{number:03d}"] = skipped
+            store.update_metadata(candidate=candidates)
+            self._cycle_update(store, number, status="candidate_no_change")
+            return skipped
+        try:
+            pushed = self._push_tree(
+                run_dir=ctx.run_dir, info=ctx.info, cycle=number,
+                candidate=dict(candidate), store=store,
+            )
+        except CandidatePushError as exc:
+            raise PipelineFailure("PUSH_FAILED", "candidate push did not complete") from exc
+        self._cycle_update(
+            store,
+            number,
+            status=(
+                "candidate_pushed"
+                if pushed.get("remote_status") == "available"
+                else "candidate_ready"
+            ),
+        )
+        return pushed
+
+
+class CandidateRemoteStaging:
+    """Stage one exact candidate on the remote under a bounded retry budget.
+
+    Remote proof never replaces local identity: the remote tip must equal the
+    candidate SHA exactly.  An optional remote degrades to a warning; a
+    required remote that stays unavailable is a waiting condition.
+    """
+
+    def __init__(
+        self,
+        recovery: Any,
+        *,
+        store: Any,
+        attempts: int,
+        emit: Callable[..., None],
+        remote: str,
+        remote_required: bool,
+        remote_tip: Callable[..., str | None],
+        push: Callable[..., None],
+    ) -> None:
+        self._recovery = recovery
+        self._store = store
+        self._attempts = attempts
+        self._emit = emit
+        self._remote = remote
+        self._remote_required = remote_required
+        self._remote_tip = remote_tip
+        self._push = push
+
+    def stage(
+        self, *, run_dir: Path, info: Any, cycle: int, candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        store = self._store
+        previous_candidate_sha = None
+        if cycle > 1:
+            previous = read_json_artifact(_candidate_commit_path(run_dir, cycle - 1))
+            if isinstance(previous, dict):
+                previous_candidate_sha = previous.get("commit_sha")
+        key = self._recovery.budget_key("candidate-push", f"{cycle:03d}")
+        tree = candidate.get("tree_sha")
+        last_failure: Exception | None = None
+        while True:
+            try:
+                remote_tip = self._remote_tip(
+                    info.source_repo, remote=self._remote, branch=info.branch,
+                )
+                if remote_tip not in {None, candidate["commit_sha"], previous_candidate_sha}:
+                    return self._unavailable(
+                        run_dir, info, cycle, candidate, "remote branch identity mismatch",
+                    )
+                if remote_tip != candidate["commit_sha"]:
+                    self._push(
+                        info.worktree, remote=self._remote,
+                        branch=info.branch, commit_sha=candidate["commit_sha"],
+                    )
+                verified_tip = self._remote_tip(
+                    info.source_repo, remote=self._remote, branch=info.branch,
+                )
+                if verified_tip != candidate["commit_sha"]:
+                    return self._unavailable(
+                        run_dir, info, cycle, candidate, "remote candidate SHA mismatch",
+                    )
+                break
+            except (GitError, OSError, ValueError) as exc:
+                last_failure = exc
+                admission = self._recovery.admit(
+                    key, reason="PUSH_FAILED", budget=self._attempts,
+                    phase="candidate_push", cycle=cycle, tree_before=tree, tree_after=tree,
+                )
+                if not admission.admitted:
+                    unavailable = self._unavailable(
+                        run_dir, info, cycle, candidate, "transport unavailable",
+                    )
+                    if self._remote_required:
+                        raise CandidatePushError(
+                            "PUSH_FAILED: candidate push did not complete"
+                        ) from last_failure
+                    return unavailable
+
+        candidate = {
+            **candidate,
+            "remote": self._remote,
+            "remote_branch": info.branch,
+            "remote_sha": candidate["commit_sha"],
+            "pushed_at": candidate.get("pushed_at") or datetime.now(timezone.utc).isoformat(),
+            "remote_status": "available",
+        }
+        atomic_write_text(_candidate_commit_path(run_dir, cycle), json_text(candidate))
+        candidate_state = dict(store.load().get("candidate") or {})
+        candidate_state[f"{cycle:03d}"] = candidate
+        store.update_metadata(
+            candidate=candidate_state,
+            remote_branch=info.branch,
+            remote_sha=candidate["commit_sha"],
+        )
+        self._emit(
+            "candidate.pushed", phase="publication", cycle=cycle,
+            data={
+                "parent_sha": candidate.get("parent_sha"),
+                "commit_sha": candidate.get("commit_sha"),
+                "tree_sha": candidate.get("tree_sha"),
+                "remote": candidate.get("remote"),
+                "branch": candidate.get("remote_branch") or info.branch,
+                "remote_sha": candidate.get("remote_sha"),
+                "pushed_at": candidate.get("pushed_at"),
+                "remote_status": candidate.get("remote_status"),
+            },
+            once=True,
+        )
+        return candidate
+
+    def _unavailable(
+        self, run_dir: Path, info: Any, cycle: int, candidate: dict[str, Any], reason: str,
+    ) -> dict[str, Any]:
+        unavailable = {
+            **candidate,
+            "remote": self._remote,
+            "remote_branch": info.branch,
+            "remote_sha": None,
+            "pushed_at": None,
+            "remote_status": "unavailable",
+        }
+        atomic_write_text(_candidate_commit_path(run_dir, cycle), json_text(unavailable))
+        state = self._store.load()
+        candidate_state = dict(state.get("candidate") or {})
+        candidate_state[f"{cycle:03d}"] = unavailable
+        self._store.update_metadata(
+            candidate=candidate_state,
+            remote_branch=info.branch,
+            remote_sha=None,
+        )
+        self._emit(
+            "candidate.push_unavailable",
+            phase="publication",
+            cycle=cycle,
+            data={
+                "warning": "candidate staging remote is unavailable",
+                "reason": reason,
+                "required": self._remote_required,
+                "commit_sha": unavailable.get("commit_sha"),
+                "tree_sha": unavailable.get("tree_sha"),
+                "remote": self._remote,
+                "branch": info.branch,
+                "remote_status": "unavailable",
+            },
+        )
+        return unavailable

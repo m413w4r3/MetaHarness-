@@ -91,39 +91,30 @@ def _page(
 
 
 _TIMELINE = (
-    ("created", "CREATED"), ("planning", "PLANNING"),
-    ("awaiting_plan_approval", "AWAITING PLAN APPROVAL"), ("worktree_ready", "WORKTREE"),
-    ("preparing", "PREPARING"), ("implementing", "IMPLEMENTING"),
-    ("revising", "REVISING"), ("revalidating", "REVALIDATING"),
-    ("approved", "APPROVED"), ("waiting_remote", "WAITING FOR REMOTE"),
-    ("publishing", "PUBLISHING"), ("published", "PUBLISHED"),
+    ("running", "RUNNING"),
+    ("committed", "COMMITTED"), ("published", "PUBLISHED"),
 )
 _ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
 _TERMINAL_LABELS = {
-    "blocked": "BLOCKED", "plan_rejected": "REJECTED", "failed": "FAILED",
-    "interrupted": "INTERRUPTED", "waiting_human": "WAITING FOR OPERATOR",
-    "paused": "PAUSED",
+    "failed": "FAILED", "partial": "PARTIAL",
+    "waiting_human": "WAITING FOR OPERATOR",
     "waiting_external": "WAITING FOR EXTERNAL AUTHORIZATION",
-    "waiting_remote": "WAITING FOR REMOTE",
 }
 _WAITING_LABELS = {
     "waiting_external": "Waiting for external authorization",
-    "waiting_remote": "Waiting for remote",
     "waiting_human": "Waiting for operator decision",
-    "paused": "Paused after step",
 }
 TERMINAL_STATUSES = frozenset({"committed", "published", *_TERMINAL_LABELS})
-AWAITING_APPROVAL_STATUS = "awaiting_plan_approval"
+AWAITING_APPROVAL_STATUS = "plan_approval"
 def refresh_seconds_for_run(run: dict[str, Any]) -> int | None:
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = str(state.get("status", run.get("status", "")))
+    phase = str(state.get("phase", run.get("phase", "")))
     if status in TERMINAL_STATUSES:
         return None
-    if status == AWAITING_APPROVAL_STATUS:
+    if phase == AWAITING_APPROVAL_STATUS:
         approval = run.get("approval") if isinstance(run.get("approval"), dict) else {}
         return 1 if approval.get("recorded") else None
-    if status == "approved":
-        return 1
     return 2
 
 
@@ -138,7 +129,7 @@ def _failure(value: Any) -> str:
 
 def _status_badge(status: Any) -> str:
     value = str(status or "—")
-    style = "failed" if value in {"failed", "blocked", "plan_rejected", "interrupted"} else "success" if value in {"committed", "approved", "published"} else ""
+    style = "failed" if value == "failed" else "success" if value in {"committed", "published"} else ""
     return f'<span class="badge {style}">{_e(_WAITING_LABELS.get(value, value))}</span>'
 
 
@@ -217,9 +208,6 @@ def _execution_policy_label(config: HarnessConfig) -> str:
 def _timeline_items(status: Any) -> str:
     current = str(status or "")
     current_order = _ORDER.get(current, -1)
-    if current == "committed":
-        # Historic non-publishing runs end immediately after APPROVED.
-        current_order = _ORDER["approved"] + 1
     items = []
     for value, label in _TIMELINE:
         classes = "current" if value == current else "done" if current_order >= 0 and _ORDER.get(value, 99) < current_order else ""
@@ -528,7 +516,7 @@ def _v2_steps(state: dict[str, Any], artifacts: Any = None) -> str:
 
 
 # Statuses during which a cycle phase is the current one (auto-opened).
-_CHECK_PHASES = frozenset({"validating", "revalidating"})
+_CHECK_PHASES = frozenset({"deterministic_gate", "audit"})
 
 
 def _checks_verdict(checks: Any) -> str:
@@ -572,6 +560,7 @@ def _cycle_sections(run: dict[str, Any]) -> str:
     cycles = run.get("cycle_artifacts") if isinstance(run.get("cycle_artifacts"), list) else []
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = str(state.get("status", ""))
+    phase = str(state.get("phase", ""))
     current = run.get("cycle") if isinstance(run.get("cycle"), int) else 1
     terminal = status in TERMINAL_STATUSES
     sections: list[str] = []
@@ -586,16 +575,13 @@ def _cycle_sections(run: dict[str, Any]) -> str:
             _step_card(item, item) for item in steps if isinstance(item, dict)
         ) or '<p class="muted">No staged steps.</p>'
 
-        def phase_open(phases: frozenset[str]) -> str:
-            return " open" if active and not terminal and status in phases else ""
-
         failure = cycle.get("failure")
         header_note = f' · <span class="danger">{_e(failure)}</span>' if failure else ""
         sections.append(
             f'<details class="card cycle cycle-{_e(number)}"{" open" if active or terminal and number == len(cycles) else ""}>'
             f'<summary>CYCLE {_e(_cycle_label(number))} — {_e(kind)} · {_e(cycle.get("status") or "—")}{header_note}</summary>'
             f'{cards}'
-            f'{_cycle_checks_block(cycle.get("checks"), phase_open(_CHECK_PHASES))}'
+            f'{_cycle_checks_block(cycle.get("checks"), " open" if active and not terminal and phase in _CHECK_PHASES else "")}'
             '</details>'
         )
     return "".join(sections)
@@ -684,7 +670,6 @@ def _execution_card_v2(
     if config is not None:
         metadata = {profile.id: safe_profile_metadata(profile) for profile in profiles_for_config(config).values()}
     execution = state.get("execution") if isinstance(state.get("execution"), dict) else {}
-    planner_state = state.get("planner") if isinstance(state.get("planner"), dict) else {}
     selection = run.get("execution_selection")
     approved = selection if isinstance(selection, dict) else {}
     planner = execution.get("planner") if isinstance(execution.get("planner"), dict) else {}
@@ -726,7 +711,7 @@ def run_page_polls(run: dict[str, Any]) -> bool:
 
     state = run.get("state") if isinstance(run.get("state"), dict) else {}
     status = str(state.get("status", run.get("status", "")) or "")
-    return bool(status) and status not in LIVE_STOP_STATUSES
+    return bool(status) and status not in LIVE_STOP_STATUSES and state.get("phase") != AWAITING_APPROVAL_STATUS
 
 
 _PIPELINE_SYMBOLS = {
@@ -736,20 +721,16 @@ _FAILURE_MESSAGES = {
     "AGENT_TIMEOUT": "Worker timed out",
     "AGENT_RUNTIME_FAILED": "Worker failed",
     "AGENT_SCOPE_VIOLATION": "Worker changed Git history or scope",
-    "AGENT_NO_CHANGE": "Step changed nothing",
-    "STEP_WRITE_SET_VIOLATION": "Step changed an unauthorized path",
+    "AGENT_CONTRACT_MISMATCH": "Worker did not satisfy the step contract",
     "CHECK_INFRASTRUCTURE_UNAVAILABLE": "Deterministic check infrastructure is unavailable",
     "CHECK_SIDE_EFFECT_REPEATED": "A deterministic check repeatedly changed the candidate",
-    "HUMAN_REQUIRED": "Human action required",
-    "LLM_FAILURE": "Model call failed",
-    "PLANNER_BLOCKED": "Planner could not safely produce a plan",
-    "PLAN_REPOSITORY_PRECONDITION_INVALID": "Planning failed: plan paths do not match the repository",
+    "LLM_TRANSPORT_EXHAUSTED": "Model call failed",
+    "PLANNER_OUTPUT_INVALID": "Planning failed: plan paths do not match the repository",
     "PUSH_FAILED": "Publication push failed",
     "BASE_MOVED_SINCE_RUN": "Base branch moved since the run started",
     "RESUME_INTEGRITY_FAILURE": "Resume refused: the run no longer matches its checkpoint",
     "RESUME_REQUIRES_OPERATOR": "Resume requires an operator",
     "INTERRUPTED": "Run interrupted",
-    "PAUSED": "Run paused after the current step",
 }
 
 
@@ -821,7 +802,7 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     status = str(state.get("status", run.get("status", "")) or "")
     failure = run.get("failure", state.get("failure"))
     if status not in {
-        "failed", "blocked", "interrupted", "paused", "waiting_remote", "waiting_external",
+        "failed", "partial", "waiting_external",
         "waiting_human",
     } or not isinstance(failure, dict):
         return ""
@@ -841,7 +822,7 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
             f' · iteration={_e(resume.get("iteration") or "—")}'
             f' · step index={_e(resume.get("step_index") if resume.get("step_index") is not None else "—")}</p>'
         )
-        button_label = "RESUME RUN" if status == "paused" else label
+        button_label = label
         button = (
             f'<form action="/runs/{_e(run.get("run_id"))}/resume" method="post">'
             f'<input type="hidden" name="_token" value="{_e(token)}">'
@@ -874,11 +855,11 @@ def _run_card(run: dict[str, Any], token: str | None, overview: dict[str, Any], 
             ("planner", "Planner"), ("implementer", "Implementer"),
         )
     )
-    style = "failed" if status in {"failed", "blocked", "plan_rejected", "interrupted"} else "success" if status in {"committed", "approved", "published"} else ""
+    style = "failed" if status == "failed" else "success" if status in {"committed", "published"} else ""
     current_step = state.get("current_step")
     pause_requested = state.get("pause_requested") is True
     pause_action = ""
-    if status == "implementing" and isinstance(current_step, str) and current_step and token:
+    if status == "running" and state.get("phase") == "implement_step" and isinstance(current_step, str) and current_step and token:
         pause_action = (
             f'<form action="/runs/{_e(run_id)}/pause" method="post">'
             f'<input type="hidden" name="_token" value="{_e(token)}">'
@@ -938,7 +919,10 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
     plan = run.get("plan") if isinstance(run.get("plan"), dict) else {}; failure = run.get("failure", state.get("failure"))
     approval = run.get("approval") if isinstance(run.get("approval"), dict) else {}
     overview = run.get("overview") if isinstance(run.get("overview"), dict) else {}
-    can_decide = status == AWAITING_APPROVAL_STATUS and bool(token) and not approval.get("recorded")
+    can_decide = (
+        status == "running" and state.get("phase") == AWAITING_APPROVAL_STATUS
+        and bool(token) and not approval.get("recorded")
+    )
     approval_forms = ""
     is_v2 = state.get("planning_protocol") == "v2"
     if can_decide and is_v2:
@@ -955,13 +939,13 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
         f'<details open><summary>View consolidated report</summary><pre>{_e(consolidated_content or "Diagnostics not generated yet.")}</pre></details></section>'
     )
     polls = run_page_polls(run)
-    failed = status in {"failed", "interrupted"}
+    failed = status == "failed"
     agent_section = (
         _cycle_sections(run) if isinstance(run.get("cycle_artifacts"), list) and run.get("cycle_artifacts")
         else _v2_steps(state, run.get("step_artifacts"))
     )
-    plan_open = " open" if _section_open(run, ("LLM_FAILURE", "PLAN_", "PLANNER")) else ""
-    body = f'''<main id="run" data-run-id="{_e(run_id)}" data-status="{_e(status)}"><p><a href="/">← Tous les runs</a></p>
+    plan_open = " open" if _section_open(run, ("LLM_TRANSPORT_EXHAUSTED", "PLAN_", "PLANNER")) else ""
+    body = f'''<main id="run" data-run-id="{_e(run_id)}" data-status="{_e(status)}" data-phase="{_e(state.get("phase"))}"><p><a href="/">← Tous les runs</a></p>
 {_run_card(run, token, overview, is_v2)}
 {_publish_section(state)}
 {_pipeline_section(overview)}

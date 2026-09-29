@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -430,7 +429,7 @@ class TopologyValidationTests(_Repo):
                 ),
             )
         self.assertEqual(str(caught.exception), "step=S01 no_mutation")
-        self.assertEqual(caught.exception.code, "PLAN_REPOSITORY_PRECONDITION_INVALID")
+        self.assertEqual(caught.exception.code, "PLANNER_OUTPUT_INVALID")
 
     def test_a_created_path_can_be_read_and_written_later(self) -> None:
         validate_plan_repository_topology(
@@ -522,7 +521,7 @@ class PlannerNormalizationTests(PipelineHarness):
 
     def test_two_impossible_plans_fail_planning_before_any_worker(self) -> None:
         # Two semantic planner answers, the run's one step budget.
-        config = self.config()
+        self.config()
         self.config_path.write_text(
             self.config_path.read_text(encoding="utf-8") + "\n[budget]\nstep_attempts = 2\n",
             encoding="utf-8",
@@ -535,7 +534,7 @@ class PlannerNormalizationTests(PipelineHarness):
         # An impossible plan is a fixable planner error: resumable, not human.
         self.assertEqual(result.status, RunStatus.WAITING_EXTERNAL)
         state = self.state()
-        self.assertEqual(state["failure"]["reason"], "PLAN_REPOSITORY_PRECONDITION_INVALID")
+        self.assertEqual(state["failure"]["reason"], "PLANNER_OUTPUT_INVALID")
         self.assertIn("step=S01 no_mutation", state["failure"]["detail"])
         self.assertEqual(len(self.planner.requests), 2)
         self.assertEqual(self.workers.calls, [])

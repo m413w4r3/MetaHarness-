@@ -3,10 +3,9 @@
 This module owns exactly one pipeline operation, ``execute_cycle_step``.  It
 drives the bounded worker attempts of one approved step: the transient retry
 and executor-fallback admissions stay with
-:mod:`~metaharness.orchestration.worker_recovery`, the single worker request and
-its normalized candidate result with
-:mod:`~metaharness.orchestration.worker_attempt`.  The successful attempt is
-then handed to :mod:`~metaharness.orchestration.step_acceptance`.
+:mod:`~metaharness.orchestration.recovery`, the single worker request and its
+normalized candidate result with :mod:`~metaharness.orchestration.worker_attempt`.
+The successful attempt then crosses the acceptance boundary in this module.
 
 It never plans a cycle, never reviews a candidate, never repairs a contract
 itself and never crosses a commit boundary.
@@ -14,71 +13,64 @@ itself and never crosses a commit boundary.
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import (
-    Mapping,
-    Sequence,
-    TYPE_CHECKING,
-)
-from ..agent.base import (
-    AGENT_AUTH_FAILURE,
-)
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
+
 from ..attempt_transaction import (
     AttemptBoundary,
     AttemptViolation,
     CandidateAttemptTransaction,
     git_ownership,
-    ownership_violations,
     status_has_unstaged_or_untracked,
 )
+from ..commit_gate import COMMIT_GATE_FAILED, CommitSafetyError, StepVerification, accepted_step_record, commit_safety_gate, step_verification
 from ..gitops import (
     GitError,
+    WorktreeInfo,
     candidate_tree_sha,
+    commit_parents,
+    commit_step_tree,
     current_head,
     index_tree_sha,
     resolve_tree,
-    restore_paths_from_tree,
-    stage_all,
+    staged_diff,
     status_porcelain,
 )
 from ..models import ExecutionRole, ImplementationStep
+from ..planning.artifacts import read_approved_step_contract
+from ..planning.protocol import V2PlanParseError
 from ..profiles import profile_for_role
-from ..recovery_policy import (
-    FailureClass,
-    RecoveryStrategy,
-    classify_failure,
-)
+from ..recovery_policy import FailureClass, RecoveryStrategy, classify_failure
+from ..redaction import redact
 from ..result import atomic_write_text
-from ..usage import normalize_usage
 from ..resume import read_checkpoint
 from ..state import RunStateStore
-from .durable_readers import FAILED_CONTINUED, SKIPPED_DEPENDENCY, settled_step_status
-from .per_step_gate import per_step_check_ids
-from .pipeline_v2 import (
-    BudgetExhausted,
-    CyclePlan,
-    PipelineFailure,
-    PipelineV2Context,
-    step_dir as cycle_step_dir,
-)
-from .recovery import RecoveryAdmission
-from .step_authority import future_step_ownership
+from ..usage import normalize_usage
+from .gates import per_step_check_ids
+from .pipeline_v2 import BudgetExhausted, CyclePlan, PipelineFailure, PipelineV2Context
+from .pipeline_v2 import step_dir as cycle_step_dir
+from .publication import accepted_chain_records
+from .recovery import RecoveryAdmission, normalize_exit_reason
 from .shared import (
+    FAILED_CONTINUED,
+    SKIPPED_DEPENDENCY,
     GitOwnership,
     StepExecutionFailure,
+    StepExecutionOutcome,
     archive_attempt,
+    bounded_parse_detail,
     bounded_v2_report,
     json_text,
+    read_json_artifact,
     safe_candidate_tree,
+    settled_step_status,
 )
-from .step_authority import (
-    EffectiveStepAuthority,
-    EffectiveStepExecution,
-    approved_step_contract,
-    approved_step_authority,
-    write_authority_diagnostic,
-)
-
 
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
@@ -143,6 +135,7 @@ class StepExecutionService:
                 future_ownership=future_step_ownership(cycle_plan.plan.steps, index),
             )
         except StepExecutionFailure as failure:
+            failure.reason = normalize_exit_reason(failure.reason)
             if classify_failure(failure.reason).failure_class is not FailureClass.FIXABLE:
                 raise
             self._mark_failed_continue(
@@ -187,7 +180,6 @@ class StepExecutionService:
             raise PipelineFailure(
                 code, f"{failure.reason}: {violation.detail}", step_id=step.id,
             ) from violation
-        directory = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, step.id)
         decision = classify_failure(failure.reason, exhausted=True)
         strategies = [
             item.get("strategy") for item in store.load().get("recovery_attempts") or ()
@@ -209,7 +201,6 @@ class StepExecutionService:
             attempt=1, tree_before=tree, tree_after=green.tree, budget_remaining=0,
             phase="implementation", cycle=self.runtime.trace_cycle, step_id=step.id,
         )
-
     def _settle(
         self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
         step: ImplementationStep, record: Mapping[str, object],
@@ -316,6 +307,7 @@ class StepExecutionService:
                     )
                 return EffectiveStepExecution(outcome, authority)
             except StepExecutionFailure as failure:
+                failure.reason = normalize_exit_reason(failure.reason)
                 atomic_write_text(artifact_dir / "failure.json", json_text({
                     "schema_version": 1,
                     "reason": failure.reason[:120],
@@ -345,8 +337,7 @@ class StepExecutionService:
                     if feedback:
                         retry_addendum = bounded_v2_report(feedback)
                     continue
-                if failure.reason == AGENT_AUTH_FAILURE:
-                    failure.reason = "EXTERNAL_AUTH_REQUIRED"
+                if failure.reason == "EXTERNAL_AUTH_REQUIRED":
                     failure.detail = "executor credentials or external authorization are required"
                     failure.step_dir = artifact_dir
                     raise
@@ -394,37 +385,578 @@ class StepExecutionService:
                     continue
                 failure.step_dir = artifact_dir
                 raise
-    @staticmethod
-    def _restore_failed_step_attempt(
-        worktree: Path, tree_before: str, allowed: set[str],
-    ) -> bool:
-        try:
-            restore_paths_from_tree(worktree, tree_before, sorted(allowed))
-            stage_all(worktree)
-            return (
-                candidate_tree_sha(worktree) == tree_before
-                and index_tree_sha(worktree) == tree_before
-                and not status_has_unstaged_or_untracked(status_porcelain(worktree))
-            )
-        except (GitError, OSError):
-            return False
-    def _pre_step_boundary_drift(
-        self, repo: Path, worktree: Path, ownership_before: GitOwnership, *,
-        branch_ref: str, base_sha: str, tree_before: str,
-    ) -> str | None:
-        """Why the repository is no longer exactly in its pre-step state."""
 
-        try:
-            if candidate_tree_sha(worktree) != tree_before:
-                return "the candidate tree is no longer the pre-step tree"
-            if index_tree_sha(worktree) != tree_before:
-                return "the index is no longer the pre-step index"
-            if status_has_unstaged_or_untracked(status_porcelain(worktree)):
-                return "the worktree has unstaged or untracked modifications"
-        except GitError as exc:
-            return f"Git state is unreadable: {exc}"
-        violations = ownership_violations(
-            ownership_before, git_ownership(repo, worktree),
-            branch_ref=branch_ref, base_sha=base_sha,
+
+if TYPE_CHECKING:  # pragma: no cover - the plan authority is the coordinator
+    from .pipeline_v2 import CyclePlan
+
+
+STEP_AUTHORITY_NAME = "step_authority.json"
+STEP_CANDIDATE_NAME = "step_candidate.json"
+STEP_ACCEPTANCE_NAME = "step_acceptance.json"
+STEP_CANDIDATE_SCHEMA_VERSION = 1
+_MAX_JSON_BYTES = 256 * 1024
+_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+class StepAuthorityError(Exception):
+    """Durable candidate evidence is incomplete or inconsistent."""
+
+    code = "RESUME_INTEGRITY_FAILURE"
+
+
+def mutable_paths(step: ImplementationStep) -> tuple[str, ...]:
+    return tuple(sorted({*step.write_set, *step.create_set, *step.delete_set}))
+
+
+def future_step_ownership(
+    steps: Sequence[ImplementationStep], index: int,
+) -> dict[str, tuple[str, ...]]:
+    """Paths assigned to later approved steps, for verification dependencies."""
+
+    return {
+        step.id: paths
+        for step in steps[index + 1:]
+        if (paths := mutable_paths(step))
+    }
+
+
+def canonical_sha256(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _read_json(path: Path) -> Any:
+    try:
+        if path.stat().st_size > _MAX_JSON_BYTES:
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class EffectiveStepAuthority:
+    """The plan step and its hash-bound, approved contract."""
+
+    step_id: str
+    title: str
+    execution_class: str
+    depends_on: str | None
+    effective_step: ImplementationStep = field(repr=False)
+    effective_contract: str = field(repr=False)
+    approved_contract_sha256: str
+    effective_contract_sha256: str
+
+    @property
+    def read_set(self) -> tuple[str, ...]:
+        return self.effective_step.read_set
+
+    @property
+    def write_set(self) -> tuple[str, ...]:
+        return self.effective_step.write_set
+
+    @property
+    def create_set(self) -> tuple[str, ...]:
+        return self.effective_step.create_set
+
+    @property
+    def delete_set(self) -> tuple[str, ...]:
+        return self.effective_step.delete_set
+
+    @property
+    def mutable_scope(self) -> tuple[str, ...]:
+        return mutable_paths(self.effective_step)
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "step_id": self.step_id,
+            "title": self.title,
+            "execution_class": self.execution_class,
+            "depends_on": self.depends_on,
+            "read_set": list(self.read_set),
+            "write_set": list(self.write_set),
+            "create_set": list(self.create_set),
+            "delete_set": list(self.delete_set),
+            "approved_contract_sha256": self.approved_contract_sha256,
+            "effective_contract_sha256": self.effective_contract_sha256,
+        }
+
+    @property
+    def authority_sha256(self) -> str:
+        return canonical_sha256(self.identity_payload())
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "effective_authority_sha256": self.authority_sha256,
+            "effective_contract_sha256": self.effective_contract_sha256,
+            "approved_contract_sha256": self.approved_contract_sha256,
+            "effective_mutable_paths": list(self.mutable_scope),
+        }
+
+
+@dataclass(frozen=True)
+class EffectiveStepExecution:
+    """A worker outcome together with the authority it executed under."""
+
+    outcome: StepExecutionOutcome
+    authority: EffectiveStepAuthority
+
+
+def approved_step_contract(cycle_plan: "CyclePlan", step: ImplementationStep) -> str:
+    """The hash-bound approved contract: immutable evidence of the step."""
+
+    try:
+        return read_approved_step_contract(
+            cycle_plan.contracts_dir, cycle_plan.bundle, step.id,
         )
-        return "; ".join(violations) or None
+    except (V2PlanParseError, OSError, UnicodeError) as exc:
+        raise PipelineFailure("PLAN_APPROVAL_INVALID", str(exc), step_id=step.id) from exc
+
+
+def approved_step_authority(
+    step: ImplementationStep, approved_contract: str,
+) -> EffectiveStepAuthority:
+    digest = hashlib.sha256(approved_contract.encode("utf-8")).hexdigest()
+    return EffectiveStepAuthority(
+        step_id=step.id, title=step.title,
+        execution_class=step.execution_class.value, depends_on=step.depends_on,
+        effective_step=step, effective_contract=approved_contract,
+        approved_contract_sha256=digest, effective_contract_sha256=digest,
+    )
+
+
+def build_step_candidate(
+    *, run_id: str, cycle: int, step_id: str, parent_head_sha: str,
+    tree_before: str, tree_after: str, changed_paths: Sequence[str], profile_id: str,
+    authority: EffectiveStepAuthority, verification: Mapping[str, Any],
+    step_record_sha256: str, final_report_sha256: str | None,
+    source: str,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": STEP_CANDIDATE_SCHEMA_VERSION,
+        "run_id": run_id,
+        "cycle": cycle,
+        "step_id": step_id,
+        "parent_head_sha": parent_head_sha,
+        "tree_before": tree_before,
+        "tree_after": tree_after,
+        "changed_paths": sorted(changed_paths),
+        "profile_id": profile_id,
+        "effective_authority_sha256": authority.authority_sha256,
+        "effective_contract_sha256": authority.effective_contract_sha256,
+        "approved_contract_sha256": authority.approved_contract_sha256,
+        "effective_mutable_paths": list(authority.mutable_scope),
+        "verification": dict(verification),
+        "outcome": {
+            "step_record": "step.json",
+            "step_record_sha256": step_record_sha256,
+            "final_report": "agent.final.md",
+            "final_report_sha256": final_report_sha256,
+        },
+        "source": source,
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    payload["candidate_sha256"] = canonical_sha256(payload)
+    return payload
+
+
+def write_step_candidate(step_dir: Path, payload: Mapping[str, Any]) -> str:
+    """Write the candidate, read it back and return the sha of its bytes."""
+
+    path = step_dir / STEP_CANDIDATE_NAME
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    atomic_write_text(path, text)
+    if read_step_candidate(step_dir) != dict(payload):
+        raise StepAuthorityError("step candidate could not be durably written")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def read_step_candidate(step_dir: Path) -> dict[str, Any] | None:
+    """The self-hashed candidate, or ``None`` when absent; corruption raises."""
+
+    path = step_dir / STEP_CANDIDATE_NAME
+    if not path.exists():
+        return None
+    payload = _read_json(path)
+    if not isinstance(payload, dict) or payload.get("schema_version") != STEP_CANDIDATE_SCHEMA_VERSION:
+        raise StepAuthorityError("step candidate is unreadable or has an unknown schema")
+    body = {key: value for key, value in payload.items() if key != "candidate_sha256"}
+    if payload.get("candidate_sha256") != canonical_sha256(body):
+        raise StepAuthorityError("step candidate hash changed")
+    changed = payload.get("changed_paths")
+    outcome = payload.get("outcome")
+    if (
+        not all(
+            isinstance(payload.get(key), str) and _OBJECT_ID.fullmatch(payload[key])
+            for key in ("parent_head_sha", "tree_before", "tree_after")
+        )
+        or not all(
+            isinstance(payload.get(key), str) and _SHA256.fullmatch(payload[key])
+            for key in ("effective_authority_sha256", "effective_contract_sha256")
+        )
+        or not isinstance(changed, list) or not changed
+        or any(not isinstance(item, str) for item in changed)
+        or not isinstance(outcome, dict)
+        or not isinstance(payload.get("step_id"), str)
+    ):
+        raise StepAuthorityError("step candidate is incomplete")
+    return payload
+
+
+def write_authority_diagnostic(step_dir: Path, authority: EffectiveStepAuthority) -> None:
+    """Advisory copy of the approved authority an attempt ran with."""
+
+    atomic_write_text(
+        step_dir / STEP_AUTHORITY_NAME,
+        json.dumps({"step_id": authority.step_id, **authority.summary()},
+                   ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+
+
+if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
+    from .runtime import RunRuntime
+
+
+class StepAcceptanceService:
+    """One owner of the step acceptance transactions described in this module."""
+
+    def __init__(self, runtime: "RunRuntime") -> None:
+        self.runtime = runtime
+
+    def accept_execution(
+        self, store: RunStateStore, ctx: PipelineV2Context, cycle_plan: CyclePlan,
+        index: int, execution: EffectiveStepExecution, *, parent_sha: str,
+    ) -> None:
+        """Cross the durable worker-success -> commit boundary of one step.
+
+        A changed tree is first frozen as ``step_candidate.json`` and then
+        passed through the commit gate. Until the next checkpoint is written,
+        a crash replays this step from its last accepted Git commit.
+        """
+
+        authority, outcome = execution.authority, execution.outcome
+        step_dir = cycle_step_dir(ctx.run_dir, cycle_plan.cycle, authority.step_id)
+        future = tuple(item.id for item in cycle_plan.plan.steps[index + 1:])
+        accept = functools.partial(
+            self._accept_v2_step_tree,
+            store=store, run_dir=ctx.run_dir, info=ctx.info, authority=authority,
+            outcome=outcome, parent_sha=parent_sha, future_step_ids=future,
+            run_id=ctx.run_id, step_dir=step_dir,
+        )
+        try:
+            if outcome.no_change or outcome.tree_after == outcome.tree_before:
+                # Nothing to commit: no candidate crosses a commit boundary.
+                accept()
+                return
+            verification = self._step_verification(authority, outcome, future)
+            self._persist_step_candidate(
+                ctx, cycle_plan, step_dir, authority, outcome, verification,
+                parent_sha=parent_sha, source="worker_success",
+            )
+            accept(verification=verification)
+        except (CommitSafetyError, GitError) as exc:
+            raise self._step_acceptance_failure(step_dir, authority, exc) from exc
+
+    def _step_verification(
+        self, authority: EffectiveStepAuthority, outcome: StepExecutionOutcome,
+        future_step_ids: Sequence[str],
+    ) -> StepVerification:
+        try:
+            return step_verification(
+                outcome.final_report, step_id=authority.step_id,
+                future_step_ids=future_step_ids,
+                reported_status=getattr(outcome, "verification_status", None),
+                deferred_requested=bool(getattr(outcome, "deferred_verify", "")),
+            )
+        except CommitSafetyError:
+            self.runtime.observability.trace_emit(
+                "step.verification.completed", phase="implementation",
+                cycle=self.runtime.trace_cycle, step_id=authority.step_id,
+                data={
+                    "status": "failed", "tree_before": outcome.tree_before,
+                    "tree_after": outcome.tree_after, "deferred": False,
+                },
+            )
+            raise
+
+    def _persist_step_candidate(
+        self, ctx: PipelineV2Context, cycle_plan: CyclePlan, step_dir: Path,
+        authority: EffectiveStepAuthority, outcome: StepExecutionOutcome,
+        verification: StepVerification, *, parent_sha: str, source: str,
+    ) -> dict[str, Any]:
+        """Freeze a successful worker candidate before its commit boundary."""
+
+        record_path = step_dir / "step.json"
+        final_path = step_dir / "agent.final.md"
+        try:
+            record_sha = hashlib.sha256(record_path.read_bytes()).hexdigest()
+            final_sha = (
+                hashlib.sha256(final_path.read_bytes()).hexdigest()
+                if final_path.is_file() else None
+            )
+        except OSError as exc:
+            raise PipelineFailure(
+                "DURABLE_ARTIFACT_CORRUPTED", f"step record is unreadable: {exc}",
+                step_id=authority.step_id,
+            ) from exc
+        payload = build_step_candidate(
+            run_id=ctx.run_id, cycle=cycle_plan.cycle.number, step_id=authority.step_id,
+            parent_head_sha=parent_sha, tree_before=outcome.tree_before,
+            tree_after=outcome.tree_after, changed_paths=outcome.changed_paths,
+            profile_id=outcome.profile_id, authority=authority,
+            verification=verification.payload(), step_record_sha256=record_sha,
+            final_report_sha256=final_sha, source=source,
+        )
+        try:
+            write_step_candidate(step_dir, payload)
+        except StepAuthorityError as exc:
+            raise PipelineFailure(exc.code, str(exc), step_id=authority.step_id) from exc
+        write_authority_diagnostic(step_dir, authority)
+        self.runtime.observability.trace_emit(
+            "step.candidate.persisted", phase="implementation",
+            cycle=cycle_plan.cycle.number, step_id=authority.step_id,
+            data={
+                "tree_after": outcome.tree_after, "source": source,
+                "effective_authority_sha256": authority.authority_sha256,
+                "effective_contract_sha256": authority.effective_contract_sha256,
+            },
+        )
+        return payload
+    def _step_acceptance_failure(
+        self, step_dir: Path, authority: EffectiveStepAuthority, exc: Exception,
+    ) -> PipelineFailure:
+        """Record which authority refused the commit; the gate stays strict."""
+
+        code = getattr(exc, "code", None) if isinstance(exc, CommitSafetyError) else None
+        code = code or COMMIT_GATE_FAILED
+        message = bounded_parse_detail(exc)
+        try:
+            atomic_write_text(step_dir / STEP_ACCEPTANCE_NAME, json_text({
+                "schema_version": 1, "status": "refused", "step_id": authority.step_id,
+                "code": code, "detail": message,
+                "paths": list(getattr(exc, "paths", ()))[:20],
+                "commit_gate_authority_sha256": authority.authority_sha256,
+                "effective_contract_sha256": authority.effective_contract_sha256,
+                "effective_mutable_paths": list(authority.mutable_scope),
+            }))
+        except OSError:
+            pass
+        # A security refusal keeps its own fatal code; every other refusal is
+        # the ordinary, fixable commit-gate failure.
+        fatal = classify_failure(code).failure_class is FailureClass.FATAL
+        return PipelineFailure(
+            code if fatal else COMMIT_GATE_FAILED,
+            f"{code}: {message} (authority {authority.authority_sha256[:16]})",
+            step_id=authority.step_id,
+        )
+    def _accept_v2_step_tree(
+        self,
+        *,
+        store: RunStateStore,
+        run_dir: Path,
+        info: WorktreeInfo,
+        authority: EffectiveStepAuthority,
+        outcome: StepExecutionOutcome,
+        parent_sha: str,
+        future_step_ids: Sequence[str],
+        run_id: str,
+        step_dir: Path,
+        verification: StepVerification | None = None,
+    ) -> str | None:
+        """Run the reusable safety gate and accept one normal step tree.
+
+        Worker attempts never call this method until their structural and
+        scope gates have passed.  A red/failed attempt therefore remains an
+        artifact tree only.  The explicit deferred contract is the sole
+        exception to a passed verification status.  The commit gate receives
+        the effective authority the worker executed under, never the
+        approved step it was repaired from.
+        """
+
+        step_id = authority.step_id
+        if current_head(info.worktree) != parent_sha:
+            raise CommitSafetyError(
+                "step parent HEAD changed before acceptance", code=COMMIT_GATE_FAILED,
+            )
+        if outcome.no_change:
+            if (
+                outcome.tree_after != outcome.tree_before
+                or candidate_tree_sha(info.worktree) != outcome.tree_after
+                or index_tree_sha(info.worktree) != outcome.tree_after
+                or status_has_unstaged_or_untracked(status_porcelain(info.worktree))
+            ):
+                raise CommitSafetyError(
+                    "no-change outcome does not match the exact current tree",
+                    code=COMMIT_GATE_FAILED,
+                )
+            parent_list = commit_parents(info.worktree, parent_sha)
+            expected_parent = parent_list[0] if parent_list else None
+            store.update_metadata(
+                expected_head_sha=parent_sha,
+                expected_parent_sha=expected_parent,
+                expected_tree_sha=outcome.tree_after,
+                next_step_id=(future_step_ids[0] if future_step_ids else None),
+                no_change_step=step_id,
+            )
+            self.runtime.observability.trace_emit(
+                "step.no_change.accepted", phase="implementation",
+                cycle=self.runtime.trace_cycle, step_id=step_id,
+                data={"head_sha": parent_sha, "tree_sha": outcome.tree_after},
+            )
+            return None
+        if verification is None:
+            verification = self._step_verification(authority, outcome, future_step_ids)
+        verification_status, deferred = verification.status, verification.deferred
+
+        self.runtime.observability.trace_emit(
+            "step.verification.completed",
+            phase="implementation",
+            cycle=self.runtime.trace_cycle,
+            step_id=step_id,
+            data={
+                "status": verification_status,
+                "tree_before": outcome.tree_before,
+                "tree_after": outcome.tree_after,
+                "deferred": deferred is not None,
+            },
+        )
+
+        # A no-change deferred mismatch is a traceable worker outcome, not a
+        # new Git state.  There is no legal empty commit; the later candidate
+        # gate still sees the durable mismatch artifact.
+        if outcome.tree_after == outcome.tree_before:
+            if deferred is None:
+                raise CommitSafetyError(
+                    "an unchanged step tree is neither a no-change nor a deferred outcome",
+                    code=COMMIT_GATE_FAILED,
+                )
+            state = store.load()
+            deferred_records = list(state.get("deferred_verifications") or [])
+            deferred_records.append({
+                "step_id": step_id,
+                "verification_status": "deferred",
+                "tree_before": outcome.tree_before,
+                "tree_after": outcome.tree_after,
+                "changed_paths": [],
+                "deferred_reason": deferred.reason,
+                "dependent_step_ids": list(deferred.dependent_step_ids),
+                "deferred_verify_command_or_contract": deferred.command_or_contract,
+                "commit_sha": None,
+            })
+            parents = commit_parents(info.worktree, parent_sha)
+            expected_parent = parents[0] if parents else None
+            store.update_metadata(
+                deferred_verifications=deferred_records,
+                expected_head_sha=parent_sha,
+                expected_parent_sha=expected_parent,
+                expected_tree_sha=outcome.tree_after,
+                next_step_id=(future_step_ids[0] if future_step_ids else None),
+            )
+            return None
+
+        gate = commit_safety_gate(
+            info.worktree,
+            tree_sha=outcome.tree_after,
+            parent_sha=parent_sha,
+            mutable_scope=(
+                *authority.mutable_scope, *outcome.out_of_scope_paths
+            ),
+            verification_status=verification_status,
+            deferred_reason=deferred.reason if deferred is not None else None,
+            dependent_step_ids=deferred.dependent_step_ids if deferred is not None else (),
+            deferred_command_or_contract=(
+                deferred.command_or_contract if deferred is not None else None
+            ),
+            secrets=self.runtime.secrets,
+            # v2 deliberately treats a large diff as bounded review
+            # evidence; the canonical blob-size and binary policies still
+            # apply in the shared scanner.
+            max_diff_bytes=None,
+        )
+        diff_path = step_dir / "diff.patch"
+        atomic_write_text(diff_path, redact(staged_diff(info.worktree), self.runtime.secrets))
+        commit_sha = commit_step_tree(
+            info.worktree,
+            tree_sha=gate.tree_sha,
+            parent_sha=gate.parent_sha,
+            step_id=step_id,
+            step_title=authority.title,
+            body=f"MetaHarness-Run: {run_id}",
+        )
+        record = accepted_step_record(
+            step_id=step_id,
+            verification_status=verification_status,
+            parent_sha=parent_sha,
+            commit_sha=commit_sha,
+            tree_before=outcome.tree_before,
+            tree_after=outcome.tree_after,
+            changed_paths=gate.changed_paths,
+            deferred=deferred,
+            authority=authority.summary(),
+        )
+        self._finalize_accepted_step(
+            store, run_dir, step_dir, record, future_step_ids=future_step_ids,
+            authority=authority, diff_path=diff_path,
+        )
+        return commit_sha
+    def _finalize_accepted_step(
+        self, store: RunStateStore, run_dir: Path, step_dir: Path,
+        record: Mapping[str, Any], *, future_step_ids: Sequence[str],
+        authority: EffectiveStepAuthority, diff_path: Path | None,
+    ) -> None:
+        """Record one committed step durably; idempotent across a resume."""
+
+        commit_sha = record["commit_sha"]
+        step_path = step_dir / "step.json"
+        step_payload = read_json_artifact(step_path)
+        if not isinstance(step_payload, dict):
+            step_payload = {"id": authority.step_id}
+        step_payload.update(record)
+        step_payload["verification_status"] = record["verification_status"]
+        atomic_write_text(step_path, json_text(step_payload))
+
+        def merged(records: Any) -> list[dict[str, Any]]:
+            kept = [
+                item for item in (records or [])
+                if not (isinstance(item, dict) and item.get("commit_sha") == commit_sha)
+            ]
+            return [*kept, dict(record)]
+
+        state = store.load()
+        chain = merged(accepted_chain_records(run_dir))
+        atomic_write_text(run_dir / "accepted-chain.json", json_text({"commits": chain}))
+        atomic_write_text(step_dir / STEP_ACCEPTANCE_NAME, json_text({
+            "schema_version": 1, "status": "accepted", "step_id": authority.step_id,
+            "commit_sha": commit_sha, "parent_sha": record["parent_sha"],
+            "tree_after": record["tree_after"],
+            "commit_gate_authority_sha256": authority.authority_sha256,
+            "effective_contract_sha256": authority.effective_contract_sha256,
+        }))
+        store.update_metadata(
+            accepted_steps=merged(state.get("accepted_steps")),
+            accepted_commits=merged(state.get("accepted_commits")),
+            expected_head_sha=commit_sha,
+            expected_parent_sha=record["parent_sha"],
+            expected_tree_sha=record["tree_after"],
+            next_step_id=future_step_ids[0] if future_step_ids else None,
+        )
+        self.runtime.observability.trace_emit(
+            "step.committed",
+            phase="implementation",
+            cycle=self.runtime.trace_cycle,
+            step_id=authority.step_id,
+            data={
+                "parent_sha": record["parent_sha"],
+                "commit_sha": commit_sha,
+                "tree_sha": record["tree_after"],
+                "changed_paths": list(record["changed_paths"]),
+                "effective_authority_sha256": authority.authority_sha256,
+                **(self.runtime.observability.trace_diff_reference(diff_path) if diff_path is not None else {}),
+            },
+        )
+
+
+__all__ = ['EffectiveStepAuthority', 'EffectiveStepExecution', 'STEP_ACCEPTANCE_NAME', 'STEP_AUTHORITY_NAME', 'STEP_CANDIDATE_NAME', 'StepAuthorityError', 'approved_step_authority', 'approved_step_contract', 'build_step_candidate', 'canonical_sha256', 'mutable_paths', 'read_step_candidate', 'write_authority_diagnostic', 'write_step_candidate']

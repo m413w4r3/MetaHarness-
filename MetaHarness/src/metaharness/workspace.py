@@ -51,15 +51,15 @@ def _safe_name(name: str, used: set[str]) -> str:
 
 def _cwd(worktree: Path, command: WorkspaceSetupCommand) -> Path:
     if Path(command.cwd).is_absolute() or "\x00" in command.cwd:
-        raise WorkspaceSetupError("WORKSPACE_SETUP_FAILED")
+        raise WorkspaceSetupError("CHECK_INFRASTRUCTURE_UNAVAILABLE")
     root = worktree.resolve()
     candidate = (root / command.cwd).resolve()
     try:
         candidate.relative_to(root)
     except ValueError:
-        raise WorkspaceSetupError("WORKSPACE_SETUP_FAILED") from None
+        raise WorkspaceSetupError("CHECK_INFRASTRUCTURE_UNAVAILABLE") from None
     if not candidate.is_dir():
-        raise WorkspaceSetupError("WORKSPACE_SETUP_FAILED")
+        raise WorkspaceSetupError("CHECK_INFRASTRUCTURE_UNAVAILABLE")
     return candidate
 
 
@@ -84,7 +84,7 @@ def prepare_workspace(
     except ValueError:
         pass
     else:
-        raise WorkspaceSetupError("WORKSPACE_SETUP_FAILED")
+        raise WorkspaceSetupError("CHECK_INFRASTRUCTURE_UNAVAILABLE")
     setup_dir = artifact_root / "setup"
     setup_dir.mkdir(parents=True, exist_ok=True)
     results: list[WorkspaceSetupResult] = []
@@ -93,9 +93,9 @@ def prepare_workspace(
 
     try:
         if status_porcelain(root):
-            raise WorkspaceSetupError("WORKSPACE_SETUP_MUTATED")
+            raise WorkspaceSetupError("CONFIGURATION_INVALID")
     except GitError:
-        raise WorkspaceSetupError("WORKSPACE_SETUP_FAILED") from None
+        raise WorkspaceSetupError("CHECK_INFRASTRUCTURE_UNAVAILABLE") from None
 
     for command in commands:
         safe_name = redact(command.name, secrets)
@@ -142,19 +142,19 @@ def prepare_workspace(
             try:
                 mutated = bool(status_porcelain(root))
             except GitError:
-                raise WorkspaceSetupError("WORKSPACE_SETUP_FAILED", frozen) from None
+                raise WorkspaceSetupError("CHECK_INFRASTRUCTURE_UNAVAILABLE", frozen) from None
             if mutated:
-                raise WorkspaceSetupError("WORKSPACE_SETUP_MUTATED", frozen)
+                raise WorkspaceSetupError("CONFIGURATION_INVALID", frozen)
             if timed_out:
-                raise WorkspaceSetupError("WORKSPACE_SETUP_TIMEOUT", frozen)
+                raise WorkspaceSetupError("CHECK_INFRASTRUCTURE_UNAVAILABLE", frozen)
             if exit_code != 0:
-                raise WorkspaceSetupError("WORKSPACE_SETUP_FAILED", frozen)
+                raise WorkspaceSetupError("CHECK_INFRASTRUCTURE_UNAVAILABLE", frozen)
         except WorkspaceSetupError:
             raise
         except (OSError, ValueError):
             frozen = tuple(results)
             _persist_results(setup_dir / "results.json", frozen)
-            raise WorkspaceSetupError("WORKSPACE_SETUP_FAILED", frozen) from None
+            raise WorkspaceSetupError("CHECK_INFRASTRUCTURE_UNAVAILABLE", frozen) from None
     return tuple(results)
 
 

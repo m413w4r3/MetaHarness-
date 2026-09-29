@@ -7,10 +7,8 @@ from pathlib import Path
 from unittest import mock
 
 from metaharness.agent.protocol import CONTRACT_MISMATCH_HEADER
-from metaharness.commit_gate import commit_safety_gate
 from metaharness.models import ExecutionRole, RunStatus
-from metaharness.orchestration.step_acceptance import StepAcceptanceService
-from metaharness.orchestration.step_authority import read_step_candidate
+from metaharness.orchestration.step_execution import StepAcceptanceService, read_step_candidate
 from metaharness.orchestrator import Orchestrator
 from metaharness.resume import resume_info
 from tests.pipeline.support import PipelineHarness, continuation_answer, git, initial_plan, write
@@ -76,13 +74,14 @@ class StepAuthorityTests(PipelineHarness):
             write("feature.txt", "good\n"),
         )
         with mock.patch(
-            "metaharness.orchestration.step_acceptance.commit_safety_gate",
+            "metaharness.orchestration.step_execution.commit_safety_gate",
             side_effect=KeyboardInterrupt(),
         ):
             result = self.orchestrator(
                 self.config(), planner=[initial_plan(STEP)],
             ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.INTERRUPTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.FAILED, self.state().get("failure"))
+        self.assertEqual(result.failure_reason, "INTERRUPTED")
         self.assertTrue((self.step_dir() / "attempts/01/step.json").exists())
         self.assertFalse((self.step_dir() / "contract_repairs").exists())
         info = resume_info(self.run_dir(), self.state())
@@ -102,7 +101,7 @@ class StepAuthorityTests(PipelineHarness):
             write("feature.txt", "good\n"), write("feature.txt", "good\n"),
         )
         with mock.patch(
-            "metaharness.orchestration.step_acceptance.commit_safety_gate",
+            "metaharness.orchestration.step_execution.commit_safety_gate",
             side_effect=KeyboardInterrupt(),
         ):
             self.run_pipeline()

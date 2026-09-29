@@ -15,7 +15,7 @@ from ..models import HarnessConfig
 class CodexRuntimeError(RuntimeError):
     """The managed Codex runtime cannot be safely prepared."""
 
-    code = "CODEX_RUNTIME_FAILURE"
+    code = "INTERNAL_HARNESS_ERROR"
 
 
 _MANAGED_CONFIG = (

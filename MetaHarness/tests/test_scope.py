@@ -15,13 +15,7 @@ import unittest
 
 from pathlib import Path
 
-from metaharness.attempt_transaction import (
-    BRANCH_MODIFIED_OUTSIDE_AUTHORITY,
-    REMOTE_AUTHORITY_MISMATCH,
-    audit_git_mutation,
-    git_ownership,
-    recover_worker_git_state,
-)
+from metaharness.attempt_transaction import TREE_MODIFIED_OUTSIDE_AUTHORITY, audit_git_mutation, git_ownership, recover_worker_git_state
 from metaharness.gitops import (
     current_head,
     local_branches,
@@ -198,7 +192,7 @@ class GitRecoveryTests(PipelineHarness):
         git(self.repo, "update-ref", "refs/heads/foreign", moved)
 
         audit = self.audit()
-        self.assertEqual(audit.fatal_code, BRANCH_MODIFIED_OUTSIDE_AUTHORITY)
+        self.assertEqual(audit.fatal_code, TREE_MODIFIED_OUTSIDE_AUTHORITY)
         self.assertIn("refs/heads/foreign", audit.fatal_detail)
         self.assertFalse(audit.recoverable)
 
@@ -210,7 +204,7 @@ class GitRecoveryTests(PipelineHarness):
         git(self.worktree, "push", "-q", "origin", "metaharness/run")
 
         audit = self.audit()
-        self.assertEqual(audit.fatal_code, REMOTE_AUTHORITY_MISMATCH)
+        self.assertEqual(audit.fatal_code, TREE_MODIFIED_OUTSIDE_AUTHORITY)
         self.assertFalse(audit.recoverable)
 
 

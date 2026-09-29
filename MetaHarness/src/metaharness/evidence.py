@@ -34,11 +34,11 @@ from .validation import (
 )
 
 
-DIFF_TOO_LARGE = "DIFF_TOO_LARGE"
-SECRET_IN_DIFF = "SECRET_IN_DIFF"
-SECRET_IN_STAGED_BLOB = "SECRET_IN_STAGED_BLOB"
-UNSCANNABLE_STAGED_BLOB = "UNSCANNABLE_STAGED_BLOB"
-UNREVIEWABLE_TEXT_DIFF = "UNREVIEWABLE_TEXT_DIFF"
+DIFF_SIZE_FAILURE = "DETERMINISTIC_GATE_FAILED:diff_too_large"
+DIFF_SECRET_FAILURE = "COMMIT_SECURITY_FAILURE:secret_in_diff"
+BLOB_SECRET_FAILURE = "COMMIT_SECURITY_FAILURE:secret_in_staged_blob"
+BLOB_CONTENT_FAILURE = "COMMIT_SECURITY_FAILURE:unscannable_staged_blob"
+COMMIT_SECURITY_FAILURE = "COMMIT_SECURITY_FAILURE"
 MAX_SECRET_SCAN_BLOB_BYTES = 16 * 1024 * 1024
 
 _FAILURE_EVIDENCE_MAX_BYTES = 48 * 1024
@@ -219,90 +219,8 @@ def _utf8_prefix(value: str, limit: int) -> str:
     )
 
 
-def _diff_sections(diff: str) -> list[str]:
-    """Split a git diff into deterministic per-file sections."""
-
-    sections: list[str] = []
-    current: list[str] = []
-    for line in diff.splitlines(keepends=True):
-        if line.startswith("diff --git ") and current:
-            sections.append("".join(current))
-            current = []
-        current.append(line)
-    if current:
-        sections.append("".join(current))
-    return sections or ([diff] if diff else [])
 
 
-def _bounded_section(section: str, budget: int) -> str:
-    """Keep a section header and both ends of its body within *budget*."""
-
-    encoded = section.encode("utf-8", errors="replace")
-    if len(encoded) <= budget:
-        return section
-    if budget <= 0:
-        return ""
-    lines = section.splitlines(keepends=True)
-    header = lines[0] if lines else section
-    marker = "\n[... file diff body abbreviated ...]\n"
-    marker_bytes = len(marker.encode("utf-8"))
-    if budget <= marker_bytes:
-        return _utf8_prefix(section, budget)
-    header_text = _utf8_prefix(header, max(1, budget // 4))
-    remaining = budget - len(header_text.encode("utf-8")) - marker_bytes
-    if remaining <= 0:
-        return _utf8_prefix(header_text + marker, budget)
-    body = "".join(lines[1:])
-    head_budget = (remaining + 1) // 2
-    tail_budget = remaining - head_budget
-    head = _utf8_prefix(body, head_budget)
-    tail = _utf8_prefix(body[-max(1, tail_budget):], tail_budget)
-    result = header_text + head + marker + tail
-    return _utf8_prefix(result, budget)
-
-
-def bounded_semantic_diff(diff: str, max_bytes: int) -> tuple[str, bool, int]:
-    """Build a deterministic, representative diff payload for semantic models.
-
-    The exact diff remains the evidence artifact.  This helper only bounds the
-    copy embedded in an LLM request and distributes the budget across all git
-    file sections so early files cannot crowd out later ones.
-    """
-
-    if not isinstance(diff, str):
-        raise TypeError("diff must be a string")
-    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
-        raise ValueError("max_bytes must be a positive integer")
-    full_bytes = len(diff.encode("utf-8", errors="replace"))
-    if full_bytes <= max_bytes:
-        return diff, False, full_bytes
-
-    sections = _diff_sections(diff)
-    metadata = (
-        "SEMANTIC DIFF EXCERPT\n"
-        f"FULL_DIFF_BYTES: {full_bytes}\n"
-        "TRUNCATED: true\n"
-        f"FILES_CHANGED: {len(sections)}\n\n"
-        "The exact candidate commit/tree remains authoritative.\n"
-        "Some diff bodies are abbreviated because this is an LLM context budget,\n"
-        "not an execution or correctness gate.\n\n"
-    )
-    metadata_bytes = len(metadata.encode("utf-8"))
-    if metadata_bytes >= max_bytes:
-        return _utf8_prefix(metadata, max_bytes), True, full_bytes
-
-    available = max_bytes - metadata_bytes
-    # Every section gets a deterministic share.  This guarantees that a
-    # large plan still exposes the last file rather than stopping at a prefix.
-    base, extra = divmod(available, len(sections) or 1)
-    excerpts: list[str] = []
-    for index, section in enumerate(sections):
-        budget = base + (1 if index < extra else 0)
-        excerpt = _bounded_section(section, budget)
-        if excerpt:
-            excerpts.append(excerpt)
-    payload = metadata + "\n".join(excerpts)
-    return _utf8_prefix(payload, max_bytes), True, full_bytes
 
 
 @dataclass(frozen=True)
@@ -458,11 +376,11 @@ def _gate_failures(
 ) -> list[str]:
     failures: list[str] = []
     if not head_matches:
-        failures.append("HEAD_MISMATCH")
+        failures.append("COMMIT_GATE_FAILED")
     if not diff or not changed_files:
-        failures.append("EMPTY_DIFF")
+        failures.append("DETERMINISTIC_GATE_FAILED:empty_diff")
     if len(diff.encode("utf-8", errors="replace")) > max_diff_bytes:
-        failures.append(DIFF_TOO_LARGE)
+        failures.append(DIFF_SIZE_FAILURE)
     return failures
 
 
@@ -484,17 +402,17 @@ def _staged_blob_failures(
     # describe is never silently treated as a deletion.
     for path in changed_files:
         if path not in described:
-            failures.append(f"{UNSCANNABLE_STAGED_BLOB}:{path}")
+            failures.append(f"{BLOB_CONTENT_FAILURE}:{path}")
     encoded_secrets = tuple(secret.encode("utf-8") for secret in secrets if secret)
     for blob in staged_changed_blobs(root, changes):
         if blob.size > MAX_SECRET_SCAN_BLOB_BYTES:
-            failures.append(f"{UNSCANNABLE_STAGED_BLOB}:{blob.path}")
+            failures.append(f"{BLOB_CONTENT_FAILURE}:{blob.path}")
             continue
         if not encoded_secrets:
             continue
         content = read_staged_blob(root, blob.object_id)
         if any(secret in content for secret in encoded_secrets):
-            failures.append(f"{SECRET_IN_STAGED_BLOB}:{blob.path}")
+            failures.append(f"{BLOB_SECRET_FAILURE}:{blob.path}")
     return failures
 
 
@@ -508,7 +426,7 @@ def _unreviewable_text_diff_failures(
     binary_paths = staged_binary_files(root)
     submodule_paths = frozenset(change.path for change in changes if change.is_gitlink)
     return [
-        f"{UNREVIEWABLE_TEXT_DIFF}:{path}"
+        f"{COMMIT_SECURITY_FAILURE}:{path}"
         for path in changed_files
         if path not in submodule_paths
         and Path(path).suffix.casefold() in _TEXT_DIFF_SUFFIXES
@@ -537,9 +455,9 @@ def scan_staged_security(
     failures = _staged_blob_failures(root, changed_files, changes, secrets)
     failures.extend(_unreviewable_text_diff_failures(root, changed_files, changes))
     if contains_secret(diff, secrets):
-        failures.append(SECRET_IN_DIFF)
+        failures.append(DIFF_SECRET_FAILURE)
     if max_diff_bytes is not None and len(diff.encode("utf-8", errors="replace")) > max_diff_bytes:
-        failures.append(DIFF_TOO_LARGE)
+        failures.append(DIFF_SIZE_FAILURE)
     return tuple(failures)
 
 
@@ -608,7 +526,7 @@ def collect_evidence(
         max_diff_bytes=config.max_diff_bytes if enforce_diff_size else 2**63 - 1,
     )
     if allow_empty_diff:
-        failures = [failure for failure in failures if failure != "EMPTY_DIFF"]
+        failures = [failure for failure in failures if failure != "DETERMINISTIC_GATE_FAILED:empty_diff"]
     failures.extend(scan_staged_security(
         root,
         secrets=secrets,
@@ -629,7 +547,7 @@ def collect_evidence(
         if check.failure_kind in {"side_effect_repeated", "side_effect_unstable"}:
             failures.append(f"CHECK_SIDE_EFFECT_REPEATED:{check.name}")
         elif check.workspace_mutated and not check.mutation_recovered:
-            failures.append(f"CHECK_MUTATED:{check.name}")
+            failures.append(f"CHECK_FAILED:{check.name}")
         # A check whose trusted preflight answered "no" never ran: the run
         # keeps that fact as a durable warning instead of a red gate.
         if check.failure_kind == "skipped_infra":
@@ -642,12 +560,12 @@ def collect_evidence(
         if required_check_ids is None and not check_config.required:
             continue
         if check.timed_out:
-            failures.append(f"CHECK_TIMEOUT:{check.name}")
+            failures.append(f"CHECK_INFRASTRUCTURE_UNAVAILABLE:{check.name}")
         elif check.failure_kind in {
             "missing_executable", "process_start_failed", "signal_terminated",
             "infrastructure_unavailable",
         }:
-            failures.append(f"CHECK_INFRA_FAILURE:{check.name}")
+            failures.append(f"CHECK_INFRASTRUCTURE_UNAVAILABLE:{check.name}")
         elif check.exit_code != 0:
             if judge_check is None:
                 failures.append(f"CHECK_FAILED:{check.name}")

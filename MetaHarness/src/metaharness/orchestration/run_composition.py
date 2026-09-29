@@ -17,7 +17,6 @@ from ..agent.execution import ExecutorRuntimeConfig, executor_for_profile
 from ..gitops import (
     RepositoryReference,
     WorktreeInfo,
-    candidate_tree_sha,
     changed_paths_between_trees,
     current_head,
     diffstat_between_commits,
@@ -44,10 +43,9 @@ from ..validation import ValidationError, frozen_check_policy
 from ..plan_repository_validation import validate_plan_repository_topology
 from ..planning.artifacts import persist_iteration_plan, validate_implementation_bundle
 from ..planning.continue_request import PlannerContinueFacts
-from ..planning.planner_continue import ContinueDecision, PlannerContinue, PlannerContinueResult
-from .candidate import CandidateLifecycle
-from .check_failure import hard_integrity_failures
-from .gate_acceptance import GateAcceptanceService
+from ..planning.planner_continue import PlannerContinue, PlannerContinueResult
+from .publication import CandidateLifecycle
+from .gates import GateAcceptanceService, hard_integrity_failures
 from .pipeline_v2 import (
     BudgetExhausted, CyclePlan, IterationOutcome, PipelineFailure, PipelineV2Context,
     PipelineV2Operations,
@@ -55,9 +53,7 @@ from .pipeline_v2 import (
     gate_dir,
     step_dir as cycle_step_dir,
 )
-from .durable_readers import (
-    completed_step_records, load_evidence, gate_mutable_authority, settled_step_status,
-)
+from .shared import completed_step_records, load_evidence, settled_step_status
 from ..planning.artifacts import iteration_plan_dir
 from .run_bootstrap import PreparedV2Run
 from .shared import (
@@ -349,7 +345,7 @@ class RunComposition:
             # continuation authority must send a fully trusted selection.
             unknown = [item.detail for item in plan.normalizations if item.code == DROP_UNKNOWN_REQUIRED_CHECK]
             raise PipelineFailure("PLANNER_OUTPUT_INVALID", {"untrusted_checks": unknown})
-        plan_sha = persist_iteration_plan(ctx.run_dir, iteration, plan)
+        persist_iteration_plan(ctx.run_dir, iteration, plan)
         bundle, _bundle_sha = validate_implementation_bundle(
             iteration_plan_dir(ctx.run_dir, iteration), expected_step_ids=[step.id for step in plan.steps],
         )

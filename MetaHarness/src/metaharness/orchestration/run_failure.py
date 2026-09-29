@@ -77,8 +77,6 @@ def _failure_reason(exc: Exception) -> str:
         # Their stable ``.code`` is the authority: these reasons must stay
         # recognizable as permanently non-resumable.
         return exc.code
-    if isinstance(exc, OrchestrationError) and str(exc).startswith("CHECK_PREFLIGHT_FAILED:"):
-        return str(exc).split()[0]
     if isinstance(exc, OrchestrationError) and str(exc).startswith(
         "CHECK_INFRASTRUCTURE_UNAVAILABLE:"
     ):
@@ -86,34 +84,34 @@ def _failure_reason(exc: Exception) -> str:
     if isinstance(exc, (OrchestrationError, ValidationError)):
         detail = str(exc)
         for code in (
-            "AGENT_GIT_VIOLATION", "ROLLBACK_FAILED", "ROLLBACK_TREE_MISMATCH",
-            "TREE_MISMATCH", "HEAD_MISMATCH", "DURABLE_ARTIFACT_CORRUPTED",
+            "AGENT_GIT_VIOLATION", "ROLLBACK_FAILED",
+            "COMMIT_GATE_FAILED", "DURABLE_ARTIFACT_CORRUPTED",
         ):
             if detail.startswith(code + ":"):
                 return code
     if isinstance(exc, CandidatePushError):
         return exc.code
     if isinstance(exc, CommitBoundaryError):
-        return "TOCTOU_FAILURE"
+        return "COMMIT_GATE_FAILED"
     if isinstance(exc, GitError):
         return "GIT_FAILURE"
     if isinstance(exc, AgentError):
-        return getattr(exc, "code", "AGENT_FAILURE")
+        return getattr(exc, "code", "AGENT_RUNTIME_FAILED")
     if isinstance(exc, PlanRepositoryPreconditionError):
         return exc.code
     if isinstance(exc, ApprovalError):
         return "PLAN_APPROVAL_INVALID"
     if isinstance(exc, ExecutionSelectionError):
-        return "EXECUTION_SELECTION_INVALID"
+        return "PLAN_APPROVAL_INVALID"
     if isinstance(exc, PlanParseError):
         return "PLANNER_OUTPUT_INVALID"
     if isinstance(exc, LLMError):
         # A transport that names its own stable condition (the exhausted
         # horizon) keeps that code; every other transport error stays the
-        # generic ``LLM_FAILURE`` classification.
-        return getattr(exc, "code", "LLM_FAILURE")
+        # generic ``LLM_TRANSPORT_EXHAUSTED`` classification.
+        return getattr(exc, "code", "LLM_TRANSPORT_EXHAUSTED")
     if isinstance(exc, ValidationError):
-        return "CHECK_SETUP_INVALID"
+        return "CONFIGURATION_INVALID"
     if isinstance(exc, WorkspaceSetupError):
         return exc.code
     if isinstance(exc, GitHubIntegrationError):

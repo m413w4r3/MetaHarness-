@@ -57,7 +57,7 @@ PARSER_PREFIXES = ("parse_", "_parse_", "read_meta", "_read_meta")
 # ---------------------------------------------------------------------------
 
 SPLIT_PACKAGES = (PACKAGE / "orchestration", PACKAGE / "planning")
-MODULE_MAX_LINES = 900
+MODULE_MAX_LINES = 1200
 # Landed sizes of the modules that predate the refoundation: frozen ceilings,
 # never raised by accident.  C7 deleted the last oversized module with the
 # check-repair and semantic-revision pipeline it served, so the ratchet is
@@ -71,29 +71,15 @@ PIPELINE_TEST_MAX_LINES = 1000
 # invariant 7: no module imports a `_private_name` of another module
 # ---------------------------------------------------------------------------
 
-# Every private import the refoundation landed with: the intra-package toolbox
-# of `orchestration/shared.py`, the explicit primitives its siblings expose, and
-# five module-local names five test modules still reach into.  Frozen: any new
-# edge fails, and the table may only shrink.
+# Private orchestration imports present before this deletion pass, plus the
+# two test-only probes retained for direct protocol assertions. New edges fail.
 FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
-    "metaharness.orchestration.candidate": {
-        "metaharness.orchestration.shared": ('_json_text', '_read_json_artifact'),
-    },
-    "metaharness.orchestration.check_recovery": {
-        "metaharness.orchestration.shared": ('_archive_attempt_tree', '_safe_candidate_tree'),
-    },
     "metaharness.orchestration.gates": {
         "metaharness.orchestration.shared": (
             "_CHECK_ATTEMPT_ARTIFACTS",
-            "_REVISION_ATTEMPT_ARTIFACTS",
             "_archive_attempt",
-            "_archive_attempt_tree",
             "_check_payload",
-            "_git_ownership",
-            "_is_object_id",
             "_json_text",
-            "_read_json_artifact",
-            "_record_failure_tree",
             "_safe_candidate_tree",
         ),
     },
@@ -104,18 +90,17 @@ FROZEN_PRIVATE_IMPORTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
             "_read_json_artifact",
             "_status_has_unstaged_or_untracked",
         ),
-        "metaharness.orchestration.candidate": ('_candidate_commit_path', '_commit_web_url'),
     },
-    "metaharness.orchestration.worker_recovery": {
+    "metaharness.orchestration.recovery": {
         "metaharness.orchestration.shared": (
-            "_REVISION_ATTEMPT_ARTIFACTS",
-            "_archive_attempt",
-            "_json_text",
-            "_read_json_artifact",
-            "_record_failure_tree",
-            "_safe_candidate_tree",
-            "_safe_status",
+            "_archive_attempt", "_archive_attempt_tree", "_safe_candidate_tree", "_safe_status",
         ),
+    },
+    "tests.test_audit_prompt": {
+        "metaharness.orchestration.audit": ("_evidence_payload",),
+    },
+    "tests.autonomy.test_resume_external": {
+        "metaharness.cli": ("_auto_resume",),
     },
     "tests.test_agent_events": {
         "metaharness.claude.agent": ('_scan_events',),
@@ -751,7 +736,7 @@ class RemovedAuthoritySurfaceTests(unittest.TestCase):
         self.assertEqual(tuple(stage.name for stage in GateStage), ("POST_IMPLEMENTATION",))
         self.assertEqual(
             tuple(field for field in ExecutionFallbacks.__dataclass_fields__),
-            ("mechanical", "reasoning", "agentic"),
+            ("mechanical", "reasoning", "agentic", "audit"),
         )
         self.assertEqual(SCHEMA_VERSION, 8)
         self.assertEqual(

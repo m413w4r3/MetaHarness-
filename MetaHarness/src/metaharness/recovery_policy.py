@@ -1,10 +1,11 @@
 """Deterministic classification of pipeline failures and recovery budgets.
 
-One stable failure code maps to exactly one :class:`FailureClass` through the
-single table :data:`FAILURE_CLASSES`; a code the table does not name is an
-ordinary ``FIXABLE`` failure, never a stop.  Every class owns one ordered
-ladder (:data:`RECOVERY_LADDERS`).  ``HARD_STOP`` is reachable only from the
-closed ``FATAL`` allowlist and ``WAIT_HUMAN`` only from ``SPEC_DECISION``.
+One canonical stable failure code maps to exactly one :class:`FailureClass`
+through the single table :data:`FAILURE_CLASSES`; input aliases resolve before
+classification, while an unknown code is an ordinary ``FIXABLE`` failure.
+Every class owns one ordered ladder (:data:`RECOVERY_LADDERS`).  ``HARD_STOP``
+is reachable only from the closed ``FATAL`` allowlist and ``WAIT_HUMAN`` only
+from ``SPEC_DECISION``.
 """
 
 from __future__ import annotations
@@ -52,49 +53,49 @@ _T, _F, _S, _X = (
 # The single classification authority.  A key ending or starting with ``*`` is
 # a prefix or suffix pattern; an exact key always wins over a pattern.
 FAILURE_CLASSES: Mapping[str, FailureClass] = {
-    # -- FATAL: secrets and content the harness cannot inspect.
-    "SECRET_*": _X, "*_BLOB_NOT_REVIEWABLE": _X,
-    "UNSCANNABLE_STAGED_BLOB": _X, "STAGED_BLOB_SCAN_FAILED": _X, "UNREVIEWABLE_TEXT_DIFF": _X, "COMMIT_SECURITY_FAILURE": _X,
-    # -- FATAL: writes outside physical authority, foreign Git state.
-    "TREE_MODIFIED_OUTSIDE_AUTHORITY": _X, "HEAD_MODIFIED_OUTSIDE_AUTHORITY": _X,
-    "BRANCH_MODIFIED_OUTSIDE_AUTHORITY": _X, "REMOTE_AUTHORITY_MISMATCH": _X,
-    "BASE_MOVED_SINCE_RUN": _X, "REPOSITORY_TREE_DRIFT_UNEXPLAINED": _X, "HARD_DENY_PATH_MUTATION": _X,
-    # -- FATAL: the last green tree or the durable authority cannot be restored.
-    "ROLLBACK_FAILED": _X, "ROLLBACK_TREE_MISMATCH": _X, "RESUME_REQUIRES_OPERATOR": _X,
-    "RESUME_INTEGRITY_FAILURE": _X, "DURABLE_ARTIFACT_CORRUPTED": _X,
-    "RUN_SCHEMA_UNSUPPORTED": _X,
-    "AUDIT_PROFILE_NOT_WRITABLE": _X,
-    # -- SPEC_DECISION: a product or policy choice the SPEC leaves open.
-    "SPEC_DECISION_REQUIRED": _S,
-    # -- TRANSIENT: providers, transport, executors and infrastructure.
-    "LLM_*": _T, "AGENT_START_FAILED": _T, "AGENT_RUNTIME_FAILED": _T,
-    "AGENT_TIMEOUT": _T, "AGENT_PROTOCOL_FAILED": _T, "AGENT_FAILURE": _T,
-    "AGENT_AUTH_FAILURE": _T, "AGENT_RATE_LIMITED": _T, "MISSING_PROVIDER_CREDENTIALS": _T,
-    "PROVIDER_CREDENTIALS_MISSING": _T, "EXTERNAL_AUTH_REQUIRED": _T,
-    "REMOTE_TEMPORARILY_UNAVAILABLE": _T, "REMOTE_UNAVAILABLE": _T,
-    "CANDIDATE_REMOTE_UNAVAILABLE": _T, "PUSH_FAILED": _T, "CANDIDATE_PUSH_FAILED": _T,
-    "GITHUB_WORKSTREAM_FAILURE": _T, "GIT_FAILURE": _T,
-    "CHECK_TIMEOUT": _T, "CHECK_PREFLIGHT_FAILED": _T, "CHECK_INFRA_FAILURE": _T,
-    "CHECK_INFRASTRUCTURE_UNAVAILABLE": _T,
-    "CHECK_SIDE_EFFECT_REPEATED": _T, "CHECK_SIDE_EFFECT_UNSTABLE": _T,
-    "WORKSPACE_SETUP_FAILED": _T, "WORKSPACE_SETUP_TIMEOUT": _T,
-    # -- FIXABLE: model, contract, scope and correctness failures.
-    "AGENT_CONTRACT_MISMATCH": _F, "AGENT_NO_CHANGE": _F, "AGENT_SCOPE_VIOLATION": _F,
-    "AGENT_GIT_VIOLATION": _F,
-    "CHECK_FAILED": _F, "DETERMINISTIC_GATE_FAILED": _F,
-    "AUDIT_REMAINING": _F, "CODEX_RUNTIME_FAILURE": _F,
-    "GITHUB_CONFIG_INVALID": _F, "GITHUB_ISSUE_NOT_FOUND": _F,
-    "GITHUB_PR_CANDIDATE_MISMATCH": _F, "GITHUB_PR_REQUIRES_RUN_BRANCH": _F,
-    "PER_STEP_GATE_REGRESSION": _F, "CHECK_SETUP_INVALID": _F,
-    "PLANNER_OUTPUT_INVALID": _F,
-    "PLANNER_BLOCKED_REQUIRES_OPERATOR": _F, "PLAN_APPROVAL_INVALID": _F,
-    "PLAN_REPOSITORY_PRECONDITION_INVALID": _F,
-    "REPOSITORY_EVIDENCE_RECOVERY_EXHAUSTED": _F,
-    "EXECUTION_SELECTION_INVALID": _F, "WORKSPACE_SETUP_MUTATED": _F,
-    "COMMIT_GATE_FAILED": _F, "COMMIT_SCOPE_VIOLATION": _F, "COMMIT_PARENT_MISMATCH": _F,
-    "COMMIT_WORKTREE_DRIFT": _F, "COMMIT_VERIFICATION_FAILURE": _F,
-    "COMMIT_TREE_MISMATCH": _F, "HEAD_MISMATCH": _F, "TREE_MISMATCH": _F, "TOCTOU_FAILURE": _F, "INVALID_PHASE_TRANSITION": _F,
-    "INTERNAL_HARNESS_ERROR": _F,
+    # Read-only safety for fatal boundaries recorded by current v4 checkpoints.
+    # These codes are no longer produced; unknown namespaces stay FIXABLE.
+    'UNSCANNABLE_STAGED_BLOB': _X,
+    'STAGED_BLOB_SCAN_FAILED': _X,
+    'UNREVIEWABLE_TEXT_DIFF': _X,
+    'HEAD_MODIFIED_OUTSIDE_AUTHORITY': _X,
+    'BRANCH_MODIFIED_OUTSIDE_AUTHORITY': _X,
+    'REMOTE_AUTHORITY_MISMATCH': _X,
+    'ROLLBACK_TREE_MISMATCH': _X,
+    'SECRET_*': _X,
+    '*_BLOB_NOT_REVIEWABLE': _X,
+    'COMMIT_SECURITY_FAILURE': _X,
+    'TREE_MODIFIED_OUTSIDE_AUTHORITY': _X,
+    'BASE_MOVED_SINCE_RUN': _X,
+    'REPOSITORY_TREE_DRIFT_UNEXPLAINED': _X,
+    'HARD_DENY_PATH_MUTATION': _X,
+    'ROLLBACK_FAILED': _X,
+    'RESUME_REQUIRES_OPERATOR': _X,
+    'RESUME_INTEGRITY_FAILURE': _X,
+    'DURABLE_ARTIFACT_CORRUPTED': _X,
+    'RUN_SCHEMA_UNSUPPORTED': _X,
+    'AUDIT_PROFILE_NOT_WRITABLE': _X,
+    'SPEC_DECISION_REQUIRED': _S,
+    'LLM_*': _T,
+    'AGENT_RUNTIME_FAILED': _T,
+    'AGENT_TIMEOUT': _T,
+    'EXTERNAL_AUTH_REQUIRED': _T,
+    'PUSH_FAILED': _T,
+    'GITHUB_WORKSTREAM_FAILURE': _T,
+    'GIT_FAILURE': _T,
+    'CHECK_INFRASTRUCTURE_UNAVAILABLE': _T,
+    'CHECK_SIDE_EFFECT_REPEATED': _T,
+    'AGENT_CONTRACT_MISMATCH': _F,
+    'AGENT_SCOPE_VIOLATION': _F,
+    'AGENT_GIT_VIOLATION': _F,
+    'CHECK_FAILED': _F,
+    'DETERMINISTIC_GATE_FAILED': _F,
+    'INTERNAL_HARNESS_ERROR': _F,
+    'CONFIGURATION_INVALID': _F,
+    'PER_STEP_GATE_REGRESSION': _F,
+    'PLANNER_OUTPUT_INVALID': _F,
+    'PLAN_APPROVAL_INVALID': _F,
+    'COMMIT_GATE_FAILED': _F,
 }
 
 RECOVERY_LADDERS: Mapping[FailureClass, tuple[RecoveryStrategy, ...]] = {
@@ -273,6 +274,23 @@ def stable_code(failure: object) -> str:
     return failure.strip().split(":", 1)[0].strip().upper()
 
 
+# Provider spellings accepted at input boundaries. Durable records use the
+# canonical code on the right and never emit these aliases as failure reasons.
+_FAILURE_CODE_ALIASES: Mapping[str, str] = {
+    "AGENT_AUTH_FAILURE": "EXTERNAL_AUTH_REQUIRED",
+    "LLM_401": "EXTERNAL_AUTH_REQUIRED",
+    "LLM_403": "EXTERNAL_AUTH_REQUIRED",
+    "LLM_AUTH_FAILURE": "EXTERNAL_AUTH_REQUIRED",
+}
+
+
+def canonical_failure_code(failure: object) -> str:
+    """Resolve one accepted input alias to its durable stable code."""
+
+    code = stable_code(failure)
+    return _FAILURE_CODE_ALIASES.get(code, code)
+
+
 def _lookup(code: str) -> FailureClass | None:
     known = FAILURE_CLASSES.get(code)
     if known is not None:
@@ -300,7 +318,7 @@ def classify_failure(failure: str, *, exhausted: bool = False) -> RecoveryDecisi
     caller's loop is ``exhausted``.  Pure: it never emits or logs anything.
     """
 
-    known = _lookup(stable_code(failure))
+    known = _lookup(canonical_failure_code(failure))
     failure_class = known or FailureClass.FIXABLE
     ladder = RECOVERY_LADDERS[failure_class]
     return RecoveryDecision(
@@ -311,7 +329,8 @@ def classify_failure(failure: str, *, exhausted: bool = False) -> RecoveryDecisi
 
 __all__ = [
     "AutonomyBudget", "ExecutionFallbacks", "FAILURE_CLASSES", "FailureClass",
-    "RECOVERY_LADDERS", "RecoveryDecision", "RecoveryStrategy", "classify_failure",
+    "RECOVERY_LADDERS", "RecoveryDecision", "RecoveryStrategy", "canonical_failure_code",
+    "classify_failure",
     "elapsed_hours", "recovery_ladder", "stable_code", "unsupported_cost_cap",
     "wall_clock_exhausted",
 ]

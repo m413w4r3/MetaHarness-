@@ -611,7 +611,7 @@ class MetaHarnessRequestHandler(BaseHTTPRequestHandler):
                     "reasoning_profile", "agentic_profile",
                     "audit_profile",
                     "decomposition",
-                    "decomposition", "execution_mode_policy", "single_step_max_mutable_paths",
+                    "execution_mode_policy", "single_step_max_mutable_paths",
                     "staged_step_max_mutable_paths",
                 }, exact=False)
                 if not {"_token", "spec", "run_id", "planner_profile"}.issubset(payload):

@@ -9,16 +9,9 @@ from .chat import (
     OpenAIChatTextClient,
     TextLLMResult,
 )
-from .wire import (
-    AmbiguousFieldError,
-    ParsedTextDocument,
-    WireParseError,
-    parse_labeled_document,
-)
 from ..models import LLMEndpointConfig
 
 __all__ = [
-    "AmbiguousFieldError",
     "LLMError",
     "LLMEndpointConfig",
     "LLMHTTPError",
@@ -26,8 +19,5 @@ __all__ = [
     "ConversationUnavailableError",
     "ConversationContinuationClient",
     "OpenAIChatTextClient",
-    "ParsedTextDocument",
     "TextLLMResult",
-    "WireParseError",
-    "parse_labeled_document",
 ]

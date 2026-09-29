@@ -87,7 +87,6 @@ from .models import (
     RunCycle,
     TaskPlanV2,
     WorkspaceSetupCommand,
-    WorkstreamRef,
     SelectedProfile,
     StepExecutionSelection,
 )
@@ -127,6 +126,12 @@ from .validation import CheckResult, ValidationError, run_check_preflights, run_
 from .workspace import WorkspaceSetupError, WorkspaceSetupResult, prepare_workspace
 
 __all__ = [
+    "FanoutTraceSink",
+    "JsonlTraceSink",
+    "NullTraceSink",
+    "TraceEvent",
+    "TraceSink",
+    "TraceStream",
     "AgentConfig",
     "AgentResult",
     "ApprovalConfig",
@@ -187,7 +192,6 @@ __all__ = [
     "GateStage",
     "TaskPlanV2",
     "WorkspaceSetupCommand",
-    "WorkstreamRef",
     "NullGitHubWorkstreamClient",
     "SelectedProfile",
     "StepExecutionSelection",

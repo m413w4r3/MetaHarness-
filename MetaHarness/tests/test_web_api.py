@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from unittest.mock import patch
 
 from metaharness.approval import compute_plan_identity_from_run, write_check_authority
+from metaharness.diagnostics import build_run_diagnostics
 from metaharness.models import (
     CheckConfig,
     ContextConfig,
@@ -39,12 +40,12 @@ from metaharness.web.server import create_server
 # status itself is never written: each fixture names the machine state the
 # projection derives it from.
 FIXTURE_STATES = {
-    "created": RunMachineState(),
-    "planning": RunMachineState(RunPhase.PLANNER),
-    "awaiting_plan_approval": RunMachineState(RunPhase.PLAN_APPROVAL),
-    "implementing": RunMachineState(RunPhase.IMPLEMENT_STEP),
-    "validating": RunMachineState(RunPhase.DETERMINISTIC_GATE),
-    "revising": RunMachineState(RunPhase.AUDIT),
+    "running_empty": RunMachineState(),
+    "running_planner": RunMachineState(RunPhase.PLANNER),
+    "running_approval": RunMachineState(RunPhase.PLAN_APPROVAL),
+    "running_implementation": RunMachineState(RunPhase.IMPLEMENT_STEP),
+    "running_gate": RunMachineState(RunPhase.DETERMINISTIC_GATE),
+    "running_audit": RunMachineState(RunPhase.AUDIT),
     "waiting_external": RunMachineState(disposition=RunDisposition.WAIT_EXTERNAL, reason="AGENT_TIMEOUT"),
     "committed": RunMachineState(RunPhase.CANDIDATE_PUSH, RunDisposition.COMPLETED),
 }
@@ -113,7 +114,7 @@ class WebServerTests(unittest.TestCase):
         connection.close()
         return response.status, json.loads(content) if content else None, content
 
-    def create_run(self, run_id: str, status: str = "created") -> Path:
+    def create_run(self, run_id: str, status: str = "running_empty") -> Path:
         run_dir = self.runs / run_id
         store = RunStateStore(run_dir / "state.json")
         store.initialize(run_id)
@@ -125,7 +126,7 @@ class WebServerTests(unittest.TestCase):
             patch("metaharness.web.server.model_profiles", return_value={"profiles": []}) as profiles,
             patch("metaharness.web.server.list_runs", return_value=[{"run_id": "r1"}]) as runs,
             patch("metaharness.web.server.get_run", return_value={"run_id": "r1"}) as get_run,
-            patch("metaharness.web.server.live_status", return_value={"status": "created"}) as live,
+            patch("metaharness.web.server.live_status", return_value={"status": "running"}) as live,
             patch("metaharness.web.server.progress", return_value={"next_offset": 4}) as progress,
         ):
             cases = (
@@ -388,7 +389,7 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(status, 409)
 
     def _create_v2_approval_run(self, run_id: str, *, stored_checks_sha256: str | None = None) -> Path:
-        run_dir = self.create_run(run_id, "awaiting_plan_approval")
+        run_dir = self.create_run(run_id, "running_approval")
         raw = "META PLAN v2\nSTATUS: READY\n"
         contract = "# v2 contract\n"
         (run_dir / "planner.raw.md").write_text(raw, encoding="utf-8")
@@ -494,7 +495,7 @@ class WebServerTests(unittest.TestCase):
             self.post_form("/runs/form-steps/approval", {**fields, **twelve, "step_profile__S13": "luna"}), 400
         )
 
-        page_dir = self.create_run("form-page", "awaiting_plan_approval")
+        page_dir = self.create_run("form-page", "running_approval")
         (page_dir / "iterations/01/plan/implementation_bundle.json").parent.mkdir(parents=True, exist_ok=True)
         (page_dir / "iterations/01/plan/implementation_bundle.json").write_text(
             json.dumps({"steps": [{"id": f"S{number:02d}"} for number in range(1, 13)]}),
@@ -587,7 +588,7 @@ class WebServerTests(unittest.TestCase):
         (run_dir / "state.json").write_text(json.dumps({"status": "waiting_external", "current_step": None}), encoding="utf-8")
         trace = run_dir / "trace/events.v1.jsonl"
         trace.parent.mkdir(parents=True)
-        trace.write_text(json.dumps({"sequence": 1, "timestamp": "2026-09-23T15:45:17Z", "event": "repair.waiting_external", "phase": "repair", "step_id": "S04", "data": {"reason": "LLM_FAILURE", "detail": "HTTP 503 after 3 attempts"}}) + "\n", encoding="utf-8")
+        trace.write_text(json.dumps({"sequence": 1, "timestamp": "2026-09-23T15:45:17Z", "event": "repair.waiting_external", "phase": "repair", "step_id": "S04", "data": {"reason": "LLM_TRANSPORT_EXHAUSTED", "detail": "HTTP 503 after 3 attempts"}}) + "\n", encoding="utf-8")
         payload = api.live_status(self.runs, "waiting-progress", self.config)
         self.assertTrue(any("HTTP 503" in event for event in payload["progress_events"]))
 
@@ -655,17 +656,18 @@ class WebServerTests(unittest.TestCase):
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assertEqual(status, 200)
         self.assert_run_shape(payload)
-        self.assertEqual(payload["status"], "implementing")
+        self.assertEqual(payload["status"], "running")
         self.assertEqual(payload["state"]["worktree"], "/tmp/wt live")
         status, polled, _ = self.request("GET", "/api/runs/live/live")
         self.assertEqual(status, 200)
         self.assert_poll_shape(polled)
-        self.assertEqual(polled["status"], "implementing")
+        self.assertEqual(polled["status"], "running")
+        self.assertEqual(polled["phase"], "implement_step")
 
         store.set_run_state(RunMachineState(RunPhase.DETERMINISTIC_GATE))
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assert_run_shape(payload)
-        self.assertEqual(payload["status"], "validating")
+        self.assertEqual(payload["status"], "running")
 
         # The audit authority answers the gate; the attempted audit is visible
         # as the reviewing status of the same gate phase.
@@ -677,7 +679,7 @@ class WebServerTests(unittest.TestCase):
         store.set_run_state(RunMachineState(RunPhase.AUDIT))
         status, payload, _ = self.request("GET", "/api/runs/live")
         self.assert_run_shape(payload)
-        self.assertEqual(payload["status"], "revising")
+        self.assertEqual(payload["status"], "running")
 
         store.set_run_state(
             RunMachineState(RunPhase.CANDIDATE_PUSH, RunDisposition.COMPLETED),
@@ -689,15 +691,77 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(payload["state"]["commit_sha"], "c" * 40)
         self.assertIsNone(payload["failure"])
 
-        failed = self.create_run("broken", "implementing")
+        failed = self.create_run("broken", "running_implementation")
         RunStateStore(failed / "state.json").record_failure("CHECK_FAILED", "unit")
         status, payload, _ = self.request("GET", "/api/runs/broken")
         self.assert_run_shape(payload)
         self.assertEqual(payload["status"], "failed")
         self.assertEqual(payload["state"]["failure"], {"reason": "CHECK_FAILED", "detail": "unit"})
 
+    def test_current_v4_projection_reads_the_recorded_disposition(self) -> None:
+        directory = self.create_run("v4-status", "running_implementation")
+        path = directory / "state.json"
+        state = json.loads(path.read_text())
+        state["status"] = "implementing"
+        path.write_text(json.dumps(state), encoding="utf-8")
+        before = path.read_bytes()
+        run = api.get_run(self.runs, "v4-status", config=self.config)
+        self.assertEqual(run["state"]["status"], "running")
+        self.assertEqual(run["state"]["phase"], "implement_step")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_diagnostics_keep_steps_and_the_iteration_contract(self) -> None:
+        directory = self.create_run("diagnostic-steps", "running_implementation")
+        plan_dir = directory / "iterations/01/plan"
+        step_dir = plan_dir / "steps/S01"
+        step_dir.mkdir(parents=True)
+        (step_dir / "contract.md").write_text("contract from iteration one", encoding="utf-8")
+        (plan_dir / "task_plan.json").write_text(json.dumps({
+            "steps": [{"id": "S01", "title": "visible step summary"}],
+        }), encoding="utf-8")
+        (directory / "cycles/001/implementation/steps/S01").mkdir(parents=True)
+        report = build_run_diagnostics(self.config, directory)
+        self.assertIn("visible step summary", report)
+        self.assertIn("contract from iteration one", report)
+        self.assertIn("iterations/01/plan/steps/S01/contract.md", report)
+
+    def test_live_approval_boundary_stops_polling_without_a_status_change(self) -> None:
+        self.create_run("approval-live", "running_planner")
+        planning = api.live_status(self.runs, "approval-live", self.config)
+        store = RunStateStore(self.runs / "approval-live" / "state.json")
+        store.set_run_state(RunMachineState(RunPhase.PLAN_APPROVAL))
+        approval = api.live_status(self.runs, "approval-live", self.config)
+        self.assertEqual(planning["status"], approval["status"])
+        self.assertEqual(approval["phase"], "plan_approval")
+        self.assertTrue(planning["running"])
+        self.assertFalse(approval["running"])
+
+    def test_pipeline_running_items_follow_the_phase(self) -> None:
+        run_dir = self.runs / "phase-projection"
+        run_dir.mkdir()
+        for phase, expected in (
+            ("implement_step", "waiting"),
+            ("deterministic_gate", "running"),
+            ("audit", "waiting"),
+            ("publish", "waiting"),
+        ):
+            with self.subTest(phase=phase):
+                state = {"status": "running", "phase": phase, "cycle": 1}
+                rows = {row["key"]: row for row in api.run_pipeline(run_dir, state, self.config)}
+                self.assertEqual(rows["c1-checks"]["state"], expected)
+                self.assertEqual(rows["publish"]["state"], "running" if phase == "publish" else "waiting")
+
+    def test_failed_approval_phase_does_not_offer_approval_controls(self) -> None:
+        run_dir = self._create_v2_approval_run("approval-failed")
+        store = RunStateStore(run_dir / "state.json")
+        store.set_run_state(RunMachineState(
+            RunPhase.PLAN_APPROVAL, RunDisposition.FAILED, "PLAN_REJECTED",
+        ))
+        page = self.get_html("/runs/approval-failed")
+        self.assertNotIn('action="/runs/approval-failed/approval"', page)
+
     def test_approval_controls_follow_status(self) -> None:
-        self.create_run("before", "planning")
+        self.create_run("before", "running_planner")
         page = self.get_html("/runs/before")
         self.assertNotIn('action="/runs/before/approval"', page)
         self.assertNotIn('http-equiv="refresh"', page)
@@ -729,13 +793,13 @@ class WebServerTests(unittest.TestCase):
         for suffix, state, resume, expected_state in (
             (
                 "waiting",
-                {"status": api.AWAITING_APPROVAL, "cycle": 1, "planner": {"decision": "READY"}},
+                {"status": "running", "phase": api.AWAITING_APPROVAL, "cycle": 1, "planner": {"decision": "READY"}},
                 None,
                 "running",
             ),
             (
                 "resumable",
-                {"status": "created", "cycle": 1, "planner": {"decision": "READY"}},
+                {"status": "running", "cycle": 1, "planner": {"decision": "READY"}},
                 {"resumable": True, "phase": "plan_approval", "iteration": 1},
                 "resumable",
             ),

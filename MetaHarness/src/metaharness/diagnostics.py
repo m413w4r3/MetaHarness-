@@ -18,6 +18,7 @@ from typing import Any, Iterable, Mapping
 from .agent.events import parse_event, summarize_step_event
 from .config import HarnessConfig
 from .profiles import profiles_for_config, safe_profile_metadata
+from .planning.artifacts import iteration_plan_dir
 from .redaction import config_secret_values, redact
 from .result import atomic_write_text
 from .resume import ResumeCheckpointError, read_checkpoint, resume_info
@@ -183,98 +184,6 @@ _MAX_TERMINAL_ERRORS = 8
 _MAX_TERMINAL_FIELD_CHARS = 500
 
 
-def _terminal_text(value: Any) -> str:
-    if not isinstance(value, str) or not value:
-        return "—"
-    return " ".join(value.split())[:_MAX_TERMINAL_FIELD_CHARS] or "—"
-
-
-def _agent_terminal_summary(
-    run_dir: Path, relative: str, secrets: tuple[str, ...]
-) -> str:
-    """Render only bounded terminal metadata from the durable result."""
-
-    item = _artifact(run_dir, relative)
-    payload: Mapping[str, Any] = {}
-    if item.exists:
-        text, _size, truncated = _read_bounded(item.path, MAX_ARTIFACT_BYTES, secrets)
-        try:
-            candidate = json.loads(text) if not truncated else None
-        except (TypeError, ValueError):
-            candidate = None
-        if isinstance(candidate, Mapping):
-            payload = candidate
-
-    is_error = payload.get("terminal_is_error")
-    is_error_text = str(is_error).lower() if isinstance(is_error, bool) else "—"
-    num_turns = payload.get("terminal_num_turns")
-    num_turns_text = str(num_turns) if isinstance(num_turns, int) and not isinstance(num_turns, bool) else "—"
-    raw_errors = payload.get("terminal_errors")
-    if isinstance(raw_errors, (list, tuple)):
-        errors = [
-            _terminal_text(error)
-            for error in raw_errors[:_MAX_TERMINAL_ERRORS]
-            if isinstance(error, str) and error
-        ]
-        errors_text = "; ".join(errors) if errors else "—"
-    else:
-        errors_text = "—"
-    summary = "\n".join([
-        "Terminal:",
-        f"  type: {_terminal_text(payload.get('terminal_type'))}",
-        f"  subtype: {_terminal_text(payload.get('terminal_subtype'))}",
-        f"  is_error: {is_error_text}",
-        f"  num_turns: {num_turns_text}",
-        f"  stop_reason: {_terminal_text(payload.get('terminal_stop_reason'))}",
-        f"  errors: {errors_text}",
-    ])
-    return _clean(summary, secrets)
-
-
-def _agent_result_artifact(
-    run_dir: Path, relative: str, secrets: tuple[str, ...]
-) -> str:
-    """Keep the bounded agent result visible without replaying untrusted fields."""
-
-    item = _artifact(run_dir, relative)
-    result = _artifact_header(item)
-    if not item.exists:
-        return result
-    text, _size, truncated = _read_bounded(item.path, MAX_ARTIFACT_BYTES, secrets)
-    try:
-        payload = json.loads(text) if not truncated else None
-    except (TypeError, ValueError):
-        payload = None
-    if not isinstance(payload, Mapping):
-        return result + "JSON (bounded):\n" + text + "\n"
-
-    safe = {
-        key: payload[key]
-        for key in (
-            "exit_code", "timed_out", "final_message", "usage", "stderr_tail",
-        )
-        if key in payload
-    }
-    for key in ("terminal_type", "terminal_subtype", "terminal_stop_reason"):
-        if key in payload:
-            safe[key] = _terminal_text(payload[key])
-    if isinstance(payload.get("terminal_is_error"), bool):
-        safe["terminal_is_error"] = payload["terminal_is_error"]
-    if (
-        isinstance(payload.get("terminal_num_turns"), int)
-        and not isinstance(payload.get("terminal_num_turns"), bool)
-    ):
-        safe["terminal_num_turns"] = payload["terminal_num_turns"]
-    errors = payload.get("terminal_errors")
-    if isinstance(errors, (list, tuple)):
-        safe["terminal_errors"] = [
-            _terminal_text(error)
-            for error in errors[:_MAX_TERMINAL_ERRORS]
-            if isinstance(error, str) and error
-        ]
-    return result + "JSON (safe subset):\n" + _clean(_json(safe), secrets)
-
-
 def _section(title: str, body: str) -> str:
     return f"## {title}\n\n{body.rstrip()}\n\n"
 
@@ -355,7 +264,7 @@ def _plan_summary(run_dir: Path, secrets: tuple[str, ...], relative: str) -> str
         for step in steps:
             if not isinstance(step, Mapping):
                 continue
-                safe["steps"].append({key: step.get(key) for key in ("id", "title", "execution_class", "depends_on", "read_set", "write_set", "create_set", "delete_set", "contract_sha256") if key in step})
+            safe["steps"].append({key: step.get(key) for key in ("id", "title", "execution_class", "depends_on", "read_set", "write_set", "create_set", "delete_set", "contract_sha256") if key in step})
     return _artifact_header(item) + "Structured summary:\n" + redact(_json(safe), secrets)
 
 
@@ -544,7 +453,7 @@ def _cycle(run_dir: Path, cycle: int, secrets: tuple[str, ...]) -> str:
     record = _safe_json_payload(cycle_dir(run_dir, cycle) / "cycle.json")
     kind = record.get("kind") if isinstance(record, Mapping) else None
     parts = [_section(f"CYCLE {cycle:03d}", f"kind: {kind or ('initial' if cycle == 1 else 'unknown')}")]
-    contracts = ""
+    contracts = iteration_plan_dir(run_dir, cycle).relative_to(run_dir).as_posix() + "/"
     parts.append(_section("Plan", "Approved plan: see PLANNER RESPONSE and PLAN / BUNDLE."))
     steps_root = implementation_steps_dir(run_dir, cycle)
     try:
@@ -766,8 +675,4 @@ def write_run_diagnostics(config: HarnessConfig, run_dir: str | Path) -> Path:
     return target
 
 
-__all__ = [
-    "DIAGNOSTICS_ERROR_NAME", "DIAGNOSTICS_NAME", "MAX_ARTIFACT_BYTES",
-    "MAX_PLANNER_REQUEST_BYTES", "MAX_REPORT_BYTES", "build_run_diagnostics",
-    "write_run_diagnostics",
-]
+__all__ = ['DIAGNOSTICS_ERROR_NAME', 'DIAGNOSTICS_NAME', 'MAX_ARTIFACT_BYTES', 'MAX_PLANNER_REQUEST_BYTES', 'MAX_REPORT_BYTES', 'build_run_diagnostics', 'write_run_diagnostics']

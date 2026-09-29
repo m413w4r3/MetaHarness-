@@ -188,7 +188,7 @@ class RunManager:
                 state = RunStateStore(directory / "state.json").load()
             except (OSError, OrchestrationError, TypeError, UnicodeError, ValueError):
                 continue
-            if state.get("status") != "awaiting_plan_approval":
+            if state.get("status") != "running" or state.get("phase") != "plan_approval":
                 continue
             if resume_info(directory, state).resumable:
                 self.resume_approved_run(run_id)

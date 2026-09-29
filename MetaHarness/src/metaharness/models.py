@@ -295,25 +295,13 @@ class RunStatus(StrEnum):
     run never stores one as a decision, and no service ever writes one.
     """
 
-    CREATED = "created"
-    PLANNING = "planning"
+    RUNNING = "running"
     WAITING_HUMAN = "waiting_human"
-    AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
     WAITING_EXTERNAL = "waiting_external"
-    PAUSED = "paused"
-    WAITING_REMOTE = "waiting_remote"
-    PLAN_REJECTED = "plan_rejected"
-    PREPARING = "preparing"
-    IMPLEMENTING = "implementing"
-    VALIDATING = "validating"
-    REVISING = "revising"
-    APPROVED = "approved"
-    PUBLISHING = "publishing"
-    PUBLISHED = "published"
     COMMITTED = "committed"
+    PUBLISHED = "published"
     PARTIAL = "partial"
     FAILED = "failed"
-    INTERRUPTED = "interrupted"
 
 
 class RunPhase(StrEnum):
@@ -621,6 +609,11 @@ def transition(current: RunMachineState, event: RunEvent) -> RunMachineState:
             raise RunTransitionError(
                 "a wait event requires the WAIT_EXTERNAL or WAIT_HUMAN disposition"
             )
+        if (
+            event.disposition is RunDisposition.WAIT_HUMAN
+            and event.reason != "SPEC_DECISION_REQUIRED"
+        ):
+            raise RunTransitionError("WAIT_HUMAN is reserved for SPEC_DECISION")
         return RunMachineState(current.phase, event.disposition, event.reason)
     if event.kind is RunEventKind.FAIL:
         return RunMachineState(current.phase, RunDisposition.FAILED, event.reason)
@@ -645,20 +638,6 @@ def transition(current: RunMachineState, event: RunEvent) -> RunMachineState:
 
 # -- the single derived projection -------------------------------------------
 
-# The status of a running phase.  It is the only place these strings
-# are chosen; every waiting or terminal status is derived below.
-_RUNNING_STATUS: Mapping[RunPhase, RunStatus] = {
-    RunPhase.CONTEXT: RunStatus.PLANNING,
-    RunPhase.PLANNER: RunStatus.PLANNING,
-    RunPhase.PLAN_APPROVAL: RunStatus.AWAITING_PLAN_APPROVAL,
-    RunPhase.WORKTREE_SETUP: RunStatus.PREPARING,
-    RunPhase.IMPLEMENT_STEP: RunStatus.IMPLEMENTING,
-    RunPhase.DETERMINISTIC_GATE: RunStatus.VALIDATING,
-    RunPhase.AUDIT: RunStatus.REVISING,
-    RunPhase.CANDIDATE_READY: RunStatus.APPROVED,
-    RunPhase.CANDIDATE_PUSH: RunStatus.APPROVED,
-    RunPhase.PUBLISH: RunStatus.PUBLISHING,
-}
 # The operation a completed run stopped at names its completion: only the
 # publication of the accepted candidate is a publication, every earlier
 # operation (the candidate push itself) stops at the committed candidate.
@@ -666,16 +645,6 @@ _COMPLETED_STATUS: Mapping[RunPhase, RunStatus] = {
     RunPhase.PUBLISH: RunStatus.PUBLISHED,
     RunPhase.PLANNER: RunStatus.PARTIAL,
 }
-# Failure reasons that name *what* an external wait waits for; the phase stays
-# the operation to retry, the reason carries the business meaning.  An
-# infrastructure reason is an ordinary external wait: a skipped check is a
-# durable warning, and only a check that declares itself blocking may stop the
-# run for an infrastructure it cannot reach.
-_REMOTE_REASONS = frozenset({
-    "PUSH_FAILED", "CANDIDATE_PUSH_FAILED", "CANDIDATE_REMOTE_UNAVAILABLE",
-    "REMOTE_UNAVAILABLE", "REMOTE_TEMPORARILY_UNAVAILABLE",
-})
-_REMOTE_PHASES = frozenset({RunPhase.CANDIDATE_PUSH, RunPhase.PUBLISH})
 @dataclass(frozen=True)
 class RunOutcome:
     """The derived status view of one durable run state."""
@@ -701,52 +670,42 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
         raise RunTransitionError("project_run_outcome expects a RunMachineState")
     phase, disposition, reason = state.phase, state.disposition, state.reason
     if disposition is RunDisposition.RUNNING:
-        status = _RUNNING_STATUS[phase] if phase is not None else RunStatus.CREATED
-        return RunOutcome(phase, disposition, status, False, False)
+        return RunOutcome(phase, disposition, RunStatus.RUNNING, False, False)
     if disposition is RunDisposition.COMPLETED:
         return RunOutcome(
             phase, disposition, _COMPLETED_STATUS.get(phase, RunStatus.COMMITTED), False, False,
         )
     if disposition is RunDisposition.FAILED:
-        # The failure reason decides whether a resume may still claim the run.
-        status = (
-            RunStatus.INTERRUPTED if reason == INTERRUPTED_REASON else RunStatus.FAILED
-        )
-        return RunOutcome(phase, disposition, status, False, True)
+        return RunOutcome(phase, disposition, RunStatus.FAILED, False, True)
     if disposition is RunDisposition.WAIT_EXTERNAL:
-        if reason == PAUSED_REASON:
-            return RunOutcome(phase, disposition, RunStatus.PAUSED, True, True)
-        if reason in _REMOTE_REASONS and phase in _REMOTE_PHASES:
-            status = RunStatus.WAITING_REMOTE
-        else:
-            status = RunStatus.WAITING_EXTERNAL
-        return RunOutcome(phase, disposition, status, True, True)
-    if reason == PLAN_REJECTED_REASON:
-        return RunOutcome(phase, disposition, RunStatus.PLAN_REJECTED, False, False)
+        return RunOutcome(phase, disposition, RunStatus.WAITING_EXTERNAL, True, True)
+    if reason != "SPEC_DECISION_REQUIRED":
+        raise RunTransitionError("WAIT_HUMAN is reserved for SPEC_DECISION")
     return RunOutcome(phase, disposition, RunStatus.WAITING_HUMAN, False, False)
 
-# The single status bridge: a durable status names exactly one disposition.
-# Nothing else maps a status onto a disposition.
-_STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
-    RunStatus.CREATED: RunDisposition.RUNNING,
-    RunStatus.PLANNING: RunDisposition.RUNNING,
-    RunStatus.WAITING_HUMAN: RunDisposition.WAIT_HUMAN,
-    RunStatus.AWAITING_PLAN_APPROVAL: RunDisposition.RUNNING,
-    RunStatus.WAITING_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
-    RunStatus.PAUSED: RunDisposition.WAIT_EXTERNAL,
-    RunStatus.WAITING_REMOTE: RunDisposition.WAIT_EXTERNAL,
-    RunStatus.PLAN_REJECTED: RunDisposition.WAIT_HUMAN,
-    RunStatus.PREPARING: RunDisposition.RUNNING,
-    RunStatus.IMPLEMENTING: RunDisposition.RUNNING,
-    RunStatus.VALIDATING: RunDisposition.RUNNING,
-    RunStatus.REVISING: RunDisposition.RUNNING,
-    RunStatus.APPROVED: RunDisposition.RUNNING,
-    RunStatus.PUBLISHING: RunDisposition.RUNNING,
-    RunStatus.PUBLISHED: RunDisposition.COMPLETED,
-    RunStatus.COMMITTED: RunDisposition.COMPLETED,
-    RunStatus.PARTIAL: RunDisposition.COMPLETED,
-    RunStatus.FAILED: RunDisposition.FAILED,
-    RunStatus.INTERRUPTED: RunDisposition.FAILED,
+# One read-only bridge for status spellings written by earlier v4 runs.
+# Runtime code only projects the seven RunStatus members above.
+_STATUS_DISPOSITIONS: Mapping[str, RunDisposition] = {
+    RunStatus.RUNNING.value: RunDisposition.RUNNING,
+    RunStatus.WAITING_HUMAN.value: RunDisposition.WAIT_HUMAN,
+    RunStatus.WAITING_EXTERNAL.value: RunDisposition.WAIT_EXTERNAL,
+    RunStatus.PUBLISHED.value: RunDisposition.COMPLETED,
+    RunStatus.COMMITTED.value: RunDisposition.COMPLETED,
+    RunStatus.PARTIAL.value: RunDisposition.COMPLETED,
+    RunStatus.FAILED.value: RunDisposition.FAILED,
+    "created": RunDisposition.RUNNING,
+    "planning": RunDisposition.RUNNING,
+    "awaiting_plan_approval": RunDisposition.RUNNING,
+    "preparing": RunDisposition.RUNNING,
+    "implementing": RunDisposition.RUNNING,
+    "validating": RunDisposition.RUNNING,
+    "revising": RunDisposition.RUNNING,
+    "approved": RunDisposition.RUNNING,
+    "publishing": RunDisposition.RUNNING,
+    "paused": RunDisposition.WAIT_EXTERNAL,
+    "waiting_remote": RunDisposition.WAIT_EXTERNAL,
+    "plan_rejected": RunDisposition.FAILED,
+    "interrupted": RunDisposition.FAILED,
 }
 
 
@@ -758,8 +717,11 @@ def disposition_for_status(status: RunStatus | str) -> RunDisposition:
     """
 
     try:
-        return _STATUS_DISPOSITIONS[RunStatus(status)]
-    except (TypeError, ValueError) as exc:
+        value = status.value if isinstance(status, RunStatus) else status
+        if not isinstance(value, str):
+            raise KeyError(value)
+        return _STATUS_DISPOSITIONS[value.casefold()]
+    except (KeyError, TypeError, ValueError) as exc:
         raise RunTransitionError(f"run status {status!r} is unknown") from exc
 
 
@@ -849,23 +811,6 @@ class RepositoryConfig:
     web_url: str | None = None
 
 
-@dataclass(frozen=True)
-class WorkstreamRef:
-    """Stable references that identify one MetaHarness workstream.
-
-    This is deliberately smaller than the durable Git state.  It is useful at
-    integration boundaries (for example GitHub) without becoming a second
-    state representation.
-    """
-
-    run_id: str
-    base_ref: str
-    base_sha: str
-    local_branch: str
-    worktree: str
-    remote_branch: str | None = None
-    issue_number: int | None = None
-    pull_request_number: int | None = None
 
 
 @dataclass(frozen=True)

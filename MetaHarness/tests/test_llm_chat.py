@@ -1,4 +1,3 @@
-import base64
 import email.message
 import io
 import json
@@ -21,7 +20,6 @@ from metaharness.llm.chat import (  # noqa: E402
     LLMProtocolError,
     LLMTransportExhaustedError,
     OpenAIChatTextClient,
-    TextFileAttachment,
 )
 from metaharness.models import LLMEndpointConfig  # noqa: E402
 
@@ -500,87 +498,7 @@ class TransportHorizonTests(unittest.TestCase):
         self.assertLess(first, second)
 
 
-class FileFallbackTests(unittest.TestCase):
-    EVIDENCE = TextFileAttachment(
-        filename="repair-evidence.md",
-        text="EVIDENCE_SENTINEL",
-    )
-
-    def call(self, harness, **kwargs):
-        with (
-            mock.patch("time.monotonic", harness.clock.monotonic),
-            mock.patch("time.sleep", harness.clock.sleep),
-        ):
-            return harness.client().complete_with_file_fallback(
-                "INLINE_SENTINEL",
-                fallback_prompt="FALLBACK_CONTROL",
-                attachments=(self.EVIDENCE,),
-                **kwargs,
-            )
-
-    def test_the_inline_payload_is_tried_first_and_the_file_after_the_delay(self):
-        harness = HorizonHarness(
-            [
-                (502, {}, {"error": "bad gateway"}),
-                (502, {}, {"error": "bad gateway"}),
-                (200, {}, completion("repaired")),
-            ],
-            max_wait_seconds=120,
-        )
-
-        result = self.call(harness, fallback_after_seconds=5)
-
-        self.assertEqual(result.text, "repaired")
-        contents = [
-            request["payload"]["messages"][0]["content"]
-            for request in harness.opener.requests
-        ]
-        self.assertEqual(contents[:2], ["INLINE_SENTINEL", "INLINE_SENTINEL"])
-        attachment = contents[2]
-        self.assertIsInstance(attachment, list)
-        self.assertEqual(attachment[0], {"type": "text", "text": "FALLBACK_CONTROL"})
-        self.assertEqual(attachment[1]["type"], "input_file")
-        self.assertEqual(attachment[1]["file"]["filename"], "repair-evidence.md")
-        prefix, encoded = attachment[1]["file"]["file_data"].split(",", 1)
-        self.assertEqual(prefix, "data:text/markdown;base64")
-        self.assertEqual(base64.b64decode(encoded).decode("utf-8"), "EVIDENCE_SENTINEL")
-        # The evidence travels only as a file, never as inline control text.
-        self.assertNotIn("EVIDENCE_SENTINEL", attachment[0]["text"])
-
-    def test_a_retry_inside_the_delay_never_attaches_a_file(self):
-        harness = HorizonHarness([
-            (502, {}, {"error": "bad gateway"}),
-            (200, {}, completion()),
-        ])
-
-        self.call(harness, fallback_after_seconds=3600)
-
-        self.assertEqual(len(harness.opener.requests), 2)
-        for request in harness.opener.requests:
-            self.assertEqual(_payload_content(request), "INLINE_SENTINEL")
-        self.assertNotIn("input_file", json.dumps(harness.opener.requests))
-
-    def test_a_non_retryable_status_never_attaches_a_file(self):
-        harness = HorizonHarness([(401, {}, {"error": "unauthorized"})])
-
-        with self.assertRaises(LLMHTTPError):
-            self.call(harness)
-
-        self.assertEqual(len(harness.opener.requests), 1)
-        self.assertEqual(_payload_content(harness.opener.requests[0]), "INLINE_SENTINEL")
-        self.assertNotIn("input_file", json.dumps(harness.opener.requests))
-
-    def test_a_failed_completion_still_exhausts_the_same_horizon(self):
-        harness = HorizonHarness(
-            [(502, {}, {"error": "bad gateway"})], max_wait_seconds=5,
-        )
-
-        with self.assertRaises(LLMTransportExhaustedError):
-            self.call(harness)
-
-        self.assertGreaterEqual(len(harness.opener.requests), 1)
-        self.assertNotIn("input_file", json.dumps(harness.opener.requests))
-
+class InlineRequestTests(unittest.TestCase):
     def test_standard_complete_is_unchanged_by_the_file_fallback_feature(self):
         harness = HorizonHarness(
             [(502, {}, {"error": "bad gateway"})], max_wait_seconds=5,
@@ -603,27 +521,6 @@ class FileFallbackTests(unittest.TestCase):
                 },
             )
 
-    def test_the_fallback_delay_must_be_a_non_negative_number(self):
-        for value in (-1, "later", True):
-            with self.subTest(value=value):
-                with self.assertRaises(ValueError):
-                    HorizonHarness([(200, {}, completion())]).client(
-                    ).complete_with_file_fallback(
-                        "inline",
-                        fallback_prompt="control",
-                        attachments=(self.EVIDENCE,),
-                        fallback_after_seconds=value,
-                    )
-
-    def test_attachment_validation_rejects_unsafe_values(self):
-        for filename in ("", "a/b.md", "a\\b.md", "a\x00b", "x" * 129):
-            with self.subTest(filename=filename):
-                with self.assertRaises(ValueError):
-                    TextFileAttachment(filename=filename, text="x")
-        with self.assertRaises(ValueError):
-            TextFileAttachment(filename="a.md", text="x", media_type="not a type")
-        with self.assertRaises(TypeError):
-            TextFileAttachment(filename="a.md", text=None)
 
 
 if __name__ == "__main__":

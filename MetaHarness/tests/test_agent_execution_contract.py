@@ -1,4 +1,3 @@
-import json
 import subprocess
 import tempfile
 import unittest
@@ -6,27 +5,9 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from metaharness.agent import (
-    AGENT_PROTOCOL_FAILED,
-    AGENT_RUNTIME_FAILED,
-    AGENT_SCOPE_VIOLATION,
-    AGENT_START_FAILED,
-    AgentError,
-    AgentExecutor,
-    AgentProtocolError,
-    AgentRunRequest,
-    AgentRunResult,
-    AgentScopeError,
-    ClaudeCodeExecutor,
-    CodexExecutor,
-    ExecutorRuntimeConfig,
-    executor_for_profile,
-)
+from metaharness.agent import AGENT_RUNTIME_FAILED, AGENT_SCOPE_VIOLATION, AgentError, AgentExecutor, AgentProtocolError, AgentRunRequest, AgentScopeError, ClaudeCodeExecutor, CodexExecutor, ExecutorRuntimeConfig, executor_for_profile
 from metaharness.agent.base import AgentResult
 from metaharness.models import ExecutionRole, ModelProfile, ProfileDriver, SelectionMode
-from metaharness.orchestrator import Orchestrator, ResumeError
-from metaharness.resume import pipeline_version_from_state
-from metaharness.state import RunStateStore
 
 
 def git(root: Path, *args: str) -> str:
@@ -135,8 +116,8 @@ class AgentExecutionContractTests(unittest.TestCase):
         runtime = ExecutorRuntimeConfig(environment={}, codex_home=self.root / "codex-home")
         selected = profile(ProfileDriver.CODEX, ExecutionRole.IMPLEMENTER)
         cases = (
-            (AgentError("start"), AGENT_START_FAILED),
-            (AgentProtocolError("protocol"), AGENT_PROTOCOL_FAILED),
+            (AgentError("start"), AGENT_RUNTIME_FAILED),
+            (AgentProtocolError("protocol"), AGENT_RUNTIME_FAILED),
             (AgentScopeError("scope"), AGENT_SCOPE_VIOLATION),
             (OSError("runtime"), AGENT_RUNTIME_FAILED),
         )

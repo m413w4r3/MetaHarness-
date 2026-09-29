@@ -29,7 +29,7 @@ from .step_ids import MAX_STEPS, STEP_ID_RE, step_ids
 class ExecutionSelectionError(ValueError):
     """The execution selection is absent, invalid, or no longer matches config."""
 
-    code = "EXECUTION_SELECTION_INVALID"
+    code = "PLAN_APPROVAL_INVALID"
 
 
 class ExecutionSelectionConflict(ExecutionSelectionError):

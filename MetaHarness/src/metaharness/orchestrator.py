@@ -173,8 +173,7 @@ class Orchestrator:
         store: RunStateStore | None = None
         try:
             run_dir.mkdir(parents=True, exist_ok=False)
-            # The SPEC copy is created before state initialization, as the
-            # CREATED phase contract requires both to exist together.
+            # Copy the SPEC before initializing the durable run state.
             (run_dir / "spec.md").write_text(spec_content, encoding="utf-8")
             options_sha256 = write_run_options(run_dir, run_options)
             store = RunStateStore(run_dir / "state.json")
@@ -200,11 +199,9 @@ class Orchestrator:
             )
             if on_created is not None:
                 on_created(run_dir)
-            # The first durable boundary, declared once creation is announced:
-            # the run is CREATED until it exists, then CONTEXT owns the phase
-            # it will resume.  It intentionally carries no Git/plan identity
-            # yet, since context and repository discovery are themselves
-            # resumable operations.
+            # The first durable boundary declares CONTEXT as the operation to
+            # resume. It carries no Git/plan identity yet because context and
+            # repository discovery are themselves resumable operations.
             write_checkpoint(run_dir, ResumeCheckpoint(phase=ResumePhase.CONTEXT))
             return self._runtime.observability.diagnose_result(
                 self._execute(store, run_dir, selected_run_id, spec_content)

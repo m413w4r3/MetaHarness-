@@ -30,7 +30,7 @@ from .planning.normalization import (
 from .result import atomic_write_text
 from .usage import PLANNER_ATTEMPTS_DIR
 
-PLAN_REPOSITORY_PRECONDITION_INVALID = "PLAN_REPOSITORY_PRECONDITION_INVALID"
+PLANNER_OUTPUT_INVALID = "PLANNER_OUTPUT_INVALID"
 PRECONDITION_ARTIFACT = "repository_preconditions.json"
 MAX_PREVIOUS_PLAN_CHARS = 64 * 1024
 MAX_BLOCKERS_CHARS = 4 * 1024
@@ -57,7 +57,7 @@ _SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".jks")
 class PlanRepositoryPreconditionError(ValueError):
     """A plan's change sets are impossible against its start tree."""
 
-    code = PLAN_REPOSITORY_PRECONDITION_INVALID
+    code = PLANNER_OUTPUT_INVALID
 
     def __init__(self, violations: Sequence["PathPreconditionViolation"]):
         self.violations = tuple(violations)
@@ -191,7 +191,7 @@ def violations_payload(
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
-        "reason": PLAN_REPOSITORY_PRECONDITION_INVALID,
+        "reason": PLANNER_OUTPUT_INVALID,
         "start_tree_sha": start_tree_sha,
         "violations": [
             {"step_id": item.step_id, "kind": item.kind, "path": item.path}
@@ -273,7 +273,7 @@ def archive_rejected_planner_attempt(
 __all__ = [
     "MAX_PREVIOUS_PLAN_CHARS",
     "PLANNER_ATTEMPTS_DIR",
-    "PLAN_REPOSITORY_PRECONDITION_INVALID",
+    "PLANNER_OUTPUT_INVALID",
     "PRECONDITION_ARTIFACT",
     "PathPreconditionViolation",
     "PlanRepositoryPreconditionError",
