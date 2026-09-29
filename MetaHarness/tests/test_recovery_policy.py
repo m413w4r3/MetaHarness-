@@ -10,7 +10,11 @@ from pathlib import Path
 
 import metaharness
 from metaharness.models import RunDisposition, RunStatus
-from metaharness.orchestration.recovery import RecoveryCoordinator, project_exit
+from metaharness.orchestration.recovery import (
+    RecoveryCoordinator,
+    project_exit,
+    terminal_state_for,
+)
 from metaharness.recovery_policy import (
     FAILURE_CLASSES,
     RECOVERY_LADDERS,
@@ -75,6 +79,7 @@ def literal_failure_codes(source: Path = _SOURCE) -> dict[str, str]:
 class FailureClassificationTests(unittest.TestCase):
     def test_unknown_codes_do_not_inherit_a_namespace_policy(self) -> None:
         for code in (
+            "unknown",
             "RESUME_TEMPORARY_FAILURE", "ROLLBACK_RETRY_PENDING",
             "STAGED_BLOB_RETRY_PENDING", "WORKER_SECURITY_FAILURE",
             "CUSTOM_OUTSIDE_AUTHORITY", "CUSTOM_AUTHORITY_MISMATCH",
@@ -149,10 +154,14 @@ class FailureClassificationTests(unittest.TestCase):
         ))
         for code in ("AUDIT_REMAINING", "WAITING_REPAIR_EXHAUSTED", "TOTALLY_NEW"):
             with self.subTest(code=code):
-                decision, terminal = project_exit(code, phase=ResumePhase.IMPLEMENT_STEP)
+                decision = classify_failure(code, exhausted=True)
                 self.assertIs(decision.strategy, RecoveryStrategy.MARK_FAILED_CONTINUE)
-                self.assertIs(terminal.disposition, RunDisposition.WAIT_EXTERNAL)
-                self.assertTrue(terminal.resumable)
+                with self.assertRaisesRegex(ValueError, "not a terminal run disposition"):
+                    terminal_state_for(
+                        decision, failure_code=code, phase=ResumePhase.IMPLEMENT_STEP,
+                    )
+                with self.assertRaisesRegex(ValueError, "not a terminal run disposition"):
+                    project_exit(code, phase=ResumePhase.IMPLEMENT_STEP)
 
     def test_transient_ladder_ends_wait_external(self) -> None:
         self.assertEqual(recovery_ladder(FailureClass.TRANSIENT), (
@@ -163,10 +172,15 @@ class FailureClassificationTests(unittest.TestCase):
             with self.subTest(code=code):
                 decision, terminal = project_exit(code, phase=ResumePhase.AUDIT)
                 self.assertIs(decision.strategy, RecoveryStrategy.WAIT_EXTERNAL)
+                self.assertIs(terminal.disposition, RunDisposition.WAIT_EXTERNAL)
                 self.assertTrue(terminal.resumable)
-        _decision, terminal = project_exit("SPEC_DECISION_REQUIRED", phase=ResumePhase.PLANNER)
+        decision, terminal = project_exit("SPEC_DECISION_REQUIRED", phase=ResumePhase.PLANNER)
+        self.assertIs(decision.strategy, RecoveryStrategy.WAIT_HUMAN)
+        self.assertIs(terminal.disposition, RunDisposition.WAIT_HUMAN)
         self.assertIs(terminal.status, RunStatus.WAITING_HUMAN)
-        _decision, terminal = project_exit("COMMIT_SECURITY_FAILURE:secret_in_diff", phase=ResumePhase.DETERMINISTIC_GATE)
+        decision, terminal = project_exit("COMMIT_SECURITY_FAILURE:secret_in_diff", phase=ResumePhase.DETERMINISTIC_GATE)
+        self.assertIs(decision.strategy, RecoveryStrategy.HARD_STOP)
+        self.assertIs(terminal.disposition, RunDisposition.FAILED)
         self.assertIs(terminal.status, RunStatus.FAILED)
 
     def test_all_literal_pipeline_failure_codes_are_explicitly_classified(self) -> None:
@@ -264,6 +278,12 @@ class UnclassifiedObservabilityTests(unittest.TestCase):
                 "agent-step:001:S01", reason="AGENT_TIMEOUT", budget=2,
                 phase="implementation", cycle=1, step_id="S01",
             )
+            coordinator.trace(
+                "recovery.exhausted", reason="SOME_FUTURE_FAILURE",
+                decision=classify_failure("SOME_FUTURE_FAILURE", exhausted=True),
+                attempt=3, tree_before=None, tree_after=None, budget_remaining=0,
+                phase="implementation", step_id="S01",
+            )
 
         # The unknown code still walks the ordinary ladder.
         self.assertTrue(admission.admitted)
@@ -274,6 +294,8 @@ class UnclassifiedObservabilityTests(unittest.TestCase):
             {(item["data"]["code"], item["once"]) for item in unclassified},
             {("SOME_FUTURE_FAILURE", True)},
         )
+        exhausted = [kwargs for event, kwargs in events if event == "recovery.exhausted"]
+        self.assertEqual(exhausted[-1]["data"]["terminal_status"], None)
 
 
 if __name__ == "__main__":

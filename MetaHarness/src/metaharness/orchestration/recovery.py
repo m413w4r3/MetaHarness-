@@ -94,21 +94,23 @@ def failure_code(reason: str) -> str:
     return reason.split(":", 1)[0].strip().upper()
 
 
-# The only postures the last step of a ladder may leave behind.  A ``FIXABLE``
-# failure that escaped every loop has no step left to settle: the run stays
-# resumable instead of waiting for a human.
+# The only terminal run postures in a recovery ladder.  MARK_FAILED_CONTINUE
+# is consumed by its phase owner and is never a run disposition.
 _TERMINAL_RUN_DISPOSITIONS = {
     RecoveryStrategy.HARD_STOP: RunDisposition.FAILED,
     RecoveryStrategy.WAIT_HUMAN: RunDisposition.WAIT_HUMAN,
     RecoveryStrategy.WAIT_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
-    RecoveryStrategy.MARK_FAILED_CONTINUE: RunDisposition.WAIT_EXTERNAL,
 }
 
 
 def terminal_state_for(
     decision: RecoveryDecision, *, failure_code: str, phase: RunPhase,
 ) -> RecoveryTerminalState:
-    """Project the last ladder step of one decision onto a durable run status."""
+    """Project a terminal ladder step onto a durable run status.
+
+    MARK_FAILED_CONTINUE belongs to phase-local unit handling and cannot be
+    represented as a terminal run posture.
+    """
 
     if not isinstance(failure_code, str) or not failure_code.strip():
         raise TypeError("terminal failure_code must be a non-empty reason-code string")
@@ -116,7 +118,9 @@ def terminal_state_for(
         raise TypeError("terminal projection requires a recovery decision")
     disposition = _TERMINAL_RUN_DISPOSITIONS.get(decision.strategy)
     if disposition is None:
-        raise ValueError(f"recovery strategy {decision.strategy.value} is not a ladder end")
+        raise ValueError(
+            f"recovery strategy {decision.strategy.value} is not a terminal run disposition"
+        )
     code = failure_code.split(":", 1)[0].upper()
     event = (
         RunEvent.fail(reason=code)
@@ -137,8 +141,8 @@ def project_exit(
 ) -> tuple[RecoveryDecision, RecoveryTerminalState]:
     """Project a failure that left its recovery loop onto a durable status.
 
-    Every automatic recovery is consumed inside its own loop, so a failure
-    reaching this boundary lands on the last step of its class ladder.
+    Terminal strategies are projected here. MARK_FAILED_CONTINUE must already
+    have been consumed by a phase-local continuable unit before this boundary.
     """
 
     if not isinstance(reason, str) or not reason.strip():
@@ -447,7 +451,11 @@ class RecoveryCoordinator:
             data["recovered"] = recovered
         if event == "recovery.exhausted":
             checkpoint_phase = checkpoint_phase or _TRACE_CHECKPOINT.get(phase)
-            if terminal_status is None and checkpoint_phase is not None:
+            if (
+                terminal_status is None
+                and checkpoint_phase is not None
+                and decision.strategy in _TERMINAL_RUN_DISPOSITIONS
+            ):
                 try:
                     terminal_status = terminal_state_for(
                         decision, failure_code=reason, phase=checkpoint_phase,

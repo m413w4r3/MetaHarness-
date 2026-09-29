@@ -18,8 +18,13 @@ from metaharness.models import (
     project_run_outcome,
     transition,
 )
-from metaharness.orchestration.recovery import project_exit
-from metaharness.recovery_policy import AutonomyBudget, RecoveryStrategy, stable_code
+from metaharness.orchestration.recovery import project_exit, terminal_state_for
+from metaharness.recovery_policy import (
+    AutonomyBudget,
+    RecoveryStrategy,
+    classify_failure,
+    stable_code,
+)
 from tests.test_recovery_policy import literal_failure_codes
 
 
@@ -151,18 +156,21 @@ class C11StructureTests(unittest.TestCase):
                 RunEvent.wait(RunDisposition.WAIT_HUMAN, reason="CHECK_INFRASTRUCTURE_UNAVAILABLE"),
             )
 
-    def test_external_wait_resumes_and_fixable_does_not_hard_stop(self) -> None:
+    def test_external_wait_resumes_and_fixable_has_no_run_terminal_projection(self) -> None:
         waiting = RunMachineState(
             RunPhase.IMPLEMENT_STEP, RunDisposition.WAIT_EXTERNAL, "AGENT_TIMEOUT",
         )
         self.assertTrue(project_run_outcome(waiting).resumable)
         self.assertEqual(transition(waiting, RunEvent.resume()).disposition, RunDisposition.RUNNING)
-        _decision, terminal = project_exit("AGENT_CONTRACT_MISMATCH", phase=RunPhase.IMPLEMENT_STEP)
-        self.assertIsNot(terminal.disposition, RunDisposition.FAILED)
-        self.assertEqual(terminal.status, RunStatus.WAITING_EXTERNAL)
-        self.assertEqual(
-            _decision.strategy, RecoveryStrategy.MARK_FAILED_CONTINUE,
-        )
+        decision = classify_failure("AGENT_CONTRACT_MISMATCH", exhausted=True)
+        self.assertIs(decision.strategy, RecoveryStrategy.MARK_FAILED_CONTINUE)
+        with self.assertRaisesRegex(ValueError, "not a terminal run disposition"):
+            terminal_state_for(
+                decision, failure_code="AGENT_CONTRACT_MISMATCH",
+                phase=RunPhase.IMPLEMENT_STEP,
+            )
+        with self.assertRaisesRegex(ValueError, "not a terminal run disposition"):
+            project_exit("AGENT_CONTRACT_MISMATCH", phase=RunPhase.IMPLEMENT_STEP)
 
     def test_partial_is_autonomous_and_terminal(self) -> None:
         outcome = project_run_outcome(
