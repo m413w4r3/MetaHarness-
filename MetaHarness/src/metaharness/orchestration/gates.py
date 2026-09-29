@@ -34,6 +34,7 @@ from ..state import RunStateStore
 from ..validation import (
     ValidationError,
     bounded_tail,
+    check_result_json,
     config_with_check_authority,
     run_checks,
 )
@@ -45,24 +46,34 @@ from .pipeline_v2 import (
     gate_dir,
 )
 from .shared import (
-    _CHECK_ATTEMPT_ARTIFACTS,
-    _archive_attempt,
-    _check_payload,
-    _json_text,
-    _safe_candidate_tree,
+    archive_attempt,
     gate_mutable_authority,
     is_object_id,
     json_text,
     load_evidence,
     read_json_artifact,
+    safe_candidate_tree,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
     from .runtime import RunRuntime
 
 
-if TYPE_CHECKING:  # pragma: no cover - the service is the composition root
-    from .gates import GateService
+_CHECK_ATTEMPT_ARTIFACTS = (
+    "checks.json", "changed-files.txt", "diff.patch", "evidence.json", "checks",
+)
+
+
+def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
+    """Project one accepted check bundle into its durable JSON shape."""
+
+    payload: list[dict[str, Any]] = []
+    for check in bundle.checks:
+        item = dict(check) if isinstance(check, Mapping) else check_result_json(check)
+        if bundle.required_check_ids:
+            item["required"] = item.get("name") in bundle.required_check_ids
+        payload.append(item)
+    return payload
 
 
 _FEEDBACK_EXCERPT_BYTES = 2000
@@ -290,7 +301,7 @@ class GateService:
             cycle=cycle_plan.cycle.number, stage=stage.value, worktree=ctx.info.worktree,
         )
 
-        _archive_attempt(directory, names=_CHECK_ATTEMPT_ARTIFACTS)
+        archive_attempt(directory, names=_CHECK_ATTEMPT_ARTIFACTS)
         store.update_metadata(current_step=None)
         evidence, baseline_payload = self._final_evidence(
             ctx.info.worktree, ctx.base_sha, directory, run_dir=ctx.run_dir,
@@ -408,7 +419,7 @@ class GateService:
                 return stored, {}
         checks_started_at = self.runtime.observability.trace_time()
         checks_started_mono = time.perf_counter()
-        checks_tree_before = _safe_candidate_tree(worktree)
+        checks_tree_before = safe_candidate_tree(worktree)
         self.runtime.observability.trace_emit(
             "checks.started",
             phase="validation",
@@ -483,7 +494,7 @@ class GateService:
                     "stage": stage.value if stage is not None else None,
                     "passed": False,
                     "failures": [type(exc).__name__],
-                    "tree_sha": _safe_candidate_tree(worktree),
+                    "tree_sha": safe_candidate_tree(worktree),
                     "wall_time_ms": round((time.perf_counter() - checks_started_mono) * 1000),
                 },
             )
@@ -517,7 +528,7 @@ class GateService:
             "checks": verdicts,
             "warnings": list(evidence.warnings),
         }
-        atomic_write_text(evidence_dir / "baseline.json", _json_text(payload))
+        atomic_write_text(evidence_dir / "baseline.json", json_text(payload))
         return evidence, payload
 
 

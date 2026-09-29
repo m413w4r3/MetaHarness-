@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from ..commit_gate import CommitSafetyError, assert_deferred_verifications_resolved
 from ..evidence import EvidenceBundle
+from ..attempt_transaction import status_has_unstaged_or_untracked
 from ..gitops import (
     BaseMovedError,
     BasePushError,
@@ -49,10 +50,9 @@ from .recovery import project_exit
 from .shared import (
     CandidatePushError,
     CommitBoundaryError,
-    _is_object_id,
-    _json_text,
-    _read_json_artifact,
-    _status_has_unstaged_or_untracked,
+    is_object_id,
+    json_text,
+    read_json_artifact,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - the composition root is the runtime
@@ -198,7 +198,7 @@ class PublicationService:
             )
         accepted_candidate_sha = state.get("candidate_commit_sha")
         if (
-            not _is_object_id(accepted_candidate_sha)
+            not is_object_id(accepted_candidate_sha)
             or accepted_candidate_sha != commit_sha
         ):
             raise GitHubWorkstreamError(
@@ -330,7 +330,7 @@ class PublicationService:
         candidate = evidence.staged_tree_sha
         if index_tree_sha(worktree) != candidate or candidate_tree_sha(worktree) != candidate:
             raise CommitBoundaryError("candidate tree changed before candidate commit")
-        if _status_has_unstaged_or_untracked(status_porcelain(worktree)):
+        if status_has_unstaged_or_untracked(status_porcelain(worktree)):
             raise CommitBoundaryError("worktree has changes before candidate commit")
         return candidate
     def push_candidate(
@@ -432,7 +432,7 @@ class PublicationService:
             **publish_payload,
             "run_branch_cleanup": cleanup,
         }
-        atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
+        atomic_write_text(run_dir / "publish.json", json_text(publish_payload))
         return store.update_metadata(publish=publish_payload)
     def _complete_candidate_publication(
         self,
@@ -616,7 +616,7 @@ class PublicationService:
             commit_sha=commit_sha,
             cycle=cycle,
         )
-        atomic_write_text(run_dir / "publish.json", _json_text(publish_payload))
+        atomic_write_text(run_dir / "publish.json", json_text(publish_payload))
         metadata_fields = {"remote_branch": info.branch} if self.runtime.config.github.enabled else {}
         state = store.set_run_state(
             RunMachineState(disposition=RunDisposition.COMPLETED),
@@ -690,7 +690,7 @@ def accepted_chain_records(run_dir: Path) -> tuple[dict[str, Any], ...]:
     chain_path = run_dir / "accepted-chain.json"
     if not chain_path.is_file():
         return ()
-    chain = _read_json_artifact(chain_path)
+    chain = read_json_artifact(chain_path)
     if isinstance(chain, dict):
         chain = chain.get("commits")
     if not isinstance(chain, list) or not all(
@@ -747,7 +747,7 @@ class CandidateLifecycle:
             gate_stage=stage.value,
             no_change=no_change,
         )
-        atomic_write_text(_candidate_commit_path(ctx.run_dir, number), _json_text(payload))
+        atomic_write_text(_candidate_commit_path(ctx.run_dir, number), json_text(payload))
         candidate_state = dict(store.load().get("candidate") or {})
         candidate_state[f"{number:03d}"] = payload
         store.update_metadata(
@@ -761,7 +761,7 @@ class CandidateLifecycle:
     ) -> dict[str, Any]:
         if candidate.get("no_change") is True:
             skipped = {**candidate, "remote_sha": None, "pushed_at": None, "remote_status": "not_required"}
-            atomic_write_text(_candidate_commit_path(ctx.run_dir, number), _json_text(skipped))
+            atomic_write_text(_candidate_commit_path(ctx.run_dir, number), json_text(skipped))
             candidates = dict(store.load().get("candidate") or {})
             candidates[f"{number:03d}"] = skipped
             store.update_metadata(candidate=candidates)
@@ -821,7 +821,7 @@ class CandidateRemoteStaging:
         store = self._store
         previous_candidate_sha = None
         if cycle > 1:
-            previous = _read_json_artifact(_candidate_commit_path(run_dir, cycle - 1))
+            previous = read_json_artifact(_candidate_commit_path(run_dir, cycle - 1))
             if isinstance(previous, dict):
                 previous_candidate_sha = previous.get("commit_sha")
         key = self._recovery.budget_key("candidate-push", f"{cycle:03d}")
@@ -873,7 +873,7 @@ class CandidateRemoteStaging:
             "pushed_at": candidate.get("pushed_at") or datetime.now(timezone.utc).isoformat(),
             "remote_status": "available",
         }
-        atomic_write_text(_candidate_commit_path(run_dir, cycle), _json_text(candidate))
+        atomic_write_text(_candidate_commit_path(run_dir, cycle), json_text(candidate))
         candidate_state = dict(store.load().get("candidate") or {})
         candidate_state[f"{cycle:03d}"] = candidate
         store.update_metadata(
@@ -908,7 +908,7 @@ class CandidateRemoteStaging:
             "pushed_at": None,
             "remote_status": "unavailable",
         }
-        atomic_write_text(_candidate_commit_path(run_dir, cycle), _json_text(unavailable))
+        atomic_write_text(_candidate_commit_path(run_dir, cycle), json_text(unavailable))
         state = self._store.load()
         candidate_state = dict(state.get("candidate") or {})
         candidate_state[f"{cycle:03d}"] = unavailable

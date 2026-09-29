@@ -49,10 +49,10 @@ from .pipeline_v2 import BudgetExhausted, PipelineFailure
 from .shared import (
     OrchestrationError,
     StepExecutionFailure,
-    _archive_attempt,
-    _archive_attempt_tree,
-    _safe_candidate_tree,
-    _safe_status,
+    archive_attempt,
+    archive_attempt_tree,
+    safe_candidate_tree,
+    safe_status,
 )
 
 
@@ -539,13 +539,13 @@ class WorkerRecovery:
         if before is None:
             refuse(
                 "RESUME_REQUIRES_OPERATOR", "pre-attempt tree identity is unavailable",
-                failure.tree_after or _safe_candidate_tree(worktree),
+                failure.tree_after or safe_candidate_tree(worktree),
             )
             return None
         if failure.tree_after is None:
             refuse("RESUME_REQUIRES_OPERATOR", "post-attempt tree identity is unavailable", None)
             return None
-        if _safe_status(worktree) is None:
+        if safe_status(worktree) is None:
             refuse("RESUME_REQUIRES_OPERATOR", "post-attempt status is unreadable", failure.tree_after)
             return None
         if failure.status_before is None:
@@ -560,7 +560,7 @@ class WorkerRecovery:
                 set((*step.write_set, *step.create_set, *step.delete_set)),
             )
         except AttemptViolation as violation:
-            refuse(violation.code, violation.detail, _safe_candidate_tree(worktree))
+            refuse(violation.code, violation.detail, safe_candidate_tree(worktree))
             return None
 
         failure.tree_after = before
@@ -582,7 +582,7 @@ class WorkerRecovery:
             failure.step_dir = artifact_dir
             return None
         self._store.update_metadata(current_step=step.id)
-        _archive_attempt(artifact_dir)
+        archive_attempt(artifact_dir)
         return admission
 
 
@@ -656,7 +656,7 @@ class CheckInfrastructureRecovery:
                     f"CHECK_INFRASTRUCTURE_UNAVAILABLE: {error.code}; "
                     "workspace setup attempts exhausted"
                 ) from error
-            _archive_attempt_tree(run_dir / "setup")
+            archive_attempt_tree(run_dir / "setup")
             pending = admission
 
     def run_preflights(
@@ -753,7 +753,7 @@ class GateInfraRetries:
         self._owner._guard()
         recovery = self._owner._recovery
         reason = "CHECK_INFRASTRUCTURE_UNAVAILABLE" if failure_kind == "timeout" else "CHECK_INFRASTRUCTURE_UNAVAILABLE"
-        tree = _safe_candidate_tree(self._worktree)
+        tree = safe_candidate_tree(self._worktree)
         admission = recovery.admit(
             recovery.budget_key("check-infra", f"{self._cycle:03d}", self._stage, check_id),
             reason=f"{reason}:{check_id}", budget=self._owner._attempts,

@@ -200,3 +200,122 @@ AUTONOMY BUDGET HAS EXACTLY 5 FIELDS ; ORCHESTRATION ≤ 14 MODULES.
 WAIT_HUMAN ONLY FOR SPEC_DECISION ; NO LEGACY REPAIR PIPELINE REINTRODUCED.
 NO NEW AUTONOMY MECHANISM ADDED.
 **SRC ≤ 32000 LINES : NON. C11 STRUCTURAL BUDGETS CLOSED : NON.**
+
+## P3 deletion-first orchestration pass (2026-09-29)
+
+### Metrics
+
+| METRIC | BEFORE (HEAD) | AFTER | LIMIT |
+| --- | ---: | ---: | ---: |
+| src/metaharness physical Python lines | 34,631 | 34,545 | ≤ 32,000 |
+| Direct orchestration modules, excluding __init__.py | 13 | 13 | ≤ 14 |
+| RunPhase | 10 | 10 | ≤ 10 |
+| RunStatus | 7 | 7 | ≤ 10 |
+| Durable failure/reason codes | 39 | 39 | ≤ 40 |
+| AutonomyBudget fields | 5 | 5 | exactly 5 |
+
+The source budget remains open by 2,545 lines. The focused C11 test measured
+the current tree and fails only test_source_line_budget. The full-suite run
+preceded a final comment/self-import cleanup and measured 34,549 lines.
+
+### Orchestration survey
+
+There were no direct orchestration modules at or below 100 lines. The single
+runtime-caller modules were audit, run_composition, run_failure,
+step_execution, and worker_attempt; each owns a distinct service, so none
+is a wrapper to delete. Caller counts were unchanged by this pass:
+
+| Module | Callers |
+| --- | ---: |
+| audit | 1 |
+| gates | 4 |
+| pipeline_v2 | 11 |
+| publication | 4 |
+| recovery | 4 |
+| run_bootstrap | 2 |
+| run_composition | 1 |
+| run_failure | 1 |
+| run_resume | 2 |
+| runtime | 9 |
+| shared | 12 |
+| step_execution | 1 |
+| worker_attempt | 1 |
+
+The internal dependency graph is unchanged except for removal of self-imports
+from gates and runtime: audit → pipeline_v2, publication, runtime, shared;
+gates → pipeline_v2, runtime, shared; pipeline_v2 → —;
+publication → pipeline_v2, recovery, runtime, shared;
+recovery → pipeline_v2, shared; run_bootstrap → gates, pipeline_v2, runtime,
+shared; run_composition → gates, pipeline_v2, publication, run_bootstrap,
+runtime, shared; run_failure → pipeline_v2, recovery, run_resume, runtime,
+shared; run_resume → shared; runtime → audit, gates, pipeline_v2, publication,
+recovery, run_bootstrap, run_composition, run_failure, shared, step_execution,
+worker_attempt; shared → pipeline_v2; step_execution → gates, pipeline_v2,
+publication, recovery, runtime, shared; worker_attempt → runtime, shared.
+
+Production orchestration private imports from siblings fell from 13 to 0.
+Two test-only private probes remain (audit._evidence_payload and
+cli._auto_resume) for direct protocol assertions.
+
+### Deleted, merged, and retained
+
+- Deleted modules: none in this pass. There were no remaining wrapper modules
+  under the direct orchestration package.
+- Merged modules: no additional file merges were justified. HEAD already has
+  audit_prompt/audit_protocol → audit;
+  check_failure/gate_acceptance/per_step_gate → gates;
+  candidate → publication; check_recovery/worker_recovery → recovery;
+  run_observability → runtime; and step_authority/step_acceptance →
+  step_execution.
+- Deleted helpers: unused read_tree_file, create_file_once,
+  _PLANNER_ATTEMPT_ARTIFACTS, the unused agent-report limit alias, and
+  redundant private aliases/self-imports.
+- Moved helper: check result projection and its attempt artifact list now live
+  in gates; publication imports the worktree status predicate directly from
+  attempt_transaction.
+- Shared helpers: sibling consumers use public spellings for JSON, attempt
+  archival, tree, and Git identity helpers. shared retains helpers with
+  multiple orchestration consumers.
+- Kept modules: audit (writable bounded protocol and repairs), gates (frozen
+  check authority and regression-only blocking), pipeline_v2 (milestone
+  lifecycle), publication (candidate and remote boundary), recovery
+  (classification and bounded retries), run_bootstrap (initial setup),
+  run_composition (continuation wiring), run_failure (settlement), run_resume
+  (Git-first checkpoint recovery), runtime (composition and observability),
+  shared (multi-consumer primitives), step_execution (scope, acceptance and
+  commit), and worker_attempt (one executor attempt).
+
+The required legacy-path search found no runtime contract/check repair or
+reviser pipeline, old plan-recovery service, RecoveryBudgets, or retired retry
+knobs. STEP_ACCEPTANCE remains only as an artifact name, not a phase. Current
+resume integrity checks and the guard rejecting a root-level legacy
+execution-selection artifact remain active authority checks.
+
+### Checks and final confirmations
+
+- Targeted runner: 206 tests across 15 modules; 10 modules passed and 5
+  exposed the already documented project_exit/MARK_FAILED_CONTINUE
+  exception-projection defect. test_config, architecture boundaries,
+  recovery policy, lifecycle/publication, audit, gate baseline, planner
+  normalization, generic pipeline, and worker recovery passed.
+- Final structural/architecture selection: 36 tests; 35 passed, with only the
+  source LOC budget failing.
+- Full suite, .venv/bin/python scripts/test_parallel.py -j 4: 913 tests in
+  70 modules; 1 failure, 155 errors, 3 skipped; 71.10 seconds. Forty errors
+  were the known exception-projection defect; 115 were local-socket
+  PermissionError failures under the sandbox.
+- compileall, import smoke check, and git diff --check: passed.
+
+SRC <= 32000 LINES: NO (34,545). ORCHESTRATION <= 14 MODULES: YES (13).
+RUNPHASE <= 10: YES (10). RUNSTATUS <= 10: YES (7).
+DURABLE FAILURE CODES <= 40: YES (39).
+AUTONOMY BUDGET HAS EXACTLY 5 FIELDS: YES.
+AUTOWORK MAX_STEPS_PER_PLAN = 21: YES.
+AUTOWORK REQUIRE_PLAN_APPROVAL = FALSE: YES.
+WAIT_HUMAN ONLY FOR SPEC_DECISION: YES. FATAL ONLY HARD-STOPS: YES.
+FIXABLE EXHAUSTION CONTINUES AUTONOMOUSLY: YES.
+TRANSIENT EXHAUSTION WAITS EXTERNALLY AND IS RESUMABLE: YES.
+NO LEGACY REPAIR PIPELINE REINTRODUCED: YES.
+NO NEW AUTONOMY MECHANISM ADDED: YES.
+C11 STRUCTURAL BUDGETS CLOSED: NO; the physical source-line limit remains
+the sole unmet structural budget.

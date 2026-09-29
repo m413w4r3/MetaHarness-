@@ -33,6 +33,20 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "metaharness"
 
 
+def source_python_loc(source: Path = SRC) -> int:
+    return sum(
+        len(path.read_text(encoding="utf-8").splitlines())
+        for path in source.rglob("*.py")
+    )
+
+
+def orchestration_modules(source: Path = SRC) -> list[Path]:
+    return [
+        path for path in (source / "orchestration").glob("*.py")
+        if path.name != "__init__.py"
+    ]
+
+
 def produced_failure_codes(source: Path = SRC) -> set[str]:
     """Canonical durable vocabulary from error, state and evidence producers.
 
@@ -109,6 +123,14 @@ class C11StructureTests(unittest.TestCase):
             config = tomllib.load(stream)
         self.assertEqual(config["planning"]["max_steps_per_plan"], 21)
         self.assertFalse(config["approval"]["require_plan_approval"])
+        self.assertEqual(config["gate"]["per_step"], ["lint", "typecheck", "test-collection"])
+        self.assertEqual(config["budget"], {
+            "step_attempts": 3,
+            "audit_repairs": 2,
+            "max_iterations": 8,
+            "max_wall_clock_hours": 12,
+            "max_cost": 0,
+        })
         self.assertEqual(config["planning"]["single_step_max_mutable_paths"], 6)
         self.assertEqual(config["planning"]["staged_step_max_mutable_paths"], 12)
         self.assertEqual(config["planning"]["max_read_paths_per_step"], 18)
@@ -120,9 +142,13 @@ class C11StructureTests(unittest.TestCase):
             "max_wall_clock_hours", "max_cost",
         ))
         self.assertEqual(len(fields(AutonomyBudget)), 5)
-        self.assertLessEqual(len(RunPhase), 10)
-        self.assertLessEqual(len(RunStatus), 10)
-        self.assertLessEqual(len(list((SRC / "orchestration").glob("*.py"))), 14)
+        self.assertLessEqual(len(RunPhase), 10, f"RunPhase has {len(RunPhase)} members")
+        self.assertLessEqual(len(RunStatus), 10, f"RunStatus has {len(RunStatus)} members")
+        modules = orchestration_modules()
+        self.assertLessEqual(
+            len(modules), 14,
+            f"orchestration has {len(modules)} direct Python modules",
+        )
 
     def test_durable_failure_code_budget(self) -> None:
         codes = produced_failure_codes()
@@ -151,9 +177,10 @@ class C11StructureTests(unittest.TestCase):
             self.assertNotIn("AGENT_AUTH_FAILURE", codes)
 
     def test_source_line_budget(self) -> None:
+        loc = source_python_loc()
         self.assertLessEqual(
-            sum(len(path.read_text(encoding="utf-8").splitlines()) for path in SRC.rglob("*.py")),
-            32_000,
+            loc, 32_000,
+            f"src/metaharness contains {loc} physical Python lines",
         )
 
     def test_wait_human_is_exclusive_to_spec_decision(self) -> None:

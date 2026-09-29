@@ -13,17 +13,11 @@ import inspect
 import json
 import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ..agent.diagnostics import TOKEN_DIAGNOSTICS_NAME
-from ..attempt_transaction import (
-    GitOwnership,
-    git_ownership,
-    ownership_violations,
-    status_has_unstaged_or_untracked,
-)
+from ..attempt_transaction import GitOwnership
 from ..evidence import EvidenceBundle
 from ..gitops import (
     GitError,
@@ -37,7 +31,6 @@ from ..models import CycleKind, GateStage, RunCycle
 from ..result import ResultArtifactError, atomic_write_text
 from ..resume import ResumeIntegrityError
 from ..usage import normalize_usage
-from ..validation import check_result_json
 from .pipeline_v2 import cycle_record_path, step_dir
 
 
@@ -62,7 +55,7 @@ class CycleArtifactService:
         if cycle.number != ctx.iteration or cycle.kind is not CycleKind.INITIAL:
             raise ResumeIntegrityError("cycle number does not match the current iteration")
         path = cycle_record_path(ctx.run_dir, cycle)
-        record = _json_text({
+        record = json_text({
             "schema_version": 1,
             "number": cycle.number,
             "kind": cycle.kind.value,
@@ -105,13 +98,10 @@ class CycleArtifactService:
         self.cycle_update(store, cycle, status="running")
 
 
-_MAX_AGENT_REPORT_BYTES = 32_000
-
-
 _MAX_STEP_REPORT_BYTES = 2_048
 
 
-_AGENT_ARTIFACTS = (
+AGENT_ARTIFACTS = (
     "prompt.diagnostics.json",
     "agent.events.jsonl",
     "agent.stderr.log",
@@ -133,7 +123,7 @@ def bounded_v2_report(text: str) -> str:
     return head + marker.decode()
 
 
-def _json_text(value: Any) -> str:
+def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
@@ -177,11 +167,7 @@ def chat_client(
     return constructor(endpoint, **kwargs)
 
 
-_git_ownership = git_ownership
-_ownership_violations = ownership_violations
-
-
-def _git_ownership_payload(ownership: GitOwnership) -> dict[str, Any]:
+def git_ownership_payload(ownership: GitOwnership) -> dict[str, Any]:
     return {
         "head_ref": ownership.head_ref,
         "head": ownership.head,
@@ -266,16 +252,7 @@ _ATTEMPT_ARTIFACTS = (
 )
 
 
-_PLANNER_ATTEMPT_ARTIFACTS = (
-    "planner.request.txt", "planner.repair.request.txt", "prompt.diagnostics.json", "prompt.diagnostics.repair.json", "planner.raw.md", "task_plan.json",
-    "implementation_bundle.json", "planner.usage.json",
-)
-
-
-_CHECK_ATTEMPT_ARTIFACTS = ("checks.json", "changed-files.txt", "diff.patch", "evidence.json", "checks")
-
-
-_PLANNER_CONVERSATION = "planner.conversation.json"
+PLANNER_CONVERSATION = "planner.conversation.json"
 
 
 class CandidatePushError(OrchestrationError):
@@ -284,7 +261,7 @@ class CandidatePushError(OrchestrationError):
     code = "PUSH_FAILED"
 
 
-def _read_json_artifact(path: Path, limit: int = 16 * 1024 * 1024) -> Any:
+def read_json_artifact(path: Path, limit: int = 16 * 1024 * 1024) -> Any:
     try:
         if path.stat().st_size > limit:
             return None
@@ -301,49 +278,37 @@ def _read_bounded_text(path: Path, limit: int = 64 * 1024) -> str:
         return ""
 
 
-def _read_tree_file(path: Path) -> str | None:
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return None
-    return value if _GIT_OBJECT_ID.fullmatch(value) else None
-
-
 def is_object_id(value: Any) -> bool:
     """Whether `value` names one Git object; the siblings' public spelling."""
 
     return isinstance(value, str) and _GIT_OBJECT_ID.fullmatch(value) is not None
 
 
-# The refoundation's frozen importers still reach for the private spelling.
-_is_object_id = is_object_id
-
-
-def _safe_candidate_tree(worktree: Path) -> str | None:
+def safe_candidate_tree(worktree: Path) -> str | None:
     try:
         return candidate_tree_sha(worktree)
     except GitError:
         return None
 
 
-def _safe_index_tree(worktree: Path) -> str | None:
+def safe_index_tree(worktree: Path) -> str | None:
     try:
         return index_tree_sha(worktree)
     except GitError:
         return None
 
 
-def _safe_status(worktree: Path) -> tuple[str, ...] | None:
+def safe_status(worktree: Path) -> tuple[str, ...] | None:
     try:
         return status_porcelain(worktree)
     except GitError:
         return None
 
 
-def _record_failure_tree(artifact_dir: Path, worktree: Path) -> None:
+def record_failure_tree(artifact_dir: Path, worktree: Path) -> None:
     """Record the tree a failed attempt left, so a resume can recognize it."""
 
-    tree = _safe_candidate_tree(worktree)
+    tree = safe_candidate_tree(worktree)
     if tree is None:
         return
     try:
@@ -352,7 +317,7 @@ def _record_failure_tree(artifact_dir: Path, worktree: Path) -> None:
         pass
 
 
-def _archive_attempt(directory: Path, *, names: tuple[str, ...] = _ATTEMPT_ARTIFACTS) -> Path | None:
+def archive_attempt(directory: Path, *, names: tuple[str, ...] = _ATTEMPT_ARTIFACTS) -> Path | None:
     """Move a failed attempt's artifacts aside before retrying that operation."""
 
     present = [name for name in names if (directory / name).exists()]
@@ -376,7 +341,7 @@ def _archive_attempt_target(directory: Path) -> Path:
     return target
 
 
-def _archive_attempt_tree(directory: Path) -> None:
+def archive_attempt_tree(directory: Path) -> None:
     """Archive every file of a retryable operation, including dynamic logs."""
 
     if not directory.is_dir():
@@ -399,40 +364,6 @@ def _archive_attempt_tree(directory: Path) -> None:
         os.replace(source, destination)
 
 
-def _create_file_once(path: Path, data: bytes) -> None:
-    """Atomically create *path* with *data*; never replace an existing file.
-
-    Raises :class:`FileExistsError` when *path* already exists.
-    """
-
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary, path)
-    finally:
-        os.unlink(temporary)
-    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
-def _check_payload(bundle: EvidenceBundle) -> list[dict[str, Any]]:
-    # A bundle rebuilt from ``evidence.json`` on resume carries the persisted
-    # bounded payloads instead of CheckResult objects.
-    payload: list[dict[str, Any]] = []
-    for check in bundle.checks:
-        item = dict(check) if isinstance(check, Mapping) else check_result_json(check)
-        if bundle.required_check_ids:
-            item["required"] = item.get("name") in bundle.required_check_ids
-        payload.append(item)
-    return payload
-
-
 @dataclasses.dataclass(frozen=True)
 class GateMutableAuthority:
     """The one durable mutation authority of a gate episode."""
@@ -443,31 +374,6 @@ class GateMutableAuthority:
     source: str
     sha256: str
     initial_paths: tuple[str, ...] = ()
-
-
-_status_has_unstaged_or_untracked = status_has_unstaged_or_untracked
-
-
-# The public spelling of the toolbox the run authorities import: the sibling
-# services keep reading the private names above, while `run_bootstrap`, the
-# composition root, the durable readers, the resume gate, the failure
-# projection, the observability stream, the runtime kernel and the step
-# services reach the same objects through their public names.
-AGENT_ARTIFACTS = _AGENT_ARTIFACTS
-MAX_AGENT_REPORT_BYTES = _MAX_AGENT_REPORT_BYTES
-PLANNER_CONVERSATION = _PLANNER_CONVERSATION
-json_text = _json_text
-git_ownership_payload = _git_ownership_payload
-read_bounded_text = _read_bounded_text
-read_json_artifact = _read_json_artifact
-create_file_once = _create_file_once
-read_tree_file = _read_tree_file
-safe_candidate_tree = _safe_candidate_tree
-archive_attempt = _archive_attempt
-archive_attempt_target = _archive_attempt_target
-archive_attempt_tree = _archive_attempt_tree
-record_failure_tree = _record_failure_tree
-safe_index_tree = _safe_index_tree
 
 
 def load_evidence(directory: Path) -> EvidenceBundle | None:
@@ -545,7 +451,7 @@ def load_completed_step(step_dir: Path, step_id: str) -> dict[str, Any] | None:
         **({"no_change": True} if no_change else {}),
         **({"out_of_scope_paths": sorted(set(extra))} if extra else {}),
         "usage": normalize_usage(record.get("usage")),
-        "final": bounded_v2_report(read_bounded_text(step_dir / "agent.final.md")),
+        "final": bounded_v2_report(_read_bounded_text(step_dir / "agent.final.md")),
         **({"deferred_verify": bounded_v2_report(str(record["deferred_verify"]))}
            if isinstance(record.get("deferred_verify"), str) and record["deferred_verify"].strip()
            else {}),

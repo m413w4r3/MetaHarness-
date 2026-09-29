@@ -5,8 +5,7 @@ config and run options, the secrets used for redaction, the trace stream, the
 recovery services, the execution selection and the durable checkpoints.  It
 composes the four run authorities -- bootstrap, composition, failure and
 observability -- and keeps the run-level entries that span them: the recovery
-coordinators, the cycle-record merge, the checkpoint boundary and the operator
-plan recovery.
+coordinators, the cycle-record merge and the checkpoint boundary.
 
 ``metaharness.orchestrator`` is the façade that constructs this runtime and
 hands it to the coordinator; no module of this package imports the façade.
@@ -276,9 +275,6 @@ class RunRuntime:
             plan_sha256=plan_sha256 or previous.plan_sha256,
         ))
 
-
-if TYPE_CHECKING:
-    from .runtime import RunRuntime
 
 _OUTPUT_DISCIPLINE_TARGETS = {
     ExecutionRole.PLANNER: "META PLAN v2 only",

@@ -12,6 +12,7 @@ import dataclasses, json, time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Mapping, NoReturn, TYPE_CHECKING
+from ..attempt_transaction import GitOwnership, git_ownership
 from ..approval import (
     ApprovalDecision, ApprovalError, PlanIdentity,
     compute_plan_identity_from_run,
@@ -70,8 +71,8 @@ from .shared import read_repository_reference
 from .pipeline_v2 import BudgetExhausted
 from .gates import per_step_check_ids
 from .shared import (
-    GitOwnership, OrchestrationError, PLANNER_CONVERSATION, archive_attempt_tree,
-    git_ownership, git_ownership_payload, is_object_id, json_text,
+    OrchestrationError, PLANNER_CONVERSATION, archive_attempt_tree,
+    git_ownership_payload, is_object_id, json_text,
     read_json_artifact,
 )
 
