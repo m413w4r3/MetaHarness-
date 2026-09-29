@@ -418,8 +418,8 @@ class PublicationService:
 
         The publication state is deliberately written by the caller before
         this method is entered. If interruption
-        happens while cleaning up, the already-published state must not be
-        downgraded to INTERRUPTED by the outer run boundary.
+        happens while cleaning up, the outer run boundary must not rewrite the
+        already-published state as a failed interruption.
         """
 
         try:

@@ -38,11 +38,12 @@ preamble/postamble are not sent to that agent.
 4. Render `implementation_contract.md` from the parsed READY plan and persist
    the SHA-256 identity of the exact `planner.raw.md` and
    `implementation_contract.md` bytes.
-5. If enabled, set `AWAITING_PLAN_APPROVAL` and wait for one approval artifact.
-   `APPROVE` allows the run to continue; `REJECT` ends it as
-   `PLAN_REJECTED`. This gate is before worktree creation, so rejection creates
-   no worktree, agent execution, or commit. A decision cannot approve another
-   plan because both hashes must match the state identity.
+5. If enabled, keep disposition `RUNNING` at phase `plan_approval` while
+   waiting for one approval artifact. `APPROVE` allows the run to continue;
+   `REJECT` ends it with reason `PLAN_REJECTED`. This gate is before worktree
+   creation, so rejection creates no worktree, agent execution, or commit. A
+   decision cannot approve another plan because both hashes must match the
+   state identity.
 6. Create one worktree at the resolved base SHA and give the selected
    implementation profile the canonical contract only. Each accepted step is
    committed by the harness after its gate; a failed attempt keeps durable

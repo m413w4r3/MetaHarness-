@@ -14,7 +14,7 @@
   var POLL_MS = 2000;
   var STOP_STATUSES = {
     committed: true, published: true, partial: true, failed: true,
-    interrupted: true, waiting_human: true, waiting_external: true,
+    waiting_human: true, waiting_external: true,
   };
   var WAITING_LABELS = {
     waiting_external: "Waiting for external authorization",
@@ -110,7 +110,7 @@
     });
     var badge = byId("live-status");
     if (badge) {
-      badge.classList.toggle("failed", status === "failed" || status === "interrupted");
+      badge.classList.toggle("failed", status === "failed");
       badge.classList.toggle("success", status === "published" || status === "committed");
     }
     var failure = byId("live-failure");

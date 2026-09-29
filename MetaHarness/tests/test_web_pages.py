@@ -275,7 +275,7 @@ class P19WebTests(unittest.TestCase):
         self.assertEqual(payload["approval"], {"recorded": False, "decision": None})
 
     def test_refresh_rules(self) -> None:
-        for status in ("created", "running"):
+        for status in ("running",):
             self.assertEqual(refresh_seconds_for_run({"status": status}), 2)
         self.assertIsNone(refresh_seconds_for_run({"status": "running", "phase": "plan_approval", "approval": {"recorded": False}}))
         self.assertEqual(refresh_seconds_for_run({"status": "running", "phase": "plan_approval", "approval": {"recorded": True}}), 1)

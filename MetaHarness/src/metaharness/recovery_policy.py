@@ -1,10 +1,11 @@
 """Deterministic classification of pipeline failures and recovery budgets.
 
-One stable failure code maps to exactly one :class:`FailureClass` through the
-single table :data:`FAILURE_CLASSES`; a code the table does not name is an
-ordinary ``FIXABLE`` failure, never a stop.  Every class owns one ordered
-ladder (:data:`RECOVERY_LADDERS`).  ``HARD_STOP`` is reachable only from the
-closed ``FATAL`` allowlist and ``WAIT_HUMAN`` only from ``SPEC_DECISION``.
+One canonical stable failure code maps to exactly one :class:`FailureClass`
+through the single table :data:`FAILURE_CLASSES`; input aliases resolve before
+classification, while an unknown code is an ordinary ``FIXABLE`` failure.
+Every class owns one ordered ladder (:data:`RECOVERY_LADDERS`).  ``HARD_STOP``
+is reachable only from the closed ``FATAL`` allowlist and ``WAIT_HUMAN`` only
+from ``SPEC_DECISION``.
 """
 
 from __future__ import annotations
@@ -78,7 +79,6 @@ FAILURE_CLASSES: Mapping[str, FailureClass] = {
     'LLM_*': _T,
     'AGENT_RUNTIME_FAILED': _T,
     'AGENT_TIMEOUT': _T,
-    'AGENT_AUTH_FAILURE': _T,
     'EXTERNAL_AUTH_REQUIRED': _T,
     'PUSH_FAILED': _T,
     'GITHUB_WORKSTREAM_FAILURE': _T,
@@ -274,6 +274,23 @@ def stable_code(failure: object) -> str:
     return failure.strip().split(":", 1)[0].strip().upper()
 
 
+# Provider spellings accepted at input boundaries. Durable records use the
+# canonical code on the right and never emit these aliases as failure reasons.
+_FAILURE_CODE_ALIASES: Mapping[str, str] = {
+    "AGENT_AUTH_FAILURE": "EXTERNAL_AUTH_REQUIRED",
+    "LLM_401": "EXTERNAL_AUTH_REQUIRED",
+    "LLM_403": "EXTERNAL_AUTH_REQUIRED",
+    "LLM_AUTH_FAILURE": "EXTERNAL_AUTH_REQUIRED",
+}
+
+
+def canonical_failure_code(failure: object) -> str:
+    """Resolve one accepted input alias to its durable stable code."""
+
+    code = stable_code(failure)
+    return _FAILURE_CODE_ALIASES.get(code, code)
+
+
 def _lookup(code: str) -> FailureClass | None:
     known = FAILURE_CLASSES.get(code)
     if known is not None:
@@ -301,7 +318,7 @@ def classify_failure(failure: str, *, exhausted: bool = False) -> RecoveryDecisi
     caller's loop is ``exhausted``.  Pure: it never emits or logs anything.
     """
 
-    known = _lookup(stable_code(failure))
+    known = _lookup(canonical_failure_code(failure))
     failure_class = known or FailureClass.FIXABLE
     ladder = RECOVERY_LADDERS[failure_class]
     return RecoveryDecision(
@@ -312,7 +329,8 @@ def classify_failure(failure: str, *, exhausted: bool = False) -> RecoveryDecisi
 
 __all__ = [
     "AutonomyBudget", "ExecutionFallbacks", "FAILURE_CLASSES", "FailureClass",
-    "RECOVERY_LADDERS", "RecoveryDecision", "RecoveryStrategy", "classify_failure",
+    "RECOVERY_LADDERS", "RecoveryDecision", "RecoveryStrategy", "canonical_failure_code",
+    "classify_failure",
     "elapsed_hours", "recovery_ladder", "stable_code", "unsupported_cost_cap",
     "wall_clock_exhausted",
 ]

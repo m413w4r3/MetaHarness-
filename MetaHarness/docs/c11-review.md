@@ -8,17 +8,111 @@ Le garde de structure reste strict et échoue sur ce seul budget.
 
 | Autorité runtime | BEFORE | AFTER | Cible |
 | --- | ---: | ---: | ---: |
-| Lignes Python physiques sous `src/metaharness` | 36 371 | 34 582 | ≤ 32 000 — échec |
+| Lignes Python physiques sous `src/metaharness` | 36 371 | 34 631 | ≤ 32 000 — échec |
 | Modules directs `orchestration`, `__init__.py` inclus | 26 | 14 | ≤ 14 |
 | RunPhase | 10 | 10 | ≤ 10 |
-| RunStatus | 19 | 9 | ≤ 10 |
-| Codes détectés chez les producteurs, raisons PARTIAL incluses | 80 | 40 | ≤ 40 |
+| RunStatus | 19 | 7 | ≤ 10 |
+| Reasons canoniques détectés chez les producteurs, PARTIAL inclus | 80 | 39 | ≤ 40 |
 | Champs AutonomyBudget | 5 | 5 | exactement 5 |
+
+## P2 — réduction de taxonomie (2026-09-29)
+
+| Mesure P2 | Avant | Après | Cible |
+| --- | ---: | ---: | ---: |
+| RunStatus | 9 | 7 | ≤ 10 |
+| RunPhase | 10 | 10 | ≤ 10 |
+| Reasons durables canoniques | 40 | 39 | ≤ 40 |
+| Champs AutonomyBudget | 5 | 5 | exactement 5 |
+
+RUNSTATUS BEFORE : `CREATED, RUNNING, WAITING_HUMAN, WAITING_EXTERNAL,
+COMMITTED, PUBLISHED, PARTIAL, FAILED, INTERRUPTED`.
+RUNSTATUS AFTER : `RUNNING, WAITING_HUMAN, WAITING_EXTERNAL, COMMITTED,
+PUBLISHED, PARTIAL, FAILED`.
+
+Les usages runtime avant la réduction étaient dans `models.py` (projection et
+bridge), `state.py` (initialisation et persistance), `result.py` (résultat),
+`resume.py` (table phase/statut), `orchestration/runtime.py` (trace et
+diagnostics), `cli.py` (sortie 130), et `web/api.py`, `web/pages.py` et
+`web/static/run.js` (contrôle, présentation et polling). Les tests couvraient
+`test_state`, `test_step_authority`, `test_recovery_policy`, les suites
+`pipeline`/`autonomy`, `test_web_api` et `test_web_pages`. `CREATED` dérivait
+de `phase=None` sous RUNNING ; `INTERRUPTED` de FAILED + reason INTERRUPTED.
+Les statuts `COMMITTED`, `PUBLISHED` et `PARTIAL` restent les résultats
+terminaux publics distincts. PLAN_REJECTED reste reason sous FAILED.
+
+Inventaire des tests qui lisaient chaque membre avant P2 : `CREATED` —
+`test_state.py`; `RUNNING` — `test_state.py`; `WAITING_HUMAN` —
+`test_c11_structure.py`, `test_state.py`, `test_recovery_policy.py`,
+`pipeline/test_multi_iteration.py`, `pipeline/test_autonomy_contract.py`,
+`pipeline/test_budget.py`, `pipeline/test_worker_recovery.py`,
+`pipeline/test_per_step_gate.py`, `autonomy/test_resume_external.py`,
+`autonomy/test_recovery_default.py`, `autonomy/support.py`;
+`WAITING_EXTERNAL` — `test_state.py`, `test_plan_repository_validation.py`,
+`pipeline/test_resume.py`, `pipeline/test_multi_iteration.py`,
+`pipeline/test_budget.py`, `pipeline/test_worker_recovery.py`,
+`pipeline/test_remote.py`, `pipeline/test_per_step_gate.py`,
+`autonomy/test_resume_external.py`, `autonomy/test_transport.py`;
+`COMMITTED` — `test_state.py`, `autonomy/test_resume_external.py`,
+`autonomy/support.py`; `PUBLISHED` — `test_state.py`,
+`test_step_authority.py`, `test_plan_repository_validation.py`,
+`pipeline/test_lifecycle.py`, `pipeline/test_resume.py`,
+`pipeline/test_multi_iteration.py`, `pipeline/test_autonomy_contract.py`,
+`pipeline/test_budget.py`, `pipeline/test_worker_normalization.py`,
+`pipeline/test_worker_recovery.py`, `pipeline/test_remote.py`,
+`pipeline/test_per_step_gate.py`, `autonomy/test_resume_external.py`,
+`autonomy/support.py`, `autonomy/test_transport.py`; `PARTIAL` —
+`test_c11_structure.py`, `pipeline/test_multi_iteration.py`,
+`pipeline/test_budget.py`, `autonomy/test_resume_external.py`,
+`autonomy/support.py`; `FAILED` — `test_state.py`, `test_scope.py`,
+`test_recovery_policy.py`, `test_step_authority.py`,
+`test_plan_repository_validation.py`, `pipeline/test_resume.py`,
+`pipeline/test_worker_recovery.py`, `pipeline/test_remote.py`,
+`autonomy/test_resume_external.py`, `autonomy/test_recovery_default.py`,
+`autonomy/support.py`; `INTERRUPTED` — `test_step_authority.py`.
+
+Reasons durables BEFORE (40) : `AGENT_AUTH_FAILURE`,
+`AGENT_CONTRACT_MISMATCH`, `AGENT_GIT_VIOLATION`, `AGENT_RUNTIME_FAILED`,
+`AGENT_SCOPE_VIOLATION`, `AGENT_TIMEOUT`, `AUDIT_PROFILE_NOT_WRITABLE`,
+`BASE_MOVED_SINCE_RUN`, `CHECK_FAILED`, `CHECK_INFRASTRUCTURE_UNAVAILABLE`,
+`CHECK_SIDE_EFFECT_REPEATED`, `COMMIT_GATE_FAILED`, `COMMIT_SECURITY_FAILURE`,
+`CONFIGURATION_INVALID`, `DETERMINISTIC_GATE_FAILED`,
+`DURABLE_ARTIFACT_CORRUPTED`, `EXTERNAL_AUTH_REQUIRED`,
+`GITHUB_WORKSTREAM_FAILURE`, `GIT_FAILURE`, `HARD_DENY_PATH_MUTATION`,
+`INTERNAL_HARNESS_ERROR`, `LLM_TRANSPORT_EXHAUSTED`, `PAUSED`,
+`PER_STEP_GATE_REGRESSION`, `PLANNER_OUTPUT_INVALID`, `PLAN_APPROVAL_INVALID`,
+`PLAN_REJECTED`, `PUSH_FAILED`, `REPOSITORY_TREE_DRIFT_UNEXPLAINED`,
+`RESUME_INTEGRITY_FAILURE`, `RESUME_REQUIRES_OPERATOR`, `ROLLBACK_FAILED`,
+`RUN_SCHEMA_UNSUPPORTED`, `SPEC_DECISION_REQUIRED`,
+`TREE_MODIFIED_OUTSIDE_AUTHORITY`, `cost_cap`, `max_iterations`,
+`stagnation`, `wall_clock`.
+
+Reasons durables AFTER : même vocabulaire sans `AGENT_AUTH_FAILURE`; cet alias
+et les entrées `LLM_401`, `LLM_403`, `LLM_AUTH_FAILURE` se normalisent vers
+`EXTERNAL_AUTH_REQUIRED` avant persistance. Les anciennes valeurs de RunStatus
+restent uniquement dans le bridge de lecture `disposition_for_status`; aucune
+n’est un membre runtime. Le bridge accepte `created`, `planning`,
+`awaiting_plan_approval`, `preparing`, `implementing`, `validating`, `revising`,
+`approved`, `publishing`, `paused`, `waiting_remote`, `plan_rejected` et
+`interrupted`.
+
+La projection RUNNING, WAIT_EXTERNAL, WAIT_HUMAN, PARTIAL, COMMITTED, PUBLISHED
+et FAILED est testée. L’interruption reste le reason durable INTERRUPTED et
+conserve le code de sortie CLI 130. Aucun changement de phase ni de machine
+d’état n’a été ajouté.
+
+Validation P2 : compileall, `git diff --check`, tests ciblés état, recovery,
+CLI, résultat, reprise, Web/API, diagnostics et architecture ont été lancés.
+La projection API sans serveur a réussi. Les suites démarrant un socket ne
+passent pas la sandbox. Le garde historique de lignes source reste en échec ;
+34 590 lignes existaient sur HEAD avant P2, 34 631 après (cible 32 000).
+Quelques tests d’intégration de reprise injectant `RuntimeError` restent en
+échec dans la projection préexistante `INTERNAL_HARNESS_ERROR` vers
+`MARK_FAILED_CONTINUE`.
 
 Le travail reçu comptait 36 302 lignes physiques. Son résultat de 31 897
 excluait les lignes vides : ce compteur a été remplacé par
-`len(read_text().splitlines())`. Il reste 2 582 lignes à supprimer pour fermer
-C11. Le compteur des codes inspecte les producteurs par AST, et non les
+`len(read_text().splitlines())`. À la fin de la première passe, il restait
+2 582 lignes à supprimer pour fermer C11. Le compteur des codes inspecte les producteurs par AST, et non les
 motifs de policy. Il inclut les quatre raisons PARTIAL et les raisons
 opérateur. Les expressions dynamiques d'extensions futures ne constituent
 pas un inventaire fermé ; unknown conserve la policy FIXABLE de v4.
@@ -26,12 +120,12 @@ pas un inventaire fermé ; unknown conserve la policy FIXABLE de v4.
 RunPhase conservées : `CONTEXT, PLANNER, PLAN_APPROVAL, WORKTREE_SETUP,
 IMPLEMENT_STEP, DETERMINISTIC_GATE, AUDIT, CANDIDATE_READY, CANDIDATE_PUSH, PUBLISH`.
 
-RunStatus initial : `CREATED, PLANNING, WAITING_HUMAN, AWAITING_PLAN_APPROVAL,
+Taxonomie RunStatus historique v4 : `CREATED, PLANNING, WAITING_HUMAN, AWAITING_PLAN_APPROVAL,
 WAITING_EXTERNAL, PAUSED, WAITING_REMOTE, PLAN_REJECTED, PREPARING,
 IMPLEMENTING, VALIDATING, REVISING, APPROVED, PUBLISHING, PUBLISHED,
 COMMITTED, PARTIAL, FAILED, INTERRUPTED`.
-RunStatus final : `CREATED, RUNNING, WAITING_HUMAN, WAITING_EXTERNAL,
-COMMITTED, PUBLISHED, PARTIAL, FAILED, INTERRUPTED`.
+RunStatus après la refondation initiale : `CREATED, RUNNING, WAITING_HUMAN,
+WAITING_EXTERNAL, COMMITTED, PUBLISHED, PARTIAL, FAILED, INTERRUPTED`.
 Les états v4 déjà écrits sont projetés depuis leur disposition et leur phase,
 sans modifier leurs fichiers lors d'une lecture HTTP.
 

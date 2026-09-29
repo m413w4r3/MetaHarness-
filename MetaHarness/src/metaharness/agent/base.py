@@ -15,8 +15,9 @@ from ..models import AgentExecutorCapabilities, ExecutionRole
 
 AgentUsage = dict[str, int]
 
-# Durable, backend-neutral failure reasons.  Backend-specific diagnostics stay
-# in ``backend_reason`` and never become pipeline state.
+# Backend-neutral worker failures. Provider auth adapters use
+# ``AGENT_AUTH_FAILURE`` as input; durable run state stores
+# ``EXTERNAL_AUTH_REQUIRED`` instead.
 AGENT_RUNTIME_FAILED = "AGENT_RUNTIME_FAILED"
 AGENT_TIMEOUT = "AGENT_TIMEOUT"
 AGENT_SCOPE_VIOLATION = "AGENT_SCOPE_VIOLATION"

@@ -32,7 +32,6 @@ from metaharness.models import (
 from metaharness.approval import ApprovalDecision, PlanIdentity, write_plan_approval
 from metaharness.resume import (
     CHECKPOINT_INTEGRITY_OPERATION,
-    PHASE_STATUS,
     ResumeCheckpoint,
     ResumePhase,
     checkpoint_payload,
@@ -59,9 +58,9 @@ class StateTests(unittest.TestCase):
 
             self.assertEqual(initial["schema_version"], 1)
             self.assertEqual(initial["run_id"], "run-123")
-            self.assertEqual(initial["status"], "created")
+            self.assertEqual(initial["status"], "running")
             self.assertIsNone(initial["failure"])
-            self.assertEqual(json.loads(state_path.read_text())["status"], "created")
+            self.assertEqual(json.loads(state_path.read_text())["status"], "running")
 
             store.update_metadata(planner={"request_id": "p1"})
             store.set_run_state(
@@ -184,7 +183,7 @@ class StateLockingTests(unittest.TestCase):
             # The writer really reached flock and the kernel refused it.
             self.assertTrue(probe.blocked("writer").wait(5))
             self.assertFalse(finished.is_set())
-            self.assertEqual(store.load()["status"], "created")
+            self.assertEqual(store.load()["status"], "running")
         thread.join(timeout=5)
         self.assertTrue(finished.is_set())
         self.assertTrue(store.load()["marker"])
@@ -396,7 +395,7 @@ class FrozenRunOptionsSchemaTests(unittest.TestCase):
             self.assertIn(RUN_SCHEMA_UNSUPPORTED, str(caught.exception))
             self.assertEqual(path.read_bytes(), data)
             self.assertEqual(store.load()["run_options_sha256"], digest)
-            self.assertEqual(store.load()["status"], RunStatus.CREATED.value)
+            self.assertEqual(store.load()["status"], RunStatus.RUNNING.value)
 
 
 class FrozenCheckpointSchemaTests(unittest.TestCase):
@@ -550,7 +549,7 @@ INVALID_TRANSITIONS = (
 
 # (phase, disposition, reason, status, resumable, resume eligible)
 PROJECTION_MATRIX = (
-    (None, D.RUNNING, None, RunStatus.CREATED, False, False),
+    (None, D.RUNNING, None, RunStatus.RUNNING, False, False),
     (R.CONTEXT, D.RUNNING, None, RunStatus.RUNNING, False, False),
     (R.PLAN_APPROVAL, D.RUNNING, None, RunStatus.RUNNING, False, False),
     (R.IMPLEMENT_STEP, D.RUNNING, None, RunStatus.RUNNING, False, False),
@@ -676,7 +675,7 @@ class RunMachineTests(unittest.TestCase):
         for phase in RunPhase:
             with self.subTest(phase=phase.value):
                 outcome = project_run_outcome(RunMachineState(phase, D.RUNNING))
-                self.assertEqual(outcome.status.value, PHASE_STATUS[phase])
+                self.assertIs(outcome.status, RunStatus.RUNNING)
                 self.assertFalse(outcome.resume_eligible)
                 # The status a resume claims is never a waiting or terminal one.
                 self.assertNotIn(outcome.status.value, {"failed", "published", "committed"})
@@ -688,10 +687,15 @@ class RunMachineTests(unittest.TestCase):
                 self.assertIsInstance(disposition_for_status(status), RunDisposition)
         for status, disposition in (
             ("waiting_external", D.WAIT_EXTERNAL),
-            ("waiting_external", D.WAIT_EXTERNAL),
             ("waiting_human", D.WAIT_HUMAN),
             ("failed", D.FAILED),
             ("interrupted", D.FAILED),
+            ("planning", D.RUNNING),
+            ("awaiting_plan_approval", D.RUNNING),
+            ("publishing", D.RUNNING),
+            ("paused", D.WAIT_EXTERNAL),
+            ("waiting_remote", D.WAIT_EXTERNAL),
+            ("plan_rejected", D.FAILED),
             ("committed", D.COMPLETED),
             ("published", D.COMPLETED),
             ("running", D.RUNNING),
@@ -700,6 +704,32 @@ class RunMachineTests(unittest.TestCase):
                 self.assertIs(disposition_for_status(status), disposition)
         with self.assertRaises(ValueError):
             disposition_for_status("not-a-status")
+
+    def test_legacy_statuses_are_read_only_projections(self) -> None:
+        old_running = (
+            "created", "planning", "awaiting_plan_approval", "preparing",
+            "implementing", "validating", "revising", "approved", "publishing",
+        )
+        for spelling in old_running:
+            with self.subTest(spelling=spelling):
+                self.assertIs(
+                    project_run_outcome(machine_state_for_run({"status": spelling})).status,
+                    RunStatus.RUNNING,
+                )
+        for spelling in ("paused", "waiting_remote"):
+            with self.subTest(spelling=spelling):
+                self.assertIs(
+                    project_run_outcome(machine_state_for_run({"status": spelling})).status,
+                    RunStatus.WAITING_EXTERNAL,
+                )
+        for spelling in ("plan_rejected", "interrupted"):
+            with self.subTest(spelling=spelling):
+                self.assertIs(
+                    project_run_outcome(machine_state_for_run({"status": spelling})).status,
+                    RunStatus.FAILED,
+                )
+        for spelling in (*old_running, "paused", "waiting_remote", "plan_rejected", "interrupted"):
+            self.assertNotIn(spelling.upper(), RunStatus.__members__)
 
     def test_the_checkpoint_phase_is_the_authority(self) -> None:
         # The run state only ever carries the posture: whatever a status
@@ -751,7 +781,7 @@ class RunStateProjectionTests(unittest.TestCase):
 
     def test_initialize_seeds_the_canonical_posture(self) -> None:
         state = self.store.load()
-        self.assertEqual(state["status"], RunStatus.CREATED.value)
+        self.assertEqual(state["status"], RunStatus.RUNNING.value)
         self.assertEqual(state["disposition"], RunDisposition.RUNNING.value)
 
     def test_set_run_state_derives_the_status_from_the_posture(self) -> None:
@@ -812,7 +842,7 @@ class RunStateProjectionTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 mutate()
-        self.assertEqual(self.store.load()["status"], RunStatus.CREATED.value)
+        self.assertEqual(self.store.load()["status"], RunStatus.RUNNING.value)
 
     def test_a_recorded_status_is_re_derived_and_never_trusted(self) -> None:
         # A recorded status that contradicts the posture is not authority: the

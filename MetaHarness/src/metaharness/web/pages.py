@@ -91,13 +91,13 @@ def _page(
 
 
 _TIMELINE = (
-    ("created", "CREATED"), ("running", "RUNNING"),
+    ("running", "RUNNING"),
     ("committed", "COMMITTED"), ("published", "PUBLISHED"),
 )
 _ORDER = {value: index for index, (value, _label) in enumerate(_TIMELINE)}
 _TERMINAL_LABELS = {
     "failed": "FAILED", "partial": "PARTIAL",
-    "interrupted": "INTERRUPTED", "waiting_human": "WAITING FOR OPERATOR",
+    "waiting_human": "WAITING FOR OPERATOR",
     "waiting_external": "WAITING FOR EXTERNAL AUTHORIZATION",
 }
 _WAITING_LABELS = {
@@ -129,7 +129,7 @@ def _failure(value: Any) -> str:
 
 def _status_badge(status: Any) -> str:
     value = str(status or "—")
-    style = "failed" if value in {"failed", "interrupted"} else "success" if value in {"committed", "published"} else ""
+    style = "failed" if value == "failed" else "success" if value in {"committed", "published"} else ""
     return f'<span class="badge {style}">{_e(_WAITING_LABELS.get(value, value))}</span>'
 
 
@@ -802,7 +802,7 @@ def _failure_card(run: dict[str, Any], token: str | None, overview: dict[str, An
     status = str(state.get("status", run.get("status", "")) or "")
     failure = run.get("failure", state.get("failure"))
     if status not in {
-        "failed", "partial", "interrupted", "waiting_external",
+        "failed", "partial", "waiting_external",
         "waiting_human",
     } or not isinstance(failure, dict):
         return ""
@@ -855,7 +855,7 @@ def _run_card(run: dict[str, Any], token: str | None, overview: dict[str, Any], 
             ("planner", "Planner"), ("implementer", "Implementer"),
         )
     )
-    style = "failed" if status in {"failed", "interrupted"} else "success" if status in {"committed", "published"} else ""
+    style = "failed" if status == "failed" else "success" if status in {"committed", "published"} else ""
     current_step = state.get("current_step")
     pause_requested = state.get("pause_requested") is True
     pause_action = ""
@@ -939,7 +939,7 @@ def render_run(run: dict[str, Any], token: str | None = None, *, config: Harness
         f'<details open><summary>View consolidated report</summary><pre>{_e(consolidated_content or "Diagnostics not generated yet.")}</pre></details></section>'
     )
     polls = run_page_polls(run)
-    failed = status in {"failed", "interrupted"}
+    failed = status == "failed"
     agent_section = (
         _cycle_sections(run) if isinstance(run.get("cycle_artifacts"), list) and run.get("cycle_artifacts")
         else _v2_steps(state, run.get("step_artifacts"))

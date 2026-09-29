@@ -56,7 +56,10 @@ from .audit import AuditService
 from .gates import GateService
 from .pipeline_v2 import PipelineV2Context, PipelineV2Coordinator
 from .publication import PublicationService
-from .recovery import CheckInfrastructureRecovery, RecoveryCoordinator, WorkerRecovery
+from .recovery import (
+    CheckInfrastructureRecovery, RecoveryCoordinator, WorkerRecovery,
+    normalize_exit_reason,
+)
 from .run_bootstrap import RunBootstrap
 from .run_composition import RunComposition
 from .run_failure import RunFailure
@@ -287,14 +290,20 @@ _OUTPUT_DISCIPLINE_TARGETS = {
 def _safe_agent_result_payload(result: Any) -> dict[str, Any]:
     """Persist bounded protocol metadata, never the raw backend result."""
 
+    exit_reason = getattr(result, "exit_reason", None)
+    if isinstance(exit_reason, str) and exit_reason.strip():
+        exit_reason = normalize_exit_reason(exit_reason)
+    backend_reason = getattr(result, "backend_reason", None)
+    if isinstance(backend_reason, str) and backend_reason.strip():
+        backend_reason = normalize_exit_reason(backend_reason)
     return {
         "status": getattr(result, "status", None),
-        "exit_reason": getattr(result, "exit_reason", None),
+        "exit_reason": exit_reason,
         "exit_code": getattr(result, "exit_code", None),
         "timed_out": bool(getattr(result, "timed_out", False)),
         "usage": normalize_usage(getattr(result, "usage", None)),
         "driver": getattr(result, "driver", None),
-        "backend_reason": getattr(result, "backend_reason", None),
+        "backend_reason": backend_reason,
     }
 
 
@@ -321,7 +330,6 @@ class RunObservability:
                 "run.created",
                 phase="run",
                 cycle=1,
-                data={"status": RunStatus.CREATED.value},
             )
 
     def trace_emit(
@@ -436,6 +444,12 @@ class RunObservability:
             getattr(result, "usage", None)
             if result is not None and raw_result is None else None
         )
+        observed_exit_reason = (
+            exit_reason if exit_reason is not None
+            else getattr(result, "exit_reason", None)
+        )
+        if isinstance(observed_exit_reason, str) and observed_exit_reason.strip():
+            observed_exit_reason = normalize_exit_reason(observed_exit_reason)
 
         aliases = {
             "input_tokens": ("input_tokens", "prompt_tokens"),
@@ -510,7 +524,7 @@ class RunObservability:
             "output_tokens": metric("output_tokens"),
             "reasoning_output_tokens": metric("reasoning_output_tokens"),
             "tool_call_count": None,
-            "exit_reason": exit_reason if exit_reason is not None else getattr(result, "exit_reason", None),
+            "exit_reason": observed_exit_reason,
             "tree_before": tree_before or getattr(result, "tree_before", None),
             "tree_after": getattr(result, "tree_after", None) if result is not None else None,
             "external_session_id": getattr(result, "external_session_id", None) if result is not None else None,
@@ -662,9 +676,7 @@ class RunObservability:
                 },
                 once=True,
             )
-        elif result.status in {
-            RunStatus.FAILED, RunStatus.INTERRUPTED,
-        }:
+        elif result.status is RunStatus.FAILED:
             failure = result.state.get("failure") if isinstance(result.state, Mapping) else None
             self.trace_emit(
                 "run.failed",
@@ -689,7 +701,7 @@ class RunObservability:
             )
 
         if result.status in {
-            RunStatus.FAILED, RunStatus.INTERRUPTED,
+            RunStatus.FAILED,
             RunStatus.WAITING_HUMAN,
             RunStatus.WAITING_EXTERNAL,
             RunStatus.COMMITTED, RunStatus.PUBLISHED, RunStatus.PARTIAL,

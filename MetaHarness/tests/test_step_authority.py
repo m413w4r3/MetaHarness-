@@ -80,7 +80,8 @@ class StepAuthorityTests(PipelineHarness):
             result = self.orchestrator(
                 self.config(), planner=[initial_plan(STEP)],
             ).run_text(SPEC, run_id="run")
-        self.assertEqual(result.status, RunStatus.INTERRUPTED, self.state().get("failure"))
+        self.assertEqual(result.status, RunStatus.FAILED, self.state().get("failure"))
+        self.assertEqual(result.failure_reason, "INTERRUPTED")
         self.assertTrue((self.step_dir() / "attempts/01/step.json").exists())
         self.assertFalse((self.step_dir() / "contract_repairs").exists())
         info = resume_info(self.run_dir(), self.state())

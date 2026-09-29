@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Collection, Mapping, Sequence
 
-from ..agent.base import AGENT_AUTH_FAILURE, AGENT_RUNTIME_FAILED, AGENT_TIMEOUT
+from ..agent.base import AGENT_RUNTIME_FAILED, AGENT_TIMEOUT
 from ..attempt_transaction import (
     AttemptBoundary,
     AttemptViolation,
@@ -37,7 +37,9 @@ from ..models import (
     project_run_outcome,
     transition,
 )
-from ..recovery_policy import RecoveryDecision, RecoveryStrategy, classify_failure
+from ..recovery_policy import (
+    RecoveryDecision, RecoveryStrategy, canonical_failure_code, classify_failure,
+)
 from ..result import ResultArtifactError, atomic_write_text
 from ..scope import ScopePolicy
 from ..state import RunStateStore
@@ -69,10 +71,6 @@ class RecoveryTerminalState:
     phase: RunPhase | None = None
 
 
-# Provider credentials are an external waiting condition, never a retry.
-_AUTH_ALIASES = frozenset({
-    "AGENT_AUTH_FAILURE", "LLM_401", "LLM_403", "LLM_AUTH_FAILURE",
-})
 # The trace phase of a recovery loop names its durable phase.
 _TRACE_CHECKPOINT = {
     "implementation": RunPhase.IMPLEMENT_STEP,
@@ -156,7 +154,9 @@ def normalize_exit_reason(reason: str) -> str:
 
     if not isinstance(reason, str) or not reason.strip():
         raise TypeError("exit reason must be a non-empty reason-code string")
-    return "EXTERNAL_AUTH_REQUIRED" if failure_code(reason) in _AUTH_ALIASES else reason
+    code = failure_code(reason)
+    canonical = canonical_failure_code(code)
+    return canonical if canonical != code else reason
 
 
 @dataclass(frozen=True)
@@ -516,7 +516,8 @@ class WorkerRecovery:
         the stable reason the run must project.
         """
 
-        reason = failure.reason
+        reason = normalize_exit_reason(failure.reason)
+        failure.reason = reason
         before = failure.tree_before
         trace = {"phase": "implementation", "cycle": cycle, "step_id": failure.step_id}
         attempt = self._recovery.used(retry_key) + 1
@@ -564,7 +565,7 @@ class WorkerRecovery:
 
         failure.tree_after = before
         failure.index_tree_after = before
-        if reason == AGENT_AUTH_FAILURE:
+        if reason == "EXTERNAL_AUTH_REQUIRED":
             # The same credentials can never succeed: an external change is due.
             failure.step_dir = artifact_dir
             return None

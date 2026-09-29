@@ -22,7 +22,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from ..agent.base import AGENT_AUTH_FAILURE
 from ..attempt_transaction import (
     AttemptBoundary,
     AttemptViolation,
@@ -57,7 +56,7 @@ from .gates import per_step_check_ids
 from .pipeline_v2 import BudgetExhausted, CyclePlan, PipelineFailure, PipelineV2Context
 from .pipeline_v2 import step_dir as cycle_step_dir
 from .publication import accepted_chain_records
-from .recovery import RecoveryAdmission
+from .recovery import RecoveryAdmission, normalize_exit_reason
 from .shared import (
     FAILED_CONTINUED,
     SKIPPED_DEPENDENCY,
@@ -136,6 +135,7 @@ class StepExecutionService:
                 future_ownership=future_step_ownership(cycle_plan.plan.steps, index),
             )
         except StepExecutionFailure as failure:
+            failure.reason = normalize_exit_reason(failure.reason)
             if classify_failure(failure.reason).failure_class is not FailureClass.FIXABLE:
                 raise
             self._mark_failed_continue(
@@ -307,6 +307,7 @@ class StepExecutionService:
                     )
                 return EffectiveStepExecution(outcome, authority)
             except StepExecutionFailure as failure:
+                failure.reason = normalize_exit_reason(failure.reason)
                 atomic_write_text(artifact_dir / "failure.json", json_text({
                     "schema_version": 1,
                     "reason": failure.reason[:120],
@@ -336,8 +337,7 @@ class StepExecutionService:
                     if feedback:
                         retry_addendum = bounded_v2_report(feedback)
                     continue
-                if failure.reason == AGENT_AUTH_FAILURE:
-                    failure.reason = "EXTERNAL_AUTH_REQUIRED"
+                if failure.reason == "EXTERNAL_AUTH_REQUIRED":
                     failure.detail = "executor credentials or external authorization are required"
                     failure.step_dir = artifact_dir
                     raise

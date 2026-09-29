@@ -214,7 +214,7 @@ def _load_state(run_dir: Path) -> dict[str, Any]:
             state = RunStateStore(run_dir / "state.json").load()
             if not isinstance(state, dict):
                 raise TypeError("run state must contain an object")
-            if "disposition" in state:
+            if "status" in state or "disposition" in state:
                 state = {**state, "status": status_of_run_state(state).value}
             return state
         except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1133,7 +1133,7 @@ _LIVE_EVENT_WINDOW_BYTES = 256 * 1024
 # Statuses for which the run page stops polling: terminal, or waiting for a
 # human decision that needs the complete server-rendered page.
 LIVE_STOP_STATUSES = frozenset({
-    "committed", "published", "partial", "failed", "interrupted",
+    "committed", "published", "partial", "failed",
     "waiting_human", "waiting_external",
 })
 _DIAGNOSTIC_COUNTERS = (
@@ -1237,10 +1237,10 @@ def run_pipeline(
     cycles is never assumed.
     """
 
-    status = str(state.get("status") or "")
+    status = status_of_run_state(state).value
     failure = state.get("failure") if isinstance(state.get("failure"), Mapping) else {}
     reason = str(failure.get("reason") or "") if failure else ""
-    failed = status in {"failed", "interrupted"}
+    failed = status == "failed"
     current = _state_cycle(state)
     planner = state.get("planner") if isinstance(state.get("planner"), Mapping) else {}
     resumable = isinstance(resume, Mapping) and bool(resume.get("resumable"))
@@ -1275,7 +1275,7 @@ def run_pipeline(
         add("planner", "Planner · operator decision required", "waiting")
     elif decision == "BLOCKED" or failed:
         add("planner", "Planner", "failed")
-    elif status == "created" or (status == "running" and state_phase in {"context", "planner"}):
+    elif status == "running" and state_phase in {None, "context", "planner"}:
         add("planner", "Planner", "running")
     else:
         add("planner", "Planner", "waiting")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import tomllib
 import unittest
+from dataclasses import fields
 from pathlib import Path
 
 from metaharness.models import (
@@ -18,7 +19,7 @@ from metaharness.models import (
     project_run_outcome,
     transition,
 )
-from metaharness.orchestration.recovery import project_exit, terminal_state_for
+from metaharness.orchestration.recovery import normalize_exit_reason, project_exit, terminal_state_for
 from metaharness.recovery_policy import (
     AutonomyBudget,
     RecoveryStrategy,
@@ -33,10 +34,10 @@ SRC = ROOT / "src" / "metaharness"
 
 
 def produced_failure_codes(source: Path = SRC) -> set[str]:
-    """Lower bound from actual error, state and evidence producers.
+    """Canonical durable vocabulary from error, state and evidence producers.
 
-    Unresolved dynamic codes can only increase the count. Policy patterns and
-    consumers (including UI labels and tests) do not count as producers.
+    Provider aliases are normalized at their persistence boundary. Policy
+    patterns and consumers (including UI labels and tests) are not producers.
     """
     trees = [ast.parse(path.read_text(encoding="utf-8")) for path in source.rglob("*.py")]
     constants: dict[str, set[str]] = {}
@@ -64,7 +65,11 @@ def produced_failure_codes(source: Path = SRC) -> set[str]:
             return values(node.args[2])
         return set()
 
-    codes = set(literal_failure_codes(source))
+    def durable_code(code: str) -> str:
+        normalized = normalize_exit_reason(code)
+        return normalized if normalized in PARTIAL_REASONS else stable_code(normalized)
+
+    codes = {durable_code(code) for code in literal_failure_codes(source)}
     for tree in trees:
         for node in ast.walk(tree):
             candidates: list[ast.AST] = []
@@ -94,7 +99,7 @@ def produced_failure_codes(source: Path = SRC) -> set[str]:
                 for value in values(candidate):
                     code = stable_code(value)
                     if code.isupper() and code.replace("_", "").isalnum():
-                        codes.add(code)
+                        codes.add(durable_code(code))
     return codes | set(PARTIAL_REASONS)
 
 
@@ -114,6 +119,7 @@ class C11StructureTests(unittest.TestCase):
             "step_attempts", "audit_repairs", "max_iterations",
             "max_wall_clock_hours", "max_cost",
         ))
+        self.assertEqual(len(fields(AutonomyBudget)), 5)
         self.assertLessEqual(len(RunPhase), 10)
         self.assertLessEqual(len(RunStatus), 10)
         self.assertLessEqual(len(list((SRC / "orchestration").glob("*.py"))), 14)
@@ -128,16 +134,21 @@ class C11StructureTests(unittest.TestCase):
         codes = produced_failure_codes()
         self.assertTrue(set(PARTIAL_REASONS) <= codes)
         self.assertTrue({"PAUSED", "INTERRUPTED", "PLAN_REJECTED", "EXTERNAL_AUTH_REQUIRED"} <= codes)
+        self.assertNotIn("AGENT_AUTH_FAILURE", codes)
+        self.assertEqual(normalize_exit_reason("AGENT_AUTH_FAILURE"), "EXTERNAL_AUTH_REQUIRED")
 
     def test_failure_inventory_detects_a_new_runtime_producer(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
             (source / "producer.py").write_text(
-                'def fail(store):\n    store.record_failure("NEW_DURABLE_CODE")\n',
+                'def fail(store):\n    store.record_failure("NEW_DURABLE_CODE")\n    store.record_failure("AGENT_AUTH_FAILURE")\n',
                 encoding="utf-8",
             )
-            self.assertIn("NEW_DURABLE_CODE", produced_failure_codes(source))
+            codes = produced_failure_codes(source)
+            self.assertIn("NEW_DURABLE_CODE", codes)
+            self.assertIn("EXTERNAL_AUTH_REQUIRED", codes)
+            self.assertNotIn("AGENT_AUTH_FAILURE", codes)
 
     def test_source_line_budget(self) -> None:
         self.assertLessEqual(
@@ -178,6 +189,45 @@ class C11StructureTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, RunStatus.PARTIAL)
         self.assertTrue(outcome.disposition.terminal)
+
+    def test_public_statuses_are_one_projection_of_machine_facts(self) -> None:
+        cases = (
+            (RunMachineState(RunPhase.IMPLEMENT_STEP), RunStatus.RUNNING),
+            (
+                RunMachineState(
+                    RunPhase.DETERMINISTIC_GATE, RunDisposition.WAIT_EXTERNAL,
+                    "CHECK_INFRASTRUCTURE_UNAVAILABLE",
+                ),
+                RunStatus.WAITING_EXTERNAL,
+            ),
+            (
+                RunMachineState(
+                    RunPhase.PLANNER, RunDisposition.WAIT_HUMAN, "SPEC_DECISION_REQUIRED",
+                ),
+                RunStatus.WAITING_HUMAN,
+            ),
+            (
+                RunMachineState(RunPhase.CANDIDATE_PUSH, RunDisposition.COMPLETED),
+                RunStatus.COMMITTED,
+            ),
+            (
+                RunMachineState(RunPhase.PUBLISH, RunDisposition.COMPLETED),
+                RunStatus.PUBLISHED,
+            ),
+            (
+                RunMachineState(RunPhase.PLANNER, RunDisposition.COMPLETED),
+                RunStatus.PARTIAL,
+            ),
+            (
+                RunMachineState(
+                    RunPhase.IMPLEMENT_STEP, RunDisposition.FAILED, "AGENT_SCOPE_VIOLATION",
+                ),
+                RunStatus.FAILED,
+            ),
+        )
+        for machine, expected in cases:
+            with self.subTest(expected=expected.value):
+                self.assertIs(project_run_outcome(machine).status, expected)
 
 
 if __name__ == "__main__":

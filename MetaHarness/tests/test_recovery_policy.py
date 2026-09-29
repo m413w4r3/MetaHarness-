@@ -12,6 +12,7 @@ import metaharness
 from metaharness.models import RunDisposition, RunStatus
 from metaharness.orchestration.recovery import (
     RecoveryCoordinator,
+    normalize_exit_reason,
     project_exit,
     terminal_state_for,
 )
@@ -110,6 +111,15 @@ class FailureClassificationTests(unittest.TestCase):
         # A suffix never changes the class of its stable code.
         self.assertIs(classify_failure("CHECK_FAILED:unit").failure_class, FailureClass.FIXABLE)
 
+    def test_provider_auth_aliases_share_one_durable_transient_code(self) -> None:
+        self.assertNotIn("AGENT_AUTH_FAILURE", FAILURE_CLASSES)
+        for alias in ("AGENT_AUTH_FAILURE", "LLM_401", "LLM_403", "LLM_AUTH_FAILURE"):
+            with self.subTest(alias=alias):
+                canonical = normalize_exit_reason(alias)
+                self.assertEqual(canonical, "EXTERNAL_AUTH_REQUIRED")
+                self.assertIs(classify_failure(canonical).failure_class, FailureClass.TRANSIENT)
+                self.assertIs(classify_failure(alias).failure_class, FailureClass.TRANSIENT)
+
     def test_only_fatal_class_can_hard_stop(self) -> None:
         for failure_class in FailureClass:
             with self.subTest(failure_class=failure_class):
@@ -186,7 +196,10 @@ class FailureClassificationTests(unittest.TestCase):
     def test_all_literal_pipeline_failure_codes_are_explicitly_classified(self) -> None:
         codes = literal_failure_codes()
         self.assertIn("RESUME_INTEGRITY_FAILURE", codes)
-        unclassified = {code: where for code, where in codes.items() if not classify_failure(code).known}
+        unclassified = {
+            code: where for code, where in codes.items()
+            if not classify_failure(normalize_exit_reason(code)).known
+        }
         self.assertEqual(unclassified, {}, "classify these codes in FAILURE_CLASSES")
         # The guard disciplines the source; the runtime stays fail-open.
         self.assertIs(classify_failure("DYNAMIC_UNKNOWN").failure_class, FailureClass.FIXABLE)

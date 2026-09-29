@@ -40,7 +40,7 @@ from metaharness.web.server import create_server
 # status itself is never written: each fixture names the machine state the
 # projection derives it from.
 FIXTURE_STATES = {
-    "created": RunMachineState(),
+    "running_empty": RunMachineState(),
     "running_planner": RunMachineState(RunPhase.PLANNER),
     "running_approval": RunMachineState(RunPhase.PLAN_APPROVAL),
     "running_implementation": RunMachineState(RunPhase.IMPLEMENT_STEP),
@@ -114,7 +114,7 @@ class WebServerTests(unittest.TestCase):
         connection.close()
         return response.status, json.loads(content) if content else None, content
 
-    def create_run(self, run_id: str, status: str = "created") -> Path:
+    def create_run(self, run_id: str, status: str = "running_empty") -> Path:
         run_dir = self.runs / run_id
         store = RunStateStore(run_dir / "state.json")
         store.initialize(run_id)
@@ -126,7 +126,7 @@ class WebServerTests(unittest.TestCase):
             patch("metaharness.web.server.model_profiles", return_value={"profiles": []}) as profiles,
             patch("metaharness.web.server.list_runs", return_value=[{"run_id": "r1"}]) as runs,
             patch("metaharness.web.server.get_run", return_value={"run_id": "r1"}) as get_run,
-            patch("metaharness.web.server.live_status", return_value={"status": "created"}) as live,
+            patch("metaharness.web.server.live_status", return_value={"status": "running"}) as live,
             patch("metaharness.web.server.progress", return_value={"next_offset": 4}) as progress,
         ):
             cases = (
@@ -799,7 +799,7 @@ class WebServerTests(unittest.TestCase):
             ),
             (
                 "resumable",
-                {"status": "created", "cycle": 1, "planner": {"decision": "READY"}},
+                {"status": "running", "cycle": 1, "planner": {"decision": "READY"}},
                 {"resumable": True, "phase": "plan_approval", "iteration": 1},
                 "resumable",
             ),

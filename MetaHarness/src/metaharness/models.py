@@ -295,7 +295,6 @@ class RunStatus(StrEnum):
     run never stores one as a decision, and no service ever writes one.
     """
 
-    CREATED = "created"
     RUNNING = "running"
     WAITING_HUMAN = "waiting_human"
     WAITING_EXTERNAL = "waiting_external"
@@ -303,7 +302,6 @@ class RunStatus(StrEnum):
     PUBLISHED = "published"
     PARTIAL = "partial"
     FAILED = "failed"
-    INTERRUPTED = "interrupted"
 
 
 class RunPhase(StrEnum):
@@ -672,36 +670,42 @@ def project_run_outcome(state: RunMachineState) -> RunOutcome:
         raise RunTransitionError("project_run_outcome expects a RunMachineState")
     phase, disposition, reason = state.phase, state.disposition, state.reason
     if disposition is RunDisposition.RUNNING:
-        status = RunStatus.RUNNING if phase is not None else RunStatus.CREATED
-        return RunOutcome(phase, disposition, status, False, False)
+        return RunOutcome(phase, disposition, RunStatus.RUNNING, False, False)
     if disposition is RunDisposition.COMPLETED:
         return RunOutcome(
             phase, disposition, _COMPLETED_STATUS.get(phase, RunStatus.COMMITTED), False, False,
         )
     if disposition is RunDisposition.FAILED:
-        # The failure reason decides whether a resume may still claim the run.
-        status = (
-            RunStatus.INTERRUPTED if reason == INTERRUPTED_REASON else RunStatus.FAILED
-        )
-        return RunOutcome(phase, disposition, status, False, True)
+        return RunOutcome(phase, disposition, RunStatus.FAILED, False, True)
     if disposition is RunDisposition.WAIT_EXTERNAL:
         return RunOutcome(phase, disposition, RunStatus.WAITING_EXTERNAL, True, True)
     if reason != "SPEC_DECISION_REQUIRED":
         raise RunTransitionError("WAIT_HUMAN is reserved for SPEC_DECISION")
     return RunOutcome(phase, disposition, RunStatus.WAITING_HUMAN, False, False)
 
-# The single status bridge: a durable status names exactly one disposition.
-# Nothing else maps a status onto a disposition.
-_STATUS_DISPOSITIONS: Mapping[RunStatus, RunDisposition] = {
-    RunStatus.CREATED: RunDisposition.RUNNING,
-    RunStatus.RUNNING: RunDisposition.RUNNING,
-    RunStatus.WAITING_HUMAN: RunDisposition.WAIT_HUMAN,
-    RunStatus.WAITING_EXTERNAL: RunDisposition.WAIT_EXTERNAL,
-    RunStatus.PUBLISHED: RunDisposition.COMPLETED,
-    RunStatus.COMMITTED: RunDisposition.COMPLETED,
-    RunStatus.PARTIAL: RunDisposition.COMPLETED,
-    RunStatus.FAILED: RunDisposition.FAILED,
-    RunStatus.INTERRUPTED: RunDisposition.FAILED,
+# One read-only bridge for status spellings written by earlier v4 runs.
+# Runtime code only projects the seven RunStatus members above.
+_STATUS_DISPOSITIONS: Mapping[str, RunDisposition] = {
+    RunStatus.RUNNING.value: RunDisposition.RUNNING,
+    RunStatus.WAITING_HUMAN.value: RunDisposition.WAIT_HUMAN,
+    RunStatus.WAITING_EXTERNAL.value: RunDisposition.WAIT_EXTERNAL,
+    RunStatus.PUBLISHED.value: RunDisposition.COMPLETED,
+    RunStatus.COMMITTED.value: RunDisposition.COMPLETED,
+    RunStatus.PARTIAL.value: RunDisposition.COMPLETED,
+    RunStatus.FAILED.value: RunDisposition.FAILED,
+    "created": RunDisposition.RUNNING,
+    "planning": RunDisposition.RUNNING,
+    "awaiting_plan_approval": RunDisposition.RUNNING,
+    "preparing": RunDisposition.RUNNING,
+    "implementing": RunDisposition.RUNNING,
+    "validating": RunDisposition.RUNNING,
+    "revising": RunDisposition.RUNNING,
+    "approved": RunDisposition.RUNNING,
+    "publishing": RunDisposition.RUNNING,
+    "paused": RunDisposition.WAIT_EXTERNAL,
+    "waiting_remote": RunDisposition.WAIT_EXTERNAL,
+    "plan_rejected": RunDisposition.FAILED,
+    "interrupted": RunDisposition.FAILED,
 }
 
 
@@ -713,8 +717,11 @@ def disposition_for_status(status: RunStatus | str) -> RunDisposition:
     """
 
     try:
-        return _STATUS_DISPOSITIONS[RunStatus(status)]
-    except (TypeError, ValueError) as exc:
+        value = status.value if isinstance(status, RunStatus) else status
+        if not isinstance(value, str):
+            raise KeyError(value)
+        return _STATUS_DISPOSITIONS[value.casefold()]
+    except (KeyError, TypeError, ValueError) as exc:
         raise RunTransitionError(f"run status {status!r} is unknown") from exc
 
 

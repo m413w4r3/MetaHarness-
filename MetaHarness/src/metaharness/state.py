@@ -126,7 +126,7 @@ class RunStateStore:
             "schema_version": 1,
             "pipeline_version": pipeline_version,
             "run_id": run_id,
-            "status": RunStatus.CREATED.value,
+            "status": RunStatus.RUNNING.value,
             "disposition": RunDisposition.RUNNING.value,
             "phase": None,
             "reason": None,

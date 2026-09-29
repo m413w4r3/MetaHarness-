@@ -120,7 +120,6 @@ def read_checkpoint_record(run_dir: str | Path) -> ResumeCheckpoint | None:
 
 
 read_checkpoint = read_checkpoint_record
-PHASE_STATUS = {phase: project_run_outcome(RunMachineState(phase, RunDisposition.RUNNING)).status.value for phase in ResumePhase}
 
 
 def resume_label(checkpoint: ResumeCheckpoint) -> str:
@@ -236,7 +235,7 @@ class ResumeRequiresOperatorError(ResumeError):
 
 
 __all__ = [
-    "CHECKPOINT_INTEGRITY_OPERATION", "PHASE_STATUS", "RUN_SCHEMA_UNSUPPORTED",
+    "CHECKPOINT_INTEGRITY_OPERATION", "RUN_SCHEMA_UNSUPPORTED",
     "ResumeCheckpoint", "ResumeCheckpointError",
     "ResumeError", "ResumeInfo", "ResumeIntegrityError", "ResumeNotAllowedError",
     "ResumePhase", "ResumeRequiresOperatorError", "ResumeSchemaUnsupportedError",
